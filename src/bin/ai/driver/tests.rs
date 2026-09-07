@@ -446,6 +446,12 @@ fn startup_choice_auto_resumes_terminal_bound_session() {
     assert_eq!(choice.history_file, suspended_history);
     assert_eq!(choice.active_persona.id, reviewer.id);
     assert_eq!(choice.model.as_deref(), Some("test-model"));
+    assert!(
+        choice
+            .resumed_suspended_entry
+            .as_ref()
+            .is_some_and(|entry| entry.session_id == "sess-123")
+    );
     assert!(choice.startup_notice.is_some());
     assert!(
         SuspendedSessionStore::new()

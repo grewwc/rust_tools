@@ -348,6 +348,14 @@ fn suspended_sessions_root() -> PathBuf {
 }
 
 pub(in crate::ai) fn current_terminal_key() -> Option<String> {
+    if crate::ai::terminal_session::is_worker() {
+        return crate::ai::terminal_session::current_terminal_key();
+    }
+    physical_terminal_key()
+}
+
+/// Resolve the real client's terminal identity before a PTY worker is launched.
+pub(in crate::ai) fn physical_terminal_key() -> Option<String> {
     resolve_terminal_key_from_sources(
         |name| std::env::var(name).ok(),
         current_tty_path().as_deref(),

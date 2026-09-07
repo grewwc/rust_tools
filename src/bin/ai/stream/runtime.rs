@@ -1194,6 +1194,9 @@ fn commit_visible_content(
         if !text.is_empty() {
             current_history.push_str(text);
             state.content.assistant_text.push_str(text);
+            // Live output for a real-time `/bg` handoff (best-effort, no-op
+            // unless the backgrounded process opened its live-output FIFO).
+            crate::ai::background::publish_live_output(text);
         }
         return Ok(());
     }
@@ -1225,6 +1228,9 @@ fn commit_visible_content(
     state.content.assistant_text.reserve(text.len());
     current_history.push_str(&text);
     state.content.assistant_text.push_str(&text);
+    // Live output for a real-time `/bg` handoff (best-effort, no-op unless the
+    // backgrounded process opened its live-output FIFO).
+    crate::ai::background::publish_live_output(&text);
 
     Ok(())
 }
@@ -1482,22 +1488,44 @@ fn append_fold_content(fold: &mut super::state::ThinkingFoldState, content: &str
     }
 }
 
-/// Covers only the thinking body window (fold summary + recent visible lines); the header is not included.
-///
-/// The header (`○`) is printed once when folding activates and stays anchored above the body; every redraw after that only
-/// erases and rewrites the body. The body shows at most `max_visible_lines` physical content lines plus one fold summary, and stays
-/// within the visible viewport, so relative erases always reach it and it never scrolls out of sync into the
-/// scrollback — and even if it did, no second header could be created, eliminating "orphan header stacking" at the root.
+/// Redraw the fold header and body within the viewport; cached row counts cover only the body.
 fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    // Only erase the previous body region; the header is anchored above it and must never be touched.
-    // Note: after the terminal narrows, the terminal auto-reflows old body into more physical lines at the current width;
-    // so do not trust the cached window_rows — recompute how many rows the last body would take at the current width.
-    let erase_rows = thinking_fold_rendered_body_rows(fold).max(fold.window_rows);
-    erase_fold_body(&mut out, erase_rows)?;
-    if fold.active && !fold.header_drawn {
-        write_fold_header(&mut out, fold)?;
+    thinking_fold_redraw_to(&mut out, fold)
+}
+
+fn thinking_fold_redraw_to(
+    out: &mut impl Write,
+    fold: &mut super::state::ThinkingFoldState,
+) -> io::Result<()> {
+    // Erase one extra row above the previous body and redraw the header on
+    // every redraw. After the terminal narrows it auto-reflows the old body
+    // into more physical lines at the current width, and the app's view of the
+    // width can lag the reflow (xterm.js reflows immediately; the PTY winsize
+    // reaches the app later), so one redraw can erase fewer rows than the body
+    // now occupies, stranding the leftovers between the header and the body.
+    // The extra row makes each redraw consume one of those stranded rows (the
+    // row directly above the body is always fold-owned: the header when clean,
+    // a stranded body row after a racing reflow), so the window converges back
+    // to [header][body] instead of accumulating permanent stacked
+    // `… more` / `… N earlier lines` markers. The header is redrawn on that
+    // same row, so the extra erase never touches transcript content above the
+    // fold. The first redraw (activation) has nothing on screen above the
+    // cursor, so it erases nothing and the header lands at the fold's start
+    // position as before; every later redraw has a header (and possibly an
+    // empty body) above the cursor that must be cleared and reprinted.
+    let body_rows = thinking_fold_rendered_body_rows(fold).max(fold.window_rows);
+    let erase_rows = if fold.header_drawn {
+        // The header ends with CRLF. With no body, the cursor is on the blank
+        // row below it, so the erase span must include that row as well.
+        body_rows.max(1).saturating_add(1)
+    } else {
+        body_rows
+    };
+    erase_fold_body(out, erase_rows)?;
+    if fold.active {
+        write_fold_header(out, fold)?;
         fold.header_drawn = true;
     }
 
@@ -1529,7 +1557,7 @@ fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Resul
     Ok(())
 }
 
-/// Print the anchored fold header. Should be called only once after folding activates.
+/// Print the fold header, leaving the cursor at the start of the first body row.
 fn write_fold_header(
     out: &mut impl Write,
     fold: &super::state::ThinkingFoldState,
@@ -2025,7 +2053,14 @@ fn process_stream_payload(
 
         // Some long tool-chain contexts make the model verbatim-repeat one sentence in thinking. Continuing to read only
         // burns the output budget and makes the terminal look stuck; escalate to retryable truncation and let the upper layer lower the reasoning tier.
-        if has_degenerate_repetition(&state.content.reasoning_text) {
+        // Gate the reasoning-tail kill on "no productive output yet": once the model is emitting visible text or tool
+        // calls, a repeating reasoning tail is cosmetic (the answer is already arriving) and killing the stream would
+        // discard valid content. Visible-text repetition is guarded separately below by its own detector, so a genuine
+        // content loop is still caught.
+        if state.content.assistant_text.trim().is_empty()
+            && state.content.tool_calls_map.is_empty()
+            && has_degenerate_repetition(&state.content.reasoning_text)
+        {
             state.content.finish_reason_seen = true;
             state.content.finish_reason_value =
                 Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
@@ -2150,8 +2185,17 @@ fn process_stream_payload(
                 // **visible output** (the incident was assistant content repeating one phrase verbatim until it filled the
                 // output budget, producing 160k chars of junk that got persisted and poisoned the next request, triggering a provider
                 // 400 InvalidParameter). Previously the degeneration guard only hung on reasoning_content, leaving visible
-                // text completely unguarded. On hit, set finish_reason and stop the stream; the upper layer retries downgraded.
-                if has_degenerate_repetition(&state.content.assistant_text) {
+                // text completely unguarded. On hit, strip the repeated junk tail so the preserved partial text is clean,
+                // set finish_reason and stop the stream; the upper layer retries downgraded.
+                if let Some(repeated_len) =
+                    degenerate_repetition_strip_len(&state.content.assistant_text)
+                {
+                    // Drop the looped tail (at most MAX_REASONING_REPEAT_CHARS * REASONING_REPEAT_COUNT chars) from the
+                    // partial text: without this, the junk would ride into the retry/finalize as "partial progress" and
+                    // could be persisted, poisoning the next request exactly like the original incident.
+                    let keep = state.content.assistant_text.chars().count() - repeated_len;
+                    state.content.assistant_text =
+                        state.content.assistant_text.chars().take(keep).collect();
                     state.content.finish_reason_seen = true;
                     state.content.finish_reason_value =
                         Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
@@ -2242,9 +2286,14 @@ fn collected_tool_call_matches(
 /// verbatim-repeat one sentence in the chain or body; continuing to read only drains the output budget and persists junk.
 /// Compares characters rather than bytes to handle Chinese correctly; the fragment must contain enough real content —
 /// letters, digits or Chinese characters — so separator lines, whitespace or Markdown punctuation are not misjudged as a degeneration loop.
-fn has_degenerate_repetition(text: &str) -> bool {
-    // This detector runs on every stream chunk, so only keep a tail large enough to cover the largest candidate fragment,
-    // avoiding a long reasoning that degrades into repeatedly scanning the whole text as context grows.
+/// Number of trailing chars forming a degenerate verbatim repetition (one pattern repeated
+/// REASONING_REPEAT_COUNT times at the tail), or None when no such tail exists.
+///
+/// Same detection rules as the former boolean detector, but also returns the repeated tail length so
+/// callers can strip the looped junk before the partial text flows to retry/finalize. Runs on every
+/// stream chunk, so it only keeps a tail large enough to cover the largest candidate fragment,
+/// avoiding a long reasoning that degrades into repeatedly scanning the whole text as context grows.
+fn degenerate_repetition_strip_len(text: &str) -> Option<usize> {
     let mut chars = text
         .chars()
         .rev()
@@ -2253,7 +2302,7 @@ fn has_degenerate_repetition(text: &str) -> bool {
     chars.reverse();
     let max_pattern_len = (chars.len() / REASONING_REPEAT_COUNT).min(MAX_REASONING_REPEAT_CHARS);
     if max_pattern_len < MIN_REASONING_REPEAT_CHARS {
-        return false;
+        return None;
     }
 
     for pattern_len in MIN_REASONING_REPEAT_CHARS..=max_pattern_len {
@@ -2267,10 +2316,43 @@ fn has_degenerate_repetition(text: &str) -> bool {
         if repeated[pattern_len..pattern_len * 2] == *pattern
             && repeated[pattern_len * 2..] == *pattern
         {
-            return true;
+            if is_fold_placeholder_repeat_pattern(pattern) {
+                continue;
+            }
+            return Some(repeated_len);
         }
     }
-    false
+    None
+}
+
+fn is_fold_placeholder_repeat_pattern(pattern: &[char]) -> bool {
+    let pattern = pattern.iter().collect::<String>();
+    let trimmed = pattern.trim();
+    let Some(rest) = trimmed
+        .strip_prefix('…')
+        .or_else(|| trimmed.strip_prefix("..."))
+    else {
+        return false;
+    };
+    let rest = rest.trim();
+    if rest == "more" {
+        return true;
+    }
+    let mut words = rest.split_whitespace();
+    let Some(count) = words.next() else {
+        return false;
+    };
+    if !count.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    matches!(
+        (words.next(), words.next(), words.next()),
+        (Some("earlier"), Some("line" | "lines"), None)
+    )
+}
+
+fn has_degenerate_repetition(text: &str) -> bool {
+    degenerate_repetition_strip_len(text).is_some()
 }
 
 #[derive(Clone, Copy)]

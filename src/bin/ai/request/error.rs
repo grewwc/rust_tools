@@ -189,11 +189,56 @@ pub(crate) fn apply_request_auth(
     builder: reqwest::RequestBuilder,
     endpoint: &str,
     api_key: &str,
+    session_id: &str,
 ) -> reqwest::RequestBuilder {
-    if api_key.trim().is_empty() && models::endpoint_supports_anonymous_auth(endpoint) {
+    let builder = if api_key.trim().is_empty() && models::endpoint_supports_anonymous_auth(endpoint)
+    {
+        builder
+    } else {
+        builder.bearer_auth(api_key)
+    };
+    apply_opencode_session_header(builder, endpoint, session_id)
+}
+
+/// Attaches the `x-opencode-session` request header for OpenCode gateway traffic.
+///
+/// OpenCode requires clients to send a stable per-conversation session identifier in
+/// this header so it can attribute traffic and optimize prompt caching. The header is
+/// only added when the endpoint belongs to the OpenCode gateway (`opencode.ai` or one
+/// of its subdomains, matched on the parsed host); other providers never see it. The
+/// value is the current aios session id, stable across the whole conversation. Requests
+/// with an empty session id pass through untouched.
+pub(crate) fn apply_opencode_session_header(
+    builder: reqwest::RequestBuilder,
+    endpoint: &str,
+    session_id: &str,
+) -> reqwest::RequestBuilder {
+    let session_id = session_id.trim();
+    if session_id.is_empty() || !is_opencode_gateway_endpoint(endpoint) {
         return builder;
     }
-    builder.bearer_auth(api_key)
+    builder.header("x-opencode-session", session_id)
+}
+
+/// Returns `true` when `endpoint` points at the OpenCode gateway: its parsed URL host
+/// is exactly `opencode.ai` or a subdomain of it (`*.opencode.ai`).
+///
+/// Matching on the parsed host (instead of substring search) keeps the header off
+/// look-alike endpoints such as `https://proxy.example.com/opencode.ai/v1` or
+/// `https://opencode.ai.evil.example/v1`, whose hosts are not controlled by the
+/// OpenCode gateway. Endpoints that fail to parse as a URL with a host (empty string,
+/// no scheme, no host) are treated as non-OpenCode rather than guessed from the text.
+fn is_opencode_gateway_endpoint(endpoint: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(endpoint.trim()) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    // `url` keeps a trailing dot when the host is an FQDN (e.g. `opencode.ai.`); strip
+    // it so the apex still matches. Host names are case-insensitive.
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "opencode.ai" || host.ends_with(".opencode.ai")
 }
 
 pub(crate) fn should_retry_status(status: StatusCode) -> bool {
@@ -457,5 +502,63 @@ mod tests {
 
         let network = RequestError::cancelled("canceled");
         assert!(!is_context_overflow_error(&network));
+    }
+
+    #[test]
+    fn opencode_session_header_only_for_opencode_gateway_hosts() {
+        let client = reqwest::Client::new();
+        let header = |endpoint: &str, session: &str| {
+            apply_opencode_session_header(client.get(endpoint), endpoint, session)
+                .build()
+                .unwrap()
+                .headers()
+                .get("x-opencode-session")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+
+        // OpenCode gateway: exact apex, subdomains, explicit port, mixed case.
+        assert_eq!(
+            header("https://opencode.ai/zen/v1/chat/completions", "s1"),
+            Some("s1".to_string())
+        );
+        assert_eq!(
+            header("https://api.opencode.ai/v1/chat/completions", "s2"),
+            Some("s2".to_string())
+        );
+        assert_eq!(
+            header("https://opencode.ai:443/zen/v1/chat/completions", "s3"),
+            Some("s3".to_string())
+        );
+        assert_eq!(
+            header("https://OPEncode.AI/zen/v1/chat/completions", "s4"),
+            Some("s4".to_string())
+        );
+
+        // Look-alike hosts that merely contain "opencode.ai" as a substring are not
+        // the OpenCode gateway and must never receive the header.
+        assert_eq!(
+            header("https://proxy.example.com/opencode.ai/v1", "s5"),
+            None
+        );
+        assert_eq!(
+            header("https://opencode.ai.evil.example/v1", "s6"),
+            None
+        );
+        assert_eq!(header("https://notopencode.ai/v1", "s7"), None);
+
+        // Empty session id never attaches the header, even on the real gateway.
+        assert_eq!(header("https://opencode.ai/zen/v1", "  "), None);
+    }
+
+    #[test]
+    fn opencode_gateway_endpoint_rejects_unparseable_or_hostless_inputs() {
+        assert!(!is_opencode_gateway_endpoint(""));
+        assert!(!is_opencode_gateway_endpoint("opencode.ai/zen/v1"));
+        assert!(!is_opencode_gateway_endpoint("https:///zen/v1"));
+        assert!(!is_opencode_gateway_endpoint("https://opencode.ai.evil.example/v1"));
+        assert!(!is_opencode_gateway_endpoint("https://notopencode.ai/v1"));
+        assert!(is_opencode_gateway_endpoint("https://opencode.ai./zen/v1"));
+        assert!(is_opencode_gateway_endpoint("https://zen.opencode.ai/v1"));
     }
 }

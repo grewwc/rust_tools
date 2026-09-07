@@ -187,15 +187,6 @@ pub fn side_notes_to_messages(notes: Vec<SideNote>) -> Vec<Message> {
         .collect()
 }
 
-/// Convenience: drain and directly return Messages (empty Vec when nothing pending).
-pub fn drain_side_notes_as_messages(history_file: &Path, target: Option<&str>) -> Vec<Message> {
-    let notes = drain_side_notes(history_file, target);
-    if notes.is_empty() {
-        return Vec::new();
-    }
-    side_notes_to_messages(notes)
-}
-
 /// The current process's target identifier: None for foreground; subagents learn their task_id
 /// via task_local or environment variables.
 pub fn current_target_id() -> Option<String> {
@@ -216,20 +207,6 @@ pub fn current_target_id() -> Option<String> {
         }
     }
     None
-}
-
-/// Called by the turn loop before each model request: drains pending notes for the current target
-/// and injects them into messages. Returns the number injected, so the caller can decide whether
-/// to print a hint.
-pub fn poll_and_inject(history_file: &Path, messages: &mut Vec<Message>) -> usize {
-    let target = current_target_id();
-    let target_ref = target.as_deref();
-    let injected = drain_side_notes_as_messages(history_file, target_ref);
-    let n = injected.len();
-    if n > 0 {
-        messages.extend(injected);
-    }
-    n
 }
 
 #[cfg(test)]

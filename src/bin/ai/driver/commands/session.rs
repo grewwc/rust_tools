@@ -335,6 +335,31 @@ pub(crate) fn select_stale_sessions<'a>(
         .collect()
 }
 
+/// Whether a side-note submitted while a turn is running should be executed as a
+/// real-time session command instead of being injected into the LLM context.
+///
+/// Currently this is exactly the top-level suspend family handled by
+/// [`try_handle_session_command`] (`/bg`, `:bg`, `/suspend`, `/detach`, `/susp`):
+/// the user asks to background the session mid-turn, so the intent is to suspend the
+/// session, not to hand the text to the model. Other commands are intentionally
+/// excluded — mid-turn `/close` (session deletion) or `/sessions *` mutations are far
+/// riskier and are not part of this feature.
+pub(crate) fn is_real_time_background_command(input: &str) -> bool {
+    let trimmed = input.trim();
+    // Require an explicit command prefix, mirroring the prompt-side dispatch in
+    // `try_handle_session_command`: a bare "bg" is ordinary guidance text, not a command.
+    let Some(normalized) = trimmed
+        .strip_prefix('/')
+        .or_else(|| trimmed.strip_prefix(':'))
+    else {
+        return false;
+    };
+    matches!(
+        normalized.split_whitespace().next(),
+        Some("bg" | "suspend" | "detach" | "susp")
+    )
+}
+
 pub fn try_handle_session_command(
     app: &mut App,
     input: &str,
@@ -2123,5 +2148,45 @@ mod tests {
         assert!(store.session_history_file("sess-old").exists());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn is_real_time_background_command_recognizes_suspend_family_only() {
+        for cmd in [
+            "/bg",
+            ":bg",
+            "/suspend",
+            "/detach",
+            "/susp",
+            "  /bg  ",
+            "\t/suspend",
+            "/bg any trailing args",
+        ] {
+            assert!(
+                is_real_time_background_command(cmd),
+                "{cmd:?} should be recognized as a real-time background command"
+            );
+        }
+        for cmd in [
+            "/close",
+            "/fork",
+            "/mark",
+            "/unmark",
+            "/sessions",
+            "/ss",
+            "/sessions list",
+            "/help",
+            "/bgx",
+            "bg",
+            ":bgx",
+            "please /bg",
+            "",
+            "   ",
+        ] {
+            assert!(
+                !is_real_time_background_command(cmd),
+                "{cmd:?} should NOT be recognized as a real-time background command"
+            );
+        }
     }
 }

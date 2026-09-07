@@ -245,7 +245,7 @@ async fn request_messages_with_key(
     for attempt in 1..=retry_policy.max_attempts {
         let client = app.client.clone();
         let build_request = || {
-            apply_request_auth(client.post(endpoint), endpoint, api_key)
+            apply_request_auth(client.post(endpoint), endpoint, api_key, &app.session_id)
                 .header("Content-Type", "application/json")
                 .body(http_body.clone())
         };
@@ -677,7 +677,8 @@ pub async fn do_request_json(
         .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
         // Non-streaming auxiliary request: 60s timeout per attempt
         let send_future = async {
-            let resp = apply_request_auth(app.client.post(&endpoint), &endpoint, api_key)
+            let resp =
+                apply_request_auth(app.client.post(&endpoint), &endpoint, api_key, &app.session_id)
                 .header("Content-Type", "application/json")
                 .body(request_body.clone())
                 .send()
@@ -951,7 +952,7 @@ pub async fn do_request_text_streaming(
             token_budget::estimate_serialized_request_tokens(&request_body);
         let client = app.client.clone();
         let build_request = || {
-            apply_request_auth(client.post(&endpoint), &endpoint, api_key)
+            apply_request_auth(client.post(&endpoint), &endpoint, api_key, &app.session_id)
                 .header("Content-Type", "application/json")
                 .body(request_body.clone())
         };

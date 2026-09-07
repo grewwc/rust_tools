@@ -36,7 +36,7 @@ use crate::ai::{
     cli::{self},
     config,
     config_schema::AiConfig,
-    history::{SessionStore, SuspendedSessionStore},
+    history::{SessionStore, SuspendedSessionEntry, SuspendedSessionStore},
     mcp::{McpClient, SharedMcpClient},
     models,
     prompt::PromptEditor,
@@ -305,6 +305,20 @@ fn suspend_session_on_sigint(app: &App) {
     }
 }
 
+fn restore_consumed_suspended_session(entry: Option<&SuspendedSessionEntry>, fallback_model: &str) {
+    let Some(entry) = entry else { return };
+    let model = entry.model.as_deref().unwrap_or(fallback_model);
+    if let Err(err) = SuspendedSessionStore::new().save_for_terminal_key(
+        &entry.terminal_key,
+        &entry.session_id,
+        entry.history_file.as_path(),
+        &entry.persona_id,
+        model,
+    ) {
+        eprintln!("[resume] failed to restore suspended session binding: {err}");
+    }
+}
+
 fn decision_log_persist_enabled() -> bool {
     configw::get_all_config()
         .get_opt(AiConfig::DECISION_LOG_PERSIST_ENABLE)
@@ -428,6 +442,10 @@ pub(in crate::ai) async fn run_with_cli(
         return Ok(());
     }
 
+    // Claim the live terminal endpoint before loading or mutating this session.
+    // A second client must attach to its existing worker, never run a second one.
+    crate::ai::terminal_session::register_session(&session_id)?;
+
     if let Err(err) = session_store.ensure_root_dir() {
         eprintln!("[Warning] Failed to create sessions dir: {}", err);
     }
@@ -440,11 +458,6 @@ pub(in crate::ai) async fn run_with_cli(
     let _session_pid_guard =
         session_pid::SessionPidGuard::register(session_store.sessions_root(), &session_id);
 
-    // A crash can occur between checkpoint rollback publishing the live SQLite and the
-    // assets; finish transaction recovery first so later turns never read
-    // cross-version state.
-    session_store.recover_checkpoint_state(&session_id)?;
-
     let shutdown = Arc::new(AtomicBool::new(false));
     let streaming = Arc::new(AtomicBool::new(false));
     let cancel_stream = Arc::new(AtomicBool::new(false));
@@ -452,6 +465,9 @@ pub(in crate::ai) async fn run_with_cli(
     let streaming_flag = Arc::clone(&streaming);
     let cancel_stream_flag = Arc::clone(&cancel_stream);
     ctrlc::set_handler(move || {
+        if crate::ai::background::forward_sigint_to_live_attach_target() {
+            return;
+        }
         signal::handle_sigint(
             signal_flag.as_ref(),
             streaming_flag.as_ref(),
@@ -468,6 +484,63 @@ pub(in crate::ai) async fn run_with_cli(
     } else {
         models::initial_model(&cli)
     };
+
+    // Live-session re-attach: a previous real-time `/bg` handoff left this
+    // session running in the shell background with stdout/stderr redirected to
+    // /dev/null and no log file, so re-entering would otherwise show a stale,
+    // static session and could race the backgrounded process on the same
+    // history. Attach to its live-output FIFO and stream the ongoing chunks
+    // until the background process exits, then fall through to the normal
+    // session flow (which shows the completed result).
+    if crate::ai::background::is_session_live(&session_id) {
+        use crate::ai::background::AttachOutcome;
+        let attach_session = session_id.clone();
+        let attach_shutdown = Arc::clone(&shutdown);
+        let _attach_side_note_input =
+            if crate::ai::stream::side_note_input::side_note_input_enabled() {
+                Some(
+                    crate::ai::stream::side_note_input::SideNoteInputGuard::spawn_for_attach(
+                        session_store.session_history_file(&session_id),
+                        Arc::clone(&shutdown),
+                    ),
+                )
+            } else {
+                None
+            };
+        let attach_result = tokio::task::spawn_blocking(move || {
+            crate::ai::background::attach_live_session(&attach_session, &attach_shutdown)
+        })
+        .await
+        .unwrap_or_else(|err| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("live session attach worker failed: {err}"),
+            ))
+        });
+        match attach_result {
+            Ok(AttachOutcome::BackgroundCompleted) => {}
+            Ok(AttachOutcome::UserDetached) => {
+                restore_consumed_suspended_session(
+                    startup_choice.resumed_suspended_entry.as_ref(),
+                    &current_model,
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                restore_consumed_suspended_session(
+                    startup_choice.resumed_suspended_entry.as_ref(),
+                    &current_model,
+                );
+                return Err(err.into());
+            }
+        }
+    }
+
+    // A crash can occur between checkpoint rollback publishing the live SQLite and the
+    // assets; finish transaction recovery first so later turns never read
+    // cross-version state.
+    session_store.recover_checkpoint_state(&session_id)?;
+
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;

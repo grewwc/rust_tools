@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 mod agents;
 mod background;
+mod terminal_session;
 mod cli;
 mod config;
 pub mod config_schema;
@@ -44,11 +45,24 @@ mod test_support {
 /// `background::spawn_daemon_child`), avoiding fork carrying the parent's
 /// half-initialized CF/os_log/objc state into the child.
 pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
+    // Internal helper used only by a live side-note `/bg` handoff. It is a fresh
+    // process so it can safely resume the still-running parent without inheriting
+    // the parent's runtime state; it must not parse normal CLI arguments.
+    let mut args: Vec<String> = std::env::args().collect();
+    if let Some(code) = terminal_session::prepare_entry(&mut args)? {
+        std::process::exit(code);
+    }
+    if args.get(1).map(String::as_str) == Some("--resume-detached-parent") {
+        if args.len() != 2 {
+            return Err("--resume-detached-parent is an internal command".into());
+        }
+        return background::resume_detached_parent();
+    }
+
     // Internal daemon marker: the background-mode parent prepends
     // `--daemon-child <session_id>` to the arguments; strip it here, parse the rest
     // normally, then route to the daemon child entry point
     // (`background::run_background_child`).
-    let mut args: Vec<String> = std::env::args().collect();
     let daemon_session = if args.get(1).map(String::as_str) == Some("--daemon-child") {
         let sid = args.get(2).cloned();
         args.drain(1..3);
@@ -64,7 +78,15 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
         background::detach_daemon_session()?;
     }
 
-    let cli = cli::parse_cli_args(args.into_iter());
+    let cli = cli::parse_cli_args(args.clone().into_iter());
+
+    // Attach before loading session history or creating a runtime: a live worker
+    // remains the sole owner of its conversation and in-flight model request.
+    if daemon_session.is_none()
+        && let Some(code) = terminal_session::maybe_run_client(&cli, &args)?
+    {
+        std::process::exit(code);
+    }
 
     if let Some(session_id) = daemon_session {
         return background::run_background_child(cli, session_id);
@@ -84,7 +106,9 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(driver::run_with_cli(cli))
+    let result = runtime.block_on(driver::run_with_cli(cli));
+    background::cleanup_live_background_pid_file();
+    result
 }
 
 mod ff_embed {

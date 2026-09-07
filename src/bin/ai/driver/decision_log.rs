@@ -37,6 +37,8 @@ pub enum DecisionType {
     SessionTitle,
     /// Reasoning effort downgrade decision on truncation retry
     TruncationDowngrade,
+    /// Degenerate-repetition stop (reasoning/content loop) finalized without ladder convergence
+    DegenerateRepetitionStop,
     /// Root-cause record for a runtime-forced no-tool handoff
     RuntimeStop,
 }
@@ -465,6 +467,37 @@ pub fn log_truncation_downgrade(
             "reasoning_effort kept".to_string()
         },
         reasoning: note.to_string(),
+        confidence: None,
+        outcome: None,
+        execution_time_ms: None,
+    });
+}
+
+/// Record a degenerate-repetition stop: the model looped on one phrase (reasoning or visible
+/// content) and the runtime finalized the turn honestly after its dedicated retry budget instead
+/// of burning the generic truncation ladder, which cannot fix content-triggered loops. Writes
+/// only to the decision log (session side channel, never enters model context), so the incident
+/// stays auditable without replaying the looped content into future requests.
+pub fn log_degenerate_repetition_stop(
+    store: &DecisionLogStore,
+    session_id: &str,
+    turn_id: usize,
+    model: &str,
+    attempts: usize,
+    reasoning_chars: usize,
+) {
+    store.log(DecisionLog {
+        timestamp: 0, // Will be set by log()
+        session_id: session_id.to_string(),
+        turn_id,
+        decision_type: DecisionType::DegenerateRepetitionStop,
+        context: format!(
+            "model={model} degenerate_repetition stopped after {attempts} attempts (reasoning chars: {reasoning_chars})"
+        ),
+        alternatives_considered: vec![],
+        chosen_option: "finalize honestly with degraded message / partial text".to_string(),
+        reasoning: "content-triggered repetition does not converge with the effort ladder; retry budget capped and turn finalized"
+            .to_string(),
         confidence: None,
         outcome: None,
         execution_time_ms: None,

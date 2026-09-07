@@ -4,7 +4,12 @@
 // box is not open). This module polls for Ctrl+G (0x07) in cbreak mode (ICANON/ECHO
 // off, ISIG/OPOST kept): on hit it opens a one-line input; Esc / F2 / Alt+Enter submit
 // the draft as a side-note with `from="user"` into the foreground queue, and the next
-// iteration injects it into the LLM context via `driver::side_note::poll_and_inject`.
+// iteration injects it into the LLM context (turn loop drains via
+// `driver::side_note::drain_side_notes`).
+// A `/bg`-family draft is handled by the listener itself after it releases terminal
+// input ownership: the same process becomes a shell background job without cancelling
+// the active request, then an English continuation note is queued for the next turn
+// iteration. The literal command is never injected into the LLM context.
 // Pressing Ctrl+G again while typing discards the current draft; Enter does not send
 // (aligned with the main input's "Enter=newline, Esc/F2 submit" key semantics).
 //
@@ -31,6 +36,7 @@ use std::{
 
 use crate::ai::{
     driver::{runtime_ctx, side_note::push_side_note},
+    history::SuspendedSessionStore,
     theme::{ACCENT_MUTED, RESET},
 };
 use crate::commonw::prompt::{acquire_background_stdin, foreground_stdin_requested};
@@ -196,7 +202,8 @@ pub(crate) fn side_note_input_enabled() -> bool {
     let term_out = runtime_ctx::terminal_output_enabled();
     let stdin_tty = io::stdin().is_terminal();
     let depth = runtime_ctx::current_subagent_depth();
-    let enabled = term_out && stdin_tty && depth == 0;
+    let enabled =
+        term_out && stdin_tty && depth == 0 && !crate::ai::background::live_background_active();
     // Temporary diagnostics (prints the real value of each enable condition when
     // RUST_TOOLS_SIDE_NOTE_DEBUG=1), for locating why the listener fails to start
     // when "Ctrl+G does nothing"; remove after diagnosis.
@@ -216,8 +223,57 @@ pub(crate) struct SideNoteInputGuard {
     task: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SideNoteLoopExit {
+    Stop,
+    ResumeAfterForeground,
+    BackgroundRequested,
+}
+
+enum BackgroundRequestAction {
+    LiveHandoff {
+        session_id: String,
+        persona_id: String,
+        model: String,
+    },
+    DetachAttach {
+        shutdown: Arc<AtomicBool>,
+    },
+}
+
 impl SideNoteInputGuard {
-    pub(crate) fn spawn(history_file: PathBuf) -> Self {
+    /// The session metadata is used only for a live `/bg` handoff after cbreak mode
+    /// and the stdin lease have both been released by this worker.
+    pub(crate) fn spawn(
+        history_file: PathBuf,
+        session_id: String,
+        persona_id: String,
+        model: String,
+    ) -> Self {
+        Self::spawn_with_background_action(
+            history_file,
+            BackgroundRequestAction::LiveHandoff {
+                session_id,
+                persona_id,
+                model,
+            },
+        )
+    }
+
+    /// Attach-mode side-note listener. Normal side-notes are still persisted to
+    /// the backgrounded session's queue; a `/bg` draft detaches only the current
+    /// attach view and is never injected into the model context.
+    pub(crate) fn spawn_for_attach(history_file: PathBuf, shutdown: Arc<AtomicBool>) -> Self {
+        Self::spawn_with_background_action(
+            history_file,
+            BackgroundRequestAction::DetachAttach { shutdown },
+        )
+    }
+
+    fn spawn_with_background_action(
+        history_file: PathBuf,
+        background_action: BackgroundRequestAction,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let task_stop = stop.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -259,11 +315,71 @@ impl SideNoteInputGuard {
                     if let Some(ready_tx) = ready_tx.take() {
                         let _ = ready_tx.send(true);
                     }
-                    let resume_after_foreground =
-                        side_note_input_loop(&history_file, &task_stop, term);
+                    let exit = side_note_input_loop(&history_file, &task_stop, term);
                     drop(stdin_owner);
-                    if !resume_after_foreground {
-                        break;
+                    match exit {
+                        SideNoteLoopExit::ResumeAfterForeground => continue,
+                        SideNoteLoopExit::BackgroundRequested => {
+                            if crate::ai::terminal_session::is_worker() {
+                                // Only the client detaches. Keep polling this same PTY
+                                // so Ctrl+G works immediately after every reattach,
+                                // without cancelling or steering the active model turn.
+                                if let Err(error) = crate::ai::terminal_session::detach() {
+                                    eprintln!("[background] detach failed: {error}");
+                                }
+                                continue;
+                            }
+                            match &background_action {
+                                BackgroundRequestAction::LiveHandoff {
+                                    session_id,
+                                    persona_id,
+                                    model,
+                                } => {
+                                    let suspended_store = SuspendedSessionStore::new();
+                                    let suspended_entry = match suspended_store
+                                        .suspend_current_terminal(
+                                            session_id,
+                                            history_file.as_path(),
+                                            persona_id,
+                                            model,
+                                        ) {
+                                        Ok(entry) => entry,
+                                        Err(error) => {
+                                            eprintln!(
+                                                "[background] live handoff failed: cannot save suspended session binding: {error}"
+                                            );
+                                            break;
+                                        }
+                                    };
+                                    match crate::ai::background::detach_live_session(session_id) {
+                                        Ok(()) => {
+                                            // The handoff only pauses the in-flight request while the
+                                            // shell retakes the terminal; it does not cancel it. Queue
+                                            // guidance after the handoff so a failed handoff cannot
+                                            // falsely tell the model that interaction is unavailable.
+                                            let _ = push_side_note(
+                                                &history_file,
+                                                crate::ai::background::BACKGROUND_CONTINUATION_NOTE,
+                                                "user",
+                                                None,
+                                            );
+                                        }
+                                        Err(error) => {
+                                            let _ = suspended_store.take_selected_for_terminal_key(
+                                                &suspended_entry.terminal_key,
+                                                &suspended_entry,
+                                            );
+                                            eprintln!("[background] live handoff failed: {error}");
+                                        }
+                                    }
+                                }
+                                BackgroundRequestAction::DetachAttach { shutdown } => {
+                                    shutdown.store(true, Ordering::Relaxed);
+                                }
+                            }
+                            break;
+                        }
+                        SideNoteLoopExit::Stop => break,
                     }
                 }
                 if let Some(ready_tx) = ready_tx {
@@ -495,14 +611,21 @@ fn submit_draft(
     input: &mut Vec<char>,
     pending: &mut Vec<u8>,
     in_input: &mut bool,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let content: String = input.iter().collect();
     pending.clear();
     let content = content.trim().to_string();
     if content.is_empty() {
         input.clear();
         *in_input = false;
-        return clear_input(footer);
+        clear_input(footer)?;
+        return Ok(false);
+    }
+    if crate::ai::driver::commands::session::is_real_time_background_command(&content) {
+        input.clear();
+        *in_input = false;
+        clear_input(footer)?;
+        return Ok(true);
     }
     // Do not insert a confirmation line into the transcript: the model may be mid-way
     // through streaming a Markdown paragraph and an extra newline would change its
@@ -511,12 +634,14 @@ fn submit_draft(
         Some(true) => {
             input.clear();
             *in_input = false;
-            clear_input(footer)
+            clear_input(footer)?;
+            Ok(false)
         }
         Some(false) => {
             // Keep the draft and keep showing the composer so the user's instruction
             // is not silently lost; press Esc/F2 again to retry, or Ctrl+G to give up.
-            redraw_input(footer, input)
+            redraw_input(footer, input)?;
+            Ok(false)
         }
         None => Err(io::Error::new(
             io::ErrorKind::Interrupted,
@@ -610,14 +735,18 @@ fn is_submit_escape(stop: &AtomicBool) -> bool {
     }
 }
 
-/// Returns true when the exit was caused by a foreground prompt taking over; the
-/// caller should retake stdin after the prompt finishes.
-fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: CbreakTerm) -> bool {
+/// Returns why the listener released terminal input ownership.
+fn side_note_input_loop(
+    history_file: &PathBuf,
+    stop: &AtomicBool,
+    _term: CbreakTerm,
+) -> SideNoteLoopExit {
     // Input mode: UTF-8 byte accumulation buffer + parsed characters + echoed column count
     let mut pending: Vec<u8> = Vec::new();
     let mut input: Vec<char> = Vec::new();
     let mut in_input = false;
     let mut footer: Option<FooterReservation> = None;
+    let mut background_requested = false;
 
     loop {
         if should_yield_stdin(stop) {
@@ -754,17 +883,20 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
                     let Some(active_footer) = footer.as_mut() else {
                         break;
                     };
-                    if submit_draft(
+                    match submit_draft(
                         history_file,
                         stop,
                         active_footer,
                         &mut input,
                         &mut pending,
                         &mut in_input,
-                    )
-                    .is_err()
-                    {
-                        break;
+                    ) {
+                        Ok(true) => {
+                            background_requested = true;
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(_) => break,
                     }
                     if !in_input {
                         if let Some(mut finished_footer) = footer.take() {
@@ -832,7 +964,13 @@ fn side_note_input_loop(history_file: &PathBuf, stop: &AtomicBool, _term: Cbreak
         }
         let _ = active_footer.leave();
     }
-    foreground_stdin_requested() && !stop.load(Ordering::Relaxed)
+    if background_requested {
+        SideNoteLoopExit::BackgroundRequested
+    } else if foreground_stdin_requested() && !stop.load(Ordering::Relaxed) {
+        SideNoteLoopExit::ResumeAfterForeground
+    } else {
+        SideNoteLoopExit::Stop
+    }
 }
 
 #[cfg(test)]

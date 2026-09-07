@@ -13,7 +13,11 @@ struct Cli {
     #[arg(short = 'o', default_value = "", value_name = "FILE")]
     output: String,
 
-    #[arg(long, default_value_t = false, help = "sort arrays before diff")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "sort arrays before diff (accepted, ignored: array diff is order-independent)"
+    )]
     sort: bool,
 
     #[arg(
@@ -116,7 +120,7 @@ fn main() {
         let old = jsonw::Json::from_file(&cli.files[0], options).unwrap();
         let new = jsonw::Json::from_file(&cli.files[1], options).unwrap();
 
-        let diff = jsonw::diff_json(old.value(), new.value(), cli.sort);
+        let diff = jsonw::diff_json(old.value(), new.value());
         let diff_value = serde_json::to_value(diff).unwrap_or(Value::Null);
         let diff_json = jsonw::Json::new(diff_value);
 

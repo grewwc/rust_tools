@@ -30,9 +30,10 @@ use super::{
     prepare::prepare_turn,
     record_llm_summary_attempt_chars, should_try_llm_summary,
     tool_result::{
-        FinalGateState, audit_evidence_gate_action, completion_evidence_state,
-        completion_tool_result_succeeded, handle_iteration_execution_for_model,
-        is_evidence_gated_audit_agent, tool_call_is_successful_mutation_candidate,
+        DEGENERATE_REPETITION_FINISH_REASON, FinalGateState, audit_evidence_gate_action,
+        completion_evidence_state, completion_tool_result_succeeded,
+        handle_iteration_execution_for_model, is_evidence_gated_audit_agent,
+        tool_call_is_successful_mutation_candidate,
     },
     types::{IterationExecution, TurnLoopStep, TurnOutcome, TurnPreparation},
 };
@@ -89,6 +90,14 @@ const MAX_STREAM_ERROR_RETRIES: usize = 16;
 /// Retry cap for consecutive "model output too long / truncated tool-call JSON" truncations.
 /// stream_error uses its own separate cap and does not count toward this one.
 const MAX_MODEL_TRUNCATION_RETRIES: usize = 3;
+/// Retry cap for consecutive degenerate-repetition stops (the model loops on one phrase in
+/// reasoning or visible content). This is deliberately separate from MAX_MODEL_TRUNCATION_RETRIES:
+/// effort/max_tokens downgrades cannot fix a content-triggered loop — the model re-generates the
+/// same loop from the same context — so retrying 3 times like a length truncation just burns budget
+/// (the incident session burned 12+ generations across 4 turns without converging). Budget per
+/// turn: the original generation + ONE corrective retry carrying the dedicated
+/// `tool_followup:degenerate_repetition` note, then finalize honestly with the collected reasoning.
+const DEGENERATE_REPETITION_MAX_ATTEMPTS: usize = 2;
 /// Ratio threshold of reasoning to completion tokens: at or above it, the truncation is classified
 /// as "reasoning ate the budget", where lowering reasoning_effort directly shortens the chain of
 /// thought and frees budget for visible text; below it, the truncation is mostly caused by overly
@@ -216,6 +225,10 @@ struct TurnRetryState {
     consecutive_empty_responses: usize,
     consecutive_truncations: usize,
     consecutive_stream_errors: usize,
+    /// Consecutive degenerate-repetition stops (reasoning/content loop) in this turn. Separate
+    /// budget from consecutive_truncations: the effort ladder cannot fix content-triggered loops,
+    /// so this caps retries independently (see DEGENERATE_REPETITION_MAX_ATTEMPTS).
+    consecutive_degenerate_repetitions: usize,
     saved_effort_override: Option<Option<crate::ai::provider::ReasoningEffort>>,
     saved_thinking_disabled: bool,
     saved_max_tokens_override: Option<u32>,
@@ -228,6 +241,7 @@ impl TurnRetryState {
             consecutive_empty_responses: 0,
             consecutive_truncations: 0,
             consecutive_stream_errors: 0,
+            consecutive_degenerate_repetitions: 0,
             saved_effort_override: app.cli.reasoning_effort_override,
             saved_thinking_disabled: app.cli.thinking_disabled_override,
             saved_max_tokens_override: app.cli.max_tokens_override,
@@ -949,6 +963,9 @@ pub(in crate::ai::driver) async fn run_turn(
                         Some(
                             crate::ai::stream::side_note_input::SideNoteInputGuard::spawn(
                                 app.session_history_file.clone(),
+                                app.session_id.clone(),
+                                app.active_persona.id.clone(),
+                                app.current_model.clone(),
                             ),
                         )
                     } else {
@@ -1051,7 +1068,36 @@ fn execute_audit_command(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Drain pending side-notes for the current target and inject them into the LLM
+/// context. Called at the top of every iteration so guidance queued in the file
+/// is seen by the next LLM request. Applies to foreground tasks and subagents
+/// alike; subagents are targeted via task-local SUBAGENT_TASK_ID (falling back to
+/// the AIOS_SUBAGENT_TASK_ID / SUBAGENT_TASK_ID env vars).
+///
+/// A `/bg`-family draft never reaches the queue: the side-note listener recognizes
+/// it and detaches the terminal client itself, so only plain guidance is injected.
+fn drain_side_notes_and_inject(
+    history_file: &std::path::Path,
+    messages: &mut Vec<crate::ai::history::Message>,
+    turn_messages: &mut Vec<crate::ai::history::Message>,
+) {
+    let target = crate::ai::driver::side_note::current_target_id();
+    let notes = crate::ai::driver::side_note::drain_side_notes(history_file, target.as_deref());
+    if notes.is_empty() {
+        return;
+    }
+    {
+        let injected = crate::ai::driver::side_note::side_notes_to_messages(notes);
+        let n = injected.len();
+        messages.extend(injected.clone());
+        turn_messages.extend(injected);
+        crate::ai::driver::print::print_tool_note_line(
+            "side-note",
+            &format!("injected {n} note(s)"),
+        );
+    }
+}
+
 async fn run_turn_body(
     app: &mut App,
     mcp_client: &SharedMcpClient,
@@ -1163,6 +1209,9 @@ async fn run_turn_body(
     let loop_result = 'turn: loop {
         let iteration = supervisor.next_iteration();
         let effective_max_iterations = supervisor.effective_max_iterations(max_iterations);
+        if crate::ai::background::live_background_active() {
+            app.cli.background = true;
+        }
         // From round two onward, replace the images inlined in user messages of the
         // request projection with the textual digest produced in the previous round, to
         // avoid replaying base64 in the tool loop and tripping Doubao/Ark-side 429 TPM
@@ -1267,23 +1316,9 @@ async fn run_turn_body(
         // is injected into context so the next LLM request sees it immediately. Applies to
         // foreground tasks and subagents alike; subagents are targeted via task-local
         // SUBAGENT_TASK_ID (falling back to the AIOS_SUBAGENT_TASK_ID / SUBAGENT_TASK_ID env vars).
-        // Everything goes through side_note::poll_and_inject to avoid two injection paths diverging
-        // and leaking original text back.
-        {
-            let before = messages.len();
-            let cnt = crate::ai::driver::side_note::poll_and_inject(
-                &app.session_history_file,
-                &mut messages,
-            );
-            if cnt > 0 {
-                let injected = messages[before..].to_vec();
-                turn_messages.extend(injected);
-                crate::ai::driver::print::print_tool_note_line(
-                    "side-note",
-                    &format!("injected {cnt} note(s)"),
-                );
-            }
-        }
+        // A `/bg`-family draft never lands in the queue — the side-note listener handles it
+        // directly — so every drained note is plain guidance.
+        drain_side_notes_and_inject(&app.session_history_file, &mut messages, &mut turn_messages);
         let active_skill_name = skill_turn.primary_skill_name().map(str::to_string);
         let compression_report = std::mem::take(&mut supervisor.pending_compression_report);
         let mut response_model = None;
@@ -1394,13 +1429,131 @@ async fn run_turn_body(
             // tool JSON) still cannot converge, to avoid endless retries burning budget. The
             // threshold is 3: it gives the model two chances to shrink and rewrite.
             if let IterationExecution::Truncated(stream_result) = &execution {
-                retry.consecutive_truncations += 1;
                 // Reset tool-loop detection: repeated calls during truncation retries are expected
                 // behavior and must not be misjudged as a tool dead-loop that triggers a hard-stop
                 // convergence.
                 supervisor.mark_truncation_skip();
 
-                if stream_result.stream_error {
+                let is_degenerate_repetition = stream_result
+                    .finish_reason_value
+                    .as_deref()
+                    .is_some_and(|reason| reason == DEGENERATE_REPETITION_FINISH_REASON);
+
+                if is_degenerate_repetition {
+                    // Separate failure mode from output-length truncation: the model looped on one
+                    // phrase (reasoning or visible content), detected locally or reported by the
+                    // server. The generic effort/max_tokens ladder cannot fix a content-triggered
+                    // loop — the model re-generates the same loop from the same context — so do not
+                    // burn extra downgraded generations on it.
+                    retry.consecutive_degenerate_repetitions += 1;
+                    // A degenerate stop is not a length truncation: keep the two budgets independent
+                    // so a later length truncation still starts from the top of its own ladder.
+                    retry.consecutive_truncations = 0;
+                    if retry.consecutive_degenerate_repetitions
+                        >= DEGENERATE_REPETITION_MAX_ATTEMPTS
+                    {
+                        // Budget exhausted (original generation + corrective retry). Finalize
+                        // honestly: never burn more generations on a content-triggered loop, and
+                        // never leave the misleading generic "shrink output" placeholder.
+                        let partial_text = stream_result.assistant_text.trim();
+                        let has_visible_text = !partial_text.is_empty();
+                        crate::ai::driver::decision_log::log_degenerate_repetition_stop(
+                            crate::ai::driver::decision_log::get_decision_log_store(),
+                            &crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
+                            crate::ai::driver::runtime_ctx::current_turn_id_or_zero(),
+                            &next_model,
+                            retry.consecutive_degenerate_repetitions,
+                            stream_result.reasoning_text.trim().chars().count(),
+                        );
+                        // Persist the stopped attempt's text + reasoning outside canonical history so
+                        // the incident stays auditable without replaying looped content into future
+                        // requests (same side table as user-interrupted streams).
+                        if !stream_result.assistant_text.is_empty()
+                            || !stream_result.reasoning_text.is_empty()
+                        {
+                            if let Err(error) =
+                                crate::ai::history::append_interrupted_stream_diagnostic_sqlite(
+                                    &app.session_history_file,
+                                    &next_model,
+                                    &stream_result.assistant_text,
+                                    &stream_result.reasoning_text,
+                                )
+                            {
+                                eprintln!(
+                                    "[Warning] Failed to save degenerate-repetition diagnostics: {error}"
+                                );
+                            }
+                        }
+                        if has_visible_text {
+                            // The model produced real content and only its tail looped (the stream
+                            // layer already stripped the repeated junk); accept the partial answer
+                            // instead of discarding it.
+                            let _ = writeln!(
+                                std::io::stderr(),
+                                "  ▲ {} degenerate-repetition stops; keeping the visible content produced so far",
+                                retry.consecutive_degenerate_repetitions
+                            );
+                            output.assistant_text = partial_text.to_string();
+                        } else {
+                            // No visible content at all: the loop consumed the whole generation in
+                            // reasoning. Give an honest, actionable message plus the reasoning tail
+                            // the detector saw, instead of the generic placeholder that misattributes
+                            // the cause to output length.
+                            let _ = writeln!(
+                                std::io::stderr(),
+                                "  ✗ {} degenerate-repetition stops; ending the turn with an explanation",
+                                retry.consecutive_degenerate_repetitions
+                            );
+                            let mut degraded = String::from(
+                                "[Model output was stopped: the response stream repeated itself and the runtime \
+                                 terminated the generation to avoid burning tokens and persisting junk. One corrective \
+                                 retry did not converge — the repetition is triggered by the current conversation \
+                                 context, not by the output budget.\n\
+                                 Suggest: retry this request, lower the reasoning effort, or switch models for the next turn.]",
+                            );
+                            let reasoning = stream_result.reasoning_text.trim();
+                            if !reasoning.is_empty() {
+                                // Bounded tail excerpt: the tail is exactly what the detector sees,
+                                // so show the user what the model was looping on.
+                                const EXCERPT_CHARS: usize = 800;
+                                let excerpt: String = reasoning
+                                    .chars()
+                                    .rev()
+                                    .take(EXCERPT_CHARS)
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                    .collect();
+                                degraded
+                                    .push_str("\n\n[Reasoning tail from the stopped attempt]\n");
+                                degraded.push_str(&excerpt);
+                            }
+                            output.assistant_text = degraded;
+                        }
+                        // A degenerate stop also finalizes outside the normal FinalResponse gate
+                        // path (same as the truncation partial-text acceptance above): run the
+                        // evidence gate so a partial audit payload cannot bypass it.
+                        if is_evidence_gated_audit_agent(app.current_agent.as_str()) {
+                            let effective_cwd =
+                                crate::ai::driver::runtime_ctx::effective_cwd().ok();
+                            let _ = audit_evidence_gate_action(
+                                app.current_agent.as_str(),
+                                &mut messages,
+                                &turn_messages,
+                                &mut output.assistant_text,
+                                effective_cwd.as_deref(),
+                                true,
+                                iteration,
+                                effective_max_iterations,
+                            );
+                        }
+                        break 'turn Ok(None);
+                    }
+                    // First occurrence: skip the effort/max_tokens ladder entirely — only the
+                    // dedicated `tool_followup:degenerate_repetition` note (injected below by
+                    // handle_iteration_execution_for_model → append_truncation_retry_note) can help
+                    // a content-triggered loop; a downgraded retry would just re-loop.
+                } else if stream_result.stream_error {
                     // Truncation caused by stream-read errors (network jitter / abnormal server stream
                     // drop). The model did not output too much, so lowering reasoning_effort or
                     // injecting a shrink prompt is pointless. It does not accumulate into
@@ -1428,6 +1581,7 @@ async fn run_turn_body(
                 } else {
                     // Real truncation: the model hit the output cap or produced half-cut tool JSON.
                     retry.consecutive_stream_errors = 0;
+                    retry.consecutive_truncations += 1;
 
                     // Zero-output truncation detection: completion=0 + finish_reason=length means the
                     // server rejected the max_tokens value (typically a relay/compatibility layer
@@ -1622,6 +1776,9 @@ async fn run_turn_body(
                     retry.max_tokens_downgraded = false;
                 }
             }
+            if crate::ai::background::live_background_active() {
+                app.cli.background = true;
+            }
             let step = match handle_iteration_execution_for_model(
                 app,
                 response_model.as_deref().unwrap_or(&next_model),
@@ -1710,7 +1867,13 @@ async fn run_turn_body(
                     }
                     break 'turn Ok(None);
                 }
-                TurnLoopStep::Return(outcome) => break 'turn Ok(Some(outcome)),
+                TurnLoopStep::Return(outcome) => {
+                    // Do not drain here: this exit bypasses normal finalization, so
+                    // ordinary notes injected here would be removed from the queue
+                    // without being persisted. Live `/bg` is handled directly by
+                    // SideNoteInputGuard before this branch is reached.
+                    break 'turn Ok(Some(outcome));
+                }
             }
         }
         // ↓↓↓ Post-processing for the Continue branch (the mc lock has been released; awaiting is

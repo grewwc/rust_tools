@@ -7,7 +7,6 @@ model_tier: standard
 max_steps: 64
 tool_groups:
   - core
-  - executor
 disable_mcp_tools: true
 ---
 

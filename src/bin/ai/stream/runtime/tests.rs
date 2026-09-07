@@ -256,6 +256,54 @@ fn degenerate_repetition_catches_visible_content_runaway() {
 }
 
 #[test]
+fn degenerate_repetition_ignores_fold_placeholder_quotes() {
+    // Terminal fold placeholders can legitimately appear repeated in a user-provided
+    // screenshot transcript and then be quoted in model reasoning.
+    let repeated_placeholder = "    … 13 earlier lines\n".repeat(3);
+    let quoted_terminal_output = format!(
+        "Looking at the displayed output:\n```text\n{}",
+        repeated_placeholder
+    );
+
+    assert!(!has_degenerate_repetition(&quoted_terminal_output));
+    assert!(!has_degenerate_repetition(
+        &"    ... 13 earlier lines\n".repeat(3)
+    ));
+    assert!(!has_degenerate_repetition(&"    … more\n".repeat(3)));
+}
+
+#[test]
+fn degenerate_repetition_strip_len_returns_tail_and_keeps_prefix() {
+    let phrase = "需要先确认当前上下文是否仍然有效，然后再继续执行。";
+    let prefix = "正常的前置说明文本。";
+    let text = format!("{prefix}{}", phrase.repeat(3));
+    // The detector must see through the prefix and return exactly the repeated tail length.
+    let strip = degenerate_repetition_strip_len(&text).expect("degenerate tail must be detected");
+    assert_eq!(strip, phrase.chars().count() * 3);
+    // Stripping that tail must leave the clean prefix untouched.
+    let keep = text.chars().count() - strip;
+    let cleaned: String = text.chars().take(keep).collect();
+    assert_eq!(cleaned, prefix);
+    assert!(!has_degenerate_repetition(&cleaned));
+    // Non-degenerate inputs have nothing to strip.
+    assert_eq!(degenerate_repetition_strip_len(&phrase.repeat(2)), None);
+    // Separator-only tails are not contentful, so nothing to strip.
+    assert_eq!(degenerate_repetition_strip_len(&"----------------".repeat(3)), None);
+}
+
+#[test]
+fn degenerate_repetition_strip_len_cleans_visible_content_runaway() {
+    // The visible-content incident shape: real conclusion first, then the looped junk tail.
+    let phrase = "我再重新读一遍修复区域，以确保我掌握的是当前状态。";
+    let text = format!("先给出结论。{}", phrase.repeat(3));
+    let strip = degenerate_repetition_strip_len(&text).expect("junk tail must be detected");
+    let keep = text.chars().count() - strip;
+    let cleaned: String = text.chars().take(keep).collect();
+    assert_eq!(cleaned, "先给出结论。");
+    assert!(!has_degenerate_repetition(&cleaned));
+}
+
+#[test]
 fn thinking_fold_defaults_to_configured_lines_for_tty() {
     assert_eq!(
         resolve_thinking_fold_max_visible_lines(true, None),
@@ -1984,10 +2032,135 @@ fn thinking_fold_erase_rows_follow_current_terminal_reflow_of_previous_body() {
 }
 
 #[test]
+fn thinking_fold_redraw_reuses_header_after_empty_body() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    unsafe {
+        std::env::set_var("COLUMNS", "200");
+    }
+
+    let mut fold = super::super::state::ThinkingFoldState::new();
+    fold.active = true;
+    fold.max_visible_lines = 2;
+    let mut header = Vec::new();
+    write_fold_header(&mut header, &fold).unwrap();
+    let mut out = Vec::new();
+
+    thinking_fold_redraw_to(&mut out, &mut fold).unwrap();
+    assert_eq!(out, header, "activation must not erase preceding output");
+    assert!(fold.header_drawn);
+    assert_eq!(fold.window_rows, 0);
+
+    // With no body the cursor is on the blank row below the header. Clear both
+    // rows before reprinting, just as for a one-row body, without moving above
+    // the fold. Repeated open markers and skipped blank lines keep this state.
+    let mut redraw_prefix = Vec::new();
+    erase_fold_body(&mut redraw_prefix, 2).unwrap();
+    redraw_prefix.extend_from_slice(&header);
+    for content in ["", "\n \n", "first line"] {
+        append_fold_content(&mut fold, content);
+        out.clear();
+        thinking_fold_redraw_to(&mut out, &mut fold).unwrap();
+        assert!(
+            out.starts_with(&redraw_prefix),
+            "redraw must replace the existing header after {content:?}: {out:?}"
+        );
+        if fold.window_rows == 0 {
+            assert_eq!(out, redraw_prefix);
+        }
+    }
+    assert_eq!(fold.window_rows, 1);
+
+    // Once content exists, the cursor already rests on its last row: the
+    // normal one-row body must still erase exactly two rows including the header.
+    out.clear();
+    thinking_fold_redraw_to(&mut out, &mut fold).unwrap();
+    assert!(out.starts_with(&redraw_prefix));
+
+    unsafe {
+        std::env::remove_var("COLUMNS");
+    }
+}
+
+#[test]
+fn thinking_fold_empty_body_completion_replaces_header() {
+    let mut fold = super::super::state::ThinkingFoldState::new();
+    fold.active = true;
+    fold.max_visible_lines = 2;
+    let mut out = Vec::new();
+
+    thinking_fold_redraw_to(&mut out, &mut fold).unwrap();
+    assert_eq!(fold.window_rows, 0);
+    out.clear();
+    finalize_fold_to(&mut out, &mut fold, true).unwrap();
+
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        format!("\r\x1b[1A\r\x1b[2K  {ACCENT_MUTED}✓ thinking · 0 lines\x1b[0m\r\n")
+    );
+    assert!(!fold.active);
+    assert!(!fold.header_drawn);
+    assert_eq!(fold.window_rows, 0);
+}
+
+#[test]
+fn subagent_fold_redraw_preserves_body_and_footer() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    unsafe {
+        std::env::set_var("COLUMNS", "200");
+    }
+
+    let mut fold = super::super::state::ThinkingFoldState::new_with_labels(
+        "subagent explore",
+        "done subagent explore",
+        false,
+    );
+    fold.active = true;
+    fold.max_visible_lines = 2;
+    append_fold_content(&mut fold, "first line\nsecond line");
+    let mut out = Vec::new();
+    thinking_fold_redraw_to(&mut out, &mut fold).unwrap();
+    let mut header = Vec::new();
+    write_fold_header(&mut header, &fold).unwrap();
+    assert!(out.starts_with(&header));
+    assert_eq!(fold.window_rows, 2);
+
+    append_fold_content(&mut fold, "\nthird line");
+    out.clear();
+    thinking_fold_redraw_to(&mut out, &mut fold).unwrap();
+    let mut redraw_prefix = Vec::new();
+    erase_fold_body(&mut redraw_prefix, 3).unwrap();
+    redraw_prefix.extend_from_slice(&header);
+    assert!(out.starts_with(&redraw_prefix));
+    assert_eq!(fold.window_rows, 3);
+
+    out.clear();
+    finalize_fold_to(&mut out, &mut fold, false).unwrap();
+    let rendered = String::from_utf8(out).unwrap();
+    assert!(rendered.contains("second line"));
+    assert!(rendered.contains("third line"));
+    assert!(!rendered.contains("first line"));
+    assert!(rendered.ends_with("done subagent explore · 3 lines\x1b[0m\r\n"));
+    assert!(!rendered.contains("\x1b[0J"));
+    assert!(!fold.active);
+    assert!(!fold.header_drawn);
+
+    unsafe {
+        std::env::remove_var("COLUMNS");
+    }
+}
+
+#[test]
 fn thinking_fold_header_anchored_once_and_window_rows_track_body_only() {
-    // "Orphan header stacking" regression: the header lands only on the first redraw (header_drawn=true)
-    // and is never printed again no matter how many redraws follow; window_rows counts only body physical
-    // rows (excluding the header), so cursor-up erasure always targets the visible body area and never drifts when the window scrolls into scrollback.
+    // The header is reprinted on every redraw (each redraw erases one extra
+    // row above the body and redraws the header there, so a resize reflow that
+    // outruns the app's view of the width cannot leave permanent stacked
+    // markers); window_rows still counts only body physical rows (excluding
+    // the header), so cursor-up erasure targets the visible body area and
+    // never drifts when the window scrolls into scrollback.
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -2007,7 +2180,7 @@ fn thinking_fold_header_anchored_once_and_window_rows_track_body_only() {
     assert_eq!(state.render.thinking_fold.rendered_body_lines.len(), 1);
 
     write_thinking_content_folded("line-2\nline-3\nline-4\n", &mut state, &markers).unwrap();
-    // The header still lands only once and is never reprinted.
+    // header_drawn stays true across redraws (the header is reprinted each redraw).
     assert!(state.render.thinking_fold.header_drawn);
     // 4 completed, 2 visible -> fold marker(1) + visible(2) = body 3 rows, header not counted.
     assert_eq!(state.render.thinking_fold.window_rows, 3);

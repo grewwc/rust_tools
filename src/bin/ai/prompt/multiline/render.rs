@@ -272,13 +272,16 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // Keep the existing input color and current-line underline, but apply them
     // only to actual characters so blank cells cannot participate in reflow.
     style_input_text(textarea, &current_lines);
-    // Draw the editing caret into the buffer as a thin vertical bar instead of
-    // a reversed block. The real terminal cursor is kept hidden and parked on
-    // the viewport's final row by the input loop so that terminal width reflow
-    // cannot split the long help line below the caret into persistent
-    // scrollback rows. A drawn caret is required here: the hardware cursor is
-    // the width-reflow anchor and cannot also sit at the editing position.
-    textarea.set_cursor_render_mode(CursorRenderMode::Hidden);
+    // Draw the editing caret as a styled cell so the character under the cursor
+    // stays visible. The real terminal cursor remains hidden and parked on the
+    // viewport's final row by the input loop as the width-reflow anchor.
+    let (red, green, blue) = crate::ai::theme::ACCENT_INPUT_RGB;
+    textarea.set_cursor_style(
+        Style::default()
+            .fg(Color::Rgb(red, green, blue))
+            .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+    );
+    textarea.set_cursor_render_mode(CursorRenderMode::Cell);
 
     // Input box: a left-edge vertical bar marking the editing area, in the same
     // color as the completion panel frame. Only the LEFT border is drawn: a full
@@ -300,15 +303,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // This avoids a duplicate CJK-width calculation that can disagree with the
     // widget's internal screen map.
     let visual_cursor_position = textarea.rendered_cursor_position();
-    if let Some(position) = visual_cursor_position {
-        // LEFT ONE EIGHTH BLOCK (U+258F): a 1/8-width vertical bar at the
-        // cell's left edge, matching a hardware bar cursor. Replacing the cell
-        // hides any character underneath only while the caret sits on it.
-        let (red, green, blue) = crate::ai::theme::ACCENT_INPUT_RGB;
-        let caret_cell = &mut f.buffer_mut()[(position.x, position.y)];
-        caret_cell.set_symbol("▏");
-        caret_cell.set_style(Style::default().fg(Color::Rgb(red, green, blue)));
-    }
 
     // Render the completion panel
     if let Some(panel) = completion_panel {
@@ -874,10 +868,11 @@ mod tests {
                 visual_caret.y.saturating_sub(viewport_area.y),
             ))
         );
-        // The visible caret is a drawn vertical-bar cell; the hidden hardware
-        // cursor is parked at the viewport tail by the input loop.
+        // The visible caret is a styled cell; the hidden hardware cursor is
+        // parked at the viewport tail by the input loop.
         let caret_cell = &terminal.backend().buffer()[(visual_caret.x, visual_caret.y)];
-        assert_eq!(caret_cell.symbol(), "▏");
+        assert_eq!(caret_cell.symbol(), " ");
+        assert!(caret_cell.modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -963,8 +958,11 @@ mod tests {
         // the bar adds no row, so content starts on the box's top row.
         let input_x = popup_x + 2;
         let input_y = viewport_area.y;
-        // The first character is the reversed buffer cursor, so inspect the
-        // next text cell when checking that input styling does not fill blanks.
+        let cursor_cell = &terminal.backend().buffer()[(input_x, input_y)];
+        assert_eq!(cursor_cell.symbol(), "h");
+        assert!(cursor_cell.modifier.contains(Modifier::REVERSED));
+        // Inspect the next text cell when checking that input styling does not
+        // fill blanks.
         let text_cell = &terminal.backend().buffer()[(input_x + 1, input_y)];
         let blank_cell = &terminal.backend().buffer()[(input_x + 20, input_y)];
         let (red, green, blue) = crate::ai::theme::ACCENT_INPUT_RGB;
@@ -1054,9 +1052,11 @@ mod tests {
                 expected.y.saturating_sub(viewport_area.y),
             ))
         );
-        // The cell at the measured caret holds the drawn vertical-bar glyph.
+        // At end-of-line the styled cursor cell is blank, but it must not replace
+        // any CJK glyph before it.
         let caret_cell = &terminal.backend().buffer()[(expected.x, expected.y)];
-        assert_eq!(caret_cell.symbol(), "▏");
+        assert_eq!(caret_cell.symbol(), " ");
+        assert!(caret_cell.modifier.contains(Modifier::REVERSED));
     }
 
 }

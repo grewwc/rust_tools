@@ -481,8 +481,9 @@ fn is_executor_skill(skills: &[&SkillManifest]) -> bool {
 
 /// Whether a skill / agent manifest declares a group that gates hidden tools
 /// (see `crate::ai::tools::group_gates_hidden_tools`). Unlike the
-/// `is_executor_*` helpers this is mode-agnostic: a `mode: all` agent carrying
-/// the executor group (e.g. `build`) counts too. Drives the "available on
+/// `is_executor_*` helpers this is mode-agnostic: any manifest — agent or
+/// skill — carrying the executor group counts (no builtin agent declares it
+/// today; only opt-in skills do). Drives the "available on
 /// demand via enable_tools" hint for turns whose resident tool set had the
 /// heavy execution primitives deferred out by `manifest_tool_definitions`, so
 /// read-only agents (plan / explore) never get irrelevant process/IPC hints.

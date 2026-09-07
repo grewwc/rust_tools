@@ -22,6 +22,7 @@ pub(super) struct StartupSessionChoice {
     pub(super) history_file: PathBuf,
     pub(super) session_id: String,
     pub(super) model: Option<String>,
+    pub(super) resumed_suspended_entry: Option<SuspendedSessionEntry>,
     pub(super) startup_notice: Option<String>,
 }
 
@@ -236,6 +237,7 @@ where
             .map(|id| id.to_string())
             .unwrap_or_else(|| Uuid::new_v4().to_string()),
         model: None,
+        resumed_suspended_entry: None,
         startup_notice: None,
     };
 
@@ -283,6 +285,7 @@ where
             choice.session_id = entry.session_id.clone();
             // Restore the model saved at suspension time instead of using the default model.
             choice.model = entry.model.clone();
+            choice.resumed_suspended_entry = Some(entry.clone());
 
             let remaining = previews.len().saturating_sub(1);
             let mut persona_fallback = false;

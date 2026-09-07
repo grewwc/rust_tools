@@ -270,6 +270,7 @@ pub(in crate::ai) use sqlite::{read_image_digest_sqlite, upsert_image_digest_sql
 #[allow(unused_imports)]
 pub(in crate::ai) use suspended::{
     SuspendedSessionEntry, SuspendedSessionStore, format_suspended_timestamp_label,
+    physical_terminal_key,
 };
 #[cfg(test)]
 pub(in crate::ai) use task_evidence::render_unintegrated_task_evidence;

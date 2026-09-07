@@ -6,7 +6,6 @@ color: success
 model_tier: heavy
 tool_groups:
   - core
-  - executor
 disable_mcp_tools: true
 ---
 

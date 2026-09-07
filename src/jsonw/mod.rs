@@ -22,9 +22,9 @@
 //! let old = json!({"name": "Alice", "age": 25});
 //! let new = json!({"name": "Alice", "age": 26, "city": "Beijing"});
 //!
-//! let diffs = diff_json(&old, &new, false);
+//! let diffs = diff_json(&old, &new);
 //! for diff in diffs {
-//!     println!("路径：{}, 旧值：{:?}, 新值：{:?}", diff.key, diff.old, diff.new);
+//!     println!("path: {}, old: {:?}, new: {:?}", diff.key, diff.old, diff.new);
 //! }
 //! ```
 //!

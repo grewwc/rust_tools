@@ -487,6 +487,87 @@ fn truncated_response_retries_and_injects_shrink_note() {
 }
 
 #[test]
+fn degenerate_repetition_retry_injects_dedicated_note_and_keeps_partial() {
+    let mut app = test_app_with_tools(&["write_file"]);
+    let mcp = crate::ai::mcp::McpClient::new();
+    let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
+    let mut messages = Vec::new();
+    let mut turn_messages = Vec::new();
+    let mut persisted_turn_messages = 0usize;
+    let mut final_assistant_text = String::new();
+    let mut final_assistant_recorded = false;
+    let mut force_final_response = false;
+    let mut terminal_dedupe_candidate = None;
+
+    let step = handle_iteration_execution(
+        &mut app,
+        "explain",
+        &mcp_snapshot(&shared_mcp),
+        &shared_mcp,
+        IterationExecution::Truncated(crate::ai::types::StreamResult {
+            outcome: crate::ai::types::StreamOutcome::Truncated,
+            tool_calls: Vec::new(),
+            assistant_text: "先给出结论。".to_string(),
+            hidden_meta: String::new(),
+            reasoning_text: "需要先确认当前上下文是否仍然有效，然后再继续执行。".repeat(3),
+            reasoning_items: Vec::new(),
+            skip_response_drain: true,
+            truncated_by_length: false,
+            stream_error: false,
+            finish_reason_value: Some("degenerate_repetition".to_string()),
+            usage_prompt_tokens: 0,
+            usage_cached_prompt_tokens: 0,
+            usage_completion_tokens: 0,
+            usage_reasoning_tokens: 0,
+        }),
+        &mut messages,
+        &mut turn_messages,
+        false,
+        &mut persisted_turn_messages,
+        &mut final_assistant_text,
+        &mut final_assistant_recorded,
+        &mut force_final_response,
+        &mut terminal_dedupe_candidate,
+        true,
+        1,
+        16,
+        1,
+        &mut false,
+    )
+    .unwrap();
+
+    // A degenerate stop auto-retries (Continue), never completes silently.
+    assert!(matches!(step, TurnLoopStep::Continue));
+    assert!(final_assistant_text.is_empty());
+    assert!(!final_assistant_recorded);
+    // Partial visible text is preserved as assistant context but not persisted.
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == "assistant" && m.content.as_str() == Some("先给出结论。"))
+    );
+    assert!(
+        !turn_messages
+            .iter()
+            .any(|m| m.role == "assistant" && m.content.as_str() == Some("先给出结论。")),
+        "partial text must not leak into turn_messages (persistence track)"
+    );
+    // The dedicated degenerate-repetition note is injected, NOT the generic shrink hint.
+    assert!(messages.iter().any(|m| {
+        m.role == ROLE_INTERNAL_NOTE
+            && m.content
+                .as_str()
+                .is_some_and(|c| c.starts_with(DEGENERATE_REPETITION_RETRY_NOTE_PREFIX))
+    }));
+    assert!(!messages.iter().any(|m| {
+        m.role == ROLE_INTERNAL_NOTE
+            && m.content
+                .as_str()
+                .is_some_and(|c| c.starts_with(TRUNCATION_RETRY_NOTE_PREFIX))
+    }));
+}
+
+#[test]
 fn truncation_retry_note_replaces_with_updated_count() {
     let mut app = test_app_with_tools(&["write_file"]);
     let mcp = crate::ai::mcp::McpClient::new();

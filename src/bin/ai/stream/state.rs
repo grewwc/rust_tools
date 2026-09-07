@@ -252,7 +252,7 @@ pub(super) struct ThinkingFoldState {
     /// Total completed line count (including folded lines)
     pub(super) total_lines: usize,
     /// Number of terminal physical rows occupied by the current fold window (body only, excluding the header). The cursor sits on the last
-    /// body line, not on the blank line below the window; redrawing only needs to move up `window_rows - 1`.
+    /// body line, or on the blank row below the header when the body is empty.
     pub(super) window_rows: usize,
     /// Body plain-text physical lines actually written to the terminal last time (including indentation/wrapping, excluding ANSI / header), used to
     /// recompute how many physical rows the old window occupies at the **current** column width after a terminal resize, so cursor-up leaves no residue.
@@ -262,9 +262,8 @@ pub(super) struct ThinkingFoldState {
     pub(super) rewrite_right_margin_cols: usize,
     /// Whether active thinking fold mode is in effect
     pub(super) active: bool,
-    /// Whether the header (`○ thinking`) has been laid down. Streaming redraws never erase/repaint it along with the body; only at teardown is it
-    /// changed in place to `✓ thinking`. This way, even if body erasure drifts out of sync, a second header can never appear,
-    /// eliminating the "orphan header stacking" rendering bug at its root.
+    /// Whether a fold header is on screen. Streaming redraws clear and replace it along with the body; thinking completion changes it
+    /// in place to `✓ thinking`. When the body is empty, the cursor is one row below this header.
     pub(super) header_drawn: bool,
     /// Fold-block header text (e.g. `○ thinking` / `subagent explore`).
     pub(super) header_label: String,

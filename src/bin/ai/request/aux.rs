@@ -61,10 +61,11 @@ async fn send_aux_chat_request_with_key_rotation(
             ));
         }
 
-        let send_future = apply_request_auth(app.client.post(endpoint), endpoint, api_key)
-            .header("Content-Type", "application/json")
-            .body(http_body.clone())
-            .send();
+        let send_future =
+            apply_request_auth(app.client.post(endpoint), endpoint, api_key, &app.session_id)
+                .header("Content-Type", "application/json")
+                .body(http_body.clone())
+                .send();
 
         let response = match tokio::time::timeout(header_timeout, send_future).await {
             Ok(Ok(r)) => r,

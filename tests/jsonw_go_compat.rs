@@ -17,11 +17,13 @@ fn test_parse_with_comments_and_control_chars() {
 }
 
 #[test]
-fn test_diff_json_sort_arrays() {
+fn test_diff_json_array_alignment() {
     let old = serde_json::json!({"a":[3,2,1]});
     let new = serde_json::json!({"a":[1,2,4]});
-    let diff = diff_json(&old, &new, true);
-    assert!(diff.iter().any(|d| d.key == "a.2"));
+    // Equal items cancel out regardless of position; the leftover pair is
+    // compared under the old array's index.
+    let diff = diff_json(&old, &new);
+    assert!(diff.iter().any(|d| d.key == "a.0" && d.old == 3 && d.new == 4));
 }
 
 #[test]

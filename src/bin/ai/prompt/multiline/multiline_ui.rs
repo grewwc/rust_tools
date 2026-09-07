@@ -284,11 +284,42 @@ fn rebuild_fixed_viewport(
     Ok(area)
 }
 
+/// Re-anchor the existing fixed viewport after terminal width/height reflow.
+///
+/// A resize is normally consumed before the next keyboard event, but a
+/// background session-title update can request the first foreground redraw
+/// after a long idle period. That redraw must re-anchor first rather than paint
+/// the old fixed coordinates over the reflowed terminal content.
+fn rebuild_after_terminal_reflow(
+    terminal: &mut MultilineTerminal,
+    base_viewport_height: u16,
+    fitted_completion_items: Option<usize>,
+    last_drawn_area: Option<Rect>,
+) -> io::Result<Rect> {
+    let terminal_size = terminal.backend().size()?;
+    let requested_height = viewport_height_with_completion(
+        terminal_size.height,
+        base_viewport_height,
+        fitted_completion_items,
+    );
+    let rebuilt_area = rebuild_fixed_viewport(
+        terminal,
+        terminal_size,
+        requested_height,
+        parked_anchor_offset(last_drawn_area, requested_height),
+        ViewportRebuildMode::ReserveMissingRows,
+        last_drawn_area.map(|area| area.y),
+        false,
+    )?;
+    park_reflow_anchor(terminal, rebuilt_area)?;
+    Ok(rebuilt_area)
+}
+
 /// Parks the hardware cursor at the viewport's bottom row, hidden.
 ///
-/// The visible editing caret is drawn into the buffer as a reverse-video cell
-/// (see render.rs), so it reflows with the text and needs no tracking. The
-/// hardware cursor is parked at a FIXED row of the box instead — its bottom
+/// The visible editing caret is drawn into the buffer as a styled cell (see
+/// render.rs), so it reflows with the text and needs no tracking. The hardware
+/// cursor is parked at a FIXED row of the box instead — its bottom
 /// row — because emulators preserve a cursor's logical line through width
 /// reflow, and the box height never changes on a width reflow. A rebuild
 /// recovers the reflowed top as `bottom - (height - 1)`, taking `height` from
@@ -304,7 +335,7 @@ fn park_reflow_anchor<B: Backend>(
     );
     // The hardware cursor stays hidden: a hidden cursor still tracks its
     // logical line through reflow, so DSR queries keep returning a valid
-    // anchor, and the visible caret is the drawn reverse-video cell.
+    // anchor, and the visible caret is the drawn styled cell.
     terminal.backend_mut().hide_cursor()?;
     terminal.backend_mut().set_cursor_position(anchor)?;
     terminal.backend_mut().flush()?;
@@ -357,6 +388,20 @@ fn textarea_logical_char_count(textarea: &TextArea<'_>) -> usize {
 fn take_redraw_request(redraw_requested: &mut bool, external_change: bool) -> bool {
     *redraw_requested |= external_change;
     std::mem::take(redraw_requested)
+}
+
+/// Consume a deferred resize at a redraw safe point.
+///
+/// A viewport-height rebuild already reads and re-anchors the live cursor, so
+/// no second reflow rebuild is needed in that case. Otherwise the caller must
+/// rebuild before it draws the frame.
+fn take_standalone_resize_rebuild(
+    pending_resize_rebuild: &mut bool,
+    viewport_rebuilt: bool,
+) -> bool {
+    let needs_rebuild = *pending_resize_rebuild && !viewport_rebuilt;
+    *pending_resize_rebuild = false;
+    needs_rebuild
 }
 
 fn submitted_input_preview_lines(content: &str) -> Vec<String> {
@@ -466,9 +511,10 @@ impl PromptEditor {
             // an unchanged input screen. Resize and title events explicitly
             // request the next frame.
             let mut redraw_requested = true;
-            // Set when a resize arrives; the rebuild is deferred until the next
-            // non-resize event so the emulator's async reflow has finished and
-            // the DSR-based anchor is accurate again.
+            // Set when a resize arrives. The rebuild runs before the next
+            // foreground redraw (including a background title update) or before
+            // a non-resize input event, after the emulator has had a chance to
+            // finish its asynchronous reflow.
             let mut pending_resize_rebuild = false;
 
             loop {
@@ -478,6 +524,7 @@ impl PromptEditor {
                 let title_changed = self.apply_pending_session_title_updates();
 
                 if take_redraw_request(&mut redraw_requested, title_changed) {
+                    let mut viewport_rebuilt = false;
                     // When the panel state changes, resize the fixed viewport to
                     // match the height the panel needs.
                     let current_items = completion_panel.as_ref().map(|p| p.items.len());
@@ -504,6 +551,7 @@ impl PromptEditor {
                         last_drawn_area = Some(rebuilt_area);
                         fitted_completion_items = current_items;
                         force_repaint_next_frame = false;
+                        viewport_rebuilt = true;
                     }
 
                     // Auto-grow the viewport when content exceeds the textarea capacity
@@ -536,7 +584,21 @@ impl PromptEditor {
                             last_drawn_area = Some(rebuilt_area);
                             base_viewport_height = new_height;
                             force_repaint_next_frame = false;
+                            viewport_rebuilt = true;
                         }
+                    }
+
+                    if take_standalone_resize_rebuild(
+                        &mut pending_resize_rebuild,
+                        viewport_rebuilt,
+                    ) {
+                        let rebuilt_area = rebuild_after_terminal_reflow(
+                            &mut terminal,
+                            base_viewport_height,
+                            fitted_completion_items,
+                            last_drawn_area,
+                        )?;
+                        last_drawn_area = Some(rebuilt_area);
                     }
 
                     let force_repaint = force_repaint_next_frame;
@@ -582,8 +644,8 @@ impl PromptEditor {
                     // events, so a DSR cursor query issued now returns the
                     // pre-reflow row and the box would be rebuilt at a stale
                     // position (the caret visibly jumps). Defer the rebuild to
-                    // just before the next non-resize event (typically the next
-                    // keypress), when the reflow has certainly finished.
+                    // the next foreground redraw or non-resize event, after the
+                    // asynchronous reflow has had a chance to finish.
                     pending_resize_rebuild = true;
                     continue;
                 }

@@ -271,7 +271,7 @@ fn executor_group_agent(name: &str) -> AgentManifest {
 
 #[test]
 fn executor_group_defers_process_primitives_but_keeps_core_editing() {
-    // build/executor use tool_groups: [core, executor]. Execution primitives (process/IPC/shm/env)
+    // Executor-group manifests use tool_groups: [core, executor]. Execution primitives (process/IPC/shm/env)
     // are lazy by default and stay out of the resident tool set; apply_patch/write_file (core∩executor) are kept,
     // so editing capability is preserved with zero loss.
     let build_agent = executor_group_agent("build");
