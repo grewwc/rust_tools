@@ -36,7 +36,8 @@ Sessions are the unit of conversation persistence; IDs are not restricted to UUI
 - **Per session** (`SessionStore::validate_session_id` enforces 1–128 ASCII
   letters/digits/`-`/`_`, not strict UUID shape):
   - `<id>.sqlite` — canonical history. Tables: `messages`, `meta`, `context_messages`,
-    `context_snapshot`, `tool_execution_outcomes`, `skill_activation_events`, `image_digests`.
+    `context_snapshot`, `tool_execution_outcomes`, `skill_activation_events`,
+    `image_digests`, `interrupted_stream_diagnostics`.
   - `<id>.assets/` — session assets: `folded-tool-groups/`, `tool-overflow-compressed/`,
     `context-checkpoints/`, images, etc.
   - `.<id>.sqlite.state.lock` (state lock) and `<id>.<pid>.pid` (live-process marker).
@@ -62,11 +63,9 @@ Sessions are the unit of conversation persistence; IDs are not restricted to UUI
 11. **Output post-processing is display-only.** `ai.output.postprocess_command`
     (config_schema.rs) optionally pipes the final assistant body through a shell
     filter (stdin -> stdout) right before `render_markdown_block` in
-    `driver/turn_runtime/finalize.rs`. It is strictly best-effort (any failure
-    shows the original text) and never mutates canonical history. Repo ships
-    `scripts/postprocess_terminal.py` (Chinese punctuation inside code /
-    file-location contexts -> ASCII, plus fullwidth parens in prose) as a
-    ready-made filter.
+    `driver/turn_runtime/finalize.rs` (via `output_postprocess.rs`). Best-effort:
+    any failure shows the original text; never mutates canonical history. Repo
+    filter + behavior details: `scripts/AGENTS.md`.
 
 ## Scoped guides
 

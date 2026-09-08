@@ -36,5 +36,6 @@ lives in `tools/storage/rag_store.rs` (rebuild + hybrid merge) and the
    with the vector index using `hybrid_vector_weight`.
 4. **No automatic recall.** Knowledge is read only through explicit
    `knowledge_*` tool calls - never scan or inject the store
-   automatically while preparing a turn. Notebook is an independent tool-backed
-   context source, not coupled to knowledge retrieval.
+   automatically while preparing a turn. The notebook (`a -n` / `-ns` memo
+   search, `driver/note_search.rs`) is an independent context source, not
+   coupled to knowledge retrieval.

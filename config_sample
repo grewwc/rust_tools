@@ -34,10 +34,10 @@ ida-dev.api_key = "<your-ida-dev-key>"
 
 
 special.tags = "固化"
-re.remote.host = 10.37.110.250
+re.remote.host = xxxx
 
 ai.embedding.api_key = <your-volcano-key>
-feishu.app_id = cli_a93c49d60678dcbb
+feishu.app_id = <your-app-id>
 feishu.app_secret = "<your-feishu-app-secret>"
 
 
