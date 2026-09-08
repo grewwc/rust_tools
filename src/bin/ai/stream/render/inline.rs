@@ -1,4 +1,6 @@
-use crate::ai::stream::render::code::{MONOKAI_BG, MONOKAI_FG};
+use crate::ai::stream::render::{
+    MARKDOWN_ACCENT, MARKDOWN_CODE_FG, MARKDOWN_STRONG,
+};
 
 /// Terminals by default render East-Asian **Ambiguous** width characters (arrows `→`, math symbols `× ± ≤ ≥ ≠`,
 /// box-drawing, braille, etc.) as single-column; only true Wide/fullwidth characters (CJK, etc.) take 2 columns.
@@ -202,7 +204,8 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
     let normalized = normalize_cjk_punct_around_path(s);
     let s = normalized.as_str();
     let bytes = s.as_bytes();
-    let mut out = String::new();
+    // Apply the base before plain text too, including after a list marker reset.
+    let mut out = String::from(base);
     let mut i = 0usize;
     let mut bold = false;
     let mut italic = false;
@@ -214,11 +217,11 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
         out.push_str("\x1b[0m");
         out.push_str(base);
         if bold {
+            out.push_str(MARKDOWN_STRONG);
             out.push_str("\x1b[1m");
         }
         if code {
-            out.push_str(MONOKAI_BG);
-            out.push_str(MONOKAI_FG);
+            out.push_str(MARKDOWN_CODE_FG);
         }
         if italic {
             out.push_str("\x1b[3m");
@@ -282,8 +285,10 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
                 let content = &s[i + 2..close - 2];
                 bold = true;
                 apply_style(&mut out, base, bold, italic, code, math);
-                // bold interiors may still contain italic / code; recursion keeps nested styles correct.
-                out.push_str(&render_inline_md(content, base));
+                // Nested spans must restore the enclosing emphasis, not just the
+                // paragraph color, after their own ANSI reset.
+                let nested_base = format!("{base}{MARKDOWN_STRONG}\x1b[1m");
+                out.push_str(&render_inline_md(content, &nested_base));
                 bold = false;
                 apply_style(&mut out, base, bold, italic, code, math);
                 i = close;
@@ -300,7 +305,8 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
                 let content = &s[i + 1..close - 1];
                 italic = true;
                 apply_style(&mut out, base, bold, italic, code, math);
-                out.push_str(&render_inline_md(content, base));
+                let nested_base = format!("{base}\x1b[3m");
+                out.push_str(&render_inline_md(content, &nested_base));
                 italic = false;
                 apply_style(&mut out, base, bold, italic, code, math);
                 i = close;
@@ -407,7 +413,8 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
             if italic {
                 out.push_str("\x1b[3m");
             }
-            out.push_str("\x1b[4m\x1b[34m");
+            out.push_str("\x1b[4m");
+            out.push_str(MARKDOWN_ACCENT);
             out.push_str(url);
             apply_style(&mut out, base, bold, italic, code, math);
             out.push_str(trail);
@@ -804,7 +811,6 @@ fn is_escaped_at(s: &str, idx: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::stream::render::code::{MONOKAI_BG, MONOKAI_FG};
 
     #[test]
     fn wrap_md_cell_uses_visible_width_for_math_and_code_spans() {
@@ -909,11 +915,61 @@ mod tests {
     }
 
     #[test]
-    fn inline_code_uses_monokai_colors() {
-        let rendered = render_inline_md("use `cargo test` please", "");
-        assert!(rendered.contains(MONOKAI_BG));
-        assert!(rendered.contains(MONOKAI_FG));
-        assert!(rendered.contains("cargo test"));
+    fn inline_code_uses_code_color_without_background_and_restores_body() {
+        let base = crate::ai::stream::render::MARKDOWN_BODY;
+        let rendered = render_inline_md("use `cargo test` please", base);
+        assert!(rendered.starts_with(&format!("{base}use ")));
+        assert!(rendered.contains(&format!("{MARKDOWN_CODE_FG}cargo test")));
+        // No background fill: inline code must not emit a background-color sequence.
+        assert!(!rendered.contains("48;2;"));
+        assert!(!rendered.contains(crate::ai::stream::render::code::MONOKAI_FG));
+        assert!(rendered.ends_with(&format!("\x1b[0m{base} please\x1b[0m")));
+    }
+
+    #[test]
+    fn plain_inline_text_applies_its_base_without_markers() {
+        let base = crate::ai::stream::render::MARKDOWN_BODY;
+        assert_eq!(render_inline_md("正文", base), format!("{base}正文\x1b[0m"));
+    }
+
+    #[test]
+    fn nested_inline_code_restores_enclosing_emphasis_and_dimness() {
+        let base = format!("\x1b[2m{}", crate::ai::stream::render::MARKDOWN_BODY);
+        for (input, nested_base) in [
+            (
+                "前 **重点 `src/main.rs:42` 继续** 后",
+                format!("{base}{MARKDOWN_STRONG}\x1b[1m"),
+            ),
+            (
+                "前 *斜体 `src/main.rs:42` 继续* 后",
+                format!("{base}\x1b[3m"),
+            ),
+        ] {
+            let rendered = render_inline_md(input, &base);
+            assert!(rendered.contains(&format!("{MARKDOWN_CODE_FG}src/main.rs:42")));
+            assert!(
+                rendered.contains(&format!("\x1b[0m{nested_base} 继续")),
+                "nested code must restore its enclosing style: {rendered:?}"
+            );
+            assert!(rendered.ends_with(&format!("\x1b[0m{base} 后\x1b[0m")));
+        }
+    }
+
+    #[test]
+    fn muted_link_restores_emphasis_before_trailing_text() {
+        let base = crate::ai::stream::render::MARKDOWN_BODY;
+        let rendered = render_inline_md("**see https://example.com/docs, then** done", base);
+        assert!(rendered.contains(&format!("\x1b[4m{MARKDOWN_ACCENT}https://example.com/docs")));
+        assert!(rendered.contains(&format!("\x1b[0m{base}{MARKDOWN_STRONG}\x1b[1m, then")));
+        assert!(rendered.ends_with(&format!("\x1b[0m{base} done\x1b[0m")));
+    }
+
+    #[test]
+    fn heading_base_survives_inline_code_reset() {
+        let base = format!("\x1b[1m{MARKDOWN_ACCENT}");
+        let rendered = render_inline_md("Before `code` after", &base);
+        assert!(rendered.starts_with(&format!("{base}Before ")));
+        assert!(rendered.ends_with(&format!("\x1b[0m{base} after\x1b[0m")));
     }
 
     #[test]
@@ -944,10 +1000,9 @@ mod tests {
 
     #[test]
     fn unclosed_backtick_is_not_styled() {
-        // Unclosed backtick: must be emitted as a literal character, never opening the code background.
+        // Unclosed backtick: must be emitted as a literal character, never styling the span.
         let rendered = render_inline_md("use `cargo to test", "");
-        assert!(!rendered.contains(MONOKAI_BG));
-        assert!(!rendered.contains(MONOKAI_FG));
+        assert!(!rendered.contains(MARKDOWN_CODE_FG));
         assert!(rendered.contains("`cargo to test"));
     }
 

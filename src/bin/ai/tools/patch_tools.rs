@@ -1553,9 +1553,26 @@ fn format_char_with_code_point(ch: char) -> String {
 }
 
 /// Describes the position and Unicode code point of the first differing character
-/// between two lines of text, making it easy to spot "looks-alike" differences
-/// such as smart quotes or full/half-width characters.
-fn describe_first_char_mismatch(expected: &str, actual: &str) -> Option<String> {
+/// Formats a char for mismatch diagnostics, rendering invisible characters
+/// (space, tab) visibly so the difference cannot be collapsed by a display layer
+/// or mistaken for an empty prefix in the model's view of the two lines.
+fn format_char_visible(ch: char) -> String {
+    match ch {
+        ' ' => "'␣' (U+0020)".to_string(),
+        '\t' => "'\\t' (U+0009)".to_string(),
+        _ => format_char_with_code_point(ch),
+    }
+}
+
+/// Finds the first character difference between `expected` and `actual`.
+///
+/// Returns `(1-based column, expected char, actual char)`; an `Option::None`
+/// char means that side of the line ended first (e.g. `(Some(exp), None)` means
+/// the actual line already ended where the expected line still has a char).
+fn first_char_mismatch(
+    expected: &str,
+    actual: &str,
+) -> Option<(usize, Option<char>, Option<char>)> {
     let mut column = 1usize;
     let mut expected_chars = expected.chars();
     let mut actual_chars = actual.chars();
@@ -1565,31 +1582,46 @@ fn describe_first_char_mismatch(expected: &str, actual: &str) -> Option<String> 
             (Some(exp), Some(act)) if exp == act => {
                 column += 1;
             }
-            (Some(exp), Some(act)) => {
-                return Some(format!(
-                    "column {}: expected {}, found {}",
-                    column,
-                    format_char_with_code_point(exp),
-                    format_char_with_code_point(act)
-                ));
-            }
-            (Some(exp), None) => {
-                return Some(format!(
-                    "column {}: expected {}, found end of line",
-                    column,
-                    format_char_with_code_point(exp)
-                ));
-            }
-            (None, Some(act)) => {
-                return Some(format!(
-                    "column {}: expected end of line, found {}",
-                    column,
-                    format_char_with_code_point(act)
-                ));
-            }
+            (Some(exp), Some(act)) => return Some((column, Some(exp), Some(act))),
+            (Some(exp), None) => return Some((column, Some(exp), None)),
+            (None, Some(act)) => return Some((column, None, Some(act))),
             (None, None) => return None,
         }
     }
+}
+
+/// between two lines of text, making it easy to spot "looks-alike" differences
+/// such as smart quotes or full/half-width characters.
+fn describe_first_char_mismatch(expected: &str, actual: &str) -> Option<String> {
+    first_char_mismatch(expected, actual).map(|(column, exp, act)| match (exp, act) {
+        (Some(exp), Some(act)) => format!(
+            "column {column}: expected {}, found {}",
+            format_char_visible(exp),
+            format_char_visible(act)
+        ),
+        (Some(exp), None) => format!(
+            "column {column}: expected {}, found end of line",
+            format_char_visible(exp)
+        ),
+        (None, Some(act)) => format!(
+            "column {column}: expected end of line, found {}",
+            format_char_visible(act)
+        ),
+        (None, None) => unreachable!("first_char_mismatch returns None for identical lines"),
+    })
+}
+
+/// Renders a caret line aligned under the first differing character of `expected`
+/// (1-based `column`).
+///
+/// The padding replicates the `{:?}` debug rendering used for the full mismatch
+/// line, so the caret points at the exact character even when the two lines look
+/// identical at first glance (e.g. a space where the file has `<`). The found
+/// line needs no separate caret: both lines are identical up to that column.
+fn render_mismatch_caret(expected: &str, column: usize) -> String {
+    let prefix: String = expected.chars().take(column.saturating_sub(1)).collect();
+    let prefix_width = format!("{prefix:?}").chars().count();
+    format!("{}^", " ".repeat(prefix_width))
 }
 
 fn describe_aligned_block_first_mismatch(
@@ -1769,6 +1801,18 @@ fn describe_context_mismatch(
                     "  line {}: expected {:?}, found {:?}{}\n",
                     file_line, exp, act, first_diff
                 ));
+                // Caret line under the first differing char. This is the one
+                // piece of the diagnostic that survives display mangling of the
+                // line content itself: it marks the exact position so the model
+                // can fix the byte even when expected/found look identical.
+                if let Some((column, _, _)) = first_char_mismatch(exp, act) {
+                    let label_width = format!("  line {}: expected ", file_line).chars().count();
+                    msg.push_str(&format!(
+                        "{}{}\n",
+                        " ".repeat(label_width),
+                        render_mismatch_caret(exp, column)
+                    ));
+                }
             }
             if best.mismatches.len() > show {
                 msg.push_str(&format!(
@@ -2459,12 +2503,39 @@ fn verify_patch_write_is_current(write: &PreparedPatchWrite) -> Result<(), Strin
 
 fn apply_prepared_patch_write(write: &PreparedPatchWrite) -> Result<(), String> {
     match &write.action {
-        PreparedPatchAction::Write(next) => FileStore::new(write.path.clone())
-            .write_all(next)
-            .map_err(|err| err.to_string()),
+        PreparedPatchAction::Write(next) => {
+            let store = FileStore::new(write.path.clone());
+            // `commit_patch_writes` verifies every write is still current up front (early batch
+            // abort with a friendly error before anything is applied). Passing `write.before` as
+            // the snapshot hint turns the actual write into a compare-and-swap
+            // (`write_all_with_before_hint` → kernel `vfs_write_if_unchanged`): the check and the
+            // write share one kernel-lock hold, so other writers using that kernel cannot
+            // interleave. External processes do not participate in that lock.
+            //
+            // A `None` `before` means Add File: the precondition is that the target does not
+            // exist, so the create-only CAS (`write_new_file_if_absent` → kernel
+            // `vfs_write_if_unchanged` with expected=None) enforces absence instead of writing
+            // unconditionally — a file created concurrently since preparation is never
+            // overwritten.
+            match write.before.as_deref() {
+                Some(before) => store.write_all_with_before_hint(next, Some(before)),
+                None => store.write_new_file_if_absent(next),
+            }
+            .map_err(|err| err.to_string())
+        }
         PreparedPatchAction::Delete => {
-            fs::remove_file(&write.path)
-                .map_err(|err| format!("Failed to delete {}: {err}", write.path.display()))?;
+            // Delete targets always carry a before snapshot (see DeleteFile validation).
+            // Conditional removal detects changed content; it is serialized with writers
+            // using the same kernel, not arbitrary external processes.
+            let expected = write.before.as_deref().ok_or_else(|| {
+                format!(
+                    "internal error: delete of {} has no before snapshot",
+                    write.path.display()
+                )
+            })?;
+            FileStore::new(write.path.clone())
+                .remove_file_if_unchanged(expected)
+                .map_err(|err| err.to_string())?;
             let _ = crate::ai::tools::storage::mutation_log::record(
                 &write.path,
                 "delete",
@@ -2477,48 +2548,84 @@ fn apply_prepared_patch_write(write: &PreparedPatchWrite) -> Result<(), String> 
 }
 
 fn restore_prepared_patch_write(write: &PreparedPatchWrite) -> Result<(), String> {
-    match &write.before {
-        Some(content) => FileStore::new(write.path.clone())
-            .write_all(content)
-            .map_err(|err| format!("failed to restore {}: {err}", write.path.display())),
-        None => match fs::remove_file(&write.path) {
-            Ok(()) => {
-                // Roll back the deletion (the file was newly created in this
-                // batch): record the deleted content so the audit trail is complete.
-                let deleted = match &write.action {
-                    PreparedPatchAction::Write(c) => Some(c.as_str()),
-                    PreparedPatchAction::Delete => None,
-                };
-                let _ = crate::ai::tools::storage::mutation_log::record(
-                    &write.path,
-                    "delete",
-                    deleted,
-                    None,
-                );
-                Ok(())
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(format!(
-                "failed to remove {} during rollback: {err}",
-                write.path.display()
-            )),
-        },
+    let store = FileStore::new(write.path.clone());
+    // A failed operation may have left the original state intact. Do not write again in that
+    // case. Otherwise, only undo the exact postimage this batch intended to install. Partial
+    // writes and intervening edits are ambiguous and must be left intact with an error rather
+    // than overwritten or deleted in the name of rollback.
+    let already_restored = match &write.before {
+        Some(before) => store.read_to_string().is_ok_and(|current| current == *before),
+        None => matches!(
+            fs::symlink_metadata(&write.path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound
+        ),
+    };
+    if already_restored {
+        return Ok(());
     }
+    let result = match (&write.before, &write.action) {
+        (Some(before), PreparedPatchAction::Write(after)) => {
+            store.write_all_with_before_hint(before, Some(after))
+        }
+        (Some(before), PreparedPatchAction::Delete) => store.write_new_file_if_absent(before),
+        (None, PreparedPatchAction::Write(after)) => store.remove_file_if_unchanged(after).map(|()| {
+            crate::ai::tools::storage::mutation_log::record(
+                &write.path,
+                "delete",
+                Some(after),
+                None,
+            );
+        }),
+        (None, PreparedPatchAction::Delete) => {
+            return Err(format!(
+                "internal error: rollback of {} has no before snapshot",
+                write.path.display()
+            ));
+        }
+    };
+    result.map_err(|err| format!("failed to restore {} during rollback: {err}", write.path.display()))
 }
 
 fn commit_patch_writes(writes: &[PreparedPatchWrite]) -> Result<(), String> {
+    commit_patch_writes_with(writes, apply_prepared_patch_write)
+}
+
+fn commit_patch_writes_with(
+    writes: &[PreparedPatchWrite],
+    mut apply: impl FnMut(&PreparedPatchWrite) -> Result<(), String>,
+) -> Result<(), String> {
     for write in writes {
         verify_patch_write_is_current(write)?;
     }
 
     for (idx, write) in writes.iter().enumerate() {
-        if let Err(write_err) = apply_prepared_patch_write(write) {
-            let restoration_errors: Vec<_> = writes[..=idx]
+        if let Err(write_err) = apply(write) {
+            // A [FILE_CHANGED] error means the file was concurrently modified since the
+            // up-front verification and our write never happened: rolling it back to the
+            // prepared snapshot would clobber that concurrent change, so the failed write
+            // itself must not be restored (only earlier, already-applied writes are). Any
+            // other failure may have left a changed file, so the current write is considered
+            // too. Rollback only restores an exact postimage (or accepts an unchanged preimage);
+            // partial/unknown content is retained and reported as an incomplete rollback.
+            let restore_end = if write_err.contains("[FILE_CHANGED]") {
+                idx
+            } else {
+                idx + 1
+            };
+            let restoration_errors: Vec<_> = writes[..restore_end]
                 .iter()
                 .rev()
                 .filter_map(|written| restore_prepared_patch_write(written).err())
                 .collect();
             if restoration_errors.is_empty() {
+                if restore_end == 0 {
+                    // Nothing was applied before the failure, so there is nothing to restore
+                    // (the concurrent change is left intact).
+                    return Err(format!(
+                        "failed to apply {}: {write_err}",
+                        write.path.display()
+                    ));
+                }
                 return Err(format!(
                     "failed to apply {}: {write_err}; all affected files were restored",
                     write.path.display()

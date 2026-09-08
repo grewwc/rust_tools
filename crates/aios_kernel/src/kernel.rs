@@ -185,33 +185,35 @@ pub const DEFAULT_MAILBOX_CAPACITY: usize = 64;
 #[derive(Debug, Clone)]
 pub struct Process {
     pub pid: u64,
-    pub parent_pid: Option<u64>, // 父进程 PID
+    pub parent_pid: Option<u64>, // Parent process PID
     pub name: String,
-    pub goal: String, // 任务描述
+    pub goal: String, // Task goal description
     pub state: ProcessState,
-    pub result: Option<String>, // 终止结果
+    pub result: Option<String>, // Termination result
     pub mailbox: VecDeque<String>,
     pub max_mailbox_capacity: usize,
-    pub pending_signals: VecDeque<Signal>, // 待处理信号
+    pub pending_signals: VecDeque<Signal>, // Pending signals
     pub priority: u8,
-    pub quota_turns: usize, // 最大 LLM turn 数
+    pub quota_turns: usize, // Max LLM turns allowed
     pub capabilities: ProcessCapabilities,
     pub is_foreground: bool,
-    pub turns_used: usize, // 已使用 turn 数
+    pub turns_used: usize, // Turns used
     pub created_at_tick: u64,
-    pub process_group: Option<u64>, // 进程组 ID
-    pub is_daemon: bool,            // 是否守护进程
+    pub process_group: Option<u64>, // Process group ID
+    pub is_daemon: bool,            // Whether this is a daemon process
     pub max_restarts: usize,
-    pub restart_count: usize,         // 重启计数
-    pub env: FastMap<String, String>, // 环境变量
+    pub restart_count: usize,         // Restart count
+    pub env: FastMap<String, String>, // Environment variables
     pub history_file: Option<PathBuf>,
-    pub allowed_tools: FastSet<String>, // 允许的工具
-    pub tool_calls_used: usize,         // 已使用 tool call 数
+    pub allowed_tools: FastSet<String>, // Allowed tools
+    pub tool_calls_used: usize,         // Tool calls used
     pub working_dir: Option<PathBuf>,
-    /// 结构化资源上限（新）。旧字段 `quota_turns` 仍保留做为 max_turns 的视图；
-    /// 当 `limits` 被 sys_rlimit_set 修改时两者会保持同步。
+    /// Structured resource limits (new). The legacy `quota_turns` field is kept
+    /// as a view of max_turns; the two stay in sync when `limits` is modified
+    /// via sys_rlimit_set.
     pub limits: crate::primitives::ResourceLimit,
-    /// 结构化资源使用累计（新）。`turns_used / tool_calls_used` 仍与此同步。
+    /// Structured resource usage accumulation (new). `turns_used` and
+    /// `tool_calls_used` stay in sync with this.
     pub usage: crate::primitives::ResourceUsage,
 }
 
@@ -240,7 +242,7 @@ pub struct Process {
 ///   - set_working_dir(): Change current working directory
 pub trait Syscall {
     fn spawn(
-        // 创建子进程
+        // Create a child process
         &mut self,
         parent_pid: Option<u64>,
         name: String,
@@ -250,35 +252,35 @@ pub trait Syscall {
         capabilities: Option<ProcessCapabilities>,
         allowed_tools: Option<FastSet<String>>,
     ) -> Result<u64, String>;
-    fn wait_on(&mut self, target_pid: u64) -> Result<(), String>; // 等待进程终止
+    fn wait_on(&mut self, target_pid: u64) -> Result<(), String>; // Wait for process termination
     fn wait_on_events(
         &mut self,
         event_ids: Vec<EventId>,
         policy: WaitPolicy,
         timeout_ticks: Option<u64>,
-    ) -> Result<Option<u64>, String>; // 等待外部事件
-    fn send_ipc(&mut self, target_pid: u64, message: String) -> Result<(), String>; // 发送 IPC 消息
-    fn read_mailbox(&mut self) -> Result<Vec<String>, String>; // 读取邮箱
-    fn set_env(&mut self, key: String, value: String) -> Result<(), String>; // 设置环境变量
-    fn get_env(&self, key: &str) -> Option<String>; // 获取环境变量
-    fn current_process_id(&self) -> Option<u64>; // 获取当前 PID
-    fn get_process(&self, pid: u64) -> Option<&Process>; // 获取进程信息
-    fn list_processes(&self) -> Vec<Process>; // 列出所有进程
-    fn sleep_current(&mut self, turns: u64) -> Result<u64, String>; // 睡眠 N 个 tick
-    fn kill_process(&mut self, target_pid: u64, reason: String) -> Result<(), String>; // 请求终止进程
-    fn reap_process(&mut self, target_pid: u64) -> Result<String, String>; // 收集终止进程结果
-    fn signal_process(&mut self, target_pid: u64, signal: Signal) -> Result<(), String>; // 发送信号
-    fn set_process_group(&mut self, pid: u64, pgid: u64) -> Result<(), String>; // 设置进程组
-    fn signal_process_group(&mut self, pgid: u64, signal: Signal) -> Result<usize, String>; // 组播信号
-    fn shm_create(&mut self, key: String, value: String) -> Result<(), String>; // 创建共享内存
-    fn shm_read(&self, key: &str) -> Result<String, ShmReadError>; // 读取共享内存
-    fn shm_read_degraded(&self, key: &str) -> Option<String>; // 容错读取
-    fn shm_write(&mut self, key: String, value: String) -> Result<(), String>; // 写入共享��存
-    fn shm_delete(&mut self, key: &str) -> Result<(), String>; // 删除共享内存
-    fn shm_health_check(&self) -> Vec<(String, ShmReadError)>; // 健康检查
-    fn shm_cleanup_orphans(&mut self) -> usize; // 清理孤立共享内存
-    fn set_working_dir(&mut self, dir: PathBuf) -> Result<(), String>; // 设置工作目录
-    fn get_working_dir(&self) -> Option<PathBuf>; // 获取工作目录
+    ) -> Result<Option<u64>, String>; // Wait for external events
+    fn send_ipc(&mut self, target_pid: u64, message: String) -> Result<(), String>; // Send IPC message
+    fn read_mailbox(&mut self) -> Result<Vec<String>, String>; // Read mailbox
+    fn set_env(&mut self, key: String, value: String) -> Result<(), String>; // Set environment variable
+    fn get_env(&self, key: &str) -> Option<String>; // Get environment variable
+    fn current_process_id(&self) -> Option<u64>; // Get current PID
+    fn get_process(&self, pid: u64) -> Option<&Process>; // Get process info
+    fn list_processes(&self) -> Vec<Process>; // List all processes
+    fn sleep_current(&mut self, turns: u64) -> Result<u64, String>; // Sleep for N ticks
+    fn kill_process(&mut self, target_pid: u64, reason: String) -> Result<(), String>; // Request process termination
+    fn reap_process(&mut self, target_pid: u64) -> Result<String, String>; // Collect terminated process result
+    fn signal_process(&mut self, target_pid: u64, signal: Signal) -> Result<(), String>; // Send signal
+    fn set_process_group(&mut self, pid: u64, pgid: u64) -> Result<(), String>; // Set process group
+    fn signal_process_group(&mut self, pgid: u64, signal: Signal) -> Result<usize, String>; // Signal a process group
+    fn shm_create(&mut self, key: String, value: String) -> Result<(), String>; // Create shared memory
+    fn shm_read(&self, key: &str) -> Result<String, ShmReadError>; // Read shared memory
+    fn shm_read_degraded(&self, key: &str) -> Option<String>; // Fault-tolerant read
+    fn shm_write(&mut self, key: String, value: String) -> Result<(), String>; // Write shared memory
+    fn shm_delete(&mut self, key: &str) -> Result<(), String>; // Delete shared memory
+    fn shm_health_check(&self) -> Vec<(String, ShmReadError)>; // Health check
+    fn shm_cleanup_orphans(&mut self) -> usize; // Clean up orphaned shared memory
+    fn set_working_dir(&mut self, dir: PathBuf) -> Result<(), String>; // Set working directory
+    fn get_working_dir(&self) -> Option<PathBuf>; // Get working directory
     fn spawn_daemon(
         &mut self,
         parent_pid: Option<u64>,
@@ -308,72 +310,83 @@ pub trait KernelInternal {
         quota_turns: usize,
         allowed_tools: Option<FastSet<String>>,
     ) -> u64;
-    /// 弹出下一个就绪进程用于调度（单个）
+    /// Pop the next ready process for scheduling (single).
     fn pop_ready(&mut self) -> Option<Process>;
-    /// 批量弹出多个就绪进程（用于并发执行）
+    /// Pop multiple ready processes in batch (for concurrent execution).
     fn pop_all_ready(&mut self, max: usize) -> Vec<Process>;
-    /// 设置当前正在执行的进程 PID
+    /// Set the PID of the currently executing process.
     fn set_current_pid(&mut self, pid: Option<u64>);
-    /// 终止当前正在执行的进程（设置状态为 Terminated，结果为传入的字符串）
+    /// Terminate the currently executing process (set state to Terminated with
+    /// the given result string).
     fn terminate_current(&mut self, result: String);
-    /// 获取指定 PID 的进程可变引用
+    /// Get a mutable reference to the process with the given PID.
     fn get_process_mut(&mut self, pid: u64) -> Option<&mut Process>;
-    /// 消费并清除 yield 请求标志，返回之前的值
-    /// 进程可通过 yield_current 工具请求让出 CPU
+    /// Consume and clear the yield request flag, returning its previous value.
+    /// Processes can request to yield the CPU via the yield_current tool.
     fn consume_yield_requested(&mut self) -> bool;
-    /// 重新置位 yield 请求标志。
+    /// Re-set the yield request flag.
     ///
-    /// 某些上层封装（如 `epoll_wait_many`）会先 `consume_yield_requested()` 读取
-    /// 挂起状态用于自身决策，这会把内核里的让出意图清掉，导致后续 turn-loop 再调
-    /// `consume_yield_requested()` 时读到 false、无法把控制权交还调度器（子 agent
-    /// 因此永远停在 Ready）。这些封装在确认确实发生挂起后，必须用本方法把标志重新
-    /// 置位，保证让出意图不丢失。
+    /// Some upper-layer wrappers (such as `epoll_wait_many`) first call
+    /// `consume_yield_requested()` to read the pending state for their own
+    /// decisions, which clears the kernel's yield intent. A later call to
+    /// `consume_yield_requested()` in the turn loop would then read false and
+    /// fail to hand control back to the scheduler (leaving the child agent
+    /// stuck in Ready forever). After confirming that a suspension actually
+    /// occurred, these wrappers must re-set the flag with this method so the
+    /// yield intent is not lost.
     fn request_yield(&mut self);
-    /// 查询某个内核事件是否已被标记为完成。
+    /// Check whether a kernel event has been marked as completed.
     fn event_is_completed(&self, event_id: EventId) -> bool;
-    /// 删除已终止的进程（非等待状态）
+    /// Drop a terminated process (non-waiting state).
     fn drop_terminated(&mut self, target_pid: u64) -> bool;
-    /// 推进调度器 tick，唤醒到期睡眠进程
+    /// Advance the scheduler tick, waking sleeping processes that are due.
     fn advance_tick(&mut self);
-    /// 批量推进调度器 tick，唤醒所有到期进程。
+    /// Advance the scheduler tick in batch, waking all due processes.
     fn advance_ticks(&mut self, ticks: u64) {
         for _ in 0..ticks {
             self.advance_tick();
         }
     }
-    /// 当前调度器 tick。
+    /// The current scheduler tick.
     fn current_tick(&self) -> u64;
-    /// 下一个需要由计时器唤醒的 tick。
+    /// The next tick that needs to be woken by a timer.
     fn next_wakeup_tick(&self) -> Option<u64>;
-    /// 检查是否有就绪进程（用于调度决策）
+    /// Check whether there are ready processes (for scheduling decisions).
     fn has_ready(&self) -> bool;
-    /// 返回就绪队列中的进程数量
+    /// Return the number of processes in the ready queue.
     fn ready_count(&self) -> usize;
-    /// 启用/禁用轮转调度（默认禁用）
+    /// Enable/disable round-robin scheduling (disabled by default).
     fn set_round_robin(&mut self, enabled: bool);
-    /// 检查是否启用了轮转调度
+    /// Check whether round-robin scheduling is enabled.
     fn is_round_robin(&self) -> bool;
-    /// 将当前进程重新放回就绪队列（用于轮转调度）
+    /// Put the current process back into the ready queue (for round-robin
+    /// scheduling).
     fn requeue_current(&mut self) -> bool;
-    /// 如果前台进程处于 Ready 状态（被唤醒），将其从就绪队列中取出并设为 Running。
-    /// 返回被激活的前台进程，若无则返回 None。
+    /// If the foreground process is Ready (woken up), take it out of the ready
+    /// queue and set it to Running. Returns the activated foreground process,
+    /// or None if there is none.
     fn pop_foreground_ready(&mut self) -> Option<Process>;
-    /// 主动唤醒处于等待/睡眠状态的进程，并向其 mailbox 写入唤醒原因。
-    /// 返回 true 表示进程被重新放入 ready 队列。
+    /// Actively wake a process in Waiting/Sleeping state and write the wake
+    /// reason into its mailbox. Returns true if the process was re-queued into
+    /// the ready queue.
     fn wake_process(&mut self, pid: u64, message: String) -> bool;
-    /// 处理当前进程的所有待处理信号，返回是否处理了信号
+    /// Process all pending signals of the current process, returning whether
+    /// any signal was handled.
     fn process_pending_signals(&mut self) -> bool;
-    /// 通知 kernel 某些外部事件已进入终态，用于唤醒等待这些事件的进程。
-    /// 返回被唤醒的 PID 列表。
+    /// Notify the kernel that some external events have reached a terminal
+    /// state, to wake up processes waiting on them. Returns the list of PIDs
+    /// that were woken.
     fn notify_events_completed(&mut self, completed_event_ids: &[EventId]) -> Vec<u64>;
-    /// 为指定进程增加已使用 turn 数（用于配额检查）
+    /// Increment the used turn count for the given process (for quota checks).
     fn increment_turns_used_for(&mut self, pid: u64);
-    /// 为指定进程增加已使用 tool call 数（用于配额检查）
+    /// Increment the used tool call count for the given process (for quota
+    /// checks).
     fn increment_tool_calls_used_for(&mut self, pid: u64);
-    /// 检查所有守护进程是否需要重启（当超过 max_restarts 时停止重启）
-    /// 返回需要重启的进程 PID 列表
+    /// Check whether any daemon process needs a restart (stop restarting once
+    /// max_restarts is exceeded). Returns the list of PIDs that need a restart.
     fn check_daemon_restart(&mut self) -> Vec<u64>;
-    /// 清理指定进程的所有资源（IPC、共享内存、环境变量、信号等）
+    /// Clean up all resources of the given process (IPC, shared memory,
+    /// environment variables, signals, etc.).
     fn cleanup_process_resources(&mut self, pid: u64);
 }
 

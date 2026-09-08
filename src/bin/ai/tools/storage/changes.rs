@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::ai::config_schema::AiConfig;
-use crate::ai::tools::storage::mutation_log::{MutationEntry, is_capped, read_all};
+use crate::ai::tools::storage::mutation_log::{BeforeState, MutationEntry, is_capped, read_all};
 
 // ---------------------------------------------------------------------------
 // Editor
@@ -134,11 +134,35 @@ pub struct FileChange {
     pub write_count: usize,
     pub delete_count: usize,
     pub before_first: Option<String>,
+    /// Presence before the first mutation; later snapshots must not replace it.
+    pub before_state: BeforeState,
     pub after_last: Option<String>,
     /// Authoritative per-write diffs (`- `/`+ ` lines) recorded at write time, in
     /// write order. Large-file snapshots are truncated and unreliable, so
     /// rendering and patch generation prefer these diffs.
     pub diffs: Vec<String>,
+}
+
+impl FileChange {
+    pub(crate) fn before_unavailable(&self) -> bool {
+        self.before_state == BeforeState::Unknown
+            || (self.before_state == BeforeState::Present && self.before_first.is_none())
+    }
+
+    /// Only known absence can stand in for an empty preimage in a comparison.
+    pub(crate) fn snapshots_full(&self) -> bool {
+        !self.before_unavailable()
+            && !self.before_first.as_deref().is_some_and(is_capped)
+            && !self.after_last.as_deref().is_some_and(is_capped)
+    }
+
+    pub(crate) fn unavailable_notice(&self) -> &'static str {
+        if self.before_state == BeforeState::Unknown {
+            "…[net diff unavailable: initial file presence unknown; before snapshot unavailable; contents not compared]"
+        } else {
+            "…[net diff unavailable: file was present but before snapshot unavailable; contents not compared]"
+        }
+    }
 }
 
 fn cwd_for_display() -> Option<PathBuf> {
@@ -154,13 +178,13 @@ fn to_rel(path: &str, cwd: Option<&Path>) -> String {
     path.to_string()
 }
 
-fn grouped_changes(entries: &[MutationEntry]) -> Vec<FileChange> {
+pub(crate) fn grouped_changes(entries: &[MutationEntry]) -> Vec<FileChange> {
     let cwd = cwd_for_display();
     let mut grouped: Vec<FileChange> = Vec::new();
     for e in entries {
         if let Some(g) = grouped.iter_mut().find(|g| g.path == e.path) {
             g.after_last.clone_from(&e.after);
-            // op 最终状态以最后一条为准，net 随后重算
+            // Keep the initial state and use only the last postimage for net status.
             if e.op == "write" {
                 g.write_count += 1;
             } else {
@@ -173,10 +197,11 @@ fn grouped_changes(entries: &[MutationEntry]) -> Vec<FileChange> {
             grouped.push(FileChange {
                 path: e.path.clone(),
                 rel: to_rel(&e.path, cwd.as_deref()),
-                net: String::new(), // 占位
+                net: String::new(), // Computed after grouping.
                 write_count: if e.op == "write" { 1 } else { 0 },
                 delete_count: if e.op == "delete" { 1 } else { 0 },
                 before_first: e.before.clone(),
+                before_state: e.effective_before_state(),
                 after_last: e.after.clone(),
                 diffs: e.diff.iter().cloned().collect(),
             });
@@ -184,11 +209,13 @@ fn grouped_changes(entries: &[MutationEntry]) -> Vec<FileChange> {
     }
     for g in &mut grouped {
         let last_deleted = g.after_last.is_none() && g.delete_count > 0;
-        // 若最后一条是 delete，则 after_last 为 None，视为 deleted；否则按 before 判 created/modified
+        // Missing contents do not establish that the file was created.
         g.net = if last_deleted {
             "deleted".to_string()
-        } else if g.before_first.is_none() && g.after_last.is_some() {
+        } else if g.before_state == BeforeState::Absent && g.after_last.is_some() {
             "created".to_string()
+        } else if g.before_state == BeforeState::Unknown {
+            "written".to_string()
         } else {
             "modified".to_string()
         };
@@ -196,25 +223,15 @@ fn grouped_changes(entries: &[MutationEntry]) -> Vec<FileChange> {
     grouped
 }
 
-/// Whether the before_first / after_last snapshots are complete (present and
-/// not truncated). Diffing truncated snapshots misreads the truncation edge as
-/// a deletion (false deletion); in that case the authoritative diff recorded at
-/// write time is used instead.
-pub(crate) fn snapshots_full(before_first: &Option<String>, after_last: &Option<String>) -> bool {
-    match (before_first, after_last) {
-        (Some(b), Some(a)) => !is_capped(b) && !is_capped(a),
-        (Some(b), None) => !is_capped(b),
-        (None, Some(a)) => !is_capped(a),
-        (None, None) => true,
-    }
-}
-
 /// Renderable diff block for one file. When snapshots are complete it keeps the
 /// existing net-diff logic (small-file behavior unchanged); when truncated it
 /// uses the authoritative diff recorded at write time so the truncation edge is
 /// never rendered as a deletion.
-fn file_snippet(g: &FileChange, max_lines: usize) -> Option<String> {
-    if snapshots_full(&g.before_first, &g.after_last) {
+pub(crate) fn file_snippet(g: &FileChange, max_lines: usize) -> Option<String> {
+    if g.before_unavailable() {
+        return Some(g.unavailable_notice().to_string());
+    }
+    if g.snapshots_full() {
         return diff_snippet(
             g.before_first.as_deref(),
             g.after_last.as_deref(),
@@ -224,13 +241,8 @@ fn file_snippet(g: &FileChange, max_lines: usize) -> Option<String> {
     if !g.diffs.is_empty() {
         return diff_block_from_lines(&g.diffs.join(""), max_lines);
     }
-    // Old logs (no diff field) with truncated snapshots: fall back to a snapshot
-    // diff (possibly distorted, but better than no information).
-    diff_snippet(
-        g.before_first.as_deref(),
-        g.after_last.as_deref(),
-        max_lines,
-    )
+    // Legacy capped snapshots cannot prove either a net diff or equality.
+    Some("…[snapshots truncated; contents not compared; no recorded diff available]".to_string())
 }
 
 /// Renders stored `- `/`+ ` lines as a ```diff block, capped at max_lines with a
@@ -268,7 +280,7 @@ pub fn session_grouped_changes() -> Vec<FileChange> {
 // Patch generation
 // ---------------------------------------------------------------------------
 
-fn diff_snippet(before: Option<&str>, after: Option<&str>, max_lines: usize) -> Option<String> {
+pub(crate) fn diff_snippet(before: Option<&str>, after: Option<&str>, max_lines: usize) -> Option<String> {
     let (b, a): (Vec<&str>, Vec<&str>) = match (before, after) {
         (None, None) => return None,
         (None, Some(a)) => (Vec::new(), a.lines().collect()),
@@ -320,6 +332,13 @@ pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
     let mut out = String::new();
     for g in &grouped {
         out.push_str(&format!("diff -- {} {}\n", g.rel, g.rel));
+        if g.before_unavailable() {
+            // Do not invent an empty preimage or apply later incremental diffs
+            // as though they described the unavailable initial snapshot.
+            out.push_str(g.unavailable_notice());
+            out.push_str("\n\n");
+            continue;
+        }
         match g.net.as_str() {
             "created" => {
                 out.push_str(&format!("--- /dev/null\n+++ b/{}\n", g.rel));
@@ -330,7 +349,7 @@ pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
                 // version that does not exist under /dev/null. So only use
                 // diffs.last() for the single-write case and otherwise dump the
                 // (capped) final snapshot, which is at least a valid all-`+` body.
-                if !snapshots_full(&g.before_first, &g.after_last) {
+                if !g.snapshots_full() {
                     let mut used_diff = false;
                     if g.diffs.len() == 1 {
                         if let Some(d) = g.diffs.last() {
@@ -361,7 +380,7 @@ pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
                 // back to the (capped) before snapshot when no authoritative diff
                 // exists (old logs written without the diff field), so the patch is
                 // never an empty body under the deletion header.
-                if !snapshots_full(&g.before_first, &g.after_last) {
+                if !g.snapshots_full() {
                     let mut used_diff = false;
                     if let Some(d) = g.diffs.last() {
                         out.push_str(d);
@@ -383,7 +402,7 @@ pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
             }
             _ => {
                 out.push_str(&format!("--- a/{}\n+++ b/{}\n", g.rel, g.rel));
-                if !snapshots_full(&g.before_first, &g.after_last) && !g.diffs.is_empty() {
+                if !g.snapshots_full() {
                     // With truncated snapshots, use the authoritative diff
                     // directly (`- `/`+ ` lines are the patch body).
                     let body = g.diffs.join("");
@@ -391,10 +410,13 @@ pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
                     if !body.ends_with('\n') {
                         out.push('\n');
                     }
+                    if g.diffs.is_empty() {
+                        out.push_str("…[snapshots truncated; contents not compared; no recorded diff available]\n");
+                    }
                 } else if let Some(snippet) =
                     diff_snippet(g.before_first.as_deref(), g.after_last.as_deref(), 200)
                 {
-                    // 去掉 ```diff 围栏，仅保留差异行
+                    // Strip the Markdown fence and retain only diff lines.
                     for line in snippet.lines() {
                         if line.starts_with("```") || line.starts_with("（差异") {
                             continue;
@@ -403,7 +425,7 @@ pub fn mutation_patch(entries: &[MutationEntry]) -> Option<String> {
                         out.push('\n');
                     }
                 } else if g.before_first != g.after_last {
-                    // 回退：全量 before/after
+                    // Fall back to the complete before/after snapshots.
                     if let Some(b) = g.before_first.as_deref() {
                         for l in b.lines() {
                             out.push_str(&format!("-{l}\n"));
@@ -526,7 +548,7 @@ pub fn format_session_summary_with_git(include_git_extra: bool) -> String {
     }
     if let Some(lp) = &log_path {
         out.push_str(&format!(
-            "完整 before/after 见 mutation log：{}\n可用 read_file 读取该日志获取每个改动的原始与最终内容。\n",
+            "Recorded snapshots and per-write diffs: {}\nSnapshots may be truncated or unavailable; read the log for recorded evidence.\n",
             lp.display()
         ));
     }
@@ -660,7 +682,7 @@ fn open_with_vscode(patch_path: &Path, cwd: &Path) -> Result<String, String> {
         // Truncated snapshots are not the full file, so code --diff would show a
         // wrong comparison; fall back to opening the patch instead (the patch is
         // built from the authoritative diff recorded at write time).
-        if before_ok && after_ok && snapshots_full(&g.before_first, &g.after_last) {
+        if before_ok && after_ok && g.snapshots_full() {
             // 尝试 --diff 双文件对比（后台 detached）
             let mut cmd = Command::new("code");
             cmd.arg("--diff")
@@ -779,6 +801,83 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_initial_snapshot_survives_later_mutations_and_renderers() {
+        for state in [BeforeState::Present, BeforeState::Unknown] {
+            let mut entries = vec![MutationEntry {
+                seq: 0, ts: "t".into(), path: "/proj/existing.rs".into(),
+                op: "write".into(), before: None, before_state: Some(state),
+                after: Some("first\n".into()), diff: None,
+            }];
+            let later = [
+                ("write", Some("first\n"), Some("second\n"), BeforeState::Present),
+                ("delete", Some("second\n"), None, BeforeState::Present),
+                ("write", None, Some("recreated\n"), BeforeState::Absent),
+            ];
+            for index in 0..=later.len() {
+                if index > 0 {
+                    let (op, before, after, before_state) = later[index - 1];
+                    entries.push(MutationEntry {
+                        seq: index as u64, ts: "t".into(), path: entries[0].path.clone(),
+                        op: op.into(), before: before.map(str::to_string),
+                        before_state: Some(before_state), after: after.map(str::to_string),
+                        diff: crate::ai::tools::storage::mutation_log::entry_diff(before, after),
+                    });
+                }
+                let grouped = grouped_changes(&entries);
+                let g = &grouped[0];
+                assert_eq!(g.before_state, state);
+                assert!(g.before_first.is_none());
+                assert!(!g.snapshots_full());
+                let expected = if index == 2 { "deleted" }
+                    else if state == BeforeState::Present { "modified" } else { "written" };
+                assert_eq!(g.net, expected);
+                for rendered in [file_snippet(g, 30).unwrap(), mutation_patch(&entries).unwrap()] {
+                    assert!(rendered.contains("before snapshot unavailable"), "{rendered}");
+                    assert!(rendered.contains("not compared"), "{rendered}");
+                    assert!(!rendered.contains("/dev/null"), "{rendered}");
+                    assert!(!rendered.lines().any(|line| line.starts_with('+') || line.starts_with('-')), "{rendered}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn known_absence_and_empty_preimage_remain_distinct() {
+        for (state, before, expected) in [
+            (BeforeState::Absent, None, "created"),
+            (BeforeState::Present, Some(""), "modified"),
+        ] {
+            let entry = MutationEntry {
+                seq: 0, ts: "t".into(), path: "/proj/file.rs".into(), op: "write".into(),
+                before: before.map(str::to_string), before_state: Some(state),
+                after: Some("new\n".into()), diff: None,
+            };
+            let grouped = grouped_changes(&[entry]);
+            assert_eq!(grouped[0].net, expected);
+            assert!(grouped[0].snapshots_full());
+            assert!(file_snippet(&grouped[0], 30).unwrap().contains("+ new"));
+        }
+    }
+
+    #[test]
+    fn capped_identical_snapshots_keep_comparison_uncertainty() {
+        use crate::ai::tools::storage::mutation_log::{cap_content, entry_diff};
+        let content = "same line\n".repeat(200_000);
+        for diff in [None, entry_diff(Some(&content), Some(&content))] {
+            let entry = MutationEntry {
+                seq: 0, ts: "t".into(), path: "/proj/large.rs".into(), op: "write".into(),
+                before: Some(cap_content(&content)), before_state: Some(BeforeState::Present),
+                after: Some(cap_content(&content)), diff,
+            };
+            let grouped = grouped_changes(std::slice::from_ref(&entry));
+            for rendered in [file_snippet(&grouped[0], 30).unwrap(), mutation_patch(&[entry]).unwrap()] {
+                assert!(rendered.contains("not compared"), "{rendered}");
+                assert!(!rendered.contains("differ beyond"), "{rendered}");
+            }
+        }
+    }
+
+    #[test]
     fn grouped_changes_computes_net_correctly() {
         let entries = vec![
             MutationEntry {
@@ -788,6 +887,7 @@ mod tests {
                 op: "write".into(),
                 before: None,
                 after: Some("hello".into()),
+                before_state: None,
                 diff: Some("+ hello\n".into()),
             },
             MutationEntry {
@@ -797,6 +897,7 @@ mod tests {
                 op: "write".into(),
                 before: Some("old".into()),
                 after: Some("new".into()),
+                before_state: None,
                 diff: Some("- old\n+ new\n".into()),
             },
             MutationEntry {
@@ -806,6 +907,7 @@ mod tests {
                 op: "write".into(),
                 before: Some("new".into()),
                 after: Some("new2".into()),
+                before_state: None,
                 diff: Some("- new\n+ new2\n".into()),
             },
         ];
@@ -831,6 +933,7 @@ mod tests {
             op: "write".into(),
             before: None,
             after: Some("line1\nline2".into()),
+            before_state: None,
             diff: Some("+ line1\n+ line2\n".into()),
         }];
         let patch = mutation_patch(&entries).unwrap();
@@ -905,6 +1008,7 @@ mod tests {
                 op: "write".into(),
                 before: Some(cap_content(&before)),
                 after: Some(cap_content(&after)),
+                before_state: None,
                 diff: entry_diff(Some(&before), Some(&after)),
             },
             MutationEntry {
@@ -914,6 +1018,7 @@ mod tests {
                 op: "write".into(),
                 before: Some(cap_content(&after)),
                 after: Some(cap_content(&after2)),
+                before_state: None,
                 diff: entry_diff(Some(&after), Some(&after2)),
             },
         ];
@@ -925,7 +1030,7 @@ mod tests {
             2,
             "authoritative diffs of both writes must be collected"
         );
-        assert!(!snapshots_full(&g.before_first, &g.after_last));
+        assert!(!g.snapshots_full());
         let snippet = file_snippet(g, 30).unwrap();
         assert!(snippet.contains("- TO_BE_REMOVED"), "snippet: {snippet}");
         assert!(snippet.contains("+ TO_BE_ADDED"), "snippet: {snippet}");
@@ -966,6 +1071,7 @@ mod tests {
                 op: "write".into(),
                 before: None,
                 after: Some(cap_content(&v1)),
+                before_state: None,
                 diff: entry_diff(None, Some(&v1)),
             },
             MutationEntry {
@@ -975,6 +1081,7 @@ mod tests {
                 op: "write".into(),
                 before: Some(cap_content(&v1)),
                 after: Some(cap_content(&v2)),
+                before_state: None,
                 diff: entry_diff(Some(&v1), Some(&v2)),
             },
         ];
@@ -983,7 +1090,7 @@ mod tests {
         let g = &grouped[0];
         assert_eq!(g.net, "created");
         assert_eq!(g.diffs.len(), 2);
-        assert!(!snapshots_full(&g.before_first, &g.after_last));
+        assert!(!g.snapshots_full());
         let patch = mutation_patch(&entries).unwrap();
         // Body must be all additions: no `- ` lines after the headers.
         let mut in_body = false;
@@ -1034,6 +1141,7 @@ mod tests {
             op: "delete".into(),
             before: Some(cap_content(&before)),
             after: None,
+            before_state: None,
             // Old log format: no authoritative diff recorded.
             diff: None,
         }];
@@ -1042,7 +1150,7 @@ mod tests {
         let g = &grouped[0];
         assert_eq!(g.net, "deleted");
         assert!(g.diffs.is_empty());
-        assert!(!snapshots_full(&g.before_first, &g.after_last));
+        assert!(!g.snapshots_full());
         let patch = mutation_patch(&entries).unwrap();
         // The body must not be empty: the capped before snapshot is dumped as
         // deletion lines.

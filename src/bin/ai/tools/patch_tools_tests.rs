@@ -2222,3 +2222,257 @@ fn prepared_patch_rejects_external_change_before_commit() {
     assert_eq!(fs::read_to_string(&path).unwrap(), "changed_elsewhere\n");
     let _ = fs::remove_dir_all(base);
 }
+
+#[test]
+fn prepared_patch_write_cas_detects_change_between_verify_and_apply() {
+    // Simulates the TOCTOU window the up-front verification cannot cover: the file is
+    // modified after `verify_patch_write_is_current` would have passed but before the
+    // write lands. The compare-and-swap at apply time must abort without clobbering the
+    // concurrent change, and must not treat the stale snapshot as the real pre-write state.
+    let path = make_temp_path("cas_write_stale");
+    let base = path.parent().unwrap().to_path_buf();
+    fs::create_dir_all(&base).unwrap();
+    fs::write(&path, "original\n").unwrap();
+    let prepared = super::PreparedPatchWrite {
+        path: path.clone(),
+        before: Some("original\n".to_string()),
+        action: super::PreparedPatchAction::Write("patched\n".to_string()),
+        hints: Vec::new(),
+    };
+
+    // Concurrent modification landing after verification.
+    fs::write(&path, "concurrent-edit\n").unwrap();
+    let err = super::apply_prepared_patch_write(&prepared)
+        .expect_err("stale snapshot must abort the write");
+    assert!(err.contains("[FILE_CHANGED]"), "err: {err}");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "concurrent-edit\n",
+        "the concurrent change must be preserved"
+    );
+
+    // A matching snapshot still applies.
+    fs::write(&path, "original\n").unwrap();
+    super::apply_prepared_patch_write(&prepared).expect("matching snapshot applies");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "patched\n");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn prepared_patch_add_file_cas_detects_concurrent_create() {
+    // Add File records before = None (the target must not exist). The commit must be a
+    // create-only compare-and-swap: a file created concurrently since preparation is never
+    // overwritten, and the logged before stays truthful (a brand-new file).
+    let path = make_temp_path("cas_add_file_stale");
+    let base = path.parent().unwrap().to_path_buf();
+    fs::create_dir_all(&base).unwrap();
+    let prepared = super::PreparedPatchWrite {
+        path: path.clone(),
+        before: None,
+        action: super::PreparedPatchAction::Write("added\n".to_string()),
+        hints: Vec::new(),
+    };
+
+    // Concurrent creation landing after preparation: must abort, preserving the new content.
+    fs::write(&path, "concurrent-create\n").unwrap();
+    let err = super::apply_prepared_patch_write(&prepared)
+        .expect_err("existing target must abort the Add File write");
+    assert!(err.contains("[FILE_CHANGED]"), "err: {err}");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "concurrent-create\n",
+        "the concurrently created file must be preserved"
+    );
+
+    // Target still absent: the Add File write lands.
+    fs::remove_file(&path).unwrap();
+    super::apply_prepared_patch_write(&prepared).expect("absent target applies");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "added\n");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn prepared_patch_delete_cas_detects_change_between_verify_and_apply() {
+    // Same TOCTOU protection for deletes: a concurrently modified file must not be removed,
+    // and the prepared (stale) snapshot must not be logged as the real pre-delete state.
+    let path = make_temp_path("cas_delete_stale");
+    let base = path.parent().unwrap().to_path_buf();
+    fs::create_dir_all(&base).unwrap();
+    fs::write(&path, "original\n").unwrap();
+    let prepared = super::PreparedPatchWrite {
+        path: path.clone(),
+        before: Some("original\n".to_string()),
+        action: super::PreparedPatchAction::Delete,
+        hints: Vec::new(),
+    };
+
+    fs::write(&path, "concurrent-edit\n").unwrap();
+    let err = super::apply_prepared_patch_write(&prepared)
+        .expect_err("stale snapshot must abort the delete");
+    assert!(err.contains("[FILE_CHANGED]"), "err: {err}");
+    assert!(path.exists(), "the concurrently modified file must survive");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "concurrent-edit\n");
+
+    // A matching snapshot still deletes.
+    fs::write(&path, "original\n").unwrap();
+    super::apply_prepared_patch_write(&prepared).expect("matching snapshot deletes");
+    assert!(!path.exists());
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn prepared_patch_rollback_restores_only_unchanged_postimages() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let path = make_temp_path("rollback_postimages");
+    let base = path.parent().unwrap().to_path_buf();
+    fs::create_dir_all(&base).unwrap();
+
+    for (before, action) in [
+        (Some("original\n"), super::PreparedPatchAction::Write("patched\n".into())),
+        (None, super::PreparedPatchAction::Write("added\n".into())),
+        (Some("original\n"), super::PreparedPatchAction::Delete),
+    ] {
+        if let Some(content) = before {
+            fs::write(&path, content).unwrap();
+        }
+        let prepared = super::PreparedPatchWrite {
+            path: path.clone(),
+            before: before.map(str::to_owned),
+            action,
+            hints: Vec::new(),
+        };
+        super::apply_prepared_patch_write(&prepared).unwrap();
+        super::restore_prepared_patch_write(&prepared).unwrap();
+        assert_eq!(fs::read_to_string(&path).ok().as_deref(), before);
+        // An already-restored operation is a no-op, including an absent Add File target.
+        super::restore_prepared_patch_write(&prepared).unwrap();
+        if path.exists() {
+            fs::remove_file(&path).unwrap();
+        }
+    }
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn prepared_patch_rollback_preserves_intervening_edits_and_reports_incomplete() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let first = make_temp_path("rollback_conflict");
+    let base = first.parent().unwrap().to_path_buf();
+    let second = base.join("second.txt");
+    fs::create_dir_all(&base).unwrap();
+
+    // Cover restoring an update, removing an addition, and recreating a deletion.
+    for (before, action) in [
+        (Some("original\n"), super::PreparedPatchAction::Write("patched\n".into())),
+        (None, super::PreparedPatchAction::Write("added\n".into())),
+        (Some("original\n"), super::PreparedPatchAction::Delete),
+    ] {
+        if let Some(content) = before {
+            fs::write(&first, content).unwrap();
+        }
+        fs::write(&second, "second-before\n").unwrap();
+        let writes = [
+            super::PreparedPatchWrite {
+                path: first.clone(),
+                before: before.map(str::to_owned),
+                action,
+                hints: Vec::new(),
+            },
+            super::PreparedPatchWrite {
+                path: second.clone(),
+                before: Some("second-before\n".into()),
+                action: super::PreparedPatchAction::Write("second-after\n".into()),
+                hints: Vec::new(),
+            },
+        ];
+        let err = super::commit_patch_writes_with(&writes, |write| {
+            if write.path == first {
+                super::apply_prepared_patch_write(write)
+            } else {
+                // An unrelated writer changes the first target after its successful commit.
+                fs::write(&first, "external-edit\n").unwrap();
+                Err("injected second-file failure".into())
+            }
+        }).expect_err("rollback must report a conflict rather than clobber external content");
+        assert!(err.contains("rollback was incomplete"), "{err}");
+        assert!(err.contains("[FILE_CHANGED]"), "{err}");
+        assert_eq!(fs::read_to_string(&first).unwrap(), "external-edit\n");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "second-before\n");
+        fs::remove_file(&first).unwrap();
+    }
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn prepared_patch_rollback_preserves_partial_write_and_restores_earlier_files() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let first = make_temp_path("rollback_partial");
+    let base = first.parent().unwrap().to_path_buf();
+    let second = base.join("second.txt");
+    fs::create_dir_all(&base).unwrap();
+    fs::write(&first, "first-before\n").unwrap();
+    fs::write(&second, "second-before\n").unwrap();
+    let writes = [
+        super::PreparedPatchWrite {
+            path: first.clone(),
+            before: Some("first-before\n".into()),
+            action: super::PreparedPatchAction::Write("first-after\n".into()),
+            hints: Vec::new(),
+        },
+        super::PreparedPatchWrite {
+            path: second.clone(),
+            before: Some("second-before\n".into()),
+            action: super::PreparedPatchAction::Write("second-after\n".into()),
+            hints: Vec::new(),
+        },
+    ];
+    let err = super::commit_patch_writes_with(&writes, |write| {
+        if write.path == first {
+            super::apply_prepared_patch_write(write)
+        } else {
+            fs::write(&second, "second-a").unwrap();
+            Err("injected partial write failure".into())
+        }
+    }).unwrap_err();
+    assert!(err.contains("rollback was incomplete"), "{err}");
+    assert_eq!(fs::read_to_string(&first).unwrap(), "first-before\n");
+    assert_eq!(fs::read_to_string(&second).unwrap(), "second-a");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn first_char_mismatch_reports_column_and_chars() {
+    assert_eq!(
+        super::first_char_mismatch("abc", "abx"),
+        Some((3, Some('c'), Some('x')))
+    );
+    // Left side longer than right: end-of-line on the actual side.
+    assert_eq!(super::first_char_mismatch("ab", "a"), Some((2, Some('b'), None)));
+    // Right side longer than left.
+    assert_eq!(super::first_char_mismatch("a", "ab"), Some((2, None, Some('b'))));
+    assert_eq!(super::first_char_mismatch("ab", "ab"), None);
+}
+
+#[test]
+fn describe_first_char_mismatch_renders_invisible_chars_visibly() {
+    // The exact failure mode from real sessions: the file has '<' where the
+    // patch line has a space, and the two full lines otherwise look identical.
+    let detail = super::describe_first_char_mismatch("let x = \"a b\";", "let x = \"a<b\";")
+        .unwrap();
+    assert!(detail.contains("column 11"), "{detail}");
+    assert!(detail.contains("expected '␣' (U+0020)"), "{detail}");
+    assert!(detail.contains("found '<' (U+003C)"), "{detail}");
+}
+
+#[test]
+fn render_mismatch_caret_aligns_under_debug_rendered_prefix() {
+    // Padding mirrors the `{:?}` rendering of the line text, which wraps the
+    // prefix in quotes: `"ab"` renders as 4 chars, so the caret lands on the
+    // space at column 3 of `"ab c"` (position 4 of the rendered text).
+    assert_eq!(super::render_mismatch_caret("ab c", 3), "    ^");
+    assert_eq!(
+        super::render_mismatch_caret("\"a b\"", 4),
+        // prefix = `"a ` (3 chars); `{:?}` renders it as `"\"a "` — 6 chars.
+        "      ^"
+    );
+}

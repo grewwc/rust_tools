@@ -6,6 +6,14 @@ color: success
 model_tier: heavy
 tool_groups:
   - core
+tools:
+  - task
+  - task_spawn
+  - task_spawn_batch
+  - task_wait
+  - task_status
+  - task_integrate
+  - task_cancel
 disable_mcp_tools: true
 ---
 

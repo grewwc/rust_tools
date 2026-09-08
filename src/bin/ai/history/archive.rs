@@ -6,10 +6,13 @@ use super::{compress::ARCHIVE_NOTE_PREFIX, types::Message};
 
 const OVERFLOW_HISTORY_FILENAME: &str = "overflow-history.md";
 
-/// 展开压缩器写入 internal_note 的 overflow 归档回指，供 `/history` 查看完整会话。
+/// Expand overflow-archive back-references written by the compressor into
+/// `internal_note` messages, so `/history` can show the full session.
 ///
-/// 同一路径可能因旧版重复注入而出现多次，只展开一次。归档不可读或格式不完整时
-/// 保留原回指，避免把唯一的恢复线索从 `/history` 输出中隐藏掉。
+/// The same path may appear multiple times due to duplicate injection by older
+/// versions; expand it only once. If the archive is unreadable or the format is
+/// incomplete, keep the original back-reference so the only recovery clue is
+/// not hidden from the `/history` output.
 pub(super) fn expand_overflow_archives(messages: Vec<Message>) -> Vec<Message> {
     let mut expanded = Vec::with_capacity(messages.len());
     let mut loaded_paths = Vec::<PathBuf>::new();
@@ -170,7 +173,8 @@ fn finish_message(messages: &mut Vec<Message>, role: Option<&str>, content_lines
     {
         content_lines.pop();
     }
-    // OverflowSink 在不同 append 批次之间写入 `---`；它不是消息正文。
+    // OverflowSink writes `---` between different append batches; it is not
+    // message content.
     if content_lines
         .last()
         .is_some_and(|line| line.trim() == "---")

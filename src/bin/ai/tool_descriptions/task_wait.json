@@ -13,7 +13,7 @@
       },
       "timeout_secs": {
         "type": "integer",
-        "description": "Wait budget for THIS call (clamped to [1, 60], default 30). Suspends the parent, so call only after independent work is exhausted. Hitting the budget does NOT cancel or stall the subagent; it keeps running — use task_status while other work remains."
+        "description": "Wait budget for THIS call (clamped 1–60, default 30). Suspends the parent — call only after independent work is exhausted. Hitting the budget does NOT cancel or stall subagents; they keep running — use task_status while other work remains."
       },
       "wait_policy": {
         "type": "string",
@@ -21,7 +21,7 @@
           "all",
           "any"
         ],
-        "description": "Optional. 'any' (default) returns on the first finisher so the parent resumes promptly; 'all' waits until every pending task finishes. Remaining tasks stay alive and can be retrieved later."
+        "description": "'any' (default) returns on the first finisher; 'all' waits until every pending task finishes. Remaining tasks stay alive and can be retrieved later."
       }
     },
     "required": [

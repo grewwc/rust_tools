@@ -41,7 +41,7 @@ use crate::primitives::{
     FutexAddr, FutexOps, FutexState, FutexWakeReason, IpcOps, IpcRecvResult, LlmAccountOutcome,
     LlmModelPrice, LlmOps, LlmUsageReport, ResourceLimit, ResourceUsage, ResourceUsageDelta,
     RlimitDim, RlimitOps, RlimitVerdict, TraceKind, TraceLevel, TraceOps, TraceRecord, TraceRing,
-    VfsError, VfsOps, VfsStat,
+    VfsError, VfsOps, VfsReadRange, VfsStat,
 };
 
 const DEFAULT_COMPLETED_EVENT_RETENTION: usize = 8192;

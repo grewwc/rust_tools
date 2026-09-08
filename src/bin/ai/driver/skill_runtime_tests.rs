@@ -319,6 +319,63 @@ fn executor_group_defers_process_primitives_but_keeps_core_editing() {
 }
 
 #[test]
+fn manifest_groups_union_explicit_tools_keeps_delegation_subset_resident() {
+    // build.agent declares [core] plus a whitelist of the task family
+    // (task/task_spawn/task_spawn_batch/task_wait/task_status/task_integrate/
+    // task_cancel) to keep delegation tools visible without paying for the
+    // whole 12-tool group in every turn. The loader must merge group
+    // expansion with explicitly named tools (previously mutually exclusive
+    // branches), and the unlisted heavy/admin tools stay lazy.
+    let mut agent = agent("build", Vec::new());
+    agent.tool_groups = vec!["core".to_string()];
+    agent.tools = vec![
+        "task".to_string(),
+        "task_spawn".to_string(),
+        "task_spawn_batch".to_string(),
+        "task_wait".to_string(),
+        "task_status".to_string(),
+        "task_integrate".to_string(),
+        "task_cancel".to_string(),
+    ];
+
+    let tools = builtin_tools_for_skill(&[], Some(&agent));
+    let names = tools
+        .into_iter()
+        .map(|tool| tool.function.name)
+        .collect::<Vec<_>>();
+
+    for resident in [
+        "read_file",
+        "apply_patch",
+        "enable_tools",
+        "task",
+        "task_spawn",
+        "task_spawn_batch",
+        "task_wait",
+        "task_status",
+        "task_integrate",
+        "task_cancel",
+    ] {
+        assert!(
+            names.iter().any(|n| n == resident),
+            "{resident} should be resident"
+        );
+    }
+    for lazy in [
+        "manage_team",
+        "task_audit",
+        "task_evidence_read",
+        "task_retry",
+        "send_side_note",
+    ] {
+        assert!(
+            !names.iter().any(|n| n == lazy),
+            "{lazy} should stay lazy-loaded"
+        );
+    }
+}
+
+#[test]
 fn explicit_tools_list_is_not_filtered_by_lazy_load() {
     // Tools explicitly named via `tools:` become resident: even a named execution primitive is not culled.
     let mut agent = agent("custom", Vec::new());

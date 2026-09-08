@@ -323,14 +323,13 @@ fn try_open_single_file_diff(
     g: &crate::ai::tools::storage::changes::FileChange,
     kind: &EditorKind,
 ) -> Option<Result<String, String>> {
-    // 仅当存在 before/after 差异时才有意义；两者皆 None 表示纯 meta
+    // A comparison needs at least one captured side.
     if g.before_first.is_none() && g.after_last.is_none() {
         return None;
     }
-    // Truncated snapshots are not the full file, so code --diff would show a
-    // wrong comparison; fall back to the patch path (the patch is built from the
-    // authoritative diff recorded at write time).
-    if !crate::ai::tools::storage::changes::snapshots_full(&g.before_first, &g.after_last) {
+    // Unavailable or truncated snapshots cannot be represented by empty files
+    // in code --diff; use the patch path with its explicit limitations instead.
+    if !g.snapshots_full() {
         return None;
     }
     // 落盘到会话临时目录（与 file_store 沙箱保持一致，避免直接写系统 /tmp 越界）
@@ -378,6 +377,32 @@ fn try_open_single_file_diff(
         .map(|_| cmd_display.clone())
         .map_err(|e| format!("failed to launch editor '{}': {e}", prog));
     Some(res)
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::ai::tools::storage::mutation_log::{BeforeState, MutationEntry};
+
+    #[test]
+    fn external_diff_rejects_unavailable_initial_snapshot_before_spawning() {
+        for state in [BeforeState::Present, BeforeState::Unknown] {
+            let entries = [MutationEntry {
+                seq: 0,
+                ts: "t".into(),
+                path: "/proj/file.rs".into(),
+                op: "write".into(),
+                before: None,
+                before_state: Some(state),
+                after: Some("replacement\n".into()),
+                diff: None,
+            }];
+            let grouped = changes::grouped_changes(&entries);
+            for editor in [EditorKind::Vscode, EditorKind::Cursor] {
+                assert!(try_open_single_file_diff(&grouped[0], &editor).is_none());
+            }
+        }
+    }
 }
 
 fn open_patch_path_with_editor(

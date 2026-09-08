@@ -1,9 +1,13 @@
-//! `keep_recent_user_turns_when_trimming` 的字节上限逃逸阀单元测试。
+//! Unit tests for the byte-budget escape valve of
+//! `keep_recent_user_turns_when_trimming`.
 //!
-//! 覆盖变更 B：保护尾窗原先仅按「user 轮数」定义、无字节上限，tool-heavy
-//! agentic 会话（少 user 轮 × 每轮上百次工具调用）会让尾窗撑到 MB 级且结构上
-//! 禁止收敛。加入字节上限后，尾窗过大时逐步收缩保护轮数（最少 1 轮），把更早
-//! 的工具组暴露给 fold/spill 路径。正常小尾窗行为零变化。
+//! Covers change B: the protected tail window was originally defined only by
+//! "user turn count" with no byte cap, so tool-heavy agentic sessions (few user
+//! turns x hundreds of tool calls per turn) could grow the tail window to MB
+//! scale and structurally prevent convergence. With the byte cap in place, an
+//! oversized tail window gradually shrinks the number of protected turns (at
+//! least 1), exposing earlier tool groups to the fold/spill path. Normal small
+//! tail-window behavior is unchanged.
 
 use super::*;
 
@@ -17,8 +21,9 @@ fn msg(role: &str, content: &str) -> Message {
     }
 }
 
-/// 正常小会话：多个 user 轮但尾窗很小，行为不变——
-/// ≤48K → 3 轮；无 budget（budget=0）时永远走基础判定。
+/// Normal small session: several user turns but a small tail window, behavior
+/// unchanged — ≤48K → 3 turns; no budget (budget=0) always falls back to the
+/// baseline decision.
 #[test]
 fn tail_window_keeps_baseline_for_small_sessions() {
     let messages = vec![
@@ -31,30 +36,34 @@ fn tail_window_keeps_baseline_for_small_sessions() {
         msg("user", "q4"),
         msg("assistant", "a4"),
     ];
-    // 小尾窗 + 大 budget：保持 3 轮（≤48K 分支）。
+    // Small tail window + large budget: keep 3 turns (the ≤48K branch).
     assert_eq!(keep_recent_user_turns_when_trimming(&messages, 90_000), 3);
-    // budget=0 显式关闭上限：仍走基础判定。
+    // budget=0 explicitly disables the cap: still uses the baseline decision.
     assert_eq!(keep_recent_user_turns_when_trimming(&messages, 0), 3);
 }
 
-/// tool-heavy：仅 2 个 user 轮，但最近这轮尾窗 billable ≫ budget。
-/// 逃逸阀应把保护轮数下调到 1，让倒数第 2 轮及更早暴露给收敛路径。
+/// Tool-heavy: only 2 user turns, but the tail window's billable for the
+/// latest turn ≫ budget. The escape valve should lower the protected turn
+/// count to 1, exposing the second-to-last turn and earlier to the
+/// convergence path.
 #[test]
 fn tail_window_shrinks_when_bytes_exceed_budget() {
     let huge = "x".repeat(60_000);
     let messages = vec![
         msg("user", "第一轮问题"),
-        msg("assistant", &huge), // 第一轮的巨大工具/回复体量
+        msg("assistant", &huge), // Huge tool/reply payload from the first turn
         msg("user", "第二轮问题"),
-        msg("assistant", &huge), // 第二轮同样巨大
+        msg("assistant", &huge), // Second turn is equally huge
     ];
-    // 总量已 > 48K → 基础判定给 2；但「保留 2 轮」的尾窗（从第一个 user 起）
-    // billable ≈ 120K ≫ budget(40K)，逃逸阀下调到 1。
+    // Total already > 48K → baseline gives 2; but the "keep 2 turns" tail
+    // window (from the first user on) is billable ≈ 120K ≫ budget(40K), so the
+    // escape valve drops it to 1.
     assert_eq!(keep_recent_user_turns_when_trimming(&messages, 40_000), 1);
 }
 
-/// 保底不变式：即便最新一轮自身就超 budget，也永不低于 1 轮
-/// （最新一轮 user 及其工具组必须逐字保留，由组级保护继续兜底）。
+/// Floor invariant: even if the latest turn alone exceeds the budget, never go
+/// below 1 turn (the latest user turn and its tool groups must be preserved
+/// verbatim; group-level protection continues to provide the safety net).
 #[test]
 fn tail_window_never_drops_below_one_turn() {
     let huge = "y".repeat(200_000);
@@ -62,7 +71,8 @@ fn tail_window_never_drops_below_one_turn() {
     assert_eq!(keep_recent_user_turns_when_trimming(&messages, 10_000), 1);
 }
 
-/// budget 足够大能容纳按基础判定算出的尾窗时，不触发下调。
+/// When the budget is large enough to accommodate the tail window computed by
+/// the baseline, no shrink is triggered.
 #[test]
 fn tail_window_no_shrink_when_budget_accommodates() {
     let mid = "z".repeat(30_000);
@@ -72,7 +82,7 @@ fn tail_window_no_shrink_when_budget_accommodates() {
         msg("user", "q2"),
         msg("assistant", &mid),
     ];
-    // 总量 ≈ 60K > 48K → 基础判定 2；尾窗（2 user 轮 = 全量）billable ≈ 60K
-    // ≤ budget(90K)，不触发下调，保持 2。
+    // Total ≈ 60K > 48K → baseline 2; the tail window (2 user turns = the
+    // whole set) is billable ≈ 60K ≤ budget(90K), so no shrink, stays 2.
     assert_eq!(keep_recent_user_turns_when_trimming(&messages, 90_000), 2);
 }

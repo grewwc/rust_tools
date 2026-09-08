@@ -55,9 +55,10 @@ pub(in crate::ai) fn with_sessions_lifecycle_lock<T>(
     result
 }
 
-/// 递归复制目录树 `src` -> `dst`（`dst` 不应已存在）。
-/// fork_session 时用于完整复制 assets 目录：checkpoint 正文位于嵌套目录中，
-/// 浅复制会让 fork 后的 marker 指向缺失文件。
+/// Recursively copy the directory tree `src` -> `dst` (`dst` must not exist
+/// yet). Used by fork_session to copy the assets directory completely:
+/// checkpoint bodies live in nested directories, and a shallow copy would
+/// leave forked markers pointing at missing files.
 pub(super) fn copy_dir_recursively(src: &Path, dst: &Path) -> io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
@@ -99,7 +100,8 @@ pub(in crate::ai) enum PruneSessionDeleteResult {
     Active,
 }
 
-/// 标题的持久化来源。旧数据库没有来源标记，必须保守处理，避免误覆盖已有好标题。
+/// The persisted origin of a title. Old databases have no origin marker and
+/// must be treated conservatively so existing good titles are not overwritten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::ai) enum SessionTitleOrigin {
     Model,
@@ -120,7 +122,8 @@ impl SessionTitleOrigin {
         match self {
             Self::Model => "model",
             Self::Fallback => "fallback",
-            // Legacy 只用于读取旧数据，新的写入必须显式标记真实来源。
+            // Legacy is only for reading old data; new writes must explicitly
+            // mark the real origin.
             Self::Legacy => "legacy",
         }
     }
@@ -147,7 +150,8 @@ impl SessionStore {
         &self.root
     }
 
-    /// 会话 ID 会成为持久化路径的一部分，调用方必须先拒绝非法输入，不能静默改写。
+    /// The session ID becomes part of persisted paths; callers must reject
+    /// invalid input first and never silently rewrite it.
     pub(in crate::ai) fn validate_session_id(session_id: &str) -> io::Result<()> {
         if session_id.is_empty()
             || session_id.len() > MAX_SESSION_ID_BYTES
@@ -178,7 +182,8 @@ impl SessionStore {
         self.root.join(format!("{id}.assets"))
     }
 
-    /// 该 session 的 checkpoint 存放目录：`<sessions_root>/checkpoints/<id>/`。
+    /// This session's checkpoint directory:
+    /// `<sessions_root>/checkpoints/<id>/`.
     pub(in crate::ai) fn checkpoints_dir(&self, session_id: &str) -> PathBuf {
         let id = sanitize_session_id(session_id);
         self.root.join("checkpoints").join(id)
@@ -190,8 +195,10 @@ impl SessionStore {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(err),
         };
-        // 先在本线程筛选出合法 session（文件名校验 + stat），再把每个库的元数据读取
-        // 分发到并行线程：逐个串行打开几十上百个 sqlite 是 `/ss` 的主要耗时之一。
+        // First filter valid sessions on this thread (file-name check + stat),
+        // then dispatch each database's metadata read to parallel threads:
+        // opening dozens or hundreds of sqlite files serially is one of `/ss`'s
+        // main costs.
         let mut jobs: Vec<(String, PathBuf, Option<SystemTime>)> = Vec::new();
         for entry in entries {
             let entry = entry?;
@@ -203,7 +210,8 @@ impl SessionStore {
                 continue;
             };
             let id = stem.to_string();
-            // 忽略旧版本或外部写入留下的不合法文件名，避免它们重新进入可选 session 集合。
+            // Ignore invalid file names left by old versions or external
+            // writers so they cannot re-enter the selectable session set.
             if Self::validate_session_id(&id).is_err() {
                 continue;
             }
@@ -213,7 +221,9 @@ impl SessionStore {
             };
             jobs.push((id, path, file_modified));
         }
-        // 并行读取结果按下标汇总回主线程，按原顺序插入 SkipMap，排序与串行版本一致。
+        // Parallel reads are gathered back on the main thread by index and
+        // inserted into the SkipMap in original order, keeping the same
+        // ordering as the serial version.
         let mut metadata_results = Self::read_session_list_metadata_parallel(&jobs);
 
         let mut sessions: Box<SkipMap<(u64, String), SessionInfo>> =
@@ -241,14 +251,18 @@ impl SessionStore {
                 ),
                 None => (None, None, None, 0, false),
             };
-            // 新库使用事务内维护的逻辑活动时间；旧库由元数据读取层回退到最后一条
-            // canonical message 的 created_at。只有无法读取逻辑时间时才使用主库 mtime。
-            // 不能使用 -shm/-wal mtime：只读连接和 SQLite 内部维护也可能刷新它们。
+            // New databases use the logical activity time maintained inside
+            // transactions; for old databases the metadata reader falls back
+            // to the last canonical message's created_at. The main DB mtime
+            // is only used when no logical time is readable. -shm/-wal
+            // mtimes must not be used: read-only connections and SQLite
+            // housekeeping can also refresh them.
             let modified_local = last_activity_unix_ms
                 .and_then(DateTime::<Utc>::from_timestamp_millis)
                 .map(|time| time.with_timezone(&Local))
                 .or_else(|| file_modified.map(DateTime::<Local>::from));
-            // 优先使用 LLM 生成的标题（存储在 meta 表中），fallback 到首条消息摘要。
+            // Prefer the LLM-generated title (stored in the meta table),
+            // falling back to the first message's summary.
             let summary = generated_title
                 .as_deref()
                 .map(normalize_generated_session_title)
@@ -269,8 +283,9 @@ impl SessionStore {
                     id,
                     modified_local,
                     history_revision,
-                    // 大小按需由 `attach_session_sizes` / `session_total_size` 计算；
-                    // list_sessions 不再递归统计每个 session 的 assets 目录。
+                    // Sizes are computed on demand by `attach_session_sizes`
+                    // / `session_total_size`; list_sessions no longer walks
+                    // every session's assets directory.
                     size_bytes: 0,
                     first_user_prompt,
                     summary,
@@ -281,11 +296,14 @@ impl SessionStore {
         Ok(sessions.into_iter().map(|(_, v)| v).collect())
     }
 
-    /// 并行读取多个 session 库的列表元数据（标题、首条请求、活动时间）。
+    /// Read list metadata (title, first request, activity time) of many
+    /// session databases in parallel.
     ///
-    /// 与 `list_sessions` 原有容错语义一致：单个库读取失败返回 `None`，由调用方回退到
-    /// 文件 mtime；不会让一个损坏或旧格式的 session 阻断整个列表。静态分片避免原子
-    /// 计数争用，`std::thread::scope` 保证线程只借用 `jobs` 而不拷贝。
+    /// Keeps `list_sessions`'s original fault-tolerance semantics: a failed
+    /// read of one database yields `None` and the caller falls back to the
+    /// file mtime; one corrupt or old-format session never blocks the whole
+    /// list. Static striding avoids atomic-counter contention, and
+    /// `std::thread::scope` lets threads borrow `jobs` without copying.
     fn read_session_list_metadata_parallel(
         jobs: &[(String, PathBuf, Option<SystemTime>)],
     ) -> Vec<Option<SessionListMetadata>> {
@@ -321,7 +339,8 @@ impl SessionStore {
         results
     }
 
-    /// 只读取一个 session 的恢复预览信息，避免启动恢复时扫描并统计全部 session。
+    /// Read the recovery preview of a single session only, so startup
+    /// recovery does not scan and stat every session.
     pub(in crate::ai) fn read_session_preview(
         &self,
         session_id: &str,
@@ -384,8 +403,9 @@ impl SessionStore {
         Ok(total)
     }
 
-    /// 计算单个 session 的总占用字节，供 `/ss current` 等只展示单个 session 大小的命令使用，
-    /// 避免为了一个 session 扫描并统计全部 session。
+    /// Compute the total bytes of a single session, for commands like
+    /// `/ss current` that only show one session's size, without scanning and
+    /// stat-ing all sessions.
     pub(in crate::ai) fn session_total_size(&self, session_id: &str) -> io::Result<u64> {
         let derived_history_size = *self
             .derived_session_history_artifact_sizes()?
@@ -398,14 +418,19 @@ impl SessionStore {
         )
     }
 
-    /// 并行地为已列出的 session 填充 `size_bytes`。
+    /// Fill in `size_bytes` for the listed sessions in parallel.
     ///
-    /// `list_sessions` 出于性能不再计算大小：逐个 session 递归统计 assets 是主要瓶颈
-    /// （本机约 2.6s）。只有 `/ss list` 等需要展示大小的命令才调用本方法，把每个 session 的
-    /// 统计任务分发到独立线程，用多核把墙钟时间压到几百毫秒。
-    /// 递归统计结果按目录顶层指纹缓存在 `<root>/.sizes-cache.json`：指纹只读取 assets /
-    /// checkpoints 的直接子项（名称、类型、长度、mtime），新增/删除/改写文件都会反映到
-    /// 指纹上；指纹未变时直接复用缓存，后续 `/ss` 不再重复遍历几百 MB 的 overflow 目录。
+    /// `list_sessions` no longer computes sizes for performance: recursively
+    /// stat-ing every session's assets is the main bottleneck (~2.6s on this
+    /// machine). Only commands that display sizes (e.g. `/ss list`) call this
+    /// method, dispatching each session's stat to its own thread and using
+    /// all cores to bring wall-clock time down to a few hundred milliseconds.
+    /// Results are cached in `<root>/.sizes-cache.json` keyed by a top-level
+    /// directory fingerprint: the fingerprint reads only the direct children
+    /// of assets / checkpoints (name, type, length, mtime), so added,
+    /// deleted, or rewritten files all show up in it; when the fingerprint is
+    /// unchanged the cache is reused and later `/ss` calls do not re-walk
+    /// multi-hundred-MB overflow directories.
     pub(in crate::ai) fn attach_session_sizes(
         &self,
         sessions: &mut [SessionInfo],
@@ -416,7 +441,8 @@ impl SessionStore {
         let derived_history_sizes = self.derived_session_history_artifact_sizes()?;
         let cache_path = self.root.join(SESSION_SIZE_CACHE_FILE);
         let mut cache = Self::load_session_size_cache(&cache_path);
-        // 预收集 (下标, session_id, 派生大小)；线程只借用 self，不借用 sessions。
+        // Pre-collect (index, session_id, derived size); threads only borrow
+        // self, not sessions.
         let jobs: Vec<(usize, String, u64)> = sessions
             .iter()
             .enumerate()
@@ -439,7 +465,9 @@ impl SessionStore {
                         scope.spawn(move || {
                             let assets_dir = self.session_assets_dir(&id);
                             let checkpoints_dir = self.checkpoints_dir(&id);
-                            // 顶层指纹命中缓存时跳过递归遍历；遍历失败按旧语义记 0 且不写缓存。
+                            // Skip the recursive walk when the top-level
+                            // fingerprint hits the cache; on walk failure
+                            // record 0 and do not write the cache, as before.
                             let (assets_size, checkpoints_size, recompute) = match (
                                 Self::dir_two_level_fingerprint(&assets_dir),
                                 Self::dir_two_level_fingerprint(&checkpoints_dir),
@@ -516,7 +544,8 @@ impl SessionStore {
             for (id, fingerprint, assets_size, checkpoints_size) in recomputed {
                 cache.insert(id, (fingerprint, assets_size, checkpoints_size));
             }
-            // 顺带清掉已删除 session 的残留缓存项，避免缓存文件无限增长。
+            // Also drop leftover cache entries of deleted sessions so the
+            // cache file cannot grow without bound.
             let current_ids: std::collections::HashSet<&str> =
                 sessions.iter().map(|session| session.id.as_str()).collect();
             cache.retain(|id, _| current_ids.contains(id.as_str()));
@@ -525,13 +554,18 @@ impl SessionStore {
         Ok(())
     }
 
-    /// 目录两级指纹：读取直接子项（名称、类型、长度、mtime），并对每个直接子目录再读取
-    /// 其直接子项，用于判断目录树是否变化。新增/删除/改写都会改变文件自身的 size/mtime
-    /// 或所在目录的 mtime，从而改变指纹；不存在的目录返回 `Ok("-")`。相比递归遍历，
-    /// 指纹读取量与"顶层条目数 + 直接子目录条目数"成正比。
-    /// 已知边界：深度 ≥3 的文件内容改写不改任何祖先目录的 mtime，两层指纹感知不到；
-    /// 本仓库实际结构（assets 两层、checkpoints 目录以 rename 原子发布）不受影响，
-    /// 且任何新增/删除仍会经目录 mtime 信号使缓存失效自愈。
+    /// Two-level directory fingerprint: reads direct children (name, type,
+    /// length, mtime) and, for each direct subdirectory, its direct children,
+    /// to detect tree changes. Adding/deleting/rewriting changes either the
+    /// file's own size/mtime or its directory's mtime, which changes the
+    /// fingerprint; a missing directory yields `Ok("-")`. Compared with a
+    /// recursive walk, the fingerprint reads are proportional to "top-level
+    /// entry count + direct-subdirectory entry count".
+    /// Known edge: rewriting a file at depth >= 3 changes no ancestor
+    /// directory mtime, which the two-level fingerprint cannot see; this
+    /// repository's actual layout (assets two levels deep, checkpoints
+    /// published atomically via rename) is unaffected, and any add/delete
+    /// still heals the cache through directory mtime signals.
     fn dir_two_level_fingerprint(path: &Path) -> io::Result<String> {
         let entries = match fs::read_dir(path) {
             Ok(entries) => entries,
@@ -544,7 +578,9 @@ impl SessionStore {
             let file_type = entry.file_type()?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let (kind, size, mtime_ns) = if file_type.is_dir() {
-                // 子目录本身不参与字节统计，但它的 mtime 会随内容增删变化，用作变更信号。
+                // Subdirectories do not count toward the byte total, but
+                // their mtime changes with content add/delete and serves as a
+                // change signal.
                 let mtime = fs::metadata(&entry.path())
                     .ok()
                     .and_then(|m| Self::metadata_mtime_nanos(&m))
@@ -558,12 +594,16 @@ impl SessionStore {
                     Self::metadata_mtime_nanos(&metadata).unwrap_or(0),
                 )
             } else {
-                // 符号链接等既不递归也不计入大小，与 directory_size 的语义一致。
+                // Symlinks etc. are neither recursed into nor counted,
+                // matching directory_size's semantics.
                 ("o", 0u64, 0)
             };
             parts.push(format!("{kind}|{name}|{size}|{mtime_ns}"));
-            // 第二级：直接子目录内的文件改写（size/mtime 变化）与新增/删除同样可感知。
-            // 条目带父目录名前缀，避免不同目录下的同名子项混淆；第二级读取失败不阻断整体。
+            // Second level: rewrites (size/mtime changes) and add/delete of
+            // files inside direct subdirectories are detected too. Entries
+            // carry the parent directory name as a prefix so same-named
+            // children of different directories cannot be confused; a failed
+            // second-level read does not block the whole fingerprint.
             if file_type.is_dir() {
                 let Ok(sub_entries) = fs::read_dir(entry.path()) else {
                     continue;
@@ -610,8 +650,11 @@ impl SessionStore {
             .map(|d| d.as_nanos())
     }
 
-    /// 会话大小缓存的持久化格式：`Vec<(session_id, fingerprint, assets_size, checkpoints_size)>`。
-    /// 直接序列化元组序列，避免为缓存结构引入 serde derive；文件缺失或损坏时整体失效重算。
+    /// Persisted format of the session size cache:
+    /// `Vec<(session_id, fingerprint, assets_size, checkpoints_size)>`.
+    /// Serializes the tuple sequence directly to avoid a serde derive for the
+    /// cache structure; a missing or corrupt file invalidates the whole cache
+    /// and triggers recomputation.
     fn load_session_size_cache(path: &Path) -> FastMap<String, (String, u64, u64)> {
         let Ok(bytes) = fs::read(path) else {
             return FastMap::default();
@@ -644,7 +687,9 @@ impl SessionStore {
             .collect();
         let payload =
             serde_json::to_vec(&entries).map_err(|error| io::Error::other(error.to_string()))?;
-        // 临时文件 + rename 原子发布，与 sqlite 备份的发布方式一致；并发 /ss 各写各的临时文件。
+        // Atomic publish via temporary file + rename, same as sqlite backup
+        // publishing; concurrent /ss calls each write their own temporary
+        // file.
         let temporary = path.with_file_name(format!(
             ".{}.tmp-{}",
             SESSION_SIZE_CACHE_FILE,
@@ -655,8 +700,10 @@ impl SessionStore {
         Ok(())
     }
 
-    /// 删除 session 后主动移除其大小缓存条目，避免残留条目悬挂到下一次有重算的 /ss。
-    /// 写失败不阻塞删除流程：attach_session_sizes 的 retain 清理会自愈兜底。
+    /// Actively remove a session's size-cache entry after deletion, so the
+    /// leftover entry does not dangle until the next /ss that recomputes.
+    /// A failed write does not block deletion: attach_session_sizes's retain
+    /// cleanup heals it.
     fn remove_session_size_cache_entry(&self, session_id: &str) -> io::Result<()> {
         let cache_path = self.root.join(SESSION_SIZE_CACHE_FILE);
         let mut cache = Self::load_session_size_cache(&cache_path);
@@ -755,16 +802,19 @@ impl SessionStore {
         let checkpoints = self.checkpoints_dir(session_id);
         let deleted = with_sessions_lifecycle_lock(&self.root, || {
             super::checkpoint::with_checkpoint_lock(&checkpoints, || {
-                // 与 canonical writer / rollback 共用同一把跨进程锁；锁文件本身必须保留，
-                // 否则删除期间或紧随其后的 writer 可能在不同 inode 上各自取得 flock。
+                // Shares the same cross-process lock as the canonical writer /
+                // rollback; the lock file itself must be kept, otherwise a
+                // writer during or right after deletion could flock different
+                // inodes for the same path.
                 with_session_state_lock(&path, || {
                     self.delete_session_artifacts_unlocked(session_id, &path, &assets, &checkpoints)
                 })
             })
         })?;
         if deleted {
-            // 删除成功后主动清理缓存条目；清理失败不影响删除结果，残留条目由
-            // attach_session_sizes 的 retain 自愈兜底。
+            // Actively clean the cache entry after a successful delete; a
+            // failed cleanup does not affect the delete result, and leftover
+            // entries are healed by attach_session_sizes's retain.
             let _ = self.remove_session_size_cache_entry(session_id);
             // Reclaim the in-process state-lock map entry: subagent paths reclaim it in
             // `delete_subagent_history`, but a deleted main session would otherwise leave its
@@ -778,9 +828,11 @@ impl SessionStore {
         Ok(deleted)
     }
 
-    /// prune 的最终校验与删除必须共同持有 lifecycle + checkpoint + session state 锁。
-    /// `is_active` 在所有元数据校验通过后、真正 unlink 前执行，供调用方做最后一次
-    /// PID 活跃检查；state lock 文件本身不属于删除集合，会跨本次临界区保留。
+    /// Prune's final validation and deletion must jointly hold the lifecycle
+    /// + checkpoint + session-state locks. `is_active` runs after all metadata
+    /// checks pass and before the actual unlink, so the caller can do a last
+    /// PID liveness check; the state-lock file itself is not part of the
+    /// deletion set and survives this critical section.
     pub(in crate::ai) fn delete_session_if_unchanged(
         &self,
         candidate: &SessionInfo,
@@ -825,7 +877,9 @@ impl SessionStore {
                         &assets,
                         &checkpoints,
                     )?;
-                    // 删除成功后主动清理缓存条目；失败不阻断 prune 结果，缓存自愈兜底。
+                    // Actively clean the cache entry after a successful
+                    // delete; a failure does not block the prune result, and
+                    // the cache self-heals.
                     let _ = self.remove_session_size_cache_entry(&candidate.id);
                     Ok(PruneSessionDeleteResult::Deleted)
                 })
@@ -886,7 +940,8 @@ impl SessionStore {
         })
     }
 
-    /// 在读取 live session 前恢复被中断的 checkpoint rollback 事务。
+    /// Recover interrupted checkpoint rollback transactions before reading a
+    /// live session.
     pub(in crate::ai) fn recover_checkpoint_state(&self, session_id: &str) -> io::Result<()> {
         Self::validate_session_id(session_id)?;
         super::checkpoint::CheckpointStore::from_session_paths(
@@ -917,10 +972,12 @@ impl SessionStore {
                 }
             }
             self.delete_all_derived_session_history_artifacts()?;
-            // 兼容旧版本留下的孤立 checkpoint 目录：它们没有对应的 `.sqlite`，不会被
-            // `list_sessions` 枚举，但 clear-all 的语义仍应清空全部会话数据。
+            // Tolerate orphan checkpoint directories left by old versions:
+            // they have no matching `.sqlite` and are not enumerated by
+            // `list_sessions`, but clear-all must still wipe all session data.
             remove_dir_if_exists(&checkpoints_root)?;
-            // 全部会话已清空，缓存整体失效，直接移除缓存文件。
+            // All sessions are cleared, so the whole cache is stale; just
+            // remove the cache file.
             remove_file_if_exists(&self.root.join(SESSION_SIZE_CACHE_FILE))?;
             Ok(deleted)
         })
@@ -935,9 +992,10 @@ impl SessionStore {
         read_first_user_prompt_sqlite(&path)
     }
 
-    /// 判断 session 是否为空（没有任何用户消息）。
-    /// 用于交互模式下用户直接 Ctrl+C 退出时清理空 session。
-    /// 文件不存在或 messages 表中没有 role='user' 的记录均视为空。
+    /// Whether the session is empty (no user messages at all).
+    /// Used to clean up empty sessions when the user exits with Ctrl+C in
+    /// interactive mode. A missing file or no role='user' rows in the
+    /// messages table both count as empty.
     pub(in crate::ai) fn is_empty_session(&self, session_id: &str) -> io::Result<bool> {
         Self::validate_session_id(session_id)?;
         let path = self.session_history_file(session_id);
@@ -948,14 +1006,15 @@ impl SessionStore {
         Ok(count == 0)
     }
 
-    /// 读取 session 标题。
+    /// Read the session title.
     pub(in crate::ai) fn read_session_title(&self, session_id: &str) -> io::Result<Option<String>> {
         Ok(self
             .read_session_title_with_origin(session_id)?
             .map(|title| title.text))
     }
 
-    /// 读取 session 标题及其来源。没有来源标记的旧数据会标为 `Legacy`。
+    /// Read the session title and its origin. Old data without an origin
+    /// marker is labeled `Legacy`.
     pub(in crate::ai) fn read_session_title_with_origin(
         &self,
         session_id: &str,
@@ -973,7 +1032,7 @@ impl SessionStore {
         Ok(Some(SessionTitle { text, origin }))
     }
 
-    /// 写入模型生成的 session 标题。
+    /// Write a model-generated session title.
     pub(in crate::ai) fn write_session_title(
         &self,
         session_id: &str,
@@ -982,7 +1041,7 @@ impl SessionStore {
         self.write_session_title_with_origin(session_id, title, SessionTitleOrigin::Model)
     }
 
-    /// 写入 session 标题及其来源。
+    /// Write a session title together with its origin.
     pub(in crate::ai) fn write_session_title_with_origin(
         &self,
         session_id: &str,
@@ -1018,7 +1077,7 @@ impl SessionStore {
         write_session_marked_sqlite(&self.session_history_file(session_id), marked)
     }
 
-    /// 检查是否已有 LLM 生成的标题。
+    /// Whether an LLM-generated title already exists.
     pub(in crate::ai) fn has_generated_title(&self, session_id: &str) -> bool {
         self.read_session_title_with_origin(session_id)
             .ok()
@@ -1035,8 +1094,10 @@ impl SessionStore {
         read_all_messages_sqlite(&path)
     }
 
-    /// 在持有源、目标 session 锁时复制完整 state，并允许调用者继续修改新分支。
-    /// 多 session 锁按目录排序获取，避免两个反向 fork 互相等待。
+    /// Copy the full state while holding the source and destination session
+    /// locks, and let the caller keep modifying the new branch afterwards.
+    /// Multi-session locks are acquired in directory order so two forks in
+    /// opposite directions cannot wait on each other.
     fn fork_session_with<T>(
         &self,
         src: &str,
@@ -1069,8 +1130,10 @@ impl SessionStore {
                 }
                 backup_sqlite(&src_path, &dst_path)?;
 
-                // assets 目录是可选的；若存在则必须完整复制。checkpoint 正文位于嵌套
-                // 目录中，浅复制会让 fork 后的 marker 指向缺失文件。
+                // The assets directory is optional; if present it must be
+                // copied completely. Checkpoint bodies live in nested
+                // directories, and a shallow copy would leave forked markers
+                // pointing at missing files.
                 if src_assets.is_dir() {
                     if let Err(error) = copy_dir_recursively(&src_assets, &dst_assets) {
                         let _ = delete_history_artifacts(&dst_path);
@@ -1092,14 +1155,17 @@ impl SessionStore {
         )
     }
 
-    /// 把 `src` session 整体复制到 `dst` 作为新分支。原 session 不动。
-    /// 拒绝覆盖已有 dst（避免误覆盖）。assets 目录如果存在也递归复制。
+    /// Copy the `src` session wholesale to `dst` as a new branch. The source
+    /// session is untouched. Refuses to overwrite an existing dst (to avoid
+    /// accidental clobbering). The assets directory is copied recursively if
+    /// present.
     pub(in crate::ai) fn fork_session(&self, src: &str, dst: &str) -> io::Result<()> {
         self.fork_session_with(src, dst, |_| Ok(()))
     }
 
-    /// 在 `src` 之上分支，并保留前 `keep_turns` 个完整用户 turn。
-    /// 适合"我想从某轮回滚后换个方向继续"的场景。
+    /// Branch on top of `src`, keeping the first `keep_turns` complete user
+    /// turns. Fits the "I want to roll back to a turn and continue in a
+    /// different direction" scenario.
     pub(in crate::ai) fn branch_session(
         &self,
         src: &str,
@@ -1138,11 +1204,13 @@ impl SessionStore {
         Ok(())
     }
 
-    /// 将 session 完整打包为 zip 归档（SQLite + assets），用于跨机器迁移。
-    /// 归档结构：
-    ///   manifest.json   — 版本号 + 原始 session id + 创建时间
-    ///   session.sqlite  — 完整的 SQLite 数据库（已 checkpoint，含全部消息/标题/摘要）
-    ///   assets/...      — assets 目录内容（若存在）
+    /// Package a session wholesale into a zip archive (SQLite + assets) for
+    /// cross-machine migration.
+    /// Archive layout:
+    ///   manifest.json   - version + original session id + creation time
+    ///   session.sqlite  - full SQLite database (checkpointed; all messages /
+    ///                      titles / summaries)
+    ///   assets/...      - assets directory contents (if present)
     pub(in crate::ai) fn export_session_archive(
         &self,
         session_id: &str,
@@ -1190,7 +1258,7 @@ impl SessionStore {
                 let mut sqlite_file = File::open(&snapshot)?;
                 std::io::copy(&mut sqlite_file, &mut zip)?;
 
-                // assets/（可选）
+                // assets/ (optional)
                 let assets_dir = self.session_assets_dir(session_id);
                 if assets_dir.is_dir() {
                     add_dir_to_zip(&mut zip, &assets_dir, "assets", options)?;
@@ -1204,9 +1272,9 @@ impl SessionStore {
         })
     }
 
-    /// 从 zip 归档导入 session。
-    /// `dst_id` 指定导入后的 session id（已存在则报错）。
-    /// 返回导入后的 session id。
+    /// Import a session from a zip archive.
+    /// `dst_id` is the session id to import into (errors if it already
+    /// exists). Returns the imported session id.
     pub(in crate::ai) fn import_session_archive(
         &self,
         archive_path: &Path,
@@ -1219,7 +1287,7 @@ impl SessionStore {
 
         validate_archive_entries(&mut archive)?;
 
-        // 读取 manifest（可选，仅用于校验）
+        // Read the manifest (optional, only for validation)
         let manifest = {
             let mut buf = Vec::new();
             match archive.by_name("manifest.json") {
@@ -1230,7 +1298,7 @@ impl SessionStore {
                 Err(_) => None,
             }
         };
-        let _ = manifest; // 仅用于校验，不强制使用原 id
+        let _ = manifest; // Only for validation; the original id is not enforced
 
         let dst_sqlite = self.session_history_file(dst_id);
         let dst_assets = self.session_assets_dir(dst_id);
@@ -1245,7 +1313,7 @@ impl SessionStore {
             }
 
             let result = (|| {
-                // 解压 session.sqlite
+                // Extract session.sqlite
                 {
                     let mut entry = archive.by_name("session.sqlite").map_err(|e| {
                         io::Error::other(format!("session.sqlite not found in archive: {e}"))
@@ -1254,7 +1322,7 @@ impl SessionStore {
                     std::io::copy(&mut entry, &mut out)?;
                 }
 
-                // 解压 assets/（如果存在）
+                // Extract assets/ (if present)
                 for i in 0..archive.len() {
                     let mut entry = archive
                         .by_index(i)
@@ -1302,7 +1370,8 @@ impl SessionStore {
     }
 }
 
-/// 校验归档布局，且在创建目标文件前拒绝 Zip Slip、重复 SQLite 和未知条目。
+/// Validate the archive layout, rejecting Zip Slip, duplicate SQLite files,
+/// and unknown entries before any destination file is created.
 fn validate_archive_entries(archive: &mut zip::ZipArchive<File>) -> io::Result<()> {
     let mut session_sqlite_count = 0usize;
     let mut manifest_count = 0usize;
@@ -1435,7 +1504,8 @@ fn is_sqlite_history_artifact_name(file_name: &str) -> bool {
         || file_name.ends_with(".sqlite-journal")
 }
 
-/// 统计目录内常规文件的字节数；符号链接不跟随，避免显示尺寸时产生循环或越界读取。
+/// Count bytes of regular files in a directory; symlinks are not followed,
+/// avoiding cycles or out-of-tree reads when displaying sizes.
 fn directory_size(path: &Path) -> io::Result<u64> {
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
@@ -1463,7 +1533,7 @@ fn remove_dir_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
-/// 递归地把目录内容添加到 zip 归档中。
+/// Recursively add a directory's contents to a zip archive.
 fn add_dir_to_zip(
     zip: &mut zip::ZipWriter<File>,
     dir: &Path,
@@ -1515,23 +1585,23 @@ fn sanitize_session_id(session_id: &str) -> String {
     }
 }
 
-/// 从第一条用户消息生成一个简洁的 session 标题/摘要。
-/// 处理 JSON 内容（如图片数据），提取关键信息并生成概括性标题。
-/// 与简单截断不同，此函数会：
-/// 1. 去掉 agent/命令前缀（如 "a "、"/"）
-/// 2. 提取第一句话（到句号/问号/感叹号/换行）
-/// 3. 去掉常见的冗余前缀（"帮我"、"请"、"我想"等）
-/// 4. 控制在合理长度
+/// Generate a concise session title/summary from the first user message.
+/// Handles JSON content (e.g. image data), extracting key information into a
+/// summarizing title. Unlike a plain truncation, this function:
+/// 1. strips agent/command prefixes (e.g. "a ", "/")
+/// 2. extracts the first sentence (up to a sentence-ending mark or newline)
+/// 3. strips common filler prefixes (e.g. "帮我", "请", "我想")
+/// 4. caps the result at a reasonable length
 pub(in crate::ai) fn generate_session_summary(first_prompt: &str) -> String {
     let text = first_prompt.trim();
     if text.is_empty() {
         return "(空会话)".to_string();
     }
 
-    // 去掉 agent 前缀（如 "a "、"a:"、"agent:"等）
+    // Strip the agent prefix (e.g. "a ", "a:", "agent:", etc.)
     let text = strip_agent_prefix(text);
 
-    // 处理多条消息合并的情况（用 \n---\n 分隔）
+    // Handle merged multi-message input (separated by \n---\n)
     let messages: Vec<&str> = text.split("\n---\n").collect();
     let mut all_text_parts = Vec::new();
     let mut has_any_image = false;
@@ -1542,7 +1612,7 @@ pub(in crate::ai) fn generate_session_summary(first_prompt: &str) -> String {
             continue;
         }
 
-        // 尝试解析为 JSON 数组（多模态消息）
+        // Try parsing as a JSON array (multimodal messages)
         if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(msg) {
             let (parts, has_image) = extract_from_json_array(&arr);
             all_text_parts.extend(parts);
@@ -1550,7 +1620,7 @@ pub(in crate::ai) fn generate_session_summary(first_prompt: &str) -> String {
                 has_any_image = true;
             }
         }
-        // 尝试解析为单个 JSON 对象
+        // Try parsing as a single JSON object
         else if let Ok(obj) = serde_json::from_str::<serde_json::Value>(msg) {
             if let Some(obj) = obj.as_object() {
                 let item_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1568,9 +1638,10 @@ pub(in crate::ai) fn generate_session_summary(first_prompt: &str) -> String {
                 }
             }
         }
-        // 普通文本
+        // Plain text
         else {
-            // 提取第一句话（到句号/问号/感叹号/换行）
+            // Extract the first sentence (up to a sentence-ending mark or
+            // newline)
             let first_sentence = extract_first_sentence(msg);
             if !first_sentence.is_empty() {
                 all_text_parts.push(first_sentence);
@@ -1586,12 +1657,12 @@ pub(in crate::ai) fn generate_session_summary(first_prompt: &str) -> String {
     }
 
     let combined = all_text_parts.join(" ");
-    // 去掉常见的冗余前缀，使标题更简洁概括
+    // Strip common filler prefixes so the title is more concise
     let cleaned = strip_filler_prefixes(&combined);
     truncate_summary(&cleaned, 40)
 }
 
-/// 从 JSON 数组中提取文本部分和图片标记。
+/// Extract text parts and the image flag from a JSON array.
 fn extract_from_json_array(arr: &[serde_json::Value]) -> (Vec<String>, bool) {
     let mut parts = Vec::new();
     let mut has_image = false;
@@ -1615,7 +1686,7 @@ fn extract_from_json_array(arr: &[serde_json::Value]) -> (Vec<String>, bool) {
     (parts, has_image)
 }
 
-/// 截断摘要到指定长度，添加省略号。
+/// Truncate a summary to the given length, appending an ellipsis.
 fn truncate_summary(s: &str, max_len: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max_len {
@@ -1626,15 +1697,20 @@ fn truncate_summary(s: &str, max_len: usize) -> String {
     out
 }
 
-/// 会话标题清洗共用的冗余前缀清单（请求壳 / 疑问词）。
+/// Shared filler-prefix list for session title cleaning (request shells /
+/// question words).
 ///
-/// 历史上 `strip_request_filler_prefixes` 与 `strip_filler_prefixes` 各维护一份
-/// 几乎相同的数组，且前者**缺** 如何/怎么/怎样，导致“如何实现 X”经 LLM 标题
-/// 路径与 fallback 摘要路径清洗结果不一致。这里合并为唯一真源，两处共用。
+/// Historically `strip_request_filler_prefixes` and `strip_filler_prefixes`
+/// each maintained a nearly identical array, and the former was missing
+/// 如何/怎么/怎样, so "如何实现 X" was cleaned differently on the LLM-title
+/// path versus the fallback-summary path. This single source of truth is
+/// shared by both.
 ///
-/// **顺序即匹配优先级**：strip 循环按数组顺序贪婪匹配，长复合前缀必须排在其
-/// 短子串之前（如 "你帮我看一下" 在 "帮我" 之前），否则会先剥掉短前缀、留下
-/// 半截壳。新增项请遵守“长前缀在前、短词垫后”。
+/// Order is match priority: the strip loops greedily match in array order,
+/// so long compound prefixes must come before their shorter substrings (e.g.
+/// "你帮我看一下" before "帮我"), otherwise the short prefix is stripped
+/// first, leaving a broken shell. New entries: long prefixes first, short
+/// words last.
 const SESSION_TITLE_FILLER_PREFIXES: &[&str] = &[
     "你帮我看一下",
     "你帮我给",
@@ -1669,18 +1745,24 @@ const SESSION_TITLE_FILLER_PREFIXES: &[&str] = &[
     "怎样",
 ];
 
-/// 移除模型输出里的 `<think>...</think>` 思维链，返回可作标题的纯净正文。
+/// Remove the `<think>...</think>` chain of thought from model output,
+/// returning clean text usable as a title.
 ///
-/// 背景：部分模型（thinking 模式）会把思维链包在 `<think>` 标签里连同答案一起
-/// 返回。若不剥离，`.lines().next()` 会截到 `<think>` 首行、且
-/// `is_low_quality_session_title("<think>")` 判为合格，导致思维链碎片被写成标题。
+/// Background: some models (thinking mode) wrap the chain of thought in a
+/// `<think>` tag and return it together with the answer. Without stripping,
+/// `.lines().next()` would cut at the `<think>` first line and
+/// `is_low_quality_session_title("<think>")` would judge it acceptable, so
+/// a reasoning fragment could be written as the title.
 ///
-/// 规则：大小写不敏感匹配 `<think>` / `</think>`；成对出现的整段删除；出现未闭合
-/// 的 `<think>`（有起始无结束）时，截断到该 `<think>` 之前的内容（思维链往往后置，
-/// 其前的正文才是答案）。非 think 文本原样保留。
+/// Rules: match `<think>` / `</think>` case-insensitively; remove a complete
+/// pair as a whole; for an unclosed `<think>` (open without close), truncate
+/// to the content before that `<think>` (the chain of thought usually trails,
+/// and the text before it is the answer). Non-think text is kept verbatim.
 pub(in crate::ai) fn strip_think_tags(text: &str) -> String {
-    // 直接在原串上按 ASCII 大小写不敏感定位标签字节，避免先 `to_lowercase()`
-    // 再按其索引回切 `text`——某些 Unicode 字符小写后字节长度会变，导致索引错位。
+    // Locate tag bytes directly on the original string with ASCII
+    // case-insensitive matching, avoiding a `to_lowercase()` copy that would
+    // then be sliced back into `text` by index — some Unicode characters
+    // change byte length when lowercased, which would misalign the indices.
     fn find_ci(haystack: &str, needle_lower: &str, from: usize) -> Option<usize> {
         let bytes = haystack.as_bytes();
         let nlen = needle_lower.len();
@@ -1702,11 +1784,12 @@ pub(in crate::ai) fn strip_think_tags(text: &str) -> String {
         let after_open = open + "<think>".len();
         match find_ci(text, "</think>", after_open) {
             Some(close) => {
-                // 跳过整段 `<think>...</think>`，从闭合标签之后继续。
+                // Skip the whole `<think>...</think>` segment; continue after
+                // the closing tag.
                 cursor = close + "</think>".len();
             }
             None => {
-                // 未闭合：丢弃 `<think>` 起始之后的全部内容。
+                // Unclosed: drop everything after the `<think>` start.
                 return out.trim().to_string();
             }
         }
@@ -1715,9 +1798,11 @@ pub(in crate::ai) fn strip_think_tags(text: &str) -> String {
     out.trim().to_string()
 }
 
-/// 清洗模型生成的 session 标题，避免把“帮我/请问”等请求壳写进标题。
+/// Clean a model-generated session title so request shells like "帮我/请问"
+/// do not end up in the title.
 pub(in crate::ai) fn normalize_generated_session_title(title: &str) -> String {
-    // 先剥离思维链：防御纵深，覆盖 finalize 直接把 LLM 原文交进来的路径。
+    // Strip the chain of thought first as defense in depth, covering paths
+    // where finalize hands over the raw LLM text directly.
     let title = strip_think_tags(title);
     let first_line = title.lines().next().unwrap_or("").trim();
     if is_preserved_content_message(first_line) {
@@ -1728,7 +1813,8 @@ pub(in crate::ai) fn normalize_generated_session_title(title: &str) -> String {
     truncate_summary(without_request.trim(), 30)
 }
 
-/// 判断已有标题是否像原始用户请求片段；这类旧标题允许后续 turn 重新生成覆盖。
+/// Returns whether the existing title looks like a raw user-request fragment;
+/// such old titles are allowed to be regenerated and overwritten by later turns.
 pub(in crate::ai) fn is_low_quality_session_title(title: &str) -> bool {
     let trimmed = title.trim();
     if trimmed.is_empty()
@@ -1743,7 +1829,8 @@ pub(in crate::ai) fn is_low_quality_session_title(title: &str) -> bool {
     stripped_request_prefix || trimmed.chars().count() > 40
 }
 
-/// 归档协议是内部上下文，不应作为会话标题展示或被视为有效标题。
+/// The archive protocol is internal context; it must not be shown as a session
+/// title or treated as a valid title.
 pub(super) fn is_preserved_content_message(text: &str) -> bool {
     let text = text.trim_start();
     text.starts_with("[[PRESERVED_CONTENT_STUB_V1]]")
@@ -1771,10 +1858,10 @@ fn strip_request_filler_prefixes(mut text: &str) -> (&str, bool) {
     }
 }
 
-/// 去掉 agent/命令前缀（如 "a "、"a:"、"agent:"、"/" 等）。
+/// Strip the agent/command prefix (e.g. "a ", "a:", "a：", "/", etc.).
 fn strip_agent_prefix(text: &str) -> &str {
     let t = text.trim_start();
-    // 匹配 "a "、"a:"、"a：" 等 agent 前缀
+    // Match agent prefixes such as "a ", "a:", "a：".
     if let Some(rest) = t.strip_prefix("a ") {
         return rest.trim_start();
     }
@@ -1784,38 +1871,44 @@ fn strip_agent_prefix(text: &str) -> &str {
     if let Some(rest) = t.strip_prefix("a：") {
         return rest.trim_start();
     }
-    // 匹配 "/" 开头的命令前缀（去掉命令名，保留参数）
+    // Match command prefixes starting with "/" (drop the command name, keep
+    // the arguments).
     if let Some(rest) = t.strip_prefix('/') {
-        // 跳过命令名（到第一个空白）
+        // Skip the command name (up to the first whitespace).
         if let Some(space_pos) = rest.find(|c: char| c.is_whitespace()) {
             return rest[space_pos..].trim_start();
         }
-        // 只有命令名没有参数，返回空
+        // Only a command name with no arguments: return empty.
         return "";
     }
     t
 }
 
-/// 提取第一句话（到句号、问号、感叹号或换行）。
+/// Extract the first sentence (up to a period, question mark, exclamation
+/// mark, or newline).
 fn extract_first_sentence(text: &str) -> String {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut end = text.len();
     for (idx, (i, ch)) in chars.iter().enumerate() {
         match ch {
-            // 中文句号/问号/感叹号/换行 → 直接截断
+            // Chinese period / question mark / exclamation mark / newline:
+            // cut here.
             '。' | '？' | '！' | '\n' => {
                 end = *i;
                 break;
             }
-            // 英文句号 → 需要判断是否是句子边界还是文件名/标识符的一部分
+            // ASCII period: decide whether it is a sentence boundary or part
+            // of a filename / identifier.
             '.' => {
                 let prev_is_alnum = idx > 0 && chars[idx - 1].1.is_alphanumeric();
                 let next_is_alnum = idx + 1 < chars.len() && chars[idx + 1].1.is_alphanumeric();
-                // 如果前后都是字母/数字（如 a.rs、file.txt、v2.0），不视为句子边界
+                // Alphanumeric on both sides (e.g. a.rs, file.txt, v2.0):
+                // not a sentence boundary.
                 if prev_is_alnum && next_is_alnum {
                     continue;
                 }
-                // 如果后面是空格或字符串结束，视为句子边界
+                // Followed by whitespace or end of string: treat as a sentence
+                // boundary.
                 let next_is_space = idx + 1 < chars.len() && chars[idx + 1].1.is_whitespace();
                 let is_last = idx + 1 >= chars.len();
                 if next_is_space || is_last {
@@ -1823,7 +1916,7 @@ fn extract_first_sentence(text: &str) -> String {
                     break;
                 }
             }
-            // 英文问号/感叹号 → 直接截断
+            // ASCII question mark / exclamation mark: cut here.
             '?' | '!' => {
                 end = *i;
                 break;
@@ -1834,7 +1927,7 @@ fn extract_first_sentence(text: &str) -> String {
     text[..end].trim().to_string()
 }
 
-/// 去掉常见的冗余前缀，使标题更简洁概括。
+/// Strip common redundant prefixes so the title is shorter and more concise.
 fn strip_filler_prefixes(text: &str) -> String {
     let fillers = SESSION_TITLE_FILLER_PREFIXES;
     let mut t = text.trim();
@@ -1919,24 +2012,27 @@ mod tests {
 
     #[test]
     fn strip_think_tags_removes_reasoning_and_keeps_real_title() {
-        // 成对标签：整段思维链被移除，仅保留其后的真标题。
+        // Paired tags: the whole chain of thought is removed, leaving only
+        // the real title after it.
         assert_eq!(
             strip_think_tags("<think>让我想想用户到底要什么</think>\n优化上下文压缩逻辑"),
             "优化上下文压缩逻辑"
         );
-        // 大小写不敏感。
+        // Case-insensitive.
         assert_eq!(
             strip_think_tags("<Think>reasoning</THINK>Session 标题修复"),
             "Session 标题修复"
         );
-        // 未闭合：截断到 `<think>` 之前，答案在前时仍能保留。
+        // Unclosed: truncated before `<think>`; the answer that precedes it
+        // is still kept.
         assert_eq!(
             strip_think_tags("真正的标题<think>后面是没写完的思维链"),
             "真正的标题"
         );
-        // 无标签：原样返回（仅 trim）。
+        // No tags: returned as-is (only trimmed).
         assert_eq!(strip_think_tags("普通标题"), "普通标题");
-        // 经 normalize 后，纯思维链输入不会被当成合格标题。
+        // After normalize, a pure chain-of-thought input is not treated as a
+        // valid title.
         assert!(normalize_generated_session_title("<think>only reasoning</think>").is_empty());
     }
 
@@ -1950,7 +2046,8 @@ mod tests {
 
     #[test]
     fn session_size_cache_reuses_top_level_fingerprint_hits() {
-        // 临时 sessions 根目录：SessionStore 的根目录从 history 文件路径推导。
+        // Temporary sessions root: SessionStore derives its root from the
+        // history file path.
         let session_id = format!("size-cache-{}", uuid::Uuid::new_v4());
         let root = std::env::temp_dir().join(format!(
             "ai-session-size-cache-test-{}-{}",
@@ -1960,7 +2057,8 @@ mod tests {
         let store = SessionStore::new(&root.join("unused.sqlite"));
         store.ensure_root_dir().unwrap();
 
-        // 造一个 session：sqlite 主库 + assets 目录内两层文件。
+        // Create a session: sqlite main DB + two levels of files inside the
+        // assets dir.
         let sqlite_path = store.session_history_file(&session_id);
         fs::write(&sqlite_path, vec![0u8; 100]).unwrap();
         let assets_dir = store.session_assets_dir(&session_id);
@@ -1970,37 +2068,43 @@ mod tests {
 
         let mut sessions = store.list_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
-        // 期望：主库 100 + assets 70 + 顶层指纹中不存在的 checkpoints 0。
+        // Expected: main DB 100 + assets 70 + checkpoints 0 (absent from the
+        // top-level fingerprint).
         store.attach_session_sizes(&mut sessions).unwrap();
         assert_eq!(sessions[0].size_bytes, 170);
 
-        // 第二次调用走缓存命中，大小保持不变。
+        // Second call hits the cache; the size stays unchanged.
         store.attach_session_sizes(&mut sessions).unwrap();
         assert_eq!(sessions[0].size_bytes, 170);
-        // 缓存文件已持久化。
+        // The cache file is persisted.
         assert!(store.root.join(SESSION_SIZE_CACHE_FILE).is_file());
 
-        // 顶层新增文件会改变指纹，缓存失效并重算。
+        // A new top-level file changes the fingerprint, invalidating the
+        // cache and forcing a recompute.
         fs::write(assets_dir.join("c.txt"), vec![0u8; 20]).unwrap();
         store.attach_session_sizes(&mut sessions).unwrap();
         assert_eq!(sessions[0].size_bytes, 190);
 
-        // 深层新增文件：sub 目录 mtime 变化，指纹失效并重算。
+        // New deep file: the sub dir mtime changes, invalidating the
+        // fingerprint and forcing a recompute.
         fs::write(assets_dir.join("sub").join("c2.txt"), vec![0u8; 15]).unwrap();
         store.attach_session_sizes(&mut sessions).unwrap();
         assert_eq!(sessions[0].size_bytes, 205);
 
-        // 深层文件覆写：两级指纹感知子目录内文件的 size/mtime 变化，缓存失效并重算。
+        // Deep file overwrite: the two-level fingerprint picks up size/mtime
+        // changes inside the subdir, invalidating the cache and forcing a
+        // recompute.
         fs::write(assets_dir.join("sub").join("b.txt"), vec![0u8; 10]).unwrap();
         store.attach_session_sizes(&mut sessions).unwrap();
         assert_eq!(sessions[0].size_bytes, 175);
 
-        // 自愈：顶层新增文件后重算，深层覆写也一并反映出来。
+        // Self-healing: recompute after a new top-level file; the deep
+        // overwrite is reflected too.
         fs::write(assets_dir.join("d.txt"), vec![0u8; 5]).unwrap();
         store.attach_session_sizes(&mut sessions).unwrap();
         assert_eq!(sessions[0].size_bytes, 180);
 
-        // 清理临时目录。
+        // Clean up the temp directory.
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2015,7 +2119,7 @@ mod tests {
         let store = SessionStore::new(&root.join("unused.sqlite"));
         store.ensure_root_dir().unwrap();
 
-        // 造一个 session 并触发缓存写入。
+        // Create a session and trigger a cache write.
         let sqlite_path = store.session_history_file(&session_id);
         fs::write(&sqlite_path, vec![0u8; 100]).unwrap();
         let assets_dir = store.session_assets_dir(&session_id);
@@ -2027,13 +2131,15 @@ mod tests {
         store.attach_session_sizes(&mut sessions).unwrap();
         assert!(store.root.join(SESSION_SIZE_CACHE_FILE).is_file());
 
-        // 删除 session 后，缓存条目应被同步移除（不依赖下一次 attach 的 retain 自愈）。
+        // After deleting the session, its cache entry must be removed
+        // synchronously (not relying on the next attach's retain
+        // self-healing).
         assert!(store.delete_session(&session_id).unwrap());
         let cache =
             SessionStore::load_session_size_cache(&store.root.join(SESSION_SIZE_CACHE_FILE));
         assert!(!cache.contains_key(&session_id));
 
-        // 清理临时目录。
+        // Clean up the temp directory.
         let _ = fs::remove_dir_all(&root);
     }
 

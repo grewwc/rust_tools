@@ -1,11 +1,14 @@
-//! 会话检查点（checkpoint）/ 回滚。
+//! Session checkpoints and rollback.
 //!
-//! 每个 session 的对话历史落在一个独立的 SQLite WAL 文件里。检查点通过
-//! SQLite Online Backup API 创建一致快照，并同时保存 session assets，避免主库
-//! 复制遗漏 WAL 页或 context checkpoint 正文。
+//! Each session's conversation history lives in its own SQLite WAL file.
+//! Checkpoints create a consistent snapshot via the SQLite Online Backup API
+//! and also save the session assets, so that copying the main database cannot
+//! miss WAL pages or context-checkpoint bodies.
 //!
-//! context-history 缓存以文件 len/mtime 与 `meta.history_revision` 作为失效键，
-//! 复制文件会改变这些值，从而自动让缓存失效，回滚后能读到正确历史。
+//! The context-history cache keys invalidation on file len/mtime and
+//! `meta.history_revision`; copying files changes those values, which
+//! invalidates the cache automatically, so the correct history is readable
+//! after a rollback.
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -40,13 +43,15 @@ const GENERATION_PREVIOUS_MARKER: &str = ".previous-";
 const LIVE_ROLLBACK_PREFIX: &str = ".live-rollback-";
 const LIVE_ROLLBACK_MANIFEST: &str = "rollback.manifest";
 
-/// 进程内互斥与 `flock` 共同覆盖同一个 session 的 checkpoint 生命周期。
-/// 每个 session 各自持有 Mutex，避免不同 session 的快照操作互相串行化。
+/// In-process mutexes combined with `flock` cover the checkpoint lifecycle of
+/// one session. Each session holds its own Mutex so snapshot operations of
+/// different sessions do not serialize against each other.
 static CHECKPOINT_SESSION_LOCKS: LazyLock<Mutex<FastMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(FastMap::default()));
 
-/// checkpoint 根目录的共享/排他 gate。普通操作持共享锁，`clear-all` 持排他锁，
-/// 因此后者不会和一个刚创建的 session checkpoint 交错。
+/// Shared/exclusive gate for the checkpoint root directory. Normal operations
+/// hold the shared lock, `clear-all` holds the exclusive lock, so the latter
+/// cannot interleave with a just-created session checkpoint.
 static CHECKPOINT_ROOT_LOCKS: LazyLock<Mutex<FastMap<PathBuf, Arc<RwLock<()>>>>> =
     LazyLock::new(|| Mutex::new(FastMap::default()));
 
@@ -59,11 +64,11 @@ pub(in crate::ai) struct CheckpointInfo {
 
 #[derive(Debug, Clone)]
 pub(in crate::ai) struct CheckpointStore {
-    /// 当前 session 的 live sqlite 文件。
+    /// The live sqlite file of the current session.
     session_file: PathBuf,
-    /// 当前 session 的 assets 目录。
+    /// The assets directory of the current session.
     session_assets: PathBuf,
-    /// 该 session 的检查点目录。
+    /// The checkpoint directory of this session.
     dir: PathBuf,
 }
 
@@ -115,7 +120,8 @@ impl CheckpointStore {
         self.dir.join(format!("{}.assets", sanitize_name(name)))
     }
 
-    /// 保存当前 session 历史为名为 `name` 的检查点。返回检查点文件路径。
+    /// Save the current session history as a checkpoint named `name`.
+    /// Returns the checkpoint file path.
     pub(in crate::ai) fn save(&self, name: &str) -> io::Result<PathBuf> {
         let normalized_name = sanitize_name(name);
         self.with_locked(|store| {
@@ -151,12 +157,14 @@ impl CheckpointStore {
         })
     }
 
-    /// 列出该 session 的全部检查点（按修改时间从新到旧，大小含 assets）。
+    /// List all checkpoints of this session (newest first by modification
+    /// time; size includes assets).
     pub(in crate::ai) fn list(&self) -> io::Result<Vec<CheckpointInfo>> {
         self.with_locked(|store| store.list_unlocked())
     }
 
-    /// 把名为 `name` 的检查点回滚到当前 session（覆盖 live 历史）。
+    /// Roll the checkpoint named `name` back into the current session
+    /// (overwrites the live history).
     pub(in crate::ai) fn rollback(&self, name: &str) -> io::Result<()> {
         let normalized_name = sanitize_name(name);
         self.with_locked(|store| {
@@ -167,7 +175,8 @@ impl CheckpointStore {
                 ));
             };
             match source {
-                // 旧格式没有 assets 快照，保留既有兼容语义：仅恢复 SQLite。
+                // The legacy format has no assets snapshot; keep the existing
+                // compatibility semantics: restore the SQLite file only.
                 CheckpointSource::Legacy { sqlite } => {
                     if let Some(parent) = store.session_file.parent() {
                         fs::create_dir_all(parent)?;
@@ -182,7 +191,8 @@ impl CheckpointStore {
         })
     }
 
-    /// 删除名为 `name` 的检查点。返回是否确有文件被删除。
+    /// Delete the checkpoint named `name`. Returns whether any file was
+    /// actually deleted.
     pub(in crate::ai) fn delete(&self, name: &str) -> io::Result<bool> {
         let normalized_name = sanitize_name(name);
         self.with_locked(|store| {
@@ -197,7 +207,8 @@ impl CheckpointStore {
         })
     }
 
-    /// 在启动期和每次 checkpoint 操作前恢复未完成的 live rollback。
+    /// Recover unfinished live rollbacks at startup and before every
+    /// checkpoint operation.
     pub(super) fn recover(&self) -> io::Result<()> {
         self.with_locked(|_| Ok(()))
     }
@@ -325,8 +336,10 @@ impl CheckpointStore {
         if had_previous {
             let _ = fs::remove_dir_all(previous);
         }
-        // 新 generation 已成为唯一真相；旧布局仅作兼容读取，后续清理失败不会破坏
-        // 已发布的 checkpoint，下次持锁操作会再次回收。
+        // The new generation is now the single source of truth; the legacy
+        // layout is only kept for compatible reads. A later cleanup failure
+        // cannot break the published checkpoint; the next lock-held operation
+        // reaps it again.
         let _ = self.remove_legacy_checkpoint(name);
         Ok(())
     }
@@ -486,8 +499,9 @@ impl CheckpointStore {
             }
         }
 
-        // generation 已发布时，遗留的旧 `.sqlite` / `.assets` 不再是可恢复状态，
-        // 必须回收并避免其绕开配额统计。
+        // Once a generation is published, leftover legacy `.sqlite` / `.assets`
+        // are no longer recoverable state and must be reclaimed so they cannot
+        // bypass quota accounting.
         for entry in entries {
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("sqlite") {
@@ -504,7 +518,8 @@ impl CheckpointStore {
     }
 }
 
-/// 对同一 session 的 checkpoint 事务持有进程内与跨进程排他锁。
+/// Hold the in-process and cross-process exclusive lock for one session's
+/// checkpoint transactions.
 pub(super) fn with_checkpoint_lock<T>(
     checkpoint_dir: &Path,
     operation: impl FnOnce() -> io::Result<T>,
@@ -515,7 +530,8 @@ pub(super) fn with_checkpoint_lock<T>(
     })
 }
 
-/// 清空全部 session 时独占 checkpoint 根目录，避免与保存、回滚、fork 或归档交错。
+/// Exclusively lock the checkpoint root while clearing all sessions, so
+/// clearing cannot interleave with save, rollback, fork, or archive.
 pub(super) fn with_checkpoint_root_exclusive_lock<T>(
     checkpoints_root: &Path,
     operation: impl FnOnce() -> io::Result<T>,
@@ -526,8 +542,8 @@ pub(super) fn with_checkpoint_root_exclusive_lock<T>(
     )
 }
 
-/// 锁文件放在 checkpoint 根目录的同级，清理 snapshot 目录时不会 unlink 正在持有的
-/// lock inode。
+/// Lock files live next to the checkpoint root; cleaning up snapshot
+/// directories never unlinks a lock inode that is currently held.
 fn checkpoint_lock_dir(checkpoint_dir: &Path) -> PathBuf {
     let checkpoints_root = checkpoint_dir.parent().unwrap_or_else(|| Path::new("."));
     checkpoint_lock_dir_from_root(checkpoints_root)
@@ -586,8 +602,10 @@ fn with_session_checkpoint_lock<T>(
     result
 }
 
-/// 同时访问多个 session 时按规范化目录顺序取得锁，避免两个方向相反的 fork
-/// 互相等待。重复目录会去重，因此退化为同一 session 时也不会重入 Mutex。
+/// When accessing multiple sessions at once, acquire locks in normalized
+/// directory order so two forks in opposite directions cannot wait on each
+/// other. Duplicate directories are deduplicated, so degrading to a single
+/// session never re-enters the Mutex.
 pub(super) fn with_checkpoint_locks<T>(
     checkpoint_dirs: &[&Path],
     operation: impl FnOnce() -> io::Result<T>,
@@ -834,9 +852,11 @@ fn copy_directory_snapshot(source: &Path, destination: &Path) -> io::Result<()> 
     Ok(())
 }
 
-/// overflow assets 以 UUID 命名且写入后不可变。rollback 只补回 checkpoint 引用的
-/// 文件，不能整体替换 live 目录：并发 writer 可能已经创建新 asset 并在 rollback 后
-/// 向 canonical DB 提交其 stub，删除该文件会留下无法回读的 `file_path`。
+/// Overflow assets are UUID-named and immutable after writing. Rollback only
+/// restores files referenced by the checkpoint; it must not replace the live
+/// directory wholesale: a concurrent writer may have created a new asset and
+/// committed its stub to the canonical DB after the rollback, and deleting
+/// that file would leave a `file_path` that can never be read back.
 fn restore_checkpoint_assets(source: &Path, destination: &Path) -> io::Result<()> {
     fs::create_dir_all(destination)?;
     if source.is_dir() {
@@ -845,7 +865,8 @@ fn restore_checkpoint_assets(source: &Path, destination: &Path) -> io::Result<()
     Ok(())
 }
 
-/// 把检查点名规整为安全的文件名（字母数字、`-`、`_`，其余转 `_`）。
+/// Normalize a checkpoint name into a safe file name (alphanumeric, `-`, `_`;
+/// everything else becomes `_`).
 fn sanitize_name(name: &str) -> String {
     let mut out = String::new();
     for ch in name.chars() {
@@ -995,7 +1016,7 @@ mod tests {
         let session_id = "sess-abc";
         let store = CheckpointStore::new(&history_file, session_id);
 
-        // 还没有 session 文件时 save 应失败。
+        // save must fail before any session file exists.
         assert!(store.save("c1").is_err());
 
         append_history_messages(
@@ -1010,11 +1031,11 @@ mod tests {
         )
         .unwrap();
 
-        // 保存检查点 c1。
+        // Save checkpoint c1.
         let ckpt = store.save("c1").unwrap();
         assert!(ckpt.exists());
 
-        // 修改 live 历史为 "v2"。
+        // Change the live history to "v2".
         append_history_messages(
             &store.session_file,
             &[Message {
@@ -1027,26 +1048,26 @@ mod tests {
         )
         .unwrap();
 
-        // list 能看到 c1。
+        // list can see c1.
         let listed = store.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "c1");
 
-        // 回滚到 c1，live 历史应恢复为只有 "v1"。
+        // Roll back to c1; the live history should be restored to only "v1".
         store.rollback("c1").unwrap();
         let restored = build_message_arr(10, &store.session_file).unwrap();
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].content, Value::String("v1".to_string()));
 
-        // 回滚不存在的检查点应报错。
+        // Rolling back a nonexistent checkpoint must error.
         assert!(store.rollback("nope").is_err());
 
-        // 删除 c1。
+        // Delete c1.
         assert!(store.delete("c1").unwrap());
         assert!(!store.delete("c1").unwrap());
         assert!(store.list().unwrap().is_empty());
 
-        // 清理。
+        // Cleanup.
         if let Some(grandparent) = history_file.parent() {
             let _ = fs::remove_dir_all(grandparent);
         }

@@ -436,6 +436,10 @@ fn filter_subagent_hidden_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
 }
 
 fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option<Vec<ToolDef>> {
+    let mut defs: Vec<ToolDef> = Vec::new();
+    // Case-insensitive dedup so a tool named both via a group and by an
+    // explicit `tools:` entry rides along only once.
+    let mut names_seen: Vec<String> = Vec::new();
     if !tool_groups.is_empty() {
         // Manifest group names resolve against the closed ToolGroup vocabulary;
         // unknown names are skipped (matching how unknown names have always
@@ -449,22 +453,35 @@ fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option
         // / shm / env primitives). Their schemas are large and usage rare, so
         // they do not ride along in every turn's request; the model enables
         // them on demand via `enable_tools`, shrinking per-turn tools tokens.
-        // Tools named explicitly via `tools:` take the branch below and are
-        // never dropped (naming a tool pins it as resident). Core tools like
-        // apply_patch / write_file are never marked hidden, so editing
-        // capability is unaffected.
-        let expanded = super::super::tools::tool_definitions_for_groups(&groups)
-            .into_iter()
-            .filter(|tool| !super::super::tools::tool_defers_eager_load(&tool.function.name))
-            .collect::<Vec<_>>();
-        return Some(ensure_required_baseline_tools(expanded));
+        // Tools named explicitly via `tools:` (below) are never dropped:
+        // naming a tool pins it as resident. Core tools like apply_patch /
+        // write_file are never marked hidden, so editing capability is
+        // unaffected.
+        for tool in super::super::tools::tool_definitions_for_groups(&groups) {
+            if !super::super::tools::tool_defers_eager_load(&tool.function.name) {
+                names_seen.push(tool.function.name.clone());
+                defs.push(tool);
+            }
+        }
     }
     if !tools.is_empty() {
-        return Some(ensure_required_baseline_tools(
-            super::super::tools::get_tool_definitions_by_names(tools),
-        ));
+        // Explicitly named tools pin a tool into every turn even when its
+        // group is also declared, bypassing the deferred-eager-load pruning
+        // above (a manifest listing a name opts that tool in).
+        for tool in super::super::tools::get_tool_definitions_by_names(tools) {
+            if !names_seen
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(&tool.function.name))
+            {
+                names_seen.push(tool.function.name.clone());
+                defs.push(tool);
+            }
+        }
     }
-    None
+    if defs.is_empty() {
+        return None;
+    }
+    Some(ensure_required_baseline_tools(defs))
 }
 
 fn is_executor_agent(agent: &AgentManifest) -> bool {

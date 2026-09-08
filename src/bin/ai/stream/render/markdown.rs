@@ -14,6 +14,7 @@ use crate::ai::stream::render::table::{
     render_table_bottom, render_table_header, render_table_mid, render_table_row, render_table_top,
     split_indent, table_column_ranges, table_preview_height,
 };
+use crate::ai::stream::render::{MARKDOWN_BODY, MARKDOWN_HEADING};
 use crate::ai::stream::state::{END_THINKING_TAG_TEXT, THINKING_TAG_TEXT};
 use crate::ai::theme::{
     ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SECONDARY, ACCENT_SUCCESS,
@@ -471,21 +472,19 @@ impl MarkdownStreamRenderer {
     }
 
     fn handle_char(&mut self, out: &mut dyn Write, ch: char) -> io::Result<()> {
-        // 真实内容行的第一个字符到达：把此前缓存的纯空行照数补回，再输出该行。
+        // Restore deferred paragraph spacing before the first content character.
         if self.deferred_blank_lines > 0 && self.line_char_count == 1 {
             self.flush_deferred_blank_lines(out)?;
         }
-        // 表格上下文（含潜在表头行）一律静默缓冲，不逐字 echo，也不做 cursor-up
-        // 覆盖重画——等表格结束时由 consume_line/flush 一次性画出成品盒框表。字符已在
-        // write_chunk_to 里 push 进 line_buf，这里什么都不做即可完成缓冲。彻底移除了
-        // "预测终端折行行数"这一残像/叠表根因。
+        // Buffer table candidates without echoing. consume_line/flush renders the
+        // finished table once, avoiding cursor-up estimates and leftover previews.
         if self.should_buffer_table_line() {
             return Ok(());
         }
 
-        // 数学块及其独占行分隔符必须整行缓冲。否则实时预览会先把原始 TeX 输出到
-        // 屏幕，换行后再追加 Unicode 成品，造成重复内容。行首空白也先短暂缓冲；
-        // 一旦确认不是数学分隔符，就一次性补发此前缓存的前缀。
+        // Buffer math blocks and delimiter candidates to avoid echoing raw TeX
+        // before the rendered formula. Replay the buffered prefix once it can
+        // no longer be a math delimiter, using the same color as ordinary prose.
         if !self.in_code_block {
             let is_math_candidate =
                 self.math_block_delimiter.is_some() || self.math_candidate_tail.is_math_candidate();
@@ -498,6 +497,7 @@ impl MarkdownStreamRenderer {
                 if self.dimmed {
                     out.write_all(b"\x1b[2m")?;
                 }
+                out.write_all(MARKDOWN_BODY.as_bytes())?;
                 out.write_all(self.line_buf.as_bytes())?;
                 self.line_preview_emitted = true;
                 self.line_preview_height_stale = true;
@@ -514,8 +514,11 @@ impl MarkdownStreamRenderer {
             self.line_preview_height_stale = true;
             return Ok(());
         }
-        if self.line_char_count == 1 && self.dimmed {
-            out.write_all(b"\x1b[2m")?;
+        if self.line_char_count == 1 {
+            if self.dimmed {
+                out.write_all(b"\x1b[2m")?;
+            }
+            out.write_all(MARKDOWN_BODY.as_bytes())?;
         }
         self.emit_char(out, ch)?;
         self.line_preview_emitted = true;
@@ -1169,12 +1172,14 @@ impl MarkdownStreamRenderer {
             return String::new();
         }
 
+        let prose_base = format!("{base}{MARKDOWN_BODY}");
+        let base = prose_base.as_str();
+
         if let Some((level, title)) = parse_heading(trimmed) {
-            let (heading_style, underline_char, underline_style) = match level {
-                1 => ("\x1b[1m\x1b[38;2;191;219;254m", Some('━'), ACCENT_RULE),
-                2 => ("\x1b[1m\x1b[38;2;125;211;252m", Some('─'), ACCENT_RULE),
-                3 => ("\x1b[1m\x1b[38;2;165;180;252m", None, ACCENT_RULE),
-                _ => ("\x1b[1m\x1b[38;2;148;163;184m", None, ACCENT_RULE),
+            let underline_char = match level {
+                1 => Some('━'),
+                2 => Some('─'),
+                _ => None,
             };
             let mut out = String::new();
             if !self.bol {
@@ -1182,9 +1187,7 @@ impl MarkdownStreamRenderer {
                 self.bol = true;
             }
             out.push_str(indent);
-            out.push_str(base);
-            out.push_str(heading_style);
-            let combined_base = format!("{}{}", base, heading_style);
+            let combined_base = format!("{base}\x1b[1m{MARKDOWN_HEADING}");
             out.push_str(&render_inline_md(title, &combined_base));
             out.push_str("\x1b[0m\n");
 
@@ -1193,7 +1196,7 @@ impl MarkdownStreamRenderer {
                 out.push_str(indent);
                 out.push_str(base);
                 out.push_str("\x1b[2m");
-                out.push_str(underline_style);
+                out.push_str(ACCENT_RULE);
                 out.push_str(&std::iter::repeat_n(ch, len).collect::<String>());
                 out.push_str("\x1b[0m\n");
             }
@@ -1205,9 +1208,10 @@ impl MarkdownStreamRenderer {
         }
 
         if let Some(body) = parse_blockquote(trimmed) {
+            let quote_base = format!("{base}{ACCENT_MUTED}");
             return format!(
-                "{indent}{base}{ACCENT_MUTED}▍\x1b[0m {base}{}\n",
-                render_inline_md(body, base)
+                "{indent}{base}{ACCENT_MUTED}▍\x1b[0m {}\n",
+                render_inline_md(body, &quote_base)
             );
         }
 
@@ -1243,7 +1247,7 @@ impl MarkdownStreamRenderer {
         if line.is_empty() {
             return "\n".to_string();
         }
-        format!("{}{}{}\n", indent, base, render_inline_md(rest, base))
+        format!("{}{}\n", indent, render_inline_md(rest, base))
     }
 }
 
@@ -1617,6 +1621,79 @@ mod tests {
             i += ch.len_utf8();
         }
         out
+    }
+
+    #[test]
+    fn prose_palette_applies_after_list_and_quote_markers() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        for (source, expected) in [
+            ("正文", "正文\n"),
+            ("1. 正文", "1. 正文\n"),
+            ("  - 正文", "  • 正文\n"),
+            ("- [ ] 正文", "○ 正文\n"),
+            ("- [x] 正文", "✓ 正文\n"),
+        ] {
+            let out = renderer.consume_line(source, false);
+            assert_eq!(strip_ansi_for_test(&out), expected);
+            assert!(out.ends_with(&format!("{MARKDOWN_BODY}正文\x1b[0m\n")));
+        }
+        let quote = renderer.consume_line("> 引用", false);
+        assert_eq!(strip_ansi_for_test(&quote), "▍ 引用\n");
+        assert!(quote.contains(&format!("{ACCENT_MUTED}引用")));
+    }
+
+    #[test]
+    fn headings_use_a_warm_hierarchy_without_changing_structure() {
+        for level in 1..=6 {
+            let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+            renderer.bol = true;
+            let out = renderer.consume_line(&format!("{} 标题", "#".repeat(level)), false);
+            assert!(out.contains(&format!("\x1b[1m{MARKDOWN_HEADING}标题")));
+            let expected = match level {
+                1 => "标题\n━━━\n",
+                2 => "标题\n───\n",
+                _ => "标题\n",
+            };
+            assert_eq!(strip_ansi_for_test(&out), expected);
+        }
+    }
+
+    #[test]
+    fn streaming_preview_and_repaint_share_body_color_including_buffered_prefixes() {
+        for dimmed in [false, true] {
+            for source in ["正文", "  正文", "$PATH"] {
+                let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+                let mut preview = String::new();
+                for ch in source.chars() {
+                    preview.push_str(
+                        &renderer
+                            .write_chunk_for_test(&ch.to_string(), dimmed)
+                            .unwrap(),
+                    );
+                }
+                let base = format!("{}{MARKDOWN_BODY}", if dimmed { "\x1b[2m" } else { "" });
+                assert_eq!(preview, format!("{base}{source}"));
+                let repaint = renderer.flush_pending_for_test().unwrap();
+                assert!(repaint.contains(&base));
+                assert!(repaint.ends_with("\x1b[0m\n"));
+                assert!(renderer.flush_pending_for_test().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn prose_palette_does_not_replace_code_highlighting_or_status_colors() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        renderer.consume_line("```rust", false);
+        assert_eq!(
+            renderer.consume_line("let x = 1;", false),
+            format!(
+                "{MONOKAI_BG}{}\x1b[0m\n",
+                highlight_code_line("let x = 1;", Some("rust"))
+            )
+        );
+        let status = renderer.consume_line(END_THINKING_TAG_TEXT, false);
+        assert_eq!(status, format!("{ACCENT_MUTED}✓ thinking\x1b[0m\n"));
     }
 
     #[test]
@@ -2005,10 +2082,10 @@ mod tests {
         );
     }
 
-    /// 极简 VT100 网格模拟器：复现"流式预览 → cursor-up 重写"实际落到终端后的可见结果。
-    /// 仅实现本渲染器会发出的控制序列：可打印字符（含 CJK 宽度）、`\n`(CRLF)、`\r`、
-    /// CSI nA（光标上移）、CSI 0J（清到屏幕末尾）、SGR（忽略）。DECAWM 自动换行按真实
-    /// 终端语义建模：全角字符放不下右边一列时提前折到下一行（留空位）。
+    /// Minimal VT100 grid for streaming previews and cursor-up repainting.
+    /// Handles CJK widths, CRLF, cursor-up, erase-to-end, and skips complete SGR
+    /// sequences including truecolor parameters. Wide characters wrap early if
+    /// only one column remains, matching terminal auto-wrap behavior.
     struct VtGrid {
         width: usize,
         rows: Vec<Vec<char>>,
@@ -2068,18 +2145,17 @@ mod tests {
                             let mut num = String::new();
                             let mut final_byte = '\0';
                             for c in chars.by_ref() {
-                                if c.is_ascii_digit() {
-                                    num.push(c);
-                                } else {
+                                if ('@'..='~').contains(&c) {
                                     final_byte = c;
                                     break;
                                 }
+                                num.push(c);
                             }
                             let n: usize = num.parse().unwrap_or(0);
                             match final_byte {
                                 'A' => self.row = self.row.saturating_sub(n.max(1)),
                                 'J' => {
-                                    // 0J: 清到屏幕末尾
+                                    // 0J: clear from the cursor to the end of the screen.
                                     for c in self.col..self.width {
                                         self.rows[self.row][c] = ' ';
                                     }
@@ -2148,6 +2224,39 @@ mod tests {
         let mut bytes = renderer.write_block_for_test(markdown, dimmed).unwrap();
         bytes.push_str(&renderer.flush_pending_for_test().unwrap());
         bytes
+    }
+
+    #[test]
+    fn long_review_keeps_visible_text_and_wrapping_in_stream_and_block_output() {
+        let _guard = env_guard();
+        let markdown = "1. **[P1] `read_file` 仍会读取整行，长内容需要限制内存。**\n\n   证据: `src/bin/ai/tools/service/file.rs:42`，建议分块读取并保留完整内容。\n\n2. **[P2] 嵌套样式** 后的正文不应变亮。";
+        for cols in [24, 80] {
+            unsafe { std::env::set_var("COLUMNS", cols.to_string()) };
+            let mut streamed = VtGrid::new(cols);
+            streamed.feed(&render_full_stream(markdown, false));
+            let mut blocked = VtGrid::new(cols);
+            blocked.feed(&render_full_block(markdown, false));
+            // Streamed mode may defer paragraph spacing until it sees the next
+            // content line. Compare nonempty rows so this test isolates the
+            // invariant relevant to palette changes: ANSI colors cannot alter
+            // visible text or terminal wrapping.
+            let streamed_rows = streamed
+                .screen()
+                .into_iter()
+                .filter(|row| !row.is_empty())
+                .collect::<Vec<_>>();
+            let blocked_rows = blocked
+                .screen()
+                .into_iter()
+                .filter(|row| !row.is_empty())
+                .collect::<Vec<_>>();
+            assert_eq!(streamed_rows, blocked_rows, "terminal width: {cols}");
+            let text = blocked_rows.join("");
+            assert!(text.contains("read_file"));
+            assert!(text.contains("src/bin/ai/tools/service/file.rs:42"));
+            assert!(!text.contains("**"));
+            assert!(!text.contains("38;2;"));
+        }
     }
 
     #[test]

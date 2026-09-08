@@ -16,7 +16,7 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -43,35 +43,66 @@ const MAX_CONTENT_BYTES: usize = 16 * 1024;
 /// side use it to tell whether a before/after snapshot is complete.
 const TRUNCATED_MARKER: &str = "[truncated ";
 
-/// Per-entry cap for the authoritative diff. The diff is computed from full
-/// content and normally contains only the changed lines, far smaller than the
-/// file itself; in the extreme case (full rewrite) it is capped here. Capping
-/// happens at a line boundary, so the rendered output is still a truthful
-/// partial diff — unlike truncated snapshots, it never misjudges the truncation
-/// edge as a deletion.
+/// Per-entry cap for the authoritative diff. The diff normally contains only the
+/// changed lines, far smaller than the file itself; in the extreme case (full
+/// rewrite) it is capped here. Capping happens at a line boundary, so the
+/// rendered output is still a truthful partial diff — unlike truncated
+/// snapshots, it never misjudges the truncation edge as a deletion.
 const MAX_DIFF_BYTES: usize = 64 * 1024;
 
-/// 一条文件变更记录。
+/// Cap for one before/after side of `entry_diff`: content beyond this is never
+/// scanned when building the diff. Without it a full rewrite of a multi-GB file
+/// materialized a complete `+ …` diff for the entire new content in memory
+/// before the 64 KiB output cap applied (P2 regression). 1 MiB is far above
+/// real-world per-write sizes and the largest diff fixture in the test suite
+/// (~48 KiB), so the common path is unaffected.
+const MAX_DIFF_INPUT_BYTES: usize = 1024 * 1024;
+
+/// Initial file presence, independent of whether its contents were captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BeforeState {
+    Absent,
+    Present,
+    Unknown,
+}
+
+/// One recorded file mutation.
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct MutationEntry {
-    /// 单调递增序号（全局）。
+    /// Globally increasing sequence number.
     pub seq: u64,
-    /// ISO8601 UTC 时间戳。
+    /// ISO8601 UTC timestamp.
     pub ts: String,
-    /// 文件绝对路径。
+    /// Absolute file path.
     pub path: String,
-    /// 操作类型：`"write"` 或 `"delete"`。
+    /// Operation: `"write"` or `"delete"`.
     pub op: String,
-    /// 改动前内容（新文件为 None；删除时为被删内容）。
+    /// Captured preimage. None can mean absence or unavailable contents; consult
+    /// `effective_before_state` before treating it as an empty file.
     pub before: Option<String>,
-    /// 改动后内容（删除为 None）。
+    /// Missing in legacy logs, whose None preimages retain their old meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_state: Option<BeforeState>,
+    /// Captured postimage; None for deletion.
     pub after: Option<String>,
-    /// Line-level diff of this write computed on the full before/after
-    /// (`- ` old lines / `+ ` new lines). Once a snapshot is truncated a reliable
-    /// diff cannot be rebuilt (the truncation edge reads as a deletion), so this
-    /// diff is the authoritative source for audit and display; old logs that lack
-    /// the field deserialize to None and rendering falls back to snapshot diffs.
+    /// Line-level diff of this write (`- ` old lines / `+ ` new lines), computed
+    /// from the before/after content within `MAX_DIFF_INPUT_BYTES`. Once a
+    /// snapshot is truncated a reliable diff cannot be rebuilt (the truncation
+    /// edge reads as a deletion), so this diff is the authoritative source for
+    /// audit and display; old logs that lack the field deserialize to None and
+    /// rendering falls back to snapshot diffs.
     pub diff: Option<String>,
+}
+
+impl MutationEntry {
+    pub(crate) fn effective_before_state(&self) -> BeforeState {
+        self.before_state.unwrap_or(if self.before.is_some() {
+            BeforeState::Present
+        } else {
+            BeforeState::Absent
+        })
+    }
 }
 
 /// 当前 session 的 mutation log 文件路径。
@@ -79,30 +110,58 @@ pub(crate) fn log_path() -> Option<PathBuf> {
     current_session_assets_dir().map(|d| d.join("mutation_log.jsonl"))
 }
 
-/// 追加一条变更记录。best-effort：任何失败均静默丢弃，绝不影响真实写盘。
-///
-/// 落在 session 运行时目录（assets / 子代理 scratch / checkpoint 等）下的路径直接
-/// 跳过——它们不是主 agent 的项目改动，不应污染审计视图。过大的 before/after 内容
-/// 会被截断，避免日志随会话无界增长。
-pub(crate) fn record(path: &std::path::Path, op: &str, before: Option<&str>, after: Option<&str>) {
+/// Legacy entry point for callers whose None preimage means known absence.
+pub(crate) fn record(path: &Path, op: &str, before: Option<&str>, after: Option<&str>) {
+    let before_state = if before.is_some() {
+        BeforeState::Present
+    } else {
+        BeforeState::Absent
+    };
+    record_with_before_state(path, op, before, after, before_state);
+}
+
+/// Best-effort recording with file presence separate from snapshot availability.
+/// Runtime artifacts are skipped and recording failures never affect the write.
+pub(crate) fn record_with_before_state(
+    path: &Path,
+    op: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+    before_state: BeforeState,
+) {
     let Some(assets_dir) = current_session_assets_dir() else {
-        // 无活动 driver context（测试 / 一次性调用）：静默跳过。
+        // Tests and one-shot callers without a driver context do not record.
         return;
     };
     if should_skip(path, &assets_dir) {
         return;
     }
 
-    let entry = MutationEntry {
+    let entry = make_entry(path, op, before, after, before_state);
+    append_entry(&assets_dir.join("mutation_log.jsonl"), &entry);
+}
+
+fn make_entry(
+    path: &Path,
+    op: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+    before_state: BeforeState,
+) -> MutationEntry {
+    MutationEntry {
         seq: SEQ.fetch_add(1, Ordering::Relaxed),
         ts: Utc::now().to_rfc3339(),
         path: path.to_string_lossy().into_owned(),
         op: op.to_string(),
         before: before.map(cap_content),
+        before_state: Some(before_state),
         after: after.map(cap_content),
-        diff: entry_diff(before, after),
-    };
-    append_entry(&assets_dir.join("mutation_log.jsonl"), &entry);
+        diff: if before.is_none() && before_state != BeforeState::Absent {
+            Some("…[before snapshot unavailable; contents not compared]\n".to_string())
+        } else {
+            entry_diff(before, after)
+        },
+    }
 }
 
 /// 把内容裁到 `MAX_CONTENT_BYTES` 以内（按字符边界安全截断），超出时附标注。
@@ -127,13 +186,46 @@ pub(crate) fn is_capped(s: &str) -> bool {
     s.contains(TRUNCATED_MARKER)
 }
 
-/// Computes the line-level diff of this write from the full before/after. At
-/// record time the content is not yet truncated, so the diff is always reliable;
-/// rendering prefers it over snapshot diffs to avoid false deletions at the
-/// truncation edge. Returns None when there is nothing to show (new empty file
-/// or unchanged content).
+/// Truncates `s` to at most `MAX_DIFF_INPUT_BYTES` bytes at a char boundary.
+/// Returns a prefix slice (no allocation) plus whether truncation happened.
+fn cap_diff_input(s: &str) -> (&str, bool) {
+    if s.len() <= MAX_DIFF_INPUT_BYTES {
+        return (s, false);
+    }
+    let mut end = MAX_DIFF_INPUT_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&s[..end], true)
+}
+
+/// Computes the line-level diff of this write from the before/after content.
+/// For files within `MAX_DIFF_INPUT_BYTES` the diff is computed on the full
+/// content and is always reliable; rendering prefers it over snapshot diffs to
+/// avoid false deletions at the truncation edge. Content beyond the cap is never
+/// scanned, so a large rewrite cannot materialize an O(file) diff; the result is
+/// then a truthful leading partial and a truncation line is appended so a
+/// partial diff is never mistaken for a complete one — or for "unchanged".
+/// Returns None only when there is truly nothing to show (new empty file, both
+/// absent, or unchanged content within the scanned window).
 pub(crate) fn entry_diff(before: Option<&str>, after: Option<&str>) -> Option<String> {
-    let out = match (before, after) {
+    let (b, b_capped) = match before {
+        Some(s) => {
+            let (t, c) = cap_diff_input(s);
+            (Some(t), c)
+        }
+        None => (None, false),
+    };
+    let (a, a_capped) = match after {
+        Some(s) => {
+            let (t, c) = cap_diff_input(s);
+            (Some(t), c)
+        }
+        None => (None, false),
+    };
+    let capped = b_capped || a_capped;
+
+    let mut out = match (b, a) {
         (None, None) => return None,
         (None, Some(a)) => {
             let lines: Vec<&str> = a.lines().collect();
@@ -178,12 +270,27 @@ pub(crate) fn entry_diff(before: Option<&str>, after: Option<&str>) -> Option<St
             for l in &av[prefix..av.len() - suffix] {
                 out.push_str(&format!("+ {l}\n"));
             }
-            if out.is_empty() {
-                return None; // before 与 after 完全相同
-            }
             out
         }
     };
+
+    if out.is_empty() {
+        if capped {
+            // Matching prefixes prove neither equality nor a difference in the
+            // unscanned tail, including when the full inputs happen to be equal.
+            out.push_str(&format!(
+                "…[no differing lines within the first {MAX_DIFF_INPUT_BYTES} bytes; \
+                 remaining content not compared; leading portion only]\n"
+            ));
+        } else {
+            return None;
+        }
+    } else if capped {
+        out.push_str(&format!(
+            "…[diff input truncated at {MAX_DIFF_INPUT_BYTES} bytes; leading portion only — \
+             read the file for the full change]\n"
+        ));
+    }
     Some(cap_diff(out))
 }
 
@@ -394,6 +501,7 @@ mod tests {
                 path: "/proj/a.rs".into(),
                 op: "write".into(),
                 before: Some("old".into()),
+                before_state: None,
                 after: Some("new".into()),
                 diff: Some("- old\n+ new\n".into()),
             },
@@ -406,6 +514,7 @@ mod tests {
                 path: "/proj/b.rs".into(),
                 op: "delete".into(),
                 before: Some("gone".into()),
+                before_state: None,
                 after: None,
                 diff: Some("- gone\n".into()),
             },
@@ -448,6 +557,7 @@ mod tests {
                 path: "/proj/a.rs".into(),
                 op: "write".into(),
                 before: None,
+                before_state: None,
                 after: Some("x".into()),
                 diff: None,
             },
@@ -492,6 +602,130 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].before.as_deref(), Some("old"));
         assert_eq!(entries[0].diff, None);
+        assert_eq!(entries[0].before_state, None);
+        assert_eq!(entries[0].effective_before_state(), BeforeState::Present);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_missing_before_state_retains_create_delete_semantics() {
+        for (before, after, op, expected) in [
+            (None, Some("new"), "write", BeforeState::Absent),
+            (Some("old"), None, "delete", BeforeState::Present),
+        ] {
+            let entry: MutationEntry = serde_json::from_value(serde_json::json!({
+                "seq": 1, "ts": "t", "path": "/proj/a.rs", "op": op,
+                "before": before, "after": after,
+            })).unwrap();
+            assert_eq!(entry.before_state, None);
+            assert_eq!(entry.effective_before_state(), expected);
+            assert_eq!(entry.diff, None);
+        }
+    }
+
+    #[test]
+    fn unavailable_preimage_records_state_without_fabricating_additions() {
+        for state in [BeforeState::Present, BeforeState::Unknown] {
+            for after in [Some("replacement\n"), Some(""), None] {
+                let entry = make_entry(Path::new("/proj/a.rs"), "write", None, after, state);
+                let json = serde_json::to_string(&entry).unwrap();
+                let decoded: MutationEntry = serde_json::from_str(&json).unwrap();
+                assert_eq!(decoded.before_state, Some(state));
+                assert_eq!(decoded.effective_before_state(), state);
+                assert!(decoded.before.is_none());
+                let diff = decoded.diff.unwrap();
+                assert!(diff.contains("before snapshot unavailable"));
+                assert!(diff.contains("not compared"));
+                assert!(!diff.lines().any(|line| line.starts_with("+ ") || line.starts_with("- ")));
+            }
+        }
+        let created = make_entry(Path::new("/proj/new.rs"), "write", None, Some("new\n"), BeforeState::Absent);
+        assert_eq!(created.diff.as_deref(), Some("+ new\n"));
+    }
+
+    #[test]
+    fn identical_large_inputs_do_not_claim_an_unobserved_tail_difference() {
+        let input = "same line\n".repeat(MAX_DIFF_INPUT_BYTES / 5);
+        assert!(input.len() > MAX_DIFF_INPUT_BYTES);
+        let diff = entry_diff(Some(&input), Some(&input)).unwrap();
+        assert!(diff.contains("remaining content not compared"));
+        assert!(!diff.contains("differ beyond"));
+        assert!(!diff.lines().any(|line| line.starts_with("+ ") || line.starts_with("- ")));
+        assert!(diff.len() < 512);
+    }
+
+    #[test]
+    fn entry_diff_bounds_huge_content_instead_of_building_full_diff() {
+        // Regression (P2): a multi-MB write used to materialize a full `+ line`
+        // diff for the whole content in memory before the 64 KiB cap applied.
+        let mut big = String::new();
+        for i in 0..200_000 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        assert!(big.len() > MAX_DIFF_INPUT_BYTES);
+        let d = entry_diff(None, Some(&big)).expect("diff must exist");
+        // Leading additions only; the diff must stay far below the file size.
+        assert!(d.starts_with("+ line 0\n"), "diff: {d}");
+        assert!(
+            d.len() < MAX_DIFF_INPUT_BYTES,
+            "diff must be bounded, got {} bytes",
+            d.len()
+        );
+        // The reader must see a truncation notice (input cap or output cap
+        // marker), never silently believe the diff is complete.
+        assert!(d.contains("truncated"), "diff: {d}");
+    }
+
+    #[test]
+    fn entry_diff_capped_window_never_reports_unchanged() {
+        // Regression: before/after share the first 1 MiB but differ beyond it.
+        // Returning None would read as "unchanged"; the truncation must surface.
+        let mut a = String::new();
+        let mut b = String::new();
+        for i in 0..300_000 {
+            let line = format!("same line {i}\n");
+            a.push_str(&line);
+            b.push_str(&line);
+        }
+        a.push_str("DIFFERENT TAIL\n");
+        let d = entry_diff(Some(&b), Some(&a)).expect("must not be None for capped input");
+        assert!(
+            d.contains("leading portion only"),
+            "must surface truncation, got: {d}"
+        );
+    }
+
+    #[test]
+    fn entry_diff_single_line_huge_rewrite_is_bounded() {
+        // Pathological case from the P2 report: one multi-MB line (minified
+        // JSON / single-line log). The whole line must not be copied.
+        let line = "x".repeat(3 * 1024 * 1024);
+        let d = entry_diff(None, Some(&line)).unwrap();
+        assert!(d.len() < 200 * 1024, "bounded: {} bytes", d.len());
+        // cap_diff walks back to the nearest newline; a single-line diff reduces
+        // to the truncation notice, which is truthful and still bounded.
+        assert!(d.contains("truncated"), "diff: {d}");
+    }
+
+    #[test]
+    fn entry_diff_cap_input_handles_multibyte_char_at_window_boundary() {
+        // A 3-byte UTF-8 char straddling the 1 MiB cap must not panic and must
+        // produce a valid bounded diff (cap_diff_input walks back to a char
+        // boundary before slicing).
+        let mut s = String::new();
+        s.push_str(&"a".repeat(MAX_DIFF_INPUT_BYTES - 1));
+        s.push('中'); // 3 bytes, crosses the cap boundary
+        s.push_str(&"b".repeat(100));
+        assert!(s.len() > MAX_DIFF_INPUT_BYTES);
+        let d = entry_diff(None, Some(&s)).unwrap();
+        assert!(d.len() < MAX_DIFF_INPUT_BYTES, "bounded: {} bytes", d.len());
+        assert!(d.contains("truncated"), "diff: {d}");
+    }
+
+    #[test]
+    fn entry_diff_small_content_behavior_is_unchanged() {
+        assert_eq!(entry_diff(Some("a\nb\n"), Some("a\nb\n")), None);
+        assert_eq!(entry_diff(None, Some("")), None);
+        assert_eq!(entry_diff(Some("a\nb\nc\n"), Some("a\nb\nx\n")), Some("- c\n+ x\n".into()));
     }
 }

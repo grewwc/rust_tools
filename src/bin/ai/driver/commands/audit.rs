@@ -218,53 +218,12 @@ fn capture_git_diff_fallback() -> String {
     out
 }
 
-/// 把 mutation log 条目格式化为审计提示用的改动摘要。
-///
-/// 按文件路径分组（保留首次改动顺序），取每个文件的原始 before（首条）与最终 after
-/// （末条）生成净变更类型与紧凑行差异；输出总量有上限，超出则截断并指向 mutation log
-/// 文件本身，子代理可用 read_file 读取完整 before/after。
+/// Format mutation evidence for the audit prompt using the same initial-state
+/// and snapshot-availability rules as show_changes and exported patches.
 fn format_mutation_log(
     entries: &[crate::ai::tools::storage::mutation_log::MutationEntry],
 ) -> String {
-    // (path, first_before, last_after, last_op, write_count, delete_count, diffs)
-    let mut summary: Vec<(
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-        usize,
-        usize,
-        Vec<String>,
-    )> = Vec::new();
-    for e in entries {
-        if let Some(s) = summary
-            .iter_mut()
-            .find(|(p, _, _, _, _, _, _)| p == &e.path)
-        {
-            s.2 = e.after.clone();
-            s.3 = e.op.clone();
-            if e.op == "write" {
-                s.4 += 1;
-            } else {
-                s.5 += 1;
-            }
-            if let Some(d) = &e.diff {
-                s.6.push(d.clone());
-            }
-        } else {
-            summary.push((
-                e.path.clone(),
-                e.before.clone(),
-                e.after.clone(),
-                e.op.clone(),
-                if e.op == "write" { 1 } else { 0 },
-                if e.op == "delete" { 1 } else { 0 },
-                e.diff.iter().cloned().collect(),
-            ));
-        }
-    }
-
-    let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
+    let summary = crate::ai::tools::storage::changes::grouped_changes(entries);
     let log_path = crate::ai::tools::storage::mutation_log::log_path();
     let mut out = String::from(
         "以下是 main agent 在本会话通过 write_file / apply_patch 改动的文件（按首次改动顺序）。\n\
@@ -272,50 +231,23 @@ fn format_mutation_log(
     );
     const CAP: usize = 14_000;
     let mut truncated = false;
-    for (i, (path, first_before, last_after, last_op, wc, dc, diffs)) in summary.iter().enumerate()
-    {
+    for (i, g) in summary.iter().enumerate() {
         if out.len() >= CAP {
             truncated = true;
             break;
         }
-        let rel = cwd
-            .as_ref()
-            .and_then(|c| std::path::Path::new(path).strip_prefix(c).ok())
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.clone());
-        let net = match (
-            last_op.as_str(),
-            first_before.is_some(),
-            last_after.is_some(),
-        ) {
-            ("delete", _, _) => "deleted",
-            (_, false, true) => "created",
-            _ => "modified",
-        };
         let mut counts = String::new();
-        if *wc > 0 {
-            counts.push_str(&format!("{wc} write"));
+        if g.write_count > 0 {
+            counts.push_str(&format!("{} write", g.write_count));
         }
-        if *dc > 0 {
+        if g.delete_count > 0 {
             if !counts.is_empty() {
                 counts.push_str(", ");
             }
-            counts.push_str(&format!("{dc} delete"));
+            counts.push_str(&format!("{} delete", g.delete_count));
         }
-        out.push_str(&format!("{}. {}  [{net}]  ({counts})\n", i + 1, rel));
-        if !crate::ai::tools::storage::changes::snapshots_full(first_before, last_after)
-            && !diffs.is_empty()
-        {
-            // Truncated snapshots: use the authoritative diff recorded at write
-            // time so the truncation edge is never rendered as a deletion.
-            if let Some(block) =
-                crate::ai::tools::storage::changes::diff_block_from_lines(&diffs.join(""), 30)
-            {
-                out.push_str(&block);
-                out.push_str("\n\n");
-            }
-        } else if let Some(diff) = diff_snippet(first_before.as_deref(), last_after.as_deref(), 30)
-        {
+        out.push_str(&format!("{}. {}  [{}]  ({counts})\n", i + 1, g.rel, g.net));
+        if let Some(diff) = crate::ai::tools::storage::changes::file_snippet(g, 30) {
             out.push_str(&diff);
             out.push_str("\n\n");
         }
@@ -325,59 +257,12 @@ fn format_mutation_log(
     }
     if let Some(lp) = &log_path {
         out.push_str(&format!(
-            "完整 before/after（含每次写入的中间状态）见 mutation log：{}\n\
-             可用 read_file 读取该日志获取每个改动的原始与最终内容。\n",
+            "Recorded snapshots and per-write diffs: {}\n\
+             Snapshots may be truncated or unavailable; read the log for recorded evidence.\n",
             lp.display()
         ));
     }
     out
-}
-
-/// 生成 before -> after 的紧凑行差异片段（剔除公共前缀/后缀行）。
-///
-/// 适用于单区域编辑；多区域编辑会把中间整段标为差异（由调用方截断）。返回 None 表示
-/// 内容未变或前后均无内容。最多展示 `max_lines` 行，超出则截断并提示。
-fn diff_snippet(before: Option<&str>, after: Option<&str>, max_lines: usize) -> Option<String> {
-    let (b, a): (Vec<&str>, Vec<&str>) = match (before, after) {
-        (None, None) => return None,
-        (None, Some(a)) => (Vec::new(), a.lines().collect()),
-        (Some(b), None) => (b.lines().collect(), Vec::new()),
-        (Some(b), Some(a)) => (b.lines().collect(), a.lines().collect()),
-    };
-    if b == a {
-        return None;
-    }
-    let mut prefix = 0;
-    while prefix < b.len() && prefix < a.len() && b[prefix] == a[prefix] {
-        prefix += 1;
-    }
-    let mut suffix = 0;
-    while suffix < b.len() - prefix
-        && suffix < a.len() - prefix
-        && b[b.len() - 1 - suffix] == a[a.len() - 1 - suffix]
-    {
-        suffix += 1;
-    }
-    let mut lines: Vec<String> = Vec::new();
-    for l in &b[prefix..b.len() - suffix] {
-        lines.push(format!("- {l}"));
-    }
-    for l in &a[prefix..a.len() - suffix] {
-        lines.push(format!("+ {l}"));
-    }
-    if lines.is_empty() {
-        return None;
-    }
-    let total = lines.len();
-    if total <= max_lines {
-        Some(format!("```diff\n{}\n```", lines.join("\n")))
-    } else {
-        let shown: Vec<&str> = lines.iter().take(max_lines).map(|s| s.as_str()).collect();
-        Some(format!(
-            "```diff\n{}\n```\n（差异共 {total} 行，已展示前 {max_lines} 行；完整内容见 mutation log）",
-            shown.join("\n")
-        ))
-    }
 }
 
 fn is_inside_git_work_tree(cwd: &Path) -> bool {
@@ -405,9 +290,10 @@ mod tests {
     use super::{
         AUDIT_SUBAGENT_HARD_TIMEOUT, AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME, AuditCommand,
         FAST_AUDIT_SUBAGENT_HARD_TIMEOUT, FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME,
-        compose_audit_prompt, diff_snippet, format_mutation_log, parse_audit_command,
+        compose_audit_prompt, format_mutation_log, parse_audit_command,
         terminal_audit_result,
     };
+    use crate::ai::tools::storage::changes::diff_snippet;
 
     #[test]
     fn audit_subagent_hard_timeout_is_fifteen_minutes() {
@@ -659,6 +545,7 @@ model_reason=inherited parent agent current model\n\
             path: "/proj/src/a.rs".into(),
             op: "write".into(),
             before: Some("fn a() {}\n".into()),
+            before_state: None,
             after: Some("fn a() { return 1; }\n".into()),
             diff: Some("- fn a() {}\n+ fn a() { return 1; }\n".into()),
         }];
@@ -668,5 +555,41 @@ model_reason=inherited parent agent current model\n\
         assert!(out.contains("1 write"));
         assert!(out.contains("- fn a() {}"));
         assert!(out.contains("+ fn a() { return 1; }"));
+    }
+
+    #[test]
+    fn audit_preserves_unknown_initial_snapshot_across_later_writes() {
+        use crate::ai::tools::storage::mutation_log::{BeforeState, MutationEntry};
+        for state in [BeforeState::Present, BeforeState::Unknown] {
+            let mut entries = vec![MutationEntry {
+                seq: 0, ts: "t".into(), path: "/proj/existing.rs".into(), op: "write".into(),
+                before: None, before_state: Some(state), after: Some("first\n".into()), diff: None,
+            }];
+            entries.push(MutationEntry {
+                seq: 1, ts: "t".into(), path: entries[0].path.clone(), op: "write".into(),
+                before: Some("first\n".into()), before_state: Some(BeforeState::Present),
+                after: Some("second\n".into()), diff: Some("- first\n+ second\n".into()),
+            });
+            let out = format_mutation_log(&entries);
+            assert!(!out.contains("[created]"), "{out}");
+            assert!(out.contains(if state == BeforeState::Present { "[modified]" } else { "[written]" }), "{out}");
+            assert!(out.contains("before snapshot unavailable"), "{out}");
+            assert!(out.contains("2 write"), "{out}");
+            assert!(!out.lines().any(|line| line.starts_with('+') || line.starts_with('-')), "{out}");
+        }
+    }
+
+    #[test]
+    fn audit_identical_large_write_reports_only_comparison_limit() {
+        use crate::ai::tools::storage::mutation_log::{BeforeState, MutationEntry, cap_content, entry_diff};
+        let content = "same line\n".repeat(200_000);
+        let entries = [MutationEntry {
+            seq: 0, ts: "t".into(), path: "/proj/large.rs".into(), op: "write".into(),
+            before: Some(cap_content(&content)), before_state: Some(BeforeState::Present),
+            after: Some(cap_content(&content)), diff: entry_diff(Some(&content), Some(&content)),
+        }];
+        let out = format_mutation_log(&entries);
+        assert!(out.contains("remaining content not compared"), "{out}");
+        assert!(!out.contains("differ beyond"), "{out}");
     }
 }

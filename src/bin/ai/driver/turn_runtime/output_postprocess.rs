@@ -1,9 +1,10 @@
 //! Display-only post-processing of the final assistant body before it is
 //! painted to the terminal.
 //!
-//! When `ai.output.postprocess_command` is set, the completed body text is
-//! piped through that shell command (stdin -> stdout) right before
-//! `render_markdown_block`. This lets users fix cosmetic issues in the
+//! When `ai.output.postprocess_command` is set, body text is piped through
+//! that shell command (stdin -> stdout) right before `render_markdown_block`
+//! -- live turns in `finalize.rs` and the `/history last` replay in
+//! `driver/input.rs`. This lets users fix cosmetic issues in the
 //! terminal echo without touching canonical history (e.g.
 //! `scripts/postprocess_terminal.py`, which converts Chinese punctuation
 //! inside code / file-location contexts (and fullwidth parentheses in

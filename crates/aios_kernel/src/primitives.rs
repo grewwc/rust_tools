@@ -657,6 +657,32 @@ pub struct VfsStat {
     pub is_dir: bool,
 }
 
+/// Result of a bounded byte-range read (`VfsOps::vfs_read_range`).
+///
+/// `content` is the decoded UTF-8 prefix of `[offset, offset + max_bytes)`. The kernel trims the
+/// tail at a UTF-8 character boundary so a multibyte character that happens to straddle the range
+/// end is never decoded incorrectly; `next_offset` then skips past that trimmed tail, so the caller
+/// can simply resume reading at `next_offset` without re-reading partial characters.
+///
+/// `hit_eof` is true when the read reached the end of the file (i.e. a subsequent read at
+/// `next_offset` would return empty content). When `content` is empty and `hit_eof` is true the
+/// caller is at the end of the file.
+///
+/// A range whose `max_bytes` is zero, or smaller than the next multibyte character of the file,
+/// cannot make progress; the kernel reports this as a `VfsError::Io` ("... increase max_bytes to
+/// make progress") instead of returning `("", offset, hit_eof=false)`, so a paged caller never
+/// loops forever on the same offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VfsReadRange {
+    /// UTF-8 content of the requested range (possibly trimmed at a char boundary at the tail).
+    pub content: String,
+    /// Byte offset where the next read should resume (`offset + bytes read from the file`, i.e.
+    /// past any partial character trimmed from the tail).
+    pub next_offset: u64,
+    /// True when the file has no further bytes at/after `next_offset`.
+    pub hit_eof: bool,
+}
+
 /// VFS device interface. The in-kernel representation of `/dev/vfs`.
 pub trait VfsOps {
     /// Read the entire file into a string. On success, the byte count is charged to pid
@@ -668,12 +694,60 @@ pub trait VfsOps {
         path: &std::path::Path,
     ) -> Result<String, VfsError>;
 
+    /// Read at most `max_bytes` from `path` starting at byte `offset`, charging `fs_bytes` for the
+    /// bytes actually transferred (i.e. the returned `content` length).
+    ///
+    /// This keeps every individual read bounded so the caller can stream a large file through the
+    /// shared kernel lock chunk by chunk without stalling other tenants for the whole file (see the
+    /// VFS safety note on the impl in `local/vfs.rs`).
+    /// A chunk smaller than the next UTF-8 character (or `max_bytes == 0`) yields a
+    /// `VfsError::Io` telling the caller to increase `max_bytes`, never a non-advancing result.
+    fn vfs_read_range(
+        &mut self,
+        pid: Option<u64>,
+        path: &std::path::Path,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<VfsReadRange, VfsError>;
+
     /// Write the entire file. Parent directories are created automatically.
     fn vfs_write_all(
         &mut self,
         pid: Option<u64>,
         path: &std::path::Path,
         content: &str,
+    ) -> Result<(), VfsError>;
+
+    /// Compare-and-swap write: write `content` to `path` only if the file still matches
+    /// `expected`, aborting with a `VfsError::Io` carrying the `[FILE_CHANGED]` message otherwise.
+    ///
+    /// `expected` semantics: `Some(b)` requires the file to exist with exactly content `b`;
+    /// `None` atomically creates a new file using `create_new`, refusing any existing path
+    /// (including a dangling symlink). On mismatch the file is left untouched.
+    ///
+    /// The check and the write share a single hold of the kernel lock, so no other in-process
+    /// VFS operation can interleave between them. This closes the check-then-write race for
+    /// callers that verified a snapshot earlier (e.g. patch application). For existing files,
+    /// this serialization covers only writers using the same kernel, not arbitrary external
+    /// processes. The create-only path rejects concurrent creation by external writers too;
+    /// it does not make the subsequent content write atomic or undo a partial I/O failure.
+    fn vfs_write_if_unchanged(
+        &mut self,
+        pid: Option<u64>,
+        path: &std::path::Path,
+        expected: Option<&str>,
+        content: &str,
+    ) -> Result<(), VfsError>;
+
+    /// Compare-and-swap delete: remove `path` only if its content still matches `expected`
+    /// (same atomicity contract and `[FILE_CHANGED]` error as `vfs_write_if_unchanged`).
+    /// `expected == None` requires the file to not exist already; removing a missing file then
+    /// reports `VfsError::NotFound`, mirroring plain `vfs_remove_file`.
+    fn vfs_remove_if_unchanged(
+        &mut self,
+        pid: Option<u64>,
+        path: &std::path::Path,
+        expected: Option<&str>,
     ) -> Result<(), VfsError>;
 
     /// Query file metadata. Not counted toward fs_bytes.

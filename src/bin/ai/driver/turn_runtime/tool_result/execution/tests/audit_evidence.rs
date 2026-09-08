@@ -336,7 +336,7 @@ fn audit_rejects_requested_lines_that_read_file_did_not_render() {
         )),
         tool_result_message(
             "truncated-read",
-            "     1\tline 1\n... [truncated: output capped at 64000 chars; showing lines 1-1 of 3; 2 more line(s) not shown. Continue with offset=2 to read the rest.]",
+            "     1\tline 1\n... [truncated: capped at 64000 chars; lines 1-1 of 3; 2 more not shown. Continue: offset=2]",
         ),
     ];
     let mut final_text = complete_report("src/lib.rs");
@@ -371,7 +371,7 @@ fn audit_rejects_a_zero_limit_read_file_result() {
         )),
         tool_result_message(
             "zero-limit-read",
-            "... [truncated: showing lines 1-0 of 3; 3 more line(s) not shown. Continue with offset=1 to read the rest.]",
+            "... [truncated: lines 1-0 of 3; 3 more not shown. Continue: offset=1]",
         ),
     ];
     let mut final_text = complete_report("src/lib.rs");

@@ -33,6 +33,9 @@ pub(in crate::ai) mod tool_result;
 mod types;
 
 pub(super) use orchestrator::run_turn;
+// `/history last` replay (driver/input.rs) paints the stored body through the
+// same display-only post-processing as the live turn path (finalize.rs).
+pub(super) use output_postprocess::postprocess_terminal_text;
 // Earlier steps declared checkpoint/progress as orchestrator-private submodules, but execution.rs references them as
 // `turn_runtime::checkpoint|progress`; these re-exports restore turn_runtime-level visibility.
 pub(crate) use orchestrator::{checkpoint, progress};

@@ -487,7 +487,10 @@ fn rebuild_after_terminal_reflow(
         terminal_size,
         requested_height,
         parked_anchor_offset(last_drawn_area, requested_height),
-        ViewportRebuildMode::ReserveMissingRows,
+        // Reflow moves an already-reserved viewport; it must never append more
+        // terminal rows. Appending here makes every delayed resize notification
+        // scroll the inline editor and strands the previously drawn caret.
+        ViewportRebuildMode::ReflowOnly,
         last_drawn_area.map(|area| area.y),
         false,
     )?;
@@ -522,6 +525,19 @@ fn park_reflow_anchor<B: Backend>(
     terminal.backend_mut().set_cursor_position(anchor)?;
     terminal.backend_mut().flush()?;
     Ok(())
+}
+
+fn update_pending_resize_rebuild(
+    pending_resize_rebuild: &mut bool,
+    last_applied_terminal_size: Size,
+    notified_terminal_size: Size,
+) {
+    // VS Code/xterm.js can deliver a delayed duplicate Resize notification.
+    // Re-querying and clearing the viewport for an unchanged size can move the
+    // anchor without any real reflow and leave the drawn caret behind. If a
+    // resize burst returns to the applied size before rebuilding, cancel the
+    // pending rebuild for the same reason.
+    *pending_resize_rebuild = notified_terminal_size != last_applied_terminal_size;
 }
 
 fn clear_fixed_viewport<B: Backend>(
@@ -667,6 +683,7 @@ impl PromptEditor {
         };
 
         let initial_viewport_area = terminal.get_frame().area();
+        let mut last_applied_terminal_size = terminal.backend().size()?;
         // The viewport currently on screen. Its top row is where exit cleanup
         // starts, and its height is where the parked anchor's offset comes
         // from, so both stay consistent with what is actually drawn.
@@ -698,10 +715,10 @@ impl PromptEditor {
             // an unchanged input screen. Resize and title events explicitly
             // request the next frame.
             let mut redraw_requested = true;
-            // Set when a resize arrives. The rebuild runs before the next
-            // foreground redraw (including a background title update) or before
-            // a non-resize input event, after the emulator has had a chance to
-            // finish its asynchronous reflow.
+            // Set only when a resize notification changes the terminal size. The
+            // rebuild runs before the next foreground redraw (including a
+            // background title update) or before a non-resize input event, giving
+            // the emulator time to finish its asynchronous scrollback reflow.
             let mut pending_resize_rebuild = false;
 
             loop {
@@ -737,6 +754,7 @@ impl PromptEditor {
                         // would otherwise anchor to a stale row.
                         park_reflow_anchor(&mut terminal, rebuilt_area)?;
                         last_drawn_area = Some(rebuilt_area);
+                        last_applied_terminal_size = terminal_size;
                         fitted_completion_items = current_items;
                         force_repaint_next_frame = false;
                         viewport_rebuilt = true;
@@ -772,6 +790,7 @@ impl PromptEditor {
                             )?;
                             park_reflow_anchor(&mut terminal, rebuilt_area)?;
                             last_drawn_area = Some(rebuilt_area);
+                            last_applied_terminal_size = terminal_size;
                             base_viewport_height = new_height;
                             force_repaint_next_frame = false;
                             viewport_rebuilt = true;
@@ -788,6 +807,7 @@ impl PromptEditor {
                             last_drawn_area,
                         )?;
                         last_drawn_area = Some(rebuilt_area);
+                        last_applied_terminal_size = terminal.backend().size()?;
                     }
 
                     let force_repaint = force_repaint_next_frame;
@@ -835,49 +855,30 @@ impl PromptEditor {
                 else {
                     continue;
                 };
-                if let Event::Resize(_, _) = event {
+                if let Event::Resize(width, height) = event {
                     // Do not rebuild here: the emulator (VS Code / xterm.js)
                     // rewraps the scrollback asynchronously after the resize
-                    // events, so a DSR cursor query issued now returns the
-                    // pre-reflow row and the box would be rebuilt at a stale
-                    // position (the caret visibly jumps). Defer the rebuild to
-                    // the next foreground redraw or non-resize event, after the
-                    // asynchronous reflow has had a chance to finish.
-                    pending_resize_rebuild = true;
+                    // events, so a DSR cursor query issued now can return the
+                    // pre-reflow row. Ignore delayed same-size notifications and
+                    // defer a real resize until foreground work needs a redraw.
+                    update_pending_resize_rebuild(
+                        &mut pending_resize_rebuild,
+                        last_applied_terminal_size,
+                        Size::new(width, height),
+                    );
                     continue;
                 }
                 if pending_resize_rebuild {
                     pending_resize_rebuild = false;
-                    let terminal_size = terminal.backend().size()?;
-                    let requested_height = viewport_height_with_completion(
-                        terminal_size.height,
-                        base_viewport_height,
-                        fitted_completion_items,
-                    );
-                    // The hardware cursor is parked (hidden) at the viewport's
-                    // bottom row, and the emulator preserves that logical line
-                    // through the width reflow. A live DSR query returns where
-                    // the bottom row landed; subtracting `height - 1` (the box
-                    // height never changes on a width reflow) recovers the
-                    // reflowed viewport top, so the box tracks the re-wrapped
-                    // transcript exactly. Clearing from that top down removes
-                    // the reflowed copy of the old viewport (no ghost rows), and
-                    // the rows above stay untouched because they now hold the
-                    // re-wrapped transcript (hence clear_gap_above stays false).
-                    let rebuilt_area = rebuild_fixed_viewport(
+                    let rebuilt_area = rebuild_after_terminal_reflow(
                         &mut terminal,
                         &mut screen,
-                        terminal_size,
-                        requested_height,
-                        parked_anchor_offset(last_drawn_area, requested_height),
-                        ViewportRebuildMode::ReserveMissingRows,
-                        last_drawn_area.map(|area| area.y),
-                        false,
+                        base_viewport_height,
+                        fitted_completion_items,
+                        last_drawn_area,
                     )?;
-                    // Store the rebuilt box and re-park immediately so the next
-                    // draw and any later rebuild anchor to the current box.
-                    park_reflow_anchor(&mut terminal, rebuilt_area)?;
                     last_drawn_area = Some(rebuilt_area);
+                    last_applied_terminal_size = terminal.backend().size()?;
                 }
 
                 let previous_input_len = textarea_logical_char_count(&textarea);
@@ -952,7 +953,8 @@ mod tests {
         ViewportRebuildMode, clear_fixed_viewport, clear_row_range, fixed_viewport_area,
         force_frame_repaint, multiline_viewport_height, park_reflow_anchor, parked_anchor_offset,
         prepare_fixed_viewport, submitted_input_preview_lines, take_redraw_request,
-        terminal_with_fixed_viewport, viewport_height_with_completion,
+        take_standalone_resize_rebuild, terminal_with_fixed_viewport,
+        update_pending_resize_rebuild, viewport_height_with_completion,
     };
 
     fn key(code: KeyCode) -> Event {
@@ -1110,15 +1112,42 @@ mod tests {
     }
 
     #[test]
-    fn idle_poll_timeouts_do_not_request_more_frames() {
+    fn pending_resize_waits_for_foreground_redraw() {
         let mut redraw_requested = true;
 
         assert!(take_redraw_request(&mut redraw_requested, false));
         assert!(!take_redraw_request(&mut redraw_requested, false));
-        assert!(!take_redraw_request(&mut redraw_requested, false));
 
-        assert!(take_redraw_request(&mut redraw_requested, true));
+        let mut pending_resize_rebuild = true;
+        // An idle poll timeout leaves both states unchanged. A later foreground
+        // redraw consumes the pending resize exactly once.
         assert!(!take_redraw_request(&mut redraw_requested, false));
+        assert!(pending_resize_rebuild);
+        redraw_requested = true;
+        assert!(take_redraw_request(&mut redraw_requested, false));
+        assert!(take_standalone_resize_rebuild(
+            &mut pending_resize_rebuild,
+            false
+        ));
+        assert!(!pending_resize_rebuild);
+        assert!(!take_redraw_request(&mut redraw_requested, false));
+    }
+
+    #[test]
+    fn duplicate_resize_notification_does_not_schedule_rebuild() {
+        let applied = ratatui::layout::Size::new(80, 24);
+        let mut pending = false;
+
+        update_pending_resize_rebuild(&mut pending, applied, applied);
+        assert!(!pending);
+
+        update_pending_resize_rebuild(&mut pending, applied, ratatui::layout::Size::new(79, 24));
+        assert!(pending);
+
+        // A resize burst that returns to the applied dimensions before the
+        // rebuild must cancel the stale intermediate notification.
+        update_pending_resize_rebuild(&mut pending, applied, applied);
+        assert!(!pending);
     }
 
     #[test]

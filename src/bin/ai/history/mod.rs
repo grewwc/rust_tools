@@ -9,12 +9,15 @@ mod suspended;
 mod task_evidence;
 mod types;
 
-/// 历史压缩器依赖的"模型摘要"端口（依赖倒置）：
-/// 持久层不直接调用请求执行管线，由 request/aux.rs 为 `App` 实现后注入。
+/// The "model summarization" port the history compressor depends on
+/// (dependency inversion): the persistence layer never calls the request
+/// pipeline directly; `request/aux.rs` implements this for `App` and injects
+/// it.
 ///
-/// 注意：`&self` 与 `messages` 复用同一个生命周期 `'a`。摘要 future 同时借用
-/// 二者，若让它们各自独立，返回的 `Box<dyn Future + Send + '_>` 无法同时满足
-/// 两个借用生命期的类型检查（`lifetime may not live long enough`）。
+/// Note: `&self` and `messages` share the same lifetime `'a`. The summary
+/// future borrows both; if they had independent lifetimes, the returned
+/// `Box<dyn Future + Send + '_>` could not satisfy both borrow lifetimes in
+/// type checking (`lifetime may not live long enough`).
 pub(in crate::ai) trait HistoryMessageSummarizer {
     fn summarize_history_messages<'a>(
         &'a self,
@@ -59,8 +62,10 @@ pub(in crate::ai) use sessions::{
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::fork_history_for_subagent;
 
-/// 为子代理准备独立的历史文件。首次派发按需 fork 父历史；resume 只复用既有
-/// child 文件，绝不能再次用父快照覆盖子代理已经产生的证据。
+/// Prepare an independent history file for a sub-agent. First dispatch forks
+/// the parent history on demand; resume only reuses the existing child file
+/// and must never overwrite the evidence the sub-agent has already produced
+/// with a fresh parent snapshot.
 pub(in crate::ai) fn prepare_subagent_history(
     parent: &Path,
     child: &Path,
@@ -96,8 +101,10 @@ pub(in crate::ai) fn prepare_subagent_history(
     }
 }
 
-/// 文本历史后端不能交给 SQLite Online Backup。先写同目录临时文件再 rename，
-/// 避免子代理观察到半份父历史；父文件尚未创建时继承语义等同于空历史。
+/// The text history backend cannot use SQLite Online Backup. Write a
+/// temporary file in the same directory and then rename it, so the sub-agent
+/// never observes half of the parent history; when the parent file does not
+/// exist yet, inheritance is equivalent to an empty history.
 fn publish_text_subagent_history(
     parent: &Path,
     child: &Path,
@@ -129,29 +136,37 @@ fn publish_text_subagent_history(
     result
 }
 
-/// 同步子代理的 history 仅在任务执行期间存在。任务已停止后清除主文件、SQLite
-/// sidecar、跨进程 state lock 文件与进程内 state-lock map 条目；文本后端复用同一
-/// 清理入口也不会产生额外副作用。
+/// A synced sub-agent's history exists only for the duration of its task.
+/// After the task stops, remove the main file, SQLite sidecars, the
+/// cross-process state-lock file, and the in-process state-lock map entry;
+/// the text backend reuses the same cleanup entry point without extra side
+/// effects.
 ///
-/// 同时按同一 stem 规则清理子代理的 assets 目录（`<stem>.assets`，与
-/// `driver::side_note::assets_dir_for_history` 相同推导）：plan_state /
-/// side_note / working-checkpoint 都写在子代理自己的 assets 下，任务结束后即成为
-/// 孤儿残留。保留路径（[`preserve_subagent_history`]）不走这里，因此被保留的
-/// history 里引用的子代理 assets 文件不会被误删。
+/// Also clean up the sub-agent's assets directory using the same stem rule
+/// (`<stem>.assets`, derived the same way as
+/// `driver::side_note::assets_dir_for_history`): plan_state / side_note /
+/// working-checkpoint all live under the sub-agent's own assets and become
+/// orphan residue once the task ends. The preserved path
+/// ([`preserve_subagent_history`]) does not go through here, so sub-agent
+/// assets referenced by a preserved history are never deleted by mistake.
 pub(in crate::ai) fn delete_subagent_history(path: &Path) -> io::Result<()> {
     let history_result = blob::delete_history_artifacts(path);
     let lock_result = sqlite::delete_session_state_lock(path);
-    // 回收进程内 per-path 锁条目，避免子代理路径（按 pid/task_id 唯一）累积后
-    // 令 SESSION_STATE_LOCKS map 无界增长。放在磁盘清理之后、不影响其错误传播。
+    // Reclaim the in-process per-path lock entry so sub-agent paths (unique
+    // by pid/task_id) cannot accumulate and let the SESSION_STATE_LOCKS map
+    // grow unboundedly. Runs after the disk cleanup and does not affect its
+    // error propagation.
     sqlite::remove_session_state_lock_entry(path);
     let assets_result = delete_subagent_assets_dir(path);
     history_result.and(lock_result).and(assets_result)
 }
 
-/// 删除从子代理 history 文件推导出的 assets 目录：`<parent>/<stem>.assets`
-/// （stem 去掉 `.sqlite` 等扩展名），与 `driver::side_note::assets_dir_for_history`
-/// 保持同一规则。仅在文件名带 `.subagent-` / `.proc-` 派生标记时执行，防止误传
-/// 主会话路径时把主会话的 assets 目录一并清掉；目录不存在视为成功（幂等）。
+/// Delete the assets directory derived from a sub-agent history file:
+/// `<parent>/<stem>.assets` (stem without the `.sqlite`-style extension),
+/// following the same rule as `driver::side_note::assets_dir_for_history`.
+/// Only runs when the file name carries a `.subagent-` / `.proc-` derived
+/// marker, so passing a main-session path cannot wipe the main session's
+/// assets directory; a missing directory counts as success (idempotent).
 fn delete_subagent_assets_dir(path: &Path) -> io::Result<()> {
     let file_name = path
         .file_name()
@@ -177,14 +192,18 @@ fn delete_subagent_assets_dir(path: &Path) -> io::Result<()> {
     }
 }
 
-/// 超时保留场景下子代理历史文件的新路径（`<原路径>.timeout-preserved`）。
+/// The new path of a sub-agent history file in the timeout-preservation
+/// scenario (`<original path>.timeout-preserved`).
 pub(in crate::ai) fn preserved_subagent_history_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.timeout-preserved", path.display()))
 }
 
-/// 预超时硬超时后保留子代理已写入的历史：把主历史文件改名（而非删除）以便父代理
-/// 提取超时前的工作产物；同时清理原路径的 SQLite sidecar 与状态锁，避免锁残留。
-/// 返回保留后的路径；历史文件不存在时返回 `None`（调用方按原逻辑清理即可）。
+/// After a hard pre-timeout, preserve the sub-agent's written history: rename
+/// (rather than delete) the main history file so the parent can extract work
+/// produced before the timeout; also clean up the original path's SQLite
+/// sidecars and state lock to avoid lock residue. Returns the preserved path,
+/// or `None` when the history file does not exist (the caller then cleans up
+/// as usual).
 pub(in crate::ai) fn preserve_subagent_history(path: &Path) -> Option<PathBuf> {
     if !path.exists() {
         return None;
@@ -238,9 +257,10 @@ pub(in crate::ai) fn preserve_subagent_history(path: &Path) -> Option<PathBuf> {
     Some(preserved)
 }
 
-/// 清理 sub-agent 私有 memory 文件：jsonl 本体 + 派生的 `.db` 索引（连同其
-/// WAL/SHM sidecar）。与 [`delete_subagent_history`] 同生命周期，仅在任务真正
-/// 结束（非 resume 保留）时调用。
+/// Clean up a sub-agent's private memory files: the jsonl body plus the
+/// derived `.db` index (together with its WAL/SHM sidecars). Shares the
+/// lifecycle of [`delete_subagent_history`]; only called when the task truly
+/// ends (not on resume preservation).
 pub(in crate::ai) fn delete_subagent_memory(memory_path: &Path) -> io::Result<()> {
     let jsonl_result = blob::delete_history_artifacts(memory_path);
     let db_result = match memory_path.file_stem().and_then(|stem| stem.to_str()) {
@@ -402,11 +422,14 @@ struct ContextHistoryCacheKey {
     overflow_dir: Option<PathBuf>,
     file_len: Option<u64>,
     modified_unix_ms: Option<u128>,
-    /// history DB 的写入版本号（`meta.history_revision`）：每次写事务内递增。
-    /// WAL 模式下主文件 len/mtime 可能长时间不变，单独依赖文件元数据会让 cache
-    /// 错误命中已删/已改的历史。该版本号是**跨连接**可见的强失效信号，
-    /// 取代不可靠的 `PRAGMA data_version`（后者是连接局部值，新连接读到的初值
-    /// 不随外部写入而变）。
+    /// The write version of the history DB (`meta.history_revision`),
+    /// incremented within every write transaction. In WAL mode the main
+    /// file's len/mtime can stay unchanged for a long time, so relying on
+    /// file metadata alone would let the cache wrongly hit deleted or
+    /// rewritten history. This revision is a strong invalidation signal
+    /// visible across connections, replacing the unreliable `PRAGMA
+    /// data_version` (which is connection-local: a new connection's initial
+    /// value does not track external writes).
     history_revision: Option<i64>,
 }
 
@@ -423,8 +446,10 @@ pub(in crate::ai) fn is_system_like_role(role: &str) -> bool {
     types::is_system_like_role(role)
 }
 
-/// `/history` 人工查看入口需要展示完整会话，而不是只展示压缩后留在主历史库里的
-/// inline 消息。归档仅在查看时展开，不进入模型上下文，也不参与 rewind 写回。
+/// The `/history` manual-view entry point must show the full session, not
+/// just the inline messages left in the main history store after compression.
+/// Archives are expanded only for viewing; they never enter the model context
+/// and never participate in rewind write-back.
 pub(in crate::ai) fn build_message_arr_for_history_view(
     history_file: &Path,
 ) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
@@ -459,15 +484,17 @@ pub(in crate::ai) fn build_context_history(
         return Ok(cached);
     }
 
-    // SQLite 会话把 canonical history 与可替换的 context snapshot 分层保存。
-    // 请求只读取 snapshot + watermark 之后的原始增量；人工历史始终读取 canonical 表。
+    // SQLite sessions store canonical history and a replaceable context
+    // snapshot in layers. Requests read the snapshot plus the raw increments
+    // after the watermark; manual history always reads the canonical table.
     let mut history = if blob::is_sqlite_path(history_file) {
         sqlite::read_context_history_sqlite(history_file, &projection_fingerprint)?.messages
     } else {
         build_message_arr(usize::MAX, history_file)?
     };
-    // canonical 层刻意保留 raw 工具结果；请求层必须重新执行同一物理上限，
-    // 防止 snapshot 水位之后的 SQLite tail 绕过 current-turn 投影。
+    // The canonical layer deliberately keeps raw tool results; the request
+    // layer must re-apply the same physical cap so the SQLite tail after the
+    // snapshot watermark cannot bypass the current-turn projection.
     compress::cap_raw_tool_results_for_context(&mut history, overflow_dir.as_deref(), cwd);
     let out = if history_max_chars == 0 {
         if history_count >= history.len() {
@@ -494,8 +521,10 @@ pub(in crate::ai) fn build_context_history(
     Ok(out)
 }
 
-/// 快照只对生成它的投影策略有效。策略配置变化时回退到 canonical messages
-/// 重建，避免继续沿用旧预算或旧压缩算法产生的有损上下文。
+/// A snapshot is only valid for the projection strategy that produced it.
+/// When the strategy configuration changes, fall back to rebuilding from
+/// canonical messages so lossy context produced by an old budget or old
+/// compression algorithm is not reused.
 fn context_projection_fingerprint(
     history_max_chars: usize,
     history_keep_last: usize,
@@ -584,9 +613,9 @@ fn store_cached_context_history(key: ContextHistoryCacheKey, value: Vec<Message>
     }
 }
 
-/// 清除指定 history_file 的所有 context 缓存条目。
-/// session 切换 / clear-history / delete 时调用，避免下个 turn 命中
-/// 已经被删/被替换的旧历史。
+/// Remove all context cache entries for the given history_file.
+/// Called on session switch / clear-history / delete so the next turn cannot
+/// hit old history that has been deleted or replaced.
 pub(in crate::ai) fn invalidate_context_history_cache_for(history_file: &std::path::Path) {
     let Ok(mut cache) = CONTEXT_HISTORY_CACHE.lock() else {
         return;
@@ -594,7 +623,8 @@ pub(in crate::ai) fn invalidate_context_history_cache_for(history_file: &std::pa
     cache.retain(|entry| entry.key.history_file != history_file);
 }
 
-/// 全量清空 context history 缓存。极端场景（如清理任务、单测）使用。
+/// Clear the entire context history cache. Used in extreme scenarios (e.g.
+/// cleanup tasks, unit tests).
 #[allow(dead_code)]
 pub(in crate::ai) fn clear_context_history_cache() {
     if let Ok(mut cache) = CONTEXT_HISTORY_CACHE.lock() {
@@ -602,10 +632,11 @@ pub(in crate::ai) fn clear_context_history_cache() {
     }
 }
 
-/// 原子预留 session 的下一个全局 turn 序号。
+/// Atomically reserve the session's next global turn index.
 ///
-/// 当前 session store 统一使用 SQLite；拒绝旧文本路径，避免悄悄退回会在
-/// 重启或多进程场景重复编号的进程内计数。
+/// The session store is uniformly SQLite today; reject the legacy text path
+/// so it cannot silently fall back to an in-process counter that would
+/// renumber turns across restarts or multiple processes.
 pub(in crate::ai) fn reserve_turn_index(history_file: &Path) -> io::Result<usize> {
     if !blob::is_sqlite_path(history_file) {
         return Err(io::Error::new(
@@ -623,8 +654,9 @@ pub(in crate::ai) async fn compact_session_history_with_app(
     compact_session_history_with_app_inner(app, false, cwd).await
 }
 
-/// 任务边界触发的压缩：阈值更激进（160 vs 200），适合 turn 收尾且 agent 没有
-/// 再调工具的"答案已交付"时刻调用。
+/// Compression triggered at task boundaries: a more aggressive threshold
+/// (160 vs 200), suited for the "answer already delivered" moment at the end
+/// of a turn when the agent will not call tools again.
 pub(in crate::ai) async fn compact_session_history_at_boundary_with_app(
     app: &App,
     cwd: Option<&Path>,
@@ -686,8 +718,10 @@ async fn compact_session_history_with_app_inner(
     }
 
     let compacted = if exceeds_context_budget || exceeds_tool_evidence_budget {
-        // 与下一轮 `build_context_history` 使用完全相同的压缩策略，并把结果写回
-        // context snapshot。原始消息只存在 canonical 层，不会被压缩覆盖。
+        // Use exactly the same compression strategy as the next
+        // `build_context_history` call and write the result back into the
+        // context snapshot. Raw messages exist only in the canonical layer
+        // and are never overwritten by compression.
         compress::compress_messages_for_context(
             messages.clone(),
             app.config.history_max_chars,
@@ -775,7 +809,8 @@ mod tests {
         let history = dir.join("subagent-1-2.jsonl");
         std::fs::write(&history, "{\"role\":\"user\",\"content\":\"hello\"}\n").unwrap();
 
-        // 保留：主文件改名为 `<path>.timeout-preserved`，原路径不再存在。
+        // Preservation: the main file is renamed to
+        // `<path>.timeout-preserved`; the original path no longer exists.
         let preserved = preserve_subagent_history(&history).expect("preserve should succeed");
         assert_eq!(preserved, preserved_subagent_history_path(&history));
         assert!(!history.exists(), "original history must be renamed away");
@@ -785,10 +820,11 @@ mod tests {
             "preserved path should carry the .timeout-preserved suffix"
         );
 
-        // 幂等：再次调用（原路径已不存在）返回 None，不报错。
+        // Idempotent: calling again (the original path no longer exists)
+        // returns None without error.
         assert!(preserve_subagent_history(&history).is_none());
 
-        // 文件不存在时返回 None。
+        // Returns None when the file does not exist.
         assert!(preserve_subagent_history(&dir.join("missing.jsonl")).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);

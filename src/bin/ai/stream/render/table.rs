@@ -599,6 +599,7 @@ pub(super) fn render_table_header(
         .collect::<Vec<_>>();
     let header_height = header_lines.iter().map(|c| c.len()).max().unwrap_or(1);
 
+    let base = format!("\x1b[1m{}", super::MARKDOWN_HEADING);
     let mut out = String::new();
     for line_idx in 0..header_height {
         out.push_str(indent);
@@ -613,10 +614,9 @@ pub(super) fn render_table_header(
                 cell_line,
                 *width,
                 align.get(i).copied().unwrap_or(TableAlign::Left),
-                "",
+                &base,
             );
             out.push(' ');
-            out.push_str("\x1b[1m\x1b[36m");
             out.push_str(&padded);
             out.push_str("\x1b[0m");
             out.push(' ');
@@ -659,7 +659,7 @@ pub(super) fn render_table_row(
                 cell_line,
                 *width,
                 align.get(i).copied().unwrap_or(TableAlign::Left),
-                "",
+                super::MARKDOWN_BODY,
             );
             out.push(' ');
             out.push_str(&padded);
@@ -712,6 +712,22 @@ fn raw_cols() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_cells_use_prose_palette_and_restore_headers_after_inline_code() {
+        let widths = [14];
+        let header = render_table_header("", &["A `code` tail".into()], &[], &widths);
+        let base = format!("\x1b[1m{}", super::super::MARKDOWN_HEADING);
+        assert!(header.contains(&format!("{base}A ")));
+        assert!(header.contains(&format!("\x1b[0m{base} tail")));
+        assert!(!header.contains("\x1b[36m"));
+        assert_eq!(strip_ansi_codes(&header), "│ A code tail    │\n");
+
+        let row = render_table_row("", &["正文 `value`".into()], &[], &widths);
+        assert!(row.contains(&format!("{}正文 ", super::super::MARKDOWN_BODY)));
+        assert!(row.contains(super::super::MARKDOWN_CODE_FG));
+        assert_eq!(strip_ansi_codes(&row), "│ 正文 value     │\n");
+    }
     use crate::ai::stream::render::inline::visible_width;
     use crate::ai::test_support::ENV_LOCK;
 

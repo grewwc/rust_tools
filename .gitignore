@@ -18,3 +18,5 @@ history.sessions/
 history.sqlite
 history.sqlite-*
 .tmp*
+# Generated Python bytecode for repository scripts.
+/scripts/__pycache__/

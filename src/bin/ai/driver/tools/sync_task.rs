@@ -151,15 +151,39 @@ fn suppress_subagent_terminal_output(wrapped: BoxedSubagentFuture) -> BoxedSubag
 }
 
 /// Runs a synchronous sub-agent requested by the model through the `task` tool. The sub-agent gets
-/// a pre-timeout wrap-up request within the existing 10-minute hard limit, so it can stop expanding
-/// the investigation and return useful partial conclusions instead of being killed mid-step.
+/// a pre-timeout wrap-up request before the hard limit, so it can stop expanding the investigation
+/// and return useful partial conclusions instead of being killed mid-step. The default budget is
+/// 10 minutes; the `audit` agent gets an extended 15-minute budget (see
+/// `sync_task_timeouts_for_agent`).
 pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
+    let (hard_timeout, wrap_up_lead_time) = sync_task_timeouts_for_agent(args);
     execute_sync_task_with_pre_timeout_wrap_up(
         tool_call_id,
         args,
-        SYNC_TASK_HARD_TIMEOUT,
-        Some(SYNC_TASK_WRAP_UP_LEAD_TIME),
+        hard_timeout,
+        wrap_up_lead_time,
     )
+}
+
+/// Sync-task budget by requested agent. The audit agent carries the heaviest evidence contract
+/// (per-finding falsification checks and three evidence arrays sourced from in-turn `read_file`s),
+/// so a cold-starting subagent often cannot finish a complete report within the default 10-minute
+/// sync budget. Give `audit` the same extended budget as the explicit `/audit` command (shared
+/// constants in `driver/commands/audit.rs`); every other agent keeps the default. `audit-fast`
+/// also keeps the default: its 8-minute `/audit --fast` budget is calibrated for that command's
+/// pinned session-model + high-thinking configuration, which model-initiated `task` calls do not
+/// apply.
+fn sync_task_timeouts_for_agent(args: &Value) -> (Duration, Option<Duration>) {
+    // Mirror `prepare_subagent_task`'s trim and `select_subagent`'s ASCII
+    // case-insensitive lookup so `"Audit"` / `"audit "` cannot slip past the
+    // extended-budget match while still resolving to the audit agent.
+    match args.get("agent").and_then(|v| v.as_str()).map(str::trim) {
+        Some(agent) if agent.eq_ignore_ascii_case("audit") => (
+            crate::ai::driver::commands::audit::AUDIT_SUBAGENT_HARD_TIMEOUT,
+            Some(crate::ai::driver::commands::audit::AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME),
+        ),
+        _ => (SYNC_TASK_HARD_TIMEOUT, Some(SYNC_TASK_WRAP_UP_LEAD_TIME)),
+    }
 }
 
 /// Internal synchronous-task entry point with caller-selected timeout and wrap-up policy. These
@@ -1038,6 +1062,40 @@ mod tests {
         assert_eq!(
             SYNC_TASK_HARD_TIMEOUT - SYNC_TASK_WRAP_UP_LEAD_TIME,
             Duration::from_secs(7 * 60)
+        );
+    }
+
+    #[test]
+    fn audit_agent_gets_extended_sync_budget_others_keep_default() {
+        let default = (SYNC_TASK_HARD_TIMEOUT, Some(SYNC_TASK_WRAP_UP_LEAD_TIME));
+        assert_eq!(sync_task_timeouts_for_agent(&serde_json::json!({})), default);
+        assert_eq!(
+            sync_task_timeouts_for_agent(&serde_json::json!({ "agent": "build" })),
+            default
+        );
+        // audit-fast's 8-minute budget is calibrated for `/audit --fast`'s pinned
+        // configuration; model-initiated calls keep the (larger) default budget.
+        assert_eq!(
+            sync_task_timeouts_for_agent(&serde_json::json!({ "agent": "audit-fast" })),
+            default
+        );
+        assert_eq!(
+            sync_task_timeouts_for_agent(&serde_json::json!({ "agent": "audit" })),
+            (
+                crate::ai::driver::commands::audit::AUDIT_SUBAGENT_HARD_TIMEOUT,
+                Some(
+                    crate::ai::driver::commands::audit::AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME
+                )
+            )
+        );
+        assert_eq!(
+            sync_task_timeouts_for_agent(&serde_json::json!({ "agent": "Audit " })),
+            (
+                crate::ai::driver::commands::audit::AUDIT_SUBAGENT_HARD_TIMEOUT,
+                Some(
+                    crate::ai::driver::commands::audit::AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME
+                )
+            )
         );
     }
 

@@ -446,10 +446,14 @@ pub(crate) fn last_assistant_conclusion_text(app: &App) -> Result<Option<String>
     }))
 }
 
-/// `/history last`：完整回放最后一条 assistant 结论消息，并走终端 markdown 渲染。
+/// `/history last`: replay the last assistant conclusion message fully,
+/// rendered through the terminal markdown renderer.
 fn render_last_history_message(app: &App) -> Result<(), Box<dyn Error>> {
     match last_assistant_conclusion_text(app)? {
         Some(text) => {
+            // Same display-only post-processing as the live turn path, so a
+            // replay renders exactly what the turn painted.
+            let text = super::turn_runtime::postprocess_terminal_text(text);
             crate::ai::stream::render_markdown_block(&text)?;
             Ok(())
         }

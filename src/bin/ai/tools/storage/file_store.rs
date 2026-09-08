@@ -3,7 +3,20 @@ use std::path::{Path, PathBuf};
 
 use crate::ai::errors::AiError;
 use crate::ai::tools::storage::temp_registry;
-use aios_kernel::primitives::VfsError;
+use aios_kernel::primitives::{VfsError, VfsReadRange, VfsStat};
+
+/// Targets larger than this are not fully read for the mutation-log pre-change snapshot. Reading
+/// (and later diffing) a multi-hundred-MB file while holding the shared kernel lock would stall
+/// every other tenant for the whole file, for little audit value; the write entry is still
+/// recorded with explicit prior existence, even when the pre-write content is unavailable.
+const SNAPSHOT_FULL_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Shared wording for compare-and-swap failures (write/delete when the file changed since the
+/// caller's snapshot). The kernel returns the identical literal from
+/// `local/vfs.rs` (`FILE_CHANGED_MSG`) so kernel-bound and unbound paths surface the same
+/// message; keep the two in sync.
+const FILE_CHANGED_MSG: &str =
+    "[FILE_CHANGED] file changed since it was last read; re-read and rebuild before retrying";
 
 pub(crate) struct FileStore {
     /// Original path as passed by the caller (unresolved), shown in error messages so the model
@@ -99,21 +112,270 @@ impl FileStore {
         })
     }
 
+    /// Query file metadata (size / type). Routed through the kernel when bound so sensitive-path
+    /// enforcement stays on the kernel side; bare `std::fs` otherwise.
+    pub(crate) fn stat(&self) -> Result<VfsStat, AiError> {
+        if let Some(result) = try_vfs_stat(&self.path) {
+            return result.map_err(|e| vfs_to_ai_err(&self.path, e));
+        }
+        let meta = fs::metadata(&self.path).map_err(|e| {
+            AiError::file(self.path.display().to_string(), e.to_string())
+        })?;
+        Ok(VfsStat {
+            size: meta.len(),
+            is_file: meta.is_file(),
+            is_dir: meta.is_dir(),
+        })
+    }
+
+    /// Read at most `max_bytes` from byte `offset`, mirroring the kernel's bounded range read.
+    ///
+    /// Each call holds the shared kernel lock for a single bounded chunk (see the VFS safety note
+    /// in `aios_kernel/src/local/vfs.rs`), so a caller streaming a large file never stalls other
+    /// kernel tenants for the whole file. The tail is trimmed at a UTF-8 character boundary and
+    /// `next_offset` skips past it, exactly like `vfs_read_range`.
+    pub(crate) fn read_range(&self, offset: u64, max_bytes: usize) -> Result<VfsReadRange, AiError> {
+        if let Some(result) = try_vfs_read_range(&self.path, offset, max_bytes) {
+            return result.map_err(|e| vfs_to_ai_err(&self.path, e));
+        }
+        // Same guard as the kernel's `vfs_read_range`: a zero-byte chunk can never advance a paged
+        // caller, so reject it instead of returning (offset, empty content, hit_eof=false).
+        if max_bytes == 0 {
+            return Err(AiError::file(
+                self.path.display().to_string(),
+                "Failed to read file: max_bytes must be at least 1 to make progress".to_string(),
+            ));
+        }
+        // Fallback when the kernel is not bound (unit tests / CLI): reproduce the kernel's bounded
+        // read semantics, including the tail char-boundary trim.
+        let mut file = fs::File::open(&self.path).map_err(|e| {
+            AiError::file(
+                self.path.display().to_string(),
+                format!("Failed to read file: {}", e),
+            )
+        })?;
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(offset)).map_err(|e| {
+            AiError::file(
+                self.path.display().to_string(),
+                format!("Failed to read file: {}", e),
+            )
+        })?;
+        let mut raw = Vec::with_capacity(max_bytes);
+        let read = file
+            .by_ref()
+            .take(max_bytes as u64)
+            .read_to_end(&mut raw)
+            .map_err(|e| {
+                AiError::file(
+                    self.path.display().to_string(),
+                    format!("Failed to read file: {}", e),
+                )
+            })?;
+        // Mirror of the kernel's `vfs_read_range`: a chunk that exactly fills `max_bytes` may still
+        // be at the true end of the file (remaining bytes == max_bytes), so peek one byte past the
+        // chunk to keep `hit_eof` faithful to the "next read would be empty" contract. The probe
+        // runs only on full chunks, never on short (final) reads.
+        let mut probe = [0u8; 1];
+        let probe_read = if read == max_bytes {
+            file.read(&mut probe).map_err(|e| {
+                AiError::file(
+                    self.path.display().to_string(),
+                    format!("Failed to read file: {}", e),
+                )
+            })?
+        } else {
+            0
+        };
+        let reached_eof = read < max_bytes || probe_read == 0;
+        let (content, consumed) = decode_range_utf8(&raw, reached_eof).map_err(|msg| {
+            AiError::file(self.path.display().to_string(), msg)
+        })?;
+        Ok(VfsReadRange {
+            content,
+            next_offset: offset + consumed as u64,
+            hit_eof: reached_eof && consumed as usize == read,
+        })
+    }
+
     pub(crate) fn write_all(&self, content: &str) -> Result<(), AiError> {
-        // Pre-change snapshot (best-effort): used for the before field of the mutation log.
-        // New files / binaries / read failures all yield None and never affect the write itself.
-        let before = self.read_to_string().ok();
-        let result = self.write_all_inner(content);
+        self.write_all_with_before_hint(content, None)
+    }
+
+    /// Like `write_all`, but accepts a caller-supplied snapshot of the pre-write content (e.g. the
+    /// content a patch engine already verified is current).
+    ///
+    /// When `known_before` is `Some`, the write becomes a compare-and-swap (`write_all_cas_inner`):
+    /// the file is re-read and compared to `known_before` in the same kernel-lock hold as the
+    /// write, so another writer using the same kernel cannot interleave. External writers do not
+    /// participate in that lock. When `None`, the
+    /// write proceeds unconditionally (best-effort pre-write snapshot for the log only).
+    pub(crate) fn write_all_with_before_hint(
+        &self,
+        content: &str,
+        known_before: Option<&str>,
+    ) -> Result<(), AiError> {
+        // Snapshot availability and prior existence are separate: an omitted or unreadable
+        // preimage must not make an overwrite look like a newly created file in the audit log.
+        // For targets above SNAPSHOT_FULL_READ_MAX_BYTES the whole-file snapshot read is
+        // skipped: it would hold the shared kernel lock for the whole file, for little audit
+        // value. The write entry itself is still recorded, and the mutation-log diff is bounded
+        // to the first 1 MiB of content by mutation_log::entry_diff, so a large rewrite never
+        // materializes a full-content diff.
+        use crate::ai::tools::storage::mutation_log::BeforeState;
+        let (before, before_state) = match known_before {
+            Some(known) => (Some(known.to_string()), BeforeState::Present),
+            None => match self.stat() {
+                Ok(st) => (
+                    if st.size > SNAPSHOT_FULL_READ_MAX_BYTES {
+                        None
+                    } else {
+                        self.read_to_string().ok()
+                    },
+                    BeforeState::Present,
+                ),
+                Err(_) => {
+                    let state = match fs::symlink_metadata(&self.path) {
+                        Ok(_) => BeforeState::Present,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            BeforeState::Absent
+                        }
+                        Err(_) => BeforeState::Unknown,
+                    };
+                    (None, state)
+                }
+            },
+        };
+        // A caller-supplied snapshot is enforced by compare-and-swap (never trusts the hint);
+        // otherwise the plain write path is used.
+        let result = match known_before {
+            Some(known) => self.write_all_cas_inner(known, content),
+            None => self.write_all_inner(content),
+        };
         if result.is_ok() {
             // Record into the session-level mutation log (best-effort; never affects the write result).
-            crate::ai::tools::storage::mutation_log::record(
+            // On the CAS path success also proves `before` equals the actual pre-write content.
+            crate::ai::tools::storage::mutation_log::record_with_before_state(
                 &self.path,
                 "write",
                 before.as_deref(),
                 Some(content),
+                before_state,
             );
         }
         result
+    }
+
+    /// Create-only write for "Add File" patches: writes `content` only if the target does not
+    /// exist yet. Both paths use OS-level `create_new`, so a concurrent creator's file or symlink
+    /// cannot be overwritten. Content is written after creation; a later I/O failure may leave a
+    /// partial file. This differs from `write_all_with_before_hint(content, None)`,
+    /// where `None` means "before state unknown" and the write proceeds unconditionally; here the
+    /// absence of the file is the enforced precondition. The mutation-log entry records
+    /// `before = None` (a brand-new file).
+    pub(crate) fn write_new_file_if_absent(&self, content: &str) -> Result<(), AiError> {
+        let result = if let Some(vfs_result) =
+            try_vfs_write_if_unchanged(&self.path, None, content)
+        {
+            vfs_result.map_err(|e| vfs_to_ai_err(&self.path, e))
+        } else {
+            // An existence pre-check races with external creators even without a bound kernel.
+            use std::io::Write;
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    AiError::file(
+                        self.path.display().to_string(),
+                        format!("Failed to create directory: {}", e),
+                    )
+                })?;
+            }
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.path)
+                .map_err(|err| {
+                    AiError::file(
+                        self.path.display().to_string(),
+                        if err.kind() == std::io::ErrorKind::AlreadyExists {
+                            FILE_CHANGED_MSG.to_string()
+                        } else {
+                            format!("Failed to create file: {err}")
+                        },
+                    )
+                })?;
+            if let Err(write_err) = file.write_all(content.as_bytes()) {
+                // Mirror the kernel-bound create path: the file was created by this call,
+                // so a failed write can only leave a partial prefix of `content` behind.
+                // Remove it best-effort (only while it is still our own prefix) so the
+                // "absent" precondition is restored; a concurrently replaced file is kept.
+                remove_partial_create_file(&self.path, content);
+                return Err(AiError::file(
+                    self.path.display().to_string(),
+                    format!("Failed to write file: {write_err}"),
+                ));
+            }
+            Ok(())
+        };
+        if result.is_ok() {
+            crate::ai::tools::storage::mutation_log::record(
+                &self.path,
+                "write",
+                None,
+                Some(content),
+            );
+        }
+        result
+    }
+
+    /// Compare-and-swap write used when a caller supplied a `known_before` snapshot: writes
+    /// `content` only if the file still equals `expected`.
+    ///
+    /// Kernel-bound, `vfs_write_if_unchanged` performs check+write under one kernel-lock hold, so
+    /// no in-process VFS operation (read or write from any other agent) can interleave between
+    /// them. Without a kernel the read-compare-write fallback is best-effort. Neither path can
+    /// serialize writes by arbitrary external processes to existing files.
+    fn write_all_cas_inner(&self, expected: &str, content: &str) -> Result<(), AiError> {
+        if let Some(result) = try_vfs_write_if_unchanged(&self.path, Some(expected), content) {
+            return result.map_err(|e| vfs_to_ai_err(&self.path, e));
+        }
+        let current = if self.path.exists() {
+            Some(self.read_to_string()?)
+        } else {
+            None
+        };
+        if current.as_deref() != Some(expected) {
+            return Err(AiError::file(
+                self.path.display().to_string(),
+                FILE_CHANGED_MSG.to_string(),
+            ));
+        }
+        self.write_all_inner(content)
+    }
+
+    /// Compare-and-swap delete: removes the file only if its content still equals `expected`.
+    /// Same atomicity contract as `write_all_cas_inner` (kernel-lock-atomic when bound), so a
+    /// delete detects changes since preparation. External writers do not share the kernel lock.
+    pub(crate) fn remove_file_if_unchanged(&self, expected: &str) -> Result<(), AiError> {
+        if let Some(result) = try_vfs_remove_if_unchanged(&self.path, Some(expected)) {
+            return result.map_err(|e| vfs_to_ai_err(&self.path, e));
+        }
+        let current = if self.path.exists() {
+            Some(self.read_to_string()?)
+        } else {
+            None
+        };
+        if current.as_deref() != Some(expected) {
+            return Err(AiError::file(
+                self.path.display().to_string(),
+                FILE_CHANGED_MSG.to_string(),
+            ));
+        }
+        fs::remove_file(&self.path).map_err(|e| {
+            AiError::file(
+                self.path.display().to_string(),
+                format!("Failed to delete file: {}", e),
+            )
+        })
     }
 
     fn write_all_inner(&self, content: &str) -> Result<(), AiError> {
@@ -162,6 +424,107 @@ fn try_vfs_write(path: &Path, content: &str) -> Option<Result<(), VfsError>> {
     let mut os = os_arc.lock().ok()?;
     let pid = os.current_process_id();
     Some(os.vfs_write_all(pid, path, content))
+}
+
+/// Behavior-identical copy of the kernel's `remove_partial_create_file`
+/// (crates/aios_kernel/src/local/vfs.rs): best-effort cleanup for a `create_new` write
+/// that failed partway through `content`. Removes the file only while its current bytes
+/// are still a strict prefix of `content` (i.e. it can only be our own partial write);
+/// a file replaced by an external writer is left intact. Keep the two in sync.
+fn remove_partial_create_file(path: &Path, content: &str) {
+    let current = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    if !content.as_bytes().starts_with(&current) || current.len() == content.len() {
+        // Either the file is not ours (not a prefix of what we wrote), or the write
+        // actually completed in full (current == content): both cases must be left for
+        // the regular compare-and-swap rollback to decide.
+        return;
+    }
+    let _ = fs::remove_file(path);
+}
+
+fn try_vfs_write_if_unchanged(
+    path: &Path,
+    expected: Option<&str>,
+    content: &str,
+) -> Option<Result<(), VfsError>> {
+    use crate::ai::tools::os_tools::GLOBAL_OS;
+
+    let guard = GLOBAL_OS.lock().ok()?;
+    let os_arc = guard.as_ref()?.clone();
+    drop(guard);
+    let mut os = os_arc.lock().ok()?;
+    let pid = os.current_process_id();
+    Some(os.vfs_write_if_unchanged(pid, path, expected, content))
+}
+
+fn try_vfs_remove_if_unchanged(
+    path: &Path,
+    expected: Option<&str>,
+) -> Option<Result<(), VfsError>> {
+    use crate::ai::tools::os_tools::GLOBAL_OS;
+
+    let guard = GLOBAL_OS.lock().ok()?;
+    let os_arc = guard.as_ref()?.clone();
+    drop(guard);
+    let mut os = os_arc.lock().ok()?;
+    let pid = os.current_process_id();
+    Some(os.vfs_remove_if_unchanged(pid, path, expected))
+}
+
+fn try_vfs_stat(path: &Path) -> Option<Result<VfsStat, VfsError>> {
+    use crate::ai::tools::os_tools::GLOBAL_OS;
+
+    let guard = GLOBAL_OS.lock().ok()?;
+    let os_arc = guard.as_ref()?.clone();
+    drop(guard);
+    let mut os = os_arc.lock().ok()?;
+    Some(os.vfs_stat(path))
+}
+
+fn try_vfs_read_range(
+    path: &Path,
+    offset: u64,
+    max_bytes: usize,
+) -> Option<Result<VfsReadRange, VfsError>> {
+    use crate::ai::tools::os_tools::GLOBAL_OS;
+
+    let guard = GLOBAL_OS.lock().ok()?;
+    let os_arc = guard.as_ref()?.clone();
+    drop(guard);
+    let mut os = os_arc.lock().ok()?;
+    let pid = os.current_process_id();
+    Some(os.vfs_read_range(pid, path, offset, max_bytes))
+}
+
+/// Decodes a bounded read buffer as UTF-8 for the unbound `read_range` fallback. Kept
+/// behavior-identical to the kernel copy in `aios_kernel/src/local/vfs.rs` so kernel-bound and
+/// unbound reads agree; keep the two in sync (see the kernel doc comment for the semantics).
+/// In particular, a chunk that falls entirely inside a single multibyte character (file continues,
+/// no valid prefix) is an error telling the caller to increase `max_bytes`, never a non-advancing
+/// `("", 0)` result.
+fn decode_range_utf8(bytes: &[u8], reached_eof: bool) -> Result<(String, usize), String> {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => Ok((s.to_string(), bytes.len())),
+        Err(e) if e.error_len().is_some() || reached_eof => {
+            Err("Failed to read file: stream did not contain valid UTF-8".to_string())
+        }
+        Err(e) => {
+            let valid = e.valid_up_to();
+            if valid == 0 {
+                return Err(
+                    "Failed to read file: read chunk is too small to contain a complete UTF-8 \
+                     character; increase max_bytes to make progress"
+                        .to_string(),
+                );
+            }
+            let s = std::str::from_utf8(&bytes[..valid])
+                .expect("prefix up to the first UTF-8 error is always valid");
+            Ok((s.to_string(), valid))
+        }
+    }
 }
 
 fn is_sensitive_fs_path(path: &Path) -> bool {
@@ -441,7 +804,8 @@ mod tests {
     use super::{
         FileStore, blocked_overflow_read_reason_for_assets, is_read_file_overflow_artifact,
         is_sensitive_fs_path, is_session_overflow_asset_path, normalize_lexical,
-        overflow_artifact_tool_name, path_within_allowed_roots, path_within_roots, temp_registry,
+        overflow_artifact_tool_name, path_within_allowed_roots, path_within_roots, remove_partial_create_file,
+        temp_registry,
     };
     use crate::ai::test_support::ENV_LOCK;
     use std::path::{Path, PathBuf};
@@ -727,6 +1091,62 @@ mod tests {
     }
 
     #[test]
+    fn read_range_tiny_chunk_errors_instead_of_stalling() {
+        // Covers the unbound fallback path (kernel not bound in unit tests): a chunk entirely
+        // inside the leading multibyte char, or max_bytes == 0, must error with an actionable
+        // message instead of returning (offset, empty content, hit_eof=false).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("file-store-range-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("tiny.txt");
+        // "中" (3 bytes) + "文" (3 bytes).
+        std::fs::write(&p, "中文").unwrap();
+        let store = FileStore::new(p.clone());
+
+        let err = store.read_range(0, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("too small") && err.to_string().contains("max_bytes"),
+            "unexpected: {err}"
+        );
+        let err = store.read_range(0, 0).unwrap_err();
+        assert!(err.to_string().contains("max_bytes"), "unexpected: {err}");
+
+        // Normal reads are unaffected: a chunk containing the whole char resumes past it.
+        let r = store.read_range(0, 100).unwrap();
+        assert_eq!(r.content, "中文");
+        assert_eq!(r.next_offset, 6);
+        assert!(r.hit_eof);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_range_exact_fill_reports_hit_eof() {
+        // Covers the unbound fallback path (kernel not bound in unit tests): a chunk whose
+        // max_bytes exactly equals the remaining bytes must report hit_eof=true (contract: the
+        // next read at next_offset would be empty) instead of forcing a redundant final read.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("file-store-range-exact-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("exact.txt");
+        std::fs::write(&p, "0123456789").unwrap();
+        let store = FileStore::new(p.clone());
+
+        let r = store.read_range(0, 10).unwrap();
+        assert_eq!(r.content, "0123456789");
+        assert_eq!(r.next_offset, 10);
+        assert!(r.hit_eof, "exact fill at EOF must report hit_eof");
+
+        let r2 = store.read_range(0, 5).unwrap();
+        assert!(!r2.hit_eof);
+        let r3 = store.read_range(r2.next_offset, 100).unwrap();
+        assert_eq!(r3.content, "56789");
+        assert!(r3.hit_eof);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn session_temp_dir_is_always_writable() {
         // The session temp dir (returned by runtime_ctx::temp_dir()) must remain writable even when it is not
         // under effective_cwd: the model may discover the temp path in earlier tool output
@@ -813,5 +1233,155 @@ mod tests {
         crate::commonw::configw::refresh();
         let _ = std::fs::remove_file(temp_root.join("empty.configw"));
         let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn write_all_with_before_hint_stale_hint_aborts_and_preserves_file() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "file-store-cas-write-{}",
+            uuid::Uuid::new_v4()
+        ));
+        // The kernel is not bound in unit tests, so this exercises the read-compare-write
+        // fallback: a stale snapshot must abort without touching the file, then succeed once the
+        // snapshot matches the on-disk content.
+        std::fs::write(&path, "current-on-disk").unwrap();
+        let store = FileStore::new(path.clone());
+        let err = store
+            .write_all_with_before_hint("next", Some("stale-snapshot"))
+            .expect_err("stale hint must abort the write");
+        assert!(err.to_string().contains("[FILE_CHANGED]"), "err: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "current-on-disk",
+            "aborted CAS must not modify the file"
+        );
+        store
+            .write_all_with_before_hint("next", Some("current-on-disk"))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "next");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_file_if_unchanged_stale_hint_aborts_and_preserves_file() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "file-store-cas-del-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "current-on-disk").unwrap();
+        let store = FileStore::new(path.clone());
+        let err = store
+            .remove_file_if_unchanged("stale-snapshot")
+            .expect_err("stale hint must abort the delete");
+        assert!(err.to_string().contains("[FILE_CHANGED]"), "err: {err}");
+        assert!(path.exists(), "aborted CAS delete must keep the file");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "current-on-disk"
+        );
+        store
+            .remove_file_if_unchanged("current-on-disk")
+            .unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn write_new_file_if_absent_requires_absent_target() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "file-store-create-only-{}",
+            uuid::Uuid::new_v4()
+        ));
+        // Absent target: the create-only write succeeds.
+        FileStore::new(path.clone())
+            .write_new_file_if_absent("created\n")
+            .expect("absent target must be created");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "created\n");
+
+        // Target created concurrently since prepare: the write must abort and preserve it,
+        // instead of the unconditional-write behavior of write_all_with_before_hint(None).
+        std::fs::write(&path, "concurrent-create\n").unwrap();
+        let err = FileStore::new(path.clone())
+            .write_new_file_if_absent("overwrite\n")
+            .expect_err("existing target must abort the create-only write");
+        assert!(err.to_string().contains("[FILE_CHANGED]"), "err: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "concurrent-create\n",
+            "aborted create-only write must preserve the concurrent file"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_new_file_if_absent_concurrent_creators_have_one_winner() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = std::env::temp_dir().join(format!("file-store-create-race-{}", uuid::Uuid::new_v4()));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8).map(|id| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let content = format!("creator-{id}\n");
+                barrier.wait();
+                let result = FileStore::new(path).write_new_file_if_absent(&content);
+                (content, result)
+            })
+        }).collect();
+        let results: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        let winners: Vec<_> = results.iter().filter(|(_, result)| result.is_ok()).collect();
+        assert_eq!(winners.len(), 1, "create-only writes must have exactly one winner");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), winners[0].0);
+        for (_, result) in &results {
+            if let Err(err) = result {
+                assert!(err.to_string().contains("[FILE_CHANGED]"), "{err}");
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_new_file_if_absent_does_not_follow_dangling_symlink() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let dir = std::env::temp_dir().join(format!("file-store-create-link-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("link.txt");
+        let target = dir.join("missing.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = FileStore::new(link.clone()).write_new_file_if_absent("new\n").unwrap_err();
+        assert!(err.to_string().contains("[FILE_CHANGED]"), "{err}");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(!target.exists(), "create-only write must not create the symlink's target");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_partial_create_file_cleans_only_own_partial_write() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let base = std::env::temp_dir().join(format!("file-store-partial-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Own partial write (strict prefix) -> removed.
+        let partial = base.join("partial.txt");
+        std::fs::write(&partial, "hello world, prefix").unwrap();
+        remove_partial_create_file(&partial, "hello world, prefix and more");
+        assert!(!partial.exists(), "own partial write must be cleaned up");
+
+        // Completed write (content equal to intended) -> left for CAS rollback.
+        let full = base.join("full.txt");
+        std::fs::write(&full, "exact match").unwrap();
+        remove_partial_create_file(&full, "exact match");
+        assert!(full.exists(), "completed write must be left for CAS rollback");
+
+        // Foreign content -> preserved, never deleted.
+        let foreign = base.join("foreign.txt");
+        std::fs::write(&foreign, "somebody else's bytes").unwrap();
+        remove_partial_create_file(&foreign, "our intended content");
+        assert!(foreign.exists(), "foreign file must not be deleted");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

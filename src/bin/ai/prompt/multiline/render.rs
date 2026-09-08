@@ -508,20 +508,28 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
 
     if let Some(msg) = status_msg {
         let c2 = chunks[4];
-        if c2.height >= 1 && c2.width > 2 {
-            let status_width = (c2.width - 2) as usize;
-            let status_text = truncate_with_ellipsis(msg, status_width);
-            let status_para = Paragraph::new(Line::from(Span::styled(
-                status_text,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .alignment(Alignment::Center);
+        if c2.height >= 1 && c2.width > 0 {
+            let clear_area = Rect::new(c2.x, c2.y, c2.width, 1);
+            f.render_widget(Clear, clear_area);
 
-            let status_area = Rect::new(c2.x + 1, c2.y, c2.width - 2, 1);
-            f.render_widget(Clear, status_area);
-            f.render_widget(status_para, status_area);
+            let status_area = if c2.width > 2 {
+                Rect::new(c2.x + 1, c2.y, c2.width - 2, 1)
+            } else {
+                clear_area
+            };
+            if status_area.width > 0 {
+                let status_width = status_area.width as usize;
+                let status_text = truncate_with_ellipsis(msg, status_width);
+                let status_para = Paragraph::new(Line::from(Span::styled(
+                    status_text,
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )))
+                .alignment(Alignment::Center);
+
+                f.render_widget(status_para, status_area);
+            }
         }
     }
 
@@ -918,6 +926,45 @@ mod tests {
                 "viewport row {y} still contains a decorative divider: {row:?}"
             );
         }
+    }
+
+    #[test]
+    fn status_message_clears_entire_help_row() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .unwrap();
+        let mut textarea = TextArea::from(vec!["/model gpt-6-astra".to_string()]);
+        let mut viewport_area = Rect::ZERO;
+
+        terminal
+            .draw(|f| {
+                viewport_area = f.area();
+                render_multiline_popup(
+                    f,
+                    &mut textarea,
+                    Some("已补全为 gpt-6-astra"),
+                    None,
+                    "deepseek-v4-flash-volcano",
+                    "max",
+                    Some("将kernel.rs中文注释改为英文"),
+                );
+            })
+            .unwrap();
+
+        let rendered = (viewport_area.y..viewport_area.bottom())
+            .map(|y| buffer_row(terminal.backend(), y, viewport_area.x, viewport_area.width))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("gpt-6-astra"));
+        assert!(
+            !rendered.contains('换'),
+            "status overlay left stale help text behind: {rendered:?}"
+        );
     }
 
     #[test]
