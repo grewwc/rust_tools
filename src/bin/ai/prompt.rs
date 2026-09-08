@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fs,
     io::{self, BufRead},
     path::{Path, PathBuf},
@@ -83,6 +84,11 @@ pub(super) struct PromptEditor {
     /// One-shot notification after the first frame is drawn. Startup background
     /// initialization can use it to avoid terminal first-screen rendering.
     first_render_notifier: Option<Sender<()>>,
+    /// Once a DSR query times out, later untagged replies cannot be matched to
+    /// new queries. Keep subsequent prompts on a query-free editing screen.
+    cursor_position_queries_disabled: bool,
+    /// Preserve non-CPR lookahead even when Escape submits the current prompt.
+    pending_terminal_events: VecDeque<crossterm::event::Event>,
 }
 
 impl Drop for PromptEditor {
@@ -127,6 +133,8 @@ impl PromptEditor {
             session_title_update_subscription,
             session_title_updates: Mutex::new(session_title_updates),
             first_render_notifier: None,
+            cursor_position_queries_disabled: false,
+            pending_terminal_events: VecDeque::new(),
         }
     }
 
@@ -208,18 +216,9 @@ impl PromptEditor {
         if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
             return self.read_multi_line_no_tty();
         }
-        match self.read_multi_line_tui() {
-            Ok(input) => Ok(input),
-            Err(err) if Self::is_cursor_position_timeout(&err) => {
-                // TUI 初始化失败（如 ratatui 内部的光标位置查询 \x1b[6n 超时）后降级到
-                // 无 TUI 读取。迟到的 CPR 应答（如 \x1b[17;1R）可能已残留在 stdin 输入
-                // 缓冲：它既会在 cooked 模式下被回显，也会污染兜底读取的首行内容。
-                // 先丢弃这些残留字节再读取。
-                crate::ai::driver::input::clear_stdin_buffer();
-                self.read_multi_line_no_tty()
-            }
-            Err(err) => Err(err),
-        }
+        // A cursor-query timeout is handled inside the raw-mode editor. Never
+        // flush typeahead or switch to cooked input while a reply is in flight.
+        self.read_multi_line_tui()
     }
 
     fn is_cursor_position_timeout(err: &io::Error) -> bool {
@@ -238,13 +237,13 @@ impl PromptEditor {
         let stdin = io::stdin();
         let mut lines = Vec::new();
         if stdin.is_terminal() {
-            // 从 TUI 降级到这里的场景下（如光标位置查询超时），stdin 仍是交互式 tty：
-            // EOF 永远不会到来，按行读到 EOF 会永久卡住、无法进入下一轮输入。读一行即返回。
+            // With redirected stdout, stdin may still be a terminal. Read one
+            // line rather than waiting for EOF from an interactive user.
             if let Some(line) = stdin.lock().lines().next() {
                 lines.push(line?);
             }
         } else {
-            // 管道/重定向输入：按行消费全部内容直到 EOF。
+            // Consume all piped or redirected input through EOF.
             for line in stdin.lock().lines() {
                 lines.push(line?);
             }
@@ -290,6 +289,10 @@ impl PromptEditor {
 #[cfg(test)]
 #[path = "prompt_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "prompt/terminal_input_tests.rs"]
+mod terminal_input_tests;
 
 pub(super) fn trim_trailing_newline(mut line: String) -> String {
     while matches!(line.chars().last(), Some('\n' | '\r')) {

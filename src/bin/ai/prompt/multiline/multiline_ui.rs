@@ -1,11 +1,20 @@
-use std::io;
-use std::time::Duration;
+use std::{
+    collections::VecDeque,
+    io,
+    time::{Duration, Instant},
+};
 
 use crossterm::{
     cursor,
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
-    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size as terminal_size},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode, size as terminal_size,
+    },
 };
 use ratatui::{
     Terminal,
@@ -96,6 +105,173 @@ fn viewport_height_with_completion(
 }
 
 type MultilineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
+/// Crossterm emits a key if ESC arrives in its own read. Only after a query
+/// timeout, briefly defer that ambiguous key so a fragmented CPR cannot submit
+/// the textarea. A standalone Escape still works after this bounded grace;
+/// fragments arriving later than the grace cannot be distinguished from typing.
+const CPR_ESCAPE_GRACE: Duration = Duration::from_millis(250);
+
+fn read_prompt_event(
+    pending: &mut VecDeque<Event>,
+    guard_reply_fragments: bool,
+    mut read: impl FnMut(Duration) -> io::Result<Option<Event>>,
+) -> io::Result<Option<Event>> {
+    if let Some(event) = pending.pop_front() {
+        return Ok(Some(event));
+    }
+    let Some(first) = read(Duration::from_millis(250))? else {
+        return Ok(None);
+    };
+    if !guard_reply_fragments
+        || !matches!(&first, Event::Key(key) if key.code == KeyCode::Esc
+            && key.modifiers.is_empty() && key.kind == KeyEventKind::Press)
+    {
+        return Ok(Some(first));
+    }
+
+    let deadline = Instant::now() + CPR_ESCAPE_GRACE;
+    let mut tail = String::new();
+    let mut lookahead = VecDeque::new();
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        let Some(event) = read(remaining)? else { break };
+        lookahead.push_back(event.clone());
+        if matches!(event, Event::Resize(_, _)) {
+            continue;
+        }
+        let Event::Key(key) = event else { break };
+        let KeyCode::Char(ch) = key.code else { break };
+        if key.kind != KeyEventKind::Press
+            || !(key.modifiers.is_empty() || (ch == 'R' && key.modifiers == KeyModifiers::SHIFT))
+        {
+            break;
+        }
+        tail.push(ch);
+        match cursor_reply_tail(&tail) {
+            Some(true) => {
+                // Resize notifications are real input, not part of the reply.
+                pending.extend(
+                    lookahead
+                        .into_iter()
+                        .filter(|event| matches!(event, Event::Resize(_, _))),
+                );
+                return Ok(None);
+            }
+            Some(false) => {}
+            None => break,
+        }
+    }
+    // Replay every event on a mismatch or timeout, including across submissions.
+    pending.extend(lookahead);
+    Ok(Some(first))
+}
+
+/// Some(false) is a CPR prefix, Some(true) a complete reply, None ordinary input.
+fn cursor_reply_tail(tail: &str) -> Option<bool> {
+    let tail = tail.strip_prefix('[')?;
+    let (coordinates, complete) = tail.strip_suffix('R').map_or((tail, false), |s| (s, true));
+    let mut parts = coordinates.split(';');
+    let row = parts.next()?;
+    let column = parts.next();
+    let digits = |s: &str| s.len() <= 5 && s.bytes().all(|byte| byte.is_ascii_digit());
+    if parts.next().is_some() || !digits(row) || column.is_some_and(|s| !digits(s)) {
+        return None;
+    }
+    if column.is_some() && row.is_empty() {
+        return None;
+    }
+    if complete && (row.is_empty() || column.is_none_or(str::is_empty)) {
+        return None;
+    }
+    Some(complete)
+}
+
+/// A timed-out DSR reply must remain inside the event parser, not cooked stdin.
+/// The alternate screen provides known coordinates without another query and
+/// keeps the main transcript intact. Query disabling survives prompt sessions:
+/// a late reply has no request id and must not anchor a later inline viewport.
+#[derive(Default)]
+struct PromptScreen {
+    queries_disabled: bool,
+    alternate: bool,
+}
+
+impl PromptScreen {
+    fn prepare_viewport(
+        &mut self,
+        backend: &mut CrosstermBackend<io::Stdout>,
+        terminal_size: Size,
+        requested_height: u16,
+        cursor_offset_row: u16,
+        mode: ViewportRebuildMode,
+        clear_existing_viewport: bool,
+        previous_top_row: Option<u16>,
+    ) -> io::Result<Rect> {
+        if !self.queries_disabled {
+            match prepare_fixed_viewport(
+                backend,
+                terminal_size,
+                requested_height,
+                cursor_offset_row,
+                mode,
+                clear_existing_viewport,
+            ) {
+                Ok(area) => return Ok(area),
+                Err(err) if PromptEditor::is_cursor_position_timeout(&err) => {
+                    self.queries_disabled = true;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if !self.alternate {
+            // The inline box is already drawn on the main screen when a
+            // mid-editing rebuild falls back here. The emulator saves the main
+            // screen on EnterAlternateScreen and restores it verbatim on
+            // LeaveAlternateScreen at exit, so the old box (including the
+            // drawn caret cell) would come back as a permanent ghost over the
+            // transcript. Clear it first: transcript rows sit ABOVE the box
+            // top, so this touches nothing but the box. (If a width reflow
+            // has already moved the box down, a few re-wrapped transcript
+            // tail rows may also be blanked; a DSR query is the only way to
+            // tell, and it just timed out.)
+            if let Some(top_row) = previous_top_row {
+                backend.set_cursor_position(Position::new(0, top_row))?;
+                backend.clear_region(BackendClearType::AfterCursor)?;
+                backend.flush()?;
+            }
+            // Set this before writing so cleanup also runs on a partial write.
+            self.alternate = true;
+            execute!(io::stdout(), EnterAlternateScreen)?;
+        }
+        prepare_query_free_viewport(backend, terminal_size, requested_height)
+    }
+}
+
+impl Drop for PromptScreen {
+    fn drop(&mut self) {
+        if self.alternate {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
+    }
+}
+
+/// Only used on the alternate screen, where clearing cannot erase transcript.
+fn prepare_query_free_viewport<B: Backend>(
+    backend: &mut B,
+    terminal_size: Size,
+    requested_height: u16,
+) -> Result<Rect, B::Error> {
+    let area = Rect::new(
+        0,
+        0,
+        terminal_size.width,
+        requested_height.max(1).min(terminal_size.height.max(1)),
+    );
+    backend.set_cursor_position(Position::new(0, 0))?;
+    backend.clear_region(BackendClearType::All)?;
+    backend.flush()?;
+    Ok(area)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewportRebuildMode {
@@ -210,16 +386,17 @@ fn parked_anchor_offset(last_drawn_area: Option<Rect>, new_height: u16) -> u16 {
 /// size notifications can oscillate, turning those reservations into a growing
 /// blank gap. A fixed viewport avoids that automatic behavior; this bootstrap
 /// scrolls only the rows that are actually missing at the bottom of the screen.
-fn build_fixed_terminal(height: u16) -> io::Result<MultilineTerminal> {
+fn build_fixed_terminal(height: u16, screen: &mut PromptScreen) -> io::Result<MultilineTerminal> {
     let mut backend = CrosstermBackend::new(io::stdout());
     let terminal_size = backend.size()?;
-    let area = prepare_fixed_viewport(
+    let area = screen.prepare_viewport(
         &mut backend,
         terminal_size,
         height,
         0,
         ViewportRebuildMode::ReserveMissingRows,
         false,
+        None,
     )?;
     terminal_with_fixed_viewport(backend, area).map_err(|err| io::Error::other(err.to_string()))
 }
@@ -251,6 +428,7 @@ fn clear_row_range<B: Backend>(
 /// clearing the previous extent there would erase re-wrapped transcript.
 fn rebuild_fixed_viewport(
     terminal: &mut MultilineTerminal,
+    screen: &mut PromptScreen,
     terminal_size: Size,
     new_height: u16,
     cursor_offset_row: u16,
@@ -258,25 +436,25 @@ fn rebuild_fixed_viewport(
     previous_top_row: Option<u16>,
     clear_previous_extent: bool,
 ) -> io::Result<Rect> {
-    let area = prepare_fixed_viewport(
+    let area = screen.prepare_viewport(
         terminal.backend_mut(),
         terminal_size,
         new_height,
         cursor_offset_row,
         mode,
         true,
+        previous_top_row,
     )?;
     *terminal = terminal_with_fixed_viewport(CrosstermBackend::new(io::stdout()), area)
         .map_err(|err| io::Error::other(err.to_string()))?;
     // A height change keeps the box top fixed, so a SHRINKING box leaves its
     // former bottom rows on screen as ghosts. Blank exactly that remainder;
     // rows above the box hold transcript and must never be touched.
-    if clear_previous_extent {
+    if clear_previous_extent && !screen.alternate {
         if let Some(previous_top) = previous_top_row {
             // The parked anchor sits on the previous box's bottom row, so its
             // offset identifies that box's height.
-            let previous_bottom =
-                previous_top.saturating_add(cursor_offset_row.saturating_add(1));
+            let previous_bottom = previous_top.saturating_add(cursor_offset_row.saturating_add(1));
             let new_bottom = area.y.saturating_add(area.height);
             clear_row_range(terminal.backend_mut(), new_bottom, previous_bottom)?;
         }
@@ -292,6 +470,7 @@ fn rebuild_fixed_viewport(
 /// the old fixed coordinates over the reflowed terminal content.
 fn rebuild_after_terminal_reflow(
     terminal: &mut MultilineTerminal,
+    screen: &mut PromptScreen,
     base_viewport_height: u16,
     fitted_completion_items: Option<usize>,
     last_drawn_area: Option<Rect>,
@@ -304,6 +483,7 @@ fn rebuild_after_terminal_reflow(
     );
     let rebuilt_area = rebuild_fixed_viewport(
         terminal,
+        screen,
         terminal_size,
         requested_height,
         parked_anchor_offset(last_drawn_area, requested_height),
@@ -331,7 +511,9 @@ fn park_reflow_anchor<B: Backend>(
 ) -> Result<(), B::Error> {
     let anchor = Position::new(
         viewport_area.x,
-        viewport_area.y.saturating_add(viewport_area.height.saturating_sub(1)),
+        viewport_area
+            .y
+            .saturating_add(viewport_area.height.saturating_sub(1)),
     );
     // The hardware cursor stays hidden: a hidden cursor still tracks its
     // logical line through reflow, so DSR queries keep returning a valid
@@ -435,10 +617,8 @@ impl PromptEditor {
         // termios: the foreground flag makes it stop poll/read, restore termios
         // and release its stdin lease, and only then does this function return.
         // Without the handshake, the cursor-position query (\x1b[6n) below races
-        // the listener for stdin, its DSR response gets consumed, the query
-        // blocks until timeout, and the whole input box falls back to a
-        // prompt-less line read — the terminal appears frozen after the final
-        // answer with no input prompt.
+        // the listener for stdin: a stolen response would force an unnecessary
+        // timeout and a switch to the query-free editing screen.
         let _stdin_owner = acquire_foreground_stdin();
         enable_raw_mode()?;
 
@@ -471,9 +651,16 @@ impl PromptEditor {
             .map(|(_, h)| multiline_viewport_height(h, self.pending_prefill.as_deref()))
             .unwrap_or(EMPTY_VIEWPORT_HEIGHT);
 
-        let mut terminal = match build_fixed_terminal(base_viewport_height) {
+        let mut screen = PromptScreen {
+            queries_disabled: self.cursor_position_queries_disabled,
+            ..PromptScreen::default()
+        };
+        let mut terminal = match build_fixed_terminal(base_viewport_height, &mut screen) {
             Ok(terminal) => terminal,
             Err(err) => {
+                self.cursor_position_queries_disabled = screen.queries_disabled;
+                drop(screen);
+                let _ = execute!(io::stdout(), DisableBracketedPaste, cursor::Show);
                 let _ = disable_raw_mode();
                 return Err(err);
             }
@@ -537,6 +724,7 @@ impl PromptEditor {
                         );
                         let rebuilt_area = rebuild_fixed_viewport(
                             &mut terminal,
+                            &mut screen,
                             terminal_size,
                             new_height,
                             parked_anchor_offset(last_drawn_area, new_height),
@@ -560,7 +748,8 @@ impl PromptEditor {
                     // Content rows that fit = viewport height minus the
                     // model/help chrome rows (the left-edge marker bar occupies
                     // a column, not a row).
-                    let textarea_capacity = base_viewport_height.saturating_sub(VIEWPORT_CHROME_LINES);
+                    let textarea_capacity =
+                        base_viewport_height.saturating_sub(VIEWPORT_CHROME_LINES);
                     if content_lines > textarea_capacity
                         && base_viewport_height < MAX_VIEWPORT_HEIGHT
                     {
@@ -573,6 +762,7 @@ impl PromptEditor {
                         if new_height > base_viewport_height {
                             let rebuilt_area = rebuild_fixed_viewport(
                                 &mut terminal,
+                                &mut screen,
                                 terminal_size,
                                 new_height,
                                 parked_anchor_offset(last_drawn_area, new_height),
@@ -588,12 +778,11 @@ impl PromptEditor {
                         }
                     }
 
-                    if take_standalone_resize_rebuild(
-                        &mut pending_resize_rebuild,
-                        viewport_rebuilt,
-                    ) {
+                    if take_standalone_resize_rebuild(&mut pending_resize_rebuild, viewport_rebuilt)
+                    {
                         let rebuilt_area = rebuild_after_terminal_reflow(
                             &mut terminal,
+                            &mut screen,
                             base_viewport_height,
                             fitted_completion_items,
                             last_drawn_area,
@@ -632,12 +821,20 @@ impl PromptEditor {
                     force_repaint_next_frame = false;
                 }
 
-                if !event::poll(Duration::from_millis(250))
-                    .map_err(|e| io::Error::other(e.to_string()))?
-                {
+                let Some(event) = read_prompt_event(
+                    &mut self.pending_terminal_events,
+                    screen.queries_disabled,
+                    |timeout| {
+                        if event::poll(timeout)? {
+                            event::read().map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                )?
+                else {
                     continue;
-                }
-                let event = event::read().map_err(|e| io::Error::other(e.to_string()))?;
+                };
                 if let Event::Resize(_, _) = event {
                     // Do not rebuild here: the emulator (VS Code / xterm.js)
                     // rewraps the scrollback asynchronously after the resize
@@ -669,6 +866,7 @@ impl PromptEditor {
                     // re-wrapped transcript (hence clear_gap_above stays false).
                     let rebuilt_area = rebuild_fixed_viewport(
                         &mut terminal,
+                        &mut screen,
                         terminal_size,
                         requested_height,
                         parked_anchor_offset(last_drawn_area, requested_height),
@@ -707,14 +905,17 @@ impl PromptEditor {
         // the cursor there, so the submit preview follows the previous output.
         let _ = terminal.hide_cursor();
         let cleared_viewport =
-            clear_fixed_viewport(&mut terminal, last_drawn_area.map(|area| area.y)).unwrap_or(false);
+            clear_fixed_viewport(&mut terminal, last_drawn_area.map(|area| area.y))
+                .unwrap_or(false);
         drop(terminal);
         if !cleared_viewport {
             let _ = execute!(io::stdout(), Clear(ClearType::FromCursorDown));
         }
-    let _ = execute!(io::stdout(), cursor::Show);
-    // Restore the default cursor shape: the editor switched it to a thin bar
-    // via DECSCUSR while active.
+        self.cursor_position_queries_disabled = screen.queries_disabled;
+        drop(screen);
+        let _ = execute!(io::stdout(), cursor::Show);
+        // Restore the default cursor shape: the editor switched it to a thin bar
+        // via DECSCUSR while active.
         let _ = execute!(io::stdout(), cursor::SetCursorStyle::DefaultUserShape);
         let _ = execute!(io::stdout(), DisableBracketedPaste);
         let _ = disable_raw_mode();
@@ -748,12 +949,165 @@ mod tests {
     };
 
     use super::{
-        ViewportRebuildMode, clear_fixed_viewport, clear_row_range,
-        fixed_viewport_area, force_frame_repaint, multiline_viewport_height,
-        park_reflow_anchor, parked_anchor_offset, prepare_fixed_viewport,
-        submitted_input_preview_lines, take_redraw_request,
+        ViewportRebuildMode, clear_fixed_viewport, clear_row_range, fixed_viewport_area,
+        force_frame_repaint, multiline_viewport_height, park_reflow_anchor, parked_anchor_offset,
+        prepare_fixed_viewport, submitted_input_preview_lines, take_redraw_request,
         terminal_with_fixed_viewport, viewport_height_with_completion,
     };
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn split_cursor_reply_is_consumed_without_losing_resize_or_following_text() {
+        let mut input = VecDeque::from([key(KeyCode::Esc), Event::Resize(90, 30)]);
+        input.extend("[13;1R".chars().map(|ch| key(KeyCode::Char(ch))));
+        input.push_back(key(KeyCode::Char('x')));
+        let mut pending = VecDeque::new();
+        let mut read = |_| Ok(input.pop_front());
+        assert_eq!(
+            super::read_prompt_event(&mut pending, true, &mut read).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::read_prompt_event(&mut pending, true, &mut read).unwrap(),
+            Some(Event::Resize(90, 30))
+        );
+        assert_eq!(
+            super::read_prompt_event(&mut pending, true, &mut read).unwrap(),
+            Some(key(KeyCode::Char('x')))
+        );
+    }
+
+    #[test]
+    fn cursor_reply_guard_preserves_standalone_escape_and_invalid_lookahead() {
+        for tail in ["", "x", "[1x", "[13;", "[;1R", "[123456;1R"] {
+            let original = std::iter::once(key(KeyCode::Esc))
+                .chain(tail.chars().map(|ch| key(KeyCode::Char(ch))))
+                .collect::<VecDeque<_>>();
+            let mut input = original.clone();
+            let mut pending = VecDeque::new();
+            let mut output = VecDeque::new();
+            while !input.is_empty() || !pending.is_empty() {
+                if let Some(event) =
+                    super::read_prompt_event(&mut pending, true, |_| Ok(input.pop_front())).unwrap()
+                {
+                    output.push_back(event);
+                }
+            }
+            assert_eq!(output, original, "tail={tail:?}");
+        }
+    }
+
+    #[test]
+    fn cursor_reply_guard_leaves_literal_text_paste_and_control_keys_unchanged() {
+        let original = "[13;1R"
+            .chars()
+            .map(|ch| key(KeyCode::Char(ch)))
+            .chain([
+                Event::Paste("\x1b[13;1R".into()),
+                Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                key(KeyCode::Backspace),
+                key(KeyCode::Enter),
+                key(KeyCode::Left),
+            ])
+            .collect::<VecDeque<_>>();
+        let mut input = original.clone();
+        let mut pending = VecDeque::new();
+        let mut output = VecDeque::new();
+        while !input.is_empty() {
+            output.push_back(
+                super::read_prompt_event(&mut pending, true, |_| Ok(input.pop_front()))
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(output, original);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn healthy_terminal_escape_is_not_delayed_or_read_ahead() {
+        let mut calls = 0;
+        let event = super::read_prompt_event(&mut VecDeque::new(), false, |_| {
+            calls += 1;
+            Ok(Some(key(KeyCode::Esc)))
+        })
+        .unwrap();
+        assert_eq!(event, Some(key(KeyCode::Esc)));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn cursor_reply_tail_accepts_only_bounded_cpr_coordinates() {
+        for prefix in ["[", "[1", "[13;", "[13;1"] {
+            assert_eq!(super::cursor_reply_tail(prefix), Some(false));
+        }
+        for reply in ["[13;1R", "[65535;65535R"] {
+            assert_eq!(super::cursor_reply_tail(reply), Some(true));
+        }
+        for invalid in [
+            "",
+            "13;1R",
+            "[R",
+            "[1R",
+            "[;1R",
+            "[1;R",
+            "[1;2;3R",
+            "[1;2x",
+            "[123456;1R",
+        ] {
+            assert_eq!(super::cursor_reply_tail(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn query_free_viewport_bootstrap_and_resize_never_query_or_scroll() {
+        let mut output = Vec::new();
+        {
+            let mut backend = ratatui::backend::CrosstermBackend::new(&mut output);
+            let area = super::prepare_query_free_viewport(
+                &mut backend,
+                ratatui::layout::Size::new(80, 24),
+                5,
+            )
+            .unwrap();
+            assert_eq!(area, Rect::new(0, 0, 80, 5));
+            let mut terminal = terminal_with_fixed_viewport(backend, area).unwrap();
+
+            // An alternate-screen resize has no transcript to re-anchor and
+            // must not send another DSR after a previous query timed out.
+            let resized = super::prepare_query_free_viewport(
+                terminal.backend_mut(),
+                ratatui::layout::Size::new(60, 4),
+                7,
+            )
+            .unwrap();
+            assert_eq!(resized, Rect::new(0, 0, 60, 4));
+            terminal.resize(resized).unwrap();
+            terminal
+                .draw(|frame| frame.render_widget(Paragraph::new("ready"), frame.area()))
+                .unwrap();
+        }
+        assert!(!output.windows(4).any(|bytes| bytes == b"\x1b[6n"));
+        assert!(!output.contains(&b'\n'));
+    }
+
+    #[test]
+    fn query_free_viewport_clamps_height_on_small_terminals() {
+        let mut backend = TestBackend::new(10, 3);
+        for (requested_height, expected_height) in [(0, 1), (2, 2), (8, 3)] {
+            let area = super::prepare_query_free_viewport(
+                &mut backend,
+                ratatui::layout::Size::new(10, 3),
+                requested_height,
+            )
+            .unwrap();
+            assert_eq!(area, Rect::new(0, 0, 10, expected_height));
+            assert_eq!(backend.get_cursor_position().unwrap(), Position::new(0, 0));
+        }
+    }
 
     #[test]
     fn idle_poll_timeouts_do_not_request_more_frames() {
@@ -1205,5 +1559,4 @@ mod tests {
             ]
         );
     }
-
 }
