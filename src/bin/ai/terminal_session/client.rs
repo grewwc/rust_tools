@@ -40,6 +40,13 @@ const RESET: &[u8] = b"\x1b7\x1b[r\x1b8\x1b[?2004l\x1b[0m\x1b[?25h";
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll timeout; doubles as the resize-check cadence.
 const POLL_MS: i32 = 150;
+/// Bounded display backlog: a stalled SSH link must not freeze the client.
+/// Output beyond this cap is dropped (with a notice) instead of blocking;
+/// the host's 256 KB replay buffer still lets a re-attach recover the tail.
+pub(super) const MAX_DISPLAY_BACKLOG: usize = 4 * 1024 * 1024;
+/// After EXIT/DETACHED, keep draining the backlog for this long so output
+/// produced while the terminal was stalled is still shown once it recovers.
+const EXIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Set by SIGHUP/SIGTERM/SIGINT so the loop exits and the terminal is restored
 /// even if the event loop never sees another event.
@@ -50,6 +57,13 @@ pub(super) struct AttachEnd {
     pub(super) code: i32,
     /// True when the host asked us to leave: the worker keeps running.
     pub(super) detached: bool,
+    /// Session id from the attach reply; used for re-attach hints after the
+    /// connection dies unexpectedly.
+    pub(super) session: Option<String>,
+    /// True only when the connection died unexpectedly (socket EOF or read
+    /// error); never set for a normal EXIT/DETACHED. The worker may still be
+    /// running, so a re-attach hint is only meaningful in this case.
+    pub(super) connection_lost: bool,
 }
 
 pub(super) fn maybe_run(cli: &ParsedCli, original_args: &[String]) -> EntryResult {
@@ -100,12 +114,28 @@ pub(super) fn maybe_run_impl(
     };
     let end = attach(stream, terminal, query_window(stdin_fd), stdin_fd, stdout_fd)?;
     if end.detached {
-        eprintln!(
+        notice(
             "[bg] session still running in the background: run `a` in this terminal \
-             (or `a -ss <session-id>` in any terminal) to re-attach"
+             (or `a -ss <session-id>` in any terminal) to re-attach\n",
         );
+    } else if let Some(hint) = reattach_hint(&end) {
+        notice(&hint);
     }
     Ok(Some(end.code))
+}
+
+/// Hint after a lost connection. Only an unexpected disconnect (socket EOF or
+/// read error) can leave a live worker; a normal worker exit with code 1 must
+/// not suggest re-attaching to a session that is already gone.
+pub(super) fn reattach_hint(end: &AttachEnd) -> Option<String> {
+    if end.connection_lost {
+        if let Some(session) = &end.session {
+            return Some(format!(
+                "[session connection closed; if it is still running, re-attach with `a -ss {session}`]\n"
+            ));
+        }
+    }
+    None
 }
 
 /// Where to attach: an explicit `-ss` session socket, the terminal binding, or
@@ -233,23 +263,62 @@ pub(super) fn attach(
     // A previous client may have died without cleanup; reset modes before the
     // worker's output, preserving the shell's current output position. Install
     // the guard first so even a failed reset write restores the terminal.
-    write_fd(stdout_fd, RESET)?;
+    // Best-effort: stdout is O_NONBLOCK now, and a stalled terminal must not
+    // abort the attach.
+    let _ = write_fd(stdout_fd, RESET);
     let mut queue = Queue::default();
     queue.json(wire::REQUEST, &Request::Attach { terminal, window })?;
     let mut decoder = Decoder::default();
     let mut last_window = window;
+    let mut backlog = DisplayBacklog::default();
+    let mut session: Option<String> = None;
+    // Set once EXIT/DETACHED arrives. The loop keeps draining the backlog for
+    // a bounded window, so output produced while the terminal was stalled is
+    // still shown once the terminal recovers, then attach returns.
+    let mut ending: Option<AttachEnd> = None;
+    let mut ending_since = Instant::now();
+    // Set when the host socket hits EOF while `ending` is already set (the
+    // host closes the connection right after EXIT/DETACHED). The fd is then
+    // excluded from poll (`fd = -1`) so the lingering POLLHUP cannot turn the
+    // bounded flush window into a busy loop.
+    let mut socket_done = false;
     loop {
+        if let Some(end) = ending.take() {
+            if backlog.is_empty() || ending_since.elapsed() >= EXIT_FLUSH_TIMEOUT {
+                // Timeout with a backlog that never drained: `pump` never
+                // reached the point where it emits the drop notice, so queue
+                // it behind the remaining data and pump once. A terminal that
+                // recovers right now still sees it; one that stays stalled
+                // loses it with the process, as before.
+                if !backlog.is_empty() {
+                    backlog.queue_notice();
+                    let _ = backlog.pump(stdout_fd);
+                }
+                return Ok(end);
+            }
+            ending = Some(end);
+        }
         // Bounded input: a slow host must not make the frontend grow without
-        // limit. Dropped input is preferable to a wedged session.
-        if !queue.is_empty() && queue.flush(&mut stream).is_err() {
+        // limit. Dropped input is preferable to a wedged session. Once the
+        // socket is gone (EOF after EXIT/DETACHED) there is nothing to flush
+        // to; skip rather than hit the dead fd every poll.
+        if !socket_done && !queue.is_empty() && queue.flush(&mut stream).is_err() {
             queue = Queue::default();
         }
         let mut descriptors = [
-            pollfd(stdin_fd, libc::POLLIN),
+            // During the ending flush window input is meaningless (the worker
+            // is gone or detached); drop stdin from poll instead of queueing
+            // keystrokes that would be thrown away by the dead socket.
+            pollfd(if ending.is_some() { -1 } else { stdin_fd }, libc::POLLIN),
             pollfd(
-                stream.as_raw_fd(),
-                libc::POLLIN | if queue.is_empty() { 0 } else { libc::POLLOUT },
+                if socket_done { -1 } else { stream.as_raw_fd() },
+                if socket_done {
+                    0
+                } else {
+                    libc::POLLIN | if queue.is_empty() { 0 } else { libc::POLLOUT }
+                },
             ),
+            pollfd(stdout_fd, if backlog.is_empty() { 0 } else { libc::POLLOUT }),
         ];
         let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, POLL_MS) };
         if result < 0 {
@@ -260,7 +329,7 @@ pub(super) fn attach(
             return Err(error);
         }
         if SIGNALED.load(Ordering::Relaxed) {
-            return Ok(AttachEnd { code: 0, detached: false });
+            return Ok(AttachEnd { code: 0, detached: false, session, connection_lost: false });
         }
         if descriptors[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             let mut bytes = [0u8; 8192];
@@ -276,12 +345,12 @@ pub(super) fn attach(
                     break;
                 }
                 if count == 0 {
-                    return Ok(AttachEnd { code: 0, detached: false }); // terminal closed
+                    return Ok(AttachEnd { code: 0, detached: false, session, connection_lost: false }); // terminal closed
                 }
                 match io::Error::last_os_error().kind() {
                     io::ErrorKind::Interrupted => continue,
                     io::ErrorKind::WouldBlock => break,
-                    _ => return Ok(AttachEnd { code: 0, detached: false }),
+                    _ => return Ok(AttachEnd { code: 0, detached: false, session, connection_lost: false }),
                 }
             }
         }
@@ -298,16 +367,19 @@ pub(super) fn attach(
                                 if let Some(error) = reply.error {
                                     return Err(io::Error::other(error));
                                 }
+                                session = reply.session;
                             }
-                            wire::OUTPUT => write_fd(stdout_fd, &payload)?,
+                            wire::OUTPUT => backlog.push_frame(&payload),
                             wire::DETACHED => {
-                                return Ok(AttachEnd { code: 0, detached: true });
+                                ending = Some(AttachEnd { code: 0, detached: true, session: session.clone(), connection_lost: false });
+                                ending_since = Instant::now();
                             }
                             wire::EXIT => {
                                 let code = i32::from_be_bytes(payload.try_into().map_err(|_| {
                                     io::Error::other("invalid PTY exit frame")
                                 })?);
-                                return Ok(AttachEnd { code, detached: false });
+                                ending = Some(AttachEnd { code, detached: false, session: session.clone(), connection_lost: false });
+                                ending_since = Instant::now();
                             }
                             // INPUT/RESIZE are client->host only.
                             _ => {}
@@ -319,13 +391,54 @@ pub(super) fn attach(
                     break;
                 }
                 if count == 0 {
-                    return Ok(AttachEnd { code: 1, detached: false }); // host died
+                    // The host closes the socket right after EXIT/DETACHED; the
+                    // ending flush window must not be cut short by that EOF.
+                    if ending.is_some() {
+                        socket_done = true;
+                        break;
+                    }
+                    // Host died without EXIT/DETACHED: a lost connection, but
+                    // keep the same bounded flush window as the EXIT/DETACHED
+                    // path so tail output buffered before the death is still
+                    // shown on a healthy terminal (empty backlog returns now).
+                    let end = AttachEnd { code: 1, detached: false, session: session.clone(), connection_lost: true };
+                    if backlog.is_empty() {
+                        return Ok(end);
+                    }
+                    ending = Some(end);
+                    ending_since = Instant::now();
+                    socket_done = true;
+                    break;
                 }
                 match io::Error::last_os_error().kind() {
                     io::ErrorKind::Interrupted => continue,
                     io::ErrorKind::WouldBlock => break,
-                    _ => return Ok(AttachEnd { code: 1, detached: false }),
+                    _ => {
+                        if ending.is_some() {
+                            socket_done = true;
+                            break;
+                        }
+                        // Socket read error without EXIT/DETACHED: same lost
+                        // connection handling as EOF above, including the
+                        // bounded flush of already-buffered tail output.
+                        let end = AttachEnd { code: 1, detached: false, session: session.clone(), connection_lost: true };
+                        if backlog.is_empty() {
+                            return Ok(end);
+                        }
+                        ending = Some(end);
+                        ending_since = Instant::now();
+                        socket_done = true;
+                        break;
+                    }
                 }
+            }
+        }
+        if descriptors[2].revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0 {
+            // Terminal writable (or gone): drain the display backlog. A real
+            // write error here means the terminal itself disappeared, so
+            // continuing to attach is pointless.
+            if let Err(error) = backlog.pump(stdout_fd) {
+                return Err(error);
             }
         }
         let window = query_window(stdin_fd);
@@ -336,10 +449,107 @@ pub(super) fn attach(
     }
 }
 
+/// Bounded, non-blocking display output for the real terminal. A stalled
+/// terminal (e.g. an unresponsive SSH link) must never freeze the client:
+/// frames beyond MAX_DISPLAY_BACKLOG are dropped and one notice is emitted
+/// once the backlog drains. The host keeps its own 256 KB replay buffer, so
+/// a re-attach still recovers the tail of what was dropped here.
+#[derive(Default)]
+pub(super) struct DisplayBacklog {
+    bytes: Vec<u8>,
+    offset: usize,
+    truncated: bool,
+    dropped: usize,
+}
+
+impl DisplayBacklog {
+    pub(super) fn is_empty(&self) -> bool {
+        self.offset >= self.bytes.len()
+    }
+
+    /// Queue a whole output frame. Frames that would exceed the cap are
+    /// dropped whole (frame boundaries stay clean) and remembered for the
+    /// notice emitted when the backlog drains.
+    pub(super) fn push_frame(&mut self, payload: &[u8]) {
+        if payload.is_empty() {
+            return;
+        }
+        if self.bytes.len() - self.offset + payload.len() > MAX_DISPLAY_BACKLOG {
+            self.truncated = true;
+            self.dropped += payload.len();
+        } else {
+            self.bytes.extend_from_slice(payload);
+        }
+    }
+
+    /// Write as much as the terminal accepts right now (`fd` is O_NONBLOCK).
+    /// WouldBlock keeps the remainder for the next poll; a real error means
+    /// the terminal is gone and surfaces as Err.
+    pub(super) fn pump(&mut self, fd: RawFd) -> io::Result<()> {
+        loop {
+            if self.offset >= self.bytes.len() {
+                if self.truncated {
+                    // Drain completed: emit the notice and settle the round.
+                    self.queue_notice();
+                    continue;
+                }
+                self.bytes.clear();
+                self.offset = 0;
+                return Ok(());
+            }
+            let count = unsafe {
+                libc::write(fd, self.bytes[self.offset..].as_ptr() as *const _, self.bytes.len() - self.offset)
+            };
+            if count > 0 {
+                self.offset += count as usize;
+                // Compact amortized so a long backlog never shifts repeatedly.
+                if self.offset >= 64 * 1024 {
+                    self.bytes.copy_within(self.offset.., 0);
+                    self.bytes.truncate(self.bytes.len() - self.offset);
+                    self.offset = 0;
+                }
+                continue;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(());
+            }
+            return Err(error);
+        }
+    }
+
+    /// Append the drop notice behind whatever is still buffered (data first,
+    /// notice last), settling the current stall round. Bypasses the cap: a
+    /// notice must never be dropped by the same cap it reports. `pump` emits
+    /// it once the backlog drains; the flush-timeout path calls this directly
+    /// for a last attempt on a terminal that never caught up.
+    pub(super) fn queue_notice(&mut self) {
+        if self.truncated {
+            self.truncated = false;
+            let dropped = self.dropped;
+            self.dropped = 0;
+            self.bytes.extend_from_slice(&truncated_notice(dropped));
+        }
+    }
+}
+
+fn truncated_notice(dropped: usize) -> Vec<u8> {
+    format!(
+        "\r\n\x1b[2m[output truncated: terminal was unresponsive; {dropped} bytes dropped]\x1b[0m\r\n"
+    )
+    .into_bytes()
+}
+
 struct TerminalGuard {
     fd: RawFd,
     output_fd: RawFd,
     original: libc::termios,
+    /// Original fcntl flags of `output_fd`, restored on drop so the shared
+    /// terminal description is not left O_NONBLOCK for the shell.
+    original_flags: libc::c_int,
 }
 
 impl TerminalGuard {
@@ -354,7 +564,15 @@ impl TerminalGuard {
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { fd, output_fd, original })
+        // Non-blocking output: the attach display loop must never be suspended
+        // by a stalled terminal (e.g. an unresponsive SSH link).
+        let flags = unsafe { libc::fcntl(output_fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(output_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            let error = io::Error::last_os_error();
+            let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) }; // roll back raw mode
+            return Err(error);
+        }
+        Ok(Self { fd, output_fd, original, original_flags: flags })
     }
 }
 
@@ -366,6 +584,7 @@ impl Drop for TerminalGuard {
         if unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) } != 0 {
             eprintln!("[debug] termios restore failed: {}", io::Error::last_os_error());
         }
+        let _ = unsafe { libc::fcntl(self.output_fd, libc::F_SETFL, self.original_flags) };
     }
 }
 
@@ -418,6 +637,21 @@ fn write_fd(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+/// Best-effort stderr notice that never blocks: the terminal itself may be
+/// wedged (e.g. a stalled SSH link), so give the fd a short writability
+/// window and drop the notice if it does not fit.
+fn notice(text: &str) {
+    let fd = libc::STDERR_FILENO;
+    let mut pfd = pollfd(fd, libc::POLLOUT);
+    if unsafe { libc::poll(&mut pfd, 1, 500) } > 0 && pfd.revents & libc::POLLOUT != 0 {
+        // Single write, no retry loop: `fd` is a blocking terminal and the
+        // available space after POLLOUT may be smaller than the text. A short
+        // write is fine for a notice; looping here could block on a wedged
+        // terminal again.
+        unsafe { libc::write(fd, text.as_ptr() as *const _, text.len()) };
+    }
 }
 
 fn pollfd(fd: RawFd, events: i16) -> libc::pollfd {

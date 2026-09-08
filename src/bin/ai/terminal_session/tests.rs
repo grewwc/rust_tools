@@ -2,9 +2,12 @@
 //! PTY pair (host + client share it) and its own temp registry root, so no
 //! real terminal, real `a` process, or the real registry is touched.
 
-use super::client::{attach, eligible, maybe_run_impl};
+use super::client::{
+    attach, eligible, maybe_run_impl, reattach_hint, AttachEnd, DisplayBacklog, MAX_DISPLAY_BACKLOG,
+};
 use super::{host, registry, wire};
 use crate::ai::cli::ParsedCli;
+use std::io::{self, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -92,6 +95,17 @@ fn write_all(fd: RawFd, bytes: &[u8]) {
             unsafe { libc::write(fd, bytes[offset..].as_ptr() as *const _, bytes.len() - offset) };
         assert!(count > 0, "PTY master write failed");
         offset += count as usize;
+    }
+}
+
+/// Non-blocking drain of `fd` into `out`; stops at the first WouldBlock.
+fn drain_fd(fd: RawFd, out: &mut Vec<u8>) {
+    let mut chunk = [0u8; 8192];
+    loop {
+        match unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut _, chunk.len()) } {
+            n if n > 0 => out.extend_from_slice(&chunk[..n as usize]),
+            _ => break, // WouldBlock: nothing more for now
+        }
     }
 }
 
@@ -350,4 +364,277 @@ fn maybe_run_attaches_to_live_terminal_binding() {
         Some(value) => unsafe { std::env::set_var("TMUX_PANE", value) },
         None => unsafe { std::env::remove_var("TMUX_PANE") },
     }
+}
+
+#[test]
+fn display_backlog_drops_overflow_and_notices_once() {
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    for fd in [read_fd, write_fd] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "F_GETFL failed");
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0,
+            "F_SETFL failed"
+        );
+    }
+    // Fill the pipe so writes fail with WouldBlock, like a stalled terminal.
+    let filler = [b'x'; 4096];
+    loop {
+        let count = unsafe { libc::write(write_fd, filler.as_ptr() as *const _, filler.len()) };
+        if count > 0 {
+            continue;
+        }
+        assert_eq!(
+            io::Error::last_os_error().kind(),
+            io::ErrorKind::WouldBlock,
+            "pipe fill must end at EAGAIN"
+        );
+        break;
+    }
+    let mut backlog = DisplayBacklog::default();
+    let kept = vec![b'a'; 100 * 1024];
+    backlog.push_frame(&kept);
+    // A frame that would exceed the cap is dropped (with a notice) instead of
+    // growing the backlog without bound.
+    let dropped = vec![b'b'; 5 * 1024 * 1024];
+    backlog.push_frame(&dropped);
+    // Terminal still full: pump must not block and must keep the remainder.
+    backlog.pump(write_fd).unwrap();
+    assert!(!backlog.is_empty());
+    let mut output = Vec::new();
+    // Discard the filler (pre-existing terminal content), then start fresh.
+    drain_fd(read_fd, &mut output);
+    output.clear();
+    // Terminal recovers: pump writes only what fits, so drain between pumps.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !backlog.is_empty() {
+        assert!(Instant::now() < deadline, "backlog must drain within 5s");
+        backlog.pump(write_fd).unwrap();
+        drain_fd(read_fd, &mut output);
+    }
+    drain_fd(read_fd, &mut output);
+    assert!(output.starts_with(&kept[..]), "kept frame must arrive first");
+    let notice = String::from_utf8_lossy(&output[kept.len()..]);
+    assert!(notice.contains("[output truncated: terminal was unresponsive"));
+    assert!(notice.contains(&format!("{} bytes dropped", dropped.len())));
+    assert_eq!(notice.matches("output truncated").count(), 1, "notice must appear exactly once");
+}
+
+#[test]
+fn stalled_terminal_does_not_freeze_client() {
+    // A worker that floods output while the client's terminal never reads
+    // (the PTY master is left untouched) used to block attach forever in the
+    // blocking stdout write. The bounded backlog must let attach finish once
+    // the worker exits.
+    let mut worker = Command::new("/bin/sh");
+    worker.args(["-c", "i=0; while [ $i -lt 20000 ]; do echo 'payload line'; i=$((i+1)); done"]);
+    let (root, socket) = start_host(worker);
+    let (master, slave) = pty_pair();
+    let slave_fd = slave.as_raw_fd();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let stream = connect_socket(&socket, Duration::from_secs(5));
+        let end = attach(stream, "test-terminal".into(), window(), slave_fd, slave_fd);
+        tx.send(end).unwrap();
+    });
+    // Never read `master`: attach must still return (worker exit plus the
+    // bounded flush window) instead of hanging on a full terminal buffer.
+    let end = rx.recv_timeout(Duration::from_secs(30)).unwrap().unwrap();
+    assert_eq!(end.code, 0);
+    let _ = (master, root);
+}
+
+#[test]
+fn second_stall_notice_reports_only_second_round_drops() {
+    // A previous stall must not leak into the next notice: the dropped counter
+    // resets when the notice is emitted, so a second stall reports only its
+    // own bytes (before the fix, both rounds were summed into the second
+    // notice, e.g. "7 MB dropped" when the second round only dropped 2 MB).
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    for fd in [read_fd, write_fd] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "F_GETFL failed");
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0,
+            "F_SETFL failed"
+        );
+    }
+    let mut backlog = DisplayBacklog::default();
+    let drain_all = |backlog: &mut DisplayBacklog, write_fd: RawFd, read_fd: RawFd| {
+        let mut output = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !backlog.is_empty() {
+            assert!(Instant::now() < deadline, "backlog must drain within 5s");
+            backlog.pump(write_fd).unwrap();
+            drain_fd(read_fd, &mut output);
+        }
+        drain_fd(read_fd, &mut output);
+        output
+    };
+    // Each round keeps a small frame so the backlog is non-empty and pump
+    // runs to the truncation branch (a lone dropped frame leaves `bytes`
+    // empty; the notice is still emitted because attach calls pump every
+    // poll, but this test must drive it explicitly).
+    let kept = vec![b'a'; 1024];
+    // Round 1: one big frame dropped while the terminal is stalled.
+    let first_dropped = vec![b'b'; 5 * 1024 * 1024];
+    backlog.push_frame(&kept);
+    backlog.push_frame(&first_dropped);
+    let first = drain_all(&mut backlog, write_fd, read_fd);
+    let first_text = String::from_utf8_lossy(&first);
+    assert!(first_text.contains(&format!("{} bytes dropped", first_dropped.len())));
+    // Round 2: a 6 MB frame also exceeds the cap; the notice must report
+    // only this round's 6 MB, not the 5 MB from round 1.
+    let second_dropped = vec![b'c'; 6 * 1024 * 1024];
+    backlog.push_frame(&kept);
+    backlog.push_frame(&second_dropped);
+    let second = drain_all(&mut backlog, write_fd, read_fd);
+    let second_text = String::from_utf8_lossy(&second);
+    assert!(second_text.contains(&format!("{} bytes dropped", second_dropped.len())));
+    assert!(
+        !second_text.contains(&format!("{} bytes dropped", first_dropped.len() + second_dropped.len())),
+        "second notice must not sum both stalls"
+    );
+}
+
+#[test]
+fn exit_code_one_is_not_reported_as_lost_connection() {
+    // A worker that exits with status 1 must be returned verbatim, not
+    // mislabeled as a lost connection (which would trigger a misleading
+    // re-attach hint for an already-finished session).
+    let mut worker = Command::new("/bin/sh");
+    worker.args(["-c", "exit 1"]);
+    let (root, socket) = start_host(worker);
+    let (master, slave) = pty_pair();
+    let slave_fd = slave.as_raw_fd();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let stream = connect_socket(&socket, Duration::from_secs(5));
+        let end = attach(stream, "test-terminal".into(), window(), slave_fd, slave_fd);
+        tx.send(end).unwrap();
+    });
+    let end = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+    assert_eq!(end.code, 1, "worker exit status must be forwarded");
+    assert!(!end.detached);
+    assert!(!end.connection_lost, "normal exit 1 must not look like a lost connection");
+    let _ = (master, root);
+}
+
+#[test]
+fn socket_eof_is_reported_as_lost_connection() {
+    // Host-side death: the socket dies without EXIT/DETACHED, so the client
+    // must flag a lost connection (the worker may still be alive elsewhere).
+    let (master, slave) = pty_pair();
+    let slave_fd = slave.as_raw_fd();
+    let (peer, held) = UnixStream::pair().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let end = attach(peer, "test-terminal".into(), window(), slave_fd, slave_fd);
+        tx.send(end).unwrap();
+    });
+    // Let attach write its REQUEST frame first, then close the peer like a
+    // dead host (socket EOF without any EXIT/DETACHED frame).
+    thread::sleep(Duration::from_millis(300));
+    drop(held);
+    let end = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+    assert_eq!(end.code, 1);
+    assert!(!end.detached);
+    assert!(end.connection_lost, "socket EOF without EXIT must be a lost connection");
+    let _ = master;
+}
+
+#[test]
+fn reattach_hint_only_for_lost_connections_with_session() {
+    let with_session = || Some("sess-1".into());
+    let lost = AttachEnd { code: 1, detached: false, session: with_session(), connection_lost: true };
+    assert!(reattach_hint(&lost).is_some(), "lost connection with a session id must hint");
+    assert!(
+        reattach_hint(&lost).unwrap().contains("a -ss sess-1"),
+        "hint must include the re-attach command"
+    );
+    // Normal worker exit with code 1: no hint, the session is already gone.
+    let normal = AttachEnd { code: 1, detached: false, session: with_session(), connection_lost: false };
+    assert!(reattach_hint(&normal).is_none(), "normal exit 1 must not hint");
+    // Lost connection without a session id: nothing useful to hint.
+    let anonymous = AttachEnd { code: 1, detached: false, session: None, connection_lost: true };
+    assert!(reattach_hint(&anonymous).is_none(), "no session id means no hint");
+}
+
+#[test]
+fn host_death_flushes_backlog_before_returning() {
+    // Unexpected EOF must not throw away buffered tail output: like the
+    // EXIT/DETACHED path, the client drains the display backlog for a
+    // bounded window before returning the lost-connection result.
+    let (master, slave) = pty_pair();
+    let slave_fd = slave.as_raw_fd();
+    let (peer, mut held) = UnixStream::pair().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let end = attach(peer, "test-terminal".into(), window(), slave_fd, slave_fd);
+        tx.send(end).unwrap();
+    });
+    // REPLY, then one OUTPUT frame, then the host dies without EXIT/DETACHED.
+    let reply = wire::frame(wire::REPLY, br#"{"session":"s1"}"#).unwrap();
+    held.write_all(&reply).unwrap();
+    let tail = b"tail output before host death";
+    held.write_all(&wire::frame(wire::OUTPUT, tail).unwrap()).unwrap();
+    thread::sleep(Duration::from_millis(300));
+    drop(held); // host dies
+    let end = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+    assert_eq!(end.code, 1);
+    assert!(end.connection_lost);
+    // The buffered OUTPUT must have been flushed to the terminal, not lost.
+    let out = read_until(master.as_raw_fd(), tail, Duration::from_secs(5));
+    assert!(
+        out.windows(tail.len()).any(|w| w == tail),
+        "tail output was lost: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    let _ = master;
+}
+
+#[test]
+fn truncation_notice_survives_a_backlog_at_cap() {
+    // The flush-timeout path queues the drop notice behind a backlog that
+    // never drained. The notice must bypass the cap (otherwise it would be
+    // dropped by the very cap it reports) and still drain out.
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    for fd in [read_fd, write_fd] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "F_GETFL failed");
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0,
+            "F_SETFL failed"
+        );
+    }
+    let mut backlog = DisplayBacklog::default();
+    // Fill almost to the cap, then drop a frame on top: a stall round begins.
+    backlog.push_frame(&vec![b'x'; MAX_DISPLAY_BACKLOG - 64]);
+    backlog.push_frame(&vec![b'y'; 1024]); // exceeds the cap, dropped
+    // Simulate the flush-timeout path: queue the notice while the backlog is
+    // still full (with the notice appended it exceeds the cap).
+    backlog.queue_notice();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut out = Vec::new();
+    while !backlog.is_empty() {
+        assert!(Instant::now() < deadline, "backlog must drain within 5s");
+        backlog.pump(write_fd).unwrap();
+        drain_fd(read_fd, &mut out);
+    }
+    drain_fd(read_fd, &mut out);
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("1024 bytes dropped"),
+        "notice missing or wrong: {:?}",
+        &text[text.len().saturating_sub(200)..]
+    );
 }
