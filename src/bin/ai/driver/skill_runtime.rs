@@ -740,33 +740,15 @@ fn build_hidden_mcp_tool_catalog(
         .map(|tool| tool.function.name.clone())
         .filter(|name| !loaded_names.contains_str(name))
         .collect();
-    if hidden.is_empty() {
-        return None;
-    }
     rust_tools::sortw::stable_sort_by(&mut hidden, |a, b| a.cmp(b));
     hidden.dedup();
 
-    const MAX_DISPLAY: usize = 8;
-    let displayed = hidden
-        .iter()
-        .take(MAX_DISPLAY)
-        .map(|name| format!("`{name}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let remaining = hidden.len().saturating_sub(MAX_DISPLAY);
-
-    let mut out = format!(
+    render_hidden_tool_catalog(
         "Configured MCP tools are available but not loaded in this turn.\n\
          If the task needs an external system or MCP-backed capability, discover and enable matching \
-         `mcp_*` tools via `enable_tools` first.\n\
-         Available: {}",
-        displayed
-    );
-    if remaining > 0 {
-        out.push_str(&format!(", and {remaining} more"));
-    }
-    out.push('.');
-    Some(out)
+         `mcp_*` tools via `enable_tools` first.",
+        &hidden,
+    )
 }
 
 fn build_hidden_execution_primitive_catalog(
@@ -775,40 +757,22 @@ fn build_hidden_execution_primitive_catalog(
     // Deferred heavy-execution primitives (process / IPC / shared-memory / env)
     // are not loaded into every turn by default. List the registered-but-not-
     // loaded names here so the model stays aware they exist and can enable them
-    // on demand via `enable_tools`. Mirrors `build_hidden_mcp_tool_catalog`
-    // (same MAX_DISPLAY truncation; silent when everything is already loaded).
+    // on demand via `enable_tools`. The shared renderer handles truncation and
+    // stays silent when everything is already loaded.
     let mut hidden: Vec<String> = super::super::tools::deferred_eager_load_tool_summaries()
         .into_iter()
         .map(|(name, _desc)| name)
         .filter(|name| !available_tools.contains_str(name))
         .collect();
-    if hidden.is_empty() {
-        return None;
-    }
     rust_tools::sortw::stable_sort_by(&mut hidden, |a, b| a.cmp(b));
     hidden.dedup();
 
-    const MAX_DISPLAY: usize = 8;
-    let displayed = hidden
-        .iter()
-        .take(MAX_DISPLAY)
-        .map(|name| format!("`{name}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let remaining = hidden.len().saturating_sub(MAX_DISPLAY);
-
-    let mut out = format!(
+    render_hidden_tool_catalog(
         "Process / IPC / shared-memory primitives are available but not loaded this turn.\n\
          For multi-process orchestration, background daemons, cross-process IPC, shared memory, \
-         or per-process env/working-dir control, enable the needed tools via `enable_tools`.\n\
-         Available: {}",
-        displayed
-    );
-    if remaining > 0 {
-        out.push_str(&format!(", and {remaining} more"));
-    }
-    out.push('.');
-    Some(out)
+         or per-process env/working-dir control, enable the needed tools via `enable_tools`.",
+        &hidden,
+    )
 }
 
 /// Lazily-loaded subagent orchestration family: task-group tools (group
@@ -844,27 +808,36 @@ fn build_hidden_task_tool_catalog(available_tools: &Box<SkipSet<String>>) -> Opt
         .copied()
         .filter(|name| !available_tools.contains_str(name))
         .collect();
-    if hidden.is_empty() {
+
+    render_hidden_tool_catalog(
+        "Subagent orchestration tools are available but not loaded in this turn.\n\
+         When the task splits into multiple independent branches that would benefit from \
+         subagent parallelism (broad discovery, cross-module mapping, independent verification, \
+         or concurrent research), enable the needed tools via `enable_tools`.",
+        &hidden,
+    )
+}
+
+/// Render names in caller-supplied order: MCP and execution catalogs sort and
+/// deduplicate first, while the task catalog deliberately keeps family order.
+fn render_hidden_tool_catalog(
+    introduction: &str,
+    hidden_names: &[impl AsRef<str>],
+) -> Option<String> {
+    if hidden_names.is_empty() {
         return None;
     }
 
     const MAX_DISPLAY: usize = 8;
-    let displayed = hidden
+    let displayed = hidden_names
         .iter()
         .take(MAX_DISPLAY)
-        .map(|name| format!("`{name}`"))
+        .map(|name| format!("`{}`", name.as_ref()))
         .collect::<Vec<_>>()
         .join(", ");
-    let remaining = hidden.len().saturating_sub(MAX_DISPLAY);
+    let remaining = hidden_names.len().saturating_sub(MAX_DISPLAY);
 
-    let mut out = format!(
-        "Subagent orchestration tools are available but not loaded in this turn.\n\
-         When the task splits into multiple independent branches that would benefit from \
-         subagent parallelism (broad discovery, cross-module mapping, independent verification, \
-         or concurrent research), enable the needed tools via `enable_tools`.\n\
-         Available: {}",
-        displayed
-    );
+    let mut out = format!("{introduction}\nAvailable: {displayed}");
     if remaining > 0 {
         out.push_str(&format!(", and {remaining} more"));
     }

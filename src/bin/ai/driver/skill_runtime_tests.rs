@@ -349,13 +349,14 @@ fn hidden_execution_primitive_catalog_advertises_deferred_tools() {
 
     let catalog = build_hidden_execution_primitive_catalog(&Box::new(available))
         .expect("deferred primitives should produce a catalog");
-    assert!(catalog.contains("enable the needed tools via `enable_tools`"));
-    // The catalog shows the first MAX_DISPLAY(8) entries in sorted order and
-    // folds the rest into "and N more". `kill_process` sorts first and must
-    // be inside the display window; assert on it rather than `spawn_process`
-    // (the latter sorts last and falls outside the truncation).
-    assert!(catalog.contains("kill_process"));
-    assert!(catalog.contains("more."));
+    assert_eq!(
+        catalog,
+        "Process / IPC / shared-memory primitives are available but not loaded this turn.\n\
+         For multi-process orchestration, background daemons, cross-process IPC, shared memory, \
+         or per-process env/working-dir control, enable the needed tools via `enable_tools`.\n\
+         Available: `kill_process`, `ps_ipc`, `ps_processes`, `read_mailbox`, `reap_process`, \
+         `send_ipc_message`, `set_env`, `set_process_group`, and 11 more."
+    );
 }
 
 #[test]
@@ -380,12 +381,15 @@ fn hidden_task_tool_catalog_advertises_lazy_subagent_family() {
 
     let catalog = build_hidden_task_tool_catalog(&Box::new(available))
         .expect("unloaded task family should produce a catalog");
-    assert!(catalog.contains("enable the needed tools via `enable_tools`"));
-    assert!(catalog.contains("task_spawn"));
-    assert!(catalog.contains("task_spawn_batch"));
-    // The display window takes the first MAX_DISPLAY(8) entries in family
-    // order and folds the rest into "and N more".
-    assert!(catalog.contains("more."));
+    assert_eq!(
+        catalog,
+        "Subagent orchestration tools are available but not loaded in this turn.\n\
+         When the task splits into multiple independent branches that would benefit from \
+         subagent parallelism (broad discovery, cross-module mapping, independent verification, \
+         or concurrent research), enable the needed tools via `enable_tools`.\n\
+         Available: `task`, `task_spawn`, `task_spawn_batch`, `task_wait`, `task_status`, \
+         `task_retry`, `task_cancel`, `task_evidence_read`, and 4 more."
+    );
 }
 
 #[test]
@@ -417,12 +421,14 @@ async fn hidden_task_tool_catalog_suppressed_inside_subagent() {
     // Subagents can never enable the task family (it is hidden when
     // SUBAGENT_DEPTH > 0), so the nudge would be misleading there; the
     // catalog must stay silent at depth > 0.
-    SUBAGENT_DEPTH.scope(1, async {
-        let mut available = SkipSet::new(16);
-        available.insert("read_file".to_string());
-        available.insert("enable_tools".to_string());
-        assert!(build_hidden_task_tool_catalog(&Box::new(available)).is_none());
-    });
+    SUBAGENT_DEPTH
+        .scope(1, async {
+            let mut available = SkipSet::new(16);
+            available.insert("read_file".to_string());
+            available.insert("enable_tools".to_string());
+            assert!(build_hidden_task_tool_catalog(&Box::new(available)).is_none());
+        })
+        .await;
 }
 
 #[test]
@@ -1124,12 +1130,64 @@ fn hidden_mcp_tool_catalog_lists_real_available_tools() {
     )
     .unwrap();
 
-    assert!(catalog.contains("Configured MCP tools are available but not loaded"));
-    assert!(catalog.contains("discover and enable matching `mcp_*` tools"));
-    assert!(catalog.contains("`enable_tools`"));
-    assert!(catalog.contains("`mcp_feishu_docs_get_text_by_url`"));
-    assert!(catalog.contains("`mcp_pdf-extract_pdf_extract_text`"));
-    assert!(!catalog.contains("`mcp_feishu_doc_create_from_markdown`"));
+    assert_eq!(
+        catalog,
+        "Configured MCP tools are available but not loaded in this turn.\n\
+         If the task needs an external system or MCP-backed capability, discover and enable matching \
+         `mcp_*` tools via `enable_tools` first.\n\
+         Available: `mcp_feishu_docs_get_text_by_url`, `mcp_pdf-extract_pdf_extract_text`."
+    );
+}
+
+#[test]
+fn hidden_mcp_tool_catalog_preserves_rendered_bytes_at_display_boundary() {
+    // Unsorted duplicates and an already-loaded tool must not change the
+    // display window or the count of remaining unique, unloaded tools.
+    for (count, expected_list) in [
+        (0, None),
+        (1, Some("`mcp_test_01`.")),
+        (
+            8,
+            Some(
+                "`mcp_test_01`, `mcp_test_02`, `mcp_test_03`, `mcp_test_04`, \
+                 `mcp_test_05`, `mcp_test_06`, `mcp_test_07`, `mcp_test_08`.",
+            ),
+        ),
+        (
+            9,
+            Some(
+                "`mcp_test_01`, `mcp_test_02`, `mcp_test_03`, `mcp_test_04`, \
+                 `mcp_test_05`, `mcp_test_06`, `mcp_test_07`, `mcp_test_08`, and 1 more.",
+            ),
+        ),
+    ] {
+        let mut all_tools = vec![tool("mcp_test_loaded")];
+        for index in (1..=count).rev() {
+            let name = format!("mcp_test_{index:02}");
+            all_tools.push(tool(&name));
+            all_tools.push(tool(&name));
+        }
+        let catalog = build_hidden_mcp_tool_catalog(&all_tools, &[tool("mcp_test_loaded")]);
+        let expected = expected_list.map(|list| {
+            format!(
+                "Configured MCP tools are available but not loaded in this turn.\n\
+                 If the task needs an external system or MCP-backed capability, discover and enable matching \
+                 `mcp_*` tools via `enable_tools` first.\n\
+                 Available: {list}"
+            )
+        });
+        assert_eq!(catalog, expected, "hidden tool count: {count}");
+
+        let mut builder = SystemPromptBuilder::new();
+        if let Some(catalog) = catalog {
+            builder.push(ContextKind::Capability, catalog);
+        }
+        let expected_prompt = expected
+            .map(|text| format!("<capabilities>\n{text}\n</capabilities>\n"))
+            .unwrap_or_default();
+        assert_eq!(builder.render_system_prompt(), expected_prompt);
+    }
+    assert!(build_hidden_mcp_tool_catalog(&[], &[]).is_none());
 }
 
 #[test]
