@@ -3,11 +3,7 @@ use crate::ai::{
     driver::model::OcrExtraction,
     mcp::McpClient,
     skills::SkillManifest,
-    theme::{
-        ACCENT_COMMAND, ACCENT_DANGER, ACCENT_EMPHASIZED_OUTPUT, ACCENT_MUTED, ACCENT_PRIMARY,
-        ACCENT_RULE, ACCENT_SECONDARY, ACCENT_SUCCESS, ACCENT_TOOL_NAME, ACCENT_WARN, BOLD, DIM,
-        RESET,
-    },
+    theme::{self, BOLD, DIM, RESET},
     types::App,
 };
 
@@ -87,12 +83,12 @@ pub fn print_ocr_summary(extraction: &OcrExtraction) {
 pub(in crate::ai) fn format_section_header(title: &str, detail: Option<&str>) -> String {
     let mut out = String::new();
     out.push_str(BOLD);
-    out.push_str(ACCENT_SUCCESS);
+    out.push_str(theme::current().accent_success);
     out.push_str(title);
     out.push_str(RESET);
     if let Some(detail) = detail.filter(|detail| !detail.is_empty()) {
         out.push(' ');
-        out.push_str(ACCENT_MUTED);
+        out.push_str(theme::current().accent_muted);
         out.push('·');
         out.push(' ');
         out.push_str(detail);
@@ -102,21 +98,27 @@ pub(in crate::ai) fn format_section_header(title: &str, detail: Option<&str>) ->
 }
 
 pub(in crate::ai) fn format_section_note(note: &str) -> String {
-    format!("  {}{}{}", ACCENT_MUTED, note, RESET)
+    format!("  {}{}{}", theme::current().accent_muted, note, RESET)
 }
 
 pub(in crate::ai) fn format_section_item(label: &str, description: &str) -> String {
     if description.is_empty() {
-        return format!("  {}{}{}", ACCENT_PRIMARY, label, RESET);
+        return format!("  {}{}{}", theme::current().accent_primary, label, RESET);
     }
     format!(
         "  {}{}{} {}· {}{}{}",
-        ACCENT_PRIMARY, label, RESET, ACCENT_MUTED, RESET, DIM, description
+        theme::current().accent_primary,
+        label,
+        RESET,
+        theme::current().accent_muted,
+        RESET,
+        DIM,
+        description
     ) + RESET
 }
 
 pub(in crate::ai) fn format_empty_state(label: &str) -> String {
-    format!("  {}{}{}", ACCENT_MUTED, label, RESET)
+    format!("  {}{}{}", theme::current().accent_muted, label, RESET)
 }
 
 pub(in crate::ai) fn format_assistant_banner(
@@ -129,9 +131,9 @@ pub(in crate::ai) fn format_assistant_banner(
         (None, Some(skill)) => Some(format!("skill:{skill}")),
         (None, None) => None,
     };
-    let mut out = format!("{BOLD}{ACCENT_SUCCESS}assistant{RESET}");
+    let mut out = format!("{BOLD}{}assistant{RESET}", theme::current().accent_success);
     if let Some(detail) = detail.as_deref() {
-        out.push_str(&format!(" {ACCENT_MUTED}· {detail}{RESET}"));
+        out.push_str(&format!(" {}· {detail}{RESET}", theme::current().accent_muted));
     }
     out
 }
@@ -139,14 +141,24 @@ pub(in crate::ai) fn format_assistant_banner(
 pub(in crate::ai) fn format_tool_header(tool_name: &str) -> String {
     format!(
         "{}{}tool{} {}{}{}",
-        BOLD, ACCENT_SUCCESS, RESET, ACCENT_TOOL_NAME, tool_name, RESET
+        BOLD,
+        theme::current().accent_success,
+        RESET,
+        theme::current().accent_tool_name,
+        tool_name,
+        RESET
     )
 }
 
 pub(in crate::ai) fn format_tool_status(status: &str, tool_name: &str, accent: &str) -> String {
     format!(
         "  {}{}{} {}{}{}",
-        accent, status, RESET, ACCENT_TOOL_NAME, tool_name, RESET
+        accent,
+        status,
+        RESET,
+        theme::current().accent_tool_name,
+        tool_name,
+        RESET
     )
 }
 
@@ -161,49 +173,54 @@ pub(in crate::ai) fn format_tool_status_with_file_target(
         format!(
             "{}  {}·{} {}{}{} {}{}{}",
             status_line,
-            ACCENT_MUTED,
+            theme::current().accent_muted,
             RESET,
-            ACCENT_SECONDARY,
+            theme::current().accent_secondary,
             path_part,
             RESET,
-            ACCENT_COMMAND,
+            theme::current().accent_command,
             line_part,
             RESET,
         )
     } else {
         format!(
             "{}  {}·{} {}{}{}",
-            status_line, ACCENT_MUTED, RESET, ACCENT_SECONDARY, target, RESET
+            status_line,
+            theme::current().accent_muted,
+            RESET,
+            theme::current().accent_secondary,
+            target,
+            RESET
         )
     }
 }
 
 pub(in crate::ai) fn format_tool_status_running(tool_name: &str) -> String {
-    format_tool_status("●", tool_name, ACCENT_PRIMARY)
+    format_tool_status("●", tool_name, theme::current().accent_primary)
 }
 
 pub(in crate::ai) fn format_tool_status_cached(tool_name: &str) -> String {
-    format_tool_status("◇", tool_name, ACCENT_SECONDARY)
+    format_tool_status("◇", tool_name, theme::current().accent_secondary)
 }
 
 pub(in crate::ai) fn format_tool_status_skipped(tool_name: &str) -> String {
-    format_tool_status("–", tool_name, ACCENT_WARN)
+    format_tool_status("–", tool_name, theme::current().accent_warn)
 }
 
 pub(in crate::ai) fn format_tool_status_completed(tool_name: &str) -> String {
-    format_tool_status("✓", tool_name, ACCENT_SUCCESS)
+    format_tool_status("✓", tool_name, theme::current().accent_success)
 }
 
 pub(in crate::ai) fn format_tool_status_failed(tool_name: &str) -> String {
-    format_tool_status("×", tool_name, ACCENT_DANGER)
+    format_tool_status("×", tool_name, theme::current().accent_danger)
 }
 
 pub(in crate::ai) fn format_tool_status_deferred(tool_name: &str) -> String {
-    format_tool_status("◷", tool_name, ACCENT_WARN)
+    format_tool_status("◷", tool_name, theme::current().accent_warn)
 }
 
 pub(in crate::ai) fn format_tool_output_prefix() -> String {
-    format!("  {}│{} {}", ACCENT_RULE, RESET, DIM)
+    format!("  {}│{} {}", theme::current().accent_rule, RESET, DIM)
 }
 
 pub(in crate::ai) fn format_tool_output_line(line: &str) -> String {
@@ -217,12 +234,16 @@ fn format_emphasized_tool_output_line(line: &str) -> String {
 fn format_tool_output_line_with_dim(line: &str, dim: bool) -> String {
     let sanitized = sanitize_for_terminal(line);
     if sanitized.is_empty() {
-        format!("  {}│{}", ACCENT_RULE, RESET)
+        format!("  {}│{}", theme::current().accent_rule, RESET)
     } else {
-        let body_style = if dim { DIM } else { ACCENT_EMPHASIZED_OUTPUT };
+        let body_style = if dim {
+            DIM
+        } else {
+            theme::current().accent_emphasized_output
+        };
         format!(
             "  {}│{} {}{}{}",
-            ACCENT_RULE, RESET, body_style, sanitized, RESET
+            theme::current().accent_rule, RESET, body_style, sanitized, RESET
         )
     }
 }
@@ -298,7 +319,14 @@ pub(in crate::ai) fn sanitize_for_terminal(text: &str) -> String {
 pub(in crate::ai) fn format_tool_note_line(label: &str, value: &str) -> String {
     format!(
         "  {}│{} {}{}:{} {}{}{}",
-        ACCENT_RULE, RESET, BOLD, label, RESET, ACCENT_MUTED, value, RESET
+        theme::current().accent_rule,
+        RESET,
+        BOLD,
+        label,
+        RESET,
+        theme::current().accent_muted,
+        value,
+        RESET
     )
 }
 
@@ -320,7 +348,13 @@ pub(in crate::ai) fn format_skill_activation_note(
 pub(in crate::ai) fn format_tool_command_line(command: &str) -> String {
     format!(
         "  {}│{} {}${} {}{}{}",
-        ACCENT_RULE, RESET, ACCENT_MUTED, RESET, ACCENT_COMMAND, command, RESET
+        theme::current().accent_rule,
+        RESET,
+        theme::current().accent_muted,
+        RESET,
+        theme::current().accent_command,
+        command,
+        RESET
     )
 }
 
@@ -602,7 +636,7 @@ mod tests {
         format_tool_status_completed, format_tool_status_with_file_target, sanitize_for_terminal,
     };
     use crate::ai::driver::model::{OcrExtraction, OcrImageSummary};
-    use crate::ai::theme::{ACCENT_COMMAND, ACCENT_EMPHASIZED_OUTPUT, ACCENT_SECONDARY, DIM};
+    use crate::ai::theme::{self, DIM};
 
     fn strip_ansi_for_test(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
@@ -732,12 +766,12 @@ mod tests {
         assert!(
             normal
                 .iter()
-                .all(|line| !line.contains(ACCENT_EMPHASIZED_OUTPUT))
+                .all(|line| !line.contains(theme::current().accent_emphasized_output))
         );
         assert!(
             emphasized
                 .iter()
-                .all(|line| line.contains(ACCENT_EMPHASIZED_OUTPUT))
+                .all(|line| line.contains(theme::current().accent_emphasized_output))
         );
     }
 
@@ -752,7 +786,7 @@ mod tests {
         let rendered = format_tool_command_line("cargo check --bin a");
         let visible = strip_ansi_for_test(&rendered);
         assert_eq!(visible, "  │ $ cargo check --bin a");
-        assert!(rendered.contains(ACCENT_COMMAND));
+        assert!(rendered.contains(theme::current().accent_command));
     }
 
     #[test]
@@ -781,7 +815,10 @@ mod tests {
         let visible = strip_ansi_for_test(&rendered);
 
         assert_eq!(visible, "  ✓ read_file  · tool_result/execution.rs");
-        assert!(rendered.contains(&format!("{ACCENT_SECONDARY}tool_result/execution.rs")));
+        assert!(rendered.contains(&format!(
+            "{}tool_result/execution.rs",
+            theme::current().accent_secondary
+        )));
     }
 
     #[test]

@@ -48,3 +48,6 @@ ai.embedding.model = doubao-embedding-vision
 
 
 ai.output.postprocess_command = python3 /path/to/rust_tools/scripts/postprocess_terminal.py
+
+ai.theme = monokai        # 内置主题
+ai.theme.file = ~/my.json # 或自定义文件(优先级更高)

@@ -12,7 +12,7 @@ use crate::ai::{
     models,
     provider::{self, ProviderAdapter},
     request::{StreamChunk, merge_reasoning_fragments},
-    theme::{ACCENT_MUTED, DIM, RESET},
+    theme::{self, RESET},
     types::{App, StreamOutcome, StreamResult, take_stream_cancelled},
 };
 use crate::commonw::configw;
@@ -251,7 +251,7 @@ fn print_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
 fn write_waiting_hint_line(label: &str) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    writeln!(out, "  {ACCENT_MUTED}⠋ {label}{RESET}")?;
+    writeln!(out, "  {}⠋ {label}{RESET}", theme::current().accent_muted)?;
     out.flush()
 }
 
@@ -342,7 +342,7 @@ fn upgrade_waiting_hint_for_buffering(state: &mut StreamProcessingState) -> io::
     let stdout = io::stdout();
     let mut out = stdout.lock();
     write!(out, "\x1b[1A\r\x1b[2K")?;
-    writeln!(out, "  {ACCENT_MUTED}⠋ buffering…{RESET}")?;
+    writeln!(out, "  {}⠋ buffering…{RESET}", theme::current().accent_muted)?;
     out.flush()?;
     state.render.waiting_hint_buffering = true;
     Ok(())
@@ -366,7 +366,7 @@ fn show_deferred_body_buffering_hint(state: &mut StreamProcessingState) -> io::R
     if state.render.waiting_hint_active {
         write!(out, "\x1b[1A\r\x1b[2K")?;
     }
-    writeln!(out, "  {ACCENT_MUTED}⠋ generating…{RESET}")?;
+    writeln!(out, "  {}⠋ generating…{RESET}", theme::current().accent_muted)?;
     out.flush()?;
     state.render.waiting_hint_active = true;
     state.render.waiting_hint_buffering = true;
@@ -765,7 +765,7 @@ fn maybe_print_prompt_cache_metrics(usage: &crate::ai::request::StreamUsage) {
         .map(|d| d.cached_tokens)
         .unwrap_or(0);
     if let Some(line) = format_prompt_cache_metrics(usage.prompt_tokens, cached) {
-        println!("  {ACCENT_MUTED}{line}{RESET}");
+        println!("  {}{line}{RESET}", theme::current().accent_muted);
     }
 }
 
@@ -1562,7 +1562,7 @@ fn write_fold_header(
     out: &mut impl Write,
     fold: &super::state::ThinkingFoldState,
 ) -> io::Result<()> {
-    write!(out, "  {ACCENT_MUTED}{}\x1b[0m\r\n", fold.header_label)
+    write!(out, "  {}{}\x1b[0m\r\n", theme::current().accent_muted, fold.header_label)
 }
 
 /// Write the final header directly when thinking ends; used for an empty fold that never wrote an in-progress header.
@@ -1573,7 +1573,8 @@ fn write_thinking_fold_completion_header(
 ) -> io::Result<()> {
     write!(
         out,
-        "  {ACCENT_MUTED}{} · {line_count} lines\x1b[0m\r\n",
+        "  {}{} · {line_count} lines\x1b[0m\r\n",
+        theme::current().accent_muted,
         fold.footer_label,
     )
 }
@@ -1702,7 +1703,8 @@ fn finalize_fold_to(
         }
         write!(
             out,
-            "  {ACCENT_MUTED}{} · {line_count} lines\x1b[0m\r\n",
+            "  {}{} · {line_count} lines\x1b[0m\r\n",
+            theme::current().accent_muted,
             fold.footer_label,
         )?;
     }
@@ -1859,11 +1861,14 @@ fn render_thinking_fold_window_lines(
         let rendered_line = format!("{THINKING_FOLD_BODY_INDENT}{wrapped_row}");
         rows += 1;
         if is_marker {
-            out.push_str(ACCENT_MUTED);
+            out.push_str(theme::current().accent_muted);
             out.push_str(&rendered_line);
             out.push_str("\x1b[0m");
         } else {
-            out.push_str(DIM);
+            // Thinking body uses the theme's muted color (same family as the marker) instead of
+            // SGR-dim on the terminal default foreground: dim support varies by terminal, and the
+            // result was nearly indistinguishable from the answer body text on some setups.
+            out.push_str(&theme::current().accent_muted);
             out.push_str(&rendered_line);
             out.push_str(RESET);
         }
@@ -2655,7 +2660,7 @@ fn write_stream_content_to_terminal(
         io::stdout().flush()?;
     } else {
         if dimmed {
-            print!("{DIM}{content}{RESET}");
+            print!("{}{content}{RESET}", theme::current().accent_muted);
         } else {
             print!("{content}");
         }

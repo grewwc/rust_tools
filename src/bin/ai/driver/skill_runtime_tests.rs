@@ -1060,7 +1060,7 @@ fn system_prompt_uses_success_criteria_for_normal_and_goal_convergence() {
 }
 
 #[test]
-fn asking_user_guidance_only_on_default_interactive_path() {
+fn ask_protocol_lives_in_tool_description_not_prose() {
     let available = Box::new(SkipSet::new(16));
     let build_agent = agent("build", vec![]);
 
@@ -1071,8 +1071,9 @@ fn asking_user_guidance_only_on_default_interactive_path() {
         &PromptContext::default(),
     )
     .render_system_prompt();
-    assert!(interactive.contains("<asking_the_user>"));
-    assert!(interactive.contains("information only the user can provide"));
+    // The prose guidance block was removed; the ask protocol now travels as
+    // request_user_input tool metadata, injected by build_skill_turn_guard.
+    assert!(!interactive.contains("<asking_the_user>"));
 
     let goal = build_system_prompt(
         Some(&build_agent),
@@ -1106,6 +1107,48 @@ fn asking_user_guidance_only_on_default_interactive_path() {
     )
     .render_system_prompt();
     assert!(!skill_turn.contains("<asking_the_user>"));
+
+    // The merged ask protocol lives in the tool metadata, visible to every turn
+    // that carries the tool.
+    let tool = crate::ai::tools::get_tool_definitions_by_names(&[
+        "request_user_input".to_string(),
+    ]);
+    assert_eq!(tool.len(), 1);
+    let desc = &tool[0].function.description;
+    assert!(desc.contains("genuinely blocked"));
+    assert!(desc.contains("one focused question"));
+    assert!(desc.contains("exhaust what tools and verification can establish"));
+    assert!(
+        desc.contains("restores that skill only for the user's immediately following normal message")
+    );
+}
+
+#[test]
+fn request_user_input_injection_matrix() {
+    let humanizer = skill("humanizer", "Rewrite text naturally");
+    let skills: &[&SkillManifest] = &[&humanizer];
+
+    // Skill turns always inject (cross-turn handoff), even under goal mode.
+    assert!(super::should_inject_request_user_input(skills, &None, false));
+    assert!(super::should_inject_request_user_input(
+        skills,
+        &Some("g".to_string()),
+        false
+    ));
+    // Ordinary interactive turns inject the explicit ask protocol.
+    assert!(super::should_inject_request_user_input(&[], &None, false));
+    // Goal mode and background turns deliberately disable asking.
+    assert!(!super::should_inject_request_user_input(
+        &[],
+        &Some("g".to_string()),
+        false
+    ));
+    assert!(!super::should_inject_request_user_input(&[], &None, true));
+    assert!(!super::should_inject_request_user_input(
+        &[],
+        &Some("g".to_string()),
+        true
+    ));
 }
 
 #[test]
@@ -1938,7 +1981,7 @@ fn agent(name: &str, mcp_servers: Vec<&str>) -> AgentManifest {
 }
 
 #[test]
-fn manifest_skill_group_does_not_expose_request_user_input_without_active_skill() {
+fn manifest_tool_groups_cannot_expose_request_user_input() {
     let mut active_agent = agent("ordinary", vec![]);
     active_agent.tool_groups.push("skill".to_string());
 
@@ -1948,7 +1991,7 @@ fn manifest_skill_group_does_not_expose_request_user_input_without_active_skill(
         !tools
             .iter()
             .any(|tool| tool.function.name == "request_user_input"),
-        "manifest tool_groups must not expose the skill-only handoff control tool"
+        "manifest tool_groups must not expose the driver-injected ask/handoff control tool"
     );
 }
 

@@ -828,7 +828,7 @@ mod tests {
         let listed = execute_enable_tools(&json!({"operation": "list"})).unwrap();
         assert!(
             !listed.contains("  - request_user_input:"),
-            "skill-only control tools must not appear in the normal enable catalog"
+            "driver-injected control tools must not appear in the normal enable catalog"
         );
 
         let output =

@@ -911,6 +911,12 @@ pub(in crate::ai::driver) async fn run_turn(
     one_shot_mode: bool,
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
+    // Hot-reload config + theme at the turn boundary so `ai.theme` /
+    // `ai.theme.file` edits (or edits to a custom theme JSON) apply on the
+    // next user message without restarting the long-lived agent process.
+    crate::commonw::configw::refresh();
+    crate::ai::theme::refresh();
+
     // Step 3: turn-start hook (preserving the original pairing semantics; must fire before the
     // /audit shortcut). Allocate the real turn identity first (atomic increment in the session
     // SQLite), then fire the start hook, so on_turn_start / on_turn_end read the real

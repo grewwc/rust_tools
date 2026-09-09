@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use crate::ai::stream::extract::strip_ansi_codes;
 use crate::ai::stream::render::code::{
-    MONOKAI_BG, MONOKAI_DIM, highlight_code_line, parse_code_block_language,
+    highlight_code_line, parse_code_block_language,
 };
 use crate::ai::stream::render::html::{
     contains_close_table_tag, contains_open_table_tag, parse_html_table, render_html_table,
@@ -14,11 +14,8 @@ use crate::ai::stream::render::table::{
     render_table_bottom, render_table_header, render_table_mid, render_table_row, render_table_top,
     split_indent, table_column_ranges, table_preview_height,
 };
-use crate::ai::stream::render::{MARKDOWN_BODY, MARKDOWN_HEADING};
 use crate::ai::stream::state::{END_THINKING_TAG_TEXT, THINKING_TAG_TEXT};
-use crate::ai::theme::{
-    ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SECONDARY, ACCENT_SUCCESS,
-};
+use crate::ai::theme;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MathBlockDelimiter {
@@ -494,10 +491,13 @@ impl MarkdownStreamRenderer {
             }
             if self.math_line_candidate_buffered {
                 self.math_line_candidate_buffered = false;
-                if self.dimmed {
-                    out.write_all(b"\x1b[2m")?;
-                }
-                out.write_all(MARKDOWN_BODY.as_bytes())?;
+                out.write_all(
+                    if self.dimmed {
+                        theme::current().accent_muted.as_bytes()
+                    } else {
+                        theme::current().markdown_body.as_bytes()
+                    },
+                )?;
                 out.write_all(self.line_buf.as_bytes())?;
                 self.line_preview_emitted = true;
                 self.line_preview_height_stale = true;
@@ -515,10 +515,13 @@ impl MarkdownStreamRenderer {
             return Ok(());
         }
         if self.line_char_count == 1 {
-            if self.dimmed {
-                out.write_all(b"\x1b[2m")?;
-            }
-            out.write_all(MARKDOWN_BODY.as_bytes())?;
+            out.write_all(
+                if self.dimmed {
+                    theme::current().accent_muted.as_bytes()
+                } else {
+                    theme::current().markdown_body.as_bytes()
+                },
+            )?;
         }
         self.emit_char(out, ch)?;
         self.line_preview_emitted = true;
@@ -663,7 +666,7 @@ impl MarkdownStreamRenderer {
             );
             self.math_block_buf.clear();
             if !rendered.is_empty() {
-                let line = format!("{ACCENT_SECONDARY}{rendered}\x1b[0m\n");
+                let line = format!("{}{rendered}\x1b[0m\n", theme::current().accent_secondary);
                 out.write_all(line.as_bytes())?;
                 self.bol = true;
             }
@@ -1039,7 +1042,7 @@ impl MarkdownStreamRenderer {
             return String::new();
         }
         self.table_placeholder_shown = true;
-        format!("{indent}{ACCENT_MUTED}⋯ 生成表格中\x1b[0m\n")
+        format!("{indent}{}⋯ 生成表格中\x1b[0m\n", theme::current().accent_muted)
     }
 
     /// 若占位提示正显示在屏幕上，返回清除它的确定序列（上移 1 行并清到屏末）。
@@ -1069,7 +1072,7 @@ impl MarkdownStreamRenderer {
             } else {
                 "✓ thinking"
             };
-            return format!("{indent}{ACCENT_MUTED}{label}\x1b[0m\n");
+            return format!("{indent}{}{label}\x1b[0m\n", theme::current().accent_muted);
         }
 
         // A math block may already be open (e.g. a fenced latex block); its closing
@@ -1083,7 +1086,11 @@ impl MarkdownStreamRenderer {
                 self.code_block_lang = None;
                 let block_indent = std::mem::take(&mut self.code_block_indent);
                 let border = "─".repeat(22);
-                return format!("{block_indent}{MONOKAI_BG}{MONOKAI_DIM}╰{border}\x1b[0m\n");
+                return format!(
+                    "{block_indent}{}{}╰{border}\x1b[0m\n",
+                    theme::current().code_background,
+                    theme::current().code_dim
+                );
             } else {
                 let lang = parse_code_block_language(trimmed);
                 // `latex` / `tex` / `math` fences carry formulas: buffer the lines and
@@ -1099,7 +1106,11 @@ impl MarkdownStreamRenderer {
                 self.code_block_lang = lang;
                 self.code_line_number = 0;
                 let lang = self.code_block_lang.as_deref().unwrap_or("code");
-                return format!("{indent}{MONOKAI_BG}{MONOKAI_DIM}╭─ {lang}\x1b[0m\n");
+                return format!(
+                    "{indent}{}{}╭─ {lang}\x1b[0m\n",
+                    theme::current().code_background,
+                    theme::current().code_dim
+                );
             }
         }
 
@@ -1112,11 +1123,13 @@ impl MarkdownStreamRenderer {
             if code_text.is_empty() {
                 if self.show_line_gutter {
                     return format!(
-                        "{block_indent}{MONOKAI_BG}{MONOKAI_DIM}{} │\x1b[0m\n",
+                        "{block_indent}{}{}{} │\x1b[0m\n",
+                        theme::current().code_background,
+                        theme::current().code_dim,
                         line_num_str
                     );
                 }
-                return format!("{block_indent}{MONOKAI_BG}\x1b[0m\n");
+                return format!("{block_indent}{}\x1b[0m\n", theme::current().code_background);
             }
             let wrapped = wrap_code_block_text(
                 code_text,
@@ -1125,14 +1138,14 @@ impl MarkdownStreamRenderer {
             let mut out = String::new();
             for (idx, segment) in wrapped.iter().enumerate() {
                 out.push_str(block_indent);
-                out.push_str(MONOKAI_BG);
+                out.push_str(theme::current().code_background);
                 if self.show_line_gutter {
                     let gutter = if idx == 0 {
                         line_num_str.as_str()
                     } else {
                         "   "
                     };
-                    out.push_str(MONOKAI_DIM);
+                    out.push_str(theme::current().code_dim);
                     out.push_str(gutter);
                     out.push_str(" │");
                 }
@@ -1156,7 +1169,7 @@ impl MarkdownStreamRenderer {
                 );
                 self.math_block_buf.clear();
                 if !rendered.is_empty() {
-                    return format!("{base}{ACCENT_SECONDARY}{rendered}\x1b[0m\n");
+                    return format!("{base}{}{rendered}\x1b[0m\n", theme::current().accent_secondary);
                 }
                 return String::new();
             }
@@ -1172,8 +1185,16 @@ impl MarkdownStreamRenderer {
             return String::new();
         }
 
-        let prose_base = format!("{base}{MARKDOWN_BODY}");
-        let base = prose_base.as_str();
+        // Dimmed prose is the thinking channel: use the theme's muted color directly instead of
+        // dimming markdown_body (SGR 2m applied to the body color is barely distinguishable from
+        // plain body text on many terminals). accent_muted contrasts with markdown_body in every
+        // builtin theme, so thinking stays visibly distinct from the final answer.
+        let prose_base = if self.dimmed {
+            theme::current().accent_muted
+        } else {
+            theme::current().markdown_body
+        };
+        let base = prose_base;
 
         if let Some((level, title)) = parse_heading(trimmed) {
             let underline_char = match level {
@@ -1187,7 +1208,7 @@ impl MarkdownStreamRenderer {
                 self.bol = true;
             }
             out.push_str(indent);
-            let combined_base = format!("{base}\x1b[1m{MARKDOWN_HEADING}");
+            let combined_base = format!("{base}\x1b[1m{}", theme::current().markdown_heading);
             out.push_str(&render_inline_md(title, &combined_base));
             out.push_str("\x1b[0m\n");
 
@@ -1196,7 +1217,7 @@ impl MarkdownStreamRenderer {
                 out.push_str(indent);
                 out.push_str(base);
                 out.push_str("\x1b[2m");
-                out.push_str(ACCENT_RULE);
+                out.push_str(theme::current().accent_rule);
                 out.push_str(&std::iter::repeat_n(ch, len).collect::<String>());
                 out.push_str("\x1b[0m\n");
             }
@@ -1204,13 +1225,18 @@ impl MarkdownStreamRenderer {
         }
 
         if is_thematic_break(trimmed) {
-            return format!("{indent}{base}{ACCENT_RULE}{}\x1b[0m\n", "─".repeat(28));
+            return format!(
+                "{indent}{base}{}{}\x1b[0m\n",
+                theme::current().accent_rule,
+                "─".repeat(28)
+            );
         }
 
         if let Some(body) = parse_blockquote(trimmed) {
-            let quote_base = format!("{base}{ACCENT_MUTED}");
+            let quote_base = format!("{base}{}", theme::current().accent_muted);
             return format!(
-                "{indent}{base}{ACCENT_MUTED}▍\x1b[0m {}\n",
+                "{indent}{base}{}▍\x1b[0m {}\n",
+                theme::current().accent_muted,
                 render_inline_md(body, &quote_base)
             );
         }
@@ -1221,21 +1247,21 @@ impl MarkdownStreamRenderer {
             if let Some(checked) = checkbox {
                 out.push_str(base);
                 if checked {
-                    out.push_str(ACCENT_SUCCESS);
+                    out.push_str(theme::current().accent_success);
                     out.push('✓');
                 } else {
-                    out.push_str(ACCENT_MUTED);
+                    out.push_str(theme::current().accent_muted);
                     out.push('○');
                 }
                 out.push_str("\x1b[0m ");
             } else if prefix.ends_with(". ") {
                 out.push_str(base);
-                out.push_str(ACCENT_MUTED);
+                out.push_str(theme::current().accent_muted);
                 out.push_str(prefix.trim_end());
                 out.push_str("\x1b[0m ");
             } else {
                 out.push_str(base);
-                out.push_str(ACCENT_PRIMARY);
+                out.push_str(theme::current().accent_primary);
                 out.push('•');
                 out.push_str("\x1b[0m ");
             }
@@ -1493,15 +1519,15 @@ fn code_block_preview_prefix(
 ) -> String {
     let mut out = String::new();
     out.push_str(block_indent);
-    out.push_str(MONOKAI_BG);
+    out.push_str(theme::current().code_background);
     if show_line_gutter {
-        out.push_str(MONOKAI_DIM);
+        out.push_str(theme::current().code_dim);
         out.push_str(line_num_str);
         out.push_str(" │\x1b[0m");
     } else {
         out.push_str("\x1b[0m");
     }
-    out.push_str(MONOKAI_BG);
+    out.push_str(theme::current().code_background);
     if dimmed {
         out.push_str("\x1b[2m");
     }
@@ -1635,11 +1661,11 @@ mod tests {
         ] {
             let out = renderer.consume_line(source, false);
             assert_eq!(strip_ansi_for_test(&out), expected);
-            assert!(out.ends_with(&format!("{MARKDOWN_BODY}正文\x1b[0m\n")));
+            assert!(out.ends_with(&format!("{}正文\x1b[0m\n", theme::current().markdown_body)));
         }
         let quote = renderer.consume_line("> 引用", false);
         assert_eq!(strip_ansi_for_test(&quote), "▍ 引用\n");
-        assert!(quote.contains(&format!("{ACCENT_MUTED}引用")));
+        assert!(quote.contains(&format!("{}引用", theme::current().accent_muted)));
     }
 
     #[test]
@@ -1648,7 +1674,10 @@ mod tests {
             let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
             renderer.bol = true;
             let out = renderer.consume_line(&format!("{} 标题", "#".repeat(level)), false);
-            assert!(out.contains(&format!("\x1b[1m{MARKDOWN_HEADING}标题")));
+            assert!(out.contains(&format!(
+                "\x1b[1m{}标题",
+                theme::current().markdown_heading
+            )));
             let expected = match level {
                 1 => "标题\n━━━\n",
                 2 => "标题\n───\n",
@@ -1671,7 +1700,11 @@ mod tests {
                             .unwrap(),
                     );
                 }
-                let base = format!("{}{MARKDOWN_BODY}", if dimmed { "\x1b[2m" } else { "" });
+                let base = if dimmed {
+                    theme::current().accent_muted.clone()
+                } else {
+                    theme::current().markdown_body.clone()
+                };
                 assert_eq!(preview, format!("{base}{source}"));
                 let repaint = renderer.flush_pending_for_test().unwrap();
                 assert!(repaint.contains(&base));
@@ -1688,12 +1721,13 @@ mod tests {
         assert_eq!(
             renderer.consume_line("let x = 1;", false),
             format!(
-                "{MONOKAI_BG}{}\x1b[0m\n",
+                "{}{}\x1b[0m\n",
+                theme::current().code_background,
                 highlight_code_line("let x = 1;", Some("rust"))
             )
         );
         let status = renderer.consume_line(END_THINKING_TAG_TEXT, false);
-        assert_eq!(status, format!("{ACCENT_MUTED}✓ thinking\x1b[0m\n"));
+        assert_eq!(status, format!("{}✓ thinking\x1b[0m\n", theme::current().accent_muted));
     }
 
     #[test]

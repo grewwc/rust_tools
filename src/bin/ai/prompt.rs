@@ -87,6 +87,16 @@ pub(super) struct PromptEditor {
     /// Once a DSR query times out, later untagged replies cannot be matched to
     /// new queries. Keep subsequent prompts on a query-free editing screen.
     cursor_position_queries_disabled: bool,
+    /// A query that timed out this session can leave one orphan ESC byte in
+    /// crossterm's queue: the leading 0x1B arrived alone while the CPR poll was
+    /// filtering for cursor events, crossterm parsed it as an Escape key, and
+    /// the `[row;colR` tail follows as ordinary char events. This flag arms a
+    /// one-shot guard for that single byte. It is consumed (disarmed) as soon
+    /// as the first standalone Escape after arming is classified, so unlike
+    /// `cursor_position_queries_disabled` it never suppresses later, real
+    /// Escape submissions. Persists across prompt rounds because the orphan can
+    /// be delivered after a non-Escape submission (F2 / Alt+Enter).
+    pending_late_cpr_escape_guard: bool,
     /// Preserve non-CPR lookahead even when Escape submits the current prompt.
     pending_terminal_events: VecDeque<crossterm::event::Event>,
 }
@@ -134,6 +144,7 @@ impl PromptEditor {
             session_title_updates: Mutex::new(session_title_updates),
             first_render_notifier: None,
             cursor_position_queries_disabled: false,
+            pending_late_cpr_escape_guard: false,
             pending_terminal_events: VecDeque::new(),
         }
     }

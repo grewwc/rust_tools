@@ -1990,7 +1990,9 @@ fn completed_thinking_fold_replaces_anchored_header_in_place() {
     assert_eq!(
         String::from_utf8(out).unwrap(),
         format!(
-            "\r\x1b[1A\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[1A\r\r\x1b[1A\r\x1b[2K  {ACCENT_MUTED}✓ thinking · 3 lines\x1b[0m\r\n{ACCENT_MUTED}    … 3 earlier lines\x1b[0m"
+            "\r\x1b[1A\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[1A\r\r\x1b[1A\r\x1b[2K  {}✓ thinking · 3 lines\x1b[0m\r\n{}    … 3 earlier lines\x1b[0m",
+            crate::ai::theme::current().accent_muted,
+            crate::ai::theme::current().accent_muted,
         )
     );
     assert!(!fold.active);
@@ -2097,7 +2099,10 @@ fn thinking_fold_empty_body_completion_replaces_header() {
 
     assert_eq!(
         String::from_utf8(out).unwrap(),
-        format!("\r\x1b[1A\r\x1b[2K  {ACCENT_MUTED}✓ thinking · 0 lines\x1b[0m\r\n")
+        format!(
+            "\r\x1b[1A\r\x1b[2K  {}✓ thinking · 0 lines\x1b[0m\r\n",
+            crate::ai::theme::current().accent_muted,
+        )
     );
     assert!(!fold.active);
     assert!(!fold.header_drawn);

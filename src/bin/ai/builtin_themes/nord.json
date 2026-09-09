@@ -1,0 +1,33 @@
+{
+  "name": "nord",
+  "type": "dark",
+  "colors": {
+    "accent.primary": "#88C0D0",
+    "accent.toolName": "#D08770",
+    "accent.secondary": "#B48EAD",
+    "accent.command": "#A3BE8C",
+    "accent.muted": "#4C566A",
+    "accent.input": "#D8DEE9",
+    "accent.success": "#A3BE8C",
+    "accent.emphasizedOutput": "#8FBCBB",
+    "accent.warn": "#EBCB8B",
+    "accent.danger": "#BF616A",
+    "accent.marked": "#BF616A",
+    "accent.rule": "#3B4252",
+    "accent.submitted": "#EBCB8B",
+    "markdown.body": "#D8DEE9",
+    "markdown.strong": "#ECEFF4",
+    "markdown.heading": "#88C0D0",
+    "markdown.accent": "#81A1C1",
+    "markdown.codeFg": "#B48EAD",
+    "markdown.math": "#EBCB8B",
+    "code.background": "#2E3440",
+    "code.foreground": "#D8DEE9",
+    "code.comment": "#4C566A",
+    "code.keyword": "#81A1C1",
+    "code.string": "#A3BE8C",
+    "code.number": "#B48EAD",
+    "code.type": "#8FBCBB",
+    "code.dim": "#4C566A"
+  }
+}

@@ -196,6 +196,18 @@ impl AiConfig {
     /// prose) as a ready-made filter.
     pub const OUTPUT_POSTPROCESS_COMMAND: &str = "ai.output.postprocess_command";
 
+    // ── Theme (terminal rendering) ─────────────────────────
+    /// Terminal color theme name. Resolved to `~/.config/rust_tools/themes/
+    /// <name>.json` (user override) first, then to a built-in theme embedded
+    /// from `src/bin/ai/builtin_themes/` (`default`, `monokai`, `light`,
+    /// `dracula`, `one-dark`, `tokyo-night`, `nord`, `catppuccin`).
+    /// Theme JSON uses VSCode-style flat `colors` keys (see `theme.rs`).
+    /// Empty = the built-in default palette.
+    pub const THEME: &str = "ai.theme";
+    /// Absolute path to a custom theme JSON file. Takes precedence over
+    /// `ai.theme` when set and readable. Supports `~` expansion.
+    pub const THEME_FILE: &str = "ai.theme.file";
+
     // ── Token usage stats ──────────────────────────────────
     /// When true, persist the per-session DecisionLog sidecar JSONL file.
     /// Default true; the in-memory DecisionLogStore remains enabled.

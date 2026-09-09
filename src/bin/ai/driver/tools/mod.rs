@@ -503,7 +503,7 @@ where
                 crate::ai::driver::print::format_tool_status(
                     "Retry",
                     tool_name,
-                    crate::ai::theme::ACCENT_WARN
+                    crate::ai::theme::current().accent_warn
                 )
             );
             result = exec();

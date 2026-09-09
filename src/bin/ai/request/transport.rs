@@ -15,7 +15,7 @@ use super::super::{
     provider::adapter_for,
     types::App,
 };
-use crate::ai::theme::{ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_SUCCESS, ACCENT_WARN, RESET};
+use crate::ai::theme::{self, RESET};
 
 use super::aux::charge_llm_usage_to_kernel;
 use super::builder::build_request_body;
@@ -609,13 +609,21 @@ pub(crate) fn print_info(app: &App, model: &str) {
         });
     let session_part = summary
         .filter(|s| !s.is_empty())
-        .map(|s| format!("{ACCENT_MUTED} · {ACCENT_WARN}{}{RESET}", s))
+        .map(|s| format!("{} · {}{}{RESET}", theme::current().accent_muted, theme::current().accent_warn, s))
         .unwrap_or_default();
 
     // Use println! to avoid manual-flush permission issues; model and session are merged into one line.
     println!(
-        "{ACCENT_MUTED}[{ACCENT_SUCCESS}{}{ACCENT_MUTED} (search: {ACCENT_WARN}{search}{ACCENT_MUTED}, effort: {ACCENT_PRIMARY}{effort_label}{ACCENT_MUTED}){session_part}{ACCENT_MUTED}]{RESET}",
+        "{}[{}{}{} (search: {}{search}{}, effort: {}{effort_label}{}){session_part}{}]{RESET}",
+        theme::current().accent_muted,
+        theme::current().accent_success,
         models::model_display_label(model),
+        theme::current().accent_muted,
+        theme::current().accent_warn,
+        theme::current().accent_muted,
+        theme::current().accent_primary,
+        theme::current().accent_muted,
+        theme::current().accent_muted,
     );
 }
 

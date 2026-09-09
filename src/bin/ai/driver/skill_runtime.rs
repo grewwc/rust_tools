@@ -570,6 +570,20 @@ fn builtin_tools_for_skill(
     ))
 }
 
+/// Whether the driver injects the `request_user_input` control tool for this
+/// turn. Present whenever a human is attached to an interactive turn: skills
+/// need it for the cross-turn continuation handoff, and ordinary turns get the
+/// explicit ask protocol (tool metadata) instead of a prose guidance block.
+/// Goal mode demands autonomous progress and background turns have no attached
+/// terminal, so both deliberately disable asking and never inject the tool.
+fn should_inject_request_user_input(
+    skills: &[&SkillManifest],
+    goal_mode: &Option<String>,
+    is_background: bool,
+) -> bool {
+    !skills.is_empty() || (goal_mode.is_none() && !is_background)
+}
+
 fn available_tool_names(builtin_tools: &[ToolDef], mcp_tools: &[ToolDef]) -> Box<SkipSet<String>> {
     builtin_tools
         .iter()
@@ -1107,20 +1121,11 @@ fn build_system_prompt(
             include_str!("system_prompts/interactive_skill_handoff.md"),
         );
     }
-    // Question-prompt guidance for non-skill turns, injected only on the default
-    // interactive path: skill turns already have the request_user_input handoff
-    // protocol, goal mode demands autonomous progress, and background mode has
-    // no attached terminal — so none of the three inject it.
-    // The guidance also anchors anti-hallucination: when a conclusion depends on
-    // the user's private information, ask rather than guess/fabricate; but info
-    // that can be checked ourselves is still looked up with tools first — never
-    // skip autonomous investigation just because asking is allowed.
-    if skills.is_empty() && ctx.goal_mode.is_none() && !ctx.is_background {
-        b.push(
-            ContextKind::Behavior,
-            include_str!("system_prompts/asking_the_user.md"),
-        );
-    }
+    // The ask protocol ("ask only when genuinely blocked; one focused question;
+    // wait for the reply") travels as `request_user_input` tool metadata, injected
+    // for every interactive turn by build_skill_turn_guard. Goal mode and
+    // background turns deliberately disable asking, so they get neither the tool
+    // nor any prose guidance; skill turns carry their own handoff block above.
     b.push_labeled(
         ContextKind::Behavior,
         "execution_environment",
@@ -1529,9 +1534,13 @@ fn build_skill_turn_guard(
     super::super::tools::enable_tools::set_hidden_group_declared(hidden_group_declared);
 
     let mut builtin_tools = builtin_tools_for_skill(skills, active_agent.as_ref());
-    // Externally downloaded skills cannot pre-declare this runtime's continuation protocol; inject this driver-owned tool
-    // only while a skill is active, so ordinary turns gain no schema noise or behavior branches.
-    if !skills.is_empty() {
+    // Externally downloaded skills cannot pre-declare this runtime's ask/handoff
+    // protocol via manifest tool_groups; the driver injects request_user_input by
+    // name for every interactive turn. Skill turns need the cross-turn
+    // continuation handoff; ordinary turns get the explicit ask protocol in place
+    // of prose-only guidance. Goal mode and background turns deliberately disable
+    // asking, so neither injects the tool.
+    if should_inject_request_user_input(skills, &app.goal_mode, app.cli.background) {
         builtin_tools.extend(crate::ai::tools::get_tool_definitions_by_names(&[
             "request_user_input".to_string(),
         ]));

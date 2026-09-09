@@ -1,18 +1,13 @@
-/// Background color for code blocks.
-/// A warm dark gray (#282828) that provides excellent contrast with Monokai colors.
-pub(super) const MONOKAI_BG: &str = "\x1b[48;2;40;40;40m";
-pub(super) const MONOKAI_FG: &str = "\x1b[38;2;248;248;242m";
-pub(super) const MONOKAI_COMMENT: &str = "\x1b[38;2;117;113;94m";
-pub(super) const MONOKAI_KEYWORD: &str = "\x1b[38;2;249;38;114m";
-pub(super) const MONOKAI_STRING: &str = "\x1b[38;2;230;219;116m";
-pub(super) const MONOKAI_NUMBER: &str = "\x1b[38;2;174;129;255m";
-pub(super) const MONOKAI_TYPE: &str = "\x1b[38;2;102;217;239m";
-pub(super) const MONOKAI_IDENT: &str = MONOKAI_FG;
-pub(super) const MONOKAI_RESET: &str = "\x1b[0m";
-/// Semantic alias: restore default foreground after a token.
-pub(super) const MONOKAI_DEFAULT: &str = MONOKAI_FG;
-/// Dimmed color for line numbers and fence borders (#6B6B6B)
-pub(super) const MONOKAI_DIM: &str = "\x1b[38;2;107;107;107m";
+// The code-block palette (background, foreground, comment, keyword, string,
+// number, type, dim) is no longer hardcoded here: it lives in the active
+// `theme::current()` under the `code.*` keys, so a theme JSON can restyle
+// syntax highlighting without a recompile. `t()` below is the local alias
+// used throughout this file.
+
+/// The active theme (code-block palette alias).
+fn t() -> &'static crate::ai::theme::Theme {
+    crate::ai::theme::current()
+}
 
 // ---------------------------------------------------------------------------
 // Parse code-block fence
@@ -84,18 +79,18 @@ fn is_ident_continue(ch: char) -> bool {
 
 fn classify_identifier_color(ident: &str, lang: Option<&str>) -> &'static str {
     if is_keyword(ident, lang) {
-        return MONOKAI_KEYWORD;
+        return t().code_keyword;
     }
     if is_type_like(ident, lang) {
-        return MONOKAI_TYPE;
+        return t().code_type;
     }
     if matches!(
         ident,
         "true" | "false" | "nil" | "null" | "None" | "nullptr"
     ) {
-        return MONOKAI_NUMBER;
+        return t().code_number;
     }
-    MONOKAI_IDENT
+    t().code_foreground
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +203,8 @@ fn is_type_like(ident: &str, lang: Option<&str>) -> bool {
 
 pub(super) fn highlight_code_line(line: &str, lang: Option<&str>) -> String {
     let mut out = String::with_capacity(line.len() + 32);
-    out.push_str(MONOKAI_DEFAULT);
+    let t = t();
+    out.push_str(t.code_foreground);
     let mut chars = line.chars().peekable();
     let line_comment = line_comment_prefix(lang);
 
@@ -218,30 +214,30 @@ pub(super) fn highlight_code_line(line: &str, lang: Option<&str>) -> String {
             && ch == prefix.0
             && chars.peek().copied() == Some(prefix.1)
         {
-            out.push_str(MONOKAI_COMMENT);
+            out.push_str(t.code_comment);
             out.push(ch);
             out.push(chars.next().unwrap_or(prefix.1));
             for rest in chars.by_ref() {
                 out.push(rest);
             }
-            out.push_str(MONOKAI_DEFAULT);
+            out.push_str(t.code_foreground);
             break;
         }
 
         // --- hash comment (#) ---
         if ch == '#' && hash_starts_comment(lang) {
-            out.push_str(MONOKAI_COMMENT);
+            out.push_str(t.code_comment);
             out.push(ch);
             for rest in chars.by_ref() {
                 out.push(rest);
             }
-            out.push_str(MONOKAI_DEFAULT);
+            out.push_str(t.code_foreground);
             break;
         }
 
         // --- strings ---
         if matches!(ch, '"' | '\'' | '`') {
-            out.push_str(MONOKAI_STRING);
+            out.push_str(t.code_string);
             out.push(ch);
             let quote = ch;
             let mut escaped = false;
@@ -259,13 +255,13 @@ pub(super) fn highlight_code_line(line: &str, lang: Option<&str>) -> String {
                     break;
                 }
             }
-            out.push_str(MONOKAI_DEFAULT);
+            out.push_str(t.code_foreground);
             continue;
         }
 
         // --- numbers ---
         if ch.is_ascii_digit() {
-            out.push_str(MONOKAI_NUMBER);
+            out.push_str(t.code_number);
             out.push(ch);
             // Only consume digits, separators, decimal point — do NOT blindly
             // accept x/o/b or all hex chars (avoids "10x" eating the 'x').
@@ -277,7 +273,7 @@ pub(super) fn highlight_code_line(line: &str, lang: Option<&str>) -> String {
                     break;
                 }
             }
-            out.push_str(MONOKAI_DEFAULT);
+            out.push_str(t.code_foreground);
             continue;
         }
 
@@ -296,7 +292,7 @@ pub(super) fn highlight_code_line(line: &str, lang: Option<&str>) -> String {
             let color = classify_identifier_color(&ident, lang);
             out.push_str(color);
             out.push_str(&ident);
-            out.push_str(MONOKAI_DEFAULT);
+            out.push_str(t.code_foreground);
             continue;
         }
 
@@ -319,12 +315,12 @@ mod tests {
     fn rust_code_block_uses_monokai_like_colors() {
         let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
         let fence = renderer.consume_line("```rust", false);
-        assert!(fence.contains(MONOKAI_BG));
+        assert!(fence.contains(t().code_background));
         assert_eq!(renderer.code_block_lang(), Some("rust"));
 
         let code = renderer.consume_line("fn main() { let x = 42; }", false);
-        assert!(code.contains(MONOKAI_KEYWORD));
-        assert!(code.contains(MONOKAI_NUMBER));
+        assert!(code.contains(t().code_keyword));
+        assert!(code.contains(t().code_number));
 
         let _ = renderer.consume_line("```", false);
         assert!(renderer.code_block_lang().is_none());
@@ -377,56 +373,56 @@ mod tests {
     #[test]
     fn test_highlight_comment_rust() {
         let out = highlight_code_line("// hello world", Some("rust"));
-        assert!(out.contains(MONOKAI_COMMENT));
+        assert!(out.contains(t().code_comment));
     }
 
     #[test]
     fn test_highlight_comment_python() {
         let out = highlight_code_line("# hello world", Some("python"));
-        assert!(out.contains(MONOKAI_COMMENT));
+        assert!(out.contains(t().code_comment));
     }
 
     #[test]
     fn test_highlight_comment_hash_fallback() {
         let out = highlight_code_line("# comment", None);
-        assert!(out.contains(MONOKAI_COMMENT));
+        assert!(out.contains(t().code_comment));
     }
 
     #[test]
     fn test_highlight_comment_hash_not_for_rust() {
         let out = highlight_code_line("# not a comment in rust", Some("rust"));
-        // '#' is not a comment in rust, so MONOKAI_COMMENT should not appear
-        assert!(!out.contains(MONOKAI_COMMENT));
+        // '#' is not a comment in rust, so the comment color should not appear
+        assert!(!out.contains(t().code_comment));
     }
 
     #[test]
     fn test_highlight_string_with_escape() {
         let out = highlight_code_line(r#""hello \"world\"""#, Some("rust"));
-        assert!(out.contains(MONOKAI_STRING));
+        assert!(out.contains(t().code_string));
     }
 
     #[test]
     fn test_highlight_single_quoted_string() {
         let out = highlight_code_line("'c'", Some("rust"));
-        assert!(out.contains(MONOKAI_STRING));
+        assert!(out.contains(t().code_string));
     }
 
     #[test]
     fn test_highlight_number_decimal() {
         let out = highlight_code_line("42", Some("rust"));
-        assert!(out.contains(MONOKAI_NUMBER));
+        assert!(out.contains(t().code_number));
     }
 
     #[test]
     fn test_highlight_number_underscore_sep() {
         let out = highlight_code_line("1_000_000", Some("rust"));
-        assert!(out.contains(MONOKAI_NUMBER));
+        assert!(out.contains(t().code_number));
     }
 
     #[test]
     fn test_highlight_number_float() {
         let out = highlight_code_line("3.14", Some("rust"));
-        assert!(out.contains(MONOKAI_NUMBER));
+        assert!(out.contains(t().code_number));
     }
 
     #[test]
@@ -434,7 +430,7 @@ mod tests {
         // "10xyz" — old code consumed 'x' as part of the number.
         // Now only digits/./_ are consumed after a digit start.
         let out = highlight_code_line("10xyz", Some("rust"));
-        let number_region = out.split(MONOKAI_DEFAULT).next().unwrap_or("");
+        let number_region = out.split(t().code_foreground).next().unwrap_or("");
         assert!(
             !number_region.contains('x'),
             "'x' should not be inside the number region, got: {number_region:?}"
@@ -444,43 +440,43 @@ mod tests {
     #[test]
     fn test_highlight_keyword_rust() {
         let out = highlight_code_line("fn main() {}", Some("rust"));
-        assert!(out.contains(MONOKAI_KEYWORD));
+        assert!(out.contains(t().code_keyword));
     }
 
     #[test]
     fn test_highlight_keyword_python() {
         let out = highlight_code_line("def foo():", Some("python"));
-        assert!(out.contains(MONOKAI_KEYWORD));
+        assert!(out.contains(t().code_keyword));
     }
 
     #[test]
     fn test_highlight_type_rust() {
         let out = highlight_code_line("let x: String;", Some("rust"));
-        assert!(out.contains(MONOKAI_TYPE));
+        assert!(out.contains(t().code_type));
     }
 
     #[test]
     fn test_highlight_type_go() {
         let out = highlight_code_line("var s string", Some("go"));
-        assert!(out.contains(MONOKAI_TYPE));
+        assert!(out.contains(t().code_type));
     }
 
     #[test]
     fn test_highlight_literal_bool() {
         let out = highlight_code_line("true", Some("rust"));
-        assert!(out.contains(MONOKAI_NUMBER));
+        assert!(out.contains(t().code_number));
     }
 
     #[test]
     fn test_highlight_literal_null() {
         let out = highlight_code_line("null", Some("javascript"));
-        assert!(out.contains(MONOKAI_NUMBER));
+        assert!(out.contains(t().code_number));
     }
 
     #[test]
     fn test_highlight_no_double_color_leak() {
         let out = highlight_code_line("fn main() {}", Some("rust"));
-        let reset_count = out.matches(MONOKAI_DEFAULT).count();
+        let reset_count = out.matches(t().code_foreground).count();
         assert!(
             reset_count >= 2,
             "expected multiple resets, got {}",
@@ -491,6 +487,6 @@ mod tests {
     #[test]
     fn test_highlight_empty_line() {
         let out = highlight_code_line("", Some("rust"));
-        assert_eq!(out, MONOKAI_DEFAULT);
+        assert_eq!(out, t().code_foreground);
     }
 }

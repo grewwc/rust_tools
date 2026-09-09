@@ -52,7 +52,7 @@ pub(super) use crate::ai::driver::print::{
     format_tool_output_line, format_tool_output_prefix, print_tool_command_line,
     print_tool_note_line, sanitize_for_terminal,
 };
-pub(super) use crate::ai::theme::{ACCENT_MUTED, ACCENT_RULE, RESET};
+pub(super) use crate::ai::theme::RESET;
 
 mod audit_evidence;
 mod completion_gate;

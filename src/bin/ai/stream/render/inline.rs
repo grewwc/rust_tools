@@ -1,6 +1,4 @@
-use crate::ai::stream::render::{
-    MARKDOWN_ACCENT, MARKDOWN_CODE_FG, MARKDOWN_STRONG,
-};
+use crate::ai::theme;
 
 /// Terminals by default render East-Asian **Ambiguous** width characters (arrows `→`, math symbols `× ± ≤ ≥ ≠`,
 /// box-drawing, braille, etc.) as single-column; only true Wide/fullwidth characters (CJK, etc.) take 2 columns.
@@ -214,20 +212,21 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
     let mut math = false;
 
     fn apply_style(out: &mut String, base: &str, bold: bool, italic: bool, code: bool, math: bool) {
+        let t = theme::current();
         out.push_str("\x1b[0m");
         out.push_str(base);
         if bold {
-            out.push_str(MARKDOWN_STRONG);
+            out.push_str(t.markdown_strong);
             out.push_str("\x1b[1m");
         }
         if code {
-            out.push_str(MARKDOWN_CODE_FG);
+            out.push_str(t.markdown_code_fg);
         }
         if italic {
             out.push_str("\x1b[3m");
         }
         if math {
-            out.push_str("\x1b[95m");
+            out.push_str(t.markdown_math);
         }
     }
 
@@ -287,7 +286,7 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
                 apply_style(&mut out, base, bold, italic, code, math);
                 // Nested spans must restore the enclosing emphasis, not just the
                 // paragraph color, after their own ANSI reset.
-                let nested_base = format!("{base}{MARKDOWN_STRONG}\x1b[1m");
+                let nested_base = format!("{base}{}\x1b[1m", theme::current().markdown_strong);
                 out.push_str(&render_inline_md(content, &nested_base));
                 bold = false;
                 apply_style(&mut out, base, bold, italic, code, math);
@@ -414,7 +413,7 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
                 out.push_str("\x1b[3m");
             }
             out.push_str("\x1b[4m");
-            out.push_str(MARKDOWN_ACCENT);
+            out.push_str(theme::current().markdown_accent);
             out.push_str(url);
             apply_style(&mut out, base, bold, italic, code, math);
             out.push_str(trail);
@@ -916,29 +915,32 @@ mod tests {
 
     #[test]
     fn inline_code_uses_code_color_without_background_and_restores_body() {
-        let base = crate::ai::stream::render::MARKDOWN_BODY;
+        let base = theme::current().markdown_body;
         let rendered = render_inline_md("use `cargo test` please", base);
         assert!(rendered.starts_with(&format!("{base}use ")));
-        assert!(rendered.contains(&format!("{MARKDOWN_CODE_FG}cargo test")));
+        assert!(rendered.contains(&format!("{}cargo test", theme::current().markdown_code_fg)));
         // No background fill: inline code must not emit a background-color sequence.
         assert!(!rendered.contains("48;2;"));
-        assert!(!rendered.contains(crate::ai::stream::render::code::MONOKAI_FG));
+        // Inline code must never be painted with the block-code foreground. Assert on the code
+        // segment itself rather than whole-string containment: themes where markdown.body equals
+        // code.foreground (e.g. dracula) legitimately contain that color as the prose base.
+        assert!(!rendered.contains(&format!("{}cargo test", theme::current().code_foreground)));
         assert!(rendered.ends_with(&format!("\x1b[0m{base} please\x1b[0m")));
     }
 
     #[test]
     fn plain_inline_text_applies_its_base_without_markers() {
-        let base = crate::ai::stream::render::MARKDOWN_BODY;
+        let base = theme::current().markdown_body;
         assert_eq!(render_inline_md("正文", base), format!("{base}正文\x1b[0m"));
     }
 
     #[test]
     fn nested_inline_code_restores_enclosing_emphasis_and_dimness() {
-        let base = format!("\x1b[2m{}", crate::ai::stream::render::MARKDOWN_BODY);
+        let base = format!("\x1b[2m{}", theme::current().markdown_body);
         for (input, nested_base) in [
             (
                 "前 **重点 `src/main.rs:42` 继续** 后",
-                format!("{base}{MARKDOWN_STRONG}\x1b[1m"),
+                format!("{base}{}\x1b[1m", theme::current().markdown_strong),
             ),
             (
                 "前 *斜体 `src/main.rs:42` 继续* 后",
@@ -946,7 +948,7 @@ mod tests {
             ),
         ] {
             let rendered = render_inline_md(input, &base);
-            assert!(rendered.contains(&format!("{MARKDOWN_CODE_FG}src/main.rs:42")));
+            assert!(rendered.contains(&format!("{}src/main.rs:42", theme::current().markdown_code_fg)));
             assert!(
                 rendered.contains(&format!("\x1b[0m{nested_base} 继续")),
                 "nested code must restore its enclosing style: {rendered:?}"
@@ -957,16 +959,16 @@ mod tests {
 
     #[test]
     fn muted_link_restores_emphasis_before_trailing_text() {
-        let base = crate::ai::stream::render::MARKDOWN_BODY;
+        let base = theme::current().markdown_body;
         let rendered = render_inline_md("**see https://example.com/docs, then** done", base);
-        assert!(rendered.contains(&format!("\x1b[4m{MARKDOWN_ACCENT}https://example.com/docs")));
-        assert!(rendered.contains(&format!("\x1b[0m{base}{MARKDOWN_STRONG}\x1b[1m, then")));
+        assert!(rendered.contains(&format!("\x1b[4m{}https://example.com/docs", theme::current().markdown_accent)));
+        assert!(rendered.contains(&format!("\x1b[0m{base}{}\x1b[1m, then", theme::current().markdown_strong)));
         assert!(rendered.ends_with(&format!("\x1b[0m{base} done\x1b[0m")));
     }
 
     #[test]
     fn heading_base_survives_inline_code_reset() {
-        let base = format!("\x1b[1m{MARKDOWN_ACCENT}");
+        let base = format!("\x1b[1m{}", theme::current().markdown_accent);
         let rendered = render_inline_md("Before `code` after", &base);
         assert!(rendered.starts_with(&format!("{base}Before ")));
         assert!(rendered.ends_with(&format!("\x1b[0m{base} after\x1b[0m")));
@@ -1002,7 +1004,7 @@ mod tests {
     fn unclosed_backtick_is_not_styled() {
         // Unclosed backtick: must be emitted as a literal character, never styling the span.
         let rendered = render_inline_md("use `cargo to test", "");
-        assert!(!rendered.contains(MARKDOWN_CODE_FG));
+        assert!(!rendered.contains(theme::current().markdown_code_fg));
         assert!(rendered.contains("`cargo to test"));
     }
 

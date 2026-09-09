@@ -132,7 +132,7 @@ pub(crate) fn execute_request_user_input(args: &Value) -> Result<String, String>
 
     Ok(format!(
         "User input has been requested: {question}\n\
-         Ask the user this question in your final response, then stop. The active skill will be restored only for the user's immediately following normal message."
+         Ask the user this question in your final response, then stop. If a skill is active, it will be restored only for the user's immediately following normal message."
     ))
 }
 

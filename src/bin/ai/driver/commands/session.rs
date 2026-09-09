@@ -39,7 +39,10 @@ pub(in crate::ai) const CANONICAL_SESSION_SUBCOMMANDS: &[&str] = &[
 /// only emitted when stdout is a terminal; piped output stays plain.
 fn marked_session_style() -> (&'static str, &'static str) {
     if std::io::stdout().is_terminal() {
-        (crate::ai::theme::ACCENT_MARKED, crate::ai::theme::RESET)
+        (
+            crate::ai::theme::current().accent_marked,
+            crate::ai::theme::RESET,
+        )
     } else {
         ("", "")
     }

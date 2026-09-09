@@ -37,7 +37,7 @@ use std::{
 use crate::ai::{
     driver::{runtime_ctx, side_note::push_side_note},
     history::SuspendedSessionStore,
-    theme::{ACCENT_MUTED, RESET},
+    theme::{self, RESET},
 };
 use crate::commonw::prompt::{acquire_background_stdin, foreground_stdin_requested};
 
@@ -145,19 +145,33 @@ impl FooterReservation {
 
     fn draw(&mut self, input: &[char]) -> io::Result<()> {
         self.refresh()?;
-        let (prefix, visible, caret) = composer_line_parts(input, self.cols as usize);
         let stdout = io::stdout();
         let mut out = stdout.lock();
+        self.draw_to(&mut out, input)?;
+        out.flush()
+    }
+
+    /// Build and write the composer line through a supplied writer so the control
+    /// sequence can be regression-tested without a TTY. The caller must hold the
+    /// stdout lock for the whole write: the lock is shared with the stream renderer,
+    /// and interleaving would split the save/draw/restore sequence into model text.
+    fn draw_to(&mut self, out: &mut impl io::Write, input: &[char]) -> io::Result<()> {
+        let (prefix, visible, caret) = composer_line_parts(input, self.cols as usize);
         // The stdout lock is shared with the stream renderer: the whole control
         // sequence cannot be interleaved into model text. Do not leave the real
         // cursor in the footer, so the next model/token output does not start from
         // the input row; the tail uses a visible block caret to mark the edit point.
+        // Argument order is load-bearing: the first positional `{}` is the absolute
+        // CUP row; an SGR string in that slot would terminate the CSI early and draw
+        // the composer at the model-output cursor instead of the footer row.
         write!(
             out,
-            "\x1b7\x1b[?25l\x1b[{};1H\x1b[2K{ACCENT_MUTED}{prefix}{RESET}{visible}{ACCENT_MUTED}{caret}{RESET}\x1b8\x1b[?25h",
-            self.rows
+            "\x1b7\x1b[?25l\x1b[{};1H\x1b[2K{}{prefix}{RESET}{visible}{}{caret}{RESET}\x1b8\x1b[?25h",
+            self.rows,
+            theme::current().accent_muted,
+            theme::current().accent_muted
         )?;
-        out.flush()
+        Ok(())
     }
 
     fn clear(&mut self) -> io::Result<()> {
@@ -1110,5 +1124,28 @@ mod tests {
                     < cols
             );
         }
+    }
+
+    #[test]
+    fn composer_draw_targets_footer_row_before_any_color() {
+        let mut footer = FooterReservation { cols: 80, rows: 24 };
+        let mut out = Vec::new();
+        footer.draw_to(&mut out, &[]).unwrap();
+        let seq = String::from_utf8(out).unwrap();
+        // The absolute CUP to the reserved footer row must precede every SGR color:
+        // an SGR string in the CUP row slot terminates the CSI early, the rest of
+        // the address leaks as literal text, and the composer is drawn at the
+        // model-output cursor instead of the footer row (duplicated-composer bug).
+        let expected = format!("\x1b7\x1b[?25l\x1b[{};1H\x1b[2K", footer.rows);
+        assert!(
+            seq.starts_with(&expected),
+            "composer must address the footer row first: {seq:?}"
+        );
+        // Both positional color slots must receive SGR sequences, never the row number.
+        assert_eq!(
+            seq.matches(theme::current().accent_muted).count(),
+            2,
+            "composer color slots misfilled: {seq:?}"
+        );
     }
 }

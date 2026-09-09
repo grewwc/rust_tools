@@ -1,0 +1,33 @@
+{
+  "name": "dracula",
+  "type": "dark",
+  "colors": {
+    "accent.primary": "#8BE9FD",
+    "accent.toolName": "#FFB86C",
+    "accent.secondary": "#BD93F9",
+    "accent.command": "#46DA6B",
+    "accent.muted": "#6272A4",
+    "accent.input": "#F8F8F2",
+    "accent.success": "#50FA7B",
+    "accent.emphasizedOutput": "#8BE9FD",
+    "accent.warn": "#FFB86C",
+    "accent.danger": "#FF5555",
+    "accent.marked": "#FF79C6",
+    "accent.rule": "#44475A",
+    "accent.submitted": "#F1FA8C",
+    "markdown.body": "#F8F8F2",
+    "markdown.strong": "#F8F8F2",
+    "markdown.heading": "#FF79C6",
+    "markdown.accent": "#8BE9FD",
+    "markdown.codeFg": "#BD93F9",
+    "markdown.math": "#FF79C6",
+    "code.background": "#282A36",
+    "code.foreground": "#F8F8F2",
+    "code.comment": "#6272A4",
+    "code.keyword": "#FF79C6",
+    "code.string": "#F1FA8C",
+    "code.number": "#BD93F9",
+    "code.type": "#8BE9FD",
+    "code.dim": "#6272A4"
+  }
+}

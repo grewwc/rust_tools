@@ -97,19 +97,54 @@ impl TtyToolOutputFoldState {
     }
 
     fn redraw(&mut self) -> std::io::Result<()> {
-        let mut out = std::io::stdout();
-        if self.window_rows > 0 {
-            write!(out, "\x1b[{}A\r\x1b[0J", self.window_rows)?;
-        }
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        self.redraw_to(&mut out)
+    }
+
+    /// Redraw through a supplied writer so the cursor sequence can be regression-tested
+    /// without a TTY. The caller must retain exclusive access to the writer for the
+    /// whole erase-and-replace operation; otherwise the side-note footer can be drawn
+    /// between the cursor movement and the replacement window.
+    pub(super) fn redraw_to(&mut self, out: &mut impl std::io::Write) -> std::io::Result<()> {
+        let had_window = self.window_rows > 0;
+        erase_tty_tool_output_fold_window(out, self.window_rows)?;
 
         let (window, window_rows) = render_tty_tool_output_fold_window(self);
         if !window.is_empty() {
             out.write_all(window.as_bytes())?;
+        }
+        if had_window || !window.is_empty() {
             out.flush()?;
         }
         self.window_rows = window_rows;
         Ok(())
     }
+}
+
+/// Clear only the previous folded-output rows before redrawing them. The window ends
+/// with a newline, so its cursor is one row below the first row to erase. `CSI 0J`
+/// would continue to the physical screen bottom and clear the DECSTBM-reserved
+/// side-note composer, even though the composer is outside the output scroll region.
+fn erase_tty_tool_output_fold_window(
+    out: &mut impl std::io::Write,
+    rows: usize,
+) -> std::io::Result<()> {
+    if rows == 0 {
+        return Ok(());
+    }
+
+    write!(out, "\r\x1b[{rows}A")?;
+    for row in 0..rows {
+        write!(out, "\r\x1b[2K")?;
+        if row + 1 < rows {
+            write!(out, "\x1b[1B")?;
+        }
+    }
+    if rows > 1 {
+        write!(out, "\x1b[{}A", rows - 1)?;
+    }
+    write!(out, "\r")
 }
 
 pub(in crate::ai::driver::turn_runtime) fn tty_tool_output_hidden_count(
@@ -156,7 +191,9 @@ pub(in crate::ai::driver::turn_runtime) fn render_tty_tool_output_fold_window(
 
     if hidden_count > 0 {
         let marker = format!(
-            "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}{}{RESET}",
+            "  {}│{RESET} {}{}{RESET}",
+            crate::ai::theme::current().accent_rule,
+            crate::ai::theme::current().accent_muted,
             clamp_tool_output_body(&format!("··· {hidden_count} lines folded ···"))
         );
         rows += 1;

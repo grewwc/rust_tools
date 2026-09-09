@@ -106,15 +106,20 @@ fn viewport_height_with_completion(
 
 type MultilineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
-/// Crossterm emits a key if ESC arrives in its own read. Only after a query
-/// timeout, briefly defer that ambiguous key so a fragmented CPR cannot submit
-/// the textarea. A standalone Escape still works after this bounded grace;
-/// fragments arriving later than the grace cannot be distinguished from typing.
+/// Crossterm emits a key if ESC arrives in its own read. After a query timeout,
+/// briefly defer that single ambiguous key so a fragmented CPR cannot submit
+/// the textarea. `cpr_escape_guard_armed` is a ONE-SHOT flag: at most one
+/// orphan ESC is left by one timed-out query (the sticky "disable queries"
+/// state never issues another), so it is cleared as soon as the first
+/// standalone Escape after arming is classified — whether it turned out to be
+/// the late reply (consumed) or a real keypress (replayed and submitted). A
+/// standalone Escape therefore works after this bounded grace at most once per
+/// timeout; later Escape submissions are never deferred or swallowed.
 const CPR_ESCAPE_GRACE: Duration = Duration::from_millis(250);
 
 fn read_prompt_event(
     pending: &mut VecDeque<Event>,
-    guard_reply_fragments: bool,
+    cpr_escape_guard_armed: &mut bool,
     mut read: impl FnMut(Duration) -> io::Result<Option<Event>>,
 ) -> io::Result<Option<Event>> {
     if let Some(event) = pending.pop_front() {
@@ -123,7 +128,7 @@ fn read_prompt_event(
     let Some(first) = read(Duration::from_millis(250))? else {
         return Ok(None);
     };
-    if !guard_reply_fragments
+    if !*cpr_escape_guard_armed
         || !matches!(&first, Event::Key(key) if key.code == KeyCode::Esc
             && key.modifiers.is_empty() && key.kind == KeyEventKind::Press)
     {
@@ -155,6 +160,8 @@ fn read_prompt_event(
                         .into_iter()
                         .filter(|event| matches!(event, Event::Resize(_, _))),
                 );
+                // The single orphan ESC from the timed-out query is consumed.
+                *cpr_escape_guard_armed = false;
                 return Ok(None);
             }
             Some(false) => {}
@@ -163,6 +170,9 @@ fn read_prompt_event(
     }
     // Replay every event on a mismatch or timeout, including across submissions.
     pending.extend(lookahead);
+    // The first post-timeout Escape was a real key (no CPR tail): the one-shot
+    // guard is spent, so every later Escape submits immediately.
+    *cpr_escape_guard_armed = false;
     Ok(Some(first))
 }
 
@@ -194,6 +204,11 @@ fn cursor_reply_tail(tail: &str) -> Option<bool> {
 struct PromptScreen {
     queries_disabled: bool,
     alternate: bool,
+    /// One-shot guard armed only in the same transition where a DSR query
+    /// times out. Cleared by `read_prompt_event` after the first Escape is
+    /// classified, so it does not stay armed merely because queries remain
+    /// disabled for later prompts.
+    cpr_guard_armed: bool,
 }
 
 impl PromptScreen {
@@ -219,6 +234,7 @@ impl PromptScreen {
                 Ok(area) => return Ok(area),
                 Err(err) if PromptEditor::is_cursor_position_timeout(&err) => {
                     self.queries_disabled = true;
+                    self.cpr_guard_armed = true;
                 }
                 Err(err) => return Err(err),
             }
@@ -605,13 +621,16 @@ fn take_standalone_resize_rebuild(
 fn submitted_input_preview_lines(content: &str) -> Vec<String> {
     let mut rendered = Vec::new();
     let mut lines = content.lines();
-    let marker = crate::ai::theme::ACCENT_SUCCESS;
-    // The post-submit preview uses a soft mid-purple, distinct from the editing
-    // state's warm gray, readable on both light and dark backgrounds.
-    let body = crate::ai::theme::ACCENT_SUBMITTED;
+    let marker = crate::ai::theme::current().accent_success;
+    // The post-submit preview body uses the theme's `accent.submitted`, a bright
+    // signature warm hue (amber/yellow on dark themes, deep purple on light).
+    // It is deliberately NOT a white/gray: assistant output is full of near-white
+    // body/strong text, so the echoed user input must carry its own hue to stay
+    // visible and recognizable as the user's own text. The bold green marker
+    // keeps the submit boundary distinct.
+    let body = crate::ai::theme::current().accent_submitted;
     if let Some(first) = lines.next() {
-        // Bold green `>` marker + low-saturation warm-gray body, matching the
-        // textarea editing-state colors.
+        // Bold `❯` marker marks the submit boundary; the body color is theme-driven.
         rendered.push(format!("\x1b[1m{marker}❯\x1b[0m {body}{first}\x1b[0m"));
         for line in lines {
             rendered.push(format!("  {body}{line}\x1b[0m"));
@@ -669,12 +688,14 @@ impl PromptEditor {
 
         let mut screen = PromptScreen {
             queries_disabled: self.cursor_position_queries_disabled,
+            cpr_guard_armed: self.pending_late_cpr_escape_guard,
             ..PromptScreen::default()
         };
         let mut terminal = match build_fixed_terminal(base_viewport_height, &mut screen) {
             Ok(terminal) => terminal,
             Err(err) => {
                 self.cursor_position_queries_disabled = screen.queries_disabled;
+                self.pending_late_cpr_escape_guard = screen.cpr_guard_armed;
                 drop(screen);
                 let _ = execute!(io::stdout(), DisableBracketedPaste, cursor::Show);
                 let _ = disable_raw_mode();
@@ -843,7 +864,7 @@ impl PromptEditor {
 
                 let Some(event) = read_prompt_event(
                     &mut self.pending_terminal_events,
-                    screen.queries_disabled,
+                    &mut screen.cpr_guard_armed,
                     |timeout| {
                         if event::poll(timeout)? {
                             event::read().map(Some)
@@ -913,6 +934,10 @@ impl PromptEditor {
             let _ = execute!(io::stdout(), Clear(ClearType::FromCursorDown));
         }
         self.cursor_position_queries_disabled = screen.queries_disabled;
+        // Carry the still-pending one-shot guard into later prompts: the orphan
+        // ESC only surfaces on the next standalone Escape, which a non-Escape
+        // submission (F2 / Alt+Enter) can precede.
+        self.pending_late_cpr_escape_guard = screen.cpr_guard_armed;
         drop(screen);
         let _ = execute!(io::stdout(), cursor::Show);
         // Restore the default cursor shape: the editor switched it to a thin bar
@@ -968,18 +993,47 @@ mod tests {
         input.push_back(key(KeyCode::Char('x')));
         let mut pending = VecDeque::new();
         let mut read = |_| Ok(input.pop_front());
+        let mut armed = true;
         assert_eq!(
-            super::read_prompt_event(&mut pending, true, &mut read).unwrap(),
+            super::read_prompt_event(&mut pending, &mut armed, &mut read).unwrap(),
             None
         );
+        assert!(!armed, "consuming the orphan reply must disarm the one-shot guard");
         assert_eq!(
-            super::read_prompt_event(&mut pending, true, &mut read).unwrap(),
+            super::read_prompt_event(&mut pending, &mut armed, &mut read).unwrap(),
             Some(Event::Resize(90, 30))
         );
         assert_eq!(
-            super::read_prompt_event(&mut pending, true, &mut read).unwrap(),
+            super::read_prompt_event(&mut pending, &mut armed, &mut read).unwrap(),
             Some(key(KeyCode::Char('x')))
         );
+    }
+
+    #[test]
+    fn one_shot_guard_submits_later_escape_immediately_after_consuming_reply() {
+        // The orphan ESC plus its fragmented late CPR is consumed first ...
+        let mut input = VecDeque::new();
+        input.push_back(key(KeyCode::Esc));
+        input.extend("[13;1R".chars().map(|ch| key(KeyCode::Char(ch))));
+        // ... then a real standalone Escape (the submit key) must go through.
+        input.push_back(key(KeyCode::Esc));
+        let mut pending = VecDeque::new();
+        let mut armed = true;
+        assert_eq!(
+            super::read_prompt_event(&mut pending, &mut armed, |_| Ok(input.pop_front()))
+                .unwrap(),
+            None
+        );
+        assert!(!armed, "the one orphan reply disarms the guard exactly once");
+        // No 250 ms lookahead may delay this real submission.
+        let mut calls = 0;
+        let event = super::read_prompt_event(&mut pending, &mut armed, |_| {
+            calls += 1;
+            Ok(input.pop_front())
+        })
+        .unwrap();
+        assert_eq!(event, Some(key(KeyCode::Esc)));
+        assert_eq!(calls, 1);
     }
 
     #[test]
@@ -991,9 +1045,11 @@ mod tests {
             let mut input = original.clone();
             let mut pending = VecDeque::new();
             let mut output = VecDeque::new();
+            let mut armed = true;
             while !input.is_empty() || !pending.is_empty() {
                 if let Some(event) =
-                    super::read_prompt_event(&mut pending, true, |_| Ok(input.pop_front())).unwrap()
+                    super::read_prompt_event(&mut pending, &mut armed, |_| Ok(input.pop_front()))
+                        .unwrap()
                 {
                     output.push_back(event);
                 }
@@ -1018,9 +1074,10 @@ mod tests {
         let mut input = original.clone();
         let mut pending = VecDeque::new();
         let mut output = VecDeque::new();
+        let mut armed = true;
         while !input.is_empty() {
             output.push_back(
-                super::read_prompt_event(&mut pending, true, |_| Ok(input.pop_front()))
+                super::read_prompt_event(&mut pending, &mut armed, |_| Ok(input.pop_front()))
                     .unwrap()
                     .unwrap(),
             );
@@ -1032,7 +1089,8 @@ mod tests {
     #[test]
     fn healthy_terminal_escape_is_not_delayed_or_read_ahead() {
         let mut calls = 0;
-        let event = super::read_prompt_event(&mut VecDeque::new(), false, |_| {
+        let mut armed = false;
+        let event = super::read_prompt_event(&mut VecDeque::new(), &mut armed, |_| {
             calls += 1;
             Ok(Some(key(KeyCode::Esc)))
         })
@@ -1573,8 +1631,8 @@ mod tests {
 
     #[test]
     fn submitted_input_preview_formats_single_and_multi_line_content() {
-        let marker = crate::ai::theme::ACCENT_SUCCESS;
-        let body = crate::ai::theme::ACCENT_SUBMITTED;
+        let marker = crate::ai::theme::current().accent_success;
+        let body = crate::ai::theme::current().accent_submitted;
         let reset = "\x1b[0m";
         assert_eq!(
             submitted_input_preview_lines("hello"),

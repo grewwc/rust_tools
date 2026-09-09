@@ -183,7 +183,9 @@ impl<'a> TerminalToolObserver<'a> {
                     print!("{RESET}\n");
                     self.at_line_start = true;
                     println!(
-                        "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· streaming output folded until completion ···{RESET}"
+                        "  {}│{RESET} {}··· streaming output folded until completion ···{RESET}",
+                        crate::ai::theme::current().accent_rule,
+                        crate::ai::theme::current().accent_muted,
                     );
                 }
             } else if self.fold_total_lines < TOOL_OUTPUT_FOLD_MAX_VISIBLE {
@@ -229,7 +231,11 @@ impl<'a> TerminalToolObserver<'a> {
         }
         if self.fold_total_lines > TOOL_OUTPUT_FOLD_MAX_VISIBLE {
             let folded = self.fold_total_lines - TOOL_OUTPUT_FOLD_MAX_VISIBLE;
-            println!("  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded} lines folded ···{RESET}");
+            println!(
+                "  {}│{RESET} {}··· {folded} lines folded ···{RESET}",
+                crate::ai::theme::current().accent_rule,
+                crate::ai::theme::current().accent_muted,
+            );
             self.at_line_start = true;
         } else if !self.at_line_start {
             if newline {

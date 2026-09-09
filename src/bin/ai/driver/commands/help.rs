@@ -22,7 +22,7 @@ pub fn print_interactive_help() {
     println!("    /history export [file.txt]   export current preview to a file");
     println!("    /history copy                copy current preview to clipboard");
     println!(
-        "    /history last                replay the last assistant message with markdown rendering"
+        "    /history last [N]            replay the Nth most recent assistant message with markdown rendering"
     );
     println!(
         "    /history replay              replay the last turn's assistant conclusion (text only)"

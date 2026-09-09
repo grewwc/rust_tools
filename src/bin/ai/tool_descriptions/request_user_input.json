@@ -1,6 +1,6 @@
 {
   "name": "request_user_input",
-  "description": "When an active skill needs information, a decision, or confirmation from the user before continuing, use this instead of merely ending with a question. The driver restores that skill only for the user's immediately following normal message.",
+  "description": "Ask the user one focused question and wait for the reply, instead of merely ending the response with a question. Use it only when you are genuinely blocked: only the user can make the decision; required input is missing; the action is risky or irreversible; or a consequential conclusion needs information only the user can provide (intent, preferences, requirements, unstated constraints). Before asking, exhaust what tools and verification can establish — never skip autonomous investigation just because asking is allowed. Do not ask when you can reasonably decide: when several approaches are valid, choose the safer one and proceed; handle routine details yourself. Ask exactly one focused question. When a skill is active, the driver restores that skill only for the user's immediately following normal message; an explicit skill selection overrides it.",
   "parameters": {
     "type": "object",
     "properties": {

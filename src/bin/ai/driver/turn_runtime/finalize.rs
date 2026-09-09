@@ -267,7 +267,14 @@ fn spawn_background_compaction(app: &App, at_boundary: bool) {
                 )
                 .await
             };
-            if let Err(err) = compact_result {
+            // Runs inside the terminal-output-suppressed scope above: a background
+            // failure must not write to the TTY while the textarea owns it (the raw
+            // newline would shift the parked cursor and overwrite the help line).
+            // Compaction is a best-effort write-back cache; the next turn's prepare
+            // retries it in the foreground and reports there if still failing.
+            if let Err(err) = compact_result
+                && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+            {
                 eprintln!("[Warning] Failed to compact persisted history: {}", err);
             }
             mark_session_compaction_finished(&session_id);

@@ -766,10 +766,19 @@ async fn compact_session_history_with_app_inner(
     } else {
         "turn-count"
     };
-    eprintln!(
-        "[history] persisted {reason} compaction: {original_chars} -> {} chars",
-        messages_total_chars_pub(&compacted)
-    );
+    // Background compaction can finish while the interactive multiline textarea
+    // already owns the terminal in raw mode. This eprintln goes to the same TTY:
+    // it overwrites the help/status line, and with ONLCR disabled in raw mode the
+    // trailing newline shifts the parked hardware cursor by one row, permanently
+    // misaligning the caret from the edited line. Background callers run inside a
+    // terminal-output-suppressed scope; only the foreground caller (textarea not
+    // open) may print this diagnostic.
+    if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        eprintln!(
+            "[history] persisted {reason} compaction: {original_chars} -> {} chars",
+            messages_total_chars_pub(&compacted)
+        );
+    }
     Ok(())
 }
 

@@ -104,7 +104,6 @@ use super::{
 
 #[cfg(test)]
 #[allow(unused_imports)]
-use crate::ai::theme::{ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_SUCCESS, ACCENT_WARN, RESET};
 
 #[cfg(test)]
 #[allow(unused_imports)]

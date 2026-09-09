@@ -24,7 +24,7 @@ const COMPLETION_WINDOW: usize = 12;
 /// cells become real terminal output and can be reflowed into extra rows when
 /// an IDE terminal is repeatedly narrowed and widened.
 fn style_input_text(textarea: &mut TextArea<'_>, lines: &[String]) {
-    let (red, green, blue) = crate::ai::theme::ACCENT_INPUT_RGB;
+    let (red, green, blue) = crate::ai::theme::current().accent_input_rgb;
     let input_style = Style::default().fg(Color::Rgb(red, green, blue));
     let cursor_row = textarea.cursor().0;
 
@@ -275,7 +275,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // Draw the editing caret as a styled cell so the character under the cursor
     // stays visible. The real terminal cursor remains hidden and parked on the
     // viewport's final row by the input loop as the width-reflow anchor.
-    let (red, green, blue) = crate::ai::theme::ACCENT_INPUT_RGB;
+    let (red, green, blue) = crate::ai::theme::current().accent_input_rgb;
     textarea.set_cursor_style(
         Style::default()
             .fg(Color::Rgb(red, green, blue))
@@ -1012,7 +1012,7 @@ mod tests {
         // fill blanks.
         let text_cell = &terminal.backend().buffer()[(input_x + 1, input_y)];
         let blank_cell = &terminal.backend().buffer()[(input_x + 20, input_y)];
-        let (red, green, blue) = crate::ai::theme::ACCENT_INPUT_RGB;
+        let (red, green, blue) = crate::ai::theme::current().accent_input_rgb;
 
         assert_eq!(text_cell.symbol(), "e");
         assert_eq!(text_cell.fg, Color::Rgb(red, green, blue));

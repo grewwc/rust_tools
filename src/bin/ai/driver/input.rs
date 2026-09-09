@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use regex::RegexBuilder;
 
 use crate::ai::history;
-use crate::ai::theme::{ACCENT_MUTED, ACCENT_SUCCESS, RESET};
+use crate::ai::theme::{self, RESET};
 use crate::ai::types::{App, QuestionContext};
 use crate::clipboardw::string_content;
 
@@ -118,7 +118,7 @@ enum LocalCommand {
     ExportHistory(HistoryPreviewOptions, Option<PathBuf>),
     CopyHistory(HistoryPreviewOptions),
     RewindHistory(HistoryRewindTarget),
-    RenderLastHistoryMessage,
+    RenderHistoryMessageAt(usize),
     ReplayHistory,
 }
 
@@ -171,8 +171,8 @@ fn handle_local_command_inner(app: &mut App, input: &str) -> Result<bool, Box<dy
         LocalCommand::ShowHistory(options) => {
             println!("{}", render_history_preview(app, options)?);
         }
-        LocalCommand::RenderLastHistoryMessage => {
-            render_last_history_message(app)?;
+        LocalCommand::RenderHistoryMessageAt(nth_back) => {
+            render_history_message_at(app, nth_back)?;
         }
         LocalCommand::ReplayHistory => {
             println!("{}", render_history_replay(app)?);
@@ -239,14 +239,26 @@ fn parse_history_local_command(args: &[&str]) -> Result<Option<LocalCommand>, Bo
         return parse_history_rewind_command(&args[1..])
             .map(|target| Some(LocalCommand::RewindHistory(target)));
     }
-    // `/history last`：按 markdown 渲染回放最后一条 assistant 结论消息。
+    // `/history last [N]`: replay the Nth most recent assistant conclusion
+    // message (1 = latest) through the markdown renderer.
     if args.first().copied() == Some("last") {
-        if args.len() > 1 {
-            return Err("`/history last` takes no arguments".into());
+        let nth_back = match args.get(1) {
+            None => 1,
+            Some(&raw) => raw.parse::<usize>().map_err(|_| {
+                "`/history last` expects an optional positive number, e.g. /history last 3"
+                    .to_string()
+            })?,
+        };
+        if nth_back == 0 {
+            return Err("`/history last` index must be >= 1".into());
         }
-        return Ok(Some(LocalCommand::RenderLastHistoryMessage));
+        if args.len() > 2 {
+            return Err("`/history last` takes at most one argument".into());
+        }
+        return Ok(Some(LocalCommand::RenderHistoryMessageAt(nth_back)));
     }
-    // `/history replay`：回放最后一轮模型的结论文本（不含 tool/thinking）。
+    // `/history replay`: replay the most recent assistant conclusion text only
+    // (no tool/thinking steps).
     if args.first().copied() == Some("replay") {
         if args.len() > 1 {
             return Err("`/history replay` takes no arguments".into());
@@ -425,8 +437,18 @@ fn render_history_preview(
 }
 
 pub(crate) fn last_assistant_conclusion_text(app: &App) -> Result<Option<String>, Box<dyn Error>> {
+    assistant_conclusion_text_at(app, 1)
+}
+
+/// Find the `nth_back`-most-recent assistant conclusion (1 = most recent):
+/// an assistant message with no tool calls and non-empty text content.
+pub(crate) fn assistant_conclusion_text_at(
+    app: &App,
+    nth_back: usize,
+) -> Result<Option<String>, Box<dyn Error>> {
     let history_file = active_history_path(app);
     let messages = history::build_message_arr(usize::MAX, &history_file)?;
+    let mut seen = 0usize;
     Ok(messages.iter().rev().find_map(|message| {
         if message.role != "assistant" {
             return None;
@@ -442,14 +464,15 @@ pub(crate) fn last_assistant_conclusion_text(app: &App) -> Result<Option<String>
         if text.trim().is_empty() {
             return None;
         }
-        Some(text)
+        seen += 1;
+        (seen == nth_back).then_some(text)
     }))
 }
 
-/// `/history last`: replay the last assistant conclusion message fully,
-/// rendered through the terminal markdown renderer.
-fn render_last_history_message(app: &App) -> Result<(), Box<dyn Error>> {
-    match last_assistant_conclusion_text(app)? {
+/// `/history last [N]`: replay the Nth most recent assistant conclusion
+/// message (1 = latest), rendered through the terminal markdown renderer.
+fn render_history_message_at(app: &App, nth_back: usize) -> Result<(), Box<dyn Error>> {
+    match assistant_conclusion_text_at(app, nth_back)? {
         Some(text) => {
             // Same display-only post-processing as the live turn path, so a
             // replay renders exactly what the turn painted.
@@ -458,7 +481,9 @@ fn render_last_history_message(app: &App) -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         None => {
-            println!("[history] No assistant conclusion found in recent history.");
+            println!(
+                "[history] No assistant conclusion found at index {nth_back} in recent history."
+            );
             Ok(())
         }
     }
@@ -1111,11 +1136,12 @@ fn finalize_question(
 mod tests {
     use super::{
         HistoryAction, HistoryPreviewOptions, HistoryRewindTarget, HistoryRoleFilter, LocalCommand,
-        apply_history_rewind, extract_at_file_references, extract_forced_skill_references,
-        finalize_question, highlight_history_keyword, last_assistant_conclusion_text,
-        parse_history_preview_options, parse_local_command, plan_history_rewind,
-        render_history_preview, render_history_replay, resolve_inline_image_path,
-        searchable_history_content, summarize_history_content, truncate_for_terminal,
+        apply_history_rewind, assistant_conclusion_text_at, extract_at_file_references,
+        extract_forced_skill_references, finalize_question, highlight_history_keyword,
+        last_assistant_conclusion_text, parse_history_preview_options, parse_local_command,
+        plan_history_rewind, render_history_preview, render_history_replay,
+        resolve_inline_image_path, searchable_history_content, summarize_history_content,
+        truncate_for_terminal,
     };
     use crate::ai::{
         history::{self, Message, append_history_messages},
@@ -1437,8 +1463,15 @@ mod tests {
         );
         assert_eq!(
             parse_local_command("/history last").unwrap(),
-            Some(LocalCommand::RenderLastHistoryMessage)
+            Some(LocalCommand::RenderHistoryMessageAt(1))
         );
+        assert_eq!(
+            parse_local_command("/history last 3").unwrap(),
+            Some(LocalCommand::RenderHistoryMessageAt(3))
+        );
+        assert!(parse_local_command("/history last 0").is_err());
+        assert!(parse_local_command("/history last x").is_err());
+        assert!(parse_local_command("/history last 2 3").is_err());
         assert_eq!(
             parse_local_command("/history copy").unwrap(),
             Some(LocalCommand::CopyHistory(HistoryPreviewOptions {
@@ -1767,6 +1800,59 @@ mod tests {
 
         let replayed = last_assistant_conclusion_text(&app).unwrap();
         assert_eq!(replayed.as_deref(), Some(markdown.as_str()));
+
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn assistant_conclusion_text_at_counts_back_past_tool_steps() {
+        let history_path =
+            std::env::temp_dir().join(format!("ai-history-nth-{}.sqlite", Uuid::new_v4()));
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+
+        let tool_step = Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: "call_1".to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: Some("thinking".to_string()),
+        };
+        append_history_messages(
+            &history_path,
+            &[
+                test_message("user", "first question"),
+                test_message("assistant", "first answer"),
+                test_message("user", "second question"),
+                tool_step,
+                test_message("tool", "file contents"),
+                test_message("assistant", "second answer"),
+                test_message("user", "third question"),
+                test_message("assistant", "third answer"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            assistant_conclusion_text_at(&app, 1).unwrap().as_deref(),
+            Some("third answer")
+        );
+        assert_eq!(
+            assistant_conclusion_text_at(&app, 2).unwrap().as_deref(),
+            Some("second answer")
+        );
+        assert_eq!(
+            assistant_conclusion_text_at(&app, 3).unwrap().as_deref(),
+            Some("first answer")
+        );
+        assert_eq!(assistant_conclusion_text_at(&app, 4).unwrap(), None);
 
         let _ = std::fs::remove_file(history_path);
     }
@@ -2115,8 +2201,11 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
 
     // 无 TUI 编辑器时，在输入提示前打印一行简短的模型提示。
     println!(
-        "  {ACCENT_MUTED}[{ACCENT_SUCCESS}{}{ACCENT_MUTED}]{RESET}",
+        "  {}[{}{}{}]{RESET}",
+        theme::current().accent_muted,
+        theme::current().accent_success,
         model_label,
+        theme::current().accent_muted,
     );
 
     let mut lines = Vec::new();

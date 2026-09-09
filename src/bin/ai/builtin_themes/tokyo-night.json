@@ -1,0 +1,33 @@
+{
+  "name": "tokyo-night",
+  "type": "dark",
+  "colors": {
+    "accent.primary": "#7AA2F7",
+    "accent.toolName": "#FF9E64",
+    "accent.secondary": "#BB9AF7",
+    "accent.command": "#9ECE6A",
+    "accent.muted": "#565F89",
+    "accent.input": "#C0CAF5",
+    "accent.success": "#9ECE6A",
+    "accent.emphasizedOutput": "#73DACA",
+    "accent.warn": "#E0AF68",
+    "accent.danger": "#F7768E",
+    "accent.marked": "#F7768E",
+    "accent.rule": "#24283B",
+    "accent.submitted": "#E0AF68",
+    "markdown.body": "#C0CAF5",
+    "markdown.strong": "#D8DEFF",
+    "markdown.heading": "#F7768E",
+    "markdown.accent": "#7DCFFF",
+    "markdown.codeFg": "#BB9AF7",
+    "markdown.math": "#73DACA",
+    "code.background": "#1A1B26",
+    "code.foreground": "#C0CAF5",
+    "code.comment": "#565F89",
+    "code.keyword": "#BB9AF7",
+    "code.string": "#9ECE6A",
+    "code.number": "#FF9E64",
+    "code.type": "#7DCFFF",
+    "code.dim": "#565F89"
+  }
+}

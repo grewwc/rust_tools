@@ -599,7 +599,7 @@ pub(super) fn render_table_header(
         .collect::<Vec<_>>();
     let header_height = header_lines.iter().map(|c| c.len()).max().unwrap_or(1);
 
-    let base = format!("\x1b[1m{}", super::MARKDOWN_HEADING);
+    let base = format!("\x1b[1m{}", crate::ai::theme::current().markdown_heading);
     let mut out = String::new();
     for line_idx in 0..header_height {
         out.push_str(indent);
@@ -659,7 +659,7 @@ pub(super) fn render_table_row(
                 cell_line,
                 *width,
                 align.get(i).copied().unwrap_or(TableAlign::Left),
-                super::MARKDOWN_BODY,
+                crate::ai::theme::current().markdown_body,
             );
             out.push(' ');
             out.push_str(&padded);
@@ -717,15 +717,15 @@ mod tests {
     fn table_cells_use_prose_palette_and_restore_headers_after_inline_code() {
         let widths = [14];
         let header = render_table_header("", &["A `code` tail".into()], &[], &widths);
-        let base = format!("\x1b[1m{}", super::super::MARKDOWN_HEADING);
+        let base = format!("\x1b[1m{}", crate::ai::theme::current().markdown_heading);
         assert!(header.contains(&format!("{base}A ")));
         assert!(header.contains(&format!("\x1b[0m{base} tail")));
         assert!(!header.contains("\x1b[36m"));
         assert_eq!(strip_ansi_codes(&header), "│ A code tail    │\n");
 
         let row = render_table_row("", &["正文 `value`".into()], &[], &widths);
-        assert!(row.contains(&format!("{}正文 ", super::super::MARKDOWN_BODY)));
-        assert!(row.contains(super::super::MARKDOWN_CODE_FG));
+        assert!(row.contains(&format!("{}正文 ", crate::ai::theme::current().markdown_body)));
+        assert!(row.contains(crate::ai::theme::current().markdown_code_fg));
         assert_eq!(strip_ansi_codes(&row), "│ 正文 value     │\n");
     }
     use crate::ai::stream::render::inline::visible_width;

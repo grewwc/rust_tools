@@ -1,0 +1,33 @@
+{
+  "name": "light",
+  "type": "light",
+  "colors": {
+    "accent.primary": "#4078F2",
+    "accent.toolName": "#E45649",
+    "accent.secondary": "#A626A4",
+    "accent.command": "#5B7DB1",
+    "accent.muted": "#8A8F98",
+    "accent.input": "#3B3B3B",
+    "accent.success": "#50A14F",
+    "accent.emphasizedOutput": "#4C9A5F",
+    "accent.warn": "#C18401",
+    "accent.danger": "#E45649",
+    "accent.marked": "#E5534B",
+    "accent.rule": "#D8D8DE",
+    "accent.submitted": "#A626A4",
+    "markdown.body": "#24292E",
+    "markdown.strong": "#1F2328",
+    "markdown.heading": "#1F2328",
+    "markdown.accent": "#4078F2",
+    "markdown.codeFg": "#6F42C1",
+    "markdown.math": "#D73A49",
+    "code.background": "#F5F5F5",
+    "code.foreground": "#383A42",
+    "code.comment": "#A0A1A7",
+    "code.keyword": "#A626A4",
+    "code.string": "#50A14F",
+    "code.number": "#986801",
+    "code.type": "#4078F2",
+    "code.dim": "#9D9D9D"
+  }
+}

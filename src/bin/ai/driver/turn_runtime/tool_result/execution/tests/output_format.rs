@@ -142,3 +142,41 @@ fn tty_tool_output_fold_window_clamps_each_line_to_single_row() {
         std::env::remove_var("COLUMNS");
     }
 }
+
+#[test]
+fn tty_tool_output_fold_redraw_clears_only_its_previous_rows() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    unsafe {
+        std::env::set_var("COLUMNS", "200");
+    }
+
+    let mut fold = TtyToolOutputFoldState::default();
+    fold.total_lines = 1;
+    fold.recent_lines.push_back("completed line".to_owned());
+    fold.current_line = "initial partial line".to_owned();
+    let mut initial = Vec::new();
+    fold.redraw_to(&mut initial).unwrap();
+
+    fold.current_line = "updated partial line".to_owned();
+    let mut redraw = Vec::new();
+    fold.redraw_to(&mut redraw).unwrap();
+    let redraw = String::from_utf8(redraw).unwrap();
+
+    // The previous two-row window is erased in place. A screen-to-end erase
+    // (`CSI 0J`) would also erase the DECSTBM-reserved side-note composer.
+    assert!(
+        redraw.starts_with("\r\x1b[2A\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[1A\r"),
+        "unexpected redraw sequence: {redraw:?}"
+    );
+    assert!(
+        !redraw.contains("\x1b[0J"),
+        "unexpected full-screen erase: {redraw:?}"
+    );
+    assert!(redraw.contains("updated partial line"));
+
+    unsafe {
+        std::env::remove_var("COLUMNS");
+    }
+}
