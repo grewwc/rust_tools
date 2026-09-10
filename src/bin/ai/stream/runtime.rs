@@ -1756,6 +1756,15 @@ fn finalize_fold_to(
             theme::current().accent_muted,
             fold.footer_label,
         )?;
+    } else if final_body_rows > 0 {
+        // The collapsed window ends on the one-line summary marker (the body
+        // is rendered without a trailing newline so streaming redraws do not
+        // scroll). Finalize is terminal: release the cursor onto a fresh line,
+        // otherwise the next output — the deferred-body "generating…" hint or
+        // the final answer echoed by the driver — concatenates onto the marker
+        // row ("… N earlier lines   ⠋ generating…"). With zero body rows the
+        // completion header already ends with CRLF, so no extra blank line.
+        out.write_all(b"\r\n")?;
     }
     out.flush()?;
 

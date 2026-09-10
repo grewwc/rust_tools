@@ -323,10 +323,13 @@ pub(super) fn attach(
         let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, POLL_MS) };
         if result < 0 {
             let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
+            // EINTR (SIGWINCH/SIGHUP/...): fall through instead of `continue`
+            // so the resize check at the bottom of the loop forwards the new
+            // window immediately; `revents` stay zero for a failed poll, so no
+            // descriptor handler runs spuriously.
+            if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
+            }
         }
         if SIGNALED.load(Ordering::Relaxed) {
             return Ok(AttachEnd { code: 0, detached: false, session, connection_lost: false });
@@ -606,6 +609,17 @@ impl Signals {
                     libc::sigaction(signal, &action, std::ptr::null_mut());
                 }
                 libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+                // Empty handler: its only job is to make `poll(2)` fail with
+                // EINTR on a resize, so the loop reaches the window-size check
+                // immediately instead of waiting for the 150 ms poll timeout.
+                let mut winch_action: libc::sigaction = std::mem::zeroed();
+                winch_action.sa_sigaction = {
+                    extern "C" fn noop(_: libc::c_int) {}
+                    noop as *const () as usize
+                };
+                libc::sigemptyset(&mut winch_action.sa_mask);
+                winch_action.sa_flags = 0;
+                libc::sigaction(libc::SIGWINCH, &winch_action, std::ptr::null_mut());
             }
         }
         Signals
