@@ -9,7 +9,7 @@ use super::lock::with_session_state_lock;
 use super::migrations::init_history_schema;
 use super::revision::{read_i64_meta_from_conn, touch_session_activity};
 use super::store::{SessionListMetadata, decode_message_content};
-use super::{LAST_ACTIVITY_META_KEY, SESSION_MARKED_META_KEY};
+use super::{LAST_ACTIVITY_META_KEY, SESSION_MARKED_META_KEY, SESSION_MARK_MESSAGE_META_KEY};
 
 pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Option<String>> {
     let conn = open_history_db(path)?;
@@ -121,10 +121,27 @@ pub(in crate::ai) fn read_session_marked_sqlite(path: &Path) -> io::Result<bool>
     Ok(read_session_marked_from_conn(&conn))
 }
 
-/// Persist the session "important" mark (`/mark` / `/unmark`). Uses a key/value
-/// in the meta table so the flag survives clear-history and is copied by fork /
-/// import (both copy the whole SQLite file).
-pub(in crate::ai) fn write_session_marked_sqlite(path: &Path, marked: bool) -> io::Result<()> {
+/// Message part of an atomic mark write (`/mark` / `/unmark`): `Keep` leaves any
+/// an existing mark message untouched (bare `/mark`), `Set` upserts it
+/// (`/mark <message>`), `Clear` removes it (`/unmark`).
+pub(in crate::ai) enum MarkMessageUpdate<'a> {
+    Keep,
+    Set(&'a str),
+    Clear,
+}
+
+/// Atomically persist the session "important" mark flag and its optional mark message in
+/// one lock + one transaction. `/mark`/`/unmark` must never persist a half state:
+/// committing the flag and the message in separate transactions would let a crash
+/// between the two commits (or a concurrent command interleaving between them)
+/// leave "marked without message" or "unmarked with a stale message" behind.
+/// Both keys live in the meta table, so they survive clear-history and are copied
+/// by fork / import (which copy the whole SQLite file).
+pub(in crate::ai) fn write_session_mark_sqlite(
+    path: &Path,
+    marked: bool,
+    message: MarkMessageUpdate<'_>,
+) -> io::Result<()> {
     with_session_state_lock(path, || {
         let mut conn = open_history_db(path)?;
         init_history_schema(&conn)?;
@@ -136,9 +153,45 @@ pub(in crate::ai) fn write_session_marked_sqlite(path: &Path, marked: bool) -> i
             rusqlite::params![SESSION_MARKED_META_KEY, if marked { "1" } else { "0" }],
         )
         .map_err(|e| io::Error::other(e.to_string()))?;
+        match message {
+            MarkMessageUpdate::Keep => {}
+            MarkMessageUpdate::Set(text) => {
+                // Blank input is treated as Keep: "Set" never deletes data.
+                let text = text.trim();
+                if !text.is_empty() {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO meta (key, value, created_at) VALUES (?1, ?2, unixepoch())",
+                        rusqlite::params![SESSION_MARK_MESSAGE_META_KEY, text],
+                    )
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                }
+            }
+            MarkMessageUpdate::Clear => {
+                tx.execute(
+                    "DELETE FROM meta WHERE key=?1",
+                    rusqlite::params![SESSION_MARK_MESSAGE_META_KEY],
+                )
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            }
+        }
         touch_session_activity(&tx)?;
         tx.commit().map_err(|e| io::Error::other(e.to_string()))
     })
+}
+
+/// Read the `/mark` message stored under meta key `session_mark_message`.
+/// Missing or blank values are reported as `None`.
+pub(in crate::ai) fn read_session_mark_message_sqlite(path: &Path) -> io::Result<Option<String>> {
+    let conn = open_history_db_read_only(path)?;
+    let message: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='session_mark_message' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    Ok(message.filter(|message| !message.trim().is_empty()))
 }
 
 /// Read the source of the session title (`model` / `fallback`); when missing, the caller treats it as legacy data.

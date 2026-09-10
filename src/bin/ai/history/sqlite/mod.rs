@@ -26,6 +26,7 @@ const STALE_PATCH_TARGETS_META_KEY: &str = "stale_patch_targets_v1";
 const LLM_PRUNE_MARKS_META_KEY: &str = "llm_prune_marks_v1";
 const LAST_ACTIVITY_META_KEY: &str = "last_activity_unix_ms";
 const SESSION_MARKED_META_KEY: &str = "session_marked";
+const SESSION_MARK_MESSAGE_META_KEY: &str = "session_mark_message";
 
 pub(super) use lock::{
     delete_session_state_lock, remove_session_state_lock_entry, with_session_state_lock,
@@ -41,9 +42,9 @@ pub(in crate::ai) use context::{
     read_recent_turn_window_sqlite, write_context_snapshot_sqlite_with_busy_timeout,
 };
 pub(in crate::ai) use metadata::{
-    read_first_user_prompt_sqlite, read_session_list_metadata_sqlite, read_session_marked_sqlite,
-    read_session_title_origin_sqlite, read_session_title_sqlite, write_session_marked_sqlite,
-    write_session_title_sqlite,
+    read_first_user_prompt_sqlite, read_session_list_metadata_sqlite, read_session_mark_message_sqlite,
+    read_session_marked_sqlite, read_session_title_origin_sqlite, read_session_title_sqlite,
+    write_session_mark_sqlite, write_session_title_sqlite, MarkMessageUpdate,
 };
 pub(in crate::ai) use outcomes::{
     append_interrupted_stream_diagnostic_sqlite, append_skill_activation_event_sqlite,
@@ -63,7 +64,7 @@ pub(in crate::ai) use rollback::{
 pub(in crate::ai) use store::{
     ContextHistory, SessionListMetadata, append_history_sqlite, append_history_sqlite_for_model,
     coalesce_repeated_wait_wake_notes_sqlite, count_user_turns_sqlite, read_all_messages_sqlite,
-    replace_all_messages_sqlite, reserve_turn_index_sqlite,
+    read_all_messages_with_models_sqlite, replace_all_messages_sqlite, reserve_turn_index_sqlite,
 };
 pub(in crate::ai) use trim::{
     clear_session_history_sqlite, remap_context_checkpoint_paths_sqlite, truncate_messages_sqlite,

@@ -1,9 +1,9 @@
 {
-  "key": "deepseek-v4-flash-opencode",
+  "key": "deepseek-flash-opencode",
   "aliases": [
     "DEEPSEEK_V4_FLASH_OPENCODE"
   ],
-  "name": "deepseek-v4-flash",
+  "name": "deepseek-flash",
   "adapter": "opencode",
   "quality_tier": "strong",
   "is_vl": false,
@@ -13,7 +13,7 @@
   "subagent_priority": 85,
   "default_reasoning_effort": "max",
   "reasoning_content_replay": true,
-  "context_window_tokens": 1000000,
-  "max_output_tokens": 393216,
+  "context_window_tokens": 128000,
+  "max_output_tokens": 65536,
   "endpoint": "https://opencode.ai/zen/go/v1/chat/completions"
 }

@@ -50,8 +50,22 @@ impl FileStore {
     }
 
     pub(crate) fn validate_write_access(&self) -> Result<(), AiError> {
+        self.validate_write_access_inner(false)
+    }
+
+    /// Validate a direct `write_file` target, including the OS-selected system temp directory.
+    ///
+    /// This is intentionally separate from the shared write check used by `apply_patch`: the
+    /// request is to make direct scratch writes convenient without widening patch targets.
+    pub(crate) fn validate_write_file_access(&self) -> Result<(), AiError> {
+        self.validate_write_access_inner(true)
+    }
+
+    fn validate_write_access_inner(&self, allow_system_temp: bool) -> Result<(), AiError> {
         self.validate_read_access()?;
-        if path_within_allowed_roots(&self.path) {
+        if path_within_allowed_roots(&self.path)
+            || (allow_system_temp && path_within_system_temp_dir(&self.path))
+        {
             return Ok(());
         }
         // Same-session temp files: write_file(temp=true) has registered the resolved absolute path in the
@@ -703,6 +717,35 @@ fn resolve_effective_path(path: PathBuf) -> PathBuf {
     normalize_lexical(&base.join(path))
 }
 
+/// Whether `path` is below the operating system's default temporary directory without traversing
+/// a symlink introduced beneath that directory.
+///
+/// `std::env::temp_dir()` delegates the location choice to the target OS and its environment
+/// (`TMPDIR`-style locations on Unix and `%TEMP%`-style locations on Windows); do not hardcode
+/// `/tmp` here. The temp root itself may be an OS-provided symlink, but a symlink in a caller-
+/// supplied descendant could redirect the write outside the permitted temp tree.
+fn path_within_system_temp_dir(path: &Path) -> bool {
+    let temp_dir = normalize_lexical(&std::env::temp_dir());
+    let path = normalize_lexical(path);
+    let Ok(relative) = path.strip_prefix(&temp_dir) else {
+        return false;
+    };
+
+    let mut current = temp_dir;
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => return false,
+        };
+        if metadata.file_type().is_symlink() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Read `ai.sandbox.extra_sensitive_paths` (comma-separated, whitespace trimmed).
 fn config_extra_sensitive_substrings() -> Vec<String> {
     let raw = crate::commonw::configw::get_all_config().get(
@@ -991,6 +1034,74 @@ mod tests {
 
         assert!(result.0);
         assert!(!result.1);
+    }
+
+    #[test]
+    fn write_file_access_allows_os_temp_outside_project_root() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let system_temp = normalize_lexical(&std::env::temp_dir());
+        let Some(temp_parent) = system_temp.parent() else {
+            return;
+        };
+        let project_root = temp_parent.join(format!("file-store-project-{}", uuid::Uuid::new_v4()));
+        let target = system_temp.join(format!("file-store-direct-{}.txt", uuid::Uuid::new_v4()));
+
+        let old_cfg = std::env::var_os("CONFIGW_PATH");
+        unsafe { std::env::set_var("CONFIGW_PATH", project_root.join("empty.configw")) };
+        crate::commonw::configw::refresh();
+
+        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(project_root, || {
+            FileStore::new(target).validate_write_file_access()
+        });
+
+        match old_cfg {
+            Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+            None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+        }
+        crate::commonw::configw::refresh();
+
+        assert!(
+            result.is_ok(),
+            "system temp write should be allowed: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_access_rejects_symlink_escape_from_os_temp() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let system_temp = normalize_lexical(&std::env::temp_dir());
+        let Some(temp_parent) = system_temp.parent() else {
+            return;
+        };
+        let project_root = temp_parent.join(format!(
+            "file-store-symlink-project-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let outside = project_root.join("outside.txt");
+        let link = system_temp.join(format!("file-store-symlink-{}", uuid::Uuid::new_v4()));
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let old_cfg = std::env::var_os("CONFIGW_PATH");
+        unsafe { std::env::set_var("CONFIGW_PATH", project_root.join("empty.configw")) };
+        crate::commonw::configw::refresh();
+
+        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
+            .sync_scope(project_root.clone(), || {
+                FileStore::new(link.clone()).validate_write_file_access()
+            });
+
+        match old_cfg {
+            Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+            None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+        }
+        crate::commonw::configw::refresh();
+        let _ = std::fs::remove_file(&link);
+
+        assert!(
+            result.is_err(),
+            "a temp symlink must not escape the system temp directory"
+        );
     }
 
     #[test]

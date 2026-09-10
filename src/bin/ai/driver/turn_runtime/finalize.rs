@@ -446,6 +446,12 @@ pub(super) async fn finalize_turn(
             // the original text is shown unchanged; canonical history is untouched.
             let visible_text = super::output_postprocess::postprocess_terminal_text(visible_text);
             crate::ai::stream::render_markdown_block(&visible_text)?;
+            // Mirror what the user just read: if a cursor-position query times
+            // out, the input box falls back to the alternate screen with no
+            // transcript to sit under, and shows this tail above itself.
+            if let Some(editor) = app.prompt_editor.as_mut() {
+                editor.set_alternate_screen_tail(&visible_text);
+            }
         }
         persist_pending_turn_messages_for_model(
             app,

@@ -1,6 +1,15 @@
-//! plan 状态持久化：显式接收 `&App`（工具入口解析会话上下文），会话资产路径与
-//! side_note 共用 `driver::side_note::assets_dir_for_history` 推导；原子写（临时文件 + rename）
-//! + 进程内互斥锁，避免并发读写撕裂状态文件。
+//! Plan state persistence: tool entry points explicitly pass `&App` (session context
+//! resolution lives in the driver); the session asset path is derived from the same
+//! helper as side_note (`driver::side_note::assets_dir_for_history`); atomic writes
+//! (temp file + rename) plus an in-process mutex prevent concurrent read-modify-write
+//! races on the state file.
+//!
+//! Layer responsibilities: `model` is pure data (no I/O, no rendering), `store` is
+//! persistence only, `render` produces user-facing text. `update_plan_step` enriches
+//! the "step not found" error with the full rendered plan so it is self-healing:
+//! after context compression folds the plan-creation turns away, the model has no
+//! other way to learn the real step numbers (regression: hallucinated step 6/5
+//! updates in a muse-spark session that ended with a fabricated plan narrative).
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -15,10 +24,11 @@ use super::model::{PlanState, StepStatus, StepTransition};
 
 pub(crate) const PLAN_STATE_FILE_NAME: &str = "plan-state.json";
 
-/// 会话内活跃计划的持久化路径（位于 session assets 根下）。
+/// Persistent path of the session's active plan (under the session assets root).
 pub(crate) fn plan_state_path(app: &App) -> PathBuf {
-    // 会话资产根与 side_note / checkpoint 共用同一推导：`session_history_file`
-    // 即 `<sessions_root>/<id>.sqlite`，取其父目录 + stem 即 `<sessions_root>/<id>.assets`。
+    // Derived from the same session assets root as side_note / checkpoint:
+    // `session_history_file` is `<sessions_root>/<id>.sqlite`; its parent dir + stem
+    // give `<sessions_root>/<id>.assets` (see `assets_dir_for_history`).
     assets_dir_for_history(&app.session_history_file).join(PLAN_STATE_FILE_NAME)
 }
 
@@ -34,12 +44,14 @@ pub(crate) fn load_plan_state(app: &App) -> Result<Option<PlanState>, String> {
         .map_err(|e| format!("plan state {} is corrupt: {e}", path.display()))
 }
 
-/// 原子落盘（tmp + rename），避免中途崩溃留下半截 JSON。
+/// Monotonic sequence used to give temp files unique names (see `save_plan_state`).
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// 会话内计划读-改-写互斥：`record_plan` / `update_plan_step` 的 load→mutate→save
-/// 必须原子化，否则并发调用（如同轮多个工具、后台子代理）会互相覆盖对方的状态。
-/// 仅进程内线程间互斥；跨进程安全由 tmp+rename 原子落盘兜底（最后写者胜）。
+/// Read-modify-write mutex for plan state: the load→mutate→save sequence in
+/// `record_plan` / `update_plan_step` must be atomic, or concurrent calls (parallel
+/// tools in one round, background subagents) would overwrite each other's state.
+/// Only guards threads inside this process; cross-process safety comes from the
+/// atomic tmp+rename (last writer wins).
 static PLAN_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn save_plan_state(app: &App, state: &PlanState) -> Result<(), String> {
@@ -48,8 +60,9 @@ pub(crate) fn save_plan_state(app: &App, state: &PlanState) -> Result<(), String
         .parent()
         .ok_or_else(|| "invalid plan-state path".to_string())?;
     std::fs::create_dir_all(parent).map_err(|e| format!("cannot create plan-state dir: {e}"))?;
-    // tmp 名按 进程 id + 单调序号 唯一，同一会话内并发写互不覆盖彼此的 tmp 文件；
-    // rename 本身原子，最终路径上只会出现完整 JSON。
+    // Temp names are unique per process id + monotonic sequence, so concurrent
+    // writers never clobber each other's temp files; rename is atomic, so the final
+    // path only ever contains a complete JSON document.
     let tmp = parent.join(format!(
         ".{}.{}-{}.tmp",
         PLAN_STATE_FILE_NAME,
@@ -101,7 +114,110 @@ pub(crate) fn update_plan_step(
             )
         }
     };
-    let transition = state.apply_update(step, status, note)?;
+    let transition = match state.apply_update(step, status, note) {
+        Ok(transition) => transition,
+        // The plan-creation turns may be folded away by context compression, so a bare
+        // "Step N not found" would leave the model guessing step numbers from memory.
+        // Attach the full rendered plan plus a read-only persistence pointer (the
+        // absolute plan-state.json path) to make the error self-healing. The pointer
+        // must NOT suggest calling `plan` to "view": `plan` only creates/replaces the
+        // plan and requires `steps`, so a view call would either fail or silently
+        // replace the plan (regression: an earlier hint told the model to "re-view"
+        // via `plan`).
+        Err(msg) => {
+            return Err(format!(
+                "{msg}\nCurrent plan:\n{}Plan state persists at {} (plan-state.json, session assets) and survives context compression; read it with read_file if you need the current steps later. `plan` only creates or replaces the plan — use `plan_update` for status changes.\n",
+                state.render(),
+                plan_state_path(app).display()
+            ))
+        }
+    };
     save_plan_state(app, &state)?;
     Ok((state, transition))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Removes the temporary session dir even when an assertion panics.
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Per-process counter so tests starting in the same millisecond never share a
+    /// temp dir (pid + timestamp alone collided and the tests destroyed each other's
+    /// plan-state files; reproduced as flaky failures under parallel test threads).
+    static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Test app whose plan-state file lands in a fresh temp dir (never the shared
+    /// `default.assets/` fallback), mirroring the plan_tools test setup.
+    fn test_app() -> (App, TempDirGuard) {
+        let base = std::env::temp_dir().join(format!(
+            "plan-state-store-test-{}-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let guard = TempDirGuard(base.clone());
+        let mut app = crate::ai::middleware::test_util::test_app();
+        app.session_history_file = base.join("session.sqlite");
+        app.session_id = "plan-state-store-test".to_string();
+        (app, guard)
+    }
+
+    fn three_step_plan(app: &App) {
+        let steps = serde_json::json!([
+            { "step": 1, "action": "Read", "tool": "read_file" },
+            { "step": 2, "action": "Patch", "tool": "apply_patch" },
+            { "step": 3, "action": "Verify", "tool": "execute_command" }
+        ]);
+        record_plan(app, "Demo", steps.as_array().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn update_missing_step_reports_full_plan_for_self_healing() {
+        let (app, _guard) = test_app();
+        three_step_plan(&app);
+        // Give step 1 a visible terminal status so the reported plan shows suffixes.
+        update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
+
+        let err = update_plan_step(&app, 9, StepStatus::Done, None).unwrap_err();
+        assert!(err.contains("Step 9 not found in the active plan."), "{err}");
+        assert!(err.contains("Current plan:"), "{err}");
+        // Real step numbers and statuses are listed, so the model can pick one instead
+        // of guessing (regression: hallucinated step 6/5 after compression).
+        assert!(err.contains("Step 1. [read_file] Read (done)"), "{err}");
+        assert!(err.contains("Step 2. [apply_patch] Patch"), "{err}");
+        assert!(err.contains("3 step(s) planned."), "{err}");
+        // Persistence pointer: the plan survives compression at plan-state.json.
+        assert!(err.contains("plan-state.json"), "{err}");
+        // The recovery pointer must stay read-only: `plan` only creates/replaces the
+        // plan (regression: a hint telling the model to "re-view" via `plan` would
+        // fail on bare calls or silently replace the plan with guessed steps).
+        assert!(err.contains("read_file"), "{err}");
+        assert!(!err.contains("re-view"), "{err}");
+
+        // The failed update must not have mutated any state.
+        let state = load_plan_state(&app).unwrap().unwrap();
+        assert_eq!(state.done_count(), 1);
+        assert_eq!(state.steps[1].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn update_without_plan_asks_to_create_one() {
+        let (app, _guard) = test_app();
+        let err = update_plan_step(&app, 1, StepStatus::Done, None).unwrap_err();
+        assert!(err.contains("No active plan"), "{err}");
+        assert!(err.contains("Call `plan`"), "{err}");
+    }
 }

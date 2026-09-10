@@ -1,6 +1,6 @@
 {
   "name": "plan_update",
-  "description": "Update the status of one step in the active plan created by `plan` (running before starting, done when finished, failed/skipped when not completable). Echoes the full updated plan; statuses persist per session.",
+  "description": "Update the status of one step in the active plan created by `plan` (running before starting, done when finished, failed/skipped when not completable). Returns the aggregate progress, the remaining steps, and any failed step with its reason (failures stay visible in later updates so the work can be retried or re-planned); statuses persist per session.",
   "parameters": {
     "type": "object",
     "properties": {

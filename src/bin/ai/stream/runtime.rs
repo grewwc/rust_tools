@@ -44,6 +44,13 @@ const FINISH_REASON_GRACE_MS: u64 = 750;
 /// Idle timeout: after some content arrived, a long stretch without a new chunk means the server has silently finished.
 /// Some providers send neither finish_reason nor close the connection after finishing; only this timeout catches that.
 const STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
+/// Tool-call argument stall timeout: once a tool call opens, its arguments must finish within this window even if
+/// the provider keeps trickling argument deltas. The idle timeout only catches total silence; a server that sends one
+/// small delta every <45s refreshes the meaningful-progress timer forever, leaving the terminal stuck on
+/// "receiving `tool` arguments…" (observed incident: an apply_patch call whose arguments never completed for 13+
+/// minutes). Normal tool arguments stream to completion in seconds, so this bound is generous and only fires on
+/// pathological streams; it falls through to the same truncation path as the idle timeout.
+const STREAM_TOOL_ARGS_STALL_TIMEOUT_SECS: u64 = 180;
 /// First-chunk timeout: the request was sent but the server never sends the first byte (queued, stuck gateway, ...).
 /// Longer than the idle timeout, since some models take time to cold-start or queue.
 const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 90;
@@ -103,6 +110,24 @@ fn initial_stream_processing_state(app: &App) -> StreamProcessingState {
     StreamProcessingState::with_filters(app.hooks.stream_filters().clone())
 }
 
+/// Update the tool-argument stall timer: starts it when a tool call opens, resets it once no
+/// tool call is open or the stream already finished. See `STREAM_TOOL_ARGS_STALL_TIMEOUT_SECS`.
+fn update_tool_args_open_at(
+    state: &StreamContentState,
+    open_at: Option<Instant>,
+) -> Option<Instant> {
+    if state.finish_reason_seen || state.tool_calls_map.is_empty() {
+        None
+    } else {
+        Some(open_at.unwrap_or_else(Instant::now))
+    }
+}
+
+/// Whether an open tool call has been receiving arguments for at least `stall_timeout` without finishing.
+fn tool_args_stream_stalled(open_at: Option<Instant>, now: Instant, stall_timeout: Duration) -> bool {
+    open_at.is_some_and(|open_at| now.duration_since(open_at) >= stall_timeout)
+}
+
 pub(super) async fn stream_response(
     app: &mut App,
     response: &mut reqwest::Response,
@@ -146,10 +171,27 @@ pub(super) async fn stream_response(
             || s.content.finish_reason_seen
     };
     let mut idle_timeout_secs = None;
+    let mut tool_args_open_at = None;
+    let mut tool_args_stalled = false;
 
     while !app.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
         if let Some(result) = immediate_cancel_result(app, &mut state) {
             return Ok(result);
+        }
+
+        // A tool call that stays open too long is a stalled stream even if the provider keeps
+        // trickling argument deltas (each delta refreshes the idle timer as meaningful progress).
+        // Bound the total time a tool call may stay open; on expiry fall through to the same
+        // truncation path as the idle timeout (drops the unconfirmed tool call and retries).
+        tool_args_open_at = update_tool_args_open_at(&state.content, tool_args_open_at);
+        if tool_args_stream_stalled(
+            tool_args_open_at,
+            Instant::now(),
+            Duration::from_secs(STREAM_TOOL_ARGS_STALL_TIMEOUT_SECS),
+        ) {
+            tool_args_stalled = true;
+            idle_timeout_secs = Some(STREAM_TOOL_ARGS_STALL_TIMEOUT_SECS);
+            break;
         }
 
         // Use a shorter idle timeout when there is executable/visible progress; empty packets, usage-only and heartbeat
@@ -216,10 +258,17 @@ pub(super) async fn stream_response(
             clear_waiting_hint(&mut state)?;
             let stdout = io::stdout();
             let mut out = stdout.lock();
-            writeln!(
-                out,
-                "  ⚠ 响应流连续 {timeout_secs} 秒无有效进展，按流中断处理…"
-            )?;
+            if tool_args_stalled {
+                writeln!(
+                    out,
+                    "  ⚠ 工具调用参数流超过 {timeout_secs} 秒未完成，按流中断处理…"
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "  ⚠ 响应流连续 {timeout_secs} 秒无有效进展，按流中断处理…"
+                )?;
+            }
             out.flush()?;
         }
     }

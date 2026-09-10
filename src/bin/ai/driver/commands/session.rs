@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::ai::{
     history::{
-        PruneSessionDeleteResult, SessionInfo, SessionStore, SessionTitleOrigin,
+        MarkMessageUpdate, PruneSessionDeleteResult, SessionInfo, SessionStore, SessionTitleOrigin,
         SuspendedSessionEntry, SuspendedSessionStore, format_suspended_timestamp_label,
         generate_session_summary,
     },
@@ -18,6 +18,7 @@ pub(in crate::ai) const CANONICAL_SESSION_SUBCOMMANDS: &[&str] = &[
     "list",
     "verbose",
     "current",
+    "id",
     "new",
     "use",
     "suspend",
@@ -25,6 +26,7 @@ pub(in crate::ai) const CANONICAL_SESSION_SUBCOMMANDS: &[&str] = &[
     "unbind",
     "delete",
     "prune",
+    "message",
     "clear-history",
     "clear-all",
     "dump-history",
@@ -323,8 +325,9 @@ fn resolve_existing_session_selector(
 pub(crate) const MAX_PRUNE_DAYS: i64 = 3_650_000;
 
 /// Selects sessions inactive for N days: those whose `modified_local` is earlier
-/// than `cutoff` count as expired. The current session is never deleted; sessions
-/// without a timestamp cannot be age-ordered and are conservatively skipped.
+/// than `cutoff` count as expired. The current session and sessions marked
+/// important via `/mark` are never deleted; sessions without a timestamp cannot
+/// be age-ordered and are conservatively skipped.
 pub(crate) fn select_stale_sessions<'a>(
     sessions: &'a [SessionInfo],
     current_session_id: &str,
@@ -333,7 +336,9 @@ pub(crate) fn select_stale_sessions<'a>(
     sessions
         .iter()
         .filter(|s| {
-            s.id != current_session_id && s.modified_local.map(|t| t < cutoff).unwrap_or(false)
+            s.id != current_session_id
+                && !s.marked
+                && s.modified_local.map(|t| t < cutoff).unwrap_or(false)
         })
         .collect()
 }
@@ -361,6 +366,13 @@ pub(crate) fn is_real_time_background_command(input: &str) -> bool {
         normalized.split_whitespace().next(),
         Some("bg" | "suspend" | "detach" | "susp")
     )
+}
+
+/// Render the `/session` output: the current session id on its own line.
+/// Kept as a named function so the printed value is unit-testable without
+/// redirecting process-wide stdout.
+fn render_current_session_id(app: &App) -> String {
+    app.session_id.clone()
 }
 
 pub fn try_handle_session_command(
@@ -408,6 +420,11 @@ pub fn try_handle_session_command(
         "mark"
     } else if top_level_unmark {
         "unmark"
+    } else if cmd == "session" {
+        // Bare `/session` (no subcommand) shows the current session id — the
+        // intuitive reading of the singular name. `/sessions` and `/ss` keep
+        // defaulting to the session list; explicit subcommands are unchanged.
+        parts.next().unwrap_or("id")
     } else {
         parts.next().unwrap_or("list")
     };
@@ -421,6 +438,7 @@ pub fn try_handle_session_command(
             println!("  /sessions [list]          list all sessions (default, no sizes)");
             println!("  /sessions verbose         list all sessions with per-session sizes");
             println!("  /sessions current         show current session info");
+            println!("  /session [id]             show current session id (bare /session too)");
             println!("  /sessions new             create and switch to new session");
             println!("  /sessions use <id>        switch to specified session");
             println!("  /sessions suspend         suspend current session and return to shell");
@@ -431,10 +449,13 @@ pub fn try_handle_session_command(
                 "  /fork                     fork current session into a new branch (keeps original) and switch"
             );
             println!(
-                "  /mark                     mark current session as important (shown in red in `/ss`)"
+                "  /mark [message]            mark current session as important (shown in red in `/ss`); the optional message is shown via `/ss message`"
             );
             println!(
                 "  /unmark                   remove the important mark from the current session"
+            );
+            println!(
+                "  /sessions message [id]     show the mark message of a session (default: current; `last` = most recent)"
             );
             println!(
                 "  /sessions bound           list suspended sessions bound to current terminal"
@@ -448,7 +469,7 @@ pub fn try_handle_session_command(
             );
             println!("  /sessions clear-all       delete all sessions");
             println!(
-                "  /sessions prune <days>    delete sessions inactive for N days (current session kept)"
+                "  /sessions prune <days>    delete sessions inactive for N days (current and marked sessions are kept)"
             );
             println!(
                 "  /sessions dump-history <id>              dump session history to JSON (<id>-history.json)"
@@ -537,19 +558,76 @@ pub fn try_handle_session_command(
                 println!("size: {}", format_size(size));
                 let marked = store.read_session_marked(&app.session_id).unwrap_or(false);
                 println!("marked: {}", if marked { "yes" } else { "no" });
+                if marked {
+                    match store.read_session_mark_message(&app.session_id) {
+                        Ok(message) if !message.is_empty() => println!("mark-message: {message}"),
+                        Ok(_) => {}
+                        Err(error) => {
+                            eprintln!("[sessions current] failed to read mark message: {error}")
+                        }
+                    }
+                }
                 if let Some(t) = modified_local {
                     println!("modified: {}", t.format("%Y-%m-%d %H:%M:%S"));
                 }
             }
         }
-        "mark" => match store.write_session_marked(&app.session_id, true) {
-            Ok(()) => println!("Marked session as important: {}", app.session_id),
-            Err(err) => eprintln!("[mark] failed to mark session: {err}"),
-        },
-        "unmark" => match store.write_session_marked(&app.session_id, false) {
-            Ok(()) => println!("Removed important mark from session: {}", app.session_id),
-            Err(err) => eprintln!("[unmark] failed to unmark session: {err}"),
-        },
+        "id" => {
+            // `/session` / `/session id`: the current session id on its own
+            // line, easy to copy for `a --session <id>` or `/sessions use <id>`.
+            println!("{}", render_current_session_id(app));
+        }
+        "mark" => {
+            // `/mark [message]`: trailing words are the mark message shown via
+            // `/ss message`. Bare `/mark` keeps any existing message.
+            let message: String = parts.collect::<Vec<_>>().join(" ");
+            let message = message.trim();
+            // Flag and message go through one lock + one transaction, so an
+            // interleaved concurrent `/mark`/`/unmark` or a crash mid-command
+            // can never persist "marked without message" / a stale message.
+            let message_update = if message.is_empty() {
+                MarkMessageUpdate::Keep
+            } else {
+                MarkMessageUpdate::Set(message)
+            };
+            match store.write_session_mark(&app.session_id, true, message_update) {
+                Ok(()) if message.is_empty() => {
+                    println!("Marked session as important: {}", app.session_id);
+                }
+                Ok(()) => println!(
+                    "Marked session as important: {} ({})",
+                    app.session_id, message
+                ),
+                Err(err) => eprintln!("[mark] failed to mark session: {err}"),
+            }
+        }
+        "unmark" => {
+            // Trailing words are drained (not stored): `/unmark` never sets a message.
+            let _ = parts.collect::<Vec<_>>();
+            match store.write_session_mark(&app.session_id, false, MarkMessageUpdate::Clear) {
+                Ok(()) => println!("Removed important mark from session: {}", app.session_id),
+                Err(err) => eprintln!("[unmark] failed to unmark session: {err}"),
+            }
+        }
+        "message" | "mark-message" | "mark_message" => {
+            let selector = parts.next().unwrap_or("current");
+            let id = match resolve_existing_session_selector(&store, &app.session_id, selector)
+            {
+                Ok(id) => id,
+                Err(error) => {
+                    eprintln!("Failed to read mark message: {error}");
+                    return Ok(true);
+                }
+            };
+            if !store.read_session_marked(&id).unwrap_or(false) {
+                println!("no mark for session '{id}'");
+                return Ok(true);
+            }
+            match store.read_session_mark_message(&id) {
+                Ok(message) => println!("{message}"),
+                Err(error) => eprintln!("Failed to read mark message: {error}"),
+            }
+        }
         "new" | "create" => {
             let new_id = Uuid::new_v4().to_string();
             // Clear the old session's history cache and explicit-enabled tools
@@ -924,12 +1002,25 @@ pub fn try_handle_session_command(
             let cutoff = chrono::Local::now() - chrono::Duration::days(days);
             let sessions = store.list_sessions()?;
             let stale = select_stale_sessions(&sessions, &app.session_id, cutoff);
+            // Marked sessions are excluded above; report how many were spared so
+            // the "nothing deleted" case does not look like missing data.
+            let marked_kept = sessions
+                .iter()
+                .filter(|s| {
+                    s.id != app.session_id
+                        && s.marked
+                        && s.modified_local.map(|t| t < cutoff).unwrap_or(false)
+                })
+                .count();
             if stale.is_empty() {
                 println!("No sessions inactive for {} day(s).", days);
+                if marked_kept > 0 {
+                    println!("({marked_kept} marked session(s) kept)");
+                }
                 return Ok(true);
             }
             println!(
-                "Found {} session(s) inactive for {} day(s) (current session kept):",
+                "Found {} session(s) inactive for {} day(s) (current and marked sessions kept):",
                 stale.len(),
                 days
             );
@@ -1355,6 +1446,27 @@ mod tests {
             })
             .await;
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bare_session_prints_current_session_id() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+
+        // The printed value is exactly the current session id.
+        assert_eq!(render_current_session_id(&app), app.session_id);
+        assert_eq!(render_current_session_id(&app), "sess-old");
+        // Bare `/session` and `/session id` are consumed as local commands
+        // (never passed through to the model)...
+        assert!(try_handle_session_command(&mut app, "/session").unwrap());
+        assert!(try_handle_session_command(&mut app, "/session id").unwrap());
+        // ...while `/ss`, `/sessions`, and existing subcommands keep working.
+        assert!(try_handle_session_command(&mut app, "/ss").unwrap());
+        assert!(try_handle_session_command(&mut app, "/sessions current").unwrap());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1844,6 +1956,10 @@ mod tests {
             make_session_info("recent", Some(5)),
             make_session_info("current", Some(40)),
             make_session_info("unknown", None),
+            SessionInfo {
+                marked: true,
+                ..make_session_info("marked-old", Some(40))
+            },
         ];
         let cutoff = Local::now() - Duration::days(30);
         let stale = select_stale_sessions(&sessions, "current", cutoff);
@@ -1965,6 +2081,123 @@ mod tests {
                 .map(|s| s.marked),
             Some(false)
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mark_message_roundtrip_and_unmark_clears_it() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let id = app.session_id.clone();
+
+        // No message by default; bare `/mark` keeps it that way.
+        assert_eq!(store.read_session_mark_message(&id).unwrap(), "");
+        assert!(try_handle_session_command(&mut app, "/mark").unwrap());
+        assert!(store.read_session_marked(&id).unwrap());
+        assert_eq!(store.read_session_mark_message(&id).unwrap(), "");
+        // Trailing words become the mark message, via both `/mark` and
+        // `/sessions mark`.
+        assert!(try_handle_session_command(&mut app, "/mark fix login bug").unwrap());
+        assert_eq!(
+            store.read_session_mark_message(&id).unwrap(),
+            "fix login bug"
+        );
+        assert!(try_handle_session_command(&mut app, "/sessions mark second note").unwrap());
+        assert_eq!(
+            store.read_session_mark_message(&id).unwrap(),
+            "second note"
+        );
+        // The `message` arm resolves selectors and prints without failing:
+        // current (marked), unknown id, and unmarked sessions.
+        assert!(try_handle_session_command(&mut app, "/sessions message").unwrap());
+        assert!(try_handle_session_command(&mut app, "/ss message no-such-session").unwrap());
+        // `/unmark` clears both the flag and the message.
+        assert!(try_handle_session_command(&mut app, "/unmark").unwrap());
+        assert!(!store.read_session_marked(&id).unwrap());
+        assert_eq!(store.read_session_mark_message(&id).unwrap(), "");
+        assert!(try_handle_session_command(&mut app, "/ss message").unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_session_mark_atomic_roundtrip() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let id = app.session_id.clone();
+
+        // `Set` writes flag and message in the same transaction.
+        store
+            .write_session_mark(&id, true, MarkMessageUpdate::Set("note"))
+            .unwrap();
+        assert!(store.read_session_marked(&id).unwrap());
+        assert_eq!(store.read_session_mark_message(&id).unwrap(), "note");
+        // `Keep` (bare `/mark`) preserves an existing message.
+        store
+            .write_session_mark(&id, true, MarkMessageUpdate::Keep)
+            .unwrap();
+        assert_eq!(store.read_session_mark_message(&id).unwrap(), "note");
+        // `Clear` (`/unmark`) removes flag and message together.
+        store
+            .write_session_mark(&id, false, MarkMessageUpdate::Clear)
+            .unwrap();
+        assert!(!store.read_session_marked(&id).unwrap());
+        assert_eq!(store.read_session_mark_message(&id).unwrap(), "");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prune_keeps_marked_sessions_on_disk() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        for id in ["sess-marked-old", "sess-plain-old"] {
+            append_history_messages(
+                &store.session_history_file(id),
+                &[Message {
+                    role: "user".to_string(),
+                    content: Value::String(format!("hi {id}")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        }
+        // Mark first: persisting the mark refreshes activity time, so the
+        // backdate below must come after.
+        store
+            .write_session_mark("sess-marked-old", true, MarkMessageUpdate::Set("keep me"))
+            .unwrap();
+        set_session_activity_days_ago(&store.session_history_file("sess-marked-old"), 40);
+        set_session_activity_days_ago(&store.session_history_file("sess-plain-old"), 40);
+
+        let cutoff = Local::now() - Duration::days(30);
+        let sessions = store.list_sessions().unwrap();
+        assert!(
+            sessions
+                .iter()
+                .find(|s| s.id == "sess-marked-old")
+                .is_some_and(|s| s.marked)
+        );
+        let stale_ids: Vec<String> = select_stale_sessions(&sessions, &app.session_id, cutoff)
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        assert_eq!(stale_ids, vec!["sess-plain-old".to_string()]);
 
         let _ = fs::remove_dir_all(root);
     }

@@ -6,7 +6,7 @@ fn print_model_help() {
     println!("  /model                              list available models");
     println!("  /model current                      show current model & effort");
     println!("  /model <selector> [<question>...]   switch to a model");
-    println!("                                      e.g. /model deepseek-v4-flash-opencode");
+    println!("                                      e.g. /model deepseek-flash-opencode");
     println!(
         "                                      (text after the selector is asked on this turn)"
     );

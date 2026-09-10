@@ -1347,11 +1347,16 @@ fn build_system_prompt(
                 // semantics; only the track-as-you-go cadence is restated here.
                 lines.push("Track step progress with `plan_update` as you work (per-step status semantics live in its tool description).".to_string());
             } else {
-                lines.push("Track step progress with `plan_update`: mark a step `running` before starting it and `done` when finished; use `failed`/`skipped` when a step cannot be completed as planned. Each `plan_update` echoes the full plan with per-step status.".to_string());
+                lines.push("Track step progress with `plan_update`: mark a step `running` before starting it and `done` when finished; use `failed`/`skipped` when a step cannot be completed as planned. Each `plan_update` returns the changed step, the aggregate progress, and the remaining steps.".to_string());
             }
             lines.push("Treat the plan as a living roadmap: when findings, changed requirements, or a dead end reshape the task, call `plan` again instead of drifting; the latest plan is preserved in full as the task anchor while older versions may be summarized.".to_string());
             if has_tool(available_tools, "task_spawn") {
-                lines.push("When planning, mark `delegate: true` on every substantive step, serial or parallel: subagents start with a clean, focused context and the parent reviews results. Keep in the parent only trivial single-tool steps, tightly coupled overlapping edits, and final review/synthesis. `parallelizable: true` means no dependency on earlier steps (concurrent task_spawn); delegated steps without it run one at a time via the synchronous `task`, with the parent handing the needed context in the prompt.".to_string());
+                // Delegation policy lives here (always-on). The parent-side boundary is
+                // stated once in the async_subagent_orchestration section (rendered under
+                // the same `task_spawn` gate below), and the per-shape orchestration
+                // mechanics come from the plan-time footer in
+                // `plan_state::render::delegation_guidance`, so neither is repeated here.
+                lines.push("When planning, mark `delegate: true` on every substantive step, serial or parallel: subagents start with a clean, focused context and the parent reviews results. `parallelizable: true` means no dependency on earlier steps (run those concurrently via `task_spawn`); delegated steps without it run one at a time via the synchronous `task`.".to_string());
             }
         }
         if has_tool(available_tools, "spawn_process") {

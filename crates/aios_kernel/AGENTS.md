@@ -17,8 +17,8 @@ src/kernel.rs       # Kernel / Syscall / KernelInternal traits, Process, Process
                     # ProcessCapabilities, SharedKernel, CurrentPidProvider
 src/primitives.rs   # FutexOps, TraceOps, EpollOps, RlimitOps, LlmOps, VfsOps,
                     # DaemonOps, IpcOps + their types (ResourceLimit/Usage, ...)
-src/local/          # LocalOS: single-machine implementation of every trait (~6.6K
-                    # lines), split by facility (syscall, futex, ipc, vfs, daemon, ...)
+src/local/          # LocalOS: single-machine implementation of every trait, split
+                    # by facility (syscall, futex, ipc, vfs, daemon, ...)
 src/types.rs        # FastMap / FastSet (rustc-hash re-exports)
 ```
 

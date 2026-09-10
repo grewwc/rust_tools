@@ -10,6 +10,7 @@ use crate::ai::{
         Message, ROLE_INTERNAL_NOTE, SessionStore, compress::TOOL_RESULT_RAW_HARD_CAP_CHARS,
         is_system_like_role,
     },
+    tools::plan_state::{PlanState, load_plan_state, plan_state_path},
     types::App,
     types::ToolCall,
 };
@@ -263,6 +264,11 @@ fn save_working_context_checkpoint(
     Ok(path)
 }
 
+/// Marker message for a successful `plan` call. The working checkpoint file is written (or
+/// overwritten) and the model receives a stable path plus summary to recover the plan from.
+///
+/// `plan_update` does not append a marker (that would add one internal note per status flip);
+/// it refreshes that same file through `refresh_working_checkpoint_after_plan_update`.
 fn working_checkpoint_message_for_plan(
     app: &App,
     tool_call: &ToolCall,
@@ -276,9 +282,16 @@ fn working_checkpoint_message_for_plan(
     }
 
     let args = serde_json::from_str::<Value>(&tool_call.function.arguments).ok();
-    let summary =
-        truncate_checkpoint_summary(&plan_checkpoint_summary(args.as_ref(), result_content));
-    let body = build_plan_working_checkpoint_body(tool_call, args.as_ref(), result_content);
+    // The persisted plan state is the single source for the step list and its statuses; the
+    // `plan` arguments are only a fallback for when persisting the plan failed.
+    let state = load_plan_state(app).ok().flatten();
+    let summary = truncate_checkpoint_summary(&plan_checkpoint_summary(
+        args.as_ref(),
+        state.as_ref(),
+        result_content,
+    ));
+    let body =
+        build_plan_working_checkpoint_body(app, tool_call, args.as_ref(), state.as_ref());
     let marker = match save_working_context_checkpoint(app, &summary, &body) {
         Ok(path) => {
             crate::ai::driver::runtime_ctx::publish_subagent_checkpoint_summary(&summary);
@@ -303,11 +316,55 @@ fn working_checkpoint_message_for_plan(
     })
 }
 
-fn plan_checkpoint_summary(args: Option<&Value>, result_content: &str) -> String {
+/// Refresh the working checkpoint after a `plan_update` changed a step status.
+///
+/// The plan-time marker already points at this file, so a status change rewrites it in place
+/// instead of appending another internal note. Without persisted plan state this is a no-op,
+/// so a refresh can never leave a checkpoint that contradicts the state file.
+fn refresh_working_checkpoint_after_plan_update(app: &App, tool_call: &ToolCall) {
+    if tool_call.function.name != "plan_update" {
+        return;
+    }
+    let Ok(Some(state)) = load_plan_state(app) else {
+        return;
+    };
+    let args = serde_json::from_str::<Value>(&tool_call.function.arguments).ok();
+    // Keep the plan-time title semantics: a plan without a summary falls back to its first
+    // step instead of the content-free "plan updated" default.
+    let fallback_title = state
+        .steps
+        .first()
+        .map(|step| step.action.as_str())
+        .unwrap_or_default();
+    let summary = truncate_checkpoint_summary(&plan_checkpoint_summary(
+        args.as_ref(),
+        Some(&state),
+        fallback_title,
+    ));
+    let body = build_plan_working_checkpoint_body(app, tool_call, args.as_ref(), Some(&state));
+    if let Err(error) = save_working_context_checkpoint(app, &summary, &body)
+        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+    {
+        eprintln!("failed to refresh working context checkpoint: {error}");
+    }
+}
+
+fn plan_checkpoint_summary(
+    args: Option<&Value>,
+    state: Option<&PlanState>,
+    result_content: &str,
+) -> String {
     if let Some(summary) = args
         .and_then(|args| args.get("summary"))
         .and_then(Value::as_str)
         .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+    {
+        return format!("working_checkpoint: {summary}");
+    }
+
+    if let Some(summary) = state
+        .map(|state| state.summary.trim())
         .filter(|summary| !summary.is_empty())
     {
         return format!("working_checkpoint: {summary}");
@@ -325,23 +382,36 @@ fn plan_checkpoint_summary(args: Option<&Value>, result_content: &str) -> String
     format!("working_checkpoint: {summary}")
 }
 
+/// Body of the working checkpoint.
+///
+/// `state` is the persisted plan state when it could be loaded; without it (persisting the
+/// plan failed) the step list falls back to the `plan` arguments and carries no statuses. The
+/// plan appears exactly once: the recovery snapshot already contains the step list, so there
+/// is no second "raw plan output" copy.
 fn build_plan_working_checkpoint_body(
+    app: &App,
     tool_call: &ToolCall,
     args: Option<&Value>,
-    result_content: &str,
+    state: Option<&PlanState>,
 ) -> String {
     let mut body = String::new();
     body.push_str("kind: runtime_owned_working_checkpoint\n");
-    body.push_str("source_tool: plan\n");
+    body.push_str(&format!("source_tool: {}\n", tool_call.function.name));
     body.push_str(&format!("tool_call_id: {}\n", tool_call.id));
     body.push_str(&format!(
         "updated_at: {}\n",
         chrono::Local::now().to_rfc3339()
     ));
     body.push_str("\n## Facts\n");
-    body.push_str(
-        "- The current working plan below came from the latest successful `plan` tool call.\n",
-    );
+    match state {
+        Some(_) => body.push_str(&format!(
+            "- The step list below is the live `plan` state, refreshed on every `plan_update`; the authoritative copy is `{}`.\n",
+            plan_state_path(app).display()
+        )),
+        None => body.push_str(
+            "- The plan state could not be loaded from this session; the step list below comes from the `plan` tool arguments and carries no statuses.\n",
+        ),
+    }
     body.push_str(
         "- This file is overwritten by runtime when a newer working checkpoint is produced.\n",
     );
@@ -350,21 +420,23 @@ fn build_plan_working_checkpoint_body(
         "- Treat this checkpoint as the active task ledger until a newer working checkpoint replaces it.\n",
     );
     body.push_str("\n## Files Read\n");
-    body.push_str("- Not captured by `plan`.\n");
+    body.push_str("- Not captured by the plan tools.\n");
     body.push_str("\n## Files Modified\n");
-    body.push_str("- Not captured by `plan`.\n");
+    body.push_str("- Not captured by the plan tools.\n");
     body.push_str("\n## Task Evidence\n");
     body.push_str(
         "- Durable subagent delivery/integration state is maintained in the sibling `task-evidence.md` checkpoint and injected automatically into parent turns.\n",
     );
     body.push_str("\n## Next Steps\n");
-    if let Some(steps) = render_plan_steps(args) {
-        body.push_str(&steps);
-    } else {
-        body.push_str("- See raw plan output below.\n");
+    match state {
+        Some(state) => body.push_str(&state.render_recovery_snapshot()),
+        None => match render_plan_steps(args) {
+            Some(steps) => body.push_str(&steps),
+            None => body.push_str(
+                "- Step list unavailable: no persisted plan state and unreadable `plan` arguments.\n",
+            ),
+        },
     }
-    body.push_str("\n## Raw Plan Output\n\n");
-    body.push_str(result_content.trim());
     body.push('\n');
     body
 }
@@ -1089,6 +1161,8 @@ pub(super) fn append_tool_result_messages_for_model(
         if let Some(message) = working_checkpoint_message_for_plan(app, tool_call, &result.content)
         {
             working_checkpoint_messages.push(message);
+        } else {
+            refresh_working_checkpoint_after_plan_update(app, tool_call);
         }
     }
     for message in working_checkpoint_messages {
@@ -1113,28 +1187,27 @@ fn tool_result_success_for_observer(tool_name: &str, content: &str) -> bool {
     !prefix.starts_with("error:") && !prefix.starts_with("failed:")
 }
 
-/// 在一次工具调用轮结束后，基于本轮累计的 `turn_messages` 生成
-/// code-inspection working memory，避免在长 turn 里重复扫描工具结果。
+/// After a tool round, summarize this turn's repo inspections into a working-memory note so a
+/// long turn does not rescan or re-read the same files.
 pub(super) fn record_tool_inspection_artifacts(
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
 ) {
     let findings = collect_repo_inspection_findings(turn_messages);
-    append_code_inspection_working_memory(messages, turn_messages, &findings);
+    append_code_inspection_working_memory(messages, &findings);
 }
 
 fn append_code_inspection_working_memory(
     messages: &mut Vec<Message>,
-    turn_messages: &[Message],
     findings: &[RepoInspectionFinding],
 ) {
-    let Some(note) = build_code_inspection_working_memory(turn_messages, findings) else {
+    let Some(note) = build_code_inspection_working_memory(findings) else {
         return;
     };
 
-    // In-place 替换：working memory 是"当前轮工具调用的总结"，
-    // 每轮都会重新生成。把旧的同前缀 note 原地替换，避免多轮叠加堆出 N 条
-    // 大体相同、但都被持久化的 internal_note。
+    // Replace in place: the working memory summarizes the current turn and is regenerated
+    // every round, so rewriting the existing note with the same prefix keeps N
+    // near-identical copies from piling up as persisted internal notes.
     let mut found_prior = false;
     for message in messages.iter_mut() {
         if !is_system_like_role(&message.role) {
@@ -1142,7 +1215,7 @@ fn append_code_inspection_working_memory(
         }
         if let Value::String(content) = &message.content {
             if content.starts_with(CODE_INSPECTION_MEMORY_PREFIX) {
-                // 完全相同则什么都不做（保持 prompt cache 命中）
+                // An identical note is left untouched so the prompt cache keeps hitting.
                 if content == &note {
                     return;
                 }
@@ -1192,101 +1265,29 @@ pub(super) fn record_final_stream_response(
     record_hidden_self_note(app, turn_messages, &remaining_meta);
 }
 
-fn build_code_inspection_working_memory(
-    turn_messages: &[Message],
-    findings: &[RepoInspectionFinding],
-) -> Option<String> {
-    let exact_calls = collect_completed_repo_inspection_calls(turn_messages);
-
-    let mut raw_repo_tool_count = 0usize;
-    let mut write_tool_count = 0usize;
-    for message in turn_messages {
-        let Some(tool_calls) = &message.tool_calls else {
-            continue;
-        };
-        for tool_call in tool_calls {
-            let tool_name = tool_call.function.name.as_str();
-            if !is_repo_inspection_tool(tool_name) {
-                continue;
-            }
-            if is_raw_repo_tool(tool_name) {
-                raw_repo_tool_count += 1;
-            }
-            if is_write_tool(tool_name) {
-                write_tool_count += 1;
-            }
-        }
-    }
-
-    if findings.is_empty()
-        && exact_calls.is_empty()
-        && raw_repo_tool_count < 2
-        && write_tool_count == 0
-    {
+/// Working-memory note listing what this turn has already inspected.
+///
+/// One line per call (`<tool><scope> => <essential result>`), deduplicated by that line. The
+/// note carries no second description of the same call: the raw-argument list that used to
+/// precede it restated what `scope` already conveys. A call whose result summarized to
+/// nothing is not listed at all; the note exists to prevent repeat reads of content that is
+/// already available.
+fn build_code_inspection_working_memory(findings: &[RepoInspectionFinding]) -> Option<String> {
+    if findings.is_empty() {
         return None;
     }
 
     let mut note = String::from(CODE_INSPECTION_MEMORY_PREFIX);
     note.push('\n');
-    if !exact_calls.is_empty() {
-        note.push_str("Completed exact tool calls in this turn; do not repeat identical args unless the file/data changed or the previous result was unusable:\n");
-        for call in exact_calls.iter().rev().take(8).rev() {
-            note.push_str("- ");
-            note.push_str(call);
-            note.push('\n');
-        }
-    }
+    note.push_str("Already inspected in this turn; treat these as known context and re-read a file only when it changed or the earlier result was unusable:\n");
+    // Only the most recent inspections are listed; older ones are already in the
+    // conversation. The cap keeps the note inside `truncate_note`'s character budget, so a
+    // long note cannot drop the newest entries.
     for finding in findings.iter().rev().take(6).rev() {
         note.push_str(&finding.rendered);
         note.push('\n');
     }
-    note.push_str(
-        "Treat these findings as already-known context. Avoid re-running the same reads unless you need verification.\n",
-    );
     Some(truncate_note(&note, 1800))
-}
-
-fn collect_completed_repo_inspection_calls(turn_messages: &[Message]) -> Vec<String> {
-    let completed_ids = turn_messages
-        .iter()
-        .filter_map(|message| {
-            (message.role == "tool")
-                .then(|| message.tool_call_id.clone())
-                .flatten()
-        })
-        .collect::<Vec<_>>();
-    if completed_ids.is_empty() {
-        return Vec::new();
-    }
-
-    let mut out = Vec::new();
-    let mut seen = FxHashSet::default();
-    for message in turn_messages {
-        let Some(tool_calls) = &message.tool_calls else {
-            continue;
-        };
-        for tool_call in tool_calls {
-            if !completed_ids.iter().any(|id| id == &tool_call.id) {
-                continue;
-            }
-            let tool_name = tool_call.function.name.as_str();
-            if !is_repo_inspection_tool(tool_name) {
-                continue;
-            }
-            let args = normalized_tool_arguments(&tool_call.function.arguments);
-            let rendered = format!("{tool_name}({args})");
-            if seen.insert(rendered.clone()) {
-                out.push(rendered);
-            }
-        }
-    }
-    out
-}
-
-fn normalized_tool_arguments(raw: &str) -> String {
-    serde_json::from_str::<Value>(raw)
-        .map(|value| value.to_string())
-        .unwrap_or_else(|_| raw.trim().to_string())
 }
 
 fn collect_repo_inspection_findings(turn_messages: &[Message]) -> Vec<RepoInspectionFinding> {
@@ -1343,10 +1344,6 @@ fn is_repo_inspection_tool(tool_name: &str) -> bool {
         tool_name,
         "read_file" | "tree" | "apply_patch" | "write_file"
     )
-}
-
-fn is_raw_repo_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "read_file" | "tree")
 }
 
 fn is_write_tool(tool_name: &str) -> bool {
@@ -1507,7 +1504,8 @@ mod tests {
     };
     use super::{
         WORKING_CHECKPOINT_FILE_NAME, extract_context_checkpoints, save_context_checkpoint_in_dir,
-        smart_truncate_to_sentence, truncate_checkpoint_summary,
+        refresh_working_checkpoint_after_plan_update, smart_truncate_to_sentence,
+        truncate_checkpoint_summary,
         working_checkpoint_message_for_plan,
     };
     use std::sync::{Arc, atomic::AtomicBool};
@@ -1850,6 +1848,89 @@ mod tests {
     }
 
     #[test]
+    fn plan_checkpoint_tracks_live_statuses_without_duplicating_the_plan() {
+        let session_root =
+            std::env::temp_dir().join(format!("ai-plan-live-{}", uuid::Uuid::new_v4()));
+        let history_file = session_root.join("history.sqlite");
+        let app = test_app(history_file);
+        let steps = serde_json::json!([
+            {
+                "step": 1,
+                "action": "Read driver checkpoint persistence",
+                "reason": "Find the durable write path",
+                "tool": "read_file"
+            },
+            {
+                "step": 2,
+                "action": "Refresh the checkpoint",
+                "reason": "Keep recovery state current",
+                "tool": "apply_patch"
+            }
+        ]);
+        crate::ai::tools::plan_state::record_plan(
+            &app,
+            "Inspect checkpoint flow",
+            steps.as_array().unwrap(),
+        )
+        .expect("plan state should persist");
+
+        let plan_call = tool_call(
+            "call_plan_live",
+            "plan",
+            serde_json::json!({ "summary": "Inspect checkpoint flow", "steps": steps }),
+        );
+        let message =
+            working_checkpoint_message_for_plan(&app, &plan_call, "Plan: Inspect checkpoint flow")
+                .expect("plan result should create a working checkpoint marker");
+        let marker = message.content.as_str().unwrap_or_default().to_string();
+        assert!(marker.contains("working_checkpoint: Inspect checkpoint flow"));
+        assert!(marker.contains(WORKING_CHECKPOINT_FILE_NAME));
+        let path = marker
+            .split("path=")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .map(std::path::PathBuf::from)
+            .expect("marker should carry the checkpoint path");
+
+        let body = std::fs::read_to_string(&path).expect("working checkpoint body");
+        assert!(body.contains("Progress: 0/2 steps done."));
+        assert!(body.contains("plan-state.json"));
+        assert!(!body.contains("## Raw Plan Output"));
+        // The plan appears exactly once: the step list is not repeated in a second copy.
+        assert_eq!(body.matches("Read driver checkpoint persistence").count(), 1);
+
+        crate::ai::tools::plan_state::update_plan_step(
+            &app,
+            1,
+            crate::ai::tools::plan_state::StepStatus::Done,
+            None,
+        )
+        .expect("step status should persist");
+        let update_call = tool_call(
+            "call_plan_update_live",
+            "plan_update",
+            serde_json::json!({ "step": 1, "status": "done" }),
+        );
+        // A status flip refreshes the same file instead of appending another note.
+        assert!(
+            working_checkpoint_message_for_plan(
+                &app,
+                &update_call,
+                "Step 1. [read_file] Read driver checkpoint persistence (done)"
+            )
+            .is_none()
+        );
+        refresh_working_checkpoint_after_plan_update(&app, &update_call);
+
+        let refreshed =
+            std::fs::read_to_string(&path).expect("refreshed working checkpoint body");
+        assert!(refreshed.contains("Progress: 1/2 steps done."));
+        assert!(refreshed.contains("Step 1. [read_file] Read driver checkpoint persistence (done)"));
+        // The refresh still keeps a single copy of the step list.
+        assert_eq!(refreshed.matches("Read driver checkpoint persistence").count(), 1);
+    }
+
+    #[test]
     fn append_tool_result_messages_records_plan_working_checkpoint_marker() {
         let session_root = std::env::temp_dir().join(format!(
             "ai-plan-working-checkpoint-round-{}",
@@ -2146,7 +2227,7 @@ mod tests {
     }
 
     #[test]
-    fn working_memory_note_includes_findings_and_correction() {
+    fn working_memory_note_lists_each_inspection_once() {
         let turn_messages = vec![
             Message {
                 role: "assistant".to_string(),
@@ -2191,16 +2272,19 @@ mod tests {
         ];
 
         let findings = collect_repo_inspection_findings(&turn_messages);
-        let note = build_code_inspection_working_memory(&turn_messages, &findings).expect("note");
+        let note = build_code_inspection_working_memory(&findings).expect("note");
         assert!(note.contains("Current code-inspection working memory"));
-        assert!(note.contains("Completed exact tool calls in this turn"));
-        assert!(note.contains("read_file("));
-        assert!(note.contains("\"file_path\":\"src/lib.rs\""));
-        assert!(note.contains("\"offset\":10"));
-        assert!(note.contains("read_file("));
-        assert!(note.contains("\"file_path\":\"src/main.rs\""));
+        assert!(note.contains("Already inspected in this turn"));
         assert!(note.contains("read_file(file=src/lib.rs, lines=10..29)"));
+        assert!(note.contains("read_file(file=src/main.rs, lines=1..40)"));
         assert!(note.contains("tree(path=src)"));
+        // Each inspected call is described once: the note no longer also lists the raw
+        // arguments of every completed call, and its instruction line is not repeated.
+        assert_eq!(note.matches("read_file(file=src/lib.rs").count(), 1);
+        assert_eq!(note.matches("read_file(file=src/main.rs").count(), 1);
+        assert_eq!(note.matches("Already inspected in this turn").count(), 1);
+        assert!(!note.contains("Completed exact tool calls in this turn"));
+        assert!(!note.contains("\"file_path\""));
     }
 
     #[test]
@@ -2237,8 +2321,9 @@ mod tests {
         ];
 
         let findings = collect_repo_inspection_findings(&turn_messages);
-        let note = build_code_inspection_working_memory(&turn_messages, &findings).expect("note");
+        let note = build_code_inspection_working_memory(&findings).expect("note");
         assert!(note.contains("tree(path=src)"));
+        assert_eq!(note.matches("tree(path=src)").count(), 1);
     }
 
     #[test]

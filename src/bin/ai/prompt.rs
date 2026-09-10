@@ -8,6 +8,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
+    time::Instant,
 };
 
 use rustyline::{CompletionType, Config, Editor, history::DefaultHistory};
@@ -85,20 +86,34 @@ pub(super) struct PromptEditor {
     /// initialization can use it to avoid terminal first-screen rendering.
     first_render_notifier: Option<Sender<()>>,
     /// Once a DSR query times out, later untagged replies cannot be matched to
-    /// new queries. Keep subsequent prompts on a query-free editing screen.
+    /// new queries. Subsequent prompts stay on the query-free editing screen
+    /// until a probe round-trip succeeds (see the editor's recovery probe).
+    /// Only the fact of degradation is carried: the probe backoff restarts with
+    /// every prompt, so a new prompt retries the inline screen immediately
+    /// instead of waiting out the backoff the previous prompt accumulated.
     cursor_position_queries_disabled: bool,
-    /// A query that timed out this session can leave one orphan ESC byte in
-    /// crossterm's queue: the leading 0x1B arrived alone while the CPR poll was
-    /// filtering for cursor events, crossterm parsed it as an Escape key, and
-    /// the `[row;colR` tail follows as ordinary char events. This flag arms a
-    /// one-shot guard for that single byte. It is consumed (disarmed) as soon
-    /// as the first standalone Escape after arming is classified, so unlike
-    /// `cursor_position_queries_disabled` it never suppresses later, real
-    /// Escape submissions. Persists across prompt rounds because the orphan can
-    /// be delivered after a non-Escape submission (F2 / Alt+Enter).
-    pending_late_cpr_escape_guard: bool,
+    /// Send time of every DSR query whose reply is still unaccounted for, oldest
+    /// first. A reply carries no request id, so while a *recent* one is
+    /// outstanding a new inline query could read a stale answer and anchor the box
+    /// on the wrong row. The queue also drives the orphan-Escape guard: a
+    /// timed-out query can leave one orphan ESC byte in crossterm's queue (the
+    /// leading 0x1B arrived alone while the CPR poll was filtering for cursor
+    /// events, so crossterm parsed it as an Escape key and the `[row;colR` tail
+    /// follows as ordinary char events). Each entry makes the event parser defer
+    /// the next standalone Escape briefly, so the orphan is swallowed instead of
+    /// being typed into the box, while a real Escape still submits after that
+    /// grace. Entries expire ten seconds after their query: a reply that late was
+    /// lost with the connection, and deferring for it would tax every later
+    /// submission. Persists across prompt rounds because the orphan can be
+    /// delivered after a non-Escape submission (F2 / Alt+Enter).
+    pending_cpr_replies: VecDeque<Instant>,
     /// Preserve non-CPR lookahead even when Escape submits the current prompt.
     pending_terminal_events: VecDeque<crossterm::event::Event>,
+    /// Tail of the most recent model output, mirrored above the input box when a
+    /// timed-out cursor query forces the editor onto the alternate screen (where
+    /// the emulator keeps the real transcript out of reach). Filled by the turn
+    /// finalizer right after the answer is rendered.
+    alternate_tail_lines: Vec<String>,
 }
 
 impl Drop for PromptEditor {
@@ -144,8 +159,9 @@ impl PromptEditor {
             session_title_updates: Mutex::new(session_title_updates),
             first_render_notifier: None,
             cursor_position_queries_disabled: false,
-            pending_late_cpr_escape_guard: false,
+            pending_cpr_replies: VecDeque::new(),
             pending_terminal_events: VecDeque::new(),
+            alternate_tail_lines: Vec::new(),
         }
     }
 
@@ -159,6 +175,14 @@ impl PromptEditor {
     /// avoiding direct prints outside the TUI that would disturb the input box.
     pub(super) fn set_status_message(&mut self, message: impl Into<String>) {
         self.pending_status_msg = Some(message.into());
+    }
+
+    /// Mirror the tail of a just-rendered model answer. The alternate-screen
+    /// fallback (cursor-position query timed out) repaints these rows above the
+    /// box, so an unstable link still shows what the model just said instead of
+    /// an empty screen.
+    pub(super) fn set_alternate_screen_tail(&mut self, text: &str) {
+        self.alternate_tail_lines = alternate_tail_source_lines(text);
     }
 
     /// Set the current model display name; the next `read_multi_line` shows it
@@ -295,6 +319,27 @@ impl PromptEditor {
         }
         let _ = editor.save_history(&self.history_path);
     }
+}
+
+/// Source lines retained for the alternate-screen mirror. The mirror itself
+/// shows at most a screenful, so this only bounds what the editor keeps alive.
+const ALTERNATE_TAIL_SOURCE_LINES: usize = 40;
+
+/// Extract the tail lines mirrored by `PromptEditor::set_alternate_screen_tail`.
+///
+/// Blank lines are dropped: the mirror is a compact reminder of how the answer
+/// ended, and blank rows would waste the few rows available above the box.
+fn alternate_tail_source_lines(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    if lines.len() > ALTERNATE_TAIL_SOURCE_LINES {
+        lines.drain(..lines.len() - ALTERNATE_TAIL_SOURCE_LINES);
+    }
+    lines
 }
 
 #[cfg(test)]

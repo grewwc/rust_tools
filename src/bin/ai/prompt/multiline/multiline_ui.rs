@@ -19,10 +19,12 @@ use crossterm::{
 use ratatui::{
     Terminal,
     backend::{Backend, ClearType as BackendClearType, CrosstermBackend},
-    buffer::CellDiffOption,
+    buffer::{Cell, CellDiffOption},
     layout::{Position, Rect, Size},
+    style::{Modifier, Style},
 };
 use tui_textarea::TextArea;
+use unicode_width::UnicodeWidthChar;
 
 use super::{
     MultilineHistoryState,
@@ -106,20 +108,52 @@ fn viewport_height_with_completion(
 
 type MultilineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
-/// Crossterm emits a key if ESC arrives in its own read. After a query timeout,
-/// briefly defer that single ambiguous key so a fragmented CPR cannot submit
-/// the textarea. `cpr_escape_guard_armed` is a ONE-SHOT flag: at most one
-/// orphan ESC is left by one timed-out query (the sticky "disable queries"
-/// state never issues another), so it is cleared as soon as the first
-/// standalone Escape after arming is classified — whether it turned out to be
-/// the late reply (consumed) or a real keypress (replayed and submitted). A
-/// standalone Escape therefore works after this bounded grace at most once per
-/// timeout; later Escape submissions are never deferred or swallowed.
+/// How long a single ambiguous Escape is deferred so a fragmented CPR cannot
+/// submit the textarea.
 const CPR_ESCAPE_GRACE: Duration = Duration::from_millis(250);
 
+/// How long a timed-out DSR reply may still be expected in the input stream.
+/// Past this the reply was lost with the connection (an SSH drop discards it in
+/// transit), so the guard stops deferring Escapes for it and recovery stops
+/// waiting for it.
+const CPR_REPLY_WINDOW: Duration = Duration::from_secs(10);
+
+/// Upper bound on unaccounted replies kept in the guard queue. Every timed-out
+/// query pushes one, so the queue only grows while the link stays down.
+const MAX_PENDING_CPR_REPLIES: usize = 8;
+
+/// Delays before successive recovery probes: the first runs while a one-off
+/// stall is likely to have cleared, later ones back off to a steady 30 s so a
+/// dead link costs one query per interval instead of one per frame.
+const RECOVERY_PROBE_BACKOFFS: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+];
+
+/// A main-screen probe is only safe once no *recent* reply is outstanding: an
+/// older reply would already have been delivered, so an answer arriving now is
+/// the probe's own.
+const CPR_PROBE_QUIET_PERIOD: Duration = Duration::from_secs(2);
+
+fn recovery_probe_delay(failures: u32) -> Duration {
+    let index = (failures as usize).min(RECOVERY_PROBE_BACKOFFS.len() - 1);
+    RECOVERY_PROBE_BACKOFFS[index]
+}
+
+/// Crossterm emits a key if ESC arrives in its own read. After a query timeout,
+/// briefly defer that ambiguous key so a fragmented CPR cannot submit the
+/// textarea. `pending_cpr_replies` holds one entry per timed-out query whose
+/// reply may still be in the input stream: the first inline query, its retry,
+/// and every failed recovery probe. Each entry is removed when its reply is
+/// actually observed, so every orphan gets swallowed and a real Escape only
+/// pays the grace once per outstanding reply. Entries expire after
+/// `CPR_REPLY_WINDOW`, because a reply that late was lost with the connection
+/// and deferring forever would tax every later Escape submission.
 fn read_prompt_event(
     pending: &mut VecDeque<Event>,
-    cpr_escape_guard_armed: &mut bool,
+    pending_cpr_replies: &mut VecDeque<Instant>,
     mut read: impl FnMut(Duration) -> io::Result<Option<Event>>,
 ) -> io::Result<Option<Event>> {
     if let Some(event) = pending.pop_front() {
@@ -128,7 +162,8 @@ fn read_prompt_event(
     let Some(first) = read(Duration::from_millis(250))? else {
         return Ok(None);
     };
-    if !*cpr_escape_guard_armed
+    prune_expired_cpr_replies(pending_cpr_replies, Instant::now());
+    if pending_cpr_replies.is_empty()
         || !matches!(&first, Event::Key(key) if key.code == KeyCode::Esc
             && key.modifiers.is_empty() && key.kind == KeyEventKind::Press)
     {
@@ -160,8 +195,8 @@ fn read_prompt_event(
                         .into_iter()
                         .filter(|event| matches!(event, Event::Resize(_, _))),
                 );
-                // The single orphan ESC from the timed-out query is consumed.
-                *cpr_escape_guard_armed = false;
+                // One orphan ESC from a timed-out query is consumed.
+                pending_cpr_replies.pop_front();
                 return Ok(None);
             }
             Some(false) => {}
@@ -170,10 +205,20 @@ fn read_prompt_event(
     }
     // Replay every event on a mismatch or timeout, including across submissions.
     pending.extend(lookahead);
-    // The first post-timeout Escape was a real key (no CPR tail): the one-shot
-    // guard is spent, so every later Escape submits immediately.
-    *cpr_escape_guard_armed = false;
+    // The Escape was a real key (no CPR tail), but the outstanding replies stay
+    // queued: a reply that is merely slow must still be swallowed when it
+    // arrives, otherwise its trailing `[row;colR` would be typed into the box.
     Ok(Some(first))
+}
+
+/// Drops replies that can no longer arrive, oldest first.
+fn prune_expired_cpr_replies(pending: &mut VecDeque<Instant>, now: Instant) {
+    while pending
+        .front()
+        .is_some_and(|query| now.duration_since(*query) >= CPR_REPLY_WINDOW)
+    {
+        pending.pop_front();
+    }
 }
 
 /// Some(false) is a CPR prefix, Some(true) a complete reply, None ordinary input.
@@ -198,20 +243,81 @@ fn cursor_reply_tail(tail: &str) -> Option<bool> {
 
 /// A timed-out DSR reply must remain inside the event parser, not cooked stdin.
 /// The alternate screen provides known coordinates without another query and
-/// keeps the main transcript intact. Query disabling survives prompt sessions:
-/// a late reply has no request id and must not anchor a later inline viewport.
+/// keeps the main transcript intact, but it also hides that transcript, so the
+/// editor keeps probing the main screen and returns to it as soon as a query
+/// works again. Query disabling survives prompt sessions: a late reply has no
+/// request id and must not anchor a later inline viewport.
 #[derive(Default)]
 struct PromptScreen {
     queries_disabled: bool,
     alternate: bool,
-    /// One-shot guard armed only in the same transition where a DSR query
-    /// times out. Cleared by `read_prompt_event` after the first Escape is
-    /// classified, so it does not stay armed merely because queries remain
-    /// disabled for later prompts.
-    cpr_guard_armed: bool,
+    /// Send time of every query whose reply is still unaccounted for, oldest
+    /// first. Feeds the orphan-Escape guard in `read_prompt_event`, and holds
+    /// recovery probes back while a fresh reply could be mistaken for theirs.
+    pending_cpr_replies: VecDeque<Instant>,
+    /// One inline retry per prompt session: a rebuild must not block on two
+    /// two-second waits per frame once the link really is down.
+    retry_used: bool,
+    /// Failed query/probe attempts so far, used to space out the next probe.
+    recovery_failures: u32,
+    /// Earliest instant for the next main-screen probe.
+    next_recovery_probe: Option<Instant>,
+    /// Tail of the last model output, repainted above the box on the alternate
+    /// screen (`PromptEditor::set_alternate_screen_tail`).
+    tail: Vec<String>,
 }
 
 impl PromptScreen {
+    /// Records `timed_out` queries whose replies may still arrive, and schedules
+    /// the next attempt to get back onto the main screen.
+    fn note_timed_out_queries(&mut self, timed_out: u8, now: Instant) {
+        self.note_pending_cpr(timed_out, now);
+        self.queries_disabled = true;
+        // The first probe runs while a one-off stall is likely to have cleared;
+        // later ones back off so a dead link costs one query per interval instead
+        // of one per frame.
+        self.next_recovery_probe = Some(now + recovery_probe_delay(self.recovery_failures));
+        self.recovery_failures = self.recovery_failures.saturating_add(1);
+    }
+
+    /// Retain the number of DSR replies that may still arrive without changing
+    /// whether future inline queries are enabled.
+    fn note_pending_cpr(&mut self, pending: u8, now: Instant) {
+        for _ in 0..pending {
+            self.pending_cpr_replies.push_back(now);
+        }
+        while self.pending_cpr_replies.len() > MAX_PENDING_CPR_REPLIES {
+            self.pending_cpr_replies.pop_front();
+        }
+        prune_expired_cpr_replies(&mut self.pending_cpr_replies, now);
+    }
+
+    /// True when the main screen may be probed again: only once no *recent*
+    /// reply is outstanding (an older one would already have been delivered, so
+    /// an answer arriving now is the probe's own) and the backoff has elapsed.
+    fn recovery_probe_due(&mut self, now: Instant) -> bool {
+        self.replies_settled(now)
+            && self.queries_disabled
+            && self.next_recovery_probe.is_none_or(|at| now >= at)
+    }
+
+    /// True while no *recent* reply is outstanding, i.e. a query answer arriving
+    /// now belongs to that query. An older outstanding reply was either already
+    /// delivered or lost with the link, so it no longer competes.
+    fn replies_settled(&mut self, now: Instant) -> bool {
+        prune_expired_cpr_replies(&mut self.pending_cpr_replies, now);
+        self
+            .pending_cpr_replies
+            .back()
+            .is_none_or(|query| now.duration_since(*query) >= CPR_PROBE_QUIET_PERIOD)
+    }
+
+    /// Clears the probe schedule after a probe put the inline box back.
+    fn note_recovered(&mut self) {
+        self.recovery_failures = 0;
+        self.next_recovery_probe = None;
+    }
+
     fn prepare_viewport(
         &mut self,
         backend: &mut CrosstermBackend<io::Stdout>,
@@ -222,7 +328,8 @@ impl PromptScreen {
         clear_existing_viewport: bool,
         previous_top_row: Option<u16>,
     ) -> io::Result<Rect> {
-        if !self.queries_disabled {
+        let now = Instant::now();
+        if !self.queries_disabled && self.replies_settled(now) {
             match prepare_fixed_viewport(
                 backend,
                 terminal_size,
@@ -233,8 +340,41 @@ impl PromptScreen {
             ) {
                 Ok(area) => return Ok(area),
                 Err(err) if PromptEditor::is_cursor_position_timeout(&err) => {
-                    self.queries_disabled = true;
-                    self.cpr_guard_armed = true;
+                    // A stalled round-trip is usually a transient link hiccup, so
+                    // retry once before paying for the alternate screen. Both
+                    // attempts read the same parked cursor row — nothing is drawn
+                    // in between — so even the answer to the first query anchors
+                    // the second one correctly. A reflow invalidates that (the
+                    // anchor moves with the re-wrapped text), which is what the
+                    // size comparison detects. Reply timestamps are taken when an
+                    // attempt gives up, so the retry's own two seconds do not
+                    // count against the reply window or the probe backoff.
+                    if !self.retry_used && backend.size().ok() == Some(terminal_size) {
+                        self.retry_used = true;
+                        match prepare_fixed_viewport(
+                            backend,
+                            terminal_size,
+                            requested_height,
+                            cursor_offset_row,
+                            mode,
+                            clear_existing_viewport,
+                        ) {
+                            Ok(area) => {
+                                // One reply is still unaccounted for: the first
+                                // timed-out query or, if that reply was consumed
+                                // by the retry, the retry's own response. Keep
+                                // later queries from treating it as authoritative.
+                                self.note_pending_cpr(1, Instant::now());
+                                return Ok(area);
+                            }
+                            Err(err) if PromptEditor::is_cursor_position_timeout(&err) => {
+                                self.note_timed_out_queries(2, Instant::now());
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    } else {
+                        self.note_timed_out_queries(1, Instant::now());
+                    }
                 }
                 Err(err) => return Err(err),
             }
@@ -259,7 +399,15 @@ impl PromptScreen {
             self.alternate = true;
             execute!(io::stdout(), EnterAlternateScreen)?;
         }
-        prepare_query_free_viewport(backend, terminal_size, requested_height)
+        if !self.queries_disabled {
+            // A recent reply, not a dead link, kept the inline path out: query
+            // again as soon as that reply can no longer answer the query, or the
+            // inline probe would never run and the box would stay on the
+            // alternate screen for the rest of the prompt.
+            self.queries_disabled = true;
+            self.next_recovery_probe = Some(now + CPR_PROBE_QUIET_PERIOD);
+        }
+        prepare_query_free_viewport(backend, terminal_size, requested_height, &self.tail)
     }
 }
 
@@ -271,22 +419,109 @@ impl Drop for PromptScreen {
     }
 }
 
+/// Rows of mirrored model output kept above the box on the alternate screen.
+/// Bounded so a viewport rebuild never repaints more than a few rows over a
+/// slow link.
+const MAX_ALTERNATE_TAIL_ROWS: u16 = 12;
+
 /// Only used on the alternate screen, where clearing cannot erase transcript.
+///
+/// The box is anchored to the bottom of the screen with the tail of the last
+/// model output mirrored directly above it: this fallback has no working cursor
+/// query left to place an inline box under the real transcript (the emulator
+/// keeps that one saved and hidden), so without the mirror the answer the user
+/// wants to read is the one thing missing from the screen.
 fn prepare_query_free_viewport<B: Backend>(
     backend: &mut B,
     terminal_size: Size,
     requested_height: u16,
+    tail: &[String],
 ) -> Result<Rect, B::Error> {
+    let height = requested_height.max(1).min(terminal_size.height.max(1));
     let area = Rect::new(
         0,
-        0,
+        terminal_size.height.saturating_sub(height),
         terminal_size.width,
-        requested_height.max(1).min(terminal_size.height.max(1)),
+        height,
     );
     backend.set_cursor_position(Position::new(0, 0))?;
     backend.clear_region(BackendClearType::All)?;
+    draw_alternate_tail(backend, terminal_size.width, area.y, tail)?;
+    // Park the cursor at the box top: that is the position the following frame
+    // (and any redraw) starts from.
+    backend.set_cursor_position(Position::new(area.x, area.y))?;
     backend.flush()?;
     Ok(area)
+}
+
+/// Mirror the newest rows of the model output tail directly above the box.
+///
+/// These rows sit outside the ratatui viewport, which `Viewport::Fixed` never
+/// draws into or clears, so the text stays until the next rebuild.
+fn draw_alternate_tail<B: Backend>(
+    backend: &mut B,
+    width: u16,
+    bottom_row: u16,
+    tail: &[String],
+) -> Result<(), B::Error> {
+    if tail.is_empty() || width == 0 || bottom_row == 0 {
+        return Ok(());
+    }
+    let rows = alternate_tail_rows(tail, width, bottom_row.min(MAX_ALTERNATE_TAIL_ROWS) as usize);
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let style = Style::default().add_modifier(Modifier::DIM);
+    let first_row = bottom_row - rows.len() as u16;
+    // One cell per grapheme column: trailing columns of a wide glyph are left
+    // out of the iterator (the terminal advances over them), because the
+    // backend prints every cell it is handed.
+    let mut cells: Vec<(u16, u16, Cell)> = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let y = first_row + index as u16;
+        let mut x = 0u16;
+        for ch in row.chars() {
+            let mut cell = Cell::from(ch);
+            cell.set_style(style);
+            cells.push((x, y, cell));
+            x += UnicodeWidthChar::width_cjk(ch).unwrap_or(1).max(1) as u16;
+        }
+    }
+    backend.draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
+    Ok(())
+}
+
+/// Wrap the mirrored tail to `width` columns and keep the newest `max_rows`
+/// rows. Wrapping rather than truncating keeps the closing sentence readable,
+/// which is the part the user is trying to recover.
+fn alternate_tail_rows(tail: &[String], width: u16, max_rows: usize) -> Vec<String> {
+    let width = width as usize;
+    if width == 0 || max_rows == 0 {
+        return Vec::new();
+    }
+    let mut rows: VecDeque<String> = VecDeque::new();
+    for line in tail {
+        let mut row = String::new();
+        let mut row_width = 0usize;
+        for ch in line.chars() {
+            let ch_width = UnicodeWidthChar::width_cjk(ch).unwrap_or(1).max(1);
+            if row_width + ch_width > width && !row.is_empty() {
+                rows.push_back(std::mem::take(&mut row));
+                row_width = 0;
+                // Drop rows that scrolled past the top of the mirror.
+                while rows.len() > max_rows {
+                    rows.pop_front();
+                }
+            }
+            row.push(ch);
+            row_width += ch_width;
+        }
+        rows.push_back(row);
+        while rows.len() > max_rows {
+            rows.pop_front();
+        }
+    }
+    rows.into_iter().collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -402,7 +637,84 @@ fn parked_anchor_offset(last_drawn_area: Option<Rect>, new_height: u16) -> u16 {
 /// size notifications can oscillate, turning those reservations into a growing
 /// blank gap. A fixed viewport avoids that automatic behavior; this bootstrap
 /// scrolls only the rows that are actually missing at the bottom of the screen.
-fn build_fixed_terminal(height: u16, screen: &mut PromptScreen) -> io::Result<MultilineTerminal> {
+/// Rebuilt viewport after a recovery probe: the caller adopts this terminal and
+/// treats `area` as the viewport already in place, because the probe restored a
+/// screen without drawing a box frame on it.
+struct RecoveredViewport {
+    terminal: MultilineTerminal,
+    area: Rect,
+    /// Screen size the probe anchored for. Callers must record this instead of
+    /// re-reading the backend size: a resize that landed during the probe's
+    /// blocking cursor query would otherwise look already applied, and its
+    /// queued `Event::Resize` would be dropped as a duplicate, leaving a box
+    /// anchored for the pre-resize screen (and a stale row for exit cleanup).
+    size: Size,
+}
+
+/// Leaves the alternate screen and re-places the box on the main screen once a
+/// DSR round-trip works again.
+///
+/// The alternate screen hides the real transcript until the editor exits, so it
+/// is held only while queries keep failing: every prompt start and every idle
+/// tick retries the inline path through here. Returns `None` while the next
+/// probe is not due yet.
+fn try_recover_inline_viewport(
+    screen: &mut PromptScreen,
+    new_height: u16,
+) -> io::Result<Option<RecoveredViewport>> {
+    if !screen.recovery_probe_due(Instant::now()) {
+        return Ok(None);
+    }
+    let mut backend = CrosstermBackend::new(io::stdout());
+    let terminal_size = backend.size()?;
+    if screen.alternate {
+        // Leaving restores the main screen together with the cursor row where the
+        // inline box was cleared before entering, which is exactly the box top —
+        // so the query answer needs no parked-bottom-row offset.
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        screen.alternate = false;
+    }
+    screen.queries_disabled = false;
+    // The probe already is a second chance for the query that degraded the
+    // screen, so it must not also spend the prompt's one inline retry.
+    screen.retry_used = true;
+    let area = screen.prepare_viewport(
+        &mut backend,
+        terminal_size,
+        new_height,
+        0,
+        ViewportRebuildMode::ReserveMissingRows,
+        false,
+        None,
+    )?;
+    if screen.queries_disabled {
+        // The probe timed out as well: `prepare_viewport` already re-entered the
+        // alternate screen and armed the next backoff.
+    } else {
+        screen.note_recovered();
+    }
+    let terminal = terminal_with_fixed_viewport(backend, area)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    Ok(Some(RecoveredViewport {
+        terminal,
+        area,
+        size: terminal_size,
+    }))
+}
+
+/// Returns the terminal together with the screen size its anchor was computed
+/// for; the caller records that size instead of a fresh `size()` read, so a
+/// resize that landed during the build is not mistaken for one already applied.
+fn build_fixed_terminal(
+    height: u16,
+    screen: &mut PromptScreen,
+) -> io::Result<(MultilineTerminal, Size)> {
+    // A previous timeout must not pin the whole session to the alternate screen:
+    // try the inline path again, and fall through to the query-free one if it
+    // still fails.
+    if let Some(recovered) = try_recover_inline_viewport(screen, height)? {
+        return Ok((recovered.terminal, recovered.size));
+    }
     let mut backend = CrosstermBackend::new(io::stdout());
     let terminal_size = backend.size()?;
     let area = screen.prepare_viewport(
@@ -414,7 +726,9 @@ fn build_fixed_terminal(height: u16, screen: &mut PromptScreen) -> io::Result<Mu
         false,
         None,
     )?;
-    terminal_with_fixed_viewport(backend, area).map_err(|err| io::Error::other(err.to_string()))
+    let terminal = terminal_with_fixed_viewport(backend, area)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    Ok((terminal, terminal_size))
 }
 
 /// Blanks the rows in `[from_row, to_row)` one line at a time, leaving every
@@ -688,23 +1002,25 @@ impl PromptEditor {
 
         let mut screen = PromptScreen {
             queries_disabled: self.cursor_position_queries_disabled,
-            cpr_guard_armed: self.pending_late_cpr_escape_guard,
+            pending_cpr_replies: self.pending_cpr_replies.clone(),
+            tail: self.alternate_tail_lines.clone(),
             ..PromptScreen::default()
         };
-        let mut terminal = match build_fixed_terminal(base_viewport_height, &mut screen) {
-            Ok(terminal) => terminal,
-            Err(err) => {
-                self.cursor_position_queries_disabled = screen.queries_disabled;
-                self.pending_late_cpr_escape_guard = screen.cpr_guard_armed;
-                drop(screen);
-                let _ = execute!(io::stdout(), DisableBracketedPaste, cursor::Show);
-                let _ = disable_raw_mode();
-                return Err(err);
-            }
-        };
+        let (mut terminal, anchored_terminal_size) =
+            match build_fixed_terminal(base_viewport_height, &mut screen) {
+                Ok(built) => built,
+                Err(err) => {
+                    self.cursor_position_queries_disabled = screen.queries_disabled;
+                    self.pending_cpr_replies = std::mem::take(&mut screen.pending_cpr_replies);
+                    drop(screen);
+                    let _ = execute!(io::stdout(), DisableBracketedPaste, cursor::Show);
+                    let _ = disable_raw_mode();
+                    return Err(err);
+                }
+            };
 
         let initial_viewport_area = terminal.get_frame().area();
-        let mut last_applied_terminal_size = terminal.backend().size()?;
+        let mut last_applied_terminal_size = anchored_terminal_size;
         // The viewport currently on screen. Its top row is where exit cleanup
         // starts, and its height is where the parked anchor's offset comes
         // from, so both stay consistent with what is actually drawn.
@@ -862,9 +1178,9 @@ impl PromptEditor {
                     force_repaint_next_frame = false;
                 }
 
-                let Some(event) = read_prompt_event(
+                let prompt_event = read_prompt_event(
                     &mut self.pending_terminal_events,
-                    &mut screen.cpr_guard_armed,
+                    &mut screen.pending_cpr_replies,
                     |timeout| {
                         if event::poll(timeout)? {
                             event::read().map(Some)
@@ -872,8 +1188,25 @@ impl PromptEditor {
                             Ok(None)
                         }
                     },
-                )?
-                else {
+                )?;
+                let Some(event) = prompt_event else {
+                    // Idle tick: the alternate screen is a fallback, not a
+                    // destination. Probe the main screen for a working query and
+                    // re-anchor the inline box there.
+                    let probe_height = viewport_height_with_completion(
+                        terminal.backend().size()?.height,
+                        base_viewport_height,
+                        fitted_completion_items,
+                    );
+                    if let Some(recovered) = try_recover_inline_viewport(&mut screen, probe_height)? {
+                        terminal = recovered.terminal;
+                        last_drawn_area = Some(recovered.area);
+                        // The probe's own size, not a fresh read: a resize that
+                        // landed during its blocking query must still queue the
+                        // reflow rebuild (see `build_fixed_terminal`).
+                        last_applied_terminal_size = recovered.size;
+                        redraw_requested = true;
+                    }
                     continue;
                 };
                 if let Event::Resize(width, height) = event {
@@ -934,10 +1267,10 @@ impl PromptEditor {
             let _ = execute!(io::stdout(), Clear(ClearType::FromCursorDown));
         }
         self.cursor_position_queries_disabled = screen.queries_disabled;
-        // Carry the still-pending one-shot guard into later prompts: the orphan
-        // ESC only surfaces on the next standalone Escape, which a non-Escape
-        // submission (F2 / Alt+Enter) can precede.
-        self.pending_late_cpr_escape_guard = screen.cpr_guard_armed;
+        // Carry the unaccounted replies into later prompts: an orphan ESC only
+        // surfaces on the next standalone Escape, which a non-Escape submission
+        // (F2 / Alt+Enter) can precede.
+        self.pending_cpr_replies = std::mem::take(&mut screen.pending_cpr_replies);
         drop(screen);
         let _ = execute!(io::stdout(), cursor::Show);
         // Restore the default cursor shape: the editor switched it to a thin bar
@@ -993,24 +1326,27 @@ mod tests {
         input.push_back(key(KeyCode::Char('x')));
         let mut pending = VecDeque::new();
         let mut read = |_| Ok(input.pop_front());
-        let mut armed = true;
+        let mut replies = VecDeque::from([std::time::Instant::now()]);
         assert_eq!(
-            super::read_prompt_event(&mut pending, &mut armed, &mut read).unwrap(),
+            super::read_prompt_event(&mut pending, &mut replies, &mut read).unwrap(),
             None
         );
-        assert!(!armed, "consuming the orphan reply must disarm the one-shot guard");
+        assert!(
+            replies.is_empty(),
+            "consuming the orphan reply must account for the timed-out query"
+        );
         assert_eq!(
-            super::read_prompt_event(&mut pending, &mut armed, &mut read).unwrap(),
+            super::read_prompt_event(&mut pending, &mut replies, &mut read).unwrap(),
             Some(Event::Resize(90, 30))
         );
         assert_eq!(
-            super::read_prompt_event(&mut pending, &mut armed, &mut read).unwrap(),
+            super::read_prompt_event(&mut pending, &mut replies, &mut read).unwrap(),
             Some(key(KeyCode::Char('x')))
         );
     }
 
     #[test]
-    fn one_shot_guard_submits_later_escape_immediately_after_consuming_reply() {
+    fn consumed_orphan_reply_keeps_later_escape_immediate() {
         // The orphan ESC plus its fragmented late CPR is consumed first ...
         let mut input = VecDeque::new();
         input.push_back(key(KeyCode::Esc));
@@ -1018,16 +1354,19 @@ mod tests {
         // ... then a real standalone Escape (the submit key) must go through.
         input.push_back(key(KeyCode::Esc));
         let mut pending = VecDeque::new();
-        let mut armed = true;
+        let mut replies = VecDeque::from([std::time::Instant::now()]);
         assert_eq!(
-            super::read_prompt_event(&mut pending, &mut armed, |_| Ok(input.pop_front()))
+            super::read_prompt_event(&mut pending, &mut replies, |_| Ok(input.pop_front()))
                 .unwrap(),
             None
         );
-        assert!(!armed, "the one orphan reply disarms the guard exactly once");
+        assert!(
+            replies.is_empty(),
+            "the orphan reply is accounted for exactly once"
+        );
         // No 250 ms lookahead may delay this real submission.
         let mut calls = 0;
-        let event = super::read_prompt_event(&mut pending, &mut armed, |_| {
+        let event = super::read_prompt_event(&mut pending, &mut replies, |_| {
             calls += 1;
             Ok(input.pop_front())
         })
@@ -1045,10 +1384,10 @@ mod tests {
             let mut input = original.clone();
             let mut pending = VecDeque::new();
             let mut output = VecDeque::new();
-            let mut armed = true;
+            let mut replies = VecDeque::from([std::time::Instant::now()]);
             while !input.is_empty() || !pending.is_empty() {
                 if let Some(event) =
-                    super::read_prompt_event(&mut pending, &mut armed, |_| Ok(input.pop_front()))
+                    super::read_prompt_event(&mut pending, &mut replies, |_| Ok(input.pop_front()))
                         .unwrap()
                 {
                     output.push_back(event);
@@ -1074,29 +1413,150 @@ mod tests {
         let mut input = original.clone();
         let mut pending = VecDeque::new();
         let mut output = VecDeque::new();
-        let mut armed = true;
+        let mut replies = VecDeque::from([std::time::Instant::now()]);
         while !input.is_empty() {
             output.push_back(
-                super::read_prompt_event(&mut pending, &mut armed, |_| Ok(input.pop_front()))
+                super::read_prompt_event(&mut pending, &mut replies, |_| Ok(input.pop_front()))
                     .unwrap()
                     .unwrap(),
             );
         }
         assert_eq!(output, original);
         assert!(pending.is_empty());
+        assert_eq!(
+            replies.len(),
+            1,
+            "ordinary input must not consume an unaccounted reply"
+        );
     }
 
     #[test]
     fn healthy_terminal_escape_is_not_delayed_or_read_ahead() {
         let mut calls = 0;
-        let mut armed = false;
-        let event = super::read_prompt_event(&mut VecDeque::new(), &mut armed, |_| {
+        let mut replies = VecDeque::new();
+        let event = super::read_prompt_event(&mut VecDeque::new(), &mut replies, |_| {
             calls += 1;
             Ok(Some(key(KeyCode::Esc)))
         })
         .unwrap();
         assert_eq!(event, Some(key(KeyCode::Esc)));
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn every_timed_out_query_swallows_its_own_orphan_reply() {
+        // A retried query (or a failed recovery probe) leaves its own orphan in
+        // the input stream; each must be swallowed, and the real Escape that
+        // follows them must still submit without another grace.
+        let mut input = VecDeque::new();
+        for _ in 0..2 {
+            input.push_back(key(KeyCode::Esc));
+            input.extend("[13;1R".chars().map(|ch| key(KeyCode::Char(ch))));
+        }
+        input.push_back(key(KeyCode::Esc));
+        let mut pending = VecDeque::new();
+        let mut replies = VecDeque::from([std::time::Instant::now(), std::time::Instant::now()]);
+        for _ in 0..2 {
+            assert_eq!(
+                super::read_prompt_event(&mut pending, &mut replies, |_| Ok(input.pop_front()))
+                    .unwrap(),
+                None
+            );
+        }
+        assert!(replies.is_empty(), "both orphans were accounted for");
+        let mut calls = 0;
+        let event = super::read_prompt_event(&mut pending, &mut replies, |_| {
+            calls += 1;
+            Ok(input.pop_front())
+        })
+        .unwrap();
+        assert_eq!(event, Some(key(KeyCode::Esc)));
+        assert_eq!(calls, 1, "later Escape submissions are not deferred again");
+    }
+
+    #[test]
+    fn a_slow_reply_is_still_swallowed_after_a_real_escape_was_replayed() {
+        // The grace can expire before a fragmented reply's tail arrives (the gap
+        // is what the empty second read simulates). The entry stays queued, so
+        // the orphan cannot land in the box as literal text.
+        let mut replies = VecDeque::from([std::time::Instant::now()]);
+        let mut input = VecDeque::from([key(KeyCode::Esc), key(KeyCode::Esc)]);
+        input.extend("[13;1R".chars().map(|ch| key(KeyCode::Char(ch))));
+        let mut reads = 0usize;
+        let mut read = |_: std::time::Duration| {
+            reads += 1;
+            // The second read is the lookahead behind the real Escape: it finds
+            // no tail within the grace.
+            if reads == 2 {
+                return Ok(None);
+            }
+            Ok(input.pop_front())
+        };
+        assert_eq!(
+            super::read_prompt_event(&mut VecDeque::new(), &mut replies, &mut read).unwrap(),
+            Some(key(KeyCode::Esc))
+        );
+        assert_eq!(replies.len(), 1, "an unaccounted reply stays queued");
+        assert_eq!(
+            super::read_prompt_event(&mut VecDeque::new(), &mut replies, &mut read).unwrap(),
+            None,
+            "the late reply is still consumed"
+        );
+        assert!(replies.is_empty());
+    }
+
+    #[test]
+    fn a_lost_reply_stops_deferring_escapes_after_the_window() {
+        // A reply the connection dropped must not tax every later Escape: the
+        // entry expires and the Escape goes through immediately.
+        let expired = std::time::Instant::now()
+            .checked_sub(super::CPR_REPLY_WINDOW)
+            .expect("the test process must be older than the reply window");
+        let mut replies = VecDeque::from([expired]);
+        let mut calls = 0;
+        let event = super::read_prompt_event(&mut VecDeque::new(), &mut replies, |_| {
+            calls += 1;
+            Ok(Some(key(KeyCode::Esc)))
+        })
+        .unwrap();
+        assert_eq!(event, Some(key(KeyCode::Esc)));
+        assert_eq!(calls, 1, "an expired reply must not delay the Escape");
+        assert!(replies.is_empty(), "expired replies are dropped");
+    }
+
+    #[test]
+    fn recovery_probe_backoff_grows_and_saturates() {
+        let seconds: Vec<u64> = (0..5)
+            .map(|failures| super::recovery_probe_delay(failures).as_secs())
+            .collect();
+        assert_eq!(
+            seconds,
+            vec![1, 5, 15, 30, 30],
+            "a dead link is probed at a steady interval, not on every frame"
+        );
+    }
+
+    #[test]
+    fn recovery_probe_waits_out_fresh_replies_and_its_backoff() {
+        let start = std::time::Instant::now();
+        let mut screen = super::PromptScreen::default();
+        assert!(
+            !screen.recovery_probe_due(start),
+            "an inline screen must not probe"
+        );
+        screen.note_timed_out_queries(1, start);
+        assert!(screen.queries_disabled);
+        assert_eq!(screen.pending_cpr_replies.len(), 1);
+        // The reply may still be in flight and would answer the probe instead.
+        assert!(!screen.recovery_probe_due(start + std::time::Duration::from_millis(500)));
+        assert!(screen.recovery_probe_due(start + std::time::Duration::from_secs(2)));
+        // A failed probe backs off for five seconds before the next attempt.
+        screen.note_timed_out_queries(1, start + std::time::Duration::from_secs(2));
+        assert!(!screen.recovery_probe_due(start + std::time::Duration::from_secs(5)));
+        assert!(screen.recovery_probe_due(start + std::time::Duration::from_secs(7)));
+        screen.note_recovered();
+        assert_eq!(screen.recovery_failures, 0);
+        assert!(screen.next_recovery_probe.is_none());
     }
 
     #[test]
@@ -1131,9 +1591,11 @@ mod tests {
                 &mut backend,
                 ratatui::layout::Size::new(80, 24),
                 5,
+                &[],
             )
             .unwrap();
-            assert_eq!(area, Rect::new(0, 0, 80, 5));
+            // Bottom-anchored: the mirrored output tail sits directly above.
+            assert_eq!(area, Rect::new(0, 19, 80, 5));
             let mut terminal = terminal_with_fixed_viewport(backend, area).unwrap();
 
             // An alternate-screen resize has no transcript to re-anchor and
@@ -1142,6 +1604,7 @@ mod tests {
                 terminal.backend_mut(),
                 ratatui::layout::Size::new(60, 4),
                 7,
+                &[],
             )
             .unwrap();
             assert_eq!(resized, Rect::new(0, 0, 60, 4));
@@ -1162,11 +1625,63 @@ mod tests {
                 &mut backend,
                 ratatui::layout::Size::new(10, 3),
                 requested_height,
+                &[],
             )
             .unwrap();
-            assert_eq!(area, Rect::new(0, 0, 10, expected_height));
-            assert_eq!(backend.get_cursor_position().unwrap(), Position::new(0, 0));
+            let expected_top = 3 - expected_height;
+            assert_eq!(area, Rect::new(0, expected_top, 10, expected_height));
+            assert_eq!(
+                backend.get_cursor_position().unwrap(),
+                Position::new(0, expected_top)
+            );
         }
+    }
+
+    #[test]
+    fn query_free_viewport_mirrors_output_tail_above_the_box() {
+        // A timed-out cursor query drops the editor onto the alternate screen
+        // with the transcript hidden; the newest rows of the previous answer are
+        // mirrored directly above the box instead.
+        let mut backend = TestBackend::new(20, 10);
+        let tail = vec![
+            "first line".to_string(),
+            "second line".to_string(),
+            "third line".to_string(),
+        ];
+        let area = super::prepare_query_free_viewport(
+            &mut backend,
+            ratatui::layout::Size::new(20, 10),
+            4,
+            &tail,
+        )
+        .unwrap();
+
+        assert_eq!(area, Rect::new(0, 6, 20, 4));
+        let buffer = backend.buffer();
+        let row_text = |y: u16| {
+            (0..20u16)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert_eq!(row_text(3), "first line");
+        assert_eq!(row_text(4), "second line");
+        assert_eq!(row_text(5), "third line");
+        // Box rows stay empty: the mirror never draws inside the viewport.
+        assert!(row_text(6).is_empty());
+    }
+
+    #[test]
+    fn alternate_tail_rows_wrap_and_keep_the_newest_rows() {
+        let tail = vec!["abcdefghij".to_string(), "中文测试".to_string()];
+        // "abcd"/"efgh"/"ij" then "中文"/"测试": only the newest three rows fit.
+        assert_eq!(
+            super::alternate_tail_rows(&tail, 4, 3),
+            vec!["ij".to_string(), "中文".to_string(), "测试".to_string()]
+        );
+        assert!(super::alternate_tail_rows(&tail, 0, 3).is_empty());
+        assert!(super::alternate_tail_rows(&tail, 4, 0).is_empty());
     }
 
     #[test]

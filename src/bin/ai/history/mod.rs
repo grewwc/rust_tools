@@ -61,6 +61,8 @@ pub(in crate::ai) use sessions::{
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::fork_history_for_subagent;
+#[allow(unused_imports)]
+pub(in crate::ai) use sqlite::MarkMessageUpdate;
 
 /// Prepare an independent history file for a sub-agent. First dispatch forks
 /// the parent history on demand; resume only reuses the existing child file
@@ -446,15 +448,39 @@ pub(in crate::ai) fn is_system_like_role(role: &str) -> bool {
     types::is_system_like_role(role)
 }
 
+/// Canonical message list with per-message source-model provenance (the model
+/// that produced each message), for display paths that attribute content to its
+/// origin. SQLite history carries the model column; legacy blob history has none.
+pub(in crate::ai) fn build_message_arr_with_models(
+    history_file: &Path,
+) -> Result<Vec<(Message, Option<String>)>, Box<dyn std::error::Error>> {
+    if blob::is_sqlite_path(history_file) {
+        sqlite::read_all_messages_with_models_sqlite(history_file)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    } else {
+        Ok(build_message_arr(usize::MAX, history_file)?
+            .into_iter()
+            .map(|message| (message, None))
+            .collect())
+    }
+}
+
 /// The `/history` manual-view entry point must show the full session, not
 /// just the inline messages left in the main history store after compression.
 /// Archives are expanded only for viewing; they never enter the model context
 /// and never participate in rewind write-back.
+///
+/// Each message is returned alongside its persisted `source_model` provenance
+/// so the view can label content by its producing model. Messages expanded
+/// from overflow archives carry `None`: the archives do not persist a
+/// per-message model, so their provenance is unknown rather than inherited
+/// from the stub (see `archive::expand_overflow_archives`).
 pub(in crate::ai) fn build_message_arr_for_history_view(
     history_file: &Path,
-) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
-    let messages = build_message_arr(usize::MAX, history_file)?;
-    Ok(archive::expand_overflow_archives(messages))
+) -> Result<Vec<(Message, Option<String>)>, Box<dyn std::error::Error>> {
+    Ok(archive::expand_overflow_archives(build_message_arr_with_models(
+        history_file,
+    )?))
 }
 
 pub(in crate::ai) fn build_context_history(

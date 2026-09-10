@@ -925,7 +925,9 @@ pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
     // Temp files live in runtime-controlled temp dirs (session assets or system temp), outside the
     // user's project space, so skip the sandbox write check (consistent with tool-overflow behavior).
     if !is_temp {
-        store.validate_write_access().map_err(|e| e.to_string())?;
+        store
+            .validate_write_file_access()
+            .map_err(|e| e.to_string())?;
     }
     store.write_all(content).map_err(|e| e.to_string())?;
 
@@ -960,7 +962,9 @@ pub(crate) fn execute_write_file_streaming(
     // Temp files live in runtime-controlled temp dirs, outside the user's project space; skip the sandbox write check.
     if !is_temp {
         emit_stream_line(on_chunk, "validating write access");
-        store.validate_write_access().map_err(|e| e.to_string())?;
+        store
+            .validate_write_file_access()
+            .map_err(|e| e.to_string())?;
     }
 
     emit_stream_line(on_chunk, &format!("writing {} byte(s)", content.len()));
@@ -1019,6 +1023,37 @@ mod tests {
             assert!(output.contains("Line 3"));
         });
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_write_file_allows_system_temp_outside_project_root() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let system_temp = std::env::temp_dir();
+        let Some(temp_parent) = system_temp.parent() else {
+            return;
+        };
+        let project_root = temp_parent.join(format!("ai-tools-project-{}", uuid::Uuid::new_v4()));
+        let path = make_temp_path("system_temp");
+        let old_cfg = std::env::var_os("CONFIGW_PATH");
+        unsafe { std::env::set_var("CONFIGW_PATH", project_root.join("empty.configw")) };
+        crate::commonw::configw::refresh();
+
+        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(project_root, || {
+            execute_write_file(&serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "content": "system temp write"
+            }))
+        });
+
+        match old_cfg {
+            Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+            None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+        }
+        crate::commonw::configw::refresh();
+
+        assert!(result.is_ok(), "system temp write failed: {result:?}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "system temp write");
         let _ = fs::remove_file(&path);
     }
 

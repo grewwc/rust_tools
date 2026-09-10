@@ -445,6 +445,65 @@ pub(in crate::ai) fn read_all_messages_sqlite(path: &Path) -> io::Result<Vec<Mes
     .map_err(|e| io::Error::other(e.to_string()))
 }
 
+/// Read the full canonical message list together with each message's persisted
+/// `source_model` provenance (the model that produced the content). Display-only
+/// consumers (`/history` view, replay attribution) use this; the shared `Message`
+/// type deliberately does not carry the model, so it travels as a parallel value.
+pub(in crate::ai) fn read_all_messages_with_models_sqlite(
+    path: &Path,
+) -> io::Result<Vec<(Message, Option<String>)>> {
+    let conn = match open_history_db(path) {
+        Ok(c) => c,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    // Same self-healing as `build_message_arr_sqlite`: a fresh file has no
+    // `messages` table yet and a pre-migration DB lacks the `source_model`
+    // column, so ensure the schema (including the column migration) first.
+    init_history_schema(&conn)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT role, content, tool_calls, tool_call_id, reasoning_content, source_model
+             FROM messages
+             ORDER BY id ASC",
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let role: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            let tool_calls: Option<String> = row.get(2)?;
+            let tool_call_id: Option<String> = row.get(3)?;
+            let reasoning_content: Option<String> = row.get(4)?;
+            let source_model: Option<String> = row.get(5)?;
+            Ok((
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+                reasoning_content,
+                source_model,
+            ))
+        })
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let mut messages = Vec::new();
+    for row in rows {
+        let (role, content, tool_calls, tool_call_id, reasoning_content, source_model) =
+            row.map_err(|e| io::Error::other(e.to_string()))?;
+        messages.push((
+            Message {
+                role,
+                content: decode_message_content(&content),
+                tool_calls: decode_tool_calls(tool_calls.as_deref()),
+                tool_call_id,
+                reasoning_content,
+            },
+            source_model,
+        ));
+    }
+    Ok(messages)
+}
+
 pub(super) fn read_messages_since_id(
     conn: &Connection,
     start_message_id: i64,

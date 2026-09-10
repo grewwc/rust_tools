@@ -158,7 +158,27 @@ impl PtyEditor {
         );
     }
 
-    fn finish(&mut self, query_free: bool) {
+    fn query_count(&self) -> usize {
+        self.output
+            .windows(4)
+            .filter(|bytes| *bytes == b"\x1b[6n")
+            .count()
+    }
+
+    fn assert_query_count(&self, expected: usize) {
+        assert_eq!(
+            self.query_count(),
+            expected,
+            "unexpected DSR query count: {}",
+            String::from_utf8_lossy(&self.output)
+        );
+    }
+
+    /// Verifies the child exited cleanly. `degraded` says whether the session
+    /// ever fell back to the alternate screen: the recovery probe can have left
+    /// it again, so only the enter/leave balance and that lower bound are
+    /// asserted.
+    fn finish(&mut self, degraded: bool) {
         self.wait_for("PTY_CHILD_DONE");
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -173,13 +193,12 @@ impl PtyEditor {
             assert!(Instant::now() < deadline, "child did not exit");
             self.pump(Duration::from_millis(20));
         }
-        assert_eq!(
-            self.output
-                .windows(4)
-                .filter(|bytes| *bytes == b"\x1b[6n")
-                .count(),
-            1,
-            "later prompts must not issue new DSR queries"
+        // Every prompt retries the main screen (recovery probe) while the
+        // editor is degraded, so only the lower bound is stable.
+        assert!(
+            self.query_count() >= 1,
+            "the editor never queried the cursor: {}",
+            String::from_utf8_lossy(&self.output)
         );
         let enters = self
             .output
@@ -192,7 +211,7 @@ impl PtyEditor {
             .filter(|bytes| *bytes == b"\x1b[?1049l")
             .count();
         assert_eq!(enters, leaves, "alternate screen was not restored");
-        assert_eq!(enters > 0, query_free);
+        assert_eq!(enters > 0, degraded);
         assert!(
             !self.contains("^[[13;1R"),
             "cooked-mode echo leaked a cursor reply"
@@ -345,4 +364,56 @@ fn responsive_cursor_query_keeps_inline_editor() {
     pty.submit();
     pty.result(0, "draft");
     pty.finish(false);
+        pty.assert_query_count(1);
+    }
+
+    #[test]
+    fn cursor_query_retry_keeps_editor_inline_after_one_stalled_round_trip() {
+        let mut pty = PtyEditor::start(1);
+        pty.wait_for("\x1b[6n");
+        // Withhold the first reply so the query times out, then answer the retry:
+        // one stalled round-trip must not cost the whole session its transcript.
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while pty.query_count() < 2 && Instant::now() < deadline {
+            pty.pump(Duration::from_millis(20));
+        }
+        assert_eq!(pty.query_count(), 2, "the timed-out query was not retried");
+        pty.send(b"\x1b[13;1R");
+        pty.ready(0);
+        assert!(
+            !pty.contains("\x1b[?1049h"),
+            "a retried query must keep the inline editor: {}",
+            String::from_utf8_lossy(&pty.output)
+        );
+        pty.submit();
+        pty.result(0, "draft");
+        pty.finish(false);
+        pty.assert_query_count(2);
 }
+
+    #[test]
+    fn recovery_probe_restores_the_main_screen_after_the_link_recovers() {
+        let mut pty = PtyEditor::start(1);
+        pty.wait_for("\x1b[6n");
+        // Withhold the reply so the query times out, then answer the recovery
+        // probe that follows the fallback: the editor must leave the alternate
+        // screen and put the inline box back under the main transcript.
+        pty.ready(0);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while pty.query_count() < 3 && Instant::now() < deadline {
+            pty.pump(Duration::from_millis(20));
+        }
+        assert_eq!(
+            pty.query_count(),
+            3,
+            "no recovery probe followed the fallback: {}",
+            String::from_utf8_lossy(&pty.output)
+        );
+        assert!(pty.contains("\x1b[?1049h"), "the editor never degraded");
+        pty.send(b"\x1b[13;1R");
+        pty.wait_for("\x1b[?1049l");
+        pty.still_editing(0);
+        pty.submit();
+        pty.result(0, "draft");
+        pty.finish(true);
+    }

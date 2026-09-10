@@ -150,6 +150,10 @@ enum HistoryRewindTarget {
 struct HistoryPreviewItem {
     message: history::Message,
     user_ordinal: Option<usize>,
+    /// The model that produced this message, persisted as `source_model`
+    /// provenance in sqlite history; `None` for legacy blob history or messages
+    /// written before the column existed.
+    source_model: Option<String>,
 }
 
 fn handle_local_command(app: &mut App, input: &str) -> io::Result<bool> {
@@ -425,31 +429,44 @@ fn render_history_preview(
             .user_ordinal
             .map(|ordinal| format!(" (u{ordinal})"))
             .unwrap_or_default();
+        // Attribute assistant content to the model that produced it; user and
+        // tool rows carry the then-active model too, which would be misleading.
+        let model_tag = if item.message.role == "assistant" {
+            item.source_model
+                .as_deref()
+                .map(|model| format!(" (model: {model})"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "{}. [{}] {}{}\n",
+            "{}. [{}] {}{}{}\n",
             idx + 1,
             item.message.role,
             content,
-            marker
+            marker,
+            model_tag,
         ));
     }
     Ok(out.trim_end().to_string())
 }
 
 pub(crate) fn last_assistant_conclusion_text(app: &App) -> Result<Option<String>, Box<dyn Error>> {
-    assistant_conclusion_text_at(app, 1)
+    Ok(assistant_conclusion_text_at(app, 1)?.map(|(text, _)| text))
 }
 
 /// Find the `nth_back`-most-recent assistant conclusion (1 = most recent):
-/// an assistant message with no tool calls and non-empty text content.
+/// an assistant message with no tool calls and non-empty text content. Returns
+/// the text together with its persisted `source_model` provenance (when known),
+/// so replay paths can attribute the rendered content to its producing model.
 pub(crate) fn assistant_conclusion_text_at(
     app: &App,
     nth_back: usize,
-) -> Result<Option<String>, Box<dyn Error>> {
+) -> Result<Option<(String, Option<String>)>, Box<dyn Error>> {
     let history_file = active_history_path(app);
-    let messages = history::build_message_arr(usize::MAX, &history_file)?;
+    let messages = history::build_message_arr_with_models(&history_file)?;
     let mut seen = 0usize;
-    Ok(messages.iter().rev().find_map(|message| {
+    Ok(messages.iter().rev().find_map(|(message, source_model)| {
         if message.role != "assistant" {
             return None;
         }
@@ -465,7 +482,7 @@ pub(crate) fn assistant_conclusion_text_at(
             return None;
         }
         seen += 1;
-        (seen == nth_back).then_some(text)
+        (seen == nth_back).then_some((text, source_model.clone()))
     }))
 }
 
@@ -473,7 +490,12 @@ pub(crate) fn assistant_conclusion_text_at(
 /// message (1 = latest), rendered through the terminal markdown renderer.
 fn render_history_message_at(app: &App, nth_back: usize) -> Result<(), Box<dyn Error>> {
     match assistant_conclusion_text_at(app, nth_back)? {
-        Some(text) => {
+        Some((text, source_model)) => {
+            // Label the replay with the model that produced it (display-only;
+            // the replayed body itself stays untouched).
+            if let Some(model) = source_model {
+                println!("[history] This message was produced by model: {model}");
+            }
             // Same display-only post-processing as the live turn path, so a
             // replay renders exactly what the turn painted.
             let text = super::turn_runtime::postprocess_terminal_text(text);
@@ -507,7 +529,7 @@ fn collect_history_messages(
     let mut user_ordinal = 0usize;
     let filtered = messages
         .into_iter()
-        .filter_map(|message| {
+        .filter_map(|(message, source_model)| {
             let ordinal = if message.role == "user" {
                 user_ordinal += 1;
                 Some(user_ordinal)
@@ -524,6 +546,7 @@ fn collect_history_messages(
             role_matches.then_some(HistoryPreviewItem {
                 message,
                 user_ordinal: ordinal,
+                source_model,
             })
         })
         .filter(|item| {
@@ -1144,7 +1167,7 @@ mod tests {
         truncate_for_terminal,
     };
     use crate::ai::{
-        history::{self, Message, append_history_messages},
+        history::{self, Message, append_history_messages, append_history_messages_for_model},
         types::{
             AgentContext, App, AppConfig, FunctionDefinition, SkillBiasMemory, ToolDefinition,
         },
@@ -1600,6 +1623,62 @@ mod tests {
     }
 
     #[test]
+    fn render_history_preview_shows_source_model_for_assistant_messages() {
+        let history_path = std::env::temp_dir()
+            .join(format!("ai-history-model-{}.sqlite", Uuid::new_v4()));
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+
+        append_history_messages_for_model(
+            &history_path,
+            &[
+                test_message("user", "question"),
+                test_message("assistant", "answer one"),
+            ],
+            "glm-5.2-opencode",
+        )
+        .unwrap();
+        append_history_messages_for_model(
+            &history_path,
+            &[test_message("assistant", "answer two")],
+            "gpt-5.5",
+        )
+        .unwrap();
+
+        let rendered = render_history_preview(
+            &app,
+            HistoryPreviewOptions {
+                count: 10,
+                role_filter: HistoryRoleFilter::All,
+                full: false,
+                grep: None,
+            },
+        )
+        .unwrap();
+        // Assistant content is attributed to the model that produced it; user
+        // rows carry the then-active model too, which must not be shown.
+        assert!(rendered.contains("[assistant] answer one (model: glm-5.2-opencode)"));
+        assert!(rendered.contains("[assistant] answer two (model: gpt-5.5)"));
+        assert!(!rendered.contains("[user] (model:"));
+
+        // The role filter keeps attribution.
+        let assistant_only = render_history_preview(
+            &app,
+            HistoryPreviewOptions {
+                count: 10,
+                role_filter: HistoryRoleFilter::Assistant,
+                full: false,
+                grep: None,
+            },
+        )
+        .unwrap();
+        assert!(assistant_only.contains("(model: gpt-5.5)"));
+        assert!(assistant_only.contains("(model: glm-5.2-opencode)"));
+
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
     fn render_history_preview_filters_user_messages() {
         let history_path =
             std::env::temp_dir().join(format!("ai-history-filter-{}.sqlite", Uuid::new_v4()));
@@ -1841,15 +1920,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            assistant_conclusion_text_at(&app, 1).unwrap().as_deref(),
+            assistant_conclusion_text_at(&app, 1)
+                .unwrap()
+                .as_ref()
+                .map(|(text, _)| text.as_str()),
             Some("third answer")
         );
         assert_eq!(
-            assistant_conclusion_text_at(&app, 2).unwrap().as_deref(),
+            assistant_conclusion_text_at(&app, 2)
+                .unwrap()
+                .as_ref()
+                .map(|(text, _)| text.as_str()),
             Some("second answer")
         );
         assert_eq!(
-            assistant_conclusion_text_at(&app, 3).unwrap().as_deref(),
+            assistant_conclusion_text_at(&app, 3)
+                .unwrap()
+                .as_ref()
+                .map(|(text, _)| text.as_str()),
             Some("first answer")
         );
         assert_eq!(assistant_conclusion_text_at(&app, 4).unwrap(), None);

@@ -516,3 +516,24 @@ fn overflow_stub_argument_guard_catches_transcribed_stubs() {
     );
     assert!(super::prepare_tool_call(&mcp, &benign, None).is_ok());
 }
+
+#[test]
+fn plan_update_not_found_gets_plan_specific_hint() {
+    // "Step 6 not found in the active plan." matches both the plan branch and the
+    // generic "not found" branch; the plan branch must win (it is ordered first), or
+    // the model receives a misleading file-path hint after context compression folded
+    // the plan-creation turns (regression: hallucinated step 6/5 updates).
+    let err = "Step 6 not found in the active plan.";
+    let hint = super::remediation_hint("plan_update", err, None).unwrap();
+    assert!(
+        hint.contains("Suggestion: reuse an existing step number"),
+        "plan hint differs: {hint}"
+    );
+    assert!(hint.contains("plan-state.json"), "{hint}");
+    assert!(!hint.contains("search/list tool"), "{hint}");
+
+    // Generic file-not-found errors keep the original, file-oriented hint.
+    let generic = super::remediation_hint("read_file", "no such file: /x/y", None).unwrap();
+    assert!(generic.contains("verify the path or identifier"), "{generic}");
+    assert!(!generic.contains("plan-state.json"), "{generic}");
+}

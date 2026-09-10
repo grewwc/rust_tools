@@ -857,7 +857,7 @@ fn clamp_ignores_stale_high_known_prompt_after_compression() {
 }
 
 #[test]
-fn deepseek_v4_flash_short_prompt_keeps_declared_output_budget() {
+fn short_prompt_keeps_every_declared_output_budget() {
     let messages = vec![Message {
         role: "user".to_string(),
         content: Value::String("hi".to_string()),
@@ -866,20 +866,23 @@ fn deepseek_v4_flash_short_prompt_keeps_declared_output_budget() {
         reasoning_content: None,
     }];
 
-    // If this fell back to the strong tier's 200K window, it would be squeezed to
-    // ~198K; with the 1M window, DeepSeek V4 Flash's declared full completion
-    // budget must be kept.
-    for model in [
-        "deepseek-v4-flash-opencode",
-        "deepseek-v4-flash-0731-alibaba",
-    ] {
-        let model_max = super::super::models::max_output_tokens(model).unwrap();
+    // A short prompt must not squeeze a declared completion budget: whenever the entry's window
+    // covers `max_output_tokens + safety margin`, the full cap has to survive. Iterating the
+    // registry (instead of naming keys) keeps this true after registry renames.
+    let mut checked = 0;
+    for def in crate::ai::model_names::all() {
+        let Some(model_max) = models::max_output_tokens(&def.key) else {
+            continue;
+        };
         assert_eq!(
-            clamp_max_tokens_for_prompt(model, &messages, None, model_max, None),
+            clamp_max_tokens_for_prompt(&def.key, &messages, None, model_max, None),
             model_max,
-            "{model}"
+            "{}",
+            def.key
         );
+        checked += 1;
     }
+    assert!(checked > 0, "registry must declare at least one output cap");
 }
 
 #[test]
@@ -892,8 +895,22 @@ fn build_request_body_sends_provider_model_name_for_key_handle() {
         reasoning_content: None,
     }];
 
+    // The wire model name is the registry `name`, while the selector/`key` may include the
+    // platform suffix. Take the entry from the registry so a rename cannot make this observe a
+    // fallback path instead of the mapping it is meant to guard.
+    let def = crate::ai::model_names::all()
+        .iter()
+        .find(|m| {
+            m.adapter == crate::ai::provider::ApiProvider::OpenCode
+                && m.enable_thinking
+                && !m.name.starts_with("enc:")
+                && m.name.to_ascii_lowercase().contains("deepseek")
+        })
+        .copied()
+        .expect("registry must contain a plaintext OpenCode DeepSeek entry with thinking enabled");
+
     let body = build_request_body(
-        "deepseek-v4-flash-opencode",
+        &def.key,
         &messages,
         false,
         true,
@@ -909,7 +926,9 @@ fn build_request_body_sends_provider_model_name_for_key_handle() {
 
     assert_eq!(
         json.get("model").and_then(|v| v.as_str()),
-        Some("deepseek-v4-flash")
+        Some(def.name.as_str()),
+        "{}",
+        def.key
     );
     assert_eq!(
         json.pointer("/thinking/type").and_then(|v| v.as_str()),
@@ -918,7 +937,7 @@ fn build_request_body_sends_provider_model_name_for_key_handle() {
 }
 
 #[test]
-fn opencode_deepseek_sends_thinking_object_alongside_reasoning_effort() {
+fn opencode_thinking_entries_send_thinking_object_alongside_reasoning_effort() {
     let messages = vec![Message {
         role: "user".to_string(),
         content: Value::String("hi".to_string()),
@@ -927,10 +946,26 @@ fn opencode_deepseek_sends_thinking_object_alongside_reasoning_effort() {
         reasoning_content: None,
     }];
 
-    for model in [
-        "deepseek-v4-flash-opencode",
-        "deepseek-v4-flash-free-opencode",
-    ] {
+    // The OpenCode dialect only sends the thinking object for DeepSeek models
+    // (thinking_dialect_for in src/bin/ai/provider/adapter/thinking.rs). Each such entry with
+    // thinking enabled must keep sending it while the top-level reasoning_effort rides along
+    // (gateway-verified to coexist without wire conflict). Entries are discovered from the
+    // registry so renames cannot empty the loop.
+    let mut checked = 0;
+    for def in crate::ai::model_names::all() {
+        if def.adapter != crate::ai::provider::ApiProvider::OpenCode
+            || !def.enable_thinking
+            || def.name.starts_with("enc:")
+        {
+            continue;
+        }
+        if !models::request_model_name(&def.key)
+            .to_ascii_lowercase()
+            .contains("deepseek")
+        {
+            continue;
+        }
+        let model = def.key.as_str();
         let body = build_request_body(
             model,
             &messages,
@@ -945,9 +980,6 @@ fn opencode_deepseek_sends_thinking_object_alongside_reasoning_effort() {
             None,
         );
         let json = serde_json::to_value(&body).unwrap();
-        // The DeepSeek dialect always sends the thinking object; the top-level
-        // reasoning_effort is still sent per adapter rules (gateway-verified to
-        // coexist without wire conflict).
         assert_eq!(
             json.pointer("/thinking/type").and_then(|v| v.as_str()),
             Some("enabled"),
@@ -958,7 +990,12 @@ fn opencode_deepseek_sends_thinking_object_alongside_reasoning_effort() {
             Some("high"),
             "{model}"
         );
+        checked += 1;
     }
+    assert!(
+        checked > 0,
+        "registry must contain an OpenCode entry with thinking enabled"
+    );
 }
 
 #[test]
@@ -1094,39 +1131,84 @@ fn dashscope_qwen_metadata_matches_documented_thinking_controls() {
 }
 
 #[test]
-fn opencode_deepseek_aux_disabled_thinking_object_ignores_effort() {
+fn opencode_disabled_thinking_object_ignores_effort() {
     let endpoint = crate::ai::provider::OPENCODE_DEFAULT_ENDPOINT.to_string();
+    let def = crate::ai::model_names::all()
+        .iter()
+        .find(|m| {
+            m.adapter == crate::ai::provider::ApiProvider::OpenCode
+                && m.enable_thinking
+                && !m.name.starts_with("enc:")
+                && m.name.to_ascii_lowercase().contains("deepseek")
+        })
+        .copied()
+        .expect("registry must contain a plaintext OpenCode DeepSeek entry with thinking enabled");
     let (thinking, top_level_reasoning_effort, nested_reasoning) = resolve_reasoning_wire_controls(
-        "deepseek-v4-flash-opencode",
+        &def.key,
         &endpoint,
         false,
         Some("high"),
     );
 
-    // The DeepSeek dialect always sends thinking:{"type":"disabled"}; the
-    // top-level reasoning_effort is still sent per adapter rules
+    // The OpenCode dialect always sends thinking:{"type":"disabled"} when force-off is
+    // requested; the top-level reasoning_effort is still sent per adapter rules
     // (gateway-verified that thinking:disabled takes precedence over effort).
     assert_eq!(
         thinking
             .get("thinking")
             .and_then(|v| v.get("type"))
             .and_then(|v| v.as_str()),
-        Some("disabled")
+        Some("disabled"),
+        "{}",
+        def.key
     );
     assert_eq!(top_level_reasoning_effort, Some("high"));
     assert!(nested_reasoning.is_none());
 }
 
 #[test]
-fn modelhub_models_support_reasoning_with_tools_via_responses() {
-    for model in ["gpt-5.5", "gpt-5.6-sol"] {
-        assert!(!models::reasoning_effort_conflicts_with_tools(model));
-        assert!(models::endpoint_for_model(model, "").ends_with("/v1/responses"));
-        assert_eq!(
-            models::request_protocol_dialect(model, &models::endpoint_for_model(model, "")),
-            RequestProtocolDialect::Responses
+fn responses_protocol_entries_support_reasoning_with_tools() {
+    // Every entry declaring `request_protocol: responses` must keep the responses dialect and
+    // accept reasoning_effort together with tools. Registry-driven, so renames cannot leave the
+    // assertions running against a model that no longer resolves.
+    // Encrypted endpoints are decrypted through a key file whose path derives from CONFIGW_PATH,
+    // so this test must hold ENV_LOCK against tests that repoint CONFIGW_PATH.
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let mut checked = 0;
+    for def in crate::ai::model_names::all() {
+        if def.request_protocol != Some(RequestProtocolDialect::Responses) {
+            continue;
+        }
+        assert!(
+            !models::reasoning_effort_conflicts_with_tools(&def.key),
+            "{}",
+            def.key
         );
+        let endpoint = models::endpoint_for_model(&def.key, "");
+        assert_eq!(
+            models::request_protocol_dialect(&def.key, &endpoint),
+            RequestProtocolDialect::Responses,
+            "{}",
+            def.key
+        );
+        // Only assert the route shape when the endpoint is readable: without the key file the
+        // encrypted value stays encrypted and says nothing about the route.
+        if !crate::commonw::secret::is_encrypted(&endpoint) {
+            assert!(
+                endpoint.ends_with("/v1/responses"),
+                "{}: {endpoint}",
+                def.key
+            );
+        }
+        checked += 1;
     }
+    assert!(
+        checked > 0,
+        "registry must declare at least one responses-protocol entry"
+    );
 }
 
 #[test]

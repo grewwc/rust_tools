@@ -3228,4 +3228,66 @@ mod golden_wire {
         );
         assert!(!result.assistant_text.contains("thinking step"));
     }
+
+    #[test]
+    fn tool_args_open_at_starts_on_open_tool_call_and_resets_on_finish() {
+        let app = crate::ai::middleware::test_util::test_app();
+        let mut content = initial_stream_processing_state(&app).content;
+
+        // No tool call open yet: the stall timer stays unset.
+        assert_eq!(update_tool_args_open_at(&content, None), None);
+
+        // A tool call opens: the timer starts at that moment.
+        content
+            .tool_calls_map
+            .insert(0, ToolCallBuilder::default());
+        let open_at = update_tool_args_open_at(&content, None);
+        assert!(open_at.is_some(), "timer must start when a tool call opens");
+
+        // While the call stays open the original timestamp is preserved.
+        assert_eq!(update_tool_args_open_at(&content, open_at), open_at);
+
+        // Finish reason clears the timer even if the map is not empty yet.
+        content.finish_reason_seen = true;
+        assert_eq!(update_tool_args_open_at(&content, open_at), None);
+
+        // Empty map also clears it.
+        content.finish_reason_seen = false;
+        content.tool_calls_map.clear();
+        assert_eq!(update_tool_args_open_at(&content, open_at), None);
+    }
+
+    #[test]
+    fn tool_args_stall_detects_pathological_trickle_stream() {
+        let timeout = Duration::from_secs(STREAM_TOOL_ARGS_STALL_TIMEOUT_SECS);
+        let now = Instant::now();
+
+        // No open tool call: never stalled.
+        assert!(!tool_args_stream_stalled(None, now, timeout));
+        // Still inside the window: not stalled.
+        assert!(!tool_args_stream_stalled(
+            Some(now - Duration::from_secs(179)),
+            now,
+            timeout
+        ));
+        // Just below the boundary: not stalled.
+        assert!(!tool_args_stream_stalled(
+            Some(now - Duration::from_secs(180) + Duration::from_millis(1)),
+            now,
+            timeout
+        ));
+        // At and beyond the boundary: stalled — this is the trickle-stream
+        // case where the idle timer never fires because every delta counts
+        // as meaningful progress.
+        assert!(tool_args_stream_stalled(
+            Some(now - Duration::from_secs(180)),
+            now,
+            timeout
+        ));
+        assert!(tool_args_stream_stalled(
+            Some(now - Duration::from_secs(181)),
+            now,
+            timeout
+        ));
+    }
 }

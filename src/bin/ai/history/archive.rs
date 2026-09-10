@@ -13,13 +13,21 @@ const OVERFLOW_HISTORY_FILENAME: &str = "overflow-history.md";
 /// versions; expand it only once. If the archive is unreadable or the format is
 /// incomplete, keep the original back-reference so the only recovery clue is
 /// not hidden from the `/history` output.
-pub(super) fn expand_overflow_archives(messages: Vec<Message>) -> Vec<Message> {
+///
+/// Expanded messages report *unknown* source provenance (`None`): the archive
+/// persists only the `Message` bodies and never a per-message model, and the
+/// stub's own persisted model is the model active when the stub was written —
+/// which can differ from the models that produced the archived content.
+/// Inheriting the stub's model would therefore be a false attribution.
+pub(super) fn expand_overflow_archives(
+    messages: Vec<(Message, Option<String>)>,
+) -> Vec<(Message, Option<String>)> {
     let mut expanded = Vec::with_capacity(messages.len());
     let mut loaded_paths = Vec::<PathBuf>::new();
 
-    for message in messages {
+    for (message, source_model) in messages {
         let Some(path) = overflow_archive_path(&message) else {
-            expanded.push(message);
+            expanded.push((message, source_model));
             continue;
         };
         if loaded_paths.iter().any(|loaded| loaded == &path) {
@@ -31,12 +39,14 @@ pub(super) fn expand_overflow_archives(messages: Vec<Message>) -> Vec<Message> {
             .map(|markdown| parse_overflow_history(&markdown))
             .unwrap_or_default();
         if archived.is_empty() {
-            expanded.push(message);
+            expanded.push((message, source_model));
             continue;
         }
 
         loaded_paths.push(path);
-        expanded.extend(archived);
+        // Archived messages have no per-message model (see the doc comment);
+        // report unknown rather than inheriting the stub's model.
+        expanded.extend(archived.into_iter().map(|m| (m, None)));
     }
     expanded
 }
@@ -205,7 +215,9 @@ fn finish_message(messages: &mut Vec<Message>, role: Option<&str>, content_lines
 
 #[cfg(test)]
 mod tests {
-    use super::parse_overflow_history;
+    use super::{expand_overflow_archives, parse_overflow_history, Message};
+    use serde_json::Value;
+    use uuid::Uuid;
 
     #[test]
     fn parses_overflow_batches_in_original_order() {
@@ -316,5 +328,51 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content.as_str(), Some("first"));
+    }
+
+    #[test]
+    fn expanded_archive_messages_do_not_inherit_stub_source_model() {
+        // The stub recognizer only accepts files named `overflow-history.md`,
+        // so host the temp archive in its own directory.
+        let dir = std::env::temp_dir().join(format!("ai-archive-model-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive_path = dir.join("overflow-history.md");
+        // Plain-Markdown archive body, the same shape the legacy write path
+        // produced (no per-message raw JSON, hence no model either).
+        std::fs::write(&archive_path, "## Assistant\n\narchived answer\n").unwrap();
+
+        let stub = Message {
+            role: "internal_note".to_string(),
+            content: Value::String(format!(
+                "长期记忆归档：更早的原始对话已移出上下文窗口，原文保存在会话归档文件中（零压缩）。\n归档文件: {}",
+                archive_path.display()
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let ordinary = Message {
+            role: "user".to_string(),
+            content: Value::String("still in canonical history".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+
+        let expanded = expand_overflow_archives(vec![
+            (ordinary, Some("gpt-5.5".to_string())),
+            (stub, Some("glm-5.2-opencode".to_string())),
+        ]);
+
+        // Non-stub rows keep their own provenance; expanded archive rows must
+        // report unknown instead of inheriting the stub's (potentially
+        // unrelated) model.
+        assert_eq!(expanded[0].0.role, "user");
+        assert_eq!(expanded[0].1.as_deref(), Some("gpt-5.5"));
+        assert_eq!(expanded[1].0.role, "assistant");
+        assert_eq!(expanded[1].0.content.as_str(), Some("archived answer"));
+        assert_eq!(expanded[1].1, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

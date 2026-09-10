@@ -22,6 +22,8 @@ the nearest child `AGENTS.md`.
 - `knowledge/`: shared types, lexical similarity, embedding provider, vector index
 - `stream/`: streaming protocol, chunk extraction, state machine, `stream/render/` terminal rendering. Golden wire→parse regression tests live in `stream/runtime/tests.rs` (`mod golden_wire`): a `ScriptedSse` loopback server feeds fixture SSE events through the real `stream_response` state machine and asserts the parsed `StreamResult` (offline, CI-safe). Add new provider wire shapes as fixtures there.
 - `cli.rs` / `theme.rs` / `background.rs`: CLI entry, theming, background tasks
+- `terminal_session/`: PTY session plumbing (client/host/registry/replay/wire);
+  `builtin_themes/` themes embedded by `theme.rs`; `tests/` module-level integration tests
 - `persona.rs` / `files.rs` / `types.rs` / `errors.rs` / `request_protocol.rs`: persona, file helpers (`extract_key_lines`), shared types, `AiError`, request dialect
 - `tool_descriptions/`: per-tool JSON metadata (description, compact parameter
   schema, optional turn-first-use guidance, group membership) auto-discovered
@@ -54,7 +56,7 @@ Sessions are the unit of conversation persistence; IDs are not restricted to UUI
 2. **Driver owns the turn.** Prompt assembly, model calls, tool loops, history mutation, and final response flow through `driver/`; no ad-hoc side effects.
 3. **Provider/request boundary.** Routing/normalization in `request/`; wire differences in `provider/` adapter hooks. `ApiProvider` is the adapter axis; model/platform metadata lives in `models/` + `model_names.rs`.
 4. **Tool contracts.** Names/schemas/display/history policy are registry-driven. Per-turn visibility is progressive (`core` default, `enable_tools` for lazy `builtin`); hidden MCP/catalog hints must match real registry names.
-5. **Path/session authority.** `runtime_ctx::effective_cwd()` for user paths; runtime helpers for session/temp state.
+5. **Path/session authority.** `runtime_ctx::effective_cwd()` is the working-directory authority for user paths (tools and sub-agents); runtime helpers for session/temp state.
 6. **History is truth.** Canonical `turn_messages` vs rebuildable context projection: compression replaces only the projection, never canonical history (only explicit user lifecycle ops truncate). Preserve pruned evidence via overflow/file pointers; persist delivered subagent results and require explicit `task_integrate`.
 7. **Derived-context provenance.** Runtime policy notes may map to `system`; model-authored self-notes/checkpoints stay `assistant`-derived and unverified. Never promote prior assistant wording into system fact; project via user/assistant handoff pairs only.
 8. **Synthetic user messages.** Runtime-injected `role=="user"` (subagent handoff, image followup, etc.) must use `history::runtime_synthetic_user_message` and be detected via `history::is_runtime_synthetic_user_message`/`last_real_user_index` — never bare `rposition(role=="user")`. Clear the origin sidecar in `request/normalize` before provider serialization.
@@ -66,6 +68,15 @@ Sessions are the unit of conversation persistence; IDs are not restricted to UUI
     `driver/turn_runtime/finalize.rs` (via `output_postprocess.rs`). Best-effort:
     any failure shows the original text; never mutates canonical history. Repo
     filter + behavior details: `scripts/AGENTS.md`.
+
+12. **Registry-driven tests.** `models/*.json` is runtime config that churns
+    (keys, names, aliases, context windows, output caps), so tests must discover
+    entries (`model_names::all()`) and assert invariants instead of pinning
+    literals: a registry rename must not fail a test. Existing patterns:
+    `models_tests.rs::registry_identifiers_resolve_to_their_owning_entry`,
+    `output_caps_above_the_tier_default_window_declare_an_explicit_window`. When a
+    scenario needs specific metadata (thinking channel, tier, protocol), select the
+    entry by the declaring property rather than by key.
 
 ## Scoped guides
 

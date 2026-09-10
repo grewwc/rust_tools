@@ -1701,9 +1701,9 @@ mod tests {
                     );
                 }
                 let base = if dimmed {
-                    theme::current().accent_muted.clone()
+                    theme::current().accent_muted
                 } else {
-                    theme::current().markdown_body.clone()
+                    theme::current().markdown_body
                 };
                 assert_eq!(preview, format!("{base}{source}"));
                 let repaint = renderer.flush_pending_for_test().unwrap();

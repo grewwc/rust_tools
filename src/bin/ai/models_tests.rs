@@ -291,30 +291,90 @@ fn model_keys_resolve_to_model_handles() {
 }
 
 #[test]
-fn model_key_selects_duplicate_name_provider() {
-    let key = "deepseek-v4-flash-opencode";
-    let def = super::model_names::find_by_identifier(key)
-        .expect("model registry should contain opencode deepseek-v4-flash");
+fn duplicate_name_entries_stay_selectable_by_key() {
+    // When two entries share a `name`, the bare name can only pick one of them, so every entry
+    // must stay reachable through its own `key`. The duplicate group is discovered from the
+    // registry instead of being pinned, so renames/additions cannot invalidate this test.
+    let all = super::model_names::all();
+    let duplicate = all.iter().find_map(|def| {
+        if def.name.starts_with("enc:") {
+            return None;
+        }
+        let group: Vec<&ModelDef> = all
+            .iter()
+            .copied()
+            .filter(|m| m.name == def.name)
+            .collect();
+        (group.len() >= 2).then_some((def.name.as_str(), group))
+    });
+    let Some((name, group)) = duplicate else {
+        eprintln!("skip: registry has no two plaintext-name entries sharing a name");
+        return;
+    };
 
-    assert_eq!(def.name, "deepseek-v4-flash");
-    assert_eq!(def.adapter, ApiProvider::OpenCode);
-    assert_eq!(determine_model(key), key);
-    assert_eq!(request_model_name(key), "deepseek-v4-flash");
-    assert_eq!(model_adapter(key), ApiProvider::OpenCode);
-    assert_eq!(determine_model("DEEPSEEK_V4_FLASH_OPENCODE"), key);
-    assert_eq!(determine_model("deepseek-v4-flash opencode"), key);
+    for def in &group {
+        let key = def.key.as_str();
+        assert_eq!(
+            super::model_names::find_by_key(key).map(|m| m.key.as_str()),
+            Some(key),
+            "{key}: key must resolve to its own entry"
+        );
+        assert_eq!(determine_model(key), super::model_names::model_handle(def), "{key}");
+        assert_eq!(request_model_name(key), def.name, "{key}");
+        assert_eq!(model_adapter(key), def.adapter, "{key}");
+    }
+
+    // The bare name is ambiguous, but it must land on one of the entries bearing it.
+    let resolved = determine_model(name);
+    assert!(
+        group
+            .iter()
+            .any(|def| super::model_names::model_handle(def) == resolved),
+        "{name}: bare name resolved to {resolved}, which is not one of its entries"
+    );
+
+    // Appending the platform slug is the supported way to disambiguate the duplicates.
+    for def in &group {
+        let selector = format!("{} {}", def.name, super::model_names::platform_label(def));
+        assert_eq!(
+            determine_model(&selector),
+            super::model_names::model_handle(def),
+            "{selector}"
+        );
+    }
 }
 
 #[test]
-fn deepseek_v4_flash_routes_declare_full_context_budget() {
-    // DeepSeek V4 Flash's 393,216 output cap needs the 1M context window; it must not
-    // fall back to strong tier's conservative 200K default, or the builder would clamp max_tokens too early.
-    for key in [
-        "deepseek-v4-flash-opencode",
-        "deepseek-v4-flash-0731-alibaba",
-    ] {
-        assert_eq!(context_window_tokens(key), 1_000_000, "{key}");
-        assert_eq!(max_output_tokens(key), Some(393_216), "{key}");
+fn output_caps_above_the_tier_default_window_declare_an_explicit_window() {
+    // The request builder clamps max_tokens to `window - est_prompt - safety margin`
+    // (CONTEXT_WINDOW_SAFETY_MARGIN_TOKENS in src/bin/ai/request/builder.rs), so an entry whose
+    // declared output cap only fits because no window was declared gets clamped on every request.
+    // Encoded registry-wide so it catches new entries too, instead of pinning the models that
+    // happened to need an explicit window when the rule was first written.
+    const SAFETY_MARGIN_TOKENS: usize = 2_048;
+
+    for def in super::model_names::all() {
+        let Some(out) = def.max_output_tokens else {
+            continue;
+        };
+        let out = out as usize;
+        match def.context_window_tokens.filter(|window| *window > 0) {
+            Some(window) => assert!(
+                out < window,
+                "{}: max_output_tokens {out} must stay below the declared window {window}",
+                def.key
+            ),
+            None => {
+                let tier_default = super::default_context_window_tokens_for_tier(def.quality_tier);
+                assert!(
+                    out + SAFETY_MARGIN_TOKENS < tier_default,
+                    "{}: max_output_tokens {out} needs an explicit context_window_tokens \
+                     (the tier default window {tier_default} leaves less than the \
+                     {SAFETY_MARGIN_TOKENS}-token safety margin)",
+                    def.key
+                );
+            }
+        }
     }
 }
 
@@ -425,15 +485,67 @@ fn endpoint_for_known_model_prefers_model_config_over_global_fallback() {
 }
 
 #[test]
-fn deepseek_v4_flash_selector_keeps_opencode_compatibility() {
-    assert_eq!(
-        determine_model("deepseek-v4-flash"),
-        "deepseek-v4-flash-opencode"
-    );
-    assert_eq!(
-        determine_model("deepseek-v4-flash-0731-alibaba"),
-        "deepseek-v4-flash-0731-alibaba"
-    );
+fn registry_identifiers_resolve_to_their_owning_entry() {
+    // Renaming or re-platforming an entry silently breaks every caller that still spells the old
+    // identifier (config `ai.model.default`, `/model <selector>`, disabled-model lists). All
+    // identifiers used here come from the registry itself, so the guard survives config churn.
+    let all = super::model_names::all();
+
+    for def in &all {
+        assert_eq!(
+            super::model_names::find_by_key(&def.key).map(|m| m.key.as_str()),
+            Some(def.key.as_str()),
+            "{}: key must resolve to itself",
+            def.key
+        );
+        assert_eq!(
+            determine_model(&def.key),
+            super::model_names::model_handle(def),
+            "{}: key must resolve to its handle",
+            def.key
+        );
+    }
+
+    for def in &all {
+        for alias in &def.aliases {
+            // A duplicate alias (e.g. QWEN3_MAX in two entries) resolves to whichever entry the
+            // index saw last; that ambiguity is a registry issue, not a resolver bug.
+            let declared_elsewhere = all
+                .iter()
+                .any(|other| other.key != def.key && other.aliases.contains(alias));
+            if declared_elsewhere {
+                continue;
+            }
+            assert_eq!(
+                super::model_names::find_by_key(alias).map(|m| m.key.as_str()),
+                Some(def.key.as_str()),
+                "{alias}: alias must resolve to the entry that declares it"
+            );
+        }
+    }
+
+    for def in &all {
+        if def.name.starts_with("enc:") {
+            continue;
+        }
+        let resolved = determine_model(&def.name);
+        let shares_name = all.iter().filter(|other| other.name == def.name).count() > 1;
+        if shares_name {
+            assert!(
+                all.iter().any(|other| other.name == def.name
+                    && super::model_names::model_handle(other) == resolved),
+                "{}: ambiguous name resolved outside its own group ({resolved})",
+                def.name
+            );
+        } else {
+            assert_eq!(
+                resolved,
+                super::model_names::model_handle(def),
+                "{}",
+                def.name
+            );
+        }
+    }
 }
 
 #[test]

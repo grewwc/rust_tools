@@ -12,7 +12,7 @@ src/osa.rs    # osascript wrapper + AppleScript templates — every Excel quirk 
 src/tools.rs  # tools_list + handle_tools_call dispatch + 9 tool impls + CSV helpers
 ```
 
-Transport (`cap_text(24K)`/`with_timeout`/`JsonRpcErr`/dispatch loop) lives in `crates/mcp_stdio`.
+Transport (`cap_text(24K)`/`with_timeout`/`JsonRpcErr`/dispatch loop) lives in `crates/mcp_stdio`, whose `AGENTS.md` owns the shared transport invariants (per-op cap < host timeout, error wording, text cap).
 
 ## Build / Test
 
@@ -34,10 +34,9 @@ cargo build -p mcp_excel   # ~10s; third-party deps tokio+serde_json (+ local mc
 ## Invariants (do not break)
 
 1. **No session / no shutdown hook.** Excel owns state across one-shot `osascript -e` calls; `main` holds no state; idempotent `open_workbook` (reuse-if-open) stitches calls.
-2. **Server cap < host timeout.** Every op `with_timeout(op_timeout_ms())` default 90s; host 120s recommended.
-3. **Error wording avoids transport triggers.** Timeout says "operation reached the N ms server cap"; raw `-50`/`-10003` pass verbatim (diagnostic, not triggers).
-4. **Only `content[0].text` (cap 24K via `cap_text`).** Large ranges must be exported to disk, not returned inline.
-5. **Persist via `export_csv`, not `save_workbook`.** Sandboxed `save workbook as` → systemic `-50` in non-interactive context (not a syntax bug — do not re-attempt); `export_csv` reads range then Rust writes file; `save_workbook` stays EXPERIMENTAL.
+2. **Raw AppleScript errors pass verbatim.** `-50`/`-10003` are diagnostics, not host transport triggers; never wrap them in wording the host kills on (`mcp_stdio`).
+3. **Large ranges must be exported to disk, not returned inline** — only `content[0].text` reaches the model.
+4. **Persist via `export_csv`, not `save_workbook`.** Sandboxed `save workbook as` → systemic `-50` in non-interactive context (not a syntax bug — do not re-attempt); `export_csv` reads range then Rust writes file; `save_workbook` stays EXPERIMENTAL.
 
 ## Environment / Tool set / Host
 

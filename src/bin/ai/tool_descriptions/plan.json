@@ -1,7 +1,7 @@
 {
   "name": "plan",
   "description": "Create or replace a plan for a complex task. Use `plan_update` for status changes and call `plan` again only when the task shape changes. Skip simple one-step work.",
-  "first_use_guidance": "Guidance for later plan operations in this turn:\n- Keep step statuses current with `plan_update`; replace the plan only when the task shape changes.\n- Set `delegate` true for substantive bounded work. Keep trivial work, tightly coupled edits, and final review in the parent.\n- Delegated steps run serially with `task` unless independent steps use `parallelizable` with concurrent `task_spawn`.\n- Mark `parallelizable` only when the step has no dependency on the previous step.\n- Use the primary tool name in `tool`, or `none` when no tool is needed.",
+  "first_use_guidance": "Guidance for later plan operations in this turn:\n- Keep step statuses current with `plan_update` as you work; replace the plan only when the task shape changes.",
   "parameters": {
     "type": "object",
     "properties": {

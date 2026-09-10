@@ -736,19 +736,23 @@ fn system_prompt_renders_safety_redlines_and_no_hallucination() {
     assert!(prompt.contains("Never perform dangerous operations"));
     assert!(prompt.contains("Never bypass or work around safety mechanisms"));
     assert!(prompt.contains("state the exact command and its consequences and wait for approval"));
-    // Anti-hallucination policy: unconditionally rendered. Detailed fact
-    // tracing lives in correctness_guardrails; this test protects the
-    // complementary evidence/inference boundary, metadata limit, and
-    // conclusion-calibration rules.
+    // Anti-hallucination policy: unconditionally rendered, and deliberately limited to what
+    // correctness_guardrails does not already state — the conclusion gate (unverified content
+    // is never presented as a conclusion), the metadata limit, and the no-padding rule. Fact
+    // tracing and conclusion calibration stay single-sourced in correctness_guardrails.
     assert!(prompt.contains("<no_hallucination>"));
-    assert!(prompt.contains("Distinguish evidence from inference"));
-    assert!(prompt.contains("label every inference and state its evidentiary basis"));
+    assert!(prompt.contains(
+        "Unverified content must never be presented as a conclusion or recommendation"
+    ));
+    assert!(prompt.contains("label it as inference or unknown"));
     assert!(prompt.contains("beyond a field's documented semantics"));
     assert!(prompt.contains(
         "does not establish provenance, lineage, capability, intent, or comparative rank"
     ));
-    assert!(prompt.contains("Calibrate conclusions to the evidence"));
-    assert!(prompt.contains("do not introduce unstated premises, causal links, or facts"));
+    assert!(prompt.contains("Do not introduce unstated premises, causal links, or facts"));
+    // Restating correctness_guardrails' evidence rules here would be duplication, not
+    // emphasis: the base prompt renders both blocks on every request.
+    assert!(!prompt.contains("Calibrate conclusions to the evidence"));
 }
 
 #[test]
@@ -1012,6 +1016,64 @@ fn system_prompt_links_task_convergence_criteria_to_plan_when_available() {
     .render_system_prompt();
     assert!(empty.contains("<task_convergence>"));
     assert!(!empty.contains("encode these criteria into the `plan`"));
+}
+
+#[test]
+fn system_prompt_operationalizes_structural_escalation_in_task_convergence() {
+    // The minimal-change vs architecture tradeoff must live in exactly one
+    // fragment: task_convergence is the unconditional criteria carrier and must
+    // state an observable trigger plus the required proposal shape, while
+    // tool_usage stays call mechanics and must not restate the tradeoff.
+    // The trigger stays qualitative on purpose: no runtime counter reaches this
+    // fragment, so a count-based threshold would be a number the model can only
+    // fabricate once its own edits have been compressed away.
+    let cases = [
+        PromptContext::default(),
+        PromptContext {
+            goal_mode: Some("finish the goal".to_string()),
+            is_background: false,
+        },
+    ];
+    for ctx in cases {
+        let prompt = build_system_prompt(None, &[], &Box::new(SkipSet::new(16)), &ctx)
+            .render_system_prompt();
+        assert!(prompt.contains("<task_convergence>"));
+        let task_convergence = prompt
+            .split("<task_convergence>")
+            .nth(1)
+            .and_then(|rest| rest.split("</task_convergence>").next())
+            .expect("task_convergence fragment is rendered");
+        assert!(
+            task_convergence.contains("present the structural option instead of another patch"),
+            "structural-escalation action missing from the rendered prompt"
+        );
+        assert!(
+            task_convergence.contains("keeps adding special cases rather than removing them"),
+            "structural-escalation trigger missing from the rendered prompt"
+        );
+        assert!(
+            !task_convergence.contains("or more times"),
+            "the escalation trigger must stay qualitative: a count the session cannot \
+             observe is either unusable or fabricated"
+        );
+        assert!(
+            prompt.contains("impact surface (callers and dependents)"),
+            "structural-option proposal shape missing from the rendered prompt"
+        );
+        let tool_usage = prompt
+            .split("<tool_usage>")
+            .nth(1)
+            .and_then(|rest| rest.split("</tool_usage>").next())
+            .expect("tool_usage fragment is rendered");
+        assert!(
+            !tool_usage.contains("architecture"),
+            "the change-shaping tradeoff must not be restated in tool_usage"
+        );
+        assert!(
+            !tool_usage.contains("smallest local change"),
+            "tool_usage must not keep an unconditional minimal-change preference"
+        );
+    }
 }
 
 #[test]

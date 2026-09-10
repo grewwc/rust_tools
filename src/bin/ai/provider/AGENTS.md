@@ -2,9 +2,12 @@
 
 ## Scope
 
-Applies to `src/bin/ai/provider/**`. `mod.rs` defines the `ApiProvider` enum +
-shared types; `adapter/` holds the `ProviderAdapter` trait + per-provider impls
-(`alibaba`, `compatible`, `openai`, `opencode`, `openrouter`, `thinking`).
+Applies to `src/bin/ai/provider/**`. `mod.rs` defines the `ApiProvider` enum
+(`compatible`, `alibaba`, `openai`, `opencode`) + shared types; `adapter/` holds
+the `ProviderAdapter` trait and its impls — one per enum variant, plus
+`openrouter` (an endpoint variant of OpenAI wire format, selected by
+`adapter_for` when the endpoint contains `openrouter.ai`; no enum entry, only a
+different log label) and `thinking.rs`, the orthogonal thinking-dialect axis.
 
 ## Key invariants
 

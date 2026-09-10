@@ -311,7 +311,10 @@ mod encrypted_replay_reconstruct_tests {
     #[test]
     fn rebuilds_items_from_encoded_history_for_encrypted_model() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let model = "muse-spark-1.2-contributor";
+        // Must resolve in the model registry with reasoning_encrypted_replay: true
+        // (models/muse-spark-1.3-contributor.json); an unknown identifier makes the
+        // reconstruct gate return early and the rebuild never runs.
+        let model = "muse-spark-1.3-contributor";
         let items = vec![json!({"type":"reasoning","encrypted_content":"ENC"})];
         let messages = vec![assistant_call_with_reasoning(
             "call-1",
@@ -328,7 +331,7 @@ mod encrypted_replay_reconstruct_tests {
     #[test]
     fn live_side_channel_takes_precedence_over_history() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let model = "muse-spark-1.2-contributor";
+        let model = "muse-spark-1.3-contributor";
         let stale = vec![json!({"encrypted_content":"OLD"})];
         let fresh = vec![json!({"encrypted_content":"NEW"})];
         let messages = vec![assistant_call_with_reasoning(
@@ -338,7 +341,8 @@ mod encrypted_replay_reconstruct_tests {
         let mut live: FxHashMap<String, Vec<Value>> = FxHashMap::default();
         live.insert("call-1".to_string(), fresh.clone());
         let rebuilt = reconstruct_encrypted_reasoning_items_for_model(model, &messages, &live);
-        // 内存侧信道（当轮最新）优先，落库旧值不得覆盖。
+        // The in-memory side channel (freshest for the current turn) wins;
+        // archived values must never overwrite it.
         assert_eq!(rebuilt.get("call-1"), Some(&fresh));
     }
 
@@ -347,11 +351,12 @@ mod encrypted_replay_reconstruct_tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let model = "glm-5.2-opencode";
         let items = vec![json!({"encrypted_content":"ENC"})];
-        // 即便历史里带加密标记，非 encrypted-replay 模型也不重建（返回 live 原样）。
+        // Even if history carries an encrypted marker, non encrypted-replay
+        // models never rebuild (they return the live map as-is).
         let messages = vec![assistant_call_with_reasoning(
             "call-1",
             Some(encode_encrypted_reasoning_replay_state(
-                "muse-spark-1.2-contributor",
+                "muse-spark-1.3-contributor",
                 &items,
             )),
         )];
@@ -367,20 +372,22 @@ mod encrypted_replay_reconstruct_tests {
     fn runtime_disable_env_short_circuits_reconstruction() {
         use crate::ai::history::compress::encrypted_reasoning_replay_runtime_enabled;
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // 保存并恢复进程级 env，避免污染并行测试。
+        // Save and restore the process-level env var to avoid polluting parallel tests.
         let saved = std::env::var("AIOS_DISABLE_ENCRYPTED_REPLAY").ok();
 
-        // SAFETY: 单测内串行 set/remove 同一 key 并在结束前恢复；本测试不与其它
-        // 依赖该 env 的测试并行断言。
+        // SAFETY: this test sets/removes the same key serially and restores it
+        // before exiting; it never asserts concurrently with other tests that
+        // depend on this env var.
         unsafe { std::env::set_var("AIOS_DISABLE_ENCRYPTED_REPLAY", "1") };
         assert!(!encrypted_reasoning_replay_runtime_enabled());
-        let model = "muse-spark-1.2-contributor";
+        let model = "muse-spark-1.3-contributor";
         let items = vec![json!({"encrypted_content":"ENC"})];
         let messages = vec![assistant_call_with_reasoning(
             "call-1",
             Some(encode_encrypted_reasoning_replay_state(model, &items)),
         )];
-        // 关闭时即便模型 capable、历史有编码 blob，也不重建。
+        // With replay disabled, no rebuild happens even if the model is capable
+        // and history carries an encoded blob.
         assert!(
             reconstruct_encrypted_reasoning_items_for_model(
                 model,
@@ -462,7 +469,7 @@ mod force_off_effort_tests {
             apply_thinking_force_off_effort(
                 true,
                 ApiProvider::OpenCode,
-                "deepseek-v4-flash-opencode",
+                "deepseek-flash-opencode",
                 "https://api.deepseek.com/v1",
                 Some("low"),
             ),

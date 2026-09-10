@@ -1499,7 +1499,6 @@ fn tightened_ladder_rung_archives_full_text_and_advises_archive_read() {
         &FxHashSet::default(),
     );
     assert_eq!(folded_groups, 4);
-    let archive_dir = overflow_dir.join("folded-tool-groups");
 
     let stubs: Vec<String> = folded
         .iter()
@@ -1589,7 +1588,7 @@ fn protected_precision_group_archives_full_text_so_header_must_not_claim_stub_on
         None,
         &FxHashSet::default(),
     );
-    let (folded, folded_groups) = fold_early_tool_groups(
+    let (_, folded_groups) = fold_early_tool_groups(
         &messages,
         2,
         Some(overflow_dir.as_path()),

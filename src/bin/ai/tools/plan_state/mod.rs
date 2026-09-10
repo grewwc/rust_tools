@@ -11,7 +11,7 @@ mod render;
 mod store;
 
 pub(crate) use model::{PlanState, StepStatus};
-pub(crate) use store::{record_plan, update_plan_step};
+pub(crate) use store::{load_plan_state, plan_state_path, record_plan, update_plan_step};
 
 use serde_json::Value;
 
@@ -48,12 +48,16 @@ fn execute_plan_update(args: &Value) -> Result<String, String> {
         result.push_str(warning);
         result.push('\n');
     }
-    result.push_str(&state.render());
+    // Only the delta reaches the model: the full plan is already in this turn's `plan`
+    // result and in the recovery checkpoint. `render_update_delta` keeps the step line
+    // format that the display echo below extracts from.
+    result.push_str(&state.render_update_delta(step));
     Ok(result)
 }
 
-/// Compact terminal echo for plan_update. The model still receives the complete
-/// plan, while the terminal shows only the changed step, progress, and warnings.
+/// Compact terminal echo for plan_update: the stored result already carries only the changed
+/// step, progress, and remaining steps, so this trims it further to the changed step, the
+/// aggregate progress line, and any warning.
 fn compact_plan_update_echo(content: &str, args: &Value) -> String {
     let step = args.get("step").and_then(|v| v.as_u64());
     let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
@@ -185,5 +189,85 @@ Progress: 0/2 steps done, 1 running, 1 pending.";
             "got: {out}"
         );
         assert!(out.contains("Progress: "), "got: {out}");
+    }
+
+    /// End-to-end wiring of the `plan_update` entry: with a live driver context the entry
+    /// must stay a delta (header, changed step, progress, remaining steps) instead of
+    /// re-echoing the full plan, and the step-not-found path must keep its self-healing
+    /// full-plan echo.
+    #[test]
+    fn plan_update_entry_returns_delta_and_self_healing_error() {
+        use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext};
+        use crate::ai::mcp::{McpClient, SharedMcpClient};
+        use std::sync::{Arc, Mutex};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // The drop guard cleans the temporary session dir even when an assertion panics.
+        struct TempDirGuard(std::path::PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let base = std::env::temp_dir().join(format!(
+            "plan-update-entry-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let _guard = TempDirGuard(base.clone());
+        let mut app = crate::ai::middleware::test_util::test_app();
+        // The plan-state path is derived from `session_history_file`, so keep it under the
+        // temp dir and never let the shared `default.assets/` fallback leak between runs.
+        app.session_history_file = base.join("session.sqlite");
+        app.session_id = "plan-update-entry-test".to_string();
+
+        let steps = json!([
+            { "step": 1, "action": "Read", "tool": "read_file", "reason": "Locate the writer" },
+            { "step": 2, "action": "Patch", "tool": "apply_patch", "reason": "Fix the writer" },
+            { "step": 3, "action": "Verify", "tool": "execute_command", "reason": "Prove the fix" }
+        ]);
+        record_plan(&app, "Demo", steps.as_array().unwrap()).unwrap();
+
+        let ctx = DriverContext::new(
+            app.clone(),
+            Arc::new(Mutex::new(McpClient::new())) as SharedMcpClient,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        );
+
+        DRIVER_CTX.sync_scope(ctx, || {
+            let out = execute_plan_update(&json!({"step": 2, "status": "done"})).unwrap();
+            assert!(out.starts_with("Plan: Demo\n"), "got: {out}");
+            assert!(out.contains("Step 2. [apply_patch] Patch (done)"), "got: {out}");
+            assert!(out.contains("  Reason: Fix the writer\n"), "got: {out}");
+            // Each step appears at most once: the closed-out step is not repeated in the
+            // remaining list below.
+            assert_eq!(out.matches("Step 2.").count(), 1, "got: {out}");
+            assert!(out.contains("Progress: 1/3 steps done"), "got: {out}");
+            assert!(out.contains("Remaining steps:"), "got: {out}");
+            // Delta, not a full re-echo: the plan-time footer bookkeeping stays out, but
+            // every non-terminal step keeps its reason so the most recent delta stays a
+            // self-contained roadmap after context compression. Step 1 is still pending
+            // here (only step 2 was flipped), so it is a remaining step and carries its
+            // reason; a done step would be dropped with its reason.
+            assert!(out.contains("Reason: Locate the writer"), "got: {out}");
+            assert!(out.contains("Reason: Prove the fix"), "got: {out}");
+            assert!(!out.contains("step(s) planned."), "got: {out}");
+            assert!(!out.contains("marked for delegation"), "got: {out}");
+
+            // A step number that is no longer in the plan still returns the full plan so the
+            // model can recover the real numbering after context compression folded the
+            // plan-creation turn away.
+            let err = execute_plan_update(&json!({"step": 9, "status": "done"})).unwrap_err();
+            assert!(err.contains("Step 9 not found"), "got: {err}");
+            assert!(err.contains("Current plan:"), "got: {err}");
+            assert!(err.contains("Step 3. [execute_command] Verify"), "got: {err}");
+        });
     }
 }

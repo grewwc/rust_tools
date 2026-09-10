@@ -1001,3 +1001,48 @@ fn wait_wake_coalesce_sqlite_is_noop_when_nothing_matches() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn read_all_messages_with_models_self_heals_fresh_and_pre_migration_dbs() {
+    let dir = std::env::temp_dir().join(format!(
+        "model_read_self_heal_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Brand-new path: no schema yet -> the reader must return empty, not error
+    // (the messages table only exists after init_history_schema runs).
+    let fresh = dir.join("fresh.sqlite");
+    assert_eq!(read_all_messages_with_models_sqlite(&fresh).unwrap(), vec![]);
+
+    // Pre-migration DB: messages table without the source_model column -> the
+    // reader self-heals via the column migration instead of failing.
+    let legacy = dir.join("legacy.sqlite");
+    let conn = Connection::open(&legacy).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tool_calls TEXT,
+            tool_call_id TEXT,
+            reasoning_content TEXT,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+        INSERT INTO messages (role, content) VALUES ('assistant', '\"hello\"');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let pairs = read_all_messages_with_models_sqlite(&legacy).unwrap();
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0].0.role, "assistant");
+    assert_eq!(pairs[0].0.content, Value::String("hello".to_string()));
+    assert_eq!(pairs[0].1, None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

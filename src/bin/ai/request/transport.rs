@@ -23,9 +23,9 @@ use super::error::{
     REQUEST_MAX_ATTEMPTS, RequestError, RequestErrorKind, RequestRetryPolicy,
     STREAM_RESPONSE_HEADER_TIMEOUT_SECS, api_key_for_request_model, apply_request_auth,
     clear_stale_request_interrupt_before_request, config_forces_thinking,
-    endpoint_for_request_model, is_retryable_reqwest_error, is_retryable_status_with_body,
-    parse_retry_after, request_retry_policy_for_current_context, retry_delay, retry_delay_429,
-    should_retry_status, should_rotate_key, sleep_with_cancel,
+    endpoint_for_request_model, is_deterministic_status_error, is_retryable_reqwest_error,
+    is_retryable_status_with_body, parse_retry_after, request_retry_policy_for_current_context,
+    retry_delay, retry_delay_429, should_retry_status, should_rotate_key, sleep_with_cancel,
 };
 use super::normalize::{
     agent_tools_for_request, fold_resolved_tool_failures, normalize_messages_for_model,
@@ -48,6 +48,48 @@ fn retry_scope_tag() -> String {
         Some(pid) => format!("[pid {pid}] "),
         None => String::new(),
     }
+}
+
+/// Max characters of the error-response body shown in status-retry warnings.
+const RETRY_BODY_SNIPPET_CHARS: usize = 200;
+
+/// Collapses an error-response body into a single-line snippet for status
+/// retry warnings: whitespace runs become single spaces so the diagnostic
+/// stays on one terminal line, then hard-truncates to `max_chars` with an
+/// ellipsis. The body is the only signal telling transient gateway failures
+/// apart from deterministic rejections, and it is never persisted — without
+/// the snippet every 400 looks identical in the terminal.
+fn retry_body_snippet(body: &str, max_chars: usize) -> String {
+    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    format!("{}…", collapsed.chars().take(max_chars).collect::<String>())
+}
+
+/// Whether a failed status response is retried inside the current key's ladder.
+///
+/// `deterministic_rejection` (from `is_deterministic_status_error`) suppresses
+/// the ladder even when the status otherwise looks transient to
+/// `is_retryable_status_with_body`: a deterministic 400 relayed with "upstream"
+/// wording can never succeed by resending the byte-identical payload, so
+/// retrying would burn all `max_attempts` (~2.5 min at 12 attempts) before the
+/// driver's reactive compaction or final error handling runs.
+///
+/// `body` is the raw response body: the status-text prefix that
+/// `RequestError::status` adds carries no retry marker, so classifying the body
+/// directly is equivalent to classifying the built message and lets the caller
+/// keep ownership of the body until the error is actually constructed.
+fn should_retry_status_in_ladder(
+    status: reqwest::StatusCode,
+    body: &str,
+    deterministic_rejection: bool,
+    attempt: usize,
+    max_attempts: usize,
+) -> bool {
+    !deterministic_rejection
+        && is_retryable_status_with_body(status, body)
+        && attempt < max_attempts
 }
 
 async fn wait_for_app_request_interrupt(app: &App) {
@@ -313,23 +355,41 @@ async fn request_messages_with_key(
                     "request canceled by user while reading error response body",
                 )
                 .await?;
-                let mut err = RequestError::status(status, body);
+                // Classify the body before it is moved into the error:
+                // deterministic 400s skip the retry ladder below (an
+                // over-window payload or a validation rejection can never
+                // succeed by resending the identical request).
+                let deterministic_400 = is_deterministic_status_error(status, &body);
 
                 // 429 (quota/rate limit) is not backed off within a single key: return immediately with the clamped retry_after,
                 // let the upper layer rotate other keys first, and only then decide on backoff retry once keys are exhausted.
                 if status_code == 429 {
+                    let mut err = RequestError::status(status, body);
                     err.retry_after = retry_after_delay;
                     return Err(err);
                 }
 
-                if is_retryable_status_with_body(status, &err.message)
-                    && attempt < retry_policy.max_attempts
-                {
+                if should_retry_status_in_ladder(
+                    status,
+                    &body,
+                    deterministic_400,
+                    attempt,
+                    retry_policy.max_attempts,
+                ) {
                     let delay = retry_delay(attempt);
+                    // Built only when a warning is actually emitted, so 429 and
+                    // non-retryable statuses never pay for the snippet.
+                    let snippet = retry_body_snippet(&body, RETRY_BODY_SNIPPET_CHARS);
+                    let body_note = if snippet.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {snippet}")
+                    };
                     super::emit_request_diagnostic(format_args!(
-                        "[Warning] {}{} - sleep {} 秒后重试 (attempt {}/{})",
+                        "[Warning] {}{}{} - sleep {} 秒后重试 (attempt {}/{})",
                         retry_scope_tag(),
                         status,
+                        body_note,
                         delay.as_secs_f32(),
                         attempt,
                         retry_policy.max_attempts
@@ -341,7 +401,7 @@ async fn request_messages_with_key(
                     }
                     continue;
                 }
-                return Err(err);
+                return Err(RequestError::status(status, body));
             }
             Err(err) => {
                 let retryable = match &err.kind {
@@ -1170,5 +1230,82 @@ pub async fn do_request_text_streaming(
             continue;
         }
         return Ok(content);
+    }
+}
+
+#[cfg(test)]
+mod body_snippet_tests {
+    use super::retry_body_snippet;
+
+    #[test]
+    fn snippet_collapses_whitespace_and_truncates_with_ellipsis() {
+        let long = format!("upstream error\n{}\n end", "x".repeat(500));
+        let out = retry_body_snippet(&long, 200);
+        assert!(!out.contains('\n'));
+        assert_eq!(out.chars().count(), 201); // 200 kept chars + ellipsis
+        assert!(out.ends_with('…'));
+
+        // Short bodies pass through intact.
+        assert_eq!(
+            retry_body_snippet("bad request: dangling tool_calls", 200),
+            "bad request: dangling tool_calls"
+        );
+
+        // Whitespace-only bodies collapse to empty so the caller omits the note.
+        assert_eq!(retry_body_snippet("  \n\t ", 200), "");
+    }
+}
+
+/// Ladder decision for failed status responses. The regression this guards
+/// against: a relay-wrapped deterministic 400 (400 + "upstream" + overflow
+/// phrasing) that `is_retryable_status_with_body` alone would ladder through
+/// all 12 attempts before reactive compaction ever saw it.
+#[cfg(test)]
+mod retry_ladder_tests {
+    use super::should_retry_status_in_ladder;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn deterministic_rejection_skips_the_ladder_but_plain_upstream_400_retries() {
+        // Incident shape: retryable by marker, deterministic by classifier.
+        assert!(!should_retry_status_in_ladder(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"upstream error: context_length_exceeded"}}"#,
+            true,
+            1,
+            12
+        ));
+        // Same body without the deterministic verdict stays on the ladder.
+        assert!(should_retry_status_in_ladder(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"upstream request failed"}}"#,
+            false,
+            1,
+            12
+        ));
+        // Plain 400 without "upstream" is not laddered at all.
+        assert!(!should_retry_status_in_ladder(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"bad request"}}"#,
+            false,
+            1,
+            12
+        ));
+        // Exhausted attempt budget stops the ladder.
+        assert!(!should_retry_status_in_ladder(
+            StatusCode::BAD_GATEWAY,
+            "bad gateway",
+            false,
+            12,
+            12
+        ));
+        // 5xx keeps its transient behavior.
+        assert!(should_retry_status_in_ladder(
+            StatusCode::BAD_GATEWAY,
+            "bad gateway",
+            false,
+            1,
+            12
+        ));
     }
 }

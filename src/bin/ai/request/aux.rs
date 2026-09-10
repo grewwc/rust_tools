@@ -793,9 +793,11 @@ mod session_title_tests {
 
     #[test]
     fn aux_request_key_candidates_prefers_named_provider_key() {
-        // 回归：命名 key（opencode.api_key_xxx）配置下，辅助请求（标题/摘要）的
-        // key 候选必须与主请求一致优先使用命名 key；此前只用 primary key 会回退
-        // 到全局 api_key（对网关失效时 401 静默失败 → session 无标题/无摘要）。
+        // Regression: with a named provider key configured (`opencode.api_key_*`), auxiliary
+        // requests (title/summary) must offer the same key candidates as the main request.
+        // Using only the primary key fell back to the global api_key, which fails against the
+        // gateway with a silent 401 (sessions ended up without titles/summaries).
+        // The model is taken from the registry so entry renames cannot break the test.
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -812,14 +814,23 @@ mod session_title_tests {
         unsafe { std::env::set_var("CONFIGW_PATH", &path) };
         crate::commonw::configw::refresh();
 
+        let model = crate::ai::model_names::all()
+            .iter()
+            .find(|m| {
+                m.adapter == crate::ai::provider::ApiProvider::OpenCode
+                    && !m.name.starts_with("enc:")
+            })
+            .copied()
+            .expect("registry must contain an OpenCode entry with a plaintext name");
+
         let keys = aux_request_key_candidates(
-            "deepseek-v4-flash-opencode",
+            &model.key,
             crate::ai::provider::OPENCODE_DEFAULT_ENDPOINT,
             "global-invalid",
         );
         assert_eq!(keys, vec!["named-valid", "global-invalid"]);
 
-        // 清理：恢复原有 CONFIGW_PATH（若有），避免影响同进程后续测试
+        // Restore the previous CONFIGW_PATH (if any) so later tests in this process are unaffected.
         match old_configw_path {
             Some(old) => unsafe { std::env::set_var("CONFIGW_PATH", old) },
             None => unsafe { std::env::remove_var("CONFIGW_PATH") },

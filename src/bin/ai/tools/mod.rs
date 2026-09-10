@@ -6,7 +6,9 @@ pub mod os_tools;
 mod overflow_search;
 mod patch_tools;
 pub(crate) mod permissions;
-mod plan_state;
+// `App` is `pub(in crate::ai)`, so the plan-state API stays at the same visibility; the
+// driver reaches it through this path instead of duplicating plan persistence.
+pub(in crate::ai) mod plan_state;
 mod plan_tools;
 mod rag_tools;
 pub(crate) mod registry;

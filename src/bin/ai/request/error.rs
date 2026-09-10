@@ -391,16 +391,46 @@ pub(crate) fn is_context_overflow_error(err: &RequestError) -> bool {
     if status.as_u16() != 400 {
         return false;
     }
-    let lower = err.message.to_ascii_lowercase();
-    lower.contains("context_length_exceeded")
-        || lower.contains("context length")
-        || lower.contains("context window")
-        || lower.contains("maximum context")
-        || lower.contains("too many tokens")
-        || lower.contains("reduce the length")
-        || lower.contains("input is too long")
-        || lower.contains("prompt is too long")
-        || lower.contains("string too long")
+    context_overflow_body_markers(&err.message.to_ascii_lowercase())
+}
+
+/// Body-text markers (lowercased input) for "input exceeds the model window"
+/// rejections; shared by [`is_context_overflow_error`] and
+/// [`is_deterministic_status_error`] so the two classifiers cannot drift.
+fn context_overflow_body_markers(lower_text: &str) -> bool {
+    lower_text.contains("context_length_exceeded")
+        || lower_text.contains("context length")
+        || lower_text.contains("context window")
+        || lower_text.contains("maximum context")
+        || lower_text.contains("too many tokens")
+        || lower_text.contains("reduce the length")
+        || lower_text.contains("input is too long")
+        || lower_text.contains("prompt is too long")
+        || lower_text.contains("string too long")
+}
+
+/// Whether a 400 response is a deterministic rejection: resending the
+/// byte-identical payload can never succeed, so the transport retry ladder
+/// must be skipped regardless of any "upstream" text the gateway wrapped
+/// around the body (see `is_retryable_status_with_body` — "upstream" 400s are
+/// otherwise treated as transient and laddered up to 12 attempts).
+///
+/// Two families:
+/// - context-overflow rejections (same phrasing as
+///   [`is_context_overflow_error`]); the only cure is shrinking the context,
+///   which the driver's reactive compaction path can do as soon as the error
+///   reaches it instead of after a full backoff ladder;
+/// - provider validation rejections: `invalid_request_error` is the standard
+///   OpenAI-compatible error type for malformed requests and is deterministic
+///   for a fixed payload.
+///
+/// Restricted to 400 so 429/5xx stay on the existing transient/backoff paths.
+pub(crate) fn is_deterministic_status_error(status: StatusCode, body: &str) -> bool {
+    if status.as_u16() != 400 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    context_overflow_body_markers(&lower) || lower.contains("invalid_request_error")
 }
 
 /// Returns `true` if the error indicates an auth or quota issue with the API key
@@ -560,5 +590,38 @@ mod tests {
         assert!(!is_opencode_gateway_endpoint("https://notopencode.ai/v1"));
         assert!(is_opencode_gateway_endpoint("https://opencode.ai./zen/v1"));
         assert!(is_opencode_gateway_endpoint("https://zen.opencode.ai/v1"));
+    }
+
+    #[test]
+    fn deterministic_400_classification_skips_only_deterministic_bodies() {
+        // Overflow phrasing: deterministic; reserved for reactive compaction.
+        assert!(is_deterministic_status_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"This model's maximum context length is 262144 tokens"}}"#
+        ));
+        // Provider validation rejection: deterministic.
+        assert!(is_deterministic_status_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"type":"invalid_request_error","message":"messages with role 'tool' must be a response to a preceding message with 'tool_calls'"}}"#
+        ));
+        // Real incident shape: the relay wrapped an overflow rejection in
+        // "upstream" wording, which `is_retryable_status_with_body` reads as
+        // transient; the classifier must still call it deterministic so the
+        // ladder is skipped and reactive compaction runs immediately.
+        assert!(is_deterministic_status_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"upstream error: context_length_exceeded"}}"#
+        ));
+        // Relay-wrapped transient failure without deterministic markers stays
+        // on the retry ladder.
+        assert!(!is_deterministic_status_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"upstream request failed"}}"#
+        ));
+        // Only 400 is deterministic-classified; 5xx keeps transient handling.
+        assert!(!is_deterministic_status_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "maximum context length exceeded"
+        ));
     }
 }

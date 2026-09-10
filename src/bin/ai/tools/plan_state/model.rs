@@ -59,9 +59,10 @@ impl StepStatus {
         }
     }
 
-    /// 是否为终态：进入 done/failed/skipped 后再次改写成其他状态，属于"覆盖终态"
-    /// （重做/重试/重开），`apply_update` 会在该场景返回 warning 提示。
-    fn is_terminal(self) -> bool {
+    /// Whether the status is terminal: once a step entered `done`/`failed`/`skipped`,
+    /// rewriting it to another status counts as overriding a terminal status
+    /// (redo/retry/reopen), which `apply_update` reports as a warning.
+    pub(crate) fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Failed | Self::Skipped)
     }
 }

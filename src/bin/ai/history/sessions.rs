@@ -19,9 +19,10 @@ use super::{
     sqlite::{
         SessionListMetadata, backup_sqlite, read_all_messages_sqlite,
         read_first_user_prompt_sqlite, read_session_list_metadata_sqlite,
-        read_session_marked_sqlite, read_session_title_origin_sqlite, read_session_title_sqlite,
+        read_session_mark_message_sqlite, read_session_marked_sqlite,
+        read_session_title_origin_sqlite, read_session_title_sqlite,
         remap_context_checkpoint_paths_sqlite, with_session_state_lock,
-        write_session_marked_sqlite, write_session_title_sqlite,
+        write_session_mark_sqlite, write_session_title_sqlite, MarkMessageUpdate,
     },
     types::Message,
 };
@@ -1067,14 +1068,28 @@ impl SessionStore {
         read_session_marked_sqlite(&path)
     }
 
-    /// Persist the session "important" mark (`/mark` / `/unmark`).
-    pub(in crate::ai) fn write_session_marked(
+    /// Read the `/mark` message. A missing session or a session without a
+    /// message yields an empty string.
+    pub(in crate::ai) fn read_session_mark_message(&self, session_id: &str) -> io::Result<String> {
+        Self::validate_session_id(session_id)?;
+        let path = self.session_history_file(session_id);
+        if !path.exists() {
+            return Ok(String::new());
+        }
+        Ok(read_session_mark_message_sqlite(&path)?.unwrap_or_default())
+    }
+
+    /// Atomically persist the session "important" mark flag and its optional
+    /// mark message in one lock + one transaction (see `write_session_mark_sqlite`), so
+    /// `/mark`/`/unmark` never persist a half state.
+    pub(in crate::ai) fn write_session_mark(
         &self,
         session_id: &str,
         marked: bool,
+        message: MarkMessageUpdate<'_>,
     ) -> io::Result<()> {
         Self::validate_session_id(session_id)?;
-        write_session_marked_sqlite(&self.session_history_file(session_id), marked)
+        write_session_mark_sqlite(&self.session_history_file(session_id), marked, message)
     }
 
     /// Whether an LLM-generated title already exists.

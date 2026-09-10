@@ -20,6 +20,7 @@ src/bin/a.rs                # AI agent entry point
 src/bin/ai/                 # AI runtime core
 src/bin/ff/                 # file-finder module embedded by `a` via include! in ai/mod.rs
 src/bin/*.rs                # one-off CLI tools (c, j, secret, pdf, ...) - not part of `a`
+scripts/                    # repo shell/Python helpers (guide: scripts/AGENTS.md)
 crates/aios_kernel/         # scheduler / IPC / process state machine
 crates/rust_tools_macros/   # proc macros
 crates/mcp_stdio/           # shared MCP-over-stdio skeleton: JSON-RPC transport + run<McpServer>
@@ -67,17 +68,15 @@ Prefer an existing focused test before running one.
    them as part of the change (repo-wide Chinese-comment migration).
 3. **Collections**: `rustc-hash` FxHashMap/FxHashSet via re-exports.
 4. **Config keys**: add only in `src/bin/ai/config_schema.rs`.
-5. **AI tools**: schema in `tools/registry/`, logic in `tools/service/`.
-6. **Tests**: keep close to changed module; serial tests use `test_support::ENV_LOCK`.
-7. **Extensibility**: data-driven/registration-based over hardcoded `if`/`else`.
-8. **AGENTS.md maintenance**: after code changes, revise/delete stale rules nearby — don't just append. Contradictory stale rules are worse than missing ones.
-9. **Git safety**: never `stash`/`stash drop` others' uncommitted changes. Use temp branch/worktree or stash only your own.
-10. **Architecture-first**: many fallbacks = wrong data flow — refactor the happy path instead.
+5. **Tests**: keep close to changed module; serial tests use `test_support::ENV_LOCK`.
+6. **Extensibility**: data-driven/registration-based over hardcoded `if`/`else`.
+7. **AGENTS.md maintenance**: after code changes, revise/delete stale rules nearby — don't just append. Contradictory stale rules are worse than missing ones.
+8. **Git safety**: never `stash`/`stash drop` others' uncommitted changes. Use temp branch/worktree or stash only your own.
+9. **Architecture-first**: many fallbacks = wrong data flow — refactor the happy path instead.
 
 ## High-Value Pitfalls
 
 1. `.agent` / builtin `.skill` files are compiled in via `include_str!` (editing recompiles); user `.skill` files load at runtime.
 2. `src/bin/ff/` is embedded into `a` via `include!` in `src/bin/ai/mod.rs` (`a.rs`
    itself is just `mod ai;`); changes affect the agent binary.
-3. `runtime_ctx::effective_cwd()` is the working-directory authority for tools and sub-agents.
-4. `objc2*` deps are macOS-only.
+3. `objc2*` deps are macOS-only.

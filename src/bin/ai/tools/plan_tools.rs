@@ -25,7 +25,13 @@ fn execute_plan(args: &Value) -> Result<String, String> {
     if let Some(ctx) = crate::ai::driver::runtime_ctx::try_current() {
         match crate::ai::tools::plan_state::record_plan(&ctx.app_proto, summary, steps) {
             // Render persisted state so replanning preserves completed-step suffixes and progress.
-            Ok(state) => Ok(state.render()),
+            Ok(state) => Ok(format!(
+                "{}\nPlan state persists at {} (plan-state.json, session assets) and survives \
+                 context compression; read it with read_file if you need the current steps later. \
+                 `plan` only creates or replaces a plan — keep statuses current with `plan_update`.\n",
+                state.render(),
+                crate::ai::tools::plan_state::plan_state_path(&ctx.app_proto).display()
+            )),
             Err(e) => Ok(format!(
                 "{rendered}\nWarning: could not register this plan as session state (plan_update will fail until this is fixed): {e}\n"
             )),
@@ -315,6 +321,22 @@ mod tests {
             let first = execute_plan(&args).unwrap();
             assert!(!first.contains("(done)"));
             assert!(!first.contains("Progress: 1/2 steps done."));
+            // The persistence pointer teaches the model that the plan survives context
+            // compression (readable via read_file on plan-state.json; `plan` itself is
+            // create/replace-only and must never be used to "view" it), so it never has
+            // to guess step numbers after early turns are folded away.
+            assert!(
+                first.contains("plan-state.json"),
+                "new plan echo must point at the persisted state:\n{first}"
+            );
+            assert!(
+                first.contains("read_file"),
+                "new plan echo must point at a read-only way to see the plan:\n{first}"
+            );
+            assert!(
+                !first.contains("re-view"),
+                "plan echo must not suggest calling `plan` to view (it creates/replaces):\n{first}"
+            );
 
             // Persist step 1 through the same load-mutate-save path as plan_update.
             crate::ai::tools::plan_state::update_plan_step(&app, 1, StepStatus::Done, None)

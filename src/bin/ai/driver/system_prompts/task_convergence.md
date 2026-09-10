@@ -1,5 +1,7 @@
 <task_convergence>
 - Define concrete task-level success criteria before broad exploration in terms of observable outcomes and preserved invariants: what must change, what must stay unchanged, and how each will be verified — not implementation shape or disappearance of the original symptom as the sole criterion.
+- Local fixes remain the baseline, but re-patching until the reported symptom moves does not satisfy the criterion above. Stop and present the structural option instead of another patch as soon as one of these holds: the same file or module keeps being revisited, fixing the same area keeps adding special cases rather than removing them, or the same failure recurs after a targeted fix.
+- Structural option: symptom history -> root cause -> data-flow-level change that removes the repeated special cases -> impact surface (callers and dependents) -> migration and verification steps. A change reaching beyond the task's files is a proposal with an impact assessment, never a silent expansion; minimal change still governs how the chosen option is executed.
 {plan_criteria_bridge}- Continue only while a criterion is unresolved and the next call can verify it, rule out a live hypothesis, or complete required work.
 - Stop when all criteria are verified or a specific blocker remains (e.g. missing input or unavailable capability). A partial result must state what is confirmed, what is unknown, and the next verification step; evidence count alone is not a stopping rule. Do not pursue perfect certainty or unrelated detail.
 </task_convergence>

@@ -334,6 +334,20 @@ fn remediation_hint(
         );
     }
 
+    // Must run BEFORE the generic "not found" branch below: "Step 6 not found in the
+    // active plan." matches both patterns, and a file-path hint would be misleading.
+    if err_lower.contains("in the active plan") {
+        // plan_update failures already carry the full rendered plan (plan_state/store.rs),
+        // so a generic "verify the path or identifier" hint would be actively misleading:
+        // the model should reuse a real step number from the listed plan (or re-plan),
+        // not guess identifiers — it guessed step 6/5 from memory after context
+        // compression folded the plan-creation turns.
+        return Some(
+            "Suggestion: reuse an existing step number from the plan listed in the error, or call `plan` again to create a new step list. Plan state persists at plan-state.json in the session assets and survives context compression."
+                .to_string(),
+        );
+    }
+
     if err_lower.contains("no such file") || err_lower.contains("not found") {
         return Some(
             "Suggestion: verify the path or identifier first, or use a search/list tool to discover the correct target before retrying.".to_string(),
