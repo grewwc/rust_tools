@@ -6,9 +6,11 @@ fullwidth parentheses in plain prose and fullwidth colons / full stops that
 directly abut an ASCII letter.  A full stop immediately before an inline-code
 span that starts with an ASCII letter is treated the same way.  Other Chinese
 punctuation in plain prose is left untouched.  Halfwidth English sentence
-punctuation in plain prose is spaced away from any directly abutting CJK
-ideograph (exception 7), so a mark never jams against a Chinese character in
-mixed CJK/ASCII prose.
+punctuation in plain prose gets a space *after* it when a CJK ideograph or
+an inline-code span follows, and a halfwidth `(` directly abutting an
+ideograph or a closing code span gets a space *before* it (exception 7), so
+mixed CJK/ASCII prose never jams while the mark stays attached to the word
+or code span it punctuates.
 
 Contexts that are translated (Chinese -> ASCII punctuation):
 
@@ -66,22 +68,24 @@ Contexts that are translated (Chinese -> ASCII punctuation):
      tokens such as `main。rs` (a typo for `main.rs`).
 
   7. Halfwidth English sentence punctuation (`,` `.` `!` `?` `;` `:`) in
-     plain prose: a space is inserted wherever the mark directly abuts a CJK
-     ideograph -- before the mark when the ideograph precedes it
-     (`完成,rustc` becomes `完成 ,rustc`), after the mark when the ideograph
-     follows it (`rustc,完成` becomes `rustc, 完成`), and on both sides when
-     it sits between two ideographs (`完成!继续` becomes `完成 ! 继续`).  A
-     side that already has whitespace is left alone; a mark at a line end, or
-     at an ANSI or inline-code boundary, keeps no leading space, so no
-     trailing whitespace is produced.  A mark whose neighbours are ASCII
-     letters, digits, or other punctuation is untouched (`Hello,world`,
-     `1,000`, `a, b` stay as-is), and parens / quotes are deliberately not in
-     the set (a space inside `(注)` would read as `( 注 )`; fullwidth parens
-     have their own spacing, exception 4).  Inside fenced blocks, inline code
-     spans, and path spans the marks are token content and are never spaced
-     -- a space would corrupt tokens such as `main.rs:10`.  The rule also
-     applies to the halfwidth marks produced by exceptions 5 and 6
-     (`完成。Next` becomes `完成. Next`, then `完成 . Next`).
+     plain prose: a space is inserted *after* the mark, never before it, so
+     the mark stays attached to the preceding word or code span.  The space
+     is added when the mark is followed by a CJK ideograph (`rustc,完成`
+     becomes `rustc, 完成`; `完成!继续` becomes `完成! 继续`) or by an
+     inline-code span (`` `a`,`b` `` becomes `` `a`, `b` ``).  A mark
+     followed by ASCII letters, digits, punctuation, whitespace, or a line
+     end is untouched (`Hello,world`, `1,000`, `a, b`, `完成:rustc` stay
+     as-is), so no leading or trailing whitespace is ever produced.  A
+     halfwidth `(` gets one space *before* it when it directly follows a CJK
+     ideograph or a closing inline-code backtick (`函数(x)` becomes
+     `函数 (x)`; `` `code`(注) `` becomes `` `code` (注) ``), but never
+     after an ASCII letter, so call syntax such as `f(x)` stays bare; the
+     closing `)` is never spaced (no `( 注 )`; fullwidth parens have their
+     own rule, exception 4).  Inside fenced blocks, inline code spans, and
+     path spans the marks are token content and are never spaced -- a space
+     would corrupt tokens such as `main.rs:10`.  The same trailing-space
+     outcome applies to the halfwidth marks produced by exceptions 5 and 6
+     (`完成。Next` becomes `完成. Next`).
 
 ANSI escape sequences are preserved verbatim and act as token boundaries, so
 the script can also be used as a pipe filter directly on rendered terminal
@@ -180,29 +184,31 @@ def _prose_ascii_adjacent_bare_sub(m):
     return ":" if m.group(0) == "\uff1a" else "."
 
 
-# Halfwidth English sentence punctuation in plain prose: a space is inserted
-# wherever the mark directly abuts a CJK ideograph (module docstring,
-# exception 7) -- before the mark when the ideograph precedes it
-# (`完成,rustc` -> `完成 ,rustc`), after the mark when the ideograph follows
-# (`rustc,完成` -> `rustc, 完成`), and on both sides when it sits between two
-# ideographs (`完成!继续` -> `完成 ! 继续`).  A side that already has
-# whitespace is untouched, and a mark at a line end or ANSI / inline-code
-# boundary keeps no leading space (no trailing whitespace).  Marks next to
-# ASCII letters, digits, or other punctuation are not affected (`Hello,world`,
-# `1,000`, `a, b`); parens / quotes are deliberately not in the set (a space
-# inside `(注)` would read as `( 注 )`), and code / path contexts are handled
-# upstream with bare replacements, so this never touches a token such as
-# `main.rs:10`.  Two passes: the leading-space pass first, then the trailing
-# one -- a single alternation could only fire once per mark.
-_PROSE_CJK_LEAD_SPACE_RE = re.compile(r"(?<=[\u4e00-\u9fff])([,.;:!?])(?=.)")
+# Halfwidth English sentence punctuation in plain prose (module docstring,
+# exception 7): a space is inserted only *after* a mark, when a CJK ideograph
+# directly follows (`rustc,完成` -> `rustc, 完成`), so the mark stays glued
+# to the word it punctuates (`完成,rustc` keeps no leading space).  A mark
+# followed by ASCII, punctuation, whitespace, or a line end is untouched
+# (`Hello,world`, `1,000`, `a, b`, `请确认:`).  `(` is handled separately:
+# it is the only mark that receives a *leading* space, and only when it
+# directly follows a CJK ideograph -- `f(x)` call syntax (an ASCII letter
+# before the paren) stays bare.  Code / path contexts translate upstream with
+# bare replacements, so tokens such as `main.rs:10` are never touched here.
+# This pass runs on each prose *fragment* between inline code spans; the
+# split loop in _translate_prose_punct handles the span-boundary cases
+# (`` `a`,`b` ``, `` `code`(注) ``) where the mark or `(` directly abuts a
+# backtick delimiter.
 _PROSE_CJK_TRAIL_SPACE_RE = re.compile(r"([,.;:!?])(?=[\u4e00-\u9fff])")
+_PROSE_CJK_OPEN_PAREN_SPACE_RE = re.compile(r"(?<=[一-鿿])\(")
 
 
 def _space_cjk_abut(text):
-    """Insert a space between a halfwidth sentence-punctuation mark and any
-    directly abutting CJK ideograph (module docstring, exception 7)."""
-    text = _PROSE_CJK_LEAD_SPACE_RE.sub(r" \1", text)
-    return _PROSE_CJK_TRAIL_SPACE_RE.sub(r"\1 ", text)
+    """Space halfwidth sentence punctuation inside one prose fragment (the
+    text between inline code spans; module docstring, exception 7): one
+    trailing space before a following CJK ideograph, and one leading space
+    before a `(` that directly follows an ideograph."""
+    text = _PROSE_CJK_TRAIL_SPACE_RE.sub(r"\1 ", text)
+    return _PROSE_CJK_OPEN_PAREN_SPACE_RE.sub(r" (", text)
 
 
 def _translate(s):
@@ -313,14 +319,16 @@ def _process_path_run(run):
 def _translate_prose_punct(text):
     """Convert remaining fullwidth parentheses to ASCII, and the fullwidth
     colon / period to `: ` / `. ` in prose when they directly abut an ASCII
-    letter, then space halfwidth sentence punctuation away from any directly
-    abutting CJK ideograph (exception 7).  These inside fenced blocks, inline
-    code spans, and path spans are already translated by the upstream passes
-    with a bare `.`/`:` (a space would corrupt tokens such as `main.rs:10`,
-    `C:\\Users`, or `main。rs`); whatever `（`/`）`/`：`/`。` is left is
-    prose-level and gets converted here (see module docstring,
-    exceptions 4-6).  Exception 7 runs on the prose between inline code spans
-    only, whose halfwidth marks are token content."""
+    letter, then apply exception 7: a trailing space after a halfwidth
+    sentence mark when a CJK ideograph or an inline-code span follows, and a
+    leading space before a halfwidth `(` following an ideograph or a closing
+    code span.  Marks inside fenced blocks, inline code spans, and path
+    spans are already translated by the upstream passes with a bare `.`/`:`
+    (a space would corrupt tokens such as `main.rs:10`, `C:\\Users`, or
+    `main。rs`); whatever `（`/`）`/`：`/`。` is left is prose-level and gets
+    converted here (see module docstring, exceptions 4-6).  Exception 7 runs
+    on each prose fragment between inline code spans, plus span-boundary
+    spacing in the split loop below; marks inside spans are token content."""
     out = []
     # Apply every rule per visible segment: ANSI codes are token boundaries,
     # so a char never "sees" an escape byte (e.g. the trailing `m` of a SGR
@@ -330,8 +338,9 @@ def _translate_prose_punct(text):
         # Fullwidth parens to halfwidth with a separating space, but only
         # where the space cannot break Markdown emphasis flanking: `）` is
         # spaced before a word / CJK char or an opening bracket, and `（` is
-        # spaced after a word / CJK char, a closing bracket, or a closing
-        # `**` (non-space + `**`).  Everywhere else -- line edges,
+        # spaced after a word / CJK char, a closing bracket, a closing `**`
+        # (non-space + `**`), or a closing inline-code backtick.  Everywhere
+        # else -- line edges,
         # whitespace, emphasis delimiters as in `**（x）**`, fullwidth
         # punctuation -- the paren is replaced bare: a space next to a
         # delimiter renders the `**` as literal text, and a space before
@@ -341,7 +350,7 @@ def _translate_prose_punct(text):
         # Order matters: `）` is handled first.
         visible = re.sub(r"\uff09(?=[\w(\[])", ") ", visible)
         visible = re.sub(
-            r"(?:(?<=[\w)\]）】」』])|(?<=\S\*\*))\uff08", " (", visible
+            r"(?:(?<=[\w)\]）】」』])|(?<=\S\*\*)|(?<=`))\uff08", " (", visible
         )
         visible = visible.replace("\uff08", "(").replace("\uff09", ")")
         visible = _PROSE_ASCII_ADJACENT_SPACED_RE.sub(
@@ -350,16 +359,32 @@ def _translate_prose_punct(text):
         visible = _PROSE_ASCII_ADJACENT_BARE_RE.sub(
             _prose_ascii_adjacent_bare_sub, visible
         )
-        # Exception 7: space halfwidth sentence punctuation away from abutting
-        # CJK ideographs, on the prose between inline code spans only (a mark
-        # inside a span is token content and would be corrupted by a space).
+        # Exception 7: each prose fragment between inline code spans gets a
+        # trailing space after a mark directly followed by a CJK ideograph,
+        # and a leading space before a `(` directly following an ideograph.
+        # Span boundaries are handled in this same loop: a fragment that ends
+        # with a sentence mark directly abuts the next span's opening
+        # backtick, so the mark gets one trailing space (`` `a`,`b` `` ->
+        # `` `a`, `b` ``); a fragment starting with `(` directly follows the
+        # previous span's closing backtick, so it gets one leading space
+        # (`` `code`(注) `` -> `` `code` (注) ``).  Existing whitespace means
+        # the endswith / startswith predicates do not fire, so no space is
+        # ever doubled, and span contents are never seen by these predicates.
         parts = []
         pos = 0
         for m in _INLINE_CODE_RE.finditer(visible):
-            parts.append(_space_cjk_abut(visible[pos : m.start()]))
+            fragment = _space_cjk_abut(visible[pos : m.start()])
+            if pos > 0 and fragment.startswith("("):
+                fragment = " " + fragment
+            if fragment.endswith((",", ".", ";", ":", "!", "?")):
+                fragment += " "
+            parts.append(fragment)
             parts.append(m.group(0))
             pos = m.end()
-        parts.append(_space_cjk_abut(visible[pos:]))
+        tail = _space_cjk_abut(visible[pos:])
+        if pos > 0 and tail.startswith("("):
+            tail = " " + tail
+        parts.append(tail)
         out.append("".join(parts))
         out.append(ansi)
     return "".join(out)
@@ -456,13 +481,13 @@ def _selftest():
         # Prose transition: comma after a path stays Chinese.
         ("查看 src/main.rs，请确认", "查看 src/main.rs，请确认"),
         # Prose colon -> ': ' only when it directly abuts an ASCII letter
-        # (either side); pure-Chinese labels keep the fullwidth form.  The
-        # halfwidth result then gets exception 7's leading space when an
-        # ideograph precedes it.
+        # (either side); pure-Chinese labels keep the fullwidth form.
+        # Exception 7 adds no leading space, so a converted colon / period
+        # stays attached to the ASCII word it punctuates.
         ("他说：你好，世界。请确认！", "他说：你好，世界。请确认！"),
         ("文件：/tmp/x，处理完成。", "文件：/tmp/x，处理完成。"),
         ("使用 rustc：完成", "使用 rustc: 完成"),
-        ("完成：Next step", "完成 : Next step"),
+        ("完成：Next step", "完成: Next step"),
         # Colon at end of line: bare `:` after ASCII (no trailing space),
         # fullwidth after pure-Chinese labels.
         ("运行 cargo check：", "运行 cargo check:"),
@@ -470,12 +495,12 @@ def _selftest():
         # Prose period -> '. ' only when it directly abuts an ASCII letter
         # (either side); pure-Chinese periods keep the fullwidth form.
         ("使用 rustc。下一步继续", "使用 rustc. 下一步继续"),
-        ("完成。Next step 继续", "完成 . Next step 继续"),
+        ("完成。Next step 继续", "完成. Next step 继续"),
         # Markdown delimiters do not render, so a period before an
         # ASCII-leading inline-code span needs its prose space outside code;
-        # exception 7 then adds the leading space (the period abuts the
-        # ideograph).
-        ("提示规则。`src/main.rs:10`", "提示规则 . `src/main.rs:10`"),
+        # the converted period already carries that trailing space, and no
+        # leading space is added.
+        ("提示规则。`src/main.rs:10`", "提示规则. `src/main.rs:10`"),
         # A CJK-leading inline-code span is not ASCII-adjacent and stays
         # untouched.
         ("提示规则。`路径`", "提示规则。`路径`"),
@@ -532,9 +557,9 @@ def _selftest():
         ("完成).然后退出", "完成). 然后退出"),
         # Not abutting CJK: kept.
         ("a,b 与 1,000 件", "a,b 与 1,000 件"),
-        # A mark that already has a trailing space still gets the leading
-        # space when an ideograph precedes it.
-        ("已写入, 请确认", "已写入 , 请确认"),
+        # A mark that already has a trailing space keeps it; no leading
+        # space is added.
+        ("已写入, 请确认", "已写入, 请确认"),
         # A period directly before CJK is spaced even after a letter or a
         # dot; `main.rs.未` is prose here (span protection requires CJK
         # punctuation in the run), so it is spaced too.
@@ -554,19 +579,18 @@ def _selftest():
         # Colon before whitespace reuses the existing space (no doubling).
         ("使用 rustc： 完成", "使用 rustc: 完成"),
         # Exception 7: halfwidth English sentence punctuation abutting a CJK
-        # ideograph in prose gets a space on that side -- before the mark
-        # when the ideograph precedes it, after when it follows, both when it
-        # sits between two ideographs.  A side already separated by
-        # whitespace is untouched.
+        # ideograph in prose gets a space only AFTER the mark (never before),
+        # so it stays attached to the preceding word; a mark followed by
+        # ASCII keeps no space at all.
         ("rustc:完成", "rustc: 完成"),
-        ("完成:rustc", "完成 :rustc"),
-        ("完成!继续", "完成 ! 继续"),
-        ("完成?继续", "完成 ? 继续"),
-        ("请确认;然后执行", "请确认 ; 然后执行"),
-        ("使用rustc,完成!继续", "使用rustc, 完成 ! 继续"),
-        ("完成, 继续", "完成 , 继续"),
-        ("完成! 继续", "完成 ! 继续"),
-        ("在 2026年9月8日,完成", "在 2026年9月8日 , 完成"),
+        ("完成:rustc", "完成:rustc"),
+        ("完成!继续", "完成! 继续"),
+        ("完成?继续", "完成? 继续"),
+        ("请确认;然后执行", "请确认; 然后执行"),
+        ("使用rustc,完成!继续", "使用rustc, 完成! 继续"),
+        ("完成, 继续", "完成, 继续"),
+        ("完成! 继续", "完成! 继续"),
+        ("在 2026年9月8日,完成", "在 2026年9月8日, 完成"),
         # Marks next to ASCII letters, digits, or other punctuation are
         # untouched; parens / quotes are deliberately not in the set.
         ("Hello,world 与 a,b 与 1,000", "Hello,world 与 a,b 与 1,000"),
@@ -577,6 +601,26 @@ def _selftest():
         ("已完成,", "已完成,"),
         # Inside inline code spans the marks are token content.
         ("`完成!继续` 保持原样", "`完成!继续` 保持原样"),
+        # Halfwidth `(` after a CJK ideograph gets a leading space, while
+        # call syntax after an ASCII letter stays bare.
+        ("函数(x)调用 f(x) 保持", "函数 (x)调用 f(x) 保持"),
+        # A halfwidth / fullwidth `(` directly after a closing code span gets
+        # a leading space.
+        ("写入 `index=ToBViking.DIM_VALUE_INDEX`(默认名) 即可",
+         "写入 `index=ToBViking.DIM_VALUE_INDEX` (默认名) 即可"),
+        ("写入 `index`（默认名）", "写入 `index` (默认名)"),
+        # A sentence mark directly between two inline code spans gets a
+        # trailing space; an existing space is not doubled.
+        ("使用 `dim_value_index`,`tob_viking.py:148` 解析",
+         "使用 `dim_value_index`, `tob_viking.py:148` 解析"),
+        ("使用 `a`, `b`", "使用 `a`, `b`"),
+        # The comma inside the first span is token content; the boundary
+        # comma between the two spans still gets its trailing space.
+        ("使用 `a,`,`b`", "使用 `a,`, `b`"),
+        # Semicolon / colon follow the same trailing-space-only rule, and a
+        # mark with ASCII on both sides is untouched.
+        ("完成;下一步 与 rustc:完成 与 完成:rustc",
+         "完成; 下一步 与 rustc: 完成 与 完成:rustc"),
     ]
     failures = 0
     for i, (inp, expected) in enumerate(cases, 1):
