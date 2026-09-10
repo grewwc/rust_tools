@@ -14,6 +14,7 @@
 // =============================================================================
 
 use std::io::Write;
+use std::time::Duration;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -24,14 +25,16 @@ use super::{
     MID_TURN_COMPRESS_SOFT_FLOOR, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
     MID_TURN_LLM_SUMMARY_MAX_CHARS,
     finalize::finalize_turn,
-    iteration::{execute_turn_iteration, refresh_skill_turn_for_iteration},
+    iteration::{
+        execute_turn_iteration, finish_interrupted_turn, refresh_skill_turn_for_iteration,
+    },
     mid_turn_compress_hard_threshold, mid_turn_compress_soft_threshold,
     persistence::persist_pending_turn_messages,
     prepare::prepare_turn,
     record_llm_summary_attempt_chars, should_try_llm_summary,
     tool_result::{
-        DEGENERATE_REPETITION_FINISH_REASON, FinalGateState, audit_evidence_gate_action,
-        completion_evidence_state, completion_tool_result_succeeded,
+        append_empty_response_retry_note, DEGENERATE_REPETITION_FINISH_REASON, FinalGateState,
+        audit_evidence_gate_action, completion_evidence_state, completion_tool_result_succeeded,
         handle_iteration_execution_for_model, is_evidence_gated_audit_agent,
         tool_call_is_successful_mutation_candidate,
     },
@@ -1427,6 +1430,54 @@ async fn run_turn_body(
                     );
                     output.assistant_text = "[Model returned empty responses repeatedly; please retry or switch models]".to_string();
                     break 'turn Ok(None);
+                }
+                // Spaced retry instead of blind back-to-back resends: consecutive empty
+                // responses are usually a short provider outage (HTTP 200, no content) that
+                // clears within tens of seconds — every immediate retry lands inside the
+                // fault window (observed: 6/6 failures, then a manual retry 15s later
+                // succeeded). Back off exponentially (2s, 4s, 8s, then capped at 10s) so
+                // later attempts land after recovery, and append an in-memory note so the
+                // retried request body differs from the failed one (guards against
+                // deterministic gateway/cache failures on byte-identical prompts). No model
+                // downgrade here: the failure is transient, not a model-capability issue.
+                append_empty_response_retry_note(
+                    &mut messages,
+                    retry.consecutive_empty_responses,
+                );
+                const EMPTY_RESPONSE_RETRY_BACKOFF_BASE_SECS: u64 = 2;
+                const EMPTY_RESPONSE_RETRY_BACKOFF_MAX_SECS: u64 = 10;
+                let shift = retry
+                    .consecutive_empty_responses
+                    .saturating_sub(1)
+                    .min(3) as u32;
+                let backoff = Duration::from_secs(
+                    EMPTY_RESPONSE_RETRY_BACKOFF_BASE_SECS
+                        .saturating_mul(1u64 << shift)
+                        .min(EMPTY_RESPONSE_RETRY_BACKOFF_MAX_SECS),
+                );
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "  ▲ empty response #{}, backing off {}s before retrying",
+                    retry.consecutive_empty_responses,
+                    backoff.as_secs()
+                );
+                if crate::ai::request::sleep_with_cancel(app, backoff).await {
+                    // User interrupted (Ctrl+C) or shut down during the backoff: end the turn
+                    // through the same path as a mid-stream cancel (finish_interrupted_turn).
+                    // That flushes pending turn messages to canonical history and returns a
+                    // TurnOutcome, so we must exit via `Ok(Some(outcome))` (which skips
+                    // finalize_turn): a bare `Ok(None)` would hit finalize_turn's empty-text
+                    // branch, which neither persists this turn's rounds nor shows anything but
+                    // "no response". Goal-continuation logic keys on last_turn_interrupted
+                    // (set inside finish_interrupted_turn) to keep goal mode.
+                    let outcome = finish_interrupted_turn(
+                        app,
+                        one_shot_mode,
+                        &turn_messages,
+                        &mut persisted_turn_messages,
+                        should_quit,
+                    );
+                    break 'turn Ok(Some(outcome));
                 }
             } else {
                 retry.consecutive_empty_responses = 0;

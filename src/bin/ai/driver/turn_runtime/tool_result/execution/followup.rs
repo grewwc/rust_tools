@@ -206,6 +206,51 @@ pub(in crate::ai::driver::turn_runtime) fn append_truncation_retry_note(
     });
 }
 
+pub(in crate::ai::driver::turn_runtime) const EMPTY_RESPONSE_RETRY_NOTE_PREFIX: &str =
+    "tool_followup:empty_response_retry\n";
+
+/// After an empty response (no text, no tool calls, no reasoning content), append a
+/// lightweight note before the automatic retry so the retried request body differs from
+/// the failed one. Rationale: providers occasionally return successful-but-empty
+/// completions deterministically for a byte-identical prompt (gateway/cache state);
+/// changing the body gives the retry a chance to bypass that state. The note deliberately
+/// gives no behavioral instruction — a transient empty response needs no corrective hint,
+/// and telling the model to "continue" could alter its next answer.
+///
+/// In-memory only (same rule as the truncation note): it lives in `messages` for this
+/// turn and is never written to the persisted `turn_messages` track, so it cannot replay
+/// into later turns. Idempotent: the previous empty-response note is replaced with the
+/// latest one, and any stale truncation/degenerate-repetition hint is cleared too — a
+/// response that came back empty invalidates the previous "shrink your output"
+/// instruction, so the two signals can never stack.
+pub(in crate::ai::driver::turn_runtime) fn append_empty_response_retry_note(
+    messages: &mut Vec<Message>,
+    consecutive_empty_responses: usize,
+) {
+    messages.retain(|message| {
+        !(message.role == ROLE_INTERNAL_NOTE
+            && message.content.as_str().is_some_and(|content| {
+                content.starts_with(EMPTY_RESPONSE_RETRY_NOTE_PREFIX)
+                    || content.starts_with(TRUNCATION_RETRY_NOTE_PREFIX)
+                    || content.starts_with(DEGENERATE_REPETITION_RETRY_NOTE_PREFIX)
+            }))
+    });
+    let note = format!(
+        "{}The previous generation returned an empty response (retry #{}). This is usually a \
+         transient provider-side failure; the runtime is retrying with the same context. \
+         Continue the task normally from the current state; you do not need to acknowledge \
+         this note.",
+        EMPTY_RESPONSE_RETRY_NOTE_PREFIX, consecutive_empty_responses
+    );
+    messages.push(Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: serde_json::Value::String(note),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
 pub(in crate::ai::driver::turn_runtime) fn extract_image_paths_from_file_read_tool_calls(
     tool_calls: &[ToolCall],
 ) -> Vec<String> {

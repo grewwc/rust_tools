@@ -809,7 +809,7 @@ fn shutdown_iteration_execution(
     ))
 }
 
-fn finish_interrupted_turn(
+pub(in crate::ai::driver::turn_runtime) fn finish_interrupted_turn(
     app: &mut App,
     one_shot_mode: bool,
     turn_messages: &[Message],

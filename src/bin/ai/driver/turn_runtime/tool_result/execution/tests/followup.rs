@@ -754,3 +754,46 @@ fn runtime_synthetic_user_auto_image_followup_is_multimodal() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn empty_response_retry_note_is_idempotent_and_clears_stale_hints() {
+    // A stale truncation hint must not survive: an empty response invalidates the
+    // previous "shrink your output" instruction, so the two signals never stack.
+    let mut messages = vec![Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(format!(
+            "{TRUNCATION_RETRY_NOTE_PREFIX}shrink your output next round"
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    append_empty_response_retry_note(&mut messages, 1);
+    assert_eq!(messages.len(), 1, "stale truncation note must be replaced, not stacked");
+    assert!(
+        messages[0]
+            .content
+            .as_str()
+            .is_some_and(|c| c.starts_with(EMPTY_RESPONSE_RETRY_NOTE_PREFIX)),
+        "the only remaining note must be the empty-response retry note"
+    );
+    assert!(
+        messages[0]
+            .content
+            .as_str()
+            .is_some_and(|c| c.contains("(retry #1)")),
+        "note must carry the retry count so each retried request body differs"
+    );
+
+    // A second empty response replaces the note with the updated count (idempotent).
+    append_empty_response_retry_note(&mut messages, 2);
+    assert_eq!(messages.len(), 1);
+    assert!(
+        messages[0]
+            .content
+            .as_str()
+            .is_some_and(|c| c.starts_with(EMPTY_RESPONSE_RETRY_NOTE_PREFIX)
+                && c.contains("(retry #2)"))
+    );
+}
