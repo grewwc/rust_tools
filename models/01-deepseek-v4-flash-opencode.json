@@ -6,7 +6,7 @@
   "name": "deepseek-flash",
   "adapter": "opencode",
   "quality_tier": "strong",
-  "is_vl": false,
+  "is_vl": true,
   "search_enabled": true,
   "tools_default_enabled": true,
   "enable_thinking": true,

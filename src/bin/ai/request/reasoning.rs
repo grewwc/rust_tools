@@ -65,10 +65,19 @@ pub(super) fn resolve_reasoning_wire_controls<'a>(
     (thinking, top_level_reasoning_effort, nested_reasoning)
 }
 
-/// 按模型能力归一化 tool-call assistant 的 `reasoning_content` 回放策略：
-/// - GLM 等声明 exact replay 的模型保留服务端原文，维持跨工具调用连续性；
-/// - DeepSeek 等要求字段回传的模型保留现有原文，缺失时补空字符串；
-/// - 其余模型彻底移除隐藏 reasoning，避免跨 turn 泄漏和上下文膨胀。
+/// Normalize the assistant `reasoning_content` replay policy by model capability:
+/// - Models that must echo the field back (DeepSeekThinkingDialect) keep the
+///   field shape on **every** replayed assistant message, including non-tool-call
+///   turns and empty reasoning: an own exact-replay blob decodes back to the
+///   original provider text, foreign/encrypted markers are cleared to an empty
+///   string, and a missing field is filled with an empty string — a missing
+///   field is rejected by the gateway with 400 "The `reasoning_content` in the
+///   thinking mode must be passed back", while an empty string passes.
+/// - Models declaring exact replay (GLM) only replay the original provider text
+///   for tool-call rounds (by decoding the internal marker) to preserve
+///   cross-tool-call continuity; non-tool-call messages strip hidden reasoning.
+/// - All other models strip hidden reasoning entirely, avoiding cross-turn
+///   leakage and context bloat.
 pub(super) fn normalize_reasoning_content_replay_for_model(model: &str, messages: &mut [Message]) {
     let exact_replay = models::reasoning_content_replay_enabled(model);
     let adapter_kind = models::model_adapter(model);
@@ -81,43 +90,53 @@ pub(super) fn normalize_reasoning_content_replay_for_model(model: &str, messages
         if message.role != "assistant" {
             continue;
         }
+        if shape_only_replay {
+            // The DeepSeek thinking-mode gateway validates that every replayed
+            // assistant message carries `reasoning_content` (see the function
+            // docs), so this branch covers all assistant messages, not only
+            // tool-call rounds. Persisted replay state (exact or encrypted
+            // markers) must never be sent verbatim to the provider: an own exact
+            // marker decodes back to the original text, and any other marker
+            // (cross-model / encrypted) is cleared to an empty string to keep
+            // only the field shape.
+            let current = message.reasoning_content.take();
+            message.reasoning_content = Some(match &current {
+                Some(reasoning)
+                    if crate::ai::history::compress::is_persisted_reasoning_replay(
+                        reasoning,
+                    ) =>
+                {
+                    crate::ai::history::compress::decode_reasoning_replay_for_model(
+                        model, reasoning,
+                    )
+                    .unwrap_or_default()
+                }
+                Some(reasoning) => reasoning.clone(),
+                None => String::new(),
+            });
+            continue;
+        }
         let has_tool_calls = message
             .tool_calls
             .as_ref()
             .is_some_and(|tool_calls| !tool_calls.is_empty());
-        if !has_tool_calls {
-            message.reasoning_content = None;
-            continue;
-        }
         if exact_replay {
-            // exact continuation state 只能由同一模型生成。未标记内容（例如切换前
-            // GPT 的 reasoning）和其他 exact 模型的状态都不能跨模型回放。
-            message.reasoning_content =
-                message.reasoning_content.as_deref().and_then(|reasoning| {
-                    crate::ai::history::compress::decode_reasoning_replay_for_model(
-                        model, reasoning,
-                    )
-                });
+            // Exact continuation state can only be produced by the same model;
+            // untagged content (e.g. pre-switch GPT reasoning) and other exact
+            // models' state must not be replayed across models.
+            if !has_tool_calls {
+                message.reasoning_content = None;
+            } else {
+                message.reasoning_content =
+                    message.reasoning_content.as_deref().and_then(|reasoning| {
+                        crate::ai::history::compress::decode_reasoning_replay_for_model(
+                            model, reasoning,
+                        )
+                    });
+            }
             continue;
         }
-        if shape_only_replay {
-            // 内部持久化状态（exact 或 encrypted 回放标记）绝不能原样发给 provider：
-            // 这类 blob 编码自其他/本模型的 exact 或加密推理状态，跨模型回放既泄漏
-            // 内部状态，也可能被网关当作无效推理文本拒绝。与 GLM exact 标记切到
-            // DeepSeek 的既有语义一致（见 request/tests.rs 的跨模型断言），这里把
-            // 两类标记统一清成空字符串，只保留字段形状。
-            let carries_replay_marker = message
-                .reasoning_content
-                .as_deref()
-                .is_some_and(crate::ai::history::compress::is_persisted_reasoning_replay);
-            if carries_replay_marker {
-                message.reasoning_content = Some(String::new());
-            } else {
-                message.reasoning_content.get_or_insert_default();
-            }
-        } else {
-            message.reasoning_content = None;
-        }
+        message.reasoning_content = None;
     }
 }
 

@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::VecDeque,
     io,
     time::{Duration, Instant},
@@ -251,8 +252,8 @@ fn cursor_reply_tail(tail: &str) -> Option<bool> {
 struct PromptScreen {
     queries_disabled: bool,
     alternate: bool,
-    /// Send time of every query whose reply is still unaccounted for, oldest
-    /// first. Feeds the orphan-Escape guard in `read_prompt_event`, and holds
+    /// Completion time of every query whose reply is still unaccounted for,
+    /// oldest first. Feeds the orphan-Escape guard in `read_prompt_event`, and holds
     /// recovery probes back while a fresh reply could be mistaken for theirs.
     pending_cpr_replies: VecDeque<Instant>,
     /// One inline retry per prompt session: a rebuild must not block on two
@@ -268,28 +269,15 @@ struct PromptScreen {
 }
 
 impl PromptScreen {
-    /// Records `timed_out` queries whose replies may still arrive, and schedules
-    /// the next attempt to get back onto the main screen.
-    fn note_timed_out_queries(&mut self, timed_out: u8, now: Instant) {
-        self.note_pending_cpr(timed_out, now);
+    /// Schedules recovery after a failed anchor attempt. Individual cursor
+    /// queries account for their replies before this method runs.
+    fn note_query_failure(&mut self, now: Instant) {
         self.queries_disabled = true;
         // The first probe runs while a one-off stall is likely to have cleared;
         // later ones back off so a dead link costs one query per interval instead
         // of one per frame.
         self.next_recovery_probe = Some(now + recovery_probe_delay(self.recovery_failures));
         self.recovery_failures = self.recovery_failures.saturating_add(1);
-    }
-
-    /// Retain the number of DSR replies that may still arrive without changing
-    /// whether future inline queries are enabled.
-    fn note_pending_cpr(&mut self, pending: u8, now: Instant) {
-        for _ in 0..pending {
-            self.pending_cpr_replies.push_back(now);
-        }
-        while self.pending_cpr_replies.len() > MAX_PENDING_CPR_REPLIES {
-            self.pending_cpr_replies.pop_front();
-        }
-        prune_expired_cpr_replies(&mut self.pending_cpr_replies, now);
     }
 
     /// True when the main screen may be probed again: only once no *recent*
@@ -330,50 +318,42 @@ impl PromptScreen {
     ) -> io::Result<Rect> {
         let now = Instant::now();
         if !self.queries_disabled && self.replies_settled(now) {
-            match prepare_fixed_viewport(
+            match prepare_anchored_viewport(
                 backend,
                 terminal_size,
                 requested_height,
                 cursor_offset_row,
                 mode,
                 clear_existing_viewport,
+                &mut self.pending_cpr_replies,
             ) {
                 Ok(area) => return Ok(area),
                 Err(err) if PromptEditor::is_cursor_position_timeout(&err) => {
                     // A stalled round-trip is usually a transient link hiccup, so
-                    // retry once before paying for the alternate screen. Both
-                    // attempts read the same parked cursor row — nothing is drawn
-                    // in between — so even the answer to the first query anchors
-                    // the second one correctly. A reflow invalidates that (the
-                    // anchor moves with the re-wrapped text), which is what the
-                    // size comparison detects. Reply timestamps are taken when an
-                    // attempt gives up, so the retry's own two seconds do not
-                    // count against the reply window or the probe backoff.
+                    // retry once before paying for the alternate screen. Fresh
+                    // anchors verify the reply stream again; rebuilds query the
+                    // same parked row. A reflow invalidates the parked row, so
+                    // retry only while the terminal size is unchanged. Both
+                    // attempts share the same outstanding-reply accounting.
                     if !self.retry_used && backend.size().ok() == Some(terminal_size) {
                         self.retry_used = true;
-                        match prepare_fixed_viewport(
+                        match prepare_anchored_viewport(
                             backend,
                             terminal_size,
                             requested_height,
                             cursor_offset_row,
                             mode,
                             clear_existing_viewport,
+                            &mut self.pending_cpr_replies,
                         ) {
-                            Ok(area) => {
-                                // One reply is still unaccounted for: the first
-                                // timed-out query or, if that reply was consumed
-                                // by the retry, the retry's own response. Keep
-                                // later queries from treating it as authoritative.
-                                self.note_pending_cpr(1, Instant::now());
-                                return Ok(area);
-                            }
+                            Ok(area) => return Ok(area),
                             Err(err) if PromptEditor::is_cursor_position_timeout(&err) => {
-                                self.note_timed_out_queries(2, Instant::now());
+                                self.note_query_failure(Instant::now());
                             }
                             Err(err) => return Err(err),
                         }
                     } else {
-                        self.note_timed_out_queries(1, Instant::now());
+                        self.note_query_failure(Instant::now());
                     }
                 }
                 Err(err) => return Err(err),
@@ -558,6 +538,114 @@ fn fixed_viewport_area(
     )
 }
 
+/// Each query emits one CPR request and a successful read consumes one reply,
+/// possibly an older one. Preserve the net outstanding count across retries,
+/// replacing consumed old entries with the new query's timestamp. A failed
+/// query conservatively retains its entry even if writing the request failed.
+fn tracked_cursor_query<T, E>(
+    pending: &mut VecDeque<Instant>,
+    query: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let result = query();
+    pending.push_back(Instant::now());
+    if result.is_ok() {
+        pending.pop_front();
+    }
+    while pending.len() > MAX_PENDING_CPR_REPLIES {
+        pending.pop_front();
+    }
+    result
+}
+
+/// Probe round trips a fresh anchor may spend before giving up.
+const VERIFIED_ANCHOR_ATTEMPTS: u8 = 3;
+
+/// The two rows the next anchor probe commands for itself.
+///
+/// Both rows slide by one per probe and do not repeat within a screen height,
+/// because the probe accepts a pair of replies as its own: a pair left unread by
+/// an earlier probe commanded the same two rows under a fixed pair, and the
+/// reply read after it would then be that probe's pinned answer — a row the
+/// cursor was moved to, not the row it lives on. Anchoring the box on that row
+/// is what leaves blank rows above the box, or clears printed output when the
+/// stale row is higher up the screen.
+///
+/// The counter is a function-local static because it belongs to this one probe;
+/// no other module state should have to know about it.
+fn anchor_probe_rows(last_screen_row: u16) -> (u16, u16) {
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    static ANCHOR_PROBE_SEQUENCE: AtomicU16 = AtomicU16::new(0);
+
+    // `low` stays below `last_screen_row` so `high = low + 1` never leaves the
+    // screen; `last_screen_row == 0` is handled by the caller before this runs.
+    let span = u32::from(last_screen_row);
+    let low = (u32::from(ANCHOR_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed)) % span) as u16;
+    (low, low + 1)
+}
+
+/// Reads the cursor row in a way that a reply left over from an earlier query
+/// cannot spoof.
+///
+/// `ESC[6n` replies carry no tag, so a single answer cannot be told apart from
+/// a stale one. This protocol instead pins the cursor to two rows it commands
+/// itself — rows no earlier probe commanded — and requires both replies to land
+/// exactly on those rows; only then has every earlier reply been read, and the
+/// following query is trusted.
+/// The caller's cursor is put back with `restore` on every exit path, so the
+/// probes never move where the box is drawn afterwards.
+fn verified_cursor_row(
+    query_row: &mut impl FnMut() -> io::Result<u16>,
+    save: &mut impl FnMut() -> io::Result<()>,
+    restore: &mut impl FnMut() -> io::Result<()>,
+    set_row: &mut impl FnMut(u16) -> io::Result<()>,
+    last_screen_row: u16,
+    pending: &mut VecDeque<Instant>,
+) -> io::Result<u16> {
+    if last_screen_row == 0 {
+        // Both probes would command the same row, so every reply matches and
+        // proves nothing; a single-row screen also has no row a stale reply
+        // could get wrong.
+        return tracked_cursor_query(pending, query_row);
+    }
+    for _ in 0..VERIFIED_ANCHOR_ATTEMPTS {
+        save()?;
+        let (low_row, high_row) = anchor_probe_rows(last_screen_row);
+        // Both probe answers are collected before anything is propagated, so a
+        // query that times out still reaches `restore` below instead of leaving
+        // the caller's cursor parked on a probe row.
+        let probe = (|| -> io::Result<(u16, u16)> {
+            set_row(low_row)?;
+            let low = tracked_cursor_query(pending, &mut *query_row)?;
+            set_row(high_row)?;
+            let high = tracked_cursor_query(pending, &mut *query_row)?;
+            Ok((low, high))
+        })();
+        let restored = restore();
+        let (low, high) = match probe {
+            Ok(rows) => {
+                restored?;
+                rows
+            }
+            // The probe already failed with the error the caller knows how to
+            // handle (a DSR timeout). Reporting a restore error instead would
+            // turn that into a hard failure.
+            Err(err) => return Err(err),
+        };
+        if low == low_row && high == high_row {
+            // Nothing older than the two probes answered them, so the reply
+            // stream is drained. Retire any old accounting before the final
+            // query, whose own reply must remain guarded if it times out.
+            pending.clear();
+            return tracked_cursor_query(pending, query_row);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "The cursor position could not be read within a normal duration",
+    ))
+}
+
 fn prepare_fixed_viewport<B: Backend>(
     backend: &mut B,
     terminal_size: Size,
@@ -565,12 +653,36 @@ fn prepare_fixed_viewport<B: Backend>(
     cursor_offset_row: u16,
     mode: ViewportRebuildMode,
     clear_existing_viewport: bool,
+    pending: &mut VecDeque<Instant>,
 ) -> Result<Rect, B::Error> {
     // One synchronous DSR query is the authoritative cursor position for this
-    // rebuild. Issuing an extra query cannot identify a stale reply (both use
-    // the same untagged terminal response) and can instead leave another reply
-    // in the input stream when a resize interrupts the round-trip.
-    let cursor_position = backend.get_cursor_position()?;
+    // rebuild. A fresh anchor does not trust a single reply and verifies the
+    // reply stream first (see `prepare_anchored_viewport`); reflows and height
+    // rebuilds keep the one round trip because they run on every panel height
+    // change.
+    let cursor_position = tracked_cursor_query(pending, || backend.get_cursor_position())?;
+    prepare_fixed_viewport_at(
+        backend,
+        terminal_size,
+        requested_height,
+        cursor_offset_row,
+        mode,
+        clear_existing_viewport,
+        cursor_position,
+    )
+}
+
+/// Builds the fixed viewport for a cursor position the caller already read,
+/// without querying the terminal itself.
+fn prepare_fixed_viewport_at<B: Backend>(
+    backend: &mut B,
+    terminal_size: Size,
+    requested_height: u16,
+    cursor_offset_row: u16,
+    mode: ViewportRebuildMode,
+    clear_existing_viewport: bool,
+    cursor_position: Position,
+) -> Result<Rect, B::Error> {
     let (area, lines_to_scroll) = fixed_viewport_area(
         terminal_size,
         cursor_position,
@@ -599,6 +711,78 @@ fn prepare_fixed_viewport<B: Backend>(
     }
     backend.flush()?;
     Ok(area)
+}
+
+/// Runs the inline-anchor build, verifying the DSR reply stream first when this
+/// is a fresh anchor.
+///
+/// A fresh anchor (`cursor_offset_row == 0`) is taken as the box top directly,
+/// so a reply left over from an earlier query anchors the box on the row that
+/// earlier query reported — in practice the previous prompt's parked bottom row
+/// — and the exit clear then strands blank rows above the submitted preview. A
+/// rebuild instead recovers its top as `parked row - offset`, where the same
+/// stale reply only shifts the box inside rows that are already reserved.
+fn prepare_anchored_viewport(
+    backend: &mut CrosstermBackend<io::Stdout>,
+    terminal_size: Size,
+    requested_height: u16,
+    cursor_offset_row: u16,
+    mode: ViewportRebuildMode,
+    clear_existing_viewport: bool,
+    pending: &mut VecDeque<Instant>,
+) -> io::Result<Rect> {
+    if cursor_offset_row != 0 || mode != ViewportRebuildMode::ReserveMissingRows {
+        return prepare_fixed_viewport(
+            backend,
+            terminal_size,
+            requested_height,
+            cursor_offset_row,
+            mode,
+            clear_existing_viewport,
+            pending,
+        );
+    }
+    let last_screen_row = terminal_size.height.saturating_sub(1);
+    // The verification closures outlive each other, so they share the caller's
+    // backend through a `RefCell`; the reborrow inside the block keeps the
+    // `&mut` usable for the draw that follows.
+    let row = {
+        let shared = RefCell::new(&mut *backend);
+        let mut save = || -> io::Result<()> {
+            let mut guard = shared.borrow_mut();
+            execute!(&mut *guard, cursor::SavePosition)
+        };
+        let mut restore = || -> io::Result<()> {
+            let mut guard = shared.borrow_mut();
+            execute!(&mut *guard, cursor::RestorePosition)
+        };
+        let mut set_row = |row: u16| -> io::Result<()> {
+            let mut guard = shared.borrow_mut();
+            execute!(&mut *guard, cursor::MoveTo(0, row))
+        };
+        let mut query_row = || -> io::Result<u16> {
+            let mut guard = shared.borrow_mut();
+            let position = guard.get_cursor_position()?;
+            Ok(position.y)
+        };
+        verified_cursor_row(
+            &mut query_row,
+            &mut save,
+            &mut restore,
+            &mut set_row,
+            last_screen_row,
+            pending,
+        )?
+    };
+    prepare_fixed_viewport_at(
+        backend,
+        terminal_size,
+        requested_height,
+        cursor_offset_row,
+        mode,
+        clear_existing_viewport,
+        Position::new(0, row),
+    )
 }
 
 fn terminal_with_fixed_viewport<B: Backend>(
@@ -1296,7 +1480,7 @@ impl PromptEditor {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::{cell::RefCell, collections::VecDeque, io};
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{
@@ -1308,11 +1492,11 @@ mod tests {
     };
 
     use super::{
-        ViewportRebuildMode, clear_fixed_viewport, clear_row_range, fixed_viewport_area,
-        force_frame_repaint, multiline_viewport_height, park_reflow_anchor, parked_anchor_offset,
-        prepare_fixed_viewport, submitted_input_preview_lines, take_redraw_request,
-        take_standalone_resize_rebuild, terminal_with_fixed_viewport,
-        update_pending_resize_rebuild, viewport_height_with_completion,
+        VERIFIED_ANCHOR_ATTEMPTS, ViewportRebuildMode, clear_fixed_viewport, clear_row_range,
+        fixed_viewport_area, force_frame_repaint, multiline_viewport_height, park_reflow_anchor,
+        parked_anchor_offset, prepare_fixed_viewport, submitted_input_preview_lines,
+        take_redraw_request, take_standalone_resize_rebuild, terminal_with_fixed_viewport,
+        update_pending_resize_rebuild, verified_cursor_row, viewport_height_with_completion,
     };
 
     fn key(code: KeyCode) -> Event {
@@ -1544,14 +1728,19 @@ mod tests {
             !screen.recovery_probe_due(start),
             "an inline screen must not probe"
         );
-        screen.note_timed_out_queries(1, start);
+        screen.pending_cpr_replies.push_back(start);
+        screen.note_query_failure(start);
         assert!(screen.queries_disabled);
         assert_eq!(screen.pending_cpr_replies.len(), 1);
         // The reply may still be in flight and would answer the probe instead.
         assert!(!screen.recovery_probe_due(start + std::time::Duration::from_millis(500)));
         assert!(screen.recovery_probe_due(start + std::time::Duration::from_secs(2)));
         // A failed probe backs off for five seconds before the next attempt.
-        screen.note_timed_out_queries(1, start + std::time::Duration::from_secs(2));
+        screen
+            .pending_cpr_replies
+            .push_back(start + std::time::Duration::from_secs(2));
+        screen.note_query_failure(start + std::time::Duration::from_secs(2));
+        assert_eq!(screen.pending_cpr_replies.len(), 2);
         assert!(!screen.recovery_probe_due(start + std::time::Duration::from_secs(5)));
         assert!(screen.recovery_probe_due(start + std::time::Duration::from_secs(7)));
         screen.note_recovered();
@@ -1778,6 +1967,7 @@ mod tests {
             0,
             ViewportRebuildMode::ReserveMissingRows,
             false,
+            &mut VecDeque::new(),
         )
         .unwrap();
         assert_eq!(initial_area, Rect::new(0, 12, 10, 5));
@@ -1802,6 +1992,7 @@ mod tests {
             4,
             ViewportRebuildMode::ReflowOnly,
             true,
+            &mut VecDeque::new(),
         )
         .unwrap();
 
@@ -1844,6 +2035,7 @@ mod tests {
             0,
             ViewportRebuildMode::ReserveMissingRows,
             false,
+            &mut VecDeque::new(),
         )
         .unwrap();
         assert_eq!(initial_area, ratatui::layout::Rect::new(0, 3, 10, 3));
@@ -1863,6 +2055,7 @@ mod tests {
                 2,
                 ViewportRebuildMode::ReflowOnly,
                 true,
+                &mut VecDeque::new(),
             )
             .unwrap();
             assert!(final_area.bottom() <= 6);
@@ -1907,6 +2100,7 @@ mod tests {
                 3,
                 ViewportRebuildMode::ReflowOnly,
                 true,
+                &mut VecDeque::new(),
             )
             .unwrap();
 
@@ -1963,6 +2157,7 @@ mod tests {
             3,
             ViewportRebuildMode::ReflowOnly,
             true,
+            &mut VecDeque::new(),
         )
         .unwrap();
 
@@ -2020,6 +2215,7 @@ mod tests {
             3,
             ViewportRebuildMode::ReflowOnly,
             true,
+            &mut VecDeque::new(),
         )
         .unwrap();
 
@@ -2160,5 +2356,313 @@ mod tests {
                 format!("  {body}world{reset}"),
             ]
         );
+    }
+
+    /// Scripted stand-in for a terminal answering DSR queries: replies left over
+    /// from earlier queries are handed out first, then the row the protocol last
+    /// commanded (the saved row again once a restore runs).
+    struct ScriptedAnchor {
+        stale: VecDeque<u16>,
+        queued: Option<VecDeque<u16>>,
+        commanded: u16,
+        true_row: u16,
+        failing: bool,
+        timeout_at: Option<u32>,
+        queries: u32,
+        calls: Vec<String>,
+    }
+
+    impl ScriptedAnchor {
+        fn new(stale: impl IntoIterator<Item = u16>, true_row: u16) -> Self {
+            Self {
+                stale: stale.into_iter().collect(),
+                queued: None,
+                commanded: true_row,
+                true_row,
+                failing: false,
+                timeout_at: None,
+                queries: 0,
+                calls: Vec::new(),
+            }
+        }
+
+        /// Makes every query fail the way crossterm reports a DSR timeout.
+        fn fail_queries(&mut self) {
+            self.failing = true;
+        }
+
+        fn record(&mut self, call: impl Into<String>) {
+            self.calls.push(call.into());
+        }
+
+        fn answer(&mut self) -> io::Result<u16> {
+            self.queries += 1;
+            self.record("query");
+            // FIFO mode retains every issued query's reply, including replies
+            // left unread when a query times out or consumes an older answer.
+            if let Some(queued) = &mut self.queued {
+                queued.push_back(self.commanded);
+            }
+            if self.failing || self.timeout_at == Some(self.queries) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "The cursor position could not be read within a normal duration",
+                ));
+            }
+            Ok(self
+                .stale
+                .pop_front()
+                .or_else(|| self.queued.as_mut().and_then(VecDeque::pop_front))
+                .unwrap_or(self.commanded))
+        }
+    }
+
+    /// Drives `verified_cursor_row` against `terminal`, returning its result
+    /// together with the terminal's call log.
+    fn run_verified_anchor(
+        terminal: &RefCell<ScriptedAnchor>,
+        last_screen_row: u16,
+    ) -> (io::Result<u16>, Vec<String>) {
+        run_verified_anchor_with_pending(terminal, last_screen_row, &mut VecDeque::new())
+    }
+
+    fn run_verified_anchor_with_pending(
+        terminal: &RefCell<ScriptedAnchor>,
+        last_screen_row: u16,
+        pending: &mut VecDeque<std::time::Instant>,
+    ) -> (io::Result<u16>, Vec<String>) {
+        let mut save = || -> io::Result<()> {
+            terminal.borrow_mut().record("save");
+            Ok(())
+        };
+        let mut restore = || -> io::Result<()> {
+            let mut terminal = terminal.borrow_mut();
+            terminal.record("restore");
+            terminal.commanded = terminal.true_row;
+            Ok(())
+        };
+        let mut set_row = |row: u16| -> io::Result<()> {
+            let mut terminal = terminal.borrow_mut();
+            terminal.record(format!("set:{row}"));
+            terminal.commanded = row;
+            Ok(())
+        };
+        let mut query_row = || terminal.borrow_mut().answer();
+        let result = verified_cursor_row(
+            &mut query_row,
+            &mut save,
+            &mut restore,
+            &mut set_row,
+            last_screen_row,
+            pending,
+        );
+        (result, terminal.borrow().calls.clone())
+    }
+
+    #[test]
+    fn verified_anchor_rejects_stale_replies_left_by_an_earlier_query() {
+        // Two replies reporting the previous prompt's parked bottom row (9) are
+        // still in the stream when the fresh anchor queries, while the cursor the
+        // box must anchor to really sits on row 17.
+        let terminal = RefCell::new(ScriptedAnchor::new([9, 9], 17));
+        let (row, calls) = run_verified_anchor(&terminal, 23);
+
+        // The first attempt mismatched (9 where it commanded row 0), so the row
+        // comes from the verified second attempt — never the stale 9.
+        assert_eq!(row.unwrap(), 17);
+        assert_eq!(terminal.borrow().queries, 5);
+        // Both attempts put the cursor back, including the rejected one.
+        assert_eq!(calls.iter().filter(|call| call.as_str() == "restore").count(), 2);
+    }
+
+    #[test]
+    fn verified_anchor_answers_immediately_when_the_link_is_clean() {
+        let terminal = RefCell::new(ScriptedAnchor::new(VecDeque::new(), 17));
+        let (row, calls) = run_verified_anchor(&terminal, 23);
+
+        assert_eq!(row.unwrap(), 17);
+        // One save, the two probes, one restore, then the trusted query. The
+        // rows the probes command are consecutive rows chosen for the probe,
+        // covered by `anchor_probe_rows_only_probe_on_rows_inside_the_screen`;
+        // only the call order is pinned here.
+        assert_eq!(calls.len(), 7);
+        assert_eq!(calls[0], "save");
+        assert_eq!(calls[2], "query");
+        assert_eq!(calls[4], "query");
+        assert_eq!(calls[5], "restore");
+        assert_eq!(calls[6], "query");
+        assert!(calls[1].starts_with("set:") && calls[3].starts_with("set:"));
+    }
+
+    #[test]
+    fn verified_anchor_refreshes_pending_replies_before_old_entries_expire() {
+        let count = 2 * usize::from(VERIFIED_ANCHOR_ATTEMPTS);
+        let now = std::time::Instant::now();
+        let old = now - super::CPR_REPLY_WINDOW + std::time::Duration::from_millis(500);
+        let mut screen = super::PromptScreen::default();
+        screen.pending_cpr_replies = VecDeque::from(vec![old; count]);
+        assert!(screen.replies_settled(now));
+
+        // Each query consumes an old response but leaves its own response in
+        // flight. The net count stays constant; its timestamps must be renewed.
+        let terminal = RefCell::new(ScriptedAnchor::new(vec![8; count], 17));
+        terminal.borrow_mut().queued = Some(VecDeque::new());
+        let (row, _) = run_verified_anchor_with_pending(
+            &terminal,
+            23,
+            &mut screen.pending_cpr_replies,
+        );
+        assert!(row.is_err());
+        assert_eq!(terminal.borrow().queries as usize, count);
+        screen.note_query_failure(std::time::Instant::now());
+        assert_eq!(screen.pending_cpr_replies.len(), count);
+        assert!(screen.pending_cpr_replies.iter().all(|at| *at >= now));
+        super::prune_expired_cpr_replies(
+            &mut screen.pending_cpr_replies,
+            now + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(screen.pending_cpr_replies.len(), count);
+
+        // Deliver the actual newly queued replies as fragmented CPRs after the
+        // old timestamps expired, followed by ordinary typing and submission.
+        let queued = terminal.borrow_mut().queued.take().unwrap();
+        assert_eq!(queued.len(), count);
+        let mut input = VecDeque::new();
+        for row in queued {
+            input.push_back(key(KeyCode::Esc));
+            input.extend(format!("[{};1R", row + 1).chars().map(|ch| key(KeyCode::Char(ch))));
+        }
+        input.extend([key(KeyCode::Char('x')), key(KeyCode::Esc)]);
+        let mut pending = VecDeque::new();
+        for _ in 0..count {
+            assert_eq!(
+                super::read_prompt_event(&mut pending, &mut screen.pending_cpr_replies, |_| {
+                    Ok(input.pop_front())
+                })
+                .unwrap(),
+                None
+            );
+        }
+        assert!(screen.pending_cpr_replies.is_empty());
+        assert_eq!(
+            super::read_prompt_event(&mut pending, &mut screen.pending_cpr_replies, |_| {
+                Ok(input.pop_front())
+            })
+            .unwrap(),
+            Some(key(KeyCode::Char('x')))
+        );
+        let mut reads = 0;
+        assert_eq!(
+            super::read_prompt_event(&mut pending, &mut screen.pending_cpr_replies, |_| {
+                reads += 1;
+                Ok(input.pop_front())
+            })
+            .unwrap(),
+            Some(key(KeyCode::Esc))
+        );
+        assert_eq!(reads, 1);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn verified_anchor_timeout_counts_each_unanswered_query_across_retries() {
+        let terminal = RefCell::new(ScriptedAnchor::new([], 17));
+        terminal.borrow_mut().fail_queries();
+        let mut pending = VecDeque::new();
+        for expected in 1..=2 {
+            let (row, calls) = run_verified_anchor_with_pending(&terminal, 23, &mut pending);
+            assert!(row.is_err());
+            assert_eq!(pending.len(), expected);
+            assert_eq!(calls.last().map(String::as_str), Some("restore"));
+        }
+    }
+
+    #[test]
+    fn verified_anchor_successful_retry_clears_prior_pending_replies() {
+        let terminal = RefCell::new(ScriptedAnchor::new([], 17));
+        terminal.borrow_mut().timeout_at = Some(1);
+        let mut pending = VecDeque::new();
+        assert!(run_verified_anchor_with_pending(&terminal, 23, &mut pending).0.is_err());
+        assert_eq!(pending.len(), 1);
+
+        // The timed-out reply was lost. A matching probe pair on the retry
+        // establishes a clean stream and retires the old conservative entry.
+        assert_eq!(
+            run_verified_anchor_with_pending(&terminal, 23, &mut pending).0.unwrap(),
+            17
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn verified_anchor_final_query_timeout_keeps_only_its_reply() {
+        let terminal = RefCell::new(ScriptedAnchor::new([], 17));
+        terminal.borrow_mut().timeout_at = Some(3);
+        let mut pending = VecDeque::from([std::time::Instant::now(); 2]);
+        let (row, calls) = run_verified_anchor_with_pending(&terminal, 23, &mut pending);
+        assert!(row.is_err());
+        assert_eq!(terminal.borrow().queries, 3);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(calls[5], "restore");
+    }
+
+    #[test]
+    fn verified_anchor_single_row_query_does_not_claim_a_verified_drain() {
+        let terminal = RefCell::new(ScriptedAnchor::new([], 0));
+        let mut pending = VecDeque::from([std::time::Instant::now(); 2]);
+        let (row, _) = run_verified_anchor_with_pending(&terminal, 0, &mut pending);
+        assert_eq!(row.unwrap(), 0);
+        assert_eq!(terminal.borrow().queries, 1);
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn tracked_cursor_query_at_capacity_consumes_only_one_reply() {
+        let old = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        let mut pending = VecDeque::from(vec![old; super::MAX_PENDING_CPR_REPLIES]);
+        super::tracked_cursor_query(&mut pending, || Ok::<_, io::Error>(17)).unwrap();
+        assert_eq!(pending.len(), super::MAX_PENDING_CPR_REPLIES);
+        assert_eq!(pending.iter().filter(|at| **at == old).count(), pending.len() - 1);
+        assert!(*pending.back().unwrap() > old);
+
+        let result = super::tracked_cursor_query(&mut pending, || {
+            Err::<u16, _>(io::Error::from(io::ErrorKind::TimedOut))
+        });
+        assert!(result.is_err());
+        assert_eq!(pending.len(), super::MAX_PENDING_CPR_REPLIES);
+    }
+
+    #[test]
+    fn verified_anchor_gives_up_on_a_link_that_never_answers() {
+        // Every probe is answered with row 8 whatever row was commanded, so no
+        // attempt can show that the reply stream was drained.
+        let stale = std::iter::repeat(8u16).take(2 * usize::from(VERIFIED_ANCHOR_ATTEMPTS));
+        let terminal = RefCell::new(ScriptedAnchor::new(stale, 17));
+        let (row, calls) = run_verified_anchor(&terminal, 23);
+
+        assert!(crate::ai::prompt::PromptEditor::is_cursor_position_timeout(
+            &row.unwrap_err()
+        ));
+        assert_eq!(terminal.borrow().queries, 2 * u32::from(VERIFIED_ANCHOR_ATTEMPTS));
+        // Every attempt put the cursor back before the next probe ran.
+        assert_eq!(
+            calls.iter().filter(|call| call.as_str() == "restore").count(),
+            usize::from(VERIFIED_ANCHOR_ATTEMPTS)
+        );
+
+        // A link that does not answer at all makes the query itself time out: the
+        // attempt still restores the cursor before that error escapes.
+        let terminal = RefCell::new(ScriptedAnchor::new(VecDeque::new(), 17));
+        terminal.borrow_mut().fail_queries();
+        let (row, calls) = run_verified_anchor(&terminal, 23);
+
+        assert!(crate::ai::prompt::PromptEditor::is_cursor_position_timeout(
+            &row.unwrap_err()
+        ));
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0], "save");
+        assert!(calls[1].starts_with("set:"));
+        assert_eq!(calls[2], "query");
+        assert_eq!(calls[3], "restore");
     }
 }

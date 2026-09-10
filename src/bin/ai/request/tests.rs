@@ -2035,6 +2035,111 @@ fn opencode_deepseek_tool_call_messages_echo_even_without_thinking_gate() {
 }
 
 #[test]
+fn deepseek_non_tool_call_assistant_messages_echo_reasoning_shape() {
+    // Regression: Console Go (opencode Zen) rejects multi-turn thinking-mode
+    // requests whose replayed assistant final replies (no tool calls) lack the
+    // `reasoning_content` field: 400 "The reasoning_content in the thinking mode
+    // must be passed back". The field shape (empty string) satisfies the
+    // gateway, mirroring the existing tool-call echo contract.
+    let mut messages = vec![Message {
+        role: "assistant".to_string(),
+        content: Value::String("上一轮的最终回答".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    normalize_reasoning_content_replay_for_model("deepseek-flash-opencode", &mut messages);
+    assert_eq!(messages[0].reasoning_content.as_deref(), Some(""));
+
+    let value = serde_json::to_value(&messages[0]).unwrap();
+    assert_eq!(
+        value.get("reasoning_content").and_then(|v| v.as_str()),
+        Some(""),
+        "a missing reasoning_content must be echoed as an empty string field, not omitted"
+    );
+}
+
+#[test]
+fn deepseek_flagged_model_replays_own_exact_blob_and_fills_missing_shape() {
+    // `deepseek-flash-opencode` declares both `reasoning_content_replay` (exact
+    // blob pipeline) and the DeepSeek echo dialect. The echo must win: own-model
+    // exact blobs decode back to the original provider text, while missing or
+    // foreign reasoning still gets the empty field shape instead of being
+    // stripped (which previously 400'd mid-turn and across turns).
+    let own_blob = crate::ai::history::compress::encode_reasoning_replay_state(
+        "deepseek-flash-opencode",
+        "需要先读取目标文件。",
+    );
+    let tool_call = || Message {
+        role: "assistant".to_string(),
+        content: Value::String(String::new()),
+        tool_calls: Some(vec![crate::ai::types::ToolCall {
+            id: "call_deepseek_echo".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: Some(own_blob.clone()),
+    };
+    let mut own_blob_messages = vec![tool_call()];
+    normalize_reasoning_content_replay_for_model("deepseek-flash-opencode", &mut own_blob_messages);
+    assert_eq!(
+        own_blob_messages[0].reasoning_content.as_deref(),
+        Some("需要先读取目标文件。"),
+        "an own exact-replay blob should decode back to the original provider text"
+    );
+
+    let mut empty_tool_call_messages = vec![Message {
+        role: "assistant".to_string(),
+        content: Value::String(String::new()),
+        tool_calls: Some(vec![crate::ai::types::ToolCall {
+            id: "call_deepseek_empty".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    normalize_reasoning_content_replay_for_model(
+        "deepseek-flash-opencode",
+        &mut empty_tool_call_messages,
+    );
+    assert_eq!(empty_tool_call_messages[0].reasoning_content.as_deref(), Some(""));
+
+    // A GLM-origin exact blob must never leak to the DeepSeek provider: it is
+    // cleared to the empty shape (cross-model semantics preserved).
+    let glm_blob = crate::ai::history::compress::encode_reasoning_replay_state(
+        "glm-5.3",
+        "GLM 的推理文本",
+    );
+    let mut switched_messages = vec![Message {
+        role: "assistant".to_string(),
+        content: Value::String(String::new()),
+        tool_calls: Some(vec![crate::ai::types::ToolCall {
+            id: "call_deepseek_switched".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: Some(glm_blob),
+    }];
+    normalize_reasoning_content_replay_for_model(
+        "deepseek-flash-opencode",
+        &mut switched_messages,
+    );
+    assert_eq!(switched_messages[0].reasoning_content.as_deref(), Some(""));
+}
+
+#[test]
 fn reasoning_content_replay_is_exact_only_for_declared_models() {
     let assistant = Message {
         role: "assistant".to_string(),

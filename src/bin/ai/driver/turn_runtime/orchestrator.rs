@@ -1761,10 +1761,30 @@ async fn run_turn_body(
                             app.cli.thinking_disabled_override = true;
                         }
                     } else {
-                        // Lowering effort does not work for this dialect: do not waste retry rounds on a useless
-                        // ladder; force thinking off at the first real truncation, handing the entire output
-                        // budget to visible content.
-                        app.cli.thinking_disabled_override = true;
+                        // Lowering effort does not work for this dialect (thinking is a boolean switch there, so
+                        // there is no graded ladder to walk). Keep the user's thinking setting either way: the
+                        // previous fallback flipped thinking_disabled_override on the first truncation, which is
+                        // process-global, indistinguishable from the user's own "effort off" in the status line,
+                        // and fired without any notice. Truncation keeps its existing bounded retry path instead:
+                        // the injected shrink prompt for the next attempt, and once MAX_MODEL_TRUNCATION_RETRIES
+                        // is reached the partial text (or the explicit "truncated repeatedly" placeholder) below.
+                        // Record the condition so a retry that ends in truncated output stays auditable.
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "  ⚠ Truncated output #{}: this model has no effort gradient to trade for budget; keeping thinking as configured",
+                            retry.consecutive_truncations
+                        );
+                        crate::ai::driver::decision_log::log_truncation_downgrade(
+                            crate::ai::driver::decision_log::get_decision_log_store(),
+                            &crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
+                            crate::ai::driver::runtime_ctx::current_turn_id_or_zero(),
+                            &next_model,
+                            retry.consecutive_truncations,
+                            stream_result.usage_reasoning_tokens,
+                            stream_result.usage_completion_tokens,
+                            false,
+                            "no effort gradient for this dialect; thinking left as configured",
+                        );
                     }
                 }
 
