@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, time::Instant};
 
 use rust_tools::cw::SkipMap;
 
@@ -346,6 +346,12 @@ pub(super) struct StreamContentState {
     /// so JSON that merely happens to be valid at the cut-off moment must not be handed to the execution layer as a complete tool call.
     pub(super) tool_args_cap_exceeded: bool,
     pub(super) saw_reasoning_output: bool,
+    /// First observed reasoning/output timestamps, used for display-only throughput metrics.
+    pub(super) reasoning_started_at: Option<Instant>,
+    pub(super) output_started_at: Option<Instant>,
+    /// Approximate token totals used by the live terminal status bar before provider usage arrives.
+    pub(super) live_reasoning_tokens: u64,
+    pub(super) live_output_tokens: u64,
     pub(super) tool_calls_map: SkipMap<usize, ToolCallBuilder>,
     /// Composite key resolved for the most recent tool call without an `index`,
     /// used to attach later parameter-continuation deltas (which have neither id
@@ -393,6 +399,10 @@ impl StreamContentState {
             dropped_malformed_tool_call: false,
             tool_args_cap_exceeded: false,
             saw_reasoning_output: false,
+            reasoning_started_at: None,
+            output_started_at: None,
+            live_reasoning_tokens: 0,
+            live_output_tokens: 0,
             tool_calls_map: SkipMap::default(),
             last_indexless_tool_call_key: None,
             assistant_text: String::new(),
@@ -408,6 +418,18 @@ impl StreamContentState {
             bare_xml_tool_call_streamer: BareXmlToolCallStreamer::new(),
             inline_markup_normalizer: InlineMarkupNormalizer::new(),
             content_think_demuxer: ContentThinkDemuxer::new(),
+        }
+    }
+
+    pub(super) fn mark_reasoning_started(&mut self) {
+        if self.reasoning_started_at.is_none() {
+            self.reasoning_started_at = Some(Instant::now());
+        }
+    }
+
+    pub(super) fn mark_output_started(&mut self) {
+        if self.output_started_at.is_none() {
+            self.output_started_at = Some(Instant::now());
         }
     }
 }

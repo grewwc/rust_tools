@@ -26,6 +26,12 @@ impl AiConfig {
     pub const MODEL_ALIYUN_API_KEY: &str = "aliyun.api_key";
     pub const MODEL_VOLCANO_API_KEY: &str = "volcano.api_key";
     pub const MODEL_OPENAI_API_KEY: &str = "openai.api_key";
+    /// Official DeepSeek endpoint key, referenced by the model registry's
+    /// `api_key_config_key` field (models/deepseek-v4-flash-official.json).
+    /// Not part of any adapter's `api_key_candidates`: it is private to that
+    /// registry entry, so adding it to a candidate chain would affect every
+    /// model behind that adapter.
+    pub const MODEL_DEEPSEEK_API_KEY: &str = "deepseek.api_key";
     pub const MODEL_DEFAULT: &str = "ai.model.default";
     pub const MODEL_VL_DEFAULT: &str = "ai.model.vl_default";
     pub const MODEL_THINKING: &str = "ai.model.thinking";

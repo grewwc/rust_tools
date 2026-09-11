@@ -110,11 +110,11 @@ const REASONING_BUDGET_DOMINANCE_RATIO: f64 = 0.5;
 
 /// === Long-loop-aware mid-turn compression ===
 /// The mid-turn compression soft threshold is derived from the model's token window (flagship
-/// 256K → ~135K chars). For a long-loop turn with "moderate history size but many tool iterations",
+/// 256K → ~300K chars). For a long-loop turn with "moderate history size but many tool iterations",
 /// the history peak can stay below that threshold the whole time, so compression never fires and
 /// every round re-sends the full history-so-far plus every tool schema. Total bytes sent then grow
 /// O(n²) with iteration count and blow through the TPM limit within minutes (real case: a provider
-/// refactor session with 56 iterations in one turn, history peak ~120K < 135K threshold, sent
+/// refactor session with 56 iterations in one turn, history peak ~120K < 300K threshold, sent
 /// ~2.8M tokens in-turn, exceeding the 380K TPM limit ~7x).
 ///
 /// Mitigation: once a single turn's tool iteration count reaches this threshold we treat the turn as

@@ -25,6 +25,7 @@ use super::{
         clamp_line_to_terminal_row_with_reserve, live_preview_cursor_rows, raw_terminal_rows,
         wrap_line_to_terminal_rows_with_reserve,
     },
+    side_note_input,
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
     state::{
         StreamChunkStep, StreamContentState, StreamMarkers, StreamProcessingState,
@@ -151,6 +152,9 @@ pub(super) async fn stream_response(
     }
     configure_thinking_fold(&mut state);
     configure_subagent_preview_fold(app, &mut state, &mut markers);
+    if runtime_ctx::terminal_output_enabled() {
+        side_note_input::set_token_status(Some("↳ speed · waiting…".to_string()));
+    }
     // A completed answer is provisional until the driver's completion/citation
     // gates accept it. Keep assistant prose transactional while preserving live
     // thinking and tool activity.
@@ -453,6 +457,10 @@ fn flush_inline_markup_normalizer_on_cancel(state: &mut StreamProcessingState) {
     let (cleaned, _) = state.content.bare_xml_tool_call_streamer.push(&cleaned);
     let content = normalize_stream_text(cleaned);
     state.content.assistant_text.push_str(&content);
+    state.content.live_output_tokens = state
+        .content
+        .live_output_tokens
+        .saturating_add(estimate_stream_tokens(&content));
 }
 
 /// Thinking-fold cleanup on cancel/interrupt: if the fold window is still active we
@@ -467,6 +475,14 @@ fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
     let (residual_reasoning, residual_content) = state.content.content_think_demuxer.flush();
     state.content.reasoning_text.push_str(&residual_reasoning);
     state.content.assistant_text.push_str(&residual_content);
+    state.content.live_reasoning_tokens = state
+        .content
+        .live_reasoning_tokens
+        .saturating_add(estimate_stream_tokens(&residual_reasoning));
+    state.content.live_output_tokens = state
+        .content
+        .live_output_tokens
+        .saturating_add(estimate_stream_tokens(&residual_content));
 
     if runtime_ctx::terminal_output_enabled() {
         let _ = clear_waiting_hint(state);
@@ -637,6 +653,10 @@ fn finalize_stream_response(
     let (residual_reasoning, residual_content) = state.content.content_think_demuxer.flush();
     if !residual_reasoning.is_empty() {
         state.content.reasoning_text.push_str(&residual_reasoning);
+        state.content.live_reasoning_tokens = state
+            .content
+            .live_reasoning_tokens
+            .saturating_add(estimate_stream_tokens(&residual_reasoning));
     }
     if !residual_content.is_empty() {
         commit_visible_content(app, current_history, markers, &mut state, residual_content)?;
@@ -655,8 +675,16 @@ fn finalize_stream_response(
     }
 
     if take_stream_cancelled(app) {
-        return Ok(cancelled_stream_result(&mut state));
+        let result = cancelled_stream_result(&mut state);
+        // The stream is over, so the token-status slot must not keep a stale "live" snapshot.
+        // (A refresh here would also run before `cancelled_stream_result` accumulates its
+        // residual tokens, so it would under-report; clearing is both simpler and correct.)
+        side_note_input::set_token_status(None);
+        return Ok(result);
     }
+
+    let metrics_finished_at = Instant::now();
+    refresh_live_token_status(&state.content, metrics_finished_at);
 
     // AIOS: flush any pending LLM usage to kernel `/dev/llm` before returning.
     // Prefer the model echoed by the provider; fall back to what we requested.
@@ -674,7 +702,7 @@ fn finalize_stream_response(
             .unwrap_or(0);
         (u.prompt_tokens, cached, u.completion_tokens, reasoning)
     });
-    if let Some((echoed_model, usage)) = state.pending_llm_usage.take() {
+    let printed_throughput_line = if let Some((echoed_model, usage)) = state.pending_llm_usage.take() {
         let model_for_pricing = if echoed_model.is_empty() {
             app.current_model.clone()
         } else {
@@ -682,6 +710,14 @@ fn finalize_stream_response(
         };
         let _ = crate::ai::request::charge_llm_usage_to_kernel(app, &model_for_pricing, &usage, 0);
         maybe_print_prompt_cache_metrics(&usage);
+        maybe_print_token_throughput_metrics(&usage, &state.content, metrics_finished_at)
+    } else {
+        false
+    };
+    // The stream is over: unless an exact throughput line was just printed, the token-status
+    // slot must not keep process-state wording ("waiting…" / "live") stale after the stream ended.
+    if !printed_throughput_line {
+        side_note_input::set_token_status(None);
     }
 
     let stream_error = state.content.stream_idle_timed_out;
@@ -815,6 +851,196 @@ fn maybe_print_prompt_cache_metrics(usage: &crate::ai::request::StreamUsage) {
         .unwrap_or(0);
     if let Some(line) = format_prompt_cache_metrics(usage.prompt_tokens, cached) {
         println!("  {}{line}{RESET}", theme::current().accent_muted);
+    }
+}
+
+/// Print a heuristic generation-throughput line after a stream finishes. The timing split is an
+/// estimate, not server-reported: the reasoning window ends at the first visible output token, so
+/// interleaved thinking after output starts (or idle gaps between phases) skews the reasoning
+/// rate. `completion_tokens` includes reasoning tokens and tool-call argument tokens; the output
+/// slice is the non-reasoning remainder after subtracting
+/// `completion_tokens_details.reasoning_tokens`, so it can exceed what was rendered.
+fn maybe_print_token_throughput_metrics(
+    usage: &crate::ai::request::StreamUsage,
+    content: &StreamContentState,
+    finished_at: Instant,
+) -> bool {
+    if !runtime_ctx::terminal_output_enabled() {
+        return false;
+    }
+
+    let reasoning_tokens = usage
+        .completion_tokens_details
+        .as_ref()
+        .map(|details| details.reasoning_tokens)
+        .unwrap_or(0)
+        .min(usage.completion_tokens);
+    let output_tokens = usage.completion_tokens.saturating_sub(reasoning_tokens);
+    let reasoning_end = content.output_started_at.unwrap_or(finished_at);
+    let reasoning_elapsed = content
+        .reasoning_started_at
+        .map(|started| reasoning_end.saturating_duration_since(started));
+    let output_elapsed = content
+        .output_started_at
+        .map(|started| finished_at.saturating_duration_since(started));
+
+    let Some(line) = format_token_throughput_metrics(
+        reasoning_tokens,
+        output_tokens,
+        reasoning_elapsed,
+        output_elapsed,
+    ) else {
+        return false;
+    };
+    side_note_input::set_token_status(Some(line.clone()));
+    println!("  {}{line}{RESET}", theme::current().accent_muted);
+    true
+}
+
+fn refresh_live_token_status(content: &StreamContentState, now: Instant) {
+    if !runtime_ctx::terminal_output_enabled() {
+        return;
+    }
+    side_note_input::set_token_status(Some(format_live_token_status(content, now)));
+}
+
+fn format_live_token_status(content: &StreamContentState, now: Instant) -> String {
+    let reasoning_elapsed = content
+        .reasoning_started_at
+        .map(|started| content.output_started_at.unwrap_or(now).saturating_duration_since(started));
+    let output_elapsed = content
+        .output_started_at
+        .map(|started| now.saturating_duration_since(started));
+    let mut segments = Vec::with_capacity(2);
+    if content.live_reasoning_tokens > 0 {
+        segments.push(format!(
+            "reasoning ~{} tok @ {} tok/s",
+            format_compact_token_count(content.live_reasoning_tokens),
+            format_token_rate(content.live_reasoning_tokens, reasoning_elapsed),
+        ));
+    }
+    if content.live_output_tokens > 0 {
+        segments.push(format!(
+            "output ~{} tok @ {} tok/s",
+            format_compact_token_count(content.live_output_tokens),
+            format_token_rate(content.live_output_tokens, output_elapsed),
+        ));
+    }
+    if segments.is_empty() {
+        "↳ speed · waiting…".to_string()
+    } else {
+        format!("↳ live speed · {}", segments.join(" · "))
+    }
+}
+
+/// Live reasoning-rate text for the in-progress thinking-fold header. It is
+/// recomputed on every fold redraw (each thinking chunk), so it deliberately
+/// mirrors the approximate `~`-prefixed estimate used by the live footer
+/// status; the exact server-reported metrics are printed separately at stream
+/// end. Returns `None` until the first reasoning token arrives so the header
+/// stays stable during the pre-token window.
+fn fold_header_rate(content: &StreamContentState, now: Instant) -> Option<String> {
+    if content.live_reasoning_tokens == 0 {
+        return None;
+    }
+    let elapsed = content.reasoning_started_at.map(|started| {
+        content
+            .output_started_at
+            .unwrap_or(now)
+            .saturating_duration_since(started)
+    });
+    Some(format!(
+        "~{} tok @ {} tok/s",
+        format_compact_token_count(content.live_reasoning_tokens),
+        format_token_rate(content.live_reasoning_tokens, elapsed),
+    ))
+}
+
+/// Approximate token count for live throughput display (heuristic, prefixed with `~`):
+/// ASCII text averages ~4 chars/token, CJK characters ~1 token each (3 UTF-8 bytes each).
+/// A pure byte/4 estimate under-counts CJK by ~25%, so split by character class instead.
+fn estimate_stream_tokens(text: &str) -> u64 {
+    if text.is_empty() {
+        return 0;
+    }
+    let mut ascii = 0u64;
+    let mut non_ascii = 0u64;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii += 1;
+        } else {
+            non_ascii += 1;
+        }
+    }
+    non_ascii + ascii.div_ceil(4)
+}
+
+/// Pure formatter for the split reasoning/output throughput line.
+/// A missing timing sample is rendered as an em dash instead of inventing a rate.
+fn format_token_throughput_metrics(
+    reasoning_tokens: u64,
+    output_tokens: u64,
+    reasoning_elapsed: Option<Duration>,
+    output_elapsed: Option<Duration>,
+) -> Option<String> {
+    if reasoning_tokens == 0 && output_tokens == 0 {
+        return None;
+    }
+    if reasoning_elapsed.is_none() && output_elapsed.is_none() {
+        return None;
+    }
+
+    let mut segments = Vec::with_capacity(2);
+    if reasoning_tokens > 0 {
+        segments.push(format!(
+            "reasoning {} tok @ {} tok/s",
+            format_compact_token_count(reasoning_tokens),
+            format_token_rate(reasoning_tokens, reasoning_elapsed)
+        ));
+    }
+    if output_tokens > 0 {
+        segments.push(format!(
+            "output {} tok @ {} tok/s",
+            format_compact_token_count(output_tokens),
+            format_token_rate(output_tokens, output_elapsed)
+        ));
+    }
+    Some(format!("↳ speed · {}", segments.join(" · ")))
+}
+
+/// Minimum elapsed window before an instantaneous rate is reported; shorter windows
+/// (e.g. the first chunk right after output starts) would print misleadingly large rates.
+const MIN_RATE_WINDOW: Duration = Duration::from_millis(500);
+
+fn format_token_rate(tokens: u64, elapsed: Option<Duration>) -> String {
+    let Some(elapsed) = elapsed else {
+        return "—".to_string();
+    };
+    if elapsed < MIN_RATE_WINDOW {
+        return "—".to_string();
+    }
+    let seconds = elapsed.as_secs_f64();
+    if seconds <= 0.0 {
+        return "—".to_string();
+    }
+    format_compact_rate(tokens as f64 / seconds)
+}
+
+fn format_compact_rate(rate: f64) -> String {
+    if rate < 999.5 {
+        // A value >= 999.5 would round to "1000" below; render it in the next unit instead.
+        if rate >= 100.0 {
+            format!("{rate:.0}")
+        } else if rate >= 10.0 {
+            format!("{rate:.1}")
+        } else {
+            format!("{rate:.2}")
+        }
+    } else if rate < 999_950.0 {
+        // k-branch values >= 999_950 round to "1000.0k"; escalate to the m unit instead.
+        format!("{:.1}k", rate / 1_000.0)
+    } else {
+        format!("{:.1}m", rate / 1_000_000.0)
     }
 }
 
@@ -1241,8 +1467,16 @@ fn commit_visible_content(
         let text = content.replace(&markers.end_thinking_tag, "");
         let text = text.trim_matches('\n');
         if !text.is_empty() {
+            // Output timing starts only when real visible text is committed; a pure
+            // end_thinking_tag separator (or trimmed-away residue) must not count as output.
+            state.content.mark_output_started();
             current_history.push_str(text);
             state.content.assistant_text.push_str(text);
+            state.content.live_output_tokens = state
+                .content
+                .live_output_tokens
+                .saturating_add(estimate_stream_tokens(text));
+            refresh_live_token_status(&state.content, Instant::now());
             // Live output for a real-time `/bg` handoff (best-effort, no-op
             // unless the backgrounded process opened its live-output FIFO).
             crate::ai::background::publish_live_output(text);
@@ -1273,10 +1507,18 @@ fn commit_visible_content(
     } else {
         content
     };
+    if !text.is_empty() {
+        state.content.mark_output_started();
+    }
     current_history.reserve(text.len());
     state.content.assistant_text.reserve(text.len());
     current_history.push_str(&text);
     state.content.assistant_text.push_str(&text);
+    state.content.live_output_tokens = state
+        .content
+        .live_output_tokens
+        .saturating_add(estimate_stream_tokens(&text));
+    refresh_live_token_status(&state.content, Instant::now());
     // Live output for a real-time `/bg` handoff (best-effort, no-op unless the
     // backgrounded process opened its live-output FIFO).
     crate::ai::background::publish_live_output(&text);
@@ -1483,7 +1725,7 @@ fn write_thinking_content_folded(
             }
             fold.active = true;
         }
-        return thinking_fold_redraw(fold);
+        return thinking_fold_redraw(fold_header_rate(&state.content, Instant::now()).as_deref(), fold);
     }
 
     if !fold.active {
@@ -1492,7 +1734,7 @@ fn write_thinking_content_folded(
 
     append_fold_content(fold, content);
 
-    thinking_fold_redraw(fold)
+    thinking_fold_redraw(fold_header_rate(&state.content, Instant::now()).as_deref(), fold)
 }
 
 fn write_subagent_content_folded(
@@ -1516,7 +1758,7 @@ fn write_subagent_content_folded(
     }
 
     append_fold_content(fold, content);
-    thinking_fold_redraw(fold)
+    thinking_fold_redraw(None, fold)
 }
 
 fn append_fold_content(fold: &mut super::state::ThinkingFoldState, content: &str) {
@@ -1538,14 +1780,18 @@ fn append_fold_content(fold: &mut super::state::ThinkingFoldState, content: &str
 }
 
 /// Redraw the fold header and body within the viewport; cached row counts cover only the body.
-fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
+fn thinking_fold_redraw(
+    rate: Option<&str>,
+    fold: &mut super::state::ThinkingFoldState,
+) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    thinking_fold_redraw_to(&mut out, fold)
+    thinking_fold_redraw_to(&mut out, rate, fold)
 }
 
 fn thinking_fold_redraw_to(
     out: &mut impl Write,
+    rate: Option<&str>,
     fold: &mut super::state::ThinkingFoldState,
 ) -> io::Result<()> {
     // Erase one extra row above the previous body and redraw the header on
@@ -1574,7 +1820,7 @@ fn thinking_fold_redraw_to(
     };
     erase_fold_body(out, erase_rows)?;
     if fold.active {
-        write_fold_header(out, fold)?;
+        write_fold_header(out, rate, fold)?;
         fold.header_drawn = true;
     }
 
@@ -1609,9 +1855,18 @@ fn thinking_fold_redraw_to(
 /// Print the fold header, leaving the cursor at the start of the first body row.
 fn write_fold_header(
     out: &mut impl Write,
+    rate: Option<&str>,
     fold: &super::state::ThinkingFoldState,
 ) -> io::Result<()> {
-    write!(out, "  {}{}\x1b[0m\r\n", theme::current().accent_muted, fold.header_label)
+    write!(out, "  {}{}", theme::current().accent_muted, fold.header_label)?;
+    // Live reasoning throughput rides on the fold header: the header is the
+    // renderer's own redraw target (unlike the one-shot model/session status
+    // line printed by request/transport.rs), so appending here needs no extra
+    // cursor movement and stays inside the fold's erase span.
+    if let Some(rate) = rate {
+        write!(out, " · {rate}")?;
+    }
+    write!(out, "\x1b[0m\r\n")
 }
 
 /// Write the final header directly when thinking ends; used for an empty fold that never wrote an in-progress header.
@@ -1712,7 +1967,7 @@ fn finalize_fold_to(
         }
     } else if !fold.header_drawn {
         // Subagent preview keeps the existing two-line header/footer layout.
-        write_fold_header(&mut out, fold)?;
+        write_fold_header(&mut out, None, fold)?;
         fold.header_drawn = true;
     }
 
@@ -2111,8 +2366,14 @@ fn process_stream_payload(
     let reasoning_progress = !emitted_reasoning.is_empty();
 
     if !original_reasoning.is_empty() {
+        state.content.mark_reasoning_started();
         state.content.saw_reasoning_output = true;
         state.content.reasoning_text.push_str(&emitted_reasoning);
+        state.content.live_reasoning_tokens = state
+            .content
+            .live_reasoning_tokens
+            .saturating_add(estimate_stream_tokens(&emitted_reasoning));
+        refresh_live_token_status(&state.content, Instant::now());
 
         // Some long tool-chain contexts make the model verbatim-repeat one sentence in thinking. Continuing to read only
         // burns the output budget and makes the terminal look stuck; escalate to retryable truncation and let the upper layer lower the reasoning tier.

@@ -999,6 +999,69 @@ fn opencode_thinking_entries_send_thinking_object_alongside_reasoning_effort() {
 }
 
 #[test]
+fn deepseek_official_entries_send_thinking_object_alongside_reasoning_effort() {
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String("hi".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    // The official DeepSeek endpoint (api.deepseek.com) uses the same `thinking`
+    // object dialect as the OpenCode Zen gateway (thinking_dialect_for in
+    // src/bin/ai/provider/adapter/thinking.rs), per the official thinking-mode
+    // docs: {"thinking": {"type": "enabled"}} + top-level reasoning_effort.
+    // Entries are discovered from the registry so renames cannot empty the loop.
+    let mut checked = 0;
+    for def in crate::ai::model_names::all() {
+        let Some(endpoint) = def.endpoint.as_deref() else {
+            continue;
+        };
+        if def.adapter != crate::ai::provider::ApiProvider::Compatible
+            || !def.enable_thinking
+            || !endpoint
+                .trim()
+                .to_ascii_lowercase()
+                .contains("api.deepseek.com")
+        {
+            continue;
+        }
+        let model = def.key.as_str();
+        let body = build_request_body(
+            model,
+            &messages,
+            false,
+            true,
+            Some(true),
+            None,
+            None,
+            Some("high"),
+            None,
+            None,
+            None,
+        );
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            json.pointer("/thinking/type").and_then(|v| v.as_str()),
+            Some("enabled"),
+            "{model}"
+        );
+        assert_eq!(
+            json.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("high"),
+            "{model}"
+        );
+        assert!(json.get("enable_thinking").is_none(), "{model}");
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "registry must contain a compatible-adapter entry on api.deepseek.com with thinking enabled"
+    );
+}
+
+#[test]
 fn dashscope_deepseek_uses_model_specific_reasoning_contract() {
     const MODEL: &str = "deepseek-v4-flash-0731-alibaba";
     let messages = vec![Message {
@@ -2202,11 +2265,15 @@ fn reasoning_content_replay_is_exact_only_for_declared_models() {
     assert_eq!(gpt_messages[0].reasoning_content, None);
 }
 
-/// 加密推理回放 blob（`PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX`）是受保护的
-/// 内部状态：切到要求回传 `reasoning_content` 的 shape-only 模型（DeepSeek 方言）
-/// 时，必须清成空字符串而不是把 blob 原样发给 provider——与 GLM exact 标记切到
-/// DeepSeek 的既有语义（上方测试 2007-2016 行）一致。加密 blob 的模型自身则走
-/// else 分支整体剥离（side-channel 已在 normalize 之前重建，见 transport.rs）。
+/// The encrypted reasoning-replay blob
+/// (`PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX`) is protected internal
+/// state: when switching to a shape-only model that requires echoing back
+/// `reasoning_content` (the DeepSeek dialect), it must be cleared to an empty
+/// string instead of sending the blob verbatim to the provider — matching the
+/// existing GLM-exact-marker-to-DeepSeek semantics (test at lines 2007-2016
+/// above). For the model the blob came from (the encrypted-replay model), the
+/// else branch strips it entirely (the side-channel is rebuilt from history
+/// before normalize; see transport.rs).
 #[test]
 fn encrypted_replay_blob_cleared_when_switching_to_shape_only_model() {
     let items = vec![serde_json::json!({
@@ -2248,8 +2315,9 @@ fn encrypted_replay_blob_cleared_when_switching_to_shape_only_model() {
         "加密回放 blob 不能原样发给 DeepSeek provider"
     );
 
-    // blob 的来源模型（加密回放模型）走 else 分支整体剥离：side-channel 在
-    // normalize 之前已从历史重建（transport.rs），wire 上不应残留 blob。
+    // For the blob's origin model (the encrypted-replay model), the else
+    // branch strips it entirely: the side-channel is rebuilt from history
+    // before normalize (transport.rs), so the blob must not leak onto the wire.
     let mut origin_model_messages = vec![assistant];
     normalize_reasoning_content_replay_for_model(
         "muse-spark-1.2-contributor",

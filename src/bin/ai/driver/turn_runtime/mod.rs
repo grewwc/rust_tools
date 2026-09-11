@@ -161,10 +161,10 @@ pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_SOFT_FLOOR: usiz
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_HARD_FLOOR: usize = 80_000;
 
 /// Soft threshold: min 36K, otherwise history_max_chars * 1.5.
-/// history_max_chars defaults to 90K, giving a 135K soft threshold.
+/// history_max_chars defaults to 200K, giving a 300K soft threshold.
 ///
 /// But character thresholds and the model token window are different units: a heavily loaded prompt may be far below
-/// the 180K character threshold yet already close to the model token window. [`token_window_char_ceiling`] gives
+/// the 400K character threshold yet already close to the model token window. [`token_window_char_ceiling`] gives
 /// the model's "safe character budget"; taking the min of both ensures compression triggers earlier as the window nears.
 pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_soft_threshold(
     model: &str,
@@ -178,8 +178,9 @@ pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_soft_threshold(
 }
 
 /// Hard threshold: min 80K, otherwise history_max_chars * 3.5.
-/// history_max_chars defaults to 90K, giving a 315K hard threshold (far beyond the model context window;
-/// in practice the hard threshold is intercepted by normalize_messages_for_request before the model returns 4xx).
+/// history_max_chars defaults to 200K, giving a 700K hard threshold, far beyond the lossless soft
+/// threshold; it is capped at the model's context window ([`llm_summary_char_threshold`]) and in
+/// practice intercepted by normalize_messages_for_request before the model returns 4xx.
 /// It leaves a clear gap above the soft threshold so LLM summary does not trigger repeatedly at the soft boundary.
 /// Gated by the LLM summary character threshold — LLM summary only runs when the context approaches the model's actual context window
 /// (see [`llm_summary_char_threshold`]), not prematurely at 60% of the window.

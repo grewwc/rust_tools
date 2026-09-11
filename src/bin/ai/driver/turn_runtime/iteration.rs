@@ -1165,8 +1165,8 @@ async fn request_model_response(
     // When the context still far exceeds the threshold after lossless + lossy compression, call the LLM to squeeze the early conversation into a summary.
     // This is the last line of defense before sending the request, preventing oversized context from causing model 4xx or quality degradation
     // (the user-reported "295K compressed to 294K and then stalled" problem).
-    // The threshold is history_max_chars * 2 (default 180K), more aggressive than the orchestrator's
-    // hard threshold (*3.5 = 315K) — that one only fires between tool calls, while this covers the
+    // The threshold is history_max_chars * 2 (default 400K), more aggressive than the orchestrator's
+    // hard threshold (*3.5 = 700K) — that one only fires between tool calls, while this covers the
     // final check before every request.
     // Growth guard: mid-turn and pre-request share the same LLM summary attempt cursor.
     // If the same context batch was just attempted with no effective growth, do not request a summary again.

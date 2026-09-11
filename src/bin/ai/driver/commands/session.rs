@@ -446,7 +446,7 @@ pub fn try_handle_session_command(
                 "  /close                    close and delete current session, then exit (or :close)"
             );
             println!(
-                "  /fork                     fork current session into a new branch (keeps original) and switch"
+                "  /fork [<src>|src=<id>] [as=<id>]  fork a session into a new branch and switch"
             );
             println!(
                 "  /mark [message]            mark current session as important (shown in red in `/ss`); the optional message is shown via `/ss message`"
@@ -483,7 +483,9 @@ pub fn try_handle_session_command(
             println!(
                 "  /sessions import <file.zip> [as=<id>]           import session from archive"
             );
-            println!("  /sessions fork [src=<id>] [as=<id>]      copy session to a new branch");
+            println!(
+                "  /sessions fork [<src>|src=<id>] [as=<id>]  copy session to a new branch"
+            );
             println!("  /sessions branch <keep_turns> [src=<id>] [as=<id>]");
             println!(
                 "                                          fork then retain the first N complete user turns"
@@ -1103,15 +1105,39 @@ pub fn try_handle_session_command(
             );
         }
         "fork" => {
-            // Parse src=<id> / as=<id>; when src is not given, default to the
-            // current session.
+            // Parse one positional source or src=<id>, plus an optional as=<id>.
+            // When a source is not given, default to the current session.
             let mut src: Option<String> = None;
             let mut dst: Option<String> = None;
             for arg in parts.by_ref() {
                 if let Some(v) = arg.strip_prefix("src=") {
+                    if src.is_some() {
+                        println!(
+                            "ambiguous fork source. try: /sessions fork [<src>|src=<id>] [as=<id>]"
+                        );
+                        return Ok(true);
+                    }
                     src = Some(v.to_string());
                 } else if let Some(v) = arg.strip_prefix("as=") {
+                    if dst.is_some() {
+                        println!(
+                            "ambiguous fork destination. try: /sessions fork [<src>|src=<id>] [as=<id>]"
+                        );
+                        return Ok(true);
+                    }
                     dst = Some(v.to_string());
+                } else if arg.contains('=') {
+                    println!(
+                        "unknown fork argument: '{arg}'. try: /sessions fork [<src>|src=<id>] [as=<id>]"
+                    );
+                    return Ok(true);
+                } else if src.is_some() {
+                    println!(
+                        "ambiguous fork source. try: /sessions fork [<src>|src=<id>] [as=<id>]"
+                    );
+                    return Ok(true);
+                } else {
+                    src = Some(arg.to_string());
                 }
             }
             let src_id = src.unwrap_or_else(|| app.session_id.clone());
@@ -2382,6 +2408,66 @@ mod tests {
         // Both fork branches are kept, not deleted.
         assert!(store.session_history_file(&first_fork_id).exists());
         assert!(store.session_history_file("sess-old").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fork_command_uses_positional_foreign_source_and_switches_destination() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let original_session = app.session_id.clone();
+        let foreign_source = "sess-foreign";
+
+        append_history_messages(
+            &store.session_history_file(&app.session_id),
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("current session".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        append_history_messages(
+            &store.session_history_file(foreign_source),
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("foreign source session".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+
+        try_handle_session_command(&mut app, &format!("/ss fork {foreign_source}")).unwrap();
+
+        let destination = app.session_id.clone();
+        assert_ne!(destination, original_session);
+        assert_ne!(destination, foreign_source);
+        assert_eq!(app.session_history_file, store.session_history_file(&destination));
+        let forked = store.read_all_messages(&destination).unwrap();
+        assert_eq!(forked.len(), 1);
+        assert_eq!(
+            forked[0].content,
+            Value::String("foreign source session".to_string())
+        );
+
+        let session_count = store.list_sessions().unwrap().len();
+        assert!(
+            try_handle_session_command(&mut app, "/ss fork sess-foreign unexpected").unwrap()
+        );
+        assert_eq!(app.session_id, destination);
+        assert_eq!(store.list_sessions().unwrap().len(), session_count);
+        assert!(try_handle_session_command(&mut app, "/ss fork unexpected=value").unwrap());
+        assert_eq!(app.session_id, destination);
+        assert_eq!(store.list_sessions().unwrap().len(), session_count);
 
         let _ = fs::remove_dir_all(root);
     }

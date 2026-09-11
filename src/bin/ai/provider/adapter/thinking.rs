@@ -1,49 +1,63 @@
-//! 思考开关的「线缆方言」抽象。
+//! The "wire dialect" abstraction for the thinking switch.
 //!
-//! 「是否思考」是一个逻辑开关，但不同网关用不同的请求体字段表达它。这与
-//! provider 的鉴权 / 响应消费是**正交**的另一根轴——核心层只传入逻辑开关
-//! `enable`，由 [`thinking_dialect_for`] 选出方言，方言负责写哪些 key。这样
-//! 各 provider adapter 不必再认识彼此的思考 wire 格式。
+//! Whether thinking is enabled is a logical switch, but different gateways
+//! express it with different request-body fields. This is an axis **orthogonal**
+//! to provider auth / response consumption: the core layer only passes the
+//! logical switch `enable`, and [`thinking_dialect_for`] selects the dialect,
+//! which is responsible for writing the keys. This keeps provider adapters from
+//! having to know each other's thinking wire format.
 //!
-//! [`thinking_dialect_for`] 的分派与 [`super::adapter_for`] 一一对应（同样以
-//! provider + endpoint 决定网关），因此对模型注册表中所有模型的 wire 输出
-//! 与旧的 per-adapter `thinking_fields` 逐字节等价。
+//! [`thinking_dialect_for`] shares its axis with [`super::adapter_for`] (both
+//! are keyed on provider + endpoint), but the Compatible axis is finer:
+//! `adapter_for` returns one adapter for all compatible endpoints, while the
+//! dialect further splits by endpoint into DashScope / official DeepSeek /
+//! everything else, so the dialect cannot be derived from the adapter alone.
+//! Apart from that subdivision, the wire output for every model in the model
+//! registry is byte-identical to the old per-adapter `thinking_fields`.
 //!
-//! 三种方言：
-//! - [`EnableThinkingDialect`]：DashScope compatible-mode（百炼）→ `enable_thinking: bool`
-//! - [`DeepSeekThinkingDialect`]：DeepSeek（OpenCode Zen 网关）→ `thinking: {"type":...}`
-//! - [`NoThinkingDialect`]：纯 OpenAI / OpenRouter / MiniMax 等 → 不发送任何字段
+//! The three dialects:
+//! - [`EnableThinkingDialect`]: DashScope compatible-mode (Bailian) → `enable_thinking: bool`
+//! - [`DeepSeekThinkingDialect`]: DeepSeek (OpenCode Zen gateway / official api.deepseek.com) → `thinking: {"type":...}`
+//! - [`NoThinkingDialect`]: plain OpenAI / OpenRouter / MiniMax etc. → sends no fields
 
 use serde_json::{Map, Value, json};
 
 use super::super::ApiProvider;
 
-/// 思考开关的线缆编码方言。零状态单例。
+/// Wire encoding dialect for the thinking switch. Zero-state singleton.
 pub(in crate::ai) trait ThinkingDialect: Sync {
-    /// 把逻辑开关 `enable` 编码成请求体字段。空 Map 表示该方言不发送任何字段。
-    /// `top_level_reasoning_effort` 表示该请求最终是否会发送顶层
-    /// `reasoning_effort`；仅少数特殊方言需要据此调整 wire 形状。
+    /// Encodes the logical switch `enable` into request-body fields. An empty
+    /// Map means this dialect sends no fields. `top_level_reasoning_effort`
+    /// indicates whether the request will ultimately send a top-level
+    /// `reasoning_effort`; only a few special dialects need it to adjust the
+    /// wire shape.
     fn fields(&self, enable: bool, top_level_reasoning_effort: Option<&str>) -> Map<String, Value>;
 
-    /// 该方言是否要求 assistant tool-call 消息回传 `reasoning_content` 字段。
-    /// DeepSeek thinking-mode 在工具回合续写时会校验该字段，即使网关没有给出
-    /// 非空推理文本，也需要保留字段形状以通过协议校验。
+    /// Whether this dialect requires assistant tool-call messages to echo back
+    /// a `reasoning_content` field. DeepSeek thinking-mode validates this field
+    /// when continuing after a tool round; even when the gateway produced no
+    /// non-empty reasoning text, the field shape must be preserved to pass the
+    /// protocol check.
     fn requires_reasoning_content_echo(&self) -> bool {
         false
     }
 
-    /// 降低 `reasoning_effort` 是否能实际缩短该方言下的思考链长度。
+    /// Whether lowering `reasoning_effort` actually shortens the thinking chain
+    /// under this dialect.
     ///
-    /// 顶层 `reasoning_effort` 方言（OpenAI 兼容族）返回 `true`：降档能压缩推理
-    /// 预算。而 [`EnableThinkingDialect`] 这类「思考仅由 `enable_thinking` 布尔
-    /// 开关控制、忽略 effort」的方言返回 `false`——对它们降 effort 是空操作，
-    /// 截断重试必须直接关 thinking 才能把输出预算让给可见内容。
+    /// Top-level `reasoning_effort` dialects (the OpenAI-compatible family)
+    /// return `true`: lowering the effort compresses the reasoning budget.
+    /// Dialects like [`EnableThinkingDialect`], where thinking is controlled
+    /// solely by the `enable_thinking` boolean and effort is ignored, return
+    /// `false` — lowering effort for them is a no-op, so truncation retries
+    /// must turn thinking off directly to give the output budget back to the
+    /// visible content.
     fn reasoning_effort_reduces_thinking(&self) -> bool {
         true
     }
 }
 
-/// DashScope 协议：`{"enable_thinking": bool}`。
+/// DashScope protocol: `{"enable_thinking": bool}`.
 pub(in crate::ai) struct EnableThinkingDialect;
 
 impl ThinkingDialect for EnableThinkingDialect {
@@ -58,18 +72,22 @@ impl ThinkingDialect for EnableThinkingDialect {
     }
 
     fn reasoning_effort_reduces_thinking(&self) -> bool {
-        // 思考仅由 `enable_thinking` 布尔开关控制，请求体里根本不带 effort，
-        // 降 effort 对思考链长度零影响。
+        // Thinking is controlled solely by the `enable_thinking` boolean; the
+        // request body never carries an effort, so lowering effort has zero
+        // effect on the thinking-chain length.
         false
     }
 }
 
-/// DeepSeek（经 OpenCode Zen 网关）：`{"thinking": {"type": "enabled"|"disabled"}}`。
-/// DeepSeek 原生忽略 `enable_thinking`，只认这个对象。网关实测（2026-08）：
-/// `thinking` 对象与顶层 `reasoning_effort` 可共存、无 wire 冲突；且
-/// `thinking:{"type":"disabled"}` 优先于任意 `reasoning_effort` 生效，是唯一
-/// 可靠的思考关闭开关。因此本方言始终下发 `thinking` 对象（顶层
-/// `reasoning_effort` 由请求层按 adapter 规则照常下发）。
+/// DeepSeek (OpenCode Zen gateway / official api.deepseek.com):
+/// `{"thinking": {"type": "enabled"|"disabled"}}`.
+/// DeepSeek natively ignores `enable_thinking` and only honors this object.
+/// Gateway testing (2026-08) showed the `thinking` object and the top-level
+/// `reasoning_effort` can coexist without wire conflicts, and
+/// `thinking:{"type":"disabled"}` takes precedence over any `reasoning_effort`,
+/// making it the only reliable thinking-off switch. This dialect therefore
+/// always sends the `thinking` object (the request layer still sends the
+/// top-level `reasoning_effort` per adapter rules as usual).
 pub(in crate::ai) struct DeepSeekThinkingDialect;
 
 impl ThinkingDialect for DeepSeekThinkingDialect {
@@ -89,14 +107,17 @@ impl ThinkingDialect for DeepSeekThinkingDialect {
     }
 
     fn reasoning_effort_reduces_thinking(&self) -> bool {
-        // 网关实测：reasoning_effort 的 low/max 都保持思考开启、无分级差异，
-        // 思考是二元开关（thinking 对象）。截断重试降 effort 无效，必须直接关 thinking。
+        // Gateway testing: low and max reasoning_effort both keep thinking on
+        // with no gradation — thinking is a binary switch (the thinking
+        // object). Lowering effort on truncation retries is ineffective;
+        // thinking must be turned off directly.
         false
     }
 }
 
-/// 不发送任何思考字段（纯 OpenAI / OpenRouter 仅靠 `reasoning_effort`；
-/// MiniMax M2.x 为 always-on reasoning，网关无可靠关闭开关）。
+/// Sends no thinking fields (plain OpenAI / OpenRouter rely only on
+/// `reasoning_effort`; MiniMax M2.x has always-on reasoning with no reliable
+/// gateway off switch).
 pub(in crate::ai) struct NoThinkingDialect;
 
 impl ThinkingDialect for NoThinkingDialect {
@@ -113,23 +134,40 @@ static ENABLE_THINKING: EnableThinkingDialect = EnableThinkingDialect;
 static DEEPSEEK_THINKING: DeepSeekThinkingDialect = DeepSeekThinkingDialect;
 static NO_THINKING: NoThinkingDialect = NoThinkingDialect;
 
-/// 端点是否为 DashScope（阿里云百炼）compatible-mode。
-/// 该端点用 `enable_thinking: bool` 控制思考。具体判定逻辑见
-/// [`super::compatible::is_dashscope_endpoint`]——复用同一实现以保持与 compatible
-/// 模块的 wire 形状判定一致（大小写 / 空白 trim）。
+/// Whether the endpoint is DashScope (Alibaba Cloud Bailian) compatible-mode,
+/// which controls thinking via `enable_thinking: bool`. The matching logic is
+/// defined in [`super::compatible::is_dashscope_endpoint`] and reused here to
+/// stay consistent with the compatible module's wire-shape decision
+/// (case-insensitive / trimmed).
 use super::compatible::is_dashscope_endpoint;
 
-/// 按网关（provider + endpoint）与 model 选出思考方言，与 provider 鉴权 /
-/// 响应消费轴解耦。分派严格镜像 [`super::adapter_for`]：
-/// - OpenRouter 端点 → 不发送（与 OpenAI 一致，仅靠 reasoning_effort）
-/// - Alibaba → `enable_thinking`（DashScope compatible-mode）
-/// - Compatible → 端点为 DashScope 时走 `enable_thinking`，其余（如内部 modelhub、
-///   其他 OpenAI 兼容网关）不发送思考字段，仅靠顶层 `reasoning_effort`
-/// - OpenAi → DashScope 端点用 `enable_thinking`，纯 OpenAI 端点不发送
-/// - OpenCode → DeepSeek 模型用 `thinking` 对象，其余不发送
+/// Whether the endpoint is the official DeepSeek API (`api.deepseek.com`).
+/// Like the OpenCode Zen gateway, the official endpoint controls thinking with
+/// the `thinking: {"type":"enabled"|"disabled"}` object (the official sample
+/// curl sends this object).
+fn is_deepseek_official_endpoint(endpoint: &str) -> bool {
+    endpoint
+        .trim()
+        .to_ascii_lowercase()
+        .contains("api.deepseek.com")
+}
+
+/// Picks the thinking dialect by gateway (provider + endpoint) and model,
+/// decoupled from the provider auth / response-consumption axis. The dispatch
+/// strictly mirrors [`super::adapter_for`]:
+/// - OpenRouter endpoint → sends nothing (same as OpenAI, relies only on reasoning_effort)
+/// - Alibaba → `enable_thinking` (DashScope compatible-mode)
+/// - Compatible → DashScope endpoint uses `enable_thinking`; official DeepSeek
+///   endpoint (api.deepseek.com) uses the `thinking` object; everything else
+///   (e.g. internal modelhub, other OpenAI-compatible gateways) sends no
+///   thinking field, relying only on top-level `reasoning_effort`
+/// - OpenAi → DashScope endpoint uses `enable_thinking`; plain OpenAI endpoints send nothing
+/// - OpenCode → DeepSeek models use the `thinking` object; everything else sends nothing
 ///
-/// 历史上 `Compatible` 全量走 DashScope 方言，导致挂在 compatible provider 下的
-/// 纯 OpenAI 兼容端点（如内部 modelhub）收到未知参数 `enable_thinking` 报 400。
+/// Historically `Compatible` always used the DashScope dialect, so pure
+/// OpenAI-compatible endpoints mounted under the compatible provider (e.g.
+/// internal modelhub) received the unknown `enable_thinking` parameter and
+/// returned 400.
 pub(in crate::ai) fn thinking_dialect_for(
     provider: ApiProvider,
     model: &str,
@@ -147,6 +185,8 @@ pub(in crate::ai) fn thinking_dialect_for(
         ApiProvider::Compatible => {
             if is_dashscope_endpoint(endpoint) {
                 &ENABLE_THINKING
+            } else if is_deepseek_official_endpoint(endpoint) {
+                &DEEPSEEK_THINKING
             } else {
                 &NO_THINKING
             }
@@ -168,10 +208,12 @@ pub(in crate::ai) fn thinking_dialect_for(
     }
 }
 
-/// 对指定模型，降 `reasoning_effort` 是否能实际缩短思考链。
+/// For the given model, whether lowering `reasoning_effort` actually shortens
+/// the thinking chain.
 ///
-/// `enable_thinking` 布尔开关方言（DashScope / compatible，如 GLM）返回 `false`：
-/// 截断重试阶梯里的 effort 降档对它是空操作，必须直接关 thinking 才能收敛。
+/// Boolean `enable_thinking`-switch dialects (DashScope / compatible, e.g.
+/// GLM) return `false`: the effort step in the truncation-retry ladder is a
+/// no-op for them, so thinking must be turned off directly to converge.
 pub(in crate::ai) fn reasoning_effort_reduces_thinking_for(
     provider: ApiProvider,
     model: &str,
@@ -186,7 +228,8 @@ mod tests {
 
     #[test]
     fn enable_thinking_dialect_effort_is_noop() {
-        // DashScope compatible 端点走 enable_thinking 开关，降 effort 无效。
+        // DashScope compatible endpoints use the enable_thinking switch;
+        // lowering effort is a no-op.
         assert!(!reasoning_effort_reduces_thinking_for(
             ApiProvider::Compatible,
             "glm5.2-super-relay",
@@ -201,8 +244,9 @@ mod tests {
 
     #[test]
     fn non_dashscope_compatible_uses_openai_dialect() {
-        // 字节 modelhub / Ollama / 自部署 vLLM 等真正 OpenAI 兼容端点，
-        // 即使走 `compatible` provider，也应按 OpenAI 方言处理（reasoning_effort 生效，不发 enable_thinking）。
+        // Truly OpenAI-compatible endpoints — ByteDance modelhub / Ollama /
+        // self-hosted vLLM — should follow the OpenAI dialect even under the
+        // `compatible` provider (reasoning_effort applies, no enable_thinking).
         assert!(reasoning_effort_reduces_thinking_for(
             ApiProvider::Compatible,
             "Kimi-K2.5",
@@ -212,11 +256,43 @@ mod tests {
 
     #[test]
     fn openai_family_effort_reduces_thinking() {
-        // 顶层 reasoning_effort 方言：降档能压缩推理预算。
+        // Top-level reasoning_effort dialect: lowering the effort compresses
+        // the reasoning budget.
         assert!(reasoning_effort_reduces_thinking_for(
             ApiProvider::OpenAi,
             "gpt-5",
             super::super::OPENAI_DEFAULT_ENDPOINT,
+        ));
+    }
+
+    #[test]
+    fn deepseek_official_endpoint_uses_thinking_object_dialect() {
+        // The official endpoint (api.deepseek.com) uses the DeepSeek `thinking`
+        // object dialect, matching the official sample curl
+        // (`"thinking": {"type": "enabled"}`): enabled when on, disabled when
+        // off, independent of the top-level reasoning_effort.
+        let endpoint = "https://api.deepseek.com/chat/completions";
+        let dialect = thinking_dialect_for(ApiProvider::Compatible, "deepseek-flash", endpoint);
+        assert_eq!(
+            dialect.fields(true, Some("high")),
+            json!({ "thinking": { "type": "enabled" } })
+                .as_object()
+                .unwrap()
+                .clone()
+        );
+        assert_eq!(
+            dialect.fields(false, None),
+            json!({ "thinking": { "type": "disabled" } })
+                .as_object()
+                .unwrap()
+                .clone()
+        );
+        // Thinking is a binary switch (the thinking object); lowering effort
+        // does not shorten the chain.
+        assert!(!reasoning_effort_reduces_thinking_for(
+            ApiProvider::Compatible,
+            "deepseek-flash",
+            endpoint,
         ));
     }
 }

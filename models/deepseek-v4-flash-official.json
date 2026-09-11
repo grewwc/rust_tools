@@ -1,0 +1,17 @@
+{
+  "key": "deepseek-flash-official",
+  "name": "deepseek-flash",
+  "adapter": "compatible",
+  "quality_tier": "strong",
+  "api_key_config_key": "deepseek.api_key",
+  "is_vl": true,
+  "search_enabled": true,
+  "tools_default_enabled": true,
+  "enable_thinking": true,
+  "subagent_priority": 85,
+  "default_reasoning_effort": "max",
+  "reasoning_content_replay": true,
+  "context_window_tokens": 1000000,
+  "max_output_tokens": 393216,
+  "endpoint": "https://api.deepseek.com/chat/completions"
+}

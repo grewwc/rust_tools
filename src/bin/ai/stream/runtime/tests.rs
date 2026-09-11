@@ -74,6 +74,96 @@ fn prompt_cache_metrics_reports_hit_rate() {
 }
 
 #[test]
+fn token_throughput_metrics_split_reasoning_from_output() {
+    let line = format_token_throughput_metrics(
+        800,
+        400,
+        Some(Duration::from_secs(2)),
+        Some(Duration::from_secs(1)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        line,
+        "↳ speed · reasoning 800 tok @ 400 tok/s · output 400 tok @ 400 tok/s"
+    );
+}
+
+#[test]
+fn token_throughput_metrics_omits_unmeasurable_streams() {
+    assert_eq!(format_token_throughput_metrics(800, 0, None, None), None);
+    assert_eq!(
+        format_token_throughput_metrics(0, 1_200, None, Some(Duration::from_secs(2))),
+        Some("↳ speed · output 1.2k tok @ 600 tok/s".to_string())
+    );
+}
+
+#[test]
+fn live_token_status_reports_approximate_phase_rates() {
+    let now = Instant::now();
+    let app = crate::ai::middleware::test_util::test_app();
+    let mut state = initial_stream_processing_state(&app).content;
+    state.reasoning_started_at = Some(now - Duration::from_secs(3));
+    state.output_started_at = Some(now - Duration::from_secs(1));
+    state.live_reasoning_tokens = 8;
+    state.live_output_tokens = 12;
+
+    assert_eq!(
+        format_live_token_status(&state, now),
+        "↳ live speed · reasoning ~8 tok @ 4.00 tok/s · output ~12 tok @ 12.0 tok/s"
+    );
+}
+
+#[test]
+fn fold_header_rate_tracks_live_reasoning_throughput() {
+    let now = Instant::now();
+    let app = crate::ai::middleware::test_util::test_app();
+    let mut content = initial_stream_processing_state(&app).content;
+    // No reasoning tokens yet: the in-progress header stays stable.
+    assert_eq!(fold_header_rate(&content, now), None);
+    content.reasoning_started_at = Some(now - Duration::from_secs(2));
+    content.live_reasoning_tokens = 8;
+    assert_eq!(
+        fold_header_rate(&content, now).as_deref(),
+        Some("~8 tok @ 4.00 tok/s")
+    );
+}
+
+#[test]
+fn token_rate_under_minimum_window_is_unmeasurable() {
+    assert_eq!(format_token_rate(10_000, Some(Duration::from_millis(200))), "—");
+    assert_eq!(format_token_rate(10_000, Some(Duration::from_secs(2))), "5.0k");
+}
+
+#[test]
+fn live_token_estimate_is_zero_only_for_empty_deltas() {
+    assert_eq!(estimate_stream_tokens(""), 0);
+    assert_eq!(estimate_stream_tokens("a"), 1);
+    assert_eq!(estimate_stream_tokens("中文"), 2);
+}
+
+#[test]
+fn live_token_estimate_splits_cjk_and_ascii() {
+    // CJK chars count ~1 token each instead of the old byte/4 underestimate.
+    assert_eq!(estimate_stream_tokens("你好世界"), 4);
+    assert_eq!(estimate_stream_tokens("Hello 世界"), 4); // 6 ascii -> 2 + 2 CJK
+    assert_eq!(estimate_stream_tokens("Hello world"), 3); // 11 ascii -> ceil(11/4)
+}
+
+#[test]
+fn format_compact_rate_escalates_units_across_rounding_boundaries() {
+    // Values that round up across a unit threshold render in the next unit
+    // instead of showing a misleading "1000" / "1000.0k".
+    assert_eq!(format_compact_rate(999.4), "999");
+    assert_eq!(format_compact_rate(999.6), "1.0k");
+    assert_eq!(format_compact_rate(999_949.0), "999.9k");
+    assert_eq!(format_compact_rate(999_950.0), "1.0m");
+    // Sub-unit precision is unchanged.
+    assert_eq!(format_compact_rate(9.94), "9.94");
+    assert_eq!(format_compact_rate(99.4), "99.4");
+}
+
+#[test]
 fn terminal_dedupe_recognizes_exact_replayed_tool_round_narration() {
     let mut state = StreamProcessingState::new();
     state.render.terminal_dedupe = Some(TerminalDedupeState {
@@ -2046,10 +2136,10 @@ fn thinking_fold_redraw_reuses_header_after_empty_body() {
     fold.active = true;
     fold.max_visible_lines = 2;
     let mut header = Vec::new();
-    write_fold_header(&mut header, &fold).unwrap();
+    write_fold_header(&mut header, None, &fold).unwrap();
     let mut out = Vec::new();
 
-    thinking_fold_redraw_to(&mut out, &mut fold).unwrap();
+    thinking_fold_redraw_to(&mut out, None, &mut fold).unwrap();
     assert_eq!(out, header, "activation must not erase preceding output");
     assert!(fold.header_drawn);
     assert_eq!(fold.window_rows, 0);
@@ -2063,7 +2153,7 @@ fn thinking_fold_redraw_reuses_header_after_empty_body() {
     for content in ["", "\n \n", "first line"] {
         append_fold_content(&mut fold, content);
         out.clear();
-        thinking_fold_redraw_to(&mut out, &mut fold).unwrap();
+        thinking_fold_redraw_to(&mut out, None, &mut fold).unwrap();
         assert!(
             out.starts_with(&redraw_prefix),
             "redraw must replace the existing header after {content:?}: {out:?}"
@@ -2077,7 +2167,7 @@ fn thinking_fold_redraw_reuses_header_after_empty_body() {
     // Once content exists, the cursor already rests on its last row: the
     // normal one-row body must still erase exactly two rows including the header.
     out.clear();
-    thinking_fold_redraw_to(&mut out, &mut fold).unwrap();
+    thinking_fold_redraw_to(&mut out, None, &mut fold).unwrap();
     assert!(out.starts_with(&redraw_prefix));
 
     unsafe {
@@ -2092,7 +2182,7 @@ fn thinking_fold_empty_body_completion_replaces_header() {
     fold.max_visible_lines = 2;
     let mut out = Vec::new();
 
-    thinking_fold_redraw_to(&mut out, &mut fold).unwrap();
+    thinking_fold_redraw_to(&mut out, None, &mut fold).unwrap();
     assert_eq!(fold.window_rows, 0);
     out.clear();
     finalize_fold_to(&mut out, &mut fold, true).unwrap();
@@ -2127,15 +2217,15 @@ fn subagent_fold_redraw_preserves_body_and_footer() {
     fold.max_visible_lines = 2;
     append_fold_content(&mut fold, "first line\nsecond line");
     let mut out = Vec::new();
-    thinking_fold_redraw_to(&mut out, &mut fold).unwrap();
+    thinking_fold_redraw_to(&mut out, None, &mut fold).unwrap();
     let mut header = Vec::new();
-    write_fold_header(&mut header, &fold).unwrap();
+    write_fold_header(&mut header, None, &fold).unwrap();
     assert!(out.starts_with(&header));
     assert_eq!(fold.window_rows, 2);
 
     append_fold_content(&mut fold, "\nthird line");
     out.clear();
-    thinking_fold_redraw_to(&mut out, &mut fold).unwrap();
+    thinking_fold_redraw_to(&mut out, None, &mut fold).unwrap();
     let mut redraw_prefix = Vec::new();
     erase_fold_body(&mut redraw_prefix, 3).unwrap();
     redraw_prefix.extend_from_slice(&header);
