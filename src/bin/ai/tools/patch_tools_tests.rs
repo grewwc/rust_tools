@@ -1936,6 +1936,7 @@ fn inline_replace_old_equals_new() {
     );
     let err = apply_inline_replace(original, &envelope).expect_err("old==new should fail");
     assert!(err.contains("identical"), "error: {err}");
+    assert!(err.contains("*** Update File:"), "error: {err}");
 }
 
 #[test]
@@ -1948,6 +1949,86 @@ fn inline_replace_missing_field() {
     );
     let err = apply_inline_replace(original, &envelope).expect_err("missing new should fail");
     assert!(err.contains("missing `new:`"), "error: {err}");
+}
+
+#[test]
+fn inline_replace_rejects_extra_body_lines() {
+    // A multi-line `new:` must fail loudly: ignoring the extra line would apply only the first
+    // line and still report success (a silent partial edit).
+    let original = "hello world\n";
+    let envelope = make_envelope(
+        PatchEnvelopeOp::ReplaceInLine,
+        "test.txt",
+        &["anchor: hello", "old: world", "new: rust", "and more lines"],
+    );
+    let err = apply_inline_replace(original, &envelope).expect_err("extra lines must be rejected");
+    assert!(err.contains("unexpected line"), "error: {err}");
+    assert!(err.contains("*** Update File:"), "error: {err}");
+}
+
+#[test]
+fn inline_replace_rejects_duplicate_field() {
+    // Last-wins on a repeated field would silently drop the earlier value.
+    let original = "hello world\n";
+    let envelope = make_envelope(
+        PatchEnvelopeOp::ReplaceInLine,
+        "test.txt",
+        &["anchor: hello", "old: world", "new: rust", "new: rust2"],
+    );
+    let err = apply_inline_replace(original, &envelope).expect_err("duplicate field must fail");
+    assert!(err.contains("duplicate `new:`"), "error: {err}");
+}
+
+#[test]
+fn inline_replace_bare_new_deletes_old() {
+    // A bare `new:` (empty value) removes `old` from the located line.
+    let original = "let x = 42,\n";
+    let envelope = make_envelope(
+        PatchEnvelopeOp::ReplaceInLine,
+        "test.rs",
+        &["anchor: let x", "old: ,", "new:"],
+    );
+    let result = apply_inline_replace(original, &envelope).expect("empty new should delete");
+    assert_eq!(result, "let x = 42\n");
+}
+
+#[test]
+fn inline_replace_rejects_empty_anchor() {
+    let original = "hello world\n";
+    let envelope = make_envelope(
+        PatchEnvelopeOp::ReplaceInLine,
+        "test.txt",
+        &["anchor:", "old: world", "new: rust"],
+    );
+    let err = apply_inline_replace(original, &envelope).expect_err("empty anchor must fail");
+    assert!(err.contains("must not be empty"), "error: {err}");
+}
+
+#[test]
+fn inline_replace_tolerates_indented_field_lines() {
+    // Indentation before a field name is formatting only; it cannot change which field is set.
+    let original = "hello world\n";
+    let envelope = make_envelope(
+        PatchEnvelopeOp::ReplaceInLine,
+        "test.txt",
+        &["  anchor: hello", "  old: world", "  new: rust"],
+    );
+    let result = apply_inline_replace(original, &envelope).expect("indented fields should work");
+    assert_eq!(result, "hello rust\n");
+}
+
+#[test]
+fn inline_replace_tolerates_blank_body_lines() {
+    // Blank lines inside the section are formatting and are skipped; only non-blank unrecognized
+    // lines are rejected.
+    let original = "hello world\n";
+    let envelope = make_envelope(
+        PatchEnvelopeOp::ReplaceInLine,
+        "test.txt",
+        &["anchor: hello", "", "old: world", "  ", "new: rust"],
+    );
+    let result = apply_inline_replace(original, &envelope).expect("blank lines should be skipped");
+    assert_eq!(result, "hello rust\n");
 }
 
 #[test]
@@ -2001,6 +2082,57 @@ fn inline_replace_via_execute_apply_patch() {
     });
 
     assert_eq!(fs::read_to_string(&path).unwrap(), "the answer is 99\n");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn inline_replace_bare_new_deletes_via_execute_apply_patch() {
+    // End-to-end: a bare `new:` (substring deletion) must reach the file through the full path,
+    // and the resulting byte change must satisfy the no-op guard.
+    let _guard = ENV_LOCK.lock();
+    let path = make_temp_path("inline_e2e_delete");
+    let base = path.parent().unwrap().to_path_buf();
+    fs::create_dir_all(&base).unwrap();
+    fs::write(&path, "let x = 42,\n").unwrap();
+
+    crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+        let args = serde_json::json!({
+            "patch": format!(
+                "*** Begin Patch\n*** Replace in line: {}\nanchor: let x\nold: ,\nnew:\n*** End Patch\n",
+                path.to_string_lossy()
+            ),
+            "path": path.to_string_lossy(),
+        });
+        execute_apply_patch(&args).expect("e2e deletion should succeed");
+    });
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), "let x = 42\n");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn inline_replace_extra_lines_rejected_via_execute_apply_patch() {
+    // End-to-end: a multi-line `new:` must fail rather than silently apply its first line, so the
+    // file keeps its original content.
+    let _guard = ENV_LOCK.lock();
+    let path = make_temp_path("inline_e2e_reject");
+    let base = path.parent().unwrap().to_path_buf();
+    fs::create_dir_all(&base).unwrap();
+    fs::write(&path, "the answer is 42\n").unwrap();
+
+    let err = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+        let args = serde_json::json!({
+            "patch": format!(
+                "*** Begin Patch\n*** Replace in line: {}\nanchor: the answer\nold: 42\nnew: 99\nand more\n*** End Patch\n",
+                path.to_string_lossy()
+            ),
+            "path": path.to_string_lossy(),
+        });
+        execute_apply_patch(&args).expect_err("extra line must be rejected")
+    });
+    assert!(err.contains("unexpected line"), "error: {err}");
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), "the answer is 42\n");
     let _ = fs::remove_dir_all(base);
 }
 

@@ -722,6 +722,58 @@ fn normalize_patch_envelope(path: &Path, envelope: &PatchEnvelope) -> Result<Str
     }
 }
 
+/// The three single-line fields accepted in a `*** Replace in line:` body.
+#[derive(Clone, Copy)]
+enum InlineReplaceField {
+    Anchor,
+    Old,
+    New,
+}
+
+impl InlineReplaceField {
+    /// Field order, so a body line can index its slot directly.
+    const ALL: [Self; 3] = [Self::Anchor, Self::Old, Self::New];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Anchor => 0,
+            Self::Old => 1,
+            Self::New => 2,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Anchor => "anchor",
+            Self::Old => "old",
+            Self::New => "new",
+        }
+    }
+
+    /// Parse one body line as `<name>: <value>`, or `None` when the line is not one of the three
+    /// fields. Leading indentation before the name is formatting only and is ignored; exactly one
+    /// space after the colon is the separator, so any further leading spaces stay in the value and
+    /// a bare `name:` denotes an empty value.
+    fn parse(line: &str) -> Option<(Self, &str)> {
+        let line = line.trim_start();
+        Self::ALL.iter().find_map(|field| {
+            let rest = line.strip_prefix(field.name())?.strip_prefix(':')?;
+            Some((*field, rest.strip_prefix(' ').unwrap_or(rest)))
+        })
+    }
+}
+
+/// Render a body line for an error message, capped so an over-long line cannot bloat the tool
+/// result.
+fn preview_patch_body_line(line: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    if line.chars().count() <= MAX_CHARS {
+        return format!("{line:?}");
+    }
+    let head: String = line.chars().take(MAX_CHARS).collect();
+    format!("{head:?}...")
+}
+
 /// Inline substring replacement: use `anchor:` to locate the line, then exactly replace
 /// `old:` with `new:` within that line.
 ///
@@ -737,27 +789,48 @@ fn normalize_patch_envelope(path: &Path, envelope: &PatchEnvelope) -> Result<Str
 /// - `old` must appear exactly once in that line, otherwise error (to avoid changing the wrong
 ///   position);
 /// - if `old == new` (identical before/after), report an error as a no-op so it isn't mistaken
-///   for success.
+///   for success;
+/// - the body must be three single-line fields plus optional blank lines: unrecognized non-blank
+///   and repeated lines are rejected instead of ignored, because silently dropping them would
+///   apply a partial edit (for example the first line of a multi-line `new:`) while still
+///   reporting success.
 fn apply_inline_replace(original: &str, envelope: &PatchEnvelope) -> Result<String, String> {
     // --- Parse the three fields: anchor / old / new ---
-    let mut anchor: Option<String> = None;
-    let mut old: Option<String> = None;
-    let mut new: Option<String> = None;
+    let mut fields: [Option<String>; 3] = [None, None, None];
     for line in &envelope.body_lines {
-        if let Some(rest) = line.strip_prefix("anchor: ") {
-            anchor = Some(rest.to_string());
-        } else if let Some(rest) = line.strip_prefix("old: ") {
-            old = Some(rest.to_string());
-        } else if let Some(rest) = line.strip_prefix("new: ") {
-            new = Some(rest.to_string());
+        // Blank lines carry no content and can never express a value, so skipping them cannot hide
+        // model-authored text — unlike an unrecognized non-blank line, which may be a dropped
+        // continuation of a multi-line value.
+        if line.trim().is_empty() {
+            continue;
         }
-        // Ignore unrelated lines (blank lines, comments, etc.) and stay tolerant
+        let Some((field, value)) = InlineReplaceField::parse(line) else {
+            return Err(format!(
+                "Replace in line: unexpected line {} — a `*** Replace in line:` section takes \
+                 exactly three single-line fields (`anchor: <unique substring of the target \
+                 line>`, `old: <substring to replace>`, `new: <replacement>`); `new:` cannot \
+                 span multiple lines. To insert or replace whole lines, use a `*** Update File:` \
+                 hunk with `@@` instead (or `write_file` for a full rewrite).",
+                preview_patch_body_line(line)
+            ));
+        };
+        if fields[field.index()].replace(value.to_string()).is_some() {
+            return Err(format!(
+                "Replace in line: duplicate `{}:` field — each of `anchor:`, `old:`, `new:` may \
+                 appear exactly once.",
+                field.name()
+            ));
+        }
     }
+    let [anchor, old, new] = fields;
     let anchor = anchor.ok_or_else(|| {
         "Replace in line: missing `anchor:` field. \
          Expected `anchor: <unique substring of target line>`."
             .to_string()
     })?;
+    if anchor.is_empty() {
+        return Err("Replace in line: `anchor` field must not be empty.".to_string());
+    }
     let old = old.ok_or_else(|| {
         "Replace in line: missing `old:` field. \
          Expected `old: <exact substring to replace>`."
@@ -773,8 +846,9 @@ fn apply_inline_replace(original: &str, envelope: &PatchEnvelope) -> Result<Stri
     }
     if old == new {
         return Err(format!(
-            "Replace in line: `old` and `new` are identical ({:?}). \
-             Nothing would change; fix the patch or remove it.",
+            "Replace in line: `old` and `new` are identical ({:?}). Nothing would change; fix the \
+             patch or remove it. If you meant to insert or replace whole lines, use a \
+             `*** Update File:` hunk with `@@` instead.",
             old
         ));
     }
