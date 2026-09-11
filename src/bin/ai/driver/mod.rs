@@ -869,6 +869,13 @@ async fn run_loop(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let one_shot_mode = one_shot_cli_mode(&app.cli);
     let mut should_quit = one_shot_mode;
+    // The auto-created one-shot session is a throwaway: on exit, delete exactly
+    // this session. Local session commands (`/ss fork`, `/sessions use`, ...)
+    // switch `app.session_id` to another session, and cleanup must never delete
+    // that user-visible target — otherwise `a /ss fork src=X as=Y` prints
+    // "Forked ... switched to new branch" and then immediately deletes Y.
+    let one_shot_auto_session = (one_shot_mode && app.cli.session.is_none())
+        .then(|| app.session_id.clone());
     let mut mcp_initialized = false;
     let mut manifests_loaded = false;
     let mut skill_watcher = None;
@@ -904,9 +911,9 @@ async fn run_loop(
         // Interactive mode: if no existing session was restored and the current session
         // has no user messages (user hit Ctrl+C directly without ever typing anything),
         // also delete the empty session.
-        if one_shot_mode && app.cli.session.is_none() {
+        if let Some(auto_session) = one_shot_auto_session.as_deref() {
             let store = SessionStore::new(app.config.history_file.as_path());
-            let _ = store.delete_session(&app.session_id);
+            let _ = store.delete_session(auto_session);
             return;
         }
         if app.cli.session.is_none() {
