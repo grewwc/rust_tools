@@ -25,7 +25,6 @@ use super::{
         clamp_line_to_terminal_row_with_reserve, live_preview_cursor_rows, raw_terminal_rows,
         wrap_line_to_terminal_rows_with_reserve,
     },
-    side_note_input,
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
     state::{
         StreamChunkStep, StreamContentState, StreamMarkers, StreamProcessingState,
@@ -152,9 +151,6 @@ pub(super) async fn stream_response(
     }
     configure_thinking_fold(&mut state);
     configure_subagent_preview_fold(app, &mut state, &mut markers);
-    if runtime_ctx::terminal_output_enabled() {
-        side_note_input::set_token_status(Some("↳ speed · waiting…".to_string()));
-    }
     // A completed answer is provisional until the driver's completion/citation
     // gates accept it. Keep assistant prose transactional while preserving live
     // thinking and tool activity.
@@ -457,10 +453,6 @@ fn flush_inline_markup_normalizer_on_cancel(state: &mut StreamProcessingState) {
     let (cleaned, _) = state.content.bare_xml_tool_call_streamer.push(&cleaned);
     let content = normalize_stream_text(cleaned);
     state.content.assistant_text.push_str(&content);
-    state.content.live_output_tokens = state
-        .content
-        .live_output_tokens
-        .saturating_add(estimate_stream_tokens(&content));
 }
 
 /// Thinking-fold cleanup on cancel/interrupt: if the fold window is still active we
@@ -479,10 +471,6 @@ fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
         .content
         .live_reasoning_tokens
         .saturating_add(estimate_stream_tokens(&residual_reasoning));
-    state.content.live_output_tokens = state
-        .content
-        .live_output_tokens
-        .saturating_add(estimate_stream_tokens(&residual_content));
 
     if runtime_ctx::terminal_output_enabled() {
         let _ = clear_waiting_hint(state);
@@ -676,15 +664,10 @@ fn finalize_stream_response(
 
     if take_stream_cancelled(app) {
         let result = cancelled_stream_result(&mut state);
-        // The stream is over, so the token-status slot must not keep a stale "live" snapshot.
-        // (A refresh here would also run before `cancelled_stream_result` accumulates its
-        // residual tokens, so it would under-report; clearing is both simpler and correct.)
-        side_note_input::set_token_status(None);
         return Ok(result);
     }
 
     let metrics_finished_at = Instant::now();
-    refresh_live_token_status(&state.content, metrics_finished_at);
 
     // AIOS: flush any pending LLM usage to kernel `/dev/llm` before returning.
     // Prefer the model echoed by the provider; fall back to what we requested.
@@ -702,7 +685,7 @@ fn finalize_stream_response(
             .unwrap_or(0);
         (u.prompt_tokens, cached, u.completion_tokens, reasoning)
     });
-    let printed_throughput_line = if let Some((echoed_model, usage)) = state.pending_llm_usage.take() {
+    if let Some((echoed_model, usage)) = state.pending_llm_usage.take() {
         let model_for_pricing = if echoed_model.is_empty() {
             app.current_model.clone()
         } else {
@@ -710,14 +693,7 @@ fn finalize_stream_response(
         };
         let _ = crate::ai::request::charge_llm_usage_to_kernel(app, &model_for_pricing, &usage, 0);
         maybe_print_prompt_cache_metrics(&usage);
-        maybe_print_token_throughput_metrics(&usage, &state.content, metrics_finished_at)
-    } else {
-        false
-    };
-    // The stream is over: unless an exact throughput line was just printed, the token-status
-    // slot must not keep process-state wording ("waiting…" / "live") stale after the stream ended.
-    if !printed_throughput_line {
-        side_note_input::set_token_status(None);
+        maybe_print_token_throughput_metrics(&usage, &state.content, metrics_finished_at);
     }
 
     let stream_error = state.content.stream_idle_timed_out;
@@ -864,9 +840,9 @@ fn maybe_print_token_throughput_metrics(
     usage: &crate::ai::request::StreamUsage,
     content: &StreamContentState,
     finished_at: Instant,
-) -> bool {
+) {
     if !runtime_ctx::terminal_output_enabled() {
-        return false;
+        return;
     }
 
     let reasoning_tokens = usage
@@ -890,55 +866,16 @@ fn maybe_print_token_throughput_metrics(
         reasoning_elapsed,
         output_elapsed,
     ) else {
-        return false;
-    };
-    side_note_input::set_token_status(Some(line.clone()));
-    println!("  {}{line}{RESET}", theme::current().accent_muted);
-    true
-}
-
-fn refresh_live_token_status(content: &StreamContentState, now: Instant) {
-    if !runtime_ctx::terminal_output_enabled() {
         return;
-    }
-    side_note_input::set_token_status(Some(format_live_token_status(content, now)));
-}
-
-fn format_live_token_status(content: &StreamContentState, now: Instant) -> String {
-    let reasoning_elapsed = content
-        .reasoning_started_at
-        .map(|started| content.output_started_at.unwrap_or(now).saturating_duration_since(started));
-    let output_elapsed = content
-        .output_started_at
-        .map(|started| now.saturating_duration_since(started));
-    let mut segments = Vec::with_capacity(2);
-    if content.live_reasoning_tokens > 0 {
-        segments.push(format!(
-            "reasoning ~{} tok @ {} tok/s",
-            format_compact_token_count(content.live_reasoning_tokens),
-            format_token_rate(content.live_reasoning_tokens, reasoning_elapsed),
-        ));
-    }
-    if content.live_output_tokens > 0 {
-        segments.push(format!(
-            "output ~{} tok @ {} tok/s",
-            format_compact_token_count(content.live_output_tokens),
-            format_token_rate(content.live_output_tokens, output_elapsed),
-        ));
-    }
-    if segments.is_empty() {
-        "↳ speed · waiting…".to_string()
-    } else {
-        format!("↳ live speed · {}", segments.join(" · "))
-    }
+    };
+    println!("  {}{line}{RESET}", theme::current().accent_muted);
 }
 
 /// Live reasoning-rate text for the in-progress thinking-fold header. It is
-/// recomputed on every fold redraw (each thinking chunk), so it deliberately
-/// mirrors the approximate `~`-prefixed estimate used by the live footer
-/// status; the exact server-reported metrics are printed separately at stream
-/// end. Returns `None` until the first reasoning token arrives so the header
-/// stays stable during the pre-token window.
+/// recomputed on every fold redraw (each thinking chunk) from the approximate
+/// `~`-prefixed token estimate; the exact server-reported metrics are printed
+/// separately at stream end. Returns `None` until the first reasoning token
+/// arrives so the header stays stable during the pre-token window.
 fn fold_header_rate(content: &StreamContentState, now: Instant) -> Option<String> {
     if content.live_reasoning_tokens == 0 {
         return None;
@@ -1472,11 +1409,6 @@ fn commit_visible_content(
             state.content.mark_output_started();
             current_history.push_str(text);
             state.content.assistant_text.push_str(text);
-            state.content.live_output_tokens = state
-                .content
-                .live_output_tokens
-                .saturating_add(estimate_stream_tokens(text));
-            refresh_live_token_status(&state.content, Instant::now());
             // Live output for a real-time `/bg` handoff (best-effort, no-op
             // unless the backgrounded process opened its live-output FIFO).
             crate::ai::background::publish_live_output(text);
@@ -1514,11 +1446,6 @@ fn commit_visible_content(
     state.content.assistant_text.reserve(text.len());
     current_history.push_str(&text);
     state.content.assistant_text.push_str(&text);
-    state.content.live_output_tokens = state
-        .content
-        .live_output_tokens
-        .saturating_add(estimate_stream_tokens(&text));
-    refresh_live_token_status(&state.content, Instant::now());
     // Live output for a real-time `/bg` handoff (best-effort, no-op unless the
     // backgrounded process opened its live-output FIFO).
     crate::ai::background::publish_live_output(&text);
@@ -2373,7 +2300,6 @@ fn process_stream_payload(
             .content
             .live_reasoning_tokens
             .saturating_add(estimate_stream_tokens(&emitted_reasoning));
-        refresh_live_token_status(&state.content, Instant::now());
 
         // Some long tool-chain contexts make the model verbatim-repeat one sentence in thinking. Continuing to read only
         // burns the output budget and makes the terminal look stuck; escalate to retryable truncation and let the upper layer lower the reasoning tier.

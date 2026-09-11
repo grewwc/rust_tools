@@ -99,22 +99,6 @@ fn token_throughput_metrics_omits_unmeasurable_streams() {
 }
 
 #[test]
-fn live_token_status_reports_approximate_phase_rates() {
-    let now = Instant::now();
-    let app = crate::ai::middleware::test_util::test_app();
-    let mut state = initial_stream_processing_state(&app).content;
-    state.reasoning_started_at = Some(now - Duration::from_secs(3));
-    state.output_started_at = Some(now - Duration::from_secs(1));
-    state.live_reasoning_tokens = 8;
-    state.live_output_tokens = 12;
-
-    assert_eq!(
-        format_live_token_status(&state, now),
-        "↳ live speed · reasoning ~8 tok @ 4.00 tok/s · output ~12 tok @ 12.0 tok/s"
-    );
-}
-
-#[test]
 fn fold_header_rate_tracks_live_reasoning_throughput() {
     let now = Instant::now();
     let app = crate::ai::middleware::test_util::test_app();

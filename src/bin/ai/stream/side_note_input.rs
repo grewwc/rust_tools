@@ -29,7 +29,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
         mpsc,
-        Mutex, OnceLock,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -52,30 +51,11 @@ const SHUTDOWN_WAIT_MS: u64 = 250;
 /// Upper bound for waiting at startup for the listener to take over the terminal;
 /// on timeout the not-yet-started task is not allowed to modify the terminal.
 const STARTUP_WAIT_MS: u64 = 250;
-/// Number of physical rows permanently reserved for the bottom footer/status bar. Model
+/// Number of physical rows permanently reserved for the bottom composer row. Model
 /// output scrolls continuously in the scroll region above it.
 const FOOTER_ROWS: u16 = 1;
 const COMPOSER_PREFIX: &str = "  [side-note] Esc/F2 send · Ctrl+G cancel > ";
 const COMPOSER_CURSOR: char = '▌';
-
-static TOKEN_STATUS: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-
-/// Publish the current stream throughput text for the foreground footer.
-/// The listener thread owns terminal redraws; the stream task only updates this slot.
-pub(crate) fn set_token_status(status: Option<String>) {
-    let cell = TOKEN_STATUS.get_or_init(|| Mutex::new(None));
-    if let Ok(mut current) = cell.lock() {
-        *current = status;
-    }
-}
-
-fn token_status() -> Option<String> {
-    TOKEN_STATUS
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .ok()
-        .and_then(|current| current.clone())
-}
 
 fn should_yield_stdin(stop: &AtomicBool) -> bool {
     stop.load(Ordering::Relaxed) || foreground_stdin_requested()
@@ -87,8 +67,6 @@ fn should_yield_stdin(stop: &AtomicBool) -> bool {
 struct FooterReservation {
     cols: u16,
     rows: u16,
-    /// Last status text written to the footer, used to skip no-op redraws at poll cadence.
-    drawn_status: Option<String>,
 }
 
 impl FooterReservation {
@@ -108,7 +86,6 @@ impl FooterReservation {
         let footer = Self {
             cols,
             rows,
-            drawn_status: None,
         };
         footer.apply_reservation(stop)?;
         Ok(footer)
@@ -175,33 +152,6 @@ impl FooterReservation {
         let mut out = stdout.lock();
         self.draw_to(&mut out, input)?;
         out.flush()
-    }
-
-    fn draw_status(&mut self, status: Option<&str>) -> io::Result<()> {
-        self.refresh()?;
-        let visible = status_line_viewport(status.unwrap_or_default(), self.cols as usize);
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
-        write!(
-            out,
-            "\x1b7\x1b[?25l\x1b[{};1H\x1b[2K{}{visible}{RESET}\x1b8\x1b[?25h",
-            self.rows,
-            theme::current().accent_muted,
-        )?;
-        out.flush()
-    }
-
-    /// Poll-cadence status redraw: skip the erase/write/flush when the published
-    /// status text is unchanged — the throughput slot updates a few times per
-    /// second, far slower than this 50ms tick. Returns whether a redraw happened.
-    fn poll_status_redraw(&mut self) -> io::Result<bool> {
-        let current = token_status();
-        if current == self.drawn_status {
-            return Ok(false);
-        }
-        self.drawn_status = current.clone();
-        self.draw_status(current.as_deref())?;
-        Ok(true)
     }
 
     /// Build and write the composer line through a supplied writer so the control
@@ -554,21 +504,6 @@ fn display_width(chars: impl IntoIterator<Item = char>) -> usize {
     chars.into_iter().map(char_width).sum()
 }
 
-fn status_line_viewport(status: &str, cols: usize) -> String {
-    let available = cols.saturating_sub(1);
-    let mut visible = String::new();
-    let mut width = 0;
-    for ch in status.chars() {
-        let ch_width = char_width(ch);
-        if width + ch_width > available {
-            break;
-        }
-        visible.push(ch);
-        width += ch_width;
-    }
-    visible
-}
-
 fn composer_layout(cols: usize) -> (&'static str, Option<char>) {
     let full_width = display_width(COMPOSER_PREFIX.chars()) + char_width(COMPOSER_CURSOR) + 1;
     if cols >= full_width {
@@ -644,8 +579,6 @@ fn refresh_footer(footer: &mut FooterReservation, input: Option<&[char]>) -> io:
     footer.refresh()?;
     if let Some(input) = input {
         footer.draw(input)?;
-    } else {
-        footer.draw_status(token_status().as_deref())?;
     }
     Ok(())
 }
@@ -871,17 +804,15 @@ fn side_note_input_loop(
             if ret == 0 {
                 // The renderer still contains a few legacy full-screen erase sequences
                 // (CSI 0J). DECSTBM keeps them from scrolling into the footer but does
-                // not bound their erase range; redraw the active footer at poll cadence
-                // so both the side-note draft and live throughput survive async output.
-                let Some(active_footer) = footer.as_mut() else {
-                    continue;
-                };
+                // not bound their erase range; redraw the active composer at poll cadence
+                // so an in-progress side-note draft survives async output.
                 if in_input {
+                    let Some(active_footer) = footer.as_mut() else {
+                        continue;
+                    };
                     if redraw_input(active_footer, &input).is_err() {
                         break;
                     }
-                } else if active_footer.poll_status_redraw().is_err() {
-                    break;
                 }
                 continue;
             }
@@ -984,13 +915,6 @@ fn side_note_input_loop(
                         Ok(false) => {}
                         Err(_) => break,
                     }
-                    if !in_input {
-                        if let Some(active_footer) = footer.as_mut()
-                            && active_footer.draw_status(token_status().as_deref()).is_err()
-                        {
-                            break;
-                        }
-                    }
                 }
             }
             0x07 => {
@@ -999,9 +923,7 @@ fn side_note_input_loop(
                 pending.clear();
                 in_input = false;
                 if let Some(active_footer) = footer.as_mut() {
-                    if clear_input(active_footer).is_err()
-                        || active_footer.draw_status(token_status().as_deref()).is_err()
-                    {
+                    if clear_input(active_footer).is_err() {
                         break;
                     }
                 }
@@ -1205,7 +1127,6 @@ mod tests {
         let mut footer = FooterReservation {
             cols: 80,
             rows: 24,
-            drawn_status: None,
         };
         let mut out = Vec::new();
         footer.draw_to(&mut out, &[]).unwrap();

@@ -349,9 +349,9 @@ pub(super) struct StreamContentState {
     /// First observed reasoning/output timestamps, used for display-only throughput metrics.
     pub(super) reasoning_started_at: Option<Instant>,
     pub(super) output_started_at: Option<Instant>,
-    /// Approximate token totals used by the live terminal status bar before provider usage arrives.
+    /// Approximate reasoning token total used by the in-progress thinking-fold header
+    /// rate before provider usage arrives.
     pub(super) live_reasoning_tokens: u64,
-    pub(super) live_output_tokens: u64,
     pub(super) tool_calls_map: SkipMap<usize, ToolCallBuilder>,
     /// Composite key resolved for the most recent tool call without an `index`,
     /// used to attach later parameter-continuation deltas (which have neither id
@@ -402,7 +402,6 @@ impl StreamContentState {
             reasoning_started_at: None,
             output_started_at: None,
             live_reasoning_tokens: 0,
-            live_output_tokens: 0,
             tool_calls_map: SkipMap::default(),
             last_indexless_tool_call_key: None,
             assistant_text: String::new(),
