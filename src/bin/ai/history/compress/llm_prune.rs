@@ -190,11 +190,15 @@ pub(crate) fn parse_prune_from_hidden_meta(hidden_meta: &str) -> (Vec<String>, S
 ///    leaves the context or is excluded by the protection policy.
 /// 3. Clean up entries no longer in the current context or excluded by the
 ///    protection policy.
+///
+/// Returns whether the mark map actually changed (counter increment, new entry,
+/// or removed entry), so callers can persist without cloning the whole map just
+/// to detect a diff.
 pub(crate) fn update_prune_marks(
     current_marks: &mut FxHashMap<String, u8>,
     prune_ids: &[String],
     active_prunable_tool_ids: &FxHashSet<String>,
-) {
+) -> bool {
     let marked_ids = prune_ids
         .iter()
         .filter(|id| active_prunable_tool_ids.contains(*id))
@@ -203,14 +207,22 @@ pub(crate) fn update_prune_marks(
 
     // Increment the counters of marked tools (monotonic accumulation; a silent
     // round has empty marked_ids and is a no-op).
+    let mut changed = false;
     for id in marked_ids {
         let count = current_marks.entry(id).or_insert(0);
-        *count = count.saturating_add(1);
+        let updated = count.saturating_add(1);
+        if *count != updated {
+            changed = true;
+        }
+        *count = updated;
     }
 
     // Clean up entries with a zero count, no longer in the current context, or
     // excluded by the protection policy.
+    let len_before_cleanup = current_marks.len();
     current_marks.retain(|id, v| *v > 0 && active_prunable_tool_ids.contains(id));
+    changed |= current_marks.len() != len_before_cleanup;
+    changed
 }
 
 /// Collects the tool_call_ids in the current context that may be pruned under

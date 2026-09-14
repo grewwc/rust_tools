@@ -11,9 +11,12 @@ use crate::ai::history::Message;
 
 /// Unified LLM request description (decoupled from `request/builder.rs` internals).
 #[derive(Debug, Clone)]
-pub(crate) struct LlmRequest {
+pub(crate) struct LlmRequest<'a> {
     pub model: String,
-    pub messages: Vec<Message>,
+    /// Borrowed message slice: the caller owns the projection, so per-request retries,
+    /// middleware forwarding (`req.clone()`), and logging re-use the same buffer with
+    /// zero copies instead of deep-cloning the whole `Vec<Message>` on every send.
+    pub messages: &'a [Message],
     pub stream: bool,
     pub tools_enabled: bool,
 }
@@ -29,7 +32,7 @@ pub(crate) trait LlmClient: Send + Sync {
     fn send<'a>(
         &'a self,
         app: &'a mut crate::ai::types::App,
-        req: LlmRequest,
+        req: LlmRequest<'a>,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>>
@@ -47,7 +50,7 @@ impl LlmClient for DefaultLlmClient {
     fn send<'a>(
         &'a self,
         app: &'a mut crate::ai::types::App,
-        req: LlmRequest,
+        req: LlmRequest<'a>,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>>
@@ -58,13 +61,13 @@ impl LlmClient for DefaultLlmClient {
         Box::pin(async move {
             let model = req.model.clone();
             let raw = if req.tools_enabled {
-                crate::ai::request::do_request_messages(app, &model, &req.messages, req.stream)
+                crate::ai::request::do_request_messages(app, &model, req.messages, req.stream)
                     .await
             } else {
                 crate::ai::request::do_request_messages_without_tools(
                     app,
                     &model,
-                    &req.messages,
+                    req.messages,
                     req.stream,
                 )
                 .await
@@ -94,7 +97,7 @@ impl<C: LlmClient> LlmClient for LoggingLlmClient<C> {
     fn send<'a>(
         &'a self,
         app: &'a mut crate::ai::types::App,
-        req: LlmRequest,
+        req: LlmRequest<'a>,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>>

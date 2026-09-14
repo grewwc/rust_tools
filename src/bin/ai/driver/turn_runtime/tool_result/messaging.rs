@@ -508,13 +508,14 @@ pub(super) fn parse_prune_meta_and_update_marks(
         crate::ai::history::compress::llm_prune::parse_prune_from_hidden_meta(hidden_meta);
     let active_tool_ids =
         crate::ai::history::compress::llm_prune::active_prunable_tool_ids(messages);
-    let before = app.prune_marks.clone();
-    crate::ai::history::compress::llm_prune::update_prune_marks(
+    // `update_prune_marks` reports whether the mark map changed, avoiding a full
+    // `app.prune_marks.clone()` just to diff it afterwards.
+    let prune_marks_changed = crate::ai::history::compress::llm_prune::update_prune_marks(
         &mut app.prune_marks,
         &prune_ids,
         &active_tool_ids,
     );
-    if app.prune_marks != before
+    if prune_marks_changed
         && let Err(error) = crate::ai::history::write_llm_prune_marks_sqlite(
             &app.session_history_file,
             &app.prune_marks,
@@ -1076,8 +1077,16 @@ pub(super) fn append_tool_result_messages_for_model(
     } else {
         raw_assistant
     };
-    let mut assistant_msg = raw_assistant.clone();
-    assistant_msg.content = Value::String(narration);
+    // Build the projected assistant message from scratch instead of cloning `raw_assistant`
+    // and overwriting content: the clone would deep-copy the full narration text that is
+    // immediately discarded (`raw_assistant` keeps the full text for canonical history).
+    let assistant_msg = Message {
+        role: "assistant".to_string(),
+        content: Value::String(narration),
+        tool_calls: raw_assistant.tool_calls.clone(),
+        tool_call_id: None,
+        reasoning_content: raw_assistant.reasoning_content.clone(),
+    };
     let projected_assistant =
         crate::ai::history::compress::sanitize_message_for_persisted_history_for_model(
             source_model,
@@ -1088,7 +1097,8 @@ pub(super) fn append_tool_result_messages_for_model(
         // continuation state 当作普通 reasoning 裁掉；发送请求时会在投影副本中解码。
         messages.push(projected_assistant);
     } else {
-        messages.push(assistant_msg.clone());
+        // `assistant_msg` is not used after this push, so move it instead of cloning.
+        messages.push(assistant_msg);
     }
     // canonical history 永远保存 provider 原始消息；模型专属状态只存在于请求投影。
     turn_messages.push(raw_assistant);

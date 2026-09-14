@@ -228,9 +228,11 @@ fn reposition_context_compaction_state_before_last_user(messages: &mut Vec<Messa
     if note_index < last_user_index {
         return;
     }
-    let note = messages.remove(note_index);
-    // remove happens after last_user_index, so that index is unchanged; insert before it.
-    messages.insert(last_user_index, note);
+    // Move the note from `note_index` (after the last user message) to `last_user_index`
+    // with a single slice rotation (intermediate elements shift back by one). This is
+    // equivalent to `remove(note_index)` + `insert(last_user_index, note)` but performs
+    // one O(span) in-place shift instead of two O(n) shifts with reallocation.
+    messages[last_user_index..=note_index].rotate_right(1);
 }
 
 #[derive(Debug, Default)]
@@ -489,8 +491,31 @@ fn protected_messages_preserved(messages: &[Message], protected: &[ProtectedMess
     if protected.is_empty() {
         return true;
     }
-    let current = collect_protected_messages(messages);
-    current == protected
+    // Protected messages (all `system` messages plus the last real user message) keep
+    // their relative positions across mid-turn compression (it truncates/folds in place
+    // and never reorders), so compare by position with borrowed references. This avoids
+    // a second `collect_protected_messages` deep clone of the system prompt.
+    let last_user_index = last_real_user_index(messages);
+    let mut expected = protected.iter();
+    for (index, message) in messages.iter().enumerate() {
+        let is_protected_position = message.role == "system"
+            || (message.role == "user" && Some(index) == last_user_index);
+        if !is_protected_position {
+            continue;
+        }
+        let Some(protected_message) = expected.next() else {
+            return false;
+        };
+        if protected_message.role != message.role
+            || protected_message.content != message.content
+            || protected_message.tool_calls != message.tool_calls
+            || protected_message.tool_call_id != message.tool_call_id
+            || protected_message.reasoning_content != message.reasoning_content
+        {
+            return false;
+        }
+    }
+    expected.next().is_none()
 }
 
 fn message_chars(message: &Message) -> usize {

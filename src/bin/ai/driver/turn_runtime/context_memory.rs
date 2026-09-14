@@ -442,15 +442,23 @@ fn projection_is_valid(
     if projected.get(insertion_index) != Some(index_message) {
         return false;
     }
-    let mut without_index = projected.to_vec();
-    without_index.remove(insertion_index);
-    let expected = original
+    // `projected` minus the inserted index message must be exactly the surviving
+    // subsequence of `original`, in order. Compare element-wise with borrowed references
+    // instead of materializing `without_index`/`expected` (two full-list deep clones).
+    let mut projected_remaining = projected
         .iter()
         .enumerate()
-        .filter(|(index, _)| !removed_indices.contains(index))
-        .map(|(_, message)| message.clone())
-        .collect::<Vec<_>>();
-    if without_index != expected {
+        .filter(|(index, _)| *index != insertion_index);
+    for (original_index, message) in original.iter().enumerate() {
+        if removed_indices.contains(&original_index) {
+            continue;
+        }
+        match projected_remaining.next() {
+            Some((_, projected_message)) if projected_message == message => {}
+            _ => return false,
+        }
+    }
+    if projected_remaining.next().is_some() {
         return false;
     }
 

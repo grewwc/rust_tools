@@ -54,14 +54,16 @@ pub(super) fn build_first_use_tool_guidance_messages_with(
     prior_turn_messages: &[Message],
     guidance_for: impl Fn(&str) -> Option<String>,
 ) -> Vec<Message> {
-    let previously_called = |tool_name: &str| {
-        prior_turn_messages
-            .iter()
-            .filter(|message| message.role == "assistant")
-            .flat_map(|message| message.tool_calls.iter().flatten())
-            .any(|tool_call| tool_call.function.name == tool_name)
-    };
-    let mut guided_this_round = FastSet::default();
+    // Pre-build the set of tool names already called in prior turns (borrowed, no string
+    // allocation). A per-call linear scan over all prior assistant messages would make
+    // this O(executed_calls × prior_messages); the set makes each check O(1).
+    let previously_called: FastSet<&str> = prior_turn_messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .flat_map(|message| message.tool_calls.iter().flatten())
+        .map(|tool_call| tool_call.function.name.as_str())
+        .collect();
+    let mut guided_this_round: FastSet<&str> = FastSet::default();
     let mut messages = Vec::new();
     for (tool_call, _) in exec_result
         .executed_tool_calls
@@ -69,7 +71,7 @@ pub(super) fn build_first_use_tool_guidance_messages_with(
         .zip(exec_result.tool_results.iter())
     {
         let tool_name = tool_call.function.name.as_str();
-        if previously_called(tool_name) || !guided_this_round.insert(tool_name.to_string()) {
+        if previously_called.contains(tool_name) || !guided_this_round.insert(tool_name) {
             continue;
         }
         let Some(guidance) = guidance_for(tool_name) else {

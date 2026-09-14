@@ -653,6 +653,9 @@ pub(super) fn refresh_skill_turn_for_iteration(
         return required_project_targets.is_empty();
     }
 
+    // `matched_skill_names()` borrows `skill_turn`; the owned copy is required because
+    // `take_restore_agent_context()` below needs `&mut skill_turn` while `prev_skills`
+    // is still compared later (`prev_skills != next_skills`).
     let prev_skills = skill_turn.matched_skill_names().to_vec();
 
     // Explicit change requests from the model via the activate_skill / deactivate_skill tools take priority:
@@ -1085,12 +1088,12 @@ async fn send_llm_request(
     client: &dyn LlmClient,
     app: &mut App,
     model: &str,
-    messages: &mut Vec<Message>,
+    messages: &[Message],
     tools_enabled: bool,
 ) -> Result<reqwest::Response, request::RequestError> {
     let request = LlmRequest {
         model: model.to_string(),
-        messages: messages.clone(),
+        messages,
         stream: true,
         tools_enabled,
     };
@@ -1667,7 +1670,7 @@ mod tests {
                 fn send<'a>(
                     &'a self,
                     app: &'a mut App,
-                    req: LlmRequest,
+                    req: LlmRequest<'a>,
                 ) -> Pin<
                     Box<
                         dyn Future<
@@ -1704,7 +1707,7 @@ mod tests {
                 fn send<'a>(
                     &'a self,
                     _app: &'a mut App,
-                    _req: LlmRequest,
+                    _req: LlmRequest<'a>,
                 ) -> Pin<
                     Box<
                         dyn Future<
