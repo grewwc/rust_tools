@@ -1120,18 +1120,22 @@ fn submitted_input_preview_lines(content: &str) -> Vec<String> {
     let mut rendered = Vec::new();
     let mut lines = content.lines();
     let marker = crate::ai::theme::current().accent_success;
+    let bar = crate::ai::theme::current().accent_submitted_bar;
     // The post-submit preview body uses the theme's `accent.submitted`, a bright
     // signature warm hue (amber/yellow on dark themes, deep purple on light).
     // It is deliberately NOT a white/gray: assistant output is full of near-white
     // body/strong text, so the echoed user input must carry its own hue to stay
-    // visible and recognizable as the user's own text. The bold green marker
-    // keeps the submit boundary distinct.
+    // visible and recognizable as the user's own text. The theme-aware left
+    // bar and bold green marker keep the submit boundary distinct.
     let body = crate::ai::theme::current().accent_submitted;
     if let Some(first) = lines.next() {
-        // Bold `❯` marker marks the submit boundary; the body color is theme-driven.
-        rendered.push(format!("\x1b[1m{marker}❯\x1b[0m {body}{first}\x1b[0m"));
+        // The left bar makes a user turn scannable in long output; continuation
+        // lines keep their body aligned with the first line.
+        rendered.push(format!(
+            "\x1b[1m{bar}▎\x1b[0m \x1b[1m{marker}❯\x1b[0m {body}{first}\x1b[0m"
+        ));
         for line in lines {
-            rendered.push(format!("  {body}{line}\x1b[0m"));
+            rendered.push(format!("\x1b[1m{bar}▎\x1b[0m   {body}{line}\x1b[0m"));
         }
     }
     rendered
@@ -2343,17 +2347,20 @@ mod tests {
     #[test]
     fn submitted_input_preview_formats_single_and_multi_line_content() {
         let marker = crate::ai::theme::current().accent_success;
+        let bar = crate::ai::theme::current().accent_submitted_bar;
         let body = crate::ai::theme::current().accent_submitted;
         let reset = "\x1b[0m";
         assert_eq!(
             submitted_input_preview_lines("hello"),
-            vec![format!("\x1b[1m{marker}❯{reset} {body}hello{reset}")]
+            vec![format!(
+                "\x1b[1m{bar}▎{reset} \x1b[1m{marker}❯{reset} {body}hello{reset}"
+            )]
         );
         assert_eq!(
             submitted_input_preview_lines("hello\nworld"),
             vec![
-                format!("\x1b[1m{marker}❯{reset} {body}hello{reset}"),
-                format!("  {body}world{reset}"),
+                format!("\x1b[1m{bar}▎{reset} \x1b[1m{marker}❯{reset} {body}hello{reset}"),
+                format!("\x1b[1m{bar}▎{reset}   {body}world{reset}"),
             ]
         );
     }

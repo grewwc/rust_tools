@@ -1,0 +1,5 @@
+{INSTRUCTION_TAG} This turn carries the original image, but to control tokens it will not be sent again in later turns. In this turn's answer, use the fixed format below to output an "image digest" that writes down all the visual information needed to complete the task (UI structure, visible text, code, numbers, colors, layout and positional relationships, etc.) — afterwards you will have to rely on this digest alone and will not see the original image:
+{DIGEST_BEGIN}
+(write the image digest here)
+{DIGEST_END}
+The digest is only an intermediate step and must never be the end of this turn's reply: after outputting the digest you must keep answering the user's actual question for this turn (for example, extracting a link from the image or summarizing the UI content), calling tools as usual when needed; end the turn with a complete answer to the user's question. You may answer or call tools in parallel while emitting the digest. The original image paths are recorded by the system; if you really need them, you can read the original image again with the file tools.

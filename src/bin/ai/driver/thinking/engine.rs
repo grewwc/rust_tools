@@ -318,33 +318,31 @@ impl ThoughtTree {
 
     pub fn generate_thinking_prompt(&self, current_node_id: ThoughtNodeId) -> String {
         let path = self.path_to(current_node_id);
-        let mut prompt = String::from("You are in a Tree-of-Thoughts reasoning process.\n\n");
-        prompt.push_str("Path taken so far:\n");
+        // Dynamic middle section of the prompt: the reasoning path walked so far plus the
+        // current hypothesis/reasoning. Node content is user/model text, so it stays an
+        // argument to the template rather than part of it.
+        let mut path_lines = String::new();
         for (i, &node_id) in path.iter().enumerate() {
             if let Some(node) = self.nodes.get_ref(&node_id) {
-                prompt.push_str(&format!(
+                path_lines.push_str(&format!(
                     "  Step {}: {} (score: {:.2})\n",
                     i + 1,
                     node.hypothesis,
                     node.score
                 ));
                 if let Some(outcome) = &node.outcome_summary {
-                    prompt.push_str(&format!("    Outcome: {}\n", outcome));
+                    path_lines.push_str(&format!("    Outcome: {}\n", outcome));
                 }
             }
         }
         if let Some(current) = self.nodes.get_ref(&current_node_id) {
-            prompt.push_str(&format!("\nCurrent hypothesis: {}\n", current.hypothesis));
-            prompt.push_str(&format!("Current reasoning: {}\n", current.reasoning));
+            path_lines.push_str(&format!("\nCurrent hypothesis: {}\n", current.hypothesis));
+            path_lines.push_str(&format!("Current reasoning: {}\n", current.reasoning));
         }
-        prompt.push_str("\nGenerate 2-3 alternative hypotheses to explore. For each, provide:\n");
-        prompt.push_str("1. hypothesis: A specific approach or assumption to test\n");
-        prompt.push_str("2. reasoning: Why this might be better than the current path\n");
-        prompt.push_str(
-            "3. estimated_score: Your confidence (0.0-1.0) that this leads to a correct solution\n",
-        );
-        prompt.push_str("\nOutput STRICT JSON array: [{\"hypothesis\":\"...\",\"reasoning\":\"...\",\"estimated_score\":0.8}]\n");
-        prompt
+        format!(
+            include_str!("prompts/thought_thinking.md"),
+            path_lines = path_lines
+        )
     }
 
     pub fn generate_scoring_prompt(&self, node_id: ThoughtNodeId, tool_results: &str) -> String {
@@ -353,17 +351,7 @@ impl ThoughtTree {
             None => return String::new(),
         };
         format!(
-            "Score this reasoning step on a 0.0-1.0 scale.\n\n\
-             Hypothesis: {}\n\
-             Reasoning: {}\n\
-             Tool results: {}\n\n\
-             Scoring criteria:\n\
-             - 1.0: Hypothesis fully confirmed by evidence\n\
-             - 0.7-0.9: Strong evidence supporting this direction\n\
-             - 0.4-0.6: Mixed or inconclusive evidence\n\
-             - 0.1-0.3: Evidence contradicts the hypothesis\n\
-             - 0.0: Dead end, fundamental error\n\n\
-             Output STRICT JSON: {{\"score\":0.8,\"reason\":\"...\"}}",
+            include_str!("prompts/thought_scoring.md"),
             node.hypothesis,
             node.reasoning,
             super::verification::safe_truncate(tool_results, 2000)

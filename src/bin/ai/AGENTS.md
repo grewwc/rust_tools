@@ -13,6 +13,14 @@ the nearest child `AGENTS.md`.
 - `skills.rs` / `agents.rs` + `builtin_skills/` / `builtin_agents/` (compiled in via `include_str!`): skill/agent manifests
 - `driver/`: turn orchestration, prompt/tool loop, skill runtime
 - `history/`: canonical persistence, context projection/compression, task evidence
+- Auxiliary LLM prompts (routing, compression, thinking, subagent wrapping, ...) live
+  as `<subsystem>/prompts/*.md` loaded via `include_str!` next to the consuming module.
+  Files consumed through `format!` are templates: literal braces are escaped as `{{`/`}}`,
+  and `format_args!` cannot implicitly capture variables from a macro-expanded format
+  string, so every placeholder needs an explicit `name = value` argument. A file rendered by
+  a bare `include_str!` (no `format!`) keeps single braces, so the brace form follows the
+  consuming call site. Give prompt files distinct names across subsystems — two files named
+  `goal_mode.md` (Behavior block vs. turn template) make every grep ambiguous.
 - `request/`: LLM request execution, retry, routing, normalization; `request/wire_parse.rs` holds stream primitives shared with `stream/` (avoids provider↔stream cycle)
 - `provider/`: provider adapters and wire-format differences
 - `pipeline/` / `ports/` / `middleware/`: turn pipeline (stage/run), port traits

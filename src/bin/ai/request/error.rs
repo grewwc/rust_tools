@@ -487,6 +487,15 @@ pub(crate) fn is_retryable_stream_error(err: &str) -> bool {
         || lower.contains("503")
         || lower.contains("504")
         || lower.contains("risk_control")
+        // Backend/gateway output-buffer pressure aborts a response that is already
+        // streaming (real shape: "ClientError: Backend buffer overflow." from the
+        // DashScope compatible-mode relay). Because the response had started, this is
+        // server-side body-transfer backpressure rather than a malformed request, and a
+        // fresh attempt usually succeeds; classifying it as fatal instead ends the turn
+        // with "[Response parsing failed; please retry]".
+        || lower.contains("buffer overflow")
+        || lower.contains("buffer full")
+        || lower.contains("backpressure")
 }
 
 #[cfg(test)]
@@ -622,6 +631,28 @@ mod tests {
         assert!(!is_deterministic_status_error(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             "maximum context length exceeded"
+        ));
+    }
+
+    #[test]
+    fn backend_buffer_overflow_stream_error_is_retryable() {
+        // Real incident shape: the DashScope compatible-mode relay aborted a live
+        // stream with `ClientError: Backend buffer overflow.` after the response had
+        // already produced ~2k thinking tokens. No existing pattern matched it, so the
+        // turn was abandoned instead of retried.
+        assert!(is_retryable_stream_error(
+            "provider stream error: ClientError: Backend buffer overflow."
+        ));
+        // Same class, other relay wordings.
+        assert!(is_retryable_stream_error(
+            "provider stream error: output buffer full"
+        ));
+        assert!(is_retryable_stream_error(
+            "provider stream error: backend backpressure on stream"
+        ));
+        // Deterministic request rejections must stay non-retryable.
+        assert!(!is_retryable_stream_error(
+            "provider stream error: invalid_request_error: unsupported parameter"
         ));
     }
 }

@@ -1,0 +1,1 @@
+[Thinking Protocol] Emit tags in your reply (hidden from user): <think:begin_tree_of_thoughts>Q</think:begin_tree_of_thoughts> | <think:begin_verification>H</think:begin_verification> | <think:begin_goal>G</think:begin_goal> | <think:reset_thinking/>.

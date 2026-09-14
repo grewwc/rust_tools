@@ -1,0 +1,1 @@
+[Verification Loop Active] Current step: {}. {} Do not assume success — actively seek disconfirming evidence.

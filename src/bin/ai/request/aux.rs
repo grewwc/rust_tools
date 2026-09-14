@@ -412,18 +412,7 @@ pub(crate) async fn summarize_history_via_model(
         Message {
             role: "system".to_string(),
             content: Value::String(format!(
-                "You are a software development conversation-history compressor. Your task is to compress the earlier conversation into a summary that a later coding agent can keep working from.\n\
-Output requirements:\n\
-- Output plain text only; no markdown code blocks, no explanations.\n\
-- Must retain: explicit user requests, file paths / function names / tool names, key errors, current work, unfinished tasks, and re-readable source paths or tool invocations.\n\
-- Strictly distinguish three categories: verified facts directly supported by tool/source evidence, assistant judgments raised earlier but not yet verified, and open questions still to be confirmed. Never rewrite a statement from the assistant into a fact or a fix conclusion just because it came from the assistant.\n\
-- Only tool/source evidence directly visible in the input can support \"verified\"; an assistant's older conclusion or the paths it cites are only read-back locators and cannot be upgraded to facts by citation alone.\n\
-- Verified facts should carry a source (file path, command, or tool name) when possible; when there is no source, mark it \"source not retained\". Conflicting evidence and uncertainty must be preserved; do not make determinacy rulings on the model's behalf.\n\
-- Prioritize user decisions and sourced facts; drop small talk, repeated confirmations, and verbose logs.\n\
-- Use the headings below, with short lines starting with `- ` under each:\n\
-Main request:\nUser decisions:\nVerified facts and sources:\nUnverified assistant judgments:\nConflicts and unknowns:\nCurrent work:\nPending tasks:\n\
-- If a section has no content, write `- none`.\n\
-- Keep the total length within about {} characters.",
+                include_str!("prompts/history_compressor.md"),
                 max_chars
             )),
             tool_calls: None,
@@ -552,8 +541,8 @@ fn session_title_dialog_lines(messages: &[crate::ai::history::Message]) -> Vec<S
             }
 
             let role = match message.role.as_str() {
-                "user" => "用户",
-                "assistant" => "助手",
+                "user" => "user",
+                "assistant" => "assistant",
                 _ => return None,
             };
             Some(format!("{role}: {content}"))
@@ -680,7 +669,7 @@ mod session_title_tests {
 
         let dialog = session_title_dialog_lines(&messages);
 
-        assert_eq!(dialog, vec!["用户: 优化图片请求的 session title"]);
+        assert_eq!(dialog, vec!["user: 优化图片请求的 session title"]);
         assert!(!dialog[0].contains("image_url"));
         assert!(!dialog[0].contains("base64"));
     }
@@ -736,7 +725,7 @@ mod session_title_tests {
 
         let dialog = session_title_dialog_lines(&messages);
 
-        assert_eq!(dialog, vec!["用户: 修复 session title"]);
+        assert_eq!(dialog, vec!["user: 修复 session title"]);
     }
 
     #[test]
@@ -770,8 +759,8 @@ mod session_title_tests {
         assert_eq!(
             dialog,
             vec![
-                "用户: 修复 session title",
-                "助手: 已改为在完整回复后生成标题"
+                "user: 修复 session title",
+                "assistant: 已改为在完整回复后生成标题"
             ]
         );
     }
@@ -779,13 +768,13 @@ mod session_title_tests {
     #[test]
     fn long_title_transcript_keeps_initial_intent_and_final_conclusion() {
         let dialog = vec![
-            format!("用户: 任务意图{}", "a".repeat(3_000)),
-            format!("助手: 最终结论{}", "b".repeat(6_000)),
+            format!("user: 任务意图{}", "a".repeat(3_000)),
+            format!("assistant: 最终结论{}", "b".repeat(6_000)),
         ];
 
         let transcript = compact_session_title_transcript(&dialog);
 
-        assert!(transcript.starts_with("用户: 任务意图"));
+        assert!(transcript.starts_with("user: 任务意图"));
         assert!(transcript.ends_with('b'));
         assert!(transcript.contains("\n…\n"));
         assert!(transcript.chars().count() <= SESSION_TITLE_TRANSCRIPT_MAX_CHARS);
@@ -860,15 +849,9 @@ pub(crate) async fn generate_session_title_via_model(
 
     let transcript = compact_session_title_transcript(&dialog);
 
-    let system_prompt = "你是一个对话标题生成器。根据下面的对话内容，生成一个不超过20个字的简短标题，概括对话的核心主题。\n\
-要求：\n\
-- 只输出标题本身，不要引号，不要解释，不要前缀。\n\
-- 标题要具体、有信息量，不要太笼统。\n\
-- 如果对话附带图片，基于用户同时输入的文字概括主题，不要只复述‘看截图’、‘图片问题’等泛化表述。\n\
-- 优先用名词短语或动宾短语。\n\
-- 如果是编程相关，提到关键技术或文件名。";
+    let system_prompt = include_str!("prompts/session_title.md");
 
-    let user_prompt = format!("对话内容：\n\n{transcript}\n\n请生成标题：");
+    let user_prompt = format!("Conversation:\n\n{transcript}\n\nGenerate the title:");
 
     let control_model = control_model_for_aux_tasks(app);
     let title_model = control_model;

@@ -81,17 +81,15 @@ async fn select_skill_candidate_via_model(
         return None;
     }
 
-    let mut system_prompt = r#"You are a skill router for a code-focused assistant.
-Your job is to decide whether the current request clearly needs one of the available skills.
-Output schema: {"skill":"<exact skill name or empty>","confidence":0.0}
-Rules:
-- Route only when the request is explicitly about operating on source code, code artifacts, or a coding workflow that matches a listed skill.
-- Abstain for general knowledge, documentation lookup, high-level discussion, non-code work, or ambiguous requests.
-- Prefer abstaining over misrouting when the evidence is weak.
-- Use only the exact skill names listed below.
-- Return only valid JSON.
-Skills:
-"#.to_string();
+    let mut system_prompt = include_str!("prompts/router.md").to_string();
+
+    // `include_str!` keeps the template bytes verbatim and the template ends with
+    // `<available_skills>` (no trailing newline), so add the separator BEFORE appending
+    // the skill list; otherwise the first skill glues onto the opening tag. A guard
+    // placed after the loop could never fire (every skill line ends with `\n`).
+    if !system_prompt.ends_with('\n') {
+        system_prompt.push('\n');
+    }
 
     for s in skills {
         let desc = if s.description.trim().is_empty() {
@@ -101,6 +99,7 @@ Skills:
         };
         system_prompt.push_str(&format!("- {}: {}\n", s.name, desc));
     }
+    system_prompt.push_str("</available_skills>\n");
 
     let messages = vec![
         Message {

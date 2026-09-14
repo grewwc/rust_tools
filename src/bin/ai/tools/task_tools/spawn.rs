@@ -199,24 +199,16 @@ pub(super) fn wrap_subagent_prompt(
             let schema =
                 serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string());
             format!(
-                "Required response contract:\n\
-                 - Return exactly one JSON value matching the schema below.\n\
-                 - Do not wrap the JSON in Markdown fences or add prose before or after it.\n\
-                 <response_schema>\n{schema}\n</response_schema>\n\n"
+                include_str!("prompts/subagent_response_schema.md"),
+                schema = schema
             )
         })
         .unwrap_or_default();
     format!(
-        "Subagent task: {}\n\n\
-         Runtime constraints:\n\
-         - Treat this as a bounded leaf task for the parent agent. Do not expand scope beyond the task.\n\
-         - Reuse observed evidence and avoid equivalent read/search/list/command variants unless omitted text is needed; prefer one targeted broad call over many small ones.\n\
-         - Ground factual claims in observed evidence. For review or diagnosis, trace the relevant path and check likely counter-evidence before reporting a finding.\n\
-         - If evidence is incomplete, return a concise partial result separating confirmed conclusions, unresolved hypotheses, missing evidence, and the next verification step.\n\n\
-         {}Parent task prompt:\n{}",
-        description.trim(),
-        response_contract,
-        prompt.trim()
+        include_str!("prompts/subagent_wrap.md"),
+        task_description = description.trim(),
+        response_contract = response_contract,
+        parent_prompt = prompt.trim()
     )
 }
 

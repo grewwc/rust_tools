@@ -163,19 +163,7 @@ impl Goal {
 
     pub fn generate_decomposition_prompt(&self) -> String {
         format!(
-            "You are a goal decomposition engine. Break down this goal into actionable sub-goals.\n\n\
-             Goal: {}\n\
-             Context: {}\n\
-             Current strategy: {}\n\n\
-             Rules:\n\
-             - Each sub-goal should be independently achievable\n\
-             - Specify dependencies using 0-based indices of previously listed sub-goals\n\
-             - Assign priority (1-10, 10 = highest)\n\
-             - Sub-goals should be concrete and testable\n\
-             - Maximum {} levels of decomposition\n\n\
-             Output STRICT JSON array: [{{\"description\":\"...\",\"depends_on_indices\":[0],\"priority\":8}}]\n\
-             Use empty array for depends_on_indices if no dependencies. \
-             depends_on_indices uses 0-based index of previously listed sub-goals.",
+            include_str!("prompts/goal_decomposition.md"),
             self.description,
             super::verification::safe_truncate(&self.context, 1000),
             self.strategy.as_deref().unwrap_or("none"),
@@ -202,16 +190,7 @@ impl Goal {
             })
             .collect();
         format!(
-            "You are a strategic planner. Given the current goal state, propose a strategy.\n\n\
-             Goal: {}\n\
-             Sub-goals:\n{}\n\
-             Overall progress: {:.0}%\n\n\
-             Rules:\n\
-             - Identify the critical path\n\
-             - Suggest which blocked goals to unblock first\n\
-             - Propose any new sub-goals if needed\n\
-             - Identify risks and mitigation strategies\n\n\
-             Output STRICT JSON: {{\"strategy\":\"...\",\"critical_path\":[\"id1\",\"id2\"],\"risks\":[\"...\"],\"new_sub_goals\":[{{\"description\":\"...\",\"priority\":8}}]}}",
+            include_str!("prompts/goal_strategy.md"),
             self.description,
             sub_goals_summary.join("\n"),
             self.overall_progress * 100.0

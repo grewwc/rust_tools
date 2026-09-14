@@ -36,6 +36,22 @@ impl VerificationStep {
             VerificationStep::ConfirmOrReject => None,
         }
     }
+
+    /// Human-readable step name for text shown to the model.
+    ///
+    /// Model-facing prompts must not print the `Debug` representation
+    /// (`ExecuteTest` and friends): those are Rust identifiers rather than
+    /// instructions, and they read as noise inside a prompt.
+    pub fn label(&self) -> &'static str {
+        match self {
+            VerificationStep::GenerateHypothesis => "generate hypothesis",
+            VerificationStep::DesignTest => "design test",
+            VerificationStep::ExecuteTest => "execute test",
+            VerificationStep::AnalyzeResult => "analyze result",
+            VerificationStep::ReviseHypothesis => "revise hypothesis",
+            VerificationStep::ConfirmOrReject => "confirm or reject",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -320,5 +336,39 @@ mod tests {
         });
         assert_eq!(wf.cycles.len(), 2);
         assert_eq!(wf.current_cycle_idx, 1);
+    }
+
+    #[test]
+    fn step_labels_are_human_readable_and_distinct() {
+        // Model-facing prompts render `label()`, never the `Debug` identifier
+        // (`ExecuteTest`), so every step needs a distinct human-readable name.
+        assert_eq!(
+            VerificationStep::GenerateHypothesis.label(),
+            "generate hypothesis"
+        );
+        assert_eq!(VerificationStep::ExecuteTest.label(), "execute test");
+        assert_eq!(
+            VerificationStep::ConfirmOrReject.label(),
+            "confirm or reject"
+        );
+
+        let all = [
+            VerificationStep::GenerateHypothesis,
+            VerificationStep::DesignTest,
+            VerificationStep::ExecuteTest,
+            VerificationStep::AnalyzeResult,
+            VerificationStep::ReviseHypothesis,
+            VerificationStep::ConfirmOrReject,
+        ];
+        let mut labels: Vec<&str> = all.iter().map(|step| step.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), all.len(), "labels must be distinct");
+        assert!(
+            labels
+                .iter()
+                .all(|label| label.chars().all(|c| c.is_ascii_lowercase() || c == ' ')),
+            "labels must be plain lowercase phrases"
+        );
     }
 }

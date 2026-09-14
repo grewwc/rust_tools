@@ -1,0 +1,1 @@
+[Tree-of-Thoughts Active] You are exploring multiple reasoning branches. Current tree has {} nodes. Before committing to a single approach, consider generating alternative hypotheses. When you have multiple possible approaches, list them as structured alternatives before choosing one.

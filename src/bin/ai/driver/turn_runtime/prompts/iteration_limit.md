@@ -1,0 +1,2 @@
+[iteration-limit] You have iterated {max_iterations} rounds without converging.
+Answer the user directly with the information you have. If information is insufficient, clearly tell the user where you are stuck, what material is missing, and a suggested next step — do not issue any more tool calls.

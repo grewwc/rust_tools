@@ -372,9 +372,8 @@ pub(super) fn inject_iteration_limit_reflect_note(
     use crate::ai::history::Message;
     use serde_json::Value;
     let note = format!(
-        "[iteration-limit] You have iterated {max_iterations} rounds without converging.\n\
-        Answer the user directly with the information you have. If information is insufficient, clearly tell the user where you are stuck,\
-        what material is missing, and a suggested next step — do not issue any more tool calls."
+        include_str!("prompts/iteration_limit.md"),
+        max_iterations = max_iterations
     );
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
@@ -393,10 +392,7 @@ pub(super) fn inject_subagent_pre_timeout_wrap_up_note(
     use crate::ai::history::Message;
     use serde_json::Value;
 
-    let note = "[subagent-pre-timeout-wrap-up] The foreground wait time for the current synchronous sub-task is about to run out.\n\
-        You are now in no-tool wrap-up mode: do not issue new tool calls or expand into new audit branches.\n\
-        Immediately produce a final answer based on the evidence gathered: first list the verified conclusions;\n\
-        separately mark risks that are not yet verified — never guess.";
+    let note = include_str!("prompts/subagent_pre_timeout_wrap_up.md");
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),

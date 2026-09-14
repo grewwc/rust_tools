@@ -16,11 +16,7 @@ pub(crate) const FAST_AUDIT_SUBAGENT_HARD_TIMEOUT: Duration = Duration::from_sec
 pub(crate) const FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME: Duration = Duration::from_secs(3 * 60);
 
 const SUBAGENT_FINAL_ANSWER_MARKER: &str = "[Subagent final answer]\n";
-const AUDIT_PROGRESS_PROTOCOL: &str = "===== 审计增量交付协议 =====\n\
-每完成一个独立检查分支，必须在继续调用工具前输出一条以 `AUDIT_CHECKPOINT:` 开头的简短进度记录，包含：已检查范围、带 file:line 的阶段性发现、仍待验证的问题。\n\
-不要等到最终回答才首次汇总发现；checkpoint 是可恢复的阶段性证据。\n\
-收到收尾信号后立即停止扩展调查，基于已有 checkpoint 和工具证据生成最终审计结论。\n\
-===== 审计增量交付协议结束 =====";
+const AUDIT_PROGRESS_PROTOCOL: &str = include_str!("prompts/audit_progress_protocol.md");
 
 /// `/audit` 需要在已有 DRIVER_CTX 的 turn 内启动同步子代理，因此这里只识别命令，
 /// 实际执行由 turn_runtime 在进入模型循环前完成。
@@ -163,9 +159,9 @@ fn compose_audit_prompt(instruction: &str, changes_context: &str) -> String {
     }
     format!(
         "{instruction}\n\n\
-         ===== 本会话 main agent 已做的文件改动 =====\n\
+         ===== Files changed by the main agent in this session =====\n\
          {changes_context}\n\
-         ===== 文件改动结束 ====="
+         ===== End of file changes ====="
     )
 }
 
@@ -207,12 +203,12 @@ fn capture_git_diff_fallback() -> String {
         let stat = git_output(&cwd, &["diff", "HEAD", "--stat", "--no-color"]);
         sections.push(format!(
             "## git diff HEAD --stat\n\
-             （完整 diff 超过 {MAX_DIFF_BYTES} 字节，仅展示统计；如需完整内容请自行执行 `git diff HEAD`）\n\
+             (the complete diff exceeds {MAX_DIFF_BYTES} bytes, so only the stat is shown; run `git diff HEAD` yourself if you need the full content)\n\
              {stat}"
         ));
     }
     let mut out = String::from(
-        "（本会话无工具级 mutation log，以下为工作区未提交改动，可能含并发需求的改动）\n\n",
+        "(no tool-level mutation log for this session; below are the workspace's uncommitted changes, which may include changes from concurrent tasks)\n\n",
     );
     out.push_str(&sections.join("\n\n"));
     out
@@ -226,8 +222,8 @@ fn format_mutation_log(
     let summary = crate::ai::tools::storage::changes::grouped_changes(entries);
     let log_path = crate::ai::tools::storage::mutation_log::log_path();
     let mut out = String::from(
-        "以下是 main agent 在本会话通过 write_file / apply_patch 改动的文件（按首次改动顺序）。\n\
-         这只包含本会话工具级改动，不含其他并发需求留下的未提交改动。\n\n",
+        "Below are the files the main agent changed in this session via write_file / apply_patch (in order of first change).\n\
+         This covers only this session's tool-level changes, not uncommitted changes left by other concurrent tasks.\n\n",
     );
     const CAP: usize = 14_000;
     let mut truncated = false;
@@ -253,7 +249,7 @@ fn format_mutation_log(
         }
     }
     if truncated {
-        out.push_str("…（更多改动省略）\n\n");
+        out.push_str("…(more changes omitted)\n\n");
     }
     if let Some(lp) = &log_path {
         out.push_str(&format!(
@@ -483,16 +479,16 @@ model_reason=inherited parent agent current model\n\
         let prompt = compose_audit_prompt("review the diff", "");
         assert!(prompt.starts_with("review the diff\n\n"));
         assert!(prompt.contains("AUDIT_CHECKPOINT:"));
-        assert!(prompt.contains("不要等到最终回答才首次汇总发现"));
+        assert!(prompt.contains("Do not wait until the final answer to report findings"));
     }
 
     #[test]
     fn compose_audit_prompt_appends_changes_context() {
         let prompt = compose_audit_prompt("review the diff", "（示例改动上下文）");
         assert!(prompt.starts_with("review the diff\n\n"));
-        assert!(prompt.contains("本会话 main agent 已做的文件改动"));
+        assert!(prompt.contains("Files changed by the main agent in this session"));
         assert!(prompt.contains("（示例改动上下文）"));
-        assert!(prompt.contains("文件改动结束"));
+        assert!(prompt.contains("End of file changes"));
     }
 
     #[test]

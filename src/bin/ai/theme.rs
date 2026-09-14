@@ -14,6 +14,7 @@
 //!   "type": "dark",
 //!   "colors": {
 //!     "accent.primary": "#6E82A0",
+//!     "accent.submittedBar": "#E06C75",
 //!     "code.background": "#282828",
 //!     "markdown.math": "\u001b[95m"
 //!   }
@@ -90,6 +91,11 @@ pub(crate) struct Theme {
     /// visible and distinguishable from assistant output. The bold green `❯`
     /// marker in `prompt/multiline/multiline_ui.rs` keeps the submit boundary.
     pub(crate) accent_submitted: &'static str,
+    /// Left emphasis bar for echoed user input after submit. A theme that sets
+    /// `accent.submittedBar` uses that color; a theme that changes other colors
+    /// but not the bar mirrors its resolved `accent.success`; a theme that
+    /// overrides no known color keeps the compiled-in default.
+    pub(crate) accent_submitted_bar: &'static str,
     // ── Markdown prose (previously `MARKDOWN_*` consts in render/mod.rs) ───
     pub(crate) markdown_body: &'static str,
     pub(crate) markdown_strong: &'static str,
@@ -128,6 +134,7 @@ impl Theme {
             accent_marked: "\x1b[38;2;255;150;150m",
             accent_rule: "\x1b[38;2;71;85;105m",
             accent_submitted: "\x1b[38;2;245;158;11m",
+            accent_submitted_bar: "\x1b[38;2;224;108;117m",
             markdown_body: "\x1b[38;2;212;209;203m",
             markdown_strong: "\x1b[38;2;229;223;213m",
             markdown_heading: "\x1b[38;2;221;215;204m",
@@ -155,6 +162,7 @@ impl Theme {
             None => return Some(Theme::default_theme()),
         };
         let mut t = Theme::default_theme();
+        let mut submitted_bar_overridden = false;
         for (key, value) in colors {
             let Some(raw) = value.as_str() else { continue };
             match key.as_str() {
@@ -176,6 +184,12 @@ impl Theme {
                 "accent.marked" => set_fg(&mut t.accent_marked, raw),
                 "accent.rule" => set_fg(&mut t.accent_rule, raw),
                 "accent.submitted" => set_fg(&mut t.accent_submitted, raw),
+                "accent.submittedBar" => {
+                    if let Some(ansi) = color_to_ansi(raw, false) {
+                        t.accent_submitted_bar = leak(ansi);
+                        submitted_bar_overridden = true;
+                    }
+                }
                 "markdown.body" => set_fg(&mut t.markdown_body, raw),
                 "markdown.strong" => set_fg(&mut t.markdown_strong, raw),
                 "markdown.heading" => set_fg(&mut t.markdown_heading, raw),
@@ -192,6 +206,16 @@ impl Theme {
                 "code.dim" => set_fg(&mut t.code_dim, raw),
                 _ => {} // unknown keys are ignored so themes stay forward-compatible
             }
+        }
+        // A theme JSON that overrides no known color must stay identical to
+        // `Theme::default_theme()` (see `from_json_unknown_keys_ignored`), so the
+        // success fallback only applies once the theme actually changed a color.
+        // Resolving here, after the loop, keeps the bar independent of key order.
+        if !submitted_bar_overridden && t != Theme::default_theme() {
+            // Resolve after all theme keys are applied, so a partial theme that
+            // customizes `accent.success` automatically gives its user-input
+            // bar the same color regardless of JSON object iteration order.
+            t.accent_submitted_bar = t.accent_success;
         }
         Some(t)
     }
@@ -376,6 +400,18 @@ mod tests {
     }
 
     #[test]
+    fn from_json_submitted_bar_defaults_to_resolved_success() {
+        let json = r##"{"colors": {"accent.success": "#112233"}}"##;
+        let t = Theme::from_json(json).unwrap();
+        assert_eq!(t.accent_success, "\x1b[38;2;17;34;51m");
+        assert_eq!(t.accent_submitted_bar, t.accent_success);
+
+        let json = r##"{"colors": {"accent.success": "#112233", "accent.submittedBar": "#445566"}}"##;
+        let t = Theme::from_json(json).unwrap();
+        assert_eq!(t.accent_submitted_bar, "\x1b[38;2;68;85;102m");
+    }
+
+    #[test]
     fn from_json_unknown_keys_ignored() {
         let json = r##"{"colors": {"editor.background": "#000000", "accent.bogus": "#000000"}}"##;
         let t = Theme::from_json(json).unwrap();
@@ -412,6 +448,7 @@ mod tests {
                 t.accent_primary, t.accent_tool_name, t.accent_secondary, t.accent_command,
                 t.accent_muted, t.accent_input, t.accent_success, t.accent_emphasized_output,
                 t.accent_warn, t.accent_danger, t.accent_marked, t.accent_rule, t.accent_submitted,
+                t.accent_submitted_bar,
                 t.markdown_body, t.markdown_strong, t.markdown_heading, t.markdown_accent,
                 t.markdown_code_fg, t.markdown_math, t.code_background, t.code_foreground,
                 t.code_comment, t.code_keyword, t.code_string, t.code_number, t.code_type,

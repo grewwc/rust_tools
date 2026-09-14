@@ -114,21 +114,7 @@ const PRUNE_PROMPT_MAX_CANDIDATES: usize = 8;
 
 /// The pruning-protocol instructions injected into the system prompt.
 /// Kept short to avoid consuming too many tokens.
-pub(crate) const PRUNE_PROTOCOL_PROMPT: &str = "\n## Context Management Protocol\n\
-When your context holds outdated tool results, actively reclaim space by marking them.\n\
-Each tool result in the history has a stable id (the `call_id` / `tool_call_id` shown on\n\
-that tool output). Include a hidden self-note listing the ids to prune:\n\
-`<meta:self_note>prune:call_abc,call_xyz</meta:self_note>`\n\
-Mark any tool result that is now superseded or no longer needed — including old file\n\
-reads and code/search results whose content you have already used, that you have since\n\
-re-read, or that describe code you have already edited.\n\
-Rules:\n\
-- Never mark user messages, system instructions, assistant messages, plans, or the most recent tool results.\n\
-- Marking is safe and reversible: pruning is loss-free — the full result is archived to a\n\
-  session file and the kept stub shows its `file_path`, so you can re-read it anytime if you\n\
-  turn out to still need it. The system only prunes after you mark an id on a couple of turns\n\
-  and always protects recent results and plans.\n\
-- Put the `prune:` directive on its own line; if you also write a normal self_note, keep it in the same hidden note.";
+pub(crate) const PRUNE_PROTOCOL_PROMPT: &str = include_str!("prompts/prune_protocol.md");
 
 /// Returns whether messages of this role are protected (never pruned).
 fn is_protected_role(role: &str) -> bool {

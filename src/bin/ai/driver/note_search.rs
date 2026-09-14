@@ -739,13 +739,9 @@ async fn consolidate_scope(
         .collect();
 
     let sys = format!(
-        "You are a knowledge curator. Analyze only the current scope: {}. \
-         Every listed entry belongs to this scope; never combine it with another scope.\n\
-         Return ONLY valid JSON:\n\
-         {{\"reasoning\":\"1-sentence summary\",\"delete_ids\":[\"id1\",\"id2\"],\"merge_plan\":[{{\"ids\":[\"id1\",\"id2\"],\"merged_content\":\"...\"}}]}}\n\
-         Rules: use only listed IDs; delete only exact duplicates or obsolete entries; merge only related entries; keep useful entries. {} Priority>=200 entries are already excluded.",
-        scope.label(),
-        scope.curator_rule(),
+        include_str!("prompts/note_curator.md"),
+        scope = scope.label(),
+        curator_rule = scope.curator_rule(),
     );
     let prompt = format!(
         "Analyze these {} {} entries:\n{}",

@@ -217,10 +217,7 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
     let gate_messages = vec![
         Message {
             role: "system".to_string(),
-            content: Value::String(
-                "You are a request complexity gate. Decide whether this user request needs deliberate reasoning mode.\nOutput STRICT JSON only: {\"thinking\":true|false,\"confidence\":0.0}\nRules:\n- thinking=true for multi-step tasks, code changes, debugging, comparative analysis, or ambiguous complex intent.\n- thinking=false for greetings, simple factual asks, tiny rewrites, or short direct requests.\n- confidence is your certainty in [0,1]."
-                    .to_string(),
-            ),
+            content: Value::String(include_str!("prompts/complexity_gate.md").to_string()),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,

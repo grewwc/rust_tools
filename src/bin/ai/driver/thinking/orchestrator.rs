@@ -229,23 +229,13 @@ impl ThinkingOrchestrator {
         // After the first injection, the LLM already knows the protocol.
         if !self.protocol_injected {
             self.protocol_injected = true;
-            parts.push(
-                "[Thinking Protocol] Emit tags in your reply (hidden from user): \
-                 <think:begin_tree_of_thoughts>Q</think:begin_tree_of_thoughts> \
-                 | <think:begin_verification>H</think:begin_verification> \
-                 | <think:begin_goal>G</think:begin_goal> \
-                 | <think:reset_thinking/>."
-                    .to_string(),
-            );
+            parts.push(include_str!("prompts/thinking_protocol.md").to_string());
         }
 
         if self.active_modes.contains(&ThinkingMode::TreeOfThoughts) {
             if let Some(ref tree) = self.thought_tree {
                 parts.push(format!(
-                    "[Tree-of-Thoughts Active] You are exploring multiple reasoning branches. \
-                     Current tree has {} nodes. Before committing to a single approach, \
-                     consider generating alternative hypotheses. When you have multiple possible \
-                     approaches, list them as structured alternatives before choosing one.",
+                    include_str!("prompts/tot_active.md"),
                     tree.render_tree_summary().lines().count()
                 ));
             }
@@ -275,9 +265,8 @@ impl ThinkingOrchestrator {
                         }
                     };
                     parts.push(format!(
-                        "[Verification Loop Active] Current step: {:?}. {} \
-                         Do not assume success — actively seek disconfirming evidence.",
-                        wf.current_step, step_instruction
+                        include_str!("prompts/verification_loop.md"),
+                        wf.current_step.label(), step_instruction
                     ));
                 }
             }

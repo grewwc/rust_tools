@@ -48,7 +48,7 @@ pub(crate) const DIGEST_END: &str = "<<<END_IMAGE_DIGEST>>>";
 /// into the request's user message.
 /// The replacement phase uses it to identify and remove that instruction text
 /// part (its job is done).
-const INSTRUCTION_TAG: &str = "[图片处理协议]";
+const INSTRUCTION_TAG: &str = "[image handling protocol]";
 /// Response-header timeout (seconds) for the fallback request. A lenient bound,
 /// consistent with the history-summary aux requests.
 const DIGEST_REQUEST_HEADER_TIMEOUT_SECS: u64 = 60;
@@ -61,15 +61,10 @@ const DIGEST_REQUEST_BODY_TIMEOUT_SECS: u64 = 30;
 /// afterwards, so all visual information needed for the task must go into the digest.
 pub(crate) fn digest_instruction() -> String {
     format!(
-        "{INSTRUCTION_TAG} 本轮会附带原始图片，但为控制 Token，后续轮次不会再发送原图。\
-请在本轮回答里，用下面的固定格式输出一段“图片摘要”，把完成任务所需的全部视觉信息\
-（界面结构、可见文字、代码、数值、颜色、布局与位置关系等）写清楚——后续你将只能\
-依赖这段摘要，看不到原图：\n\
-{DIGEST_BEGIN}\n（在这里写图片摘要）\n{DIGEST_END}\n\
-摘要只是中间步骤，绝不能作为本轮回复的结尾：输出完摘要后，你必须继续回答用户本轮\
-提出的实际问题（例如提取图片中的链接、总结界面内容等），并在必要时照常调用工具；\
-最终以对用户问题的完整答复结束本轮。你可以在输出摘要的同时并行作答或调用工具。\
-原图路径由系统记录，确有需要时可用文件工具重新读取原图。"
+        include_str!("prompts/image_digest.md"),
+        INSTRUCTION_TAG = INSTRUCTION_TAG,
+        DIGEST_BEGIN = DIGEST_BEGIN,
+        DIGEST_END = DIGEST_END
     )
 }
 
@@ -155,13 +150,14 @@ fn is_instruction_part(part: &Value) -> bool {
 /// image has been converted to text + the original image path + the digest itself.
 fn build_digest_text(digest: &str, image_paths: &[String]) -> String {
     let paths = if image_paths.is_empty() {
-        "（未记录）".to_string()
+        "(not recorded)".to_string()
     } else {
         image_paths.join(", ")
     };
     format!(
-        "[图片已转为文字摘要以控制 Token 消耗；后续轮次不再重复发送原图。\
-如需精确像素/视觉细节，可用文件工具读取原图。]\n原图路径: {paths}\n图片摘要:\n{digest}"
+        "[The image was converted to a text digest to control token usage; the original image \
+is not sent again in later turns. If you need exact pixel/visual details, read the original \
+image with the file tools.]\nOriginal image path: {paths}\nImage digest:\n{digest}"
     )
 }
 
@@ -277,7 +273,12 @@ pub(crate) async fn describe_image_for_digest(
     // build_content returns a multimodal array only when the model supports image
     // input; otherwise it degrades to a plain string, meaning this model cannot
     // see images and a fallback digest is moot.
-    let user_content = build_content(model, "请按上面的协议为图片生成摘要。", image_files).ok()?;
+    let user_content = build_content(
+        model,
+        "Generate the image digest following the protocol above.",
+        image_files,
+    )
+    .ok()?;
     if !user_content.is_array() {
         return None;
     }

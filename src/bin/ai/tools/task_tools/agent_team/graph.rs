@@ -893,12 +893,12 @@ fn static_node_prompt(
         .join("\n\n");
     clip_text(
         &format!(
-            "You are node `{}` in a static agent DAG. Work directly; do not delegate.\n\n# Graph question\n{}\n\n# Node task\n{}\n\n# Current reduced state\n{}\n\n# Active upstream outputs\n{}",
-            node.spec.id,
-            question,
-            node.spec.prompt,
-            serde_json::to_string_pretty(state).unwrap_or_else(|_| "{}".to_string()),
-            if upstream.is_empty() {
+            include_str!("prompts/graph_static_node.md"),
+            node_id = node.spec.id,
+            question = question,
+            node_task = node.spec.prompt,
+            state = serde_json::to_string_pretty(state).unwrap_or_else(|_| "{}".to_string()),
+            upstream = if upstream.is_empty() {
                 "<root node>"
             } else {
                 &upstream
@@ -1260,13 +1260,19 @@ fn dynamic_prompt(question: &str, run: &DynamicGraphRun, id: &str) -> Result<Str
     let role = &candidate.spec.role;
     let prompt = match run.phase {
         DynamicPhase::Initial => format!(
-            "You are candidate `{id}` in a Graph-of-Agents run. Work directly and independently; do not delegate.\nRole: {role}\nSpecial instructions: {}\n\nQuestion:\n{question}\n\nProduce your best self-contained answer.",
-            candidate.spec.prompt
+            include_str!("prompts/graph_dynamic_initial.md"),
+            special_instructions = candidate.spec.prompt,
+            id = id,
+            role = role,
+            question = question
         ),
         DynamicPhase::Scoring => {
             let answers = ordered_candidate_outputs(run, |candidate| candidate.initial.as_deref());
             format!(
-                "You are the relevance selector `{id}` in a Graph-of-Agents run. Do not solve the question again. Score every candidate answer from 0.0 to 1.0 for correctness, usefulness, and relevance to the question. Return only the required JSON object.\n\nQuestion:\n{question}\n\nCandidate answers:\n{answers}"
+                include_str!("prompts/graph_dynamic_scoring.md"),
+                id = id,
+                question = question,
+                answers = answers
             )
         }
         DynamicPhase::Forward => {
@@ -1287,13 +1293,16 @@ fn dynamic_prompt(question: &str, run: &DynamicGraphRun, id: &str) -> Result<Str
                 .collect::<Vec<_>>()
                 .join("\n\n");
             format!(
-                "You are candidate `{id}` in the forward message-passing phase. Work directly; do not delegate.\nRole: {role}\n\nQuestion:\n{question}\n\nYour initial answer:\n{}\n\nMore-relevant inbound answers:\n{}\n\nRefine your answer using useful evidence, while correcting conflicts.",
-                candidate.initial.as_deref().unwrap_or(""),
-                if messages.is_empty() {
+                include_str!("prompts/graph_dynamic_forward.md"),
+                initial_answer = candidate.initial.as_deref().unwrap_or(""),
+                inbound_answers = if messages.is_empty() {
                     "<none>"
                 } else {
                     &messages
-                }
+                },
+                id = id,
+                role = role,
+                question = question
             )
         }
         DynamicPhase::Reverse => {
@@ -1314,13 +1323,16 @@ fn dynamic_prompt(question: &str, run: &DynamicGraphRun, id: &str) -> Result<Str
                 .collect::<Vec<_>>()
                 .join("\n\n");
             format!(
-                "You are candidate `{id}` in the reverse propagation phase. Work directly; do not delegate.\nRole: {role}\n\nQuestion:\n{question}\n\nYour forward answer:\n{}\n\nFeedback from less-central neighbors:\n{}\n\nProduce a final corrected answer. Preserve strong conclusions and incorporate valid overlooked details.",
-                candidate.forward.as_deref().unwrap_or(""),
-                if messages.is_empty() {
+                include_str!("prompts/graph_dynamic_reverse.md"),
+                forward_answer = candidate.forward.as_deref().unwrap_or(""),
+                neighbor_feedback = if messages.is_empty() {
                     "<none>"
                 } else {
                     &messages
-                }
+                },
+                id = id,
+                role = role,
+                question = question
             )
         }
         _ => {
@@ -1377,7 +1389,9 @@ fn launch_pool_task(
         .join("\n\n");
     let prompt = clip_text(
         &format!(
-            "You are the final judge in a Graph-of-Agents run. Work directly; do not delegate. Synthesize one accurate, self-contained final answer. Resolve disagreements using evidence and the relevance weights; do not mention the orchestration process.\n\nQuestion:\n{question}\n\nCandidate final answers:\n{answers}"
+            include_str!("prompts/graph_pooling_judge.md"),
+            question = question,
+            answers = answers
         ),
         MAX_PROMPT_CHARS,
     );

@@ -6,14 +6,8 @@ use crate::ai::types::App;
 /// user message with instructions to keep executing.
 pub(crate) fn build_goal_prompt(goal: &str) -> String {
     format!(
-        "你正在 GOAL MODE 下工作。这是一个长期自主任务，目标是：\n\
-         ---\n\
-         {goal}\n\
-         ---\n\
-         \n\
-         请全力以赴地完成这个目标。你可以调用任何可用的工具来推进工作。\n\
-         在每一轮结束时，如果你认为目标已经完全达成，请不要再调用任何工具，\n\
-         直接用一段文字总结你完成的工作即可。如果目标尚未达成，请继续执行下一步。"
+        include_str!("prompts/goal_mode_initial.md"),
+        goal = goal
     )
 }
 
@@ -21,11 +15,8 @@ pub(crate) fn build_goal_prompt(goal: &str) -> String {
 /// previous turn to drive the agent forward.
 pub(crate) fn build_goal_continuation_prompt(goal: &str) -> String {
     format!(
-        "[GOAL MODE - 继续] 你的目标是：{goal}\n\
-         \n\
-         请回顾你目前的进展，继续推进目标的实现。\n\
-         - 如果目标已经完全达成，不要再调用工具，直接用文字总结你的工作成果。\n\
-         - 如果还有未完成的部分，立即继续执行下一步行动。"
+        include_str!("prompts/goal_continuation.md"),
+        goal = goal
     )
 }
 

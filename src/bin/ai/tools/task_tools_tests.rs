@@ -416,8 +416,9 @@ fn prepare_subagent_task_auto_selects_model_and_fallback() {
     assert!(
         prepared
             .prompt
-            .contains("Parent task prompt:\nFind where task spawning is implemented.")
+            .contains("<parent_task_prompt>\nFind where task spawning is implemented.")
     );
+    assert!(prepared.prompt.contains("</parent_task_prompt>"));
 }
 
 #[test]
