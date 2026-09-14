@@ -6,7 +6,7 @@
     "properties": {
       "query": {
         "type": "string",
-        "description": "Search term (plain substring by default; is_regex=true for regex). Searches the current session's overflow archive (content moved out of context during compression)."
+        "description": "Search term (plain substring by default; is_regex=true for regex). Searches the session overflow archive (content moved out of context during compression)."
       },
       "scope": {
         "type": "string",
@@ -15,7 +15,7 @@
           "history",
           "tool_outputs"
         ],
-        "description": "Where to search (default: all). 'all' also includes folded-tool-groups/ and internal-note-overflow/; 'history' = overflow-history.md; 'tool_outputs' = tool-overflow-compressed/ (full snapshots of individual tool results)."
+        "description": "Where to search (default: all). 'all' also includes folded-tool-groups/ and internal-note-overflow/; 'history' = overflow-history.md; 'tool_outputs' = tool-overflow-compressed/ (full tool-result snapshots)."
       },
       "file_pattern": {
         "type": "string",

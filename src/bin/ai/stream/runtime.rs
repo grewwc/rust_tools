@@ -1785,15 +1785,29 @@ fn write_fold_header(
     rate: Option<&str>,
     fold: &super::state::ThinkingFoldState,
 ) -> io::Result<()> {
-    write!(out, "  {}{}", theme::current().accent_muted, fold.header_label)?;
+    let mut label = fold.header_label.clone();
     // Live reasoning throughput rides on the fold header: the header is the
     // renderer's own redraw target (unlike the one-shot model/session status
     // line printed by request/transport.rs), so appending here needs no extra
     // cursor movement and stays inside the fold's erase span.
     if let Some(rate) = rate {
-        write!(out, " · {rate}")?;
+        label.push_str(" · ");
+        label.push_str(rate);
     }
-    write!(out, "\x1b[0m\r\n")
+    write_fold_status_line(out, &label, fold.rewrite_right_margin_cols)
+}
+
+/// Both redraw and completion move up exactly one header row. Bound the entire
+/// decorated line, including indentation and live metrics, to that footprint;
+/// an automatically wrapped header would leave its first row behind on every
+/// redraw. This only clips the status display, never the underlying content.
+fn write_fold_status_line(
+    out: &mut impl Write,
+    label: &str,
+    reserve_cols: usize,
+) -> io::Result<()> {
+    let line = clamp_line_to_terminal_row_with_reserve(&format!("  {label}"), reserve_cols);
+    write!(out, "{}{line}\x1b[0m\r\n", theme::current().accent_muted)
 }
 
 /// Write the final header directly when thinking ends; used for an empty fold that never wrote an in-progress header.
@@ -1802,11 +1816,10 @@ fn write_thinking_fold_completion_header(
     fold: &super::state::ThinkingFoldState,
     line_count: usize,
 ) -> io::Result<()> {
-    write!(
+    write_fold_status_line(
         out,
-        "  {}{} · {line_count} lines\x1b[0m\r\n",
-        theme::current().accent_muted,
-        fold.footer_label,
+        &format!("{} · {line_count} lines", fold.footer_label),
+        fold.rewrite_right_margin_cols,
     )
 }
 
@@ -2259,6 +2272,9 @@ fn process_stream_payload(
     // first-packet/idle timeout.
     if let Some(choice) = chunk.choices.first_mut()
         && !choice.delta.content.is_empty()
+        // Passthrough (initial state and after CLOSE_TAG) hands content through
+        // unchanged: skip the demuxer push to avoid its full-chunk to_string copy.
+        && !state.content.content_think_demuxer.is_passthrough()
     {
         let (reasoning, content) = state
             .content

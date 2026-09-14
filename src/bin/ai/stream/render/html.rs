@@ -25,14 +25,104 @@ struct ParsedCell {
     is_header: bool,
 }
 
-/// 判断一行文本是否包含 `<table` 开标签（大小写不敏感）。
+/// Case-insensitive scan for an HTML `<table` opening tag outside inline code.
+///
+/// A bare `contains("<table")` match also catches prose such as `` `contains("<table")` `` or
+/// `` 用 `<table>` 包裹 ``. When that happens, `MarkdownStreamRenderer::consume_line` buffers
+/// every following line into `html_table_buf` and only stops at an `</table>` that never arrives,
+/// so the whole tail — headings and markdown tables included — is dumped back to the terminal as
+/// raw source once the stream or the block ends. A match therefore only counts when it can be a
+/// tag (`<table` followed by `>`, `/`, whitespace or end of line) and no paired backtick code
+/// span covers it.
 pub(super) fn contains_open_table_tag(line: &str) -> bool {
-    line.to_lowercase().contains("<table")
+    let bytes = line.as_bytes();
+    let needle = b"<table";
+    (0..bytes.len()).any(|at| {
+        ascii_case_insensitive_at(bytes, at, needle)
+            && tag_boundary_after(bytes, at + needle.len())
+            && !inside_code_span(bytes, at)
+    })
 }
 
-/// 判断一行文本是否包含 `</table>` 闭标签（大小写不敏感）。
+/// Case-insensitive scan for the `</table>` closing tag.
+///
+/// Deliberately looser than [`contains_open_table_tag`]: an extra match only finalizes the buffer
+/// early, and the partial buffer then falls back to raw text, while a *missed* match keeps
+/// buffering — and swallowing — the rest of the message. Skipping code spans here could therefore
+/// only make things worse.
 pub(super) fn contains_close_table_tag(line: &str) -> bool {
-    line.to_lowercase().contains("</table>")
+    // Case-insensitive byte scan: `to_lowercase().contains()` allocated a whole
+    // lowercase copy per line on the table-detection hot path.
+    line.as_bytes()
+        .windows(b"</table>".len())
+        .any(|w| w.eq_ignore_ascii_case(b"</table>"))
+}
+
+/// Case-insensitive ASCII comparison of `needle` against the bytes at `at`.
+fn ascii_case_insensitive_at(haystack: &[u8], at: usize, needle: &[u8]) -> bool {
+    haystack.len() >= at + needle.len()
+        && haystack[at..at + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(h, n)| h.eq_ignore_ascii_case(n))
+}
+
+/// True when the byte at `at` may follow `<table` inside a real tag: `>` (tag closed), `/`,
+/// whitespace (attributes follow — space, tab, and the `\r` that a CRLF source keeps at the end of
+/// a line), or end of line (the tag continues on the next line). Anything else means the literal
+/// came from prose, e.g. `contains("<table")`.
+fn tag_boundary_after(bytes: &[u8], at: usize) -> bool {
+    match bytes.get(at) {
+        None => true,
+        Some(byte) => matches!(*byte, b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\x0c'),
+    }
+}
+
+/// Length of the backtick run starting at `start`.
+fn backtick_run_len(bytes: &[u8], start: usize) -> usize {
+    bytes[start..].iter().take_while(|byte| **byte == b'`').count()
+}
+
+/// Start of the next backtick run made of exactly `run` backticks at or after `from`, i.e. the
+/// closing delimiter a code span needs. `None` while the opening run stays unpaired; the inline
+/// renderer then keeps the backticks as literal characters (`inline.rs`, `render_inline_md`).
+fn closing_backtick_run(bytes: &[u8], from: usize, run: usize) -> Option<usize> {
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let len = backtick_run_len(bytes, i);
+            if len == run {
+                return Some(i);
+            }
+            i += len;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// True when byte offset `at` sits inside a paired backtick code span of this line. Pairing is
+/// line-local, like the inline renderer, which only styles a span when it finds the closing
+/// backtick on the same line — but this scanner matches CommonMark run lengths (so a double
+/// backtick can carry a single one), while `render_inline_md` pairs a backtick with the next
+/// backtick character. The two only diverge on mixed run lengths, where the text is shown plain
+/// either way.
+fn inside_code_span(bytes: &[u8], at: usize) -> bool {
+    let mut i = 0;
+    while i < at {
+        if bytes[i] == b'`' {
+            let run = backtick_run_len(bytes, i);
+            match closing_backtick_run(bytes, i + run, run) {
+                Some(close) if at < close => return true,
+                Some(close) => i = close + run,
+                None => i += run,
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// 解析 HTML 表格文本，返回 `HtmlTable`。解析失败返回 `None`。
@@ -537,5 +627,25 @@ mod tests {
         let table = parse_html_table(html).unwrap();
         assert_eq!(table.header, vec!["A", "B"]);
         assert_eq!(table.rows, vec![vec!["1", "2"]]);
+    }
+
+    #[test]
+    fn open_tag_detection_requires_a_real_tag_outside_code_spans() {
+        assert!(contains_open_table_tag("<table>"));
+        assert!(contains_open_table_tag("  <TABLE border=\"1\">"));
+        assert!(contains_open_table_tag("<table"));
+        assert!(contains_open_table_tag("正文 <table style=\"border:1px solid\">"));
+        // A CRLF source keeps its `\r` at the end of the buffered line; the tag still ends there.
+        assert!(contains_open_table_tag("  <table\r"));
+
+        // Literal mentions in prose, inline code or quoted source are not tags.
+        assert!(!contains_open_table_tag("`contains(\"<table\")` 是裸子串匹配"));
+        assert!(!contains_open_table_tag("用 `<table>` 标签包裹"));
+        assert!(!contains_open_table_tag("table_start = \"<table\""));
+        assert!(!contains_open_table_tag("`<table` 位于代码块中"));
+
+        // An unpaired backtick stays a literal character for the inline renderer, so a real tag
+        // appearing after it must still be found.
+        assert!(contains_open_table_tag("单个 ` 反引号 <table>"));
     }
 }

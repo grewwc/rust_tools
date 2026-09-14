@@ -1162,7 +1162,11 @@ fn build_system_prompt(
     );
     // Intellectual honesty: evidence-earned agreement and respectful pushback
     // against wrong or inappropriate user premises. Unconditional — it applies
-    // in every mode and is never relaxed by a skill or goal.
+    // in every mode and is never relaxed by a skill or goal. It also hosts the
+    // anti-hallucination conclusion gate (merged here from the former separate
+    // no_hallucination section): unverified content is never presented as a
+    // conclusion, so fact tracing / evidence calibration stay single-sourced
+    // in correctness_guardrails.
     b.push(
         ContextKind::Behavior,
         include_str!("system_prompts/intellectual_honesty.md"),
@@ -1176,21 +1180,18 @@ fn build_system_prompt(
         include_str!("system_prompts/system_constraints.md"),
     );
 
-    // ── Safety red lines: zero tolerance for dangerous operations + hard anti-hallucination ──
-    // Unconditionally rendered red lines: dangerous operations forbidden +
-    // no_hallucination as a conclusion gate. Fact tracing / evidence calibration
-    // are already covered by correctness_guardrails; only the non-negotiable
-    // prohibitions stay here: dangerous operations and unverified content must
-    // never be presented as conclusions or recommendations.
+    // ── Safety red lines: zero tolerance for dangerous operations ──
+    // Unconditionally rendered red lines: dangerous operations forbidden. The
+    // anti-hallucination conclusion gate lives in intellectual_honesty above;
+    // fact tracing / evidence calibration are already covered by
+    // correctness_guardrails, so only the non-negotiable prohibitions stay
+    // here: dangerous operations and unverified content must never be
+    // presented as conclusions or recommendations.
     // Never relaxed by task, skill, or goal mode; when a skill activates, the
     // enforcement line folds these into the highest priority.
     b.push(
         ContextKind::Behavior,
         include_str!("system_prompts/safety_redlines.md"),
-    );
-    b.push(
-        ContextKind::Behavior,
-        include_str!("system_prompts/no_hallucination.md"),
     );
 
     // ── Task convergence: success criteria land in the plan carrier, closing the loop ──

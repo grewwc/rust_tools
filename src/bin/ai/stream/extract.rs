@@ -928,6 +928,11 @@ fn push_text_with_hidden_meta(
 }
 
 pub(super) fn normalize_stream_text(text: String) -> String {
+    // Most chunks contain no bare '\r': short-circuit to avoid two unconditional
+    // whole-string replace allocations.
+    if !text.contains('\r') {
+        return text;
+    }
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 

@@ -1,12 +1,12 @@
 {
   "name": "write_file",
-  "description": "Write content to a file, replacing its entire contents (no append, no merge); returns the absolute path. temp=true writes a relative filename under the per-session temp dir; otherwise use an absolute or working-directory-relative path.",
+  "description": "Write content to a file, replacing its entire contents (no append/merge); returns the absolute path. temp=true writes under the per-session temp dir; otherwise use an absolute or working-directory-relative path.",
   "parameters": {
     "type": "object",
     "properties": {
       "file_path": {
         "type": "string",
-        "description": "Path to the file to write: absolute or relative to the effective working directory when temp=false; relative filename when temp=true (absolute paths are rejected)."
+        "description": "Absolute or working-directory-relative when temp=false; relative filename when temp=true (absolute paths rejected)."
       },
       "content": {
         "type": "string",
@@ -14,7 +14,7 @@
       },
       "temp": {
         "type": "boolean",
-        "description": "When true, write under the per-session temp directory; use for scratch/intermediate files (scripts, data dumps, test fixtures). Temp files are cleaned up when the session ends. (default: false)"
+        "description": "Write under the per-session temp directory for scratch/intermediate files (scripts, data dumps, fixtures); cleaned up when the session ends. (default: false)"
       }
     },
     "required": [

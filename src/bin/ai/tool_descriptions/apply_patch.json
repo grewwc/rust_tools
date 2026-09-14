@@ -11,7 +11,7 @@
       },
       "patch": {
         "type": "string",
-      "description": "Inline edit in exactly one form: `*** Replace in line: <path>` inside a `*** Begin Patch` envelope; an envelope with `*** Update/Add/Delete File:` sections and `@@` hunks; or a unified diff. No Markdown fences or no-op edits. `*** Replace in line:` takes exactly three single-line fields: `anchor:` (unique substring of the target line), `old:` (exact substring to replace), `new:` (replacement; empty deletes `old`); to insert or replace whole lines use a `*** Update File:` hunk with `@@`. Limit: 8000 characters - for larger edits use `patch_file` or split."
+      "description": "Inline edit in exactly one form: `*** Replace in line:` inside a `*** Begin Patch` envelope; an envelope with `*** Update/Add/Delete File:` sections and `@@` hunks; or a unified diff. No Markdown fences or no-op edits. `*** Replace in line:` takes three single-line fields: `anchor:` (unique substring of the target line), `old:` (exact substring to replace), `new:` (replacement; empty deletes `old`); for whole-line edits use a `*** Update File:` hunk with `@@`. Limit: 8000 characters - for larger edits use `patch_file` or split."
       },
       "patch_file": {
         "type": "string",

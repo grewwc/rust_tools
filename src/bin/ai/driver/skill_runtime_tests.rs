@@ -727,7 +727,7 @@ fn system_prompt_enforces_concise_response_style_with_correctness_safeguard() {
 }
 
 #[test]
-fn system_prompt_renders_safety_redlines_and_no_hallucination() {
+fn system_prompt_renders_safety_redlines_and_anti_hallucination_gate() {
     let available = SkipSet::new(16);
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
@@ -736,11 +736,13 @@ fn system_prompt_renders_safety_redlines_and_no_hallucination() {
     assert!(prompt.contains("Never perform dangerous operations"));
     assert!(prompt.contains("Never bypass or work around safety mechanisms"));
     assert!(prompt.contains("state the exact command and its consequences and wait for approval"));
-    // Anti-hallucination policy: unconditionally rendered, and deliberately limited to what
-    // correctness_guardrails does not already state — the conclusion gate (unverified content
-    // is never presented as a conclusion), the metadata limit, and the no-padding rule. Fact
-    // tracing and conclusion calibration stay single-sourced in correctness_guardrails.
-    assert!(prompt.contains("<no_hallucination>"));
+    // Anti-hallucination policy: merged into intellectual_honesty (the former
+    // separate no_hallucination section), and deliberately limited to what
+    // correctness_guardrails does not already state — the conclusion gate
+    // (unverified content is never presented as a conclusion), the metadata
+    // limit, and the no-padding rule. Fact tracing and conclusion calibration
+    // stay single-sourced in correctness_guardrails.
+    assert!(prompt.contains("<intellectual_honesty>"));
     assert!(prompt.contains(
         "Unverified content must never be presented as a conclusion or recommendation"
     ));
@@ -884,11 +886,11 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     // session-observed evidence; when evidence is insufficient, one
     // targeted lookup first, otherwise report verified / unknown / next
     // step. The negative provenance tail and the abstention-preference
-    // bullet were trimmed as restatements of no_hallucination's
-    // evidence-to-conclusion gate, which requires unresolved questions
-    // to remain distinct from supported findings. That prompt owns the
-    // duty and must keep rendering (asserted in
-    // system_prompt_renders_safety_redlines_and_no_hallucination).
+    // bullet were trimmed as restatements of intellectual_honesty's
+    // conclusion gate, which requires unresolved questions to remain
+    // distinct from supported findings. That section owns the duty and
+    // must keep rendering (asserted in
+    // system_prompt_renders_safety_redlines_and_anti_hallucination_gate).
     // The efficiency guard lives in task_convergence's stopping rule and
     // must keep rendering.
     assert!(prompt.contains("must trace to evidence observed in this session"));

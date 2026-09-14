@@ -6,7 +6,7 @@
     "properties": {
       "command": {
         "type": "string",
-        "description": "Shell command. Background long-running servers and redirect their output before probing them; never run one in the foreground. Do not pipe interactive commands through `head`, `tail`, `grep`, or `tee`; they can wait for process exit and stall."
+        "description": "Shell command. Background long-running servers and redirect their output before probing; never run one in the foreground. Do not pipe interactive commands through `head`, `tail`, `grep`, or `tee`; they can wait for process exit and stall."
       },
       "cwd": {
         "type": "string",
@@ -18,7 +18,7 @@
       },
       "pty": {
         "type": "boolean",
-        "description": "Use true for interactive CLIs (prompts, QR codes, full-screen UI), false otherwise. Keyboard input is not forwarded. Blocking interactive commands are stopped after about 10-20 seconds of silence and return partial output; prefer non-blocking or headless flags."
+        "description": "Use true for interactive CLIs (prompts, QR codes, full-screen UI), false otherwise. Keyboard input is not forwarded. Blocking interactive commands stop after about 10-20 seconds of silence and return partial output; prefer non-blocking or headless flags."
       }
     },
     "required": [

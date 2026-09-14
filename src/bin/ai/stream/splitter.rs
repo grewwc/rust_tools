@@ -38,6 +38,16 @@ impl InternalToolCallStreamer {
     }
 
     pub(super) fn push(&mut self, chunk: &str) -> (String, Vec<InternalToolCallStreamEvent>) {
+        // Passthrough fast path: Idle with an empty pending buffer and no '<' in
+        // the chunk (every marker starts with '<', so no marker prefix can form).
+        // Plain text is handed through with a single copy instead of the pending
+        // round-trip (push_str + drain + second full copy).
+        if matches!(self.phase, InternalToolCallStreamerPhase::Idle)
+            && self.pending.is_empty()
+            && !chunk.contains('<')
+        {
+            return (chunk.to_string(), Vec::new());
+        }
         self.pending.push_str(chunk);
         let mut cleaned = String::new();
         let mut events = Vec::new();
@@ -227,6 +237,16 @@ impl HermesXmlToolCallStreamer {
     }
 
     pub(super) fn push(&mut self, chunk: &str) -> (String, Vec<InternalToolCallStreamEvent>) {
+        // Passthrough fast path: Idle with an empty pending buffer and no '<' in
+        // the chunk (every marker starts with '<', so no marker prefix can form).
+        // Plain text is handed through with a single copy instead of the pending
+        // round-trip (push_str + drain + second full copy).
+        if matches!(self.phase, HermesXmlPhase::Idle)
+            && self.pending.is_empty()
+            && !chunk.contains('<')
+        {
+            return (chunk.to_string(), Vec::new());
+        }
         self.pending.push_str(chunk);
         let mut cleaned = String::new();
         let mut events = Vec::new();
@@ -384,6 +404,16 @@ impl AnthropicXmlToolCallStreamer {
     }
 
     pub(super) fn push(&mut self, chunk: &str) -> (String, Vec<InternalToolCallStreamEvent>) {
+        // Passthrough fast path: Idle with an empty pending buffer and no '<' in
+        // the chunk (every marker starts with '<', so no marker prefix can form).
+        // Plain text is handed through with a single copy instead of the pending
+        // round-trip (push_str + drain + second full copy).
+        if matches!(self.phase, AnthropicXmlPhase::Idle)
+            && self.pending.is_empty()
+            && !chunk.contains('<')
+        {
+            return (chunk.to_string(), Vec::new());
+        }
         self.pending.push_str(chunk);
         let mut cleaned = String::new();
         let mut events = Vec::new();
@@ -611,6 +641,16 @@ impl BareXmlToolCallStreamer {
     }
 
     pub(super) fn push(&mut self, chunk: &str) -> (String, Vec<InternalToolCallStreamEvent>) {
+        // Passthrough fast path: Idle with an empty pending buffer and no '<' in
+        // the chunk (every marker starts with '<', so no marker prefix can form).
+        // Plain text is handed through with a single copy instead of the pending
+        // round-trip (push_str + drain + second full copy).
+        if matches!(self.phase, BareXmlPhase::Idle)
+            && self.pending.is_empty()
+            && !chunk.contains('<')
+        {
+            return (chunk.to_string(), Vec::new());
+        }
         self.pending.push_str(chunk);
         let mut cleaned = String::new();
         let mut events = Vec::new();

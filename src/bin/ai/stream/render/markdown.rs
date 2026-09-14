@@ -142,6 +142,15 @@ pub(in crate::ai) struct MarkdownStreamRenderer {
     table_placeholder_shown: bool,
     dimmed: bool,
     code_preview_segment_width: usize,
+    // Per-line cache for code-block realtime rendering: `block_indent`, the line
+    // number label, and the ioctl'd terminal width are constant within a line, so
+    // recomputing them on every character cost 2 heap allocations + 1 syscall per
+    // char. Refreshed lazily by `refresh_code_block_line_ctx` when the line number
+    // or indent changes.
+    code_block_ctx_line: usize,
+    code_block_ctx_indent: String,
+    code_block_ctx_num_str: String,
+    code_block_ctx_width: usize,
     // 已缓存但尚未落地的纯空行数。正文/收尾常带尾随空行，逐行直出会在屏幕上
     // 堆叠成多余空白（尤其在正文结束到工具状态行之间）。缓存后：有真实内容跟进
     // 就照数补回（段间空行不受影响），若直到 flush 仍无内容则作为尾随空行丢弃。
@@ -194,6 +203,10 @@ impl MarkdownStreamRenderer {
             table_placeholder_shown: false,
             dimmed: false,
             code_preview_segment_width: 0,
+            code_block_ctx_line: usize::MAX,
+            code_block_ctx_indent: String::new(),
+            code_block_ctx_num_str: String::new(),
+            code_block_ctx_width: 1,
             deferred_blank_lines: 0,
             in_html_table: false,
             html_table_buf: String::new(),
@@ -314,6 +327,13 @@ impl MarkdownStreamRenderer {
                 out.write_all(b"\n")?;
                 self.bol = true;
             }
+        }
+
+        // The block ended while an HTML table was still buffered: emit what arrived.
+        let rendered = self.take_html_table_output();
+        if !rendered.is_empty() {
+            out.write_all(rendered.as_bytes())?;
+            self.bol = rendered.ends_with('\n');
         }
 
         let state = std::mem::replace(&mut self.table_state, TableState::None);
@@ -534,10 +554,10 @@ impl MarkdownStreamRenderer {
         out: &mut dyn Write,
         ch: char,
     ) -> io::Result<()> {
-        let block_indent = self.code_block_indent.clone();
-        let line_num_str = format!("{:>3}", self.code_line_number + 1);
-        let available_width =
-            code_block_content_width(&block_indent, &line_num_str, self.show_line_gutter).max(1);
+        self.refresh_code_block_line_ctx();
+        let block_indent = self.code_block_ctx_indent.as_str();
+        let line_num_str = self.code_block_ctx_num_str.as_str();
+        let available_width = self.code_block_ctx_width;
 
         // Keep the realtime emit path aligned with `code_block_preview_height`
         // (which strips `block_indent`) and with `render_line_no_table` (which
@@ -591,8 +611,11 @@ impl MarkdownStreamRenderer {
             self.code_preview_segment_width = 0;
         }
 
-        self.emit_char(out, ch)?;
+        let mut buf = [0u8; 4];
+        out.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
         self.code_preview_segment_width += ch_width;
+        self.line_preview_emitted = true;
+        self.line_preview_height_stale = true;
         Ok(())
     }
 
@@ -601,6 +624,27 @@ impl MarkdownStreamRenderer {
             return self.code_block_preview_height(&self.line_buf);
         }
         live_preview_cursor_rows(&self.line_buf)
+    }
+
+    /// Refresh the per-line code-block context (indent copy, line-number label,
+    /// terminal width) when the current line or indent changed. The width re-queries
+    /// the terminal once per line instead of per character; the finished line's
+    /// height is still recomputed with a fresh ioctl in `code_block_preview_height`,
+    /// so a mid-line resize only affects wrapping of the current partial line.
+    fn refresh_code_block_line_ctx(&mut self) {
+        if self.code_block_ctx_line != self.code_line_number
+            || self.code_block_ctx_indent != self.code_block_indent
+        {
+            self.code_block_ctx_line = self.code_line_number;
+            self.code_block_ctx_indent = self.code_block_indent.clone();
+            self.code_block_ctx_num_str = format!("{:>3}", self.code_line_number + 1);
+            self.code_block_ctx_width = code_block_content_width(
+                &self.code_block_ctx_indent,
+                &self.code_block_ctx_num_str,
+                self.show_line_gutter,
+            )
+            .max(1);
+        }
     }
 
     fn streamed_or_measured_preview_height(&self, line: &str, preview_emitted: bool) -> usize {
@@ -672,26 +716,11 @@ impl MarkdownStreamRenderer {
             }
         }
 
-        // 流式输出在 HTML 表格缓冲中途结束——尝试解析已有内容
-        if self.in_html_table {
-            let buf = std::mem::take(&mut self.html_table_buf);
-            let indent = std::mem::take(&mut self.html_table_indent);
-            let preview_height = std::mem::take(&mut self.html_table_preview_height);
-            self.in_html_table = false;
-
-            let rendered = parse_html_table(&buf)
-                .map(|t| render_html_table(&indent, &t))
-                .unwrap_or(buf);
-            let move_up = preview_height;
-            let final_out = if move_up > 0 {
-                format!("\x1b[{move_up}A\r\x1b[0J{rendered}")
-            } else {
-                rendered
-            };
-            if !final_out.is_empty() {
-                out.write_all(final_out.as_bytes())?;
-                self.bol = final_out.ends_with('\n');
-            }
+        // The stream ended while an HTML table was still buffered: emit what arrived.
+        let rendered = self.take_html_table_output();
+        if !rendered.is_empty() {
+            out.write_all(rendered.as_bytes())?;
+            self.bol = rendered.ends_with('\n');
         }
 
         let state = std::mem::replace(&mut self.table_state, TableState::None);
@@ -885,20 +914,17 @@ impl MarkdownStreamRenderer {
         format!("{}\n", raw)
     }
 
-    /// HTML 表格缓冲完成，解析并渲染为终端表格。
+    /// HTML table buffering finished: parse it into a terminal table.
     fn finalize_html_table(&mut self, preview_emitted: bool) -> String {
         let buf = std::mem::take(&mut self.html_table_buf);
         let indent = std::mem::take(&mut self.html_table_indent);
         let preview_height = std::mem::take(&mut self.html_table_preview_height);
         self.in_html_table = false;
 
-        let table = parse_html_table(&buf);
-        let rendered = match &table {
-            Some(t) => render_html_table(&indent, t),
-            None => {
-                // 解析失败——回退为原始文本
-                buf
-            }
+        let rendered = match parse_html_table(&buf) {
+            Some(table) => render_html_table(&indent, &table),
+            // No `</table>` arrived: keep the model's raw text (see `ensure_trailing_newline`).
+            None => Self::ensure_trailing_newline(buf),
         };
 
         let move_up = preview_height
@@ -913,6 +939,46 @@ impl MarkdownStreamRenderer {
         } else {
             rendered
         }
+    }
+
+    /// Emit an HTML table buffer that the stream or the block ended on. The buffer is parsed and
+    /// rendered as a table when it is complete, otherwise it is kept as raw text.
+    ///
+    /// Rows echoed while buffering are erased with a deterministic cursor-up of
+    /// `html_table_preview_height`, so the final form is drawn exactly once.
+    fn take_html_table_output(&mut self) -> String {
+        if !self.in_html_table {
+            return String::new();
+        }
+        let buf = std::mem::take(&mut self.html_table_buf);
+        let indent = std::mem::take(&mut self.html_table_indent);
+        let preview_height = std::mem::take(&mut self.html_table_preview_height);
+        self.in_html_table = false;
+
+        let rendered = match parse_html_table(&buf) {
+            Some(table) => render_html_table(&indent, &table),
+            // No `</table>` arrived: keep the model's raw text (see `ensure_trailing_newline`).
+            None => Self::ensure_trailing_newline(buf),
+        };
+
+        if preview_height > 0 {
+            format!("\x1b[{preview_height}A\r\x1b[0J{rendered}")
+        } else {
+            rendered
+        }
+    }
+
+    /// Keeps a raw fallback line-terminated.
+    ///
+    /// Rendered blocks always end with `\n`. A fallback that stopped mid-row would leave the
+    /// terminal cursor on that row, and the multiline input box anchors on the live cursor row
+    /// (`prompt/multiline/multiline_ui.rs`, `fixed_viewport_area`), so the input line would then
+    /// be drawn over the last output row.
+    fn ensure_trailing_newline(mut text: String) -> String {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text
     }
 
     fn render_table_block(
@@ -1234,11 +1300,15 @@ impl MarkdownStreamRenderer {
 
         if let Some(body) = parse_blockquote(trimmed) {
             let quote_base = format!("{base}{}", theme::current().accent_muted);
-            return format!(
-                "{indent}{base}{}▍\x1b[0m {}\n",
-                theme::current().accent_muted,
-                render_inline_md(body, &quote_base)
+            // Prepend the prefix in place so the rendered body is not copied a
+            // second time into a fresh `format!` buffer.
+            let mut out = render_inline_md(body, &quote_base);
+            out.insert_str(
+                0,
+                &format!("{indent}{base}{}▍\x1b[0m ", theme::current().accent_muted),
             );
+            out.push('\n');
+            return out;
         }
 
         if let Some((p_indent, prefix, checkbox, body)) = split_list_prefix(line) {
@@ -2465,6 +2535,91 @@ mod tests {
         assert!(
             !joined.contains("| 函数签名 |"),
             "raw single-column markdown table leaked:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn table_literal_inside_inline_code_does_not_swallow_the_following_markdown() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "96") };
+
+        // Regression: `<table` inside an inline code span matched like an HTML table opening tag,
+        // so every following line was buffered into `html_table_buf` and finally dumped as raw
+        // source — the heading kept its `###` and the markdown table below stayed unrendered.
+        let md = "\
+`html.rs:30` `line.to_lowercase().contains(\"<table\")`：无条件整行小写拷贝分配。
+
+### 子标题
+
+| 优先级 | 位置 |
+| --- | --- |
+| P0 | normalize.rs:87 |
+";
+
+        for (path, stream) in [
+            ("stream", render_full_stream(md, false)),
+            ("block", render_full_block(md, false)),
+        ] {
+            let mut grid = VtGrid::new(96);
+            grid.feed(&stream);
+            let screen = grid.screen().join("\n");
+
+            assert!(
+                !screen.contains("### 子标题"),
+                "{path}: raw heading leaked:\n{screen}"
+            );
+            assert!(
+                !screen.contains("| 优先级 | 位置 |"),
+                "{path}: raw markdown table leaked:\n{screen}"
+            );
+            assert!(screen.contains("子标题"), "{path}: heading missing:\n{screen}");
+            assert!(screen.contains('│'), "{path}: table not rendered:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn html_table_buffering_only_starts_on_a_real_table_tag() {
+        for line in [
+            "`contains(\"<table\")` 是裸子串匹配",
+            "用 `<table>` 标签包裹",
+            "table_start = \"<table\"",
+        ] {
+            let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
+            let _ = renderer.consume_line(line, false);
+            assert!(
+                !renderer.in_html_table,
+                "{line:?} must not open an HTML table buffer"
+            );
+        }
+
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
+        let _ = renderer.consume_line("  <table border=1>", false);
+        assert!(
+            renderer.in_html_table,
+            "a real tag must still start buffering"
+        );
+    }
+
+    #[test]
+    fn unclosed_html_table_fallback_keeps_raw_source_and_ends_on_a_fresh_row() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
+        let mut output = renderer
+            .write_block_for_test("<table>\n<tr><td>1</td></tr>\n", false)
+            .unwrap();
+        output.push_str(&renderer.flush_pending_for_test().unwrap());
+
+        let visible = strip_ansi_for_test(&output);
+        assert!(
+            visible.contains("<table>"),
+            "raw source must survive:\n{visible:?}"
+        );
+        assert!(
+            visible.contains("<tr><td>1</td></tr>"),
+            "raw rows must survive:\n{visible:?}"
+        );
+        assert!(
+            visible.ends_with('\n'),
+            "fallback must end its line so the input box anchors below the output:\n{visible:?}"
         );
     }
 

@@ -1,6 +1,9 @@
 use crate::ai::{
     provider::ProviderAdapter,
-    request::{StreamChoice, StreamChunk, StreamDelta, StreamFunctionCall, StreamToolCall},
+    request::{
+        StreamChoice, StreamChunk, StreamDelta, StreamFunctionCall, StreamToolCall,
+        try_parse_stream_chunk_from_value,
+    },
 };
 
 use super::state::ParsedStreamPayload;
@@ -79,24 +82,31 @@ pub(super) fn parse_stream_payload(
         }
     }
 
-    // 非 SSE 事件路径：在调用 adapter 解析之前，先检测 provider 在流中途返回的
-    // error 对象。StreamChunk 所有字段都是 #[serde(default)]，{"error":{...}}
-    // 会被静默反序列化为空 chunk 然后丢弃，导致用户看到空响应且无任何错误提示。
-    // SSE 路径的 error 检测已并入 parse_sse_event_payload 的同一次 JSON 解析，
-    // 避免每个 chunk 双重解析。
-    if let Some(err_msg) = extract_provider_error(payload) {
-        return ParsedStreamPayload::Error(err_msg);
+    // Non-SSE event path: parse the payload once and reuse the same Value for both
+    // error detection and chunk construction (aligned with the SSE path, which
+    // merges error detection into its single parse, so each chunk is no longer
+    // parsed twice). StreamChunk fields are all #[serde(default)], so {"error":{...}}
+    // is intercepted by the error check first; only when parsing fails or the JSON
+    // cannot deserialize into a chunk (e.g. noisy wrapped JSON) do we fall back to
+    // the adapter's loose parse — semantics are identical to before.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+        if let Some(err_msg) = value.get("error").and_then(extract_error_message) {
+            return ParsedStreamPayload::Error(err_msg);
+        }
+        if let Some(chunk) = try_parse_stream_chunk_from_value(value) {
+            return ParsedStreamPayload::Chunk(chunk);
+        }
     }
 
     adapter.parse_provider_chunk(payload)
 }
 
 fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStreamPayload> {
-    let event_type = event_type.trim().to_ascii_lowercase();
+    let event_type = event_type.trim();
     if event_type.is_empty() {
         return None;
     }
-    if event_type == "done" || event_type == "[done]" {
+    if event_type.eq_ignore_ascii_case("done") || event_type.eq_ignore_ascii_case("[done]") {
         return Some(ParsedStreamPayload::Done);
     }
     // 统一解析一次并复用：各事件分支共享同一 Value，避免每个 chunk 双重 JSON
@@ -106,7 +116,7 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
     if let Some(err_msg) = value.get("error").and_then(extract_error_message) {
         return Some(ParsedStreamPayload::Error(err_msg));
     }
-    if event_type == "response.completed" {
+    if event_type.eq_ignore_ascii_case("response.completed") {
         // Responses API 的最终用量嵌在 response.usage，而不是兼容流的顶层
         // usage。将其包装成普通 chunk，复用既有的用量落账路径；仍不能把该
         // 事件视为 [DONE]，因为连接关闭才是流结束信号。
@@ -119,7 +129,7 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
     }
     // OpenAI Responses API 错误/不完整事件——必须显式处理，否则会 fallthrough
     // 到 parse_provider_chunk 被当成空 chunk 静默丢弃。
-    if event_type == "response.failed" {
+    if event_type.eq_ignore_ascii_case("response.failed") {
         let msg = value
             .get("response")
             .and_then(|r| r.get("error"))
@@ -127,7 +137,7 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
             .unwrap_or_else(|| "response failed (no error detail)".to_string());
         return Some(ParsedStreamPayload::Error(msg));
     }
-    if event_type == "response.incomplete" {
+    if event_type.eq_ignore_ascii_case("response.incomplete") {
         let reason = value
             .get("response")
             .and_then(|r| r.get("incomplete_details"))
@@ -155,26 +165,26 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
         )));
     }
     // 部分 provider 用 SSE event: error 携带错误对象
-    if event_type == "error" {
+    if event_type.eq_ignore_ascii_case("error") {
         let msg = extract_error_message(&value)
             .unwrap_or_else(|| "stream error event (no detail)".to_string());
         return Some(ParsedStreamPayload::Error(msg));
     }
 
-    if let Some(parsed) = parse_function_call_arguments_event(event_type.as_str(), &value) {
+    if let Some(parsed) = parse_function_call_arguments_event(event_type, &value) {
         return Some(parsed);
     }
-    if let Some(parsed) = parse_output_item_event(event_type.as_str(), &value) {
+    if let Some(parsed) = parse_output_item_event(event_type, &value) {
         return Some(parsed);
     }
-    if let Some(parsed) = parse_content_part_event(event_type.as_str(), &value) {
+    if let Some(parsed) = parse_content_part_event(event_type, &value) {
         return Some(parsed);
     }
-    if let Some(parsed) = parse_refusal_event(event_type.as_str(), &value) {
+    if let Some(parsed) = parse_refusal_event(event_type, &value) {
         return Some(parsed);
     }
-    if event_type.contains("reasoning")
-        && (event_type.ends_with(".delta") || event_type.ends_with(".done"))
+    if ascii_contains(event_type, "reasoning")
+        && (ascii_ends_with(event_type, ".delta") || ascii_ends_with(event_type, ".done"))
     {
         let text = extract_event_text(
             &value,
@@ -190,21 +200,21 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
         if text.is_empty() {
             return Some(ParsedStreamPayload::Ignore);
         }
-        return Some(textual_event_chunk(event_type.as_str(), "", &text));
+        return Some(textual_event_chunk(event_type, "", &text));
     }
-    if (event_type.contains("output_text") || event_type.contains("content"))
-        && (event_type.ends_with(".delta") || event_type.ends_with(".done"))
+    if (ascii_contains(event_type, "output_text") || ascii_contains(event_type, "content"))
+        && (ascii_ends_with(event_type, ".delta") || ascii_ends_with(event_type, ".done"))
     {
         let text = extract_event_text(&value, &["delta", "text", "content"]);
         if text.is_empty() {
             return Some(ParsedStreamPayload::Ignore);
         }
-        return Some(textual_event_chunk(event_type.as_str(), &text, ""));
+        return Some(textual_event_chunk(event_type, &text, ""));
     }
 
-    if event_type.ends_with(".done")
-        || event_type.ends_with(".added")
-        || event_type.ends_with(".part.done")
+    if ascii_ends_with(event_type, ".done")
+        || ascii_ends_with(event_type, ".added")
+        || ascii_ends_with(event_type, ".part.done")
     {
         return Some(ParsedStreamPayload::Ignore);
     }
@@ -212,12 +222,29 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
     None
 }
 
+/// Case-insensitive `contains` for an ASCII needle on a borrowed string. Avoids the
+/// per-event `to_ascii_lowercase()` allocation on the SSE hot path; `eq_ignore_ascii_case`
+/// leaves non-ASCII bytes unchanged, exactly matching `to_ascii_lowercase` semantics.
+fn ascii_contains(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// Case-insensitive `ends_with` for an ASCII needle on a borrowed string.
+fn ascii_ends_with(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    h.len() >= n.len() && h[h.len() - n.len()..].eq_ignore_ascii_case(n)
+}
+
 fn parse_function_call_arguments_event(
     event_type: &str,
     value: &serde_json::Value,
 ) -> Option<ParsedStreamPayload> {
-    if !event_type.contains("function_call_arguments")
-        || !(event_type.ends_with(".delta") || event_type.ends_with(".done"))
+    if !ascii_contains(event_type, "function_call_arguments")
+        || !(ascii_ends_with(event_type, ".delta") || ascii_ends_with(event_type, ".done"))
     {
         return None;
     }
@@ -247,7 +274,9 @@ fn parse_output_item_event(
     event_type: &str,
     value: &serde_json::Value,
 ) -> Option<ParsedStreamPayload> {
-    if !(event_type == "response.output_item.added" || event_type == "response.output_item.done") {
+    if !(event_type.eq_ignore_ascii_case("response.output_item.added")
+        || event_type.eq_ignore_ascii_case("response.output_item.done"))
+    {
         return None;
     }
 
@@ -273,9 +302,9 @@ fn parse_output_item_event(
             return Some(ParsedStreamPayload::Ignore);
         }
         const REASONING_ENCRYPTED_ADDED_MIN_LEN: usize = 256;
-        let is_real = if event_type == "response.output_item.done" {
+        let is_real = if event_type.eq_ignore_ascii_case("response.output_item.done") {
             true
-        } else if event_type == "response.output_item.added" {
+        } else if event_type.eq_ignore_ascii_case("response.output_item.added") {
             encrypted_len >= REASONING_ENCRYPTED_ADDED_MIN_LEN
         } else {
             false
@@ -300,7 +329,8 @@ fn parse_content_part_event(
     event_type: &str,
     value: &serde_json::Value,
 ) -> Option<ParsedStreamPayload> {
-    if !(event_type == "response.content_part.added" || event_type == "response.content_part.done")
+    if !(event_type.eq_ignore_ascii_case("response.content_part.added")
+        || event_type.eq_ignore_ascii_case("response.content_part.done"))
     {
         return None;
     }
@@ -325,7 +355,7 @@ fn parse_content_part_event(
             "", &text,
         )));
     }
-    if event_type.ends_with(".added") {
+    if ascii_ends_with(event_type, ".added") {
         // output_text 类型的 content_part.added 同样是协议重发：携带该 part 当前
         // 已存在的完整文本，与 output_text.delta 增量重叠。按增量格式解析但标记为
         // 重发（ReplayedChunk），由流层对 content 做未见后缀去重，避免正文跨事件
@@ -339,8 +369,8 @@ fn parse_content_part_event(
 }
 
 fn parse_refusal_event(event_type: &str, value: &serde_json::Value) -> Option<ParsedStreamPayload> {
-    if !event_type.contains("refusal")
-        || !(event_type.ends_with(".delta") || event_type.ends_with(".done"))
+    if !ascii_contains(event_type, "refusal")
+        || !(ascii_ends_with(event_type, ".delta") || ascii_ends_with(event_type, ".done"))
     {
         return None;
     }
@@ -363,7 +393,7 @@ fn textual_event_chunk(
         reasoning_details: String::new(),
         tool_calls: Vec::new(),
     });
-    if event_type.ends_with(".done") {
+    if ascii_ends_with(event_type, ".done") {
         ParsedStreamPayload::SnapshotChunk(chunk)
     } else {
         ParsedStreamPayload::Chunk(chunk)
@@ -386,7 +416,7 @@ fn tool_call_event_chunk(event_type: &str, tool_call: StreamToolCall) -> ParsedS
         reasoning_details: String::new(),
         tool_calls: vec![tool_call],
     });
-    if event_type.ends_with(".done") {
+    if ascii_ends_with(event_type, ".done") {
         ParsedStreamPayload::SnapshotChunk(chunk)
     } else {
         ParsedStreamPayload::Chunk(chunk)
@@ -520,17 +550,6 @@ fn extract_event_text(value: &serde_json::Value, preferred_keys: &[&str]) -> Str
             String::new()
         }
     }
-}
-
-/// 检测 payload JSON 顶层的 `error` 字段，提取可读错误信息。
-///
-/// StreamChunk 所有字段都是 `#[serde(default)]` 且无 `deny_unknown_fields`，
-/// 所以 `{"error":{...}}` 会被静默反序列化为空 chunk。此函数在解析前拦截
-/// 这类 provider 错误对象，返回可读错误信息。
-fn extract_provider_error(payload: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
-    let error = value.get("error")?;
-    extract_error_message(error)
 }
 
 /// 从一个 JSON value（通常是 `error` 字段的值）提取可读错误信息。

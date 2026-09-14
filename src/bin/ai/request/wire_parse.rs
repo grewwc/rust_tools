@@ -39,6 +39,18 @@ fn try_parse_stream_chunk(payload: &str) -> Option<StreamChunk> {
     Some(chunk)
 }
 
+/// Build a [`StreamChunk`] from an already-deserialized JSON value, applying the
+/// same `merge_reasoning` post-processing as [`try_parse_stream_chunk`]. Callers
+/// that already parsed the payload as a `Value` (e.g. for error detection) reuse
+/// it here to avoid a second full JSON parse per stream chunk.
+pub(in crate::ai) fn try_parse_stream_chunk_from_value(
+    value: serde_json::Value,
+) -> Option<StreamChunk> {
+    let mut chunk = serde_json::from_value::<StreamChunk>(value).ok()?;
+    chunk.merge_reasoning();
+    Some(chunk)
+}
+
 pub(in crate::ai) fn try_parse_stream_chunk_loose(payload: &str) -> Option<StreamChunk> {
     if let Some(chunk) = try_parse_stream_chunk(payload) {
         return Some(chunk);

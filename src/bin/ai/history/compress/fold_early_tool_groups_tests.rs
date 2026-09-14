@@ -1377,7 +1377,7 @@ fn folded_lossy_group_advises_archive_read_and_archive_header_is_honest() {
         "lossy-only groups must explain what the archive holds: {stub}"
     );
     assert!(
-        stub.contains("Read `archive_file_path` for the exact archived content"),
+        stub.contains("Read it before re-running the tool"),
         "lossy-only groups must point the model at the archive, not at a re-run: {stub}"
     );
     assert!(
@@ -1511,7 +1511,7 @@ fn tightened_ladder_rung_archives_full_text_and_advises_archive_read() {
     assert_eq!(stubs.len(), 4, "one evidence note per folded group");
     for stub in &stubs {
         assert!(
-            stub.contains("Read `archive_file_path` for the exact archived content"),
+            stub.contains("Read it before re-running the tool"),
             "every lossy stub must direct the model to the archive first: {stub}"
         );
     }

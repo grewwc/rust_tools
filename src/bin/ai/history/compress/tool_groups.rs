@@ -340,11 +340,11 @@ fn plan_tool_call_group_fold(
             })
         });
     if has_recoverable_result {
-        lines.push("compression_decision: reuse the evidence above before repeating the same read/search/list/command action; only re-run or re-read if exact omitted text is required or the underlying target changed.".to_string());
+        lines.push("compression_decision: reuse the evidence above before repeating the same read/search/list/command action; re-run only if exact text is required or the target changed.".to_string());
     } else if archive_file_path.is_some() {
-        lines.push("compression_decision: the archived tool results are the request-projection content at fold time - full text when the result survived lossy summarization (recent-window protection or small output), otherwise only a lossy summary. Read `archive_file_path` for the exact archived content; re-run the affected tool against the same target only when the archived text lacks the detail you need.".to_string());
+        lines.push("compression_decision: `archive_file_path` holds the fold-time projection - full text if it survived lossy summarization, else only a summary. Read it before re-running the tool; re-run only if the archived text lacks the detail you need.".to_string());
     } else {
-        lines.push("compression_decision: no archive was written for this fold (overflow archiving is disabled); the evidence lines above are the only remaining record of these tool results. Re-run the affected tool against the same target to get current output.".to_string());
+        lines.push("compression_decision: no archive was written for this fold (overflow disabled); the evidence above is the only record. Re-run the affected tool for current output.".to_string());
     }
 
     Some((

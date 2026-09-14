@@ -29,11 +29,11 @@
             },
             "parallelizable": {
               "type": "boolean",
-              "description": "Whether this delegated step can run with the previous step because no dependency exists. Default false."
+              "description": "Whether this step can run with the previous one (no dependency). Default false."
             },
             "delegate": {
               "type": "boolean",
-              "description": "Whether a subagent should do this step. Use true for substantive bounded work; keep trivial or tightly coupled work and final review in the parent."
+              "description": "Whether a subagent should do this step. true for substantive bounded work; keep trivial or tightly coupled work and final review in the parent."
             }
           },
           "required": [

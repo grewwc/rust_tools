@@ -2064,7 +2064,7 @@ fn completed_thinking_fold_replaces_anchored_header_in_place() {
     assert_eq!(
         String::from_utf8(out).unwrap(),
         format!(
-            "\r\x1b[1A\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[1A\r\r\x1b[1A\r\x1b[2K  {}✓ thinking · 3 lines\x1b[0m\r\n{}    … 3 earlier lines\x1b[0m\r\n",
+            "\r\x1b[1A\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[1A\r\r\x1b[1A\r\x1b[2K{}  ✓ thinking · 3 lines\x1b[0m\r\n{}    … 3 earlier lines\x1b[0m\r\n",
             crate::ai::theme::current().accent_muted,
             crate::ai::theme::current().accent_muted,
         )
@@ -2105,6 +2105,157 @@ fn thinking_fold_erase_rows_follow_current_terminal_reflow_of_previous_body() {
     unsafe {
         std::env::remove_var("COLUMNS");
     }
+}
+
+#[test]
+fn thinking_fold_terminal_grid_refresh_does_not_accumulate_headers() {
+    // Only the renderer's emitted subset is accepted: SGR, CRLF, CUU/CUD,
+    // and EL(2). This fixed-height grid includes delayed wrap and scrollback.
+    struct Grid {
+        cols: usize,
+        cells: Vec<Vec<char>>,
+        history: Vec<Vec<char>>,
+        row: usize,
+        col: usize,
+    }
+    impl Grid {
+        fn newline(&mut self) {
+            if self.row + 1 == self.cells.len() {
+                self.history.push(self.cells.remove(0));
+                self.cells.push(vec![' '; self.cols]);
+            } else {
+                self.row += 1;
+            }
+        }
+        fn feed(&mut self, text: &str) {
+            let mut chars = text.chars();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\r' => self.col = 0,
+                    '\n' => self.newline(),
+                    '\x1b' => {
+                        assert_eq!(chars.next(), Some('['));
+                        let mut args = String::new();
+                        let command = loop {
+                            let c = chars.next().expect("complete CSI");
+                            if ('@'..='~').contains(&c) {
+                                break c;
+                            }
+                            args.push(c);
+                        };
+                        match command {
+                            'm' => {}
+                            'A' => {
+                                let n = args.parse::<usize>().unwrap_or(1).max(1);
+                                self.row = self.row.saturating_sub(n);
+                                self.col = self.col.min(self.cols - 1);
+                            }
+                            'B' => {
+                                let n = args.parse::<usize>().unwrap_or(1).max(1);
+                                self.row = (self.row + n).min(self.cells.len() - 1);
+                                self.col = self.col.min(self.cols - 1);
+                            }
+                            'K' => {
+                                assert_eq!(args, "2");
+                                self.cells[self.row].fill(' ');
+                                self.col = self.col.min(self.cols - 1);
+                            }
+                            _ => panic!("unsupported CSI {args}{command}"),
+                        }
+                    }
+                    _ => {
+                        // Test fixtures use only single-cell glyphs; fail rather
+                        // than silently pretending to support other Unicode.
+                        assert!(ch.is_ascii_graphic() || matches!(ch, ' ' | '○' | '✓' | '·' | '…'));
+                        if self.col == self.cols {
+                            self.col = 0;
+                            self.newline();
+                        }
+                        self.cells[self.row][self.col] = ch;
+                        self.col += 1;
+                    }
+                }
+            }
+        }
+        fn text(&self) -> String {
+            self.history
+                .iter()
+                .chain(&self.cells)
+                .map(|row| row.iter().collect::<String>().trim_end().to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let previous_columns = std::env::var_os("COLUMNS");
+    let rates = [
+        "~973 tok @ 192 tok/s",
+        "~975 tok @ 193 tok/s",
+        "~976 tok @ 193 tok/s",
+        "~978 tok @ 193 tok/s",
+        "~980 tok @ 192 tok/s",
+        "~981 tok @ 192 tok/s",
+        "~982 tok @ 192 tok/s",
+        "~984 tok @ 193 tok/s",
+        "~986 tok @ 191 tok/s",
+    ];
+    let header_cols = format!("  ○ thinking · {}", rates[0]).chars().count();
+    let mut failures = Vec::new();
+    for cols in [200, header_cols, header_cols - 1, 32] {
+        unsafe {
+            std::env::set_var("COLUMNS", cols.to_string());
+        }
+        for bottom in [false, true] {
+            for add_body in [false, true] {
+                let mut grid = Grid {
+                    cols,
+                    cells: vec![vec![' '; cols]; 12],
+                    history: Vec::new(),
+                    row: if bottom { 10 } else { 0 },
+                    col: 0,
+                };
+                grid.feed("transcript\r\n");
+                let mut fold = super::super::state::ThinkingFoldState::new();
+                fold.active = true;
+                fold.max_visible_lines = 2;
+                let mut counts = Vec::new();
+                for (frame, rate) in rates.iter().enumerate() {
+                    if add_body && frame == 2 {
+                        append_fold_content(&mut fold, "body");
+                    }
+                    let mut bytes = Vec::new();
+                    thinking_fold_redraw_to(&mut bytes, Some(rate), &mut fold).unwrap();
+                    grid.feed(&String::from_utf8(bytes).unwrap());
+                    let screen = grid.text();
+                    assert_eq!(screen.matches("transcript").count(), 1);
+                    if add_body && frame >= 2 {
+                        assert_eq!(screen.matches("body").count(), 1);
+                    }
+                    counts.push(screen.matches("○ thinking").count());
+                }
+                let mut bytes = Vec::new();
+                finalize_fold_to(&mut bytes, &mut fold, true).unwrap();
+                grid.feed(&String::from_utf8(bytes).unwrap());
+                let remaining = grid.text().matches("○ thinking").count();
+                assert_eq!(grid.text().matches("✓ thinking").count(), 1);
+                if counts.iter().any(|&n| n != 1) || remaining != 0 {
+                    failures.push(format!(
+                        "cols={cols} bottom={bottom} add_body={add_body}: live={counts:?}, stale={remaining}"
+                    ));
+                }
+            }
+        }
+    }
+    unsafe {
+        match previous_columns {
+            Some(value) => std::env::set_var("COLUMNS", value),
+            None => std::env::remove_var("COLUMNS"),
+        }
+    }
+    assert!(failures.is_empty(), "orphan headers: {}", failures.join(", "));
 }
 
 #[test]
@@ -2161,6 +2312,14 @@ fn thinking_fold_redraw_reuses_header_after_empty_body() {
 
 #[test]
 fn thinking_fold_empty_body_completion_replaces_header() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let previous_columns = std::env::var_os("COLUMNS");
+    unsafe {
+        std::env::set_var("COLUMNS", "200");
+    }
+
     let mut fold = super::super::state::ThinkingFoldState::new();
     fold.active = true;
     fold.max_visible_lines = 2;
@@ -2174,13 +2333,20 @@ fn thinking_fold_empty_body_completion_replaces_header() {
     assert_eq!(
         String::from_utf8(out).unwrap(),
         format!(
-            "\r\x1b[1A\r\x1b[2K  {}✓ thinking · 0 lines\x1b[0m\r\n",
+            "\r\x1b[1A\r\x1b[2K{}  ✓ thinking · 0 lines\x1b[0m\r\n",
             crate::ai::theme::current().accent_muted,
         )
     );
     assert!(!fold.active);
     assert!(!fold.header_drawn);
     assert_eq!(fold.window_rows, 0);
+
+    unsafe {
+        match previous_columns {
+            Some(columns) => std::env::set_var("COLUMNS", columns),
+            None => std::env::remove_var("COLUMNS"),
+        }
+    }
 }
 
 #[test]

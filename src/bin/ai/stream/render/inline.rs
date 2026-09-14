@@ -98,7 +98,12 @@ fn is_ambiguous_emoji_block_char(ch: char) -> bool {
 /// file:line / URL boundaries, breaking click-to-jump. Convert directly when the char before the punctuation is common in paths/links;
 /// when it follows ordinary Chinese text, convert only if a clickable target actually follows (allowing spaces and inline code markers),
 /// avoiding collateral damage to purely Chinese contexts like `时间：12点`.
-fn normalize_cjk_punct_around_path(s: &str) -> String {
+fn normalize_cjk_punct_around_path(s: &str) -> std::borrow::Cow<'_, str> {
+    // Most prose lines contain none of the fullwidth punctuation that this pass
+    // rewrites; hand the input through borrowed instead of rebuilding it.
+    if !s.contains(['：', '，', '。']) {
+        return std::borrow::Cow::Borrowed(s);
+    }
     let mut out = String::with_capacity(s.len());
     let mut prev: Option<char> = None;
     let mut i = 0;
@@ -126,7 +131,7 @@ fn normalize_cjk_punct_around_path(s: &str) -> String {
         prev = Some(ch);
         i += ch.len_utf8();
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 fn is_path_neighbor(ch: char) -> bool {
@@ -200,7 +205,7 @@ fn is_clickable_terminal_target(token: &str) -> bool {
 
 pub(super) fn render_inline_md(s: &str, base: &str) -> String {
     let normalized = normalize_cjk_punct_around_path(s);
-    let s = normalized.as_str();
+    let s: &str = &normalized;
     let bytes = s.as_bytes();
     // Apply the base before plain text too, including after a list marker reset.
     let mut out = String::from(base);

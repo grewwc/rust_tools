@@ -60,7 +60,9 @@ pub(crate) use types::{
     RequestBody, StreamChoice, StreamChunk, StreamDelta, StreamFunctionCall, StreamToolCall,
     StreamUsage, merge_reasoning_fragments,
 };
-pub(in crate::ai) use wire_parse::{ParsedStreamPayload, try_parse_stream_chunk_loose};
+pub(in crate::ai) use wire_parse::{
+    ParsedStreamPayload, try_parse_stream_chunk_from_value, try_parse_stream_chunk_loose,
+};
 // External re-exports (build_content is called from several places in the driver)
 #[allow(unused_imports)]
 pub(crate) use builder::{

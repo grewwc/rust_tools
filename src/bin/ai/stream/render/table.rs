@@ -421,21 +421,41 @@ fn pad_cell(s: &str, width: usize, align: TableAlign) -> String {
 /// `visible_width` (which strips unclosed `, **, and * markers), but `render_inline_md` emits
 /// unclosed markers verbatim as literal characters, making the real width exceed the estimate and misaligning table borders.
 fn render_and_pad_cell(cell_line: &str, width: usize, align: TableAlign, base: &str) -> String {
-    let rendered = render_inline_md(cell_line, base);
+    let mut rendered = render_inline_md(cell_line, base);
     // Strip redundant VS16 from the rendered text. When VS16 follows an
     // is_ambiguous_emoji_block_char, the base already renders as 2-col emoji;
     // keeping VS16 in the string would add an extra column in the terminal.
-    let rendered = strip_redundant_vs16(&rendered);
-    let ansi_stripped = strip_ansi_codes(&rendered);
-    let actual_w = terminal_display_width(ansi_stripped.as_str());
+    // Only rebuild when a VS16 is actually present (rare).
+    if rendered.contains('\u{fe0f}') {
+        rendered = strip_redundant_vs16(&rendered);
+    }
+    // ANSI escapes are only present when styling spans produced them; otherwise
+    // measure the display width directly to avoid an extra full copy per cell.
+    let actual_w = if rendered.contains('\x1b') {
+        terminal_display_width(strip_ansi_codes(&rendered).as_str())
+    } else {
+        terminal_display_width(&rendered)
+    };
     let pad = width.saturating_sub(actual_w);
     match align {
-        TableAlign::Left => format!("{rendered}{}", " ".repeat(pad)),
-        TableAlign::Right => format!("{}{rendered}", " ".repeat(pad)),
+        TableAlign::Left => {
+            rendered.push_str(&" ".repeat(pad));
+            rendered
+        }
+        TableAlign::Right => {
+            let mut out = String::with_capacity(pad + rendered.len());
+            out.push_str(&" ".repeat(pad));
+            out.push_str(&rendered);
+            out
+        }
         TableAlign::Center => {
             let left = pad / 2;
             let right = pad - left;
-            format!("{}{rendered}{}", " ".repeat(left), " ".repeat(right))
+            let mut out = String::with_capacity(left + rendered.len() + right);
+            out.push_str(&" ".repeat(left));
+            out.push_str(&rendered);
+            out.push_str(&" ".repeat(right));
+            out
         }
     }
 }
@@ -480,23 +500,27 @@ pub(super) fn compute_table_widths(
 
     if sum > avail {
         let mut excess = sum - avail;
-        while excess > 0 {
-            // Find the index of the column with the maximum width
-            let mut max_idx = 0;
-            let mut max_w = 0;
-            for (i, &w) in widths.iter().enumerate() {
-                if w > max_w {
-                    max_w = w;
-                    max_idx = i;
+        // Reduce the widest column first, one unit at a time (same semantics as
+        // the previous re-scan loop), but bucket columns by width so each unit of
+        // excess costs O(1) instead of a full O(cols) re-scan (O(excess·cols)).
+        let max_w = widths.iter().copied().max().unwrap_or(0);
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); max_w + 1];
+        for (i, &w) in widths.iter().enumerate() {
+            buckets[w].push(i);
+        }
+        let mut w = max_w;
+        while excess > 0 && w > min_w {
+            while let Some(col) = buckets[w].pop() {
+                widths[col] -= 1;
+                buckets[w - 1].push(col);
+                excess -= 1;
+                if excess == 0 {
+                    break;
                 }
             }
-
-            if max_w <= min_w {
-                break; // Cannot reduce further
+            if buckets[w].is_empty() {
+                w -= 1;
             }
-
-            widths[max_idx] -= 1;
-            excess -= 1;
         }
     }
 

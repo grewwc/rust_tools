@@ -50,6 +50,14 @@ impl ContentThinkDemuxer {
         self.mode = Mode::Capture;
     }
 
+    /// Whether the demuxer is in passthrough mode. In passthrough the content is
+    /// handed through unchanged, so callers should skip [`Self::push`] entirely to
+    /// avoid the per-push full-chunk copy (initial state and after CLOSE_TAG are
+    /// both passthrough and cover the vast majority of content chunks).
+    pub(super) fn is_passthrough(&self) -> bool {
+        self.mode == Mode::Passthrough
+    }
+
     /// 喂入一个 content chunk，返回 `(reasoning, content)` 两路文本。
     /// 直通态是零拷贝语义的快速路径。
     pub(super) fn push(&mut self, chunk: &str) -> (String, String) {
