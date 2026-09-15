@@ -3530,4 +3530,132 @@ mod golden_wire {
             timeout
         ));
     }
+
+/// Width source for these tests: they run without a TTY, so `raw_terminal_cols()` falls back to
+/// `COLUMNS`. Mutating the process environment is `unsafe` in edition 2024; each test holds `ENV_LOCK`
+/// for the whole width-sensitive section, so no other test observes the value.
+fn set_test_columns(cols: &str) {
+    unsafe {
+        std::env::set_var("COLUMNS", cols);
+    }
+}
+
+fn clear_test_columns() {
+    unsafe {
+        std::env::remove_var("COLUMNS");
+    }
+}
+
+/// Rows of a live region are wrapped narrow enough that a later narrowing terminal cannot re-wrap them,
+/// so the stored row count still matches what is on screen and the cursor-up erase stays aligned.
+/// Without that bound a 400-column line is stored as rows of ~196 columns, which a terminal narrowed to
+/// 120 columns re-wraps into two rows each.
+#[test]
+fn live_region_rows_survive_a_narrowing_resize() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    set_test_columns("200");
+    let rows = wrap_line_to_terminal_rows_with_reserve(&"x".repeat(400), 4);
+    assert!(rows.len() > 1, "the line must be wrapped, got {} rows", rows.len());
+
+    set_test_columns("120");
+    let physical: usize = rows.iter().map(|row| live_preview_cursor_rows(row)).sum();
+    assert_eq!(
+        physical,
+        rows.len(),
+        "each stored row must still occupy one physical row after narrowing: {rows:?}"
+    );
+    clear_test_columns();
+}
+
+/// A header written on a wide terminal is one physical row; a narrowed terminal re-wraps that row into
+/// several. The erase must clear all of them — moving up exactly one row left the previous
+/// `○ thinking · …` header on screen on every redraw, which is the stack of headers seen when the
+/// terminal is resized while the model streams.
+#[test]
+fn live_region_fold_header_erase_covers_re_wrapped_rows() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let mut state = StreamProcessingState::new();
+    state.render.thinking_fold.active = true;
+    state.render.thinking_fold.set_labels(
+        "thinking about a header label that is wider than a forty column terminal row",
+        "done",
+    );
+
+    set_test_columns("200");
+    let mut header = Vec::new();
+    // The runtime call sites keep the returned text on the fold; the erase reads it back from there.
+    state.render.thinking_fold.header_rendered_line = write_fold_header(
+        &mut header,
+        Some("12.3 tok/s"),
+        &state.render.thinking_fold,
+    )
+    .unwrap();
+    assert_eq!(
+        thinking_fold_header_rendered_rows(&state.render.thinking_fold),
+        1,
+        "a wide terminal keeps the header on one row"
+    );
+
+    set_test_columns("40");
+    let rows = thinking_fold_header_rendered_rows(&state.render.thinking_fold);
+    assert!(
+        rows > 1,
+        "the narrowed terminal re-wraps the header, got {rows} rows"
+    );
+
+    state.render.thinking_fold.header_drawn = true;
+    let mut redraw = Vec::new();
+    thinking_fold_redraw_to(&mut redraw, None, &mut state.render.thinking_fold).unwrap();
+    let redraw = String::from_utf8_lossy(&redraw).into_owned();
+    assert!(
+        redraw.contains(&format!("\x1b[{}A", rows)),
+        "the erase must move up over all {rows} header rows: {redraw:?}"
+    );
+    assert!(
+        redraw.matches("\x1b[2K").count() >= rows,
+        "the erase must clear all {rows} header rows: {redraw:?}"
+    );
+    clear_test_columns();
+}
+
+/// The waiting hint owns its own line and is erased by moving back up over it, so the erase must clear
+/// every physical row the hint occupies — including rows a narrowed terminal created by re-wrapping the
+/// hint row that was already drawn.
+#[test]
+fn live_region_waiting_hint_erase_covers_re_wrapped_rows() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    set_test_columns("200");
+    let hint = clamp_line_to_terminal_row(&format!(
+        "  ⠋ receiving `read_file` arguments…{}",
+        "x".repeat(200)
+    ));
+    assert_eq!(live_preview_cursor_rows(&hint), 1);
+
+    set_test_columns("60");
+    let rows = live_preview_cursor_rows(&hint);
+    assert!(
+        rows > 1,
+        "the narrowed terminal re-wraps the hint, got {rows} rows"
+    );
+
+    let mut out = Vec::new();
+    erase_rows_above_cursor(&mut out, rows).unwrap();
+    let emitted = String::from_utf8_lossy(&out).into_owned();
+    assert_eq!(
+        emitted.matches("\x1b[2K").count(),
+        rows,
+        "emitted: {emitted:?}"
+    );
+    assert!(
+        emitted.starts_with(&format!("\r\x1b[{}A", rows)),
+        "emitted: {emitted:?}"
+    );
+    clear_test_columns();
+}
 }

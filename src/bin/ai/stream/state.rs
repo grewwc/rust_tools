@@ -121,6 +121,10 @@ pub(super) struct StreamRenderState {
     pub(super) waiting_hint_active: bool,
     pub(super) waiting_hint_buffering: bool,
     pub(super) waiting_hint_tool_call: bool,
+    /// Plain text of the waiting-hint row currently drawn on its own line (empty when none is drawn).
+    /// The erase recomputes the hint's physical row count from this text, because a terminal that
+    /// narrowed after the hint was written re-wraps the row that is already on screen.
+    pub(super) waiting_hint_line: String,
     pub(super) printed_tool_calls_header: bool,
     pub(super) current_printing_index: Option<usize>,
     pub(super) terminal_dedupe: Option<TerminalDedupeState>,
@@ -140,6 +144,7 @@ impl StreamRenderState {
             waiting_hint_active: false,
             waiting_hint_buffering: false,
             waiting_hint_tool_call: false,
+            waiting_hint_line: String::new(),
             printed_tool_calls_header: false,
             current_printing_index: None,
             terminal_dedupe: None,
@@ -265,6 +270,10 @@ pub(super) struct ThinkingFoldState {
     /// Whether a fold header is on screen. Streaming redraws clear and replace it along with the body; thinking completion changes it
     /// in place to `✓ thinking`. When the body is empty, the cursor is one row below this header.
     pub(super) header_drawn: bool,
+    /// Plain text of the header row currently drawn on screen (empty before the first header write).
+    /// The erase steps recompute its physical row count from this text instead of assuming exactly one
+    /// row, so a header re-wrapped by a narrowed terminal is still fully covered by the cursor-up erase.
+    pub(super) header_rendered_line: String,
     /// Fold-block header text (e.g. `○ thinking` / `subagent explore`).
     pub(super) header_label: String,
     /// Fold-block footer text (e.g. `✓ thinking` / `done subagent explore`).
@@ -295,6 +304,7 @@ impl ThinkingFoldState {
             rewrite_right_margin_cols: 0,
             active: false,
             header_drawn: false,
+            header_rendered_line: String::new(),
             header_label: header_label.into(),
             footer_label: footer_label.into(),
             skip_blank_lines,
@@ -318,6 +328,7 @@ impl ThinkingFoldState {
         self.rendered_body_lines.clear();
         self.active = false;
         self.header_drawn = false;
+        self.header_rendered_line.clear();
     }
 }
 

@@ -1008,12 +1008,12 @@ fn rebuild_after_terminal_reflow(
         last_drawn_area.map(|area| area.y),
         false,
     )?;
-    clear_reflowed_box_rows(terminal, screen, terminal_size, last_drawn_area, rebuilt_area)?;
+    reclaim_reflowed_box_rows(terminal, screen, terminal_size, last_drawn_area, rebuilt_area)?;
     park_reflow_anchor(terminal, rebuilt_area)?;
     Ok(rebuilt_area)
 }
 
-/// Blanks the rows a narrowing resize pushed above the rebuilt box.
+/// Reclaims the screen rows a narrowing resize pushed above the rebuilt box.
 ///
 /// A terminal re-wraps its screen on a width change: every line whose written
 /// content is wider than the new width is split into `ceil(len / cols)` rows
@@ -1021,14 +1021,22 @@ fn rebuild_after_terminal_reflow(
 /// drawn box rows are content-filled to the box width, so narrowing turns the
 /// box into `drawn_height * ceil(drawn_width / new_width)` rows on screen: its
 /// bottom row keeps its screen row, while the top moves UP by the difference.
-/// Recovering the top from the drawn height alone (`bottom - (height - 1)`)
-/// therefore leaves those extra rows above the rebuilt viewport, where they show
-/// the box's own re-wrapped text as duplicated rows that nothing overwrites
-/// again. Blank exactly that range.
+/// Recovering the top from the drawn height alone (`bottom - (height - 1)`) puts
+/// the rebuilt viewport at the bottom of that range, so the extra rows sit
+/// between the transcript and the box, holding the box's own re-wrapped text
+/// that nothing overwrites again. Blanking them removes the duplicate text but
+/// leaves the same number of empty rows in the middle of the screen, because
+/// the transcript tail those rows displaced stays where the reflow left it.
+///
+/// The screen is scrolled DOWN by that many rows instead: the transcript tail
+/// moves back against the rebuilt box and the empty rows land at the TOP of the
+/// screen, where a terminal normally shows empty space and the next output
+/// scrolls them away. `CSI Ps T` drops the bottom `Ps` rows, which are the
+/// viewport rows the rebuild is about to repaint, so nothing else is lost.
 ///
 /// Widening re-wraps nothing (xterm.js `reflowLarger` only joins lines that were
-/// continued by auto-wrap), so the range is empty there and this is a no-op.
-fn clear_reflowed_box_rows(
+/// continued by auto-wrap), so the count is zero there and this is a no-op.
+fn reclaim_reflowed_box_rows(
     terminal: &mut MultilineTerminal,
     screen: &PromptScreen,
     terminal_size: Size,
@@ -1044,10 +1052,11 @@ fn clear_reflowed_box_rows(
         return Ok(());
     }
     let reflowed_top = reflowed_box_top(previous_area, terminal_size.width, rebuilt_area);
-    if reflowed_top < rebuilt_area.y {
-        // The re-wrapped box only ever extends upwards from the rebuilt top;
-        // everything further up is transcript and must never be touched.
-        clear_row_range(terminal.backend_mut(), reflowed_top, rebuilt_area.y)?;
+    let reclaim = rebuilt_area.y.saturating_sub(reflowed_top);
+    if reclaim > 0 {
+        // Anything drawn before the scroll must reach the terminal first.
+        terminal.backend_mut().flush()?;
+        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::ScrollDown(reclaim))?;
     }
     Ok(())
 }
@@ -1073,12 +1082,23 @@ mod width_reflow_geometry_tests {
     /// Numbers measured against xterm.js 5.x: a 5-row box drawn at width 40 and
     /// narrowed to width 20 is re-wrapped into 10 rows whose bottom row keeps its
     /// screen row (11) while the top moves up to row 2 — five rows above the top
-    /// a height-only recovery computes (7), exactly the stranded rows this clears.
+    /// a height-only recovery computes (7), exactly the rows this reclaims.
     #[test]
     fn narrowing_reflow_extends_the_box_upwards_by_the_wrapped_rows() {
         let previous_area = Rect::new(0, 7, 40, 5);
         let rebuilt_area = Rect::new(0, 7, 20, 5);
         assert_eq!(reflowed_box_top(previous_area, 20, rebuilt_area), 2);
+    }
+
+    /// The rows to reclaim are the ones the re-wrap inserted: the re-wrapped box
+    /// is 10 rows tall and the rebuild recovered a 5-row viewport, so five rows
+    /// separate the recovered top (7) from the re-wrapped top (2).
+    #[test]
+    fn narrowing_reflow_reclaims_exactly_the_inserted_rows() {
+        let previous_area = Rect::new(0, 7, 40, 5);
+        let rebuilt_area = Rect::new(0, 7, 20, 5);
+        let reflowed_top = reflowed_box_top(previous_area, 20, rebuilt_area);
+        assert_eq!(rebuilt_area.y.saturating_sub(reflowed_top), 5);
     }
 
     /// Widening re-wraps nothing, so the box keeps the top the rebuild recovered.
@@ -1102,8 +1122,8 @@ mod width_reflow_geometry_tests {
 /// top as `bottom - (height - 1)`, taking `height` from the viewport that is
 /// actually on screen rather than from a stored offset that a burst of resizes
 /// can leave stale. The re-wrapped box is taller than the drawn one, so the
-/// extra rows it pushed above that top are blanked separately
-/// (`clear_reflowed_box_rows`).
+/// extra rows it pushed above that top are scrolled away separately
+/// (`reclaim_reflowed_box_rows`).
 fn park_reflow_anchor<B: Backend>(
     terminal: &mut Terminal<B>,
     viewport_area: Rect,

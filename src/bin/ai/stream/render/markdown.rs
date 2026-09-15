@@ -1347,23 +1347,45 @@ impl MarkdownStreamRenderer {
     }
 }
 
-/// 把一行文本按终端 **真实** 列宽硬截断到「最多占一个物理行」，超出部分用 `…` 收尾。
+/// Maximum wrapped width of **live regions**: rows the renderer redraws in place with relative cursor
+/// moves (thinking/subagent fold body and markers, fold status header, tool-output preview, waiting
+/// hints).
 ///
-/// 折叠窗口（thinking / 工具输出）用它保证每条可见行只占一个物理行，使 cursor-up
-/// 擦除的行数与逻辑行数严格相等，彻底摆脱 `live_preview_cursor_rows` 对自动折行的
-/// 预测——tab / 全角字符 / 超长行 / 终端 resize 都不会再让擦除行数算少而残留旧内容
-/// （表现为 header 反复堆叠、大段空白）。传入文本视为不含 ANSI 的纯文本。
+/// A terminal re-wraps rows it has already drawn when it narrows, and xterm.js reflows immediately
+/// while the new PTY winsize can reach this process a redraw (or several) later. During that window
+/// the renderer's width is still the wide one, so every cursor-up erase moves up fewer rows than the
+/// rows it wrote now occupy and it skips the top of the region: the leaked stack of
+/// `○ thinking · ~N tok` headers seen when the window is resized mid-stream. Wrapping live rows at
+/// most this wide keeps their physical row count independent of the terminal width for every terminal
+/// at least this wide, so a resize can no longer desynchronize the erase from what is on screen.
+/// Narrower terminals still wrap at their real width (unavoidable there); on that path the erase side
+/// recomputes the footprint from the stored plain text instead. The answer body, code blocks and
+/// tables are not live regions and keep the full terminal width.
+const LIVE_REGION_MAX_COLS: usize = 100;
+
+/// Wrapped width for live regions: the live terminal width, bounded by [`LIVE_REGION_MAX_COLS`].
+fn live_region_cols() -> usize {
+    raw_terminal_cols().min(LIVE_REGION_MAX_COLS)
+}
+
+/// Hard-truncate one line of text to a single physical terminal row at the live-region column width,
+/// ending an over-long line with `…`.
+///
+/// Live regions use it so every drawn row occupies exactly one physical row and the cursor-up erase
+/// row count matches the logical row count, instead of predicting terminal auto-wrap (tabs, full-width
+/// characters, over-long lines). Combined with the [`LIVE_REGION_MAX_COLS`] bound this also survives a
+/// terminal resize. Input is plain text without ANSI.
 pub(in crate::ai) fn clamp_line_to_terminal_row(line: &str) -> String {
     clamp_line_to_terminal_row_with_reserve(line, 0)
 }
 
-/// 同 [`clamp_line_to_terminal_row`]，但先从终端列宽预留 `reserve_cols` 列给行首装饰
-/// （如折叠行的 `  │ ` 前缀），保证「前缀 + clamp 后正文」合起来仍不超过一个物理行。
+/// Same as [`clamp_line_to_terminal_row`], but reserves `reserve_cols` columns for a line prefix
+/// (such as the fold's `  │ ` indent) so that prefix plus clamped text still fits one physical row.
 pub(in crate::ai) fn clamp_line_to_terminal_row_with_reserve(
     line: &str,
     reserve_cols: usize,
 ) -> String {
-    let cols = raw_terminal_cols().saturating_sub(reserve_cols).max(1);
+    let cols = live_region_cols().saturating_sub(reserve_cols).max(1);
     let mut total = 0usize;
     for ch in line.chars() {
         total += terminal_cell_width(ch);
@@ -1372,8 +1394,8 @@ pub(in crate::ai) fn clamp_line_to_terminal_row_with_reserve(
         return line.to_string();
     }
 
-    // 需要截断：仅剩一列时只能显示省略号；否则预留 1 列给省略号，保证含省略号后
-    // 仍不超过 cols。
+    // Truncation: with a single remaining column only the ellipsis fits; otherwise reserve one column
+    // for the ellipsis so the result with the ellipsis still fits within `cols`.
     if cols == 1 {
         return "…".to_string();
     }
@@ -1394,13 +1416,14 @@ pub(in crate::ai) fn clamp_line_to_terminal_row_with_reserve(
 
 /// 按当前终端宽度把单个逻辑行拆成多条可见行，并为行首装饰预留列宽。
 ///
-/// 与 [`clamp_line_to_terminal_row_with_reserve`] 不同，这里不截断内容；调用方通常会
-/// 给每个返回片段重新加上相同前缀/缩进，让手动换行后的视觉行仍留在同一个块里。
+/// Unlike [`clamp_line_to_terminal_row_with_reserve`] this never truncates content; callers usually
+/// re-apply the same prefix/indent to every returned segment so manually wrapped rows stay in one
+/// block.
 pub(in crate::ai) fn wrap_line_to_terminal_rows_with_reserve(
     line: &str,
     reserve_cols: usize,
 ) -> Vec<String> {
-    let cols = raw_terminal_cols().saturating_sub(reserve_cols).max(1);
+    let cols = live_region_cols().saturating_sub(reserve_cols).max(1);
     if line.is_empty() {
         return vec![String::new()];
     }
@@ -1410,8 +1433,9 @@ pub(in crate::ai) fn wrap_line_to_terminal_rows_with_reserve(
     let mut col = 0usize;
     for ch in line.chars() {
         let w = terminal_cell_width(ch);
-        // 当前可用区域只有一列时，宽字符无法不触发终端自动折行。以单列 ASCII
-        // 占位符代替，优先守住“每个返回片段恰好一物理行”的重绘不变量。
+        // With a single available column a wide character cannot avoid terminal auto-wrap; substitute a
+        // one-column ASCII placeholder to keep the "each returned segment is exactly one physical row"
+        // redraw invariant.
         if w > cols {
             if !current.is_empty() {
                 rows.push(std::mem::take(&mut current));

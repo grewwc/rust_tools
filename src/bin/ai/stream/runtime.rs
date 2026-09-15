@@ -22,8 +22,8 @@ use super::{
     extract::{StreamTextEvent, extract_chunk_events_streaming, normalize_stream_text},
     framing, normalize,
     render::markdown::{
-        clamp_line_to_terminal_row_with_reserve, live_preview_cursor_rows, raw_terminal_rows,
-        wrap_line_to_terminal_rows_with_reserve,
+        clamp_line_to_terminal_row, clamp_line_to_terminal_row_with_reserve, live_preview_cursor_rows,
+        raw_terminal_rows, wrap_line_to_terminal_rows_with_reserve,
     },
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
     state::{
@@ -278,8 +278,8 @@ pub(super) async fn stream_response(
 
 /// Whether to show a compact "waiting for model output" status hint in the terminal.
 /// Applies to all TTY sessions. Written and flushed on its own line so it appears
-/// immediately; once the first visible chunk arrives it is cleared with
-/// \x1b[1A\r\x1b[2K, leaving no extra lines behind.
+/// immediately; once the first visible chunk arrives it is erased by moving the cursor back up over
+/// the rows the hint occupies (see `erase_waiting_hint`), leaving no extra lines behind.
 fn should_show_waiting_hint(app: &App) -> bool {
     runtime_ctx::terminal_output_enabled()
         && io::stdout().is_terminal()
@@ -290,18 +290,41 @@ fn print_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
     if state.render.waiting_hint_active {
         return Ok(());
     }
-    // Waiting hint on its own line: cleared with \x1b[1A\r\x1b[2K when the first chunk arrives.
-    write_waiting_hint_line("waiting…")?;
+    // Waiting hint on its own line: erased with a cursor-up plus row clears when the first chunk arrives.
+    write_waiting_hint_line(state, "waiting…")?;
     state.render.waiting_hint_active = true;
     state.render.waiting_hint_tool_call = false;
     Ok(())
 }
 
-fn write_waiting_hint_line(label: &str) -> io::Result<()> {
+/// Write the hint as exactly one live-region row and remember its plain text: the hint owns its own line
+/// and is erased by moving the cursor back up over it, and a terminal that narrowed re-wraps the row that
+/// is already on screen, so the erase recomputes the physical row count from the text actually written.
+fn write_waiting_hint_line(state: &mut StreamProcessingState, label: &str) -> io::Result<()> {
+    let row = clamp_line_to_terminal_row(&format!("  ⠋ {label}"));
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    writeln!(out, "  {}⠋ {label}{RESET}", theme::current().accent_muted)?;
-    out.flush()
+    writeln!(out, "{}{row}{RESET}", theme::current().accent_muted)?;
+    out.flush()?;
+    state.render.waiting_hint_line = row;
+    Ok(())
+}
+
+/// Erase the hint row(s) currently on screen and park the cursor where the hint started, so the next
+/// output prints in its place. Clears `waiting_hint_line` but leaves the hint flags to the caller:
+/// `clear_waiting_hint` resets them, while the in-place rewrites (`upgrade_waiting_hint_for_buffering`,
+/// `show_deferred_body_buffering_hint`) keep the hint active.
+fn erase_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
+    if !state.render.waiting_hint_active || state.render.waiting_hint_line.is_empty() {
+        return Ok(());
+    }
+    let rows = live_preview_cursor_rows(&state.render.waiting_hint_line);
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    erase_rows_above_cursor(&mut out, rows)?;
+    out.flush()?;
+    state.render.waiting_hint_line.clear();
+    Ok(())
 }
 
 fn sanitize_waiting_hint_tool_name(function_name: &str) -> String {
@@ -322,7 +345,7 @@ fn print_tool_call_waiting_hint(
         clear_waiting_hint(state)?;
     }
     let function_name = sanitize_waiting_hint_tool_name(function_name);
-    write_waiting_hint_line(&format!("receiving `{function_name}` arguments…"))?;
+    write_waiting_hint_line(state, &format!("receiving `{function_name}` arguments…"))?;
     state.render.waiting_hint_active = true;
     state.render.waiting_hint_tool_call = true;
     Ok(())
@@ -387,12 +410,9 @@ fn upgrade_waiting_hint_for_buffering(state: &mut StreamProcessingState) -> io::
     {
         return Ok(());
     }
-    // Move the cursor up, clear the line, then rewrite it so the buffering state stays visible.
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    write!(out, "\x1b[1A\r\x1b[2K")?;
-    writeln!(out, "  {}⠋ buffering…{RESET}", theme::current().accent_muted)?;
-    out.flush()?;
+    // Erase the hint and rewrite it in place so the buffering state stays visible.
+    erase_waiting_hint(state)?;
+    write_waiting_hint_line(state, "buffering…")?;
     state.render.waiting_hint_buffering = true;
     Ok(())
 }
@@ -410,13 +430,10 @@ fn show_deferred_body_buffering_hint(state: &mut StreamProcessingState) -> io::R
     {
         return Ok(());
     }
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
     if state.render.waiting_hint_active {
-        write!(out, "\x1b[1A\r\x1b[2K")?;
+        erase_waiting_hint(state)?;
     }
-    writeln!(out, "  {}⠋ generating…{RESET}", theme::current().accent_muted)?;
-    out.flush()?;
+    write_waiting_hint_line(state, "generating…")?;
     state.render.waiting_hint_active = true;
     state.render.waiting_hint_buffering = true;
     Ok(())
@@ -426,11 +443,8 @@ pub(super) fn clear_waiting_hint(state: &mut StreamProcessingState) -> io::Resul
     if !state.render.waiting_hint_active {
         return Ok(());
     }
-    // Cursor up one line + \r + clear line: erase the standalone hint line so content prints in place.
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    write!(out, "\x1b[1A\r\x1b[2K")?;
-    out.flush()?;
+    // Erase the standalone hint row(s) so following content prints in place.
+    erase_waiting_hint(state)?;
     state.render.waiting_hint_active = false;
     state.render.waiting_hint_buffering = false;
     state.render.waiting_hint_tool_call = false;
@@ -1721,33 +1735,33 @@ fn thinking_fold_redraw_to(
     rate: Option<&str>,
     fold: &mut super::state::ThinkingFoldState,
 ) -> io::Result<()> {
-    // Erase one extra row above the previous body and redraw the header on
-    // every redraw. After the terminal narrows it auto-reflows the old body
-    // into more physical lines at the current width, and the app's view of the
-    // width can lag the reflow (xterm.js reflows immediately; the PTY winsize
-    // reaches the app later), so one redraw can erase fewer rows than the body
-    // now occupies, stranding the leftovers between the header and the body.
-    // The extra row makes each redraw consume one of those stranded rows (the
-    // row directly above the body is always fold-owned: the header when clean,
-    // a stranded body row after a racing reflow), so the window converges back
-    // to [header][body] instead of accumulating permanent stacked
-    // `… more` / `… N earlier lines` markers. The header is redrawn on that
-    // same row, so the extra erase never touches transcript content above the
-    // fold. The first redraw (activation) has nothing on screen above the
-    // cursor, so it erases nothing and the header lands at the fold's start
-    // position as before; every later redraw has a header (and possibly an
-    // empty body) above the cursor that must be cleared and reprinted.
+    // Erase the region currently on screen — header rows plus body rows — and redraw the header on the
+    // region's first row on every redraw, so the window stays anchored where the fold started.
+    //
+    // Both counts are recomputed from the text that was actually written, at the width in force now.
+    // A terminal that narrowed re-wraps the rows it has already drawn, and this process can learn the
+    // new width later than the reflow (xterm.js reflows immediately; the PTY winsize arrives after), so
+    // assuming the old footprint at the old width moved the erase a row short and left the previous
+    // `○ thinking · …` header behind on every redraw, stacking those headers. Live rows are additionally
+    // wrapped at most `LIVE_REGION_MAX_COLS` wide (see `render::markdown`), so for a terminal at least
+    // that wide a resize cannot change their row count at all.
+    //
+    // The first redraw (activation) has nothing on screen above the cursor, so it erases nothing and the
+    // header lands at the fold's start position as before; every later redraw has a header (and possibly
+    // an empty body) above the cursor that must be cleared and reprinted.
     let body_rows = thinking_fold_rendered_body_rows(fold).max(fold.window_rows);
     let erase_rows = if fold.header_drawn {
         // The header ends with CRLF. With no body, the cursor is on the blank
         // row below it, so the erase span must include that row as well.
-        body_rows.max(1).saturating_add(1)
+        body_rows
+            .max(1)
+            .saturating_add(thinking_fold_header_rendered_rows(fold))
     } else {
         body_rows
     };
     erase_fold_body(out, erase_rows)?;
     if fold.active {
-        write_fold_header(out, rate, fold)?;
+        fold.header_rendered_line = write_fold_header(out, rate, fold)?;
         fold.header_drawn = true;
     }
 
@@ -1780,11 +1794,15 @@ fn thinking_fold_redraw_to(
 }
 
 /// Print the fold header, leaving the cursor at the start of the first body row.
+///
+/// The written plain text is returned so the caller can keep it on the fold: later erases recompute the
+/// header's physical row count from it, at the width current then (see
+/// `thinking_fold_header_rendered_rows`).
 fn write_fold_header(
     out: &mut impl Write,
     rate: Option<&str>,
     fold: &super::state::ThinkingFoldState,
-) -> io::Result<()> {
+) -> io::Result<String> {
     let mut label = fold.header_label.clone();
     // Live reasoning throughput rides on the fold header: the header is the
     // renderer's own redraw target (unlike the one-shot model/session status
@@ -1794,20 +1812,23 @@ fn write_fold_header(
         label.push_str(" · ");
         label.push_str(rate);
     }
-    write_fold_status_line(out, &label, fold.rewrite_right_margin_cols)
+    let reserve_cols = fold.rewrite_right_margin_cols;
+    write_fold_status_line(out, &label, reserve_cols)
 }
 
-/// Both redraw and completion move up exactly one header row. Bound the entire
-/// decorated line, including indentation and live metrics, to that footprint;
-/// an automatically wrapped header would leave its first row behind on every
-/// redraw. This only clips the status display, never the underlying content.
+/// Both redraw and completion erase the header by moving up its row count. Bound the entire decorated
+/// line, including indentation and live metrics, to a single live-region row and return the plain text
+/// that was written; the erase steps recompute the row count from that text, because a narrowed terminal
+/// re-wraps the header row that is already on screen. This only clips the status display, never the
+/// underlying content.
 fn write_fold_status_line(
     out: &mut impl Write,
     label: &str,
     reserve_cols: usize,
-) -> io::Result<()> {
+) -> io::Result<String> {
     let line = clamp_line_to_terminal_row_with_reserve(&format!("  {label}"), reserve_cols);
-    write!(out, "{}{line}\x1b[0m\r\n", theme::current().accent_muted)
+    write!(out, "{}{line}\x1b[0m\r\n", theme::current().accent_muted)?;
+    Ok(line)
 }
 
 /// Write the final header directly when thinking ends; used for an empty fold that never wrote an in-progress header.
@@ -1820,19 +1841,22 @@ fn write_thinking_fold_completion_header(
         out,
         &format!("{} · {line_count} lines", fold.footer_label),
         fold.rewrite_right_margin_cols,
-    )
+    )?;
+    Ok(())
 }
 
 /// Rewrite the anchored `○ thinking` in place to the completed state instead of printing a separate `✓ thinking` below the body.
 ///
-/// Before this, `erase_fold_body` moved the cursor back to the first body line under the header; so move up one line,
-/// clear the header and rewrite it. The folded body is still drawn below the new header by the usual logic.
+/// `erase_fold_body` moved the cursor back to the first body line under the header, so the header sits
+/// directly above the cursor and is cleared row by row before being rewritten. Its row count comes from
+/// the text that was written rather than a fixed one row: after a narrowing resize the terminal re-wraps
+/// the old header, and a one-row erase would leave the header's first row behind.
 fn replace_thinking_fold_header(
     out: &mut impl Write,
     fold: &super::state::ThinkingFoldState,
     line_count: usize,
 ) -> io::Result<()> {
-    write!(out, "\r\x1b[1A\r\x1b[2K")?;
+    erase_rows_above_cursor(out, thinking_fold_header_rendered_rows(fold))?;
     write_thinking_fold_completion_header(out, fold, line_count)
 }
 
@@ -1907,7 +1931,7 @@ fn finalize_fold_to(
         }
     } else if !fold.header_drawn {
         // Subagent preview keeps the existing two-line header/footer layout.
-        write_fold_header(&mut out, None, fold)?;
+        fold.header_rendered_line = write_fold_header(&mut out, None, fold)?;
         fold.header_drawn = true;
     }
 
@@ -2000,6 +2024,37 @@ fn thinking_fold_rendered_body_rows(fold: &super::state::ThinkingFoldState) -> u
         .iter()
         .map(|line| live_preview_cursor_rows(line))
         .sum()
+}
+
+/// Physical rows the anchored fold header currently occupies. The header is written clamped to one
+/// live-region row, but a terminal that narrowed re-wraps a row that is already on screen, so the erase
+/// recomputes the footprint from the stored text (at the live width) instead of assuming a single row.
+fn thinking_fold_header_rendered_rows(fold: &super::state::ThinkingFoldState) -> usize {
+    if fold.header_rendered_line.is_empty() {
+        1
+    } else {
+        live_preview_cursor_rows(&fold.header_rendered_line)
+    }
+}
+
+/// Erase `rows` rows whose last row sits directly **above** the cursor — the shape written by
+/// `write_fold_status_line` and `write_waiting_hint_line`, both of which end with CRLF — then park the
+/// cursor on the first of the erased rows so the next write lands where that region started.
+fn erase_rows_above_cursor(out: &mut impl Write, rows: usize) -> io::Result<()> {
+    if rows == 0 {
+        return Ok(());
+    }
+    write!(out, "\r\x1b[{rows}A")?;
+    for row in 0..rows {
+        write!(out, "\r\x1b[2K")?;
+        if row + 1 < rows {
+            write!(out, "\x1b[1B")?;
+        }
+    }
+    if rows > 1 {
+        write!(out, "\x1b[{}A", rows - 1)?;
+    }
+    Ok(())
 }
 
 fn thinking_fold_window_lines(fold: &super::state::ThinkingFoldState) -> (Vec<String>, usize) {
