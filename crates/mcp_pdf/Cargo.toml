@@ -1,0 +1,17 @@
+[package]
+name = "mcp_pdf"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "mcp_pdf"
+path = "src/main.rs"
+
+[dependencies]
+# Stateless file-parser server: tokio only for the stdio loop + timeout;
+# parsing itself lives in the shared root lib (rust_tools::pdfw).
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "time"] }
+serde_json = "1"
+# Shared MCP-over-stdio protocol skeleton (JsonRpcErr / cap_text / with_timeout / run / McpServer).
+mcp_stdio = { path = "../mcp_stdio" }
+rust_tools = { path = "../.." }

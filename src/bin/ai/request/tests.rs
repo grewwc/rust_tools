@@ -371,6 +371,10 @@ fn prompt_cache_model_support_rejects_plain_openai_model() {
 }
 
 fn test_app() -> App {
+    // Test processes have no main(); ensure the rustls ring provider is
+    // installed before constructing reqwest clients (reqwest 0.13 panics at
+    // Client::build() with rustls-no-provider and no installed provider).
+    rust_tools::ensure_rustls_provider();
     App {
         cli: ParsedCli::default(),
         hooks: Default::default(),

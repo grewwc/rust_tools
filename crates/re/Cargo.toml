@@ -1,0 +1,20 @@
+[package]
+name = "re"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Deps mirror the ones the re sources actually use (see root Cargo.toml for the
+# rest of the workspace). mongodb lives here, not in the root package, so the
+# root package's rustls does not get the aws-lc-rs provider feature unified in
+# and the `a` binary stays smaller.
+chrono = "0.4.45"
+colored = "3.1.1"
+futures-util = "0.3.34"
+libc = "0.2.189"
+mongodb = "3.8.1"
+regex = "1.13.1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rust_tools = { path = "../.." }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "sync"] }
+uuid = { version = "1.18.1", features = ["v4"] }

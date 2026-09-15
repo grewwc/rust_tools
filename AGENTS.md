@@ -9,8 +9,8 @@ Rust 2024 workspace: utility library + CLI binaries. Primary product is `a`, an
 LLM-based AI agent runtime (AIOS) with process scheduling, agent/skill routing,
 tool registry, and MCP integration. Workspace members: root crate,
 `crates/rust_tools_macros`, `crates/aios_kernel`, `crates/mcp_stdio`,
-`crates/mcp_browser`, `crates/mcp_excel`. macOS-first (`objc2` deps); core
-library cross-platform.
+`crates/mcp_browser`, `crates/mcp_excel`, `crates/mcp_pdf`, `crates/re`.
+macOS-first (`objc2` deps); core library cross-platform.
 
 ## Layout
 
@@ -26,12 +26,14 @@ crates/rust_tools_macros/   # proc macros
 crates/mcp_stdio/           # shared MCP-over-stdio skeleton: JSON-RPC transport + run<McpServer>
 crates/mcp_browser/         # standalone MCP server: browser automation (macOS AppleScript / CDP)
 crates/mcp_excel/           # standalone MCP server: Excel via AppleScript
+crates/mcp_pdf/             # standalone MCP server: PDF text/metadata extraction
+crates/re/                  # memo CLI (re) — standalone bin, keeps mongodb out of `a`
 tests/                      # integration tests
 models/                     # per-model JSON registry (read at runtime)
 ```
 
-> `mcp_browser` / `mcp_excel` are standalone binaries (not deps of `a`), so
-> `cargo check --bin a` stays fast. Both reuse `mcp_stdio`; new OS-app MCP
+> `mcp_browser` / `mcp_excel` / `mcp_pdf` are standalone binaries (not deps of `a`), so
+> `cargo check --bin a` stays fast. They reuse `mcp_stdio`; new OS-app MCP
 > servers should follow the same pattern. Standalone exceptions: `src/bin/mcp_feishu.rs`
 > and `src/bin/mcp_ocr.rs` are hand-rolled JSON-RPC servers that don't reuse `mcp_stdio`.
 

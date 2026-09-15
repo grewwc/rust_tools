@@ -55,3 +55,16 @@ pub mod pdfw;
 pub mod sortw;
 pub mod strw;
 pub mod terminalw;
+
+/// Install the ring TLS crypto provider for rustls.
+///
+/// The root package builds reqwest with the `rustls-no-provider` feature so
+/// the large aws-lc-rs C code stays out of release binaries. rustls then has
+/// no default provider, and reqwest 0.13 panics when building a `Client`
+/// (or failing a TLS handshake) if none is installed. Call this once at every
+/// process entry point that may construct a reqwest client: each binary's
+/// `main()` and test fixtures. It is idempotent: `install_default()` returns
+/// `Err` only when a provider is already installed, which is ignored.
+pub fn ensure_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}

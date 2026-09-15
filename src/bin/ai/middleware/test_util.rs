@@ -12,6 +12,10 @@ use crate::ai::types::{App, AppConfig};
 
 /// Builds a minimal usable App for port-middleware tests (the mock client/executor does not read App fields).
 pub fn test_app() -> App {
+    // Test processes have no main(); ensure the rustls ring provider is
+    // installed before constructing reqwest clients (reqwest 0.13 panics at
+    // Client::build() with rustls-no-provider and no installed provider).
+    rust_tools::ensure_rustls_provider();
     let model = crate::ai::model_names::all()
         .first()
         .map(|m| m.name.clone())

@@ -244,7 +244,7 @@ fn large_image_does_not_evict_tool_history_from_budget() {
         },
         Message {
             role: "tool".to_string(),
-            content: Value::String("read_file 结果：found memo.rs at src/bin/re/memo".to_string()),
+            content: Value::String("read_file 结果：found memo.rs at crates/re/src/memo".to_string()),
             tool_calls: None,
             tool_call_id: Some("call_1".to_string()),
             reasoning_content: None,
@@ -272,7 +272,7 @@ fn large_image_does_not_evict_tool_history_from_budget() {
 
     let kept_tool_result = compressed.iter().any(|m| {
         m.role == "tool"
-            && m.content.as_str() == Some("read_file 结果：found memo.rs at src/bin/re/memo")
+            && m.content.as_str() == Some("read_file 结果：found memo.rs at crates/re/src/memo")
     });
     assert!(
         kept_tool_result,

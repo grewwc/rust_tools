@@ -23,6 +23,9 @@ struct CachedToken {
 static USER_TOKEN_CACHE: OnceLock<Mutex<Option<CachedToken>>> = OnceLock::new();
 
 fn main() {
+    // rustls has no default crypto provider (reqwest uses rustls-no-provider;
+    // see root Cargo.toml); install ring before any TLS use.
+    rust_tools::ensure_rustls_provider();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut reader = stdin.lock();

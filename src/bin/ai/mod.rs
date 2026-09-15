@@ -32,6 +32,16 @@ pub(in crate::ai) use rust_tools_macros::{agent_hang_debug, agent_hang_span};
 #[cfg(test)]
 mod tests;
 
+// Install the rustls ring crypto provider before any test in this binary
+// runs. Test processes have no main(), and reqwest (built with
+// rustls-no-provider, see root Cargo.toml) panics at Client::build() when no
+// crypto provider is installed. #[ctor] runs before the test harness starts.
+#[cfg(test)]
+#[ctor::ctor]
+fn install_rustls_provider_for_tests() {
+    rust_tools::ensure_rustls_provider();
+}
+
 #[cfg(test)]
 mod test_support {
     use std::sync::{LazyLock, Mutex};
@@ -45,6 +55,9 @@ mod test_support {
 /// `background::spawn_daemon_child`), avoiding fork carrying the parent's
 /// half-initialized CF/os_log/objc state into the child.
 pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
+    // reqwest is built with rustls-no-provider (no built-in crypto provider);
+    // install ring so any code path in this process can build TLS clients.
+    rust_tools::ensure_rustls_provider();
     // Internal helper used only by a live side-note `/bg` handoff. It is a fresh
     // process so it can safely resume the still-running parent without inheriting
     // the parent's runtime state; it must not parse normal CLI arguments.

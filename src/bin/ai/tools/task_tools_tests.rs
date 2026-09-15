@@ -53,6 +53,29 @@ use aios_kernel::{
 };
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant};
+/// RAII guard for the process-global kernel handle (`os_tools::GLOBAL_OS`) used by the task
+/// tools. A task_tools test installs its own kernel so `execute_task_*` calls route through it;
+/// on the happy path the tests used to reset it manually, but a panicking test skipped that reset
+/// and left a stale kernel installed process-wide, hijacking `FileStore` reads of unrelated tests
+/// (their `try_vfs_*` helpers prefer a set kernel over bare `std::fs`). Restoring on drop covers
+/// panics too, because test panics unwind and drop locals.
+struct OsToolsGlobalGuard(Option<aios_kernel::kernel::SharedKernel>);
+
+fn init_os_tools_guard(os: aios_kernel::kernel::SharedKernel) -> OsToolsGlobalGuard {
+    let mut g = crate::ai::tools::os_tools::GLOBAL_OS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let previous = std::mem::replace(&mut *g, Some(os));
+    OsToolsGlobalGuard(previous)
+}
+
+impl Drop for OsToolsGlobalGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+            *g = self.0.take();
+        }
+    }
+}
 
 fn manifest(name: &str, description: &str, mode: AgentMode) -> AgentManifest {
     AgentManifest {
@@ -943,7 +966,7 @@ fn task_wait_rejects_foreign_session_task_ids() {
         .unwrap_or_else(|poison| poison.into_inner());
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = "session-a".to_string();
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
     let owner_pid = {
         let mut os = app.os.lock().unwrap();
         os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None)
@@ -1012,9 +1035,6 @@ fn task_wait_rejects_foreign_session_task_ids() {
     assert!(err.contains("owned by another session"));
     assert!(remove_task_entry(&own_task_id).is_some());
     assert!(remove_task_entry(&foreign_task_id).is_some());
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
 }
 
 #[test]
@@ -1029,7 +1049,7 @@ fn task_wait_distinguishes_delivered_and_unknown_registry_misses() {
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
     app.config.history_file = root.join("history.sqlite");
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
     {
         let mut os = app.os.lock().unwrap();
         os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
@@ -1078,9 +1098,6 @@ fn task_wait_distinguishes_delivered_and_unknown_registry_misses() {
     assert!(unknown.contains(&unknown_task_id));
     assert!(!unknown.contains("results were delivered"));
 
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
     let sessions_root = crate::ai::history::SessionStore::new(&app.config.history_file)
         .sessions_root()
         .to_path_buf();
@@ -1100,7 +1117,7 @@ fn task_wait_escalates_repeated_noop_wait_on_delivered_task_to_error() {
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
     app.config.history_file = root.join("history.sqlite");
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
     {
         let mut os = app.os.lock().unwrap();
         os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
@@ -1173,9 +1190,6 @@ fn task_wait_escalates_repeated_noop_wait_on_delivered_task_to_error() {
     // Reset the global counter so later tests start clean.
     reset_task_wait_noop_counts_for_test();
 
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
     let sessions_root = crate::ai::history::SessionStore::new(&app.config.history_file)
         .sessions_root()
         .to_path_buf();
@@ -1190,7 +1204,7 @@ fn task_status_and_outstanding_anchor_filter_same_session_sibling_owner_tasks() 
         .unwrap_or_else(|poison| poison.into_inner());
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
 
     let own_task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
     let sibling_task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
@@ -1309,9 +1323,6 @@ fn task_status_and_outstanding_anchor_filter_same_session_sibling_owner_tasks() 
 
     assert!(remove_task_entry(&own_task_id).is_some());
     assert!(remove_task_entry(&sibling_task_id).is_some());
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
 }
 
 #[test]
@@ -1321,7 +1332,7 @@ fn task_cancel_refuses_same_session_foreign_owner_task() {
         .unwrap_or_else(|poison| poison.into_inner());
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
     let (owner_pid, sibling_owner_pid, child_pid, channel, futex) = {
@@ -1390,9 +1401,6 @@ fn task_cancel_refuses_same_session_foreign_owner_task() {
     os.kill_process(child_pid, "test cleanup".to_string())
         .unwrap();
     drop(os);
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
 }
 
 #[test]
@@ -1402,7 +1410,7 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
         .unwrap_or_else(|poison| poison.into_inner());
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
     let (owner_pid, child_pid, channel, futex) = {
@@ -1496,9 +1504,6 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
     os.set_current_pid(Some(owner_pid));
     os.kill_process(child_pid, "test cleanup".to_string())
         .unwrap();
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
 }
 
 #[test]
@@ -1513,7 +1518,7 @@ fn task_status_collects_completed_results_and_cleans_up_resources() {
         uuid::Uuid::new_v4().simple()
     ));
     app.config.history_file = root.join("history.sqlite");
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
     let (pid, result_channel_id, completion_futex_addr) = {
@@ -1639,9 +1644,6 @@ fn task_status_collects_completed_results_and_cleans_up_resources() {
         },
     );
 
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
     let sessions_root = crate::ai::history::SessionStore::new(&app.config.history_file)
         .sessions_root()
         .to_path_buf();
@@ -1656,7 +1658,7 @@ fn task_wait_any_returns_ready_result_without_waiting_for_pending_task() {
         .unwrap_or_else(|poison| poison.into_inner());
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
 
     let ready_task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
     let pending_task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
@@ -1765,9 +1767,6 @@ fn task_wait_any_returns_ready_result_without_waiting_for_pending_task() {
     let _ = os.futex_destroy(pending_futex);
     drop(os);
 
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
 }
 
 #[test]
@@ -1777,7 +1776,7 @@ fn task_status_cleans_up_terminated_task_without_result() {
         .unwrap_or_else(|poison| poison.into_inner());
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
     let (root_pid, pid, result_channel_id, completion_futex_addr) = {
@@ -1842,9 +1841,6 @@ fn task_status_cleans_up_terminated_task_without_result() {
     assert!(os.get_process(pid).is_none());
     drop(os);
 
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
 }
 
 #[test]
@@ -1854,7 +1850,7 @@ fn task_retry_rejects_a_different_parent_process() {
         .unwrap_or_else(|poison| poison.into_inner());
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
 
     let owner_pid = {
         let mut os = app.os.lock().unwrap();
@@ -1879,9 +1875,6 @@ fn task_retry_rejects_a_different_parent_process() {
     assert!(error.contains("different parent process"));
 
     discard_tasks_for_session(&app.session_id);
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
 }
 
 #[test]
@@ -1935,7 +1928,7 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
         .unwrap_or_else(|poison| poison.into_inner());
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
     let (root, pid, result_channel_id, completion_futex_addr) = {
@@ -2026,9 +2019,6 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
     assert!(os.futex_event_id(completion_futex_addr).is_none());
     assert!(os.get_process(pid).is_none());
 
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
 }
 
 #[tokio::test]
@@ -2038,7 +2028,7 @@ async fn discarding_session_tasks_aborts_workers_and_releases_results() {
         .unwrap_or_else(|poison| poison.into_inner());
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
     let (root, pid, result_channel_id, completion_futex_addr) = {
@@ -2109,9 +2099,6 @@ async fn discarding_session_tasks_aborts_workers_and_releases_results() {
     assert!(os.get_process(pid).is_none());
     drop(os);
 
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
 }
 
 #[tokio::test]
@@ -2121,7 +2108,7 @@ async fn wall_clock_reaper_aborts_worker_and_leaves_timeout_result_collectable()
         .unwrap_or_else(|poison| poison.into_inner());
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
     let (root, pid, result_channel_id, completion_futex_addr) = {
@@ -2200,9 +2187,6 @@ async fn wall_clock_reaper_aborts_worker_and_leaves_timeout_result_collectable()
     assert!(os.futex_event_id(completion_futex_addr).is_none());
     assert!(os.get_process(pid).is_none());
 
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
 }
 
 #[tokio::test]
@@ -2212,7 +2196,7 @@ async fn task_wait_wall_clock_timeout_aborts_worker_before_publishing_result() {
         .unwrap_or_else(|poison| poison.into_inner());
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
     let (root, pid, result_channel_id, completion_futex_addr) = {
@@ -2289,9 +2273,6 @@ async fn task_wait_wall_clock_timeout_aborts_worker_before_publishing_result() {
     assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
     assert!(os.futex_event_id(completion_futex_addr).is_none());
     drop(os);
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
 }
 
 #[test]
@@ -2416,7 +2397,7 @@ fn subagent_progress_update_never_wakes_parked_parent() {
         .unwrap_or_else(|poison| poison.into_inner());
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
     let (owner_pid, child_pid, channel, futex) = {
@@ -2502,9 +2483,6 @@ fn subagent_progress_update_never_wakes_parked_parent() {
     os.kill_process(child_pid, "test cleanup".to_string())
         .unwrap();
     drop(os);
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
 }
 
 #[test]
@@ -2517,7 +2495,7 @@ fn wake_expired_task_waits_reaps_orphaned_state_when_owner_gone() {
         .unwrap_or_else(|poison| poison.into_inner());
     let mut app = test_app_with_model("qwen3.7-max".to_string());
     app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
-    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+    let _os_guard = init_os_tools_guard(app.os.clone());
 
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
     let (supervisor_pid, owner_pid, child_pid, channel, futex) = {
@@ -2613,7 +2591,4 @@ fn wake_expired_task_waits_reaps_orphaned_state_when_owner_gone() {
     );
 
     let _ = remove_task_entry(&task_id);
-    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
-        *guard = None;
-    }
 }

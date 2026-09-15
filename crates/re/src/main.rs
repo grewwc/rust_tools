@@ -4,10 +4,8 @@ pub use rust_tools::strw;
 pub use rust_tools::{cw::Trie, terminalw};
 use std::io::{self, Write};
 
-#[path = "re/memo/mod.rs"]
 mod memo;
 
-#[path = "re/features/mod.rs"]
 mod features;
 
 use features::*;
