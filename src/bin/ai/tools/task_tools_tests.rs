@@ -1589,6 +1589,56 @@ fn task_status_collects_completed_results_and_cleans_up_resources() {
     assert!(ledger.contains(&task_id));
     assert!(ledger.contains("subagent final answer"));
 
+    let context = DriverContext::new(
+        app.clone(),
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+    );
+    crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+        (app.session_id.clone(), 0usize),
+        || {
+            DRIVER_CTX.sync_scope(context, || {
+                let args = serde_json::json!({"task_id": task_id, "source": "delivered"});
+                let output = super::execute_task_evidence_read(&args).unwrap();
+                let evidence: serde_json::Value = serde_json::from_str(&output).unwrap();
+                assert_eq!(evidence["task_id"], task_id);
+                assert_eq!(evidence["source"], "delivered");
+                assert_eq!(evidence["status"], "completed");
+                assert!(
+                    evidence["payload"]
+                        .as_str()
+                        .unwrap()
+                        .contains("subagent final answer")
+                );
+                let after = crate::ai::history::render_unintegrated_task_evidence(
+                    &app.config.history_file,
+                    &app.session_id,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    after, ledger,
+                    "reading must not integrate or rewrite evidence"
+                );
+                assert!(
+                    super::execute_task_evidence_read(&serde_json::json!({
+                        "task_id": task_id, "source": "invalid"
+                    }))
+                    .unwrap_err()
+                    .contains("source must be")
+                );
+                assert!(
+                    super::execute_task_evidence_read(&serde_json::json!({
+                        "task_id": "never-delivered", "source": "delivered"
+                    }))
+                    .unwrap_err()
+                    .contains("No delivered evidence")
+                );
+            })
+        },
+    );
+
     if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
         *guard = None;
     }

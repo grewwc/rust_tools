@@ -11,13 +11,21 @@ use super::types::{
 };
 
 mod dedup;
+mod incremental;
+#[cfg(test)]
+mod incremental_normalize_tests;
+pub(in crate::ai) use incremental::is_incremental_summary;
+use incremental::{
+    INCREMENTAL_SUMMARY_PREFIX, plan_incremental_summary_with_app,
+    plan_incremental_summary_without_app, summary_delta_messages,
+};
 pub(crate) mod llm_prune;
 mod overflow_sink;
 mod text_utils;
 mod tool_groups;
 mod tool_overflow;
 
-use text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
+use text_utils::{keep_ends_by_chars, truncate_to_chars};
 #[cfg(test)]
 use tool_groups::{FOLDED_TOOL_GROUP_ARCHIVE_DIR, fold_early_tool_groups};
 use tool_groups::{
@@ -367,6 +375,8 @@ use overflow_sink::{
     archive_messages_to_overflow, archive_truncated_field_to_overflow, build_overflow_placeholder,
     content_sha256_hex, insert_internal_note_archive_note_if_needed,
     insert_overflow_archive_note_if_exists, trim_compressed_tool_evidence_to_inline_budget,
+    trim_compressed_tool_evidence_with_status, trim_incremental_summary_notes_to_inline_budget,
+    trim_incremental_summary_notes_with_status,
 };
 
 #[cfg(test)]

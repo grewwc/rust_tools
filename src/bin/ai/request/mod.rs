@@ -7,6 +7,7 @@ mod error;
 mod image_digest;
 mod logging;
 mod normalize;
+mod prompt_feedback;
 mod protocol;
 mod reasoning;
 mod routing;
@@ -42,6 +43,7 @@ pub(in crate::ai) use logging::TransientStatusLine;
 pub(in crate::ai) use logging::emit_request_diagnostic;
 #[cfg(test)]
 pub(in crate::ai) use logging::request_diagnostics_enabled;
+pub(crate) use prompt_feedback::PromptTokenFeedback;
 pub(crate) use protocol::extract_response_text;
 #[cfg(test)]
 use protocol::responses_reasoning_replay_stats;

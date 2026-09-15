@@ -160,6 +160,13 @@ pub(in crate::ai) fn mid_turn_compress(
 ) -> (Vec<Message>, usize, usize) {
     let before = messages_total_chars(&messages);
     let messages = trim_compressed_tool_evidence_to_inline_budget(messages, overflow_dir);
+    // Re-bound the memory-increment window before this loop can append another
+    // record, so a long turn cannot grow the head past the cap plus the newest one.
+    let messages = trim_incremental_summary_notes_to_inline_budget(
+        messages,
+        overflow_dir,
+        MAX_INCREMENTAL_SUMMARY_INLINE_CHARS,
+    );
     let after_evidence_trim = messages_total_chars(&messages);
     if after_evidence_trim <= soft_threshold {
         return (messages, before, after_evidence_trim);
@@ -253,7 +260,7 @@ pub(in crate::ai) const PATH_C_PER_MSG_CAP: usize = 8_000;
 /// [`MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS`]. false does not mean the returned
 /// messages are unchanged; the hard-budget backstop may produce a partial decrease
 /// below the effective threshold. `llm_summary_inserted` says whether Path A
-/// actually ran and injected `[mid-turn-summary]`: false with `after < before`
+/// actually ran and injected a source-bound summary: false with `after < before`
 /// means the decrease came entirely from mechanical paths (fold/truncate/spill),
 /// letting the upper report distinguish "LLM summary executed" from "purely
 /// mechanical compaction" and avoid false reporting.
@@ -274,7 +281,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     // still in use.
     let mut best: Option<Vec<Message>> = None;
     let mut best_after = before;
-    // Whether Path A actually ran and injected [mid-turn-summary] (see the return
+    // Whether Path A actually ran and injected a summary increment (see the return
     // doc).
     let mut llm_summary_inserted = false;
 
@@ -292,7 +299,10 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     // old conversation span between them can be reclaimed by the LLM summary.
     let mut split_at = retained_turn_start(&messages, keep_recent_turns);
     if split_at == 0 {
-        if let Some(first_user) = messages.iter().position(|m| m.role == "user") {
+        if let Some(first_user) = messages
+            .iter()
+            .position(|m| m.role == "user" && !is_runtime_synthetic_user_message(m))
+        {
             if first_user > 0 {
                 split_at = first_user;
             }
@@ -319,20 +329,19 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
             .filter(|m| is_context_checkpoint_marker(m))
             .cloned()
             .collect();
-        let summary_source: Vec<Message> = earlier
-            .iter()
-            .filter(|m| !is_context_checkpoint_marker(m))
-            .cloned()
-            .collect();
         let has_dialog = earlier
             .iter()
             .any(|m| m.role == "user" || m.role == "assistant")
             || !checkpoint_markers.is_empty();
         if has_dialog {
-            let summary =
-                build_persisted_summary_text_with_app(app, &summary_source, summary_max_chars)
-                    .await;
-            if !summary.trim().is_empty() {
+            if let Some(summary_plan) = plan_incremental_summary_with_app(
+                app,
+                earlier,
+                summary_max_chars,
+                Some(overflow_dir.as_path()),
+            )
+            .await
+            {
                 let archive_file_path = overflow_dir.join(OVERFLOW_HISTORY_FILENAME);
                 let tail_plan = plan_early_tool_groups(
                     &messages[split_at..],
@@ -345,18 +354,16 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                 // 1. Leading system / internal_notes (agent instructions etc.)
                 //    kept verbatim
                 out.extend_from_slice(&messages[..preserved_system_end]);
-                // 2. The summary is injected as an internal_note
-                //    (normalize_messages_for_request classifies it as a Summary
-                //    heading and merges it into the system message)
-                out.push(Message {
-                    role: ROLE_INTERNAL_NOTE.to_string(),
-                    content: Value::String(format!(
-                        "[mid-turn-summary] 早期工具调用与对话已被 LLM 摘要：\n{summary}"
-                    )),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                });
+                // 2. Previous summaries remain byte-for-byte navigation context.
+                // The registered increment prefix projects as assistant-derived,
+                // never as a system fact. Only fresh input reaches the summarizer.
+                out.extend(
+                    earlier
+                        .iter()
+                        .filter(|m| is_summary_or_archive_note(m))
+                        .cloned(),
+                );
+                out.push(summary_plan.message().clone());
                 insert_archive_note_if_missing(
                     &mut out,
                     build_overflow_placeholder(&archive_file_path.to_string_lossy()),
@@ -381,6 +388,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                 // (only an idempotently hash-named fold file remains).
                 if after < best_after
                     && tail_plan.commit()
+                    && summary_plan.commit()
                     && archive_messages_to_overflow(earlier, Some(overflow_dir.as_path())).is_some()
                 {
                     best = Some(out);

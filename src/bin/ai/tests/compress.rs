@@ -4,16 +4,143 @@ use serde_json::Value;
 
 use super::super::{
     history::{
-        COLON, Message, NEWLINE, append_history, build_message_arr, compress_messages_for_context,
+        COLON, ContextCompressionStatus, Message, NEWLINE, append_history, build_message_arr,
+        compress_messages_for_context, compress_messages_for_context_with_outcome,
         messages_total_chars_pub,
     },
     types::{FunctionCall, ToolCall},
 };
 use super::*;
 
+struct CompressionTempDir(std::path::PathBuf);
+
+impl CompressionTempDir {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("ai-compression-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for CompressionTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn compression_message(role: &str, text: String) -> Message {
+    Message {
+        role: role.to_string(),
+        content: Value::String(text),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }
+}
+
+fn compression_dialogue(turns: usize, body_chars: usize) -> Vec<Message> {
+    let body = "x".repeat(body_chars);
+    (0..turns)
+        .flat_map(|i| {
+            [
+                compression_message("user", format!("QUESTION_{i:02} {body}")),
+                compression_message("assistant", format!("ANSWER_{i:02} {body}")),
+            ]
+        })
+        .collect()
+}
+
+fn assert_source_bound_summary(
+    compressed: &[Message],
+    original: &[Message],
+    overflow_dir: &std::path::Path,
+    initial_goal: &str,
+) -> Vec<Message> {
+    let summaries: Vec<_> = compressed
+        .iter()
+        .filter_map(|message| {
+            message
+                .content
+                .as_str()?
+                .strip_prefix("[incremental-memory-v1]\n")
+                .map(|json| (message, json))
+        })
+        .collect();
+    assert_eq!(summaries.len(), 1, "one removed span needs one increment");
+    let (message, json) = summaries[0];
+    assert_eq!(message.role, crate::ai::history::ROLE_INTERNAL_NOTE);
+    let record: Value = serde_json::from_str(json).expect("summary must be complete JSON");
+    assert_eq!(record["schema"], 1);
+    assert_eq!(record["provenance"], "assistant_derived_unverified");
+    assert_eq!(
+        record["source_scope"],
+        "compression_input_projection_not_claim_verification"
+    );
+    let entries = record["entries"].as_array().expect("summary entries");
+    assert!(
+        entries.iter().any(|entry| {
+            entry["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(initial_goal))
+        }),
+        "summary must preserve the initial goal: {record}"
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry["status"] == "derived_unverified")
+    );
+
+    let source = &record["source"];
+    assert_eq!(source["start_line"], 1);
+    assert_eq!(source["encoding"], "one_raw_message_json_per_line");
+    assert_eq!(source.get("source_model"), Some(&Value::Null));
+    let path = std::path::Path::new(source["archive_file_path"].as_str().unwrap());
+    assert!(path.starts_with(overflow_dir.join("summary-sources")));
+    assert_eq!(
+        path.file_stem().and_then(|stem| stem.to_str()),
+        source["sha256"].as_str()
+    );
+    let raw = std::fs::read_to_string(path).expect("source locator must be readable");
+    let restored: Vec<Message> = raw
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("complete source message"))
+        .collect();
+    assert!(
+        !restored.is_empty(),
+        "compression must archive an actual span"
+    );
+    assert!(
+        restored.len() < original.len(),
+        "recent dialogue must stay inline"
+    );
+    assert_eq!(source["end_line"].as_u64(), Some(restored.len() as u64));
+    assert_eq!(restored, original[..restored.len()]);
+    let expected_raw: String = original[..restored.len()]
+        .iter()
+        .map(|message| format!("{}\n", serde_json::to_string(message).unwrap()))
+        .collect();
+    assert_eq!(
+        raw, expected_raw,
+        "archive must preserve exact source bytes"
+    );
+    let inline: Vec<_> = compressed
+        .iter()
+        .filter(|message| message.role != crate::ai::history::ROLE_INTERNAL_NOTE)
+        .cloned()
+        .collect();
+    assert_eq!(
+        inline,
+        original[restored.len()..],
+        "source and inline tail must partition history without loss"
+    );
+    restored
+}
+
 #[test]
 fn history_compression_inserts_summary_and_keeps_recent() {
-    let path = std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
+    let dir = CompressionTempDir::new();
+    let path = dir.0.join("history.sqlite");
     let long = "x".repeat(220);
     let mut blob = String::new();
     for i in 0..10 {
@@ -23,35 +150,34 @@ fn history_compression_inserts_summary_and_keeps_recent() {
     append_history(&path, &blob).unwrap();
 
     let messages = build_message_arr(100, &path).unwrap();
-    let compressed = compress_messages_for_context(messages, 1800, 4, 200, None, None);
-
-    assert!(!compressed.is_empty());
-    assert_eq!(compressed[0].role, crate::ai::history::ROLE_INTERNAL_NOTE);
-    assert!(
-        compressed[0]
-            .content
-            .as_str()
-            .unwrap_or_default()
-            .contains("对话摘要")
+    // Source metadata needs more room than the legacy 200-character prose note.
+    // The larger cap still requires compression and retains all four recent turns.
+    let budget = 4_000;
+    assert!(messages_total_chars_pub(&messages) > budget);
+    let outcome = compress_messages_for_context_with_outcome(
+        messages.clone(),
+        budget,
+        4,
+        2_000,
+        Some(dir.0.clone()),
+        None,
     );
-    assert!(
-        compressed[0]
-            .content
-            .as_str()
-            .unwrap_or_default()
-            .contains("Main request: u0")
-    );
+    assert_eq!(outcome.status, ContextCompressionStatus::Complete);
+    assert_eq!(outcome.before_chars, messages_total_chars_pub(&messages));
     assert_eq!(
-        compressed.last().unwrap().content,
-        Value::String(format!("a9 {long}"))
+        outcome.after_chars,
+        messages_total_chars_pub(&outcome.messages)
     );
-    let total = compressed
-        .iter()
-        .map(|m| m.content.as_str().map(|s| s.chars().count()).unwrap_or(0))
-        .sum::<usize>();
-    assert!(total <= 1800);
-
-    let _ = std::fs::remove_file(path);
+    assert_eq!(outcome.max_chars, budget);
+    assert!(outcome.budget_met());
+    assert!(outcome.after_chars < outcome.before_chars);
+    let restored =
+        assert_source_bound_summary(&outcome.messages, &messages, &dir.0, "Main request: u0");
+    assert_eq!(restored, messages[..12]);
+    assert_eq!(
+        &outcome.messages[outcome.messages.len() - 8..],
+        &messages[12..]
+    );
 }
 
 #[test]
@@ -60,103 +186,87 @@ fn history_compression_summarizes_when_keep_last_exceeds_turns_but_budget_overfl
     // with a large `keep_last` (e.g. CLI default 256) but a much smaller
     // `max_chars` budget, the older-segment summary path was never taken,
     // and early user turns got silently dropped from the head of the list.
-    // The new shrink path must inject a summary note so at least a textual
-    // trace of the earliest user turns survives.
-    let path =
-        std::env::temp_dir().join(format!("ai-history-long-{}.sqlite", uuid::Uuid::new_v4()));
-    let long = "y".repeat(260);
+    // The shrink path must retain the initial goal and a readable source span.
+    let dir = CompressionTempDir::new();
+    let path = dir.0.join("history.sqlite");
+    let long = "y".repeat(10);
     let mut blob = String::new();
     for i in 0..30usize {
         blob.push_str(&format!("user{COLON}QUESTION_{i:02} {long}{NEWLINE}"));
-        blob.push_str(&format!("assistant{COLON}ANSWER_{i:02} {long}{NEWLINE}"));
+        let answer = if i == 0 { "y".repeat(5_000) } else { long.clone() };
+        blob.push_str(&format!("assistant{COLON}ANSWER_{i:02} {answer}{NEWLINE}"));
     }
     append_history(&path, &blob).unwrap();
 
     let messages = build_message_arr(300, &path).unwrap();
-    // keep_last=256 models the default configured history window; max_chars=4000
-    // is far smaller than the raw history size (30 turns * ~560 bytes ~= 17k).
-    let compressed = compress_messages_for_context(messages, 4000, 256, 600, None, None);
-
-    assert!(!compressed.is_empty());
+    // Removing the large first turn leaves room for both a complete source-bound
+    // summary and its archive pointer; uniform small turns can leave no headroom.
+    let budget = 4_000;
+    assert!(messages_total_chars_pub(&messages) > budget);
+    // Raise only the summary allowance: the source locator and provenance must
+    // fit alongside complete entries, while the original total cap stays strict.
+    let outcome = compress_messages_for_context_with_outcome(
+        messages.clone(),
+        budget,
+        256,
+        2_400,
+        Some(dir.0.clone()),
+        None,
+    );
+    assert_eq!(outcome.status, ContextCompressionStatus::Complete);
+    assert!(outcome.budget_met(), "{} > {budget}", outcome.after_chars);
+    assert_eq!(outcome.before_chars, messages_total_chars_pub(&messages));
     assert_eq!(
-        compressed[0].role,
-        crate::ai::history::ROLE_INTERNAL_NOTE,
-        "expected a synthesized summary at the head; got {:?}",
-        compressed[0].role
+        outcome.after_chars,
+        messages_total_chars_pub(&outcome.messages)
     );
-    let note_text = compressed[0]
-        .content
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    assert!(
-        note_text.contains("对话摘要"),
-        "summary header missing: {note_text:?}"
+    assert!(outcome.after_chars < outcome.before_chars);
+    assert_source_bound_summary(
+        &outcome.messages,
+        &messages,
+        &dir.0,
+        "Main request: QUESTION_00",
     );
-    assert!(
-        note_text.contains("Main request: QUESTION_00"),
-        "summary should preserve the initial goal, got: {note_text:?}"
-    );
-    // The summary should at least preserve a non-trivial textual trace of
-    // the dropped region (instead of silently losing it). The exact content
-    // depends on heuristic topic extraction; we only assert the summary body
-    // has some characters beyond the header.
-    let body_len = note_text
-        .trim_start_matches("对话摘要（自动压缩，以下为早期对话要点）：")
-        .trim()
-        .chars()
-        .count();
-    assert!(
-        body_len >= 10,
-        "summary body is essentially empty: {note_text:?}"
-    );
-
-    let total = compressed
-        .iter()
-        .map(|m| m.content.as_str().map(|s| s.len()).unwrap_or(0))
-        .sum::<usize>();
-    assert!(
-        total <= 4000,
-        "compressed payload must respect the byte budget, got {total}"
-    );
-
-    let _ = std::fs::remove_file(path);
+    assert!(outcome.messages.ends_with(&messages[messages.len() - 2..]));
 }
 
 #[test]
 fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context() {
-    let path =
-        std::env::temp_dir().join(format!("ai-overflow-test-{}.sqlite", uuid::Uuid::new_v4()));
-    let overflow_dir =
-        std::env::temp_dir().join(format!("ai-overflow-dir-{}", uuid::Uuid::new_v4()));
+    let dir = CompressionTempDir::new();
+    let path = dir.0.join("history.sqlite");
+    let overflow_dir = dir.0.join("overflow");
 
-    let long = "z".repeat(300);
+    let long = "z".repeat(10);
     let mut blob = String::new();
     for i in 0..20usize {
         blob.push_str(&format!("user{COLON}Q{i:02} {long}{NEWLINE}"));
-        blob.push_str(&format!("assistant{COLON}A{i:02} {long}{NEWLINE}"));
+        let answer = if i == 0 { "z".repeat(5_000) } else { long.clone() };
+        blob.push_str(&format!("assistant{COLON}A{i:02} {answer}{NEWLINE}"));
     }
     append_history(&path, &blob).unwrap();
 
     let messages = build_message_arr(100, &path).unwrap();
-    let compressed =
-        compress_messages_for_context(messages, 2000, 256, 400, Some(overflow_dir.clone()), None);
-
-    let first_msg = compressed.first().expect("should have messages");
+    // A dominant first turn leaves enough space after removal for the summary,
+    // the archive locator and an unchanged recent tail under the original cap.
+    let budget = 4_500;
+    assert!(messages_total_chars_pub(&messages) > budget);
+    let outcome = compress_messages_for_context_with_outcome(
+        messages.clone(),
+        budget,
+        256,
+        2_400,
+        Some(overflow_dir.clone()),
+        None,
+    );
+    assert_eq!(outcome.status, ContextCompressionStatus::Complete);
+    assert!(outcome.budget_met(), "{} > {budget}", outcome.after_chars);
     assert_eq!(
-        first_msg.role,
-        crate::ai::history::ROLE_INTERNAL_NOTE,
-        "first message should be an internal note with compressed long-term memory"
+        outcome.after_chars,
+        messages_total_chars_pub(&outcome.messages)
     );
-    let memory_text = first_msg.content.as_str().unwrap_or_default();
-    assert!(
-        memory_text.contains("长期记忆摘要"),
-        "first note should expose compressed memory, got: {memory_text:?}"
-    );
-    assert!(
-        memory_text.contains("Q00"),
-        "compressed memory should still expose the initial goal, got: {memory_text:?}"
-    );
+    assert!(outcome.after_chars < outcome.before_chars);
+    let compressed = &outcome.messages;
+    let restored = assert_source_bound_summary(compressed, &messages, &overflow_dir, "Q00");
     let archive_text = compressed
         .iter()
         .find_map(|m| {
@@ -176,6 +286,13 @@ fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context()
         overflow_file
     );
     let overflow_content = std::fs::read_to_string(&overflow_file).unwrap();
+    assert!(archive_text.contains(overflow_file.to_str().unwrap()));
+    for message in &restored {
+        assert!(
+            overflow_content.contains(message.content.as_str().unwrap()),
+            "overflow archive must preserve the full removed message"
+        );
+    }
     assert!(
         overflow_content.contains("Q00"),
         "overflow file should contain the earliest user question Q00, got first 200 chars: {:?}",
@@ -186,63 +303,222 @@ fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context()
         "overflow file should have the header"
     );
 
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_dir_all(&overflow_dir);
+    assert!(compressed.ends_with(&messages[messages.len() - 2..]));
 }
 
 #[test]
 fn overflow_flush_failure_restores_dropped_messages_without_data_loss() {
-    // Defect-1 regression: when archive flush fails, the messages pending deletion must be put back — never silently drop history.
-    let path =
-        std::env::temp_dir().join(format!("ai-overflow-fail-{}.sqlite", uuid::Uuid::new_v4()));
-    // Key: point overflow_dir at an **existing regular file**. Then OverflowSink::flush's
-    // create_dir_all(parent=file) fails, and OpenOptions.open(file/overflow-history.md)
-    // fails with ENOTDIR because a path component is a file → flush() necessarily returns false, deterministically triggering the failure-rollback path.
-    let overflow_dir =
-        std::env::temp_dir().join(format!("ai-overflow-failfile-{}", uuid::Uuid::new_v4()));
+    // A regular file in place of the directory fails deterministically, even
+    // with elevated privileges; permission-bit tests would not have that property.
+    let dir = CompressionTempDir::new();
+    let overflow_dir = dir.0.join("not-a-directory");
     std::fs::write(&overflow_dir, b"not a directory").unwrap();
-
-    let long = "z".repeat(300);
-    let mut blob = String::new();
-    for i in 0..20usize {
-        blob.push_str(&format!("user{COLON}Q{i:02} {long}{NEWLINE}"));
-        blob.push_str(&format!("assistant{COLON}A{i:02} {long}{NEWLINE}"));
+    let messages = compression_dialogue(30, 260);
+    let budget = 4_000;
+    let before = messages_total_chars_pub(&messages);
+    assert!(before > budget);
+    // Exercise both the initial older/recent split and the budget-only shrink
+    // path, with and without derived prose. All must fail closed on archive IO.
+    for keep_last in [0, 4, 256] {
+        for summary_max_chars in [0, 2_400] {
+            let outcome = compress_messages_for_context_with_outcome(
+                messages.clone(),
+                budget,
+                keep_last,
+                summary_max_chars,
+                Some(overflow_dir.clone()),
+                None,
+            );
+            assert_eq!(
+                outcome.status,
+                ContextCompressionStatus::ArchiveCommitFailed,
+                "keep_last={keep_last}, summary_max_chars={summary_max_chars}"
+            );
+            assert_eq!(
+                outcome.messages, messages,
+                "failed archival must preserve all roles, metadata and order without dangling notes"
+            );
+            assert_eq!(outcome.before_chars, before);
+            assert_eq!(outcome.after_chars, before);
+            assert_eq!(outcome.max_chars, budget);
+            assert!(!outcome.budget_met());
+        }
     }
-    append_history(&path, &blob).unwrap();
+    assert_eq!(std::fs::read(&overflow_dir).unwrap(), b"not a directory");
+}
 
-    let messages = build_message_arr(100, &path).unwrap();
-    let original_user_count = messages.iter().filter(|m| m.role == "user").count();
-    let compressed =
-        compress_messages_for_context(messages, 2000, 256, 400, Some(overflow_dir.clone()), None);
+#[test]
+fn history_compression_without_archive_sink_preserves_original_and_reports_status() {
+    let messages = compression_dialogue(30, 260);
+    let budget = 4_000;
+    let before = messages_total_chars_pub(&messages);
+    assert!(before > budget);
+    for keep_last in [0, 4, 256] {
+        for summary_max_chars in [0, 2_400] {
+            let outcome = compress_messages_for_context_with_outcome(
+                messages.clone(),
+                budget,
+                keep_last,
+                summary_max_chars,
+                None,
+                None,
+            );
+            assert_eq!(
+                outcome.status,
+                ContextCompressionStatus::MissingArchiveSink,
+                "keep_last={keep_last}, summary_max_chars={summary_max_chars}"
+            );
+            assert_eq!(
+                outcome.messages, messages,
+                "no sink must never authorize lossy prose or raw-message removal"
+            );
+            assert_eq!(outcome.before_chars, before);
+            assert_eq!(outcome.after_chars, before);
+            assert_eq!(outcome.max_chars, budget);
+            assert!(!outcome.budget_met());
+        }
+    }
+}
 
-    // flush failure → never delete history: all original user messages must still be in the return value (the old code silently dropped them).
-    let kept_user_count = compressed.iter().filter(|m| m.role == "user").count();
+#[test]
+fn history_compression_without_summary_archives_removed_dialogue_and_keeps_recent() {
+    let messages = compression_dialogue(30, 260);
+    let budget = 4_000;
+    assert!(messages_total_chars_pub(&messages) > budget);
+    for keep_last in [4, 256] {
+        let dir = CompressionTempDir::new();
+        let outcome = compress_messages_for_context_with_outcome(
+            messages.clone(),
+            budget,
+            keep_last,
+            0,
+            Some(dir.0.clone()),
+            None,
+        );
+        assert_eq!(outcome.status, ContextCompressionStatus::Complete);
+        // Budget-only shrinking selects raw turns before adding its pointer.
+        // With uniform small turns that pointer can exceed the remaining room;
+        // completion must report this, not discard protected content to hide it.
+        assert_eq!(outcome.budget_met(), keep_last == 4);
+        if !outcome.budget_met() {
+            assert!(outcome.diagnostic().unwrap().contains("budget_met=false"));
+        }
+        assert_eq!(outcome.before_chars, messages_total_chars_pub(&messages));
+        assert_eq!(
+            outcome.after_chars,
+            messages_total_chars_pub(&outcome.messages)
+        );
+        assert!(outcome.after_chars < outcome.before_chars);
+        assert!(outcome.messages.ends_with(&messages[messages.len() - 2..]));
+        let archive_path = dir.0.join("overflow-history.md");
+        let archive = std::fs::read_to_string(&archive_path)
+            .expect("zero-summary removal still needs an archive");
+        assert!(
+            outcome.messages.iter().any(|message| {
+                message.role == crate::ai::history::ROLE_INTERNAL_NOTE
+                    && message.content.as_str().is_some_and(|text| {
+                        text.contains(archive_path.to_str().unwrap()) && text.contains("read_file")
+                    })
+            }),
+            "context must retain a usable archive pointer"
+        );
+        assert!(
+            !dir.0.join("summary-sources").exists(),
+            "zero-summary mode must not synthesize a summary increment"
+        );
+        for message in &messages {
+            assert!(
+                outcome.messages.contains(message)
+                    || archive.contains(message.content.as_str().unwrap()),
+                "every original message must remain inline or readable from the archive"
+            );
+        }
+        assert!(
+            !outcome.messages.contains(&messages[0]),
+            "fixture must actually remove older dialogue"
+        );
+    }
+}
+
+#[test]
+fn history_compression_source_roundtrip_preserves_old_and_recent_tool_pairs() {
+    let dir = CompressionTempDir::new();
+    let mut messages = compression_dialogue(10, 500);
+    let (mut old_call, old_result) =
+        read_file_call_pair("call_old", "src/old.rs", "old exact output");
+    old_call.reasoning_content = Some("old source reasoning".to_string());
+    messages.splice(2..2, [old_call.clone(), old_result.clone()]);
+    let (recent_call, recent_result) =
+        read_file_call_pair("call_recent", "src/recent.rs", "recent exact output");
+    messages.splice(
+        messages.len() - 1..messages.len() - 1,
+        [recent_call.clone(), recent_result.clone()],
+    );
+    let budget = 8_000;
+    assert!(messages_total_chars_pub(&messages) > budget);
+    let outcome = compress_messages_for_context_with_outcome(
+        messages.clone(),
+        budget,
+        4,
+        2_400,
+        Some(dir.0.clone()),
+        None,
+    );
+    assert_eq!(outcome.status, ContextCompressionStatus::Complete);
+    assert!(outcome.budget_met());
     assert_eq!(
-        kept_user_count, original_user_count,
-        "flush 失败时不得丢任何 user 消息，期望 {original_user_count} 条，实得 {kept_user_count} 条"
+        outcome.after_chars,
+        messages_total_chars_pub(&outcome.messages)
     );
+    assert!(outcome.after_chars < outcome.before_chars);
+    let source = assert_source_bound_summary(
+        &outcome.messages,
+        &messages,
+        &dir.0,
+        "Main request: QUESTION_00",
+    );
+    assert!(
+        source
+            .windows(2)
+            .any(|pair| pair == [old_call.clone(), old_result.clone()])
+    );
+    assert!(
+        outcome
+            .messages
+            .windows(2)
+            .any(|pair| pair == [recent_call.clone(), recent_result.clone()])
+    );
+}
 
-    let joined: String = compressed
-        .iter()
-        .filter_map(|m| m.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        joined.contains("Q00"),
-        "最早的用户问题 Q00 必须被放回，不能丢失"
-    );
-    // The failure path must never inject summary/archive notes (avoiding dangling pointers to non-existent archive files).
-    assert!(
-        !joined.contains("长期记忆摘要"),
-        "flush 失败路径不得注入摘要 note"
-    );
-    assert!(
-        !joined.contains("长期记忆归档"),
-        "flush 失败路径不得注入归档指针 note"
-    );
-
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(&overflow_dir);
+#[test]
+fn history_compression_reports_disabled_and_no_eligible_dialogue_without_mutation() {
+    let dir = CompressionTempDir::new();
+    let messages = vec![
+        compression_message("system", "policy".repeat(1_000)),
+        compression_message("user", "latest question".to_string()),
+        compression_message("assistant", "latest answer".to_string()),
+    ];
+    let before = messages_total_chars_pub(&messages);
+    for (budget, status) in [
+        (0, ContextCompressionStatus::Disabled),
+        (4_000, ContextCompressionStatus::NoEligibleDialogue),
+    ] {
+        let outcome = compress_messages_for_context_with_outcome(
+            messages.clone(),
+            budget,
+            1,
+            2_400,
+            Some(dir.0.clone()),
+            None,
+        );
+        assert_eq!(outcome.status, status);
+        assert_eq!(outcome.messages, messages);
+        assert_eq!(outcome.before_chars, before);
+        assert_eq!(outcome.after_chars, before);
+        assert_eq!(outcome.max_chars, budget);
+        assert_eq!(outcome.budget_met(), budget == 0);
+    }
+    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
 }
 
 #[test]

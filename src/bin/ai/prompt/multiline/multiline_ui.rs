@@ -22,7 +22,7 @@ use ratatui::{
     backend::{Backend, ClearType as BackendClearType, CrosstermBackend},
     buffer::{Cell, CellDiffOption},
     layout::{Position, Rect, Size},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
 };
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthChar;
@@ -266,6 +266,16 @@ struct PromptScreen {
     /// Tail of the last model output, repainted above the box on the alternate
     /// screen (`PromptEditor::set_alternate_screen_tail`).
     tail: Vec<String>,
+    /// Width of every drawn box row, top row first, as the terminal saw it when
+    /// the row was written; empty means nothing has been recorded.
+    ///
+    /// A width reflow splits each screen row by its written content, so the rows
+    /// the re-wrap inserts above the box depend on how far each drawn row was
+    /// painted and not on the box width: rows the app never wrote (blank padding
+    /// rows inside the viewport) re-wrap into exactly one row. Widths accumulate
+    /// because the terminal keeps cells written by earlier frames, and
+    /// `prepare_viewport` drops the record whenever the box's rows are cleared.
+    box_row_widths: Vec<u16>,
 }
 
 impl PromptScreen {
@@ -316,6 +326,11 @@ impl PromptScreen {
         clear_existing_viewport: bool,
         previous_top_row: Option<u16>,
     ) -> io::Result<Rect> {
+        // Single funnel for the painted-row record: this call is about to clear
+        // the box's rows, so nothing on screen carries their widths forward.
+        if clear_existing_viewport {
+            self.box_row_widths.clear();
+        }
         let now = Instant::now();
         if !self.queries_disabled && self.replies_settled(now) {
             match prepare_anchored_viewport(
@@ -995,6 +1010,15 @@ fn rebuild_after_terminal_reflow(
         base_viewport_height,
         fitted_completion_items,
     );
+    // Read the painted row widths BEFORE the rebuild: it clears the box's rows
+    // and resets the record, so afterwards there is nothing left to derive the
+    // re-wrapped row count from.
+    let extra_rows = match last_drawn_area {
+        Some(previous_area) => {
+            reflowed_extra_rows(previous_area, &screen.box_row_widths, terminal_size.width)
+        }
+        None => 0,
+    };
     let rebuilt_area = rebuild_fixed_viewport(
         terminal,
         screen,
@@ -1008,7 +1032,7 @@ fn rebuild_after_terminal_reflow(
         last_drawn_area.map(|area| area.y),
         false,
     )?;
-    reclaim_reflowed_box_rows(terminal, screen, terminal_size, last_drawn_area, rebuilt_area)?;
+    reclaim_reflowed_box_rows(terminal, screen, extra_rows, rebuilt_area)?;
     park_reflow_anchor(terminal, rebuilt_area)?;
     Ok(rebuilt_area)
 }
@@ -1016,17 +1040,16 @@ fn rebuild_after_terminal_reflow(
 /// Reclaims the screen rows a narrowing resize pushed above the rebuilt box.
 ///
 /// A terminal re-wraps its screen on a width change: every line whose written
-/// content is wider than the new width is split into `ceil(len / cols)` rows
+/// content is wider than the new width is split into `ceil(written / cols)` rows
 /// (xterm.js `Buffer._reflowSmaller` -> `reflowSmallerGetNewLineLengths`). The
-/// drawn box rows are content-filled to the box width, so narrowing turns the
-/// box into `drawn_height * ceil(drawn_width / new_width)` rows on screen: its
-/// bottom row keeps its screen row, while the top moves UP by the difference.
-/// Recovering the top from the drawn height alone (`bottom - (height - 1)`) puts
-/// the rebuilt viewport at the bottom of that range, so the extra rows sit
-/// between the transcript and the box, holding the box's own re-wrapped text
-/// that nothing overwrites again. Blanking them removes the duplicate text but
-/// leaves the same number of empty rows in the middle of the screen, because
-/// the transcript tail those rows displaced stays where the reflow left it.
+/// drawn box rows hold content up to the furthest column the app actually wrote
+/// (`box_row_widths` — a blank padding row re-wraps into ONE row, not into
+/// `ceil(box_width / new_width)`), so `extra_rows` rows of the box's own
+/// re-wrapped text end up between the transcript and the rebuilt top, where the
+/// rebuild's clear no longer reaches them. Blanking them removes the duplicate
+/// text but leaves the same number of empty rows in the middle of the screen,
+/// because the transcript tail those rows displaced stays where the reflow left
+/// it.
 ///
 /// The screen is scrolled DOWN by that many rows instead: the transcript tail
 /// moves back against the rebuilt box and the empty rows land at the TOP of the
@@ -1034,79 +1057,224 @@ fn rebuild_after_terminal_reflow(
 /// scrolls them away. `CSI Ps T` drops the bottom `Ps` rows, which are the
 /// viewport rows the rebuild is about to repaint, so nothing else is lost.
 ///
+/// The scroll runs AFTER the rebuild cleared the box area, so the rows it pulls
+/// down from above land on cells that clear can no longer protect: the box area
+/// is cleared a second time right after the scroll, otherwise those fragments
+/// stay visible on the rows the next frame leaves blank.
+///
 /// Widening re-wraps nothing (xterm.js `reflowLarger` only joins lines that were
-/// continued by auto-wrap), so the count is zero there and this is a no-op.
+/// continued by auto-wrap), so `extra_rows` is zero there and this is a no-op.
 fn reclaim_reflowed_box_rows(
     terminal: &mut MultilineTerminal,
     screen: &PromptScreen,
-    terminal_size: Size,
-    last_drawn_area: Option<Rect>,
+    extra_rows: u16,
     rebuilt_area: Rect,
 ) -> io::Result<()> {
-    // The alternate screen has no width reflow, and without a drawn box there is
-    // nothing on screen that a reflow could have re-wrapped.
-    let Some(previous_area) = last_drawn_area else {
-        return Ok(());
-    };
+    // The alternate screen has no width reflow; a caller without a drawn box
+    // passes zero extra rows.
     if screen.alternate {
         return Ok(());
     }
-    let reflowed_top = reflowed_box_top(previous_area, terminal_size.width, rebuilt_area);
-    let reclaim = rebuilt_area.y.saturating_sub(reflowed_top);
-    if reclaim > 0 {
-        // Anything drawn before the scroll must reach the terminal first.
-        terminal.backend_mut().flush()?;
-        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::ScrollDown(reclaim))?;
+    // Never scroll more rows than exist above the box's top: the box can sit near
+    // the top of the screen, where the reflow estimate is larger than the number
+    // of rows available above it.
+    let reclaim = extra_rows.min(rebuilt_area.y);
+    if reclaim == 0 {
+        return Ok(());
     }
+    // Anything drawn before the scroll must reach the terminal first.
+    terminal.backend_mut().flush()?;
+    crossterm::execute!(terminal.backend_mut(), crossterm::terminal::ScrollDown(reclaim))?;
+    terminal.backend_mut().flush()?;
+    // The scroll moved the re-wrapped rows that sat above the box down INTO the
+    // box area, which the rebuild cleared before the scroll; wipe it again so the
+    // dragged-in rows cannot survive on cells the next frame leaves blank.
+    clear_fixed_viewport(terminal, Some(rebuilt_area.y))?;
     Ok(())
 }
 
-/// Top row a drawn box occupies on screen after a width reflow.
+/// Rows the drawn box gains above its own top when the terminal re-wraps it at
+/// `new_width`.
 ///
-/// `rebuilt_area` is the viewport the rebuild recovered from the parked anchor,
-/// i.e. the box at its old height anchored to the row that anchor still reports
-/// — the re-wrapped box's bottom row.
-fn reflowed_box_top(previous_area: Rect, new_width: u16, rebuilt_area: Rect) -> u16 {
-    let rows_per_row = previous_area.width.max(1).div_ceil(new_width.max(1)).max(1);
-    let reflowed_rows = previous_area.height.max(1).saturating_mul(rows_per_row);
-    rebuilt_area
-        .y
-        .saturating_add(rebuilt_area.height)
-        .saturating_sub(reflowed_rows)
+/// Every drawn row re-wraps into `ceil(painted_width / new_width)` rows, where
+/// `painted_width` is how far the app actually wrote into that row
+/// (`box_row_widths`) — a row the app never wrote stays exactly one row. The
+/// bottom row is the exception: the parked anchor keeps its screen row, so the
+/// rows its trailing part re-wraps into sit at or below the box's bottom row and
+/// are not rows above the box.
+///
+/// The rows above the box's top are therefore
+/// `sum(rows) - last_row_rows - (height - 1)`: the drawn rows above the bottom
+/// one re-wrap into `sum(rows) - last`, the box keeps `height - 1` of those as
+/// its own body, and everything left over was inserted above its top.
+fn reflowed_extra_rows(previous_area: Rect, row_widths: &[u16], new_width: u16) -> u16 {
+    // A row cannot be painted wider than the box it was drawn in, so nothing can
+    // re-wrap once the box fits; a zero width would also divide by zero.
+    if new_width == 0 || previous_area.width <= new_width {
+        return 0;
+    }
+    let mut reflowed = 0u16;
+    for index in 0..previous_area.height {
+        // An unknown row (never recorded, or blank) re-wraps into one row.
+        let width = row_widths.get(index as usize).copied().unwrap_or(0);
+        reflowed = reflowed.saturating_add(width.div_ceil(new_width).max(1));
+    }
+    let last = row_widths
+        .get(previous_area.height.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or(0)
+        .div_ceil(new_width)
+        .max(1);
+    // Saturating: a 65535-row box whose rows nearly all re-wrap must not wrap the
+    // counter around into a huge reclaim.
+    reflowed.saturating_sub(previous_area.height.saturating_add(last).saturating_sub(1))
+}
+
+/// Width of each box row as the terminal sees it: the furthest column the frame
+/// wrote in that row, counted from `area.left()`.
+///
+/// `full_repaint` (`force_frame_repaint`) writes every cell of the row, so the
+/// row counts as the full area width. Otherwise the furthest cell that counts as
+/// written wins — a symbol other than a space, or any non-default style
+/// attribute. Styled blank cells count: the backend emits them and the terminal
+/// extends the line's used length with them, so the write boundary rather than
+/// the last visible glyph is what re-wraps. A row the app never wrote stays 0,
+/// which `reflowed_extra_rows` treats as a single row.
+fn painted_row_widths(
+    buffer: &ratatui::buffer::Buffer,
+    area: Rect,
+    full_repaint: bool,
+) -> Vec<u16> {
+    let mut widths = Vec::with_capacity(area.height as usize);
+    for y in area.top()..area.bottom() {
+        if full_repaint {
+            widths.push(area.width);
+            continue;
+        }
+        let mut width = 0;
+        for x in (area.left()..area.right()).rev() {
+            let Some(cell) = buffer.cell((x, y)) else {
+                continue;
+            };
+            let written = cell.symbol() != " "
+                || cell.fg != Color::Reset
+                || cell.bg != Color::Reset
+                || cell.modifier != Modifier::empty();
+            if written {
+                width = x.saturating_sub(area.left()).saturating_add(1);
+                break;
+            }
+        }
+        widths.push(width);
+    }
+    widths
 }
 
 #[cfg(test)]
 mod width_reflow_geometry_tests {
     use super::*;
 
-    /// Numbers measured against xterm.js 5.x: a 5-row box drawn at width 40 and
-    /// narrowed to width 20 is re-wrapped into 10 rows whose bottom row keeps its
-    /// screen row (11) while the top moves up to row 2 — five rows above the top
-    /// a height-only recovery computes (7), exactly the rows this reclaims.
+    /// A narrowing resize reclaims the rows the terminal inserted above the box.
+    ///
+    /// A 5-row box drawn at width 40 with every row painted to the full width
+    /// re-wraps at width 20 into two screen rows per drawn row: 10 rows in total,
+    /// of which the bottom drawn row's second row stays below the parked anchor,
+    /// leaving `4 * 2 - 4 = 4` rows above the box (measured against xterm.js 5.x,
+    /// where that box occupies rows 2..11 and the rebuild recovers a 5-row
+    /// viewport anchored on row 11).
     #[test]
-    fn narrowing_reflow_extends_the_box_upwards_by_the_wrapped_rows() {
+    fn narrowing_reflow_reclaims_the_rows_inserted_above_the_box() {
         let previous_area = Rect::new(0, 7, 40, 5);
-        let rebuilt_area = Rect::new(0, 7, 20, 5);
-        assert_eq!(reflowed_box_top(previous_area, 20, rebuilt_area), 2);
-    }
-
-    /// The rows to reclaim are the ones the re-wrap inserted: the re-wrapped box
-    /// is 10 rows tall and the rebuild recovered a 5-row viewport, so five rows
-    /// separate the recovered top (7) from the re-wrapped top (2).
-    #[test]
-    fn narrowing_reflow_reclaims_exactly_the_inserted_rows() {
-        let previous_area = Rect::new(0, 7, 40, 5);
-        let rebuilt_area = Rect::new(0, 7, 20, 5);
-        let reflowed_top = reflowed_box_top(previous_area, 20, rebuilt_area);
-        assert_eq!(rebuilt_area.y.saturating_sub(reflowed_top), 5);
+        assert_eq!(reflowed_extra_rows(previous_area, &[40; 5], 20), 4);
     }
 
     /// Widening re-wraps nothing, so the box keeps the top the rebuild recovered.
     #[test]
-    fn widening_reflow_leaves_the_recovered_top_alone() {
+    fn widening_reflow_reclaims_nothing() {
         let previous_area = Rect::new(0, 3, 20, 5);
-        let rebuilt_area = Rect::new(0, 3, 40, 5);
-        assert_eq!(reflowed_box_top(previous_area, 40, rebuilt_area), 3);
+        assert_eq!(reflowed_extra_rows(previous_area, &[20; 5], 40), 0);
+    }
+
+    /// A height-only change keeps the width, so no drawn row can have been split.
+    #[test]
+    fn height_only_change_reclaims_nothing() {
+        let previous_area = Rect::new(0, 3, 40, 5);
+        assert_eq!(reflowed_extra_rows(previous_area, &[40; 5], 40), 0);
+    }
+
+    /// Rows the app never wrote are blank on screen and re-wrap into ONE row.
+    ///
+    /// Measured in xterm.js 5.x: 6 drawn rows — 3 content rows 40 columns wide
+    /// plus 3 blank padding rows — narrowed from 40 to 20 columns occupy 9 screen
+    /// rows, i.e. only 3 rows above the drawn top, while a per-drawn-row estimate
+    /// (`ceil(box_width / new_width)`) promises 6 and scrolls real transcript into
+    /// the box. The content rows above the blank bottom row insert
+    /// `9 - 1 - 5 = 3` rows above the box.
+    #[test]
+    fn blank_padding_rows_reclaim_only_the_content_rows() {
+        let previous_area = Rect::new(0, 7, 40, 6);
+        assert_eq!(
+            reflowed_extra_rows(previous_area, &[40, 40, 40, 0, 0, 0], 20),
+            3
+        );
+        // The 3 content rows alone re-wrap into 6 rows, two per drawn row, so the
+        // rows above the bottom one insert `4 - 2 = 2` rows above the box.
+        assert_eq!(
+            reflowed_extra_rows(Rect::new(0, 7, 40, 3), &[40, 40, 40], 20),
+            2
+        );
+    }
+
+    /// An unknown record must not over-scroll: every drawn row is then assumed to
+    /// be a single re-wrapped row, which is what the box of blank rows already is.
+    #[test]
+    fn unknown_row_widths_reclaim_nothing() {
+        let previous_area = Rect::new(0, 5, 40, 5);
+        assert_eq!(reflowed_extra_rows(previous_area, &[], 20), 0);
+    }
+
+    /// The bottom drawn row's trailing rows sit at or below the parked anchor row,
+    /// so they are not rows above the box and must not be reclaimed: counting
+    /// them would scroll one row too far on every narrowing reflow.
+    #[test]
+    fn bottom_row_trailing_rows_are_not_reclaimed() {
+        let previous_area = Rect::new(0, 7, 40, 5);
+        let widths = [40; 5];
+        let reflowed_rows = 10; // 5 drawn rows at 40 columns -> 2 screen rows each
+        let last = 2; // the bottom drawn row itself re-wraps into 2 screen rows
+        let rows_above_bottom_row = reflowed_rows - last;
+        assert_eq!(
+            reflowed_extra_rows(previous_area, &widths, 20),
+            rows_above_bottom_row - (previous_area.height - 1)
+        );
+        assert_eq!(reflowed_extra_rows(previous_area, &widths, 20), 4);
+    }
+
+    /// The caller clamps the count to the rows above the box's top, so a box near
+    /// the top of the screen cannot shift the whole screen down.
+    #[test]
+    fn reclaim_never_exceeds_the_rows_above_the_box() {
+        let extra_rows = reflowed_extra_rows(Rect::new(0, 7, 40, 5), &[40; 5], 20);
+        assert_eq!(extra_rows, 4);
+        let rebuilt_area = Rect::new(0, 2, 20, 5);
+        assert_eq!(extra_rows.min(rebuilt_area.y), 2);
+    }
+
+    /// `painted_row_widths` reports where the frame stopped writing: text, a
+    /// styled blank cell and a forced repaint all count, blank padding does not.
+    #[test]
+    fn painted_row_widths_follow_the_furthest_written_column() {
+        use ratatui::buffer::Buffer;
+
+        let area = Rect::new(0, 0, 10, 4);
+        let mut buffer = Buffer::empty(area);
+        buffer[(2, 0)].set_symbol("x");
+        // Row 1 is never written: its cells stay blank.
+        // Row 2 holds only a space, but a styled one, which the backend emits.
+        buffer[(4, 2)].set_style(Style::default().fg(Color::Red));
+        assert_eq!(painted_row_widths(&buffer, area, false), vec![3, 0, 5, 0]);
+        // A forced repaint writes every cell of every row, so every row is full.
+        assert_eq!(painted_row_widths(&buffer, area, true), vec![10; 4]);
     }
 }
 
@@ -1294,6 +1462,7 @@ impl PromptEditor {
             queries_disabled: self.cursor_position_queries_disabled,
             pending_cpr_replies: self.pending_cpr_replies.clone(),
             tail: self.alternate_tail_lines.clone(),
+            box_row_widths: Vec::new(),
             ..PromptScreen::default()
         };
         let (mut terminal, anchored_terminal_size) =
@@ -1439,6 +1608,7 @@ impl PromptEditor {
 
                     let force_repaint = force_repaint_next_frame;
                     let mut drawn_viewport_area = Rect::ZERO;
+                    let mut drawn_row_widths: Vec<u16> = Vec::new();
                     // The visible editing caret is drawn into the buffer (see
                     // render.rs), so it cannot jump mid-draw. The hardware
                     // cursor is hidden while ratatui applies the frame diff and
@@ -1461,8 +1631,19 @@ impl PromptEditor {
                             if force_repaint {
                                 force_frame_repaint(f);
                             }
+                            drawn_row_widths =
+                                painted_row_widths(f.buffer_mut(), area, force_repaint);
                         })
                         .map_err(|e| io::Error::other(e.to_string()))?;
+                    // Accumulate, never shrink: the terminal keeps cells written
+                    // by earlier frames, so the widest row content seen since the
+                    // rows were last erased is what re-wraps.
+                    if screen.box_row_widths.len() < drawn_row_widths.len() {
+                        screen.box_row_widths.resize(drawn_row_widths.len(), 0);
+                    }
+                    for (slot, width) in screen.box_row_widths.iter_mut().zip(&drawn_row_widths) {
+                        *slot = (*slot).max(*width);
+                    }
                     park_reflow_anchor(&mut terminal, drawn_viewport_area)?;
                     self.notify_first_render();
                     force_repaint_next_frame = false;

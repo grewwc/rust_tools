@@ -41,6 +41,8 @@ pub enum DecisionType {
     DegenerateRepetitionStop,
     /// Root-cause record for a runtime-forced no-tool handoff
     RuntimeStop,
+    /// Content-free request projection sizes and provider outcome for offline replay
+    ContextProjection,
 }
 
 /// Decision record
@@ -89,6 +91,8 @@ pub enum UserFeedback {
 /// Decision log store
 pub struct DecisionLogStore {
     logs: Arc<Mutex<Vec<DecisionLog>>>,
+    // Observation must never evict decisions or consume their feedback targets.
+    context_logs: Arc<Mutex<Vec<DecisionLog>>>,
     max_capacity: usize,
     persist_path: Arc<Mutex<Option<PathBuf>>>,
 }
@@ -97,6 +101,7 @@ impl DecisionLogStore {
     pub fn new(max_capacity: usize) -> Self {
         Self {
             logs: Arc::new(Mutex::new(Vec::with_capacity(max_capacity))),
+            context_logs: Arc::new(Mutex::new(Vec::with_capacity(max_capacity))),
             max_capacity,
             persist_path: Arc::new(Mutex::new(None)),
         }
@@ -119,6 +124,12 @@ impl DecisionLogStore {
         };
         let Some(path) = path else {
             return;
+        };
+        // Independent disk retention prevents telemetry from compacting away decisions.
+        let path = if log.decision_type == DecisionType::ContextProjection {
+            path.with_extension("context.jsonl")
+        } else {
+            path
         };
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -182,14 +193,20 @@ impl DecisionLogStore {
 
     /// Record a decision
     pub fn log(&self, mut log: DecisionLog) {
-        let mut logs = self.logs.lock().unwrap();
+        let context_projection = log.decision_type == DecisionType::ContextProjection;
+        let buffer = if context_projection { &self.context_logs } else { &self.logs };
+        let mut logs = buffer.lock().unwrap();
 
         // Set the timestamp
         log.timestamp = Local::now().timestamp_millis();
 
         // If over capacity, drop the oldest 10%
         if logs.len() >= self.max_capacity {
-            let remove_count = self.max_capacity / 10;
+            let remove_count = if context_projection {
+                (self.max_capacity / 10).max(1).min(logs.len())
+            } else {
+                self.max_capacity / 10
+            };
             logs.drain(0..remove_count);
         }
 
@@ -243,7 +260,12 @@ impl DecisionLogStore {
 
     /// Filter log entries by type
     pub fn by_type(&self, decision_type: &DecisionType) -> Vec<DecisionLog> {
-        let logs = self.logs.lock().unwrap();
+        let buffer = if *decision_type == DecisionType::ContextProjection {
+            &self.context_logs
+        } else {
+            &self.logs
+        };
+        let logs = buffer.lock().unwrap();
         logs.iter()
             .filter(|log| &log.decision_type == decision_type)
             .cloned()
@@ -315,7 +337,6 @@ impl DecisionLogStore {
     /// Statistics
     pub fn stats(&self) -> DecisionStats {
         let logs = self.logs.lock().unwrap();
-
         let total = logs.len();
         let successes = logs
             .iter()
@@ -370,6 +391,7 @@ impl DecisionLogStore {
     pub fn clear(&self) {
         let mut logs = self.logs.lock().unwrap();
         logs.clear();
+        self.context_logs.lock().unwrap().clear();
     }
 }
 

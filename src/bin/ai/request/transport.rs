@@ -18,7 +18,7 @@ use super::super::{
 use crate::ai::theme::{self, RESET};
 
 use super::aux::charge_llm_usage_to_kernel;
-use super::builder::build_request_body;
+use super::builder::{build_request_body, clamp_with_estimated_prompt};
 use super::error::{
     REQUEST_MAX_ATTEMPTS, RequestError, RequestErrorKind, RequestRetryPolicy,
     STREAM_RESPONSE_HEADER_TIMEOUT_SECS, api_key_for_request_model, apply_request_auth,
@@ -31,6 +31,7 @@ use super::normalize::{
     agent_tools_for_request, fold_resolved_tool_failures, normalize_messages_for_model,
     request_tool_names_for_model, strip_unavailable_tool_hints_from_messages,
 };
+use super::prompt_feedback::PromptTokenFeedback;
 use super::reasoning::{
     apply_prompt_cache_breakpoint, apply_thinking_force_off_effort,
     normalize_reasoning_content_replay_for_model, prompt_cache_enabled_for_model,
@@ -275,15 +276,9 @@ async fn request_messages_with_key(
     request_body: &mut RequestBody<'_>,
     retry_policy: &RequestRetryPolicy,
     endpoint: &str,
+    estimated_prompt_tokens: usize,
 ) -> Result<Response, RequestError> {
     let http_body = super::protocol::build_http_body_for_request(model, endpoint, request_body);
-    // Reuse the character estimate already computed inside build_request_body (same RequestBody),
-    // avoiding another full traversal of the same history plus re-serializing tool schemas.
-    let estimated_prompt_tokens = token_budget::calibrate_prompt_tokens_for_budget(
-        request_body.estimated_prompt_tokens,
-        app.last_known_prompt_tokens,
-        app.last_known_cached_prompt_tokens,
-    );
     for attempt in 1..=retry_policy.max_attempts {
         let client = app.client.clone();
         let build_request = || {
@@ -462,6 +457,10 @@ async fn do_request_messages_with_tool_mode(
     tools_enabled: bool,
 ) -> Result<Response, RequestError> {
     clear_stale_request_interrupt_before_request(app);
+    // Take feedback before any await: failed/cancelled requests must not leave
+    // an older pending request available for an unrelated response to fill.
+    let previous_prompt = app.last_known_prompt_tokens.take();
+    let previous_cached = app.last_known_cached_prompt_tokens.take();
 
     let mut normalized_messages = normalize_messages_for_model(model, messages);
     if let Ok(outcomes) =
@@ -556,9 +555,21 @@ async fn do_request_messages_with_tool_mode(
         tool_choice,
         reasoning_effort,
         app.cli.max_tokens_override,
-        app.last_known_prompt_tokens,
+        None,
         Some(&turn_reasoning_items),
     );
+    let mut prompt_feedback =
+        PromptTokenFeedback::capture(&app.session_id, model, &endpoint, &request_body);
+    let context_prompt_tokens = prompt_feedback.context_prompt_tokens(previous_prompt.as_ref());
+    // Calibrate only at the actual request boundary. Auxiliary builders have no
+    // request-scoped observation and use their own raw estimate. An adaptive
+    // output override may lower this cap but cannot defeat the context clamp.
+    request_body.max_tokens = models::max_output_tokens(model).map(|model_max| {
+        let cap = clamp_with_estimated_prompt(model, context_prompt_tokens, model_max);
+        app.cli
+            .max_tokens_override
+            .map_or(cap, |value| cap.min(value))
+    });
     let retry_policy = request_retry_policy_for_current_context();
 
     // --- Key rotation + 429 backoff ---
@@ -591,10 +602,22 @@ async fn do_request_messages_with_tool_mode(
                 &mut request_body,
                 &retry_policy,
                 &endpoint,
+                token_budget::tpm_prompt_tokens(
+                    context_prompt_tokens,
+                    prompt_feedback.reusable_cached_tokens(
+                        previous_prompt.as_ref(),
+                        previous_cached,
+                        api_key,
+                    ),
+                ),
             )
             .await
             {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    prompt_feedback.mark_sent_with_key(api_key);
+                    app.last_known_prompt_tokens = Some(prompt_feedback);
+                    return Ok(response);
+                }
                 Err(err) if should_rotate_key(&err) => {
                     if err.is_rate_limited() {
                         round_retry_after = err.retry_after.or(round_retry_after);
@@ -734,11 +757,9 @@ pub async fn do_request_json(
             &endpoint,
             &request_model,
             api_key,
-            token_budget::calibrate_prompt_tokens_for_budget(
-                token_budget::estimate_serialized_request_tokens(&request_body),
-                app.last_known_prompt_tokens,
-                app.last_known_cached_prompt_tokens,
-            ),
+            // Auxiliary JSON requests have a different prompt and cannot reuse
+            // the foreground request's usage or cache hit observation.
+            token_budget::estimate_serialized_request_tokens(&request_body),
             1,
         )
         .await

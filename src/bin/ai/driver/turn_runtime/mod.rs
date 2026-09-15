@@ -22,6 +22,7 @@
 
 mod context_budget;
 mod context_memory;
+mod context_metrics;
 mod debug;
 mod finalize;
 mod iteration;

@@ -133,42 +133,51 @@ fn tpm_budget_reservation_charges_physical_sends_without_extra_multiplier() {
 }
 
 #[test]
-fn tpm_budget_calibrates_overestimated_char_count_with_server_prompt_usage() {
-    // Character estimation often overestimates tokens for English code/schema;
-    // the server's previous-round usage can pull the budget back into the
-    // realistic range.
+fn tpm_budget_uses_current_request_estimate_without_unscoped_usage() {
+    assert_eq!(token_budget::tpm_prompt_tokens(46_342, None), 46_342);
+    assert_eq!(token_budget::tpm_prompt_tokens(25_875, None), 25_875);
+    assert_eq!(token_budget::tpm_prompt_tokens(0, None), 1);
+}
+
+#[test]
+fn tpm_budget_discounts_only_validated_cache_tokens_and_saturates() {
+    // Prefix and API-key compatibility are enforced before this arithmetic.
+    assert_eq!(token_budget::tpm_prompt_tokens(81_370, Some(77_184)), 4_186);
+    assert_eq!(token_budget::tpm_prompt_tokens(40_000, Some(77_184)), 1);
     assert_eq!(
-        token_budget::calibrate_prompt_tokens_for_budget(46_342, Some(25_875), None),
-        25_875
-    );
-    // But when known is too low, keep half the character estimate as a floor,
-    // avoiding underestimation after this round adds large tool results.
-    assert_eq!(
-        token_budget::calibrate_prompt_tokens_for_budget(46_342, Some(10_000), None),
-        23_171
-    );
-    // An overly high known usually comes from a stale pre-compression value;
-    // rate limiting must not keep waiting on that old high value.
-    assert_eq!(
-        token_budget::calibrate_prompt_tokens_for_budget(46_342, Some(120_000), None),
-        46_342
+        token_budget::tpm_prompt_tokens(usize::MAX, None),
+        usize::MAX
     );
 }
 
 #[test]
-fn tpm_budget_discount_cached_prompt_tokens_from_previous_request() {
-    // Of the previous round's 77,370 prompt tokens, 77,184 hit the cache; this
-    // round's budget should mostly count the newly added tail.
-    assert_eq!(
-        token_budget::calibrate_prompt_tokens_for_budget(81_370, Some(77_370), Some(77_184)),
-        4_186
+fn prompt_feedback_app_forks_do_not_inherit_usage_or_pending_requests() {
+    let mut app = test_app();
+    let model = crate::ai::model_names::all()
+        .first()
+        .expect("registry must contain a model")
+        .key
+        .clone();
+    let messages = Vec::new();
+    let body = build_request_body(
+        &model, &messages, true, false, None, None, None, None, None, None, None,
     );
-    // If the current estimate is shorter than the previous round, keep at least
-    // the previous round's uncached part instead of estimating 0.
-    assert_eq!(
-        token_budget::calibrate_prompt_tokens_for_budget(40_000, Some(77_370), Some(77_184)),
-        186
-    );
+    app.last_known_prompt_tokens = Some(PromptTokenFeedback::capture(
+        &app.session_id,
+        &model,
+        "https://example.invalid",
+        &body,
+    ));
+    app.last_known_cached_prompt_tokens = Some(100);
+    for fork in [
+        app.fork_for_subagent(),
+        app.snapshot_for_driver_context(),
+        app.snapshot_for_detached_helper(),
+    ] {
+        assert!(fork.last_known_prompt_tokens.is_none());
+        assert!(fork.last_known_cached_prompt_tokens.is_none());
+    }
+    assert!(app.last_known_prompt_tokens.is_some());
 }
 
 #[test]
@@ -820,20 +829,17 @@ fn expected_max_tokens_field(model: &str, messages: &[Message]) -> String {
     }
 }
 
-/// Regression: after history compression, `known_prompt_tokens` (the high value
-/// the server backfilled last round) must not outweigh this round's actual
-/// message volume. Otherwise clamp assumes the prompt still fills the window,
-/// remaining bottoms out at MIN_OUTPUT_TOKENS_FLOOR, the always-thinking model's
-/// output budget is eaten by reasoning → an infinite retry loop of
-/// zero-visible-text truncation.
+/// The clamp consumes a validated current-request count. Compression rejection
+/// belongs to prompt_feedback, before any observed count reaches this function.
 #[test]
-fn clamp_ignores_stale_high_known_prompt_after_compression() {
-    let model = "glm-5.2-opencode";
-    let Some(model_max) = super::super::models::max_output_tokens(model) else {
-        return;
-    };
-    // This round's messages are short (post-compression); the character estimate
-    // is ~single-digit tokens.
+fn prompt_feedback_clamp_preserves_current_count_without_truncating_overflow() {
+    let model = crate::ai::model_names::all()
+        .iter()
+        .find(|entry| models::max_output_tokens(&entry.key).is_some())
+        .expect("registry must contain an output cap")
+        .key
+        .clone();
+    let model_max = models::max_output_tokens(&model).unwrap();
     let messages = vec![Message {
         role: "user".to_string(),
         content: Value::String("short message after compression".to_string()),
@@ -842,18 +848,14 @@ fn clamp_ignores_stale_high_known_prompt_after_compression() {
         reasoning_content: None,
     }];
 
-    // The stale high known (~full window pre-compression) must not bottom out.
-    let stale_high = clamp_max_tokens_for_prompt(model, &messages, None, model_max, Some(259_000));
-    assert!(
-        stale_high > MIN_OUTPUT_TOKENS_FLOOR,
-        "stale-high known_prompt_tokens should not clamp output to the floor, got {stale_high}"
+    assert_eq!(
+        clamp_max_tokens_for_prompt(&model, &messages, None, model_max, Some(u64::MAX)),
+        MIN_OUTPUT_TOKENS_FLOOR
     );
-
-    // A reasonable known (same order of magnitude as this round's estimate) is
-    // still adopted: the result stays close to passing no known at all.
-    let fresh = clamp_max_tokens_for_prompt(model, &messages, None, model_max, Some(20));
-    let no_known = clamp_max_tokens_for_prompt(model, &messages, None, model_max, None);
-    assert_eq!(fresh, no_known);
+    assert_eq!(
+        clamp_max_tokens_for_prompt(&model, &messages, None, model_max, None),
+        model_max
+    );
 }
 
 #[test]

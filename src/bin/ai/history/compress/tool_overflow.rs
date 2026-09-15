@@ -23,7 +23,7 @@ use super::super::types::{Message, ROLE_INTERNAL_NOTE, is_system_like_role, reta
 use super::text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
 use super::tool_groups::{recent_tool_group_message_indices, recent_tool_result_groups};
 use super::{
-    COMPRESSED_TOOL_EVIDENCE_MARKER, IMAGE_OVERFLOW_SPILL_MIN_CHARS, KEEP_RECENT_TOOL_GROUPS,
+    IMAGE_OVERFLOW_SPILL_MIN_CHARS, KEEP_RECENT_TOOL_GROUPS,
     KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX, PRESERVED_CONTENT_STUB_PREFIX,
     PRESERVED_IMAGE_OVERFLOW_DIR, PRESERVED_TOOL_OVERFLOW_DIR, PRESERVED_USER_OVERFLOW_DIR,
     PlannedArchiveWrite, USER_OVERFLOW_SPILL_MIN_CHARS, automatic_summary_body, content_sha256_hex,
@@ -41,7 +41,10 @@ pub(super) async fn build_persisted_summary_text_with_app(
     messages: &[Message],
     max_chars: usize,
 ) -> String {
-    let mut prepared = messages.to_vec();
+    let mut prepared = super::summary_delta_messages(messages);
+    if prepared.is_empty() || max_chars == 0 {
+        return String::new();
+    }
     prepare_tool_messages_structured(
         &mut prepared,
         360,
@@ -55,7 +58,8 @@ pub(super) async fn build_persisted_summary_text_with_app(
     normalize_internal_notes_for_summary_model(&mut prepared);
 
     if let Some(summary) = app.summarize_history_messages(&prepared, max_chars).await {
-        let summary = normalize_whitespace(&summary);
+        // Keep section boundaries for the incremental-memory record builder.
+        let summary = summary.trim().to_string();
         if !summary.is_empty() {
             return summary;
         }
@@ -65,43 +69,9 @@ pub(super) async fn build_persisted_summary_text_with_app(
 }
 
 pub(super) fn normalize_internal_notes_for_summary_model(messages: &mut Vec<Message>) {
-    let mut out = Vec::with_capacity(messages.len());
-    let mut seen_auto_summary = false;
-
-    for mut message in messages.drain(..) {
-        if message.role == ROLE_INTERNAL_NOTE {
-            let text = value_to_string(&message.content);
-            if let Some(body) = automatic_summary_body(&text) {
-                if seen_auto_summary {
-                    continue;
-                }
-                let body = strip_nested_prior_summary_prefixes(body);
-                if !body.is_empty() {
-                    message.content = Value::String(format!(
-                        "Existing history summary (for this compression to absorb; do not copy verbatim):\n{}",
-                        summarize_text(&body, 2_000)
-                    ));
-                    out.push(message);
-                    seen_auto_summary = true;
-                }
-                continue;
-            }
-
-            if text.trim_start().contains(COMPRESSED_TOOL_EVIDENCE_MARKER) {
-                out.push(message);
-                continue;
-            }
-
-            // Ordinary internal_notes are mostly procedural notices, cache/loop
-            // state, or inline copies of self_notes. They must not be treated as
-            // long-term historical facts for the summary model to absorb
-            // repeatedly.
-            continue;
-        }
-        out.push(message);
-    }
-
-    *messages = out;
+    // Prior model-authored memories never become input evidence for a new
+    // increment. Their existing notes or archive pointers remain with callers.
+    *messages = super::summary_delta_messages(messages);
 }
 
 pub(super) fn prepare_tool_messages_structured(
@@ -1939,6 +1909,10 @@ fn push_unique_limited_global(target: &mut Vec<String>, value: String, max_items
 }
 
 pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> String {
+    // The deterministic fallback obeys the same no-recursive-summary contract
+    // as the model path. Callers preserve old notes or archive them separately.
+    let fresh = super::summary_delta_messages(messages);
+    let messages = fresh.as_slice();
     #[derive(Default, Clone)]
     struct TurnSummary {
         topic_key: String,

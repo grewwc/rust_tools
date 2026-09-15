@@ -110,6 +110,36 @@ pub(super) fn apply_pre_request_context_budget(
     messages: &mut Vec<Message>,
 ) -> ContextBudgetReport {
     let target_chars = mid_turn_compress_soft_threshold(model, app.config.history_max_chars);
+    // Persisted plan state is a fixed-cost request projection, not compressible history.
+    // Remove the previous pair before reserving the current one so refreshes cannot
+    // accumulate charges or let recall/compression spend the plan's headroom.
+    ActivePlanProjection::take(messages);
+    let active_context = active_plan_text(app);
+    let active_plan = ActivePlanProjection::new(if last_real_user_index(messages).is_some() {
+        active_context.clone()
+    } else {
+        String::new()
+    });
+    let reserved_chars = active_plan.chars();
+    let mut report = apply_history_context_budget(
+        app,
+        messages,
+        active_plan.remaining_target(target_chars),
+        &active_context,
+    );
+    active_plan.restore(messages);
+    report.before_chars = report.before_chars.saturating_add(reserved_chars);
+    report.after_chars = crate::ai::history::messages_total_chars_pub(messages);
+    report.target_chars = target_chars;
+    report
+}
+
+fn apply_history_context_budget(
+    app: &App,
+    messages: &mut Vec<Message>,
+    target_chars: usize,
+    active_context: &str,
+) -> ContextBudgetReport {
     let scan = quick_scan(messages);
     let mut report = ContextBudgetReport {
         before_chars: scan.total_chars,
@@ -121,6 +151,7 @@ pub(super) fn apply_pre_request_context_budget(
     if scan.total_chars <= target_chars
         && !scan.has_lossless_candidate
         && !super::context_memory::has_dense_recoverable_memory(messages)
+        && !super::context_memory::has_archive_recall_sources(messages)
     {
         return report;
     }
@@ -137,13 +168,21 @@ pub(super) fn apply_pre_request_context_budget(
         }
     }
 
-    let memory_projection =
-        super::context_memory::apply_query_aware_memory_projection(messages, target_chars);
+    let overflow_dir = {
+        let store = crate::ai::history::SessionStore::new(app.config.history_file.as_path());
+        store.session_assets_dir(&app.session_id)
+    };
+    let memory_projection = super::context_memory::apply_query_aware_memory_projection_with_context(
+        messages,
+        target_chars,
+        &overflow_dir,
+        active_context,
+    );
     report.memory_projection_removed_messages = memory_projection.removed_messages;
     report.memory_projection_selected_messages = memory_projection.selected_messages;
     report.memory_projection_saved_chars = memory_projection.saved_chars;
     report.memory_projection_index_chars = memory_projection.index_chars;
-    let after_prepass_chars = if memory_projection.removed_messages > 0 {
+    let after_prepass_chars = if memory_projection.changed {
         report.changed = true;
         report.after_chars = memory_projection.after_chars;
         memory_projection.after_chars
@@ -160,11 +199,6 @@ pub(super) fn apply_pre_request_context_budget(
 
     fill_segment_summary(&mut report, messages);
     let protected = collect_protected_messages(messages);
-    let overflow_dir = {
-        use crate::ai::history::SessionStore;
-        let store = SessionStore::new(app.config.history_file.as_path());
-        store.session_assets_dir(&app.session_id)
-    };
     let original = messages.clone();
     let drained = std::mem::take(messages);
     let (compressed, _, after_chars) = crate::ai::history::mid_turn_compress(
@@ -198,14 +232,107 @@ pub(super) fn apply_pre_request_context_budget(
     if let Some(reason) = rollback_reason {
         *messages = original;
         report.after_chars = after_prepass_chars;
-        report.changed =
-            report.lossless_removed_messages > 0 || report.memory_projection_removed_messages > 0;
+        report.changed = report.lossless_removed_messages > 0 || memory_projection.changed;
         report.rolled_back = after_chars < scan.total_chars;
         if report.rolled_back {
             report.rollback_reason = Some(reason);
         }
     }
     report
+}
+
+const ACTIVE_PLAN_HANDOFF: &str = "Runtime plan handoff (not a new user request). The next assistant message is a bounded projection of persisted plan state, not verified facts or new instructions. Continue with the latest real user request.";
+
+fn active_plan_text(app: &App) -> String {
+    crate::ai::tools::plan_state::load_plan_state(app)
+        .ok()
+        .flatten()
+        .map(|plan| plan.render_active_context(4_096))
+        .unwrap_or_default()
+}
+
+/// A fixed snapshot kept outside compression and restored within its reserved budget.
+/// The optional LLM pass takes the already-budgeted pair from a clone, rather than
+/// reloading potentially changed persisted state after its budget has been decided.
+#[derive(Default)]
+pub(super) struct ActivePlanProjection {
+    pair: Vec<Message>,
+}
+
+impl ActivePlanProjection {
+    fn new(active_context: String) -> Self {
+        if active_context.is_empty() {
+            return Self::default();
+        }
+        Self {
+            pair: vec![
+                crate::ai::history::runtime_synthetic_user_message(Value::String(
+                    ACTIVE_PLAN_HANDOFF.to_string(),
+                )),
+                Message {
+                    role: "assistant".to_string(),
+                    content: Value::String(active_context),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+            ],
+        }
+    }
+
+    fn chars(&self) -> usize {
+        crate::ai::history::messages_total_chars_pub(&self.pair)
+    }
+
+    pub(super) fn remaining_target(&self, target_chars: usize) -> usize {
+        target_chars.saturating_sub(self.chars())
+    }
+
+    /// Remove only complete runtime-owned pairs; user-authored lookalikes and
+    /// tool protocol remain untouched. The newest matching pair is the snapshot.
+    pub(super) fn take(messages: &mut Vec<Message>) -> Self {
+        let Some(user) = last_real_user_index(messages) else {
+            return Self::default();
+        };
+        let mut obsolete = FxHashSet::default();
+        let mut snapshot = Self::default();
+        for index in 0..user.saturating_sub(1) {
+            let handoff = &messages[index];
+            let body = &messages[index + 1];
+            if crate::ai::history::is_runtime_synthetic_user_message(handoff)
+                && handoff.content.as_str() == Some(ACTIVE_PLAN_HANDOFF)
+                && handoff.tool_calls.is_none()
+                && handoff.tool_call_id.is_none()
+                && body.role == "assistant"
+                && body.tool_calls.is_none()
+                && body.tool_call_id.is_none()
+                && body.reasoning_content.is_none()
+                && body
+                    .content
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("[active-plan]\n"))
+            {
+                obsolete.extend([index, index + 1]);
+                snapshot.pair = vec![handoff.clone(), body.clone()];
+            }
+        }
+        if obsolete.is_empty() {
+            return snapshot;
+        }
+        let mut index = 0;
+        messages.retain(|_| {
+            let keep = !obsolete.contains(&index);
+            index += 1;
+            keep
+        });
+        snapshot
+    }
+
+    pub(super) fn restore(self, messages: &mut Vec<Message>) {
+        if let Some(user) = last_real_user_index(messages) {
+            messages.splice(user..user, self.pair);
+        }
+    }
 }
 
 /// mid_turn_compress inserts the `CONTEXT_COMPACTION_STATE` note after the last user
@@ -498,8 +625,8 @@ fn protected_messages_preserved(messages: &[Message], protected: &[ProtectedMess
     let last_user_index = last_real_user_index(messages);
     let mut expected = protected.iter();
     for (index, message) in messages.iter().enumerate() {
-        let is_protected_position = message.role == "system"
-            || (message.role == "user" && Some(index) == last_user_index);
+        let is_protected_position =
+            message.role == "system" || (message.role == "user" && Some(index) == last_user_index);
         if !is_protected_position {
             continue;
         }
@@ -673,6 +800,114 @@ mod tests {
         assert_eq!(messages.last().unwrap(), &current_user);
     }
 
+    fn record_long_plan(app: &App) -> String {
+        // Summary and action fields have separate excerpt limits; multiple steps
+        // are needed to exercise the full 4096-character projection budget.
+        let steps = (1..=12)
+            .map(|step| serde_json::json!({"step": step, "action": "验证行为 ".repeat(100)}))
+            .collect::<Vec<_>>();
+        crate::ai::tools::plan_state::record_plan(
+            app,
+            &format!("alpha_recovery_signal {}", "长期计划 ".repeat(1_000)),
+            &steps,
+        )
+        .unwrap();
+        active_plan_text(app)
+    }
+
+    #[test]
+    fn context_budget_plan_triggers_compression_before_crossing_soft_target() {
+        let root = std::env::temp_dir().join(format!("plan-soft-{}", uuid::Uuid::new_v4()));
+        let app = test_app(root.join("test.sqlite"));
+        let plan_text = record_long_plan(&app);
+        let plan_chars = ActivePlanProjection::new(plan_text.clone()).chars();
+        assert!(plan_chars > 3_000);
+        let target =
+            mid_turn_compress_soft_threshold(&app.current_model, app.config.history_max_chars);
+        let mut messages = vec![msg("system", "rules"), msg("user", "continue")];
+        let fixed = crate::ai::history::messages_total_chars_pub(&messages);
+        messages.insert(1, msg("assistant", "x".repeat(target - fixed - 1_000)));
+        let canonical = messages.clone();
+        let before = crate::ai::history::messages_total_chars_pub(&messages);
+        assert!(before < target && before + plan_chars > target);
+
+        let report = apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
+        assert!(report.changed);
+        assert_eq!(report.before_chars, before + plan_chars);
+        assert_eq!(report.target_chars, target);
+        assert_eq!(
+            report.after_chars,
+            crate::ai::history::messages_total_chars_pub(&messages)
+        );
+        assert!(report.after_chars <= target);
+        assert_eq!(messages.first(), canonical.first());
+        assert_eq!(messages.last(), canonical.last());
+        let plan = ActivePlanProjection::take(&mut messages);
+        assert_eq!(plan.pair[1].content.as_str(), Some(plan_text.as_str()));
+        plan.restore(&mut messages);
+        let again = apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
+        // Compression creates an archive that recall may discover on the next pass;
+        // only the plan pair must be stable, not the entire memory projection.
+        assert_eq!(again.before_chars, report.after_chars);
+        assert_eq!(
+            again.after_chars,
+            crate::ai::history::messages_total_chars_pub(&messages)
+        );
+        assert!(again.after_chars <= target);
+        let refreshed = ActivePlanProjection::take(&mut messages);
+        assert_eq!(refreshed.chars(), plan_chars);
+        assert_eq!(refreshed.pair[1].content.as_str(), Some(plan_text.as_str()));
+        assert!(
+            !messages
+                .iter()
+                .any(|m| message_text(&m.content).starts_with("[active-plan]\n"))
+        );
+        assert_eq!(canonical.len(), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_budget_plan_counts_fast_path_and_irreducible_context() {
+        let root = std::env::temp_dir().join(format!("plan-fixed-{}", uuid::Uuid::new_v4()));
+        let app = test_app(root.join("test.sqlite"));
+        let plan_chars = ActivePlanProjection::new(record_long_plan(&app)).chars();
+        let target =
+            mid_turn_compress_soft_threshold(&app.current_model, app.config.history_max_chars);
+        for excess in [0, 1_000] {
+            let user = msg("user", "continue");
+            let system = msg(
+                "system",
+                "s".repeat(target - plan_chars - message_chars(&user) + excess),
+            );
+            let mut messages = vec![system.clone(), user.clone()];
+            let report = apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
+            assert_eq!(report.before_chars, target + excess);
+            assert_eq!(report.after_chars, target + excess);
+            assert_eq!(
+                report.after_chars,
+                crate::ai::history::messages_total_chars_pub(&messages)
+            );
+            assert_eq!(messages.first(), Some(&system));
+            assert_eq!(messages.last(), Some(&user));
+            assert_eq!(
+                ActivePlanProjection::take(&mut messages).chars(),
+                plan_chars
+            );
+            assert_eq!(messages, vec![system, user]);
+        }
+        // Without a real user there is no insertion point and no phantom plan charge.
+        let mut messages = vec![msg("system", "rules")];
+        let before = messages.clone();
+        let report = apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
+        assert_eq!(messages, before);
+        assert_eq!(report.before_chars, report.after_chars);
+        assert_eq!(
+            report.after_chars,
+            crate::ai::history::messages_total_chars_pub(&messages)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn context_budget_keeps_compaction_state_visible_before_last_user() {
         let history_file = std::env::temp_dir().join(format!(
@@ -703,6 +938,67 @@ mod tests {
             note_index < last_user_index,
             "compaction note must sit before the last user message"
         );
+    }
+
+    #[tokio::test]
+    async fn context_budget_plan_snapshot_survives_llm_backstop_without_reloading() {
+        let root = std::env::temp_dir().join(format!("plan-summary-{}", uuid::Uuid::new_v4()));
+        let app = test_app(root.join("test.sqlite"));
+        let plan_text = record_long_plan(&app);
+        // Only the current turn exists, so the summary path cannot call an LLM;
+        // its mechanical hard-budget backstop still has oversized output to shrink.
+        let mut messages = vec![
+            msg("system", "rules"),
+            msg("user", "continue"),
+            assistant_tool_call("current", "execute_command"),
+            tool_result("current", "output ".repeat(12_000)),
+        ];
+        apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
+        let original = messages.clone();
+        let before = crate::ai::history::messages_total_chars_pub(&messages);
+        let mut work = messages.clone();
+        let plan = ActivePlanProjection::take(&mut work);
+        let reserved = plan.chars();
+        assert!(reserved > 3_000);
+        assert_eq!(plan.remaining_target(1), 0);
+        crate::ai::tools::plan_state::update_plan_step(
+            &app,
+            1,
+            crate::ai::tools::plan_state::StepStatus::Failed,
+            Some("New state".into()),
+        )
+        .unwrap();
+        let target = 36_000;
+        let (mut summarized, history_before, history_after, effective, inserted) =
+            crate::ai::history::mid_turn_llm_summarize(
+                &app,
+                work,
+                super::super::MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
+                super::super::MID_TURN_LLM_SUMMARY_MAX_CHARS,
+                plan.remaining_target(target),
+                None,
+            )
+            .await;
+        plan.restore(&mut summarized);
+        let after = crate::ai::history::messages_total_chars_pub(&summarized);
+        assert_eq!(history_before + reserved, before);
+        assert_eq!(history_after + reserved, after);
+        assert!(after < before && after <= target);
+        assert!(effective);
+        assert!(!inserted);
+        assert_eq!(messages, original);
+        let restored = ActivePlanProjection::take(&mut summarized);
+        assert_eq!(restored.pair[1].content.as_str(), Some(plan_text.as_str()));
+        restored.restore(&mut summarized);
+        let mut report = super::super::CompressionReport::default();
+        report.record_llm_summary_attempt("pre-request", before, after, effective, inserted);
+        assert!(
+            report
+                .render()
+                .unwrap()
+                .contains(&format!("{before} → {after} chars"))
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -772,6 +1068,205 @@ mod tests {
             crate::ai::history::value_to_string(&message.content)
                 .starts_with(crate::ai::history::compress::QUERY_MEMORY_INDEX_PREFIX)
         }));
+    }
+
+    #[test]
+    fn context_budget_recalls_sparse_archive_using_current_plan() {
+        let root =
+            std::env::temp_dir().join(format!("context-budget-recall-{}", uuid::Uuid::new_v4()));
+        let mut app = test_app(root.join("history.json"));
+        app.config.history_max_chars = 100_000;
+        let store = crate::ai::history::SessionStore::new(&app.config.history_file);
+        let assets = store.session_assets_dir(&app.session_id);
+        app.session_history_file = store.sessions_root().join("test.sqlite");
+        let source = assets.join("context-checkpoints/recall.md");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "alpha_recovery_signal: source evidence\n").unwrap();
+        crate::ai::tools::plan_state::record_plan(
+            &app,
+            "Review alpha_recovery_signal",
+            &[serde_json::json!({"step": 1, "action": "Review alpha_recovery_signal"})],
+        )
+        .unwrap();
+        let mut messages = vec![
+            msg("system", "rules"),
+            msg(
+                crate::ai::history::ROLE_INTERNAL_NOTE,
+                format!(
+                    "[context_checkpoint path={}] archived source",
+                    source.display()
+                ),
+            ),
+            msg("user", "continue"),
+        ];
+        let canonical = messages.clone();
+        assert!(!super::super::context_memory::has_dense_recoverable_memory(
+            &messages
+        ));
+        let report = apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
+        assert!(report.changed);
+        assert_eq!(report.memory_projection_removed_messages, 0);
+        assert_eq!(
+            report.after_chars,
+            crate::ai::history::messages_total_chars_pub(&messages)
+        );
+        let recall = messages
+            .iter()
+            .position(|m| {
+                m.role == "assistant"
+                    && message_text(&m.content).starts_with("[query-memory-recall-v1]")
+            })
+            .unwrap();
+        assert!(
+            message_text(&messages[recall].content)
+                .contains("alpha_recovery_signal: source evidence")
+        );
+        assert!(crate::ai::history::is_runtime_synthetic_user_message(
+            &messages[recall - 1]
+        ));
+        assert_eq!(messages.first(), canonical.first());
+        assert_eq!(messages.last(), canonical.last());
+        assert_eq!(canonical.len(), 3);
+        let once = messages.clone();
+        apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
+        assert_eq!(messages, once);
+
+        // A plan can consume all remaining headroom; recall must not spend it again.
+        let plan_chars = ActivePlanProjection::new(record_long_plan(&app)).chars();
+        let target =
+            mid_turn_compress_soft_threshold(&app.current_model, app.config.history_max_chars);
+        let mut tight = canonical.clone();
+        let non_system = crate::ai::history::messages_total_chars_pub(&tight[1..]);
+        tight[0] = msg("system", "s".repeat(target - non_system - plan_chars));
+        let report = apply_pre_request_context_budget(&app, &app.current_model, &mut tight);
+        assert_eq!(report.before_chars, target);
+        assert_eq!(report.after_chars, target);
+        assert_eq!(
+            report.after_chars,
+            crate::ai::history::messages_total_chars_pub(&tight)
+        );
+        assert!(
+            !tight
+                .iter()
+                .any(|m| message_text(&m.content).starts_with("[query-memory-recall-v1]"))
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_budget_plan_projection_refreshes_status_without_promoting_content() {
+        let root =
+            std::env::temp_dir().join(format!("context-budget-plan-{}", uuid::Uuid::new_v4()));
+        let app = test_app(root.join("test.sqlite"));
+        let mut messages = vec![msg("system", "rules"), msg("user", "continue")];
+        let canonical = messages.clone();
+        apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
+        assert_eq!(messages, canonical);
+        crate::ai::tools::plan_state::record_plan(
+            &app,
+            "Current work",
+            &[serde_json::json!({"step": 1, "action": "Verify behavior"})],
+        )
+        .unwrap();
+        apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
+        let once = messages.clone();
+        apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
+        assert_eq!(messages, once);
+        assert!(crate::ai::history::is_runtime_synthetic_user_message(
+            &messages[1]
+        ));
+        assert_eq!(messages[2].role, "assistant");
+        assert!(message_text(&messages[2].content).contains("1=pending"));
+        assert!(message_text(&messages[2].content).contains("assistant-derived"));
+        crate::ai::tools::plan_state::update_plan_step(
+            &app,
+            1,
+            crate::ai::tools::plan_state::StepStatus::Failed,
+            Some("Verification failed".into()),
+        )
+        .unwrap();
+        apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
+        assert_eq!(messages.len(), 4);
+        assert!(message_text(&messages[2].content).contains("1=failed"));
+        assert!(message_text(&messages[2].content).contains("Verification failed"));
+        assert_eq!(messages.first(), canonical.first());
+        assert_eq!(messages.last(), canonical.last());
+        std::fs::write(
+            crate::ai::tools::plan_state::plan_state_path(&app),
+            "invalid JSON",
+        )
+        .unwrap();
+        apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
+        assert_eq!(messages, canonical);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_budget_plan_projection_replaces_small_budget_pairs_without_orphan_handoffs() {
+        let root = std::env::temp_dir().join(format!("plan-small-{}", uuid::Uuid::new_v4()));
+        let app = test_app(root.join("test.sqlite"));
+        crate::ai::tools::plan_state::record_plan(
+            &app,
+            "計画🙂",
+            &[serde_json::json!({"step": 1, "action": "界🙂".repeat(200)})],
+        )
+        .unwrap();
+        let old_plan = crate::ai::tools::plan_state::load_plan_state(&app)
+            .unwrap()
+            .unwrap();
+        crate::ai::tools::plan_state::update_plan_step(
+            &app,
+            1,
+            crate::ai::tools::plan_state::StepStatus::Failed,
+            Some("Fresh failure".into()),
+        )
+        .unwrap();
+        let fresh = active_plan_text(&app);
+        // A real user's lookalike pair and tool protocol must survive replacement.
+        let canonical = vec![
+            msg("system", "rules"),
+            msg("user", ACTIVE_PLAN_HANDOFF),
+            msg("assistant", "[active-plan]\nuser-authored lookalike"),
+            assistant_tool_call("kept", "read_file"),
+            tool_result("kept", "exact source"),
+            msg("user", "continue"),
+        ];
+        for budget in (0..=256).chain([512, 4_096]) {
+            let body = old_plan.render_active_context(budget);
+            let projection = ActivePlanProjection::new(body.clone());
+            let reserved = projection.chars();
+            let mut messages = canonical.clone();
+            projection.restore(&mut messages);
+            assert_eq!(
+                messages.len(),
+                canonical.len() + if body.is_empty() { 0 } else { 2 },
+                "budget={budget}"
+            );
+            let taken = ActivePlanProjection::take(&mut messages);
+            assert_eq!(messages, canonical, "budget={budget}");
+            assert_eq!(taken.chars(), reserved, "budget={budget}");
+            if body.is_empty() {
+                assert!(taken.pair.is_empty());
+                assert_eq!(reserved, 0);
+            } else {
+                assert_eq!(taken.pair.len(), 2);
+                assert!(crate::ai::history::is_runtime_synthetic_user_message(
+                    &taken.pair[0]
+                ));
+                assert_eq!(taken.pair[1].role, "assistant");
+                assert_eq!(taken.pair[1].content.as_str(), Some(body.as_str()));
+                assert!(body.starts_with("[active-plan]\n"));
+                assert!(body.contains("assistant-derived, not independently verified."));
+            }
+            taken.restore(&mut messages);
+            apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
+            let replacement = ActivePlanProjection::take(&mut messages);
+            assert_eq!(replacement.pair.len(), 2, "budget={budget}");
+            assert_eq!(replacement.pair[1].content.as_str(), Some(fresh.as_str()));
+            assert!(fresh.contains("Fresh failure"));
+            assert_eq!(messages, canonical, "budget={budget}");
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1024,17 +1519,18 @@ mod tests {
         assert!(was_effective, "LLM 摘要执行但被认为无效");
         assert!(
             llm_summary_inserted,
-            "LLM 摘要执行后应报告已注入 [mid-turn-summary]"
+            "the LLM summary should report an inserted incremental summary"
         );
         assert!(
             llm_after < llm_before,
             "LLM 摘要后体积未下降: {llm_before} -> {llm_after}"
         );
-        assert!(
-            after_msgs.iter().any(|m| {
-                m.role == "internal_note" && m.content.to_string().contains("mid-turn-summary")
-            }),
-            "结果中缺少 [mid-turn-summary] 摘要 note"
-        );
+        let summary = after_msgs
+            .iter()
+            .find(|message| crate::ai::history::compress::is_incremental_summary(message))
+            .expect("the LLM summary must produce a source-bound increment");
+        let text = crate::ai::history::value_to_string(&summary.content);
+        assert!(text.contains("MOCK_SUMMARY"), "{text}");
+        assert!(text.contains("summary-sources"), "{text}");
     }
 }

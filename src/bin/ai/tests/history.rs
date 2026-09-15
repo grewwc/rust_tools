@@ -352,7 +352,8 @@ fn context_history_summarizes_beyond_history_count_instead_of_dropping() {
         .unwrap();
     }
 
-    let context = build_context_history(32, &path, 6000, 32, 2000, None, None).unwrap();
+    let overflow_dir = path.with_extension("assets");
+    let context = build_context_history(32, &path, 6000, 32, 2000, Some(overflow_dir.clone()), None).unwrap();
 
     assert!(!context.is_empty());
     assert_eq!(
@@ -364,13 +365,21 @@ fn context_history_summarizes_beyond_history_count_instead_of_dropping() {
             .first()
             .and_then(|m| m.content.as_str())
             .unwrap_or_default()
-            .contains("摘要")
+            .starts_with("[incremental-memory-v1]")
     );
     assert_eq!(context.iter().filter(|m| m.role == "user").count(), 32);
     assert_eq!(
         context.last().unwrap().content,
         Value::String("answer-239".to_string())
     );
+
+    let record: Value = serde_json::from_str(
+        context[0].content.as_str().unwrap().strip_prefix("[incremental-memory-v1]\n").unwrap(),
+    ).unwrap();
+    let archived = std::fs::read_to_string(record["source"]["archive_file_path"].as_str().unwrap()).unwrap();
+    assert!(archived.contains("question-0"));
+    assert_eq!(build_message_arr(usize::MAX, &path).unwrap().len(), 480);
+    std::fs::remove_dir_all(overflow_dir).unwrap();
 
     let _ = std::fs::remove_file(path);
 }
@@ -423,7 +432,8 @@ fn context_history_keep_last_counts_user_turns_not_raw_messages() {
         .unwrap();
     }
 
-    let context = build_context_history(2, &path, 100_000, 2, 2_000, None, None).unwrap();
+    let overflow_dir = path.with_extension("assets");
+    let context = build_context_history(2, &path, 100_000, 2, 2_000, Some(overflow_dir.clone()), None).unwrap();
 
     let user_questions = context
         .iter()
@@ -441,6 +451,8 @@ fn context_history_keep_last_counts_user_turns_not_raw_messages() {
                 .unwrap_or_default()
                 .contains("question-0")
     }));
+
+    std::fs::remove_dir_all(overflow_dir).unwrap();
 
     let _ = std::fs::remove_file(path);
 }
@@ -496,17 +508,27 @@ fn context_history_summary_keeps_tool_names_and_results() {
         .unwrap();
     }
 
-    let context = build_context_history(2, &path, 1_800, 2, 1_000, None, None).unwrap();
+    let overflow_dir = path.with_extension("assets");
+    // Source-bound summaries include a complete recovery locator and provenance;
+    // reserve that metadata in addition to the tool evidence being summarized.
+    let context = build_context_history(2, &path, 3_600, 2, 2_400, Some(overflow_dir.clone()), None).unwrap();
     let summary = context
         .first()
         .and_then(|m| m.content.as_str())
         .unwrap_or_default()
         .to_string();
-    assert!(summary.contains("Verified facts and sources"));
-    assert!(summary.contains("Assistant's previous answer (not independently verified)"));
+    let record: Value = serde_json::from_str(summary.strip_prefix("[incremental-memory-v1]\n").unwrap()).unwrap();
+    assert_eq!(record["provenance"], "assistant_derived_unverified");
+    assert!(record["entries"].as_array().unwrap().iter().all(|entry| entry["status"] == "derived_unverified"));
     assert!(summary.contains("tree"));
     assert!(summary.contains("issue-0"));
     assert!(summary.contains("ERROR") || summary.contains("repeated failure"));
+
+    let archived = std::fs::read_to_string(record["source"]["archive_file_path"].as_str().unwrap()).unwrap();
+    assert!(archived.contains("issue-0"));
+    assert!(archived.contains("ERROR: repeated failure"));
+    assert!(crate::ai::history::messages_total_chars_pub(&context) <= 3_600);
+    std::fs::remove_dir_all(overflow_dir).unwrap();
 
     let _ = std::fs::remove_file(path);
 }

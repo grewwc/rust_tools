@@ -1,12 +1,18 @@
 {
   "name": "task_evidence_read",
-  "description": "Read the durable, bounded progress evidence for one asynchronous subagent task. Returns the latest structured snapshot plus its recent phase/checkpoint timeline, including elapsed and staleness data. Use this for precise diagnosis after a timeout or when task_status summaries are insufficient.",
+  "description": "Read evidence for one task. The default source=progress refreshes and returns its bounded phase/checkpoint snapshot for diagnosis. source=delivered reads the full persisted status and payload without collecting, refreshing progress, or integrating; available after collection and context compression. Use task_audit for all recorded IDs. Reading never acknowledges integration.",
   "parameters": {
     "type": "object",
     "properties": {
       "task_id": {
         "type": "string",
-        "description": "The asynchronous task_id returned by task_spawn or task_spawn_batch."
+        "description": "Exact task_id returned by task/task_spawn/task_spawn_batch or listed by task_audit. Delivered lookup preserves the ID verbatim."
+      },
+      "source": {
+        "type": "string",
+        "enum": ["progress", "delivered"],
+        "default": "progress",
+        "description": "progress preserves the existing live snapshot behavior; delivered performs a read-only lookup of a previously delivered result."
       }
     },
     "required": [

@@ -1,8 +1,8 @@
-//! LLM 请求 TPM 预检限速。
+//! TPM preflight rate limiting for LLM requests.
 //!
-//! 429 的根因不是单次请求超上下文，而是同一 turn 内连续请求把 prompt+tool schema
-//! 在 60 秒窗口里反复发送。这里在每次 physical HTTP send 前做滑动窗口预算预占：
-//! 超预算就可取消等待，预算释放后再发送。这样不裁剪工具、不硬砍迭代，只控制发送速率。
+//! The 429 issue addressed here comes from repeatedly sending prompt + tool schemas within a
+//! 60-second window during one turn, not a single request exceeding context. Reserve sliding-window
+//! budget before each physical HTTP send; wait cancellably when exhausted, limiting rate without cutting tools or iterations.
 
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
@@ -52,41 +52,17 @@ fn reservation_tokens(estimated_prompt_tokens: usize, physical_sends: usize) -> 
     estimate.saturating_mul(sends).max(1)
 }
 
-/// 用服务端上一轮返回的真实 prompt_tokens 校准字符估算。
-///
-/// 字符估算按 2 chars/token 折算，对英文代码和 JSON schema 会显著高估；截图里的
-/// 真实案例是服务端报告 25,875 prompt tokens，而字符估算路径预占 55,610。
-/// 这种高估会让普通工具循环过早 sleep，表现为"还没真正接近 TPM 就卡住"。
-/// 若上一轮还有 `cached_tokens`，则预算优先按"未缓存尾巴 + 本轮新增部分"估算，
-/// 避免 prompt cache 100% hit 时仍按整段 prompt 预占。
-///
-/// 但上一轮 usage 也可能因为本轮新增大工具结果而偏低，因此不直接全信 known：
-/// - known 低于字符估算一半时，按字符估算的一半作为地板；
-/// - known 高于字符估算时，按字符估算作为上界，避免历史压缩后沿用旧高值。
-pub(super) fn calibrate_prompt_tokens_for_budget(
-    estimated_prompt_tokens: usize,
-    known_prompt_tokens: Option<u64>,
-    known_cached_prompt_tokens: Option<u64>,
+/// Convert a current-request context estimate into a TPM reservation. The caller
+/// must validate cache reuse against the originating request and API key. Cache
+/// reuse is a rate-accounting heuristic and never reduces context occupancy.
+pub(super) fn tpm_prompt_tokens(
+    context_prompt_tokens: usize,
+    reusable_cached_prompt_tokens: Option<u64>,
 ) -> usize {
-    let Some(known) = known_prompt_tokens.and_then(|v| usize::try_from(v).ok()) else {
-        return estimated_prompt_tokens.max(1);
-    };
-    if estimated_prompt_tokens == 0 {
-        return known.max(1);
-    }
-    let known_cached = known_cached_prompt_tokens
-        .and_then(|v| usize::try_from(v).ok())
-        .unwrap_or(0)
-        .min(known);
-    if known_cached > 0 {
-        let known_uncached = known.saturating_sub(known_cached).max(1);
-        let reusable_cache = known_cached.min(estimated_prompt_tokens);
-        return estimated_prompt_tokens
-            .saturating_sub(reusable_cache)
-            .max(known_uncached);
-    }
-    let floor = estimated_prompt_tokens.div_ceil(2).max(1);
-    known.clamp(floor, estimated_prompt_tokens.max(floor))
+    let cached = reusable_cached_prompt_tokens
+        .and_then(|tokens| usize::try_from(tokens).ok())
+        .unwrap_or(0);
+    context_prompt_tokens.saturating_sub(cached).max(1)
 }
 
 fn budget_key(endpoint: &str, request_model: &str, api_key: &str) -> String {
@@ -129,7 +105,7 @@ impl TokenBudgetBucket {
         self.prune(now, window);
         let used = self.used_tokens();
 
-        // 单次请求估算已超过窗口时，等待旧账清空后放行，避免永远无法发送。
+        // If one request reaches the window limit, wait for old reservations to expire, then admit it to avoid starvation.
         if tokens >= limit {
             if used == 0 {
                 self.reservations
@@ -171,8 +147,8 @@ pub(super) fn estimate_json_request_tokens(value: &Value) -> usize {
         .max(1)
 }
 
-/// 已序列化字节的 token 估算：`estimate_json_request_tokens` 的字节变体，
-/// 直接按字节长度估算，避免对同一请求体再次全量序列化。
+/// Estimates tokens from serialized bytes: a byte-input variant of `estimate_json_request_tokens`
+/// that uses the existing serialized data rather than serializing the entire request body again.
 pub(super) fn estimate_serialized_request_tokens(bytes: &[u8]) -> usize {
     const CHARS_PER_TOKEN_CONSERVATIVE: usize = 2;
     std::str::from_utf8(bytes)
@@ -221,7 +197,7 @@ pub(super) async fn wait_for_request_budget(
                     super::emit_request_diagnostic(format_args!("{msg}"));
                 }
                 if sleep_with_cancel(app, delay).await {
-                    // 取消时顺手清掉瞬态行，避免残留
+                    // Clear the transient status line on cancellation so it does not linger.
                     drop(status_line.take());
                     return Err(RequestError::cancelled(
                         "request canceled by user during TPM budget wait",

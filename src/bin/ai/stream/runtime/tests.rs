@@ -3546,25 +3546,24 @@ fn clear_test_columns() {
     }
 }
 
-/// Rows of a live region are wrapped narrow enough that a later narrowing terminal cannot re-wrap them,
-/// so the stored row count still matches what is on screen and the cursor-up erase stays aligned.
-/// Without that bound a 400-column line is stored as rows of ~196 columns, which a terminal narrowed to
-/// 120 columns re-wraps into two rows each.
+/// Rows of a live region are wrapped at the live terminal width, not at an artificially narrowed bound,
+/// so a long logical row still shows as much text as the terminal can hold. An artificial bound (live
+/// rows capped at 100 columns) kept the stored row count resize-proof but cut every long row short on
+/// wide terminals; the resize case is handled on the erase side instead, by recomputing the footprint
+/// from the stored text (`live_region_fold_header_erase_covers_re_wrapped_rows`,
+/// `live_region_waiting_hint_erase_covers_re_wrapped_rows`).
 #[test]
-fn live_region_rows_survive_a_narrowing_resize() {
+fn live_region_rows_wrap_at_the_live_terminal_width() {
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     set_test_columns("200");
     let rows = wrap_line_to_terminal_rows_with_reserve(&"x".repeat(400), 4);
     assert!(rows.len() > 1, "the line must be wrapped, got {} rows", rows.len());
-
-    set_test_columns("120");
-    let physical: usize = rows.iter().map(|row| live_preview_cursor_rows(row)).sum();
-    assert_eq!(
-        physical,
-        rows.len(),
-        "each stored row must still occupy one physical row after narrowing: {rows:?}"
+    let widest = rows.iter().map(|row| row.chars().count()).max().unwrap_or(0);
+    assert!(
+        widest > 150,
+        "rows must use the live terminal width, got {widest} columns: {rows:?}"
     );
     clear_test_columns();
 }

@@ -62,7 +62,7 @@ fn any_vl_model_handle() -> String {
     vl_model_handle_at(0).unwrap_or_else(any_model_name)
 }
 
-fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> types::App {
+pub(in crate::ai) fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> types::App {
     types::App {
         cli: super::cli::ParsedCli::default(),
         hooks: Default::default(),

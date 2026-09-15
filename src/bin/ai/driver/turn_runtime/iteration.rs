@@ -1120,6 +1120,8 @@ async fn request_model_response(
     // Pre-request-build hooks (on_before_request → BuildRequest.before), fired before any app state mutation.
     // The request messages being built are passed in so hooks can inspect/rewrite them.
     app.fire_before_request_hooks(messages);
+    let context_before = super::context_metrics::ContextSizeBreakdown::measure(messages);
+    let context_started = std::time::Instant::now();
     if crate::ai::driver::runtime_ctx::take_subagent_checkpoint_due_reminder() {
         messages.push(Message {
             role: ROLE_INTERNAL_NOTE.to_string(),
@@ -1179,18 +1181,23 @@ async fn request_model_response(
         // Cancel safety: pass a **clone** of messages instead of `mem::take`. If this summary await
         // is interrupted by Ctrl+C, the request future is dropped while `messages` keeps its original
         // full content, so it cannot degrade into an empty Vec and send an empty context / lose message state on later requests.
-        let (after_msgs, llm_before, llm_after, was_effective, llm_summary_inserted) =
+        let mut summary_messages = messages.clone();
+        let active_plan = context_budget::ActivePlanProjection::take(&mut summary_messages);
+        let llm_before = budget_report.after_chars;
+        let (mut after_msgs, _, _, was_effective, llm_summary_inserted) =
             crate::ai::history::mid_turn_llm_summarize(
                 app,
-                messages.clone(),
+                summary_messages,
                 MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
                 MID_TURN_LLM_SUMMARY_MAX_CHARS,
-                app.config.history_max_chars,
+                active_plan.remaining_target(app.config.history_max_chars),
                 crate::ai::driver::runtime_ctx::effective_cwd()
                     .ok()
                     .as_deref(),
             )
             .await;
+        active_plan.restore(&mut after_msgs);
+        let llm_after = crate::ai::history::messages_total_chars_pub(&after_msgs);
         *messages = after_msgs;
         compression_report.record_llm_summary_attempt(
             format!("pre-request LLM (limit {llm_threshold})"),
@@ -1223,6 +1230,8 @@ async fn request_model_response(
     // the two are mutually exclusive.
     const MAX_CONTEXT_OVERFLOW_RETRIES: usize = 4;
     let mut overflow_retries = 0usize;
+    let mut provider_overflows = 0usize;
+    let mut overflow_request_retries = 0usize;
     let llm_client = build_llm_request_client(app);
     loop {
         let mut actual_model = next_model.to_string();
@@ -1266,6 +1275,12 @@ async fn request_model_response(
 
         if let Err(err) = &request_result
             && request::is_context_overflow_error(err)
+        {
+            provider_overflows += 1;
+        }
+
+        if let Err(err) = &request_result
+            && request::is_context_overflow_error(err)
             && overflow_retries < MAX_CONTEXT_OVERFLOW_RETRIES
         {
             let before = crate::ai::history::messages_total_chars_pub(messages);
@@ -1278,6 +1293,7 @@ async fn request_model_response(
             let after = reactive_shrink_context_after_overflow(app, messages, target);
             overflow_retries += 1;
             if after < before {
+                overflow_request_retries += 1;
                 crate::ai::driver::print::print_tool_note_line(
                     "context-overflow",
                     &format!(
@@ -1294,6 +1310,22 @@ async fn request_model_response(
             );
         }
 
+        super::context_metrics::record_context_request(
+            &app.session_id,
+            _iteration,
+            &actual_model,
+            super::context_metrics::ContextRequestMetrics {
+                before: context_before,
+                after: super::context_metrics::ContextSizeBreakdown::measure(messages),
+                provider_overflows,
+                overflow_retries: overflow_request_retries,
+                response_received: request_result.is_ok(),
+                elapsed_ms: context_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            },
+        );
         return request_result.map(|response| {
             if auto_model_fallback_spec.is_some() {
                 crate::ai::models::mark_subagent_model_verified(&actual_model);

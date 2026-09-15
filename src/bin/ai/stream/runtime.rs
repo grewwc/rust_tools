@@ -1742,9 +1742,9 @@ fn thinking_fold_redraw_to(
     // A terminal that narrowed re-wraps the rows it has already drawn, and this process can learn the
     // new width later than the reflow (xterm.js reflows immediately; the PTY winsize arrives after), so
     // assuming the old footprint at the old width moved the erase a row short and left the previous
-    // `○ thinking · …` header behind on every redraw, stacking those headers. Live rows are additionally
-    // wrapped at most `LIVE_REGION_MAX_COLS` wide (see `render::markdown`), so for a terminal at least
-    // that wide a resize cannot change their row count at all.
+    // `○ thinking · …` header behind on every redraw, stacking those headers. Live rows are wrapped at
+    // the live terminal width (see `render::markdown`), so a wide terminal shows them in full and the
+    // recomputed counts above are what keeps the erase aligned across a resize.
     //
     // The first redraw (activation) has nothing on screen above the cursor, so it erases nothing and the
     // header lands at the fold's start position as before; every later redraw has a header (and possibly

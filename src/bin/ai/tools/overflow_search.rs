@@ -8,6 +8,8 @@
 //!   groups (high-precision tool results appear as spill stubs or as full-text
 //!   copies kept verbatim at fold time; lossy results may be reduced to a summary)
 //! - `internal-note-overflow/`: internal context notes trimmed by budget
+//! - `context-checkpoints/`: assistant-derived checkpoint bodies (unverified)
+//! - `tool-overflow/`: verbatim oversized live tool results
 //! - `user-overflow-preserved/`, `image-overflow-preserved/`: kept user turns/images
 //!
 //! The model usually knows roughly *what* was archived but not the exact path or
@@ -32,13 +34,18 @@
 //!
 //! Safety: the search root is never taken from caller input; it is derived only
 //! from `current_session_assets_dir()`, and errors out when no driver context is
-//! active, making cross-session reads impossible.
+//! active. Discovered symlinks are excluded; both scanning and excerpt rendering
+//! use the session-bound reader, which opens every path component without
+//! following symlinks on Unix.
 
+#[cfg(not(unix))]
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use regex::{Regex, RegexBuilder};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
+#[cfg(not(unix))]
+use rustc_hash::FxHashSet;
 use serde_json::Value;
 
 use crate::ai::tools::common::{
@@ -46,6 +53,19 @@ use crate::ai::tools::common::{
     ToolRegistration, ToolSpec,
 };
 use crate::ai::tools::storage::file_store::current_session_assets_dir;
+
+// Share the content-read boundary with automatic recall, but not its scan
+// budgets: manual recovery must still reach large files and late/deep paths.
+#[path = "../driver/turn_runtime/context_memory_archive.rs"]
+mod archive_files;
+
+fn read_archive_text(archive: &archive_files::ArchiveRoot, path: &Path) -> Option<String> {
+    // Preserve full-file manual search semantics. Output is bounded separately;
+    // scan work and resident hit metadata are not bounded by automatic-recall
+    // limits. A fresh budget on each read prevents earlier files hiding later ones.
+    let mut remaining_bytes = usize::MAX;
+    archive.read_text(path, usize::MAX, &mut remaining_bytes)
+}
 
 /// Hard ceiling of matched lines returned (mirrors the shared engine cap).
 const MAX_MATCHES: usize = 200;
@@ -66,7 +86,7 @@ enum SearchScope {
     All,
     /// Only overflow-history.md (original folded messages).
     History,
-    /// Only tool-overflow-compressed/ (per-tool-result snapshots).
+    /// Tool snapshots, folded groups, internal notes, and checkpoint bodies.
     ToolOutputs,
 }
 
@@ -237,22 +257,35 @@ struct ScoredFile {
     total_matches: usize,
 }
 
-/// Iterates concrete archive files under one root (single file or directory).
-fn collect_files(root: &Path) -> Vec<PathBuf> {
-    if root.is_file() {
+/// Iterates concrete archive files without automatic-recall candidate/depth caps.
+#[cfg(unix)]
+fn collect_files(archive: &archive_files::ArchiveRoot, root: &Path) -> Vec<PathBuf> {
+    // Enumeration and content reads share the held session directory boundary;
+    // checking a canonical path before read_dir would still allow symlink swaps.
+    archive.collect_files_unbounded(root)
+}
+
+// Preserve the path-based fallback on platforms without the Unix directory
+// descriptor primitives. Containment here is best-effort, not race-safe.
+#[cfg(not(unix))]
+fn collect_files(archive: &archive_files::ArchiveRoot, root: &Path) -> Vec<PathBuf> {
+    let Ok(metadata) = fs::symlink_metadata(root) else {
+        return Vec::new();
+    };
+    if metadata.file_type().is_symlink() {
+        return Vec::new();
+    }
+    if metadata.is_file() {
         return vec![root.to_path_buf()];
     }
     let mut out: Vec<PathBuf> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-    // `path.is_dir()` follows symlinks, so a symlink cycle (a directory
-    // symlinked back into one of its ancestors) would otherwise push forever.
-    // Canonical paths break the cycle: each physical directory is visited once.
     let mut visited: FxHashSet<PathBuf> = FxHashSet::default();
     while let Some(dir) = stack.pop() {
         let Ok(canon) = fs::canonicalize(&dir) else {
             continue;
         };
-        if !visited.insert(canon) {
+        if !canon.starts_with(archive.path()) || !visited.insert(canon) {
             continue;
         }
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -262,9 +295,12 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
         // Deterministic traversal independent of filesystem order.
         names.sort();
         for path in names {
-            if path.is_dir() {
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_dir() {
                 stack.push(path);
-            } else if path.is_file() {
+            } else if metadata.is_file() {
                 out.push(path);
             }
         }
@@ -286,18 +322,26 @@ fn run_overflow_search(
     assets_dir: &Path,
     params: &OverflowSearchParams<'_>,
 ) -> Result<String, String> {
-    let roots: Vec<PathBuf> = match params.scope {
-        SearchScope::History => vec![assets_dir.join("overflow-history.md")],
-        SearchScope::ToolOutputs => vec![assets_dir.join("tool-overflow-compressed")],
-        SearchScope::All => vec![
-            assets_dir.join("overflow-history.md"),
-            assets_dir.join("tool-overflow-compressed"),
-            assets_dir.join("folded-tool-groups"),
-            assets_dir.join("internal-note-overflow"),
-            assets_dir.join("user-overflow-preserved"),
-            assets_dir.join("image-overflow-preserved"),
-        ],
+    let Some(archive) = archive_files::ArchiveRoot::new(assets_dir) else {
+        return Ok("No matches found: the session archive root is missing or unavailable; nothing was scanned.".to_string());
     };
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if params.scope != SearchScope::ToolOutputs {
+        roots.push(archive.path().join("overflow-history.md"));
+    }
+    if params.scope != SearchScope::History {
+        roots.extend(
+            archive_files::RECOVERY_DIRECTORIES
+                .iter()
+                .map(|name| archive.path().join(name)),
+        );
+    }
+    if params.scope == SearchScope::All {
+        roots.extend(
+            ["user-overflow-preserved", "image-overflow-preserved"]
+                .map(|name| archive.path().join(name)),
+        );
+    }
     let roots: Vec<(usize, PathBuf)> = roots
         .into_iter()
         .filter(|root| root.exists())
@@ -329,13 +373,13 @@ fn run_overflow_search(
         .map(glob_to_regex);
 
     for (root_idx, root) in &roots {
-        for file in collect_files(root) {
+        for file in collect_files(&archive, root) {
             if !path_matches_glob(&file, root, glob.as_ref()) {
                 continue;
             }
-            let Ok(content) = fs::read_to_string(&file) else {
-                // Unreadable or non-UTF-8 files cannot contain matches; skip
-                // without counting them toward the corpus size used by IDF.
+            let Some(content) = read_archive_text(&archive, &file) else {
+                // Unreadable, unsafe, or non-UTF-8 files were not searched;
+                // exclude them from the corpus size used by IDF.
                 continue;
             };
             files_seen += 1;
@@ -460,7 +504,7 @@ fn run_overflow_search(
         });
     }
 
-    render_selection(scored_files, params, files_seen)
+    render_selection(scored_files, params, files_seen, &archive)
 }
 
 fn is_identifier_byte(b: u8) -> bool {
@@ -493,6 +537,7 @@ fn render_selection(
     mut files: Vec<ScoredFile>,
     params: &OverflowSearchParams<'_>,
     files_seen: usize,
+    archive: &archive_files::ArchiveRoot,
 ) -> Result<String, String> {
     files.sort_by(|a, b| {
         b.file_score
@@ -605,7 +650,7 @@ fn render_selection(
         // text. Re-read the file to render the selected excerpts so at most
         // one archive file is resident at a time — and only files that
         // survived selection are re-read at all.
-        let Ok(content) = fs::read_to_string(&file.scan.display_path) else {
+        let Some(content) = read_archive_text(archive, Path::new(&file.scan.display_path)) else {
             // Vanished or unreadable between scan and render (should not
             // happen within one search): fall back to a pointer, never
             // fabricate excerpts.
@@ -796,6 +841,164 @@ mod tests {
         assert!(out.contains("user-overflow-preserved/user.md"), "{out}");
         assert!(out.contains("image-overflow-preserved/image.md"), "{out}");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn archive_search_finds_checkpoint_only_bodies_in_both_scopes() {
+        let dir = make_temp_dir();
+        fs::create_dir_all(dir.join("context-checkpoints")).unwrap();
+        fs::create_dir_all(dir.join("tool-overflow")).unwrap();
+        fs::write(
+            dir.join("context-checkpoints/opaque.md"),
+            "header\nrare_checkpoint_keyword decision\n",
+        )
+        .unwrap();
+        fs::write(dir.join("tool-overflow/live.txt"), "rare_tool_keyword result\n").unwrap();
+        for scope in [SearchScope::All, SearchScope::ToolOutputs] {
+            let mut p = params("rare_checkpoint_keyword");
+            p.scope = scope;
+            let out = run_overflow_search(&dir, &p).unwrap();
+            assert!(out.contains("context-checkpoints/opaque.md"), "{out}");
+            assert!(out.contains("2> rare_checkpoint_keyword decision"), "{out}");
+            p.query = "rare_tool_keyword";
+            assert!(run_overflow_search(&dir, &p).unwrap().contains("tool-overflow/live.txt"));
+        }
+        let mut p = params("rare_checkpoint_keyword");
+        p.scope = SearchScope::History;
+        assert!(run_overflow_search(&dir, &p).unwrap().contains("No matches found"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn archive_search_large_history_keeps_late_matches() {
+        let dir = make_temp_dir();
+        // The only hit occurs after 4 MiB; neither a file-size skip nor a prefix
+        // scan can recover it. Wide filler keeps the regression inexpensive.
+        let filler_lines = 4_097;
+        let mut body = format!("{}\n", "x".repeat(1_023)).repeat(filler_lines);
+        body.push_str("late_history_keyword recovered decision\n");
+        assert!(body.len() > 4 * 1024 * 1024);
+        fs::write(dir.join("overflow-history.md"), body).unwrap();
+        for scope in [SearchScope::History, SearchScope::All] {
+            let mut p = params("late_history_keyword");
+            p.scope = scope;
+            p.context_lines = 0;
+            let out = run_overflow_search(&dir, &p).unwrap();
+            assert!(out.contains("4098> late_history_keyword recovered decision"), "{out}");
+            assert!(out.contains("files scanned 1"), "{out}");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn archive_search_file_pattern_reaches_late_and_deep_paths() {
+        let dir = make_temp_dir();
+        let snapshots = dir.join("tool-overflow-compressed");
+        fs::create_dir_all(&snapshots).unwrap();
+        // Filtering must reach the wanted file even when more than 1,024
+        // unrelated files precede it; a capped candidate prefix would hide it.
+        for index in 0..1_025 {
+            fs::write(snapshots.join(format!("a-{index:04}.txt")), "noise\n").unwrap();
+        }
+        fs::write(snapshots.join("zz-target.txt"), "late_path_keyword evidence\n").unwrap();
+        let deep = dir.join("context-checkpoints/a/b/c/d/e/f/g/h/i");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("zz-target.txt"), "late_path_keyword checkpoint\n").unwrap();
+        let mut p = params("late_path_keyword");
+        p.file_pattern = Some("zz-target.txt");
+        for scope in [SearchScope::All, SearchScope::ToolOutputs] {
+            p.scope = scope;
+            let out = run_overflow_search(&dir, &p).unwrap();
+            assert!(out.contains("tool-overflow-compressed/zz-target.txt"), "{out}");
+            assert!(out.contains("context-checkpoints/a/b/c/d/e/f/g/h/i/zz-target.txt"), "{out}");
+            assert!(out.contains("files scanned 2"), "{out}");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_search_collects_nested_files_without_internal_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = make_temp_dir();
+        let snapshots = dir.join("tool-overflow-compressed");
+        let nested = snapshots.join("nested/deeper");
+        fs::create_dir_all(&nested).unwrap();
+        let first = snapshots.join("a.txt");
+        let second = nested.join("b.txt");
+        fs::write(&first, "nested_keyword first\n").unwrap();
+        fs::write(&second, "nested_keyword second\n").unwrap();
+        symlink(&second, snapshots.join("file-link.txt")).unwrap();
+        symlink(&nested, snapshots.join("directory-link")).unwrap();
+        symlink(&snapshots, nested.join("loop")).unwrap();
+
+        let archive = archive_files::ArchiveRoot::new(&dir).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                collect_files(&archive, &snapshots),
+                vec![first.clone(), second.clone()]
+            );
+        }
+        let out = run_overflow_search(&dir, &params("nested_keyword")).unwrap();
+        assert!(out.contains("nested/deeper/b.txt"), "{out}");
+        assert!(out.contains("files scanned 2"), "{out}");
+        assert!(!out.contains("file-link"), "{out}");
+        assert!(!out.contains("directory-link"), "{out}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_search_rejects_outside_file_directory_and_root_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = make_temp_dir();
+        let outside = make_temp_dir();
+        fs::create_dir_all(dir.join("context-checkpoints")).unwrap();
+        fs::write(outside.join("external.md"), "external_secret_keyword\n").unwrap();
+        symlink(outside.join("external.md"), dir.join("context-checkpoints/link.md")).unwrap();
+        symlink(&outside, dir.join("context-checkpoints/nested")).unwrap();
+        symlink(&outside, dir.join("tool-overflow")).unwrap();
+        symlink(outside.join("external.md"), dir.join("overflow-history.md")).unwrap();
+        let out = run_overflow_search(&dir, &params("external_secret_keyword")).unwrap();
+        assert!(out.contains("No matches found"), "{out}");
+        assert!(!out.contains("external.md"), "{out}");
+        let root_link = dir.join("session-link");
+        symlink(&outside, &root_link).unwrap();
+        let out = run_overflow_search(&root_link, &params("external_secret_keyword")).unwrap();
+        assert!(out.contains("nothing was scanned"), "{out}");
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_search_render_rejects_symlink_swapped_after_scan() {
+        let dir = make_temp_dir();
+        let outside = make_temp_dir();
+        let archive = archive_files::ArchiveRoot::new(&dir).unwrap();
+        let path = dir.join("overflow-history.md");
+        fs::write(&path, "needle original\n").unwrap();
+        assert!(read_archive_text(&archive, &path).is_some());
+        let file = ScoredFile {
+            root_idx: 0,
+            scan: FileScan {
+                root_idx: 0,
+                display_path: path.to_string_lossy().into_owned(),
+                hits: Vec::new(),
+                total_lines: 1,
+            },
+            file_score: 1.0,
+            scored: vec![(0, 1.0)],
+            total_matches: 1,
+        };
+        fs::rename(&path, dir.join("saved.md")).unwrap();
+        fs::write(outside.join("external.md"), "needle external_secret_body\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("external.md"), &path).unwrap();
+        let out = render_selection(vec![file], &params("needle"), 1, &archive).unwrap();
+        assert!(!out.contains("external_secret_body"), "{out}");
+        assert!(out.contains("file unreadable during excerpt rendering"), "{out}");
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&outside).ok();
     }
 
     #[test]

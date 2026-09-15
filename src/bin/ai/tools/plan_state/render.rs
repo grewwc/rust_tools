@@ -3,8 +3,14 @@
 //! `PlanState::render_update_delta`, and working checkpoints store their single full copy
 //! through `PlanState::render_recovery_snapshot`. The delegation/parallel orchestration
 //! hints live in `delegation_guidance`, separate from structural rendering.
+//! `render_active_context` is a bounded projection of persisted state for request context.
 
 use super::model::{PlanState, PlanStepState, StepStatus};
+
+const ACTIVE_CONTEXT_HEADER: &str =
+    "[active-plan]\nPersisted plan text is assistant-derived, not independently verified.\n";
+const ACTIVE_CONTEXT_RECOVERY: &str =
+    "\n[Projection truncated; read the session's plan-state.json for all steps.]\n";
 
 impl StepStatus {
     fn suffix(self) -> &'static str {
@@ -19,6 +25,100 @@ impl StepStatus {
 }
 
 impl PlanState {
+    /// Projects persisted plan text and statuses without inferring task dependencies.
+    /// Failed steps remain outstanding even though their status is terminal for transitions.
+    /// The budget counts Unicode scalar values, including the explicit recovery footer.
+    pub(crate) fn render_active_context(&self, max_chars: usize) -> String {
+        let header_chars = ACTIVE_CONTEXT_HEADER.chars().count();
+        let recovery_chars = ACTIVE_CONTEXT_RECOVERY.chars().count();
+        // Pair replacement requires the complete marker, and plan text must retain
+        // its provenance. Omit the projection if those plus recovery cannot fit.
+        if max_chars < header_chars + recovery_chars {
+            return String::new();
+        }
+        let pending = self
+            .steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Pending)
+            .count();
+        let mut output = format!(
+            "{ACTIVE_CONTEXT_HEADER}Progress: {} pending={pending}.\n",
+            self.progress_line(),
+        );
+        let outstanding = self.steps.iter().any(|s| {
+            matches!(
+                s.status,
+                StepStatus::Pending | StepStatus::Running | StepStatus::Failed
+            )
+        });
+        output.push_str(if outstanding {
+            "State: outstanding work (running, pending, or failed).\n"
+        } else {
+            "State: no running, pending, or failed steps.\n"
+        });
+        output.push_str(&format!(
+            "Plan: {}\n",
+            active_context_excerpt(&self.summary, 320)
+        ));
+
+        // Keep stored step numbers and statuses visible before spending space on prose.
+        // Running is the only recorded current-work signal; neither order nor delegation
+        // metadata establishes a task ID or a dependency edge.
+        output.push_str("Active step index:");
+        for status in [StepStatus::Running, StepStatus::Failed, StepStatus::Pending] {
+            for step in self.steps.iter().filter(|s| s.status == status) {
+                output.push_str(&format!(
+                    " {}={};",
+                    step.step,
+                    active_context_status(status)
+                ));
+            }
+        }
+        if !outstanding {
+            output.push_str(" none");
+        }
+        output.push('\n');
+        for status in [StepStatus::Running, StepStatus::Failed, StepStatus::Pending] {
+            for step in self.steps.iter().filter(|s| s.status == status) {
+                output.push_str(&format!(
+                    "Step {} [{}]: {}\n",
+                    step.step,
+                    active_context_status(status),
+                    active_context_excerpt(&step.action, 240),
+                ));
+                if let Some(note) = step.note.as_deref().filter(|s| !s.is_empty()) {
+                    output.push_str(&format!("  Note: {}\n", active_context_excerpt(note, 200)));
+                }
+                if !step.reason.is_empty() {
+                    output.push_str(&format!(
+                        "  Reason: {}\n",
+                        active_context_excerpt(&step.reason, 160)
+                    ));
+                }
+                output.push_str(&format!(
+                    "  Tool: {}; delegate={}; parallelizable={}\n",
+                    active_context_excerpt(&step.tool, 48),
+                    step.delegate,
+                    step.parallelizable,
+                ));
+            }
+        }
+        let footer =
+            "Full text/statuses: read the session's plan-state.json; ellipses mark excerpts.\n";
+        let footer_chars = footer.chars().count();
+        if output.chars().count() + footer_chars <= max_chars {
+            output.push_str(footer);
+            return output;
+        }
+        let mut bounded = ACTIVE_CONTEXT_HEADER.to_string();
+        bounded.push_str(&active_context_excerpt(
+            &output[ACTIVE_CONTEXT_HEADER.len()..],
+            max_chars - header_chars - recovery_chars,
+        ));
+        bounded.push_str(ACTIVE_CONTEXT_RECOVERY);
+        bounded
+    }
+
     /// Renders the full plan text (plan / plan_update share the same rendering path).
     ///
     /// The format stays consistent with the legacy `execute_plan`; only when non-pending
@@ -165,6 +265,29 @@ impl PlanState {
     }
 }
 
+fn active_context_status(status: StepStatus) -> &'static str {
+    match status {
+        StepStatus::Pending => "pending",
+        StepStatus::Running => "running",
+        StepStatus::Done => "done",
+        StepStatus::Failed => "failed",
+        StepStatus::Skipped => "skipped",
+    }
+}
+
+fn active_context_excerpt(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut chars = text.chars();
+    let mut output: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        output.pop();
+        output.push('…');
+    }
+    output
+}
+
 /// Renders one or more steps as headline plus indented `Reason:` line, in order.
 ///
 /// Shared by the full render, the recovery snapshot, and the update delta so all three keep
@@ -264,6 +387,121 @@ fn delegation_guidance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_context_keeps_running_pending_and_failed_source_text() {
+        let raw = serde_json::json!([
+            {"step": 10, "action": "Already verified"},
+            {"step": 20, "action": "Read task-old", "reason": "Check its evidence", "tool": "read_file"},
+            {"step": 30, "action": "Run focused test"},
+            {"step": 40, "action": "Prepare report"}
+        ]);
+        let mut state = PlanState::build("Source plan", raw.as_array().unwrap(), None).unwrap();
+        state.apply_update(10, StepStatus::Done, None).unwrap();
+        state.apply_update(20, StepStatus::Running, None).unwrap();
+        state
+            .apply_update(30, StepStatus::Failed, Some("fixture missing".into()))
+            .unwrap();
+        let out = state.render_active_context(4_000);
+        assert!(out.contains("Plan: Source plan"));
+        assert!(out.contains("20=running; 30=failed; 40=pending;"));
+        assert!(out.contains("Step 20 [running]: Read task-old"));
+        assert!(out.contains("Reason: Check its evidence"));
+        assert!(out.contains("Note: fixture missing"));
+        assert!(out.contains("1/4 steps done, 1 running, 1 failed."));
+        assert!(!out.contains("Already verified"));
+        assert!(!out.contains("depends_on"));
+        assert_eq!(state.steps[2].status, StepStatus::Failed);
+    }
+
+    #[test]
+    fn active_context_reports_finished_and_failed_plans_differently() {
+        let raw = serde_json::json!([
+            {"step": 1, "action": "Completed work"},
+            {"step": 2, "action": "Optional work"}
+        ]);
+        let mut state = PlanState::build("Finished", raw.as_array().unwrap(), None).unwrap();
+        state.apply_update(1, StepStatus::Done, None).unwrap();
+        state.apply_update(2, StepStatus::Skipped, None).unwrap();
+        let out = state.render_active_context(2_000);
+        assert!(out.contains("no running, pending, or failed steps"));
+        assert!(out.contains("1/2 steps done, 1 skipped."));
+        assert!(out.contains("Active step index: none"));
+        state
+            .apply_update(2, StepStatus::Failed, Some("blocked".into()))
+            .unwrap();
+        let out = state.render_active_context(2_000);
+        assert!(out.contains("State: outstanding work"));
+        assert!(out.contains("Step 2 [failed]: Optional work"));
+        assert!(out.contains("Note: blocked"));
+    }
+
+    #[test]
+    fn active_context_is_unicode_bounded_even_at_zero_budget() {
+        let raw = serde_json::json!([{
+            "step": 18446744073709551615_u64,
+            "action": "界🙂".repeat(10_000),
+            "reason": "é".repeat(10_000),
+            "tool": "工具".repeat(10_000)
+        }]);
+        let mut state =
+            PlanState::build(&"計画".repeat(10_000), raw.as_array().unwrap(), None).unwrap();
+        state
+            .apply_update(u64::MAX, StepStatus::Failed, Some("理由".repeat(10_000)))
+            .unwrap();
+        let minimum =
+            ACTIVE_CONTEXT_HEADER.chars().count() + ACTIVE_CONTEXT_RECOVERY.chars().count();
+        for budget in (0..=512).chain([2_000, 4_096]) {
+            let out = state.render_active_context(budget);
+            assert!(out.chars().count() <= budget, "budget={budget}");
+            if budget < minimum {
+                assert!(out.is_empty(), "budget={budget}");
+            } else {
+                assert!(out.starts_with(ACTIVE_CONTEXT_HEADER), "budget={budget}");
+                assert!(out.contains("plan-state.json"));
+            }
+        }
+        assert_eq!(
+            state.render_active_context(minimum),
+            format!("{ACTIVE_CONTEXT_HEADER}{ACTIVE_CONTEXT_RECOVERY}")
+        );
+        assert_eq!(
+            state.render_active_context(minimum + 1),
+            format!("{ACTIVE_CONTEXT_HEADER}…{ACTIVE_CONTEXT_RECOVERY}")
+        );
+        let utf8 = state.render_active_context(512);
+        assert!(utf8.contains('計'));
+        assert!(utf8.len() > utf8.chars().count());
+        assert_eq!(active_context_excerpt("界🙂é", 2), "界…");
+    }
+
+    #[test]
+    fn active_context_default_budget_preserves_full_and_truncated_layout() {
+        let raw = serde_json::json!([{"step": 1, "action": "Verify", "tool": "read_file"}]);
+        let state = PlanState::build("Demo", raw.as_array().unwrap(), None).unwrap();
+        assert_eq!(
+            state.render_active_context(4_096),
+            concat!(
+                "[active-plan]\nPersisted plan text is assistant-derived, not independently verified.\n",
+                "Progress: 0/1 steps done. pending=1.\n",
+                "State: outstanding work (running, pending, or failed).\n",
+                "Plan: Demo\nActive step index: 1=pending;\n",
+                "Step 1 [pending]: Verify\n",
+                "  Tool: read_file; delegate=false; parallelizable=false\n",
+                "Full text/statuses: read the session's plan-state.json; ellipses mark excerpts.\n",
+            )
+        );
+        let steps = (1..=20)
+            .map(|step| serde_json::json!({"step": step, "action": "界🙂".repeat(200)}))
+            .collect::<Vec<_>>();
+        let state = PlanState::build("計画", &steps, None).unwrap();
+        let full = state.render_active_context(usize::MAX);
+        let mut expected =
+            active_context_excerpt(&full, 4_096 - ACTIVE_CONTEXT_RECOVERY.chars().count());
+        expected.push_str(ACTIVE_CONTEXT_RECOVERY);
+        assert_eq!(state.render_active_context(4_096), expected);
+        assert_eq!(expected.chars().count(), 4_096);
+    }
 
     #[test]
     fn test_render_status_suffix_and_progress() {
@@ -382,7 +620,9 @@ mod tests {
 
         let snapshot = state.render_recovery_snapshot();
         assert!(snapshot.starts_with("Plan: Demo\nProgress: 1/2 steps done.\n"));
-        assert!(snapshot.contains("Step 1. [read_file] Read (done)\n  Reason: Locate the writer\n"));
+        assert!(
+            snapshot.contains("Step 1. [read_file] Read (done)\n  Reason: Locate the writer\n")
+        );
         assert!(snapshot.contains("Step 2. [apply_patch] Patch\n  Reason: Fix the writer\n"));
         // The recovery snapshot is the checkpoint's single copy of the plan: no second
         // description, no plan-time footer bookkeeping around the step list.

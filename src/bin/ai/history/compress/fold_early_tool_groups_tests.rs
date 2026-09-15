@@ -39,8 +39,8 @@ fn tool_result(id: &str, content: &str) -> Message {
     }
 }
 
-/// 构造：system + user + N 个 (assistant tool_calls + tool 结果) 组，全部在
-/// 同一个 user 轮内（只有一条 user 消息）——正是"臃肿全堆在当前轮"的场景。
+/// Builds system + user + N (assistant tool_calls + tool results) groups in a single
+/// user turn (only one user message), modeling all excess content accumulating in the current turn.
 fn single_turn_with_groups(n: usize, tool_result_chars: usize) -> Vec<Message> {
     let mut messages = vec![msg("system", "system prompt"), msg("user", "干活")];
     for i in 0..n {
@@ -109,8 +109,8 @@ fn folds_early_groups_in_a_single_bloated_turn() {
 
     let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
 
-    // 10 组各 1 条 tool 结果 → 10 条 tool 消息。虽然 keep_recent_groups=4，但
-    // 最近完整 4 组逐字保留，最早 6 组折叠。
+    // Ten groups with one result each give ten tool messages. With keep_recent_groups=4,
+    // the latest four complete groups remain verbatim and the earliest six are folded.
     assert_eq!(folded_groups, 6);
     let after = messages_total_chars(&folded);
     assert!(
@@ -246,11 +246,11 @@ fn removable_messages_are_archived_in_one_batch() {
 
     let archive = std::fs::read_to_string(overflow_dir.join(OVERFLOW_HISTORY_FILENAME)).unwrap();
     assert_eq!(archive.matches("## Removed messages (verbatim)").count(), 1);
-    // 正文消息（assistant 纯文本）被整批归档……
+    // Body messages (plain assistant text) are archived together...
     assert!(archive.contains("answer-0"));
     assert!(archive.contains("answer-2"));
-    // ……但 internal note 不再重复 append（问题 4 修复：note 正文证据已在各自
-    // 磁盘文件，重复归档会让 overflow-history.md 随压缩次数单调膨胀）。
+    // ...but internal notes are not appended again: their evidence already resides in individual
+    // disk files, and re-archiving it would grow overflow-history.md on every compression pass.
     assert!(!archive.contains("old-0"));
     assert!(!archive.contains(COMPRESSED_TOOL_EVIDENCE_MARKER));
 
@@ -274,7 +274,7 @@ fn keeps_recent_groups_verbatim() {
     let messages = single_turn_with_groups(8, 1_500);
     let (folded, _) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
 
-    // 8 组各 1 条 tool 结果。按完整组保护最近 4 组，最早 4 组折叠为 stub。
+    // Eight groups with one result each: keep the latest four complete groups and fold the first four into stubs.
     let full_tool_results = folded
         .iter()
         .filter(|m| m.role == "tool" && value_to_string(&m.content) == "x".repeat(1_500))
@@ -291,17 +291,17 @@ fn no_op_when_group_count_within_keep_window() {
     assert_eq!(folded.len(), messages.len());
 }
 
-/// 组原子性不变量：即使调用方要求最激进的 `keep_recent_groups=0`，折叠也必须
-/// 保留最近完整工具组，而不是按扁平 tool 消息数从并行批次中间切开。否则模型会
-/// 看到同批调用的一半结果，误以为另一半需要重跑。
+/// Group atomicity invariant: folding must handle complete tool groups, even with the most
+/// aggressive `keep_recent_groups=0`, rather than split a parallel batch by flat tool-message
+/// counts and expose only half its results, prompting unnecessary reruns of the other half.
 #[test]
 fn fold_never_crosses_recent_tool_message_protection_window() {
     let messages = single_turn_with_groups(10, 1_200);
 
-    // keep_recent_groups=0 表面上要折叠全部 10 组。
+    // keep_recent_groups=0 requests folding all ten groups.
     let (folded, folded_groups) = fold_early_tool_groups(&messages, 0, None, &FxHashSet::default());
 
-    // 每组 1 条 tool 结果；调用方要求保留 0 组，因此 10 组都可折叠。
+    // Each group has one tool result; the caller retains zero groups, so all ten may be folded.
     assert_eq!(folded_groups, 10);
     let full_tool_results = folded
         .iter()
@@ -317,13 +317,13 @@ fn fold_never_crosses_recent_tool_message_protection_window() {
 #[test]
 fn stub_preserves_file_path_recall_anchor() {
     let mut messages = vec![msg("system", "s"), msg("user", "干活")];
-    // 早期一组：read_file 结果已外溢，含 file_path 指针，必须在 stub 中保留。
+    // Early group: the read_file result is already offloaded; its file_path pointer must survive in the stub.
     messages.push(assistant_call("call-old", "read_file"));
     messages.push(tool_result(
             "call-old",
             "Output preserved for non-compressible tool `read_file`.\n- file_path: /tmp/session/xyz.txt\n- use read_file to inspect exact content.",
         ));
-    // 追加足够多的近端组把上面那组挤进折叠区。
+    // Append enough recent groups to push the earlier group into the folding region.
     for i in 0..6 {
         let id = format!("call-{i}");
         messages.push(assistant_call(&id, "text_grep"));
@@ -409,9 +409,9 @@ fn folded_read_file_group_keeps_preview_and_original_target_anchor() {
     let _ = std::fs::remove_dir_all(overflow_dir);
 }
 
-/// 一级外溢 stub 已包含（或可由 tool call 重建）原始调用参数时，二级工具组折叠
-/// 也必须保留它们。否则 history 只剩不可辨识的内部归档路径，模型会把它当源码
-/// 回读，导致「压缩产物不存在 / 源码消失」的错误判断。
+/// Second-level tool-group folding must preserve original invocation arguments already present
+/// in first-level overflow stubs or reconstructible from tool calls. Otherwise only opaque internal
+/// archive paths remain, which the model may reread as source and misdiagnose as missing artifacts or code.
 #[test]
 fn folded_archived_precision_tools_keep_original_invocation_anchors() {
     let mut messages = vec![msg("system", "s"), msg("user", "排查问题")];
@@ -477,8 +477,8 @@ fn folded_archived_precision_tools_keep_original_invocation_anchors() {
     );
 }
 
-/// 同一 user turn 内工具组过多时，`cargo test` 一类命令可能离开最近组保护窗。
-/// 折叠后仍必须能看到失败结论和关键报错，并通过 `file_path` 读取完整日志。
+/// With many tool groups in one user turn, commands such as `cargo test` may leave the recent-group window.
+/// Folding must retain the failure outcome and key diagnostics, with `file_path` pointing to the full log.
 #[test]
 fn folded_command_failure_keeps_diagnostics_and_full_output_pointer() {
     let overflow_dir =
@@ -491,7 +491,7 @@ fn folded_command_failure_keeps_diagnostics_and_full_output_pointer() {
     let mut messages = vec![msg("system", "s"), msg("user", "修复编译失败")];
     messages.push(assistant_call("command", "execute_command"));
     messages.push(tool_result("command", command_output));
-    // 将命令组推出最近 4 组保护窗，模拟一轮内大量 read/search 后触发 LLM 摘要。
+    // Push the command outside the latest four groups, modeling LLM summarization after many reads/searches in one turn.
     for i in 0..4 {
         let id = format!("later-{i}");
         messages.push(assistant_call(&id, "text_grep"));
@@ -544,8 +544,8 @@ fn assistant_plain_with_reasoning(reasoning: &str) -> Message {
     }
 }
 
-/// 跨轮滑窗：带 tool_calls 的 assistant reasoning 只保留最近
-/// `KEEP_RECENT_TOOL_CALL_REASONING` 条，更早的置 None；纯回答 reasoning 只留最近一条。
+/// Across-turn sliding window: retain only the latest `KEEP_RECENT_TOOL_CALL_REASONING`
+/// assistant reasoning entries with tool_calls, setting older ones to None; keep only the latest plain-answer reasoning.
 #[test]
 fn keeps_only_recent_tool_call_reasoning_across_turns() {
     assert_eq!(KEEP_RECENT_TOOL_CALL_REASONING, 3);
@@ -553,10 +553,10 @@ fn keeps_only_recent_tool_call_reasoning_across_turns() {
     let mut messages = vec![
         msg("system", "s"),
         msg("user", "干活"),
-        // 早期纯回答 reasoning：非最近一条，应被丢弃。
+        // Earlier plain-answer reasoning is not the latest and should be dropped.
         assistant_plain_with_reasoning("early-plain"),
     ];
-    // 5 组带 tool_calls 的 reasoning：rank 0/1 应丢弃，rank 2/3/4 保留。
+    // Five reasoning groups with tool_calls: drop ranks 0/1 and retain ranks 2/3/4.
     for i in 0..5 {
         let id = format!("call-{i}");
         messages.push(assistant_call_with_reasoning(
@@ -566,12 +566,12 @@ fn keeps_only_recent_tool_call_reasoning_across_turns() {
         ));
         messages.push(tool_result(&id, "r"));
     }
-    // 最近一条纯回答 reasoning：应保留。
+    // The latest plain-answer reasoning should be retained.
     messages.push(assistant_plain_with_reasoning("final-plain"));
 
     keep_only_recent_reasoning_content(&mut messages);
 
-    // 用 tool_call id 定位 tool-call reasoning。
+    // Locate tool-call reasoning by tool_call id.
     let tc_reasoning = |id: &str| -> Option<String> {
         messages
             .iter()
@@ -597,7 +597,7 @@ fn keeps_only_recent_tool_call_reasoning_across_turns() {
     assert_eq!(tc_reasoning("call-3").as_deref(), Some("tc-3"));
     assert_eq!(tc_reasoning("call-4").as_deref(), Some("tc-4"));
 
-    // 纯回答 reasoning：只保留最近一条（final-plain），早期一条置 None。
+    // Plain-answer reasoning: retain only the latest (final-plain), setting the earlier one to None.
     let plain_reasonings: Vec<Option<String>> = messages
         .iter()
         .filter(|m| m.role == "assistant" && m.tool_calls.is_none())
@@ -654,8 +654,8 @@ fn encrypted_replay_reasoning_survives_recent_reasoning_window() {
 
     keep_only_recent_reasoning_content(&mut messages);
 
-    // 5 条 tool-call reasoning 超过保留窗口：不带标记的普通 reasoning 会被裁掉，
-    // 加密回放状态必须全部逐字节保留（与 exact-replay 同等待遇）。
+    // Five tool-call reasoning entries exceed the retention window: unmarked reasoning would be trimmed,
+    // but all encrypted replay state must remain byte-exact, just like exact-replay state.
     assert!(
         messages.iter().filter(|m| m.tool_calls.is_some()).all(|m| m
             .reasoning_content
@@ -679,7 +679,7 @@ fn path_c_preserves_exact_replay_reasoning_verbatim() {
         .expect("exact-replay reasoning should be encoded");
     assert!(encoded.starts_with(PERSISTED_REASONING_REPLAY_PREFIX));
 
-    // Path C 的单字段上限不能把 marker+payload 当普通 reasoning 截断。
+    // The emergency per-field cap must not truncate marker+payload as ordinary reasoning.
     let mut per_field_capped = vec![assistant.clone(), tool_result("glm-call", "ok")];
     assert!(emergency_cap_messages_to_fit(
         &mut per_field_capped,
@@ -706,7 +706,7 @@ fn path_c_preserves_exact_replay_reasoning_verbatim() {
         Some(encoded.as_str())
     );
 
-    // 若 exact replay 本身已超过总预算，宁可报告未达标，也不能制造不可解码的伪状态。
+    // If exact replay alone exceeds the total budget, report failure to fit rather than create undecodable state.
     let mut aggregate_capped = vec![assistant, tool_result("glm-call", "ok")];
     assert!(!emergency_cap_messages_to_fit(
         &mut aggregate_capped,
@@ -748,7 +748,7 @@ fn path_c_preserves_encrypted_replay_reasoning_verbatim() {
         .expect("encrypted replay reasoning should be encoded");
     assert!(encoded.starts_with(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX));
 
-    // Path C 的单字段上限不能把 marker+payload 当普通 reasoning 截断。
+    // The emergency per-field cap must not truncate marker+payload as ordinary reasoning.
     let mut per_field_capped = vec![assistant.clone(), tool_result("spark-call", "ok")];
     assert!(emergency_cap_messages_to_fit(
         &mut per_field_capped,
@@ -775,7 +775,7 @@ fn path_c_preserves_encrypted_replay_reasoning_verbatim() {
         Some(encoded.as_str())
     );
 
-    // 若加密回放本身已超过总预算，宁可报告未达标，也不能制造不可解码的伪状态。
+    // If encrypted replay alone exceeds the total budget, report failure to fit rather than create undecodable state.
     let mut aggregate_capped = vec![assistant, tool_result("spark-call", "ok")];
     assert!(!emergency_cap_messages_to_fit(
         &mut aggregate_capped,
@@ -803,7 +803,7 @@ fn encrypted_reasoning_replay_roundtrip_same_model() {
     ];
     let encoded = encode_encrypted_reasoning_replay_state(model, &items);
     assert!(encoded.starts_with(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX));
-    // 与 exact-replay 前缀互不误认。
+    // The encrypted and exact-replay prefixes must remain distinguishable.
     assert!(!encoded.starts_with(PERSISTED_REASONING_REPLAY_PREFIX));
 
     let decoded = decode_encrypted_reasoning_replay_for_model(model, &encoded)
@@ -813,10 +813,10 @@ fn encrypted_reasoning_replay_roundtrip_same_model() {
 
 #[test]
 fn encrypted_reasoning_replay_dedups_same_id_duplicate() {
-    // 网关会对同一 reasoning 资源重复下发 .added（部分载荷）与 .done（完整载荷）：
-    // id 相同、encrypted_content 长度不同。历史里可能因此落库同 id 的两项，解码
-    // 必须按 id 收敛、保留最长载荷，否则回放时同一资源 id 出现两次触发 modelhub
-    // -4003 (Duplicate item found)。
+    // The gateway sends .added (partial payload) and .done (full payload) for the same reasoning resource:
+    // identical id, different encrypted_content lengths. History may persist both entries, so decoding
+    // must deduplicate by id and keep the longest payload; replaying the same resource id twice triggers modelhub
+    // -4003 (Duplicate item found).
     let model = "muse-spark-1.2-contributor";
     let items = vec![
         serde_json::json!({
@@ -844,7 +844,7 @@ fn encrypted_reasoning_replay_dedups_same_id_duplicate() {
         "必须保留最长（完整）载荷"
     );
 
-    // 不同 id 的项不受影响，全部保留。
+    // Entries with distinct ids are unaffected and all remain.
     let mixed = vec![
         serde_json::json!({"type":"reasoning","id":"rs_a","encrypted_content":"A"}),
         serde_json::json!({"type":"reasoning","id":"rs_b","encrypted_content":"B"}),
@@ -859,9 +859,9 @@ fn encrypted_reasoning_replay_dedups_same_id_duplicate() {
 fn encrypted_reasoning_replay_rejects_cross_model() {
     let items = vec![serde_json::json!({"type":"reasoning","encrypted_content":"X"})];
     let encoded = encode_encrypted_reasoning_replay_state("muse-spark-1.2-contributor", &items);
-    // 切换/回退到其它模型：解码必须返回 None，绝不把 A 的加密状态喂给 B。
+    // Switching/falling back to another model must decode to None, never passing model A's encrypted state to B.
     assert!(decode_encrypted_reasoning_replay_for_model("gpt-5.6-terra", &encoded).is_none());
-    // exact-replay 解码器也不得误解码加密前缀 payload。
+    // The exact-replay decoder must also reject payloads with the encrypted prefix.
     assert!(decode_reasoning_replay_for_model("muse-spark-1.2-contributor", &encoded).is_none());
 }
 
@@ -873,7 +873,7 @@ fn encrypted_reasoning_marker_survives_persist_sanitize() {
     let mut assistant = assistant_call("spark-call", "read_file");
     assistant.reasoning_content = Some(encode_encrypted_reasoning_replay_state(model, &items));
 
-    // 持久化 sanitize 不得把带标记的加密连续性状态裁掉（幂等保留）。
+    // Persistence sanitization must preserve marked encrypted continuation state idempotently.
     let sanitized = sanitize_message_for_persisted_history_for_model(model, &assistant);
     let encoded = sanitized
         .reasoning_content
@@ -919,9 +919,9 @@ fn truncating_mutable_content_archives_original_field() {
 
 #[test]
 fn truncating_content_refuses_empty_preview_stub_for_long_archive_paths() {
-    // 长归档路径会吃掉整个预览预算：stub 只剩路径、不含任何实际内容（假截断）。
-    // 小结果（如 task_status 轮询结果）被换成空预览 stub 后模型无法判断真实状态，
-    // 会陷入「状态确认不了 → 无限轮询」死循环。必须拒绝截断并保留原文。
+    // Long archive paths can consume the entire preview budget, leaving a path-only stub with no actual content.
+    // Replacing small results (such as task_status polls) with empty previews hides the real status and
+    // can cause endless polling to confirm it. Reject such truncation and preserve the original text.
     let overflow_dir = std::env::temp_dir().join(format!(
         "ai-truncate-empty-preview-{}-{}",
         "d".repeat(120),
@@ -943,8 +943,8 @@ fn truncating_content_refuses_empty_preview_stub_for_long_archive_paths() {
 
 #[test]
 fn truncating_reasoning_refuses_empty_preview_stub_for_long_archive_paths() {
-    // 与 Content 分支对称：长归档路径吃光预览预算时，reasoning stub 只剩路径、
-    // 不含任何实际内容（假截断）。必须拒绝截断并保留原文，交给硬预算兜底。
+    // As with Content, long archive paths can exhaust the preview budget, leaving a reasoning stub with
+    // only a path and no actual content. Reject truncation, preserve the original, and defer to the hard budget.
     let overflow_dir = std::env::temp_dir().join(format!(
         "ai-truncate-reasoning-empty-preview-{}-{}",
         "d".repeat(120),
@@ -1113,7 +1113,29 @@ fn summary_shrink_preserves_system_order_when_archive_write_fails() {
 }
 
 #[test]
-fn persisted_summary_absorbs_prior_summary_without_nested_prefix() {
+fn summary_shrink_without_archive_sink_preserves_removed_dialogue() {
+    let messages = vec![
+        msg("system", "system prompt"),
+        msg("user", "earlier request"),
+        msg("assistant", &"old evidence ".repeat(600)),
+        msg("user", "recent request"),
+    ];
+    let shrunk = shrink_messages_to_fit_with_summary(
+        messages.clone(),
+        500,
+        200,
+        None,
+        None,
+        &FxHashSet::default(),
+    );
+    assert!(
+        shrunk == messages,
+        "no-sink removal must restore the entire pre-drop projection"
+    );
+}
+
+#[test]
+fn persisted_summary_excludes_prior_summary_from_new_increment() {
     let messages = vec![
         msg(
             ROLE_INTERNAL_NOTE,
@@ -1125,7 +1147,8 @@ fn persisted_summary_absorbs_prior_summary_without_nested_prefix() {
 
     let summary = build_persisted_summary_text(&messages, 2_000);
 
-    assert!(summary.contains("初始目标: 修复压缩"), "{summary}");
+    assert!(!summary.contains("初始目标: 修复压缩"), "{summary}");
+    assert!(summary.contains("compress.rs"), "{summary}");
     assert!(
         !summary.contains("更早摘要: - 更早摘要:"),
         "summary should not recursively wrap prior summaries: {summary}"
@@ -1157,7 +1180,7 @@ fn summary_model_input_drops_ephemeral_internal_notes() {
 
     normalize_internal_notes_for_summary_model(&mut messages);
 
-    assert_eq!(messages.len(), 3);
+    assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].role, "user");
     let note = value_to_string(&messages[1].content);
     assert!(
@@ -1165,19 +1188,17 @@ fn summary_model_input_drops_ephemeral_internal_notes() {
         "compressed tool evidence should survive summary input normalization: {note}"
     );
     assert!(note.contains("src/lib.rs"), "{note}");
-    let note = value_to_string(&messages[2].content);
-    assert!(note.contains("Existing history summary"), "{note}");
-    assert!(note.contains("初始目标: 保留"), "{note}");
     assert!(!note.contains("self_note"), "{note}");
     assert!(!note.contains("tool_followup"), "{note}");
     assert!(!note.contains("应去重"), "{note}");
+    assert!(!messages.iter().any(is_summary_message));
 }
 
 #[test]
 fn zero_budget_second_pass_preserves_existing_summary_note() {
-    // 生产路径回归：prepare_turn 先用 history_summary_max_chars 构建含早期对话
-    // 摘要的投影，orchestrator 随后用 summary_max_chars=0 的压缩器做第二轮预算
-    // 检查。旧摘要 note 落在 older 段时不得被静默丢弃。
+    // A second budget pass must keep the first pass's summary and archive the
+    // older raw span before dropping it, even with no budget for a new summary.
+    let archive = std::env::temp_dir().join(format!("ai-zero-budget-{}", uuid::Uuid::new_v4()));
     let mut messages = vec![msg(
         ROLE_INTERNAL_NOTE,
         "对话摘要（自动压缩，以下为早期对话要点）：\n初始目标: 修复压缩回归",
@@ -1187,12 +1208,8 @@ fn zero_budget_second_pass_preserves_existing_summary_note() {
         messages.push(msg("assistant", &format!("第 {i} 轮回答")));
     }
 
-    let compressed = compress_messages_for_context(
-        messages, 100_000, // 预算充足，只验证 older 段过滤逻辑
-        2,       // keep_last=2：摘要 note 位于 older 段
-        0,       // summary_max_chars=0：不重建摘要，旧摘要必须保留
-        None, None,
-    );
+    let compressed =
+        compress_messages_for_context(messages, 100_000, 2, 0, Some(archive.clone()), None);
 
     let texts: Vec<String> = compressed
         .iter()
@@ -1208,6 +1225,9 @@ fn zero_budget_second_pass_preserves_existing_summary_note() {
         !texts.iter().any(|t| t.contains("第 0 轮请求")),
         "older raw turns remain replaced by their summary: {texts:?}"
     );
+    let archived = std::fs::read_to_string(archive.join(OVERFLOW_HISTORY_FILENAME)).unwrap();
+    assert!(archived.contains("第 0 轮请求"), "{archived}");
+    let _ = std::fs::remove_dir_all(archive);
 }
 
 fn assistant_call_args(id: &str, name: &str, arguments: &str) -> Message {
@@ -1342,8 +1362,7 @@ fn folded_tool_group_points_to_raw_group_archive() {
 
 #[test]
 fn folded_lossy_group_advises_archive_read_and_archive_header_is_honest() {
-    let overflow_dir =
-        std::env::temp_dir().join(format!("ai-lossy-fold-{}", uuid::Uuid::new_v4()));
+    let overflow_dir = std::env::temp_dir().join(format!("ai-lossy-fold-{}", uuid::Uuid::new_v4()));
     let mut messages = vec![msg("system", "s"), msg("user", "查看项目结构")];
     messages.push(assistant_call("tree-lossy", "tree"));
     messages.push(tool_result(
@@ -1386,8 +1405,8 @@ fn folded_lossy_group_advises_archive_read_and_archive_header_is_honest() {
     );
 
     let archive_path = archive_file_path_from_text(&stub);
-    let archived = std::fs::read_to_string(&archive_path)
-        .expect("folded group archive should be readable");
+    let archived =
+        std::fs::read_to_string(&archive_path).expect("folded group archive should be readable");
     assert!(
         archived.starts_with("# Folded tool group (request-projection copy)"),
         "{archived}"
@@ -1416,8 +1435,7 @@ fn lossy_fold_without_archive_does_not_reference_nonexistent_archive() {
         messages.push(tool_result(&id, "later"));
     }
 
-    let (folded, folded_groups) =
-        fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
+    let (folded, folded_groups) = fold_early_tool_groups(&messages, 4, None, &FxHashSet::default());
     assert_eq!(folded_groups, 1);
     let stub = folded
         .iter()
@@ -1599,8 +1617,8 @@ fn protected_precision_group_archives_full_text_so_header_must_not_claim_stub_on
 
     let mut saw_full_c = false;
     for entry in std::fs::read_dir(&archive_dir).expect("archive dir should exist") {
-        let archived =
-            std::fs::read_to_string(entry.expect("entry").path()).expect("archive should be readable");
+        let archived = std::fs::read_to_string(entry.expect("entry").path())
+            .expect("archive should be readable");
         assert!(
             archived.starts_with("# Folded tool group (request-projection copy)"),
             "{archived}"
@@ -1645,8 +1663,8 @@ fn protected_precision_group_archives_full_text_so_header_must_not_claim_stub_on
     let _ = std::fs::remove_dir_all(overflow_dir);
 }
 
-/// tool-call 轮的 assistant.content 常为空（模型只发 tool_calls、无叙述）。此时只能
-/// 从结构化 tool_calls 重建活动摘要，不能把隐藏 reasoning 提升为后续模型可见的事实。
+/// Tool-call turns often have empty assistant.content (tool_calls without narration). Reconstruct
+/// activity summaries only from structured tool_calls, never promoting hidden reasoning into later model-visible facts.
 #[test]
 fn folded_tool_group_ignores_reasoning_when_content_empty() {
     let overflow_dir =
@@ -1657,7 +1675,7 @@ fn folded_tool_group_ignores_reasoning_when_content_empty() {
         "read_file",
         r#"{"file_path":"0341-history.json","offset":1,"limit":120}"#,
     );
-    // content 留空（tool-call 轮的典型形态），仅提供 reasoning。
+    // Leave content empty, as is typical for tool-call turns, and provide only reasoning.
     call.content = Value::String(String::new());
     call.reasoning_content = Some(
         "已确认该文件是 6393 行的会话历史；下一步只统计 role 分布，不再整文件回读。".to_string(),
@@ -1796,9 +1814,9 @@ fn current_turn_identical_reread_folds_earlier_copy_and_keeps_newest_raw() {
         .map(|message| value_to_string(&message.content))
         .collect::<Vec<_>>();
 
-    // 内容级去重同样作用于本轮 precision 保护的 read_file：较早的逐字节相同副本
-    // 折叠为回指最新副本的 stub（最新副本仍是 raw 全文），既保持"precision 最新
-    // 结果 raw"不变式，又切断同轮内全文重读堆积。
+    // Content deduplication also covers current-turn precision-protected read_file results: fold older
+    // byte-identical copies into stubs pointing to the latest raw full-text copy. This preserves the
+    // latest-result-is-raw precision invariant while preventing duplicate full-text buildup within one turn.
     assert_eq!(
         results.len(),
         2,
@@ -1948,8 +1966,8 @@ fn leading_compressed_tool_evidence_notes_are_not_immortal_prefix_context() {
         remaining_evidence < 8,
         "stale compressed evidence notes should not remain an immortal prefix"
     );
-    // 问题 4 修复：internal note 不再重复归档（正文证据已在 folded group 文件）；
-    // 归档文件可能不存在（本场景无正文消息被裁），存在时也绝不含 note 文本。
+    // Do not re-archive internal notes: their evidence already resides in folded-group files.
+    // The archive may be absent when no body messages are trimmed; if present, it must not contain note text.
     let archived =
         std::fs::read_to_string(overflow_dir.join("overflow-history.md")).unwrap_or_default();
     assert!(!archived.contains("compressed_tool_round"), "{archived}");
@@ -1978,7 +1996,7 @@ fn compressed_tool_evidence_has_independent_inline_budget() {
     }
     assert!(compressed_tool_evidence_exceeds_inline_budget(&messages));
 
-    // 整体远低于全局 100K 预算，仍应由工具证据自己的 12K 上限主动收敛。
+    // Even far below the global 100K budget, tool evidence should shrink proactively to its own 12K cap.
     let compressed = compress_messages_for_context(
         messages,
         100_000,
@@ -2016,8 +2034,8 @@ fn compressed_tool_evidence_has_independent_inline_budget() {
     let _ = std::fs::remove_dir_all(overflow_dir);
 }
 
-/// 压缩后的命令组必须保留调用参数。仅保留「成功但无输出」不足以说明已经查过
-/// 哪个 author/date/cwd 组合，模型会把它当成未执行过的调查而从同一条 git log 重启。
+/// Compressed command groups must retain invocation arguments. "Succeeded with no output" alone cannot
+/// identify the author/date/cwd combination already checked, so the model may repeat the same git log investigation.
 #[test]
 fn folded_command_keeps_invocation_for_empty_success() {
     let overflow_dir =
@@ -2091,14 +2109,14 @@ fn assistant_call_args_multi(id: &str, calls: &[(&str, &str)]) -> Message {
     }
 }
 
-/// apply_patch 失败后，该路径最近的 read_file 结果不得被折叠——否则模型
-/// 会因拿不到精确 context 再次 patch 失败、陷入"重读→再失败"循环。
+/// After apply_patch fails, the latest read_file result for that path must not be folded; otherwise,
+/// missing exact context can cause another patch failure and a loop of rereads followed by failures.
 #[test]
 fn preserves_read_file_for_pending_patch_path() {
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-pending-patch-fold-{}", uuid::Uuid::new_v4()));
     let mut messages = vec![msg("system", "s"), msg("user", "改代码")];
-    // 早期：read_file 读 /a.rs（将被 apply_patch 引用）。
+    // Early read_file invocation reads /a.rs, which apply_patch will reference.
     messages.push(assistant_call_args(
         "call-rf",
         "read_file",
@@ -2108,7 +2126,7 @@ fn preserves_read_file_for_pending_patch_path() {
         "call-rf",
         "PENDING_READ_SENTINEL\nOutput preserved for non-compressible tool `read_file`.\n- file_path: /a.rs\n- use read_file to inspect exact content.",
     ));
-    // apply_patch 针对 /a.rs 失败（pending）。
+    // apply_patch fails for /a.rs, leaving the patch pending.
     messages.push(assistant_call_args(
         "call-ap",
         "apply_patch",
@@ -2118,7 +2136,7 @@ fn preserves_read_file_for_pending_patch_path() {
         "call-ap",
         "Error: apply_patch failed: context mismatch: patch hunk could not be located.",
     ));
-    // 追加足够多近端组把上面挤进折叠区。
+    // Append enough recent groups to push the earlier interactions into the folding region.
     for i in 0..6 {
         let id = format!("call-{i}");
         messages.push(assistant_call(&id, "text_grep"));
@@ -2132,7 +2150,7 @@ fn preserves_read_file_for_pending_patch_path() {
         &FxHashSet::default(),
     );
     assert!(folded_groups >= 1, "应至少折叠 apply_patch/grep 组");
-    // read_file 组必须逐字保留（不是 ROLE_INTERNAL_NOTE stub）。
+    // The read_file group must remain verbatim, not become a ROLE_INTERNAL_NOTE stub.
     let rf = folded
         .iter()
         .find(|m| {
@@ -2144,7 +2162,7 @@ fn preserves_read_file_for_pending_patch_path() {
                     .unwrap_or(false)
         })
         .expect("pending-patch 路径的 read_file 组不应被折叠");
-    let _ = rf; // 仅断言其存在且 role 仍为 assistant
+    let _ = rf; // Assert only that it exists and its role remains assistant.
     assert_tool_pairs_consistent(&folded);
     let group_archive_dir = overflow_dir.join(FOLDED_TOOL_GROUP_ARCHIVE_DIR);
     let archive = std::fs::read_dir(&group_archive_dir)
@@ -2305,8 +2323,8 @@ fn retains_overlap_when_the_file_changed_between_reads() {
     );
 }
 
-/// 渐进折叠窗口序列从最大保护窗口起、递进收紧但**绝不到 0**：最近一次工具交互
-/// 始终至少保留 1 组逐字，避免最近的结构化工具上下文也被折叠成 stub。
+/// Progressive folding windows start at maximum protection and decrease but **never reach 0**:
+/// retain at least one recent tool group verbatim so the latest structured tool context never becomes a stub.
 #[test]
 fn progressive_fold_windows_never_reach_zero() {
     let windows = progressive_fold_windows();
@@ -2328,7 +2346,7 @@ fn progressive_fold_windows_never_reach_zero() {
         !windows.contains(&0),
         "window 0 folds the most recent tool interaction into a stub (was {windows:?})"
     );
-    // 严格递减，保证每一步真正放宽折叠范围、不空转。
+    // Strictly decrease so every step expands the folding region rather than doing no work.
     assert!(
         windows.windows(2).all(|pair| pair[0] > pair[1]),
         "windows must be strictly decreasing (was {windows:?})"

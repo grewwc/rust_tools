@@ -41,7 +41,10 @@ pub(in crate::ai) use blob::{
 #[allow(unused_imports)]
 pub(in crate::ai) use checkpoint::{CheckpointInfo, CheckpointStore};
 #[allow(unused_imports)]
-pub(in crate::ai) use compress::compress_messages_for_context;
+pub(in crate::ai) use compress::{
+    ContextCompressionOutcome, ContextCompressionStatus, compress_messages_for_context,
+    compress_messages_for_context_with_outcome,
+};
 #[allow(unused_imports)]
 pub(in crate::ai) use compress::value_to_string;
 #[allow(unused_imports)]
@@ -437,7 +440,7 @@ struct ContextHistoryCacheKey {
 
 struct ContextHistoryCacheEntry {
     key: ContextHistoryCacheKey,
-    value: Arc<Vec<Message>>,
+    value: Arc<ContextCompressionOutcome>,
 }
 
 pub(in crate::ai) fn is_internal_note_role(role: &str) -> bool {
@@ -492,6 +495,26 @@ pub(in crate::ai) fn build_context_history(
     overflow_dir: Option<PathBuf>,
     cwd: Option<&Path>,
 ) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
+    build_context_history_with_outcome(
+        history_count,
+        history_file,
+        history_max_chars,
+        history_keep_last,
+        history_summary_max_chars,
+        overflow_dir,
+        cwd,
+    ).map(ContextCompressionOutcome::into_messages)
+}
+
+pub(in crate::ai) fn build_context_history_with_outcome(
+    history_count: usize,
+    history_file: &Path,
+    history_max_chars: usize,
+    history_keep_last: usize,
+    history_summary_max_chars: usize,
+    overflow_dir: Option<PathBuf>,
+    cwd: Option<&Path>,
+) -> Result<ContextCompressionOutcome, Box<dyn std::error::Error>> {
     let projection_fingerprint = context_projection_fingerprint(
         history_max_chars,
         history_keep_last,
@@ -521,20 +544,24 @@ pub(in crate::ai) fn build_context_history(
     // The canonical layer deliberately keeps raw tool results; the request
     // layer must re-apply the same physical cap so the SQLite tail after the
     // snapshot watermark cannot bypass the current-turn projection.
+    let before_chars = messages_total_chars_pub(&history);
     compress::cap_raw_tool_results_for_context(&mut history, overflow_dir.as_deref(), cwd);
-    let out = if history_max_chars == 0 {
-        if history_count >= history.len() {
+    let mut out = if history_max_chars == 0 {
+        let messages = if history_count >= history.len() {
             history
         } else {
             history[history.len() - history_count..].to_vec()
-        }
+        };
+        ContextCompressionOutcome::new(
+            messages, before_chars, history_max_chars, ContextCompressionStatus::Disabled,
+        )
     } else {
         let keep_last = if history_count == 0 {
             history_keep_last
         } else {
             history_count
         };
-        compress_messages_for_context(
+        compress_messages_for_context_with_outcome(
             history,
             history_max_chars,
             keep_last,
@@ -543,7 +570,12 @@ pub(in crate::ai) fn build_context_history(
             cwd,
         )
     };
-    store_cached_context_history(cache_key, out.clone());
+    out.before_chars = before_chars;
+    // A failed archive must be retried after its directory becomes writable,
+    // even when the canonical history and its cache key have not changed.
+    if matches!(out.status, ContextCompressionStatus::Complete | ContextCompressionStatus::Disabled) {
+        store_cached_context_history(cache_key, out.clone());
+    }
     Ok(out)
 }
 
@@ -565,8 +597,14 @@ fn context_projection_fingerprint(
     // groups now carry archive-first guidance (lossy groups point at
     // `archive_file_path`; no-archive folds state the evidence lines are the only
     // record) and the archive header/scope labels describe request-projection
-    // copies.
-    const PROJECTION_VERSION: u8 = 3;
+    // copies. v4: summaries are source-bound, assistant-derived increments; older
+    // summaries are excluded from new summarizer input rather than summarized again.
+    // v5: blocked compaction is not a completed snapshot; rebuild v4 snapshots
+    // that may have retained raw dialogue after an unreported archive failure.
+    // v6: source-bound memory increments are capped inline; older records are
+    // archived verbatim behind a single back-reference instead of accumulating one
+    // per compression round.
+    const PROJECTION_VERSION: u8 = 6;
     let overflow_dir = overflow_dir
         .map(|path| path.to_string_lossy())
         .unwrap_or_default();
@@ -614,7 +652,7 @@ fn system_time_millis(value: SystemTime) -> Option<u128> {
         .map(|duration| duration.as_millis())
 }
 
-fn try_get_cached_context_history(key: &ContextHistoryCacheKey) -> Option<Vec<Message>> {
+fn try_get_cached_context_history(key: &ContextHistoryCacheKey) -> Option<ContextCompressionOutcome> {
     let cache = CONTEXT_HISTORY_CACHE.lock().ok()?;
     cache
         .iter()
@@ -622,7 +660,7 @@ fn try_get_cached_context_history(key: &ContextHistoryCacheKey) -> Option<Vec<Me
         .map(|entry| (*entry.value).clone())
 }
 
-fn store_cached_context_history(key: ContextHistoryCacheKey, value: Vec<Message>) {
+fn store_cached_context_history(key: ContextHistoryCacheKey, value: ContextCompressionOutcome) {
     let Ok(mut cache) = CONTEXT_HISTORY_CACHE.lock() else {
         return;
     };
@@ -748,14 +786,30 @@ async fn compact_session_history_with_app_inner(
         // `build_context_history` call and write the result back into the
         // context snapshot. Raw messages exist only in the canonical layer
         // and are never overwritten by compression.
-        compress::compress_messages_for_context(
+        let outcome = compress::compress_messages_for_context_with_outcome(
             messages.clone(),
             app.config.history_max_chars,
             app.config.history_keep_last,
             app.config.history_summary_max_chars,
             Some(overflow_dir),
             cwd,
-        )
+        );
+        outcome.report();
+        // A failed recovery write is the only reason to keep the previous
+        // snapshot: the removed span has no archive to point at, so the next
+        // boundary must read canonical history again and retry. An unmet budget is
+        // not a failure (`Complete` never promises that protected messages fit
+        // inside `history_max_chars`, and `Disabled` keeps every message as is),
+        // and discarding such a projection would rebuild it from the whole
+        // unwritten span on every turn boundary.
+        if matches!(
+            outcome.status,
+            ContextCompressionStatus::MissingArchiveSink
+                | ContextCompressionStatus::ArchiveCommitFailed
+        ) {
+            return Ok(());
+        }
+        outcome.messages
     } else if at_boundary {
         compress::compact_persisted_history_at_boundary_with_app(app, messages.clone()).await
     } else {
@@ -831,6 +885,260 @@ mod tests {
                 .sum::<Duration>()
                 < CONTEXT_SNAPSHOT_WRITE_DEADLINE
         );
+    }
+
+    #[test]
+    fn context_history_outcome_retries_archive_failure_without_history_change() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("context-outcome-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let history_file = dir.join("history.sqlite");
+        let blocker = dir.join("blocked");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let sink = blocker.join("archives");
+        let messages = vec![
+            Message {
+                role: "user".into(),
+                content: serde_json::json!("archived source detail ".repeat(500)),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "assistant".into(),
+                content: serde_json::json!("old response"),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "user".into(),
+                content: serde_json::json!("current question"),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+        append_history_messages(&history_file, &messages).unwrap();
+        let build = || {
+            build_context_history_with_outcome(
+                1, &history_file, 2_000, 1, 0, Some(sink.clone()), None,
+            ).unwrap()
+        };
+        let failed = build();
+        assert_eq!(failed.status, ContextCompressionStatus::ArchiveCommitFailed);
+        assert!(!failed.budget_met());
+        assert_eq!(serde_json::to_value(&failed.messages).unwrap(), serde_json::to_value(&messages).unwrap());
+        let key = context_history_cache_key(&history_file, 1, 2_000, 1, 0, Some(&sink));
+        assert!(try_get_cached_context_history(&key).is_none());
+        assert_eq!(build().status, ContextCompressionStatus::ArchiveCommitFailed);
+
+        // Repair only the sink: the unchanged history key must not retain the
+        // failed result or prevent a fresh archive attempt.
+        std::fs::rename(&blocker, dir.join("former-blocker")).unwrap();
+        std::fs::create_dir_all(&sink).unwrap();
+        let recovered = build();
+        assert_eq!(recovered.status, ContextCompressionStatus::Complete);
+        assert!(recovered.budget_met());
+        assert!(recovered.after_chars < recovered.before_chars);
+        let cached = try_get_cached_context_history(&key).expect("completed result is cached");
+        assert_eq!(cached.status, recovered.status);
+        assert_eq!(cached.after_chars, recovered.after_chars);
+        assert_eq!(serde_json::to_value(&build().messages).unwrap(), serde_json::to_value(&recovered.messages).unwrap());
+        assert_eq!(serde_json::to_value(build_message_arr(usize::MAX, &history_file).unwrap()).unwrap(), serde_json::to_value(&messages).unwrap());
+        invalidate_context_history_cache_for(&history_file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn context_history_outcome_cache_preserves_unmet_budget_feedback() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("context-outcome-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let history_file = dir.join("history.sqlite");
+        let sink = dir.join("archives");
+        let message = Message {
+            role: "user".into(),
+            content: serde_json::json!("protected current question ".repeat(100)),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        // Compact eligible old dialogue successfully while the protected current
+        // question still exceeds the budget. Cache hits must preserve both facts.
+        let messages = vec![
+            Message { content: serde_json::json!("old prompt"), ..message.clone() },
+            Message {
+                role: "assistant".into(),
+                content: serde_json::json!("old response"),
+                ..message.clone()
+            },
+            message,
+        ];
+        append_history_messages(&history_file, &messages).unwrap();
+        let build = || build_context_history_with_outcome(
+            256, &history_file, 1, 256, 0, Some(sink.clone()), None,
+        ).unwrap();
+        let first = build();
+        assert_eq!(first.status, ContextCompressionStatus::Complete);
+        assert!(!first.budget_met());
+        assert!(first.diagnostic().is_some());
+        let key = context_history_cache_key(&history_file, 256, 1, 256, 0, Some(&sink));
+        let cached = try_get_cached_context_history(&key).expect("completed protected-tail pass is cached");
+        assert_eq!(cached.status, first.status);
+        assert_eq!(cached.diagnostic(), first.diagnostic());
+        assert!(!cached.budget_met());
+        let second = build();
+        assert_eq!(second.diagnostic(), first.diagnostic());
+        invalidate_context_history_cache_for(&history_file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Fixture for the boundary-compaction tests: a SQLite session whose old span
+    /// is compactable while the protected tail alone exceeds `history_max_chars`,
+    /// so the compaction succeeds without ever satisfying the budget. Returns the
+    /// app, the canonical messages, and the session assets directory that holds
+    /// the recovery archives.
+    fn boundary_compaction_fixture(dir_name: &str) -> (App, Vec<Message>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("{dir_name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = crate::ai::tests::test_app_with_cancel_stream(Default::default());
+        app.config.history_file = dir.join("history.jsonl");
+        app.session_id = "boundary".to_string();
+        let store = SessionStore::new(&app.config.history_file);
+        app.session_history_file = store.session_history_file(&app.session_id);
+        app.config.history_max_chars = 1;
+        app.config.history_keep_last = 1;
+        app.config.history_summary_max_chars = 4_000;
+        let messages = vec![
+            Message {
+                role: "user".into(),
+                content: serde_json::json!("task statement"),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "assistant".into(),
+                content: serde_json::json!("old response"),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "tool".into(),
+                content: serde_json::json!("raw tool detail ".repeat(3_000)),
+                tool_calls: None,
+                tool_call_id: Some("call-1".to_string()),
+                reasoning_content: None,
+            },
+            Message {
+                role: "user".into(),
+                content: serde_json::json!("current question"),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+        append_history_messages(&app.session_history_file, &messages).unwrap();
+        let overflow_dir = store.session_assets_dir(&app.session_id);
+        (app, messages, overflow_dir)
+    }
+
+    /// An unmet budget is not a compaction failure: the projection that dropped
+    /// and archived the old span must be persisted, otherwise every turn boundary
+    /// reads the whole unwritten canonical history and rebuilds it.
+    #[tokio::test]
+    async fn compact_session_history_persists_projection_with_unmet_budget() {
+        let (app, messages, overflow_dir) = boundary_compaction_fixture("context-boundary-unmet");
+        let fingerprint = context_projection_fingerprint(1, 1, 4_000, Some(&overflow_dir));
+        let before =
+            read_context_history_sqlite_with_retry(&app.session_history_file, &fingerprint)
+                .await
+                .unwrap();
+        assert!(!before.snapshot_is_current);
+        let scenario = compress::compress_messages_for_context_with_outcome(
+            messages.clone(),
+            1,
+            1,
+            4_000,
+            Some(overflow_dir.clone()),
+            None,
+        );
+        assert!(
+            !scenario.budget_met(),
+            "scenario needs a budget no compacted projection can satisfy"
+        );
+        assert!(
+            !matches!(
+                scenario.status,
+                ContextCompressionStatus::MissingArchiveSink
+                    | ContextCompressionStatus::ArchiveCommitFailed
+            ),
+            "scenario needs an adoptable projection, so only the budget/status gate blocks it"
+        );
+        assert!(
+            scenario.after_chars < messages_total_chars_pub(&messages),
+            "scenario needs a projection that really drops or trims the old span"
+        );
+
+        compact_session_history_with_app(&app, None).await.unwrap();
+
+        let after = read_context_history_sqlite_with_retry(&app.session_history_file, &fingerprint)
+            .await
+            .unwrap();
+        assert!(
+            after.snapshot_is_current,
+            "the compacted projection must be persisted even when the budget is unmet"
+        );
+        assert!(
+            messages_total_chars_pub(&after.messages) < messages_total_chars_pub(&messages),
+            "the persisted projection should carry the summary instead of the archived span"
+        );
+        assert_eq!(
+            serde_json::to_value(build_message_arr(usize::MAX, &app.session_history_file).unwrap())
+                .unwrap(),
+            serde_json::to_value(&messages).unwrap(),
+            "canonical history keeps every raw message"
+        );
+        let _ = std::fs::remove_dir_all(app.config.history_file.parent().unwrap());
+    }
+
+    /// Recovery storage failing is the one outcome that must not replace the
+    /// snapshot, and repairing it must let the unchanged history persist on the
+    /// next attempt.
+    #[tokio::test]
+    async fn compact_session_history_keeps_snapshot_when_archive_write_fails() {
+        let (app, messages, overflow_dir) =
+            boundary_compaction_fixture("context-boundary-archive-fail");
+        // A regular file where the session assets directory belongs makes every
+        // archive write fail (`create_dir_all` under a file).
+        std::fs::create_dir_all(overflow_dir.parent().unwrap()).unwrap();
+        std::fs::write(&overflow_dir, "not a directory").unwrap();
+        let fingerprint = context_projection_fingerprint(1, 1, 4_000, Some(&overflow_dir));
+
+        compact_session_history_with_app(&app, None).await.unwrap();
+
+        let failed = read_context_history_sqlite_with_retry(&app.session_history_file, &fingerprint)
+            .await
+            .unwrap();
+        assert!(
+            !failed.snapshot_is_current,
+            "a failed archive must keep the previous snapshot so the next boundary retries"
+        );
+        assert_eq!(failed.messages.len(), messages.len());
+
+        std::fs::remove_file(&overflow_dir).unwrap();
+        compact_session_history_with_app(&app, None).await.unwrap();
+        let recovered =
+            read_context_history_sqlite_with_retry(&app.session_history_file, &fingerprint)
+                .await
+                .unwrap();
+        assert!(
+            recovered.snapshot_is_current,
+            "the retry persists the projection once recovery storage is writable"
+        );
+        let _ = std::fs::remove_dir_all(app.config.history_file.parent().unwrap());
     }
 
     #[test]

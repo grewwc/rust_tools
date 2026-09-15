@@ -9,7 +9,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::ai::history::Message;
+use crate::ai::history::{
+    ContextCompressionOutcome, ContextCompressionStatus, Message, messages_total_chars_pub,
+};
 
 // =============================================================================
 // Compressor - history compression strategy port (pluggable)
@@ -19,26 +21,38 @@ use crate::ai::history::Message;
 /// implementation is used for tests/bypass. Object-safe, so it supports `Box<dyn Compressor>`
 /// injection.
 pub(crate) trait Compressor: Send + Sync {
-    fn compress(&self, messages: Vec<Message>, max_chars: usize, keep_last: usize) -> Vec<Message>;
+    fn compress(
+        &self,
+        messages: Vec<Message>,
+        max_chars: usize,
+        keep_last: usize,
+        summary_max_chars: usize,
+        overflow_dir: Option<PathBuf>,
+        cwd: Option<&Path>,
+    ) -> ContextCompressionOutcome;
     fn name(&self) -> &str;
 }
 
-/// Default compressor: delegates to the existing `history::compress_messages_for_context` (the
-/// summary=0 simplified variant). Zero behavior change: the default path still goes through
-/// `HistoryStore::build_context`; this implementation only takes effect when explicitly injected.
-/// For full summary/overflow support, build a custom Compressor with extra parameters on the
-/// calling side.
+/// Default compressor: preserves the caller's summary budget, archive sink, and working
+/// directory while reporting compaction status separately from budget success.
 pub(crate) struct DefaultCompressor;
 impl Compressor for DefaultCompressor {
-    fn compress(&self, messages: Vec<Message>, max_chars: usize, keep_last: usize) -> Vec<Message> {
-        if max_chars == 0 || messages.is_empty() {
-            return messages;
-        }
-        // Forward to the existing compression logic (summary_max_chars=0, no overflow archiving),
-        // keeping semantics identical to the hardcoded path; the full path is still owned by
-        // HistoryStore::build_context, with zero behavior change.
-        crate::ai::history::compress_messages_for_context(
-            messages, max_chars, keep_last, 0, None, None,
+    fn compress(
+        &self,
+        messages: Vec<Message>,
+        max_chars: usize,
+        keep_last: usize,
+        summary_max_chars: usize,
+        overflow_dir: Option<PathBuf>,
+        cwd: Option<&Path>,
+    ) -> ContextCompressionOutcome {
+        crate::ai::history::compress_messages_for_context_with_outcome(
+            messages,
+            max_chars,
+            keep_last,
+            summary_max_chars,
+            overflow_dir,
+            cwd,
         )
     }
     fn name(&self) -> &str {
@@ -53,10 +67,19 @@ impl Compressor for NoopCompressor {
     fn compress(
         &self,
         messages: Vec<Message>,
-        _max_chars: usize,
+        max_chars: usize,
         _keep_last: usize,
-    ) -> Vec<Message> {
-        messages
+        _summary_max_chars: usize,
+        _overflow_dir: Option<PathBuf>,
+        _cwd: Option<&Path>,
+    ) -> ContextCompressionOutcome {
+        let before_chars = messages_total_chars_pub(&messages);
+        ContextCompressionOutcome::new(
+            messages,
+            before_chars,
+            max_chars,
+            ContextCompressionStatus::Disabled,
+        )
     }
     fn name(&self) -> &str {
         "noop"
@@ -82,10 +105,8 @@ pub(crate) trait HistoryStore: Send + Sync {
         cwd: Option<&Path>,
     ) -> io::Result<Vec<Message>>;
 
-    /// Pluggable compression variant: lets the caller inject a `Compressor` strategy.
-    /// The default implementation stays backward compatible - it ignores the compressor and
-    /// forwards to `build_context`, guaranteeing zero behavior change. Concrete `HistoryStore`
-    /// implementations can override this method to actually apply `compressor.compress`.
+    /// Compatibility wrapper for injected compression. Reports a diagnostic before returning
+    /// messages; callers that need machine-readable status should use the outcome variant.
     fn build_context_with_compressor(
         &self,
         history_count: usize,
@@ -97,8 +118,7 @@ pub(crate) trait HistoryStore: Send + Sync {
         cwd: Option<&Path>,
         compressor: &dyn Compressor,
     ) -> io::Result<Vec<Message>> {
-        let _ = compressor;
-        self.build_context(
+        self.build_context_with_compressor_outcome(
             history_count,
             history_file,
             history_max_chars,
@@ -106,7 +126,34 @@ pub(crate) trait HistoryStore: Send + Sync {
             history_summary_max_chars,
             overflow_dir,
             cwd,
+            compressor,
         )
+        .map(ContextCompressionOutcome::into_messages)
+    }
+
+    /// Reads raw history and applies the injected strategy with all compression inputs intact.
+    /// This bypasses projection caches. `history_count` is not a truncation boundary here:
+    /// the compressor must archive any older span before applying its `keep_last` policy.
+    fn build_context_with_compressor_outcome(
+        &self,
+        _history_count: usize,
+        history_file: &Path,
+        history_max_chars: usize,
+        history_keep_last: usize,
+        history_summary_max_chars: usize,
+        overflow_dir: Option<PathBuf>,
+        cwd: Option<&Path>,
+        compressor: &dyn Compressor,
+    ) -> io::Result<ContextCompressionOutcome> {
+        let messages = self.load_messages(history_file)?;
+        Ok(compressor.compress(
+            messages,
+            history_max_chars,
+            history_keep_last,
+            history_summary_max_chars,
+            overflow_dir,
+            cwd,
+        ))
     }
 
     /// Convenience overload taking `Box<dyn Compressor>`, so `Pipeline` can inject it by ownership.
@@ -191,28 +238,6 @@ impl HistoryStore for DefaultHistoryStore {
         })
     }
 
-    fn build_context_with_compressor(
-        &self,
-        history_count: usize,
-        history_file: &Path,
-        history_max_chars: usize,
-        history_keep_last: usize,
-        _history_summary_max_chars: usize,
-        _overflow_dir: Option<PathBuf>,
-        _cwd: Option<&Path>,
-        compressor: &dyn Compressor,
-    ) -> io::Result<Vec<Message>> {
-        // Demonstrate "real pluggability": load the raw history first, then delegate to the
-        // compressor. Unlike the full sqlite+snapshot+cache path in `build_context`, this path
-        // is used when a strategy is explicitly injected from pipeline/tests; production behavior
-        // still goes through `build_context`, with zero behavior change.
-        // To avoid conflicting with cache semantics, this path bypasses `build_context_history`'s
-        // cache and reads directly.
-        let _ = history_count; // the pluggable path does not truncate by history_count; the compressor decides via keep_last
-        let messages = self.load_messages(history_file)?;
-        Ok(compressor.compress(messages, history_max_chars, history_keep_last))
-    }
-
     fn append_messages(&self, history_file: &Path, msgs: &[Message]) -> io::Result<()> {
         crate::ai::history::append_history_messages(history_file, msgs)
     }
@@ -278,6 +303,175 @@ impl HistoryStore for InMemoryHistoryStore {
 mod tests {
     use super::*;
     use crate::ai::history::Message;
+
+    fn dialogue() -> Vec<Message> {
+        [
+            ("user", "old request\n".repeat(1_000)),
+            ("assistant", "old answer\n".repeat(1_000)),
+            ("user", "current request".to_string()),
+        ]
+        .into_iter()
+        .map(|(role, content)| Message {
+            role: role.to_string(),
+            content: serde_json::json!(content),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn default_compressor_archives_before_zero_summary_compaction() {
+        let dir = std::env::temp_dir().join(format!("ai-port-archive-{}", uuid::Uuid::new_v4()));
+        let messages = dialogue();
+        let outcome = DefaultCompressor.compress(
+            messages.clone(),
+            2_048,
+            1,
+            0,
+            Some(dir.clone()),
+            None,
+        );
+        assert_eq!(outcome.status, ContextCompressionStatus::Complete);
+        assert_eq!(outcome.before_chars, messages_total_chars_pub(&messages));
+        assert!(outcome.after_chars < outcome.before_chars);
+        assert!(outcome.budget_met());
+        assert_eq!(outcome.messages.last(), messages.last());
+        assert!(!outcome.messages.contains(&messages[0]));
+        assert!(!outcome.messages.contains(&messages[1]));
+        let archived = std::fs::read_to_string(dir.join("overflow-history.md")).unwrap();
+        assert!(archived.contains(messages[0].content.as_str().unwrap()));
+        assert!(archived.contains(messages[1].content.as_str().unwrap()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn default_compressor_missing_sink_preserves_dialogue() {
+        let messages = dialogue();
+        for summary_max_chars in [0, 2_048] {
+            let outcome = DefaultCompressor.compress(
+                messages.clone(),
+                2_048,
+                1,
+                summary_max_chars,
+                None,
+                None,
+            );
+            assert_eq!(outcome.status, ContextCompressionStatus::MissingArchiveSink);
+            assert_eq!(outcome.messages, messages);
+            assert_eq!(outcome.before_chars, outcome.after_chars);
+            assert!(!outcome.budget_met());
+            assert!(outcome.diagnostic().unwrap().contains("no archive sink"));
+        }
+    }
+
+    #[test]
+    fn noop_compressor_reports_disabled_without_archiving() {
+        let dir = std::env::temp_dir().join(format!("ai-port-noop-{}", uuid::Uuid::new_v4()));
+        let messages = dialogue();
+        let outcome = NoopCompressor.compress(
+            messages.clone(),
+            1,
+            1,
+            2_048,
+            Some(dir.clone()),
+            None,
+        );
+        assert_eq!(outcome.status, ContextCompressionStatus::Disabled);
+        assert_eq!(outcome.messages, messages);
+        assert_eq!(outcome.before_chars, outcome.after_chars);
+        assert!(!outcome.budget_met());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn history_store_injected_compressor_forwards_all_context_options() {
+        struct AssertOptions;
+        impl Compressor for AssertOptions {
+            fn compress(
+                &self,
+                messages: Vec<Message>,
+                max_chars: usize,
+                keep_last: usize,
+                summary_max_chars: usize,
+                overflow_dir: Option<PathBuf>,
+                cwd: Option<&Path>,
+            ) -> ContextCompressionOutcome {
+                assert_eq!((max_chars, keep_last, summary_max_chars), (2_048, 1, 777));
+                assert_eq!(overflow_dir.as_deref(), Some(Path::new("explicit-archive")));
+                assert_eq!(cwd, Some(Path::new("explicit-cwd")));
+                NoopCompressor.compress(messages, max_chars, keep_last, summary_max_chars, overflow_dir, cwd)
+            }
+            fn name(&self) -> &str {
+                "assert-options"
+            }
+        }
+        let messages = dialogue();
+        let store = InMemoryHistoryStore {
+            messages: std::sync::Mutex::new(messages.clone()),
+        };
+        let outcome = store
+            .build_context_with_compressor_outcome(
+                1,
+                Path::new("unused"),
+                2_048,
+                1,
+                777,
+                Some(PathBuf::from("explicit-archive")),
+                Some(Path::new("explicit-cwd")),
+                &AssertOptions,
+            )
+            .unwrap();
+        assert_eq!(outcome.messages, messages);
+        assert_eq!(outcome.status, ContextCompressionStatus::Disabled);
+        let compatible = store
+            .build_context_with_boxed_compressor(
+                1,
+                Path::new("unused"),
+                2_048,
+                1,
+                777,
+                Some(PathBuf::from("explicit-archive")),
+                Some(Path::new("explicit-cwd")),
+                Box::new(AssertOptions),
+            )
+            .unwrap();
+        assert_eq!(compatible, messages);
+        assert_eq!(*store.messages.lock().unwrap(), messages);
+    }
+
+    #[test]
+    fn default_history_store_injected_sink_archives_without_mutating_history() {
+        let dir = std::env::temp_dir().join(format!("ai-port-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let history_file = dir.join("history.sqlite");
+        let archive_dir = dir.join("archive");
+        let store = DefaultHistoryStore;
+        store.append_messages(&history_file, &dialogue()).unwrap();
+        let raw = store.load_messages(&history_file).unwrap();
+        let outcome = store
+            .build_context_with_compressor_outcome(
+                1,
+                &history_file,
+                2_048,
+                1,
+                0,
+                Some(archive_dir.clone()),
+                Some(&dir),
+                &DefaultCompressor,
+            )
+            .unwrap();
+        assert_eq!(outcome.status, ContextCompressionStatus::Complete);
+        assert!(outcome.budget_met());
+        assert!(outcome.after_chars < outcome.before_chars);
+        assert_eq!(outcome.messages.last(), raw.last());
+        let archived = std::fs::read_to_string(archive_dir.join("overflow-history.md")).unwrap();
+        assert!(archived.contains(raw[0].content.as_str().unwrap()));
+        assert!(archived.contains(raw[1].content.as_str().unwrap()));
+        assert_eq!(store.load_messages(&history_file).unwrap(), raw);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn in_memory_store_append_messages_for_model_falls_back_to_plain_append() {

@@ -39,6 +39,7 @@ pub(in crate::ai) const SUMMARY_NOTE_PREFIXES: &[&str] = &[
     "历史摘要（自动压缩",
     "长期记忆摘要（压缩保留）",
     "[mid-turn-summary]",
+    INCREMENTAL_SUMMARY_PREFIX,
 ];
 
 /// Marker of the deterministic evidence note generated when folding a tool group.
@@ -176,6 +177,25 @@ pub(in crate::ai) fn compressed_tool_evidence_inline_chars_limit() -> usize {
     MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS
 }
 
+/// Total char cap for keeping source-bound memory increments
+/// (`[incremental-memory-v1]`) verbatim in the model context.
+///
+/// Increments are appended once per compression round and their prefix is a
+/// registered summary prefix, so older records stay inside the protected leading
+/// run and the head would otherwise grow linearly with session length. Older
+/// records are appended to overflow-history.md with zero compression and only a
+/// unified back-reference is kept in messages.
+///
+/// Sized to hold roughly the last four default-size records (the mid-turn and
+/// shrink paths cap one record at `history_summary_max_chars`, default 4_000) while
+/// staying near 8% of the default 200_000-char history budget. A record rendered at
+/// the 8_000-char persisted cap can occupy half the window on its own; that is
+/// deliberate, because the newest record is always kept and the cap only bounds how
+/// much memory stays resident between request builds. This number shapes generated
+/// projections, so changing it also requires a `PROJECTION_VERSION` bump in
+/// `history/mod.rs`.
+pub(in crate::ai) const MAX_INCREMENTAL_SUMMARY_INLINE_CHARS: usize = 16_000;
+
 /// Keep only the `self_note:` entries among the most recent `keep_recent`
 /// internal_notes. Other internal_notes (cache hints, loop-breakers, history
 /// summaries) are outside the pruning scope.
@@ -233,27 +253,138 @@ pub(in crate::ai) const USER_OVERFLOW_SPILL_MIN_CHARS: usize = 1_024;
 
 pub(in crate::ai) const IMAGE_OVERFLOW_SPILL_MIN_CHARS: usize = 512;
 
+/// Describes context compaction, independently of budget success.
+/// `Complete` does not promise that protected messages fit within `max_chars`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::ai) enum ContextCompressionStatus {
+    Complete,
+    Disabled,
+    MissingArchiveSink,
+    ArchiveCommitFailed,
+    NoEligibleDialogue,
+    SummaryUnavailable,
+}
+
+#[derive(Clone, Debug)]
+#[must_use]
+pub(in crate::ai) struct ContextCompressionOutcome {
+    pub messages: Vec<Message>,
+    pub status: ContextCompressionStatus,
+    pub before_chars: usize,
+    pub after_chars: usize,
+    pub max_chars: usize,
+}
+
+impl ContextCompressionOutcome {
+    pub(in crate::ai) fn new(
+        messages: Vec<Message>,
+        before_chars: usize,
+        max_chars: usize,
+        status: ContextCompressionStatus,
+    ) -> Self {
+        let after_chars = messages_total_chars(&messages);
+        Self { messages, status, before_chars, after_chars, max_chars }
+    }
+
+    pub(in crate::ai) fn budget_met(&self) -> bool {
+        self.max_chars == 0 || self.after_chars <= self.max_chars
+    }
+
+    pub(in crate::ai) fn diagnostic(&self) -> Option<String> {
+        let reason = match self.status {
+            ContextCompressionStatus::MissingArchiveSink => Some("no archive sink; unarchived context retained"),
+            ContextCompressionStatus::ArchiveCommitFailed => Some("archive commit failed; unarchived context retained"),
+            ContextCompressionStatus::NoEligibleDialogue => Some("no eligible fresh dialogue for a summary"),
+            ContextCompressionStatus::SummaryUnavailable => Some("no source-bound summary fits the configured summary budget"),
+            ContextCompressionStatus::Complete | ContextCompressionStatus::Disabled => None,
+        };
+        if reason.is_none() && self.budget_met() {
+            return None;
+        }
+        Some(format!(
+            "context compression {:?}: {}; {} -> {} chars, max={}, budget_met={}",
+            self.status,
+            reason.unwrap_or("protected content or disabled compression leaves the budget unmet"),
+            self.before_chars, self.after_chars, self.max_chars, self.budget_met(),
+        ))
+    }
+
+    pub(in crate::ai) fn report(&self) {
+        if let Some(diagnostic) = self.diagnostic()
+            && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+        {
+            eprintln!("[history] {diagnostic}");
+        }
+    }
+
+    /// Compatibility callers receive a diagnostic instead of silent success.
+    pub(in crate::ai) fn into_messages(self) -> Vec<Message> {
+        self.report();
+        self.messages
+    }
+}
+
 pub(in crate::ai) fn compress_messages_for_context(
-    mut messages: Vec<Message>,
+    messages: Vec<Message>,
     max_chars: usize,
     keep_last: usize,
     summary_max_chars: usize,
     overflow_dir: Option<PathBuf>,
     cwd: Option<&Path>,
 ) -> Vec<Message> {
+    compress_messages_for_context_with_outcome(
+        messages, max_chars, keep_last, summary_max_chars, overflow_dir, cwd,
+    ).into_messages()
+}
+
+pub(in crate::ai) fn compress_messages_for_context_with_outcome(
+    mut messages: Vec<Message>,
+    max_chars: usize,
+    keep_last: usize,
+    summary_max_chars: usize,
+    overflow_dir: Option<PathBuf>,
+    cwd: Option<&Path>,
+) -> ContextCompressionOutcome {
+    let before_chars = messages_total_chars(&messages);
     // The history store may still hold legacy JSON stubs. They are an internal
     // protocol of the compressor and must not be handed to the model as-is,
     // otherwise the model treats them as ordinary user text or even repeats them
     // verbatim in its final reply.
     normalize_preserved_message_stubs_for_model(&mut messages);
     if max_chars == 0 || messages.is_empty() {
-        return messages;
+        let status = if max_chars == 0 {
+            ContextCompressionStatus::Disabled
+        } else {
+            ContextCompressionStatus::Complete
+        };
+        return ContextCompressionOutcome::new(messages, before_chars, max_chars, status);
     }
 
     // compressed_tool_round notes are themselves compaction products; without an
     // independent cap they accumulate one by one before the global history budget
     // triggers, forming another kind of linear context bloat.
-    messages = trim_compressed_tool_evidence_to_inline_budget(messages, overflow_dir.as_deref());
+    let (messages, tool_window_failure) =
+        trim_compressed_tool_evidence_with_status(messages, overflow_dir.as_deref());
+    // Memory increments are compaction products too: their prefix keeps every
+    // record inside the protected leading run, so without an independent cap the
+    // head grows by one record per compression round forever. Keep the newest
+    // window inline and demote older records to the archive behind a single
+    // back-reference. This runs on every request-time projection build; the
+    // mid-turn compressor applies the same cap before its next record is appended.
+    // One build may still append up to two records (the older-span summary and,
+    // when the shrinker drops a user span, its own), so the steady-state window is
+    // the cap plus those appends and the next build re-trims it.
+    let (messages, increment_window_failure) = trim_incremental_summary_notes_with_status(
+        messages,
+        overflow_dir.as_deref(),
+        MAX_INCREMENTAL_SUMMARY_INLINE_CHARS,
+    );
+    let archive_failure = tool_window_failure.or(increment_window_failure);
+    let finish = |messages, status| {
+        ContextCompressionOutcome::new(
+            messages, before_chars, max_chars, archive_failure.unwrap_or(status),
+        )
+    };
 
     // Prune the self_note sliding cap before large-block compaction, so the
     // self_notes accumulated over thousands of turns (already written to
@@ -269,7 +400,7 @@ pub(in crate::ai) fn compress_messages_for_context(
 
     let keep_last = keep_last.min(messages.len());
     if keep_last == 0 {
-        return shrink_messages_to_fit_with_summary(
+        let outcome = shrink_messages_to_fit_with_summary_outcome(
             messages,
             max_chars,
             summary_max_chars,
@@ -277,12 +408,13 @@ pub(in crate::ai) fn compress_messages_for_context(
             cwd,
             &rustc_hash::FxHashSet::default(),
         );
+        return finish(outcome.messages, outcome.status);
     }
 
     let split_at = retained_turn_start(&messages, keep_last);
     let (older, recent) = messages.split_at(split_at);
     if older.is_empty() {
-        return shrink_messages_to_fit_with_summary(
+        let outcome = shrink_messages_to_fit_with_summary_outcome(
             recent.to_vec(),
             max_chars,
             summary_max_chars,
@@ -290,52 +422,57 @@ pub(in crate::ai) fn compress_messages_for_context(
             cwd,
             &rustc_hash::FxHashSet::default(),
         );
+        return finish(outcome.messages, outcome.status);
     }
 
-    let mut out = Vec::new();
+    // Keep policies, checkpoints, and previous increments in their original
+    // order. A new increment describes only fresh dialogue, never old summaries.
+    let mut out: Vec<Message> = older
+        .iter()
+        .filter(|message| is_system_like_role(&message.role))
+        .cloned()
+        .collect();
     if summary_max_chars > 0 {
-        let summary_source: Vec<Message> = older
-            .iter()
-            .filter(|message| !is_context_checkpoint_marker(message))
-            .cloned()
-            .collect();
-        let summary = build_persisted_summary_text(&summary_source, summary_max_chars);
-        if !summary.trim().is_empty() {
-            out.push(Message {
-                role: ROLE_INTERNAL_NOTE.to_string(),
-                content: Value::String(format!(
-                    "对话摘要（自动压缩，以下为早期对话要点）：\n{summary}"
-                )),
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-            });
+        if summary_delta_messages(older).is_empty() {
+            return finish(messages, ContextCompressionStatus::NoEligibleDialogue);
         }
+        if overflow_dir.is_none() {
+            return finish(messages, ContextCompressionStatus::MissingArchiveSink);
+        }
+        let Some(plan) =
+            plan_incremental_summary_without_app(older, summary_max_chars, overflow_dir.as_deref())
+        else {
+            return finish(messages, ContextCompressionStatus::SummaryUnavailable);
+        };
+        if !plan.commit() {
+            return finish(messages, ContextCompressionStatus::ArchiveCommitFailed);
+        }
+        out.push(plan.message().clone());
+    } else if older
+        .iter()
+        .any(|message| !is_system_like_role(&message.role))
+    {
+        // Even a zero-summary pass must archive the span before removing it.
+        let Some(path) = archive_messages_to_overflow(older, overflow_dir.as_deref()) else {
+            let status = if overflow_dir.is_none() {
+                ContextCompressionStatus::MissingArchiveSink
+            } else {
+                ContextCompressionStatus::ArchiveCommitFailed
+            };
+            return finish(messages, status);
+        };
+        insert_archive_note_if_missing(&mut out, build_overflow_placeholder(&path));
     }
-    out.extend(
-        older
-            .iter()
-            .filter(|message| {
-                // When the summary budget is 0 (e.g. second-round compaction in the
-                // production path) no summary is rebuilt; the old summary/archive
-                // notes are themselves "the compressed representation of the early
-                // conversation" and must be kept like the checkpoint marker,
-                // otherwise the summary prepare_turn already produced would be
-                // silently dropped in the second compaction round.
-                is_context_checkpoint_marker(message)
-                    || (summary_max_chars == 0 && is_summary_or_archive_note(message))
-            })
-            .cloned(),
-    );
     out.extend_from_slice(recent);
-    shrink_messages_to_fit_with_summary(
+    let outcome = shrink_messages_to_fit_with_summary_outcome(
         out,
         max_chars,
         summary_max_chars,
         overflow_dir.as_deref(),
         cwd,
         &rustc_hash::FxHashSet::default(),
-    )
+    );
+    finish(outcome.messages, outcome.status)
 }
 
 /// Char cap applied to "assistant narration carrying tool_calls" in the persisted
@@ -574,7 +711,7 @@ pub(in crate::ai) fn sanitize_persisted_history_messages(messages: Vec<Message>)
 /// pipeline spun on every turn.
 ///
 /// Folding policy (lossless):
-/// - **Summary notes**: dedupe and concatenate each note body (header stripped)
+/// - **Legacy summary notes**: dedupe and concatenate each body (header stripped)
 ///   in original order into **one** note, put back where the first summary sat.
 ///   The "initial goal" each evicted round recorded is therefore fully kept.
 /// - **Archive-pointer notes**: keep only one when contents are identical, keep
@@ -582,13 +719,16 @@ pub(in crate::ai) fn sanitize_persisted_history_messages(messages: Vec<Message>)
 ///   back-references to other archive files when importing/migrating sessions.
 /// - All other messages are kept verbatim and in order (non-summary/archive
 ///   messages are never touched).
+/// - Source-bound increments stay separate and verbatim: concatenating their
+///   bodies would destroy record boundaries and obscure chronological provenance.
 ///
 /// Fold only when there is more than one summary or identical archive pointers
 /// exist, avoiding pointless rewriting of healthy history (when the return value
 /// equals the input entry by entry, the caller's `compacted == messages` check
 /// skips persisting).
 pub(in crate::ai) fn coalesce_accumulated_summary_notes(messages: Vec<Message>) -> Vec<Message> {
-    let summary_count = messages.iter().filter(|m| is_summary_message(m)).count();
+    let legacy_summary = |m: &Message| is_summary_message(m) && !is_incremental_summary(m);
+    let summary_count = messages.iter().filter(|m| legacy_summary(m)).count();
     let mut seen_archive_texts = rustc_hash::FxHashSet::default();
     let has_duplicate_archive = messages
         .iter()
@@ -606,7 +746,7 @@ pub(in crate::ai) fn coalesce_accumulated_summary_notes(messages: Vec<Message>) 
     let mut archive_notes: Vec<Message> = Vec::new();
     let mut seen_archive_texts = rustc_hash::FxHashSet::default();
     for m in &messages {
-        if is_summary_message(m) {
+        if legacy_summary(m) {
             if first_summary_role.is_none() {
                 first_summary_role = Some(m.role.clone());
             }
@@ -645,7 +785,7 @@ pub(in crate::ai) fn coalesce_accumulated_summary_notes(messages: Vec<Message>) 
     let mut out = Vec::with_capacity(messages.len());
     let mut inserted = false;
     for m in messages {
-        if is_summary_or_archive_note(&m) {
+        if legacy_summary(&m) || is_archive_note_message(&m) {
             if !inserted {
                 if let Some(summary) = merged_summary.clone() {
                     out.push(summary);
@@ -670,52 +810,10 @@ pub(in crate::ai) fn is_archive_note_message(m: &Message) -> bool {
 }
 
 pub(in crate::ai) fn compact_persisted_history(messages: Vec<Message>) -> Vec<Message> {
-    let messages = sanitize_persisted_history_messages(messages);
-    let user_turns = messages
-        .iter()
-        .filter(|message| {
-            // Synthetic user messages (image followups etc.) do not form a real
-            // turn boundary, avoiding premature history truncation.
-            message.role == "user" && !is_runtime_synthetic_user_message(message)
-        })
-        .count();
-    if user_turns <= MAX_HISTORY_TURNS {
-        return messages;
-    }
-
-    let keep_recent_turns = PERSISTED_HISTORY_KEEP_RECENT_TURNS.min(MAX_HISTORY_TURNS - 1);
-    let split_at = retained_turn_start(&messages, keep_recent_turns);
-    if split_at == 0 || split_at >= messages.len() {
-        return messages;
-    }
-
-    let checkpoint_markers: Vec<Message> = messages[..split_at]
-        .iter()
-        .filter(|message| is_context_checkpoint_marker(message))
-        .cloned()
-        .collect();
-    let summary_source: Vec<Message> = messages[..split_at]
-        .iter()
-        .filter(|message| !is_context_checkpoint_marker(message))
-        .cloned()
-        .collect();
-    let summary =
-        build_persisted_summary_text(&summary_source, PERSISTED_HISTORY_SUMMARY_MAX_CHARS);
-    let mut out = Vec::with_capacity(messages.len() - split_at + 1);
-    if !summary.is_empty() {
-        out.push(Message {
-            role: ROLE_INTERNAL_NOTE.to_string(),
-            content: Value::String(format!(
-                "历史摘要（自动压缩，以下为更早对话的简短语义）：\n{summary}"
-            )),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        });
-    }
-    out.extend(checkpoint_markers);
-    out.extend_from_slice(&messages[split_at..]);
-    out
+    // This legacy entry point has no authoritative archive sink. Preserve its
+    // input instead of replacing recoverable history with an unbound summary.
+    // Production compaction uses the app-aware or sink-aware entry points.
+    sanitize_persisted_history_messages(messages)
 }
 
 pub(in crate::ai) async fn compact_persisted_history_with_app(
@@ -759,35 +857,27 @@ async fn compact_persisted_history_with_app_inner(
         return messages;
     }
 
-    let checkpoint_markers: Vec<Message> = messages[..split_at]
-        .iter()
-        .filter(|message| is_context_checkpoint_marker(message))
-        .cloned()
-        .collect();
-    let summary_source: Vec<Message> = messages[..split_at]
-        .iter()
-        .filter(|message| !is_context_checkpoint_marker(message))
-        .cloned()
-        .collect();
-    let summary = build_persisted_summary_text_with_app(
+    let overflow_dir = crate::ai::history::SessionStore::new(app.config.history_file.as_path())
+        .session_assets_dir(&app.session_id);
+    let Some(plan) = plan_incremental_summary_with_app(
         app,
-        &summary_source,
+        &messages[..split_at],
         PERSISTED_HISTORY_SUMMARY_MAX_CHARS,
+        Some(overflow_dir.as_path()),
     )
-    .await;
-    let mut out = Vec::with_capacity(messages.len() - split_at + 1);
-    if !summary.is_empty() {
-        out.push(Message {
-            role: ROLE_INTERNAL_NOTE.to_string(),
-            content: Value::String(format!(
-                "历史摘要（自动压缩，以下为更早对话的简短语义）：\n{summary}"
-            )),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        });
+    .await
+    else {
+        return messages;
+    };
+    if !plan.commit() {
+        return messages;
     }
-    out.extend(checkpoint_markers);
+    let mut out: Vec<Message> = messages[..split_at]
+        .iter()
+        .filter(|message| is_system_like_role(&message.role))
+        .cloned()
+        .collect();
+    out.push(plan.message().clone());
     out.extend_from_slice(&messages[split_at..]);
     out
 }

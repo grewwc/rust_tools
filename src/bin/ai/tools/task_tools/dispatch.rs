@@ -185,17 +185,57 @@ inventory::submit!(ToolHistoryPolicyRegistration {
 
 pub(crate) fn execute_task_evidence_read(args: &Value) -> Result<String, String> {
     ensure_top_level_task_orchestration("task_evidence_read")?;
+    let source = match args.get("source") {
+        None => "progress",
+        Some(Value::String(source)) if matches!(source.as_str(), "progress" | "delivered") => {
+            source.as_str()
+        }
+        Some(_) => return Err("source must be 'progress' or 'delivered'".to_string()),
+    };
     let task_id = args
         .get("task_id")
         .and_then(Value::as_str)
-        .map(str::trim)
+        // Delivered IDs are database keys, not filenames. Preserve their exact bytes;
+        // trimming or normalizing them would make some durable records unretrievable.
+        .map(|value| {
+            if source == "progress" {
+                value.trim()
+            } else {
+                value
+            }
+        })
         .filter(|value| !value.is_empty())
         .ok_or("Missing non-empty 'task_id' parameter")?;
     let owner_pid = current_task_owner_pid()?;
-    if let Some(entry_owner) = with_task_entry(task_id, |entry| entry.owner_pid) {
-        if entry_owner != owner_pid {
-            return Err(format!("Task {task_id} is owned by another process"));
-        }
+    let session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
+    if with_task_entry(task_id, |entry| {
+        task_entry_owned_by(entry, &session_id, owner_pid)
+    }) == Some(false)
+    {
+        return Err(format!(
+            "Task {task_id} is owned by another process/session"
+        ));
+    }
+
+    if source == "delivered" {
+        let context = crate::ai::driver::runtime_ctx::try_current()
+            .ok_or("Delivered evidence reads require an active driver session")?;
+        // Return before the progress branch: this lookup must neither refresh progress
+        // nor collect a task result, acknowledge integration, or recreate a missing store.
+        // After registry cleanup, durable evidence retains its existing session scope.
+        let (status, payload) = crate::ai::history::read_task_evidence_status_payload(
+            context.app_proto.config.history_file.as_path(),
+            &context.app_proto.session_id,
+            task_id,
+        ).map_err(|error| format!("Failed to read delivered evidence for task {task_id}: {error}"))?
+            .ok_or_else(|| format!("No delivered evidence for task {task_id} in this session; use task_audit to list recorded IDs"))?;
+        return serde_json::to_string_pretty(&serde_json::json!({
+            "task_id": task_id,
+            "source": "delivered",
+            "status": status,
+            "payload": payload,
+        }))
+        .map_err(|error| format!("Failed to render delivered evidence: {error}"));
     }
 
     if let Some(slot) = task_progress_slot(task_id)
@@ -237,7 +277,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
 
 /// Presents the complete subagent call ledger of the current session (spawn audit).
 ///
-/// Complements `task_evidence_read` (per-task progress evidence): this is a model-visible audit
+/// Complements `task_evidence_read` (per-task progress or delivered evidence): this is a model-visible audit
 /// view answering "which subagents were called in this agent session, when, with which
 /// agent/model, and whether results were delivered/integrated" — still queryable even after the
 /// results were collected long ago or the history was compressed.

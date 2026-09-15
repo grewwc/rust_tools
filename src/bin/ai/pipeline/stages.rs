@@ -6,10 +6,13 @@
 // `Middleware`. Disabled by default (zero behavior change); only effective when explicitly
 // pushed.
 
-use std::{future::Future, pin::Pin};
+use std::{future::Future, path::PathBuf, pin::Pin};
 
 use super::context::{PipelineContext, StageKind};
 use super::stage::Stage;
+use crate::ai::history::{
+    ContextCompressionOutcome, ContextCompressionStatus, messages_total_chars_pub,
+};
 use crate::ai::ports::history::{Compressor, DefaultCompressor};
 use crate::ai::ports::stream::{FilterChain, StreamFilter};
 
@@ -20,6 +23,9 @@ pub struct CompressStage {
     compressor: Box<dyn Compressor>,
     max_chars: usize,
     keep_last: usize,
+    summary_max_chars: usize,
+    overflow_dir: Option<PathBuf>,
+    cwd: Option<PathBuf>,
 }
 
 impl CompressStage {
@@ -29,15 +35,26 @@ impl CompressStage {
             compressor,
             max_chars,
             keep_last,
+            summary_max_chars: 0,
+            overflow_dir: None,
+            cwd: None,
         }
     }
     pub fn with_default(max_chars: usize, keep_last: usize) -> Self {
-        Self {
-            name: "compress",
-            compressor: Box::new(DefaultCompressor),
-            max_chars,
-            keep_last,
-        }
+        Self::new(Box::new(DefaultCompressor), max_chars, keep_last)
+    }
+    /// Configures the archive sink explicitly; without it, old dialogue is retained and the
+    /// outcome tags report why compaction could not proceed.
+    pub fn with_context_options(
+        mut self,
+        summary_max_chars: usize,
+        overflow_dir: Option<PathBuf>,
+        cwd: Option<PathBuf>,
+    ) -> Self {
+        self.summary_max_chars = summary_max_chars;
+        self.overflow_dir = overflow_dir;
+        self.cwd = cwd;
+        self
     }
     pub fn with_name(mut self, name: &'static str) -> Self {
         self.name = name;
@@ -63,13 +80,36 @@ impl Stage for CompressStage {
         Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>,
     > {
         Box::pin(async move {
-            if self.max_chars > 0 && !ctx.messages.is_empty() {
-                let taken = std::mem::take(&mut ctx.messages);
-                let compressed = self
-                    .compressor
-                    .compress(taken, self.max_chars, self.keep_last);
-                ctx.messages = compressed;
-            }
+            let messages = std::mem::take(&mut ctx.messages);
+            let outcome = if self.max_chars == 0 || messages.is_empty() {
+                let status = if self.max_chars == 0 {
+                    ContextCompressionStatus::Disabled
+                } else {
+                    ContextCompressionStatus::Complete
+                };
+                let before_chars = messages_total_chars_pub(&messages);
+                ContextCompressionOutcome::new(messages, before_chars, self.max_chars, status)
+            } else {
+                self.compressor.compress(
+                    messages,
+                    self.max_chars,
+                    self.keep_last,
+                    self.summary_max_chars,
+                    self.overflow_dir.clone(),
+                    self.cwd.as_deref(),
+                )
+            };
+            ctx.tags.push(format!(
+                "compress:status={:?} budget_met={} before_chars={} after_chars={} max_chars={}",
+                outcome.status,
+                outcome.budget_met(),
+                outcome.before_chars,
+                outcome.after_chars,
+                outcome.max_chars,
+            ));
+            // The outcome always owns the retained messages, including missing/failed archives.
+            // Restore them before returning so an unsuccessful compaction cannot empty context.
+            ctx.messages = outcome.into_messages();
             Ok(())
         })
     }
@@ -203,12 +243,15 @@ mod tests {
         let app = leak_app();
         let messages = vec![msg("user", "a"), msg("assistant", "b"), msg("user", "c")];
         let mut ctx = PipelineContext::new(app, messages.clone(), 0);
-        let stage = CompressStage::new(Box::new(NoopCompressor), 10, 1);
+        let stage = CompressStage::new(Box::new(NoopCompressor), 1, 1);
         let pipeline = crate::ai::pipeline::stage::Pipeline::new().push(stage);
         let tp = DefaultTurnPipeline::new("test-noop", pipeline);
         let hooks = HookRegistry::new();
         tp.run(&mut ctx, &hooks).await.unwrap();
         assert_eq!(ctx.messages, messages);
+        assert!(ctx.tags.iter().any(|tag| {
+            tag.starts_with("compress:status=Disabled budget_met=false ")
+        }));
     }
 
     #[tokio::test]
@@ -251,27 +294,131 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compress_stage_default_truncates_via_keep_last() {
+    async fn compress_stage_default_archives_with_explicit_sink() {
+        let dir = std::env::temp_dir().join(format!("ai-stage-archive-{}", uuid::Uuid::new_v4()));
         let app = leak_app();
         let messages = vec![
-            msg("user", "u1"),
-            msg("assistant", "a1"),
-            msg("user", "u2"),
-            msg("assistant", "a2"),
-            msg("user", "u3"),
+            msg("user", &"old request\n".repeat(1_000)),
+            msg("assistant", &"old answer\n".repeat(1_000)),
+            msg("user", "current request"),
         ];
-        let mut ctx = PipelineContext::new(app, messages, 0);
-        // Small max_chars with keep_last=1 is expected to trigger truncation (DefaultCompressor
-        // uses a simplified history::compress)
-        let stage = CompressStage::with_default(10, 1);
+        let mut ctx = PipelineContext::new(app, messages.clone(), 0);
+        let stage = CompressStage::with_default(2_048, 1)
+            .with_context_options(0, Some(dir.clone()), None);
         let pipeline = crate::ai::pipeline::stage::Pipeline::new().push(stage);
         let tp = DefaultTurnPipeline::new("test-default", pipeline);
         let hooks = HookRegistry::new();
         tp.run(&mut ctx, &hooks).await.unwrap();
-        // As long as the compressed length is <= the original and non-empty, the compressor
-        // was invoked
-        assert!(!ctx.messages.is_empty());
-        assert!(ctx.messages.len() <= 5);
+        assert_eq!(ctx.messages.last(), messages.last());
+        assert!(!ctx.messages.contains(&messages[0]));
+        assert!(!ctx.messages.contains(&messages[1]));
+        assert!(ctx.tags.iter().any(|tag| {
+            tag.starts_with("compress:status=Complete budget_met=true ")
+        }));
+        let archived = std::fs::read_to_string(dir.join("overflow-history.md")).unwrap();
+        assert!(archived.contains(messages[0].content.as_str().unwrap()));
+        assert!(archived.contains(messages[1].content.as_str().unwrap()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compress_stage_missing_sink_retains_messages_and_reports_unmet_budget() {
+        let app = leak_app();
+        let messages = vec![
+            msg("user", &"old request".repeat(1_000)),
+            msg("assistant", &"old answer".repeat(1_000)),
+            msg("user", "current request"),
+        ];
+        let mut ctx = PipelineContext::new(app, messages.clone(), 0);
+        CompressStage::with_default(2_048, 1)
+            .execute(&mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(ctx.messages, messages);
+        assert!(ctx.tags.iter().any(|tag| {
+            tag.starts_with("compress:status=MissingArchiveSink budget_met=false ")
+        }));
+    }
+
+    #[tokio::test]
+    async fn compress_stage_failed_archive_restores_messages_and_reports_failure() {
+        let dir = std::env::temp_dir().join(format!("ai-stage-blocked-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocked_sink = dir.join("not-a-directory");
+        std::fs::write(&blocked_sink, "archive blocker").unwrap();
+        let app = leak_app();
+        let messages = vec![
+            msg("user", &"old request".repeat(1_000)),
+            msg("assistant", &"old answer".repeat(1_000)),
+            msg("user", "current request"),
+        ];
+        let mut ctx = PipelineContext::new(app, messages.clone(), 0);
+        CompressStage::with_default(2_048, 1)
+            .with_context_options(0, Some(blocked_sink.clone()), None)
+            .execute(&mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(ctx.messages, messages);
+        assert!(ctx.tags.iter().any(|tag| {
+            tag.starts_with("compress:status=ArchiveCommitFailed budget_met=false ")
+        }));
+        assert_eq!(std::fs::read_to_string(blocked_sink).unwrap(), "archive blocker");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compress_stage_forwards_options_and_skips_disabled_or_empty_context() {
+        struct AssertOptions;
+        impl Compressor for AssertOptions {
+            fn compress(
+                &self,
+                messages: Vec<Message>,
+                max_chars: usize,
+                keep_last: usize,
+                summary_max_chars: usize,
+                overflow_dir: Option<PathBuf>,
+                cwd: Option<&std::path::Path>,
+            ) -> ContextCompressionOutcome {
+                assert_eq!((max_chars, keep_last, summary_max_chars), (2_048, 1, 777));
+                assert!(!messages.is_empty());
+                assert_eq!(overflow_dir, Some(PathBuf::from("explicit-archive")));
+                assert_eq!(cwd, Some(std::path::Path::new("explicit-cwd")));
+                NoopCompressor.compress(messages, max_chars, keep_last, summary_max_chars, None, None)
+            }
+            fn name(&self) -> &str {
+                "assert-options"
+            }
+        }
+        for (max_chars, messages, expected) in [
+            (
+                2_048,
+                vec![msg("user", &"x".repeat(4_096))],
+                "compress:status=Disabled budget_met=false ",
+            ),
+            (
+                0,
+                vec![msg("user", "unmodified")],
+                "compress:status=Disabled budget_met=true ",
+            ),
+            (
+                2_048,
+                Vec::new(),
+                "compress:status=Complete budget_met=true ",
+            ),
+        ] {
+            let mut ctx = PipelineContext::new(leak_app(), messages.clone(), 0);
+            CompressStage::new(Box::new(AssertOptions), max_chars, 1)
+                .with_context_options(
+                    777,
+                    Some(PathBuf::from("explicit-archive")),
+                    Some(PathBuf::from("explicit-cwd")),
+                )
+                .execute(&mut ctx)
+                .await
+                .unwrap();
+            assert_eq!(ctx.messages, messages);
+            assert!(ctx.tags.iter().any(|tag| tag.starts_with(expected)));
+        }
     }
 
     #[tokio::test]

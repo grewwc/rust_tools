@@ -93,8 +93,10 @@ impl App {
                 hooks.inherit_stream_filters(&self.hooks);
                 hooks
             },
-            last_known_prompt_tokens: self.last_known_prompt_tokens,
-            last_known_cached_prompt_tokens: self.last_known_cached_prompt_tokens,
+            // Request feedback belongs to one sequential request stream, never
+            // to a driver snapshot, detached helper, or forked child.
+            last_known_prompt_tokens: None,
+            last_known_cached_prompt_tokens: None,
             goal_mode: self.goal_mode.clone(),
             last_turn_had_tool_calls: self.last_turn_had_tool_calls,
             last_turn_interrupted: self.last_turn_interrupted,
@@ -175,14 +177,14 @@ pub(super) struct App {
     /// Process-level hook registry (Step 3: driver turn lifecycle hooks).
     /// Empty registry = zero behavior change; turn start/end fire in `run_turn`.
     pub(super) hooks: HookRegistry,
-    /// Actual prompt_tokens returned by the server on the last request (from usage
-    /// stats). Used to replace character estimation in the next request's
-    /// max_tokens clamp for better precision.
-    pub(super) last_known_prompt_tokens: Option<u64>,
+    /// Pending/observed prompt usage bound to its normalized request identity.
+    /// Retaining the optional field keeps App construction sites defaulting to
+    /// no feedback; a bare token count is no longer sufficient for calibration.
+    pub(super) last_known_prompt_tokens: Option<super::request::PromptTokenFeedback>,
     /// Prompt cache hit token count returned by the server on the last request.
-    /// Used to subtract the reusable prefix from the next request's TPM budget
-    /// estimate, so a 100% cache hit is not billed as the full prompt and falsely
-    /// triggers waiting.
+    /// Used only for TPM, after the companion request snapshot confirms an
+    /// unchanged prefix and the same endpoint/model/session/schema/API key.
+    /// Cache hits still occupy the full context window.
     pub(super) last_known_cached_prompt_tokens: Option<u64>,
     /// Goal mode state. `None` = not enabled; `Some("")` = waiting for the user's
     /// goal; `Some(goal)` = goal set, the agent keeps driving automatically until

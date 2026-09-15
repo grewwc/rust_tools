@@ -621,23 +621,52 @@ pub(in crate::ai) fn drop_trim_candidates_batch(
     removed
 }
 
-/// Same as [`shrink_messages_to_fit`] but, before dropping early messages
-/// outright, captures them into (or merges them with) a leading
-/// `internal_note` summary so that long conversations still retain a
-/// semantic memory of earlier user questions.
+/// Same as [`shrink_messages_to_fit`] but archives dropped early messages and,
+/// when budget permits, appends a source-bound increment after the protected
+/// leading notes. Existing summaries remain separate and in chronological order.
 pub(in crate::ai) fn shrink_messages_to_fit_with_summary(
-    mut messages: Vec<Message>,
+    messages: Vec<Message>,
     max_chars: usize,
     summary_max_chars: usize,
     overflow_dir: Option<&Path>,
     cwd: Option<&Path>,
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> Vec<Message> {
+    shrink_messages_to_fit_with_summary_outcome(
+        messages,
+        max_chars,
+        summary_max_chars,
+        overflow_dir,
+        cwd,
+        protected_tool_call_ids,
+    )
+    .into_messages()
+}
+
+/// Propagate archive failures from budget-only shrinking so callers do not
+/// cache a rolled-back projection as a completed compaction.
+pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
+    mut messages: Vec<Message>,
+    max_chars: usize,
+    summary_max_chars: usize,
+    overflow_dir: Option<&Path>,
+    cwd: Option<&Path>,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
+) -> ContextCompressionOutcome {
+    let before_chars = messages_total_chars(&messages);
+    let finish = |messages, status| {
+        ContextCompressionOutcome::new(messages, before_chars, max_chars, status)
+    };
+    let archive_failure = if overflow_dir.is_some() {
+        ContextCompressionStatus::ArchiveCommitFailed
+    } else {
+        ContextCompressionStatus::MissingArchiveSink
+    };
     if max_chars == 0 {
-        return messages;
+        return finish(messages, ContextCompressionStatus::Disabled);
     }
     if messages.is_empty() {
-        return Vec::new();
+        return finish(messages, ContextCompressionStatus::Complete);
     }
 
     redact_images_except_last(&mut messages, 1);
@@ -691,9 +720,8 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary(
     shrink_successful_write_arguments(&mut messages, overflow_dir, protected_tool_call_ids);
 
     if messages_total_chars(&messages) <= max_chars {
-        return messages;
+        return finish(messages, ContextCompressionStatus::Complete);
     }
-    let had_leading_summary = messages.first().map(is_summary_message).unwrap_or(false);
     // On archive failure the full pre-removal order must be restored; inserting
     // dropped messages at the head outright would place them before the retained
     // system prompt, breaking the message order the provider requires.
@@ -748,11 +776,12 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary(
     }
 
     let dropped_has_user_turn = dropped.iter().any(|m| m.role == "user");
-    let has_leading_summary_now = messages.first().map(is_summary_message).unwrap_or(false);
     let internal_archive_dir =
         match archive_internal_notes_deduplicated(&dropped_internal_notes, overflow_dir) {
             Ok(path) => path,
-            Err(()) => return messages_before_first_drop.unwrap_or(messages),
+            Err(()) => {
+                return finish(messages_before_first_drop.unwrap_or(messages), archive_failure);
+            }
         };
 
     if !dropped.is_empty() {
@@ -762,74 +791,29 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary(
 
             if sink.flush() {
                 let file_path_str = sink.file_path().to_string_lossy().to_string();
-                let summary_body = if dropped_has_user_turn
-                    && !has_leading_summary_now
-                    && !had_leading_summary
-                    && summary_max_chars > 0
-                {
-                    let header_chars = "对话摘要（自动压缩，以下为早期对话要点）：\n"
-                        .chars()
-                        .count();
-                    let used = messages_total_chars(&messages);
-                    // max_chars/used are char counts, so measure the header in
-                    // chars too; a byte .len() would over-subtract (CJK is 3
-                    // bytes/char). The /3 below stays as the deliberate
-                    // byte-safety margin for the Chinese summary body.
-                    let body_char_budget =
-                        max_chars.saturating_sub(used).saturating_sub(header_chars);
-                    let body_budget = (body_char_budget / 3).min(summary_max_chars);
-                    if body_budget >= 40 {
-                        let text = build_persisted_summary_text(&dropped, body_budget);
-                        if !text.trim().is_empty() {
-                            Some(text)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
                 let archive_note = build_overflow_placeholder(&file_path_str);
-                let fallback_goal =
-                    dropped
-                        .iter()
-                        .find(|message| message.role == "user")
-                        .map(|message| {
-                            summarize_text(
-                                &normalize_whitespace(&value_to_string(&message.content)),
-                                160,
-                            )
-                        });
-                let memory_note = summary_body
-                    .as_ref()
-                    .filter(|s| !s.trim().is_empty())
-                    .map(|summary| format!("长期记忆摘要（压缩保留）:\n{summary}"))
-                    .or_else(|| {
-                        fallback_goal
-                            .as_ref()
-                            .filter(|goal| !goal.trim().is_empty())
-                            .map(|goal| format!("长期记忆摘要（压缩保留）:\n初始目标: {goal}"))
-                    })
-                    .unwrap_or_else(|| {
-                        "长期记忆摘要（压缩保留）:\n较早原始对话已移出当前窗口；如果当前问题依赖前文细节，请读取归档文件。".to_string()
-                    });
-
-                if !has_leading_summary_now {
-                    messages.insert(
-                        0,
-                        Message {
-                            role: ROLE_INTERNAL_NOTE.to_string(),
-                            content: Value::String(memory_note),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            reasoning_content: None,
-                        },
-                    );
-                }
                 insert_archive_note_if_missing(&mut messages, archive_note);
+                if dropped_has_user_turn && summary_max_chars > 0 {
+                    // The archive pointer is sufficient at a tight budget. Only add
+                    // derived prose when its exact input has also been committed by
+                    // the same source-binding path used for persisted summaries.
+                    let budget = max_chars
+                        .saturating_sub(messages_total_chars(&messages))
+                        .min(summary_max_chars);
+                    if let Some(plan) =
+                        plan_incremental_summary_without_app(&dropped, budget, Some(dir))
+                        && plan.commit()
+                    {
+                        // Older increments and policy/checkpoint notes precede
+                        // this newly removed span. Keep that chronology even
+                        // when a system prompt hides the first existing summary.
+                        let insert_at = messages
+                            .iter()
+                            .take_while(|message| is_protected_leading_system_like_message(message))
+                            .count();
+                        messages.insert(insert_at, plan.message().clone());
+                    }
+                }
             } else {
                 // flush failed: never delete history. Restore the full pre-removal
                 // message snapshot and return immediately — skipping summary/archive
@@ -839,34 +823,12 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary(
                 // (retry compaction next round / request-layer clamp), while data
                 // loss is irreversible — honoring the existing lesson of "never
                 // delete history when a write fails".
-                return messages_before_first_drop.unwrap_or(messages);
+                return finish(messages_before_first_drop.unwrap_or(messages), archive_failure);
             }
-        } else if dropped_has_user_turn
-            && !has_leading_summary_now
-            && !had_leading_summary
-            && summary_max_chars > 0
-        {
-            let header_prefix = "对话摘要（自动压缩，以下为早期对话要点）：\n";
-            let header_chars = header_prefix.chars().count();
-            let used = messages_total_chars(&messages);
-            // Same char-unit accounting as the overflow-archive branch above:
-            // header measured in chars (CJK is 3 bytes/char, byte .len() would
-            // over-subtract from a char budget), /3 kept as body safety margin.
-            let body_char_budget = max_chars.saturating_sub(used).saturating_sub(header_chars);
-            let body_budget = (body_char_budget / 3).min(summary_max_chars);
-            if body_budget >= 40 {
-                let summary_text = build_persisted_summary_text(&dropped, body_budget);
-                if !summary_text.trim().is_empty() {
-                    let note = Message {
-                        role: ROLE_INTERNAL_NOTE.to_string(),
-                        content: Value::String(format!("{header_prefix}{summary_text}")),
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: None,
-                    };
-                    messages.insert(0, note);
-                }
-            }
+        } else {
+            // Without a recovery sink, dropping the raw span would make any
+            // replacement summary unverifiable. Retain the pre-removal projection.
+            return finish(messages_before_first_drop.unwrap_or(messages), archive_failure);
         }
     }
 
@@ -883,7 +845,12 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary(
 
     keep_only_recent_reasoning_content(&mut messages);
 
-    messages
+    let status = if dropped.is_empty() && messages_total_chars(&messages) > max_chars {
+        ContextCompressionStatus::NoEligibleDialogue
+    } else {
+        ContextCompressionStatus::Complete
+    };
+    finish(messages, status)
 }
 
 #[allow(dead_code)]

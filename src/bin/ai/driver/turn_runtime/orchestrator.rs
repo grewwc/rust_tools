@@ -33,7 +33,7 @@ use super::{
     prepare::prepare_turn,
     record_llm_summary_attempt_chars, should_try_llm_summary,
     tool_result::{
-        append_empty_response_retry_note, DEGENERATE_REPETITION_FINISH_REASON, FinalGateState,
+        DEGENERATE_REPETITION_FINISH_REASON, FinalGateState, append_empty_response_retry_note,
         audit_evidence_gate_action, completion_evidence_state, completion_tool_result_succeeded,
         handle_iteration_execution_for_model, is_evidence_gated_audit_agent,
         tool_call_is_successful_mutation_candidate,
@@ -1351,6 +1351,35 @@ async fn run_turn_body(
             Ok(e) => e,
             Err(err) => break 'turn Err(err),
         };
+        // Usage belongs only to the request snapshot that produced this response.
+        // Consume missing usage too, before digest-only or wrap-up paths can skip
+        // the normal response handler and leave a pending observation behind.
+        let usage_prompt = match &execution {
+            IterationExecution::Truncated(sr) | IterationExecution::FinalResponse(sr) => {
+                Some((sr.usage_prompt_tokens, sr.usage_cached_prompt_tokens))
+            }
+            IterationExecution::ToolCall(tce) => Some((
+                tce.stream_result.usage_prompt_tokens,
+                tce.stream_result.usage_cached_prompt_tokens,
+            )),
+            _ => None,
+        };
+        let accepted_usage = app
+            .last_known_prompt_tokens
+            .as_mut()
+            .is_some_and(|feedback| {
+                feedback.record_usage(
+                    &app.session_id,
+                    response_model.as_deref(),
+                    usage_prompt.map(|(prompt, _)| prompt),
+                )
+            });
+        app.last_known_cached_prompt_tokens = usage_prompt
+            .filter(|_| accepted_usage)
+            .map(|(prompt, cached)| cached.min(prompt));
+        if !accepted_usage {
+            app.last_known_prompt_tokens = None;
+        }
         // The pre-timeout wrap-up signal fires mid-model-request: abandon the current request
         // and enter a forced wrap-up iteration immediately instead of waiting for the current
         // (possibly very long) iteration to finish naturally. Consume the signal so the next
@@ -1401,23 +1430,6 @@ async fn run_turn_body(
         }
         {
             let mc = mcp_client.lock().unwrap().routing_snapshot();
-            // Calibrate the max_tokens clamp of later requests with the actual prompt_tokens
-            // returned by the server. Char-based estimates are conservative (overestimating);
-            // the server's actual value is more accurate and reduces unnecessary clamping down.
-            let usage_prompt = match &execution {
-                IterationExecution::Truncated(sr) | IterationExecution::FinalResponse(sr) => {
-                    Some((sr.usage_prompt_tokens, sr.usage_cached_prompt_tokens))
-                }
-                IterationExecution::ToolCall(tce) => Some((
-                    tce.stream_result.usage_prompt_tokens,
-                    tce.stream_result.usage_cached_prompt_tokens,
-                )),
-                _ => None,
-            };
-            if let Some((pt, cached)) = usage_prompt.filter(|(pt, _)| *pt > 0) {
-                app.last_known_prompt_tokens = Some(pt);
-                app.last_known_cached_prompt_tokens = Some(cached.min(pt));
-            }
             // Empty-response retry count: give up after more than 5 consecutive empty
             // responses to avoid wasting iteration budget
             if matches!(execution, IterationExecution::EmptyResponse) {
@@ -1440,16 +1452,10 @@ async fn run_turn_body(
                 // retried request body differs from the failed one (guards against
                 // deterministic gateway/cache failures on byte-identical prompts). No model
                 // downgrade here: the failure is transient, not a model-capability issue.
-                append_empty_response_retry_note(
-                    &mut messages,
-                    retry.consecutive_empty_responses,
-                );
+                append_empty_response_retry_note(&mut messages, retry.consecutive_empty_responses);
                 const EMPTY_RESPONSE_RETRY_BACKOFF_BASE_SECS: u64 = 2;
                 const EMPTY_RESPONSE_RETRY_BACKOFF_MAX_SECS: u64 = 10;
-                let shift = retry
-                    .consecutive_empty_responses
-                    .saturating_sub(1)
-                    .min(3) as u32;
+                let shift = retry.consecutive_empty_responses.saturating_sub(1).min(3) as u32;
                 let backoff = Duration::from_secs(
                     EMPTY_RESPONSE_RETRY_BACKOFF_BASE_SECS
                         .saturating_mul(1u64 << shift)

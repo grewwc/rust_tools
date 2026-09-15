@@ -7,8 +7,9 @@ use sha2::{Digest, Sha256};
 use super::super::types::{Message, ROLE_INTERNAL_NOTE};
 use super::{
     ARCHIVE_NOTE_PREFIX, INTERNAL_NOTE_OVERFLOW_DIR, MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS,
-    MutableMessageField, OVERFLOW_HISTORY_FILENAME, insert_archive_note_if_missing,
-    is_compressed_tool_evidence_note, message_billable_chars, value_to_string,
+    ContextCompressionStatus, MutableMessageField, OVERFLOW_HISTORY_FILENAME, insert_archive_note_if_missing,
+    is_compressed_tool_evidence_note, is_incremental_summary, message_billable_chars,
+    value_to_string,
 };
 
 #[derive(Clone)]
@@ -427,27 +428,72 @@ pub(in crate::ai) fn compressed_tool_evidence_exceeds_inline_budget(messages: &[
 /// This keeps long tool chains from crowding the context with hundreds of ~1 KiB
 /// notes.
 pub(super) fn trim_compressed_tool_evidence_to_inline_budget(
-    mut messages: Vec<Message>,
+    messages: Vec<Message>,
     overflow_dir: Option<&Path>,
 ) -> Vec<Message> {
-    if !compressed_tool_evidence_exceeds_inline_budget(&messages) {
-        return messages;
-    }
-    let Some(overflow_dir) = overflow_dir else {
-        return messages;
-    };
+    trim_compressed_tool_evidence_with_status(messages, overflow_dir).0
+}
 
-    let evidence_sizes: Vec<usize> = messages
+pub(super) fn trim_compressed_tool_evidence_with_status(
+    messages: Vec<Message>,
+    overflow_dir: Option<&Path>,
+) -> (Vec<Message>, Option<ContextCompressionStatus>) {
+    trim_archived_note_window(
+        messages,
+        overflow_dir,
+        MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS,
+        is_compressed_tool_evidence_note,
+    )
+}
+
+/// Keep the most recent contiguous window of source-bound memory increments that
+/// fits `inline_char_cap`.
+///
+/// Increments are compaction products appended once per compression round, and
+/// their prefix is registered as a summary prefix, so every record stays inside the
+/// protected leading run: neither the shrinker nor tail truncation can reclaim one.
+/// Without an independent cap the head therefore grows by one record per round
+/// forever. Older records are written to the overflow archive verbatim first and
+/// dropped from the projection only after that write succeeds, leaving one unified
+/// back-reference; the newest record always stays inline, so a single oversized
+/// record cannot leave the memory window empty.
+pub(super) fn trim_incremental_summary_notes_to_inline_budget(
+    messages: Vec<Message>,
+    overflow_dir: Option<&Path>,
+    inline_char_cap: usize,
+) -> Vec<Message> {
+    trim_incremental_summary_notes_with_status(messages, overflow_dir, inline_char_cap).0
+}
+
+pub(super) fn trim_incremental_summary_notes_with_status(
+    messages: Vec<Message>,
+    overflow_dir: Option<&Path>,
+    inline_char_cap: usize,
+) -> (Vec<Message>, Option<ContextCompressionStatus>) {
+    trim_archived_note_window(messages, overflow_dir, inline_char_cap, is_incremental_summary)
+}
+
+/// Both capped note windows retain their newest record and archive older records
+/// before removal. Return archive failures separately so a later successful
+/// global-budget pass cannot hide a failed prepass or cache it as complete.
+fn trim_archived_note_window(
+    messages: Vec<Message>,
+    overflow_dir: Option<&Path>,
+    inline_char_cap: usize,
+    is_note: fn(&Message) -> bool,
+) -> (Vec<Message>, Option<ContextCompressionStatus>) {
+    let sizes: Vec<usize> = messages
         .iter()
-        .filter(|message| is_compressed_tool_evidence_note(message))
+        .filter(|message| is_note(message))
         .map(message_billable_chars)
         .collect();
-    let mut keep_from = evidence_sizes.len();
+    if sizes.iter().sum::<usize>() <= inline_char_cap {
+        return (messages, None);
+    }
+    let mut keep_from = sizes.len();
     let mut kept_chars = 0usize;
-    for (index, chars) in evidence_sizes.iter().enumerate().rev() {
-        if keep_from == evidence_sizes.len()
-            || kept_chars.saturating_add(*chars) <= MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS
-        {
+    for (index, chars) in sizes.iter().enumerate().rev() {
+        if keep_from == sizes.len() || kept_chars.saturating_add(*chars) <= inline_char_cap {
             keep_from = index;
             kept_chars = kept_chars.saturating_add(*chars);
         } else {
@@ -455,33 +501,40 @@ pub(super) fn trim_compressed_tool_evidence_to_inline_budget(
         }
     }
     if keep_from == 0 {
-        return messages;
+        return (messages, None);
     }
+    // Demoting without an archive sink would lose the records silently.
+    let Some(overflow_dir) = overflow_dir else {
+        return (messages, Some(ContextCompressionStatus::MissingArchiveSink));
+    };
 
     let dropped: Vec<Message> = messages
         .iter()
-        .filter(|message| is_compressed_tool_evidence_note(message))
+        .filter(|message| is_note(message))
         .take(keep_from)
         .cloned()
         .collect();
     let mut sink = OverflowSink::new(overflow_dir);
     sink.push_messages(&dropped);
     if !sink.flush() {
-        return messages;
+        return (messages, Some(ContextCompressionStatus::ArchiveCommitFailed));
     }
 
-    let mut evidence_ordinal = 0usize;
+    let mut messages = messages;
+    let mut ordinal = 0usize;
     messages.retain(|message| {
-        if !is_compressed_tool_evidence_note(message) {
+        if !is_note(message) {
             return true;
         }
-        let keep = evidence_ordinal >= keep_from;
-        evidence_ordinal += 1;
+        let keep = ordinal >= keep_from;
+        ordinal += 1;
         keep
     });
-    let archive_note = build_overflow_placeholder(&sink.file_path().to_string_lossy());
-    insert_archive_note_if_missing(&mut messages, archive_note);
-    messages
+    insert_archive_note_if_missing(
+        &mut messages,
+        build_overflow_placeholder(&sink.file_path().to_string_lossy()),
+    );
+    (messages, None)
 }
 
 pub(super) fn build_overflow_placeholder(file_path: &str) -> String {

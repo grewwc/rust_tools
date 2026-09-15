@@ -1347,25 +1347,20 @@ impl MarkdownStreamRenderer {
     }
 }
 
-/// Maximum wrapped width of **live regions**: rows the renderer redraws in place with relative cursor
-/// moves (thinking/subagent fold body and markers, fold status header, tool-output preview, waiting
-/// hints).
+/// Wrapped width for **live regions**: the live terminal width. Live regions are the rows the renderer
+/// redraws in place with relative cursor moves (thinking/subagent fold body and markers, fold status
+/// header, tool-output preview, waiting hints). The answer body, code blocks and tables are not live
+/// regions and keep their own widths.
 ///
-/// A terminal re-wraps rows it has already drawn when it narrows, and xterm.js reflows immediately
-/// while the new PTY winsize can reach this process a redraw (or several) later. During that window
-/// the renderer's width is still the wide one, so every cursor-up erase moves up fewer rows than the
-/// rows it wrote now occupy and it skips the top of the region: the leaked stack of
-/// `○ thinking · ~N tok` headers seen when the window is resized mid-stream. Wrapping live rows at
-/// most this wide keeps their physical row count independent of the terminal width for every terminal
-/// at least this wide, so a resize can no longer desynchronize the erase from what is on screen.
-/// Narrower terminals still wrap at their real width (unavoidable there); on that path the erase side
-/// recomputes the footprint from the stored plain text instead. The answer body, code blocks and
-/// tables are not live regions and keep the full terminal width.
-const LIVE_REGION_MAX_COLS: usize = 100;
-
-/// Wrapped width for live regions: the live terminal width, bounded by [`LIVE_REGION_MAX_COLS`].
+/// Live rows deliberately use the same width the terminal uses to lay them out, so a long logical row
+/// still shows as much text as before. Narrowing makes the terminal re-wrap rows it has already drawn
+/// (xterm.js reflows immediately, while the new PTY winsize can reach this process one or more redraws
+/// later), so the erase side must never assume one physical row per logical row: it recomputes the
+/// footprint from the stored plain text at the current width instead
+/// (`thinking_fold_rendered_body_rows` / `thinking_fold_header_rendered_rows` and the waiting-hint
+/// erase in `stream/runtime.rs`).
 fn live_region_cols() -> usize {
-    raw_terminal_cols().min(LIVE_REGION_MAX_COLS)
+    raw_terminal_cols()
 }
 
 /// Hard-truncate one line of text to a single physical terminal row at the live-region column width,
@@ -1373,8 +1368,10 @@ fn live_region_cols() -> usize {
 ///
 /// Live regions use it so every drawn row occupies exactly one physical row and the cursor-up erase
 /// row count matches the logical row count, instead of predicting terminal auto-wrap (tabs, full-width
-/// characters, over-long lines). Combined with the [`LIVE_REGION_MAX_COLS`] bound this also survives a
-/// terminal resize. Input is plain text without ANSI.
+/// characters, over-long lines). The truncation width is the live terminal width, so a wide terminal
+/// still shows the whole line; if the terminal narrows afterwards it re-wraps that row, and the erase
+/// side recomputes the footprint from the stored text (see [`live_region_cols`]). Input is plain text
+/// without ANSI.
 pub(in crate::ai) fn clamp_line_to_terminal_row(line: &str) -> String {
     clamp_line_to_terminal_row_with_reserve(line, 0)
 }
@@ -1456,11 +1453,11 @@ pub(in crate::ai) fn wrap_line_to_terminal_rows_with_reserve(
 }
 
 pub(in crate::ai) fn live_preview_cursor_rows(line: &str) -> usize {
-    // 预览行是逐字符原样写入终端、由终端按 **真实** 列宽自动折行的，所以这里必须用
-    // raw_terminal_cols（而非保留右边距的 preview_terminal_width）来数物理行数。
-    // 否则窄于真实宽度的列数会把"恰好一行"的预览算成两行，cursor-up 多移一行，
-    // 越界清掉表格上方内容、或在重写后残留预览碎片。
-    // 折行规则与终端 DECAWM 一致：全角字符放不下右边一列时提前折行（col+w>cols）。
+    // Preview characters are written verbatim and wrap at the terminal's actual width,
+    // so count physical rows with raw_terminal_cols, not the margin-reduced preview width.
+    // A narrower width can count a one-row preview as two, moving the cursor up too far
+    // and clearing content above the table or leaving preview fragments after a redraw.
+    // Match DECAWM wrapping: wide characters wrap early when col + w > cols.
     let cols = raw_terminal_cols().max(1);
     let visible = strip_ansi_codes(line);
     let mut lines = 1usize;
@@ -1493,12 +1490,12 @@ fn preview_terminal_width() -> usize {
 }
 
 fn raw_terminal_cols() -> usize {
-    // 优先用 ioctl(TIOCGWINSZ) 拿 **实时** 列数：`a` 是常驻进程，运行在 VS Code 等
-    // 面板里时，环境变量 COLUMNS 是进程启动那一刻的快照（shell 只在每次提示符前刷新
-    // 它），面板被拖窄后 COLUMNS 往往比真实宽度大。若用过大的列数计算预览行数 / 表格
-    // 宽度，会导致 cursor-up 重写的行数算少（残留预览）以及表格超宽被终端硬折行
-    // （边框错位）。因此真实 tty 一律以 ioctl 为准，COLUMNS 仅作为非 tty（如测试、
-    // 管道）时的回退。
+    // Prefer ioctl(TIOCGWINSZ) for the live width: the long-running `a` process inherits
+    // COLUMNS at startup, so narrowing a terminal panel can leave it larger than reality.
+    // An overstated width undercounts preview rows during cursor-up redraws, leaving
+    // fragments, and makes tables wrap at the terminal edge, misaligning their borders.
+    // Use the ioctl result when available; fall back to COLUMNS when no usable size is
+    // returned, such as in non-TTY tests or pipelines.
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;

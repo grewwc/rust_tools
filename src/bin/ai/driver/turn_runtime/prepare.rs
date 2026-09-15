@@ -6,7 +6,7 @@ use crate::ai::mcp::SharedMcpClient;
 use crate::ai::{
     driver::skill_runtime,
     history::{
-        Message, ROLE_INTERNAL_NOTE, build_context_history, compact_session_history_with_app,
+        Message, ROLE_INTERNAL_NOTE, build_context_history_with_outcome, compact_session_history_with_app,
         runtime_synthetic_user_message,
     },
     request,
@@ -355,8 +355,8 @@ pub(super) async fn prepare_turn(
     let history_summary_max_chars = app.config.history_summary_max_chars;
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
     let reference_assets_dir = attachment_assets_dir.clone();
-    let history = tokio::task::spawn_blocking(move || {
-        let mut history = build_context_history(
+    let (history, compression_diagnostic) = tokio::task::spawn_blocking(move || {
+        let outcome = build_context_history_with_outcome(
             history_count,
             &history_file,
             history_max_chars,
@@ -366,6 +366,11 @@ pub(super) async fn prepare_turn(
             cwd.as_deref(),
         )
         .map_err(|e| e.to_string())?;
+        // Capture compaction feedback before image substitution changes the
+        // projection size. The driver reports safe degradation without aborting
+        // turn preparation or discarding the retained source messages.
+        let compression_diagnostic = outcome.diagnostic();
+        let mut history = outcome.messages;
         // Cross-turn image digests: replace prior turns' raw images with the
         // digest persisted in history metadata, so a new turn does not re-send
         // last turn's images to the model (consistent for all VL models).
@@ -380,11 +385,16 @@ pub(super) async fn prepare_turn(
                 Some(reference_assets_dir.as_path()),
             );
         }
-        Ok::<_, String>(history)
+        Ok::<_, String>((history, compression_diagnostic))
     })
     .await
     .map_err(|e| format!("context history task failed: {e}"))?
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    if let Some(diagnostic) = compression_diagnostic
+        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+    {
+        eprintln!("[history] {diagnostic}");
+    }
     let mut skill_turn = {
         let mc = mcp_client.lock().unwrap();
         skill_runtime::prepare_skill_for_turn(app, &mc, skill_manifests, question)?
