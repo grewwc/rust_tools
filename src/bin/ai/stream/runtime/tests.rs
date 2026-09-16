@@ -120,6 +120,122 @@ fn token_rate_under_minimum_window_is_unmeasurable() {
 }
 
 #[test]
+fn live_rate_text_gates_pre_output_and_early_windows() {
+    assert_eq!(format_live_rate_text(0, Some(Duration::from_secs(2))), None);
+    assert_eq!(format_live_rate_text(1_000, None), None);
+    assert_eq!(
+        format_live_rate_text(1_000, Some(Duration::from_millis(100))),
+        None
+    );
+}
+
+#[test]
+fn live_rate_text_formats_compact_count_and_rate() {
+    assert_eq!(
+        format_live_rate_text(1_234, Some(Duration::from_secs(2))).as_deref(),
+        Some("~1.2k tok @ 617 tok/s")
+    );
+    assert_eq!(
+        format_live_rate_text(57, Some(Duration::from_secs(3))).as_deref(),
+        Some("~57 tok @ 19.0 tok/s")
+    );
+}
+
+#[test]
+fn deferred_rate_refresh_is_gated_and_throttled() {
+    let mut state = StreamProcessingState::new();
+
+    // No output window yet: hint stays untouched.
+    refresh_deferred_body_rate_hint(&mut state).unwrap();
+    assert!(state.render.waiting_hint_line.is_empty());
+
+    // Output flowing (started 2 s ago, tokens present) but the throttle stamp is
+    // fresh: the row must not be rewritten.
+    state.render.waiting_hint_active = true;
+    state.render.waiting_hint_buffering = true;
+    state.render.waiting_hint_line = "  ⠋ generating…".to_string();
+    state.content.output_started_at = Some(Instant::now() - Duration::from_secs(2));
+    state.content.live_output_tokens = 1_000;
+    state.render.waiting_hint_rate_refreshed_at = Some(Instant::now());
+    refresh_deferred_body_rate_hint(&mut state).unwrap();
+    assert_eq!(state.render.waiting_hint_line, "  ⠋ generating…");
+
+    // A tool-call hint row must never be clobbered by the live-rate rewrite.
+    state.render.waiting_hint_tool_call = true;
+    state.render.waiting_hint_rate_refreshed_at = None;
+    refresh_deferred_body_rate_hint(&mut state).unwrap();
+    assert_eq!(state.render.waiting_hint_line, "  ⠋ generating…");
+}
+
+/// Tool-call arguments are never rendered, so the `receiving `X` arguments…` row is the only
+/// place the arrival rate of a large payload (apply_patch / execute_command / task / …) shows.
+#[test]
+fn tool_call_rate_hint_reports_argument_throughput() {
+    let mut state = StreamProcessingState::new();
+    state.render.waiting_hint_active = true;
+    state.render.waiting_hint_tool_call = true;
+    state.render.waiting_hint_line = tool_call_hint_label("apply_patch", None);
+    // The counter is fed directly so the assertion does not depend on real stream timing,
+    // while the window itself is deterministic.
+    state.content.count_tool_arg_delta(600);
+    state.content.count_tool_arg_delta(400);
+    state.content.tool_args_started_at = Some(Instant::now() - Duration::from_secs(2));
+
+    refresh_tool_call_rate_hint(&mut state, "apply_patch").unwrap();
+
+    assert_eq!(
+        state.render.waiting_hint_line,
+        "  ⠋ receiving `apply_patch` arguments… · ~1.0k tok @ 500 tok/s"
+    );
+    assert!(state.render.waiting_hint_rate_refreshed_at.is_some());
+}
+
+#[test]
+fn tool_call_rate_hint_is_gated_and_throttled() {
+    let tool_row = || tool_call_hint_label("execute_command", None);
+    let mut state = StreamProcessingState::new();
+
+    // The "generating…" row is not the tool-call hint and must never be rewritten here.
+    state.render.waiting_hint_active = true;
+    state.render.waiting_hint_line = "  ⠋ generating…".to_string();
+    state.content.tool_args_started_at = Some(Instant::now() - Duration::from_secs(2));
+    state.content.live_tool_arg_tokens = 1_000;
+    refresh_tool_call_rate_hint(&mut state, "execute_command").unwrap();
+    assert_eq!(state.render.waiting_hint_line, "  ⠋ generating…");
+
+    // Tool hint drawn and arguments flowing, but the throttle stamp is fresh: no repaint.
+    state.render.waiting_hint_tool_call = true;
+    state.render.waiting_hint_line = tool_row();
+    state.render.waiting_hint_rate_refreshed_at = Some(Instant::now());
+    refresh_tool_call_rate_hint(&mut state, "execute_command").unwrap();
+    assert_eq!(state.render.waiting_hint_line, tool_row());
+
+    // Throttle expired, but the window is still shorter than MIN_RATE_WINDOW.
+    state.render.waiting_hint_rate_refreshed_at = None;
+    state.content.tool_args_started_at = Some(Instant::now() - Duration::from_millis(100));
+    refresh_tool_call_rate_hint(&mut state, "execute_command").unwrap();
+    assert_eq!(state.render.waiting_hint_line, tool_row());
+
+    // No argument received yet: there is nothing to report.
+    state.content.tool_args_started_at = None;
+    state.content.live_tool_arg_tokens = 0;
+    refresh_tool_call_rate_hint(&mut state, "execute_command").unwrap();
+    assert_eq!(state.render.waiting_hint_line, tool_row());
+}
+
+#[test]
+fn tool_arg_metrics_reset_when_the_hint_switches_calls() {
+    let mut state = StreamProcessingState::new();
+    state.content.count_tool_arg_delta(120);
+    assert_eq!(state.content.live_tool_arg_tokens, 120);
+    assert!(state.content.tool_args_started_at.is_some());
+
+    state.content.reset_tool_args_metrics();
+    assert_eq!(state.content.live_tool_arg_tokens, 0);
+    assert!(state.content.tool_args_started_at.is_none());
+}
+
+#[test]
 fn live_token_estimate_is_zero_only_for_empty_deltas() {
     assert_eq!(estimate_stream_tokens(""), 0);
     assert_eq!(estimate_stream_tokens("a"), 1);

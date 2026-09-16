@@ -49,17 +49,16 @@ fn run() -> Result<(), String> {
 
     let mut out = Vec::new();
     for bin in bins {
-        let bin_rs = bin_dir.join(format!("{bin}.rs"));
-        if !bin_rs.exists() {
-            continue;
-        }
         let installed_bin = install_dir.join(&bin);
         let built_bin = release_dir.join(&bin);
-
-        let deps = deps_for_bin(&bin, &bin_rs, &repo_root, &graph, &interner)?;
-        let newest_src = newest_mtime(&deps)?;
         match mode {
             Mode::Build => {
+                let bin_rs = bin_dir.join(format!("{bin}.rs"));
+                if !bin_rs.exists() {
+                    continue;
+                }
+                let deps = deps_for_bin(&bin, &bin_rs, &repo_root, &graph, &interner)?;
+                let newest_src = newest_mtime(&deps)?;
                 if !built_bin.exists() {
                     out.push(bin);
                     continue;
@@ -70,6 +69,11 @@ fn run() -> Result<(), String> {
                 }
             }
             Mode::Install => {
+                // Install mode only compares the release artifact against the
+                // installed copy, so it also covers bins without a
+                // src/bin/<bin>.rs (e.g. re in crates/re and the mcp_* crates),
+                // which lets the Makefile skip re-copying up-to-date binaries
+                // instead of forcing an unconditional copy.
                 if !built_bin.exists() {
                     continue;
                 }

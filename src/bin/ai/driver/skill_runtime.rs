@@ -1162,6 +1162,13 @@ fn build_system_prompt(
         ContextKind::Behavior,
         include_str!("system_prompts/correctness_guardrails.md"),
     );
+    // Thinking scope: effort authorizes depth, not length. Unconditional — a
+    // "max" reasoning tier must still scale thinking to the question instead
+    // of writing a maximal-length thought chain.
+    b.push(
+        ContextKind::Behavior,
+        include_str!("system_prompts/thinking_budget.md"),
+    );
     // Intellectual honesty: evidence-earned agreement and respectful pushback
     // against wrong or inappropriate user premises. Unconditional — it applies
     // in every mode and is never relaxed by a skill or goal. It also hosts the

@@ -1,4 +1,11 @@
-use crate::ai::{model_names, models, provider::ReasoningEffort, types::App};
+use crate::ai::{
+    model_names, models,
+    provider::{ReasoningEffort, ThinkingOffCapability},
+    request::{
+        model_effort_graded, model_thinking_off_capability, reasoning_effort_display_label,
+    },
+    types::App,
+};
 
 fn print_model_help() {
     println!("Model commands:");
@@ -13,18 +20,11 @@ fn print_model_help() {
     println!("  /model effort                       show current reasoning effort");
     println!("  /model effort <minimal|low|medium|high|xhigh|max>");
     println!("                                      override reasoning effort");
-    println!("  /model effort off|none|auto         clear override (use model default)");
+    println!("  /model effort off|none             disable thinking (per-vendor wire adaptation)");
+    println!("  /model effort auto|clear|default|reset");
+    println!("                                      clear override (use model default)");
     println!("  /effort <level|off|auto>            standalone shortcut for /model effort");
     println!();
-}
-
-/// 计算当前生效的推理强度（与 [`request::resolve_reasoning_effort`] 同语义，
-/// 但本模块不依赖 request.rs 内部结构，所以在这里复刻一份纯查询逻辑）。
-fn effective_effort(app: &App, model: &str) -> Option<ReasoningEffort> {
-    if let Some(override_value) = app.cli.reasoning_effort_override.as_ref() {
-        return *override_value;
-    }
-    models::default_reasoning_effort(model)
 }
 
 fn format_effort(effort: Option<ReasoningEffort>) -> &'static str {
@@ -45,7 +45,7 @@ fn print_model_list(app: &App) {
     );
     println!(
         "Reasoning effort: {} (override: {})",
-        format_effort(effective_effort(app, &app.current_model)),
+        reasoning_effort_display_label(app, &app.current_model),
         match app.cli.reasoning_effort_override {
             None => "none".to_string(),
             Some(None) => "off".to_string(),
@@ -115,7 +115,7 @@ fn handle_effort_arg(app: &mut App, arg: &str) -> Result<bool, Box<dyn std::erro
     if arg.is_empty() {
         println!(
             "Reasoning effort: {} (override: {})",
-            format_effort(effective_effort(app, &app.current_model)),
+            reasoning_effort_display_label(app, &app.current_model),
             match app.cli.reasoning_effort_override {
                 None => "none".to_string(),
                 Some(None) => "off".to_string(),
@@ -135,7 +135,16 @@ fn handle_effort_arg(app: &mut App, arg: &str) -> Result<bool, Box<dyn std::erro
         }
         "off" | "none" | "no" | "false" | "disable" | "disabled" => {
             app.cli.reasoning_effort_override = Some(None);
-            println!("Reasoning effort disabled (no field will be sent).");
+            match model_thinking_off_capability(&app.current_model) {
+                // No vendor off mechanism: the override is stored but cannot be
+                // expressed on the wire — say so instead of claiming success.
+                ThinkingOffCapability::Unsupported => println!(
+                    "Reasoning effort off — but this model's gateway has no thinking off-switch; thinking stays on (server default)."
+                ),
+                _ => println!(
+                    "Reasoning effort off — thinking disabled for the current model (wire off-switch or reasoning_effort: none)."
+                ),
+            }
             return Ok(true);
         }
         _ => {}
@@ -143,7 +152,18 @@ fn handle_effort_arg(app: &mut App, arg: &str) -> Result<bool, Box<dyn std::erro
     match ReasoningEffort::parse(arg) {
         Some(level) => {
             app.cli.reasoning_effort_override = Some(Some(level));
-            println!("Reasoning effort overridden: {}", level.as_str());
+            if model_effort_graded(&app.current_model) {
+                println!("Reasoning effort overridden: {}", level.as_str());
+            } else {
+                // Model without a registry-declared reasoning_effort_wire and a
+                // binary-switch dialect (DeepSeek / DashScope): the tier is
+                // accepted but omitted from the wire — say so instead of
+                // implying a gradation took effect.
+                println!(
+                    "Reasoning effort overridden: {} — this model's thinking is a binary switch (no gradation); the tier is omitted from the wire.",
+                    level.as_str()
+                );
+            }
         }
         None => {
             println!(
@@ -223,7 +243,7 @@ pub fn try_handle_model_command(
             );
             println!(
                 "Reasoning effort: {} (model default: {}, override: {})",
-                format_effort(effective_effort(app, &app.current_model)),
+                reasoning_effort_display_label(app, &app.current_model),
                 format_effort(def.reasoning_effort),
                 match app.cli.reasoning_effort_override {
                     None => "none".to_string(),
@@ -252,10 +272,12 @@ pub fn try_handle_model_command(
         return Ok(true);
     }
 
-    // 支持行内问题：`/model <selector> [<question>...]`，question 可直接换行跟在
-    // selector 之后（与 `/skills <name>... <question>` 一致）。模型 selector 是
-    // 单 token：先整体尝试命中（保留空格归一化 selector 的既有行为），未命中时取
-    // 首个 token 作为 selector，其余文本作为本轮问题。
+    // Supports inline questions: `/model <selector> [<question>...]`, where the
+    // question may follow the selector on a new line (consistent with
+    // `/skills <name>... <question>`). The model selector is a single token:
+    // try to match the whole input first (preserving the existing
+    // whitespace-normalized selector behavior); on a miss, take the first token
+    // as the selector and the remaining text as this turn's question.
     let mut selector = raw;
     let mut inline_question: Option<String> = None;
     if let Some(first) = raw.split_whitespace().next()
@@ -282,7 +304,8 @@ pub fn try_handle_model_command(
         .unwrap_or_else(|| old_model.trim().to_string());
     if old_handle.eq_ignore_ascii_case(&next_model) {
         if let Some(question) = inline_question {
-            // 模型未变但带了行内问题：问题仍照常送入本轮。
+            // Model unchanged but an inline question was given: the question
+            // still feeds this turn.
             app.forced_question = Some(question);
             return Ok(true);
         }
@@ -438,7 +461,7 @@ mod tests {
 
     #[test]
     fn model_command_multiline_question() {
-        // /model <selector>\n<question>：换行后的文本作为本轮问题
+        // /model <selector>\n<question>: text after the newline feeds this turn.
         let models = crate::ai::model_names::all();
         if models.len() < 2 {
             return;

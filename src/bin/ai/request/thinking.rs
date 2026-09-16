@@ -1,9 +1,9 @@
-//! 思考模式（thinking mode）解析逻辑。
+//! Thinking-mode resolution logic.
 //!
-//! 决定单次请求是否启用模型的思考/推理模式：
-//! - 配置强制开关
-//! - 本地启发式短路（QuestionShape）
-//! - 辅助模型 gate（`decide_thinking_via_model`）
+//! Decides whether a single request enables the model's thinking/reasoning mode:
+//! - config force switch
+//! - local heuristic short-circuit (QuestionShape)
+//! - auxiliary model gate (`decide_thinking_via_model`)
 
 use std::borrow::Cow;
 use std::time::{Duration, Instant};
@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::ai::config_schema::AiConfig;
 use crate::ai::history::{Message, is_runtime_synthetic_user_message};
 use crate::ai::models;
+use crate::ai::provider::ThinkingOffCapability;
 use crate::ai::types::App;
 use crate::commonw::configw;
 use rust_tools::commonw;
@@ -22,20 +23,48 @@ use super::error::{
     DEFAULT_AUTO_THINKING_THRESHOLD, api_key_for_request_model, apply_request_auth,
     config_bool_is_true, control_model_for_aux_tasks, endpoint_for_request_model,
 };
+use super::reasoning::model_thinking_off_capability;
 use super::routing::{extract_router_content, strip_json_fence};
 
 /// Resolve whether to enable thinking mode for this request.
 ///
 /// Decision order:
-/// 1. Config `ai.model.thinking=true` forces thinking when the model supports it
-/// 2. If model doesn't support thinking, return false
-/// 3. If auto-thinking is disabled by config, return false
-/// 4. Auto-detect based on question complexity
+/// 1. Truncation fallback (`thinking_disabled_override`) forces thinking off
+/// 2. Explicit user "effort off" (`/effort off`) turns thinking off on dialects
+///    whose declared off capability is [`ThinkingOffCapability::RealSwitch`]
+///    (DashScope `enable_thinking` / DeepSeek `thinking`)
+/// 3. Config `ai.model.thinking=true` forces thinking when the model supports it
+/// 4. If model doesn't support thinking, return false
+/// 5. If auto-thinking is disabled by config, return false
+/// 6. Models with a registry default reasoning effort always think — the
+///    short-circuit that bypasses both the local heuristic and the model gate
+/// 7. Auto-detect based on question complexity
 #[commonw::debug_measure_time("resolve_thinking")]
 pub(super) async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool {
-    // 截断重试兜底：连续多次截断后强制关闭 thinking，优先级高于一切（含
-    // force_thinking），把输出预算完全让给可见内容。turn 末由 orchestrator 恢复。
+    // Truncation-retry fallback: after repeated truncation, thinking is forcibly
+    // disabled with priority over everything (including force_thinking), leaving
+    // the whole output budget to visible content. Restored by the orchestrator
+    // at the end of the turn.
     if app.cli.thinking_disabled_override {
+        return false;
+    }
+
+    // Explicit user "effort off" (`/effort off`, `/model effort off`,
+    // `--reasoning-effort off`) also turns thinking off on dialects whose
+    // declared off capability is a real wire off-switch (DashScope
+    // `enable_thinking:false`, DeepSeek `thinking:{"type":"disabled"}`) — same
+    // precedence tier as the truncation fallback above: a recent explicit
+    // in-session command wins over the persistent `ai.model.thinking=true`
+    // config. Effort-only dialects (capability [`ThinkingOffCapability::EffortNone`])
+    // are not handled here: `resolve_reasoning_effort` expresses their off as
+    // `reasoning_effort: "none"` instead. Unsupported dialects keep thinking on
+    // and the `/effort off` handler reports that honestly.
+    if app.cli.reasoning_effort_override == Some(None)
+        && matches!(
+            model_thinking_off_capability(model),
+            ThinkingOffCapability::RealSwitch
+        )
+    {
         return false;
     }
 
@@ -66,11 +95,13 @@ pub(super) async fn resolve_thinking(app: &App, model: &str, messages: &[Message
     }
 
     let raw_question = latest_user_message_text(messages).unwrap_or_default();
-    // 注入的 `<system-reminder>...</system-reminder>` 上下文会被拼到当前
-    // user message 最前面（见 prepare.rs / skill_runtime.rs）。它会把一句
-    // "hi" 撑成上千字符的长文本，导致本地 thinking 短路（按问题长度判定）
-    // 失效，进而落到耗时数秒的模型 gate。这里在判定前剥离这些 reminder 块，
-    // 只用用户真正输入的内容做意图与 thinking 判定。
+    // Injected `<system-reminder>...</system-reminder>` context is prepended to
+    // the current user message (see prepare.rs / skill_runtime.rs). It can
+    // inflate a one-word "hi" into a multi-thousand-character blob, defeating
+    // the local thinking short-circuit (which keys off question length) and
+    // falling through to the multi-second model gate. These reminder blocks are
+    // stripped here before judging, using only what the user actually typed for
+    // intent and thinking decisions.
     let question = strip_system_reminders(&raw_question);
     let question = question.trim();
     if !question.is_empty() {
@@ -96,9 +127,10 @@ pub(super) async fn resolve_thinking(app: &App, model: &str, messages: &[Message
 }
 
 pub(crate) fn latest_user_message_text(messages: &[Message]) -> Option<String> {
-    // 跳过合成 user 消息（task-evidence handoff、图片 followup 等）：它们注入在
-    // 真实 user 之后，若不跳过会取到交接说明而非用户真正的问题，污染 thinking
-    // 短路与模型 gate 判定。
+    // Skip synthetic user messages (task-evidence handoff, image followup, etc.):
+    // they are injected after the real user message, and picking one up here
+    // would take the handoff text instead of the user's actual question,
+    // polluting both the thinking short-circuit and the model-gate decision.
     messages
         .iter()
         .rev()
@@ -106,11 +138,13 @@ pub(crate) fn latest_user_message_text(messages: &[Message]) -> Option<String> {
         .and_then(extract_message_text)
 }
 
-/// 剥离注入到 user message 中的 `<system-reminder>...</system-reminder>` 块。
+/// Strips `<system-reminder>...</system-reminder>` blocks injected into user
+/// messages.
 ///
-/// prepare.rs / skill_runtime.rs 会把上下文提醒拼到当前 user message 最前面
-/// （为保 prompt cache）。这些块体量很大，会污染意图/thinking 判定的输入，
-/// 让一句 "hi" 看起来像是长文本。判定前去掉它们，只留用户真正输入的内容。
+/// prepare.rs / skill_runtime.rs prepend context reminders to the current user
+/// message (to preserve prompt cache). These blocks are large and pollute the
+/// intent/thinking judgment input, making a one-word "hi" look like long text.
+/// They are removed before judgment, leaving only the user's actual input.
 pub(crate) fn strip_system_reminders(text: &str) -> Cow<'_, str> {
     const OPEN: &str = "<system-reminder>";
     const CLOSE: &str = "</system-reminder>";
@@ -124,7 +158,7 @@ pub(crate) fn strip_system_reminders(text: &str) -> Cow<'_, str> {
         let after_open = &rest[start + OPEN.len()..];
         match after_open.find(CLOSE) {
             Some(end) => rest = &after_open[end + CLOSE.len()..],
-            // 没有闭合标签：丢弃剩余内容（视为未闭合的 reminder）。
+            // No closing tag: discard the rest (treated as an unterminated reminder).
             None => {
                 rest = "";
                 break;
@@ -147,8 +181,10 @@ pub(crate) fn local_thinking_decision(question: &str) -> Option<bool> {
         .filter(|line| !line.is_empty())
         .collect();
     let line_count = nonempty_lines.len();
-    // 结构化诊断痕迹：后续行出现 `label: details` / 堆栈路径样式，
-    // 不依赖具体错误关键词。QuestionShape 不覆盖此维度，内联计算后传入。
+    // Structured diagnostic traces: later lines match `label: details` /
+    // stack-path shapes, without depending on specific error keywords.
+    // QuestionShape does not cover this dimension, so it is computed inline
+    // and passed in.
     let has_diagnostic_shape = line_count >= 2
         && nonempty_lines.iter().skip(1).any(|line| {
             line.contains(": ")
@@ -164,9 +200,10 @@ pub(crate) fn local_thinking_decision(question: &str) -> Option<bool> {
         return Some(true);
     }
 
-    // 兜底恒给决策：不再返回 None，避免 resolve_thinking 落到耗时数秒的
-    // 模型 gate。中间地带（长但无结构）倒向 false（快），复杂输入已在上面
-    // 稳定判 true。
+    // Always return a decision instead of None, so resolve_thinking never falls
+    // through to the multi-second model gate. The middle ground (long but
+    // unstructured) leans false (fast); complex inputs are already reliably
+    // judged true above.
     Some(false)
 }
 
@@ -191,8 +228,9 @@ pub(crate) fn local_thinking_decision(question: &str) -> Option<bool> {
 async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]) -> Option<bool> {
     let gate_start = Instant::now();
     let user_text = latest_user_message_text(messages).unwrap_or_default();
-    // thinking gate 只需要真实用户问题，不需要 cache-preservation 用的
-    // context reminder；否则会白白烧掉辅助模型 token。
+    // The thinking gate only needs the real user question, not the
+    // cache-preservation context reminder; including it would waste the
+    // auxiliary model's tokens.
     let question = strip_system_reminders(&user_text);
     let question = question.trim();
     if question.is_empty() {
@@ -250,8 +288,9 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
     let api_key = api_key_for_request_model(app, &control_model);
     let http_body =
         super::protocol::build_http_body_for_request(&control_model, &endpoint, &mut request_body);
-    // 辅助请求（thinking gate），15 秒超时兜底：主 client 无整体 timeout，
-    // 仅 connect_timeout 不覆盖“连上但服务端不回响应头”的永久阻塞。
+    // Auxiliary request (thinking gate), 15s timeout fallback: the main client
+    // has no overall timeout, and connect_timeout alone does not cover the
+    // "connected but the server never sends response headers" permanent block.
     let send_future =
         apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key, &app.session_id)
             .header("Content-Type", "application/json")

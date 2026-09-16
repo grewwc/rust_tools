@@ -96,13 +96,6 @@ pub(in crate::ai::driver::turn_runtime) const INJECTED_CONTEXT_ECHO_PREFIXES: &[
     "self_note:",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::ai::driver::turn_runtime) enum FinalClaimKind {
-    NoClaim,
-    Completion,
-    NoImpact,
-}
-
 pub(in crate::ai::driver::turn_runtime) const DANGLING_FINAL_RECOVERY_MARKER: &str =
     "[dangling-final-recovery]";
 pub(in crate::ai::driver::turn_runtime) const DANGLING_FINAL_WARNING: &str = "[Runtime warning] The model still described a future inspection step after a one-time no-tool wrap-up retry, so this turn ended without a complete conclusion.";
@@ -693,69 +686,6 @@ pub(in crate::ai::driver::turn_runtime) fn dangling_final_recovery_action(
     });
     DanglingFinalRecoveryAction::RetryWithoutTools
 }
-
-pub(in crate::ai::driver::turn_runtime) fn final_text_claim_kind(text: &str) -> FinalClaimKind {
-    if ["没有影响", "未影响", "不会影响", "不影响", "保持不变"]
-        .iter()
-        .any(|claim| text.contains(claim))
-    {
-        return FinalClaimKind::NoImpact;
-    }
-    if [
-        "已完成",
-        "已修复",
-        "全部修复",
-        "修复完成",
-        "已更新",
-        "已经更新",
-        "已修改",
-        "已经修改",
-    ]
-    .iter()
-    .any(|claim| text.contains(claim))
-    {
-        return FinalClaimKind::Completion;
-    }
-
-    let text = text.to_ascii_lowercase();
-    if [
-        "no impact",
-        "unaffected",
-        "unchanged",
-        "does not affect",
-        "doesn't affect",
-    ]
-    .iter()
-    .any(|claim| text.contains(claim))
-    {
-        return FinalClaimKind::NoImpact;
-    }
-    if [
-        "completed",
-        "fixed",
-        "resolved",
-        "implemented",
-        "done",
-        "updated",
-        "changed",
-    ]
-    .iter()
-    .any(|word| contains_non_negated_completion_word(&text, word))
-        || [
-            "changes are ready",
-            "change is ready",
-            "implementation is ready",
-            "fix is ready",
-            "patch is ready",
-        ]
-        .iter()
-        .any(|claim| text.contains(claim))
-    {
-        return FinalClaimKind::Completion;
-    }
-    FinalClaimKind::NoClaim
-}
-
 /// Decide whether the final response merely regurgitates a context note the runtime
 /// injected, verbatim, without giving a real answer. Hit signature: after stripping the
 /// `[Runtime warning]` section the runtime appended post-hoc, the remaining visible body

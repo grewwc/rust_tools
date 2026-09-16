@@ -6,8 +6,8 @@ pub(in crate::ai) use adapter::{
     openai_adapter, opencode_adapter,
 };
 pub(in crate::ai) use adapter::{
-    ProviderAdapter, adapter_for, compatible_wire_shapes, reasoning_effort_reduces_thinking_for,
-    thinking_dialect_for,
+    ProviderAdapter, ThinkingOffCapability, adapter_for, compatible_wire_shapes,
+    reasoning_effort_reduces_thinking_for, thinking_dialect_for, thinking_off_capability_for,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]

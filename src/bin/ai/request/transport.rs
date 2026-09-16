@@ -12,7 +12,7 @@ use serde_json::Value;
 use super::super::{
     history::{Message, SessionStore, generate_session_summary},
     models,
-    provider::adapter_for,
+    provider::{ThinkingOffCapability, adapter_for},
     types::App,
 };
 use crate::ai::theme::{self, RESET};
@@ -33,9 +33,10 @@ use super::normalize::{
 };
 use super::prompt_feedback::PromptTokenFeedback;
 use super::reasoning::{
-    apply_prompt_cache_breakpoint, apply_thinking_force_off_effort,
-    normalize_reasoning_content_replay_for_model, prompt_cache_enabled_for_model,
-    reconstruct_encrypted_reasoning_items_for_model, resolve_reasoning_effort,
+    apply_prompt_cache_breakpoint, apply_thinking_force_off_effort, model_effort_graded,
+    model_thinking_off_capability, normalize_reasoning_content_replay_for_model,
+    prompt_cache_enabled_for_model, reconstruct_encrypted_reasoning_items_for_model,
+    resolve_reasoning_effort,
 };
 use super::thinking::resolve_thinking;
 use super::token_budget;
@@ -493,7 +494,12 @@ async fn do_request_messages_with_tool_mode(
             "elapsed_ms": thinking_start.elapsed().as_secs_f64() * 1000.0,
         },
     );
-    if force_thinking_requested && !enable_thinking {
+    // The "thinking requested but unsupported" diagnostic must key off the
+    // model's registry capability, not the resolved flag: `resolve_thinking`
+    // can now return false for other reasons (the user's explicit `/effort off`,
+    // the truncation force-off fallback), which are intentional thinking-off
+    // decisions — not "the model doesn't support thinking".
+    if force_thinking_requested && !models::enable_thinking(model) {
         super::emit_request_diagnostic(format_args!(
             "[Info] thinking 已请求，但当前模型 `{}` 不支持 thinking；本轮将继续以普通模式输出。",
             model
@@ -662,12 +668,33 @@ pub(crate) fn print_info(app: &App, model: &str) {
     } else {
         "false"
     };
-    let effort_label = if app.cli.thinking_disabled_override {
-        // The truncation fallback already forced thinking off (the last resort when lowering effort is ineffective for
-        // always-thinking models); label it explicitly to avoid confusion with "auto / model default".
-        "off"
+    let effort_label = if app.cli.thinking_disabled_override
+        || app.cli.reasoning_effort_override == Some(None)
+    {
+        // The truncation fallback or the user's explicit `/effort off` turns thinking off
+        // (via the wire switch or `reasoning_effort:"none"`); label it explicitly to avoid
+        // confusion with "auto / model default".
+        if app.cli.reasoning_effort_override == Some(None)
+            && matches!(
+                model_thinking_off_capability(model),
+                ThinkingOffCapability::Unsupported
+            )
+        {
+            // No vendor off mechanism: the intent is stored but the wire cannot
+            // express it — label honestly instead of implying thinking is off.
+            "off (unsupported)"
+        } else {
+            "off"
+        }
     } else {
         match resolve_reasoning_effort(app, model) {
+            Some(_) if !model_effort_graded(model) => {
+                // Model without a registry-declared reasoning_effort_wire and a
+                // binary-switch dialect (DeepSeek / DashScope): the resolved
+                // tier (override or registry default) has no wire effect and is
+                // omitted — don't imply a gradation exists.
+                "n/a (binary switch)"
+            }
             Some(e) => e.as_str(),
             None => "auto",
         }

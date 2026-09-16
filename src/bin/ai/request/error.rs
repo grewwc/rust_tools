@@ -177,6 +177,11 @@ pub(crate) fn config_forces_thinking() -> bool {
     config_bool_is_true(cfg.get_opt(AiConfig::MODEL_THINKING))
 }
 
+/// Effective endpoint for the model's request: the registry endpoint (models/*.json,
+/// including per-model overrides in ~/.config/rust_tools/models/). `app.config.endpoint`
+/// is a test-only fallback that production leaves empty (the old `ai.model.endpoint`
+/// config key was removed), so this always matches the endpoint used for the
+/// wire-dialect decisions in the request builder.
 pub(crate) fn endpoint_for_request_model(app: &App, model: &str) -> String {
     models::endpoint_for_model(model, &app.config.endpoint)
 }

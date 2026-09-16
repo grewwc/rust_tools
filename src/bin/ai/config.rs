@@ -26,10 +26,9 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     let openai_api_key = cfg
         .get_opt(AiConfig::MODEL_OPENAI_API_KEY)
         .unwrap_or_default();
-    let endpoint = cfg.get_opt(AiConfig::MODEL_ENDPOINT).unwrap_or_default();
     let default_model =
         models::determine_model(&cfg.get_opt(AiConfig::MODEL_DEFAULT).unwrap_or_default());
-    let default_endpoint = models::endpoint_for_model(&default_model, &endpoint);
+    let default_endpoint = models::endpoint_for_model(&default_model, "");
     let default_model_api_key = models::api_key_for_model(&default_model, &api_key);
     if api_key.trim().is_empty()
         && opencode_api_key.trim().is_empty()
@@ -72,7 +71,7 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         api_key,
         base_history_file: history_file.clone(),
         history_file,
-        endpoint,
+        endpoint: String::new(),
         vl_default_model,
         history_max_chars,
         history_keep_last,

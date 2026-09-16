@@ -1,4 +1,7 @@
-INSTALL_BINS ?= $(sort $(patsubst src/bin/%.rs,%,$(wildcard src/bin/*.rs)))
+# Standalone MCP server crates live in crates/, not src/bin/*.rs, so the
+# wildcard below cannot see them; install them alongside the regular bins.
+MCP_BINS := mcp_browser mcp_excel mcp_pdf
+INSTALL_BINS ?= $(sort $(patsubst src/bin/%.rs,%,$(wildcard src/bin/*.rs)) $(MCP_BINS))
 ALL_BINS ?= $(INSTALL_BINS) c
 
 # 允许 `make install fk` / `make install fk ff` 语法
@@ -7,28 +10,45 @@ $(INSTALL_BINS): install ; @:
 
 RELEASE_DIR := target/release
 DEBUG_DIR := target/debug
-INSTALLW := $(RELEASE_DIR)/installw
+INSTALLW := $(DEBUG_DIR)/installw
 CargoLock := $(wildcard Cargo.lock)
 INSTALLW_DEPS := $(shell find src -type f -name '*.rs') Cargo.toml $(CargoLock)
 
 $(RELEASE_DIR)/%: src/bin/%.rs
 	cargo build --release --bin $*
 
+# mcp_* have no src/bin/*.rs prerequisite; build them from the workspace root.
+# Give each target its own crate's sources only, so touching one crate does not
+# re-trigger the recipes of the others (cargo still skips no-op rebuilds).
+# mcp_pdf links the root lib (crates/mcp_pdf/Cargo.toml), so it also watches the
+# root crate's sources; mcp_browser/mcp_excel do not depend on the root lib.
+$(RELEASE_DIR)/mcp_browser: $(shell find crates/mcp_browser -type f -name '*.rs') Cargo.toml
+	cargo build --release -p mcp_browser --bin mcp_browser
+
+$(RELEASE_DIR)/mcp_excel: $(shell find crates/mcp_excel -type f -name '*.rs') Cargo.toml
+	cargo build --release -p mcp_excel --bin mcp_excel
+
+$(RELEASE_DIR)/mcp_pdf: $(shell find crates/mcp_pdf -type f -name '*.rs') $(shell find src -type f -name '*.rs') Cargo.toml
+	cargo build --release -p mcp_pdf --bin mcp_pdf
+
 all: $(addprefix $(RELEASE_DIR)/,$(ALL_BINS))
 
 $(INSTALLW): $(INSTALLW_DEPS)
 	cargo build --bin installw
 
-RUSTFLAGS_INSTALL ?= -Awarnings
-install: export RUSTFLAGS := $(strip $(RUSTFLAGS) $(RUSTFLAGS_INSTALL))
+# `re` lives in crates/re, not src/bin/, so installw's build mode (which
+# resolves src/bin/<bin>.rs dependencies) never emits it; build it explicitly
+# and let move_executable.sh's install mode decide whether to re-copy.
 .PHONY: install
-install:
+install: $(INSTALLW) $(addprefix $(RELEASE_DIR)/,$(MCP_BINS))
 	$(eval REQUESTED := $(filter-out install,$(MAKECMDGOALS)))
 	$(eval BINS := $(or $(REQUESTED),$(INSTALL_BINS)))
 	@set -e; \
 	if [ -n "$(REQUESTED)" ]; then \
 		args=""; \
-		for b in $(BINS); do args="$$args --bin $$b"; done; \
+		for b in $(BINS); do \
+			case "$$b" in mcp_browser|mcp_excel|mcp_pdf) args="$$args -p $$b --bin $$b";; *) args="$$args --bin $$b";; esac; \
+		done; \
 		cargo build --release $$args; \
 		sh ./move_executable.sh --force $(BINS); \
 	else \
@@ -38,7 +58,9 @@ install:
 			for b in $$bins; do args="$$args --bin $$b"; done; \
 			cargo build --release $$args; \
 		fi; \
+		cargo build --release -p re; \
 		sh ./move_executable.sh $(BINS); \
+		sh ./move_executable.sh re $(MCP_BINS); \
 	fi
 
 	@$(MAKE) install-completions

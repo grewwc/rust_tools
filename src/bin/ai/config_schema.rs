@@ -7,13 +7,17 @@
 /// ```rust
 /// use crate::ai::config_schema::AiConfig;
 /// let cfg = configw::get_all_config();
-/// let endpoint = cfg.get_opt(AiConfig::MODEL_ENDPOINT);
+/// let default_model = cfg.get_opt(AiConfig::MODEL_DEFAULT);
 /// ```
 pub struct AiConfig;
 
 impl AiConfig {
     // ── Model ──────────────────────────────────────────────
-    pub const MODEL_ENDPOINT: &str = "ai.model.endpoint";
+    // `ai.model.endpoint` was removed: the model registry (models/*.json plus
+    // per-model overrides in ~/.config/rust_tools/models/) is the single endpoint
+    // authority. A global override diverged from the wire-dialect decisions in
+    // request/builder.rs (which have no override), producing mismatched thinking /
+    // reasoning_effort fields against the actual request URL.
     /// Subagent model selection inherits the parent agent's current model by
     /// default. Set to "false" or "0" to use the auto-selection logic instead
     /// (model registry subagent_priority / task difficulty classification).

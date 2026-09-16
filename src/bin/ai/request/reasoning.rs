@@ -1,11 +1,11 @@
-//! 推理/思考模式控制 + prompt cache 断点注入。
+//! Reasoning/thinking-mode control + prompt-cache breakpoint injection.
 //!
-//! 从 request/mod.rs 提取的推理相关逻辑：
-//! - thinking wire 字段解析（各 provider adapter 的字段差异）
-//! - thinking 模型的 reasoning_content echo 补齐
-//! - 辅助/后台请求的思考关闭注入
-//! - prompt cache 断点注入（cache_control）
-//! - reasoning_effort 档位解析
+//! Reasoning-related logic extracted from request/mod.rs:
+//! - thinking wire-field parsing (per-provider-adapter field differences)
+//! - `reasoning_content` echo completion for thinking models
+//! - thinking-off injection for auxiliary/background requests
+//! - prompt-cache breakpoint injection (`cache_control`)
+//! - `reasoning_effort` tier resolution
 
 use serde_json::{Map, Value, json};
 
@@ -13,19 +13,30 @@ use super::super::{
     history::{Message, is_system_like_role},
     models,
     provider::{
-        ApiProvider, ReasoningEffort, adapter_for, compatible_wire_shapes,
-        reasoning_effort_reduces_thinking_for, thinking_dialect_for,
+        ApiProvider, ReasoningEffort, ThinkingOffCapability, adapter_for,
+        compatible_wire_shapes, reasoning_effort_reduces_thinking_for, thinking_dialect_for,
+        thinking_off_capability_for,
     },
     types::App,
 };
 use crate::commonw::configw;
 
-/// 解析各 provider adapter 对思考/推理字段的具体形状。
+/// Resolve the thinking/reasoning field shapes for each provider adapter.
 ///
-/// 返回三元组：
-/// 1. 顶层 thinking 对象（或其它 provider 特定字段），空则不注入；
-/// 2. 顶层 reasoning_effort 字符串（部分 provider 放顶层）；
-/// 3. 嵌套 reasoning 对象（部分 provider 放 body.reasoning）。
+/// Returns a triple:
+/// 1. the top-level thinking object (or other provider-specific fields), empty
+///    when nothing is injected;
+/// 2. the top-level `reasoning_effort` string (some providers place it at the
+///    top level);
+/// 3. the nested `reasoning` object (some providers place it in `body.reasoning`).
+///
+/// The effort **value** is adapted per vendor by the dialect first
+/// ([`ThinkingDialect::adapt_effort`]) **unless the registry declares a wire
+/// placement** ([`models::reasoning_effort_wire`]): a declared placement means
+/// the model's effort is vendor-verified graded (e.g. DeepSeek v4 on
+/// api.deepseek.com / OpenCode Zen, DashScope DeepSeek v4), so the tier passes
+/// through verbatim. Undeclared models fall back to the dialect default —
+/// binary-switch vendors omit the tier, everyone else passes it through.
 pub(super) fn resolve_reasoning_wire_controls<'a>(
     model: &'a str,
     endpoint: &str,
@@ -36,8 +47,20 @@ pub(super) fn resolve_reasoning_wire_controls<'a>(
     let adapter = adapter_for(adapter_kind, &endpoint);
     let request_model = models::request_model_name(model);
     let thinking_dialect = thinking_dialect_for(adapter_kind, &request_model, &endpoint);
-    // `enable_search` 的用户请求在 builder 里传入；此处仅关心 reasoning/thinking 三元组，
-    // 所以传入 `None` 占位——我们并不依赖这里返回的 enable_search。
+    // Per-vendor effort **value** adaptation: the dialect owns the mapping and
+    // this layer never invents a wire value. A registry-declared
+    // `reasoning_effort_wire` takes precedence (the model's effort is
+    // vendor-verified graded and placement is explicit); only undeclared models
+    // go through the dialect default, where binary-switch dialects omit the
+    // tier so the placement routing below has nothing to place.
+    let reasoning_effort = if models::reasoning_effort_wire(model).is_some() {
+        reasoning_effort
+    } else {
+        thinking_dialect.adapt_effort(reasoning_effort)
+    };
+    // The user's `enable_search` request is passed in by the builder; only the
+    // reasoning/thinking triple matters here, so `None` is a placeholder — this
+    // function does not depend on the returned enable_search.
     let (_, top_level_reasoning_effort, nested_reasoning) = if let Some(wire) =
         models::reasoning_effort_wire(model)
     {
@@ -50,9 +73,10 @@ pub(super) fn resolve_reasoning_wire_controls<'a>(
             ),
         }
     } else if adapter_kind == ApiProvider::Compatible {
-        // compatible provider 按 endpoint 分流：DashScope 走 DashScope 形状，
-        // 其他纯 OpenAI 兼容端点（如内部 modelhub）走 OpenAI 形状。
-        // 不能直接用 adapter.reasoning_*() 默认值，因为 trait 单例看不到 endpoint。
+        // Compatible providers split by endpoint: DashScope uses the DashScope
+        // shape, other plain OpenAI-compatible endpoints (e.g. the internal
+        // modelhub) use the OpenAI shape. The adapter.reasoning_*() defaults
+        // cannot be used here because the trait singleton cannot see the endpoint.
         compatible_wire_shapes(endpoint, None, reasoning_effort)
     } else {
         (
@@ -140,16 +164,24 @@ pub(super) fn normalize_reasoning_content_replay_for_model(model: &str, messages
     }
 }
 
-/// 从落库消息里重建 Responses 加密推理回放的侧信道 map（key = 首个 tool_call id）。
+/// Rebuilds the side-channel map for Responses encrypted-reasoning replay from
+/// persisted messages (key = first tool_call id).
 ///
-/// 背景：encrypted-replay 模型的加密推理在产出当轮存于内存 `turn_reasoning_items`，
-/// 但那是 turn 级、每轮清空、进程退出即失。跨轮 / Ctrl+C 后 resume 时，只能从落库到
-/// `reasoning_content` 的编码 blob 恢复。此函数扫描当前请求投影（已随压缩自然裁剪，
-/// 因此天然只回放"未被折叠的近期轮"，与 exact-replay 的回放范围一致），把每个带标记、
-/// 且来源模型匹配当前模型的 assistant tool-call 回合解码回 items，挂到其首个 tool_call id。
+/// Background: an encrypted-replay model's encrypted reasoning lives in the
+/// in-memory `turn_reasoning_items` during the turn that produced it, but that
+/// is turn-scoped, cleared each turn, and lost on process exit. Across turns or
+/// after a Ctrl+C resume, it can only be recovered from the encoded blob
+/// persisted in `reasoning_content`. This function scans the current request
+/// projection (already pruned naturally by compression, so it only replays
+/// "recent non-folded turns", matching exact-replay's replay scope) and decodes
+/// each marked assistant tool-call turn whose source model matches the current
+/// model back into items, attaching them to its first tool_call id.
 ///
-/// 仅补充 `live` 中缺失的 key：内存侧信道（当轮最新捕获）优先，落库解码只填历史空缺，
-/// 因此同一 key 不会被旧值覆盖。跨模型（标记里的模型≠当前模型）解码返回 None，自动跳过。
+/// Only fills keys missing from `live`: the in-memory side channel (freshest
+/// capture of the current turn) wins; persisted decoding only fills historical
+/// gaps, so an existing key is never overwritten by a stale value. Cross-model
+/// (marker model != current model) decoding returns None and is skipped
+/// automatically.
 pub(super) fn reconstruct_encrypted_reasoning_items_for_model(
     model: &str,
     messages: &[Message],
@@ -192,11 +224,13 @@ pub(super) fn reconstruct_encrypted_reasoning_items_for_model(
     merged
 }
 
-/// 把 provider adapter 给出的思考字段合并进辅助/后台请求体。
+/// Merges the provider adapter's thinking fields into an auxiliary/background
+/// request body.
 ///
-/// 辅助（非主链路）与后台请求固定关闭思考（`enable_thinking=false`），
-/// 由各 adapter 决定具体写哪些 key（`enable_thinking:false` /
-/// `thinking:{"type":"disabled"}` / 或空），核心层不再判别 provider。
+/// Auxiliary (non-main-path) and background requests always turn thinking off
+/// (`enable_thinking=false`); each adapter decides which keys to write
+/// (`enable_thinking:false` / `thinking:{"type":"disabled"}` / or nothing), and
+/// the core layer no longer discriminates by provider.
 pub(crate) fn apply_aux_thinking_fields(model: &str, body: &mut Value) {
     let endpoint = models::endpoint_for_model(model, "");
     let (fields, _, _) = resolve_reasoning_wire_controls(model, &endpoint, false, None);
@@ -210,10 +244,11 @@ pub(crate) fn apply_aux_thinking_fields(model: &str, body: &mut Value) {
     }
 }
 
-/// 是否开启 opt-in 的显式 prompt cache 断点注入。
+/// Whether opt-in explicit prompt-cache breakpoint injection is enabled.
 ///
-/// `cache_control` 是 provider/model 级能力，由模型注册表（models/）的
-/// `explicit_prompt_cache` 字段声明；普通 OpenAI 兼容模型不一定接受该扩展字段。
+/// `cache_control` is a provider/model-level capability declared by the
+/// `explicit_prompt_cache` field in the model registry (models/); plain
+/// OpenAI-compatible models may not accept this extension field.
 pub(super) fn prompt_cache_enabled_for_model(model: &str) -> bool {
     prompt_cache_config_enabled() && models::explicit_prompt_cache_enabled(model)
 }
@@ -228,9 +263,10 @@ fn prompt_cache_config_enabled() -> bool {
         .eq_ignore_ascii_case("true")
 }
 
-/// 把首条 system / internal_note 消息的纯文本内容改写为带 `cache_control`
-/// 的内容块数组，作为显式 prompt 缓存断点。仅在内容当前是字符串时转换，
-/// 幂等且不会触碰其它消息。
+/// Rewrites the first system / internal_note message's plain-text content into
+/// a content-block array carrying `cache_control`, as an explicit prompt-cache
+/// breakpoint. Only converts when the content is currently a string; idempotent
+/// and never touches other messages.
 pub(super) fn apply_prompt_cache_breakpoint(messages: &mut [Message]) {
     for message in messages.iter_mut() {
         if !is_system_like_role(&message.role) {
@@ -245,20 +281,68 @@ pub(super) fn apply_prompt_cache_breakpoint(messages: &mut [Message]) {
                 }
             ]);
         }
-        // 只在第一条 system-like 消息上设置断点即可。
+        // Setting the breakpoint on the first system-like message only is sufficient.
         break;
     }
 }
 
-/// 解析当前会话生效的推理强度档位，按优先级从高到低：
-/// 1. CLI 参数 `--reasoning-effort` 或 `/model effort <x>` 留下的覆盖
-///    （存储在 [`App.cli.reasoning_effort_override`]，其中 `Some(None)`
-///    表示用户显式关闭，`None` 表示未设置）；
-/// 2. 模型注册表（[models/](../../../../models)）中该模型的默认 `reasoning_effort`；
-/// 3. `None` -- 不注入字段，保持服务端默认行为。
+/// Per-vendor thinking-off capability for the current model (see
+/// [`ThinkingDialect::thinking_off_capability`]).
+///
+/// Deliberately resolved through the provider dialect layer rather than the
+/// registry: registry fields like `reasoning_effort_wire` describe the effort
+/// wire shape, not whether a dedicated thinking off-switch exists (e.g. the
+/// DashScope DeepSeek entries declare `reasoning_effort_wire: "top_level"` yet
+/// still turn thinking off via the `enable_thinking` switch).
+pub(crate) fn model_thinking_off_capability(model: &str) -> ThinkingOffCapability {
+    let endpoint = models::endpoint_for_model(model, "");
+    let request_model = models::request_model_name(model);
+    thinking_off_capability_for(models::model_adapter(model), &request_model, &endpoint)
+}
+
+/// Whether the current model's thinking has a wire effort gradation.
+///
+/// Registry-driven first: a model that declares `reasoning_effort_wire`
+/// (models/) has vendor-verified graded effort (e.g. DeepSeek v4 on
+/// api.deepseek.com / OpenCode Zen, DashScope DeepSeek v4), so its resolved
+/// tier is sent and shown as a real gradation. Undeclared models fall back to
+/// the thinking-dialect default, where binary-switch dialects (DeepSeek /
+/// DashScope) treat effort as a no-op and omit it from the wire.
+pub(crate) fn model_effort_graded(model: &str) -> bool {
+    models::reasoning_effort_reduces_thinking(model)
+}
+
+/// Resolve the effective reasoning intensity for the current session, highest
+/// priority first:
+/// 1. CLI argument `--reasoning-effort` or the `/model effort <x>` override
+///    stored in [`App.cli.reasoning_effort_override`] (`Some(None)` = user
+///    explicitly disabled; `None` = not set);
+/// 2. The model registry ([models/](../../../../models)) default `reasoning_effort`;
+/// 3. `None` -- no field injected, server default applies.
+///
+/// An explicit "off" (`Some(None)`) is treated as a request to actually turn
+/// thinking off. Per-vendor adaptation, driven by the dialect's declared off
+/// capability:
+/// - [`ThinkingOffCapability::RealSwitch`] dialects turn thinking off in
+///   `resolve_thinking` (DashScope `enable_thinking: false` / DeepSeek
+///   `thinking: {"type":"disabled"}`) and omit the effort field here;
+/// - [`ThinkingOffCapability::EffortNone`] dialects express off as
+///   [`ReasoningEffort::None`] ("none" on the wire) — the same value the
+///   truncation force-off fallback emits — for thinking-enabled models;
+/// - [`ThinkingOffCapability::Unsupported`] dialects omit the field; the
+///   `/effort off` handler reports that thinking stays on.
 pub(crate) fn resolve_reasoning_effort(app: &App, model: &str) -> Option<ReasoningEffort> {
-    if let Some(override_value) = app.cli.reasoning_effort_override.as_ref() {
-        return *override_value;
+    if let Some(Some(level)) = app.cli.reasoning_effort_override.as_ref() {
+        return Some(*level);
+    }
+    if app.cli.reasoning_effort_override == Some(None) {
+        // User explicitly typed `/effort off` (or `--reasoning-effort off`).
+        match model_thinking_off_capability(model) {
+            ThinkingOffCapability::EffortNone if models::enable_thinking(model) => {
+                return Some(ReasoningEffort::None);
+            }
+            _ => return None,
+        }
     }
     models::default_reasoning_effort(model)
 }
@@ -291,9 +375,20 @@ pub(crate) fn apply_thinking_force_off_effort<'a>(
     }
 }
 
-/// 返回输入框中展示的当前请求推理强度。未下发字段时明确标注为服务端默认值，
-/// 避免把「无模型默认档位」误显示为某个具体 effort。
+/// Returns the reasoning intensity shown in the input box for the current
+/// request. When no field is sent, it is explicitly labeled as the server
+/// default, so a model without a default tier is not mis-displayed as a
+/// specific effort.
 pub(crate) fn reasoning_effort_display_label(app: &App, model: &str) -> &'static str {
+    if app.cli.reasoning_effort_override == Some(None) {
+        // Explicit `/effort off`: show "off" (the user's intent) instead of the
+        // underlying "none"/"server default" value. When the vendor has no off
+        // mechanism at all, say so instead of implying thinking was turned off.
+        return match model_thinking_off_capability(model) {
+            ThinkingOffCapability::Unsupported => "off (unsupported)",
+            _ => "off",
+        };
+    }
     match resolve_reasoning_effort(app, model) {
         Some(effort) => effort.as_str(),
         None => "server default",

@@ -224,7 +224,7 @@ pub(super) async fn stream_response(
             }
         };
 
-        match process_chunk_result(
+        let step = match process_chunk_result(
             app,
             current_history,
             &markers,
@@ -232,8 +232,20 @@ pub(super) async fn stream_response(
             adapter,
             chunk_result,
         )
-        .await?
+        .await
         {
+            Ok(step) => step,
+            Err(err) => {
+                // Only `finalize` erases the fold's live header and body, and each attempt renders
+                // through its own fresh state. Aborting on a stream error would leave a
+                // `○ thinking · ...` row on screen that the next attempt's fold stacks a second
+                // header below. Settle the fold before propagating the error.
+                let _ = finalize_thinking_fold(&mut state);
+                return Err(err.into());
+            }
+        };
+
+        match step {
             StreamChunkStep::Continue {
                 meaningful_progress,
             } => {
@@ -242,34 +254,50 @@ pub(super) async fn stream_response(
                 }
             }
             StreamChunkStep::Stop => break,
-            StreamChunkStep::Return(result) => return Ok(result),
+            StreamChunkStep::Return(result) => {
+                // `Return` leaves the loop without going through the normal tail, and only fold
+                // finalize erases the fold's live header/body; settle here so an aborted attempt
+                // cannot leave a stale `○ thinking` row above the next attempt's output.
+                let _ = finalize_thinking_fold(&mut state);
+                return Ok(result);
+            }
         }
     }
 
-    if let Some(result) =
-        process_pending_tail(app, current_history, &markers, &mut state, adapter).await?
+    let tail = match process_pending_tail(app, current_history, &markers, &mut state, adapter).await
     {
+        Ok(tail) => tail,
+        Err(err) => {
+            // Same as the chunk loop above: an error here aborts the attempt while the thinking
+            // fold is still live on screen, leaving a header for the next attempt to stack on.
+            let _ = finalize_thinking_fold(&mut state);
+            return Err(err.into());
+        }
+    };
+    if let Some(result) = tail {
         return Ok(result);
     }
 
     if let Some(timeout_secs) = idle_timeout_secs.filter(|_| !state.content.finish_reason_seen) {
         state.content.stream_idle_timed_out = true;
         if runtime_ctx::terminal_output_enabled() {
-            clear_waiting_hint(&mut state)?;
+            // Best-effort writes: the idle-timeout warning is advisory, so a failed terminal
+            // write must not return early and skip the fold finalize below.
+            let _ = clear_waiting_hint(&mut state);
             let stdout = io::stdout();
             let mut out = stdout.lock();
             if tool_args_stalled {
-                writeln!(
+                let _ = writeln!(
                     out,
                     "  ⚠ 工具调用参数流超过 {timeout_secs} 秒未完成，按流中断处理…"
-                )?;
+                );
             } else {
-                writeln!(
+                let _ = writeln!(
                     out,
                     "  ⚠ 响应流连续 {timeout_secs} 秒无有效进展，按流中断处理…"
-                )?;
+                );
             }
-            out.flush()?;
+            let _ = out.flush();
         }
     }
 
@@ -313,7 +341,8 @@ fn write_waiting_hint_line(state: &mut StreamProcessingState, label: &str) -> io
 /// Erase the hint row(s) currently on screen and park the cursor where the hint started, so the next
 /// output prints in its place. Clears `waiting_hint_line` but leaves the hint flags to the caller:
 /// `clear_waiting_hint` resets them, while the in-place rewrites (`upgrade_waiting_hint_for_buffering`,
-/// `show_deferred_body_buffering_hint`) keep the hint active.
+/// `show_deferred_body_buffering_hint`, `refresh_deferred_body_rate_hint`,
+/// `refresh_tool_call_rate_hint`) keep the hint active.
 fn erase_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
     if !state.render.waiting_hint_active || state.render.waiting_hint_line.is_empty() {
         return Ok(());
@@ -337,6 +366,17 @@ fn sanitize_waiting_hint_tool_name(function_name: &str) -> String {
     }
 }
 
+/// Label for the tool-call receiving hint. `rate_text` is the optional live
+/// argument-throughput suffix: it stays `None` until a measurable argument window
+/// exists, so the row keeps its original wording in the first moments of a call.
+fn tool_call_hint_label(function_name: &str, rate_text: Option<&str>) -> String {
+    let function_name = sanitize_waiting_hint_tool_name(function_name);
+    match rate_text {
+        Some(rate_text) => format!("receiving `{function_name}` arguments… · {rate_text}"),
+        None => format!("receiving `{function_name}` arguments…"),
+    }
+}
+
 fn print_tool_call_waiting_hint(
     state: &mut StreamProcessingState,
     function_name: &str,
@@ -344,8 +384,7 @@ fn print_tool_call_waiting_hint(
     if state.render.waiting_hint_active {
         clear_waiting_hint(state)?;
     }
-    let function_name = sanitize_waiting_hint_tool_name(function_name);
-    write_waiting_hint_line(state, &format!("receiving `{function_name}` arguments…"))?;
+    write_waiting_hint_line(state, &tool_call_hint_label(function_name, None))?;
     state.render.waiting_hint_active = true;
     state.render.waiting_hint_tool_call = true;
     Ok(())
@@ -437,6 +476,125 @@ fn show_deferred_body_buffering_hint(state: &mut StreamProcessingState) -> io::R
     state.render.waiting_hint_active = true;
     state.render.waiting_hint_buffering = true;
     Ok(())
+}
+
+/// Minimum interval between in-place refreshes of a live rate hint, shared by the
+/// deferred-body "generating…" hint and the tool-call "receiving `X` arguments…" hint
+/// (only one of them owns the row at a time). The refresh is chunk-driven (no timer in
+/// the stream loop), so this bounds terminal repaints to ~2 Hz while tokens keep
+/// flowing; a stalled stream keeps the last written rate.
+const LIVE_RATE_HINT_REFRESH_MS: u64 = 500;
+
+/// Real-time output-throughput text for the deferred-body "generating…" hint.
+/// While `defer_assistant_body` withholds the final answer from the terminal until
+/// the completion/citation gates accept it, this in-place rewrite is the only
+/// place the live rate is visible. Called on each committed output chunk and
+/// throttled by `DEFERRED_HINT_RATE_REFRESH_MS`; rows whose text is unchanged are
+/// not repainted, so there is no flicker. The `~` prefix marks the estimate as
+/// heuristic; the exact server-reported numbers are printed at stream end by
+/// `maybe_print_token_throughput_metrics`.
+fn refresh_deferred_body_rate_hint(state: &mut StreamProcessingState) -> io::Result<()> {
+    // Never clobber the tool-call hint, and never draw a fresh row under a line
+    // that was already erased (the erase here is a no-op, so a blank line would
+    // duplicate the hint below the cursor).
+    if state.render.waiting_hint_tool_call || state.render.waiting_hint_line.is_empty() {
+        return Ok(());
+    }
+    let Some(started_at) = state.content.output_started_at else {
+        return Ok(());
+    };
+    let tokens = state.content.live_output_tokens;
+    let elapsed = started_at.elapsed();
+    if tokens == 0 || elapsed < MIN_RATE_WINDOW {
+        return Ok(());
+    }
+    if state
+        .render
+        .waiting_hint_rate_refreshed_at
+        .is_some_and(|at| at.elapsed() < Duration::from_millis(LIVE_RATE_HINT_REFRESH_MS))
+    {
+        return Ok(());
+    }
+    let Some(rate_text) = format_live_rate_text(tokens, Some(elapsed)) else {
+        return Ok(());
+    };
+    let label = format!("generating… · {rate_text}");
+    let row = clamp_line_to_terminal_row(&format!("  ⠋ {label}"));
+    if row == state.render.waiting_hint_line {
+        return Ok(());
+    }
+    // In-place rewrite with the same geometry as `upgrade_waiting_hint_for_buffering`:
+    // the erase draws the cursor back to where the hint started, then the rewrite
+    // lands exactly on the same row(s).
+    erase_waiting_hint(state)?;
+    write_waiting_hint_line(state, &label)?;
+    state.render.waiting_hint_rate_refreshed_at = Some(Instant::now());
+    Ok(())
+}
+
+/// Live argument-throughput text for the tool-call receiving hint. Tool-call arguments
+/// are never printed to the terminal (`write_tool_call_arguments_stream` is a no-op), so
+/// this in-place rewrite is the only sign that a large payload — apply_patch,
+/// execute_command, task, … — is still flowing. Throttled and gated exactly like the
+/// deferred-body hint; the `~` prefix marks the count as a text-based estimate.
+fn refresh_tool_call_rate_hint(
+    state: &mut StreamProcessingState,
+    function_name: &str,
+) -> io::Result<()> {
+    // Only the tool-call hint may rewrite this row: never clobber the "waiting…" /
+    // "generating…" hints, and never draw a fresh row under one already erased.
+    if !state.render.waiting_hint_tool_call || state.render.waiting_hint_line.is_empty() {
+        return Ok(());
+    }
+    let Some(started_at) = state.content.tool_args_started_at else {
+        return Ok(());
+    };
+    let tokens = state.content.live_tool_arg_tokens;
+    let elapsed = started_at.elapsed();
+    if tokens == 0 || elapsed < MIN_RATE_WINDOW {
+        return Ok(());
+    }
+    if state
+        .render
+        .waiting_hint_rate_refreshed_at
+        .is_some_and(|at| at.elapsed() < Duration::from_millis(LIVE_RATE_HINT_REFRESH_MS))
+    {
+        return Ok(());
+    }
+    let Some(rate_text) = format_live_rate_text(tokens, Some(elapsed)) else {
+        return Ok(());
+    };
+    let label = tool_call_hint_label(function_name, Some(&rate_text));
+    let row = clamp_line_to_terminal_row(&format!("  ⠋ {label}"));
+    if row == state.render.waiting_hint_line {
+        return Ok(());
+    }
+    // In-place rewrite with the same geometry as `refresh_deferred_body_rate_hint`:
+    // the erase draws the cursor back to where the hint started, then the rewrite
+    // lands exactly on the same row(s).
+    erase_waiting_hint(state)?;
+    write_waiting_hint_line(state, &label)?;
+    state.render.waiting_hint_rate_refreshed_at = Some(Instant::now());
+    Ok(())
+}
+
+/// Pure formatter for a waiting hint's live rate text (`~N tok @ R tok/s`), shared by the
+/// deferred-body "generating…" hint and the tool-call "receiving `X` arguments…" hint.
+/// `None` until the first token of that window and until `MIN_RATE_WINDOW` has elapsed,
+/// mirroring `format_token_rate`'s "—" gate so the very first chunk is not reported as a
+/// misleading burst rate.
+fn format_live_rate_text(tokens: u64, elapsed: Option<Duration>) -> Option<String> {
+    if tokens == 0 {
+        return None;
+    }
+    let rate = format_token_rate(tokens, elapsed);
+    if rate == "—" {
+        return None;
+    }
+    Some(format!(
+        "~{} tok @ {rate} tok/s",
+        format_compact_token_count(tokens),
+    ))
 }
 
 pub(super) fn clear_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
@@ -1184,6 +1342,9 @@ fn open_tool_call_line(
     index: usize,
     function_name: &str,
 ) -> io::Result<()> {
+    // The hint is about to name this call, so its argument-throughput window restarts here:
+    // whatever the row later reports belongs to the tool call shown on that row.
+    state.content.reset_tool_args_metrics();
     state.render.current_printing_index = Some(index);
     if runtime_ctx::terminal_output_enabled() && io::stdout().is_terminal() {
         print_tool_call_waiting_hint(state, function_name)?;
@@ -1261,7 +1422,11 @@ fn process_external_tool_calls_delta(
             if render_chunk.open_line {
                 let _ = open_tool_call_line(state, index, &render_chunk.function_name);
             }
+            state
+                .content
+                .count_tool_arg_delta(estimate_stream_tokens(&render_chunk.arguments));
             let _ = write_tool_call_arguments_stream(&render_chunk.arguments);
+            let _ = refresh_tool_call_rate_hint(state, &render_chunk.function_name);
         }
     }
     meaningful_progress
@@ -1344,15 +1509,22 @@ fn process_internal_tool_calls(
                 }
                 meaningful_progress = true;
                 let index = state.content.internal_tool_call_idx;
-                let builder = state.content.tool_calls_map.entry(index).or_default();
-                if builder.function_name.is_empty() {
-                    builder.id = format!("internal_{index}");
-                    builder.tool_type = "function".to_string();
-                }
-                builder.arguments.push_str(&chunk);
-                builder.printed_arguments_len = builder.arguments.len();
+                let function_name = {
+                    let builder = state.content.tool_calls_map.entry(index).or_default();
+                    if builder.function_name.is_empty() {
+                        builder.id = format!("internal_{index}");
+                        builder.tool_type = "function".to_string();
+                    }
+                    builder.arguments.push_str(&chunk);
+                    builder.printed_arguments_len = builder.arguments.len();
+                    builder.function_name.clone()
+                };
 
                 let _ = write_tool_call_arguments_stream(&chunk);
+                state
+                    .content
+                    .count_tool_arg_delta(estimate_stream_tokens(&chunk));
+                let _ = refresh_tool_call_rate_hint(state, &function_name);
             }
             InternalToolCallStreamEvent::End => {
                 if state.render.current_printing_index == Some(state.content.internal_tool_call_idx)
@@ -1404,6 +1576,7 @@ fn commit_visible_content(
             // terminal until the gates accept it. Keep a hint on its own line so
             // the terminal is never silently blank while the model generates.
             show_deferred_body_buffering_hint(state)?;
+            refresh_deferred_body_rate_hint(state)?;
         }
     }
 
@@ -1421,6 +1594,10 @@ fn commit_visible_content(
             // Output timing starts only when real visible text is committed; a pure
             // end_thinking_tag separator (or trimmed-away residue) must not count as output.
             state.content.mark_output_started();
+            state.content.live_output_tokens = state
+                .content
+                .live_output_tokens
+                .saturating_add(estimate_stream_tokens(text));
             current_history.push_str(text);
             state.content.assistant_text.push_str(text);
             // Live output for a real-time `/bg` handoff (best-effort, no-op
@@ -1455,6 +1632,10 @@ fn commit_visible_content(
     };
     if !text.is_empty() {
         state.content.mark_output_started();
+        state.content.live_output_tokens = state
+            .content
+            .live_output_tokens
+            .saturating_add(estimate_stream_tokens(&text));
     }
     current_history.reserve(text.len());
     state.content.assistant_text.reserve(text.len());

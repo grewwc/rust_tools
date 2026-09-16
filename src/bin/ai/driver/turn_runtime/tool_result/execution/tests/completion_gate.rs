@@ -246,7 +246,7 @@ fn completion_evidence_gate_allows_unrecognized_post_mutation_activity_silently(
 }
 
 #[test]
-fn dangling_action_gate_takes_over_when_mutation_final_has_no_completion_claim() {
+fn completion_gate_owns_mutation_state_finals_regardless_of_wording() {
     let mutation = test_tool_call(
         "call_patch",
         "apply_patch",
@@ -297,33 +297,34 @@ fn dangling_action_gate_takes_over_when_mutation_final_has_no_completion_claim()
     .unwrap();
 
     assert!(matches!(step, TurnLoopStep::Continue));
-    // The completion gate only reopens finals that CLAIM completion
-    // (FinalClaimKind::NoClaim passes the evidence check unverified). A final
-    // that announces an action but ends the turn instead falls through to the
-    // dangling-final gate, which forces one no-tool synthesis retry and
-    // records the no-tool wrap-up root cause.
+    // The gate is purely structural: after a provable tool-level mutation with zero
+    // post-mutation activity, any final — whatever its wording — is reopened once so
+    // the model actually verifies (positive and negative word lists are both
+    // inherently incomplete, so no wording is ever classified). A final that merely
+    // announces an action is the ideal case: the reopen note tells it to inspect the
+    // diff and run the narrowest check, which is exactly what it promised.
     assert!(
-        force_final_response,
-        "a dangling-action final must force the no-tool synthesis retry"
+        !force_final_response,
+        "the completion reopen must not force a no-tool synthesis"
     );
     assert!(
         messages.iter().any(|message| {
+            message
+                .content
+                .as_str()
+                .is_some_and(|text| text.starts_with(COMPLETION_EVIDENCE_REQUIRED_MARKER))
+        }),
+        "a mutation-state final must be reopened by the completion gate"
+    );
+    assert!(
+        !messages.iter().any(|message| {
             message.role == ROLE_INTERNAL_NOTE
                 && message
                     .content
                     .as_str()
                     .is_some_and(|text| text.starts_with("[runtime-tool-stop]"))
         }),
-        "the dangling-action retry must record its force-final reason"
-    );
-    assert!(
-        !messages.iter().any(|message| {
-            message
-                .content
-                .as_str()
-                .is_some_and(|text| text.starts_with(COMPLETION_EVIDENCE_REQUIRED_MARKER))
-        }),
-        "no completion claim means the completion gate must stay silent"
+        "the completion gate must own mutation-state finals, not the dangling gate"
     );
 }
 

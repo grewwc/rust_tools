@@ -31,6 +31,11 @@ pub(super) struct AppConfig {
     pub(super) api_key: String,
     pub(super) base_history_file: PathBuf,
     pub(super) history_file: PathBuf,
+    /// Test-only loopback hook: always empty in production since the
+    /// `ai.model.endpoint` config key was removed (the model registry is the single
+    /// endpoint authority; see config_schema.rs). Kept for fixtures that route an
+    /// unregistered model name to a local mock server (mid_turn_llm.rs,
+    /// context_budget.rs).
     pub(super) endpoint: String,
     pub(super) vl_default_model: String,
     pub(super) history_max_chars: usize,
@@ -111,11 +116,31 @@ impl App {
     }
 
     pub(super) fn fork_for_subagent(&self) -> Self {
-        self.fork_baseline()
+        let mut app = self.fork_baseline();
+        Self::reset_child_reasoning_controls(&mut app);
+        app
     }
 
     pub(super) fn snapshot_for_detached_helper(&self) -> Self {
-        self.fork_baseline()
+        let mut app = self.fork_baseline();
+        Self::reset_child_reasoning_controls(&mut app);
+        app
+    }
+
+    /// Child work (subagents / background tasks) is an independent reasoning
+    /// context and must not inherit the foreground session's reasoning-effort
+    /// controls:
+    /// - `reasoning_effort_override`: the user's `/effort off` (Some(None)) is
+    ///   upgraded to "thinking off" on the wire (`request::thinking::resolve_thinking`
+    ///   / `request::reasoning::resolve_reasoning_effort`). Inheriting it would
+    ///   silently disable thinking for delegated tasks, which previously only
+    ///   omitted the effort field and left child thinking intact. A child can
+    ///   still opt into a tier explicitly via the `reasoning_effort` task arg.
+    /// - `thinking_disabled_override`: turn-scoped truncation-ladder state
+    ///   (documented as restored at turn end); a child must never see it.
+    fn reset_child_reasoning_controls(app: &mut Self) {
+        app.cli.reasoning_effort_override = None;
+        app.cli.thinking_disabled_override = false;
     }
 }
 

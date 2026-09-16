@@ -10,6 +10,7 @@
   "search_enabled": true,
   "tools_default_enabled": true,
   "default_reasoning_effort": "high",
+  "reasoning_effort_wire": "top_level",
   "enable_thinking": true,
   "subagent_priority": 95,
   "max_output_tokens": 32768

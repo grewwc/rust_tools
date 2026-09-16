@@ -10,6 +10,7 @@
   "enable_thinking": true,
   "subagent_priority": 85,
   "default_reasoning_effort": "max",
+  "reasoning_effort_wire": "top_level",
   "reasoning_content_replay": true,
   "context_window_tokens": 1000000,
   "max_output_tokens": 393216,

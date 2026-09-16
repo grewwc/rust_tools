@@ -125,6 +125,12 @@ pub(super) struct StreamRenderState {
     /// The erase recomputes the hint's physical row count from this text, because a terminal that
     /// narrowed after the hint was written re-wraps the row that is already on screen.
     pub(super) waiting_hint_line: String,
+    /// Throttle stamp for in-place live-rate rewrites of a waiting hint — the
+    /// deferred-body "generating…" hint and the tool-call "receiving `X` arguments…"
+    /// hint share it (see `refresh_deferred_body_rate_hint` /
+    /// `refresh_tool_call_rate_hint` in runtime.rs); it bounds terminal repaints
+    /// while chunks keep flowing.
+    pub(super) waiting_hint_rate_refreshed_at: Option<Instant>,
     pub(super) printed_tool_calls_header: bool,
     pub(super) current_printing_index: Option<usize>,
     pub(super) terminal_dedupe: Option<TerminalDedupeState>,
@@ -145,6 +151,7 @@ impl StreamRenderState {
             waiting_hint_buffering: false,
             waiting_hint_tool_call: false,
             waiting_hint_line: String::new(),
+            waiting_hint_rate_refreshed_at: None,
             printed_tool_calls_header: false,
             current_printing_index: None,
             terminal_dedupe: None,
@@ -363,6 +370,18 @@ pub(super) struct StreamContentState {
     /// Approximate reasoning token total used by the in-progress thinking-fold header
     /// rate before provider usage arrives.
     pub(super) live_reasoning_tokens: u64,
+    /// Approximate non-reasoning (output) token total used by the deferred-body
+    /// "generating…" rate hint before provider usage arrives. Incremented wherever
+    /// `mark_output_started` fires (non-thinking body commits); tool-call arguments
+    /// never enter `assistant_text` and are not counted.
+    pub(super) live_output_tokens: u64,
+    /// First received argument delta of the tool call currently named on the receiving hint
+    /// (`receiving `X` arguments…`) and the approximate token total of the arguments received
+    /// since. Arguments are never rendered, so this window is the only measure of how fast a
+    /// large payload (apply_patch / execute_command / task / …) is still arriving; both fields
+    /// reset when the hint opens for another tool call.
+    pub(super) tool_args_started_at: Option<Instant>,
+    pub(super) live_tool_arg_tokens: u64,
     pub(super) tool_calls_map: SkipMap<usize, ToolCallBuilder>,
     /// Composite key resolved for the most recent tool call without an `index`,
     /// used to attach later parameter-continuation deltas (which have neither id
@@ -413,6 +432,9 @@ impl StreamContentState {
             reasoning_started_at: None,
             output_started_at: None,
             live_reasoning_tokens: 0,
+            live_output_tokens: 0,
+            tool_args_started_at: None,
+            live_tool_arg_tokens: 0,
             tool_calls_map: SkipMap::default(),
             last_indexless_tool_call_key: None,
             assistant_text: String::new(),
@@ -441,6 +463,25 @@ impl StreamContentState {
         if self.output_started_at.is_none() {
             self.output_started_at = Some(Instant::now());
         }
+    }
+
+    /// Start a fresh argument-throughput window, because the receiving hint is about to
+    /// name another tool call. The rate text describes whichever call the hint shows.
+    pub(super) fn reset_tool_args_metrics(&mut self) {
+        self.tool_args_started_at = None;
+        self.live_tool_arg_tokens = 0;
+    }
+
+    /// Record one received tool-call argument delta: the first one stamps the window start,
+    /// every one adds to the estimate the receiving hint's `~N tok @ R tok/s` text is built from.
+    pub(super) fn count_tool_arg_delta(&mut self, tokens: u64) {
+        if tokens == 0 {
+            return;
+        }
+        if self.tool_args_started_at.is_none() {
+            self.tool_args_started_at = Some(Instant::now());
+        }
+        self.live_tool_arg_tokens = self.live_tool_arg_tokens.saturating_add(tokens);
     }
 }
 

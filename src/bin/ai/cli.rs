@@ -32,8 +32,11 @@ pub(super) struct ParsedCli {
     /// - `None`: not set; follow the model default from the model registry
     ///   ([models/](../../../../models));
     /// - `Some(Some(level))`: force this tier (minimal/low/medium/high);
-    /// - `Some(None)`: user explicitly disabled it; requests omit the
-    ///   `reasoning_effort` field.
+    /// - `Some(None)`: user explicitly disabled it ("off"). This is upgraded to
+    ///   "thinking off": dialects with a real off-switch (DashScope
+    ///   `enable_thinking`, DeepSeek `thinking`) turn thinking off on the wire
+    ///   (`request::thinking::resolve_thinking`), and effort-only dialects send
+    ///   `reasoning_effort: "none"` (`request::reasoning::resolve_reasoning_effort`).
     ///
     /// Both `/model effort <x>` and `--reasoning-effort` write to this field.
     pub(super) reasoning_effort_override: Option<Option<ReasoningEffort>>,

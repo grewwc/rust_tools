@@ -1,5 +1,10 @@
-//! Completion-evidence gate: verifies that final answers claiming
-//! task completion are backed by observed tool evidence.
+//! Completion-evidence gate: after a provable tool-level mutation (apply_patch /
+//! write_file succeeded), every final response is checked purely against the tool
+//! record. The final's wording is never classified — positive and negative word
+//! lists are both inherently incomplete (a missed positive phrasing lets an
+//! unverified claim pass; a missed negative phrasing reopens an honest answer) —
+//! so the gate triggers on the provable state alone: a mutation followed by zero
+//! post-mutation work reopens once no matter how the final is phrased.
 
 use super::*;
 
@@ -224,62 +229,34 @@ pub(in crate::ai::driver::turn_runtime) fn tool_call_is_successful_mutation_cand
     }
 }
 
-pub(in crate::ai::driver::turn_runtime) fn contains_non_negated_completion_word(
-    text: &str,
-    word: &str,
-) -> bool {
-    text.match_indices(word).any(|(start, _)| {
-        let bytes = text.as_bytes();
-        let end = start + word.len();
-        let bounded_before = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
-        let bounded_after = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
-        if !bounded_before || !bounded_after {
-            return false;
-        }
-        !text[..start]
-            .split(|ch: char| !ch.is_ascii_alphabetic() && ch != '\'')
-            .filter(|token| !token.is_empty())
-            .rev()
-            .take(3)
-            .any(|token| matches!(token, "not" | "never" | "without") || token.ends_with("n't"))
-    })
-}
-
 pub(in crate::ai::driver::turn_runtime) fn completion_evidence_gate_action(
     messages: &mut Vec<Message>,
     turn_messages: &[Message],
-    final_text: &str,
+    _final_text: &str,
     force_final_response: bool,
     iteration: usize,
     max_iterations: usize,
 ) -> CompletionEvidenceGateAction {
     let evidence = completion_evidence_state(turn_messages);
-    let claim = final_text_claim_kind(final_text);
-    let evidence_is_sufficient = match claim {
-        FinalClaimKind::NoClaim => true,
-        FinalClaimKind::Completion => evidence.successful_post_mutation_verification,
-        FinalClaimKind::NoImpact => {
-            evidence.successful_post_mutation_scope_review
-                && evidence.successful_post_mutation_behavior_check
-        }
-    };
-    if !evidence.successful_mutation || evidence_is_sufficient {
-        return CompletionEvidenceGateAction::Allow;
-    }
 
-    // The gate only acts on “provable tool-level mutations”. Command-level “changes” are
-    // intent classification and may misjudge read-only commands as changes (the allowlist
-    // can never be complete); Reopen/Warn based on them would force the model to repeat
-    // conclusions — the only source of erroneous repetition the runtime can fully avoid.
+    // Purely structural gate: no claim wording is ever classified, because positive
+    // and negative word lists are both inherently incomplete — a missed positive
+    // phrasing lets an unverified claim pass (dangerous), a missed negative phrasing
+    // reopens an honest answer (annoying). The provable tool record carries
+    // everything the gate needs:
+    //   - no provable tool-level mutation   -> nothing to verify -> Allow
+    //   - known check failure               -> provable fact     -> Warn
+    //   - any successful post-mutation work -> the model did something after the
+    //     change -> Allow (asserting "no check observed" would be false)
+    //   - otherwise (mutation, then nothing, then a final) -> the change is
+    //     unverifiable no matter how it is phrased -> Reopen once, Warn on repeat.
+    // The final's wording is deliberately not consulted (hence `_final_text`); honest
+    // "cannot verify" replies and promised follow-up checks are not exempt — the
+    // reopen note tells the model to inspect the diff, run the narrowest check, or
+    // state the limitation explicitly.
     if !evidence.successful_tool_level_mutation {
         return CompletionEvidenceGateAction::Allow;
     }
-
-    // A known check failure (provable fact, not classification uncertainty) takes
-    // precedence over “post-mutation activity”: even if later benign tool calls set
-    // activity back to true, the failure fact is kept and we go Warn — the model
-    // claimed completion after a known check failure, and an honest warning causes
-    // no false repetition.
     if evidence.successful_post_mutation_failed_check {
         return CompletionEvidenceGateAction::Warn;
     }

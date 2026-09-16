@@ -181,6 +181,26 @@ fn prompt_feedback_app_forks_do_not_inherit_usage_or_pending_requests() {
 }
 
 #[test]
+fn child_forks_do_not_inherit_reasoning_effort_controls() {
+    // `/effort off` (Some(None)) is upgraded to "thinking off" on the wire; if
+    // subagents/background helpers inherited it, delegated tasks would silently
+    // lose thinking. The foreground driver snapshot must keep it so the current
+    // turn still honors the command.
+    let mut app = test_app();
+    app.cli.reasoning_effort_override = Some(None);
+    app.cli.thinking_disabled_override = true;
+    let subagent = app.fork_for_subagent();
+    let helper = app.snapshot_for_detached_helper();
+    let driver = app.snapshot_for_driver_context();
+    assert_eq!(subagent.cli.reasoning_effort_override, None);
+    assert!(!subagent.cli.thinking_disabled_override);
+    assert_eq!(helper.cli.reasoning_effort_override, None);
+    assert!(!helper.cli.thinking_disabled_override);
+    assert_eq!(driver.cli.reasoning_effort_override, Some(None));
+    assert!(driver.cli.thinking_disabled_override);
+}
+
+#[test]
 fn tpm_budget_bucket_key_distinguishes_api_keys_without_exposing_plaintext() {
     let a = token_budget::test_budget_key("https://api.example.com", "model-x", "key-a");
     let b = token_budget::test_budget_key("https://api.example.com", "model-x", "key-b");
@@ -477,6 +497,150 @@ fn dashscope_deepseek_defaults_to_thinking_for_simple_requests() {
 }
 
 #[test]
+fn effort_off_turns_off_thinking_for_switch_dialects() {
+    // `/effort off` (Some(None)) must flip thinking off on dialects with a real
+    // off-switch: DashScope `enable_thinking:false` (alibaba adapter) and the
+    // DeepSeek `thinking:{"type":"disabled"}` object (official api.deepseek.com).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut app = test_app();
+    app.cli.reasoning_effort_override = Some(None);
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String("hi".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    for model in ["deepseek-v4-flash-0731-alibaba", "deepseek-flash-official"] {
+        let enabled = rt.block_on(super::resolve_thinking(&app, model, &messages));
+        assert!(!enabled, "effort off must disable thinking for {model}");
+    }
+}
+
+#[test]
+fn effort_off_keeps_local_flag_for_effort_only_dialects() {
+    // Volcano DeepSeek (NoThinkingDialect) has no wire off-switch: resolve_thinking
+    // keeps its normal decision (the registry default-effort short-circuit), and the
+    // actual thinking-off happens via `reasoning_effort: "none"` in
+    // resolve_reasoning_effort — the only lever that dialect has.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut app = test_app();
+    app.cli.reasoning_effort_override = Some(None);
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String("hi".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let enabled = rt.block_on(super::resolve_thinking(
+        &app,
+        "deepseek-v4-flash-volcano",
+        &messages,
+    ));
+    assert!(enabled, "NoThinkingDialect keeps the local flag (wire off happens via effort none)");
+    assert_eq!(
+        super::reasoning::resolve_reasoning_effort(&app, "deepseek-v4-flash-volcano"),
+        Some(crate::ai::provider::ReasoningEffort::None),
+        "effort off must send reasoning_effort: none for effort-only dialects"
+    );
+}
+
+#[test]
+fn effort_off_omits_effort_for_switch_dialects() {
+    // Switch-based dialects express thinking off through their switch; the effort
+    // field is omitted (None), never "none" (an unverified value on DashScope).
+    let mut app = test_app();
+    app.cli.reasoning_effort_override = Some(None);
+    assert_eq!(
+        super::reasoning::resolve_reasoning_effort(&app, "deepseek-v4-flash-0731-alibaba"),
+        None,
+    );
+    assert_eq!(
+        super::reasoning::resolve_reasoning_effort(&app, "deepseek-flash-official"),
+        None,
+    );
+}
+
+#[test]
+fn effort_off_on_minimax_is_a_noop() {
+    // MiniMax M2.x (Unsupported capability) has no reliable off switch:
+    // `/effort off` must NOT change the thinking decision (it stays whatever
+    // auto-detection decides) and must NOT emit `reasoning_effort:"none"` (an
+    // unverified value the gateway may ignore or reject).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String("hi".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    for model in ["mimo-v2.5-pro", "mimo-v2.5-free-opencode"] {
+        let mut app = test_app();
+        let baseline = rt.block_on(super::resolve_thinking(&app, model, &messages));
+        app.cli.reasoning_effort_override = Some(None);
+        let with_off = rt.block_on(super::resolve_thinking(&app, model, &messages));
+        assert_eq!(
+            with_off, baseline,
+            "/effort off must not change thinking for Unsupported model {model}"
+        );
+        assert_eq!(
+            super::reasoning::resolve_reasoning_effort(&app, model),
+            None,
+            "effort off must not emit reasoning_effort for {model}"
+        );
+    }
+}
+
+#[test]
+fn reasoning_effort_display_label_reflects_explicit_off() {
+    // The status line must show the user's explicit off, not fold Some(None)
+    // back into "auto" (which would misrepresent the off state).
+    let mut app = test_app();
+    app.cli.reasoning_effort_override = Some(None);
+    assert_eq!(
+        super::reasoning::reasoning_effort_display_label(&app, "deepseek-v4-flash-0731-alibaba"),
+        "off"
+    );
+    // Unsupported (MiniMax): the honest "off (unsupported)" instead of a
+    // success-sounding "off".
+    assert_eq!(
+        super::reasoning::reasoning_effort_display_label(&app, "mimo-v2.5-pro"),
+        "off (unsupported)"
+    );
+    // No override: registry default applies, or "server default" when the model
+    // declares none (never the misleading "auto").
+    let app2 = test_app();
+    assert_eq!(
+        super::reasoning::reasoning_effort_display_label(&app2, "deepseek-v4-flash-volcano"),
+        "max"
+    );
+    assert_eq!(
+        super::reasoning::reasoning_effort_display_label(&app2, "mimo-v2.5-pro"),
+        "server default"
+    );
+}
+
+#[test]
+fn effort_defaults_to_registry_when_no_override() {
+    let app = test_app();
+    assert_eq!(
+        super::reasoning::resolve_reasoning_effort(&app, "deepseek-v4-flash-volcano"),
+        Some(crate::ai::provider::ReasoningEffort::Max),
+    );
+}
+
+#[test]
 fn test_parse_thinking_gate_output_string_bool() {
     let s = r#"{"thinking":"false","confidence":0.8}"#;
     assert_eq!(parse_thinking_gate_output(s), Some((false, 0.8)));
@@ -745,9 +909,12 @@ fn dashscope_and_other_adapter_request_body_wire_format_is_byte_stable() {
         reasoning_content: None,
     }];
 
-    // Alibaba models declaring top_level wire: enable_thinking/enable_search +
-    // top-level reasoning_effort. Locate the model by its unique key (consistent
-    // with the production path) to avoid ambiguous entries sharing a name.
+    // Alibaba models declaring top_level wire: enable_thinking/enable_search
+    // and the top-level reasoning_effort are all sent — the declared wire
+    // placement means the tier bypasses the dialect's binary-switch omission in
+    // resolve_reasoning_wire_controls. Locate the model by its unique key
+    // (consistent with the production path) to avoid ambiguous entries sharing
+    // a name.
     let alibaba_model = crate::ai::model_names::all()
         .iter()
         .find(|model| {
@@ -943,7 +1110,7 @@ fn build_request_body_sends_provider_model_name_for_key_handle() {
 }
 
 #[test]
-fn opencode_thinking_entries_send_thinking_object_alongside_reasoning_effort() {
+fn opencode_thinking_entries_send_thinking_object_and_declared_effort() {
     let messages = vec![Message {
         role: "user".to_string(),
         content: Value::String("hi".to_string()),
@@ -953,10 +1120,14 @@ fn opencode_thinking_entries_send_thinking_object_alongside_reasoning_effort() {
     }];
 
     // The OpenCode dialect only sends the thinking object for DeepSeek models
-    // (thinking_dialect_for in src/bin/ai/provider/adapter/thinking.rs). Each such entry with
-    // thinking enabled must keep sending it while the top-level reasoning_effort rides along
-    // (gateway-verified to coexist without wire conflict). Entries are discovered from the
-    // registry so renames cannot empty the loop.
+    // (thinking_dialect_for in src/bin/ai/provider/adapter/thinking.rs). Each
+    // such entry with thinking enabled must keep sending it, and the top-level
+    // reasoning_effort is placed as well: the registry declares
+    // `reasoning_effort_wire: "top_level"` for these entries (DeepSeek v4 on
+    // the OpenCode Zen gateway supports [none, low, high, max] per the official
+    // API docs), so the tier bypasses the dialect's binary-switch omission in
+    // resolve_reasoning_wire_controls. Entries are discovered from the registry
+    // so renames cannot empty the loop.
     let mut checked = 0;
     for def in crate::ai::model_names::all() {
         if def.adapter != crate::ai::provider::ApiProvider::OpenCode
@@ -991,11 +1162,7 @@ fn opencode_thinking_entries_send_thinking_object_alongside_reasoning_effort() {
             Some("enabled"),
             "{model}"
         );
-        assert_eq!(
-            json.get("reasoning_effort").and_then(|v| v.as_str()),
-            Some("high"),
-            "{model}"
-        );
+        assert_eq!(json.get("reasoning_effort"), Some(&json!("high")), "{model}");
         checked += 1;
     }
     assert!(
@@ -1005,7 +1172,7 @@ fn opencode_thinking_entries_send_thinking_object_alongside_reasoning_effort() {
 }
 
 #[test]
-fn deepseek_official_entries_send_thinking_object_alongside_reasoning_effort() {
+fn deepseek_official_entries_send_thinking_object_and_effort() {
     let messages = vec![Message {
         role: "user".to_string(),
         content: Value::String("hi".to_string()),
@@ -1017,8 +1184,11 @@ fn deepseek_official_entries_send_thinking_object_alongside_reasoning_effort() {
     // The official DeepSeek endpoint (api.deepseek.com) uses the same `thinking`
     // object dialect as the OpenCode Zen gateway (thinking_dialect_for in
     // src/bin/ai/provider/adapter/thinking.rs), per the official thinking-mode
-    // docs: {"thinking": {"type": "enabled"}} + top-level reasoning_effort.
-    // Entries are discovered from the registry so renames cannot empty the loop.
+    // docs: {"thinking": {"type": "enabled"}} together with the top-level
+    // reasoning_effort — the official API documents `[none, low, high, max]`
+    // (graded), and the registry entry declares `reasoning_effort_wire:
+    // "top_level"`, so the tier is sent. Entries are discovered from the
+    // registry so renames cannot empty the loop.
     let mut checked = 0;
     for def in crate::ai::model_names::all() {
         let Some(endpoint) = def.endpoint.as_deref() else {
@@ -1053,11 +1223,7 @@ fn deepseek_official_entries_send_thinking_object_alongside_reasoning_effort() {
             Some("enabled"),
             "{model}"
         );
-        assert_eq!(
-            json.get("reasoning_effort").and_then(|v| v.as_str()),
-            Some("high"),
-            "{model}"
-        );
+        assert_eq!(json.get("reasoning_effort"), Some(&json!("high")), "{model}");
         assert!(json.get("enable_thinking").is_none(), "{model}");
         checked += 1;
     }
@@ -1101,11 +1267,11 @@ fn dashscope_deepseek_uses_model_specific_reasoning_contract() {
             .and_then(|value| value.as_bool()),
         Some(true)
     );
-    assert_eq!(
-        json.get("reasoning_effort")
-            .and_then(|value| value.as_str()),
-        Some("max")
-    );
+    // The registry declares `reasoning_effort_wire: "top_level"` for this
+    // model, so the tier reaches the wire even though the dialect alone is a
+    // binary `enable_thinking` switch (resolve_reasoning_wire_controls bypasses
+    // adapt_effort for registry-declared models).
+    assert_eq!(json.get("reasoning_effort"), Some(&json!("max")));
     assert!(json.get("reasoning").is_none());
     assert_eq!(
         models::default_reasoning_effort(MODEL),
@@ -1141,7 +1307,7 @@ fn dashscope_deepseek_uses_model_specific_reasoning_contract() {
 }
 
 #[test]
-fn dashscope_deepseek_uses_top_level_effort_and_exact_reasoning_replay() {
+fn dashscope_deepseek_sends_effort_and_exact_reasoning_replay() {
     const MODEL: &str = "deepseek-v4-flash-0731-alibaba";
     let messages = vec![Message {
         role: "user".to_string(),
@@ -1170,11 +1336,11 @@ fn dashscope_deepseek_uses_top_level_effort_and_exact_reasoning_replay() {
             .and_then(|value| value.as_bool()),
         Some(true)
     );
-    assert_eq!(
-        json.get("reasoning_effort")
-            .and_then(|value| value.as_str()),
-        Some("high")
-    );
+    // Effort tier sent on the wire: the registry declares a top-level
+    // reasoning_effort wire placement for this model (DashScope DeepSeek v4
+    // supports low/high/max per the official docs), so the tier bypasses the
+    // dialect's binary-switch omission.
+    assert_eq!(json.get("reasoning_effort"), Some(&json!("high")));
     assert!(json.get("reasoning").is_none());
     assert!(models::reasoning_effort_reduces_thinking(MODEL));
     assert!(models::reasoning_content_replay_enabled(MODEL));
@@ -1200,7 +1366,7 @@ fn dashscope_qwen_metadata_matches_documented_thinking_controls() {
 }
 
 #[test]
-fn opencode_disabled_thinking_object_ignores_effort() {
+fn opencode_disabled_thinking_object_with_declared_effort() {
     let endpoint = crate::ai::provider::OPENCODE_DEFAULT_ENDPOINT.to_string();
     let def = crate::ai::model_names::all()
         .iter()
@@ -1219,9 +1385,12 @@ fn opencode_disabled_thinking_object_ignores_effort() {
         Some("high"),
     );
 
-    // The OpenCode dialect always sends thinking:{"type":"disabled"} when force-off is
-    // requested; the top-level reasoning_effort is still sent per adapter rules
-    // (gateway-verified that thinking:disabled takes precedence over effort).
+    // The OpenCode DeepSeek dialect always sends thinking:{"type":"disabled"}
+    // when force-off is requested (the reliable off-switch). The top-level
+    // reasoning_effort is still placed because the registry declares
+    // `reasoning_effort_wire: "top_level"` for this model — the official API
+    // documents `[none, low, high, max]` and the disabled thinking object takes
+    // precedence, so carrying the tier is harmless.
     assert_eq!(
         thinking
             .get("thinking")
@@ -1233,6 +1402,74 @@ fn opencode_disabled_thinking_object_ignores_effort() {
     );
     assert_eq!(top_level_reasoning_effort, Some("high"));
     assert!(nested_reasoning.is_none());
+}
+
+#[test]
+fn effort_value_adaptation_is_per_vendor_on_wire() {
+    // The same local tier must adapt per vendor on the wire: models without a
+    // registry-declared wire placement follow the dialect default (binary-switch
+    // dialects omit it); registry-declared models (qwen / DeepSeek v4 on
+    // DashScope, official DeepSeek, OpenCode Zen) and effort-only dialects pass
+    // it through. No if/else in the request layer — the registry placement or
+    // the dialect owns the value.
+    let dashscope_endpoint =
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+    let (thinking, top_level, nested) = resolve_reasoning_wire_controls(
+        "qwen3.7-max-alibaba",
+        dashscope_endpoint,
+        true,
+        Some("max"),
+    );
+    assert_eq!(thinking.get("enable_thinking"), Some(&json!(true)));
+    assert_eq!(
+        top_level,
+        Some("max"),
+        "qwen3.7-max-alibaba declares top_level wire placement, so the tier passes through"
+    );
+    assert!(nested.is_none());
+
+    let (thinking, top_level, nested) = resolve_reasoning_wire_controls(
+        "deepseek-flash-official",
+        "https://api.deepseek.com/chat/completions",
+        true,
+        Some("max"),
+    );
+    assert_eq!(
+        thinking.get("thinking").and_then(|v| v.get("type")),
+        Some(&json!("enabled"))
+    );
+    assert_eq!(
+        top_level,
+        Some("max"),
+        "deepseek-flash-official declares top_level wire placement, so the tier passes through"
+    );
+    assert!(nested.is_none());
+
+    // Volcano DeepSeek declares top_level wire placement like the rest of the
+    // DeepSeek v4 family (effort-only NoThinkingDialect passes it through
+    // unchanged either way).
+    let (thinking, top_level, nested) = resolve_reasoning_wire_controls(
+        "deepseek-v4-flash-volcano",
+        "https://ark.cn-beijing.volces.com/api/v3",
+        true,
+        Some("max"),
+    );
+    assert!(thinking.is_empty());
+    assert_eq!(top_level, Some("max"));
+    assert!(nested.is_none());
+}
+
+#[test]
+fn model_effort_graded_reflects_registry_declared_gradation() {
+    // Registry-declared wire placement means the model is vendor-verified
+    // graded (qwen / DeepSeek v4 on DashScope, official DeepSeek, OpenCode
+    // Zen), so "graded" is true. Undeclared models follow the dialect default,
+    // where binary-switch dialects omit the tier.
+    assert!(model_effort_graded("qwen3.7-max-alibaba"));
+    assert!(model_effort_graded("deepseek-v4-flash-0731-alibaba"));
+    assert!(model_effort_graded("deepseek-flash-official"));
+    // Effort-only dialects keep the gradation.
+    assert!(model_effort_graded("deepseek-v4-flash-volcano"));
 }
 
 #[test]
@@ -2086,10 +2323,11 @@ fn opencode_deepseek_tool_call_messages_echo_even_without_thinking_gate() {
         None,
     );
     let value = serde_json::to_value(&body).unwrap();
-    assert_eq!(
-        value.get("reasoning_effort").and_then(|v| v.as_str()),
-        Some("high")
-    );
+    // Effort tier placed: the registry declares `reasoning_effort_wire:
+    // "top_level"` for this entry, so the tier bypasses the dialect's
+    // binary-switch omission; the disabled thinking object still takes
+    // precedence for the off-switch.
+    assert_eq!(value.get("reasoning_effort"), Some(&json!("high")));
     assert_eq!(
         value.pointer("/thinking/type").and_then(|v| v.as_str()),
         Some("disabled")
@@ -2404,8 +2642,8 @@ fn dashscope_aux_requests_disable_thinking_regardless_of_provider() {
     );
     assert!(deepseek.get("enable_thinking").is_none());
 
-    // OpenCode non-deepseek has no reliable off switch; aux injects no thinking
-    // fields at all.
+    // MiniMax (mimo) on OpenCode has no reliable off switch; aux injects no
+    // thinking fields at all.
     let mut mimo = json!({ "model": "mimo-v2.5-free", "messages": [], "stream": false });
     apply_aux_thinking_fields("mimo-v2.5-free", &mut mimo);
     assert!(mimo.get("thinking").is_none());

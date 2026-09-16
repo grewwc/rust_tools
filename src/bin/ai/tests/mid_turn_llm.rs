@@ -75,8 +75,9 @@ impl SummaryFixture {
         let mut app = test_app_with_cancel_stream(Arc::new(AtomicBool::new(false)));
         app.config.history_file = root.join("history.sqlite");
         app.session_id = "summary-fixture".to_string();
-        // A registered model overrides config.endpoint. An unregistered, unique
-        // model exercises the real request path using only this loopback server.
+        // A registered model's registry endpoint wins over the test-only
+        // config.endpoint fallback. An unregistered, unique model exercises the real
+        // request path using only this loopback server.
         app.current_model = format!("summary-fixture-{}", uuid::Uuid::new_v4());
         app.config.endpoint = endpoint.clone();
         assert_eq!(

@@ -49,6 +49,8 @@ pub(crate) use protocol::extract_response_text;
 use protocol::responses_reasoning_replay_stats;
 #[cfg(test)]
 pub(crate) use reasoning::apply_aux_thinking_fields;
+pub(crate) use reasoning::model_effort_graded;
+pub(crate) use reasoning::model_thinking_off_capability;
 pub(crate) use reasoning::reasoning_effort_display_label;
 #[allow(unused_imports)]
 pub(crate) use routing::{extract_router_content, strip_json_fence};
