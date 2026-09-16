@@ -604,7 +604,9 @@ fn context_projection_fingerprint(
     // v6: source-bound memory increments are capped inline; older records are
     // archived verbatim behind a single back-reference instead of accumulating one
     // per compression round.
-    const PROJECTION_VERSION: u8 = 6;
+    // v7: summary increments carry prerequisite reuse guards; partial drafts
+    // require source recovery before their judgments can be used as premises.
+    const PROJECTION_VERSION: u8 = 7;
     let overflow_dir = overflow_dir
         .map(|path| path.to_string_lossy())
         .unwrap_or_default();

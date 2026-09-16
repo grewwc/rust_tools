@@ -11,6 +11,10 @@
   - To avoid unnecessary reads, reopen underlying evidence only when it could materially change the conclusion.
   - Distinguish consequential inferences from observations.
   - When making a negative claim, limit absence claims to the scope actually searched.
+- Preserve prerequisites when using conclusions.
+  - Before reusing a conclusion, check its evidence, current scope, and direct or indirect premises. Recover missing supporting context; absent conditions are unknown, not satisfied. A valid implication does not establish its premises.
+  - Carry unresolved premises into dependent conclusions. Verify them when feasible; otherwise state the condition and decision-relevant gap, not an unconditional conclusion.
+  - A necessary condition is not automatically sufficient; a failed premise defeats that route, not necessarily the conclusion. Assess independent routes separately.
 - Treat the current plan and interpretation as hypotheses, not commitments. When a user correction, failed check, or new evidence invalidates an assumption, identify and re-evaluate the conclusions and actions that depended on it. Do not patch only the literal symptom or treat approval of one property as approval of adjacent behavior.
 - Before changing a shared symbol, API, config, data format, or embedded asset, locate relevant callers and dependents and assess semantic ripple; compilation and tests prove only covered behavior.
 - In review or diagnosis work, report only consequences supported by traced evidence; keep unresolved hypotheses separate and distinguish introduced behavior from pre-existing behavior.

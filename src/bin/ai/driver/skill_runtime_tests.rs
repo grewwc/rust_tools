@@ -1213,6 +1213,12 @@ fn request_user_input_injection_matrix() {
         &Some("g".to_string()),
         true
     ));
+    // Subagent turns have no attached user: asking is always disabled, even with
+    // skills active (the cross-turn handoff cannot reach a human from a leaf task).
+    SUBAGENT_DEPTH.sync_scope(1, || {
+        assert!(!super::should_inject_request_user_input(skills, &None, false));
+        assert!(!super::should_inject_request_user_input(&[], &None, false));
+    });
 }
 
 #[test]

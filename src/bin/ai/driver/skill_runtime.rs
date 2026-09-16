@@ -575,13 +575,15 @@ fn builtin_tools_for_skill(
 /// need it for the cross-turn continuation handoff, and ordinary turns get the
 /// explicit ask protocol (tool metadata) instead of a prose guidance block.
 /// Goal mode demands autonomous progress and background turns have no attached
-/// terminal, so both deliberately disable asking and never inject the tool.
+/// terminal, and subagent turns have no attached user, so all three
+/// deliberately disable asking and never inject the tool.
 fn should_inject_request_user_input(
     skills: &[&SkillManifest],
     goal_mode: &Option<String>,
     is_background: bool,
 ) -> bool {
-    !skills.is_empty() || (goal_mode.is_none() && !is_background)
+    crate::ai::driver::runtime_ctx::current_subagent_depth() == 0
+        && (!skills.is_empty() || (goal_mode.is_none() && !is_background))
 }
 
 fn available_tool_names(builtin_tools: &[ToolDef], mcp_tools: &[ToolDef]) -> Box<SkipSet<String>> {
@@ -1544,8 +1546,9 @@ fn build_skill_turn_guard(
     // protocol via manifest tool_groups; the driver injects request_user_input by
     // name for every interactive turn. Skill turns need the cross-turn
     // continuation handoff; ordinary turns get the explicit ask protocol in place
-    // of prose-only guidance. Goal mode and background turns deliberately disable
-    // asking, so neither injects the tool.
+    // of prose-only guidance. Goal mode, background, and subagent turns
+    // deliberately disable asking (subagent turns have no attached user), so
+    // none of them injects the tool.
     if should_inject_request_user_input(skills, &app.goal_mode, app.cli.background) {
         builtin_tools.extend(crate::ai::tools::get_tool_definitions_by_names(&[
             "request_user_input".to_string(),

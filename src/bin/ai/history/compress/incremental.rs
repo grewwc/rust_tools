@@ -142,13 +142,24 @@ pub(super) fn plan_incremental_summary(
     });
     let entries = memory_entries(draft);
     let render = |selected: &[Value]| {
+        let omitted_entries = selected.len() < entries.len();
+        // Section boundaries do not establish semantic independence. An omitted
+        // entry may contain a retained judgment's prerequisite or correction, so
+        // partial records are recovery leads until their source is rechecked.
+        // Even an intact draft does not prove that the model retained all premises.
+        let reuse_guard = if omitted_entries {
+            "partial_draft_recover_source_before_using_judgments"
+        } else {
+            "check_prerequisites_before_using_judgments"
+        };
         let record = serde_json::json!({
             "schema": 1,
             "provenance": "assistant_derived_unverified",
             "source_scope": "compression_input_projection_not_claim_verification",
             "entries": selected,
-            "omitted_entries": selected.len() < entries.len(),
-            "interpretation": "Chronological increments, not a consolidated fact set. Recheck sources. Conflicting newer entries do not verify or silently erase old claims; superseded_conclusions are candidates, not authoritative invalidations.",
+            "omitted_entries": omitted_entries,
+            "reuse_guard": reuse_guard,
+            "interpretation": "Chronological increments, not a consolidated fact set. Recheck sources and prerequisites. Conflicting newer entries do not verify or silently erase old claims; superseded_conclusions are candidates, not authoritative invalidations.",
         });
         // Put the locator first, on its own line, so later display truncation of
         // the body does not preferentially remove the provenance back-reference.
@@ -158,8 +169,8 @@ pub(super) fn plan_incremental_summary(
             &body[1..]
         ))
     };
-    // Never truncate the locator or serialize half an entry. If no complete entry
-    // fits, refuse this candidate and let the caller retain the source messages.
+    // Never truncate the locator, reuse guard, or an entry's attached conditions.
+    // If no complete entry fits, refuse the candidate and retain source messages.
     if render(&[])?.chars().count() > max_chars {
         return None;
     }
@@ -333,6 +344,103 @@ mod tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         assert_eq!(restored, input);
+    }
+
+    fn record(plan: &IncrementalSummaryPlan) -> Value {
+        let text = value_to_string(&plan.message().content);
+        serde_json::from_str(text.strip_prefix(INCREMENTAL_SUMMARY_PREFIX).unwrap().trim())
+            .unwrap()
+    }
+
+    #[test]
+    fn incremental_memory_conditional_entry_survives_exact_budget_without_verified_status() {
+        let dir = TestDir::new();
+        let claim = "- C follows through B only if A and B's other premises hold; A is unknown; scope: current configuration; source not retained. A alone is not sufficient for B; another route to C remains possible.";
+        let draft = format!("Unverified assistant judgments:\n{claim}");
+        let input = vec![msg("assistant", claim)];
+        let full = plan_incremental_summary(&input, &draft, 4_000, Some(dir.path())).unwrap();
+        let exact_budget = value_to_string(&full.message().content).chars().count();
+        let exact = plan_incremental_summary(&input, &draft, exact_budget, Some(dir.path())).unwrap();
+        let json = record(&exact);
+        assert_eq!(json["entries"][0]["text"], claim);
+        assert_eq!(json["entries"][0]["status"], "derived_unverified");
+        assert_eq!(json["omitted_entries"], false);
+        assert_eq!(
+            json["reuse_guard"],
+            "check_prerequisites_before_using_judgments"
+        );
+        assert!(plan_incremental_summary(&input, &draft, exact_budget - 1, Some(dir.path())).is_none());
+    }
+
+    #[test]
+    fn incremental_memory_drops_oversized_conditional_entry_whole() {
+        let dir = TestDir::new();
+        let claim = format!(
+            "- C_SENTINEL follows through B; scope: {}; requires A_SENTINEL, which remains unknown.",
+            "configuration detail ".repeat(200)
+        );
+        let draft = format!("Main request:\n- Investigate\nUnverified assistant judgments:\n{claim}");
+        let input = vec![msg("assistant", &claim)];
+        let full = plan_incremental_summary(&input, &draft, 10_000, Some(dir.path())).unwrap();
+        assert_eq!(record(&full)["entries"][1]["text"], claim);
+        let partial = plan_incremental_summary(&input, &draft, 2_000, Some(dir.path())).unwrap();
+        let json = record(&partial);
+        assert_eq!(json["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(json["entries"][0]["kind"], "goals");
+        let content = value_to_string(&partial.message().content);
+        assert!(!content.contains("C_SENTINEL"));
+        assert!(!content.contains("A_SENTINEL"));
+        assert!(content.chars().count() <= 2_000);
+        assert_eq!(json["omitted_entries"], true);
+        assert_eq!(
+            json["reuse_guard"],
+            "partial_draft_recover_source_before_using_judgments"
+        );
+    }
+
+    #[test]
+    fn incremental_memory_missing_cross_section_premise_requires_source_recovery() {
+        let dir = TestDir::new();
+        let premise = format!(
+            "- A_SENTINEL remains unverified: {}",
+            "scope detail ".repeat(300)
+        );
+        let claim = "- C_SENTINEL follows through B.";
+        let draft = format!("Constraints:\n{premise}\nUnverified assistant judgments:\n{claim}");
+        let input = vec![msg("user", &premise), msg("assistant", claim)];
+        let plan = plan_incremental_summary(&input, &draft, 2_000, Some(dir.path())).unwrap();
+        let json = record(&plan);
+        assert_eq!(json["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(json["entries"][0]["text"], claim);
+        assert_eq!(json["entries"][0]["status"], "derived_unverified");
+        assert_eq!(json["omitted_entries"], true);
+        assert_eq!(
+            json["reuse_guard"],
+            "partial_draft_recover_source_before_using_judgments"
+        );
+        assert!(!value_to_string(&plan.message().content).contains("A_SENTINEL"));
+        assert!(value_to_string(&plan.message().content).chars().count() <= 2_000);
+        assert!(!plan.archive_path.exists(), "selection must remain pure");
+        assert!(plan.commit());
+        let restored: Vec<Message> = std::fs::read_to_string(&plan.archive_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(restored, input, "the omitted premise must remain recoverable");
+        let projected = crate::ai::request::normalize_messages_for_request_for_test(&[
+            plan.message().clone(),
+            msg("user", "Does C hold?"),
+        ]);
+        // Request normalization adds a derived-context header around the intact
+        // record; the guard and source must survive inside that assistant block.
+        let content = value_to_string(&plan.message().content);
+        assert!(projected.iter().any(|m| {
+            m.role == "assistant" && value_to_string(&m.content).contains(&content)
+        }));
+        assert!(!projected.iter().any(|m| {
+            m.role == "system" && value_to_string(&m.content).contains(INCREMENTAL_SUMMARY_PREFIX)
+        }));
     }
 
     #[test]
