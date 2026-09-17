@@ -718,9 +718,9 @@ fn prepare_fixed_viewport_at<B: Backend>(
         // pushes them further down. Bounding the clear to `area.height` rows
         // left exactly those stranded rows on screen.
         //
-        // The transcript-loss this used to risk came from a wrong `area.y`
-        // (collapsing to row 0 when the reflow anchor offset fell back to zero),
-        // not from the clear itself; `parked_anchor_offset` fixes that input.
+        // Width reflow callers include the old rows' extra wraps in the parked
+        // offset. Without that correction this clear starts inside the old box
+        // and leaves its first rows between the transcript and the new frame.
         backend.set_cursor_position(Position::new(0, area.y))?;
         backend.clear_region(BackendClearType::AfterCursor)?;
     }
@@ -1003,7 +1003,7 @@ fn rebuild_after_terminal_reflow(
     base_viewport_height: u16,
     fitted_completion_items: Option<usize>,
     last_drawn_area: Option<Rect>,
-) -> io::Result<Rect> {
+) -> io::Result<(Rect, Size)> {
     let terminal_size = terminal.backend().size()?;
     let requested_height = viewport_height_with_completion(
         terminal_size.height,
@@ -1014,17 +1014,23 @@ fn rebuild_after_terminal_reflow(
     // and resets the record, so afterwards there is nothing left to derive the
     // re-wrapped row count from.
     let extra_rows = match last_drawn_area {
-        Some(previous_area) => {
+        Some(previous_area) if !screen.alternate => {
             reflowed_extra_rows(previous_area, &screen.box_row_widths, terminal_size.width)
         }
-        None => 0,
+        _ => 0,
     };
+    // Locate the FIRST row of the reflowed old box, not a new-height box ending
+    // at the parked cursor. Clearing and rebuilding there removes all its visible
+    // fragments without moving transcript rows relative to scrollback. A global
+    // ScrollDown would insert blank rows at that boundary instead of repairing it.
+    let cursor_offset = parked_anchor_offset(last_drawn_area, requested_height)
+        .saturating_add(extra_rows);
     let rebuilt_area = rebuild_fixed_viewport(
         terminal,
         screen,
         terminal_size,
         requested_height,
-        parked_anchor_offset(last_drawn_area, requested_height),
+        cursor_offset,
         // Reflow moves an already-reserved viewport; it must never append more
         // terminal rows. Appending here makes every delayed resize notification
         // scroll the inline editor and strands the previously drawn caret.
@@ -1032,81 +1038,25 @@ fn rebuild_after_terminal_reflow(
         last_drawn_area.map(|area| area.y),
         false,
     )?;
-    reclaim_reflowed_box_rows(terminal, screen, extra_rows, rebuilt_area)?;
     park_reflow_anchor(terminal, rebuilt_area)?;
-    Ok(rebuilt_area)
+    // A resize during the blocking cursor query belongs to the next rebuild;
+    // callers must not mark a fresh backend size as already applied here.
+    Ok((rebuilt_area, terminal_size))
 }
 
-/// Reclaims the screen rows a narrowing resize pushed above the rebuilt box.
-///
-/// A terminal re-wraps its screen on a width change: every line whose written
-/// content is wider than the new width is split into `ceil(written / cols)` rows
-/// (xterm.js `Buffer._reflowSmaller` -> `reflowSmallerGetNewLineLengths`). The
-/// drawn box rows hold content up to the furthest column the app actually wrote
-/// (`box_row_widths` — a blank padding row re-wraps into ONE row, not into
-/// `ceil(box_width / new_width)`), so `extra_rows` rows of the box's own
-/// re-wrapped text end up between the transcript and the rebuilt top, where the
-/// rebuild's clear no longer reaches them. Blanking them removes the duplicate
-/// text but leaves the same number of empty rows in the middle of the screen,
-/// because the transcript tail those rows displaced stays where the reflow left
-/// it.
-///
-/// The screen is scrolled DOWN by that many rows instead: the transcript tail
-/// moves back against the rebuilt box and the empty rows land at the TOP of the
-/// screen, where a terminal normally shows empty space and the next output
-/// scrolls them away. `CSI Ps T` drops the bottom `Ps` rows, which are the
-/// viewport rows the rebuild is about to repaint, so nothing else is lost.
-///
-/// The scroll runs AFTER the rebuild cleared the box area, so the rows it pulls
-/// down from above land on cells that clear can no longer protect: the box area
-/// is cleared a second time right after the scroll, otherwise those fragments
-/// stay visible on the rows the next frame leaves blank.
-///
-/// Widening re-wraps nothing (xterm.js `reflowLarger` only joins lines that were
-/// continued by auto-wrap), so `extra_rows` is zero there and this is a no-op.
-fn reclaim_reflowed_box_rows(
-    terminal: &mut MultilineTerminal,
-    screen: &PromptScreen,
-    extra_rows: u16,
-    rebuilt_area: Rect,
-) -> io::Result<()> {
-    // The alternate screen has no width reflow; a caller without a drawn box
-    // passes zero extra rows.
-    if screen.alternate {
-        return Ok(());
-    }
-    // Never scroll more rows than exist above the box's top: the box can sit near
-    // the top of the screen, where the reflow estimate is larger than the number
-    // of rows available above it.
-    let reclaim = extra_rows.min(rebuilt_area.y);
-    if reclaim == 0 {
-        return Ok(());
-    }
-    // Anything drawn before the scroll must reach the terminal first.
-    terminal.backend_mut().flush()?;
-    crossterm::execute!(terminal.backend_mut(), crossterm::terminal::ScrollDown(reclaim))?;
-    terminal.backend_mut().flush()?;
-    // The scroll moved the re-wrapped rows that sat above the box down INTO the
-    // box area, which the rebuild cleared before the scroll; wipe it again so the
-    // dragged-in rows cannot survive on cells the next frame leaves blank.
-    clear_fixed_viewport(terminal, Some(rebuilt_area.y))?;
-    Ok(())
-}
-
-/// Rows the drawn box gains above its own top when the terminal re-wraps it at
-/// `new_width`.
+/// Extra rows between the old box's first row and its parked bottom-row anchor
+/// after the terminal re-wraps it at `new_width`.
 ///
 /// Every drawn row re-wraps into `ceil(painted_width / new_width)` rows, where
 /// `painted_width` is how far the app actually wrote into that row
 /// (`box_row_widths`) — a row the app never wrote stays exactly one row. The
-/// bottom row is the exception: the parked anchor keeps its screen row, so the
-/// rows its trailing part re-wraps into sit at or below the box's bottom row and
-/// are not rows above the box.
+/// bottom row is the exception: the anchor is at column zero, so that row's
+/// trailing wraps are below the anchor and do not contribute to its offset.
 ///
-/// The rows above the box's top are therefore
-/// `sum(rows) - last_row_rows - (height - 1)`: the drawn rows above the bottom
-/// one re-wrap into `sum(rows) - last`, the box keeps `height - 1` of those as
-/// its own body, and everything left over was inserted above its top.
+/// Add this count to `height - 1` BEFORE the rebuild clears the old width
+/// record. If the old top has already entered scrollback, the visible top
+/// saturates at row zero; ordinary screen erasure cannot recover those hidden
+/// input rows without also mutating the transcript's scrollback.
 fn reflowed_extra_rows(previous_area: Rect, row_widths: &[u16], new_width: u16) -> u16 {
     // A row cannot be painted wider than the box it was drawn in, so nothing can
     // re-wrap once the box fits; a zero width would also divide by zero.
@@ -1126,7 +1076,7 @@ fn reflowed_extra_rows(previous_area: Rect, row_widths: &[u16], new_width: u16) 
         .div_ceil(new_width)
         .max(1);
     // Saturating: a 65535-row box whose rows nearly all re-wrap must not wrap the
-    // counter around into a huge reclaim.
+    // counter around into an incorrect anchor offset.
     reflowed.saturating_sub(previous_area.height.saturating_add(last).saturating_sub(1))
 }
 
@@ -1174,44 +1124,34 @@ fn painted_row_widths(
 mod width_reflow_geometry_tests {
     use super::*;
 
-    /// A narrowing resize reclaims the rows the terminal inserted above the box.
-    ///
-    /// A 5-row box drawn at width 40 with every row painted to the full width
-    /// re-wraps at width 20 into two screen rows per drawn row: 10 rows in total,
-    /// of which the bottom drawn row's second row stays below the parked anchor,
-    /// leaving `4 * 2 - 4 = 4` rows above the box (measured against xterm.js 5.x,
-    /// where that box occupies rows 2..11 and the rebuild recovers a 5-row
-    /// viewport anchored on row 11).
+    /// Four rows before the parked bottom row each gain one wrap. The old top
+    /// is therefore eight rows above the anchor rather than four.
     #[test]
-    fn narrowing_reflow_reclaims_the_rows_inserted_above_the_box() {
+    fn narrowing_reflow_extends_the_old_anchor_offset() {
         let previous_area = Rect::new(0, 7, 40, 5);
         assert_eq!(reflowed_extra_rows(previous_area, &[40; 5], 20), 4);
     }
 
     /// Widening re-wraps nothing, so the box keeps the top the rebuild recovered.
     #[test]
-    fn widening_reflow_reclaims_nothing() {
+    fn widening_reflow_adds_no_anchor_offset() {
         let previous_area = Rect::new(0, 3, 20, 5);
         assert_eq!(reflowed_extra_rows(previous_area, &[20; 5], 40), 0);
     }
 
     /// A height-only change keeps the width, so no drawn row can have been split.
     #[test]
-    fn height_only_change_reclaims_nothing() {
+    fn height_only_change_adds_no_anchor_offset() {
         let previous_area = Rect::new(0, 3, 40, 5);
         assert_eq!(reflowed_extra_rows(previous_area, &[40; 5], 40), 0);
     }
 
     /// Rows the app never wrote are blank on screen and re-wrap into ONE row.
     ///
-    /// Measured in xterm.js 5.x: 6 drawn rows — 3 content rows 40 columns wide
-    /// plus 3 blank padding rows — narrowed from 40 to 20 columns occupy 9 screen
-    /// rows, i.e. only 3 rows above the drawn top, while a per-drawn-row estimate
-    /// (`ceil(box_width / new_width)`) promises 6 and scrolls real transcript into
-    /// the box. The content rows above the blank bottom row insert
-    /// `9 - 1 - 5 = 3` rows above the box.
+    /// Three 40-column content rows and three blank rows become nine rows at
+    /// width 20. Counting blank padding as full-width would clear transcript.
     #[test]
-    fn blank_padding_rows_reclaim_only_the_content_rows() {
+    fn blank_padding_rows_do_not_extend_the_anchor_offset() {
         let previous_area = Rect::new(0, 7, 40, 6);
         assert_eq!(
             reflowed_extra_rows(previous_area, &[40, 40, 40, 0, 0, 0], 20),
@@ -1225,19 +1165,18 @@ mod width_reflow_geometry_tests {
         );
     }
 
-    /// An unknown record must not over-scroll: every drawn row is then assumed to
+    /// An unknown record must not over-clear: every drawn row is then assumed to
     /// be a single re-wrapped row, which is what the box of blank rows already is.
     #[test]
-    fn unknown_row_widths_reclaim_nothing() {
+    fn unknown_row_widths_add_no_anchor_offset() {
         let previous_area = Rect::new(0, 5, 40, 5);
         assert_eq!(reflowed_extra_rows(previous_area, &[], 20), 0);
     }
 
-    /// The bottom drawn row's trailing rows sit at or below the parked anchor row,
-    /// so they are not rows above the box and must not be reclaimed: counting
-    /// them would scroll one row too far on every narrowing reflow.
+    /// The bottom row's trailing wraps are below the anchor. Counting them in
+    /// its offset would clear one transcript row on every narrowing reflow.
     #[test]
-    fn bottom_row_trailing_rows_are_not_reclaimed() {
+    fn bottom_row_trailing_rows_do_not_extend_the_anchor_offset() {
         let previous_area = Rect::new(0, 7, 40, 5);
         let widths = [40; 5];
         let reflowed_rows = 10; // 5 drawn rows at 40 columns -> 2 screen rows each
@@ -1250,14 +1189,54 @@ mod width_reflow_geometry_tests {
         assert_eq!(reflowed_extra_rows(previous_area, &widths, 20), 4);
     }
 
-    /// The caller clamps the count to the rows above the box's top, so a box near
-    /// the top of the screen cannot shift the whole screen down.
+    /// A box extending into scrollback can only have its visible suffix erased.
     #[test]
-    fn reclaim_never_exceeds_the_rows_above_the_box() {
-        let extra_rows = reflowed_extra_rows(Rect::new(0, 7, 40, 5), &[40; 5], 20);
-        assert_eq!(extra_rows, 4);
-        let rebuilt_area = Rect::new(0, 2, 20, 5);
-        assert_eq!(extra_rows.min(rebuilt_area.y), 2);
+    fn reflowed_top_saturates_at_the_visible_screen_without_scrolling() {
+        let previous = Rect::new(0, 7, 40, 5);
+        let offset = parked_anchor_offset(Some(previous), 5)
+            + reflowed_extra_rows(previous, &[40; 5], 20);
+        let (area, scroll) = fixed_viewport_area(
+            Size::new(20, 12), Position::new(0, 6), 5, offset,
+            ViewportRebuildMode::ReflowOnly,
+        );
+        assert_eq!(area, Rect::new(0, 0, 20, 5));
+        assert_eq!(scroll, 0);
+    }
+
+    #[test]
+    fn narrowing_rebuild_clears_the_old_box_without_moving_transcript() {
+        use ratatui::backend::TestBackend;
+
+        let mut backend = TestBackend::new(20, 14);
+        let body = Cell::new("K");
+        for row in 0..14 {
+            backend.draw(std::iter::once((0, row, &body))).unwrap();
+        }
+        backend.set_cursor_position(Position::new(0, 13)).unwrap();
+        backend.append_lines(2).unwrap();
+        let scrollback = backend.scrollback().clone();
+        // The old five-row frame has reflowed into ten rows starting at row 2.
+        // Its last original row starts at row 10; its trailing wrap is row 11.
+        let ghost = Cell::new("X");
+        for row in 2..12 {
+            backend.draw(std::iter::once((0, row, &ghost))).unwrap();
+        }
+        backend.set_cursor_position(Position::new(0, 10)).unwrap();
+        let previous = Rect::new(0, 7, 40, 5);
+        let offset = parked_anchor_offset(Some(previous), 5)
+            + reflowed_extra_rows(previous, &[40; 5], 20);
+        let area = prepare_fixed_viewport(
+            &mut backend, Size::new(20, 14), 5, offset,
+            ViewportRebuildMode::ReflowOnly, true, &mut VecDeque::new(),
+        ).unwrap();
+        assert_eq!(area, Rect::new(0, 2, 20, 5));
+        assert_eq!(backend.scrollback(), &scrollback);
+        for row in 0..2 {
+            assert_eq!(backend.buffer()[(0, row)].symbol(), "K");
+        }
+        for row in 2..14 {
+            assert_eq!(backend.buffer()[(0, row)].symbol(), " ");
+        }
     }
 
     /// `painted_row_widths` reports where the frame stopped writing: text, a
@@ -1282,16 +1261,11 @@ mod width_reflow_geometry_tests {
 ///
 /// The visible editing caret is drawn into the buffer as a styled cell (see
 /// render.rs), so it reflows with the text and needs no tracking. The hardware
-/// cursor is parked at a FIXED row of the box instead — its bottom row —
-/// because a parked cursor keeps its screen row across a width reflow, so that
-/// row stays the box's bottom row: measured against xterm.js 5.x, a 5-row box
-/// occupying rows 7..11 that is narrowed from 40 to 20 columns is re-wrapped
-/// into 10 rows still ending at row 11. A rebuild therefore recovers the DRAWN
-/// top as `bottom - (height - 1)`, taking `height` from the viewport that is
-/// actually on screen rather than from a stored offset that a burst of resizes
-/// can leave stale. The re-wrapped box is taller than the drawn one, so the
-/// extra rows it pushed above that top are scrolled away separately
-/// (`reclaim_reflowed_box_rows`).
+/// cursor is parked at column zero on the box's bottom row. The live anchor
+/// follows that row through terminal reflow. Recovering the old top subtracts
+/// `height - 1` plus the extra wraps of all rows BEFORE the bottom row; the
+/// bottom row's own trailing wraps are below the anchor. The resulting local
+/// clear removes the entire visible old frame without scrolling the transcript.
 fn park_reflow_anchor<B: Backend>(
     terminal: &mut Terminal<B>,
     viewport_area: Rect,
@@ -1372,16 +1346,26 @@ fn take_redraw_request(redraw_requested: &mut bool, external_change: bool) -> bo
     std::mem::take(redraw_requested)
 }
 
+/// Schedule the deferred resize once the input poll goes idle. A consumed CPR
+/// also returns no event, but can leave resize notifications queued: drain them
+/// before rebuilding so an intermediate size cannot become the new anchor.
+fn resize_redraw_after_idle(
+    pending_resize_rebuild: bool,
+    pending_events: &VecDeque<Event>,
+) -> bool {
+    pending_resize_rebuild && pending_events.is_empty()
+}
+
 /// Consume a deferred resize at a redraw safe point.
 ///
-/// A viewport-height rebuild already reads and re-anchors the live cursor, so
-/// no second reflow rebuild is needed in that case. Otherwise the caller must
-/// rebuild before it draws the frame.
+/// This must run before height or completion changes clear the old painted-row
+/// record. Only an earlier reflow rebuild can consume that geometry; a height
+/// rebuild is not a substitute for applying the old width's anchor correction.
 fn take_standalone_resize_rebuild(
     pending_resize_rebuild: &mut bool,
-    viewport_rebuilt: bool,
+    reflow_rebuilt: bool,
 ) -> bool {
-    let needs_rebuild = *pending_resize_rebuild && !viewport_rebuilt;
+    let needs_rebuild = *pending_resize_rebuild && !reflow_rebuilt;
     *pending_resize_rebuild = false;
     needs_rebuild
 }
@@ -1512,9 +1496,9 @@ impl PromptEditor {
             // request the next frame.
             let mut redraw_requested = true;
             // Set only when a resize notification changes the terminal size. The
-            // rebuild runs before the next foreground redraw (including a
-            // background title update) or before a non-resize input event, giving
-            // the emulator time to finish its asynchronous scrollback reflow.
+            // rebuild runs after an idle poll, before the next foreground redraw
+            // (including a background title update), or before non-resize input.
+            // The idle poll coalesces a resize burst without waiting for a key.
             let mut pending_resize_rebuild = false;
 
             loop {
@@ -1524,12 +1508,29 @@ impl PromptEditor {
                 let title_changed = self.apply_pending_session_title_updates();
 
                 if take_redraw_request(&mut redraw_requested, title_changed) {
-                    let mut viewport_rebuilt = false;
+                    // Consume old-screen width geometry before a completion or
+                    // content-height rebuild clears its painted-width record.
+                    // A foreground redraw can beat the queued Resize event.
+                    let mut terminal_size = last_applied_terminal_size;
+                    if take_standalone_resize_rebuild(&mut pending_resize_rebuild, false)
+                        || terminal.backend().size()? != last_applied_terminal_size
+                    {
+                        let (rebuilt_area, sampled_size) = rebuild_after_terminal_reflow(
+                            &mut terminal,
+                            &mut screen,
+                            base_viewport_height,
+                            fitted_completion_items,
+                            last_drawn_area,
+                        )?;
+                        last_drawn_area = Some(rebuilt_area);
+                        last_applied_terminal_size = sampled_size;
+                        terminal_size = sampled_size;
+                        force_repaint_next_frame = false;
+                    }
                     // When the panel state changes, resize the fixed viewport to
                     // match the height the panel needs.
                     let current_items = completion_panel.as_ref().map(|p| p.items.len());
                     if current_items != fitted_completion_items {
-                        let terminal_size = terminal.backend().size()?;
                         let new_height = viewport_height_with_completion(
                             terminal_size.height,
                             base_viewport_height,
@@ -1553,7 +1554,6 @@ impl PromptEditor {
                         last_applied_terminal_size = terminal_size;
                         fitted_completion_items = current_items;
                         force_repaint_next_frame = false;
-                        viewport_rebuilt = true;
                     }
 
                     // Auto-grow the viewport when content exceeds the textarea capacity
@@ -1567,7 +1567,6 @@ impl PromptEditor {
                     if content_lines > textarea_capacity
                         && base_viewport_height < MAX_VIEWPORT_HEIGHT
                     {
-                        let terminal_size = terminal.backend().size()?;
                         let available = terminal_size.height.saturating_sub(2).max(1);
                         let new_height = content_lines
                             .saturating_add(VIEWPORT_CHROME_LINES)
@@ -1589,21 +1588,7 @@ impl PromptEditor {
                             last_applied_terminal_size = terminal_size;
                             base_viewport_height = new_height;
                             force_repaint_next_frame = false;
-                            viewport_rebuilt = true;
                         }
-                    }
-
-                    if take_standalone_resize_rebuild(&mut pending_resize_rebuild, viewport_rebuilt)
-                    {
-                        let rebuilt_area = rebuild_after_terminal_reflow(
-                            &mut terminal,
-                            &mut screen,
-                            base_viewport_height,
-                            fitted_completion_items,
-                            last_drawn_area,
-                        )?;
-                        last_drawn_area = Some(rebuilt_area);
-                        last_applied_terminal_size = terminal.backend().size()?;
                     }
 
                     let force_repaint = force_repaint_next_frame;
@@ -1661,6 +1646,13 @@ impl PromptEditor {
                     },
                 )?;
                 let Some(event) = prompt_event else {
+                    if resize_redraw_after_idle(
+                        pending_resize_rebuild,
+                        &self.pending_terminal_events,
+                    ) {
+                        redraw_requested = true;
+                        continue;
+                    }
                     // Idle tick: the alternate screen is a fallback, not a
                     // destination. Probe the main screen for a working query and
                     // re-anchor the inline box there.
@@ -1685,7 +1677,8 @@ impl PromptEditor {
                     // rewraps the scrollback asynchronously after the resize
                     // events, so a DSR cursor query issued now can return the
                     // pre-reflow row. Ignore delayed same-size notifications and
-                    // defer a real resize until foreground work needs a redraw.
+                    // defer a real resize until an idle poll or foreground work
+                    // requests a redraw.
                     update_pending_resize_rebuild(
                         &mut pending_resize_rebuild,
                         last_applied_terminal_size,
@@ -1695,7 +1688,7 @@ impl PromptEditor {
                 }
                 if pending_resize_rebuild {
                     pending_resize_rebuild = false;
-                    let rebuilt_area = rebuild_after_terminal_reflow(
+                    let (rebuilt_area, sampled_size) = rebuild_after_terminal_reflow(
                         &mut terminal,
                         &mut screen,
                         base_viewport_height,
@@ -1703,7 +1696,7 @@ impl PromptEditor {
                         last_drawn_area,
                     )?;
                     last_drawn_area = Some(rebuilt_area);
-                    last_applied_terminal_size = terminal.backend().size()?;
+                    last_applied_terminal_size = sampled_size;
                 }
 
                 let previous_input_len = textarea_logical_char_count(&textarea);
@@ -1788,6 +1781,133 @@ mod tests {
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// Real-output fixture for an external PTY/emulator driver. Run only this
+    /// ignored test with --nocapture --test-threads=1 and answer its CPR queries.
+    /// Resize the PTY and emulator before sending `r`; `q` clears the last frame.
+    #[test]
+    #[ignore]
+    fn multiline_reflow_pty_fixture() -> io::Result<()> {
+        use std::io::Write;
+        use tui_textarea::{CursorMove, TextArea};
+
+        if std::env::var("RUST_TOOLS_REFLOW_FIXTURE").as_deref() != Ok("1") {
+            return Ok(());
+        }
+        struct RestoreTerminal;
+        impl Drop for RestoreTerminal {
+            fn drop(&mut self) {
+                let _ = crossterm::execute!(
+                    io::stdout(), crossterm::cursor::Show,
+                    crossterm::cursor::SetCursorStyle::DefaultUserShape,
+                );
+                let _ = crossterm::terminal::disable_raw_mode();
+            }
+        }
+        crossterm::terminal::enable_raw_mode()?;
+        let _restore = RestoreTerminal;
+        {
+            let mut out = io::stdout().lock();
+            write!(out, "BODY_BEGIN\r\n")?;
+            for index in 0..96 {
+                write!(out, "MARK{index:02}:English transcript 中文正文保持连续 ")?;
+                write!(out, "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ ")?;
+                write!(out, "another-long-ASCII-segment-0123456789 END{index:02}\r\n")?;
+            }
+            write!(out, "BODY_END\r\n")?;
+            out.flush()?;
+        }
+        let draft = match std::env::var("RUST_TOOLS_REFLOW_DRAFT").as_deref() {
+            Ok("multiline") => "DRAFT_LINE_1 alpha\nDRAFT_LINE_2 beta\nDRAFT_LINE_3 gamma",
+            Ok("wide") => "DRAFT_WIDE 中文宽字符测试 mixed ASCII 0123456789 中文尾部\n第二行 abcdefghijklmnopqrstuvwxyz",
+            _ => "",
+        };
+        let mut textarea = if draft.is_empty() {
+            TextArea::default()
+        } else {
+            TextArea::from(draft.lines())
+        };
+        textarea.move_cursor(CursorMove::Bottom);
+        textarea.move_cursor(CursorMove::End);
+        let original_lines = textarea.lines().to_vec();
+        let original_cursor = textarea.cursor();
+        let (_, rows) = crossterm::terminal::size()?;
+        let base_height = multiline_viewport_height(rows, Some(draft));
+        let mut screen = super::PromptScreen::default();
+        let (mut terminal, mut sampled_size) = super::build_fixed_terminal(base_height, &mut screen)?;
+        let mut area = terminal.get_frame().area();
+        let mut phase = "ready";
+        let mut pending = VecDeque::new();
+        loop {
+            let mut caret = None;
+            terminal.hide_cursor()?;
+            terminal.draw(|frame| {
+                area = frame.area();
+                caret = super::render_multiline_popup(
+                    frame, &mut textarea, None, None, "fixture-model", "high",
+                    Some("fixture-topic"),
+                );
+                screen.box_row_widths = super::painted_row_widths(frame.buffer_mut(), area, false);
+            })?;
+            park_reflow_anchor(&mut terminal, area)?;
+            assert_eq!(textarea.lines(), original_lines.as_slice());
+            assert_eq!(textarea.cursor(), original_cursor);
+            let metadata = serde_json::json!({
+                "phase": phase,
+                "size": [sampled_size.width, sampled_size.height],
+                "frame": {"x": area.x, "y": area.y, "width": area.width, "height": area.height},
+                "top": area.y,
+                "cursor": [original_cursor.0, original_cursor.1],
+                "caret": caret.map(|position| [position.x, position.y]),
+                "painted_widths": screen.box_row_widths,
+                "alternate": screen.alternate,
+            });
+            {
+                let mut out = io::stdout().lock();
+                write!(out, "\x1b]777;reflow;meta;{metadata}\x07\x1b]777;reflow;{phase}\x07")?;
+                out.flush()?;
+            }
+            loop {
+                let event = super::read_prompt_event(
+                    &mut pending, &mut screen.pending_cpr_replies, |timeout| {
+                        if crossterm::event::poll(timeout)? {
+                            crossterm::event::read().map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                )?;
+                match event {
+                    Some(Event::Key(key)) if key.kind == crossterm::event::KeyEventKind::Press => {
+                        match key.code {
+                            KeyCode::Char('r') => {
+                                (area, sampled_size) = super::rebuild_after_terminal_reflow(
+                                    &mut terminal, &mut screen, base_height, None, Some(area),
+                                )?;
+                                phase = "resized";
+                                break;
+                            }
+                            KeyCode::Char('q') => {
+                                assert!(clear_fixed_viewport(&mut terminal, Some(area.y))?);
+                                assert_eq!(textarea.lines(), original_lines.as_slice());
+                                assert_eq!(textarea.cursor(), original_cursor);
+                                drop(terminal);
+                                drop(screen);
+                                let mut out = io::stdout().lock();
+                                write!(out, "\x1b]777;reflow;finished\x07")?;
+                                out.flush()?;
+                                return Ok(());
+                            }
+                            _ => {}
+                        }
+                    }
+                    // The driver coalesces Resize notifications and explicitly
+                    // requests exactly one rebuild with `r` after each resize.
+                    _ => {}
+                }
+            }
+        }
     }
 
     #[test]
@@ -2161,25 +2281,61 @@ mod tests {
     }
 
     #[test]
-    fn pending_resize_waits_for_foreground_redraw() {
+    fn pending_resize_requests_one_idle_redraw_without_keyboard_input() {
         let mut redraw_requested = true;
 
         assert!(take_redraw_request(&mut redraw_requested, false));
         assert!(!take_redraw_request(&mut redraw_requested, false));
 
         let mut pending_resize_rebuild = true;
-        // An idle poll timeout leaves both states unchanged. A later foreground
-        // redraw consumes the pending resize exactly once.
-        assert!(!take_redraw_request(&mut redraw_requested, false));
-        assert!(pending_resize_rebuild);
-        redraw_requested = true;
+        redraw_requested |=
+            super::resize_redraw_after_idle(pending_resize_rebuild, &VecDeque::new());
         assert!(take_redraw_request(&mut redraw_requested, false));
         assert!(take_standalone_resize_rebuild(
             &mut pending_resize_rebuild,
             false
         ));
         assert!(!pending_resize_rebuild);
+        redraw_requested |=
+            super::resize_redraw_after_idle(pending_resize_rebuild, &VecDeque::new());
         assert!(!take_redraw_request(&mut redraw_requested, false));
+    }
+
+    #[test]
+    fn idle_resize_redraw_drains_notifications_buffered_by_cursor_reply() {
+        let mut pending_events = VecDeque::from([Event::Resize(60, 24)]);
+        assert!(!super::resize_redraw_after_idle(true, &pending_events));
+        assert_eq!(pending_events.pop_front(), Some(Event::Resize(60, 24)));
+        assert!(super::resize_redraw_after_idle(true, &pending_events));
+        assert!(!super::resize_redraw_after_idle(false, &pending_events));
+    }
+
+    #[test]
+    fn resize_burst_rebuilds_once_after_idle_and_ignores_duplicates() {
+        let applied = ratatui::layout::Size::new(80, 24);
+        let mut pending = false;
+        let mut notifications = VecDeque::from([
+            Event::Resize(70, 24),
+            Event::Resize(60, 24),
+            Event::Resize(60, 24),
+        ]);
+        while let Some(Event::Resize(width, height)) = notifications.pop_front() {
+            update_pending_resize_rebuild(
+                &mut pending,
+                applied,
+                ratatui::layout::Size::new(width, height),
+            );
+            if !notifications.is_empty() {
+                assert!(!super::resize_redraw_after_idle(pending, &notifications));
+            }
+        }
+        assert!(super::resize_redraw_after_idle(pending, &notifications));
+        assert!(take_standalone_resize_rebuild(&mut pending, false));
+        assert!(!take_standalone_resize_rebuild(&mut pending, false));
+
+        let applied = ratatui::layout::Size::new(60, 24);
+        update_pending_resize_rebuild(&mut pending, applied, applied);
+        assert!(!super::resize_redraw_after_idle(pending, &notifications));
     }
 
     #[test]
