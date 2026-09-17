@@ -14,6 +14,7 @@ pub(crate) mod memory_store;
 pub(crate) mod mutation_log;
 pub(crate) mod process_registry;
 pub(crate) mod rag_store;
+pub(crate) mod read_registry;
 pub(crate) mod temp_registry;
 pub(crate) mod token_usage_store;
 

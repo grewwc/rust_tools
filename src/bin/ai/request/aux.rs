@@ -489,7 +489,7 @@ impl HistoryMessageSummarizer for App {
 }
 
 fn session_title_text_content(content: &Value) -> String {
-    match content {
+    let text = match content {
         Value::Array(parts) => parts
             .iter()
             .filter(|part| part.get("type").and_then(Value::as_str) != Some("image_url"))
@@ -504,7 +504,11 @@ fn session_title_text_content(content: &Value) -> String {
         other => crate::ai::history::value_to_string(other)
             .trim()
             .to_string(),
-    }
+    };
+    // The terminal's startup-resume selection prompt can be echoed into the
+    // first user message; strip that UI noise so the title model summarizes
+    // the real request instead of the prompt itself.
+    crate::ai::history::strip_terminal_prompt_echo(&text)
 }
 
 /// 归档提示仅用于上下文恢复，不能成为会话标题的素材。
@@ -778,6 +782,33 @@ mod session_title_tests {
         assert!(transcript.ends_with('b'));
         assert!(transcript.contains("\n…\n"));
         assert!(transcript.chars().count() <= SESSION_TITLE_TRANSCRIPT_MAX_CHARS);
+    }
+
+    #[test]
+    fn title_transcript_strips_terminal_resume_echo() {
+        // The terminal's resume-selection prompt echoed into the first user
+        // message must not reach the title model (it produced the abstract
+        // "单会话仍要确认" title from exactly this capture shape).
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String(
+                "修复一个 \"/bg\" 相关的问题。为什么一个terminal，只挂了一个session，还要确认？\n\
+[resume] 当前 terminal 有 1 个挂起 session：\n\
+  1. 6ebee611-40ca-4c15-9361-81d2de4e8c62  persona=default  modified=2026-09-17 15:03  suspended=2026-09-17 15:03\n\
+选择要恢复的 session [回车=恢复，n=新 session]: "
+                    .to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        let dialog = session_title_dialog_lines(&messages);
+
+        assert_eq!(
+            dialog,
+            vec!["user: 修复一个 \"/bg\" 相关的问题。为什么一个terminal，只挂了一个session，还要确认？"]
+        );
     }
 
     #[test]

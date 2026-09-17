@@ -840,6 +840,10 @@ fn finalize_stream_response(
     }
 
     let metrics_finished_at = Instant::now();
+    // Idle timeout means the stream died before the provider could deliver a
+    // trailing usage chunk; that path already warns separately, so only surface
+    // missing usage on streams that actually completed.
+    let stream_error = state.content.stream_idle_timed_out;
 
     // AIOS: flush any pending LLM usage to kernel `/dev/llm` before returning.
     // Prefer the model echoed by the provider; fall back to what we requested.
@@ -866,9 +870,16 @@ fn finalize_stream_response(
         let _ = crate::ai::request::charge_llm_usage_to_kernel(app, &model_for_pricing, &usage, 0);
         maybe_print_prompt_cache_metrics(&usage);
         maybe_print_token_throughput_metrics(&usage, &state.content, metrics_finished_at);
+    } else if !stream_error && !state.content.tool_args_cap_exceeded {
+        // The request explicitly asked for stream_options.include_usage, so a
+        // completed stream without any usage block means the provider dropped
+        // the accounting data: surface the gap instead of silently skipping
+        // kernel charging (token stats would be missing with no trace).
+        crate::ai::request::emit_request_diagnostic(format_args!(
+            "[Warning] 流式响应结束但未收到 usage (model={})：本次调用未计入 token 统计，/usage 将缺失此调用",
+            app.current_model
+        ));
     }
-
-    let stream_error = state.content.stream_idle_timed_out;
     let (mut tool_calls, dropped_malformed) =
         collect_valid_tool_calls(&mut state.content.tool_calls_map);
     state.content.dropped_malformed_tool_call = dropped_malformed;
@@ -2282,6 +2293,23 @@ thread_local! {
     static THINKING_FOLD_BODY_BUF: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
+/// Make control characters literal before wrapping a rewritable fold row. Raw tabs
+/// move to terminal-defined tab stops, while CR/ESC can move the cursor independently
+/// of cell widths; either invalidates the erase footprint and leaks previous frames.
+/// Use fixed four-space tab indentation and visible escapes for other controls.
+/// This is display-only: the fold buffers and canonical model content stay unchanged.
+fn fold_display_line(line: &str) -> String {
+    let mut display = String::with_capacity(line.len());
+    for ch in line.chars() {
+        match ch {
+            '\t' => display.push_str("    "),
+            ch if ch.is_control() => display.extend(ch.escape_default()),
+            ch => display.push(ch),
+        }
+    }
+    display
+}
+
 /// Render the **body** of the fold window (fold summary + recent visible lines), without the header.
 /// The header is anchored and printed separately by `write_fold_header`. Writes the body into
 /// `out` (cleared first) and returns the number of physical body lines plus the plain-text rows
@@ -2303,7 +2331,10 @@ fn render_thinking_fold_window_lines(
     let marker_lines = marker_lines.min(lines.len());
     let mut wrapped_content_rows = Vec::new();
     for line in lines.iter().skip(marker_lines) {
-        wrapped_content_rows.extend(wrap_line_to_terminal_rows_with_reserve(line, reserve_cols));
+        wrapped_content_rows.extend(wrap_line_to_terminal_rows_with_reserve(
+            &fold_display_line(line),
+            reserve_cols,
+        ));
     }
     let hidden_wrapped_rows = wrapped_content_rows.len().saturating_sub(max_visible_rows);
     let marker = if hidden_wrapped_rows > 0 {

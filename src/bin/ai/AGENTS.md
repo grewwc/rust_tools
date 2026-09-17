@@ -28,7 +28,7 @@ the nearest child `AGENTS.md`.
 - `tools/`: registry, service implementations, storage, display/history policy
 - `mcp/`: MCP lifecycle, clients, routing snapshots, transport
 - `knowledge/`: shared types, lexical similarity, embedding provider, vector index
-- `stream/`: streaming protocol, chunk extraction, state machine, `stream/render/` terminal rendering. Golden wire→parse regression tests live in `stream/runtime/tests.rs` (`mod golden_wire`): a `ScriptedSse` loopback server feeds fixture SSE events through the real `stream_response` state machine and asserts the parsed `StreamResult` (offline, CI-safe). Add new provider wire shapes as fixtures there.
+- `stream/`: streaming protocol, chunk extraction, state machine, `stream/render/` terminal rendering. Golden wire→parse regression tests live in `stream/runtime/tests.rs` (`mod golden_wire`, offline `ScriptedSse` loopback) — add new provider wire shapes as fixtures there.
 - `cli.rs` / `theme.rs` / `background.rs`: CLI entry, theming, background tasks
 - `terminal_session/`: PTY session plumbing (client/host/registry/replay/wire);
   `builtin_themes/` themes embedded by `theme.rs`; `tests/` module-level integration tests
@@ -62,7 +62,7 @@ Sessions are the unit of conversation persistence; IDs are not restricted to UUI
 
 1. **Verification.** Follow root ladder; keep Cargo commands scoped.
 2. **Driver owns the turn.** Prompt assembly, model calls, tool loops, history mutation, and final response flow through `driver/`; no ad-hoc side effects.
-3. **Provider/request boundary.** Routing/normalization in `request/`; wire differences in `provider/` adapter hooks. `ApiProvider` is the adapter axis; model/platform metadata lives in `models/` + `model_names.rs`.
+3. **Provider/request boundary.** Routing/normalization in `request/`; wire differences in `provider/` adapter hooks. `ApiProvider` is the adapter axis (details in `provider/AGENTS.md`).
 4. **Tool contracts.** Names/schemas/display/history policy are registry-driven. Per-turn visibility is progressive (`core` default, `enable_tools` for lazy `builtin`); hidden MCP/catalog hints must match real registry names.
 5. **Path/session authority.** `runtime_ctx::effective_cwd()` is the working-directory authority for user paths (tools and sub-agents); runtime helpers for session/temp state.
 6. **History is truth.** Canonical `turn_messages` vs rebuildable context projection: compression replaces only the projection, never canonical history (only explicit user lifecycle ops truncate). Preserve pruned evidence via overflow/file pointers; persist delivered subagent results and require explicit `task_integrate`.

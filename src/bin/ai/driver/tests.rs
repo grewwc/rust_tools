@@ -402,7 +402,7 @@ fn resume_predicate_requires_clean_interactive_start() {
 }
 
 #[test]
-fn startup_choice_auto_resumes_terminal_bound_session() {
+fn startup_choice_explicit_resume_auto_picks_single_bound_session() {
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -434,8 +434,10 @@ fn startup_choice_auto_resumes_terminal_bound_session() {
         )
         .unwrap();
 
+    let mut cli = ParsedCli::default();
+    cli.resume = true;
     let choice = resolve_startup_session_choice(
-        &ParsedCli::default(),
+        &cli,
         &test_startup_config(&base_history),
         &persona_store,
         crate::ai::persona::default_persona(),
@@ -459,6 +461,209 @@ fn startup_choice_auto_resumes_terminal_bound_session() {
             .unwrap()
             .is_none()
     );
+
+    unsafe {
+        std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");
+        std::env::remove_var("TERM_SESSION_ID");
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn startup_choice_bare_start_auto_resumes_single_entry() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let root = std::env::temp_dir().join(format!(
+        "rt_startup_resume_single_ask_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let suspended_root = root.join("suspended");
+    let base_history = root.join("history.sqlite");
+    let suspended_history = root.join("history.persona-default.sqlite");
+
+    unsafe {
+        std::env::set_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR", &suspended_root);
+        std::env::set_var("TERM_SESSION_ID", "term-single");
+    }
+
+    let persona_store =
+        crate::ai::persona::PersonaStore::for_tests_with_path(root.join("personas.json"));
+    SuspendedSessionStore::new()
+        .save_for_terminal_key(
+            "terminal:term-single",
+            "sess-single",
+            &suspended_history,
+            "default",
+            "test-model",
+        )
+        .unwrap();
+
+    let mut selector_calls = 0;
+    let choice = resolve_startup_session_choice_with_selector(
+        &ParsedCli::default(),
+        &test_startup_config(&base_history),
+        &persona_store,
+        crate::ai::persona::default_persona(),
+        |previews| {
+            selector_calls += 1;
+            assert_eq!(previews.len(), 1);
+            assert_eq!(previews[0].entry.session_id, "sess-single");
+            Ok(Some(0))
+        },
+    )
+    .unwrap();
+
+    // A bare `a` auto-resumes a lone suspended entry without asking: with a
+    // single candidate there is nothing to disambiguate, so the selector must
+    // not be consulted at all.
+    assert_eq!(selector_calls, 0);
+    assert_eq!(choice.session_id, "sess-single");
+    assert_eq!(choice.history_file, suspended_history);
+    assert!(
+        SuspendedSessionStore::new()
+            .take_for_terminal_key("terminal:term-single")
+            .unwrap()
+            .is_none(),
+        "resumed entry must be consumed"
+    );
+
+    unsafe {
+        std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");
+        std::env::remove_var("TERM_SESSION_ID");
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn startup_choice_resume_selector_can_skip_all_entries() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let root = std::env::temp_dir().join(format!(
+        "rt_startup_resume_skip_all_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let suspended_root = root.join("suspended");
+    let base_history = root.join("history.sqlite");
+    let history_a = root.join("history.persona-default.sqlite");
+    let history_b = root.join("history.persona-reviewer.sqlite");
+
+    unsafe {
+        std::env::set_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR", &suspended_root);
+        std::env::set_var("TERM_SESSION_ID", "term-skip-all");
+    }
+
+    let persona_store =
+        crate::ai::persona::PersonaStore::for_tests_with_path(root.join("personas.json"));
+    SuspendedSessionStore::new()
+        .save_for_terminal_key(
+            "terminal:term-skip-all",
+            "sess-1",
+            &history_a,
+            "default",
+            "model-a",
+        )
+        .unwrap();
+    SuspendedSessionStore::new()
+        .save_for_terminal_key(
+            "terminal:term-skip-all",
+            "sess-2",
+            &history_b,
+            "default",
+            "model-b",
+        )
+        .unwrap();
+
+    let mut selector_calls = 0;
+    let mut cli = ParsedCli::default();
+    cli.resume = true;
+    let choice = resolve_startup_session_choice_with_selector(
+        &cli,
+        &test_startup_config(&base_history),
+        &persona_store,
+        crate::ai::persona::default_persona(),
+        |previews| {
+            selector_calls += 1;
+            assert_eq!(previews.len(), 2);
+            Ok(None)
+        },
+    )
+    .unwrap();
+
+    assert_eq!(selector_calls, 1);
+    assert_ne!(choice.session_id, "sess-1");
+    assert_ne!(choice.session_id, "sess-2");
+    assert!(
+        choice
+            .startup_notice
+            .as_deref()
+            .unwrap_or_default()
+            .contains("已跳过")
+    );
+    assert_eq!(
+        SuspendedSessionStore::new()
+            .peek_entries_for_terminal_key("terminal:term-skip-all")
+            .unwrap()
+            .len(),
+        2,
+        "skipped entries must stay bound for a later explicit resume"
+    );
+
+    unsafe {
+        std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");
+        std::env::remove_var("TERM_SESSION_ID");
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn startup_choice_explicit_resume_skips_selector_for_single_entry() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let root = std::env::temp_dir().join(format!(
+        "rt_startup_resume_single_auto_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let suspended_root = root.join("suspended");
+    let base_history = root.join("history.sqlite");
+    let suspended_history = root.join("history.persona-default.sqlite");
+
+    unsafe {
+        std::env::set_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR", &suspended_root);
+        std::env::set_var("TERM_SESSION_ID", "term-resume-auto");
+    }
+
+    let persona_store =
+        crate::ai::persona::PersonaStore::for_tests_with_path(root.join("personas.json"));
+    SuspendedSessionStore::new()
+        .save_for_terminal_key(
+            "terminal:term-resume-auto",
+            "sess-single",
+            &suspended_history,
+            "default",
+            "test-model",
+        )
+        .unwrap();
+
+    let mut cli = ParsedCli::default();
+    cli.resume = true;
+    let mut selector_calls = 0;
+    let choice = resolve_startup_session_choice_with_selector(
+        &cli,
+        &test_startup_config(&base_history),
+        &persona_store,
+        crate::ai::persona::default_persona(),
+        |_previews| {
+            selector_calls += 1;
+            Ok(Some(0))
+        },
+    )
+    .unwrap();
+
+    assert_eq!(selector_calls, 0, "explicit --resume auto-picks the lone entry");
+    assert_eq!(choice.session_id, "sess-single");
 
     unsafe {
         std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");

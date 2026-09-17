@@ -229,6 +229,81 @@ impl SuspendedSessionStore {
         Ok(cleared)
     }
 
+    /// Remove every suspended binding whose session id matches (and, when
+    /// `history_file` is given, whose history file also matches) across all
+    /// terminals. Used when a session is deleted or finishes, so a stale
+    /// binding never silently resurrects a finished/deleted session when the
+    /// terminal key is reused by a new window.
+    pub(in crate::ai) fn remove_for_session(
+        &self,
+        session_id: &str,
+        history_file: Option<&Path>,
+    ) -> io::Result<usize> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Ok(0);
+        }
+        let entries = match fs::read_dir(&self.root) {
+            Ok(v) => v,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(err) => return Err(err),
+        };
+        let mut removed_total = 0;
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(parsed) = serde_json::from_str::<SuspendedSessionFile>(&content) else {
+                continue;
+            };
+            let entries = match parsed {
+                SuspendedSessionFile::Single(entry) => vec![entry],
+                SuspendedSessionFile::Many(entries) => entries,
+            };
+            let before = entries.len();
+            let remaining: Vec<SuspendedSessionEntry> = entries
+                .into_iter()
+                .filter(|entry| {
+                    entry.session_id != session_id
+                        || history_file.is_some_and(|hf| entry.history_file.as_path() != hf)
+                })
+                .collect();
+            if remaining.len() != before {
+                removed_total += before - remaining.len();
+                self.write_entries_to_path(&path, &remaining)?;
+            }
+        }
+        Ok(removed_total)
+    }
+
+    /// Remove every suspended binding file across all terminals. Used by
+    /// `/sessions clear-all`, which deletes every session (all bindings would
+    /// otherwise dangle).
+    pub(in crate::ai) fn clear_all(&self) -> io::Result<usize> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(v) => v,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(err) => return Err(err),
+        };
+        let mut removed = 0;
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     pub(in crate::ai) fn take_selected_current_terminal(
         &self,
         selected: &SuspendedSessionEntry,
@@ -298,8 +373,16 @@ impl SuspendedSessionStore {
         entries: &[SuspendedSessionEntry],
     ) -> io::Result<()> {
         let path = self.entry_path(terminal_key);
+        self.write_entries_to_path(&path, entries)
+    }
+
+    fn write_entries_to_path(
+        &self,
+        path: &Path,
+        entries: &[SuspendedSessionEntry],
+    ) -> io::Result<()> {
         if entries.is_empty() {
-            match fs::remove_file(&path) {
+            match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
@@ -324,7 +407,7 @@ impl SuspendedSessionStore {
             let mut file = open_file_for_write_truncate(&tmp, 0o600)?;
             file.write_all(&content)?;
         }
-        fs::rename(&tmp, &path)?;
+        fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -617,6 +700,90 @@ mod tests {
         let remaining = store.list_all().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].session_id, "sess-b");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn store_remove_for_session_removes_matching_entries_across_terminals() {
+        let root = std::env::temp_dir().join(format!(
+            "rust-tools-suspended-session-remove-{}",
+            Uuid::new_v4()
+        ));
+        let store = SuspendedSessionStore::for_tests_with_root(root.clone());
+        let history_a = root.join("a.sqlite");
+        let history_b = root.join("b.sqlite");
+        let history_c = root.join("c.sqlite");
+        store
+            .save_for_terminal_key("tty:/dev/ttys020", "sess-del", &history_a, "default", "m-a")
+            .unwrap();
+        store
+            .save_for_terminal_key("tty:/dev/ttys020", "sess-keep", &history_b, "default", "m-b")
+            .unwrap();
+        store
+            .save_for_terminal_key("tty:/dev/ttys021", "sess-del", &history_c, "reviewer", "m-c")
+            .unwrap();
+
+        // By session id alone: entries in every terminal go.
+        let removed = store.remove_for_session("sess-del", None).unwrap();
+        assert_eq!(removed, 2);
+        let remaining = store
+            .peek_entries_for_terminal_key("tty:/dev/ttys020")
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].session_id, "sess-keep");
+        assert!(
+            store
+                .peek_entries_for_terminal_key("tty:/dev/ttys021")
+                .unwrap()
+                .is_empty()
+        );
+
+        // Re-add one and remove by session id + history file: only that file's
+        // entry goes, and a mismatching history file keeps the entry.
+        store
+            .save_for_terminal_key("tty:/dev/ttys021", "sess-del", &history_c, "reviewer", "m-c")
+            .unwrap();
+        let removed = store
+            .remove_for_session("sess-del", Some(&history_a))
+            .unwrap();
+        assert_eq!(removed, 0, "history_file mismatch must keep the entry");
+        let removed = store
+            .remove_for_session("sess-del", Some(&history_c))
+            .unwrap();
+        assert_eq!(removed, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn store_clear_all_removes_every_binding() {
+        let root = std::env::temp_dir().join(format!(
+            "rust-tools-suspended-session-clearall-{}",
+            Uuid::new_v4()
+        ));
+        let store = SuspendedSessionStore::for_tests_with_root(root.clone());
+        let history = root.join("history.sqlite");
+        let other = root.join("other.sqlite");
+        store
+            .save_for_terminal_key("tty:/dev/ttys030", "sess-1", &history, "default", "m-a")
+            .unwrap();
+        store
+            .save_for_terminal_key("tty:/dev/ttys031", "sess-2", &other, "reviewer", "m-b")
+            .unwrap();
+
+        let removed = store.clear_all().unwrap();
+        assert_eq!(removed, 2);
+        assert!(store.list_all().unwrap().is_empty());
+        assert!(
+            store
+                .peek_entries_for_terminal_key("tty:/dev/ttys030")
+                .unwrap()
+                .is_empty()
+        );
+
+        // Idempotent on an already-empty store.
+        assert_eq!(store.clear_all().unwrap(), 0);
 
         let _ = fs::remove_dir_all(root);
     }

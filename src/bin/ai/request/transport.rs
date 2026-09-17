@@ -845,13 +845,28 @@ pub async fn do_request_json(
                         Ok(json) => json,
                         Err(err) => return Err(Box::new(err)),
                     };
-                    // AIOS: bridge non-stream usage to kernel `/dev/llm`.
-                    if let Some(usage_val) = json.get("usage") {
-                        if let Ok(usage) = serde_json::from_value::<StreamUsage>(usage_val.clone())
-                        {
-                            let usage = usage.normalized();
-                            let latency_ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    // AIOS: bridge non-stream usage to kernel `/dev/llm`. A
+                    // non-stream response virtually always carries usage; when it
+                    // is absent or unparsable the call is missing from token
+                    // stats, so surface the gap instead of silently dropping it.
+                    let usage = json
+                        .get("usage")
+                        .and_then(|usage_val| {
+                            serde_json::from_value::<StreamUsage>(usage_val.clone()).ok()
+                        })
+                        .map(StreamUsage::normalized);
+                    match usage {
+                        Some(usage) => {
+                            let latency_ms =
+                                t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
                             let _ = charge_llm_usage_to_kernel(app, model, &usage, latency_ms);
+                        }
+                        None => {
+                            let _ = super::emit_request_diagnostic(format_args!(
+                                "[Warning] {}非流式响应未返回可解析的 usage (model={})：本次调用未计入 token 统计，/usage 将缺失此调用",
+                                retry_scope_tag(),
+                                model
+                            ));
                         }
                     }
                     return Ok(json);
@@ -1264,6 +1279,16 @@ pub async fn do_request_text_streaming(
             };
             let latency_ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
             let _ = charge_llm_usage_to_kernel(app, model_for_pricing, &usage, latency_ms);
+        } else if !(idle_timed_out && content.is_empty()) {
+            // The stream completed without any usage chunk even though the
+            // request asked for stream_options.include_usage: the provider
+            // dropped the accounting data. The about-to-retry idle-timeout path
+            // is excluded because usage loss is expected when the stream died.
+            super::emit_request_diagnostic(format_args!(
+                "[Warning] {}流式辅助请求未返回 usage (model={})：本次调用未计入 token 统计，/usage 将缺失此调用",
+                retry_scope_tag(),
+                model
+            ));
         }
 
         if idle_timed_out && content.is_empty() && attempt < REQUEST_MAX_ATTEMPTS {

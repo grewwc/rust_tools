@@ -38,6 +38,11 @@ impl FileStore {
         &self.path
     }
 
+    /// The path as originally passed in (unresolved spelling, e.g. a relative path).
+    pub(crate) fn original(&self) -> &Path {
+        &self.original
+    }
+
     pub(crate) fn validate_read_access(&self) -> Result<(), AiError> {
         // The overflow archive is the only complete post-compression snapshot on the request side and must stay readable; otherwise, to the model, it is
         // equivalent to dropping it. Historical line numbers in read_file archives are stripped by service::file before rendering to avoid

@@ -23,7 +23,9 @@ const AUDIT_PROGRESS_PROTOCOL: &str = include_str!("prompts/audit_progress_proto
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuditCommand {
     Run { instruction: String, fast: bool },
-    Usage,
+    /// 缺省 `/audit` / `/audit -f`（没有指令）：不启动子代理，而是让当前 turn
+    /// 继续，由 lead agent 自行生成审查内容后再启动审计子代理。
+    SelfGenerated { fast: bool },
 }
 
 pub(crate) fn parse_audit_command(input: &str) -> Option<AuditCommand> {
@@ -43,11 +45,11 @@ pub(crate) fn parse_audit_command(input: &str) -> Option<AuditCommand> {
 
     let instruction = remainder.trim();
     if instruction.is_empty() {
-        Some(AuditCommand::Usage)
+        Some(AuditCommand::SelfGenerated { fast: false })
     } else if let Some(rest) = strip_fast_flag(instruction) {
         if rest.is_empty() {
-            // `/audit --fast` 单独出现：没有要审计的指令，同样按用法提示处理。
-            Some(AuditCommand::Usage)
+            // `/audit --fast` 单独出现：缺省快速审计，同样由 lead agent 自生成内容。
+            Some(AuditCommand::SelfGenerated { fast: true })
         } else {
             Some(AuditCommand::Run {
                 instruction: rest.to_string(),
@@ -72,6 +74,50 @@ fn strip_fast_flag(instruction: &str) -> Option<&str> {
         return None;
     }
     Some(rest.trim_start())
+}
+
+/// 缺省 `/audit`（无指令）时注入 lead agent 的模型可见指引：审查范围由 lead agent
+/// 自行决定（只有它清楚本会话改动的细节），生成自包含的审计 prompt 后通过 `task`
+/// 工具启动 audit / audit-fast 子代理——与 `audit_own_changes` skill 的自主路径一致。
+/// 只写入 `messages` 投影（如同 loop 提示），不进入持久化的 turn_messages。
+pub(crate) fn inject_self_generated_audit_note(
+    messages: &mut Vec<crate::ai::history::Message>,
+    fast: bool,
+) {
+    let mode = if fast { "/audit -f (fast)" } else { "/audit" };
+    let agent = if fast { "audit-fast" } else { "audit" };
+    let note = format!(
+        "[audit-self-generated] The user invoked {mode} without an audit instruction: the audit \
+         scope is left to you, the lead agent, because only you know the details of what you \
+         changed in this session.\n\
+         \n\
+         Build a self-contained audit prompt yourself:\n\
+         1. Scope: cover ONLY the changes you made for the current request; list the changed \
+         files, and tell the auditor to ignore other workspace changes, concurrent work, or \
+         pre-existing issues unless they directly affect these changes.\n\
+         2. Change summary: for each changed file, state what changed and why, so the auditor \
+         can distinguish your intent from unrelated diffs.\n\
+         3. Verification focus: list the invariants, edge cases, and regression risks to check \
+         (compilation, behavior changes, error handling, concurrency or side effects, \
+         configuration impact).\n\
+         \n\
+         Then start the audit:\n\
+         - If `task` is not in your available tools, first call `enable_tools` with \
+         {{\"operation\":\"enable\",\"tools\":[\"task\"]}}.\n\
+         - Call `task` with agent=\"{agent}\" and the self-contained prompt as `prompt`. The \
+         audit subagent cannot see this conversation, so the prompt must stand alone; require it \
+         to inspect the relevant files / git diff itself when needed.\n\
+         - After the audit subagent returns, verify every finding against the code, fix \
+         confirmed issues, re-run the appropriate verification, then report the outcome to the \
+         user."
+    );
+    messages.push(crate::ai::history::Message {
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+        content: serde_json::Value::String(note),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
 }
 
 /// 同步 `/audit` 的完整 payload 会作为主 agent 的证据持久化；终端只显示子代理的
@@ -286,8 +332,8 @@ mod tests {
     use super::{
         AUDIT_SUBAGENT_HARD_TIMEOUT, AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME, AuditCommand,
         FAST_AUDIT_SUBAGENT_HARD_TIMEOUT, FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME,
-        compose_audit_prompt, format_mutation_log, parse_audit_command,
-        terminal_audit_result,
+        compose_audit_prompt, format_mutation_log, inject_self_generated_audit_note,
+        parse_audit_command, terminal_audit_result,
     };
     use crate::ai::tools::storage::changes::diff_snippet;
 
@@ -347,14 +393,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_audit_command_fast_flag_without_instruction_is_usage() {
+    fn parse_audit_command_fast_flag_without_instruction_is_self_generated() {
         assert_eq!(
             parse_audit_command("/audit --fast"),
-            Some(AuditCommand::Usage)
+            Some(AuditCommand::SelfGenerated { fast: true })
         );
         assert_eq!(
             parse_audit_command("/audit -f  "),
-            Some(AuditCommand::Usage)
+            Some(AuditCommand::SelfGenerated { fast: true })
         );
     }
 
@@ -371,9 +417,40 @@ mod tests {
     }
 
     #[test]
-    fn parse_audit_command_requires_an_instruction() {
-        assert_eq!(parse_audit_command("/audit"), Some(AuditCommand::Usage));
-        assert_eq!(parse_audit_command(" :audit   "), Some(AuditCommand::Usage));
+    fn parse_audit_command_without_instruction_is_self_generated() {
+        assert_eq!(
+            parse_audit_command("/audit"),
+            Some(AuditCommand::SelfGenerated { fast: false })
+        );
+        assert_eq!(
+            parse_audit_command(" :audit   "),
+            Some(AuditCommand::SelfGenerated { fast: false })
+        );
+    }
+
+    #[test]
+    fn inject_self_generated_audit_note_injects_internal_note_with_steps() {
+        use crate::ai::history::ROLE_INTERNAL_NOTE;
+        let mut messages = Vec::new();
+        inject_self_generated_audit_note(&mut messages, false);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, ROLE_INTERNAL_NOTE);
+        let note = messages[0].content.as_str().unwrap();
+        assert!(note.contains("[audit-self-generated]"), "{note}");
+        assert!(note.contains("agent=\"audit\""), "{note}");
+        assert!(note.contains("enable_tools"), "{note}");
+        assert!(note.contains("Scope: cover ONLY the changes"), "{note}");
+        assert!(note.contains("Change summary"), "{note}");
+        assert!(note.contains("Verification focus"), "{note}");
+
+        // fast 模式指明 audit-fast 子代理。
+        let mut fast_messages = Vec::new();
+        inject_self_generated_audit_note(&mut fast_messages, true);
+        let fast_note = fast_messages[0].content.as_str().unwrap();
+        assert!(fast_note.contains("/audit -f (fast)"), "{fast_note}");
+        assert!(fast_note.contains("agent=\"audit-fast\""), "{fast_note}");
+        assert!(fast_messages[0].tool_calls.is_none());
+        assert!(fast_messages[0].tool_call_id.is_none());
     }
 
     #[test]

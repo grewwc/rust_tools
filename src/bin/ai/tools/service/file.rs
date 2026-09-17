@@ -244,6 +244,13 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
     }
 
     let raw_content = store.read_to_string().map_err(|e| e.to_string())?;
+    // Record this read in the session registry so `list_read_files` can recall the path
+    // later (e.g. after the user says a previously-read file was updated and the model
+    // must re-read the same path instead of re-locating it with find). Recorded only
+    // after the content read succeeds, so a failed read never claims a fresh
+    // "unchanged" status. Best-effort: a registry failure must never break the read.
+    // The image-redirect branch above returns no content and is deliberately not recorded.
+    let _ = crate::ai::tools::storage::read_registry::register(file_path, store.path());
     let content = if should_strip_rendered_line_number_layer(store.path()) {
         strip_rendered_line_number_layer(&raw_content)
     } else {
@@ -453,6 +460,12 @@ fn execute_read_file_windowed(
 ) -> Result<String, String> {
     let start_abs = offset.saturating_sub(1);
     let window = read_window_lines(store, offset, limit, char_offset)?;
+    // Same success-gated recording as the whole-file path (content was delivered),
+    // using the original spelling stored on the FileStore.
+    let _ = crate::ai::tools::storage::read_registry::register(
+        store.original().to_string_lossy().as_ref(),
+        store.path(),
+    );
 
     // Mirror the whole-file path for the abnormal cases (empty file / out-of-bounds offset). The
     // windowed reader only reports `total_lines = Some` when it scanned to end-of-file, so the

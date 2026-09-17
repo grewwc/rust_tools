@@ -931,13 +931,21 @@ pub(in crate::ai::driver) async fn run_turn(
         // `/audit` is a synchronous subagent call directly requested by the user. It must be handled
         // after the parent DRIVER_CTX is established but before the child agent enters a recursive
         // turn, so that the task's isolation and evidence lifecycle can be reused.
-        if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0 {
-            if let Some(command) =
-                crate::ai::driver::commands::audit::parse_audit_command(&question)
-            {
-                return Ok(execute_audit_command(app, command, should_quit));
-            }
-        }
+        // `/audit` / `/audit -f` without an instruction is NOT short-circuited: the audit scope
+        // is left to the lead agent, which must generate the audit content itself in a normal
+        // turn (the note is injected in run_turn_body). Subagents (depth > 0) never match.
+        let self_generated_audit =
+            if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0 {
+                match crate::ai::driver::commands::audit::parse_audit_command(&question) {
+                    Some(crate::ai::driver::commands::audit::AuditCommand::SelfGenerated {
+                        fast,
+                    }) => Some(fast),
+                    Some(command) => return Ok(execute_audit_command(app, command, should_quit)),
+                    None => None,
+                }
+            } else {
+                None
+            };
         // Inject (session_id, turn_id) into task-local storage so downstream tool calls and
         // feedback write paths see the correct identity. turn_id is allocated atomically by the
         // session SQLite and covers normal, resume, and internal turns; it never repeats across
@@ -990,6 +998,7 @@ pub(in crate::ai::driver) async fn run_turn(
                     next_model,
                     precomputed_ocr,
                     one_shot_mode,
+                    self_generated_audit,
                     should_quit,
                 )
                 .await
@@ -1011,11 +1020,10 @@ fn execute_audit_command(
     should_quit: bool,
 ) -> TurnOutcome {
     match command {
-        crate::ai::driver::commands::audit::AuditCommand::Usage => {
-            println!("Usage: /audit [--fast] <instruction>");
-            println!(
-                "  --fast  快速审计：当前会话模型 + high 思考 + 更少步数 + 更短超时，适合轻量复查"
-            );
+        // run_turn intercepts SelfGenerated before calling this function; keep the arm only for
+        // match exhaustiveness.
+        crate::ai::driver::commands::audit::AuditCommand::SelfGenerated { .. } => {
+            unreachable!("SelfGenerated is handled in run_turn, never reaches execute_audit_command")
         }
         crate::ai::driver::commands::audit::AuditCommand::Run { instruction, fast } => {
             // By default only cwd/skills are inherited, keeping unrelated parent conversation and
@@ -1117,6 +1125,7 @@ async fn run_turn_body(
     next_model: String,
     precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
     one_shot_mode: bool,
+    self_generated_audit: Option<bool>,
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
     // Clear the previous round's interrupt flag at the start of every round so it
@@ -1152,6 +1161,21 @@ async fn run_turn_body(
         Ok(prep) => prep,
         Err(err) => return Err(err),
     };
+
+    // `/audit` / `/audit -f` without an instruction: tell the lead agent to generate the audit
+    // content itself (only it knows the change details) and start the audit subagent via the
+    // `task` tool; the note is injected into the request projection only, not persisted history.
+    if let Some(fast) = self_generated_audit {
+        crate::ai::driver::commands::audit::inject_self_generated_audit_note(&mut messages, fast);
+        crate::ai::driver::print::print_tool_note_line(
+            "audit",
+            if fast {
+                "/audit -f 未带指令：审计内容由 lead agent 自生成"
+            } else {
+                "/audit 未带指令：审计内容由 lead agent 自生成"
+            },
+        );
+    }
 
     persist_pending_turn_messages(
         app,

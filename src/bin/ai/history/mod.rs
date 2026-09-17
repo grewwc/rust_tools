@@ -387,6 +387,10 @@ pub(in crate::ai) fn is_low_quality_session_title(title: &str) -> bool {
     sessions::is_low_quality_session_title(title)
 }
 
+pub(in crate::ai) fn strip_terminal_prompt_echo(text: &str) -> String {
+    sessions::strip_terminal_prompt_echo(text)
+}
+
 /// Read the derived context snapshot, retrying transient SQLite I/O failures
 /// (e.g. `SQLITE_IOERR_FSTAT` while a sibling sub-agent DB is first opening
 /// WAL) on the async caller's timeline. The underlying `open_history_db` is

@@ -1613,8 +1613,16 @@ pub(in crate::ai) fn generate_session_summary(first_prompt: &str) -> String {
         return "(空会话)".to_string();
     }
 
+    // The startup-resume selection prompt can be echoed into the first user
+    // message (see `strip_terminal_prompt_echo`); it is UI noise, not user
+    // intent, and must not leak into the fallback summary.
+    let text = strip_terminal_prompt_echo(text);
+    if text.is_empty() {
+        return "(空会话)".to_string();
+    }
+
     // Strip the agent prefix (e.g. "a ", "a:", "agent:", etc.)
-    let text = strip_agent_prefix(text);
+    let text = strip_agent_prefix(&text);
 
     // Handle merged multi-message input (separated by \n---\n)
     let messages: Vec<&str> = text.split("\n---\n").collect();
@@ -1828,6 +1836,46 @@ pub(in crate::ai) fn normalize_generated_session_title(title: &str) -> String {
     truncate_summary(without_request.trim(), 30)
 }
 
+/// Remove the startup-resume prompt echo (`[resume] 当前 terminal 有 N 个挂起
+/// session：…选择要恢复的 session […]`) from text that feeds title generation.
+///
+/// When a terminal resumes a suspended session, the selection prompt printed
+/// by `prompt_select_suspended_session` (driver/session.rs) can be captured
+/// into the first user message right after the real question. That block is UI
+/// echo, not user intent; without stripping, the title model summarizes the
+/// prompt itself (e.g. "单会话仍要确认") instead of the actual request, and
+/// fallback summaries show the prompt text verbatim. Everything from the first
+/// `[resume]` line up to (and including) the trailing "选择要恢复的 session"
+/// line is dropped; user text typed after the prompt on that same line is kept.
+pub(in crate::ai) fn strip_terminal_prompt_echo(text: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if !skipping && trimmed.starts_with("[resume]") {
+            skipping = true;
+        }
+        if skipping {
+            if trimmed.starts_with("选择要恢复的 session") {
+                // The block ends with the selection prompt; anything typed
+                // after it (same line or later) is real user content.
+                // The prompt's own closing bracket is the first `]` on the
+                // line; a later `]` could belong to user-typed text.
+                if let Some((_, tail)) = trimmed.split_once(']') {
+                    let tail = tail.trim_start_matches(':').trim();
+                    if !tail.is_empty() {
+                        kept.push(tail);
+                    }
+                }
+                skipping = false;
+            }
+            continue;
+        }
+        kept.push(line);
+    }
+    kept.join("\n").trim().to_string()
+}
+
 /// Returns whether the existing title looks like a raw user-request fragment;
 /// such old titles are allowed to be regenerated and overwritten by later turns.
 pub(in crate::ai) fn is_low_quality_session_title(title: &str) -> bool {
@@ -1967,6 +2015,7 @@ mod tests {
     use super::{
         SESSION_SIZE_CACHE_FILE, SessionStore, SessionTitleOrigin, generate_session_summary,
         is_low_quality_session_title, normalize_generated_session_title, strip_think_tags,
+        strip_terminal_prompt_echo,
     };
     use crate::ai::history::{Message, append_history_messages};
     use serde_json::Value;
@@ -2057,6 +2106,45 @@ mod tests {
         let fallback = normalize_generated_session_title(&generate_session_summary(notice));
 
         assert!(fallback.is_empty());
+    }
+
+    #[test]
+    fn terminal_resume_echo_is_stripped_from_title_sources() {
+        // The exact capture shape that produced the "单会话仍要确认" title: the
+        // user's real question followed by the echoed resume-selection prompt.
+        let noisy = "修复一个 \"/bg\" 相关的问题。为什么一个terminal，只挂了一个session，还要确认？\n\
+[resume] 当前 terminal 有 1 个挂起 session：\n\
+  1. 6ebee611-40ca-4c15-9361-81d2de4e8c62  persona=default  modified=2026-09-17 15:03  suspended=2026-09-17 15:03\n\
+     排查Agent的Markdown渲染错位bug\n\
+选择要恢复的 session [回车=恢复，n=新 session]: ";
+        assert_eq!(
+            strip_terminal_prompt_echo(noisy),
+            "修复一个 \"/bg\" 相关的问题。为什么一个terminal，只挂了一个session，还要确认？"
+        );
+        // The fallback summary keeps only the real request's first sentence.
+        assert_eq!(
+            generate_session_summary(noisy),
+            "修复一个 \"/bg\" 相关的问题"
+        );
+    }
+
+    #[test]
+    fn terminal_resume_echo_multi_entry_and_typed_tail() {
+        // Multi-entry prompt variant (no user text before it): everything is
+        // echo, nothing remains.
+        let multi = "[resume] 当前 terminal 有 2 个挂起 session：\n  1. aaa\n  2. bbb\n选择要恢复的 session [1-2，回车=1，n=新 session]: ";
+        assert_eq!(strip_terminal_prompt_echo(multi), "");
+
+        // User text typed after the selection prompt on the same line is real
+        // content and must survive the strip.
+        let typed = "帮我看看\n[resume] 当前 terminal 有 1 个挂起 session：\n  1. aaa\n选择要恢复的 session [回车=恢复，n=新 session]: 顺便修一下标题";
+        assert_eq!(
+            strip_terminal_prompt_echo(typed),
+            "帮我看看\n顺便修一下标题"
+        );
+
+        // Text without the echo passes through untouched.
+        assert_eq!(strip_terminal_prompt_echo("普通消息"), "普通消息");
     }
 
     #[test]

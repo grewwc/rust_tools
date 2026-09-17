@@ -64,12 +64,17 @@ fn should_yield_stdin(stop: &AtomicBool) -> bool {
 /// Bottom footer reserved via DECSTBM. All output stays on the main screen, avoiding
 /// alternate-screen hiding of the transcript; each composer redraw saves/restores the
 /// output cursor, so continuous model output is not affected.
-struct FooterReservation {
+pub(super) struct FooterReservation {
     cols: u16,
     rows: u16,
 }
 
 impl FooterReservation {
+    #[cfg(test)]
+    pub(super) fn for_test(cols: u16, rows: u16) -> Self {
+        Self { cols, rows }
+    }
+
     fn enter(stop: &AtomicBool) -> io::Result<Self> {
         if should_yield_stdin(stop) {
             return Err(io::Error::new(
@@ -104,19 +109,25 @@ impl FooterReservation {
                 "side-note stopped",
             ));
         }
-        // Unconditionally scroll the whole visible screen by two rows to explicitly
-        // create two blank lines: "last output row + footer". We cannot assume the
-        // physical last row has no stale content after the cursor; only by first
-        // scrolling it into scrollback can leave() be guaranteed to clean up only
-        // the blank lines this footer itself created.
+        self.apply_reservation_to(&mut out)?;
+        out.flush()
+    }
+
+    pub(super) fn apply_reservation_to(&self, out: &mut impl Write) -> io::Result<()> {
+        // IND followed by RI returns to the same output cell unless it was on the
+        // bottom row: there, IND scrolls the output up once and RI follows it. This
+        // leaves room for the footer without separating the output cursor from
+        // the live fold that rewrites relative to it. Jumping to the bottom first
+        // would strand that fold and leave old thinking headers behind.
+        // Save after this adjustment because DECSTBM itself homes the cursor.
+        // As with footer redraws, the stream's live regions reserve a right margin
+        // and must not leave the cursor in a pending-wrap state.
         write!(
             out,
-            "\x1b[{};1H\n\n\x1b[1;{}r\x1b[{};1H",
-            self.rows,
-            self.output_bottom(),
+            "\x1bD\x1bM\x1b7\x1b[1;{}r\x1b8",
             self.output_bottom()
         )?;
-        out.flush()
+        Ok(())
     }
 
     fn refresh(&mut self) -> io::Result<()> {
@@ -158,7 +169,7 @@ impl FooterReservation {
     /// sequence can be regression-tested without a TTY. The caller must hold the
     /// stdout lock for the whole write: the lock is shared with the stream renderer,
     /// and interleaving would split the save/draw/restore sequence into model text.
-    fn draw_to(&mut self, out: &mut impl io::Write, input: &[char]) -> io::Result<()> {
+    pub(super) fn draw_to(&mut self, out: &mut impl io::Write, input: &[char]) -> io::Result<()> {
         let (prefix, visible, caret) = composer_line_parts(input, self.cols as usize);
         // The stdout lock is shared with the stream renderer: the whole control
         // sequence cannot be interleaved into model text. Do not leave the real
@@ -196,8 +207,13 @@ impl FooterReservation {
     fn leave(&mut self) -> io::Result<()> {
         let stdout = io::stdout();
         let mut out = stdout.lock();
-        write!(out, "\x1b7\x1b[{};1H\x1b[2K\x1b[r\x1b8\x1b[0m", self.rows)?;
+        self.leave_to(&mut out)?;
         out.flush()
+    }
+
+    pub(super) fn leave_to(&self, out: &mut impl Write) -> io::Result<()> {
+        write!(out, "\x1b7\x1b[{};1H\x1b[2K\x1b[r\x1b8\x1b[0m", self.rows)?;
+        Ok(())
     }
 }
 

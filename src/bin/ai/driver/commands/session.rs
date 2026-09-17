@@ -722,6 +722,12 @@ pub fn try_handle_session_command(
                     eprintln!("[close] failed to delete session: {}", err);
                 }
             }
+            // The session is gone (or already was): drop any suspended bindings
+            // pointing at it so a later terminal key reuse cannot silently
+            // resurrect it. Match by session id only — bindings store either the
+            // base or the session history file depending on the writer, so a
+            // history-file filter would miss some of them. Best-effort.
+            let _ = SuspendedSessionStore::new().remove_for_session(&current_id, None);
             crate::ai::driver::signal::request_shutdown(app.shutdown.as_ref());
         }
         "bound" | "bindings" | "suspended" => {
@@ -753,6 +759,12 @@ pub fn try_handle_session_command(
                 // write again and rebuild derived history.
                 crate::ai::tools::task_tools::discard_tasks_for_session(id);
                 let deleted = store.delete_session(id)?;
+                // Drop suspended bindings pointing at the deleted session (in
+                // any terminal), whether or not the session record still existed:
+                // both cases leave dangling bindings behind. Session-id match
+                // only (the stored history file differs by binding writer).
+                // Best-effort.
+                let _ = SuspendedSessionStore::new().remove_for_session(id, None);
                 if deleted {
                     crate::ai::history::invalidate_context_history_cache_for(&deleted_path);
                     deleted_count += 1;
@@ -975,6 +987,11 @@ pub fn try_handle_session_command(
 
             let deleted = store.clear_all_sessions()?;
             crate::ai::history::clear_context_history_cache();
+            // Every session is gone, so every suspended binding dangles: drop
+            // them all so no terminal key silently resumes a deleted session.
+            if let Err(err) = SuspendedSessionStore::new().clear_all() {
+                eprintln!("[sessions clear-all] failed to clear suspended bindings: {}", err);
+            }
             let new_id = Uuid::new_v4().to_string();
             switch_app_to_session(app, &store, &new_id, false)?;
             println!("Deleted {deleted} session(s). Switched to new session: {new_id}");
@@ -1073,9 +1090,15 @@ pub fn try_handle_session_command(
                 }) {
                     Ok(PruneSessionDeleteResult::Deleted) => {
                         crate::ai::history::invalidate_context_history_cache_for(&deleted_path);
+                        let _ = SuspendedSessionStore::new()
+                            .remove_for_session(&session_id, None);
                         deleted_count += 1;
                     }
                     Ok(PruneSessionDeleteResult::Missing) => {
+                        // Session record already gone: its bindings are dangling,
+                        // so drop them too.
+                        let _ = SuspendedSessionStore::new()
+                            .remove_for_session(&session_id, None);
                         skipped_count += 1;
                         println!("[prune] skipped {}: session no longer exists", s.id);
                     }

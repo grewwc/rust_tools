@@ -257,7 +257,11 @@ where
         }
         Ok(entries) => {
             let previews = build_suspended_session_previews(entries, persona_store);
-            let selected_index = if previews.len() == 1 && !cli.resume {
+            // A lone suspended session is always auto-resumed, whatever the
+            // terminal key looks like: it is exactly the `/bg` resume flow for
+            // this window, and with a single candidate there is nothing to
+            // disambiguate. Prompting here would be pure friction.
+            let selected_index = if previews.len() == 1 {
                 Some(0)
             } else {
                 selector(&previews)?

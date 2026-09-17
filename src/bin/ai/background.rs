@@ -244,7 +244,18 @@ pub(super) fn cleanup_live_background_pid_file() {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take();
     if let Some(pid_path) = pid_path {
-        let _ = std::fs::remove_file(pid_path);
+        let _ = std::fs::remove_file(&pid_path);
+        // The live `/bg` handoff wrote a suspended-session binding keyed by the
+        // terminal; this process is the session's only runner, so its exit means
+        // the session is over. Drop the binding, otherwise a later terminal that
+        // reuses the same key would silently resume a finished session. On the
+        // handoff-failure path the binding was already rolled back, so this is a
+        // no-op there. (A SIGKILLed process skips this cleanup; the binding then
+        // remains, matching the pre-fix behavior.)
+        if let Some(session_id) = pid_path.file_stem().and_then(|s| s.to_str()) {
+            let _ = crate::ai::history::SuspendedSessionStore::new()
+                .remove_for_session(session_id, None);
+        }
     }
     // Also close the live-output FIFO and remove its inode, so a subsequent
     // `a` re-entry never attaches to a stale pipe after this process exits.
@@ -740,6 +751,10 @@ pub(super) fn stop_background(session_id: &str) -> Result<(), Box<dyn std::error
     let alive = unsafe { libc::kill(pid, 0) } == 0;
     if !alive {
         let _ = std::fs::remove_file(&pid_path);
+        // The session is gone; drop any suspended binding so a terminal key
+        // reuse cannot silently resume it.
+        let _ = crate::ai::history::SuspendedSessionStore::new()
+            .remove_for_session(session_id, None);
         return Err(format!(
             "进程 {pid}（session {session_id}）已经不在了（可能已完成），已清理 PID 文件"
         )
@@ -762,6 +777,10 @@ pub(super) fn stop_background(session_id: &str) -> Result<(), Box<dyn std::error
         eprintln!("       kill -9 {pid}");
     } else {
         let _ = std::fs::remove_file(&pid_path);
+        // Confirmed stopped: the session is over, so no suspended binding should
+        // remain either.
+        let _ = crate::ai::history::SuspendedSessionStore::new()
+            .remove_for_session(session_id, None);
         eprintln!("[stop] session {session_id} (PID {pid}) stopped.");
     }
     Ok(())

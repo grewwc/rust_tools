@@ -24,8 +24,12 @@ enum MathBlockDelimiter {
     /// A fenced code block tagged `latex` / `tex` / `math`. The fence open/close
     /// lines act as the delimiters; the content is buffered and rendered through
     /// the math pipeline on close, so formulas appear like `$$...$$` blocks
-    /// instead of a code box.
-    Fenced,
+    /// instead of a code box. Carries the opener's fence char and marker run so
+    /// the closer is validated by the same rule as regular code blocks.
+    Fenced {
+        fence_char: char,
+        fence_run: usize,
+    },
 }
 
 impl MathBlockDelimiter {
@@ -40,13 +44,50 @@ impl MathBlockDelimiter {
     fn closes(self, line: &str) -> bool {
         match (self, line) {
             (Self::Dollars, "$$") | (Self::Brackets, "\\]") => true,
-            (Self::Fenced, line) => {
-                let trimmed = line.trim();
-                trimmed.starts_with("```") || trimmed.starts_with("~~~")
+            (Self::Fenced { fence_char, fence_run }, line) => {
+                // Close only on a bare fence of the same char with a run at least
+                // as long as the opener: an inner fence line such as ` ```rust `
+                // inside a fenced latex dump is formula content, not a terminator.
+                // Same rule as the code-block state machine in `render_line_no_table`.
+                is_closing_fence_line(line, fence_char, fence_run)
             }
             _ => false,
         }
     }
+}
+
+/// Classifies a fence-candidate line (already leading-trimmed): returns the fence
+/// char, the homogeneous marker run length (>= 3), and the info-string remainder.
+/// Per CommonMark, the info string of a backtick fence must not contain a
+/// backtick, so a paragraph line like ````think`/```x` is plain text, not a
+/// fence; tilde fences may contain backticks in their info string.
+fn parse_fence_marker(trimmed: &str) -> Option<(char, usize, &str)> {
+    let fence_char = trimmed.chars().next()?;
+    if fence_char != '`' && fence_char != '~' {
+        return None;
+    }
+    let run = trimmed.chars().take_while(|c| *c == fence_char).count();
+    if run < 3 {
+        return None;
+    }
+    let info = &trimmed[run..];
+    if fence_char == '`' && info.contains('`') {
+        return None;
+    }
+    Some((fence_char, run, info))
+}
+
+/// True when `trimmed` closes the open block that was started with `fence_char`
+/// and an opening marker run of `open_len`. CommonMark closers are bare: the
+/// same fence char, a run at least as long as the opener, and only whitespace
+/// after. An info string (e.g. ` ```think ` inside an open block) marks content,
+/// not a boundary — otherwise a nested-fence dump closes the outer block early
+/// and the rest of the document leaks out of the box.
+fn is_closing_fence_line(trimmed: &str, fence_char: char, open_len: usize) -> bool {
+    matches!(
+        parse_fence_marker(trimmed),
+        Some((ch, run, info)) if ch == fence_char && run >= open_len && info.trim().is_empty()
+    )
 }
 
 /// Incrementally classified tail of `line_buf.trim_start()`, advanced per arriving
@@ -127,6 +168,12 @@ pub(in crate::ai) struct MarkdownStreamRenderer {
     show_line_gutter: bool,
     code_block_indent: String,
     code_block_lang: Option<String>,
+    /// Fence marker of the open block (char + opening run length); only
+    /// meaningful while `in_code_block`. A close requires a bare run of the same
+    /// char at least this long (CommonMark), so inner shorter or info-carrying
+    /// fence lines stay content instead of terminating the block.
+    code_block_fence_char: char,
+    code_block_fence_len: usize,
     code_line_number: usize,
     math_block_delimiter: Option<MathBlockDelimiter>,
     math_block_indent: String,
@@ -191,6 +238,8 @@ impl MarkdownStreamRenderer {
             in_code_block: false,
             code_block_indent: String::new(),
             code_block_lang: None,
+            code_block_fence_char: '`',
+            code_block_fence_len: 3,
             code_line_number: 0,
             math_block_delimiter: None,
             math_block_indent: String::new(),
@@ -1131,6 +1180,8 @@ impl MarkdownStreamRenderer {
             self.in_code_block = false;
             self.code_block_indent.clear();
             self.code_block_lang = None;
+            self.code_block_fence_char = '`';
+            self.code_block_fence_len = 3;
             self.code_line_number = 0;
 
             let label = if trimmed == THINKING_TAG_TEXT {
@@ -1141,15 +1192,34 @@ impl MarkdownStreamRenderer {
             return format!("{indent}{}{label}\x1b[0m\n", theme::current().accent_muted);
         }
 
-        // A math block may already be open (e.g. a fenced latex block); its closing
-        // fence line must reach the math-close path below, not re-enter the code
-        // fence state machine here.
-        if (trimmed.starts_with("```") || trimmed.starts_with("~~~"))
-            && self.math_block_delimiter.is_none()
-        {
+        // Fence boundaries follow CommonMark: inside an open block only a *bare*
+        // fence of the same char and at least the opening run length closes it,
+        // so an inner dump like ` ```think ` stays content instead of closing the
+        // block and spilling the rest of the document outside the box. A ```/~~~
+        // line that is not a valid fence (e.g. a backtick-fence info string that
+        // itself contains backticks) is ordinary text, never a boundary.
+        let fence_boundary = if self.math_block_delimiter.is_none() {
+            if self.in_code_block {
+                is_closing_fence_line(
+                    trimmed,
+                    self.code_block_fence_char,
+                    self.code_block_fence_len,
+                )
+            } else {
+                parse_fence_marker(trimmed).is_some()
+            }
+        } else {
+            // A math block may already be open (e.g. a fenced latex block); its
+            // closing fence line must reach the math-close path below, not
+            // re-enter the code fence state machine here.
+            false
+        };
+        if fence_boundary {
             if self.in_code_block {
                 self.in_code_block = false;
                 self.code_block_lang = None;
+                self.code_block_fence_char = '`';
+                self.code_block_fence_len = 3;
                 let block_indent = std::mem::take(&mut self.code_block_indent);
                 let border = "─".repeat(22);
                 return format!(
@@ -1158,11 +1228,14 @@ impl MarkdownStreamRenderer {
                     theme::current().code_dim
                 );
             } else {
+                let (fence_char, fence_len, _) = parse_fence_marker(trimmed)
+                    .expect("fence_boundary implies a valid fence marker");
                 let lang = parse_code_block_language(trimmed);
                 // `latex` / `tex` / `math` fences carry formulas: buffer the lines and
                 // render them through the math pipeline on close, exactly like `$$...$$`.
                 if matches!(lang.as_deref(), Some("latex" | "tex" | "math")) {
-                    self.math_block_delimiter = Some(MathBlockDelimiter::Fenced);
+                    self.math_block_delimiter =
+                        Some(MathBlockDelimiter::Fenced { fence_char, fence_run: fence_len });
                     self.math_block_indent = indent.to_string();
                     self.math_block_buf.clear();
                     return String::new();
@@ -1170,6 +1243,8 @@ impl MarkdownStreamRenderer {
                 self.in_code_block = true;
                 self.code_block_indent = indent.to_string();
                 self.code_block_lang = lang;
+                self.code_block_fence_char = fence_char;
+                self.code_block_fence_len = fence_len;
                 self.code_line_number = 0;
                 let lang = self.code_block_lang.as_deref().unwrap_or("code");
                 return format!(
@@ -2013,6 +2088,119 @@ mod tests {
         let end_visible = strip_ansi_for_test(&end);
         assert_eq!(start_visible, "○ thinking\n");
         assert_eq!(end_visible, "✓ thinking\n");
+    }
+
+    #[test]
+    fn inner_info_fence_is_content_not_closer() {
+        // Mirrors a model dump that nests fences: an outer ```text block wrapping
+        // inner ```think / ```dependency / ```python fences. CommonMark closers
+        // carry no info string, so inner fence lines stay content of the open
+        // block; only bare ``` lines are boundaries.
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        assert!(renderer.consume_line("```text", false).contains("╭─ text"));
+        let inner = renderer.consume_line("```think", false);
+        // Syntax highlighting injects ANSI codes inside the backtick run, so
+        // assert on behavior (no border, block still open) not on the literal.
+        assert!(!inner.contains("╰"), "inner info fence must not close: {inner}");
+        assert_eq!(renderer.code_block_lang(), Some("text"));
+        assert!(renderer.consume_line("```", false).contains("╰"));
+        assert_eq!(renderer.code_block_lang(), None);
+        // The next info-fence line opens its own block as usual.
+        assert!(renderer.consume_line("```python", false).contains("╭─ python"));
+    }
+
+    #[test]
+    fn backtick_fence_with_backticks_in_info_is_not_a_fence() {
+        // A paragraph line like ````think`/```dependency`/```python` (4-backtick
+        // run, backticks in the would-be info string) is not a fence per
+        // CommonMark: it must render as ordinary text and never open a code box
+        // that swallows the rest of the message.
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let out = renderer.consume_line("````think`/```dependency`/```python` 各 1 次", false);
+        assert!(!out.contains("╭─"), "must not open a code block: {out}");
+        assert_eq!(renderer.code_block_lang(), None);
+        // Following markdown keeps rendering as markdown (not code content).
+        let heading = renderer.consume_line("## 结论", false);
+        assert!(heading.contains("结论"), "heading must stay a heading: {heading}");
+        assert!(!heading.contains("╭─"), "heading must not enter a code box: {heading}");
+        assert_eq!(renderer.code_block_lang(), None);
+    }
+
+    #[test]
+    fn shorter_bare_fence_does_not_close_longer_fence() {
+        // ```` opens a run-4 fence; a bare ``` inside is content (CommonMark:
+        // the closer's run must be at least as long as the opener's).
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        assert!(renderer.consume_line("````text", false).contains("╭─ text"));
+        let inner = renderer.consume_line("```", false);
+        assert!(!inner.contains("╰"), "3-backtick run must not close: {inner}");
+        assert_eq!(renderer.code_block_lang(), Some("text"));
+        assert!(renderer.consume_line("````", false).contains("╰"));
+        assert_eq!(renderer.code_block_lang(), None);
+    }
+
+    #[test]
+    fn nested_fence_dump_keeps_content_inside_boxes() {
+        // Serializes against tests that mutate COLUMNS: a narrow width wraps the
+        // fixture lines and breaks the substring-position assertions below.
+        let _guard = env_guard();
+        // End-to-end shape of the misaligned replay: outer ```text wrapping
+        // inner fences, each with content, closed by bare fences. Content must
+        // stay between its block's ╭─ / ╰ borders instead of leaking outside.
+        let text = concat!(
+            "```text\n",
+            "```think\n",
+            "用户输入仅为问候\n",
+            "```\n",
+            "\n",
+            "```dependency\n",
+            "{}\n",
+            "```\n",
+            "\n",
+            "```python\n",
+            "return \"hi\"\n",
+            "```\n",
+        );
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let out = renderer.write_block_for_test(text, false).unwrap();
+        let text_open = out.find("╭─ text").expect("text block opens");
+        let para = out.find("用户输入仅为问候").expect("paragraph present");
+        let first_close = out.find("╰").expect("text block closes");
+        assert!(
+            text_open < para && para < first_close,
+            "paragraph must render inside the text box"
+        );
+        let dep_open = out.find("╭─ dependency").expect("dependency opens");
+        let brace = out.find("{}").expect("content present");
+        let dep_close = out[first_close + "╰".len()..]
+            .find("╰")
+            .map(|i| i + first_close + 1)
+            .expect("dependency closes");
+        assert!(dep_open < brace && brace < dep_close);
+        let py_open = out.find("╭─ python").expect("python opens");
+        // Keyword coloring may split `return "hi"` with ANSI codes; the token
+        // itself stays contiguous.
+        let ret = out.find("return").expect("return present");
+        let last_close = out.rfind("╰").expect("python closes");
+        assert!(py_open < ret && ret < last_close);
+        assert_eq!(renderer.code_block_lang(), None);
+    }
+
+    #[test]
+    fn unclosed_fence_swallows_rest_like_commonmark() {
+        // A stray ``` that opens a block with no closer keeps everything after
+        // it as code content — the same behavior as CommonMark renderers (e.g.
+        // GitHub). The real fix for such source is the author's; the renderer
+        // stays spec-faithful.
+        let text = "done\n\n```\nstill code\n";
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let out = renderer.write_block_for_test(text, false).unwrap();
+        let open = out.find("╭─ code").expect("stray fence opens");
+        let body = out.find("still").expect("tail present");
+        assert!(open < body);
+        assert!(!out.contains("╰"), "no closer follows: {out}");
+        // A bare ``` stores lang None; the "code" label is display-only, and the
+        // open-marker/no-border ordering above already proves the block is open.
     }
 
     #[test]
@@ -3042,6 +3230,27 @@ make_llm_call_publisher | 一致 | 同一条 on_call complete callback
         assert!(!visible.contains('╭'), "got: {visible}");
         assert!(!visible.contains("\\frac"), "got: {visible}");
         assert!(visible.contains("(-b ± √(b² - 4ac))/2a"), "got: {visible}");
+    }
+
+    #[test]
+    fn latex_fence_closes_only_on_matching_bare_fence() {
+        // The math fenced path shares the code-block closer rule: a bare fence
+        // of the wrong char or a shorter run is formula content, and only a
+        // bare fence matching the opener (same char, run >= opener run)
+        // terminates the block. Regression: any bare fence used to close it,
+        // leaking the remaining lines out as markdown (and opening a bogus
+        // code box from the trailing longer fence).
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
+        let mut output = renderer
+            .write_block_for_test("````latex\n\\frac{1}{2}\n```\n~~~\n````\n", false)
+            .unwrap();
+        output.push_str(&renderer.flush_pending_for_test().unwrap());
+
+        let visible = crate::ai::stream::extract::strip_ansi_codes(&output);
+        assert!(visible.contains("1/2"), "got: {visible}");
+        // Neither inner fence line terminated the block, so no code box opens.
+        assert!(!visible.contains('╭'), "got: {visible}");
+        assert!(!visible.contains('╰'), "got: {visible}");
     }
 
     #[test]

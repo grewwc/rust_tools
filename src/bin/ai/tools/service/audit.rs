@@ -7,6 +7,7 @@
 /// - Easy to test and evolve the safety policy independently, decoupled from
 ///   execution logic.
 use crate::ai::config_schema::AiConfig;
+use crate::ai::tools::storage::file_store::path_within_allowed_roots;
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -2076,6 +2077,29 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         }
     }
 
+    // Global-search scope confinement: `find` / `grep -r` / `locate` and
+    // absolute glob patterns must stay inside the allowed search roots
+    // (effective cwd, or `ai.sandbox.allowed_roots` when configured). Without
+    // this, a bare-name hunt like `find /Users/bytedance -name request.txt`
+    // can hit several unrelated directories that each contain a same-named
+    // file, and the agent picks the wrong (e.g. stale) copy. See the section
+    // before `validate_find_scope` for the full rationale.
+    {
+        let base_dir = crate::ai::driver::runtime_ctx::effective_cwd()
+            .map_err(|err| format!("failed to resolve current directory: {err}"))?;
+        let base_dir = normalize_path(&base_dir);
+        validate_glob_scope(program, raw_command_tokens, &base_dir)?;
+        if program == "find" {
+            validate_find_scope(command_tokens, raw_command_tokens, &base_dir)?;
+        }
+        if matches!(program, "grep" | "egrep" | "fgrep" | "rg" | "ag" | "ack") {
+            validate_grep_scope(program, command_tokens, raw_command_tokens, &base_dir)?;
+        }
+        if program == "locate" {
+            validate_locate_scope(raw_command_tokens, &base_dir)?;
+        }
+    }
+
     // Common wrappers treat later tokens as the program that will actually run;
     // check only "the program name that will be executed", avoiding misjudging
     // ordinary content arguments (like the `rm` inside `printf '%s' rm`) as
@@ -2171,6 +2195,336 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+// =========================================================================
+// Search-scope confinement
+// =========================================================================
+//
+// Why this exists: an agent searching for a *relative* file name (e.g. the
+// user said "the request is in request.txt") can escalate to a whole-disk hunt
+// (`find /Users/bytedance -name request.txt`) and then pick the wrong copy
+// when several directories contain a same-named file (a real incident: a stale
+// `self-dev/test_llm/request.txt` was picked over the workspace copy). The
+// checks below keep name searches inside the allowed roots:
+//
+// - `find`: every search root must lie inside the allowed roots; a bare
+//   relative `-name` / `-path` target (no glob metacharacters) must exist as a
+//   direct child of one of the search roots, otherwise the search would roam
+//   unrelated directories.
+// - `grep -r` / `rg` / `ag` / `ack`: recursive search paths must lie inside
+//   the allowed roots. Non-recursive `grep file` single-file reads are not
+//   affected.
+// - `locate`: a whole-disk name index; bare names must exist in the cwd, and
+//   pattern searches are rejected outright.
+// - glob patterns (`/Users/*/request.txt`): the literal path prefix before the
+//   first metacharacter must lie inside the allowed roots. Bare relative globs
+//   (`*.rs`, `src/*.rs`) can only match inside the cwd and stay allowed.
+//
+// The allowed roots are the same as for file writes
+// (`file_store::path_within_allowed_roots`): `ai.sandbox.allowed_roots` when
+// configured, else `effective_cwd()`, always plus the session temp dir, the
+// skills dir and the rust_tools config dir. Like the rest of this module this
+// is static best-effort: shell variable expansion inside paths is not tracked.
+
+/// True when `arg` contains a glob / brace-expansion metacharacter.
+fn has_glob_metachar(arg: &str) -> bool {
+    arg.contains(['*', '?', '[', '{', '}'])
+}
+
+/// Strip one matching layer of single/double quotes from a shell token.
+fn strip_quotes(token: &str) -> &str {
+    let bytes = token.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
+            || (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"'))
+    {
+        &token[1..token.len() - 1]
+    } else {
+        token
+    }
+}
+
+/// Resolve a path argument to an absolute, lexically normalized path: expands
+/// `~` / `$HOME`, joins relative paths against `base_dir`.
+fn resolve_path_arg(arg: &str, base_dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let expanded = expand_tilde_and_home(arg)?;
+    let path = std::path::Path::new(&expanded);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    };
+    Ok(normalize_path(&resolved))
+}
+
+/// Reject glob patterns whose literal prefix escapes the allowed search roots.
+fn validate_glob_scope(
+    program: &str,
+    raw_command_tokens: &[String],
+    base_dir: &std::path::Path,
+) -> Result<(), String> {
+    // For the grep family, option values (`--include '*.h'`, `--glob '*.rs'`)
+    // are filter patterns, not search paths; skip them so they are not
+    // misread as path globs.
+    let value_options = if matches!(program, "grep" | "egrep" | "fgrep" | "rg" | "ag" | "ack") {
+        Some(grep_value_options(program))
+    } else {
+        None
+    };
+    let mut i = 1usize;
+    while i < raw_command_tokens.len() {
+        let raw = &raw_command_tokens[i];
+        if raw.starts_with('-') {
+            if let Some(opts) = value_options {
+                if opts.contains(&raw.as_str()) {
+                    i += 2; // skip the option and its value
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        // Quoted tokens are not globs (quotes make the shell treat the token
+        // as a literal file name).
+        if raw.starts_with('\'') || raw.starts_with('"') {
+            i += 1;
+            continue;
+        }
+        let Some(meta_idx) = raw.find(['*', '?', '[', '{', '}']) else {
+            i += 1;
+            continue;
+        };
+        // A glob with an empty literal prefix (`*.txt`, `**/*.rs`) can only
+        // match inside the current directory (recursively for `**`).
+        if meta_idx == 0 {
+            i += 1;
+            continue;
+        }
+        let prefix = &raw[..meta_idx];
+        let resolved = resolve_path_arg(prefix, base_dir)?;
+        if !path_within_allowed_roots(&resolved) {
+            return Err(format!(
+                "glob pattern '{raw}' would expand outside the current directory; \
+                 use explicit paths inside the current directory (or add the directory \
+                 to ai.sandbox.allowed_roots)"
+            ));
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Confine `find` search roots to the allowed roots and reject bare-name
+/// searches that cannot resolve under those roots.
+fn validate_find_scope(
+    command_tokens: &[String],
+    raw_command_tokens: &[String],
+    base_dir: &std::path::Path,
+) -> Result<(), String> {
+    // Search roots are the leading positional arguments before the first
+    // expression token (`-flag`, `(`, `)`, `!`); with no roots `find` searches
+    // `.` (the current directory).
+    let mut root_args: Vec<&str> = Vec::new();
+    for raw in raw_command_tokens.iter().skip(1) {
+        if raw.starts_with('-') || matches!(raw.as_str(), "(" | ")" | "!") {
+            break;
+        }
+        root_args.push(raw);
+    }
+    let root_args: Vec<&str> = if root_args.is_empty() {
+        vec!["."]
+    } else {
+        root_args
+    };
+
+    let mut resolved_roots = Vec::with_capacity(root_args.len());
+    for raw_root in &root_args {
+        // Strip quotes before resolving: the shell removes them at execution
+        // time, so `find '..'` really searches the parent directory. Leaving
+        // them on would make the quoted string lexically land under base_dir
+        // and pass the confinement check while the real search escapes it.
+        let resolved = resolve_path_arg(strip_quotes(raw_root), base_dir)?;
+        if !path_within_allowed_roots(&resolved) {
+            return Err(format!(
+                "find search root '{raw_root}' is outside the current directory; \
+                 only search inside the current directory (or add the root to \
+                 ai.sandbox.allowed_roots)"
+            ));
+        }
+        resolved_roots.push(resolved);
+    }
+
+    // A bare relative target (`-name request.txt`, `-path ./sub/request.txt`,
+    // no glob metacharacters) must exist as a direct child of one of the search
+    // roots. When it does not, the search would roam unrelated directories that
+    // happen to contain a same-named file, and the agent can pick the wrong
+    // (e.g. stale) copy.
+    let mut i = 1usize;
+    while i < command_tokens.len() {
+        let tok = command_tokens[i].as_str();
+        if matches!(tok, "-name" | "-iname" | "-path" | "-ipath" | "-wholename") {
+            if let Some(pattern) = raw_command_tokens.get(i + 1) {
+                let pattern = strip_quotes(pattern);
+                if !pattern.is_empty()
+                    && !has_glob_metachar(pattern)
+                    // A pattern starting with `-` is find's own option-looking
+                    // argument (e.g. `-name "-delete"`), not a user file name;
+                    // the existence check would falsely reject it.
+                    && !pattern.starts_with('-')
+                    && !std::path::Path::new(pattern).is_absolute()
+                {
+                    let exists = resolved_roots
+                        .iter()
+                        .any(|root| normalize_path(&root.join(pattern)).exists());
+                    if !exists {
+                        return Err(format!(
+                            "find searched for relative name '{pattern}', which does not exist \
+                             under the current directory; a bare-name search across unrelated \
+                             directories can pick a wrong (e.g. stale) copy of the file — use a \
+                             more specific search root (`find <subdir> -name ...`), an absolute \
+                             path, or ask the user where the file is"
+                        ));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Options of `grep` / `rg` / `ag` / `ack` whose next token is a value, not a
+/// path. Attached forms (`--include=*.rs`, `-C3`) are single tokens and need
+/// no value skip.
+fn grep_value_options(program: &str) -> &'static [&'static str] {
+    if matches!(program, "rg" | "ag" | "ack") {
+        // Note `rg -r` is `--replace` (takes a value), unlike `grep -r`.
+        &[
+            "-e", "--regexp", "-f", "--file", "-g", "--glob", "--iglob", "--match", "-t",
+            "--type", "-T", "--type-not", "-r", "--replace",
+        ]
+    } else {
+        &[
+            "-e", "--regexp", "-f", "--file", "--include", "--exclude", "--exclude-from",
+            "--include-dir", "--exclude-dir", "-d", "--directories", "-A", "--after-context",
+            "-B", "--before-context", "-C", "--context", "-m", "--max-count", "--label",
+        ]
+    }
+}
+
+/// Confine recursive search paths (`grep -r`, `rg`, `ag`, `ack`) to the
+/// allowed roots. Non-recursive `grep file` single-file reads stay unrestricted.
+fn validate_grep_scope(
+    program: &str,
+    command_tokens: &[String],
+    raw_command_tokens: &[String],
+    base_dir: &std::path::Path,
+) -> Result<(), String> {
+    let always_recursive = matches!(program, "rg" | "ag" | "ack");
+    let value_options = grep_value_options(program);
+    let mut recursive = always_recursive;
+    let mut pattern_from_option = false;
+    let mut end_of_options = false;
+    let mut positional: Vec<&str> = Vec::new();
+    let mut i = 1usize;
+    while i < command_tokens.len() {
+        let tok = command_tokens[i].as_str();
+        if !end_of_options && tok.starts_with('-') && tok != "-" {
+            if tok == "--" {
+                end_of_options = true;
+                i += 1;
+                continue;
+            }
+            // Recursion flags: `-r` / `-R` / `--recursive`, including clusters
+            // like `-rn`. Long options other than `--recursive` are excluded by
+            // the `!starts_with("--")` guard.
+            if tok == "--recursive"
+                || (tok.starts_with('-') && !tok.starts_with("--") && tok.contains('r'))
+            {
+                recursive = true;
+            }
+            if matches!(tok, "-e" | "--regexp" | "-f" | "--file")
+                // Pattern-less modes: `rg --files` lists paths only, and
+                // `ag`/`ack` `-g`/`--match` filter file names, so with these
+                // every positional argument is a search path, not a pattern.
+                || tok == "--files"
+                || (matches!(tok, "-g" | "--match") && matches!(program, "ag" | "ack"))
+            {
+                pattern_from_option = true;
+            }
+            if value_options.contains(&tok) {
+                i += 2; // skip the option and its value
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        positional.push(strip_quotes(&raw_command_tokens[i]));
+        i += 1;
+    }
+    if !recursive {
+        return Ok(());
+    }
+    // Without `-e` / `-f` the first positional is the pattern, not a path.
+    let path_args = if pattern_from_option {
+        &positional[..]
+    } else {
+        positional.get(1..).unwrap_or(&[])
+    };
+    for raw_path in path_args {
+        // Relative paths without `..` cannot escape the cwd; metacharacter
+        // paths are handled by `validate_glob_scope`.
+        if raw_path.is_empty() || has_glob_metachar(raw_path) {
+            continue;
+        }
+        let path = std::path::Path::new(raw_path);
+        if path.is_relative() && !raw_path.split('/').any(|c| c == "..") {
+            continue;
+        }
+        let resolved = resolve_path_arg(raw_path, base_dir)?;
+        if !path_within_allowed_roots(&resolved) {
+            return Err(format!(
+                "`{program}` search path '{raw_path}' is outside the current directory; \
+                 only search inside the current directory (or add the root to \
+                 ai.sandbox.allowed_roots)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `locate` searches a whole-disk name index; reject it unless the bare name
+/// already exists in the current directory (in which case `find` would work
+/// too and needs no index).
+fn validate_locate_scope(
+    raw_command_tokens: &[String],
+    base_dir: &std::path::Path,
+) -> Result<(), String> {
+    let Some(raw) = raw_command_tokens
+        .iter()
+        .skip(1)
+        .find(|t| !t.starts_with('-'))
+    else {
+        return Ok(());
+    };
+    let pattern = strip_quotes(raw);
+    if pattern.is_empty() || std::path::Path::new(pattern).is_absolute() {
+        return Ok(());
+    }
+    if has_glob_metachar(pattern) {
+        return Err(format!(
+            "locate pattern '{pattern}' is a whole-disk search; use `find` inside the \
+             current directory, or ask the user for the absolute path"
+        ));
+    }
+    if !base_dir.join(pattern).exists() {
+        return Err(format!(
+            "locate searched for relative name '{pattern}', which does not exist under the \
+             current directory; ask the user for the absolute path instead"
+        ));
+    }
     Ok(())
 }
 
@@ -2816,5 +3170,170 @@ mod tests {
         assert!(validate("timeout 10 bash -c 'rm -rf /'").is_err());
         assert!(validate("env perl -e 'system(\"rm -rf /\")'").is_err());
         assert!(validate("env env bash -c 'rm -rf /'").is_err());
+    }
+}
+
+#[cfg(test)]
+mod search_scope_tests {
+    use super::*;
+
+    fn blocked(command: &str) -> String {
+        validate_execute_command(command).unwrap_err()
+    }
+
+    fn allowed(command: &str) {
+        validate_execute_command(command).unwrap();
+    }
+
+    // ---- find ----
+
+    #[test]
+    fn find_absolute_root_outside_cwd_is_blocked() {
+        let err = blocked("find / -maxdepth 2 -name request.txt");
+        assert!(err.contains("outside the current directory"), "got: {err}");
+    }
+
+    #[test]
+    fn find_parent_relative_root_is_blocked() {
+        let err = blocked("find .. -name request.txt");
+        assert!(err.contains("outside the current directory"), "got: {err}");
+    }
+
+    #[test]
+    fn find_bare_name_not_under_cwd_is_blocked() {
+        let err = blocked("find . -maxdepth 4 -name request.txt");
+        assert!(err.contains("relative name 'request.txt'"), "got: {err}");
+        assert!(err.contains("ask the user"), "got: {err}");
+    }
+
+    #[test]
+    fn find_relative_target_inside_cwd_is_allowed() {
+        // Cargo.toml is a direct child of the crate root (test cwd).
+        allowed("find . -maxdepth 2 -name Cargo.toml");
+    }
+
+    #[test]
+    fn find_glob_patterns_are_allowed() {
+        allowed("find . -name '*.rs' -o -name '*.toml'");
+        allowed("find src -maxdepth 3 -iname '*.json'");
+    }
+
+    #[test]
+    fn incident_shape_global_name_hunt_is_blocked() {
+        // The test_llm vs. AeolusLLM request.txt incident: a whole-disk
+        // bare-name hunt (absolute root outside the cwd, piped to head) must
+        // be rejected before it can pick the wrong duplicate.
+        let err = blocked(
+            "find /Users/bytedance -maxdepth 4 -name request.txt -o -maxdepth 4 \
+             -name response.txt 2>/dev/null | head -20",
+        );
+        assert!(err.contains("outside the current directory"), "got: {err}");
+    }
+
+    // ---- glob ----
+
+    #[test]
+    fn absolute_glob_outside_cwd_is_blocked() {
+        let err = blocked("cat /Users/*/request.txt");
+        assert!(err.contains("glob pattern '/Users/*/request.txt'"), "got: {err}");
+        let err = blocked("ls /usr/*");
+        assert!(err.contains("outside the current directory"), "got: {err}");
+    }
+
+    #[test]
+    fn parent_escaping_glob_is_blocked() {
+        let err = blocked("cat ../*.rs");
+        assert!(err.contains("outside the current directory"), "got: {err}");
+    }
+
+    #[test]
+    fn relative_globs_are_allowed() {
+        allowed("ls *.rs");
+        allowed("echo src/*.rs");
+        allowed("ls **/*.rs");
+        allowed("cat '*.txt'");
+    }
+
+    // ---- grep / rg ----
+
+    #[test]
+    fn grep_recursive_search_outside_cwd_is_blocked() {
+        let err = blocked("grep -rn pattern /etc");
+        assert!(err.contains("search path '/etc'"), "got: {err}");
+        let err = blocked("grep -r pattern ..");
+        assert!(err.contains("outside the current directory"), "got: {err}");
+        let err = blocked("rg pattern /Users/bytedance");
+        assert!(err.contains("outside the current directory"), "got: {err}");
+    }
+
+    #[test]
+    fn grep_within_cwd_is_allowed() {
+        allowed("grep -rn pattern .");
+        allowed("grep -rn pattern src");
+        allowed("grep -rn --include='*.rs' pattern src");
+        allowed("grep -e foo -e bar src");
+        // Non-recursive single-file reads stay unrestricted.
+        allowed("grep -n pattern /etc/hosts");
+    }
+
+    // ---- locate ----
+
+    #[test]
+    fn locate_global_search_is_blocked() {
+        let err = blocked("locate request.txt");
+        assert!(err.contains("ask the user"), "got: {err}");
+        let err = blocked("locate '*.log'");
+        assert!(err.contains("whole-disk"), "got: {err}");
+    }
+
+    // ---- helpers ----
+
+    #[test]
+    fn strip_quotes_handles_matching_pairs() {
+        assert_eq!(strip_quotes("'abc'"), "abc");
+        assert_eq!(strip_quotes("\"abc\""), "abc");
+        assert_eq!(strip_quotes("abc"), "abc");
+        assert_eq!(strip_quotes("'abc"), "'abc");
+    }
+
+    #[test]
+    fn glob_metachar_detection() {
+        assert!(has_glob_metachar("a*b"));
+        assert!(has_glob_metachar("a?b"));
+        assert!(has_glob_metachar("a[b]"));
+        assert!(has_glob_metachar("{a,b}"));
+        assert!(!has_glob_metachar("request.txt"));
+    }
+
+    #[test]
+    fn find_quoted_parent_root_is_blocked() {
+        // The shell strips quotes before `find` runs, so `find '..'` really
+        // searches the parent directory; the confinement check must apply to
+        // the unquoted path, not the quoted string.
+        let err = blocked("find '..' -name request.txt");
+        assert!(err.contains("outside the current directory"), "got: {err}");
+        let err = blocked("find \"..\" -maxdepth 2 -name request.txt");
+        assert!(err.contains("outside the current directory"), "got: {err}");
+        let err = blocked("find './../..' -name request.txt");
+        assert!(err.contains("outside the current directory"), "got: {err}");
+    }
+
+    #[test]
+    fn rg_files_and_ag_glob_have_no_pattern_positional() {
+        // `rg --files` / `ag -g GLOB` list file paths without a pattern, so
+        // every positional is a search path and must be confined.
+        let err = blocked("rg --files /Users/bytedance");
+        assert!(err.contains("outside the current directory"), "got: {err}");
+        let err = blocked("ag -g '*.rs' /Users/bytedance");
+        assert!(err.contains("outside the current directory"), "got: {err}");
+        allowed("rg --files src");
+    }
+
+    #[test]
+    fn filter_glob_option_values_are_not_path_globs() {
+        // `--glob` / `--include` values are filter patterns, not search
+        // paths; they must not be rejected as escaping globs.
+        allowed("rg --glob /etc/*.conf pattern src");
+        allowed("grep -rn --include /usr/*.h pattern src");
     }
 }

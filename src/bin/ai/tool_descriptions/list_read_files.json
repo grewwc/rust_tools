@@ -1,0 +1,17 @@
+{
+  "name": "list_read_files",
+  "description": "List the files read via read_file in this session (deduped, most recent first). Each entry shows the path relative to the working directory, the absolute path, the last-read time, and a status: 'unchanged', 'changed' (file mtime is newer than the last read), or 'missing'. Use it to recall paths you read earlier - e.g. when the user says a previously-read file was updated and you must re-read the same path - instead of re-locating files with find/execute_command. Prefer re-reading a known path over re-searching.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Optional substring filter on the file path (relative or absolute); only matching entries are listed."
+      }
+    }
+  },
+  "groups": [
+    "builtin",
+    "core"
+  ]
+}

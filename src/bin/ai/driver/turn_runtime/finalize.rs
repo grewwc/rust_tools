@@ -344,7 +344,11 @@ fn has_session_title_source(messages: &[Message]) -> bool {
             // (AGENTS.md invariant 12) and must not seed the title; otherwise multi-subagent sessions
             // like agent-team would treat the handoff content as user intent and pollute title generation.
             && !is_runtime_synthetic_user_message(message)
-            && !value_to_string(&message.content).trim().is_empty()
+            // A user message that only captured the terminal's resume-selection
+            // prompt echo (no real intent) must not seed title generation.
+            && !crate::ai::history::strip_terminal_prompt_echo(&value_to_string(&message.content))
+                .trim()
+                .is_empty()
     })
 }
 

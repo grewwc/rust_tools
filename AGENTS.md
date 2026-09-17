@@ -72,7 +72,7 @@ Prefer an existing focused test before running one.
 4. **Config keys**: add only in `src/bin/ai/config_schema.rs`.
 5. **Tests**: keep close to changed module; serial tests use `test_support::ENV_LOCK`.
 6. **Extensibility**: data-driven/registration-based over hardcoded `if`/`else`.
-7. **AGENTS.md maintenance**: after code changes, revise/delete stale rules nearby — don't just append. Contradictory stale rules are worse than missing ones.
+7. **AGENTS.md maintenance**: after code changes, update AGENTS.md only when a nearby rule is superseded; replace or delete the affected rule in place — never just append a new bullet. Instruction files are injected into every system prompt, so they must stay concise: fold sections that keep growing and drop rules that contradict the new code (a stale rule is worse than no rule). This policy is repo-local — it lives here, not in the runtime — so keep this rule intact and enforce it when editing AGENTS.md files.
 8. **Git safety**: never `stash`/`stash drop` others' uncommitted changes. Use temp branch/worktree or stash only your own.
 9. **Architecture-first**: many fallbacks = wrong data flow — refactor the happy path instead.
 

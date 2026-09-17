@@ -2225,22 +2225,24 @@ fn thinking_fold_erase_rows_follow_current_terminal_reflow_of_previous_body() {
 
 #[test]
 fn thinking_fold_terminal_grid_refresh_does_not_accumulate_headers() {
-    // Only the renderer's emitted subset is accepted: SGR, CRLF, CUU/CUD,
-    // and EL(2). This fixed-height grid includes delayed wrap and scrollback.
+    // Accept only the fold/footer control sequences, including scroll margins,
+    // saved cursors and IND/RI. Scrollback counts towards the orphan check.
     struct Grid {
         cols: usize,
         cells: Vec<Vec<char>>,
         history: Vec<Vec<char>>,
         row: usize,
         col: usize,
+        bottom: usize,
+        saved: (usize, usize),
     }
     impl Grid {
         fn newline(&mut self) {
-            if self.row + 1 == self.cells.len() {
+            if self.row == self.bottom {
                 self.history.push(self.cells.remove(0));
-                self.cells.push(vec![' '; self.cols]);
+                self.cells.insert(self.bottom, vec![' '; self.cols]);
             } else {
-                self.row += 1;
+                self.row = (self.row + 1).min(self.cells.len() - 1);
             }
         }
         fn feed(&mut self, text: &str) {
@@ -2249,8 +2251,31 @@ fn thinking_fold_terminal_grid_refresh_does_not_accumulate_headers() {
                 match ch {
                     '\r' => self.col = 0,
                     '\n' => self.newline(),
+                    '\t' => self.col = ((self.col / 8 + 1) * 8).min(self.cols - 1),
                     '\x1b' => {
-                        assert_eq!(chars.next(), Some('['));
+                        match chars.next().expect("complete escape") {
+                            '7' => {
+                                self.saved = (self.row, self.col.min(self.cols - 1));
+                                continue;
+                            }
+                            '8' => {
+                                (self.row, self.col) = self.saved;
+                                continue;
+                            }
+                            'D' => {
+                                self.col = self.col.min(self.cols - 1);
+                                self.newline();
+                                continue;
+                            }
+                            'M' => {
+                                assert!(self.row > 0, "footer RI must follow IND");
+                                self.row -= 1;
+                                self.col = self.col.min(self.cols - 1);
+                                continue;
+                            }
+                            '[' => {}
+                            c => panic!("unsupported escape {c}"),
+                        }
                         let mut args = String::new();
                         let command = loop {
                             let c = chars.next().expect("complete CSI");
@@ -2261,6 +2286,24 @@ fn thinking_fold_terminal_grid_refresh_does_not_accumulate_headers() {
                         };
                         match command {
                             'm' => {}
+                            'h' | 'l' => assert_eq!(args, "?25"),
+                            'H' => {
+                                let (row, col) = args.split_once(';').expect("CUP coordinates");
+                                self.row = row.parse::<usize>().unwrap() - 1;
+                                self.col = col.parse::<usize>().unwrap() - 1;
+                            }
+                            'r' => {
+                                self.bottom = if args.is_empty() {
+                                    self.cells.len() - 1
+                                } else {
+                                    let (top, bottom) = args.split_once(';').unwrap();
+                                    assert_eq!(top, "1");
+                                    bottom.parse::<usize>().unwrap() - 1
+                                };
+                                assert!(self.bottom > 0);
+                                self.row = 0;
+                                self.col = 0;
+                            }
                             'A' => {
                                 let n = args.parse::<usize>().unwrap_or(1).max(1);
                                 self.row = self.row.saturating_sub(n);
@@ -2282,7 +2325,7 @@ fn thinking_fold_terminal_grid_refresh_does_not_accumulate_headers() {
                     _ => {
                         // Test fixtures use only single-cell glyphs; fail rather
                         // than silently pretending to support other Unicode.
-                        assert!(ch.is_ascii_graphic() || matches!(ch, ' ' | '○' | '✓' | '·' | '…'));
+                        assert!(ch.is_ascii_graphic() || matches!(ch, ' ' | '○' | '✓' | '·' | '…' | '▌'));
                         if self.col == self.cols {
                             self.col = 0;
                             self.newline();
@@ -2324,30 +2367,50 @@ fn thinking_fold_terminal_grid_refresh_does_not_accumulate_headers() {
         unsafe {
             std::env::set_var("COLUMNS", cols.to_string());
         }
-        for bottom in [false, true] {
-            for add_body in [false, true] {
+        for start_row in [0, 5, 10] {
+            for body in ["", "body", "body\tone\ttwo\tthree\tfour\tfive"] {
+              for with_footer in [false, true] {
                 let mut grid = Grid {
                     cols,
                     cells: vec![vec![' '; cols]; 12],
                     history: Vec::new(),
-                    row: if bottom { 10 } else { 0 },
+                    row: start_row,
                     col: 0,
+                    bottom: 11,
+                    saved: (0, 0),
                 };
+                let mut footer = super::super::side_note_input::FooterReservation::for_test(cols as u16, 12);
+                let draft: Vec<char> = "keep-draft".chars().collect();
                 grid.feed("transcript\r\n");
                 let mut fold = super::super::state::ThinkingFoldState::new();
                 fold.active = true;
                 fold.max_visible_lines = 2;
+                fold.rewrite_right_margin_cols = FOLD_REWRITE_RIGHT_MARGIN_COLS;
                 let mut counts = Vec::new();
                 for (frame, rate) in rates.iter().enumerate() {
-                    if add_body && frame == 2 {
-                        append_fold_content(&mut fold, "body");
+                    if frame == 2 {
+                        append_fold_content(&mut fold, body);
                     }
                     let mut bytes = Vec::new();
                     thinking_fold_redraw_to(&mut bytes, Some(rate), &mut fold).unwrap();
                     grid.feed(&String::from_utf8(bytes).unwrap());
+                    if with_footer && frame >= 3 {
+                        let cursor = (grid.row, grid.col);
+                        let mut bytes = Vec::new();
+                        if frame == 3 {
+                            footer.apply_reservation_to(&mut bytes).unwrap();
+                        }
+                        footer.draw_to(&mut bytes, &draft).unwrap();
+                        grid.feed(&String::from_utf8(bytes).unwrap());
+                        let expected = (cursor.0.min(10), cursor.1);
+                        if (grid.row, grid.col) != expected {
+                            failures.push(format!("footer moved cursor: {cursor:?} -> {:?}, expected {expected:?}", (grid.row, grid.col)));
+                        }
+                        assert!(grid.cells[11].iter().collect::<String>().contains("keep-draft"));
+                    }
                     let screen = grid.text();
                     assert_eq!(screen.matches("transcript").count(), 1);
-                    if add_body && frame >= 2 {
+                    if !body.is_empty() && frame >= 2 {
                         assert_eq!(screen.matches("body").count(), 1);
                     }
                     counts.push(screen.matches("○ thinking").count());
@@ -2357,11 +2420,24 @@ fn thinking_fold_terminal_grid_refresh_does_not_accumulate_headers() {
                 grid.feed(&String::from_utf8(bytes).unwrap());
                 let remaining = grid.text().matches("○ thinking").count();
                 assert_eq!(grid.text().matches("✓ thinking").count(), 1);
+                if with_footer {
+                    assert!(grid.cells[11].iter().collect::<String>().contains("keep-draft"));
+                    let cursor = (grid.row, grid.col);
+                    let mut bytes = Vec::new();
+                    footer.leave_to(&mut bytes).unwrap();
+                    grid.feed(&String::from_utf8(bytes).unwrap());
+                    assert_eq!((grid.row, grid.col), cursor);
+                    assert!(!grid.text().contains("keep-draft"));
+                    assert_eq!(grid.bottom, 11);
+                }
+                grid.feed("answer\r\n");
+                assert_eq!(grid.text().matches("answer").count(), 1);
                 if counts.iter().any(|&n| n != 1) || remaining != 0 {
                     failures.push(format!(
-                        "cols={cols} bottom={bottom} add_body={add_body}: live={counts:?}, stale={remaining}"
+                        "cols={cols} start={start_row} footer={with_footer} body={body:?}: live={counts:?}, stale={remaining}"
                     ));
                 }
+              }
             }
         }
     }
@@ -2372,6 +2448,53 @@ fn thinking_fold_terminal_grid_refresh_does_not_accumulate_headers() {
         }
     }
     assert!(failures.is_empty(), "orphan headers: {}", failures.join(", "));
+}
+
+#[test]
+fn thinking_fold_display_controls_preserve_source_and_row_footprint() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let previous_columns = std::env::var_os("COLUMNS");
+    unsafe {
+        std::env::set_var("COLUMNS", "32");
+    }
+
+    assert_eq!(
+        fold_display_line("\t中文\r\x08\x1b[2J\u{85}"),
+        "    中文\\r\\u{8}\\u{1b}[2J\\u{85}"
+    );
+    let mut fold = super::super::state::ThinkingFoldState::new();
+    fold.active = true;
+    fold.max_visible_lines = 20;
+    fold.rewrite_right_margin_cols = FOLD_REWRITE_RIGHT_MARGIN_COLS;
+    // Keep split control sequences as source text; only the display projection
+    // may turn them into inert, countable glyphs.
+    append_fold_content(&mut fold, "\t中文\r\nbody\tone\ttwo\tthree\x1b");
+    append_fold_content(&mut fold, "[2J\x08");
+    let source_line = fold.current_line.clone();
+    let source_recent = fold.recent_lines.clone();
+    let mut out = Vec::new();
+    thinking_fold_redraw_to(&mut out, None, &mut fold).unwrap();
+    let display = String::from_utf8(out).unwrap();
+    assert!(!display.contains('\t'));
+    assert!(!display.contains("\x1b[2J"));
+    assert_eq!(fold.current_line, source_line);
+    assert_eq!(fold.recent_lines, source_recent);
+    assert_eq!(fold.total_lines, 1);
+    assert_eq!(fold.window_rows, fold.rendered_body_lines.len());
+    assert_eq!(thinking_fold_rendered_body_rows(&fold), fold.window_rows);
+    for line in &fold.rendered_body_lines {
+        assert!(!line.chars().any(char::is_control));
+        assert_eq!(live_preview_cursor_rows(line), 1);
+    }
+
+    unsafe {
+        match previous_columns {
+            Some(value) => std::env::set_var("COLUMNS", value),
+            None => std::env::remove_var("COLUMNS"),
+        }
+    }
 }
 
 #[test]
@@ -2481,7 +2604,7 @@ fn subagent_fold_redraw_preserves_body_and_footer() {
     );
     fold.active = true;
     fold.max_visible_lines = 2;
-    append_fold_content(&mut fold, "first line\nsecond line");
+    append_fold_content(&mut fold, "first line\nsecond\tline");
     let mut out = Vec::new();
     thinking_fold_redraw_to(&mut out, None, &mut fold).unwrap();
     let mut header = Vec::new();
@@ -2501,7 +2624,8 @@ fn subagent_fold_redraw_preserves_body_and_footer() {
     out.clear();
     finalize_fold_to(&mut out, &mut fold, false).unwrap();
     let rendered = String::from_utf8(out).unwrap();
-    assert!(rendered.contains("second line"));
+    assert!(rendered.contains("second    line"));
+    assert!(!rendered.contains('\t'));
     assert!(rendered.contains("third line"));
     assert!(!rendered.contains("first line"));
     assert!(rendered.ends_with("done subagent explore · 3 lines\x1b[0m\r\n"));
