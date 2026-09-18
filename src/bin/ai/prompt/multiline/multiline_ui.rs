@@ -123,25 +123,10 @@ const CPR_REPLY_WINDOW: Duration = Duration::from_secs(10);
 /// query pushes one, so the queue only grows while the link stays down.
 const MAX_PENDING_CPR_REPLIES: usize = 8;
 
-/// Delays before successive recovery probes: the first runs while a one-off
-/// stall is likely to have cleared, later ones back off to a steady 30 s so a
-/// dead link costs one query per interval instead of one per frame.
-const RECOVERY_PROBE_BACKOFFS: [Duration; 4] = [
-    Duration::from_secs(1),
-    Duration::from_secs(5),
-    Duration::from_secs(15),
-    Duration::from_secs(30),
-];
-
 /// A main-screen probe is only safe once no *recent* reply is outstanding: an
 /// older reply would already have been delivered, so an answer arriving now is
 /// the probe's own.
 const CPR_PROBE_QUIET_PERIOD: Duration = Duration::from_secs(2);
-
-fn recovery_probe_delay(failures: u32) -> Duration {
-    let index = (failures as usize).min(RECOVERY_PROBE_BACKOFFS.len() - 1);
-    RECOVERY_PROBE_BACKOFFS[index]
-}
 
 /// Crossterm emits a key if ESC arrives in its own read. After a query timeout,
 /// briefly defer that ambiguous key so a fragmented CPR cannot submit the
@@ -244,10 +229,11 @@ fn cursor_reply_tail(tail: &str) -> Option<bool> {
 
 /// A timed-out DSR reply must remain inside the event parser, not cooked stdin.
 /// The alternate screen provides known coordinates without another query and
-/// keeps the main transcript intact, but it also hides that transcript, so the
-/// editor keeps probing the main screen and returns to it as soon as a query
-/// works again. Query disabling survives prompt sessions: a late reply has no
-/// request id and must not anchor a later inline viewport.
+/// keeps the main transcript intact. Once degraded, the active editor stays on
+/// that query-free screen; recovery is attempted only at the next prompt start,
+/// after cleanup has restored the main screen. Query disabling survives prompt
+/// sessions: a late reply has no request id and must not anchor a later inline
+/// viewport.
 #[derive(Default)]
 struct PromptScreen {
     queries_disabled: bool,
@@ -259,10 +245,6 @@ struct PromptScreen {
     /// One inline retry per prompt session: a rebuild must not block on two
     /// two-second waits per frame once the link really is down.
     retry_used: bool,
-    /// Failed query/probe attempts so far, used to space out the next probe.
-    recovery_failures: u32,
-    /// Earliest instant for the next main-screen probe.
-    next_recovery_probe: Option<Instant>,
     /// Tail of the last model output, repainted above the box on the alternate
     /// screen (`PromptEditor::set_alternate_screen_tail`).
     tail: Vec<String>,
@@ -279,24 +261,10 @@ struct PromptScreen {
 }
 
 impl PromptScreen {
-    /// Schedules recovery after a failed anchor attempt. Individual cursor
-    /// queries account for their replies before this method runs.
-    fn note_query_failure(&mut self, now: Instant) {
-        self.queries_disabled = true;
-        // The first probe runs while a one-off stall is likely to have cleared;
-        // later ones back off so a dead link costs one query per interval instead
-        // of one per frame.
-        self.next_recovery_probe = Some(now + recovery_probe_delay(self.recovery_failures));
-        self.recovery_failures = self.recovery_failures.saturating_add(1);
-    }
-
-    /// True when the main screen may be probed again: only once no *recent*
-    /// reply is outstanding (an older one would already have been delivered, so
-    /// an answer arriving now is the probe's own) and the backoff has elapsed.
-    fn recovery_probe_due(&mut self, now: Instant) -> bool {
-        self.replies_settled(now)
-            && self.queries_disabled
-            && self.next_recovery_probe.is_none_or(|at| now >= at)
+    /// Recovery may re-enable queries only before the next prompt is drawn.
+    /// Never leave a usable alternate-screen editor for a blocking DSR probe.
+    fn can_recover_at_prompt_start(&mut self, now: Instant) -> bool {
+        self.queries_disabled && !self.alternate && self.replies_settled(now)
     }
 
     /// True while no *recent* reply is outstanding, i.e. a query answer arriving
@@ -308,12 +276,6 @@ impl PromptScreen {
             .pending_cpr_replies
             .back()
             .is_none_or(|query| now.duration_since(*query) >= CPR_PROBE_QUIET_PERIOD)
-    }
-
-    /// Clears the probe schedule after a probe put the inline box back.
-    fn note_recovered(&mut self) {
-        self.recovery_failures = 0;
-        self.next_recovery_probe = None;
     }
 
     fn prepare_viewport(
@@ -363,12 +325,12 @@ impl PromptScreen {
                         ) {
                             Ok(area) => return Ok(area),
                             Err(err) if PromptEditor::is_cursor_position_timeout(&err) => {
-                                self.note_query_failure(Instant::now());
+                                self.queries_disabled = true;
                             }
                             Err(err) => return Err(err),
                         }
                     } else {
-                        self.note_query_failure(Instant::now());
+                        self.queries_disabled = true;
                     }
                 }
                 Err(err) => return Err(err),
@@ -394,14 +356,10 @@ impl PromptScreen {
             self.alternate = true;
             execute!(io::stdout(), EnterAlternateScreen)?;
         }
-        if !self.queries_disabled {
-            // A recent reply, not a dead link, kept the inline path out: query
-            // again as soon as that reply can no longer answer the query, or the
-            // inline probe would never run and the box would stay on the
-            // alternate screen for the rest of the prompt.
-            self.queries_disabled = true;
-            self.next_recovery_probe = Some(now + CPR_PROBE_QUIET_PERIOD);
-        }
+        // A recent reply can also keep the inline path out without a timeout.
+        // Keep every rebuild query-free for the rest of this prompt in either
+        // case; the next prompt start can reconsider recovery after cleanup.
+        self.queries_disabled = true;
         prepare_query_free_viewport(backend, terminal_size, requested_height, &self.tail)
     }
 }
@@ -836,71 +794,7 @@ fn parked_anchor_offset(last_drawn_area: Option<Rect>, new_height: u16) -> u16 {
 /// size notifications can oscillate, turning those reservations into a growing
 /// blank gap. A fixed viewport avoids that automatic behavior; this bootstrap
 /// scrolls only the rows that are actually missing at the bottom of the screen.
-/// Rebuilt viewport after a recovery probe: the caller adopts this terminal and
-/// treats `area` as the viewport already in place, because the probe restored a
-/// screen without drawing a box frame on it.
-struct RecoveredViewport {
-    terminal: MultilineTerminal,
-    area: Rect,
-    /// Screen size the probe anchored for. Callers must record this instead of
-    /// re-reading the backend size: a resize that landed during the probe's
-    /// blocking cursor query would otherwise look already applied, and its
-    /// queued `Event::Resize` would be dropped as a duplicate, leaving a box
-    /// anchored for the pre-resize screen (and a stale row for exit cleanup).
-    size: Size,
-}
-
-/// Leaves the alternate screen and re-places the box on the main screen once a
-/// DSR round-trip works again.
 ///
-/// The alternate screen hides the real transcript until the editor exits, so it
-/// is held only while queries keep failing: every prompt start and every idle
-/// tick retries the inline path through here. Returns `None` while the next
-/// probe is not due yet.
-fn try_recover_inline_viewport(
-    screen: &mut PromptScreen,
-    new_height: u16,
-) -> io::Result<Option<RecoveredViewport>> {
-    if !screen.recovery_probe_due(Instant::now()) {
-        return Ok(None);
-    }
-    let mut backend = CrosstermBackend::new(io::stdout());
-    let terminal_size = backend.size()?;
-    if screen.alternate {
-        // Leaving restores the main screen together with the cursor row where the
-        // inline box was cleared before entering, which is exactly the box top —
-        // so the query answer needs no parked-bottom-row offset.
-        execute!(io::stdout(), LeaveAlternateScreen)?;
-        screen.alternate = false;
-    }
-    screen.queries_disabled = false;
-    // The probe already is a second chance for the query that degraded the
-    // screen, so it must not also spend the prompt's one inline retry.
-    screen.retry_used = true;
-    let area = screen.prepare_viewport(
-        &mut backend,
-        terminal_size,
-        new_height,
-        0,
-        ViewportRebuildMode::ReserveMissingRows,
-        false,
-        None,
-    )?;
-    if screen.queries_disabled {
-        // The probe timed out as well: `prepare_viewport` already re-entered the
-        // alternate screen and armed the next backoff.
-    } else {
-        screen.note_recovered();
-    }
-    let terminal = terminal_with_fixed_viewport(backend, area)
-        .map_err(|err| io::Error::other(err.to_string()))?;
-    Ok(Some(RecoveredViewport {
-        terminal,
-        area,
-        size: terminal_size,
-    }))
-}
-
 /// Returns the terminal together with the screen size its anchor was computed
 /// for; the caller records that size instead of a fresh `size()` read, so a
 /// resize that landed during the build is not mistaken for one already applied.
@@ -908,11 +802,13 @@ fn build_fixed_terminal(
     height: u16,
     screen: &mut PromptScreen,
 ) -> io::Result<(MultilineTerminal, Size)> {
-    // A previous timeout must not pin the whole session to the alternate screen:
-    // try the inline path again, and fall through to the query-free one if it
-    // still fails.
-    if let Some(recovered) = try_recover_inline_viewport(screen, height)? {
-        return Ok((recovered.terminal, recovered.size));
+    // Cleanup has left the previous prompt's alternate screen. Retry only here,
+    // before a new editor is visible, and only after recent replies settle.
+    if screen.can_recover_at_prompt_start(Instant::now()) {
+        screen.queries_disabled = false;
+        // Recovery is already a second chance; keep its existing single attempt
+        // instead of also spending the ordinary prompt's one inline retry.
+        screen.retry_used = true;
     }
     let mut backend = CrosstermBackend::new(io::stdout());
     let terminal_size = backend.size()?;
@@ -1500,6 +1396,8 @@ impl PromptEditor {
             // (including a background title update), or before non-resize input.
             // The idle poll coalesces a resize burst without waiting for a key.
             let mut pending_resize_rebuild = false;
+            #[cfg(test)]
+            let mut fixture_frame_sequence = 0_u64;
 
             loop {
                 // The background only publishes title updates; the terminal is
@@ -1631,6 +1529,29 @@ impl PromptEditor {
                     }
                     park_reflow_anchor(&mut terminal, drawn_viewport_area)?;
                     self.notify_first_render();
+                    // Emit only after the real draw and anchor writes complete,
+                    // so an external PTY driver can synchronize without keys.
+                    #[cfg(test)]
+                    if std::env::var("RUST_TOOLS_EDITOR_FIXTURE").as_deref() == Ok("1") {
+                        use std::io::Write;
+
+                        fixture_frame_sequence += 1;
+                        let area = drawn_viewport_area;
+                        let metadata = serde_json::json!({
+                            "sequence": fixture_frame_sequence,
+                            "size": [last_applied_terminal_size.width, last_applied_terminal_size.height],
+                            "frame": {"x": area.x, "y": area.y, "width": area.width, "height": area.height},
+                            "alternate": screen.alternate,
+                            "cursor": textarea.cursor(),
+                            "content": textarea.lines().join("\n"),
+                        });
+                        let mut out = io::stdout().lock();
+                        write!(out, "\x1b]777;editor;frame;{metadata}\x07")?;
+                        if fixture_frame_sequence == 1 {
+                            write!(out, "\x1b]777;editor;ready\x07")?;
+                        }
+                        out.flush()?;
+                    }
                     force_repaint_next_frame = false;
                 }
 
@@ -1651,25 +1572,9 @@ impl PromptEditor {
                         &self.pending_terminal_events,
                     ) {
                         redraw_requested = true;
-                        continue;
                     }
-                    // Idle tick: the alternate screen is a fallback, not a
-                    // destination. Probe the main screen for a working query and
-                    // re-anchor the inline box there.
-                    let probe_height = viewport_height_with_completion(
-                        terminal.backend().size()?.height,
-                        base_viewport_height,
-                        fitted_completion_items,
-                    );
-                    if let Some(recovered) = try_recover_inline_viewport(&mut screen, probe_height)? {
-                        terminal = recovered.terminal;
-                        last_drawn_area = Some(recovered.area);
-                        // The probe's own size, not a fresh read: a resize that
-                        // landed during its blocking query must still queue the
-                        // reflow rebuild (see `build_fixed_terminal`).
-                        last_applied_terminal_size = recovered.size;
-                        redraw_requested = true;
-                    }
+                    // Keep the active fallback visible and responsive. A cursor
+                    // query may block, so recovery waits for the next prompt.
                     continue;
                 };
                 if let Event::Resize(width, height) = event {
@@ -1781,6 +1686,117 @@ mod tests {
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// Exercise the production input loop in an external PTY/emulator. Run this
+    /// test alone with --ignored --nocapture --test-threads=1 and
+    /// RUST_TOOLS_EDITOR_FIXTURE=1; answer CPR queries and submit with F2.
+    /// RUST_TOOLS_REFLOW_DRAFT selects empty, multiline or wide. Optional
+    /// RUST_TOOLS_EDITOR_EXPECTED checks the exact submitted text (empty for None).
+    /// RUST_TOOLS_EDITOR_REPEAT=1 opens a second prompt on the same editor to
+    /// exercise query-disable and orphan-reply state across prompt cleanup.
+    /// OSC 777 editor;frame JSON precedes editor;ready on the first draw;
+    /// editor;submitted JSON contains the returned content, including null.
+    #[test]
+    #[ignore]
+    fn multiline_editor_pty_fixture() -> io::Result<()> {
+        use std::io::{IsTerminal, Write};
+
+        if std::env::var("RUST_TOOLS_EDITOR_FIXTURE").as_deref() != Ok("1") {
+            return Ok(());
+        }
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Err(io::Error::other("editor fixture requires a PTY"));
+        }
+        let draft = match std::env::var("RUST_TOOLS_REFLOW_DRAFT").as_deref() {
+            Ok("empty") | Err(std::env::VarError::NotPresent) => "",
+            Ok("multiline") => "DRAFT_LINE_1 alpha\nDRAFT_LINE_2 beta\nDRAFT_LINE_3 gamma",
+            Ok("wide") => "DRAFT_WIDE 中文宽字符测试 mixed ASCII 0123456789 中文尾部\n第二行 abcdefghijklmnopqrstuvwxyz",
+            _ => return Err(io::Error::other("unknown RUST_TOOLS_REFLOW_DRAFT")),
+        };
+        struct RestoreFixture(std::path::PathBuf);
+        impl Drop for RestoreFixture {
+            fn drop(&mut self) {
+                let _ = crossterm::execute!(
+                    io::stdout(),
+                    crossterm::cursor::Show,
+                    crossterm::cursor::SetCursorStyle::DefaultUserShape,
+                );
+                let _ = crossterm::terminal::disable_raw_mode();
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = std::env::temp_dir().join(format!("prompt-editor-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root)?;
+        let _restore = RestoreFixture(root.clone());
+        let session_store = crate::ai::history::SessionStore::new(&root.join("history"));
+        let (subscription, updates) = crate::ai::prompt::subscribe_session_title_updates();
+        // Construct an empty REPL history rather than calling PromptEditor::new,
+        // which loads the user's ~/.liner_history before paths can be replaced.
+        let mut editor = super::PromptEditor {
+            editor: Some(
+                crate::ai::prompt::LineEditor::with_config(
+                    rustyline::Config::builder()
+                        .completion_type(rustyline::CompletionType::List)
+                        .build(),
+                )
+                .map_err(|error| io::Error::other(error.to_string()))?,
+            ),
+            history_path: root.join("repl-history"),
+            session_id: "editor-pty-test".to_string(),
+            session_store,
+            session_image_dir: root.join("disabled-image-directory"),
+            pending_prefill: None,
+            pending_status_msg: None,
+            current_model_label: "fixture-model".to_string(),
+            current_reasoning_effort_label: "high".to_string(),
+            session_topic: Some("fixture-topic".to_string()),
+            session_title_update_subscription: subscription,
+            session_title_updates: std::sync::Mutex::new(updates),
+            first_render_notifier: None,
+            cursor_position_queries_disabled: false,
+            pending_cpr_replies: VecDeque::new(),
+            pending_terminal_events: VecDeque::new(),
+            alternate_tail_lines: Vec::new(),
+        };
+        // Match the existing PTY child: fail image-directory creation before
+        // text paste can access the system clipboard.
+        std::fs::write(&editor.session_image_dir, b"")?;
+        if !draft.is_empty() {
+            editor.set_prefill(draft);
+        }
+        let mut body = String::from("BODY_BEGIN\n");
+        for index in 0..96 {
+            body.push_str(&format!(
+                "MARK{index:02}:English transcript 中文正文保持连续 abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ another-long-ASCII-segment-0123456789 END{index:02}\n"
+            ));
+        }
+        body.push_str("BODY_END\n");
+        editor.set_alternate_screen_tail(&body);
+        crossterm::terminal::enable_raw_mode()?;
+        {
+            let mut out = io::stdout().lock();
+            write!(out, "{}", body.replace('\n', "\r\n"))?;
+            out.flush()?;
+        }
+        let repeat = std::env::var("RUST_TOOLS_EDITOR_REPEAT").as_deref() == Ok("1");
+        for prompt in 0..=usize::from(repeat) {
+            if prompt > 0 && !draft.is_empty() {
+                editor.set_prefill(draft);
+            }
+            let content = editor.read_multi_line_tui()?;
+            assert!(!crossterm::terminal::is_raw_mode_enabled()?);
+            let submitted = serde_json::json!({"content": content, "prompt": prompt});
+            {
+                let mut out = io::stdout().lock();
+                write!(out, "\x1b]777;editor;submitted;{submitted}\x07")?;
+                out.flush()?;
+            }
+            if let Ok(expected) = std::env::var("RUST_TOOLS_EDITOR_EXPECTED") {
+                assert_eq!(content.as_deref().unwrap_or(""), expected);
+            }
+        }
+        Ok(())
     }
 
     /// Real-output fixture for an external PTY/emulator driver. Run only this
@@ -2116,43 +2132,76 @@ mod tests {
     }
 
     #[test]
-    fn recovery_probe_backoff_grows_and_saturates() {
-        let seconds: Vec<u64> = (0..5)
-            .map(|failures| super::recovery_probe_delay(failures).as_secs())
-            .collect();
-        assert_eq!(
-            seconds,
-            vec![1, 5, 15, 30, 30],
-            "a dead link is probed at a steady interval, not on every frame"
-        );
+    fn active_alternate_screen_never_allows_recovery_even_after_long_idle() {
+        let start = std::time::Instant::now();
+        let mut screen = super::PromptScreen::default();
+        screen.queries_disabled = true;
+        screen.alternate = true;
+        let eligible = [start, start + std::time::Duration::from_secs(3600)]
+            .map(|now| screen.can_recover_at_prompt_start(now));
+        let still_disabled = screen.queries_disabled;
+        // No alternate screen was actually entered; keep Drop query-free too.
+        screen.alternate = false;
+        assert_eq!(eligible, [false, false]);
+        assert!(still_disabled);
     }
 
     #[test]
-    fn recovery_probe_waits_out_fresh_replies_and_its_backoff() {
+    fn next_prompt_allows_recovery_after_replies_settle() {
         let start = std::time::Instant::now();
         let mut screen = super::PromptScreen::default();
         assert!(
-            !screen.recovery_probe_due(start),
-            "an inline screen must not probe"
+            !screen.can_recover_at_prompt_start(start),
+            "a healthy inline screen does not need recovery"
         );
+        // The next prompt inherits query disabling and outstanding replies, but
+        // cleanup has already left the previous prompt's alternate screen.
+        screen.queries_disabled = true;
         screen.pending_cpr_replies.push_back(start);
-        screen.note_query_failure(start);
-        assert!(screen.queries_disabled);
+        assert!(screen.can_recover_at_prompt_start(start + super::CPR_PROBE_QUIET_PERIOD));
+        // Eligibility alone must not retire orphan accounting; the verified
+        // anchor or event parser must still account for this reply.
         assert_eq!(screen.pending_cpr_replies.len(), 1);
-        // The reply may still be in flight and would answer the probe instead.
-        assert!(!screen.recovery_probe_due(start + std::time::Duration::from_millis(500)));
-        assert!(screen.recovery_probe_due(start + std::time::Duration::from_secs(2)));
-        // A failed probe backs off for five seconds before the next attempt.
+    }
+
+    #[test]
+    fn next_prompt_does_not_recover_while_recent_cpr_is_pending() {
+        let start = std::time::Instant::now();
+        let mut screen = super::PromptScreen::default();
+        screen.queries_disabled = true;
+        screen.pending_cpr_replies.push_back(start);
+        assert!(!screen.can_recover_at_prompt_start(start));
+        assert!(!screen.can_recover_at_prompt_start(
+            start + super::CPR_PROBE_QUIET_PERIOD - std::time::Duration::from_millis(1)
+        ));
+        // The newest outstanding reply controls eligibility, not the oldest.
         screen
             .pending_cpr_replies
-            .push_back(start + std::time::Duration::from_secs(2));
-        screen.note_query_failure(start + std::time::Duration::from_secs(2));
+            .push_back(start + super::CPR_PROBE_QUIET_PERIOD);
+        assert!(!screen.can_recover_at_prompt_start(start + super::CPR_PROBE_QUIET_PERIOD));
+        assert!(screen.queries_disabled);
         assert_eq!(screen.pending_cpr_replies.len(), 2);
-        assert!(!screen.recovery_probe_due(start + std::time::Duration::from_secs(5)));
-        assert!(screen.recovery_probe_due(start + std::time::Duration::from_secs(7)));
-        screen.note_recovered();
-        assert_eq!(screen.recovery_failures, 0);
-        assert!(screen.next_recovery_probe.is_none());
+    }
+
+    #[test]
+    fn next_prompt_can_recover_when_orphan_replies_are_consumed_or_expired() {
+        let start = std::time::Instant::now();
+        let mut screen = super::PromptScreen::default();
+        screen.queries_disabled = true;
+        screen.pending_cpr_replies.push_back(start);
+        let mut input = VecDeque::from([key(KeyCode::Esc)]);
+        input.extend("[13;1R".chars().map(|ch| key(KeyCode::Char(ch))));
+        assert_eq!(
+            super::read_prompt_event(&mut VecDeque::new(), &mut screen.pending_cpr_replies, |_| {
+                Ok(input.pop_front())
+            })
+            .unwrap(),
+            None
+        );
+        assert!(screen.can_recover_at_prompt_start(start));
+        screen.pending_cpr_replies.push_back(start);
+        assert!(screen.can_recover_at_prompt_start(start + super::CPR_REPLY_WINDOW));
+        assert!(screen.pending_cpr_replies.is_empty());
     }
 
     #[test]
@@ -2960,7 +3009,7 @@ mod tests {
         );
         assert!(row.is_err());
         assert_eq!(terminal.borrow().queries as usize, count);
-        screen.note_query_failure(std::time::Instant::now());
+        screen.queries_disabled = true;
         assert_eq!(screen.pending_cpr_replies.len(), count);
         assert!(screen.pending_cpr_replies.iter().all(|at| *at >= now));
         super::prune_expired_cpr_replies(

@@ -125,7 +125,9 @@ fn popup_geometry(
     let popup_width = area.width.saturating_sub(2).clamp(40, 180).min(area.width);
     let popup_x = area.x + area.width.saturating_sub(popup_width) / 2;
     let popup = Rect::new(popup_x, area.y, popup_width, area.height);
-    let horizontal_margin = 1;
+    // Resize can briefly leave fewer than two columns. Fit both margins inside
+    // the popup so narrowing never underflows or places the inner area outside it.
+    let horizontal_margin = 1.min(popup.width / 2);
     let inner = Rect::new(
         popup.x + horizontal_margin,
         popup.y + layout.top_margin,
@@ -734,6 +736,26 @@ mod tests {
                     .unwrap_or(" ")
             })
             .collect()
+    }
+
+    #[test]
+    fn extremely_narrow_popup_preserves_draft_and_cursor_when_widened() {
+        let draft = vec!["draft 中文".to_owned(), "second line".to_owned()];
+        let mut textarea = TextArea::from(draft.clone());
+        textarea.move_cursor(CursorMove::End);
+        let cursor = textarea.cursor();
+        for width in [80, 4, 2, 1, 0, 80] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_multiline_popup(
+                        frame, &mut textarea, None, None, "model", "high", None,
+                    );
+                })
+                .unwrap();
+            assert_eq!(textarea.lines(), draft, "width={width}");
+            assert_eq!(textarea.cursor(), cursor, "width={width}");
+        }
     }
 
     #[test]

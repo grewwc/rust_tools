@@ -237,6 +237,9 @@ fn opt_str(args: &Value, key: &str) -> Option<String> {
 /// Detection is conservative: DOM structure signals (iframe/class/id, dedicated input fields) come first and are most trusted;
 /// plain body keyword matching easily false-positives (e.g. an article explaining 2FA/OTP), so text-only signals are ranked after
 /// structure signals, and keyword + structure features are required to match together wherever possible.
+/// All structure signals are visibility-gated (`anyVisible`): hidden inputs/iframes
+/// (display:none / visibility:hidden / zero-size: unopened modals, templates, invisible
+/// captchas) never count as blockers.
 async fn detect_user_action_required(page: &chromiumoxide::page::Page) -> Option<String> {
     let result = page
         .evaluate_expression(r#"(function(){
@@ -264,23 +267,23 @@ async fn detect_user_action_required(page: &chromiumoxide::page::Page) -> Option
           }
           // 1) captcha：验证码 iframe（reCAPTCHA / hCaptcha / 腾讯等）或可见的 captcha
           //    类元素，且「未解决」。隐藏的页脚徽标/已关闭的弹层不算阻塞。
-          if (has('iframe[src*="recaptcha/api2/anchor"]') && !recaptchaSolved()) return 'captcha';
-          if (has('iframe[src*="hcaptcha"]') && !has('iframe[src*="badge"]') && !recaptchaSolved()) return 'captcha';
-          if (has('iframe[src*="captcha"]') && !has('iframe[src*="recaptcha/api2/bframe"]') && !has('iframe[src*="badge"]') && !recaptchaSolved()) return 'captcha';
+          if (anyVisible('iframe[src*="recaptcha/api2/anchor"]') && !recaptchaSolved()) return 'captcha';
+          if (anyVisible('iframe[src*="hcaptcha"]') && !has('iframe[src*="badge"]') && !recaptchaSolved()) return 'captcha';
+          if (anyVisible('iframe[src*="captcha"]') && !has('iframe[src*="recaptcha/api2/bframe"]') && !has('iframe[src*="badge"]') && !recaptchaSolved()) return 'captcha';
           if ((has('[class*="captcha"]') || has('[id*="captcha"]')) && anyVisible('[class*="captcha"], [id*="captcha"]') && !recaptchaSolved()) return 'captcha';
           // 2) slider：需要滑块 DOM 结构，纯文案不足以判定。
-          if (has('.geetest_slider_button') || has('.geetest_slider') || has('[class*="slider_track"]') || has('[class*="slider-btn"]') || (has('[class*="slider"]') && /滑动|拖动|slide|滑块/.test(t))) return 'slider';
+          if (anyVisible('.geetest_slider_button, .geetest_slider, [class*="slider_track"], [class*="slider-btn"]') || (anyVisible('[class*="slider"]') && /滑动|拖动|slide|滑块/.test(t))) return 'slider';
           // 3) sms_otp：优先专用输入框；纯文本需同时存在可输入的验证码框，降低误报。
-          if (has('input[autocomplete="one-time-code"]')) return 'sms_otp';
-          if ((has('input[type="tel"]') || has('input[type="text"]') || has('input[type="number"]')) && /短信验证码|短信动态码|sms.{0,5}code|one-time.{0,5}code|verification code|动态验证码/.test(t)) return 'sms_otp';
+          if (anyVisible('input[autocomplete="one-time-code"]')) return 'sms_otp';
+          if (anyVisible('input[type="tel"], input[type="text"], input[type="number"]') && /短信验证码|短信动态码|sms.{0,5}code|one-time.{0,5}code|verification code|动态验证码/.test(t)) return 'sms_otp';
           // 4) twofa：要求「关键词 + 可输入框」同时命中，避免误伤科普文。
-          if ((has('input[type="tel"]') || has('input[type="text"]') || has('input[type="number"]')) && /two-factor|双因素|二次验证|authenticator/.test(t)) return 'twofa';
+          if (anyVisible('input[type="tel"], input[type="text"], input[type="number"]') && /two-factor|双因素|二次验证|authenticator/.test(t)) return 'twofa';
           // 5) login_required：登录提示 + 页面存在密码/登录框。
-          if ((has('input[type="password"]') || has('input[name*="login"]') || has('input[id*="login"]')) && /请登录|请先登录|登录后查看|sign in to continue|please sign in|log in to continue/.test(t)) return 'login_required';
+          if (anyVisible('input[type="password"], input[name*="login"], input[id*="login"]') && /请登录|请先登录|登录后查看|sign in to continue|please sign in|log in to continue/.test(t)) return 'login_required';
           // 6) payment_verify：支付/银行验证，要求存在输入框。
-          if ((has('input[type="password"]') || has('input[type="tel"]')) && /支付密码|payment password|银行短信|bank verification/.test(t)) return 'payment_verify';
+          if (anyVisible('input[type="password"], input[type="tel"]') && /支付密码|payment password|银行短信|bank verification/.test(t)) return 'payment_verify';
           // 7) identity_verify：实名认证。
-          if (/实名认证|identity verification|verify your identity/.test(t) && (has('input') || has('form'))) return 'identity_verify';
+          if (/实名认证|identity verification|verify your identity/.test(t) && (anyVisible('input') || anyVisible('form'))) return 'identity_verify';
           return null;
         })()"#)
         .await

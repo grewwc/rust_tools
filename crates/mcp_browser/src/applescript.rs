@@ -167,13 +167,30 @@ pub fn pending_warning(session: &ApplescriptSession) -> String {
 /// Human-verification detection with the same semantics as tools.rs: captcha/slider/
 /// sms_otp/twofa/login_required/payment_verify/identity_verify. captcha means "present
 /// and unsolved" (a dismissed popup does not count); text-only clues require a
-/// keyword + input field to avoid false positives. The JS result is JSON.stringify'd.
+/// keyword + input field to avoid false positives. All signals are visibility-gated:
+/// hidden inputs/iframes (display:none / visibility:hidden / zero-size, e.g. unopened
+/// modals, hidden templates, invisible captchas) never count as blockers. No raw
+/// `body.innerHTML` substring matching is done - SPA bundles/inline config routinely
+/// embed words like "otp" or "factor" in script text, which produced false sms_otp /
+/// login_required reports on internal pages. Text clues instead use visibility-safe
+/// `body.innerText` + a visible input (same keyword rules as the CDP driver). The JS
+/// result is JSON.stringify'd.
 pub const DETECT_USER_ACTION_JS: &str = r#"(function(){
-  var vis = function(el){ return !!(el && el.offsetWidth && el.offsetHeight && el.getClientRects().length); };
+  var vis = function(el){
+    if (!el) return false;
+    var r = el.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0)) return false;
+    try {
+      var st = getComputedStyle(el);
+      if (st.display === 'none' || st.visibility === 'hidden') return false;
+    } catch (e) {}
+    return true;
+  };
   var out = null;
   try {
-    var hash = location.hash;
-    var jo = function(p){ if (location.hash.indexOf(p) >= 0) return true; if (document.body && document.body.innerHTML.indexOf(p) >= 0) return true; return false; };
+    // jo: hash-only route signal (e.g. SPA '#/twofa'). Never match body.innerHTML -
+    // inline script/config text containing "otp"/"factor"/"登录后" is not a blocker.
+    var jo = function(p){ return location.hash.indexOf(p) >= 0; };
     if (jo('sms_otp') || jo('twofa') || jo('two_fa') || jo('factor') || jo('otp')) out = out || 'sms_otp';
     if (jo('login_required') || jo('login-required') || jo('please login') || jo('请登录') || jo('登录后')) out = out || 'login_required';
     if (jo('payment_verify') || jo('payment-verify') || jo('verify payment') || jo('验证支付')) out = out || 'payment_verify';
@@ -181,6 +198,7 @@ pub const DETECT_USER_ACTION_JS: &str = r#"(function(){
     var ifr = document.querySelectorAll('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="captcha"]');
     for (var i = 0; i < ifr.length; i++) {
       var f = ifr[i];
+      if (!vis(f)) continue;
       var resp = f.contentDocument && (f.contentDocument.querySelector('textarea[name="g-recaptcha-response"], textarea[name="h-captcha-response"]') ||
                                        f.contentDocument.querySelector('[name="g-recaptcha-response"], [name="h-captcha-response"]'));
       var filled = resp && resp.value && resp.value.length > 0;
@@ -210,11 +228,29 @@ pub const DETECT_USER_ACTION_JS: &str = r#"(function(){
       var cats = ['captcha','slider','sms_otp','twofa','login_required','payment_verify','identity_verify'];
       for (var k = 0; k < inputs.length; k++) {
         var inp = inputs[k];
+        if (!vis(inp)) continue;
         var ph = ((inp.placeholder || '') + ' ' + (inp.getAttribute('aria-label') || '') + ' ' + (inp.name || '')).toLowerCase();
         for (var c = 0; c < cats.length; c++) {
           if (hits[cats[c]].test(ph)) { out = out || cats[c]; }
         }
       }
+    }
+    // Text + visible input pass, mirroring the CDP driver (tools.rs): body.innerText
+    // is visibility-safe (excludes display:none and <script> content), so keyword
+    // matching here cannot fire on bundle/config text - the original false positive.
+    if (!out) {
+      var t = "";
+      try { t = ((document.body && document.body.innerText) || '').toLowerCase(); } catch (e) {}
+      var anyVis = function(sels){
+        var els = document.querySelectorAll(sels);
+        for (var m = 0; m < els.length; m++) { if (vis(els[m])) return true; }
+        return false;
+      };
+      if (anyVis('input[type="tel"], input[type="text"], input[type="number"]') && /短信验证码|短信动态码|sms.{0,5}code|one-time.{0,5}code|verification code|动态验证码/.test(t)) out = out || 'sms_otp';
+      if (anyVis('input[type="tel"], input[type="text"], input[type="number"]') && /two-factor|双因素|二次验证|authenticator/.test(t)) out = out || 'twofa';
+      if (anyVis('input[type="password"], input[name*="login"], input[id*="login"]') && /请登录|请先登录|登录后查看|sign in to continue|please sign in|log in to continue/.test(t)) out = out || 'login_required';
+      if (anyVis('input[type="password"], input[type="tel"]') && /支付密码|payment password|银行短信|bank verification/.test(t)) out = out || 'payment_verify';
+      if (/实名认证|identity verification|verify your identity/.test(t) && (anyVis('input') || anyVis('form'))) out = out || 'identity_verify';
     }
   } catch (e) {}
   return out ? out : null;
