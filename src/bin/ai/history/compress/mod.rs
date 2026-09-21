@@ -14,6 +14,7 @@ mod dedup;
 mod incremental;
 #[cfg(test)]
 mod incremental_normalize_tests;
+pub(in crate::ai) use incremental::SOURCE_DIR;
 pub(in crate::ai) use incremental::is_incremental_summary;
 use incremental::{
     INCREMENTAL_SUMMARY_PREFIX, plan_incremental_summary_with_app,

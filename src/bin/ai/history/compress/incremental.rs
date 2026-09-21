@@ -10,7 +10,10 @@
 use super::*;
 
 pub(super) const INCREMENTAL_SUMMARY_PREFIX: &str = "[incremental-memory-v1]";
-const SOURCE_DIR: &str = "summary-sources";
+/// Session-asset directory holding the raw records behind summary increments.
+/// Exported so overflow search (`tools/overflow_search.rs`) can keep those
+/// originals searchable; a rename here must not silently hide the directory.
+pub(in crate::ai) const SOURCE_DIR: &str = "summary-sources";
 
 pub(in crate::ai) fn is_incremental_summary(message: &Message) -> bool {
     is_system_like_role(&message.role)
