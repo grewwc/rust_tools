@@ -449,10 +449,10 @@ pub fn try_handle_session_command(
                 "  /fork [<src>|src=<id>] [as=<id>]  fork a session into a new branch and switch"
             );
             println!(
-                "  /mark [message]            mark current session as important (shown in red in `/ss`); the optional message is shown via `/ss message`"
+                "  /mark [<id>|current|last] [message]  mark a session as important (default: current; shown in red in `/ss`); a leading `--` forces the rest to be a literal message for current; the optional message is shown via `/ss message`"
             );
             println!(
-                "  /unmark                   remove the important mark from the current session"
+                "  /unmark [<id>|current|last|--]  remove the important mark from a session (default: current; `--` forces current)"
             );
             println!(
                 "  /sessions message [id]     show the mark message of a session (default: current; `last` = most recent)"
@@ -580,10 +580,39 @@ pub fn try_handle_session_command(
             println!("{}", render_current_session_id(app));
         }
         "mark" => {
-            // `/mark [message]`: trailing words are the mark message shown via
-            // `/ss message`. Bare `/mark` keeps any existing message.
-            let message: String = parts.collect::<Vec<_>>().join(" ");
-            let message = message.trim();
+            // `/mark [<selector>] [message]`: a leading session selector
+            // (`current`, `last`, or an existing id) chooses the target and
+            // the rest is the mark message shown via `/ss message`. Without a
+            // selector the whole trailing text stays the message for the
+            // current session (backward compatible); bare `/mark` keeps any
+            // existing message. The selector matters for one-shot CLI
+            // (`a /ss mark <id> ...`): the auto-created session is deleted
+            // on exit, so marking "current" there would mark a throwaway.
+            // A leading `--` escapes the selector rule: every following word
+            // becomes the literal message for the current session.
+            let words: Vec<&str> = parts.collect();
+            let (target, message) = if words.first() == Some(&"--") {
+                (app.session_id.clone(), words[1..].join(" ").trim().to_string())
+            } else {
+                match words.first() {
+                    Some(first) if *first == "current" => (
+                        app.session_id.clone(),
+                        words[1..].join(" ").trim().to_string(),
+                    ),
+                    Some(first) => {
+                        match resolve_existing_session_selector(&store, &app.session_id, first)
+                        {
+                            Ok(id) => (id, words[1..].join(" ").trim().to_string()),
+                            Err(_) => (
+                                app.session_id.clone(),
+                                words.join(" ").trim().to_string(),
+                            ),
+                        }
+                    }
+                    None => (app.session_id.clone(), String::new()),
+                }
+            };
+            let message = message.as_str();
             // Flag and message go through one lock + one transaction, so an
             // interleaved concurrent `/mark`/`/unmark` or a crash mid-command
             // can never persist "marked without message" / a stale message.
@@ -592,22 +621,37 @@ pub fn try_handle_session_command(
             } else {
                 MarkMessageUpdate::Set(message)
             };
-            match store.write_session_mark(&app.session_id, true, message_update) {
+            match store.write_session_mark(&target, true, message_update) {
                 Ok(()) if message.is_empty() => {
-                    println!("Marked session as important: {}", app.session_id);
+                    println!("Marked session as important: {target}");
                 }
                 Ok(()) => println!(
                     "Marked session as important: {} ({})",
-                    app.session_id, message
+                    target, message
                 ),
                 Err(err) => eprintln!("[mark] failed to mark session: {err}"),
             }
         }
         "unmark" => {
-            // Trailing words are drained (not stored): `/unmark` never sets a message.
-            let _ = parts.collect::<Vec<_>>();
-            match store.write_session_mark(&app.session_id, false, MarkMessageUpdate::Clear) {
-                Ok(()) => println!("Removed important mark from session: {}", app.session_id),
+            // `/unmark [<selector>]`: same selector rule as `/mark`;
+            // trailing words are drained (never stored).
+            let words: Vec<&str> = parts.collect();
+            let target = match words.first() {
+                // `--` forces the current session (mirrors `/mark --`), so
+                // `/unmark last` can be escaped when "last" was a literal.
+                Some(first) if *first == "--" => app.session_id.clone(),
+                Some(first) if *first == "current" => app.session_id.clone(),
+                Some(first) => {
+                    match resolve_existing_session_selector(&store, &app.session_id, first)
+                    {
+                        Ok(id) => id,
+                        Err(_) => app.session_id.clone(),
+                    }
+                }
+                None => app.session_id.clone(),
+            };
+            match store.write_session_mark(&target, false, MarkMessageUpdate::Clear) {
+                Ok(()) => println!("Removed important mark from session: {target}"),
                 Err(err) => eprintln!("[unmark] failed to unmark session: {err}"),
             }
         }
@@ -2170,6 +2214,94 @@ mod tests {
         assert!(!store.read_session_marked(&id).unwrap());
         assert_eq!(store.read_session_mark_message(&id).unwrap(), "");
         assert!(try_handle_session_command(&mut app, "/ss message").unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mark_with_target_selector_marks_other_session() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let current = app.session_id.clone();
+        let target = "sess-target";
+        append_history_messages(
+            &store.session_history_file(target),
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("hello".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+
+        // `/ss mark <id> <message>` marks the target, not the current
+        // session: this is the one-shot `a /ss mark <id> ...` path, where
+        // the current auto session is deleted on exit.
+        assert!(
+            try_handle_session_command(&mut app, "/ss mark sess-target target note").unwrap()
+        );
+        assert!(store.read_session_marked(target).unwrap());
+        assert_eq!(
+            store.read_session_mark_message(target).unwrap(),
+            "target note"
+        );
+        assert!(!store.read_session_marked(&current).unwrap());
+
+        // An explicit `current` selector targets the current session, while
+        // an unknown first word stays a message for it (backward compat).
+        assert!(
+            try_handle_session_command(&mut app, "/mark current explicit note").unwrap()
+        );
+        assert_eq!(
+            store.read_session_mark_message(&current).unwrap(),
+            "explicit note"
+        );
+        assert!(try_handle_session_command(&mut app, "/mark stray words here").unwrap());
+        assert_eq!(
+            store.read_session_mark_message(&current).unwrap(),
+            "stray words here"
+        );
+
+        // `/unmark <id>` clears the target; bare `/unmark` clears current.
+        assert!(try_handle_session_command(&mut app, "/ss unmark sess-target").unwrap());
+        assert!(!store.read_session_marked(target).unwrap());
+        assert!(try_handle_session_command(&mut app, "/unmark").unwrap());
+        assert!(!store.read_session_marked(&current).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mark_escape_hatch_keeps_literal_selector_words_as_messages() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let current = app.session_id.clone();
+
+        // `--` forces the literal-message reading: without it, "last" would
+        // be consumed as a target selector and the message never stored.
+        assert!(try_handle_session_command(&mut app, "/mark -- last").unwrap());
+        assert!(store.read_session_marked(&current).unwrap());
+        assert_eq!(store.read_session_mark_message(&current).unwrap(), "last");
+
+        assert!(try_handle_session_command(&mut app, "/mark -- current note").unwrap());
+        assert_eq!(
+            store.read_session_mark_message(&current).unwrap(),
+            "current note"
+        );
+
+        // `/unmark --` always clears the current session.
+        assert!(try_handle_session_command(&mut app, "/unmark --").unwrap());
+        assert!(!store.read_session_marked(&current).unwrap());
 
         let _ = fs::remove_dir_all(root);
     }
