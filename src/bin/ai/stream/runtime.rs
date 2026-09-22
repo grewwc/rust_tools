@@ -23,7 +23,8 @@ use super::{
     framing, normalize,
     render::markdown::{
         clamp_line_to_terminal_row, clamp_line_to_terminal_row_with_reserve, live_preview_cursor_rows,
-        raw_terminal_rows, wrap_line_to_terminal_rows_with_reserve,
+        live_preview_cursor_rows_at, raw_terminal_cols, raw_terminal_rows,
+        wrap_line_to_terminal_rows_with_reserve,
     },
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
     state::{
@@ -278,12 +279,19 @@ pub(super) async fn stream_response(
         return Ok(result);
     }
 
-    if let Some(timeout_secs) = idle_timeout_secs.filter(|_| !state.content.finish_reason_seen) {
+    let idle_timeout_secs = idle_timeout_secs.filter(|_| !state.content.finish_reason_seen);
+    if idle_timeout_secs.is_some() {
         state.content.stream_idle_timed_out = true;
+    }
+
+    // Live regions erase relative to the current cursor. Finish all buffered
+    // output before the warning moves it, otherwise cleanup leaves an old
+    // thinking header behind and can erase part of the warning instead.
+    let result = finalize_stream_response(app, current_history, &markers, state);
+    if let Some(timeout_secs) = idle_timeout_secs {
         if runtime_ctx::terminal_output_enabled() {
-            // Best-effort writes: the idle-timeout warning is advisory, so a failed terminal
-            // write must not return early and skip the fold finalize below.
-            let _ = clear_waiting_hint(&mut state);
+            // The advisory warning must not replace the finalization result,
+            // including an error returned while flushing terminal output.
             let stdout = io::stdout();
             let mut out = stdout.lock();
             if tool_args_stalled {
@@ -301,7 +309,7 @@ pub(super) async fn stream_response(
         }
     }
 
-    finalize_stream_response(app, current_history, &markers, state)
+    result
 }
 
 /// Whether to show a compact "waiting for model output" status hint in the terminal.
@@ -1941,6 +1949,7 @@ fn thinking_fold_redraw_to(
     // The first redraw (activation) has nothing on screen above the cursor, so it erases nothing and the
     // header lands at the fold's start position as before; every later redraw has a header (and possibly
     // an empty body) above the cursor that must be cleared and reprinted.
+    let live_cols = raw_terminal_cols();
     let body_rows = thinking_fold_rendered_body_rows(fold).max(fold.window_rows);
     let erase_rows = if fold.header_drawn {
         // The header ends with CRLF. With no body, the cursor is on the blank
@@ -1951,7 +1960,26 @@ fn thinking_fold_redraw_to(
     } else {
         body_rows
     };
-    erase_fold_body(out, erase_rows)?;
+    // A narrowed terminal reflows the rows it has already drawn, and this process may learn the new
+    // winsize only afterwards, so an erase that runs inside that gap stops above the rows the reflow
+    // added. Those stranded rows sit above every later span (each redraw measures up from the cursor),
+    // so they would stay on screen for good: the stacked `○ thinking` headers left behind after
+    // resizing a VS Code panel. Recover them from the rows that gap-era erase cleared.
+    let reflow_slack = fold_reflow_slack(fold, live_cols);
+    let span = erase_rows.saturating_add(reflow_slack);
+    // Snapshot the rows this erase clears (they are rewritten right below) before overwriting them:
+    // they are the only record of what a later redraw must measure at a width that may still arrive late.
+    fold.last_erased_rows.clear();
+    if fold.header_drawn {
+        fold.last_erased_rows.push(fold.header_rendered_line.clone());
+    }
+    fold.last_erased_rows
+        .extend(fold.rendered_body_lines.iter().cloned());
+    erase_fold_body(out, span)?;
+    // Record the span computed for those rows, not the span actually written: any rows the recovery
+    // reclaimed have left the screen, and counting them here would hide a later shortfall.
+    fold.last_erase_span = erase_rows;
+    fold.last_erase_width = live_cols;
     if fold.active {
         fold.header_rendered_line = write_fold_header(out, rate, fold)?;
         fold.header_drawn = true;
@@ -2209,6 +2237,28 @@ fn thinking_fold_visible_lines(fold: &super::state::ThinkingFoldState) -> Vec<&s
         visible.push(fold.current_line.as_str());
     }
     visible
+}
+
+/// Physical rows the written rows of a fold region occupy on a terminal `cols` columns wide.
+fn thinking_fold_rows_at_width(rows: &[String], cols: usize) -> usize {
+    rows.iter()
+        .map(|row| live_preview_cursor_rows_at(row, cols))
+        .sum()
+}
+
+/// Rows an erase was short by because the terminal reflowed the fold before the new winsize reached
+/// this process (see the erase comment in `thinking_fold_redraw_to`).
+///
+/// `last_erased_rows` are the rows the last erase cleared and `last_erase_span` is the span it computed
+/// for them at `last_erase_width`, so rebuilding their height at the width in force now yields exactly
+/// the rows the reflow pushed above that span. Only the most recent erase can be measured this way — an
+/// older one's rows have since been overwritten — so a resize whose lag spans several frames can still
+/// strand rows written by its earliest frames.
+fn fold_reflow_slack(fold: &super::state::ThinkingFoldState, live_cols: usize) -> usize {
+    if !fold.header_drawn || fold.last_erase_width == 0 || fold.last_erase_width == live_cols {
+        return 0;
+    }
+    thinking_fold_rows_at_width(&fold.last_erased_rows, live_cols).saturating_sub(fold.last_erase_span)
 }
 
 fn thinking_fold_rendered_body_rows(fold: &super::state::ThinkingFoldState) -> usize {

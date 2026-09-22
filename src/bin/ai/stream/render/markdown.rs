@@ -1532,8 +1532,17 @@ pub(in crate::ai) fn live_preview_cursor_rows(line: &str) -> usize {
     // so count physical rows with raw_terminal_cols, not the margin-reduced preview width.
     // A narrower width can count a one-row preview as two, moving the cursor up too far
     // and clearing content above the table or leaving preview fragments after a redraw.
-    // Match DECAWM wrapping: wide characters wrap early when col + w > cols.
-    let cols = raw_terminal_cols().max(1);
+    live_preview_cursor_rows_at(line, raw_terminal_cols())
+}
+
+/// Physical rows `line` occupies on a terminal `cols` columns wide.
+///
+/// Split out from [`live_preview_cursor_rows`] so a caller that must judge a row at a width other than
+/// the live one shares the same rule: the thinking fold asks how tall a region it has already written
+/// would be at a width this process learns only after the terminal reflowed it.
+/// Match DECAWM wrapping: wide characters wrap early when col + w > cols.
+pub(in crate::ai) fn live_preview_cursor_rows_at(line: &str, cols: usize) -> usize {
+    let cols = cols.max(1);
     let visible = strip_ansi_codes(line);
     let mut lines = 1usize;
     let mut col = 0usize;
@@ -1564,7 +1573,7 @@ fn preview_terminal_width() -> usize {
         .max(MIN_PREVIEW_WIDTH)
 }
 
-fn raw_terminal_cols() -> usize {
+pub(in crate::ai) fn raw_terminal_cols() -> usize {
     // Prefer ioctl(TIOCGWINSZ) for the live width: the long-running `a` process inherits
     // COLUMNS at startup, so narrowing a terminal panel can leave it larger than reality.
     // An overstated width undercounts preview rows during cursor-up redraws, leaving

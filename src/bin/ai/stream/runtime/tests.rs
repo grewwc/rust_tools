@@ -2223,6 +2223,206 @@ fn thinking_fold_erase_rows_follow_current_terminal_reflow_of_previous_body() {
     }
 }
 
+/// A terminal that reflows the rows it has already drawn when it narrows and reports the new width only
+/// afterwards — the VS Code/xterm.js ordering that strands fold rows. Once the new width is known, the
+/// fold must reclaim the rows its short erase left behind, and must not eat the transcript row above it.
+#[test]
+fn thinking_fold_reclaims_rows_stranded_by_a_resize_reported_after_the_reflow() {
+    /// Models only what the fold's own writer emits: SGR is ignored, and `\r`, `\n`, CSI A/B/K plus
+    /// DECAWM auto-wrap cover the rest. The writer ends every row with CRLF, so `resize` re-wraps each
+    /// row on its own, exactly as a reflowing terminal does with hard-wrapped rows.
+    struct Grid {
+        cols: usize,
+        cells: Vec<Vec<char>>,
+        row: usize,
+        col: usize,
+    }
+
+    impl Grid {
+        fn new(cols: usize, rows: usize) -> Self {
+            Self {
+                cols,
+                cells: vec![vec![' '; cols]; rows],
+                row: 0,
+                col: 0,
+            }
+        }
+
+        fn newline(&mut self) {
+            assert!(self.row + 1 < self.cells.len(), "test grid ran out of rows");
+            self.row += 1;
+        }
+
+        fn feed(&mut self, text: &str) {
+            let mut chars = text.chars().peekable();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\r' => self.col = 0,
+                    '\n' => self.newline(),
+                    '\x1b' => {
+                        assert_eq!(chars.next(), Some('['), "only CSI sequences are modelled");
+                        let mut args = String::new();
+                        let command = loop {
+                            let next = chars.next().expect("unterminated CSI sequence");
+                            if ('@'..='~').contains(&next) {
+                                break next;
+                            }
+                            args.push(next);
+                        };
+                        match command {
+                            'm' => {}
+                            'K' => {
+                                assert_eq!(args, "2");
+                                self.cells[self.row].fill(' ');
+                            }
+                            'A' => {
+                                let rows = args.parse::<usize>().unwrap_or(1).max(1);
+                                self.row = self.row.saturating_sub(rows);
+                            }
+                            'B' => {
+                                let rows = args.parse::<usize>().unwrap_or(1).max(1);
+                                self.row = (self.row + rows).min(self.cells.len() - 1);
+                            }
+                            other => panic!("unsupported CSI {args}{other}"),
+                        }
+                    }
+                    _ => {
+                        if self.col >= self.cols {
+                            self.col = 0;
+                            self.newline();
+                        }
+                        self.cells[self.row][self.col] = ch;
+                        self.col += 1;
+                    }
+                }
+            }
+        }
+
+        /// Terminal reflow: every row on screen is re-wrapped at `cols`, rows keep their order, and the
+        /// cursor stays at the end of the row it was on.
+        fn resize(&mut self, cols: usize) {
+            let cursor_row = self.row;
+            // A terminal reflows the rows it has drawn; the blank tail below stays blank.
+            let drawn_through = self
+                .cells
+                .iter()
+                .rposition(|row| row.iter().any(|cell| *cell != ' '))
+                .map_or(0, |last| last.max(cursor_row));
+            let mut reflowed: Vec<Vec<char>> = Vec::new();
+            for (index, row) in self.cells.iter().take(drawn_through + 1).enumerate() {
+                let mut content = row.clone();
+                while content.last() == Some(&' ') {
+                    content.pop();
+                }
+                let mut fragments: Vec<Vec<char>> = content.chunks(cols).map(<[char]>::to_vec).collect();
+                if fragments.is_empty() {
+                    fragments.push(Vec::new());
+                }
+                if index == cursor_row {
+                    self.row = reflowed.len() + fragments.len() - 1;
+                    let remainder = content.len() % cols;
+                    self.col = if remainder == 0 && !content.is_empty() {
+                        cols
+                    } else {
+                        remainder
+                    };
+                }
+                // Every row of a terminal's screen is `cols` cells wide, blanks included.
+                for fragment in fragments.iter_mut() {
+                    fragment.resize(cols, ' ');
+                }
+                reflowed.extend(fragments);
+            }
+            assert!(reflowed.len() <= self.cells.len(), "test grid ran out of rows");
+            while reflowed.len() < self.cells.len() {
+                reflowed.push(vec![' '; cols]);
+            }
+            self.cells = reflowed;
+            self.cols = cols;
+        }
+
+        fn text(&self) -> String {
+            self.cells
+                .iter()
+                .map(|row| row.iter().collect::<String>())
+                .collect::<Vec<String>>()
+                .join("\n")
+        }
+    }
+
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    struct SavedColumns(Option<std::ffi::OsString>);
+    impl Drop for SavedColumns {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("COLUMNS", value),
+                    None => std::env::remove_var("COLUMNS"),
+                }
+            }
+        }
+    }
+    let _columns = SavedColumns(std::env::var_os("COLUMNS"));
+
+    unsafe {
+        std::env::set_var("COLUMNS", "140");
+    }
+    let mut grid = Grid::new(140, 64);
+    grid.feed("transcript\r\n");
+    let mut state = StreamProcessingState::new();
+    let fold = &mut state.render.thinking_fold;
+    fold.active = true;
+    fold.max_visible_lines = 2;
+    fold.rewrite_right_margin_cols = FOLD_REWRITE_RIGHT_MARGIN_COLS;
+    // One long reasoning line, so a narrowed terminal re-wraps the frame rows rather than leaving them.
+    append_fold_content(fold, &"reasoning ".repeat(20));
+    for rate in ["~1000 tok @ 100 tok/s", "~1001 tok @ 101 tok/s"] {
+        let mut bytes = Vec::new();
+        thinking_fold_redraw_to(&mut bytes, Some(rate), fold).unwrap();
+        grid.feed(&String::from_utf8(bytes).unwrap());
+    }
+    assert_eq!(grid.text().matches("○ thinking").count(), 1, "steady state");
+
+    // The panel narrows: the terminal reflows what it has drawn, and the new winsize reaches this
+    // process only after the next frame has already been written at the old width.
+    grid.resize(60);
+    let mut bytes = Vec::new();
+    thinking_fold_redraw_to(&mut bytes, Some("~1002 tok @ 102 tok/s"), fold).unwrap();
+    grid.feed(&String::from_utf8(bytes).unwrap());
+    let stranded = grid.text();
+    assert_eq!(
+        stranded.matches("○ thinking").count(),
+        2,
+        "the short erase should leave the previous header stranded:\n{stranded}"
+    );
+
+    unsafe {
+        std::env::set_var("COLUMNS", "60");
+    }
+    let mut bytes = Vec::new();
+    thinking_fold_redraw_to(&mut bytes, Some("~1003 tok @ 103 tok/s"), fold).unwrap();
+    grid.feed(&String::from_utf8(bytes).unwrap());
+
+    let screen = grid.text();
+    assert_eq!(
+        screen.matches("○ thinking").count(),
+        1,
+        "rows stranded by the resize stayed on screen:\n{screen}"
+    );
+    assert_eq!(
+        screen.matches("~1002").count(),
+        0,
+        "the header written inside the resize gap was never reclaimed:\n{screen}"
+    );
+    assert_eq!(
+        screen.matches("transcript").count(),
+        1,
+        "reclaiming the stranded rows ate the transcript row above the fold:\n{screen}"
+    );
+}
+
 #[test]
 fn thinking_fold_terminal_grid_refresh_does_not_accumulate_headers() {
     // Accept only the fold/footer control sequences, including scroll margins,
@@ -2349,7 +2549,24 @@ fn thinking_fold_terminal_grid_refresh_does_not_accumulate_headers() {
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let previous_columns = std::env::var_os("COLUMNS");
+    // Restore dimensions even when a frame assertion fails, while ENV_LOCK is held.
+    struct SavedDimensions([(&'static str, Option<std::ffi::OsString>); 2]);
+    impl Drop for SavedDimensions {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+    let _dimensions = SavedDimensions([
+        ("COLUMNS", std::env::var_os("COLUMNS")),
+        ("LINES", std::env::var_os("LINES")),
+    ]);
     let rates = [
         "~973 tok @ 192 tok/s",
         "~975 tok @ 193 tok/s",
@@ -2441,13 +2658,215 @@ fn thinking_fold_terminal_grid_refresh_does_not_accumulate_headers() {
             }
         }
     }
+    assert!(failures.is_empty(), "orphan headers: {}", failures.join(", "));
+
+    // Fixed viewport: no resize and no unrelated writes inside the live fold.
+    // Run with non-TTY stdout so COLUMNS/LINES, rather than an inherited ioctl
+    // size, drive the production wrapping and viewport-budget functions.
+    const ROWS: usize = 15;
+    const COLS: usize = 140;
     unsafe {
-        match previous_columns {
-            Some(value) => std::env::set_var("COLUMNS", value),
-            None => std::env::remove_var("COLUMNS"),
+        std::env::set_var("COLUMNS", COLS.to_string());
+        std::env::set_var("LINES", ROWS.to_string());
+    }
+    assert_eq!(raw_terminal_rows(), ROWS, "run this fixture with piped stdout");
+    assert_eq!(
+        clamp_line_to_terminal_row_with_reserve(&"x".repeat(COLS * 2), 2)
+            .chars()
+            .count(),
+        COLS - 2,
+        "run this fixture with piped stdout"
+    );
+
+    // A timeout warning is ordinary output, not part of the fold footprint.
+    // Model both orderings with real renderer bytes: the old warning-first
+    // order must reproduce an orphan, while finalize-first preserves output.
+    for warning_first in [true, false] {
+        for body in ["", "short reasoning\nsecond line"] {
+            for start_row in [0, ROWS - 2] {
+                let mut grid = Grid {
+                    cols: COLS,
+                    cells: vec![vec![' '; COLS]; ROWS],
+                    history: Vec::new(),
+                    row: start_row,
+                    col: 0,
+                    bottom: ROWS - 1,
+                    saved: (0, 0),
+                };
+                grid.feed("transcript-before-timeout\r\n");
+                let mut fold = super::super::state::ThinkingFoldState::new();
+                fold.active = true;
+                fold.max_visible_lines = 2;
+                fold.rewrite_right_margin_cols = FOLD_REWRITE_RIGHT_MARGIN_COLS;
+                append_fold_content(&mut fold, body);
+                let mut bytes = Vec::new();
+                thinking_fold_redraw_to(&mut bytes, Some(rates[0]), &mut fold).unwrap();
+                grid.feed(&String::from_utf8(bytes).unwrap());
+                if warning_first {
+                    grid.feed("timeout-warning\r\n");
+                }
+                let mut bytes = Vec::new();
+                finalize_fold_to(&mut bytes, &mut fold, true).unwrap();
+                grid.feed(&String::from_utf8(bytes).unwrap());
+                if !warning_first {
+                    grid.feed("timeout-warning\r\n");
+                }
+                let screen = grid.text();
+                assert_eq!(
+                    screen.matches("○ thinking").count(),
+                    usize::from(warning_first),
+                    "warning_first={warning_first} body={body:?} start={start_row}\n{screen}"
+                );
+                assert_eq!(screen.matches("transcript-before-timeout").count(), 1);
+                assert_eq!(screen.matches("✓ thinking").count(), 1);
+                if !warning_first {
+                    assert_eq!(screen.matches("timeout-warning").count(), 1);
+                }
+            }
         }
     }
-    assert!(failures.is_empty(), "orphan headers: {}", failures.join(", "));
+
+    let mut continuous = vec![String::new(), "ascii-start ".to_string()];
+    let mut multiline = vec![String::new(), "first line\n".to_string()];
+    for frame in 0..24 {
+        let chunk = format!("chunk-{frame:02} {}", "abcdefghij ".repeat(13));
+        continuous.push(chunk.clone());
+        multiline.push(format!("{chunk}{}", if frame % 3 == 2 { "\n" } else { "" }));
+    }
+    let mut trailing_newlines = multiline.clone();
+    // Replace the long tail with short logical lines, then empty lines and an
+    // idle frame: exercise both expanding and shrinking the physical footprint.
+    trailing_newlines.extend(
+        ["short-a\n", "short-b\n", "short-c\n", "\n", "\n", ""]
+            .map(str::to_string),
+    );
+    for (scenario, chunks) in [
+        ("continuous-ascii", continuous),
+        ("multiple-logical-lines", multiline),
+        ("trailing-newlines", trailing_newlines),
+    ] {
+        let chunk_lengths: Vec<_> = chunks.iter().map(String::len).collect();
+        for start_row in [0, 1, 6, 10, 13, 14] {
+            for max_visible_lines in [1, 2, 3] {
+                // Cover disabled, already active before the first header, and
+                // entry while a long body is being refreshed.
+                for footer_at in [None, Some(0), Some(6)] {
+                    let case = format!(
+                        "15x140 scenario={scenario} start_row={start_row} max_visible_lines={max_visible_lines} footer_at={footer_at:?}"
+                    );
+                    let mut grid = Grid {
+                        cols: COLS,
+                        cells: vec![vec![' '; COLS]; ROWS],
+                        history: Vec::new(),
+                        row: start_row,
+                        col: 0,
+                        bottom: ROWS - 1,
+                        saved: (0, 0),
+                    };
+                    grid.feed("transcript-before-fold\r\n");
+                    let mut footer = super::super::side_note_input::FooterReservation::for_test(
+                        COLS as u16,
+                        ROWS as u16,
+                    );
+                    let draft: Vec<char> = "keep-draft".chars().collect();
+                    let mut fold = super::super::state::ThinkingFoldState::new();
+                    fold.active = true;
+                    fold.max_visible_lines = max_visible_lines;
+                    fold.rewrite_right_margin_cols = FOLD_REWRITE_RIGHT_MARGIN_COLS;
+                    let mut saw_more = false;
+
+                    for (frame, chunk) in chunks.iter().enumerate() {
+                        let check = |grid: &Grid, phase: &str, ansi: &str, live_headers| {
+                            let screen = grid.text();
+                            assert_eq!(
+                                (
+                                    screen.matches("○ thinking").count(),
+                                    screen.matches("transcript-before-fold").count(),
+                                ),
+                                (live_headers, 1),
+                                "{case} frame={frame} phase={phase} chunk_lengths={:?} chunk={chunk:?} cursor=({}, {}) ANSI={ansi:?}\n{screen}",
+                                &chunk_lengths[..=frame], grid.row, grid.col,
+                            );
+                        };
+                        let footer_active = footer_at.is_some_and(|at| frame >= at);
+                        if footer_at == Some(frame) {
+                            let cursor = (grid.row, grid.col);
+                            let mut bytes = Vec::new();
+                            footer.apply_reservation_to(&mut bytes).unwrap();
+                            footer.draw_to(&mut bytes, &draft).unwrap();
+                            let ansi = String::from_utf8(bytes).unwrap();
+                            grid.feed(&ansi);
+                            check(&grid, "footer-enter", &ansi, usize::from(frame > 0));
+                            assert_eq!(
+                                (grid.row, grid.col),
+                                (cursor.0.min(ROWS - 2), cursor.1),
+                                "{case} frame={frame} footer-enter ANSI={ansi:?}"
+                            );
+                        }
+                        append_fold_content(&mut fold, chunk);
+                        let mut bytes = Vec::new();
+                        thinking_fold_redraw_to(
+                            &mut bytes,
+                            Some(rates[frame % rates.len()]),
+                            &mut fold,
+                        )
+                        .unwrap();
+                        let ansi = String::from_utf8(bytes).unwrap();
+                        grid.feed(&ansi);
+                        check(&grid, "redraw", &ansi, 1);
+                        saw_more |= ansi.contains("… more");
+                        if footer_active {
+                            // Check before repainting; a repaint must not hide
+                            // accidental footer erasure by the fold renderer.
+                            assert!(
+                                grid.cells[ROWS - 1].iter().collect::<String>().contains("keep-draft"),
+                                "{case} frame={frame} redraw erased footer ANSI={ansi:?}\n{}", grid.text()
+                            );
+                            let cursor = (grid.row, grid.col);
+                            let mut bytes = Vec::new();
+                            footer.draw_to(&mut bytes, &draft).unwrap();
+                            let ansi = String::from_utf8(bytes).unwrap();
+                            grid.feed(&ansi);
+                            check(&grid, "footer-redraw", &ansi, 1);
+                            assert_eq!((grid.row, grid.col), cursor, "{case} frame={frame} footer-redraw ANSI={ansi:?}");
+                        }
+                    }
+                    assert!(saw_more, "{case}: long ASCII must exercise the physical-row … more marker");
+                    let mut bytes = Vec::new();
+                    finalize_fold_to(&mut bytes, &mut fold, true).unwrap();
+                    let ansi = String::from_utf8(bytes).unwrap();
+                    grid.feed(&ansi);
+                    let screen = grid.text();
+                    assert_eq!(
+                        (
+                            screen.matches("○ thinking").count(),
+                            screen.matches("✓ thinking").count(),
+                            screen.matches("transcript-before-fold").count(),
+                        ),
+                        (0, 1, 1),
+                        "{case} finalize chunk_lengths={chunk_lengths:?} ANSI={ansi:?}\n{screen}"
+                    );
+                    if footer_at.is_some() {
+                        assert!(grid.cells[ROWS - 1].iter().collect::<String>().contains("keep-draft"), "{case} finalize erased footer ANSI={ansi:?}");
+                        let cursor = (grid.row, grid.col);
+                        let mut bytes = Vec::new();
+                        footer.leave_to(&mut bytes).unwrap();
+                        let ansi = String::from_utf8(bytes).unwrap();
+                        grid.feed(&ansi);
+                        assert_eq!((grid.row, grid.col), cursor, "{case} footer-leave ANSI={ansi:?}");
+                        assert_eq!(grid.bottom, ROWS - 1, "{case}");
+                        assert!(!grid.text().contains("keep-draft"), "{case}");
+                    }
+                    grid.feed("answer-after-fold\r\n");
+                    let screen = grid.text();
+                    assert_eq!(screen.matches("○ thinking").count(), 0, "{case}\n{screen}");
+                    assert_eq!(screen.matches("✓ thinking").count(), 1, "{case}\n{screen}");
+                    assert_eq!(screen.matches("transcript-before-fold").count(), 1, "{case}\n{screen}");
+                    assert_eq!(screen.matches("answer-after-fold").count(), 1, "{case}\n{screen}");
+                }
+            }
+        }
+    }
 }
 
 #[test]

@@ -281,6 +281,13 @@ pub(super) struct ThinkingFoldState {
     /// The erase steps recompute its physical row count from this text instead of assuming exactly one
     /// row, so a header re-wrapped by a narrowed terminal is still fully covered by the cursor-up erase.
     pub(super) header_rendered_line: String,
+    /// Physical rows the last erase cleared, the span that erase computed for them, and the terminal
+    /// width that span assumed (`0` width = nothing erased yet). A narrowed terminal reflows rows it has
+    /// already drawn before the new winsize reaches this process, so that erase can stop above the rows
+    /// the reflow added; the next erase measures these rows at the live width to recover the shortfall.
+    pub(super) last_erased_rows: Vec<String>,
+    pub(super) last_erase_span: usize,
+    pub(super) last_erase_width: usize,
     /// Fold-block header text (e.g. `○ thinking` / `subagent explore`).
     pub(super) header_label: String,
     /// Fold-block footer text (e.g. `✓ thinking` / `done subagent explore`).
@@ -312,6 +319,9 @@ impl ThinkingFoldState {
             active: false,
             header_drawn: false,
             header_rendered_line: String::new(),
+            last_erased_rows: Vec::new(),
+            last_erase_span: 0,
+            last_erase_width: 0,
             header_label: header_label.into(),
             footer_label: footer_label.into(),
             skip_blank_lines,
@@ -336,6 +346,9 @@ impl ThinkingFoldState {
         self.active = false;
         self.header_drawn = false;
         self.header_rendered_line.clear();
+        self.last_erased_rows.clear();
+        self.last_erase_span = 0;
+        self.last_erase_width = 0;
     }
 }
 
