@@ -1242,27 +1242,6 @@ fn take_redraw_request(redraw_requested: &mut bool, external_change: bool) -> bo
     std::mem::take(redraw_requested)
 }
 
-/// Whether a frame must re-assert every cell of the viewport instead of letting
-/// Ratatui's diff skip the cells it believes are unchanged.
-///
-/// `Terminal::flush` compares a frame only against Ratatui's own previous
-/// buffer; it has no knowledge of what the backend's display surface actually
-/// shows. A cell the terminal re-created on its own -- a reflow or an external
-/// clear can leave the editing caret's fill behind at a cell the caret has since
-/// left, and another renderer can draw over the viewport -- is blank in every
-/// later frame's buffer, so it compares equal, is never written again, and the
-/// mark stays on screen. The caret cell moving is the signal that a stale mark
-/// is both possible and about to be looked at: the user resumes typing at the
-/// caret, and that frame re-asserts the whole box. Input shrink already requests
-/// the same treatment through `force_repaint_next_frame`.
-fn full_repaint_needed(
-    requested: bool,
-    previous_caret_cell: Option<Position>,
-    caret_cell: Option<Position>,
-) -> bool {
-    requested || previous_caret_cell != caret_cell
-}
-
 /// Schedule the deferred resize once the input poll goes idle. A consumed CPR
 /// also returns no event, but can leave resize notifications queued: drain them
 /// before rebuilding so an intermediate size cannot become the new anchor.
@@ -1385,7 +1364,6 @@ impl PromptEditor {
         // starts, and its height is where the parked anchor's offset comes
         // from, so both stay consistent with what is actually drawn.
         let mut last_drawn_area: Option<Rect> = Some(initial_viewport_area);
-        let mut last_caret_cell: Option<Position> = None;
 
         let result: io::Result<Option<String>> = (|| {
             // Prefilled content (editing an existing memo): load into the textarea
@@ -1513,7 +1491,6 @@ impl PromptEditor {
 
                     let force_repaint = force_repaint_next_frame;
                     let mut drawn_viewport_area = Rect::ZERO;
-                    let mut drawn_caret_cell: Option<Position> = None;
                     let mut drawn_row_widths: Vec<u16> = Vec::new();
                     // The visible editing caret is drawn into the buffer (see
                     // render.rs), so it cannot jump mid-draw. The hardware
@@ -1525,7 +1502,7 @@ impl PromptEditor {
                             let area = f.area();
                             drawn_viewport_area = area;
                             last_drawn_area = Some(area);
-                            drawn_caret_cell = render_multiline_popup(
+                            let _ = render_multiline_popup(
                                 f,
                                 &mut textarea,
                                 status_msg.as_deref(),
@@ -1534,19 +1511,13 @@ impl PromptEditor {
                                 &self.current_reasoning_effort_label,
                                 self.session_topic.as_deref(),
                             );
-                            let full_repaint = full_repaint_needed(
-                                force_repaint,
-                                last_caret_cell,
-                                drawn_caret_cell,
-                            );
-                            if full_repaint {
+                            if force_repaint {
                                 force_frame_repaint(f);
                             }
                             drawn_row_widths =
-                                painted_row_widths(f.buffer_mut(), area, full_repaint);
+                                painted_row_widths(f.buffer_mut(), area, force_repaint);
                         })
                         .map_err(|e| io::Error::other(e.to_string()))?;
-                    last_caret_cell = drawn_caret_cell;
                     // Accumulate, never shrink: the terminal keeps cells written
                     // by earlier frames, so the widest row content seen since the
                     // rows were last erased is what re-wraps.
@@ -1702,17 +1673,15 @@ mod tests {
         backend::{Backend, TestBackend},
         buffer::Cell,
         layout::{Position, Rect},
-        style::Modifier,
         widgets::Paragraph,
     };
 
     use super::{
         VERIFIED_ANCHOR_ATTEMPTS, ViewportRebuildMode, clear_fixed_viewport, clear_row_range,
-        fixed_viewport_area, force_frame_repaint, full_repaint_needed, multiline_viewport_height,
-        park_reflow_anchor, parked_anchor_offset, prepare_fixed_viewport, render_multiline_popup,
-        submitted_input_preview_lines, take_redraw_request, take_standalone_resize_rebuild,
-        terminal_with_fixed_viewport, update_pending_resize_rebuild, verified_cursor_row,
-        viewport_height_with_completion,
+        fixed_viewport_area, force_frame_repaint, multiline_viewport_height, park_reflow_anchor,
+        parked_anchor_offset, prepare_fixed_viewport, submitted_input_preview_lines,
+        take_redraw_request, take_standalone_resize_rebuild, terminal_with_fixed_viewport,
+        update_pending_resize_rebuild, verified_cursor_row, viewport_height_with_completion,
     };
 
     fn key(code: KeyCode) -> Event {
@@ -2542,97 +2511,6 @@ mod tests {
         terminal.draw(|frame| force_frame_repaint(frame)).unwrap();
 
         assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
-    }
-
-    /// The frame re-asserts every cell of the viewport when the caret cell moves.
-    /// The terminal can re-create a caret mark at a cell the caret has left (a
-    /// reflow or an external clear does), the app's buffers are blank there in
-    /// every later frame, and the diff only writes cells whose content changed --
-    /// so without the forced frame the mark is permanent. Checked both ways: the
-    /// mark survives a frame that keeps the caret still, and is gone from the
-    /// frame that moves it.
-    #[test]
-    fn caret_move_reasserts_the_viewport_and_clears_a_stray_caret_cell() {
-        use tui_textarea::{CursorMove, TextArea};
-
-        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        let mut textarea = TextArea::from(["alpha", "beta", "gamma"]);
-        textarea.move_cursor(CursorMove::End);
-        let mut last_caret_cell = None;
-        let mut paint = |terminal: &mut Terminal<TestBackend>, textarea: &mut TextArea<'_>| {
-            let mut caret = None;
-            terminal
-                .draw(|frame| {
-                    caret = render_multiline_popup(frame, textarea, None, None, "model", "high", None);
-                    if full_repaint_needed(false, last_caret_cell, caret) {
-                        force_frame_repaint(frame);
-                    }
-                })
-                .unwrap();
-            last_caret_cell = caret;
-            caret.expect("the caret is inside the viewport")
-        };
-
-        let first_caret = paint(&mut terminal, &mut textarea);
-        // The caret sits on the blank cell that follows "alpha". Moving it leaves
-        // that cell blank in every later frame's buffer, the way the blank rows of
-        // the input are.
-        textarea.move_cursor(CursorMove::Down);
-        let second_caret = paint(&mut terminal, &mut textarea);
-        assert_ne!(first_caret, second_caret);
-
-        // A frame with the caret still: the rewriting flags a forced frame leaves
-        // behind drain here, before the mark is planted.
-        paint(&mut terminal, &mut textarea);
-
-        // What the terminal shows after a reflow or an external clear: a caret
-        // mark re-created at a cell the caret has left.
-        let mut stray = Cell::new(" ");
-        stray.modifier = Modifier::REVERSED;
-        terminal
-            .backend_mut()
-            .draw(std::iter::once((first_caret.x, first_caret.y, &stray)))
-            .unwrap();
-
-        // No caret move: nothing changed at that cell, the diff skips it, and the
-        // mark stays.
-        paint(&mut terminal, &mut textarea);
-        assert!(
-            reversed_at(&terminal, first_caret),
-            "a frame that keeps the caret still must leave the mark alone"
-        );
-
-        // The next caret move re-asserts the whole viewport and clears it.
-        textarea.move_cursor(CursorMove::Down);
-        let third_caret = paint(&mut terminal, &mut textarea);
-        assert_ne!(second_caret, third_caret);
-        assert!(
-            !reversed_at(&terminal, first_caret),
-            "the caret-moving frame must re-assert the cell the caret left"
-        );
-        assert!(
-            reversed_at(&terminal, third_caret),
-            "the caret itself is still drawn"
-        );
-    }
-
-    #[test]
-    fn full_repaint_needed_only_for_a_request_or_a_caret_move() {
-        let cell = Position::new(3, 1);
-        assert!(!full_repaint_needed(false, Some(cell), Some(cell)));
-        assert!(full_repaint_needed(
-            false,
-            Some(cell),
-            Some(Position::new(4, 1))
-        ));
-        assert!(full_repaint_needed(true, Some(cell), Some(cell)));
-        assert!(full_repaint_needed(false, None, Some(cell)));
-    }
-
-    fn reversed_at(terminal: &Terminal<TestBackend>, position: Position) -> bool {
-        terminal.backend().buffer()[(position.x, position.y)]
-            .modifier
-            .contains(Modifier::REVERSED)
     }
 
     #[test]
