@@ -247,7 +247,13 @@ impl Host {
         self.terminal = Some(terminal.clone());
         if self.worker.is_none() && self.completed.is_none() { self.spawn_worker(window, &terminal)?; }
         let reply = self.reply();
-        let replay = self.replay.snapshot();
+        // Replay exists so a re-attach to a *live* worker looks uninterrupted.
+        // An already-finished worker has nothing live to resume: dumping its
+        // transcript here reprints stale output on the new terminal, and the
+        // client then exits with the old status below instead of starting the
+        // requested session (`a -ss <id>` inside the completion-retention
+        // window). Skip the dump; still deliver REPLY + EXIT with the code.
+        let replay = if self.completed.is_none() { self.replay.snapshot() } else { Vec::new() };
         let peer = &mut self.peers[index];
         peer.output.json(wire::REPLY, &reply)?;
         if !replay.is_empty() {
@@ -366,4 +372,107 @@ pub(super) fn open_pty(window: Window) -> io::Result<(File, File)> {
 #[cfg(test)]
 pub(super) fn fixture(root: PathBuf, name: String, token: String, command: Command) -> io::Result<i32> {
     Host::new(root, name, token, Vec::new(), Some(command))?.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration as StdDuration;
+
+    /// Drive one attach through the real `message()` handshake and return the
+    /// decoded wire frames plus the peer role. `completed` preseeds an
+    /// already-finished worker (with transcript bytes in the replay buffer),
+    /// i.e. the `a -ss <id>` re-attach inside the retention window.
+    fn attach_frames(completed: bool) -> (Vec<(u8, Vec<u8>)>, Role, i32) {
+        // Keep the dir name short: the session socket lives at
+        // `<root>/<name>` and macOS temp dirs are already long, so a full
+        // uuid here blows past the Unix SUN_LEN limit.
+        let tag: String = uuid::Uuid::new_v4().simple().to_string()[..8].into();
+        let root = std::env::temp_dir().join(format!("a-pty-t-{tag}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut host =
+            // Name must stay long enough for spawn_worker's `name[2..len-5]`
+            // session-id slice; keep it short for the SUN_LEN budget above.
+            Host::new(root.clone(), format!("tt-{tag}").into(), "tok".into(), Vec::new(), None)
+                .unwrap();
+        host.replay.push(b"stale-output-line");
+        if completed {
+            host.completed = Some((3, Instant::now()));
+        }
+        let (host_end, mut client_end) = UnixStream::pair().unwrap();
+        host.peers.push(Peer {
+            stream: host_end,
+            decoder: wire::Decoder::default(),
+            output: Queue::default(),
+            role: Role::Pending,
+            alive: true,
+            since: Instant::now(),
+            alias: None,
+        });
+        let payload = serde_json::to_vec(&Request::Attach {
+            terminal: "test-terminal".into(),
+            window: Window { rows: 24, cols: 80 },
+        })
+        .unwrap();
+        host.message(0, wire::REQUEST, &payload).unwrap();
+        let role_is_exit = host.peers[0].role == Role::Exit;
+        let peer = &mut host.peers[0];
+        peer.output.flush(&mut peer.stream).unwrap();
+        client_end
+            .set_read_timeout(Some(StdDuration::from_secs(2)))
+            .unwrap();
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 4096];
+        // The whole reply is already queued in the socket; a single read
+        // batch is enough, the timeout only guards against regressions that
+        // stop responding.
+        match client_end.read(&mut chunk) {
+            Ok(0) | Err(_) => {}
+            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+        }
+        let mut decoder = wire::Decoder::default();
+        decoder.push(&raw).unwrap();
+        let mut frames = Vec::new();
+        while let Some(frame) = decoder.next().unwrap() {
+            frames.push(frame);
+        }
+        let exit_code = frames
+            .iter()
+            .find(|(kind, _)| *kind == wire::EXIT)
+            .map(|(_, payload)| i32::from_be_bytes(payload[..4].try_into().unwrap()))
+            .unwrap_or(-1);
+        let role = if role_is_exit { Role::Exit } else { Role::Attached };
+        let _ = std::fs::remove_dir_all(&root);
+        (frames, role, exit_code)
+    }
+
+    #[test]
+    fn live_attach_replays_transcript() {
+        let (frames, role, _) = attach_frames(false);
+        assert!(role == Role::Attached);
+        let output: Vec<u8> =
+            frames.into_iter().filter(|(kind, _)| *kind == wire::OUTPUT).flat_map(|(_, payload)| payload).collect();
+        assert!(
+            output.windows(b"stale-output-line".len()).any(|w| w == b"stale-output-line"),
+            "live re-attach must replay the transcript so the session looks uninterrupted"
+        );
+    }
+
+    #[test]
+    fn completed_attach_skips_stale_replay_but_delivers_exit() {
+        let (frames, role, exit_code) = attach_frames(true);
+        assert!(role == Role::Exit);
+        assert_eq!(exit_code, 3);
+        assert!(
+            frames.iter().any(|(kind, _)| *kind == wire::REPLY),
+            "completed attach must still answer REPLY"
+        );
+        let output: Vec<u8> =
+            frames.into_iter().filter(|(kind, _)| *kind == wire::OUTPUT).flat_map(|(_, payload)| payload).collect();
+        assert!(
+            !output.windows(b"stale-output-line".len()).any(|w| w == b"stale-output-line"),
+            "attaching to an already-finished worker must not reprint its transcript, got: {}",
+            String::from_utf8_lossy(&output),
+        );
+    }
 }
