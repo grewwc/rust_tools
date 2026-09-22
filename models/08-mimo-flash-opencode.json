@@ -1,0 +1,18 @@
+{
+  "key": "mimo-flash-opencode",
+  "aliases": [
+    "mimo-v2.5",
+    "mimo-v2.5-free",
+    "mimo-v2.5-free-opencode"
+  ],
+  "name": "mimo-v2.6-flash",
+  "adapter": "opencode",
+  "quality_tier": "strong",
+  "is_vl": true,
+  "search_enabled": false,
+  "tools_default_enabled": true,
+  "enable_thinking": true,
+  "subagent_priority": 80,
+  "endpoint": "https://opencode.ai/zen/go/v1/chat/completions",
+  "default_reasoning_effort": "high"
+}

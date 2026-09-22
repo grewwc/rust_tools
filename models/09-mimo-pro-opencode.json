@@ -1,5 +1,8 @@
 {
-  "key": "mimo-v2.5-pro",
+  "key": "mimo-pro-opencode",
+  "aliases": [
+    "mimo-v2.5-pro"
+  ],
   "name": "mimo-v2.5-pro",
   "adapter": "opencode",
   "quality_tier": "strong",
