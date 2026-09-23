@@ -979,24 +979,14 @@ fn reflowed_extra_rows(previous_area: Rect, row_widths: &[u16], new_width: u16) 
 /// Width of each box row as the terminal sees it: the furthest column the frame
 /// wrote in that row, counted from `area.left()`.
 ///
-/// `full_repaint` (`force_frame_repaint`) writes every cell of the row, so the
-/// row counts as the full area width. Otherwise the furthest cell that counts as
-/// written wins — a symbol other than a space, or any non-default style
-/// attribute. Styled blank cells count: the backend emits them and the terminal
-/// extends the line's used length with them, so the write boundary rather than
-/// the last visible glyph is what re-wraps. A row the app never wrote stays 0,
-/// which `reflowed_extra_rows` treats as a single row.
-fn painted_row_widths(
-    buffer: &ratatui::buffer::Buffer,
-    area: Rect,
-    full_repaint: bool,
-) -> Vec<u16> {
+/// The furthest cell that counts as written wins — a symbol other than a space,
+/// or any non-default style attribute. Styled blank cells count: the backend
+/// emits them and the terminal extends the line's used length with them, so the
+/// write boundary rather than the last visible glyph is what re-wraps. A row the
+/// app never wrote stays 0, which `reflowed_extra_rows` treats as a single row.
+fn painted_row_widths(buffer: &ratatui::buffer::Buffer, area: Rect) -> Vec<u16> {
     let mut widths = Vec::with_capacity(area.height as usize);
     for y in area.top()..area.bottom() {
-        if full_repaint {
-            widths.push(area.width);
-            continue;
-        }
         let mut width = 0;
         for x in (area.left()..area.right()).rev() {
             let Some(cell) = buffer.cell((x, y)) else {
@@ -1014,6 +1004,32 @@ fn painted_row_widths(
         widths.push(width);
     }
     widths
+}
+
+/// Columns a forced repaint must rewrite in each row: every column that can
+/// still carry ink there — the row's accumulated written width from earlier
+/// frames, or this frame's own content, whichever reaches further.
+///
+/// `previous` is the widest write per row since the box's rows were last
+/// erased, so cells beyond it are blank on the terminal: a reflow only moves
+/// ink inside rows that a rebuild erases before the next forced repaint.
+/// Writing the whole row instead makes the terminal count a short row as a
+/// full-width line, and the next narrowing re-wraps rows that hold no ink
+/// (see `reflowed_extra_rows`).
+fn forced_repaint_widths(
+    buffer: &ratatui::buffer::Buffer,
+    area: Rect,
+    previous: &[u16],
+) -> Vec<u16> {
+    painted_row_widths(buffer, area)
+        .into_iter()
+        .enumerate()
+        .map(|(row, width)| {
+            width
+                .max(previous.get(row).copied().unwrap_or(0))
+                .min(area.width)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1136,7 +1152,7 @@ mod width_reflow_geometry_tests {
     }
 
     /// `painted_row_widths` reports where the frame stopped writing: text, a
-    /// styled blank cell and a forced repaint all count, blank padding does not.
+    /// styled blank cell count, blank padding does not.
     #[test]
     fn painted_row_widths_follow_the_furthest_written_column() {
         use ratatui::buffer::Buffer;
@@ -1147,9 +1163,29 @@ mod width_reflow_geometry_tests {
         // Row 1 is never written: its cells stay blank.
         // Row 2 holds only a space, but a styled one, which the backend emits.
         buffer[(4, 2)].set_style(Style::default().fg(Color::Red));
-        assert_eq!(painted_row_widths(&buffer, area, false), vec![3, 0, 5, 0]);
-        // A forced repaint writes every cell of every row, so every row is full.
-        assert_eq!(painted_row_widths(&buffer, area, true), vec![10; 4]);
+        assert_eq!(painted_row_widths(&buffer, area), vec![3, 0, 5, 0]);
+    }
+
+    /// A forced repaint reaches as far as ink can exist in a row — its own
+    /// content or an earlier, wider write — and no further, so a row that holds
+    /// nothing is not written out to the full width the terminal would count.
+    #[test]
+    fn forced_repaint_widths_stop_at_the_last_cell_that_can_carry_ink() {
+        use ratatui::buffer::Buffer;
+
+        let area = Rect::new(0, 0, 10, 4);
+        let mut buffer = Buffer::empty(area);
+        buffer[(2, 0)].set_symbol("x");
+        buffer[(4, 2)].set_style(Style::default().fg(Color::Red));
+        // Row 0 held ten columns before it shrank to three; row 1 is blank in
+        // this frame but an earlier one wrote five columns there.
+        assert_eq!(
+            forced_repaint_widths(&buffer, area, &[10, 5, 0, 0]),
+            vec![10, 5, 5, 0]
+        );
+        // With no record of earlier writes only the content is rewritten, so the
+        // blank rows stay untouched instead of becoming full-width lines.
+        assert_eq!(forced_repaint_widths(&buffer, area, &[]), vec![3, 0, 5, 0]);
     }
 }
 
@@ -1213,19 +1249,29 @@ fn clear_fixed_viewport<B: Backend>(
 
 /// Forces every cell of the current frame to be written back to the terminal.
 ///
-/// After terminal reflow the terminal may still show a deleted
-/// character, while ratatui's previous-frame buffer already considers that
-/// position blank, so a regular diff would not emit a space there again. Use
-/// `AlwaysUpdate` only on the frame after the input got shorter: it wipes such
-/// ghosts and avoids a full redraw every frame.
-fn force_frame_repaint(frame: &mut ratatui::Frame<'_>) {
+/// Forces every cell that can carry ink in the current frame to be written back
+/// to the terminal, and returns the per-row width record that follows from it.
+///
+/// After terminal reflow the terminal may still show a deleted character, while
+/// ratatui's previous-frame buffer already considers that position blank, so a
+/// regular diff would not emit a space there again. Use `AlwaysUpdate` only on
+/// the frame after the input got shorter: it wipes such ghosts and avoids a full
+/// redraw every frame. The wipe reaches only as far as `forced_repaint_widths`
+/// says ink can exist, so it does not stretch a short row to the full width.
+fn force_frame_repaint(frame: &mut ratatui::Frame<'_>, previous: &[u16]) -> Vec<u16> {
     let area = frame.area();
+    let row_widths = forced_repaint_widths(frame.buffer_mut(), area, previous);
     let buffer = frame.buffer_mut();
     for y in area.top()..area.bottom() {
-        for x in area.left()..area.right() {
+        let width = row_widths
+            .get(y.saturating_sub(area.top()) as usize)
+            .copied()
+            .unwrap_or(0);
+        for x in area.left()..area.left().saturating_add(width) {
             buffer[(x, y)].set_diff_option(CellDiffOption::AlwaysUpdate);
         }
     }
+    row_widths
 }
 
 fn textarea_logical_char_count(textarea: &TextArea<'_>) -> usize {
@@ -1511,11 +1557,11 @@ impl PromptEditor {
                                 &self.current_reasoning_effort_label,
                                 self.session_topic.as_deref(),
                             );
-                            if force_repaint {
-                                force_frame_repaint(f);
-                            }
-                            drawn_row_widths =
-                                painted_row_widths(f.buffer_mut(), area, force_repaint);
+                            drawn_row_widths = if force_repaint {
+                                force_frame_repaint(f, &screen.box_row_widths)
+                            } else {
+                                painted_row_widths(f.buffer_mut(), area)
+                            };
                         })
                         .map_err(|e| io::Error::other(e.to_string()))?;
                     // Accumulate, never shrink: the terminal keeps cells written
@@ -1864,7 +1910,7 @@ mod tests {
                     frame, &mut textarea, None, None, "fixture-model", "high",
                     Some("fixture-topic"),
                 );
-                screen.box_row_widths = super::painted_row_widths(frame.buffer_mut(), area, false);
+                screen.box_row_widths = super::painted_row_widths(frame.buffer_mut(), area);
             })?;
             park_reflow_anchor(&mut terminal, area)?;
             assert_eq!(textarea.lines(), original_lines.as_slice());
@@ -2508,7 +2554,13 @@ mod tests {
             .backend_mut()
             .draw(std::iter::once((0, 0, &slash)))
             .unwrap();
-        terminal.draw(|frame| force_frame_repaint(frame)).unwrap();
+        // The record says the row was written four columns wide, so the wipe
+        // reaches the ghost.
+        terminal
+            .draw(|frame| {
+                force_frame_repaint(frame, &[4]);
+            })
+            .unwrap();
 
         assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
     }

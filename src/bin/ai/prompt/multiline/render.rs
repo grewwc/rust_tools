@@ -17,6 +17,19 @@ use crate::ai::prompt::MAX_INPUT_CHARS;
 /// Maximum number of candidate lines the completion panel shows at once (overflow scrolls with the selection).
 const COMPLETION_WINDOW: usize = 12;
 
+/// Column budget for the informational model/topic line.
+///
+/// Every row is terminal content, so a row painted wider than the terminal is
+/// re-wrapped on each narrowing: the terminal pushes the transcript up by the
+/// extra rows and the input box follows. Widening back does not undo that — the
+/// box's rows are rewritten by the app, so the terminal has no wrapped-line
+/// group left to rejoin. Capping this line keeps the re-wrap a no-op for
+/// narrowings down to roughly this many columns, but the budget covers the text
+/// only: the row also carries the centered popup's left offset, which is 1-2
+/// columns up to ~182-column terminals and grows by one column per two columns
+/// of terminal width beyond that.
+const MODEL_LINE_MAX_COLUMNS: u16 = 80;
+
 /// Styles only cells occupied by input text.
 ///
 /// Applying a foreground color through `TextArea::set_style` styles the whole
@@ -263,7 +276,8 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                 .add_modifier(Modifier::ITALIC),
         ));
         let header = Line::from(spans);
-        let truncated_header = truncate_line_to_width(&header, header_area.width as usize);
+        let max_width = (header_area.width as usize).min(MODEL_LINE_MAX_COLUMNS as usize);
+        let truncated_header = truncate_line_to_width(&header, max_width);
         f.render_widget(Paragraph::new(truncated_header), header_area);
     }
 
@@ -710,7 +724,7 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
 mod tests {
     use super::{
         count_trailing_blank_lines, popup_layout_config, render_multiline_popup,
-        truncate_line_to_width, truncate_with_ellipsis,
+        MODEL_LINE_MAX_COLUMNS, truncate_line_to_width, truncate_with_ellipsis,
     };
     use ratatui::{
         Terminal, TerminalOptions, Viewport,
@@ -845,6 +859,51 @@ mod tests {
         assert_eq!(layout.help_lines, 1);
         assert_eq!(layout.model_header_lines, 0);
         assert_eq!(layout.min_textarea_lines, 1);
+    }
+
+    #[test]
+    fn model_line_stays_within_the_reflow_safe_width() {
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(200, 12),
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .unwrap();
+        let mut textarea = TextArea::default();
+        let long_topic = "topic-".repeat(30);
+        let mut viewport_area = Rect::ZERO;
+
+        terminal
+            .draw(|f| {
+                viewport_area = f.area();
+                render_multiline_popup(
+                    f,
+                    &mut textarea,
+                    None,
+                    None,
+                    "glm-5.2-super-relay",
+                    "max",
+                    Some(&long_topic),
+                );
+            })
+            .unwrap();
+
+        let popup_width = viewport_area
+            .width
+            .saturating_sub(2)
+            .clamp(40, 180)
+            .min(viewport_area.width);
+        let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
+        // The model line is the row above the help row, which is the viewport tail.
+        let model_row_y = viewport_area.bottom() - 2;
+        let row = buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
+        let painted = row.trim_end().len();
+        assert!(row.contains("reasoning: max"));
+        assert!(
+            painted <= popup_x as usize + 1 + MODEL_LINE_MAX_COLUMNS as usize,
+            "model line painted {painted} columns: {row:?}"
+        );
     }
 
     #[test]

@@ -910,6 +910,54 @@ fn system_prompt_requires_self_contained_comments() {
     assert!(prompt.contains("Write comments for a reader who only has the code"));
     assert!(prompt.contains("Never reference a discussion-only shorthand or codename"));
     assert!(prompt.contains("state what was decided and why"));
+    // Task artifacts (problem files, ticket/session ids, review comments) are
+    // not code context: a later reader cannot open them, so the comment must
+    // state the behavior or reason in terms the code itself defines.
+    assert!(prompt.contains("Never reference the task that produced the change"));
+    assert!(prompt.contains("problem/task description file"));
+    assert!(prompt.contains("in terms the code itself defines"));
+}
+
+#[test]
+fn system_prompt_answers_stable_general_knowledge_without_a_probe() {
+    // Common-sense and widely established facts are knowledge, not unverified
+    // evidence: no throwaway script or probe to re-derive them. Executed
+    // verification stays required for claims about this workspace / system /
+    // session, for version- or time-sensitive facts, and on explicit request.
+    let available = SkipSet::new(16);
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
+    assert!(prompt.contains("Answer stable general knowledge directly"));
+    assert!(prompt.contains("are knowledge, not unverified evidence"));
+    assert!(prompt.contains("skip the throwaway script or probe"));
+    assert!(prompt.contains(
+        "restates the same assumption instead of checking it against an independent source"
+    ));
+    assert!(prompt.contains("for version- or time-sensitive facts"));
+    assert!(prompt.contains(
+        "Executed verification is required for claims about the current workspace"
+    ));
+    // The "execute it" rule is scoped to the code/data at hand so it cannot be
+    // read as a mandate to probe general knowledge.
+    assert!(prompt.contains("Where execution settles a claim about the code or data at hand"));
+}
+
+#[test]
+fn system_prompt_groups_guardrails_under_topic_headings() {
+    // The guardrails block is the largest always-rendered behavior fragment.
+    // Topic headings keep each rule findable instead of one flat list, so the
+    // headings are asserted: a later edit must not silently flatten it again.
+    let available = SkipSet::new(16);
+    let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+        .render_system_prompt();
+    for heading in [
+        "### Scope and change impact",
+        "### Evidence and verification",
+        "### Conclusions and reporting",
+        "### Code comments",
+    ] {
+        assert!(prompt.contains(heading), "missing guardrails heading: {heading}");
+    }
 }
 
 #[test]

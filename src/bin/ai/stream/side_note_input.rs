@@ -23,16 +23,19 @@
 //   requests exit and waits for the terminal to be restored, avoiding leftover cbreak
 //   state affecting the later input box.
 use std::{
+    collections::VecDeque,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
+#[cfg(not(test))]
+use std::sync::atomic::AtomicU8;
 
 use crate::ai::{
     driver::{runtime_ctx, side_note::push_side_note},
@@ -45,6 +48,102 @@ use crate::commonw::prompt::{acquire_background_stdin, foreground_stdin_requeste
 const CTRL_G: u8 = 0x07;
 /// Poll interval in milliseconds; also bounds how quickly the stop flag is observed.
 const POLL_MS: i32 = 50;
+
+/// Upper bound for one `CSI 18 t` round trip inside the listener loop.
+const WIDTH_SERVICE_WAIT_MS: u64 = 60;
+#[cfg(not(test))]
+/// Fold-frame wait for one epoch answer (one 50ms poll cadence + service round trip + slack).
+const WIDTH_REFRESH_WAIT_MS: u64 = 150;
+#[cfg(not(test))]
+/// Freshness window of the cached emulator answer before ioctl becomes authoritative again.
+const WIDTH_REFRESH_TTL_MS: u64 = 250;
+#[cfg(not(test))]
+/// Consecutive refresh timeouts that latch `WIDTH_QUERY_UNSUPPORTED` for the process.
+const WIDTH_REFRESH_TIMEOUT_BUDGET: u8 = 2;
+
+static WIDTH_QUERY_REQUEST_EPOCH: AtomicU64 = AtomicU64::new(0);
+static WIDTH_QUERY_SERVED_EPOCH: AtomicU64 = AtomicU64::new(0);
+static WIDTH_QUERY_COLS: AtomicU16 = AtomicU16::new(0);
+/// Process-wide "terminal never answers `CSI 18 t`" latch: two consecutive timeouts stop the
+/// per-frame wait, mirroring `queries_disabled` in the prompt's DSR handling.
+static WIDTH_QUERY_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+/// Set while the listener thread owns stdin and services fold width requests.
+static LISTENER_ALIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(not(test))]
+static WIDTH_REFRESH_CONSECUTIVE_TIMEOUTS: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(not(test))]
+thread_local! {
+    static TRUTH_CACHE: std::cell::Cell<Option<(u16, Instant)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCRIPTED_TRUE_COLS: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests script the emulator's reflowed width directly instead of touching stdin.
+#[cfg(test)]
+pub(crate) fn set_scripted_true_width(cols: Option<u16>) {
+    SCRIPTED_TRUE_COLS.with(|cell| cell.set(cols.filter(|&c| c > 0)));
+}
+
+/// The cached `CSI 18 t` answer while fresh. Absent (test without a script, refresh timed
+/// out, latch tripped) means `raw_terminal_cols` keeps its ioctl/COLUMNS behavior.
+#[cfg(not(test))]
+pub(crate) fn fresh_true_width_cols() -> Option<u16> {
+    if WIDTH_QUERY_UNSUPPORTED.load(Ordering::Relaxed) {
+        return None;
+    }
+    TRUTH_CACHE.with(|cache| {
+        cache.get().and_then(|(cols, at)| {
+            (cols > 0 && at.elapsed() < Duration::from_millis(WIDTH_REFRESH_TTL_MS)).then_some(cols)
+        })
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn fresh_true_width_cols() -> Option<u16> {
+    SCRIPTED_TRUE_COLS.with(|cell| cell.get())
+}
+
+/// Asked at every fold redraw/finalize: bump the request epoch and wait (bounded) for the
+/// listener's `CSI 18 t` answer so the reflowed width lands in the cache before the erase
+/// measures anything. No listener (tests, listener-less contexts) is a silent no-op.
+#[cfg(not(test))]
+pub(crate) fn refresh_true_width() {
+    if WIDTH_QUERY_UNSUPPORTED.load(Ordering::Relaxed) || !LISTENER_ALIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    let request = WIDTH_QUERY_REQUEST_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
+    let deadline = Instant::now() + Duration::from_millis(WIDTH_REFRESH_WAIT_MS);
+    loop {
+        if WIDTH_QUERY_SERVED_EPOCH.load(Ordering::Acquire) >= request {
+            let cols = WIDTH_QUERY_COLS.load(Ordering::Relaxed);
+            if cols > 0 {
+                WIDTH_REFRESH_CONSECUTIVE_TIMEOUTS.store(0, Ordering::Relaxed);
+                TRUTH_CACHE.with(|cache| cache.set(Some((cols, Instant::now()))));
+            }
+            return;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    // No answer: expire the cache so this frame falls back to the live ioctl width, and stop
+    // waiting for good after the budget — a terminal that never answers would otherwise tax
+    // every frame of every later turn.
+    TRUTH_CACHE.with(|cache| cache.set(None));
+    if WIDTH_REFRESH_CONSECUTIVE_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1
+        >= WIDTH_REFRESH_TIMEOUT_BUDGET
+    {
+        WIDTH_QUERY_UNSUPPORTED.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn refresh_true_width() {}
 /// Upper bound for how long Drop waits for the listener thread to confirm stdin /
 /// cbreak release.
 const SHUTDOWN_WAIT_MS: u64 = 250;
@@ -351,6 +450,7 @@ impl SideNoteInputGuard {
                     if let Some(ready_tx) = ready_tx.take() {
                         let _ = ready_tx.send(true);
                     }
+                    LISTENER_ALIVE.store(true, Ordering::Release);
                     let exit = side_note_input_loop(&history_file, &task_stop, term);
                     drop(stdin_owner);
                     match exit {
@@ -424,6 +524,7 @@ impl SideNoteInputGuard {
                 // Can only be confirmed after the input loop returns and CbreakTerm has
                 // been dropped; receiving this message guarantees this thread will no
                 // longer poll/read stdin nor hold cbreak terminal state.
+                LISTENER_ALIVE.store(false, Ordering::Release);
                 let _ = terminal_released_tx.send(());
             })
             .ok();
@@ -445,6 +546,7 @@ impl SideNoteInputGuard {
 impl Drop for SideNoteInputGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        LISTENER_ALIVE.store(false, Ordering::Release);
         let _ = self
             .terminal_released
             .recv_timeout(Duration::from_millis(SHUTDOWN_WAIT_MS));
@@ -772,6 +874,140 @@ fn is_submit_escape(stop: &AtomicBool) -> bool {
 }
 
 /// Returns why the listener released terminal input ownership.
+/// Scans an accumulated buffer for a `CSI 8 ; rows ; cols t` text-area report.
+/// `Partial` keeps the read going, `Invalid` replays the bytes as ordinary input.
+#[derive(Debug, PartialEq, Eq)]
+enum ReportScan {
+    Partial,
+    Invalid,
+    Complete(u16),
+}
+
+fn scan_text_area_report(buf: &[u8]) -> ReportScan {
+    const HEAD: &[u8] = b"\x1b[8;";
+    if buf.len() <= HEAD.len() {
+        return if HEAD.starts_with(buf) {
+            ReportScan::Partial
+        } else {
+            ReportScan::Invalid
+        };
+    }
+    if !buf.starts_with(HEAD) {
+        return ReportScan::Invalid;
+    }
+    let rest = &buf[HEAD.len()..];
+    let mut rows_end = 0;
+    while rows_end < rest.len() && rest[rows_end].is_ascii_digit() {
+        rows_end += 1;
+    }
+    if rows_end == rest.len() {
+        return ReportScan::Partial;
+    }
+    if rows_end == 0 || rest[rows_end] != b';' {
+        return ReportScan::Invalid;
+    }
+    let cols_start = rows_end + 1;
+    let mut cols_end = cols_start;
+    while cols_end < rest.len() && rest[cols_end].is_ascii_digit() {
+        cols_end += 1;
+    }
+    if cols_end == rest.len() {
+        return ReportScan::Partial;
+    }
+    if cols_end == cols_start || rest[cols_end] != b't' {
+        return ReportScan::Invalid;
+    }
+    match std::str::from_utf8(&rest[cols_start..cols_end])
+        .ok()
+        .and_then(|cols| cols.parse::<u16>().ok())
+    {
+        Some(cols) if cols > 0 => ReportScan::Complete(cols),
+        _ => ReportScan::Invalid,
+    }
+}
+
+/// Services one pending `refresh_true_width` request: the served epoch always advances so
+/// the caller's bounded wait cannot hang, even when the terminal never answers.
+fn service_pending_width_query(replay: &mut VecDeque<u8>) {
+    let requested = WIDTH_QUERY_REQUEST_EPOCH.load(Ordering::Acquire);
+    if WIDTH_QUERY_SERVED_EPOCH.load(Ordering::Acquire) >= requested {
+        return;
+    }
+    let cols = if WIDTH_QUERY_UNSUPPORTED.load(Ordering::Relaxed) {
+        None
+    } else {
+        service_width_query(replay)
+    };
+    if let Some(cols) = cols {
+        WIDTH_QUERY_COLS.store(cols, Ordering::Relaxed);
+    }
+    WIDTH_QUERY_SERVED_EPOCH.store(requested, Ordering::Release);
+}
+
+/// One `CSI 18 t` round trip on the listener's own cbreak stdin lease. Bytes read while
+/// hunting for the reply that turn out to be ordinary input are pushed to `replay`, which
+/// the loop's byte source drains first, so a query can never eat a keystroke.
+fn service_width_query(replay: &mut VecDeque<u8>) -> Option<u16> {
+    let mut out = io::stdout();
+    if out.write_all(b"\x1b[18t").is_err() || out.flush().is_err() {
+        return None;
+    }
+    let deadline = Instant::now() + Duration::from_millis(WIDTH_SERVICE_WAIT_MS);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            replay.extend(buf.drain(..));
+            return None;
+        }
+        let mut pfd = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the pollfd is a stack-local, exclusively mutable reference.
+        let ret = unsafe { libc::poll(&mut pfd, 1, remaining.as_millis() as i32) };
+        if ret < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            replay.extend(buf.drain(..));
+            return None;
+        }
+        if ret == 0 {
+            replay.extend(buf.drain(..));
+            return None;
+        }
+        if pfd.revents & libc::POLLIN == 0 {
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                replay.extend(buf.drain(..));
+                return None;
+            }
+            continue;
+        }
+        let mut byte = [0u8; 1];
+        // SAFETY: one-byte stack buffer; poll confirmed readability.
+        let n = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
+        if n <= 0 {
+            if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            replay.extend(buf.drain(..));
+            return None;
+        }
+        if buf.len() >= 64 {
+            replay.extend(buf.drain(..));
+            return None;
+        }
+        buf.push(byte[0]);
+        match scan_text_area_report(&buf) {
+            ReportScan::Partial => {}
+            ReportScan::Complete(cols) => return Some(cols),
+            ReportScan::Invalid => replay.extend(buf.drain(..)),
+        }
+    }
+}
+
 fn side_note_input_loop(
     history_file: &PathBuf,
     stop: &AtomicBool,
@@ -785,12 +1021,21 @@ fn side_note_input_loop(
     // touch the scroll region or the cursor position.
     let mut footer: Option<FooterReservation> = None;
     let mut background_requested = false;
+    // Bytes the width-query service read while hunting for its `CSI 18 t` reply but that
+    // turned out to be ordinary input; the byte source below drains them first so a query
+    // never eats a keystroke.
+    let mut replay: VecDeque<u8> = VecDeque::new();
 
     loop {
         if should_yield_stdin(stop) {
             break;
         }
-        let b = {
+        // Answer a pending fold width request before blocking again: the fold's bounded
+        // wait ends within one poll cadence plus this service round trip.
+        service_pending_width_query(&mut replay);
+        let b = if let Some(queued) = replay.pop_front() {
+            queued
+        } else {
             let mut pfd = libc::pollfd {
                 fd: libc::STDIN_FILENO,
                 events: libc::POLLIN,
@@ -1002,6 +1247,18 @@ fn side_note_input_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_text_area_report_accepts_reports_and_rejects_input() {
+        assert_eq!(scan_text_area_report(b"\x1b[8;24;120t"), ReportScan::Complete(120));
+        assert_eq!(scan_text_area_report(b"\x1b[8;24;12"), ReportScan::Partial);
+        assert_eq!(scan_text_area_report(b"\x1b[8;"), ReportScan::Partial);
+        assert_eq!(scan_text_area_report(b""), ReportScan::Partial);
+        assert_eq!(scan_text_area_report(b"\x1b[24;120R"), ReportScan::Invalid);
+        assert_eq!(scan_text_area_report(b"abc"), ReportScan::Invalid);
+        assert_eq!(scan_text_area_report(b"\x1b[8;;120t"), ReportScan::Invalid);
+        assert_eq!(scan_text_area_report(b"\x1b[8;24;120X"), ReportScan::Invalid);
+    }
 
     #[test]
     fn char_width_ascii_and_wide() {

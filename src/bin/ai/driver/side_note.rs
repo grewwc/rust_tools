@@ -1,6 +1,9 @@
 // side_note.rs — real-time side-note file queue + in-memory notification
 // Written by the user or a lead agent during a turn; the running turn drains and
 // injects them into the LLM context before the next iteration.
+// If the turn ends before a queued foreground note is drained, the main input loop
+// (run_loop in driver/mod.rs) flushes the queue and runs the note as the next user
+// input instead of waiting for the user's next typed message.
 use std::{
     fs,
     path::{Path, PathBuf},

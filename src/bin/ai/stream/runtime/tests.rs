@@ -2223,153 +2223,156 @@ fn thinking_fold_erase_rows_follow_current_terminal_reflow_of_previous_body() {
     }
 }
 
+/// Models only what the fold's own writer emits: SGR is ignored, and `\r`, `\n`, CSI A/B/K plus
+/// DECAWM auto-wrap cover the rest. The writer ends every row with CRLF, so `resize` re-wraps each
+/// row on its own, exactly as a reflowing terminal does with hard-wrapped rows.
+struct ReflowGrid {
+    cols: usize,
+    cells: Vec<Vec<char>>,
+    row: usize,
+    col: usize,
+}
+
+impl ReflowGrid {
+    fn new(cols: usize, rows: usize) -> Self {
+        Self {
+            cols,
+            cells: vec![vec![' '; cols]; rows],
+            row: 0,
+            col: 0,
+        }
+    }
+
+    fn newline(&mut self) {
+        assert!(self.row + 1 < self.cells.len(), "test grid ran out of rows");
+        self.row += 1;
+    }
+
+    fn feed(&mut self, text: &str) {
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\r' => self.col = 0,
+                '\n' => self.newline(),
+                '\x1b' => {
+                    assert_eq!(chars.next(), Some('['), "only CSI sequences are modelled");
+                    let mut args = String::new();
+                    let command = loop {
+                        let next = chars.next().expect("unterminated CSI sequence");
+                        if ('@'..='~').contains(&next) {
+                            break next;
+                        }
+                        args.push(next);
+                    };
+                    match command {
+                        'm' => {}
+                        'K' => {
+                            assert_eq!(args, "2");
+                            self.cells[self.row].fill(' ');
+                        }
+                        'A' => {
+                            let rows = args.parse::<usize>().unwrap_or(1).max(1);
+                            self.row = self.row.saturating_sub(rows);
+                        }
+                        'B' => {
+                            let rows = args.parse::<usize>().unwrap_or(1).max(1);
+                            self.row = (self.row + rows).min(self.cells.len() - 1);
+                        }
+                        other => panic!("unsupported CSI {args}{other}"),
+                    }
+                }
+                _ => {
+                    if self.col >= self.cols {
+                        self.col = 0;
+                        self.newline();
+                    }
+                    self.cells[self.row][self.col] = ch;
+                    self.col += 1;
+                }
+            }
+        }
+    }
+
+    /// Terminal reflow: every row on screen is re-wrapped at `cols`, rows keep their order, and the
+    /// cursor stays at the end of the row it was on.
+    fn resize(&mut self, cols: usize) {
+        let cursor_row = self.row;
+        // A terminal reflows the rows it has drawn; the blank tail below stays blank.
+        let drawn_through = self
+            .cells
+            .iter()
+            .rposition(|row| row.iter().any(|cell| *cell != ' '))
+            .map_or(0, |last| last.max(cursor_row));
+        let mut reflowed: Vec<Vec<char>> = Vec::new();
+        for (index, row) in self.cells.iter().take(drawn_through + 1).enumerate() {
+            let mut content = row.clone();
+            while content.last() == Some(&' ') {
+                content.pop();
+            }
+            let mut fragments: Vec<Vec<char>> = content.chunks(cols).map(<[char]>::to_vec).collect();
+            if fragments.is_empty() {
+                fragments.push(Vec::new());
+            }
+            if index == cursor_row {
+                self.row = reflowed.len() + fragments.len() - 1;
+                let remainder = content.len() % cols;
+                self.col = if remainder == 0 && !content.is_empty() {
+                    cols
+                } else {
+                    remainder
+                };
+            }
+            // Every row of a terminal's screen is `cols` cells wide, blanks included.
+            for fragment in fragments.iter_mut() {
+                fragment.resize(cols, ' ');
+            }
+            reflowed.extend(fragments);
+        }
+        assert!(reflowed.len() <= self.cells.len(), "test grid ran out of rows");
+        while reflowed.len() < self.cells.len() {
+            reflowed.push(vec![' '; cols]);
+        }
+        self.cells = reflowed;
+        self.cols = cols;
+    }
+
+    fn text(&self) -> String {
+        self.cells
+            .iter()
+            .map(|row| row.iter().collect::<String>())
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+}
+
+struct SavedColumns(Option<std::ffi::OsString>);
+impl Drop for SavedColumns {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.0 {
+                Some(value) => std::env::set_var("COLUMNS", value),
+                None => std::env::remove_var("COLUMNS"),
+            }
+        }
+    }
+}
+
 /// A terminal that reflows the rows it has already drawn when it narrows and reports the new width only
 /// afterwards — the VS Code/xterm.js ordering that strands fold rows. Once the new width is known, the
-/// fold must reclaim the rows its short erase left behind, and must not eat the transcript row above it.
+/// fold must erase the whole reflowed region on every frame, stranding nothing, and must not eat the
+/// transcript row above it.
 #[test]
 fn thinking_fold_reclaims_rows_stranded_by_a_resize_reported_after_the_reflow() {
-    /// Models only what the fold's own writer emits: SGR is ignored, and `\r`, `\n`, CSI A/B/K plus
-    /// DECAWM auto-wrap cover the rest. The writer ends every row with CRLF, so `resize` re-wraps each
-    /// row on its own, exactly as a reflowing terminal does with hard-wrapped rows.
-    struct Grid {
-        cols: usize,
-        cells: Vec<Vec<char>>,
-        row: usize,
-        col: usize,
-    }
-
-    impl Grid {
-        fn new(cols: usize, rows: usize) -> Self {
-            Self {
-                cols,
-                cells: vec![vec![' '; cols]; rows],
-                row: 0,
-                col: 0,
-            }
-        }
-
-        fn newline(&mut self) {
-            assert!(self.row + 1 < self.cells.len(), "test grid ran out of rows");
-            self.row += 1;
-        }
-
-        fn feed(&mut self, text: &str) {
-            let mut chars = text.chars().peekable();
-            while let Some(ch) = chars.next() {
-                match ch {
-                    '\r' => self.col = 0,
-                    '\n' => self.newline(),
-                    '\x1b' => {
-                        assert_eq!(chars.next(), Some('['), "only CSI sequences are modelled");
-                        let mut args = String::new();
-                        let command = loop {
-                            let next = chars.next().expect("unterminated CSI sequence");
-                            if ('@'..='~').contains(&next) {
-                                break next;
-                            }
-                            args.push(next);
-                        };
-                        match command {
-                            'm' => {}
-                            'K' => {
-                                assert_eq!(args, "2");
-                                self.cells[self.row].fill(' ');
-                            }
-                            'A' => {
-                                let rows = args.parse::<usize>().unwrap_or(1).max(1);
-                                self.row = self.row.saturating_sub(rows);
-                            }
-                            'B' => {
-                                let rows = args.parse::<usize>().unwrap_or(1).max(1);
-                                self.row = (self.row + rows).min(self.cells.len() - 1);
-                            }
-                            other => panic!("unsupported CSI {args}{other}"),
-                        }
-                    }
-                    _ => {
-                        if self.col >= self.cols {
-                            self.col = 0;
-                            self.newline();
-                        }
-                        self.cells[self.row][self.col] = ch;
-                        self.col += 1;
-                    }
-                }
-            }
-        }
-
-        /// Terminal reflow: every row on screen is re-wrapped at `cols`, rows keep their order, and the
-        /// cursor stays at the end of the row it was on.
-        fn resize(&mut self, cols: usize) {
-            let cursor_row = self.row;
-            // A terminal reflows the rows it has drawn; the blank tail below stays blank.
-            let drawn_through = self
-                .cells
-                .iter()
-                .rposition(|row| row.iter().any(|cell| *cell != ' '))
-                .map_or(0, |last| last.max(cursor_row));
-            let mut reflowed: Vec<Vec<char>> = Vec::new();
-            for (index, row) in self.cells.iter().take(drawn_through + 1).enumerate() {
-                let mut content = row.clone();
-                while content.last() == Some(&' ') {
-                    content.pop();
-                }
-                let mut fragments: Vec<Vec<char>> = content.chunks(cols).map(<[char]>::to_vec).collect();
-                if fragments.is_empty() {
-                    fragments.push(Vec::new());
-                }
-                if index == cursor_row {
-                    self.row = reflowed.len() + fragments.len() - 1;
-                    let remainder = content.len() % cols;
-                    self.col = if remainder == 0 && !content.is_empty() {
-                        cols
-                    } else {
-                        remainder
-                    };
-                }
-                // Every row of a terminal's screen is `cols` cells wide, blanks included.
-                for fragment in fragments.iter_mut() {
-                    fragment.resize(cols, ' ');
-                }
-                reflowed.extend(fragments);
-            }
-            assert!(reflowed.len() <= self.cells.len(), "test grid ran out of rows");
-            while reflowed.len() < self.cells.len() {
-                reflowed.push(vec![' '; cols]);
-            }
-            self.cells = reflowed;
-            self.cols = cols;
-        }
-
-        fn text(&self) -> String {
-            self.cells
-                .iter()
-                .map(|row| row.iter().collect::<String>())
-                .collect::<Vec<String>>()
-                .join("\n")
-        }
-    }
-
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    struct SavedColumns(Option<std::ffi::OsString>);
-    impl Drop for SavedColumns {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.0 {
-                    Some(value) => std::env::set_var("COLUMNS", value),
-                    None => std::env::remove_var("COLUMNS"),
-                }
-            }
-        }
-    }
     let _columns = SavedColumns(std::env::var_os("COLUMNS"));
+    crate::ai::stream::side_note_input::set_scripted_true_width(None);
 
     unsafe {
         std::env::set_var("COLUMNS", "140");
     }
-    let mut grid = Grid::new(140, 64);
+    let mut grid = ReflowGrid::new(140, 64);
     grid.feed("transcript\r\n");
     let mut state = StreamProcessingState::new();
     let fold = &mut state.render.thinking_fold;
@@ -2388,14 +2391,17 @@ fn thinking_fold_reclaims_rows_stranded_by_a_resize_reported_after_the_reflow() 
     // The panel narrows: the terminal reflows what it has drawn, and the new winsize reaches this
     // process only after the next frame has already been written at the old width.
     grid.resize(60);
+    // The frame queries the emulator before measuring: it sees the reflowed width while ioctl still
+    // reports the old one, so its erase must cover the region outright.
+    crate::ai::stream::side_note_input::set_scripted_true_width(Some(60));
     let mut bytes = Vec::new();
     thinking_fold_redraw_to(&mut bytes, Some("~1002 tok @ 102 tok/s"), fold).unwrap();
     grid.feed(&String::from_utf8(bytes).unwrap());
     let stranded = grid.text();
     assert_eq!(
         stranded.matches("○ thinking").count(),
-        2,
-        "the short erase should leave the previous header stranded:\n{stranded}"
+        1,
+        "the lag frame must erase against the reflowed width and leave no stranded header:\n{stranded}"
     );
 
     unsafe {
@@ -2415,6 +2421,113 @@ fn thinking_fold_reclaims_rows_stranded_by_a_resize_reported_after_the_reflow() 
         screen.matches("~1002").count(),
         0,
         "the header written inside the resize gap was never reclaimed:\n{screen}"
+    );
+    assert_eq!(
+        screen.matches("transcript").count(),
+        1,
+        "reclaiming the stranded rows ate the transcript row above the fold:\n{screen}"
+    );
+}
+
+/// L=0 timing: the reflow and the winsize update both land between frames, so no frame ever
+/// renders against a stale width. The next frame already knows the new width, its own span
+/// covers the whole region, and without any stale-width correction nothing may reach above it.
+#[test]
+fn thinking_fold_resize_reported_between_frames_does_not_erase_the_transcript() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let _columns = SavedColumns(std::env::var_os("COLUMNS"));
+    crate::ai::stream::side_note_input::set_scripted_true_width(None);
+
+    unsafe {
+        std::env::set_var("COLUMNS", "140");
+    }
+    let mut grid = ReflowGrid::new(140, 64);
+    grid.feed("transcript\r\n");
+    let mut state = StreamProcessingState::new();
+    let fold = &mut state.render.thinking_fold;
+    fold.active = true;
+    fold.max_visible_lines = 2;
+    fold.rewrite_right_margin_cols = FOLD_REWRITE_RIGHT_MARGIN_COLS;
+    append_fold_content(fold, &"reasoning ".repeat(20));
+    for rate in ["~1000 tok @ 100 tok/s", "~1001 tok @ 101 tok/s"] {
+        let mut bytes = Vec::new();
+        thinking_fold_redraw_to(&mut bytes, Some(rate), fold).unwrap();
+        grid.feed(&String::from_utf8(bytes).unwrap());
+    }
+    assert_eq!(grid.text().matches("○ thinking").count(), 1, "steady state");
+
+    grid.resize(60);
+    unsafe {
+        std::env::set_var("COLUMNS", "60");
+    }
+    let mut bytes = Vec::new();
+    thinking_fold_redraw_to(&mut bytes, Some("~1002 tok @ 102 tok/s"), fold).unwrap();
+    grid.feed(&String::from_utf8(bytes).unwrap());
+
+    let screen = grid.text();
+    assert_eq!(
+        screen.matches("transcript").count(),
+        1,
+        "the no-lag resize path erased the transcript row above the fold:\n{screen}"
+    );
+    assert_eq!(
+        screen.matches("○ thinking").count(),
+        1,
+        "a lag-free frame should keep exactly one header:\n{screen}"
+    );
+}
+
+/// L>=2 timing: the winsize update arrives only after TWO frames have already rendered against
+/// the stale width. Each frame queries the emulator's reflowed width first, so neither may strand a row.
+#[test]
+fn thinking_fold_reclaims_every_header_stranded_by_multiple_lag_frames() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let _columns = SavedColumns(std::env::var_os("COLUMNS"));
+    crate::ai::stream::side_note_input::set_scripted_true_width(None);
+
+    unsafe {
+        std::env::set_var("COLUMNS", "140");
+    }
+    let mut grid = ReflowGrid::new(140, 64);
+    grid.feed("transcript\r\n");
+    let mut state = StreamProcessingState::new();
+    let fold = &mut state.render.thinking_fold;
+    fold.active = true;
+    fold.max_visible_lines = 2;
+    fold.rewrite_right_margin_cols = FOLD_REWRITE_RIGHT_MARGIN_COLS;
+    append_fold_content(fold, &"reasoning ".repeat(20));
+    for rate in ["~1000 tok @ 100 tok/s", "~1001 tok @ 101 tok/s"] {
+        let mut bytes = Vec::new();
+        thinking_fold_redraw_to(&mut bytes, Some(rate), fold).unwrap();
+        grid.feed(&String::from_utf8(bytes).unwrap());
+    }
+    assert_eq!(grid.text().matches("○ thinking").count(), 1, "steady state");
+
+    // Reflow first; the winsize update lands only after a second stale frame, so two frames
+    // render against the old width and each of them under-erases.
+    grid.resize(60);
+    crate::ai::stream::side_note_input::set_scripted_true_width(Some(60));
+    for rate in ["~1002 tok @ 102 tok/s", "~1003 tok @ 103 tok/s"] {
+        let mut bytes = Vec::new();
+        thinking_fold_redraw_to(&mut bytes, Some(rate), fold).unwrap();
+        grid.feed(&String::from_utf8(bytes).unwrap());
+    }
+    unsafe {
+        std::env::set_var("COLUMNS", "60");
+    }
+    let mut bytes = Vec::new();
+    thinking_fold_redraw_to(&mut bytes, Some("~1004 tok @ 104 tok/s"), fold).unwrap();
+    grid.feed(&String::from_utf8(bytes).unwrap());
+
+    let screen = grid.text();
+    assert_eq!(
+        screen.matches("○ thinking").count(),
+        1,
+        "headers stranded by two lag frames survived the recovery frame:\n{screen}"
     );
     assert_eq!(
         screen.matches("transcript").count(),

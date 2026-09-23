@@ -926,15 +926,22 @@ fn validate_python_code(code: &str) -> Result<(), String> {
         "subprocess.",
         "importsubprocess",
         "fromsubprocess",
-        // Block every import form of dangerous modules (including `import X as` /
-        // `from X import *`): otherwise `from os import system; system("...")` /
-        // `import os as o; o.system(...)` / `import os; x = os; x.system(...)` all
-        // bypass the direct `os.system` match above.
-        "importos",
+        // Block every `from X import ...` form (including wildcard) and alias
+        // form (`import X as ...`) of dangerous modules: otherwise `from os
+        // import system; system("...")` / `import os as o; o.system(...)` bypass
+        // the direct `os.system` match above. Plain `import os` / `import
+        // shutil` stay allowed so read-only uses keep working (`os.getcwd()`,
+        // `os.path.exists(...)`, `shutil.which(...)`); direct and
+        // dunder-mediated attribute calls (`os.system(...)`, `os.__dict__[..]`,
+        // `os.__getattribute__(..)`) are still caught by the patterns below.
+        // Residual blind spots (same best-effort level as the whole audit):
+        // copied references and `vars(...)` indirection (`import os; x = os;
+        // x.system(...)`, `vars(os)["system"](...)`) are not caught statically.
+        "importosas",
         "fromos",
         "importposix",
         "fromposix",
-        "importshutil",
+        "importshutilas",
         "fromshutil",
         "importsocket",
         "fromsocket",
@@ -1009,6 +1016,8 @@ fn validate_python_code(code: &str) -> Result<(), String> {
         "__builtins__",
         "__globals__",
         "__subclasses__",
+        "__dict__",
+        "__getattribute__",
         "ctypes.",
         "marshal.",
         "pickle.loads",
@@ -3080,6 +3089,13 @@ mod tests {
         assert!(validate("python3 -W ignore -c 'print(1)'").is_ok());
         assert!(validate("python3 -c 'print(len(\"abc\"))'").is_ok());
         assert!(validate("python3 -c 'import re; print(re.findall(r\"\\d+\", \"a1b2\"))'").is_ok());
+        // Relaxed imports: plain `import os` / `import shutil` with read-only
+        // attribute use stays allowed.
+        assert!(validate("python3 -c 'import os; print(os.getcwd())'").is_ok());
+        assert!(validate("python3 -c 'import os; print(os.path.exists(\"x\"))'").is_ok());
+        assert!(validate("python3 -c 'import os; print(os.environ.get(\"HOME\"))'").is_ok());
+        assert!(validate("python3 -c 'import shutil; print(shutil.which(\"git\"))'").is_ok());
+        assert!(validate("python3 -c 'import os.path as p; print(p.exists(\"x\"))'").is_ok());
     }
 
     #[test]
@@ -3098,10 +3114,19 @@ mod tests {
         assert!(validate("python3 -c 'ctypes.CDLL(None).system(\"id\")'").is_err());
         assert!(validate("python3 -c 'Path(\"x\").unlink()'").is_err());
         // Every import form of dangerous modules (from-import / aliasing /
-        // variable copy / sys.modules).
+        // sys.modules). Plain `import os` / `import shutil` are allowed for
+        // read-only use, so the remaining blocked forms are exactly those that
+        // expose bare or renamed dangerous calls.
         assert!(validate("python3 -c 'from os import system; system(\"rm -rf /\")'").is_err());
         assert!(validate("python3 -c 'import os as o; o.system(\"id\")'").is_err());
-        assert!(validate("python3 -c 'import os; x = os; x.system(\"id\")'").is_err());
+        assert!(validate("python3 -c 'from os import *'").is_err());
+        assert!(validate("python3 -c 'import os as o; print(o.getcwd())'").is_err());
+        assert!(validate("python3 -c 'import shutil as s; s.rmtree(\"d\")'").is_err());
+        assert!(validate("python3 -c 'import os; os.__dict__[\"system\"](\"id\")'").is_err());
+        assert!(validate("python3 -c 'import os; os.__getattribute__(\"system\")(\"id\")'").is_err());
+        // `import os; x = os; x.system(...)` / `vars(os)["system"](...)`
+        // (copied reference / vars indirection) are accepted residual blind
+        // spots of the relaxed import policy; see validate_python_code.
         assert!(validate("python3 -c 'import sys; sys.modules[\"os\"].system(\"id\")'").is_err());
         assert!(validate("python3 -c 'import posix; posix.system(\"id\")'").is_err());
         assert!(validate("python3 -c 'import signal; signal.kill(1, 9)'").is_err());

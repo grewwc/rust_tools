@@ -1574,6 +1574,15 @@ fn preview_terminal_width() -> usize {
 }
 
 pub(in crate::ai) fn raw_terminal_cols() -> usize {
+    // Emulator-truth width cached by the fold's `CSI 18 t` refresh (see
+    // `side_note_input::refresh_true_width`): while xterm.js has rewrapped the rows it
+    // already drew but the PTY winsize has not reached this process, the kernel width
+    // below is stale, and every cursor-up span measured from it stops short, stacking
+    // the previous `○ thinking` header under the redraw. A cache miss keeps this
+    // function's ioctl/COLUMNS behavior unchanged.
+    if let Some(cols) = crate::ai::stream::side_note_input::fresh_true_width_cols() {
+        return cols as usize;
+    }
     // Prefer ioctl(TIOCGWINSZ) for the live width: the long-running `a` process inherits
     // COLUMNS at startup, so narrowing a terminal panel can leave it larger than reality.
     // An overstated width undercounts preview rows during cursor-up redraws, leaving

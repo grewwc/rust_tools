@@ -1023,6 +1023,29 @@ async fn run_loop(
         subagent_status_line.finish();
 
         {
+            // ── Pending side-note → next user input ──
+            // A side-note sent from the composer (Ctrl+G) after the finished turn's
+            // last iteration-top drain stays in the foreground queue and would
+            // otherwise only reach the model glued to the user's NEXT typed message.
+            // The model output has ended by the time we get here, so flush the queue
+            // now and run the pending note(s) as the next user input instead of
+            // waiting at the input box. Only the foreground target (task id None)
+            // flushes its own queue, and one-shot sessions never loop back to input.
+            let pending_side_notes = if one_shot_mode
+                || crate::ai::driver::side_note::current_target_id().is_some()
+            {
+                Vec::new()
+            } else {
+                crate::ai::driver::side_note::drain_side_notes(&app.session_history_file, None)
+            };
+            let pending_side_note_count = pending_side_notes.len();
+            let pending_side_note_input = pending_side_notes
+                .iter()
+                .map(|note| note.content.trim())
+                .filter(|content| !content.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+
             // ── Goal mode auto-continuation ──
             // When a goal is set and the last turn called tools, skip user input and
             // inject a continuation prompt so the agent keeps pushing the goal forward.
@@ -1032,7 +1055,37 @@ async fn run_loop(
                 .filter(|g| !g.is_empty() && app.last_turn_had_tool_calls && !one_shot_mode)
                 .map(|g| commands::goal::build_goal_continuation_prompt(g));
 
-            if let Some(cont) = goal_continuation {
+            if !pending_side_note_input.is_empty() {
+                // Notice first: the user must see why a turn starts without new input
+                // and which note is being delivered.
+                let preview: String = pending_side_note_input
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(120)
+                    .collect();
+                crate::ai::driver::print::print_tool_note_line(
+                    "side-note",
+                    &format!(
+                        "model output ended before delivery; sending {} pending side-note(s) as the next user input: {preview}",
+                        pending_side_note_count
+                    ),
+                );
+                // Release the skill-manifest preload waiter exactly like the CLI-args
+                // input path does: this branch never opens the input box that would
+                // otherwise fire the first-render notification, and a blocked waiter
+                // would stall manifest takeover below.
+                if let Some(notifier) = initial_skill_manifests
+                    .as_mut()
+                    .and_then(|loader| loader.take_prompt_ready_notifier())
+                {
+                    let _ = notifier.send(());
+                }
+                question = pending_side_note_input;
+                attachments_text = String::new();
+                history_count = 0;
+            } else if let Some(cont) = goal_continuation {
                 question = cont;
                 attachments_text = String::new();
                 history_count = 0;

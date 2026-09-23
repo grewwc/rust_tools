@@ -58,7 +58,8 @@ impl FileStore {
         self.validate_write_access_inner(false)
     }
 
-    /// Validate a direct `write_file` target, including the OS-selected system temp directory.
+    /// Validate a direct `write_file` target, including the OS-selected system temp directory and
+    /// the classic Unix shared temp directories (`/tmp`, `/var/tmp`).
     ///
     /// This is intentionally separate from the shared write check used by `apply_patch`: the
     /// request is to make direct scratch writes convenient without widening patch targets.
@@ -69,7 +70,9 @@ impl FileStore {
     fn validate_write_access_inner(&self, allow_system_temp: bool) -> Result<(), AiError> {
         self.validate_read_access()?;
         if path_within_allowed_roots(&self.path)
-            || (allow_system_temp && path_within_system_temp_dir(&self.path))
+            || (allow_system_temp
+                && (path_within_system_temp_dir(&self.path)
+                    || path_within_shared_temp_dir(&self.path)))
         {
             return Ok(());
         }
@@ -730,13 +733,55 @@ fn resolve_effective_path(path: PathBuf) -> PathBuf {
 /// `/tmp` here. The temp root itself may be an OS-provided symlink, but a symlink in a caller-
 /// supplied descendant could redirect the write outside the permitted temp tree.
 fn path_within_system_temp_dir(path: &Path) -> bool {
-    let temp_dir = normalize_lexical(&std::env::temp_dir());
+    path_within_temp_root(path, &normalize_lexical(&std::env::temp_dir()))
+}
+
+/// Whether `path` is below one of the classic Unix shared temp directories (`/tmp`, `/var/tmp`,
+/// plus the `/private/...` real spellings used on macOS).
+///
+/// `path_within_system_temp_dir` alone does not cover these: on macOS `std::env::temp_dir()`
+/// returns the per-user `$TMPDIR` (e.g. `/var/folders/...`), so a model writing a scratch file to
+/// the classic `/tmp` would be blocked. On macOS `/tmp` and `/var/tmp` are symlinks to
+/// `/private/tmp` and `/private/var/tmp`; the lexical spelling is rewritten to the canonical root
+/// and then checked with the same no-symlink walk as `path_within_system_temp_dir`.
+fn path_within_shared_temp_dir(path: &Path) -> bool {
     let path = normalize_lexical(path);
-    let Ok(relative) = path.strip_prefix(&temp_dir) else {
+    shared_temp_roots().iter().any(|(spelling, real)| {
+        let Ok(relative) = path.strip_prefix(spelling) else {
+            return false;
+        };
+        let mut candidate = real.clone();
+        for component in relative.components() {
+            candidate.push(component.as_os_str());
+        }
+        path_within_temp_root(&normalize_lexical(&candidate), real)
+    })
+}
+
+/// Classic Unix shared temp roots: lexical spelling paired with its canonicalized real path.
+/// Roots that do not exist (e.g. on Windows) are skipped, making the whole check a no-op there.
+fn shared_temp_roots() -> Vec<(PathBuf, PathBuf)> {
+    ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"]
+        .iter()
+        .filter_map(|spelling| {
+            let real = normalize_lexical(&fs::canonicalize(spelling).ok()?);
+            Some((PathBuf::from(*spelling), real))
+        })
+        .collect()
+}
+
+/// Whether `path` is below `root` without traversing a symlink introduced beneath `root`.
+///
+/// `root` must be fully canonicalized (no symlink components). `path` is normalized lexically;
+/// every component below `root` is checked with `symlink_metadata`, which reports the link itself
+/// rather than following it, so a symlink (including a dangling one that `canonicalize` could not
+/// resolve) anywhere beneath `root` blocks the write instead of redirecting it outside the tree.
+/// Non-existent components are fine: the caller is about to create them.
+fn path_within_temp_root(path: &Path, root: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
         return false;
     };
-
-    let mut current = temp_dir;
+    let mut current = root.to_path_buf();
     for component in relative.components() {
         current.push(component.as_os_str());
         let metadata = match fs::symlink_metadata(&current) {
@@ -1106,6 +1151,112 @@ mod tests {
         assert!(
             result.is_err(),
             "a temp symlink must not escape the system temp directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_access_allows_shared_unix_temp_outside_project_root() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let system_temp = normalize_lexical(&std::env::temp_dir());
+        let Some(temp_parent) = system_temp.parent() else {
+            return;
+        };
+        let project_root =
+            temp_parent.join(format!("file-store-shared-temp-project-{}", uuid::Uuid::new_v4()));
+        // Classic shared temp dir (`/tmp`), NOT under `std::env::temp_dir()` on macOS.
+        let target = Path::new("/tmp")
+            .join(format!("file-store-shared-{}.txt", uuid::Uuid::new_v4()));
+
+        let old_cfg = std::env::var_os("CONFIGW_PATH");
+        unsafe { std::env::set_var("CONFIGW_PATH", project_root.join("empty.configw")) };
+        crate::commonw::configw::refresh();
+
+        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(project_root, || {
+            FileStore::new(target).validate_write_file_access()
+        });
+
+        match old_cfg {
+            Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+            None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+        }
+        crate::commonw::configw::refresh();
+
+        assert!(
+            result.is_ok(),
+            "shared temp (/tmp) write should be allowed: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_access_rejects_symlink_escape_from_shared_temp() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let system_temp = normalize_lexical(&std::env::temp_dir());
+        let Some(temp_parent) = system_temp.parent() else {
+            return;
+        };
+        let project_root = temp_parent.join(format!(
+            "file-store-shared-temp-symlink-project-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let outside = project_root.join("outside.txt");
+        let link = Path::new("/tmp")
+            .join(format!("file-store-shared-symlink-{}", uuid::Uuid::new_v4()));
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let old_cfg = std::env::var_os("CONFIGW_PATH");
+        unsafe { std::env::set_var("CONFIGW_PATH", project_root.join("empty.configw")) };
+        crate::commonw::configw::refresh();
+
+        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
+            .sync_scope(project_root.clone(), || {
+                FileStore::new(link.clone()).validate_write_file_access()
+            });
+
+        match old_cfg {
+            Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+            None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+        }
+        crate::commonw::configw::refresh();
+        let _ = std::fs::remove_file(&link);
+
+        assert!(
+            result.is_err(),
+            "a shared-temp symlink must not escape to the project root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_patch_sandbox_still_blocks_shared_unix_temp() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let system_temp = normalize_lexical(&std::env::temp_dir());
+        let Some(temp_parent) = system_temp.parent() else {
+            return;
+        };
+        let project_root =
+            temp_parent.join(format!("file-store-patch-temp-project-{}", uuid::Uuid::new_v4()));
+        let target = Path::new("/tmp")
+            .join(format!("file-store-patch-{}.txt", uuid::Uuid::new_v4()));
+
+        let old_cfg = std::env::var_os("CONFIGW_PATH");
+        unsafe { std::env::set_var("CONFIGW_PATH", project_root.join("empty.configw")) };
+        crate::commonw::configw::refresh();
+
+        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(project_root, || {
+            FileStore::new(target).validate_write_access()
+        });
+
+        match old_cfg {
+            Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+            None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+        }
+        crate::commonw::configw::refresh();
+
+        assert!(
+            result.is_err(),
+            "apply_patch targets must stay project-scoped: {result:?}"
         );
     }
 
