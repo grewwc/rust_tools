@@ -96,6 +96,22 @@ fn builtin_agents_do_not_mount_mcp_tools_by_default() {
 }
 
 #[test]
+fn builtin_audit_agents_opt_out_of_task_auto_selection() {
+    // Audit agents ship a fixed output contract (<audit_report>) and a read-only
+    // default, so auto-selection must never hand them writing work; the
+    // general-purpose build agent stays eligible.
+    for (filename, content) in BUILTIN_AGENTS {
+        let agent = parse_agent_front_matter(content).unwrap();
+        let expect_eligible = agent.name == "build";
+        assert_eq!(
+            agent.auto_select, expect_eligible,
+            "{filename} (agent {}): expected auto_select={expect_eligible}",
+            agent.name
+        );
+    }
+}
+
+#[test]
 fn builtin_build_agent_prompt_preserves_end_to_end_behavior_tracing() {
     let (_, content) = BUILTIN_AGENTS
         .iter()

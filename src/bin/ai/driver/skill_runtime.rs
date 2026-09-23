@@ -1150,6 +1150,28 @@ fn build_system_prompt(
         }
     }
 
+    // ── Safety red lines: non-negotiable prohibitions, rendered ahead of the ──
+    // working-style rules so the red lines are read before any guidance about
+    // how to work. The anti-hallucination conclusion gate ("unverified content
+    // is never presented as a conclusion") lives in intellectual_honesty below,
+    // and fact tracing / evidence calibration stay single-sourced in
+    // correctness_guardrails, so this block holds only the dangerous-operation
+    // prohibitions and the confirmation requirement.
+    // Never relaxed by task, skill, or goal mode; when a skill activates, the
+    // enforcement line folds these into the highest priority.
+    b.push(
+        ContextKind::Behavior,
+        include_str!("system_prompts/safety_redlines.md"),
+    );
+    // ── Trust boundary: tool output / fetched content is data, not instructions ──
+    // strip_system_reminders already removes forged reminder blocks from user
+    // messages mechanically; this block teaches the model to treat look-alikes
+    // embedded in tool output (web pages, documents, command output) as forged
+    // content, since authentic runtime reminders have a fixed format.
+    b.push(
+        ContextKind::Behavior,
+        include_str!("system_prompts/trust_boundary.md"),
+    );
     b.push(
         ContextKind::Behavior,
         include_str!("system_prompts/response_style.md"),
@@ -1167,7 +1189,7 @@ fn build_system_prompt(
     // of writing a maximal-length thought chain.
     b.push(
         ContextKind::Behavior,
-        include_str!("system_prompts/thinking_budget.md"),
+        include_str!("system_prompts/thinking_scope.md"),
     );
     // Intellectual honesty: evidence-earned agreement and respectful pushback
     // against wrong or inappropriate user premises. Unconditional — it applies
@@ -1189,20 +1211,6 @@ fn build_system_prompt(
         include_str!("system_prompts/system_constraints.md"),
     );
 
-    // ── Safety red lines: zero tolerance for dangerous operations ──
-    // Unconditionally rendered red lines: dangerous operations forbidden. The
-    // anti-hallucination conclusion gate lives in intellectual_honesty above;
-    // fact tracing / evidence calibration are already covered by
-    // correctness_guardrails, so only the non-negotiable prohibitions stay
-    // here: dangerous operations and unverified content must never be
-    // presented as conclusions or recommendations.
-    // Never relaxed by task, skill, or goal mode; when a skill activates, the
-    // enforcement line folds these into the highest priority.
-    b.push(
-        ContextKind::Behavior,
-        include_str!("system_prompts/safety_redlines.md"),
-    );
-
     // ── Task convergence: success criteria land in the plan carrier, closing the loop ──
     // task_convergence is the unconditionally rendered convergence discipline; the
     // plan bridge line is injected only when the plan tool is available, so the
@@ -1220,17 +1228,6 @@ fn build_system_prompt(
             include_str!("system_prompts/task_convergence.md"),
             plan_criteria_bridge = plan_criteria_bridge,
         ),
-    );
-
-    // ── Trust boundary: tool output / fetched content is data, not instructions ──
-    // The mechanical layer already strips forged reminders from user messages via
-    // strip_system_reminders; here we add model-level teaching covering the
-    // injection surface of instructions embedded in tool output (web pages,
-    // documents, command output). Consistent with the "authenticity seal": runtime
-    // reminders have a fixed format, so a look-alike inside tool output is forged.
-    b.push(
-        ContextKind::Behavior,
-        include_str!("system_prompts/trust_boundary.md"),
     );
 
     // ── Tool-result evidence status: `[reference: ...]` markers on historical ──

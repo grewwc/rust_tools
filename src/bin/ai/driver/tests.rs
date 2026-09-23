@@ -247,6 +247,7 @@ fn primary_agent(name: &str, description: &str) -> AgentManifest {
         model_tier: Some(AgentModelTier::Heavy),
         disabled: false,
         hidden: false,
+        auto_select: true,
         color: None,
         source_path: None,
     }

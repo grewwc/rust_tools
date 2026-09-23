@@ -347,6 +347,9 @@ pub(super) struct SelectedSubagent<'a> {
     pub(super) score: i32,
 }
 
+/// Picks the subagent for one `task` call. An explicit `agent` name always wins;
+/// otherwise every candidate with `auto_select: false` is excluded before scoring
+/// and only the survivors compete on lexical similarity.
 pub(super) fn select_subagent<'a>(
     all_agents: &'a [AgentManifest],
     requested_agent: Option<&str>,
@@ -390,6 +393,22 @@ pub(super) fn select_subagent<'a>(
             "Unknown subagent '{}'. Available subagents: {}",
             requested, available
         ));
+    }
+
+    // Contract-bound agents opt out of auto-selection: their prompt fixes the
+    // output shape (e.g. a machine-checked <audit_report>) and forbids edits, so
+    // a lexical score could otherwise hand them work they may not perform. They
+    // remain reachable through an explicit `agent` name handled above.
+    let subagents: Vec<&AgentManifest> = subagents
+        .into_iter()
+        .filter(|agent| agent.auto_select)
+        .collect();
+    if subagents.is_empty() {
+        return Err(
+            "No subagent accepts auto-selection: every subagent sets auto_select: false. \
+             Name one in the agent field, or mark one agent auto_select: true."
+                .to_string(),
+        );
     }
 
     let task_text = format!("{description}\n{prompt}");

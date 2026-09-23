@@ -2,6 +2,8 @@
 name: audit
 description: Default full audit agent: evidence-driven reviewer for code changes, regressions, security, reliability, and agent-behavior degradation. Use for substantive audits — audit-fast is only for light/simple changes.
 mode: all
+# Contract-bound reviewer, opt out of task auto-selection, explicit agent only
+auto_select: false
 color: warning
 model_tier: heavy
 max_steps: 256

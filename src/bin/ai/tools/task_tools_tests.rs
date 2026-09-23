@@ -94,6 +94,7 @@ fn manifest(name: &str, description: &str, mode: AgentMode) -> AgentManifest {
         model_tier: Some(AgentModelTier::Standard),
         disabled: false,
         hidden: false,
+        auto_select: true,
         color: None,
         source_path: None,
     }
@@ -622,6 +623,54 @@ fn auto_selection_matches_task_to_subagent_description() {
     .unwrap();
 
     assert_eq!(selected.agent.name, "navigator");
+}
+
+#[test]
+fn auto_selection_excludes_opted_out_agents_despite_a_higher_score() {
+    // The reviewer's text mirrors the task wording almost verbatim, so it would
+    // win the lexical comparison; auto_select: false must remove it first. This
+    // guards the failure where a contract-bound audit agent was auto-picked for
+    // code-writing work.
+    let mut build = manifest(
+        "build",
+        "Default agent for all tasks with progressive tool loading",
+        AgentMode::All,
+    );
+    build.prompt = "End-to-end delivery across code, systems and documents.".to_string();
+
+    let mut review = manifest(
+        "audit-fast",
+        "Quick bounded code review for light/simple changes",
+        AgentMode::All,
+    );
+    review.prompt =
+        "Review code changes conservatively and report real defects with evidence.".to_string();
+    review.auto_select = false;
+
+    let all_agents = vec![build, review];
+    let description = "Review code changes conservatively";
+    let prompt = "Review code changes conservatively: report real defects with evidence.";
+
+    let selected = select_subagent(&all_agents, None, description, prompt).unwrap();
+    assert_eq!(selected.agent.name, "build");
+    assert!(selected.auto_selected);
+
+    let explicit = select_subagent(&all_agents, Some("audit-fast"), description, prompt).unwrap();
+    assert_eq!(explicit.agent.name, "audit-fast");
+    assert!(!explicit.auto_selected);
+}
+
+#[test]
+fn auto_selection_errors_when_every_subagent_opts_out() {
+    let mut first = manifest("audit", "Evidence-driven reviewer", AgentMode::All);
+    first.auto_select = false;
+    let mut second = manifest("audit-fast", "Quick bounded review", AgentMode::All);
+    second.auto_select = false;
+
+    let err =
+        select_subagent(&vec![first, second], None, "Add tests", "Write unit tests.").unwrap_err();
+
+    assert!(err.contains("auto_select"), "{err}");
 }
 
 #[test]

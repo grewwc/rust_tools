@@ -212,10 +212,21 @@ pub(super) struct AgentManifest {
     pub(super) disabled: bool,
     #[serde(default)]
     pub(super) hidden: bool,
+    /// Whether `task` may pick this agent when the caller omits `agent`.
+    /// Agents whose system prompt fixes their output shape and forbids edits
+    /// (audit reviewers) set this to `false`: a lexical score must never assign
+    /// them work they are not allowed to do. They stay reachable by naming them
+    /// explicitly in the `agent` field.
+    #[serde(default = "default_auto_select")]
+    pub(super) auto_select: bool,
     #[serde(default)]
     pub(super) color: Option<String>,
     #[serde(skip)]
     pub(super) source_path: Option<String>,
+}
+
+fn default_auto_select() -> bool {
+    true
 }
 
 impl AgentManifest {
@@ -786,6 +797,7 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
     let mut model_tier: Option<String> = None;
     let mut disabled = false;
     let mut hidden = false;
+    let mut auto_select = true;
     let mut color: Option<String> = None;
     let mut tools: Vec<String> = Vec::new();
     let mut tool_groups: Vec<String> = Vec::new();
@@ -860,6 +872,9 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
                 "hidden" => {
                     hidden = unquoted.eq_ignore_ascii_case("true");
                 }
+                "auto_select" => {
+                    auto_select = unquoted.eq_ignore_ascii_case("true");
+                }
                 "disable_mcp_tools" => {
                     disable_mcp_tools = unquoted.eq_ignore_ascii_case("true");
                 }
@@ -928,6 +943,7 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
         model_tier: agent_model_tier,
         disabled,
         hidden,
+        auto_select,
         color: color.filter(|s| !s.trim().is_empty()),
         source_path: None,
     })

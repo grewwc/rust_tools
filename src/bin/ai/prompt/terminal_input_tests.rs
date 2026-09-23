@@ -15,12 +15,57 @@ use std::{
 
 const CHILD_TEST: &str = "ai::prompt::terminal_input_tests::prompt_editor_pty_child";
 const ROOT_ENV: &str = "RUST_TOOLS_PROMPT_PTY_TEST_ROOT";
+/// Device status report the child writes to ask where its cursor is.
+const CURSOR_QUERY: &str = "\x1b[6n";
+
+/// The row of the last `ESC[<row>;<col>H` in `text`.
+///
+/// The value is what a CPR reply must carry, i.e. the same 1-based row the
+/// child wrote, so the harness can echo a commanded position back verbatim.
+fn last_move_to_row(text: &str) -> Option<u16> {
+    let bytes = text.as_bytes();
+    let mut best = None;
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] != 0x1b || bytes[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 2;
+        let mut row = 0u32;
+        let mut digits = false;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            row = row * 10 + u32::from(bytes[j] - b'0');
+            digits = true;
+            j += 1;
+        }
+        // CUP is `ESC[<row>;<col>H`: the row is followed by `;`, the column
+        // and only then the terminator, so `H` sits two parameters along rather
+        // than right after the `;`.
+        if digits && j < bytes.len() && bytes[j] == b';' {
+            let mut k = j + 1;
+            while k < bytes.len() && bytes[k].is_ascii_digit() {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b'H' {
+                best = Some(row as u16);
+                i = k + 1;
+                continue;
+            }
+        }
+        i = j.max(i + 2);
+    }
+    best
+}
 
 struct PtyEditor {
     child: Child,
     master: File,
     output: Vec<u8>,
     root: PathBuf,
+    /// Cursor queries already answered. Each query gets exactly one reply;
+    /// queries below the caller's withheld index stay unanswered on purpose.
+    answered: usize,
 }
 
 impl PtyEditor {
@@ -79,6 +124,7 @@ impl PtyEditor {
             master,
             output: Vec::new(),
             root,
+            answered: 0,
         }
     }
 
@@ -174,6 +220,59 @@ impl PtyEditor {
         );
     }
 
+    /// The row the child commanded just before its `index`-th cursor query,
+    /// read from the nearest preceding `ESC[<row+1>;1H`.
+    fn row_for_query(&self, index: usize) -> Option<u16> {
+        let text = String::from_utf8_lossy(&self.output);
+        let mut from = 0usize;
+        for seen in 0..=index {
+            let at = from + text[from..].find(CURSOR_QUERY)?;
+            if seen == index {
+                return last_move_to_row(&text[..at]);
+            }
+            from = at + CURSOR_QUERY.len();
+        }
+        None
+    }
+
+    /// Answers every query from `first` onwards, each with the row the child
+    /// commanded for it. Queries below `first` are left unanswered so they
+    /// time out, which is what a stalled-link test needs.
+    ///
+    /// `verified_cursor_row` only accepts a reply landing exactly on the row it
+    /// moved to, and that row comes from a per-process counter, so a canned
+    /// reply can never satisfy it: the harness has to echo back what the child
+    /// actually asked for, like a real terminal would.
+    fn answer_queries_from(&mut self, first: usize) {
+        self.answered = self.answered.max(first);
+        while self.answered < self.query_count() {
+            let Some(row) = self.row_for_query(self.answered) else {
+                break;
+            };
+            let reply = format!("\x1b[{row};1R");
+            self.send(reply.as_bytes());
+            self.answered += 1;
+        }
+    }
+
+    /// Answers cursor queries until the child reports `PTY_READY_{round}`.
+    fn ready_responsive(&mut self, round: usize, first_query: usize) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !self.contains(&format!("PTY_READY_{round}")) && Instant::now() < deadline {
+            self.answer_queries_from(first_query);
+            self.pump(Duration::from_millis(20));
+        }
+        self.ready(round);
+    }
+
+    /// How often `needle` appears in everything the child has written.
+    fn count(&self, needle: &str) -> usize {
+        self.output
+            .windows(needle.len())
+            .filter(|bytes| *bytes == needle.as_bytes())
+            .count()
+    }
+
     /// Verifies the child exited cleanly. `degraded` says whether the session
     /// ever fell back to the alternate screen: the recovery probe can have left
     /// it again, so only the enter/leave balance and that lower bound are
@@ -211,7 +310,12 @@ impl PtyEditor {
             .filter(|bytes| *bytes == b"\x1b[?1049l")
             .count();
         assert_eq!(enters, leaves, "alternate screen was not restored");
-        assert_eq!(enters > 0, degraded);
+        assert_eq!(
+            enters > 0,
+            degraded,
+            "unexpected alternate-screen fallback: enters={enters} leaves={leaves}: {}",
+            String::from_utf8_lossy(&self.output)
+        );
         assert!(
             !self.contains("^[[13;1R"),
             "cooked-mode echo leaked a cursor reply"
@@ -359,12 +463,13 @@ fn late_cursor_reply_split_inside_csi_survives_long_fragment_delay() {
 fn responsive_cursor_query_keeps_inline_editor() {
     let mut pty = PtyEditor::start(1);
     pty.wait_for("\x1b[6n");
-    pty.send(b"\x1b[13;1R");
-    pty.ready(0);
+    // Answer every probe with the row it commanded: a terminal that replies
+    // promptly must leave the editor inline instead of degrading it.
+    pty.ready_responsive(0, 0);
     pty.submit();
     pty.result(0, "draft");
     pty.finish(false);
-        pty.assert_query_count(1);
+    pty.assert_query_count(3);
     }
 
     #[test]
@@ -378,8 +483,9 @@ fn responsive_cursor_query_keeps_inline_editor() {
             pty.pump(Duration::from_millis(20));
         }
         assert_eq!(pty.query_count(), 2, "the timed-out query was not retried");
-        pty.send(b"\x1b[13;1R");
-        pty.ready(0);
+        // Only the retry is answered: the first query keeps its timeout, and a
+        // successful retry costs the verified anchor its low/high/final probes.
+        pty.ready_responsive(0, 1);
         assert!(
             !pty.contains("\x1b[?1049h"),
             "a retried query must keep the inline editor: {}",
@@ -388,32 +494,36 @@ fn responsive_cursor_query_keeps_inline_editor() {
         pty.submit();
         pty.result(0, "draft");
         pty.finish(false);
-        pty.assert_query_count(2);
+        pty.assert_query_count(4);
 }
 
     #[test]
     fn recovery_probe_restores_the_main_screen_after_the_link_recovers() {
-        let mut pty = PtyEditor::start(1);
+        let mut pty = PtyEditor::start(2);
         pty.wait_for("\x1b[6n");
-        // Withhold the reply so the query times out, then answer the recovery
-        // probe that follows the fallback: the editor must leave the alternate
-        // screen and put the inline box back under the main transcript.
+        // Withhold every reply: both round-0 queries time out and the editor
+        // pays for the alternate screen.
         pty.ready(0);
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while pty.query_count() < 3 && Instant::now() < deadline {
-            pty.pump(Duration::from_millis(20));
-        }
-        assert_eq!(
-            pty.query_count(),
-            3,
-            "no recovery probe followed the fallback: {}",
-            String::from_utf8_lossy(&pty.output)
-        );
         assert!(pty.contains("\x1b[?1049h"), "the editor never degraded");
-        pty.send(b"\x1b[13;1R");
-        pty.wait_for("\x1b[?1049l");
-        pty.still_editing(0);
+        // Recovery re-enables queries only at the next prompt start, and only
+        // once no reply is still outstanding (CPR_PROBE_QUIET_PERIOD).
+        pty.pump(Duration::from_secs(3));
         pty.submit();
         pty.result(0, "draft");
+        pty.wait_for("\x1b[?1049l");
+        // The recovered prompt answers its own probe and must stay on the main
+        // screen rather than open a second alternate screen.
+        pty.ready_responsive(1, 2);
+        assert_eq!(
+            pty.count("\x1b[?1049h"),
+            1,
+            "the recovered prompt degraded again: {}",
+            String::from_utf8_lossy(&pty.output)
+        );
+        pty.still_editing(1);
+        pty.submit();
+        // The prefill was consumed by round 0, so round 1 only has to come back
+        // with a result to prove the recovered prompt still completes.
+        pty.wait_for("PTY_RESULT_1=");
         pty.finish(true);
     }

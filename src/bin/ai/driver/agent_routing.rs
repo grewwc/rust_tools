@@ -150,6 +150,11 @@ impl AgentReloadIdentity<'_> {
         hasher.update(b"\0");
         hasher.update(manifest.color.as_deref().unwrap_or("").as_bytes());
         hasher.update(b"|");
+        // Reload identity includes auto_select because reload_agent_manifests
+        // skips replacing the manifest list when the fingerprint is unchanged;
+        // hashing it keeps a hot-edited `auto_select` effective without a restart.
+        hasher.update([manifest.auto_select as u8]);
+        hasher.update(b"|");
     }
 }
 
@@ -243,6 +248,7 @@ mod tests {
             model_tier: Some(AgentModelTier::Standard),
             disabled: false,
             hidden: true,
+            auto_select: true,
             color: Some("#123456".to_string()),
             source_path: Some("/agents/alpha.agent".to_string()),
         }
@@ -253,8 +259,8 @@ mod tests {
         assert_eq!(
             agent_manifests_fingerprint(&[manifest_fixture()]),
             [
-                140, 115, 69, 44, 131, 187, 137, 203, 220, 193, 19, 194, 52, 186, 43, 85, 249, 202,
-                25, 228, 148, 174, 159, 6, 122, 59, 152, 207, 143, 72, 64, 11,
+                229, 91, 162, 141, 224, 214, 110, 28, 217, 146, 134, 197, 242, 124, 28, 157, 33,
+                18, 147, 95, 238, 92, 199, 40, 62, 106, 195, 178, 79, 86, 33, 146,
             ]
         );
     }
@@ -302,6 +308,7 @@ mod tests {
             ("disabled", |m| m.disabled = true),
             ("hidden", |m| m.hidden = false),
             ("color", |m| m.color = Some("#abcdef".to_string())),
+            ("auto_select", |m| m.auto_select = false),
         ];
 
         for (field, mutate) in mutations {

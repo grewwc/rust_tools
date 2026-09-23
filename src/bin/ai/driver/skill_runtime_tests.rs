@@ -50,6 +50,7 @@ fn active_agent_max_steps_override_default_iterations() {
         model_tier: None,
         disabled: false,
         hidden: false,
+        auto_select: true,
         color: None,
         source_path: None,
     };
@@ -2093,6 +2094,7 @@ fn agent(name: &str, mcp_servers: Vec<&str>) -> AgentManifest {
         model_tier: None,
         disabled: false,
         hidden: false,
+        auto_select: true,
         color: None,
         source_path: None,
     }

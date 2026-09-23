@@ -35,6 +35,7 @@ fn manifest(name: &str, description: &str, model_tier: Option<AgentModelTier>) -
         model_tier,
         disabled: false,
         hidden: false,
+        auto_select: true,
         color: None,
         source_path: None,
     }
