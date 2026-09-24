@@ -81,7 +81,7 @@ const VOLATILE_ARG_KEYS: &[&str] = &["offset", "limit", "page", "cursor", "max_r
 /// First fixed threshold for tool-round checkpoints. The default turn hard budget is 4096; the
 /// 24 / 48 / 96 checkpoint tiers only schedule convergence, never disable tools, and the
 /// accumulated round count is not reset by mutation.
-const TOOL_ROUND_CHECKPOINT: usize = 12;
+const TOOL_ROUND_CHECKPOINT: usize = 24;
 const TOOL_ROUND_CHECKPOINT_MULTIPLIERS: [usize; 3] = [1, 2, 4];
 /// Retry cap for consecutive "stream-read interrupted" truncations (stream_error). Past this we
 /// give up on the turn to avoid retrying forever while the server keeps dropping the stream
