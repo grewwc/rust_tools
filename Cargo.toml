@@ -13,6 +13,7 @@ members = [
     "crates/mcp_excel",
     "crates/re",
     "crates/mcp_pdf",
+    "crates/mcp_computer",
 ]
 
 [features]

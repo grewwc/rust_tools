@@ -1,0 +1,25 @@
+[package]
+name = "mcp_computer"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "mcp_computer"
+path = "src/main.rs"
+
+[dependencies]
+# Shared MCP-over-stdio protocol skeleton (JsonRpcErr / cap_text / with_timeout / run / McpServer).
+mcp_stdio = { path = "../mcp_stdio" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "time"] }
+serde_json = "1"
+
+# CoreGraphics event injection (mouse/keyboard/scroll), display enumeration and
+# window listing. Needed only by the macOS backend (src/backend/macos/): the Linux
+# backend drives the session's own CLIs and the `unsupported` backend needs no
+# native API, so the crate still builds on targets with neither.
+#
+# `CGRemoteOperation` is not optional: objc2 gates `CGEvent::new_keyboard_event`
+# behind `#[cfg(all(feature = "CGEventTypes", feature = "CGRemoteOperation"))]`.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes", "CFArray", "CFDictionary", "CFString", "CFNumber"] }
+objc2-core-graphics = { version = "0.3", features = ["CGEvent", "CGEventSource", "CGEventTypes", "CGDirectDisplay", "CGWindow", "CGRemoteOperation"] }

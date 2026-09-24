@@ -1,6 +1,6 @@
 # Standalone MCP server crates live in crates/, not src/bin/*.rs, so the
 # wildcard below cannot see them; install them alongside the regular bins.
-MCP_BINS := mcp_browser mcp_excel mcp_pdf
+MCP_BINS := mcp_browser mcp_computer mcp_excel mcp_pdf
 INSTALL_BINS ?= $(sort $(patsubst src/bin/%.rs,%,$(wildcard src/bin/*.rs)) $(MCP_BINS))
 ALL_BINS ?= $(INSTALL_BINS) c
 
@@ -25,6 +25,9 @@ $(RELEASE_DIR)/%: src/bin/%.rs
 $(RELEASE_DIR)/mcp_browser: $(shell find crates/mcp_browser -type f -name '*.rs') Cargo.toml
 	cargo build --release -p mcp_browser --bin mcp_browser
 
+$(RELEASE_DIR)/mcp_computer: $(shell find crates/mcp_computer -type f -name '*.rs') Cargo.toml
+	cargo build --release -p mcp_computer --bin mcp_computer
+
 $(RELEASE_DIR)/mcp_excel: $(shell find crates/mcp_excel -type f -name '*.rs') Cargo.toml
 	cargo build --release -p mcp_excel --bin mcp_excel
 
@@ -47,7 +50,7 @@ install: $(INSTALLW) $(addprefix $(RELEASE_DIR)/,$(MCP_BINS))
 	if [ -n "$(REQUESTED)" ]; then \
 		args=""; \
 		for b in $(BINS); do \
-			case "$$b" in mcp_browser|mcp_excel|mcp_pdf) args="$$args -p $$b --bin $$b";; *) args="$$args --bin $$b";; esac; \
+			case "$$b" in mcp_browser|mcp_computer|mcp_excel|mcp_pdf) args="$$args -p $$b --bin $$b";; *) args="$$args --bin $$b";; esac; \
 		done; \
 		cargo build --release $$args; \
 		sh ./move_executable.sh --force $(BINS); \
@@ -55,7 +58,9 @@ install: $(INSTALLW) $(addprefix $(RELEASE_DIR)/,$(MCP_BINS))
 		bins=$$($(INSTALLW) -- $(BINS)); \
 		if [ -n "$$bins" ]; then \
 			args=""; \
-			for b in $$bins; do args="$$args --bin $$b"; done; \
+			for b in $$bins; do \
+				case "$$b" in mcp_browser|mcp_computer|mcp_excel|mcp_pdf) args="$$args -p $$b --bin $$b";; *) args="$$args --bin $$b";; esac; \
+			done; \
 			cargo build --release $$args; \
 		fi; \
 		cargo build --release -p re; \
