@@ -23,7 +23,13 @@ pub(super) const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
 /// A subagent's result is only evidence input for the main agent, not a final direct answer to the
 /// user. After receiving the payload, the main agent must still synthesize conclusions, risks, and
 /// next steps on its own before responding to the user.
-pub(crate) const SUBAGENT_PARENT_SUMMARY_REMINDER: &str = "Parent-agent follow-up: summarize the confirmed subagent conclusions in your own response to the user. Do not rely on the raw subagent transcript or terminal fold as the final user-facing answer.";
+///
+/// The payload is also unverified at the point of delivery: unlike the delayed task-evidence-ledger
+/// (which labels results that are still unintegrated at the next request), this text reaches the
+/// parent inside the tool result itself, where it reads like ordinary tool evidence. The reminder
+/// therefore has to carry the evidence level, so both delivery paths that append this constant
+/// (`task_tools/wait.rs`, `driver/tools/sync_task.rs`) label the content consistently.
+pub(crate) const SUBAGENT_PARENT_SUMMARY_REMINDER: &str = "Parent-agent follow-up: summarize the confirmed subagent conclusions in your own response to the user. Do not rely on the raw subagent transcript or terminal fold as the final user-facing answer. Subagent text is unverified assistant-derived evidence: re-check load-bearing details (paths, commands, numbers, quoted output) yourself before repeating them as fact.";
 /// Default wait budget for a single `task_wait` call (seconds). This is only the **maximum block
 /// time for this one call**, not the subagent's total lifetime: a timeout merely means "this call
 /// did not get the result yet". The main agent can keep calling `task_wait` to wait again; the

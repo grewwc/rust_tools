@@ -3,6 +3,7 @@ use reqwest::StatusCode;
 
 mod aux;
 mod builder;
+mod current_budget;
 mod error;
 mod image_digest;
 mod logging;
@@ -44,6 +45,7 @@ pub(in crate::ai) use logging::emit_request_diagnostic;
 #[cfg(test)]
 pub(in crate::ai) use logging::request_diagnostics_enabled;
 pub(crate) use prompt_feedback::PromptTokenFeedback;
+pub(crate) use current_budget::CurrentRequestBudget;
 pub(crate) use protocol::extract_response_text;
 #[cfg(test)]
 use protocol::responses_reasoning_replay_stats;
@@ -76,6 +78,7 @@ pub(crate) use builder::{
 // Transport layer: HTTP request sending, retry, timeout, auth
 pub use transport::{do_request_json, do_request_text_streaming};
 pub(super) use transport::{do_request_messages, do_request_messages_without_tools, print_info};
+pub(crate) use transport::preview_request_budget;
 
 // The private use statements below exist only for the `tests` submodule to
 // access via `use super::*;`. The function bodies have moved to `transport.rs`;

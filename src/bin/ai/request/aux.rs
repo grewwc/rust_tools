@@ -391,10 +391,35 @@ fn build_summary_history_input(messages: &[Message], max_chars: usize) -> String
     out
 }
 
-/// 用 LLM 将较早的对话历史压缩成摘要文本，供 context-budget 压缩器使用。
-///
-/// 三段式截断（head 12k + middle keypoints 4k + tail 6k），比 head+tail
-/// 二段式多保留中段的 error/fix/decision 行，避免摘要器漏掉关键改动。
+#[cfg(test)]
+mod summary_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn summary_prompt_configuration_preserves_default_and_literal_preferences() {
+        let default = format!(include_str!("prompts/history_compressor.md"), 4_000);
+        assert_eq!(history_summary_prompt(4_000, ""), default);
+        assert_eq!(history_summary_prompt(4_000, " \n\t"), default);
+        let configured = history_summary_prompt(4_000, "Keep {file:line} citations.");
+        assert!(configured.starts_with(&default));
+        assert!(configured.ends_with("Keep {file:line} citations."));
+        assert!(configured.contains("subject to the provenance, uncertainty, and output-limit rules above"));
+    }
+}
+
+fn history_summary_prompt(max_chars: usize, additional: &str) -> String {
+    let mut prompt = format!(include_str!("prompts/history_compressor.md"), max_chars);
+    let additional = additional.trim();
+    if !additional.is_empty() {
+        prompt.push_str("\n\nAdditional summary preferences (subject to the provenance, uncertainty, and output-limit rules above):\n");
+        prompt.push_str(additional);
+    }
+    prompt
+}
+
+/// Summarize older dialogue for context compression. Priority sampling preserves
+/// recent requests, errors and decisions without letting one large message consume
+/// the entire input budget.
 pub(crate) async fn summarize_history_via_model(
     app: &App,
     messages: &[Message],
@@ -404,17 +429,15 @@ pub(crate) async fn summarize_history_via_model(
         return None;
     }
 
-    // 按消息优先级选样，避免一个超大早期消息吞掉预算；同时保留最近消息、
-    // 用户请求、错误和决策，且最终按原始时间顺序呈现。
+    // Present priority-selected messages in their original chronological order.
     let transcript = build_summary_history_input(messages, 22_000);
+    let cfg = crate::commonw::configw::get_all_config();
+    let additional = cfg.get(crate::ai::config_schema::AiConfig::HISTORY_SUMMARY_PROMPT, "");
 
     let messages = vec![
         Message {
             role: "system".to_string(),
-            content: Value::String(format!(
-                include_str!("prompts/history_compressor.md"),
-                max_chars
-            )),
+            content: Value::String(history_summary_prompt(max_chars, &additional)),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
@@ -448,12 +471,9 @@ pub(crate) async fn summarize_history_via_model(
     let endpoint = endpoint_for_request_model(app, &control_model);
     let http_body =
         super::protocol::build_http_body_for_request(&control_model, &endpoint, &mut request_body);
-    // 历史摘要是 turn 收尾的后台辅助请求（任务边界压缩会在每次答案交付后触发）。
-    // 主 client 只有 connect_timeout、没有整体 timeout，若摘要模型接受连接后迟迟
-    // 不返回响应头，这里的裸 .send()/.text() 会永久阻塞、CPU 0，表现为"答案已输出
-    // 但迟迟不回到提示符"的卡死。用显式超时兜底，超时即放弃摘要（保持原始历史）。
-    // key 按 collect_api_keys 轮换（与主请求链路一致）：命名 key 配置下仅用
-    // primary 会对网关 401 静默失败 → 无摘要。全部 key 失败时放弃摘要。
+    // Auxiliary summaries have explicit deadlines so a stalled provider cannot
+    // block return to the prompt. Rotate the same configured key candidates as
+    // main requests; timeout or exhaustion preserves the original history.
     let text = match send_aux_chat_request_with_key_rotation(
         app,
         &control_model,

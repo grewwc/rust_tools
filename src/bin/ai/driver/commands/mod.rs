@@ -2,6 +2,7 @@ pub mod agent;
 pub(crate) mod audit;
 pub(crate) mod changes;
 pub mod checkpoint;
+pub(crate) mod compact;
 pub mod export;
 pub mod feishu;
 pub mod goal;
@@ -97,6 +98,10 @@ pub fn try_handle_interactive_command(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if try_handle_local_command(app, mcp_client, input)? {
         return Ok(true);
+    }
+    // Async compaction belongs to the turn dispatcher, not skill activation.
+    if compact::compact_command_args(input).is_some() {
+        return Ok(false);
     }
     // `/audit` must be deferred to a turn that already has DRIVER_CTX, so the
     // session/task identity is not lost during local-command dispatch; it also

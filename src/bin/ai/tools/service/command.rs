@@ -349,6 +349,50 @@ fn format_command_result(output: CommandRunResult, timeout_secs: u64) -> String 
     }
 }
 
+/// True when the effective program of any command segment is `sleep`.
+///
+/// `sleep` is not blocked (it is occasionally necessary, e.g. waiting for a
+/// server to accept connections), but it burns the whole turn on dead time: the
+/// agent cannot do anything else while the command runs. Detection reuses the
+/// audit segment splitter and wrapper unwrapping (`nohup sleep 30 &` still
+/// hits, `command sleep 5` hits), so data arguments like `grep sleep file` or
+/// `man sleep` do not.
+fn contains_sleep(command: &str) -> bool {
+    super::audit::split_unquoted_segments(command).iter().any(|segment| {
+        let tokens = super::audit::effective_command_tokens(segment);
+        let program = tokens
+            .first()
+            .and_then(|token| Path::new(token).file_name())
+            .and_then(|name| name.to_str());
+        if program == Some("sleep") {
+            return true;
+        }
+        // Shells forwarding a script body via `-c` execute that body directly
+        // (`bash -c "sleep 5"`, `sh -c 'sleep 3'`), so re-parse the body to
+        // find `sleep` instead of treating it as data. `timeout 5 sleep 3`
+        // is already unwrapped by the audit wrapper logic.
+        if matches!(program, Some("bash" | "sh" | "zsh" | "ksh" | "dash")) {
+            let Some(dash_c) = tokens.iter().position(|token| token == "-c") else {
+                return false;
+            };
+            let body = tokens[dash_c + 1..].join(" ");
+            return super::audit::effective_command_tokens(&body)
+                .first()
+                .and_then(|token| Path::new(token).file_name())
+                .and_then(|name| name.to_str())
+                == Some("sleep");
+        }
+        false
+    })
+}
+
+/// Guidance prepended to a `sleep` command's result: the hint lives in the tool
+/// description too, but showing it at execution time makes it hard to miss.
+const SLEEP_WARNING: &str = "Note: this command runs `sleep`, which blocks the whole turn on \
+dead time — it is expensive. Use it only when truly necessary (e.g. waiting for a server to \
+accept connections); prefer backgrounding the work (`&` + log file) and polling a readiness \
+condition, or `task_wait` for subagent tasks.";
+
 fn execute_command_inner<F>(args: &Value, on_chunk: F) -> Result<String, String>
 where
     F: FnMut(&[u8]),
@@ -372,7 +416,10 @@ where
     let output =
         command_runner::run_command_streaming(&command, cwd, timeout, pseudo_terminal, on_chunk)?;
     let interrupted = output.timed_out || output.cancelled || output.stalled;
-    let formatted = format_command_result(output, timeout);
+    let mut formatted = format_command_result(output, timeout);
+    if contains_sleep(&command) {
+        formatted = format!("{SLEEP_WARNING}\n{formatted}");
+    }
     if interrupted {
         Err(formatted)
     } else {
@@ -394,8 +441,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_COMMAND_OUTPUT_CHARS, confirm_git_commit_if_needed, execute_command,
-        format_command_result, is_git_commit_command, resolve_command_timeout, truncate_chars,
+        MAX_COMMAND_OUTPUT_CHARS, SLEEP_WARNING, confirm_git_commit_if_needed, contains_sleep,
+        execute_command, format_command_result, is_git_commit_command, resolve_command_timeout,
+        truncate_chars,
     };
     use crate::cmd::run::CommandRunResult;
     use serde_json::json;
@@ -476,6 +524,48 @@ mod tests {
     fn commit_confirmation_passes_through_non_commit_commands() {
         assert!(confirm_git_commit_if_needed("git status").is_ok());
         assert!(confirm_git_commit_if_needed("echo hello").is_ok());
+    }
+
+    // ---- contains_sleep ----
+
+    #[test]
+    fn sleep_detection_finds_effective_sleep_program() {
+        assert!(contains_sleep("sleep 5"));
+        assert!(contains_sleep("sleep 0.5"));
+        assert!(contains_sleep("sleep 5 && cargo check"));
+        assert!(contains_sleep("nohup sleep 30 &"));
+        assert!(contains_sleep("env sleep 3"));
+        assert!(contains_sleep("command sleep 1"));
+        assert!(contains_sleep("/usr/bin/sleep 2"));
+        // Programs forwarded through a shell `-c` body execute `sleep` directly.
+        assert!(contains_sleep("bash -c \"sleep 5\""));
+        assert!(contains_sleep("sh -c 'sleep 0.5'"));
+        assert!(contains_sleep("timeout 5 sleep 3"));
+    }
+
+    #[test]
+    fn sleep_detection_ignores_data_arguments() {
+        assert!(!contains_sleep("grep sleep notes.txt"));
+        assert!(!contains_sleep("man sleep"));
+        assert!(!contains_sleep("echo sleep"));
+        assert!(!contains_sleep("ls /usr/bin/sleep"));
+        assert!(!contains_sleep("bash -c \"echo sleep\""));
+        assert!(!contains_sleep("bash -c 'grep sleep notes.txt'"));
+        assert!(!contains_sleep("timeout 5 echo 5"));
+    }
+
+    #[test]
+    fn execute_command_prepends_sleep_warning() {
+        let out = execute_command(&json!({
+            "command": "sleep 0",
+            "pty": false,
+            "timeout": 5,
+        }))
+        .unwrap();
+        assert!(
+            out.starts_with(SLEEP_WARNING),
+            "sleep result must carry the warning, got: {out}"
+        );
     }
 
     #[test]

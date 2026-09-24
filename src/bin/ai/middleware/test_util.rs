@@ -22,6 +22,7 @@ pub fn test_app() -> App {
         .unwrap_or_default();
     App {
         cli: ParsedCli::default(),
+        scoped_preflight_required: Vec::new(),
         hooks: Default::default(),
         config: AppConfig {
             api_key: String::new(),

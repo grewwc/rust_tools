@@ -101,9 +101,21 @@ fn scoped_instruction_preflight_blocks_first_mutation_until_rules_are_loaded() {
     assert!(
         rejected_tool_call_message(
             "execute_command",
-            ToolCallRejectionReason::ScopedInstructionsNeedReload
+            ToolCallRejectionReason::ScopedInstructionsNeedReload(vec![
+                std::path::PathBuf::from("/tmp/demo/AGENTS.md"),
+                std::path::PathBuf::from("/tmp/demo/src/bin/ai/AGENTS.md"),
+            ])
         )
         .contains("No file was changed")
+    );
+    assert!(
+        rejected_tool_call_message(
+            "execute_command",
+            ToolCallRejectionReason::ScopedInstructionsNeedReload(vec![
+                std::path::PathBuf::from("/tmp/demo/AGENTS.md")
+            ])
+        )
+        .contains("Missing instruction documents: /tmp/demo/AGENTS.md")
     );
 
     let _ = fs::remove_dir_all(root);

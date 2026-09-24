@@ -353,6 +353,7 @@ mod tests {
     fn test_app() -> App {
         App {
             cli: ParsedCli::default(),
+            scoped_preflight_required: Vec::new(),
             config: AppConfig {
                 api_key: String::new(),
                 base_history_file: PathBuf::new(),

@@ -563,6 +563,7 @@ fn stream_text_event_to_content_ignores_thinking_events() {
 fn test_app() -> App {
     App {
         cli: ParsedCli::default(),
+        scoped_preflight_required: Vec::new(),
         hooks: Default::default(),
         config: AppConfig {
             api_key: String::new(),

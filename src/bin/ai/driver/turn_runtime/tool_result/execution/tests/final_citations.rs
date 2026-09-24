@@ -54,6 +54,55 @@ fn final_response_citation_parser_ignores_prose_qualifier_extensions() {
 }
 
 #[test]
+fn final_response_citation_parser_skips_refusals_and_hypothetical_offers() {
+    // A correct answer that names the path it declines to cite must not read as citing it.
+    assert!(final_response_citations("There is no `src/ghost.rs:3` to cite.").is_empty());
+    assert!(final_response_citations(
+        "If you meant a different file — e.g. something like `src/ghost.rs:9` — tell me the intended name."
+    )
+    .is_empty());
+    // The exemption covers only the token it qualifies: a genuine citation stays one.
+    assert_eq!(
+        final_response_citations(
+            "There is no `src/ghost.rs:3` to cite; the rule lives in src/lib.rs:12."
+        )
+        .iter()
+        .map(|citation| citation.text.as_str())
+        .collect::<Vec<_>>(),
+        vec!["src/lib.rs:12"]
+    );
+    assert_eq!(
+        final_response_citations("There is no test for this, but see src/lib.rs:12.")
+            .iter()
+            .map(|citation| citation.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["src/lib.rs:12"]
+    );
+}
+
+#[test]
+fn final_citation_gate_allows_a_refusal_that_names_a_missing_path() {
+    let root = std::env::temp_dir().join(format!(
+        "final-citation-refusal-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    fs::create_dir_all(root.join("src")).unwrap();
+    let final_text =
+        "There is no `src/ghost.rs:3` to cite: `read_file src/ghost.rs` returned \"File not found\".";
+
+    // The path really is absent here, so an unexempted gate would reopen and then warn.
+    assert!(unvalidated_final_response_citations(final_text, Some(&root)).is_empty());
+    let mut messages = Vec::new();
+    assert_eq!(
+        final_response_citation_gate_action(&mut messages, final_text, Some(&root), false, 1, 16,),
+        FinalCitationGateAction::Allow
+    );
+    assert!(messages.is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn citation_line_check_falsifies_lines_beyond_scan_cap_cheaply() {
     let root = std::env::temp_dir().join(format!(
         "final-citation-line-check-{}",

@@ -122,6 +122,7 @@ mod tests {
         use std::sync::{Arc, atomic::AtomicBool};
         crate::ai::types::App {
             cli: crate::ai::cli::ParsedCli::default(),
+            scoped_preflight_required: Vec::new(),
             config: crate::ai::types::AppConfig {
                 api_key: String::new(),
                 base_history_file: std::path::PathBuf::new(),

@@ -49,6 +49,10 @@ impl AiConfig {
     pub const HISTORY_MAX_CHARS: &str = "ai.history.max_chars";
     pub const HISTORY_KEEP_LAST: &str = "ai.history.keep_last";
     pub const HISTORY_SUMMARY_MAX_CHARS: &str = "ai.history.summary_max_chars";
+    /// Optional additional instructions for future LLM history summaries.
+    /// Empty preserves the built-in prompt; provenance and recovery rules remain
+    /// in force. Existing summaries are not regenerated when this changes.
+    pub const HISTORY_SUMMARY_PROMPT: &str = "ai.history.summary_prompt";
 
     // ── Intent ─────────────────────────────────────────────
     pub const INTENT_MODEL: &str = "ai.intent_model";
@@ -173,6 +177,12 @@ impl AiConfig {
     /// Shell command executed after each tool call. Env `AI_HOOK_EVENT`,
     /// `AI_TOOL_NAME`, `AI_TOOL_OK` (true/false). Empty = disabled.
     pub const HOOK_AFTER_TOOL: &str = "ai.hooks.after_tool";
+    /// Shell command before a compression attempt. Env
+    /// `AI_HOOK_EVENT=before_compression`. Empty = disabled.
+    pub const HOOK_BEFORE_COMPRESSION: &str = "ai.hooks.before_compression";
+    /// Shell command after a compression attempt, including unchanged/failed
+    /// attempts. Env `AI_HOOK_EVENT=after_compression`. Empty = disabled.
+    pub const HOOK_AFTER_COMPRESSION: &str = "ai.hooks.after_compression";
     /// Shell command executed when the interactive session ends. Env
     /// `AI_HOOK_EVENT=on_session_end`. Empty = disabled.
     pub const HOOK_ON_SESSION_END: &str = "ai.hooks.on_session_end";

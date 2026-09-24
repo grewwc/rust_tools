@@ -1279,6 +1279,7 @@ mod tests {
             pending_files: None,
             forced_skills: Vec::new(),
             forced_skill_source: None,
+            scoped_preflight_required: Vec::new(),
             pending_skill_continuation: None,
             forced_question: None,
             attached_image_files: Vec::new(),

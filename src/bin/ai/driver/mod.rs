@@ -595,6 +595,7 @@ pub(in crate::ai) async fn run_with_cli(
         },
         forced_skills: Vec::new(),
         forced_skill_source: None,
+        scoped_preflight_required: Vec::new(),
         pending_skill_continuation: None,
         forced_question: None,
         current_model,

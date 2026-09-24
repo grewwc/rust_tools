@@ -253,7 +253,7 @@ const CHARS_PER_TOKEN_CONSERVATIVE: usize = 2;
 /// the prompt nears the window, avoiding immediate truncation from tiny or zero max_tokens.
 pub(super) const MIN_OUTPUT_TOKENS_FLOOR: u32 = 1_024;
 /// Safety margin for hidden provider overhead (template tokens, role separators, reasoning reserves, etc.).
-const CONTEXT_WINDOW_SAFETY_MARGIN_TOKENS: usize = 2_048;
+pub(super) const CONTEXT_WINDOW_SAFETY_MARGIN_TOKENS: usize = 2_048;
 
 /// Conservatively estimates prompt tokens in messages, tending to overestimate. Without
 /// server usage feedback, approximates from the character count at about 2 chars/token.

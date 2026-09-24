@@ -1,11 +1,124 @@
 //! Content-free projection measurements. Character budgets are not provider token usage.
 
 use serde::{Deserialize, Serialize};
+use std::{sync::{LazyLock, Mutex}, time::Instant};
 
 use crate::ai::{
     driver::decision_log::{DecisionLog, DecisionType, get_decision_log_store},
     history::{Message, ROLE_INTERNAL_NOTE, message_billable_chars},
+    request::CurrentRequestBudget,
 };
+
+// Independent scheduler processes can share a session, but not a projection.
+// This counter describes replacements in this runtime, not persisted history revisions.
+static COMPACTION_CYCLES: LazyLock<Mutex<rustc_hash::FxHashMap<(String, Option<u64>), CompactionWindow>>> =
+    LazyLock::new(|| Mutex::new(rustc_hash::FxHashMap::default()));
+
+#[derive(Clone, Serialize)]
+struct CompactionWindow {
+    id: String,
+    cycle: u64,
+    baseline: CurrentRequestBudget,
+}
+
+impl CompactionWindow {
+    fn new(baseline: CurrentRequestBudget) -> Self {
+        Self { id: uuid::Uuid::new_v4().to_string(), cycle: 0, baseline }
+    }
+
+    fn update(&mut self, after: CurrentRequestBudget, replaced: bool) {
+        if replaced {
+            advance_cycle(&mut self.cycle, true);
+            self.id = uuid::Uuid::new_v4().to_string();
+            self.baseline = after;
+        }
+    }
+}
+
+pub(super) fn current_compaction_cycle(session_id: &str) -> u64 {
+    let key = (session_id.to_string(), crate::ai::driver::current_task_pid());
+    COMPACTION_CYCLES.lock().unwrap_or_else(|e| e.into_inner()).get(&key).map_or(0, |window| window.cycle)
+}
+
+fn advance_cycle(cycle: &mut u64, replaced: bool) -> u64 {
+    if replaced {
+        *cycle = cycle.saturating_add(1);
+    }
+    *cycle
+}
+
+fn projection_fingerprint(messages: &[Message]) -> u64 {
+    // Stream the serialized projection straight into the hasher instead of
+    // materializing the full JSON (a 300K-char projection is ~1MB+): this runs
+    // twice per compaction attempt (start + finish), so the Vec allocation would
+    // otherwise be repeated up to 4 times per request. The hashed stream is
+    // byte-identical to `serde_json::to_vec(messages)`.
+    use std::hash::Hasher;
+    use std::io::Write;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    struct HashWriter<'a, H: Hasher>(&'a mut H);
+    impl<H: Hasher> Write for HashWriter<'_, H> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.write(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    // All Message fields serialize; no content or hash is emitted in telemetry.
+    serde_json::to_writer(HashWriter(&mut hasher), messages).expect("messages serialize");
+    hasher.finish()
+}
+
+pub(super) struct CompactionAttempt {
+    before: CurrentRequestBudget,
+    fingerprint: u64,
+    started: Instant,
+    trigger: &'static str,
+    _hooks: Option<crate::ai::driver::hooks::CompressionHookGuard>,
+}
+
+impl CompactionAttempt {
+    pub(super) fn start(trigger: &'static str, before: CurrentRequestBudget, messages: &[Message]) -> Self {
+        Self {
+            before, fingerprint: projection_fingerprint(messages), started: Instant::now(), trigger,
+            // Routine projection refreshes are not budget-triggered compaction attempts.
+            _hooks: (trigger != "projection_maintenance")
+                .then(crate::ai::driver::hooks::CompressionHookGuard::new),
+        }
+    }
+
+    /// Only a committed, different projection advances the cycle. Failed archive
+    /// writes, rejected candidates and no-op summaries leave it unchanged.
+    pub(super) fn finish(self, session_id: &str, iteration: usize, model: &str,
+        after: CurrentRequestBudget, messages: &[Message], accepted: bool) {
+        let replaced = accepted && self.fingerprint != projection_fingerprint(messages);
+        let window = {
+            let key = (session_id.to_string(), crate::ai::driver::current_task_pid());
+            let mut cycles = COMPACTION_CYCLES.lock().unwrap_or_else(|e| e.into_inner());
+            let window = cycles.entry(key).or_insert_with(|| CompactionWindow::new(self.before));
+            window.update(after, replaced);
+            window.clone()
+        };
+        let elapsed_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        get_decision_log_store().log(DecisionLog {
+            timestamp: 0, session_id: session_id.to_string(), turn_id: iteration,
+            decision_type: DecisionType::ContextProjection,
+            context: serde_json::json!({
+                "schema": "context-compaction-v1", "model": model, "cycle": window.cycle,
+                "window": window,
+                "task_pid": crate::ai::driver::current_task_pid(),
+                "trigger": self.trigger, "before": self.before, "after": after,
+                "outcome": if replaced { "replaced" } else if accepted { "no_change" } else { "rejected" },
+                "duration_ms": elapsed_ms,
+            }).to_string(),
+            alternatives_considered: Vec::new(), chosen_option: "compaction_attempt".to_string(),
+            reasoning: "Measured projection replacement; token count provenance is explicit.".to_string(),
+            confidence: None, outcome: None, execution_time_ms: Some(elapsed_ms),
+        });
+    }
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct ContextSizeBreakdown {
@@ -68,6 +181,12 @@ impl ContextSizeBreakdown {
 pub(super) struct ContextRequestMetrics {
     pub(super) before: ContextSizeBreakdown,
     pub(super) after: ContextSizeBreakdown,
+    #[serde(default)]
+    pub(super) before_budget: Option<CurrentRequestBudget>,
+    #[serde(default)]
+    pub(super) after_budget: Option<CurrentRequestBudget>,
+    #[serde(default)]
+    pub(super) compaction_cycle: u64,
     pub(super) provider_overflows: usize,
     pub(super) overflow_retries: usize,
     /// HTTP response received, not semantic task success or completed streaming.
@@ -96,13 +215,13 @@ fn context_decision(
         turn_id: iteration,
         decision_type: DecisionType::ContextProjection,
         context: serde_json::json!({
-            "schema": "context-projection-v1", "model": model, "metrics": metrics,
+            "schema": "context-projection-v2", "model": model, "metrics": metrics,
         })
         .to_string(),
         alternatives_considered: Vec::new(),
         chosen_option: "request_projection".to_string(),
         reasoning:
-            "Projection-only character accounting; no message bodies or task-success inference."
+            "Projection character accounting and normalized token budgets; no message bodies or task-success inference."
                 .to_string(),
         confidence: None,
         outcome: None,
@@ -123,6 +242,54 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
         }
+    }
+
+    #[test]
+    fn context_replay_cycle_only_advances_for_committed_different_projection() {
+        let session = format!("compaction-cycle-{}", uuid::Uuid::new_v4());
+        let budget: CurrentRequestBudget = serde_json::from_value(json!({
+            "prompt_tokens": 9_000, "source": "compatible_actual_plus_estimated_growth",
+            "limits": { "physical_context_tokens": 12_000, "output_reserve_tokens": 1_000,
+                "safety_margin_tokens": 1_000, "input_allowance_tokens": 10_000, "soft_target_tokens": 8_000 }
+        })).unwrap();
+        let original = vec![message("user", json!("private original"))];
+        let changed = vec![message("user", json!("private replaced"))];
+        CompactionAttempt::start("test", budget, &original)
+            .finish(&session, 1, "model", budget, &original, true);
+        assert_eq!(current_compaction_cycle(&session), 0);
+        CompactionAttempt::start("test", budget, &original)
+            .finish(&session, 1, "model", budget, &changed, false);
+        assert_eq!(current_compaction_cycle(&session), 0);
+        let after = CurrentRequestBudget { prompt_tokens: 7_000, ..budget };
+        let mut window = CompactionWindow::new(budget);
+        let initial_id = window.id.clone();
+        window.update(after, false);
+        assert_eq!(window.id, initial_id);
+        assert_eq!(window.baseline, budget);
+        window.update(after, true);
+        assert_ne!(window.id, initial_id);
+        assert_eq!(window.baseline, after);
+        assert_eq!(window.cycle, 1);
+        CompactionAttempt::start("test", budget, &original)
+            .finish(&session, 1, "model", after, &changed, true);
+        assert_eq!(current_compaction_cycle(&session), 1);
+        CompactionAttempt::start("test", after, &changed)
+            .finish(&session, 2, "another model", after, &changed, true);
+        assert_eq!(current_compaction_cycle(&session), 1);
+        assert_eq!(current_compaction_cycle(&format!("{session}-other")), 0);
+        let logs = get_decision_log_store().by_type(&DecisionType::ContextProjection);
+        let replaced: serde_json::Value = logs.iter()
+            .filter(|log| log.session_id == session)
+            .map(|log| serde_json::from_str::<serde_json::Value>(&log.context).unwrap())
+            .find(|body| body["outcome"] == "replaced").unwrap();
+        assert_eq!(replaced["cycle"], 1);
+        assert_eq!(replaced["before"]["prompt_tokens"], 9_000);
+        assert_eq!(replaced["after"]["prompt_tokens"], 7_000);
+        assert_eq!(replaced["window"]["baseline"]["prompt_tokens"], 7_000);
+        assert!(replaced["window"]["id"].is_string());
+        assert_eq!(replaced["before"]["source"], "compatible_actual_plus_estimated_growth");
+        assert!(replaced["duration_ms"].is_u64());
+        assert!(!replaced.to_string().contains("private"));
     }
 
     #[test]
@@ -179,6 +346,9 @@ mod tests {
                 ..Default::default()
             },
             provider_overflows: 2,
+            before_budget: None,
+            after_budget: None,
+            compaction_cycle: 0,
             overflow_retries: 1,
             response_received: false,
             elapsed_ms: 50,
@@ -205,6 +375,9 @@ mod tests {
             overflow_retries: 0,
             response_received: true,
             elapsed_ms: 500,
+            before_budget: None,
+            after_budget: None,
+            compaction_cycle: 0,
         };
         store.log(context_decision("session", 1, "model", &metrics));
         let mut decision = context_decision("session", 1, "model", &metrics);
@@ -259,6 +432,9 @@ mod tests {
             overflow_retries: 0,
             response_received: true,
             elapsed_ms: 1,
+            before_budget: None,
+            after_budget: None,
+            compaction_cycle: 0,
         };
         for turn in 0..10 {
             let mut decision = context_decision("session", turn, "model", &metrics);

@@ -496,7 +496,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             } else if patch_retry_needs_fresh_read {
                 Some(ToolCallRejectionReason::PatchRetryNeedsFreshRead)
             } else if scoped_preflight_needed {
-                Some(ToolCallRejectionReason::ScopedInstructionsNeedReload)
+                Some(ToolCallRejectionReason::ScopedInstructionsNeedReload(
+                    scoped_preflight_targets.clone(),
+                ))
             } else {
                 None
             };

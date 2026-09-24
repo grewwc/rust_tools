@@ -44,7 +44,7 @@ use tool_overflow::{
 };
 use tool_overflow::{
     age_out_overflow_stub_previews, build_persisted_summary_text,
-    build_persisted_summary_text_with_app, cap_oversized_tool_results_for_context,
+    build_persisted_summary_text_with_app,
     enforce_protected_precision_group_budget, is_non_compressible_tool,
     is_preserved_tool_overflow_content, is_preserved_user_or_image_stub,
     merge_old_user_overflow_stubs, minimize_overflow_stubs_for_hard_budget,
@@ -52,6 +52,7 @@ use tool_overflow::{
     spill_oversized_preserved_messages, spill_protected_precision_to_fit,
     try_spill_preserved_message_to_stub,
 };
+pub(in crate::ai) use tool_overflow::cap_oversized_tool_results_for_context;
 
 mod persisted;
 pub(in crate::ai) use persisted::*;
@@ -329,7 +330,7 @@ fn is_summary_message(message: &Message) -> bool {
 /// Protection window over recent complete tool groups. An assistant(tool_calls)
 /// batch is an indivisible evidence unit: it must never be truncated message by
 /// message, or parallel reads would leave half a batch behind.
-const KEEP_RECENT_TOOL_GROUPS: usize = 4;
+pub(in crate::ai) const KEEP_RECENT_TOOL_GROUPS: usize = 4;
 
 /// Window sequence for progressive folding: tightens stepwise from
 /// [`KEEP_RECENT_TOOL_GROUPS`] down to [`MIN_KEEP_RECENT_TOOL_GROUPS`], widening

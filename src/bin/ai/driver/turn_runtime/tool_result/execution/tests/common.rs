@@ -35,6 +35,7 @@ pub(super) fn mcp_snapshot(shared: &SharedMcpClient) -> McpClient {
 pub(super) fn test_app_with_tools(tool_names: &[&str]) -> App {
     App {
         cli: ParsedCli::default(),
+        scoped_preflight_required: Vec::new(),
         config: AppConfig {
             api_key: String::new(),
             base_history_file: PathBuf::new(),

@@ -65,6 +65,7 @@ fn any_vl_model_handle() -> String {
 pub(in crate::ai) fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> types::App {
     types::App {
         cli: super::cli::ParsedCli::default(),
+        scoped_preflight_required: Vec::new(),
         hooks: Default::default(),
         config: types::AppConfig {
             api_key: String::new(),

@@ -343,6 +343,19 @@ pub(crate) fn select_stale_sessions<'a>(
         .collect()
 }
 
+/// Selects the sessions whose id starts with `prefix`. The prefix must be a
+/// validated session-id fragment; session ids are ASCII-only, so a byte prefix
+/// comparison is exact. Used by `/sessions delete <prefix> --prefix`.
+pub(crate) fn select_sessions_with_prefix<'a>(
+    sessions: &'a [SessionInfo],
+    prefix: &str,
+) -> Vec<&'a SessionInfo> {
+    sessions
+        .iter()
+        .filter(|session| session.id.starts_with(prefix))
+        .collect()
+}
+
 /// Whether a side-note submitted while a turn is running should be executed as a
 /// real-time session command instead of being injected into the LLM context.
 ///
@@ -373,6 +386,27 @@ pub(crate) fn is_real_time_background_command(input: &str) -> bool {
 /// redirecting process-wide stdout.
 fn render_current_session_id(app: &App) -> String {
     app.session_id.clone()
+}
+
+/// Deletes a single session with all the side effects shared by the explicit
+/// delete paths (`/sessions delete` exact-id and `--prefix` modes): terminate
+/// the session's sub-agents first (so live Futures cannot write back and
+/// rebuild derived history after the SQLite file is gone), delete the session
+/// artifacts, drop dangling suspended bindings, and invalidate the in-memory
+/// context cache. Returns whether the session record existed.
+fn delete_one_session(store: &SessionStore, session_id: &str) -> std::io::Result<bool> {
+    let deleted_path = store.session_history_file(session_id);
+    crate::ai::tools::task_tools::discard_tasks_for_session(session_id);
+    let deleted = store.delete_session(session_id)?;
+    // Drop suspended bindings pointing at the deleted session (in any
+    // terminal), whether or not the session record still existed: both cases
+    // leave dangling bindings behind. Session-id match only (the stored
+    // history file differs by binding writer). Best-effort.
+    let _ = SuspendedSessionStore::new().remove_for_session(session_id, None);
+    if deleted {
+        crate::ai::history::invalidate_context_history_cache_for(&deleted_path);
+    }
+    Ok(deleted)
 }
 
 pub fn try_handle_session_command(
@@ -461,6 +495,9 @@ pub fn try_handle_session_command(
                 "  /sessions bound           list suspended sessions bound to current terminal"
             );
             println!("  /sessions delete <id> [more...]     delete one or more sessions");
+            println!(
+                "  /sessions delete <prefix> --prefix  delete all sessions whose id starts with <prefix>"
+            );
             println!(
                 "  /sessions unbind          remove suspended-session bindings for this terminal (sessions are kept)"
             );
@@ -781,53 +818,143 @@ pub fn try_handle_session_command(
             }
         }
         "delete" | "del" | "rm" => {
-            let ids: Vec<&str> = parts.collect();
-            if ids.is_empty() {
+            let args: Vec<&str> = parts.collect();
+            if args.is_empty() {
                 println!("missing session id(s). try: /sessions delete <id1> [<id2> ...]");
                 return Ok(true);
-            };
-            if let Some(error) = ids
+            }
+            // `--prefix` selects by id prefix instead of exact ids. A session id
+            // can never start with '-', so the flag is unambiguous and may sit
+            // before or after the prefix value.
+            let prefix_mode = args.iter().any(|arg| *arg == "--prefix");
+            let ids: Vec<&str> = args
                 .iter()
-                .find_map(|id| SessionStore::validate_session_id(id).err())
-            {
-                println!("invalid session id: {error}");
-                return Ok(true);
-            }
-            let mut deleted_count = 0;
-            let mut not_found_count = 0;
-            let mut deleted_current = false;
-            for id in &ids {
-                let deleted_path = store.session_history_file(id);
-                // Must first terminate subagents still running for this session;
-                // otherwise, after the SQLite file is deleted, live Futures may
-                // write again and rebuild derived history.
-                crate::ai::tools::task_tools::discard_tasks_for_session(id);
-                let deleted = store.delete_session(id)?;
-                // Drop suspended bindings pointing at the deleted session (in
-                // any terminal), whether or not the session record still existed:
-                // both cases leave dangling bindings behind. Session-id match
-                // only (the stored history file differs by binding writer).
-                // Best-effort.
-                let _ = SuspendedSessionStore::new().remove_for_session(id, None);
-                if deleted {
-                    crate::ai::history::invalidate_context_history_cache_for(&deleted_path);
-                    deleted_count += 1;
-                    if *id == app.session_id {
-                        deleted_current = true;
-                    }
-                    println!("Deleted session: {}", id);
-                } else {
-                    not_found_count += 1;
-                    println!("Session not found: {}", id);
+                .copied()
+                .filter(|arg| *arg != "--prefix")
+                .collect();
+            if prefix_mode {
+                if ids.len() != 1 {
+                    println!(
+                        "expected exactly one session prefix. try: /sessions delete <prefix> --prefix"
+                    );
+                    return Ok(true);
                 }
-            }
-            if ids.len() > 1 {
-                println!("Summary: {deleted_count} deleted, {not_found_count} not found.");
-            }
-            if deleted_current {
-                let new_id = Uuid::new_v4().to_string();
-                switch_app_to_session(app, &store, &new_id, false)?;
-                println!("Switched to new session: {}", new_id);
+                let prefix = ids[0];
+                if let Err(error) = SessionStore::validate_session_id(prefix) {
+                    println!("invalid session prefix: {error}");
+                    return Ok(true);
+                }
+                let sessions = store.list_sessions()?;
+                let matched = select_sessions_with_prefix(&sessions, prefix);
+                if matched.is_empty() {
+                    println!("No sessions found with prefix: {prefix}");
+                    return Ok(true);
+                }
+                println!(
+                    "Found {} session(s) with prefix '{}':",
+                    matched.len(),
+                    prefix
+                );
+                let max_id_len = matched.iter().map(|s| s.id.len()).max().unwrap_or(36);
+                for s in &matched {
+                    // `*` marks the current session: deleting it switches to a
+                    // fresh session afterwards, so the user should see it here.
+                    let mark = if s.id == app.session_id { "*" } else { " " };
+                    let time = s
+                        .modified_local
+                        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let summary = s
+                        .summary
+                        .as_deref()
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or("-");
+                    let (style_open, style_close) = if s.marked {
+                        marked_session_style()
+                    } else {
+                        ("", "")
+                    };
+                    println!(
+                        "{style_open}{} {:<width$}  {}  {}{style_close}",
+                        mark,
+                        s.id,
+                        time,
+                        summary,
+                        width = max_id_len
+                    );
+                }
+                let confirm = crate::commonw::prompt::prompt_yes_or_no_danger(&format!(
+                    "Delete these {} session(s) with prefix '{}'? (y/n): ",
+                    matched.len(),
+                    prefix
+                ));
+                if confirm != Some(true) {
+                    println!("canceled by user.");
+                    return Ok(true);
+                }
+                let mut deleted_count = 0;
+                let mut not_found_count = 0;
+                let mut failed_count = 0;
+                let mut deleted_current = false;
+                for session in &matched {
+                    let id = session.id.clone();
+                    match delete_one_session(&store, &id) {
+                        Ok(true) => {
+                            deleted_count += 1;
+                            if id == app.session_id {
+                                deleted_current = true;
+                            }
+                        }
+                        Ok(false) => {
+                            not_found_count += 1;
+                            println!("Session not found: {id}");
+                        }
+                        Err(err) => {
+                            failed_count += 1;
+                            eprintln!("[sessions delete] failed to delete session {id}: {err}");
+                        }
+                    }
+                }
+                println!(
+                    "Deleted {deleted_count} session(s) with prefix '{prefix}' ({not_found_count} not found, {failed_count} failed)."
+                );
+                if deleted_current {
+                    let new_id = Uuid::new_v4().to_string();
+                    switch_app_to_session(app, &store, &new_id, false)?;
+                    println!("Switched to new session: {}", new_id);
+                }
+            } else {
+                if let Some(error) = ids
+                    .iter()
+                    .find_map(|id| SessionStore::validate_session_id(id).err())
+                {
+                    println!("invalid session id: {error}");
+                    return Ok(true);
+                }
+                let mut deleted_count = 0;
+                let mut not_found_count = 0;
+                let mut deleted_current = false;
+                for id in &ids {
+                    let deleted = delete_one_session(&store, id)?;
+                    if deleted {
+                        deleted_count += 1;
+                        if *id == app.session_id {
+                            deleted_current = true;
+                        }
+                        println!("Deleted session: {}", id);
+                    } else {
+                        not_found_count += 1;
+                        println!("Session not found: {}", id);
+                    }
+                }
+                if ids.len() > 1 {
+                    println!("Summary: {deleted_count} deleted, {not_found_count} not found.");
+                }
+                if deleted_current {
+                    let new_id = Uuid::new_v4().to_string();
+                    switch_app_to_session(app, &store, &new_id, false)?;
+                    println!("Switched to new session: {}", new_id);
+                }
             }
         }
         "unbind" | "clear-bound" | "clear_bound" | "clear-suspended" | "clear_suspended" => {
@@ -1438,6 +1565,7 @@ mod tests {
         let session_id = "sess-old".to_string();
         App {
             cli: ParsedCli::default(),
+            scoped_preflight_required: Vec::new(),
             config: AppConfig {
                 api_key: String::new(),
                 base_history_file: history_file.clone(),
@@ -2058,6 +2186,153 @@ mod tests {
         let stale = select_stale_sessions(&sessions, "current", cutoff);
         let stale_ids: Vec<&str> = stale.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(stale_ids, vec!["old"]);
+    }
+
+    #[test]
+    fn select_sessions_with_prefix_matches_only_prefixed_ids() {
+        let sessions = vec![
+            make_session_info("prompt-eval-20260924-154942-a", None),
+            make_session_info("prompt-eval-20260924-154942-b", None),
+            make_session_info("prompt-eval-20260924-154943", None),
+            make_session_info("other-prefix", None),
+            make_session_info("prompt-eval", None),
+        ];
+        let matched: Vec<&str> =
+            select_sessions_with_prefix(&sessions, "prompt-eval-20260924-154942")
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect();
+        assert_eq!(
+            matched,
+            vec!["prompt-eval-20260924-154942-a", "prompt-eval-20260924-154942-b"]
+        );
+        // A shorter prefix matches every id sharing that start, including the
+        // prefix itself.
+        let broad: Vec<&str> = select_sessions_with_prefix(&sessions, "prompt-eval")
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(
+            broad,
+            vec![
+                "prompt-eval-20260924-154942-a",
+                "prompt-eval-20260924-154942-b",
+                "prompt-eval-20260924-154943",
+                "prompt-eval",
+            ]
+        );
+    }
+
+    #[test]
+    fn delete_one_session_removes_session_and_suspended_binding() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let suspended_root = root.join("suspended");
+        unsafe {
+            std::env::set_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR", &suspended_root);
+            std::env::set_var("TERM_SESSION_ID", "term-delete");
+        }
+
+        let app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let id = "prefix-eval-12345";
+        let path = store.session_history_file(id);
+        append_history_messages(
+            &path,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("hi".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        SuspendedSessionStore::new()
+            .save_for_terminal_key(
+                "terminal:term-delete",
+                id,
+                &app.config.history_file,
+                &app.active_persona.id,
+                "test-model",
+            )
+            .unwrap();
+        assert!(path.exists());
+
+        // Deleting an existing session returns true and removes the artifacts.
+        assert!(delete_one_session(&store, id).unwrap());
+        assert!(!path.exists());
+        // The dangling suspended binding is dropped together with the session.
+        let entries = SuspendedSessionStore::new()
+            .peek_entries_for_terminal_key("terminal:term-delete")
+            .unwrap();
+        assert!(
+            entries.is_empty(),
+            "deleted session must not leave a dangling binding, got {entries:?}"
+        );
+
+        // Deleting a session that is already gone returns false, not an error.
+        assert!(!delete_one_session(&store, id).unwrap());
+
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");
+            std::env::remove_var("TERM_SESSION_ID");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_by_prefix_rejects_invalid_input_before_confirmation() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let kept = "prompt-eval-20260924-154942-a";
+        append_history_messages(
+            &store.session_history_file(kept),
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("keep me".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+
+        // All these must stop before the interactive confirmation (which would
+        // block on stdin in tests) and delete nothing: a flag without a prefix,
+        // a prefix with characters outside the session-id charset, and more
+        // than one prefix value.
+        for input in [
+            "/sessions delete --prefix",
+            "/sessions delete prompt/with-slash --prefix",
+            "/sessions delete a b --prefix",
+            "/sessions delete --prefix a b",
+        ] {
+            let handled = try_handle_session_command(&mut app, input)
+                .expect("prefix-delete handler must not error on invalid input");
+            assert!(
+                handled,
+                "delete should consume the command for input '{input}'"
+            );
+            assert!(
+                store.session_exists(kept).unwrap(),
+                "invalid input '{input}' must not delete the session"
+            );
+        }
+
+        // A prefix matching no session returns before prompting too.
+        let handled = try_handle_session_command(&mut app, "/sessions delete nomatch-xyz --prefix")
+            .expect("no-match prefix delete must not error");
+        assert!(handled);
+        assert!(store.session_exists(kept).unwrap());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Rolls the target session file's mtime back N days, to simulate "unread

@@ -16,6 +16,7 @@ pub(in crate::ai) fn cap_raw_tool_results_for_context(
     cap_oversized_tool_results_for_context(
         messages,
         TOOL_RESULT_RAW_HARD_CAP_CHARS,
+        0,
         overflow_dir,
         cwd,
     )

@@ -201,22 +201,55 @@ pub(super) fn prepare_tool_messages_structured(
 /// only past the absolute cap, preventing the canonical tail after the SQLite
 /// snapshot watermark from bypassing the current-turn projection and pushing
 /// oversized output into the model again.
-pub(super) fn cap_oversized_tool_results_for_context(
+pub(in crate::ai) fn cap_oversized_tool_results_for_context(
     messages: &mut [Message],
     hard_cap_chars: usize,
+    keep_recent_groups: usize,
     overflow_dir: Option<&Path>,
     cwd: Option<&Path>,
 ) -> usize {
     if hard_cap_chars == 0 {
         return 0;
     }
+    // The protected tail window (most recent complete tool groups) stays raw
+    // even when a result exceeds the inline cap; only older results spill.
+    let protected = recent_tool_group_message_indices(messages, keep_recent_groups);
 
+    // Cheap pre-scan (no index building, no string cloning): if no unprotected
+    // result exceeds the cap there is nothing to do. This keeps the per-request
+    // spill pass O(messages) instead of O(total argument bytes) for ordinary
+    // sessions. Preserved stubs are always far below the cap (bounded ~8K vs
+    // >= 32K), so the length check alone cannot classify a stub as oversized;
+    // the defensive stub check stays in the main loop below.
+    let mut has_oversized = false;
+    for idx in tool_message_indices(messages) {
+        if keep_recent_groups > 0 && protected.contains(&idx) {
+            continue;
+        }
+        if content_char_len(&messages[idx].content) > hard_cap_chars {
+            has_oversized = true;
+            break;
+        }
+    }
+    if !has_oversized {
+        return 0;
+    }
+
+    // Built only when at least one result actually spills.
     let id_to_tool_name = build_tool_call_name_index(messages);
     let id_to_tool_args = build_tool_call_arguments_index(messages);
     let mut capped = 0;
     for idx in tool_message_indices(messages) {
+        if keep_recent_groups > 0 && protected.contains(&idx) {
+            continue;
+        }
+        // Fast length gate without cloning; only oversized results pay the
+        // value_to_string allocation.
+        if content_char_len(&messages[idx].content) <= hard_cap_chars {
+            continue;
+        }
         let text = value_to_string(&messages[idx].content);
-        if is_preserved_tool_overflow_stub(&text) || text.chars().nth(hard_cap_chars).is_none() {
+        if is_preserved_tool_overflow_stub(&text) {
             continue;
         }
 
@@ -517,6 +550,30 @@ pub(super) fn spill_protected_precision_to_fit(
         spilled += 1;
     }
     spilled
+}
+
+/// Character length of the model-visible text of a message content value,
+/// without building an intermediate `String`. Mirrors `value_to_string`'s
+/// text extraction (string passthrough; array items only for objects whose
+/// `type` is `text`).
+fn content_char_len(content: &Value) -> usize {
+    if let Some(s) = content.as_str() {
+        return s.chars().count();
+    }
+    if let Some(arr) = content.as_array() {
+        let mut total = 0usize;
+        for item in arr {
+            if let Some(obj) = item.as_object() {
+                if obj.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(t) = obj.get("text").and_then(|t| t.as_str()) {
+                        total = total.saturating_add(t.chars().count());
+                    }
+                }
+            }
+        }
+        return total;
+    }
+    0
 }
 
 pub(super) fn build_tool_call_name_index(messages: &[Message]) -> FxHashMap<String, String> {

@@ -1,6 +1,7 @@
 {
   "name": "execute_command",
   "description": "Run a shell command. Destructive, network, and privilege-escalation commands are blocked. Truncated output reports shown/total counts; narrow or page instead of rerunning variants. Failures report the exit code.",
+  "first_use_guidance": "Guidance for later execute_command calls in this turn:\n- `sleep` is expensive: it blocks the whole turn on dead time — do not use it unless truly necessary (e.g. waiting for a server to accept connections). Prefer non-blocking patterns: background long-running work (`&` + log file) and poll readiness, or `task_wait` for subagent tasks.",
   "parameters": {
     "type": "object",
     "properties": {

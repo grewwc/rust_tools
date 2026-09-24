@@ -1,6 +1,10 @@
 //! Final-response citation gate: extracts `path:line` citations from
 //! final answers and validates them against local files before the answer is
 //! accepted.
+//! A token named only to deny or to question it is exempt (see
+//! `citation_in_non_assertive_context`): a correct refusal that names the path
+//! it declines to cite is not an evidence claim, and revalidating it would
+//! force the model to rewrite an already-correct answer.
 
 use super::*;
 
@@ -91,6 +95,90 @@ pub(in crate::ai::driver::turn_runtime) fn fenced_code_block_byte_ranges(
     ranges
 }
 
+/// How far around a citation token the non-assertive context is inspected, and how close an
+/// immediately preceding negation must sit to qualify that token. The wide window catches
+/// "the file does not exist ... `src/x.rs:3`"; the short one catches "There is no `src/x.rs:3` to
+/// cite" without swallowing a citation that a negation in an earlier clause is not about
+/// ("There is no test for this, but see src/lib.rs:12").
+const NON_ASSERTIVE_CITATION_WINDOW_BEFORE_CHARS: usize = 160;
+const NON_ASSERTIVE_CITATION_WINDOW_AFTER_CHARS: usize = 80;
+const NON_ASSERTIVE_CITATION_ADJACENT_CHARS: usize = 20;
+
+/// Phrases that turn a nearby `path:line` token into something other than an evidence claim: an
+/// existence check ("the file does not exist", `read_file src/x.rs` -> "File not found"), or a
+/// question back to the user ("if you meant ..."). A refusal necessarily names the path it declines
+/// to cite, so without this exemption the gate reopens and then warns on an answer that is already
+/// correct. Chinese variants are listed because the refusal prose may be translated while the path
+/// stays Latin.
+const NON_ASSERTIVE_CITATION_PHRASES: &[&str] = &[
+    "does not exist",
+    "doesn't exist",
+    "no such file",
+    "no file",
+    "not found",
+    "no matches",
+    "no such path",
+    "isn't a file",
+    "if you meant",
+    "meant a different",
+    "tell me the intended",
+    "did you mean",
+    "不存在",
+    "找不到",
+    "无法找到",
+    "没有这个文件",
+];
+
+/// Negations that count only immediately before the token, because the same words further away
+/// usually qualify a different path.
+const NON_ASSERTIVE_ADJACENT_PHRASES: &[&str] = &[
+    "there is no",
+    "there's no",
+    "no such",
+    "won't invent",
+    "will not invent",
+    "不存在",
+];
+
+fn char_window_before(text: &str, start: usize, max_chars: usize) -> &str {
+    let mut boundary = start;
+    for _ in 0..max_chars {
+        match text[..boundary].chars().next_back() {
+            Some(character) => boundary -= character.len_utf8(),
+            None => break,
+        }
+    }
+    &text[boundary..start]
+}
+
+fn char_window_after(text: &str, end: usize, max_chars: usize) -> &str {
+    match text[end..].char_indices().nth(max_chars) {
+        Some((offset, _)) => &text[end..end + offset],
+        None => &text[end..],
+    }
+}
+
+/// Whether the citation token at `start..end` is named only to deny or to question it.
+fn citation_in_non_assertive_context(text: &str, start: usize, end: usize) -> bool {
+    let window = format!(
+        "{} {}",
+        char_window_before(text, start, NON_ASSERTIVE_CITATION_WINDOW_BEFORE_CHARS),
+        char_window_after(text, end, NON_ASSERTIVE_CITATION_WINDOW_AFTER_CHARS)
+    )
+    .to_lowercase();
+    if NON_ASSERTIVE_CITATION_PHRASES
+        .iter()
+        .any(|phrase| window.contains(phrase))
+    {
+        return true;
+    }
+    let adjacent =
+        char_window_before(text, start, NON_ASSERTIVE_CITATION_ADJACENT_CHARS).to_lowercase();
+    NON_ASSERTIVE_ADJACENT_PHRASES
+        .iter()
+        .any(|phrase| adjacent.contains(phrase))
+}
+
 pub(in crate::ai::driver::turn_runtime) fn final_response_citations(
     final_text: &str,
 ) -> Vec<FinalCitation> {
@@ -116,6 +204,11 @@ pub(in crate::ai::driver::turn_runtime) fn final_response_citations(
         if !citation_has_token_boundaries(final_text, full.start(), full.end())
             || !looks_like_final_citation_path(path.as_str())
         {
+            continue;
+        }
+        // Only asserted citations are validated: a path named to say it is missing, or to ask which
+        // file was meant, carries no evidence claim to check.
+        if citation_in_non_assertive_context(final_text, full.start(), full.end()) {
             continue;
         }
         let Ok(start_line) = start.as_str().parse::<u64>() else {

@@ -19,6 +19,7 @@ use crate::ai::theme::{self, RESET};
 
 use super::aux::charge_llm_usage_to_kernel;
 use super::builder::{build_request_body, clamp_with_estimated_prompt};
+use super::current_budget::CurrentRequestBudget;
 use super::error::{
     REQUEST_MAX_ATTEMPTS, RequestError, RequestErrorKind, RequestRetryPolicy,
     STREAM_RESPONSE_HEADER_TIMEOUT_SECS, api_key_for_request_model, apply_request_auth,
@@ -450,19 +451,41 @@ pub(crate) async fn do_request_messages_without_tools(
     do_request_messages_with_tool_mode(app, model, messages, stream, false).await
 }
 
-async fn do_request_messages_with_tool_mode(
-    app: &mut App,
+/// Preview the same normalized input and output reservation used by transport.
+/// This borrows feedback without consuming it, never sends a request, and leaves
+/// canonical messages untouched. Thinking resolution is local: nonempty user
+/// text is decided by the heuristic and the empty-question gate skips its LLM.
+/// Call again after changing messages, model, tools, or output/effort overrides.
+pub(crate) async fn preview_request_budget(
+    app: &App,
     model: &str,
     messages: &[Message],
     stream: bool,
     tools_enabled: bool,
-) -> Result<Response, RequestError> {
-    clear_stale_request_interrupt_before_request(app);
-    // Take feedback before any await: failed/cancelled requests must not leave
-    // an older pending request available for an unrelated response to fill.
-    let previous_prompt = app.last_known_prompt_tokens.take();
-    let previous_cached = app.last_known_cached_prompt_tokens.take();
+) -> CurrentRequestBudget {
+    let mut projection = prepare_request_projection(app, model, messages, tools_enabled).await;
+    let (_, _, budget) = projection.measure(app, model, stream, app.last_known_prompt_tokens.as_ref());
+    budget
+}
 
+/// Owns the wire projection so measurement can borrow it without borrowing App
+/// across the mutable transport path. Both preview and send build tools once.
+struct RequestProjection {
+    messages: Vec<Message>,
+    tools: Option<Value>,
+    tool_choice: Option<Value>,
+    enable_thinking: bool,
+    reasoning_effort: Option<&'static str>,
+    reasoning_items: rustc_hash::FxHashMap<String, Vec<Value>>,
+    endpoint: String,
+}
+
+async fn prepare_request_projection(
+    app: &App,
+    model: &str,
+    messages: &[Message],
+    tools_enabled: bool,
+) -> RequestProjection {
     let mut normalized_messages = normalize_messages_for_model(model, messages);
     if let Ok(outcomes) =
         crate::ai::history::read_tool_execution_outcomes_sqlite(&app.session_history_file)
@@ -482,7 +505,6 @@ async fn do_request_messages_with_tool_mode(
         (None, None)
     };
     let thinking_start = Instant::now();
-    let force_thinking_requested = config_forces_thinking();
     let enable_thinking = resolve_thinking(app, model, &normalized_messages).await;
     crate::ai::agent_hang_debug!(
         "pre-fix",
@@ -494,17 +516,6 @@ async fn do_request_messages_with_tool_mode(
             "elapsed_ms": thinking_start.elapsed().as_secs_f64() * 1000.0,
         },
     );
-    // The "thinking requested but unsupported" diagnostic must key off the
-    // model's registry capability, not the resolved flag: `resolve_thinking`
-    // can now return false for other reasons (the user's explicit `/effort off`,
-    // the truncation force-off fallback), which are intentional thinking-off
-    // decisions — not "the model doesn't support thinking".
-    if force_thinking_requested && !models::enable_thinking(model) {
-        super::emit_request_diagnostic(format_args!(
-            "[Info] thinking 已请求，但当前模型 `{}` 不支持 thinking；本轮将继续以普通模式输出。",
-            model
-        ));
-    }
     // Encrypted reasoning side-channel rebuild: must run before `normalize_reasoning_content_replay_for_model`,
     // because the latter strips the `reasoning_content` (our persisted encoded blob) for encrypted-replay models.
     // The in-memory side channel (freshest for the current turn) wins; the persisted blob only fills historical gaps. The field is then stripped from the wire projection as usual.
@@ -545,37 +556,81 @@ async fn do_request_messages_with_tool_mode(
         &endpoint,
         reasoning_effort,
     );
+    RequestProjection {
+        messages: normalized_messages,
+        tools: tools_value,
+        tool_choice,
+        enable_thinking,
+        reasoning_effort,
+        reasoning_items: turn_reasoning_items,
+        endpoint,
+    }
+}
+
+impl RequestProjection {
+    fn measure<'a>(
+        &'a mut self,
+        app: &App,
+        model: &'a str,
+        stream: bool,
+        previous: Option<&PromptTokenFeedback>,
+    ) -> (RequestBody<'a>, PromptTokenFeedback, CurrentRequestBudget) {
+        let mut body = build_request_body(
+            model,
+            &self.messages,
+            stream,
+            self.enable_thinking,
+            models::search_enabled(model).then_some(true),
+            self.tools.take(),
+            self.tool_choice.take(),
+            self.reasoning_effort,
+            app.cli.max_tokens_override,
+            None,
+            Some(&self.reasoning_items),
+        );
+        let feedback = PromptTokenFeedback::capture(&app.session_id, model, &self.endpoint, &body);
+        let budget = CurrentRequestBudget::measure(model, app.cli.max_tokens_override, &feedback, previous);
+        // Auxiliary builders lack request-scoped usage. Only this shared main
+        // request boundary calibrates the raw estimate, including tools once.
+        // An adaptive output override may lower, never defeat, the context cap.
+        body.max_tokens = models::max_output_tokens(model).map(|model_max| {
+            let cap = clamp_with_estimated_prompt(model, budget.prompt_tokens, model_max);
+            app.cli.max_tokens_override.map_or(cap, |value| cap.min(value))
+        });
+        (body, feedback, budget)
+    }
+}
+
+async fn do_request_messages_with_tool_mode(
+    app: &mut App,
+    model: &str,
+    messages: &[Message],
+    stream: bool,
+    tools_enabled: bool,
+) -> Result<Response, RequestError> {
+    clear_stale_request_interrupt_before_request(app);
+    // Take feedback before any await: failed/cancelled requests must not leave
+    // an older pending request available for an unrelated response to fill.
+    let previous_prompt = app.last_known_prompt_tokens.take();
+    let previous_cached = app.last_known_cached_prompt_tokens.take();
+    let mut projection = prepare_request_projection(app, model, messages, tools_enabled).await;
+    // Explicit off decisions are not evidence that the model lacks thinking.
+    if config_forces_thinking() && !models::enable_thinking(model) {
+        super::emit_request_diagnostic(format_args!(
+            "[Info] thinking 已请求，但当前模型 `{}` 不支持 thinking；本轮将继续以普通模式输出。",
+            model
+        ));
+    }
+    let endpoint = projection.endpoint.clone();
     maybe_emit_responses_reasoning_replay_diagnostic(
         model,
         &endpoint,
-        &normalized_messages,
-        &turn_reasoning_items,
+        &projection.messages,
+        &projection.reasoning_items,
     );
-    let mut request_body = build_request_body(
-        model,
-        &normalized_messages,
-        stream,
-        enable_thinking,
-        models::search_enabled(model).then_some(true),
-        tools_value,
-        tool_choice,
-        reasoning_effort,
-        app.cli.max_tokens_override,
-        None,
-        Some(&turn_reasoning_items),
-    );
-    let mut prompt_feedback =
-        PromptTokenFeedback::capture(&app.session_id, model, &endpoint, &request_body);
-    let context_prompt_tokens = prompt_feedback.context_prompt_tokens(previous_prompt.as_ref());
-    // Calibrate only at the actual request boundary. Auxiliary builders have no
-    // request-scoped observation and use their own raw estimate. An adaptive
-    // output override may lower this cap but cannot defeat the context clamp.
-    request_body.max_tokens = models::max_output_tokens(model).map(|model_max| {
-        let cap = clamp_with_estimated_prompt(model, context_prompt_tokens, model_max);
-        app.cli
-            .max_tokens_override
-            .map_or(cap, |value| cap.min(value))
-    });
+    let (mut request_body, mut prompt_feedback, budget) =
+        projection.measure(app, model, stream, previous_prompt.as_ref());
+    let context_prompt_tokens = budget.prompt_tokens;
     let retry_policy = request_retry_policy_for_current_context();
 
     // --- Key rotation + 429 backoff ---
@@ -660,6 +715,134 @@ async fn do_request_messages_with_tool_mode(
         message: adapter.keys_exhausted_message().to_string(),
         retry_after: None,
     }))
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use super::super::current_budget::PromptCountSource;
+    use futures_util::FutureExt;
+    use serde_json::json;
+
+    fn message(role: &str, content: &str) -> Message {
+        Message {
+            role: role.to_owned(),
+            content: Value::String(content.to_owned()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn model() -> String {
+        crate::ai::model_names::all()
+            .iter()
+            .find(|entry| {
+                models::tools_enabled(&entry.key)
+                    && models::max_output_tokens(&entry.key).is_some()
+                    && !prompt_cache_enabled_for_model(&entry.key)
+                    && !models::reasoning_encrypted_replay_enabled(&entry.key)
+            })
+            .expect("registry must contain a tool model without cache breakpoints or opaque replay")
+            .key
+            .clone()
+    }
+
+    fn app() -> App {
+        let mut app = super::super::tests::test_app();
+        app.cli.thinking_disabled_override = true;
+        app.agent_context = Some(crate::ai::types::AgentContext {
+            tools: vec![serde_json::from_value(json!({
+                "type": "function",
+                "function": {
+                    "name": "budget_fixture",
+                    "description": "large schema content ".repeat(100),
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })).unwrap()],
+            ..Default::default()
+        });
+        app
+    }
+
+    #[test]
+    fn current_budget_shared_projection_counts_tools_once_and_preserves_inputs() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut app = app();
+        let model = model();
+        app.cli.max_tokens_override = Some(512);
+        let messages = vec![message("user", "hello"), message("tool", "orphan result")];
+        let original = serde_json::to_value(&messages).unwrap();
+        for tools_enabled in [true, false] {
+            let mut projection = prepare_request_projection(&app, &model, &messages, tools_enabled)
+                .now_or_never().expect("preparation must not invoke an auxiliary LLM");
+            let message_tokens = super::super::builder::estimate_request_prompt_tokens(&projection.messages, None);
+            let tool_tokens = projection.tools.as_ref().map_or(0, |tools| {
+                serde_json::to_string(tools).unwrap().chars().count().div_ceil(2)
+            });
+            assert_eq!(tool_tokens > 0, tools_enabled);
+            let (body, _, measured) = projection.measure(&app, &model, true, None);
+            assert_eq!(measured.prompt_tokens, message_tokens + tool_tokens);
+            assert_eq!(body.estimated_prompt_tokens, measured.prompt_tokens);
+            assert_eq!(body.max_tokens, Some(512));
+            assert_eq!(measured.limits.output_reserve_tokens, 512);
+            assert_eq!(measured.limits.physical_context_tokens, models::context_window_tokens(&model));
+            let preview = preview_request_budget(&app, &model, &messages, true, tools_enabled)
+                .now_or_never().expect("preview must finish without network I/O");
+            assert_eq!(preview, measured);
+        }
+        assert_eq!(serde_json::to_value(&messages).unwrap(), original);
+        assert_eq!(app.agent_context.as_ref().unwrap().tools.len(), 1);
+    }
+
+    #[test]
+    fn current_budget_preview_borrows_usage_charges_growth_and_ignores_cache_discount() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut app = app();
+        let model = model();
+        let mut messages = vec![message("user", "prefix")];
+        let mut previous = prepare_request_projection(&app, &model, &messages, true).now_or_never().unwrap();
+        let (_, feedback, baseline) = previous.measure(&app, &model, true, None);
+        app.last_known_prompt_tokens = Some(feedback);
+        app.last_known_cached_prompt_tokens = Some(u64::MAX);
+        let pending = preview_request_budget(&app, &model, &messages, true, true).now_or_never().unwrap();
+        assert_eq!(pending.source, PromptCountSource::NormalizedEstimate);
+        let actual = baseline.prompt_tokens * 2;
+        assert!(app.last_known_prompt_tokens.as_mut().unwrap().record_usage(
+            &app.session_id, Some(&model), Some(actual as u64)
+        ));
+        messages.push(message("assistant", &"new code payload ".repeat(1_000)));
+        let mut current = prepare_request_projection(&app, &model, &messages, true).now_or_never().unwrap();
+        let (body, _, measured) = current.measure(&app, &model, true, app.last_known_prompt_tokens.as_ref());
+        let growth = body.estimated_prompt_tokens - baseline.prompt_tokens;
+        assert!(growth > 0);
+        assert_eq!(measured.prompt_tokens, actual + growth * 2);
+        assert_eq!(measured.source, PromptCountSource::CompatibleActualPlusEstimatedGrowth);
+        for _ in 0..2 {
+            let preview = preview_request_budget(&app, &model, &messages, true, true).now_or_never().unwrap();
+            assert_eq!(preview, measured);
+            assert!(app.last_known_prompt_tokens.is_some());
+            assert_eq!(app.last_known_cached_prompt_tokens, Some(u64::MAX));
+        }
+        let replacement = vec![message("user", "compressed replacement")];
+        let replaced = preview_request_budget(&app, &model, &replacement, true, true).now_or_never().unwrap();
+        assert_eq!(replaced.source, PromptCountSource::NormalizedEstimate);
+        let no_tools = preview_request_budget(&app, &model, &messages, true, false).now_or_never().unwrap();
+        assert_eq!(no_tools.source, PromptCountSource::NormalizedEstimate);
+    }
+
+    #[test]
+    fn current_budget_preview_thinking_resolution_stays_local_for_registry_models() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let app = super::super::tests::test_app();
+        for entry in crate::ai::model_names::all() {
+            for text in ["", "hello", "Diagnose this failure:\nmodule::call -> error"] {
+                let messages = vec![message("user", text)];
+                assert!(preview_request_budget(&app, &entry.key, &messages, true, true).now_or_never().is_some(),
+                    "preview must not await an auxiliary LLM for {}", entry.key);
+            }
+        }
+    }
 }
 
 pub(crate) fn print_info(app: &App, model: &str) {

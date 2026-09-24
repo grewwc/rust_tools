@@ -140,7 +140,7 @@ const MAX_TOOL_RESULT_LINE_TRIM_CHARS: usize = 8_000;
 ///   reserved for a single tool result. 256K token model → 64K chars, 200K → 50K, 128K → 32K.
 /// - Cap 64K: keeps a single tool result from consuming too much context even on very large windows.
 /// - Floor 32K: never below the baseline so small-window models do not offload too often.
-pub(in crate::ai::driver::turn_runtime) fn max_tool_result_inline_chars(model: &str) -> usize {
+pub(crate) fn max_tool_result_inline_chars(model: &str) -> usize {
     const CHARS_PER_TOKEN: usize = 2;
     let window = crate::ai::models::context_window_tokens(model);
     window
@@ -243,15 +243,18 @@ pub(in crate::ai::driver::turn_runtime) fn token_window_char_ceiling(model: &str
         .saturating_div(5)
         .max(MID_TURN_COMPRESS_SOFT_FLOOR)
 }
-/// Pre-request LLM summary re-trigger minimum growth: if messages have grown by less than this since the last LLM summary,
-/// skip it, avoiding a repeated LLM call every turn when summarization fails.
+/// Pre-request LLM summary re-trigger minimum change: if messages have changed by less than this since the last LLM summary,
+/// skip it, avoiding a repeated LLM call every turn when summarization fails. The gate compares the absolute delta, so a
+/// projection that materially shrank (e.g. mechanical compression) is not mistaken for the same unchanged projection.
 pub(in crate::ai::driver::turn_runtime) const PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH: usize = 20_000;
 
 /// Records the total message character count after the last LLM summary attempt per independent execution context.
 ///
 /// mid-turn and pre-request share this cursor: if the same context batch just attempted an LLM summary
 /// and no new compression headroom appeared, do not repeat the request at the other trigger point. Both success and no-op
-/// attempts record the post-attempt size; retry only after real growth exceeds [`PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH`].
+/// attempts record the post-attempt size; retry only after the projection changed by at least
+/// [`PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH`] in either direction (shrinkage below the cursor means a materially different,
+/// still-over-budget projection, which must not be suppressed).
 /// The key includes both the session and the current scheduler process pid so the parent agent and concurrent subagents do not suppress each other.
 static LAST_LLM_SUMMARY_ATTEMPT_CHARS: std::sync::LazyLock<
     std::sync::Mutex<rust_tools::commonw::FastMap<String, usize>>,
@@ -296,8 +299,8 @@ pub(in crate::ai::driver::turn_runtime) fn should_try_llm_summary(
         return false;
     }
     let last_attempt_chars = load_last_llm_summary_attempt_chars(session_id);
-    let growth = total_chars.saturating_sub(last_attempt_chars);
-    last_attempt_chars == 0 || growth >= PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH
+    let delta = total_chars.abs_diff(last_attempt_chars);
+    last_attempt_chars == 0 || delta >= PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH
 }
 
 /// Mid-turn compression cooldown: after one trigger, wait at least N turns before re-evaluating, avoiding repeated runs
@@ -414,6 +417,25 @@ mod tests {
     }
 
     #[test]
+    fn llm_summary_gate_reopens_after_material_shrink_below_cursor() {
+        let sid = "test-llm-summary-shrink-reopen";
+        record_llm_summary_attempt_chars(sid, 300_000);
+
+        // A later mechanical pass can shrink the projection far below the last
+        // post-attempt size while token pressure still exceeds the soft target
+        // (threshold 0 keeps the character gate open in the pre-request path).
+        // Saturated subtraction would report zero growth and suppress the only
+        // remaining relief (LLM summary); the absolute delta must reopen it.
+        assert!(should_try_llm_summary(sid, 250_000, 0));
+
+        // Small jitter around the cursor stays suppressed.
+        record_llm_summary_attempt_chars(sid, 250_000);
+        assert!(!should_try_llm_summary(sid, 251_000, 0));
+
+        record_llm_summary_attempt_chars(sid, 0);
+    }
+
+    #[test]
     fn llm_summary_attempt_scope_isolated_by_task_pid() {
         let sid = "test-llm-summary-attempt-scope";
         assert_ne!(
@@ -433,6 +455,7 @@ mod tests {
     fn test_app(history_file: PathBuf) -> App {
         App {
             cli: ParsedCli::default(),
+            scoped_preflight_required: Vec::new(),
             config: AppConfig {
                 api_key: String::new(),
                 base_history_file: history_file.clone(),

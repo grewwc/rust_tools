@@ -399,7 +399,7 @@ fn cap_oversized_reuses_reread_archive_asset_instead_of_rearchiving() {
         tool_result("first", &"y".repeat(70_000)),
     ];
     let capped =
-        cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
+        cap_oversized_tool_results_for_context(&mut messages, 64_000, 0, Some(&overflow_dir), None);
     assert!(capped > 0);
     let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
     let archive_path = std::fs::read_dir(&archive_dir)
@@ -418,7 +418,7 @@ fn cap_oversized_reuses_reread_archive_asset_instead_of_rearchiving() {
         tool_result("re-read", &raw),
     ];
     let capped =
-        cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
+        cap_oversized_tool_results_for_context(&mut messages, 64_000, 0, Some(&overflow_dir), None);
     assert_eq!(capped, 1);
     assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
     let stub_text = value_to_string(&messages[1].content);
@@ -613,7 +613,7 @@ fn cap_reuses_execute_command_cat_archive_instead_of_rearchiving() {
         tool_result("run", &"log line\n".repeat(30_000)),
     ];
     let capped =
-        cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
+        cap_oversized_tool_results_for_context(&mut messages, 64_000, 0, Some(&overflow_dir), None);
     assert!(capped > 0);
     let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
     let archive_path = std::fs::read_dir(&archive_dir)
@@ -635,7 +635,7 @@ fn cap_reuses_execute_command_cat_archive_instead_of_rearchiving() {
         tool_result("re-cat", &raw),
     ];
     let capped =
-        cap_oversized_tool_results_for_context(&mut messages, 64_000, Some(&overflow_dir), None);
+        cap_oversized_tool_results_for_context(&mut messages, 64_000, 0, Some(&overflow_dir), None);
     assert_eq!(capped, 1);
     assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
     let stub_text = value_to_string(&messages[1].content);
@@ -1058,4 +1058,53 @@ fn age_out_overflow_stub_previews_respects_protected_tail() {
     assert!(!value_to_string(&messages[2].content).contains("Preview ("));
     assert_eq!(value_to_string(&messages[5].content), recent);
     assert!(value_to_string(&messages[5].content).contains("Preview ("));
+}
+
+#[test]
+fn cap_oversized_spills_only_results_outside_recent_group_window() {
+    // The unconditional size gate must leave the most recent complete tool
+    // group raw while spilling an equally oversized older result: recent
+    // evidence stays directly usable and only aged output gets archived.
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-cap-recent-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![
+        assistant_call("old", "read_file"),
+        tool_result("old", &"y".repeat(70_000)),
+        assistant_call("new", "read_file"),
+        tool_result("new", &"z".repeat(70_000)),
+    ];
+    let capped =
+        cap_oversized_tool_results_for_context(&mut messages, 32_000, 1, Some(&overflow_dir), None);
+    assert_eq!(capped, 1);
+    assert!(
+        is_preserved_tool_overflow_stub(&value_to_string(&messages[1].content)),
+        "old oversized result must spill"
+    );
+    assert!(
+        !is_preserved_tool_overflow_stub(&value_to_string(&messages[3].content)),
+        "newest group inside the protection window must stay raw"
+    );
+    let _ = std::fs::remove_dir_all(&overflow_dir);
+}
+
+#[test]
+fn cap_no_oversized_returns_zero_and_keeps_messages_unchanged() {
+    // Fast path: when every result is below the cap, the pre-scan must
+    // short-circuit before index building / content cloning and touch nothing.
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-cap-fast-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![
+        user_msg("q1"),
+        assistant_call("a", "read_file"),
+        tool_result("a", "small output"),
+        user_msg("q2"),
+        assistant_call("b", "read_file"),
+        tool_result("b", "also small"),
+    ];
+    let capped =
+        cap_oversized_tool_results_for_context(&mut messages, 32_000, 0, Some(&overflow_dir), None);
+    assert_eq!(capped, 0);
+    assert!(!is_preserved_tool_overflow_stub(&value_to_string(&messages[2].content)));
+    assert!(!is_preserved_tool_overflow_stub(&value_to_string(&messages[5].content)));
+    let _ = std::fs::remove_dir_all(&overflow_dir);
 }

@@ -3,6 +3,7 @@
 //! Users can attach arbitrary shell commands to the following events in the ~/.configW config:
 //! - `ai.hooks.on_turn_start` / `ai.hooks.on_turn_end`
 //! - `ai.hooks.before_tool`   / `ai.hooks.after_tool`
+//! - `ai.hooks.before_compression` / `ai.hooks.after_compression`
 //! - `ai.hooks.on_session_end`
 //!
 //! Hooks run best-effort: zero overhead when unconfigured; a failure only
@@ -22,6 +23,8 @@ pub enum HookEvent {
     TurnEnd,
     BeforeTool,
     AfterTool,
+    BeforeCompression,
+    AfterCompression,
     SessionEnd,
 }
 
@@ -32,6 +35,8 @@ impl HookEvent {
             HookEvent::TurnEnd => "on_turn_end",
             HookEvent::BeforeTool => "before_tool",
             HookEvent::AfterTool => "after_tool",
+            HookEvent::BeforeCompression => "before_compression",
+            HookEvent::AfterCompression => "after_compression",
             HookEvent::SessionEnd => "on_session_end",
         }
     }
@@ -42,8 +47,29 @@ impl HookEvent {
             HookEvent::TurnEnd => AiConfig::HOOK_ON_TURN_END,
             HookEvent::BeforeTool => AiConfig::HOOK_BEFORE_TOOL,
             HookEvent::AfterTool => AiConfig::HOOK_AFTER_TOOL,
+            HookEvent::BeforeCompression => AiConfig::HOOK_BEFORE_COMPRESSION,
+            HookEvent::AfterCompression => AiConfig::HOOK_AFTER_COMPRESSION,
             HookEvent::SessionEnd => AiConfig::HOOK_ON_SESSION_END,
         }
+    }
+}
+
+/// Brackets one compression attempt through the existing lifecycle runner.
+/// The after event signals completion of the attempt, not successful compaction;
+/// early returns, archive failures and cancelled futures still close the pair.
+#[must_use]
+pub(crate) struct CompressionHookGuard;
+
+impl CompressionHookGuard {
+    pub(crate) fn new() -> Self {
+        run_lifecycle_hook(HookEvent::BeforeCompression, None, None);
+        Self
+    }
+}
+
+impl Drop for CompressionHookGuard {
+    fn drop(&mut self) {
+        run_lifecycle_hook(HookEvent::AfterCompression, None, None);
     }
 }
 
@@ -188,6 +214,22 @@ mod tests {
         assert_eq!(HookEvent::TurnEnd.as_event_str(), "on_turn_end");
         assert_eq!(HookEvent::BeforeTool.as_event_str(), "before_tool");
         assert_eq!(HookEvent::AfterTool.as_event_str(), "after_tool");
+        assert_eq!(HookEvent::BeforeCompression.as_event_str(), "before_compression");
+        assert_eq!(HookEvent::AfterCompression.as_event_str(), "after_compression");
         assert_eq!(HookEvent::SessionEnd.as_event_str(), "on_session_end");
+    }
+
+    #[test]
+    fn compression_hooks_use_lifecycle_configuration_and_event_only_context() {
+        for (event, key, name) in [
+            (HookEvent::BeforeCompression, AiConfig::HOOK_BEFORE_COMPRESSION, "before_compression"),
+            (HookEvent::AfterCompression, AiConfig::HOOK_AFTER_COMPRESSION, "after_compression"),
+        ] {
+            assert_eq!(event.config_key(), key);
+            assert_eq!(
+                build_hook_command(event, None, None, "true"),
+                format!("export AI_HOOK_EVENT='{name}'; true")
+            );
+        }
     }
 }

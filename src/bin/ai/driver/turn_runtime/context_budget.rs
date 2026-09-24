@@ -6,6 +6,7 @@ use crate::ai::{
     types::App,
 };
 
+#[cfg(test)]
 use super::mid_turn_compress_soft_threshold;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +78,7 @@ pub(super) struct ContextBudgetReport {
     pub(super) lossy_candidate_chars: usize,
     pub(super) lossless_removed_messages: usize,
     pub(super) lossless_saved_chars: usize,
+    pub(super) tool_spill_saved_chars: usize,
     pub(super) memory_projection_removed_messages: usize,
     pub(super) memory_projection_selected_messages: usize,
     pub(super) memory_projection_saved_chars: usize,
@@ -104,12 +106,59 @@ impl From<&Message> for ProtectedMessage {
     }
 }
 
-pub(super) fn apply_pre_request_context_budget(
+#[cfg(test)]
+fn apply_pre_request_context_budget(
     app: &App,
     model: &str,
     messages: &mut Vec<Message>,
 ) -> ContextBudgetReport {
     let target_chars = mid_turn_compress_soft_threshold(model, app.config.history_max_chars);
+    apply_context_budget_target(
+        app,
+        messages,
+        target_chars,
+        true,
+        super::max_tool_result_inline_chars(model),
+    )
+}
+
+/// Refresh fixed plan overhead before measuring the normalized request.
+pub(super) fn refresh_active_plan(app: &App, messages: &mut Vec<Message>) {
+    ActivePlanProjection::take(messages);
+    ActivePlanProjection::new(active_plan_text(app)).restore(messages);
+}
+
+pub(super) fn apply_measured_context_budget(
+    app: &App,
+    budget: crate::ai::request::CurrentRequestBudget,
+    messages: &mut Vec<Message>,
+) -> ContextBudgetReport {
+    let chars = crate::ai::history::messages_total_chars_pub(messages);
+    // Below token pressure, only deterministic cleanup/recall runs. A character
+    // threshold (including one changed by model selection) cannot enable loss.
+    let target = if budget.exceeds_soft_target() {
+        budget.compression_target_chars(chars)
+    } else {
+        chars.saturating_add(
+            budget.limits.soft_target_tokens.saturating_sub(budget.prompt_tokens).saturating_mul(2),
+        )
+    };
+    apply_context_budget_target(
+        app,
+        messages,
+        target,
+        budget.exceeds_soft_target(),
+        budget.inline_cap_chars,
+    )
+}
+
+fn apply_context_budget_target(
+    app: &App,
+    messages: &mut Vec<Message>,
+    target_chars: usize,
+    allow_lossy: bool,
+    tool_inline_cap_chars: usize,
+) -> ContextBudgetReport {
     // Persisted plan state is a fixed-cost request projection, not compressible history.
     // Remove the previous pair before reserving the current one so refreshes cannot
     // accumulate charges or let recall/compression spend the plan's headroom.
@@ -126,6 +175,8 @@ pub(super) fn apply_pre_request_context_budget(
         messages,
         active_plan.remaining_target(target_chars),
         &active_context,
+        allow_lossy,
+        tool_inline_cap_chars,
     );
     active_plan.restore(messages);
     report.before_chars = report.before_chars.saturating_add(reserved_chars);
@@ -139,6 +190,8 @@ fn apply_history_context_budget(
     messages: &mut Vec<Message>,
     target_chars: usize,
     active_context: &str,
+    allow_lossy: bool,
+    tool_inline_cap_chars: usize,
 ) -> ContextBudgetReport {
     let scan = quick_scan(messages);
     let mut report = ContextBudgetReport {
@@ -147,6 +200,29 @@ fn apply_history_context_budget(
         target_chars,
         ..ContextBudgetReport::default()
     };
+
+    // Size-gated tool-result offload is unconditional (independent of the
+    // soft target / allow_lossy): single results beyond the model's inline
+    // cap no longer occupy every request just because total context is under
+    // pressure. The protected tail window (most recent tool groups) stays raw.
+    let overflow_dir = {
+        let store = crate::ai::history::SessionStore::new(app.config.history_file.as_path());
+        store.session_assets_dir(&app.session_id)
+    };
+    let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
+    let tool_spilled = crate::ai::history::compress::cap_oversized_tool_results_for_context(
+        messages,
+        tool_inline_cap_chars,
+        crate::ai::history::compress::KEEP_RECENT_TOOL_GROUPS,
+        Some(overflow_dir.as_path()),
+        cwd.as_deref(),
+    );
+    if tool_spilled > 0 {
+        let after_spill_chars = crate::ai::history::messages_total_chars_pub(messages);
+        report.changed = true;
+        report.after_chars = after_spill_chars;
+        report.tool_spill_saved_chars = scan.total_chars.saturating_sub(after_spill_chars);
+    }
 
     if scan.total_chars <= target_chars
         && !scan.has_lossless_candidate
@@ -168,10 +244,6 @@ fn apply_history_context_budget(
         }
     }
 
-    let overflow_dir = {
-        let store = crate::ai::history::SessionStore::new(app.config.history_file.as_path());
-        store.session_assets_dir(&app.session_id)
-    };
     let memory_projection = super::context_memory::apply_query_aware_memory_projection_with_context(
         messages,
         target_chars,
@@ -190,7 +262,7 @@ fn apply_history_context_budget(
         after_lossless_chars
     };
 
-    if after_prepass_chars <= target_chars {
+    if !allow_lossy || after_prepass_chars <= target_chars {
         if report.changed {
             fill_segment_summary(&mut report, messages);
         }
@@ -232,7 +304,12 @@ fn apply_history_context_budget(
     if let Some(reason) = rollback_reason {
         *messages = original;
         report.after_chars = after_prepass_chars;
-        report.changed = report.lossless_removed_messages > 0 || memory_projection.changed;
+        // The spill pass already modified the projection before the lossy
+        // attempt; keep its flag through the rollback so decision logs and the
+        // context-budget progress line still report the change.
+        report.changed = tool_spilled > 0
+            || report.lossless_removed_messages > 0
+            || memory_projection.changed;
         report.rolled_back = after_chars < scan.total_chars;
         if report.rolled_back {
             report.rollback_reason = Some(reason);
@@ -455,6 +532,7 @@ fn summarize_segments(
         before_chars,
         after_chars: before_chars,
         target_chars,
+        tool_spill_saved_chars: 0,
         changed: false,
         rolled_back: false,
         rollback_reason: None,
@@ -693,6 +771,7 @@ mod tests {
     fn test_app(history_file: PathBuf) -> App {
         App {
             cli: ParsedCli::default(),
+            scoped_preflight_required: Vec::new(),
             config: AppConfig {
                 api_key: String::new(),
                 base_history_file: history_file.clone(),
@@ -776,6 +855,46 @@ mod tests {
             tool_call_id: Some(id.to_string()),
             reasoning_content: None,
         }
+    }
+
+    #[test]
+    fn context_budget_measured_tokens_gate_lossy_work_not_character_size_or_model_name() {
+        let history_file = std::env::temp_dir().join(format!("context-budget-measured-{}.sqlite", uuid::Uuid::new_v4()));
+        let mut app = test_app(history_file);
+        let canonical = vec![
+            msg("system", "exact system"),
+            msg("assistant", "old narration ".repeat(4_000)),
+            msg("user", "exact current user"),
+        ];
+        let budget: crate::ai::request::CurrentRequestBudget = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 8_000, "source": "normalized_estimate",
+            "limits": { "physical_context_tokens": 12_000, "output_reserve_tokens": 1_000,
+                "safety_margin_tokens": 1_000, "input_allowance_tokens": 10_000, "soft_target_tokens": 8_000 }
+        })).unwrap();
+        let mut messages = canonical.clone();
+        let report = apply_measured_context_budget(&app, budget, &mut messages);
+        assert!(!report.changed);
+        assert_eq!(messages, canonical);
+        app.current_model = "another selection with the same measured headroom".to_string();
+        apply_measured_context_budget(&app, budget, &mut messages);
+        assert_eq!(messages, canonical);
+
+        let pressured = crate::ai::request::CurrentRequestBudget { prompt_tokens: 40_000, ..budget };
+        let report = apply_measured_context_budget(&app, pressured, &mut messages);
+        // The token gate opened: the target shrank below the current size even
+        // though neither character size nor model name changed. But the
+        // mid-turn lossy pipeline (dedupe, structured tool trimming, group
+        // folding, reasoning cleanup) only acts on tool/agent traffic — a
+        // plain narration can only be shrunk by a cross-turn LLM summary, and
+        // the test env injects no model. Correct contract: the gate opens, the
+        // attempt finds nothing compressible, and the projection rolls back
+        // byte-for-byte (no change flags, content intact).
+        assert!(report.target_chars < report.before_chars);
+        assert_eq!(report.after_chars, report.before_chars);
+        assert!(!report.changed);
+        assert_eq!(messages.first(), canonical.first());
+        assert_eq!(messages.last(), canonical.last());
+        assert_eq!(canonical[1].content.as_str().unwrap().len(), "old narration ".len() * 4_000);
     }
 
     #[test]
@@ -1532,5 +1651,95 @@ mod tests {
         let text = crate::ai::history::value_to_string(&summary.content);
         assert!(text.contains("MOCK_SUMMARY"), "{text}");
         assert!(text.contains("summary-sources"), "{text}");
+    }
+
+    #[test]
+    fn spill_keeps_changed_flag_under_lossy_pressure() {
+        // The unconditional size-gated spill runs before any lossy work and must
+        // keep `changed = true` even when the lossy path expands afterwards:
+        // decision logs and the context-budget progress line rely on it to
+        // reflect that the projection was actually modified. Regression for the
+        // rollback branch overwriting the spill flag with the lossless/memory
+        // flags.
+        let history_file = std::env::temp_dir().join(format!(
+            "cb-spill-changed-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let app = test_app(history_file);
+        let mut messages = vec![
+            msg("system", "system prompt"),
+            // An oversized complete tool group outside the protected recent
+            // window: the unconditional spill must archive it regardless of
+            // budget, while the four recent groups stay raw.
+            assistant_tool_call("g1", "read_file"),
+            tool_result("g1", &"y".repeat(70_000)),
+            assistant_tool_call("g2", "read_file"),
+            tool_result("g2", "r2"),
+            assistant_tool_call("g3", "read_file"),
+            tool_result("g3", "r3"),
+            assistant_tool_call("g4", "read_file"),
+            tool_result("g4", "r4"),
+            assistant_tool_call("g5", "read_file"),
+            tool_result("g5", "r5"),
+            msg("user", "current question"),
+        ];
+        let report = apply_context_budget_target(&app, &mut messages, 100, true, 32_000);
+        assert!(
+            report.tool_spill_saved_chars > 0,
+            "oversized result must be spilled before lossy work"
+        );
+        assert!(
+            report.changed,
+            "spill must keep changed=true through the lossy path"
+        );
+        let text = message_text(&messages[2].content);
+        assert!(
+            text.contains("PRESERVED_TOOL_OVERFLOW_STUB"),
+            "the spilled result must be replaced by a recallable stub: {text}"
+        );
+    }
+
+    #[test]
+    fn spill_cap_chars_follow_injected_model_not_app_current_model() {
+        // The unconditional spill line must come from the model the caller
+        // measured, not from `app.current_model` (stale during model-fallback
+        // retries). A 40K result stays inline under a 1M-window model (64K
+        // line) but spills under an unknown/empty model (32K line).
+        let history_file = std::env::temp_dir().join(format!(
+            "spill-cap-model-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let app = test_app(history_file);
+        let messages = vec![
+            msg("system", "system prompt"),
+            assistant_tool_call("g1", "read_file"),
+            tool_result("g1", &"y".repeat(40_000)),
+            assistant_tool_call("g2", "read_file"),
+            tool_result("g2", "r2"),
+            assistant_tool_call("g3", "read_file"),
+            tool_result("g3", "r3"),
+            assistant_tool_call("g4", "read_file"),
+            tool_result("g4", "r4"),
+            assistant_tool_call("g5", "read_file"),
+            tool_result("g5", "r5"),
+            msg("user", "current question"),
+        ];
+        // 1M-token window model (registered name, not the file name): inline
+        // line is 64K, the 40K result stays raw.
+        let wide = apply_pre_request_context_budget(
+            &app,
+            "deepseek-v4-pro",
+            &mut messages.clone(),
+        );
+        assert_eq!(
+            wide.tool_spill_saved_chars, 0,
+            "40K result must stay inline under the 1M-window model line"
+        );
+        // Empty/unknown model (app.current_model): 32K line, same result spills.
+        let narrow = apply_pre_request_context_budget(&app, "", &mut messages.clone());
+        assert!(
+            narrow.tool_spill_saved_chars > 0,
+            "the same 40K result must spill under the 32K fallback line"
+        );
     }
 }

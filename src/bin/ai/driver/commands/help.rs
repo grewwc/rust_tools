@@ -15,6 +15,7 @@ pub fn print_interactive_help() {
         "    /changes [/diff] [--stat|--json|--patch|--open]  show session file changes & open diff externally"
     );
     println!("    /clear                    clear the terminal screen");
+    println!("    /compact                  compact session context; preserve full history");
     println!("    /usage [models|today|7d|30d|all|daily]   show LLM token usage statistics");
     println!("    /history [full|user|assistant|tool|system] [N]     show recent session messages");
     println!("    /history grep <keyword>      search recent messages by keyword");

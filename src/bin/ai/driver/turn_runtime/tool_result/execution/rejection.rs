@@ -4,11 +4,11 @@
 
 use super::*;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(in crate::ai::driver::turn_runtime) enum ToolCallRejectionReason {
     NoToolHandoff,
     PatchRetryNeedsFreshRead,
-    ScopedInstructionsNeedReload,
+    ScopedInstructionsNeedReload(Vec<PathBuf>),
 }
 
 #[cfg(test)]
@@ -53,7 +53,7 @@ pub(in crate::ai::driver::turn_runtime) fn reject_tool_calls(
             .iter()
             .map(|tool_call| crate::ai::types::ToolResult {
                 tool_call_id: tool_call.id.clone(),
-                content: rejected_tool_call_message(&tool_call.function.name, reason),
+                content: rejected_tool_call_message(&tool_call.function.name, reason.clone()),
             })
             .collect(),
         cached_hits: vec![false; tool_calls.len()],
@@ -75,9 +75,15 @@ Do not call '{tool_name}' again; instead summarize confirmed facts, answer what 
             "Error: apply_patch retry blocked. The previous patch for this file failed with `ambiguous patch`, so the matched text was not unique. \
 Do NOT retry patches in this batch — doing so will only fail again. Required recovery steps: (1) call `read_file` on the SAME target path with use_line_numbers=false to get the current raw file content (no line-number prefixes, so you can copy exact text into the patch); (2) copy context lines DIRECTLY from that fresh output, including function names or distinctive surrounding lines to ensure each hunk matches exactly ONE location; (3) call `apply_patch` only in a LATER tool round after you have successfully read the file."
         ),
-        ToolCallRejectionReason::ScopedInstructionsNeedReload => format!(
+        ToolCallRejectionReason::ScopedInstructionsNeedReload(targets) => format!(
             "Error: '{tool_name}' was paused before execution because target-scoped project instructions were not loaded yet. \
-No file was changed. The runtime will add the applicable instruction documents on the next model step. Review those rules, then retry the mutation in a later tool round; do not repeat it in this batch."
+Missing instruction documents: {}\n\
+No file was changed. The runtime will add the applicable instruction documents on the next model step. Review those rules, then retry the mutation in a later tool round; do not repeat it in this batch.",
+            targets
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
 }

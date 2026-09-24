@@ -17,10 +17,10 @@ use crate::ai::{
 };
 
 use super::{
-    CompressionReport, MID_TURN_COMPRESS_SOFT_FLOOR, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
+    CompressionReport, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
     MID_TURN_LLM_SUMMARY_MAX_CHARS, TurnOutcome, context_budget,
     persistence::persist_pending_turn_messages,
-    pre_request_llm_summary_threshold, record_llm_summary_attempt_chars, should_try_llm_summary,
+    record_llm_summary_attempt_chars, should_try_llm_summary,
     types::{IterationExecution, ToolCallExecution},
 };
 
@@ -649,8 +649,15 @@ pub(super) fn refresh_skill_turn_for_iteration(
     required_project_targets: &[PathBuf],
     messages: &mut [Message],
 ) -> bool {
+    if iteration <= 1 && required_project_targets.is_empty() {
+        return true;
+    }
     if iteration <= 1 {
-        return required_project_targets.is_empty();
+        return inject_required_project_instructions_for_first_iteration(
+            skill_turn,
+            required_project_targets,
+            messages,
+        );
     }
 
     // `matched_skill_names()` borrows `skill_turn`; the owned copy is required because
@@ -739,18 +746,50 @@ pub(super) fn refresh_skill_turn_for_iteration(
     }
 
     *skill_turn = new_skill_turn;
+    sync_system_message(skill_turn, messages);
+    scoped_project_instructions_ready
+}
+
+/// Push the preflight-required scoped project instructions on the very first
+/// iteration of a turn. Regular iterations reach them through a full skill-turn
+/// rebuild, but a rebuild right after bootstrap would re-pull the MCP toolset and
+/// re-read the SQLite activation history for no skill change; a plain push is
+/// enough. Skips documents already present in the system prompt so a carried-over
+/// target list never duplicates an injected section.
+fn inject_required_project_instructions_for_first_iteration(
+    skill_turn: &mut super::super::skill_runtime::SkillTurnGuard,
+    required_project_targets: &[PathBuf],
+    messages: &mut [Message],
+) -> bool {
+    let missing = super::super::skill_runtime::scoped_project_instructions_missing(
+        skill_turn.system_prompt(),
+        required_project_targets,
+    );
+    let ready = if missing {
+        skill_turn.push_scoped_project_instructions(required_project_targets, &[])
+    } else {
+        true
+    };
+    sync_system_message(skill_turn, messages);
+    ready
+}
+
+/// Overwrite the system message with the guard's current prompt, but only when the
+/// text actually differs: overwriting with the same string is not just useless, it
+/// repeatedly invalidates the upstream prompt cache (e.g. anthropic cache_control
+/// hits, or the driver's internal string hash reuse), silently wasting tokens in
+/// long multi-iteration turns.
+fn sync_system_message(
+    skill_turn: &mut super::super::skill_runtime::SkillTurnGuard,
+    messages: &mut [Message],
+) {
     if let Some(system_message) = messages.first_mut() {
-        // Overwrite only when the new system prompt text differs from the old.
-        // Overwriting with the same string is not just useless: it repeatedly invalidates the upstream
-        // prompt cache (e.g. anthropic cache_control hits, or the driver's internal string hash reuse),
-        // silently wasting tokens in long multi-iteration turns.
         let next_prompt = skill_turn.system_prompt();
         let same = matches!(&system_message.content, Value::String(s) if s == next_prompt);
         if !same {
             system_message.content = Value::String(next_prompt.to_string());
         }
     }
-    scoped_project_instructions_ready
 }
 
 fn continue_or_quit(should_quit: bool) -> TurnOutcome {
@@ -957,16 +996,11 @@ fn refresh_outstanding_task_anchor(messages: &mut Vec<Message>, session_id: &str
 /// Reactive context shrink: only called after the provider rejects a request
 /// for exceeding the context window.
 ///
-/// Proactive compression (`apply_pre_request_context_budget` + LLM summary)
-/// already tries to bring the context near the soft threshold before the
-/// request, but a char estimate is not an authoritative judge of tokens — a
-/// request heavy in English text, images, or tool-schema overhead can still be
-/// judged over-limit by the provider's tokenizer. Instead of failing locally
-/// on a char threshold (which would kill legitimate requests), send the
-/// request out and shrink only after a real rejection.
+/// Proactive compression measures normalized input, but estimates and compatible
+/// usage feedback still cannot predict every provider tokenizer decision.
+/// A real rejection remains authoritative even when the local estimate fits.
 ///
-/// Each call cuts the target budget by another 25% from the previous one (a
-/// floor keeps it from reaching 0), reusing the cross-turn compression
+/// Each call tightens the target while reusing the cross-turn compression
 /// pipeline [`mid_turn_compress`](crate::ai::history::mid_turn_compress)
 /// (including Path C emergency truncation) to force convergence. Returns the
 /// char count after compression. Compression policies never truncate user
@@ -1012,6 +1046,30 @@ fn reactive_shrink_context_after_overflow(
         return crate::ai::history::messages_total_chars_pub(messages);
     }
     after
+}
+
+/// Bound the total-context rescue target, not the retained size of any one
+/// message. Token-deficit estimates can saturate at zero even for large windows;
+/// they must not turn the current user instruction into a minimal archive stub.
+fn context_overflow_target_chars(
+    before: usize,
+    estimated_target: usize,
+    soft_target_tokens: usize,
+) -> usize {
+    let floor = super::MID_TURN_COMPRESS_SOFT_FLOOR;
+    // Keep recovery possible for genuinely small input budgets. A zero budget
+    // has no attainable fit, so retain the safety floor rather than discarding
+    // more user content in pursuit of an impossible target.
+    let floor = if soft_target_tokens > 0 {
+        floor.min(soft_target_tokens.saturating_mul(2))
+    } else {
+        floor
+    };
+    before
+        .saturating_mul(3)
+        .saturating_div(4)
+        .min(estimated_target)
+        .max(floor)
 }
 
 /// Update the temporary context projection at every model request boundary without touching canonical `turn_messages`.
@@ -1122,6 +1180,72 @@ fn format_context_budget_change(before_chars: usize, after_chars: usize) -> Stri
     format!("projection refreshed: {before_chars} chars")
 }
 
+/// Measure only after runtime notes, tool visibility and fixed plan overhead are
+/// present. Character targets guide mechanical work; they never establish fit.
+async fn apply_request_budget(
+    app: &App,
+    model: &str,
+    messages: &mut Vec<Message>,
+    tools_enabled: bool,
+    iteration: usize,
+    compression_report: &mut CompressionReport,
+    before: request::CurrentRequestBudget,
+) -> request::CurrentRequestBudget {
+    use super::context_metrics::CompactionAttempt;
+    let trigger = if before.exceeds_input_allowance() {
+        "pre_request_input_allowance"
+    } else if before.exceeds_soft_target() {
+        "pre_request_soft_target"
+    } else {
+        "projection_maintenance"
+    };
+    let attempt = CompactionAttempt::start(trigger, before, messages);
+    let report = context_budget::apply_measured_context_budget(app, before, messages);
+    let mut budget = request::preview_request_budget(app, model, messages, true, tools_enabled).await;
+    attempt.finish(&app.session_id, iteration, model, budget, messages,
+        report.rollback_reason.is_none() || report.changed);
+    if let Some(reason) = report.rollback_reason {
+        crate::ai::driver::print::print_tool_note_line("context-budget", reason.note());
+    } else if report.changed {
+        crate::ai::driver::print::print_tool_note_line(
+            "context-budget", &format_context_budget_change(report.before_chars, report.after_chars),
+        );
+    }
+
+    // The token budget alone opens the summary gate. The shared growth cursor
+    // only suppresses repeated attempts at the same incompressible projection.
+    let chars = crate::ai::history::messages_total_chars_pub(messages);
+    if budget.exceeds_soft_target() && should_try_llm_summary(&app.session_id, chars, 0) {
+        let attempt = CompactionAttempt::start("llm_soft_target", budget, messages);
+        // Work on a clone: dropping this future during cancellation must retain
+        // the complete live projection, including its active-plan handoff.
+        let mut summary_messages = messages.clone();
+        let active_plan = context_budget::ActivePlanProjection::take(&mut summary_messages);
+        let target = budget.compression_target_chars(chars);
+        let (mut candidate, _, _, effective, inserted) = crate::ai::history::mid_turn_llm_summarize(
+            app, summary_messages, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
+            MID_TURN_LLM_SUMMARY_MAX_CHARS, active_plan.remaining_target(target),
+            crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
+        ).await;
+        active_plan.restore(&mut candidate);
+        // The history pipeline has already committed archive guards before
+        // returning a replacement. Its effectiveness flag is not an identity test.
+        *messages = candidate;
+        let after_chars = crate::ai::history::messages_total_chars_pub(messages);
+        budget = request::preview_request_budget(app, model, messages, true, tools_enabled).await;
+        attempt.finish(&app.session_id, iteration, model, budget, messages, true);
+        compression_report.record_llm_summary_attempt(
+            format!("pre-request LLM ({} tokens)", budget.limits.soft_target_tokens),
+            chars, after_chars, effective, inserted,
+        );
+        record_llm_summary_attempt_chars(&app.session_id, after_chars);
+    }
+    // Recreating a protocol note changes normalized input too; measure it rather
+    // than carrying a pre-replacement token estimate to transport.
+    llm_prune::ensure_prune_protocol_prompt(messages, &app.prune_marks);
+    request::preview_request_budget(app, model, messages, true, tools_enabled).await
+}
+
 async fn request_model_response(
     app: &mut App,
     next_model: &str,
@@ -1133,7 +1257,6 @@ async fn request_model_response(
     // Pre-request-build hooks (on_before_request → BuildRequest.before), fired before any app state mutation.
     // The request messages being built are passed in so hooks can inspect/rewrite them.
     app.fire_before_request_hooks(messages);
-    let context_before = super::context_metrics::ContextSizeBreakdown::measure(messages);
     let context_started = std::time::Instant::now();
     if crate::ai::driver::runtime_ctx::take_subagent_checkpoint_due_reminder() {
         messages.push(Message {
@@ -1165,61 +1288,12 @@ async fn request_model_response(
     // Process before every request, not just at turn initialization, so later tool rounds within the same
     // turn can also consume prune markers that just crossed the threshold and offload losslessly before context compression.
     apply_model_guided_pruning_before_request(app, messages);
-
-    let budget_report = context_budget::apply_pre_request_context_budget(app, next_model, messages);
-    if let Some(reason) = budget_report.rollback_reason {
-        crate::ai::driver::print::print_tool_note_line("context-budget", reason.note());
-    } else if budget_report.changed {
-        crate::ai::driver::print::print_tool_note_line(
-            "context-budget",
-            &format_context_budget_change(budget_report.before_chars, budget_report.after_chars),
-        );
-    }
-
-    // === Pre-request LLM summary fallback ===
-    // When the context still far exceeds the threshold after lossless + lossy compression, call the LLM to squeeze the early conversation into a summary.
-    // This is the last line of defense before sending the request, preventing oversized context from causing model 4xx or quality degradation
-    // (the user-reported "295K compressed to 294K and then stalled" problem).
-    // The threshold is history_max_chars * 2 (default 400K), more aggressive than the orchestrator's
-    // hard threshold (*3.5 = 700K) — that one only fires between tool calls, while this covers the
-    // final check before every request.
-    // Growth guard: mid-turn and pre-request share the same LLM summary attempt cursor.
-    // If the same context batch was just attempted with no effective growth, do not request a summary again.
-    let llm_threshold = pre_request_llm_summary_threshold(next_model, app.config.history_max_chars);
-    let session_id = app.session_id.clone();
-    if should_try_llm_summary(&session_id, budget_report.after_chars, llm_threshold) {
-        // Cancel safety: pass a **clone** of messages instead of `mem::take`. If this summary await
-        // is interrupted by Ctrl+C, the request future is dropped while `messages` keeps its original
-        // full content, so it cannot degrade into an empty Vec and send an empty context / lose message state on later requests.
-        let mut summary_messages = messages.clone();
-        let active_plan = context_budget::ActivePlanProjection::take(&mut summary_messages);
-        let llm_before = budget_report.after_chars;
-        let (mut after_msgs, _, _, was_effective, llm_summary_inserted) =
-            crate::ai::history::mid_turn_llm_summarize(
-                app,
-                summary_messages,
-                MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
-                MID_TURN_LLM_SUMMARY_MAX_CHARS,
-                active_plan.remaining_target(app.config.history_max_chars),
-                crate::ai::driver::runtime_ctx::effective_cwd()
-                    .ok()
-                    .as_deref(),
-            )
-            .await;
-        active_plan.restore(&mut after_msgs);
-        let llm_after = crate::ai::history::messages_total_chars_pub(&after_msgs);
-        *messages = after_msgs;
-        compression_report.record_llm_summary_attempt(
-            format!("pre-request LLM (limit {llm_threshold})"),
-            llm_before,
-            llm_after,
-            was_effective,
-            llm_summary_inserted,
-        );
-        record_llm_summary_attempt_chars(&session_id, llm_after);
-    }
-    // The summary pipeline keeps system messages in principle; this idempotent safeguard still runs to guarantee the request-boundary protocol exists.
-    llm_prune::ensure_prune_protocol_prompt(messages, &app.prune_marks);
+    context_budget::refresh_active_plan(app, messages);
+    let context_before = super::context_metrics::ContextSizeBreakdown::measure(messages);
+    let before_budget = request::preview_request_budget(app, next_model, messages, true, !force_final_response).await;
+    let mut request_budget = apply_request_budget(
+        app, next_model, messages, !force_final_response, _iteration, &mut compression_report, before_budget.clone(),
+    ).await;
     compression_report.emit();
 
     let auto_model_fallback_spec = crate::ai::driver::runtime_ctx::auto_model_fallback_spec();
@@ -1233,8 +1307,8 @@ async fn request_model_response(
         );
     }
 
-    // Reactive context-over-limit retry: proactive compression has done its best to squeeze the context near the soft threshold, but character
-    // estimation is not the authoritative judge — the provider tokenizer is. If the request is still judged over the context limit, shrink in place and retry,
+    // The provider remains authoritative when local normalized estimates disagree.
+    // If it rejects the context, shrink the projection and remeasure before retry,
     // instead of locally raising 413 and killing a legitimate request or shoving the oversized payload at the provider and giving up.
     // Over-limit errors do not trigger model fallback (`should_try_model_fallback` already excludes 400/413);
     // the two are mutually exclusive.
@@ -1267,6 +1341,15 @@ async fn request_model_response(
                     );
                 }
                 actual_model = fallback_model.clone();
+                let mut fallback_report = CompressionReport::default();
+                let fallback_before = request::preview_request_budget(
+                    app, &fallback_model, messages, true, !force_final_response,
+                ).await;
+                request_budget = apply_request_budget(
+                    app, &fallback_model, messages, !force_final_response, _iteration, &mut fallback_report,
+                    fallback_before,
+                ).await;
+                fallback_report.emit();
                 request_result = if force_final_response {
                     send_llm_request(&*llm_client, app, &fallback_model, messages, false).await
                 } else {
@@ -1294,22 +1377,46 @@ async fn request_model_response(
             && overflow_retries < MAX_CONTEXT_OVERFLOW_RETRIES
         {
             let before = crate::ai::history::messages_total_chars_pub(messages);
-            // Cut the target by another 25% of the current size; the floor
-            // keeps it away from 0 so the shrink never becomes a no-op.
-            let target = before
-                .saturating_mul(3)
-                .saturating_div(4)
-                .max(MID_TURN_COMPRESS_SOFT_FLOOR);
+            // Provider rejection tightens the target even when our estimate fits.
+            let target = context_overflow_target_chars(
+                before,
+                request_budget.compression_target_chars(before),
+                request_budget.limits.soft_target_tokens,
+            );
+            let attempt = super::context_metrics::CompactionAttempt::start(
+                "provider_overflow", request_budget, messages,
+            );
+            // A failed send consumes usage feedback. Remeasure before shrinking
+            // so both sides use the same normalized estimate, rather than
+            // comparing a calibrated pre-send count with an uncalibrated one.
+            let before_tokens = request::preview_request_budget(
+                app, &actual_model, messages, true, !force_final_response,
+            ).await.prompt_tokens;
             let after = reactive_shrink_context_after_overflow(app, messages, target);
+            llm_prune::ensure_prune_protocol_prompt(messages, &app.prune_marks);
+            request_budget = request::preview_request_budget(
+                app, &actual_model, messages, true, !force_final_response,
+            ).await;
+            // Accept only a rescue that actually shrank the prompt: a rejected
+            // send whose projection survived unchanged must be logged as such
+            // (mirrors apply_request_budget's rollback/changed acceptance).
+            let progressed = request_budget.prompt_tokens < before_tokens;
+            attempt.finish(&app.session_id, _iteration, &actual_model, request_budget, messages, progressed);
             overflow_retries += 1;
-            if after < before {
+            if progressed {
                 overflow_request_retries += 1;
                 crate::ai::driver::print::print_tool_note_line(
                     "context-overflow",
                     &format!(
-                        "provider rejected oversized context; compressed {before} → {after} chars, retrying"
+                        "provider rejected oversized context; compressed {before} → {after} chars, {before_tokens} → {} tokens, retrying",
+                        request_budget.prompt_tokens,
                     ),
                 );
+                // The next retry starts with the selected model again, not
+                // necessarily the fallback whose provider rejected this request.
+                request_budget = request::preview_request_budget(
+                    app, next_model, messages, true, !force_final_response,
+                ).await;
                 continue;
             }
             // No progress even after the current-user-message rescue: retrying
@@ -1327,6 +1434,9 @@ async fn request_model_response(
             super::context_metrics::ContextRequestMetrics {
                 before: context_before,
                 after: super::context_metrics::ContextSizeBreakdown::measure(messages),
+                before_budget: Some(before_budget),
+                after_budget: Some(request_budget),
+                compaction_cycle: super::context_metrics::current_compaction_cycle(&app.session_id),
                 provider_overflows,
                 overflow_retries: overflow_request_retries,
                 response_received: request_result.is_ok(),
@@ -1676,6 +1786,7 @@ mod tests {
     use super::super::{record_llm_summary_attempt_chars, should_try_llm_summary};
     use super::{
         App, LlmClient, LlmRequest, StreamingFlagGuard, build_llm_request_client,
+        context_overflow_target_chars, reactive_shrink_context_after_overflow,
         no_tool_handoff_note, project_instruction_target_paths, refresh_outstanding_task_anchor,
         request, request_interrupt_pending, send_llm_request,
     };
@@ -1688,6 +1799,91 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, atomic::Ordering};
+
+    #[test]
+    fn context_overflow_target_preserves_floor_for_exhausted_estimate() {
+        let floor = super::super::MID_TURN_COMPRESS_SOFT_FLOOR;
+        for before in [0, 1, floor, 80_000, usize::MAX] {
+            for estimated_target in [0, 1, 1_000] {
+                for soft_target_tokens in [40_000, usize::MAX] {
+                    assert_eq!(
+                        context_overflow_target_chars(before, estimated_target, soft_target_tokens),
+                        floor,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn context_overflow_target_keeps_tightening_above_floor() {
+        assert_eq!(context_overflow_target_chars(100_000, 100_000, 80_000), 75_000);
+        assert_eq!(context_overflow_target_chars(100_000, 60_000, 80_000), 60_000);
+    }
+
+    #[test]
+    fn context_overflow_target_scales_only_for_nonzero_small_budgets() {
+        assert_eq!(context_overflow_target_chars(80_000, 0, 4_000), 8_000);
+        assert_eq!(context_overflow_target_chars(80_000, 0, 1), 2);
+        assert_eq!(
+            context_overflow_target_chars(80_000, 0, 0),
+            super::super::MID_TURN_COMPRESS_SOFT_FLOOR,
+        );
+    }
+
+    #[test]
+    fn context_overflow_rescue_keeps_cjk_preview_across_retries() {
+        let dir = std::env::temp_dir().join(format!("ai-overflow-floor-{}", uuid::Uuid::new_v4()));
+        let mut app = crate::ai::middleware::test_util::test_app();
+        app.config.history_file = dir.join("history.sqlite");
+        app.session_id = "overflow-floor".to_string();
+        let original = "\u{4e2d}".repeat(80_000);
+        let mut messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: Value::String("s".repeat(2_000)),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Value::String(original.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+        let canonical = messages.clone();
+        let mut prior_stub = None;
+        let mut prior_archive = None;
+        for _ in 0..4 {
+            let before = crate::ai::history::messages_total_chars_pub(&messages);
+            let target = context_overflow_target_chars(before, 0, 40_000);
+            let after = reactive_shrink_context_after_overflow(&app, &mut messages, target);
+            assert_eq!(after, super::super::MID_TURN_COMPRESS_SOFT_FLOOR);
+            let index = crate::ai::history::last_real_user_index(&messages).unwrap();
+            let stub = messages[index].content.as_str().unwrap();
+            assert!(stub.contains("head+tail preview:"));
+            assert!(stub.chars().filter(|&ch| ch == '\u{4e2d}').count() > 30_000);
+            let archive_path = stub.lines().next().unwrap().strip_prefix(
+                "[context-overflow-truncated] full original archived at: ",
+            ).unwrap();
+            let archive = std::fs::read_to_string(archive_path).unwrap();
+            assert!(archive.contains(&original));
+            if let Some(previous) = &prior_stub {
+                assert_eq!(stub, previous);
+            }
+            if let Some(previous) = &prior_archive {
+                assert_eq!(&archive, previous);
+            }
+            prior_stub = Some(stub.to_string());
+            prior_archive = Some(archive);
+        }
+        assert_eq!(canonical[1].content.as_str().unwrap(), original);
+        assert_eq!(messages[0].content, canonical[0].content);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     // ------------------------------------------------------------------
     // The RequestMiddleware chain is wired into the real request path (regression guard for the P2 fix):

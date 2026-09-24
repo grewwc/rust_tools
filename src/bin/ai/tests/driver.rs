@@ -27,6 +27,7 @@ fn resolve_model_is_unicode_safe() {
     let cancel_stream = Arc::new(AtomicBool::new(false));
     let app = types::App {
         cli,
+        scoped_preflight_required: Vec::new(),
         hooks: Default::default(),
         config,
         session_id: String::new(),

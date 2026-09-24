@@ -20,3 +20,5 @@ history.sqlite-*
 .tmp*
 # Generated Python bytecode for repository scripts.
 /scripts/__pycache__/
+# prompt_eval.py 运行产物（每 case 的转录、manifest、scores.json）：本地评测数据，不提交。
+/scripts/prompt_eval_runs/

@@ -22,16 +22,14 @@ use crate::ai::{history, mcp::SharedMcpClient, types::App};
 
 use super::{
     CompressionReport, MID_TURN_COMPRESS_COOLDOWN_ITERATIONS, MID_TURN_COMPRESS_DELTA_THRESHOLD,
-    MID_TURN_COMPRESS_SOFT_FLOOR, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
-    MID_TURN_LLM_SUMMARY_MAX_CHARS,
+    MID_TURN_COMPRESS_SOFT_FLOOR,
     finalize::finalize_turn,
     iteration::{
         execute_turn_iteration, finish_interrupted_turn, refresh_skill_turn_for_iteration,
     },
-    mid_turn_compress_hard_threshold, mid_turn_compress_soft_threshold,
+    mid_turn_compress_soft_threshold,
     persistence::persist_pending_turn_messages,
     prepare::prepare_turn,
-    record_llm_summary_attempt_chars, should_try_llm_summary,
     tool_result::{
         DEGENERATE_REPETITION_FINISH_REASON, FinalGateState, append_empty_response_retry_note,
         audit_evidence_gate_action, completion_evidence_state, completion_tool_result_succeeded,
@@ -962,6 +960,11 @@ pub(in crate::ai::driver) async fn run_turn(
             .then(crate::ai::driver::signal::ForegroundTurnGuard::enter);
         crate::ai::driver::runtime_ctx::TURN_IDENTITY
             .scope((session_id, turn_id), async {
+                if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0
+                    && crate::ai::driver::commands::compact::try_handle_compact_command(app, &question).await?
+                {
+                    return Ok(if should_quit { TurnOutcome::Quit } else { TurnOutcome::Continue });
+                }
                 // enable_tools' per-turn state must track the entire future rather than relying only on
                 // run_turn_body's happy-path tail cleanup; abort / early returns also Drop it.
                 let _enable_turn_guard =
@@ -1237,7 +1240,13 @@ async fn run_turn_body(
     // budget at every subsequent prompt rebuild this turn; it cannot be consumed once,
     // because intermediate reads and mid-turn compression may make the same mutation
     // target disappear from observable history and get re-paused.
-    let mut scoped_preflight_targets = ScopedPreflightTargets::default();
+    // Preflight pause state persists across turns via `app.scoped_preflight_required`
+    // (populated at turn end below): a mutation paused on the last iteration of a
+    // previous turn must not be re-paused at the start of the next turn just because
+    // the per-turn record was dropped.
+    let mut scoped_preflight_targets = ScopedPreflightTargets {
+        required: std::mem::take(&mut app.scoped_preflight_required),
+    };
     let loop_result = 'turn: loop {
         let iteration = supervisor.next_iteration();
         let effective_max_iterations = supervisor.effective_max_iterations(max_iterations);
@@ -1990,13 +1999,9 @@ async fn run_turn_body(
             Vec::new()
         };
 
-        // === Mid-turn progressive compression ===
-        // After each round's tool execution, check the total chars of messages; when it exceeds the
-        // soft threshold, reuse the cross-turn compression pipeline so long tool-call chains do not
-        // blow up the context. Throttling: ① a cooldown of N rounds ② skip when the delta is below
-        // DELTA, avoiding repeated no-op compression. The threshold is derived dynamically from
-        // history_max_chars (with a floor fallback) so it does not stay locked at 36K/80K after the
-        // user adjusts history_max_chars.
+        // Mechanical mid-turn work retains its cooldown and growth gate, but
+        // character count alone cannot authorize compaction. LLM summarization
+        // runs only at the request boundary after the final notes/tools are known.
         let history_max_chars = app.config.history_max_chars;
         let mid_turn_soft_base = mid_turn_compress_soft_threshold(&next_model, history_max_chars);
         // For long loops, lower the soft threshold to SOFT_FLOOR to curb the O(n²) re-send
@@ -2004,63 +2009,27 @@ async fn run_turn_body(
         // mid_turn_compress call below share the same `mid_turn_soft`, avoiding "the gate opens
         // but compression no-ops".
         let mid_turn_soft = supervisor.effective_mid_turn_soft_threshold(mid_turn_soft_base);
-        let mid_turn_hard = mid_turn_compress_hard_threshold(&next_model, history_max_chars);
         let total_chars = crate::ai::history::messages_total_chars_pub(&messages);
         if supervisor.should_try_mid_turn_compress(total_chars, mid_turn_soft) {
-            // Resolve the session overflow directory consistently with cross-turn compression
-            // (prepare.rs): mid-turn compression uses it to spill large outputs of "incompressible"
-            // tools like read_file/grep to files with zero compression plus a preview stub, freeing
-            // context without losing information (the model can read_file again).
-            let overflow_dir = {
-                use crate::ai::history::SessionStore;
-                let store = SessionStore::new(app.config.history_file.as_path());
-                store.session_assets_dir(&app.session_id)
-            };
-            let drained: Vec<crate::ai::history::Message> = std::mem::take(&mut messages);
-            let (compressed, before, after) = crate::ai::history::mid_turn_compress(
-                drained,
-                mid_turn_soft,
-                Some(overflow_dir.as_path()),
-                crate::ai::driver::runtime_ctx::effective_cwd()
-                    .ok()
-                    .as_deref(),
-            );
-            messages = compressed;
-            supervisor.mark_compress(after);
-            let mut compression_report = CompressionReport::default();
-            if after < before {
-                compression_report.record("mid-turn", before, after);
-            }
-            // Hard threshold: if still over budget after the lossless + weakly-lossy pipelines,
-            // call the LLM summary fallback to fold early conversation into a single internal_note,
-            // and merge the compression stages into one status line.
-            if after > mid_turn_hard
-                && should_try_llm_summary(&app.session_id, after, mid_turn_hard)
-            {
-                let drained: Vec<crate::ai::history::Message> = std::mem::take(&mut messages);
-                let (after_msgs, llm_before, llm_after, was_effective, llm_summary_inserted) =
-                    crate::ai::history::mid_turn_llm_summarize(
-                        app,
-                        drained,
-                        MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
-                        MID_TURN_LLM_SUMMARY_MAX_CHARS,
-                        history_max_chars,
-                        crate::ai::driver::runtime_ctx::effective_cwd()
-                            .ok()
-                            .as_deref(),
-                    )
-                    .await;
-                messages = after_msgs;
-                record_llm_summary_attempt_chars(&app.session_id, llm_after);
-                compression_report.record_llm_summary_attempt(
-                    format!("mid-turn LLM (limit {mid_turn_hard})"),
-                    llm_before,
-                    llm_after,
-                    was_effective,
-                    llm_summary_inserted,
+            super::context_budget::refresh_active_plan(app, &mut messages);
+            let budget = crate::ai::request::preview_request_budget(
+                app, &next_model, &messages, true, !force_final_response,
+            ).await;
+            if budget.exceeds_soft_target() {
+                let attempt = super::context_metrics::CompactionAttempt::start(
+                    "mid_turn_soft_target", budget, &messages,
                 );
-                compression_report.emit();
-            } else {
+                let report = super::context_budget::apply_measured_context_budget(app, budget, &mut messages);
+                let after_budget = crate::ai::request::preview_request_budget(
+                    app, &next_model, &messages, true, !force_final_response,
+                ).await;
+                attempt.finish(&app.session_id, supervisor.iteration, &next_model, after_budget,
+                    &messages, report.rollback_reason.is_none() || report.changed);
+                supervisor.mark_compress(report.after_chars);
+                let mut compression_report = CompressionReport::default();
+                if report.after_chars < report.before_chars {
+                    compression_report.record("mid-turn", report.before_chars, report.after_chars);
+                }
                 supervisor.pending_compression_report = compression_report;
             }
         }
@@ -2282,6 +2251,11 @@ async fn run_turn_body(
     crate::ai::tools::enable_tools::age_unused_explicit_tools(tools_used_this_turn.iter());
 
     let loop_result = loop_result.map_err(|e: Box<dyn std::error::Error>| e.to_string());
+    // Keep any still-uninjected pause targets for the next turn (injection is verified
+    // against the system prompt on both sides: the next turn's first iteration re-checks
+    // `scoped_project_instructions_missing` and skips documents already present, so the
+    // carried list is self-correcting).
+    app.scoped_preflight_required = scoped_preflight_targets.required().to_vec();
 
     // A one-shot continuation is set up only when an active skill explicitly requested user
     // input through a tool AND this round ended normally. This avoids guessing from

@@ -111,7 +111,7 @@ impl PromptTokenFeedback {
         self.actual_prompt_tokens.is_some()
     }
 
-    fn compatible_usage(&self, previous: &Self) -> Option<usize> {
+    pub(super) fn compatible_usage(&self, previous: &Self) -> Option<usize> {
         if !self.supports_calibration
             || !previous.supports_calibration
             || previous.awaiting_usage

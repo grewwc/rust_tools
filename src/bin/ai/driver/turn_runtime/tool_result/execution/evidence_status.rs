@@ -204,6 +204,7 @@ mod tests {
     fn test_app(history_file: PathBuf) -> App {
         let mut app = App {
             cli: ParsedCli::default(),
+            scoped_preflight_required: Vec::new(),
             config: AppConfig {
                 api_key: String::new(),
                 base_history_file: history_file.clone(),

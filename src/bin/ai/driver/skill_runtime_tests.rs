@@ -745,14 +745,14 @@ fn system_prompt_renders_safety_redlines_and_anti_hallucination_gate() {
     // stay single-sourced in correctness_guardrails.
     assert!(prompt.contains("<intellectual_honesty>"));
     assert!(prompt.contains(
-        "Unverified content must never be presented as a conclusion or recommendation"
+        "Unverified content must NEVER be presented as a conclusion or recommendation"
     ));
     assert!(prompt.contains("label it as inference or unknown"));
     assert!(prompt.contains("beyond a field's documented semantics"));
     assert!(prompt.contains(
         "does not establish provenance, lineage, capability, intent, or comparative rank"
     ));
-    assert!(prompt.contains("Do not introduce unstated premises, causal links, or facts"));
+    assert!(prompt.contains("DO NOT introduce unstated premises, causal links, or facts"));
     // Restating correctness_guardrails' evidence rules here would be duplication, not
     // emphasis: the base prompt renders both blocks on every request.
     assert!(!prompt.contains("Calibrate conclusions to the evidence"));
@@ -894,7 +894,7 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     // system_prompt_renders_safety_redlines_and_anti_hallucination_gate).
     // The efficiency guard lives in task_convergence's stopping rule and
     // must keep rendering.
-    assert!(prompt.contains("must trace to evidence observed in this session"));
+    assert!(prompt.contains("MUST trace to evidence observed in this session"));
     assert!(prompt.contains("targeted lookup; otherwise state what is verified"));
     assert!(prompt.contains("Do not pursue perfect certainty or unrelated detail"));
 }

@@ -65,6 +65,7 @@ impl App {
             pending_files: self.pending_files.clone(),
             forced_skills: self.forced_skills.clone(),
             forced_skill_source: self.forced_skill_source,
+            scoped_preflight_required: self.scoped_preflight_required.clone(),
             // This state belongs only to the next user message in the foreground;
             // `App` clones are also used for DriverContext, subagents, and
             // background tasks, which must not inherit this continuation.
@@ -171,6 +172,12 @@ pub(super) struct App {
     /// Source of `forced_skills`. Only explicit user selection carries this value,
     /// for per-turn persistence auditing.
     pub(super) forced_skill_source: Option<ForcedSkillSource>,
+    /// Mutation targets paused by the scoped-instruction preflight in a previous
+    /// turn but not yet injected into the system prompt. Transient per-turn state
+    /// (created at turn start) would lose them, re-pausing the same mutation on
+    /// every new turn; keeping them on `App` lets the first iteration of the next
+    /// turn inject the documents and unblock the retry.
+    pub(super) scoped_preflight_required: Vec<std::path::PathBuf>,
     /// One-shot continuation saved after the current skill explicitly requested
     /// user input via `request_user_input`. Consumed by the next ordinary user
     /// message; an explicit skill selection or session switch overwrites/clears it.

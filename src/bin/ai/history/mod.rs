@@ -717,6 +717,85 @@ pub(in crate::ai) fn reserve_turn_index(history_file: &Path) -> io::Result<usize
     sqlite::reserve_turn_index_sqlite(history_file)
 }
 
+/// Result of a manual projection-only compaction. An unchanged result means no
+/// smaller safely archived projection was available, not that history was erased.
+#[derive(Debug)]
+pub(crate) struct ManualCompactionOutcome {
+    pub before_chars: usize,
+    pub after_chars: usize,
+    pub summary_inserted: bool,
+    pub persisted: bool,
+}
+
+/// Explicit compaction ignores automatic size/turn-count triggers and a current
+/// snapshot, but retains the existing summarizer's archive and protected-content
+/// safeguards. It never changes the selected model or writes canonical history.
+pub(crate) async fn compact_session_history_manually_with_app(
+    app: &App,
+    cwd: Option<&Path>,
+) -> Result<ManualCompactionOutcome, Box<dyn std::error::Error>> {
+    compact_session_history_manually_with(app, |messages| async move {
+        // Manual compaction summarizes older dialogue, without forcing the hard
+        // budget backstop to shrink protected content just to meet a made-up cap.
+        let target = messages_total_chars_pub(&messages);
+        let (messages, _, _, _, summary_inserted) = compress::mid_turn_llm_summarize(
+            app, messages, 1, app.config.history_summary_max_chars, target, cwd,
+        ).await;
+        (messages, summary_inserted)
+    }).await
+}
+
+async fn compact_session_history_manually_with<F, Fut>(
+    app: &App,
+    compressor: F,
+) -> Result<ManualCompactionOutcome, Box<dyn std::error::Error>>
+where
+    F: FnOnce(Vec<Message>) -> Fut,
+    Fut: std::future::Future<Output = (Vec<Message>, bool)>,
+{
+    let history_file = &app.session_history_file;
+    // Legacy blobs have no separate projection table. Refuse rather than use
+    // their destructive write-back path for an explicitly projection-only command.
+    if !blob::is_sqlite_path(history_file) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "manual compaction requires a SQLite session; canonical history was not changed").into());
+    }
+    let overflow_dir = SessionStore::new(app.config.history_file.as_path())
+        .session_assets_dir(&app.session_id);
+    let fingerprint = context_projection_fingerprint(
+        app.config.history_max_chars, app.config.history_keep_last,
+        app.config.history_summary_max_chars, Some(&overflow_dir),
+    );
+    let context = read_context_history_sqlite_with_retry(history_file, &fingerprint).await?;
+    let before_chars = messages_total_chars_pub(&context.messages);
+    let unchanged = ManualCompactionOutcome {
+        before_chars, after_chars: before_chars, summary_inserted: false, persisted: false,
+    };
+    if context.messages.is_empty() {
+        return Ok(unchanged);
+    }
+    let _hooks = crate::ai::driver::hooks::CompressionHookGuard::new();
+    let (messages, summary_inserted) = compressor(context.messages).await;
+    let after_chars = messages_total_chars_pub(&messages);
+    if after_chars >= before_chars {
+        return Ok(unchanged);
+    }
+    let written = write_context_snapshot_with_retry(|busy_timeout| {
+        sqlite::write_context_snapshot_sqlite_with_busy_timeout(
+            history_file, &messages, context.source_message_id,
+            context.canonical_generation, &fingerprint, busy_timeout,
+        )
+    }).await?;
+    if !written {
+        return Err(io::Error::new(io::ErrorKind::WouldBlock,
+            "session changed during compaction; stale projection was not saved, retry /compact").into());
+    }
+    invalidate_context_history_cache_for(history_file);
+    Ok(ManualCompactionOutcome {
+        before_chars, after_chars, summary_inserted, persisted: true,
+    })
+}
+
 pub(in crate::ai) async fn compact_session_history_with_app(
     app: &App,
     cwd: Option<&Path>,
@@ -787,6 +866,7 @@ async fn compact_session_history_with_app_inner(
         return Ok(());
     }
 
+    let _hooks = crate::ai::driver::hooks::CompressionHookGuard::new();
     let compacted = if exceeds_context_budget || exceeds_tool_evidence_budget {
         // Use exactly the same compression strategy as the next
         // `build_context_history` call and write the result back into the
@@ -1049,6 +1129,88 @@ mod tests {
         append_history_messages(&app.session_history_file, &messages).unwrap();
         let overflow_dir = store.session_assets_dir(&app.session_id);
         (app, messages, overflow_dir)
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_persists_current_projection_and_preserves_canonical_tail() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let (mut app, messages, overflow_dir) = boundary_compaction_fixture("manual-compact");
+        app.config.history_max_chars = usize::MAX;
+        let fingerprint = context_projection_fingerprint(usize::MAX, 1, 4_000, Some(&overflow_dir));
+        let before = read_context_history_sqlite_with_retry(&app.session_history_file, &fingerprint)
+            .await.unwrap();
+        let mut snapshot = messages.clone();
+        snapshot[1].content = serde_json::json!("persisted snapshot response");
+        assert!(sqlite::write_context_snapshot_sqlite_with_busy_timeout(
+            &app.session_history_file, &snapshot, before.source_message_id,
+            before.canonical_generation, &fingerprint, Duration::from_secs(1),
+        ).unwrap());
+        assert!(read_context_history_sqlite_with_retry(&app.session_history_file, &fingerprint)
+            .await.unwrap().snapshot_is_current);
+        // Request projection still caps raw tool results under an unlimited
+        // context budget, so its cached value is not the stored snapshot.
+        let cached = build_context_history(0, &app.session_history_file, usize::MAX,
+            1, 4_000, Some(overflow_dir.clone()), None).unwrap();
+        assert_ne!(cached, snapshot);
+        let cache_key = context_history_cache_key(&app.session_history_file, 0,
+            usize::MAX, 1, 4_000, Some(&overflow_dir));
+        assert_eq!(try_get_cached_context_history(&cache_key)
+            .expect("request projection is cached").messages, cached);
+        let mut appended = messages.last().unwrap().clone();
+        appended.content = serde_json::json!("appended during manual compaction");
+        let result = compact_session_history_manually_with(&app, |input| async {
+            // Manual compaction must read the persisted snapshot, not canonical
+            // messages or the already-transformed request cache.
+            assert_eq!(input, snapshot);
+            let outcome = compress::compress_messages_for_context_with_outcome(
+                input, 1, 1, 4_000, Some(overflow_dir.clone()), None,
+            );
+            assert!(outcome.after_chars < outcome.before_chars);
+            assert!(!matches!(outcome.status, ContextCompressionStatus::MissingArchiveSink
+                | ContextCompressionStatus::ArchiveCommitFailed));
+            append_history_messages(&app.session_history_file, &[appended.clone()]).unwrap();
+            (outcome.messages, false)
+        }).await.unwrap();
+        assert!(result.persisted);
+        assert!(result.after_chars < result.before_chars);
+        assert_eq!(result.before_chars, messages_total_chars_pub(&snapshot));
+        // Check the original key directly: the append and snapshot write also
+        // change its revision, which could otherwise mask missing invalidation.
+        assert!(try_get_cached_context_history(&cache_key).is_none());
+        let mut canonical = messages;
+        canonical.push(appended.clone());
+        assert_eq!(build_message_arr(usize::MAX, &app.session_history_file).unwrap(), canonical);
+        let projected = build_context_history(0, &app.session_history_file, usize::MAX,
+            1, 4_000, Some(overflow_dir), None).unwrap();
+        assert_eq!(projected.last(), Some(&appended));
+        assert!(messages_total_chars_pub(&projected) < messages_total_chars_pub(&canonical));
+        assert!(projected.iter().any(compress::is_incremental_summary));
+        let _ = std::fs::remove_dir_all(app.config.history_file.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_archive_failure_preserves_projection_and_canonical_history() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let (app, messages, overflow_dir) = boundary_compaction_fixture("manual-archive-fail");
+        std::fs::create_dir_all(overflow_dir.parent().unwrap()).unwrap();
+        std::fs::write(&overflow_dir, "not a directory").unwrap();
+        let result = compact_session_history_manually_with(&app, |input| async {
+            let outcome = compress::compress_messages_for_context_with_outcome(
+                input, 1, 1, 4_000, Some(overflow_dir.clone()), None,
+            );
+            assert_eq!(outcome.status, ContextCompressionStatus::ArchiveCommitFailed);
+            assert_eq!(outcome.messages, messages);
+            (outcome.messages, false)
+        }).await.unwrap();
+        assert!(!result.persisted);
+        assert_eq!(result.before_chars, result.after_chars);
+        assert_eq!(build_message_arr(usize::MAX, &app.session_history_file).unwrap(), messages);
+        let fingerprint = context_projection_fingerprint(1, 1, 4_000, Some(&overflow_dir));
+        let context = read_context_history_sqlite_with_retry(&app.session_history_file, &fingerprint)
+            .await.unwrap();
+        assert!(!context.snapshot_is_current);
+        assert_eq!(context.messages, messages);
+        let _ = std::fs::remove_dir_all(app.config.history_file.parent().unwrap());
     }
 
     /// An unmet budget is not a compaction failure: the projection that dropped

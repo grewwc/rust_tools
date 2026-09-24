@@ -303,6 +303,7 @@ fn task_wait_no_hint_after_newer_spawn() {
 fn test_app_with_model(current_model: String) -> App {
     App {
         cli: ParsedCli::default(),
+        scoped_preflight_required: Vec::new(),
         hooks: Default::default(),
         config: AppConfig {
             api_key: String::new(),
