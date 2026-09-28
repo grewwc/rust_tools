@@ -218,8 +218,8 @@ pub(in crate::ai) fn cap_oversized_tool_results_for_context(
     // Cheap pre-scan (no index building, no string cloning): if no unprotected
     // result exceeds the cap there is nothing to do. This keeps the per-request
     // spill pass O(messages) instead of O(total argument bytes) for ordinary
-    // sessions. Preserved stubs are always far below the cap (bounded ~8K vs
-    // >= 32K), so the length check alone cannot classify a stub as oversized;
+    // sessions. Preserved stubs are always far below the cap (bounded ~2K vs
+    // 64K), so the length check alone cannot classify a stub as oversized;
     // the defensive stub check stays in the main loop below.
     let mut has_oversized = false;
     for idx in tool_message_indices(messages) {
@@ -1325,8 +1325,10 @@ pub(super) fn age_out_overflow_stub_previews(
 /// full; long content keeps a few leading/trailing lines with the middle folded
 /// into a placeholder line that states the omitted line count.
 pub(super) fn build_overflow_content_preview(content: &str) -> String {
-    const HEAD_LINES: usize = 8;
-    const TAIL_LINES: usize = 4;
+    // Kept small on purpose: the stub is only a recall anchor (line numbers
+    // come from key_lines below); the full text stays in the archive.
+    const HEAD_LINES: usize = 4;
+    const TAIL_LINES: usize = 2;
     const MAX_LINE_CHARS: usize = 200;
     const MAX_KEY_LINES: usize = 20;
 

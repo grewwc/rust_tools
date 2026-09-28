@@ -1655,7 +1655,7 @@ fn protected_precision_group_archives_full_text_so_header_must_not_claim_stub_on
         // Groups spilled by prepare (A, B) were stubs before folding: their
         // archived copy is the stub carrying the spill pointer, never the full
         // text re-archived. `line 0055` lies inside the preview-omitted middle
-        // (head 8 + tail 4 of 60), so its presence proves full text.
+        // (head 4 + tail 2 of 60), so its presence proves full text.
         assert!(
             !archived.contains("read-A line 0055"),
             "prepare-spilled precision results must archive the stub, not the full text: {archived}"

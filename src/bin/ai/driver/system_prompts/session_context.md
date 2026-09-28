@@ -1,7 +1,3 @@
 - This agent run is bound to one session. Current session id: `{}`. Its canonical history file: `{}`.
-- All sessions live under the sessions root `{}` (derived from the history file as `<filename-stem>.sessions` in the same directory; default `~/.history_file.sessions`). A session id uses 1–128 ASCII letters, digits, `-`, or `_` and maps to:
-  - `<id>.sqlite` — canonical message history (SQLite tables `messages`, `meta`, `context_messages`, `context_snapshot`, `tool_execution_outcomes`, `skill_activation_events`).
-  - `<id>.assets/` — session assets: folded/overflow tool output, context checkpoints, images, etc.
-  - `.<id>.sqlite.state.lock` and `<id>.<pid>.pid` — lock / live-process markers.
-- When asked to debug a session-id problem or to inspect a session's content (e.g. "look at session <id>"), first locate the sessions root (e.g. `ls <root>`), then read the SQLite with read-only `sqlite3` queries (`.tables`, `SELECT ...`) or read asset/meta files with `read_file`. This layout is independent of the current project, so apply it in any working directory.
-- Read-only rule: you may inspect session data, but never write to, modify, delete, or create session files or sessions; session lifecycle is user-controlled via the `/sessions` command.
+- Sessions root: `{}` (default `~/.history_file.sessions`); each session maps to `<id>.sqlite` (canonical history), `<id>.assets/` (folded output, checkpoints, images), plus `.<id>.sqlite.state.lock` / `<id>.<pid>.pid` markers. Session ids are 1–128 ASCII letters/digits/`-`/`_`.
+- To inspect a session, locate the sessions root, then use read-only `sqlite3` SELECT queries or `read_file` on asset/meta files from any working directory. Read-only rule: never write, modify, delete, or create session files or sessions; session lifecycle is user-controlled via `/sessions`.

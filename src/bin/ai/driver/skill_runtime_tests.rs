@@ -1014,7 +1014,7 @@ fn system_prompt_scope_discipline_bullets_have_no_leaked_indentation() {
     // prefixed by leaked source indentation.
     assert!(
         prompt.contains(
-            "\n- Investigate the user's explicit request plus only the direct dependencies"
+            "\n- Investigate only the request plus its direct dependencies"
         )
     );
     assert!(

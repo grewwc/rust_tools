@@ -187,15 +187,15 @@ pub(in crate::ai) fn compressed_tool_evidence_inline_chars_limit() -> usize {
 /// records are appended to overflow-history.md with zero compression and only a
 /// unified back-reference is kept in messages.
 ///
-/// Sized to hold roughly the last four default-size records (the mid-turn and
+/// Sized to hold roughly the last two default-size records (the mid-turn and
 /// shrink paths cap one record at `history_summary_max_chars`, default 4_000) while
-/// staying near 8% of the default 200_000-char history budget. A record rendered at
-/// the 8_000-char persisted cap can occupy half the window on its own; that is
+/// staying near 4% of the default 200_000-char history budget. A record rendered at
+/// the 8_000-char persisted cap can occupy the whole window on its own; that is
 /// deliberate, because the newest record is always kept and the cap only bounds how
 /// much memory stays resident between request builds. This number shapes generated
 /// projections, so changing it also requires a `PROJECTION_VERSION` bump in
 /// `history/mod.rs`.
-pub(in crate::ai) const MAX_INCREMENTAL_SUMMARY_INLINE_CHARS: usize = 16_000;
+pub(in crate::ai) const MAX_INCREMENTAL_SUMMARY_INLINE_CHARS: usize = 8_000;
 
 /// Keep only the `self_note:` entries among the most recent `keep_recent`
 /// internal_notes. Other internal_notes (cache hints, loop-breakers, history

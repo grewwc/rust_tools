@@ -610,7 +610,9 @@ fn context_projection_fingerprint(
     // per compression round.
     // v7: summary increments carry prerequisite reuse guards; partial drafts
     // require source recovery before their judgments can be used as premises.
-    const PROJECTION_VERSION: u8 = 7;
+    // v8: the resident incremental-summary window shrank from ~16K to ~8K chars;
+    // older records are archived behind the same single back-reference.
+    const PROJECTION_VERSION: u8 = 8;
     let overflow_dir = overflow_dir
         .map(|path| path.to_string_lossy())
         .unwrap_or_default();
