@@ -29,7 +29,11 @@ impl ContextLimits {
             output_reserve_tokens: output,
             safety_margin_tokens: safety,
             input_allowance_tokens: input,
-            soft_target_tokens: input.saturating_sub(input / 5),
+            // 70% of the input allowance: lossy mechanical compression starts
+            // earlier than the previous 80%, while the LLM summary gate keys
+            // off the input allowance itself (see apply_request_budget), so
+            // this ratio only tunes the cheaper mechanical passes.
+            soft_target_tokens: input.saturating_mul(7).saturating_div(10),
         }
     }
 }
@@ -116,7 +120,7 @@ mod tests {
     fn current_budget_reserve_and_tiny_window_boundaries() {
         let limits = ContextLimits::new(10_000, 2_000, 1_000);
         assert_eq!(limits.input_allowance_tokens, 7_000);
-        assert_eq!(limits.soft_target_tokens, 5_600);
+        assert_eq!(limits.soft_target_tokens, 4_900);
         for physical in [0, 1, 1_024, 2_048] {
             let limits = ContextLimits::new(physical, 1_024, 2_048);
             assert_eq!(limits.input_allowance_tokens, 0);

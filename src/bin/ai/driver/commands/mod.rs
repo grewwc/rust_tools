@@ -36,6 +36,70 @@ pub use share::try_handle_share_command;
 pub use skills::try_handle_skills_command;
 pub use usage::try_handle_usage_command;
 
+/// True when `token` begins a local slash command (e.g. `/sessions`, `:bg`).
+///
+/// The one-shot CLI (`cli.rs::protect_slash_command_args`) uses this to detect
+/// where `a`'s own option parsing ends and verbatim command text begins, so
+/// command flags like `--prefix` reach the command dispatcher unmodified. The
+/// REPL dispatches raw input directly and never goes through this predicate.
+/// Keep the word list in sync with the `try_handle_*_command` matchers in this
+/// module: a missing word only degrades one-shot flag pass-through to the old
+/// mangled behavior, never misroutes input.
+pub fn is_local_command_start(token: &str) -> bool {
+    let trimmed = token.trim();
+    let Some(rest) = trimmed
+        .strip_prefix('/')
+        .or_else(|| trimmed.strip_prefix(':'))
+    else {
+        return false;
+    };
+    let Some(word) = rest.split_whitespace().next() else {
+        return false;
+    };
+    matches!(
+        word,
+        "agent" | "agents"
+            | "audit"
+            | "bg"
+            | "changes"
+            | "checkpoint"
+            | "clear"
+            | "close"
+            | "compact"
+            | "cp"
+            | "detach"
+            | "diff"
+            | "effort"
+            | "export"
+            | "feishu"
+            | "fork"
+            | "goal"
+            | "h"
+            | "help"
+            | "history"
+            | "mark"
+            | "memo"
+            | "model"
+            | "models"
+            | "persona"
+            | "personas"
+            | "proc"
+            | "s"
+            | "session"
+            | "sessions"
+            | "share"
+            | "skill"
+            | "skills"
+            | "ss"
+            | "suspend"
+            | "susp"
+            | "token"
+            | "tokens"
+            | "unmark"
+            | "usage"
+    )
+}
+
 /// Handle local slash commands that do not depend on skill/agent manifests.
 ///
 /// These commands (/usage, /help, /model, /goal, ...) can be dispatched before

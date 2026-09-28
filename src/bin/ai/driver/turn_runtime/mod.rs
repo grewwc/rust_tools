@@ -136,8 +136,8 @@ const MAX_TOOL_RESULT_LINE_TRIM_CHARS: usize = 8_000;
 /// Per-result inline (not offloaded to file) character cap, computed dynamically from the model context window.
 ///
 /// - Baseline 32K (`MAX_TOOL_RESULT_INLINE_CHARS`), suited to 128K token window models.
-/// - Large-window models scale up proportionally: `context_window * chars_per_token / 8`, i.e. ~12.5% of the window
-///   reserved for a single tool result. 256K token model → 64K chars, 200K → 50K, 128K → 32K.
+/// - Large-window models scale up proportionally: `context_window * chars_per_token / 12`, i.e. ~8.3% of the window
+///   reserved for a single tool result. 256K token model → 42K chars, 200K → 33K, 128K → 21K (raised to the 32K floor).
 /// - Cap 64K: keeps a single tool result from consuming too much context even on very large windows.
 /// - Floor 32K: never below the baseline so small-window models do not offload too often.
 pub(crate) fn max_tool_result_inline_chars(model: &str) -> usize {
@@ -145,7 +145,7 @@ pub(crate) fn max_tool_result_inline_chars(model: &str) -> usize {
     let window = crate::ai::models::context_window_tokens(model);
     window
         .saturating_mul(CHARS_PER_TOKEN)
-        .saturating_div(8)
+        .saturating_div(12)
         .clamp(MAX_TOOL_RESULT_INLINE_CHARS, 64_000)
 }
 

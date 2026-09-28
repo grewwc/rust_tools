@@ -1292,6 +1292,16 @@ fn folded_tool_group_keeps_assistant_checkpoint_and_evidence_targets() {
     );
     assert!(stub.contains("evidence:"), "{stub}");
     assert!(
+        stub.contains(
+            "context_budget_note: earlier tool outputs were folded out of inline context"
+        ),
+        "stub should explain the context-budget cause: {stub}"
+    );
+    assert!(
+        stub.contains("continue with smaller targeted reads and split patches"),
+        "stub should steer recovery toward bounded work: {stub}"
+    );
+    assert!(
         stub.contains("read_file [file: 0341-history.json; range: lines=1..120]"),
         "{stub}"
     );

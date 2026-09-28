@@ -267,6 +267,8 @@ fn plan_tool_call_group_fold(
         "compressed_tool_round: {} tool calls (folded for context budget)",
         tool_calls.len()
     ));
+    lines.push("context_budget_note: earlier tool outputs were folded out of inline context because the request exceeded its tool/context budget; this does not mean the target file or command output is too large or broken.".to_string());
+    lines.push("recovery_guidance: use the evidence, previews, and original_* anchors before repeating tools. For code edits, continue with smaller targeted reads and split patches instead of re-reading the same archive/log.".to_string());
     lines.push(COMPRESSED_TOOL_EVIDENCE_MARKER.to_string());
     if let Some(path) = archive_file_path.as_deref() {
         lines.push(format!("- archive_file_path: {path}"));

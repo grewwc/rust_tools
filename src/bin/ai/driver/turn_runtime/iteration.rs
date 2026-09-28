@@ -1212,11 +1212,14 @@ async fn apply_request_budget(
         );
     }
 
-    // The token budget alone opens the summary gate. The shared growth cursor
-    // only suppresses repeated attempts at the same incompressible projection.
+    // The summary gate opens only when the measured prompt nears the input
+    // allowance; mechanical compression already runs at the soft target, so a
+    // mid-range summary would add a full-context LLM call without new headroom.
+    // The shared growth cursor suppresses repeated attempts at the same
+    // incompressible projection.
     let chars = crate::ai::history::messages_total_chars_pub(messages);
-    if budget.exceeds_soft_target() && should_try_llm_summary(&app.session_id, chars, 0) {
-        let attempt = CompactionAttempt::start("llm_soft_target", budget, messages);
+    if budget.exceeds_input_allowance() && should_try_llm_summary(&app.session_id, chars, 0) {
+        let attempt = CompactionAttempt::start("llm_input_allowance", budget, messages);
         // Work on a clone: dropping this future during cancellation must retain
         // the complete live projection, including its active-plan handoff.
         let mut summary_messages = messages.clone();
@@ -1235,7 +1238,7 @@ async fn apply_request_budget(
         budget = request::preview_request_budget(app, model, messages, true, tools_enabled).await;
         attempt.finish(&app.session_id, iteration, model, budget, messages, true);
         compression_report.record_llm_summary_attempt(
-            format!("pre-request LLM ({} tokens)", budget.limits.soft_target_tokens),
+            format!("pre-request LLM ({} tokens)", budget.limits.input_allowance_tokens),
             chars, after_chars, effective, inserted,
         );
         record_llm_summary_attempt_chars(&app.session_id, after_chars);

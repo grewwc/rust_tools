@@ -132,6 +132,192 @@ fn parse_cli_args_reads_stop_flag() {
 }
 
 #[test]
+fn parse_cli_args_passes_slash_command_flags_through_verbatim() {
+    // Unregistered command flags (e.g. `--prefix`) must survive argv parsing;
+    // the command dispatcher owns the command grammar.
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "/sessions".to_string(),
+            "delete".to_string(),
+            "prompt-eval-20260924".to_string(),
+            "--prefix".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(
+        cli.args,
+        vec!["/sessions delete prompt-eval-20260924 --prefix".to_string()]
+    );
+}
+
+#[test]
+fn parse_cli_args_keeps_flags_before_slash_command() {
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "--model".to_string(),
+            "gpt-test".to_string(),
+            "/sessions".to_string(),
+            "list".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(cli.model.as_deref(), Some("gpt-test"));
+    assert_eq!(cli.args, vec!["/sessions list".to_string()]);
+}
+
+#[test]
+fn parse_cli_args_consumes_files_before_slash_command() {
+    let file = make_temp_file("before-cmd");
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "-f".to_string(),
+            file.to_string_lossy().to_string(),
+            "/sessions".to_string(),
+            "delete".to_string(),
+            "x".to_string(),
+            "--prefix".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(cli.files, file.to_string_lossy());
+    assert_eq!(cli.args, vec!["/sessions delete x --prefix".to_string()]);
+    let _ = fs::remove_file(file);
+}
+
+#[test]
+fn parse_cli_args_does_not_join_non_command_slash_tokens() {
+    // A prompt that merely starts with a `/`-token (a path, not a command)
+    // keeps its tokens separate.
+    let cli = super::parse_cli_args(
+        ["a".to_string(), "/etc/hosts".to_string(), "解释".to_string()].into_iter(),
+    );
+    assert_eq!(
+        cli.args,
+        vec!["/etc/hosts".to_string(), "解释".to_string()]
+    );
+}
+
+#[test]
+fn parse_cli_args_passes_colon_aliases_through() {
+    let cli = super::parse_cli_args(
+        ["a".to_string(), ":bg".to_string(), "now".to_string()].into_iter(),
+    );
+    assert_eq!(cli.args, vec![":bg now".to_string()]);
+}
+
+#[test]
+fn parse_cli_args_consumes_registered_options_after_slash_command() {
+    // Registered `a` options stay consumable after the command token while
+    // the command text itself is preserved.
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "/sessions".to_string(),
+            "delete".to_string(),
+            "x".to_string(),
+            "--model".to_string(),
+            "gpt-test".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(cli.model.as_deref(), Some("gpt-test"));
+    assert_eq!(cli.args, vec!["/sessions delete x".to_string()]);
+
+    // Bool flag after the command.
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "/sessions".to_string(),
+            "list".to_string(),
+            "-bg".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert!(cli.background);
+    assert_eq!(cli.args, vec!["/sessions list".to_string()]);
+
+    // `--flag=value` form after the command.
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "/sessions".to_string(),
+            "list".to_string(),
+            "--model=gpt-test".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(cli.model.as_deref(), Some("gpt-test"));
+    assert_eq!(cli.args, vec!["/sessions list".to_string()]);
+}
+
+#[test]
+fn parse_cli_args_splits_known_and_unknown_flags_after_slash_command() {
+    // `--prefix` is command grammar and stays verbatim; `--model` is an `a`
+    // option and is consumed.
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "/sessions".to_string(),
+            "delete".to_string(),
+            "prompt-eval-20260924".to_string(),
+            "--prefix".to_string(),
+            "--model".to_string(),
+            "gpt-test".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(cli.model.as_deref(), Some("gpt-test"));
+    assert_eq!(
+        cli.args,
+        vec!["/sessions delete prompt-eval-20260924 --prefix".to_string()]
+    );
+}
+
+#[test]
+fn parse_cli_args_treats_option_value_as_value_not_command() {
+    // `--model`'s value looks like a command: terminalw pairs the value with
+    // the option, so `/sessions` is the model, not a command start.
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "--model".to_string(),
+            "/sessions".to_string(),
+            "list".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(cli.model.as_deref(), Some("/sessions"));
+    assert_eq!(cli.args, vec!["list".to_string()]);
+}
+
+#[test]
+fn parse_cli_args_consumes_files_after_slash_command() {
+    let file1 = make_temp_file("after-cmd-1");
+    let file2 = make_temp_file("after-cmd-2");
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "/sessions".to_string(),
+            "list".to_string(),
+            "-f".to_string(),
+            file1.to_string_lossy().to_string(),
+            file2.to_string_lossy().to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(
+        cli.files,
+        format!("{},{}", file1.to_string_lossy(), file2.to_string_lossy())
+    );
+    assert_eq!(cli.args, vec!["/sessions list".to_string()]);
+    let _ = fs::remove_file(file1);
+    let _ = fs::remove_file(file2);
+}
+
+#[test]
 fn model_selector_words_use_user_facing_selectors() {
     let selectors = super::model_selector_words();
 

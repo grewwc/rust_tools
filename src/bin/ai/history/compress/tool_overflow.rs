@@ -902,10 +902,10 @@ pub(super) fn build_preserved_tool_overflow_stub(
     // re-reading on sight of a file_path and looping spill → re-read → spill
     // again forever.
     let preview = build_overflow_content_preview(full_content);
-    let tool_hint = preserved_tool_overflow_hint(tool_name, recall_lines);
+    let tool_hint = preserved_tool_overflow_hint(tool_name, recall_lines, true);
     let mut out = format!(
         "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
-         Output preserved for tool `{tool_name}`. Full result saved to session asset:\n\
+         Output preserved for tool `{tool_name}` (context-budget fold). Full historical result saved to session asset:\n\
          - file_path: {}",
         path.display(),
     );
@@ -924,7 +924,11 @@ pub(super) fn build_preserved_tool_overflow_stub(
     out
 }
 
-fn preserved_tool_overflow_hint(tool_name: &str, recall_lines: &[String]) -> &'static str {
+fn preserved_tool_overflow_hint(
+    tool_name: &str,
+    recall_lines: &[String],
+    preview_inline: bool,
+) -> &'static str {
     let has_original_file_path = recall_lines
         .iter()
         .any(|line| line.starts_with("- original_file_path: "));
@@ -932,17 +936,23 @@ fn preserved_tool_overflow_hint(tool_name: &str, recall_lines: &[String]) -> &'s
         .iter()
         .any(|line| line.starts_with("- original_command: "));
     match tool_name {
+        "read_file" if has_original_file_path && preview_inline => {
+            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Use preview/`original_range` first; for current content, read a smaller range of `original_file_path` and split large patches instead of re-reading the archive. Read `file_path` only for exact historical output."
+        }
         "read_file" if has_original_file_path => {
-            "Archived snapshot of an earlier read. `original_range` marks lines already covered - for current content, read `original_file_path` past that range (identical re-reads are deduped); read `file_path` only for the exact historical output."
+            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Use `original_range` first; for current content, read a smaller range of `original_file_path` and split large patches instead of re-reading the archive. Read `file_path` only for exact historical output."
+        }
+        "read_file" if preview_inline => {
+            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Use preview first; read `file_path` only if exact historical output is required."
         }
         "read_file" => {
-            "Archived snapshot of an earlier read. Read `file_path` only if the preview is insufficient and you need the exact output; identical re-reads are deduped."
+            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Read `file_path` only if exact historical output is required."
         }
         "execute_command" if has_original_command => {
-            "Archived command output. Continue from `original_command` / `original_cwd`; `file_path` is a text archive, not a source file - read it only for the full log."
+            "Archived command output folded out of inline context for budget reasons. Continue from `original_command` / `original_cwd`; `file_path` is an archive, not a source file - read it only for the full log."
         }
         _ => {
-            "Archived output; `file_path` holds the full text. Read it only if the preview is insufficient."
+            "Archived output folded out of inline context for budget reasons; `file_path` holds full text. Read it only if the preview is insufficient."
         }
     }
 }
@@ -1198,27 +1208,10 @@ pub(super) fn collapse_overflow_stub_to_anchor(text: &str) -> Option<String> {
         .filter(|line| line.starts_with("- original_"))
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let tool_hint = if tool_name == "read_file" {
-        if recall_lines
-            .iter()
-            .any(|line| line.starts_with("- original_file_path: "))
-        {
-            "Archived snapshot of an earlier read. Read `original_file_path` for current content, `file_path` only for the exact historical output."
-        } else {
-            "Archived snapshot of an earlier read; read `file_path` only for the exact historical output."
-        }
-    } else if tool_name == "execute_command"
-        && recall_lines
-            .iter()
-            .any(|line| line.starts_with("- original_command: "))
-    {
-        "Archived command output; usually no re-read needed - continue from `original_command` / `original_cwd`."
-    } else {
-        "Full output at `file_path`; read it only if needed."
-    };
+    let tool_hint = preserved_tool_overflow_hint(&tool_name, &recall_lines, false);
     let mut out = format!(
         "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
-         Output preserved for tool `{tool_name}`. Full result saved to session asset:\n\
+         Output preserved for tool `{tool_name}` (context-budget fold). Full historical result saved to session asset:\n\
          - file_path: {file_path}"
     );
     for line in &recall_lines {

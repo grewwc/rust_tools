@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::ai::provider::ReasoningEffort;
 use crate::commonw::utils::expanduser;
 use crate::terminalw::parser::Parser as TermParser;
+use rust_tools::commonw::FastMap;
 
 /// Parsed CLI argument struct.
 #[derive(Debug, Clone)]
@@ -241,6 +242,142 @@ fn rewrite_legacy_session_aliases(argv: &mut [String]) {
     }
 }
 
+/// How a registered `a` option consumes the tokens after it. Derived from the
+/// parser registry (`collect_completion_info`), so argv pre-processing and
+/// flag registration share one source instead of drifting apart.
+#[derive(Clone, Copy)]
+enum CliOptionKind {
+    /// Boolean flag: claims no value.
+    Flag,
+    /// Value flag (`--model x`): claims the next non-`-` token, matching
+    /// terminalw's key/value pairing.
+    Value,
+    /// `--files`/`-f`: also claims following existing file specs, matching the
+    /// CLI-level grammar in `normalize_files_flags`.
+    Files,
+}
+
+/// Every registered flag name and alias mapped to its kind.
+fn cli_option_kinds(parser: &TermParser) -> FastMap<String, CliOptionKind> {
+    let mut kinds = FastMap::default();
+    for (name, ty, _, aliases) in parser.collect_completion_info() {
+        let kind = if ty == "bool" {
+            CliOptionKind::Flag
+        } else if name == "files" {
+            CliOptionKind::Files
+        } else {
+            CliOptionKind::Value
+        };
+        kinds.insert(name.clone(), kind);
+        for alias in aliases {
+            kinds.insert(alias, kind);
+        }
+    }
+    kinds
+}
+
+/// The registered option a token spells, if any. `-` alone and non-dash
+/// tokens are not options.
+fn option_token_kind(tok: &str, kinds: &FastMap<String, CliOptionKind>) -> Option<CliOptionKind> {
+    if !tok.starts_with('-') || tok.len() <= 1 {
+        return None;
+    }
+    let bare = tok.trim_start_matches('-');
+    let bare = bare.split('=').next().unwrap_or(bare);
+    kinds.get(bare).copied()
+}
+
+/// Index of the first local-command token. A token claimed as a preceding
+/// option's value is part of that option, never a command start: in
+/// `a --model /sessions list`, `/sessions` is the model value. The claim rules
+/// mirror terminalw's pairing: a pending value flag waits for the next
+/// non-`-` token, a bool claims nothing, and an inline `=` value settles the
+/// pending key. When no command start is found the caller leaves argv
+/// untouched, which is exactly terminalw's own parse path.
+fn find_command_start(argv: &[String], kinds: &FastMap<String, CliOptionKind>) -> Option<usize> {
+    let mut expecting_value = false;
+    for (i, tok) in argv.iter().enumerate() {
+        if expecting_value && !tok.starts_with('-') {
+            expecting_value = false;
+            continue;
+        }
+        if tok.starts_with('-') && tok.len() > 1 {
+            let bare = tok.trim_start_matches('-');
+            let bare = bare.split('=').next().unwrap_or(bare);
+            match kinds.get(bare) {
+                Some(CliOptionKind::Flag) => {}
+                _ => expecting_value = !tok.contains('='),
+            }
+            continue;
+        }
+        if crate::ai::driver::commands::is_local_command_start(tok) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Once the argument stream reaches a local command (`/sessions ...`,
+/// `:bg ...`), the remainder is command text owned by the command dispatcher.
+/// terminalw's argv parser would otherwise fold unregistered `--flag` tokens
+/// into `-flag` positionals (e.g. `/sessions delete <id> --prefix` arriving as
+/// `-prefix`), silently breaking the command. The command region is therefore
+/// joined into one argv element: it does not start with `-`, so terminalw
+/// classifies it as a single positional and never inspects its interior.
+///
+/// Registered `a` options are extracted from that region first and re-appended
+/// after the joined element, so `a`'s own flags keep working on either side of
+/// the command (`a /sessions list --model x` still selects the model) while
+/// unknown flags stay verbatim with the command. Option names match exactly;
+/// a bool cluster such as `-hi` behind the command passes through as command
+/// text.
+fn protect_slash_command_args(argv: &mut Vec<String>, kinds: &FastMap<String, CliOptionKind>) {
+    let Some(idx) = find_command_start(argv, kinds) else {
+        return;
+    };
+    let mut command_text: Vec<&str> = Vec::new();
+    let mut extracted: Vec<String> = Vec::new();
+    let mut i = idx;
+    while i < argv.len() {
+        let tok = argv[i].as_str();
+        let Some(kind) = option_token_kind(tok, kinds) else {
+            command_text.push(tok);
+            i += 1;
+            continue;
+        };
+        i += 1;
+        extracted.push(tok.to_string());
+        match kind {
+            CliOptionKind::Flag => {}
+            CliOptionKind::Value => {
+                if !tok.contains('=') && let Some(next) = argv.get(i) {
+                    if !next.starts_with('-') {
+                        extracted.push(next.clone());
+                        i += 1;
+                    }
+                }
+            }
+            CliOptionKind::Files => {
+                if !tok.contains('=') && let Some(next) = argv.get(i) {
+                    extracted.push(next.clone());
+                    i += 1;
+                }
+                while let Some(next) = argv.get(i) {
+                    if !file_spec_exists(next) {
+                        break;
+                    }
+                    extracted.push(next.clone());
+                    i += 1;
+                }
+            }
+        }
+    }
+    let joined = command_text.join(" ");
+    argv.truncate(idx);
+    argv.push(joined);
+    argv.extend(extracted);
+}
+
 fn file_spec_exists(raw: &str) -> bool {
     let raw = raw.trim();
     if raw.is_empty() || raw.starts_with('-') {
@@ -319,13 +456,19 @@ fn normalize_files_flags(argv: Vec<String>) -> Vec<String> {
     normalized
 }
 
-fn normalize_cli_argv(raw: &[String]) -> Vec<String> {
+fn normalize_cli_argv(raw: &[String], parser: &TermParser) -> Vec<String> {
     let mut argv = if raw.len() > 1 {
         raw[1..].to_vec()
     } else {
         Vec::new()
     };
     rewrite_legacy_session_aliases(&mut argv);
+    // Runs first: `normalize_files_flags` re-emits collected file specs as a
+    // trailing `--files <value>` pair, and the command-boundary split must not
+    // absorb that pair into the command text. Option-value skipping in
+    // `find_command_start` keeps `/`-path flag values from being mistaken for
+    // command starts.
+    protect_slash_command_args(&mut argv, &cli_option_kinds(parser));
     normalize_files_flags(argv)
 }
 
@@ -373,7 +516,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     }
 
     let mut parser = build_cli_parser();
-    let argv = normalize_cli_argv(&raw);
+    let argv = normalize_cli_argv(&raw, &parser);
 
     // Parse arguments with terminalw.
     parser.parse_argv(&argv, &[]);

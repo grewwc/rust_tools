@@ -1,11 +1,124 @@
 use super::{
     PatchEnvelopeOp, apply_inline_replace, apply_patch_target_paths_from_patch,
-    apply_unified_patch, apply_unified_patch_with_hints, execute_apply_patch,
-    file_path_from_unified_diff_header, parse_patch_envelope, parse_patch_envelopes,
+    apply_unified_patch, apply_unified_patch_with_hints, closest_file_lines, execute_apply_patch,
+    file_path_from_unified_diff_header, normalize_patch_envelope_body, parse_patch_envelope,
+    parse_patch_envelopes,
     parse_unified_diff_header_target, parse_unified_hunks, strip_code_fence, truncated_patch_hint,
 };
 use crate::ai::test_support::ENV_LOCK;
 use std::{fs, path::PathBuf};
+
+#[test]
+fn envelope_update_section_rejects_bare_nested_section_marker() {
+    // A bare `*** Replace in line:` (no path) cannot start a section, so it stayed inside the
+    // `*** Update File:` body and was folded into a context line: the envelope wrote nothing
+    // and the call reported "no changes" instead of the format error the author needed to see.
+    let patch = "*** Begin Patch\n\
+                 *** Update File: src/a.rs\n\
+                 @@\n\
+                 -old\n\
+                 +new\n\
+                 *** Replace in line:\n\
+                 anchor: let x = 1;\n\
+                 old: 1\n\
+                 new: 2\n\
+                 *** End Patch\n";
+    let envelopes = parse_patch_envelopes(patch)
+        .expect("envelopes parse")
+        .expect("envelope present");
+    let err = normalize_patch_envelope_body(&envelopes[0]).expect_err("nested header rejected");
+    assert!(err.contains("mixed patch formats"), "{err}");
+    assert!(err.contains("Replace in line"), "{err}");
+}
+
+#[test]
+fn envelope_well_formed_replace_in_line_header_starts_its_own_section() {
+    // The tolerated form: a header with a path closes the current section, so the replacement
+    // is applied as a sibling section rather than nested inside the update.
+    let patch = "*** Begin Patch\n\
+                 *** Update File: src/a.rs\n\
+                 @@\n\
+                 -old\n\
+                 +new\n\
+                 *** Replace in line: src/a.rs\n\
+                 anchor: let x = 1;\n\
+                 old: 1\n\
+                 new: 2\n\
+                 *** End Patch\n";
+    let envelopes = parse_patch_envelopes(patch)
+        .expect("envelopes parse")
+        .expect("envelope present");
+    assert_eq!(envelopes.len(), 2);
+    assert_eq!(envelopes[0].body_lines, vec!["@@", "-old", "+new"]);
+    assert_eq!(envelopes[1].op, PatchEnvelopeOp::ReplaceInLine);
+    assert_eq!(
+        envelopes[1].body_lines,
+        vec!["anchor: let x = 1;", "old: 1", "new: 2"]
+    );
+}
+
+#[test]
+fn envelope_bare_replace_in_line_header_reports_missing_path() {
+    // A `*** Replace in line:` section header without a target path (a bare marker at
+    // section level) must name the missing path explicitly, instead of only listing the
+    // expected header formats and leaving the model to infer the cause.
+    let patch = "*** Begin Patch\n\
+                 *** Replace in line:\n\
+                 anchor: let x = 1;\n\
+                 old: 1\n\
+                 new: 2\n\
+                 *** End Patch\n";
+    let err = parse_patch_envelopes(patch).unwrap_err();
+    assert!(err.contains("*** Replace in line"), "err was: {err}");
+    assert!(err.contains("malformed section header"), "err was: {err}");
+    assert!(err.contains("<path>"), "err was: {err}");
+}
+
+#[test]
+fn envelope_update_section_still_normalizes_plain_body() {
+    let patch = "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-old\n+new\n*** End Patch\n";
+    let envelopes = parse_patch_envelopes(patch)
+        .expect("envelopes parse")
+        .expect("envelope present");
+    let normalized = normalize_patch_envelope_body(&envelopes[0]).expect("body normalizes");
+    assert!(normalized.contains("-old"), "{normalized}");
+    assert!(normalized.contains("+new"), "{normalized}");
+}
+
+#[test]
+fn envelope_body_marker_text_with_diff_prefixes_is_not_rejected() {
+    // Marker-shaped *content* stays legitimate when it carries a diff prefix. The rejection only
+    // inspects bare lines starting at column 0, which is not valid body syntax anyway.
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: docs/patch_format.md\n",
+        "@@\n",
+        " *** Update File: src/a.rs\n",
+        "+*** Replace in line: src/a.rs\n",
+        "*** End Patch\n",
+    );
+    let envelopes = parse_patch_envelopes(patch)
+        .expect("envelopes parse")
+        .expect("envelope present");
+    let normalized = normalize_patch_envelope_body(&envelopes[0]).expect("marker text tolerated");
+    assert!(normalized.contains(" *** Update File: src/a.rs"), "{normalized}");
+    assert!(
+        normalized.contains("+*** Replace in line: src/a.rs"),
+        "{normalized}"
+    );
+}
+
+#[test]
+fn closest_file_lines_reports_the_shared_text_candidate() {
+    let expected = vec!["The quick brown fox jumps over the lazy dog"];
+    let orig_lines = vec![
+        "header".to_string(),
+        "The quick brown fox jumps over the lazy dog and then some more text".to_string(),
+    ];
+    let candidates = closest_file_lines(&expected, &orig_lines, 3);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].0, 2);
+}
 
 fn make_temp_path(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -242,6 +355,34 @@ fn apply_unified_patch_context_mismatch_reports_unicode_code_points() {
     assert!(err.contains("context mismatch"), "err was: {err}");
     assert!(err.contains("U+00E9"), "err was: {err}");
     assert!(err.contains("U+0065"), "err was: {err}");
+}
+
+#[test]
+fn apply_unified_patch_context_mismatch_hints_when_change_already_applied() {
+    // The duplicate-patch failure from real sessions: the file already contains the
+    // new values (an earlier call applied the same patch), and the model re-issues the
+    // identical patch. The mismatch error must point out that the change may already
+    // be applied, instead of only telling the model to rebuild the patch and retry.
+    let original = "SERVER_HOST = \"127.0.0.1\"\nLOG_LEVEL = \"debug\"\n";
+    let patch = "@@ -1,2 +1,2 @@\n\
+                 -SERVER_HOST = \"0.0.0.0\"\n\
+                 +SERVER_HOST = \"127.0.0.1\"\n\
+                 -LOG_LEVEL = \"info\"\n\
+                 +LOG_LEVEL = \"debug\"\n";
+    let err = apply_unified_patch(original, patch).unwrap_err();
+    assert!(err.contains("may already be applied"), "err was: {err}");
+    assert!(err.contains("git diff"), "err was: {err}");
+}
+
+#[test]
+fn apply_unified_patch_context_mismatch_omits_already_applied_hint() {
+    // When the added lines do not exist in the file, the mismatch has another cause
+    // and the already-applied hint must not fire.
+    let original = "alpha\nbeta\ngamma\n";
+    let patch = "@@ -2,1 +2,1 @@\n-not_present\n+changed\n";
+    let err = apply_unified_patch(original, patch).unwrap_err();
+    assert!(err.contains("context mismatch"), "err was: {err}");
+    assert!(!err.contains("may already be applied"), "err was: {err}");
 }
 
 #[test]

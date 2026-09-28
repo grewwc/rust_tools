@@ -524,6 +524,21 @@ fn parse_patch_header(header: &str) -> Result<(PatchEnvelopeOp, &str), String> {
     } else if let Some(path) = header.strip_prefix("*** Replace in line: ") {
         Ok((PatchEnvelopeOp::ReplaceInLine, path.trim()))
     } else {
+        let kind = [
+            "*** Update File",
+            "*** Add File",
+            "*** Delete File",
+            "*** Replace in line",
+        ]
+        .iter()
+        .copied()
+        .find(|marker| header.starts_with(marker));
+        if let Some(kind) = kind {
+            return Err(format!(
+                "invalid patch envelope: malformed section header `{kind}`; write it as \
+                 `{kind}: <path>` (for example `{kind}: src/main.rs`)"
+            ));
+        }
         Err(
             "invalid patch envelope: expected `*** Update File:`, `*** Add File:`, \
              `*** Delete File:`, or `*** Replace in line:`"
@@ -537,6 +552,27 @@ fn is_patch_section_header(line: &str) -> bool {
         || line.starts_with("*** Add File: ")
         || line.starts_with("*** Replace in line: ")
         || line.starts_with("*** Delete File: ")
+}
+
+/// Patch control markers that must start a top-level section. `is_patch_section_header` only
+/// recognizes headers written as `*** <Kind>: <path>`, so a malformed variant (a missing path
+/// or a missing colon, for example a bare `*** Replace in line:`) stays inside the body of the
+/// enclosing section. Treated as body text such a line is folded into a context line, and the
+/// envelope is then reported as producing no changes, hiding the real format error.
+fn patch_section_marker_kind(line: &str) -> Option<&'static str> {
+    const MARKERS: [&str; 7] = [
+        "*** Begin Patch",
+        "*** End Patch",
+        "*** End of File",
+        "*** Update File",
+        "*** Add File",
+        "*** Delete File",
+        "*** Replace in line",
+    ];
+    MARKERS
+        .iter()
+        .copied()
+        .find(|marker| line.starts_with(marker))
 }
 
 fn parse_patch_envelopes(patch: &str) -> Result<Option<Vec<PatchEnvelope>>, String> {
@@ -618,6 +654,20 @@ fn parse_patch_envelope(patch: &str) -> Result<Option<PatchEnvelope>, String> {
 }
 
 fn normalize_patch_envelope_body(envelope: &PatchEnvelope) -> Result<String, String> {
+    if let Some(marker) = envelope
+        .body_lines
+        .iter()
+        .find(|line| patch_section_marker_kind(line).is_some())
+    {
+        return Err(format!(
+            "invalid patch: detected mixed patch formats. {marker:?} is a patch section marker, \
+             but it appears inside the body of another section. A section header cannot be \
+             nested: close the current section and start a new top-level one, for example \
+             `*** Replace in line: <path>` followed by its `anchor:`, `old:`, and `new:` lines. \
+             If this line is file content instead of a marker, prefix it with a space (context \
+             line) or `+` (added line)."
+        ));
+    }
     Ok(match envelope.op {
         PatchEnvelopeOp::ReplaceInLine => {
             // ReplaceInLine does not go through the unified-diff path; it is handled directly by
@@ -1810,6 +1860,59 @@ fn describe_hunks_out_of_order(
     msg
 }
 
+/// File lines that share the most text with any expected hunk line, used only to build a
+/// diagnostic message. The nominal window printed by `describe_context_mismatch` is derived
+/// from the declared line numbers, so it can point at unrelated content when the patch's
+/// expected text is a truncated or edited copy of the real line. Scoring by shared text
+/// (longest common prefix, or containment of one line in the other) surfaces the line the
+/// patch most likely meant.
+fn closest_file_lines<'a>(
+    expected: &[&str],
+    orig_lines: &'a [String],
+    limit: usize,
+) -> Vec<(usize, &'a str)> {
+    const MIN_SHARED: usize = 12;
+    let needles: Vec<&str> = expected
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| line.len() >= MIN_SHARED)
+        .collect();
+    if needles.is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(usize, usize)> = Vec::new();
+    for (index, line) in orig_lines.iter().enumerate() {
+        let hay = line.trim();
+        if hay.len() < MIN_SHARED {
+            continue;
+        }
+        let mut score = 0;
+        for needle in &needles {
+            score = score.max(shared_prefix_len(needle, hay));
+            if needle.contains(hay) {
+                score = score.max(hay.len());
+            }
+            if hay.contains(*needle) {
+                score = score.max(needle.len());
+            }
+        }
+        if score >= MIN_SHARED {
+            scored.push((score, index));
+        }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, index)| (index + 1, orig_lines[index].trim()))
+        .collect()
+}
+
+/// Number of leading bytes shared by two lines, used to rank diagnostic candidates.
+fn shared_prefix_len(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
+}
+
 /// Constructs a "context mismatch" error with context: lists the lines the patch
 /// expected to match plus the actual lines in the original file near the nominal
 /// position, so the model can quickly self-correct instead of only seeing a bare
@@ -1830,6 +1933,38 @@ fn describe_context_mismatch(
         hunk_idx + 1,
         hunk_total
     );
+    // A hunk that cannot be located is often a duplicate of a patch that already
+    // succeeded: every line the hunk would add already exists and none of the lines
+    // it would remove remain. Name that case explicitly so the model verifies the
+    // working tree instead of rebuilding and re-issuing the same patch in a loop.
+    let adds: Vec<&str> = hunk
+        .lines
+        .iter()
+        .filter_map(|line| match line {
+            UnifiedLine::Add(text) => Some(text.trim()),
+            _ => None,
+        })
+        .collect();
+    let removes_exist = hunk.lines.iter().any(|line| match line {
+        UnifiedLine::Remove(text) => {
+            let trimmed = text.trim();
+            orig_lines.iter().any(|orig| orig.trim() == trimmed)
+        }
+        _ => false,
+    });
+    if !adds.is_empty()
+        && !removes_exist
+        && adds
+            .iter()
+            .all(|add| orig_lines.iter().any(|orig| orig.trim() == *add))
+    {
+        msg.push_str(
+            "Note: the lines this hunk adds already exist in the file and the lines it \
+             removes do not. The change may already be applied: check the working tree \
+             (e.g. `git diff`) before re-issuing the same patch; an identical patch will \
+             keep failing.\n",
+        );
+    }
     if hunk.old_start == 0 {
         msg.push_str(
             "Hunk header declared no line number (bare `@@`); the hunk is located by full-file \
@@ -1906,6 +2041,17 @@ fn describe_context_mismatch(
     } else {
         // No partial match found in the file — the block does not exist at all.
         // Echo the expected lines and the actual content near the nominal position.
+        let candidates = closest_file_lines(&expected, orig_lines, 3);
+        if !candidates.is_empty() {
+            msg.push_str("Closest actual lines by shared text:\n");
+            for (line_no, line) in candidates {
+                msg.push_str(&format!("  line {line_no}: {line}\n"));
+            }
+            msg.push_str(
+                "If one of these is the intended target, copy its text verbatim from the file; \
+                 the expected line above may be truncated or edited.\n",
+            );
+        }
         msg.push_str("Patch expected these lines (context/removed):\n");
         for (i, line) in expected.iter().take(10).enumerate() {
             msg.push_str(&format!("  expected[{}]: {}\n", i, line));

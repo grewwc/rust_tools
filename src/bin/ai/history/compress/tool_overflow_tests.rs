@@ -126,7 +126,7 @@ fn preserved_read_file_overflow_stub_keeps_original_target_anchor() {
             "read_file",
             r#"{"file_path":"src/lib.rs","offset":120,"limit":40}"#,
         ),
-        tool_result("old", &"x".repeat(1_000)),
+        tool_result("old", &"x".repeat(4_000)),
         assistant_call("recent", "read_file"),
         tool_result("recent", "recent result"),
     ];
@@ -152,6 +152,14 @@ fn preserved_read_file_overflow_stub_keeps_original_target_anchor() {
         stub.contains("Archived snapshot of an earlier read"),
         "stub: {stub}"
     );
+    assert!(
+        stub.contains("folded out of inline context for budget reasons"),
+        "stub should explain the context-budget cause: {stub}"
+    );
+    assert!(
+        stub.contains("read a smaller range of `original_file_path`"),
+        "stub should steer recovery toward bounded reads: {stub}"
+    );
 
     let anchor = collapse_overflow_stub_to_anchor(&stub).expect("stub should collapse");
     assert!(
@@ -161,6 +169,10 @@ fn preserved_read_file_overflow_stub_keeps_original_target_anchor() {
     assert!(
         anchor.contains("Archived snapshot of an earlier read"),
         "anchor: {anchor}"
+    );
+    assert!(
+        anchor.contains("split large patches instead of re-reading the archive"),
+        "anchor should keep actionable budget guidance: {anchor}"
     );
 
     let _ = std::fs::remove_dir_all(overflow_dir);
@@ -891,9 +903,14 @@ fn collapse_overflow_stub_to_anchor_drops_preview_keeps_file_path() {
     // The tool name is kept (the new format uses "Output preserved for
     // tool").
     assert!(anchor.contains("Output preserved for tool `read_file`"));
-    // read_file-type archives carry the "usually no need to re-read" notice
-    // (instead of the old leading "use read_file").
+    // read_file-type archives carry the context-budget notice (instead of the
+    // old leading "use read_file").
     assert!(anchor.contains("Archived snapshot of an earlier read"));
+    assert!(anchor.contains("folded out of inline context for budget reasons"));
+    assert!(
+        !anchor.contains("Use preview"),
+        "collapsed anchors must not point to a preview that was removed: {anchor}"
+    );
     // Still a valid stub (prefix unchanged); the downstream compaction
     // chain keeps recognizing it via the stub exemption.
     assert!(is_preserved_tool_overflow_stub(&anchor));
