@@ -49,7 +49,7 @@ pub(in crate::ai) use metadata::{
 pub(in crate::ai) use outcomes::{
     append_interrupted_stream_diagnostic_sqlite, append_skill_activation_event_sqlite,
     append_tool_execution_outcomes_sqlite, read_image_digest_sqlite, read_llm_prune_marks_sqlite,
-    read_skill_activation_events_sqlite, read_stale_patch_targets_sqlite,
+    read_skill_activation_events_sqlite, read_stale_patch_targets_sqlite, read_tool_execution_outcomes_cached,
     read_tool_execution_outcomes_sqlite, read_tool_message_ids_sqlite, upsert_image_digest_sqlite,
     write_llm_prune_marks_sqlite, write_stale_patch_targets_sqlite,
 };

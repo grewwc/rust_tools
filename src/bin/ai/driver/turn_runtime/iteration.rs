@@ -1200,8 +1200,22 @@ async fn apply_request_budget(
         "projection_maintenance"
     };
     let attempt = CompactionAttempt::start(trigger, before, messages);
+    // Happy-path fast path: the measured budget pass usually leaves the
+    // projection untouched (no spill, no lossless work, no plan refresh).
+    // Rebuilding the full request projection just to remeasure identical
+    // input costs a normalize clone, a SQLite outcomes read, tool-schema
+    // serialization, per-message fingerprints and a token scan, so reuse
+    // `before` when the projection is provably unchanged.
+    let pre_len = messages.len();
+    let pre_chars = crate::ai::history::messages_total_chars_pub(messages);
     let report = context_budget::apply_measured_context_budget(app, before, messages);
-    let mut budget = request::preview_request_budget(app, model, messages, true, tools_enabled).await;
+    let post_len = messages.len();
+    let post_chars = crate::ai::history::messages_total_chars_pub(messages);
+    let mut budget = if !report.changed && pre_len == post_len && pre_chars == post_chars {
+        before
+    } else {
+        request::preview_request_budget(app, model, messages, true, tools_enabled).await
+    };
     attempt.finish(&app.session_id, iteration, model, budget, messages,
         report.rollback_reason.is_none() || report.changed);
     if let Some(reason) = report.rollback_reason {
@@ -1217,7 +1231,9 @@ async fn apply_request_budget(
     // mid-range summary would add a full-context LLM call without new headroom.
     // The shared growth cursor suppresses repeated attempts at the same
     // incompressible projection.
-    let chars = crate::ai::history::messages_total_chars_pub(messages);
+    // `post_chars` already describes the current projection unless the LLM
+    // summary replaced it below; reuse it instead of scanning a third time.
+    let mut chars = post_chars;
     if budget.exceeds_input_allowance() && should_try_llm_summary(&app.session_id, chars, 0) {
         let attempt = CompactionAttempt::start("llm_input_allowance", budget, messages);
         // Work on a clone: dropping this future during cancellation must retain
@@ -1242,11 +1258,20 @@ async fn apply_request_budget(
             chars, after_chars, effective, inserted,
         );
         record_llm_summary_attempt_chars(&app.session_id, after_chars);
+        chars = after_chars;
     }
     // Recreating a protocol note changes normalized input too; measure it rather
     // than carrying a pre-replacement token estimate to transport.
-    llm_prune::ensure_prune_protocol_prompt(messages, &app.prune_marks);
-    request::preview_request_budget(app, model, messages, true, tools_enabled).await
+    // The common case leaves the projection untouched, so reuse the current
+    // budget instead of rebuilding the full projection a third time.
+    if llm_prune::ensure_prune_protocol_prompt(messages, &app.prune_marks) {
+        request::preview_request_budget(app, model, messages, true, tools_enabled).await
+    } else {
+        // `chars` is unused after this point; keep the assignment for clarity
+        // if later code needs the post-ensure size.
+        let _ = chars;
+        budget
+    }
 }
 
 async fn request_model_response(

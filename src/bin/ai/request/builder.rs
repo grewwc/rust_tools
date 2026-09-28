@@ -21,6 +21,7 @@ use crate::ai::{
     models,
     provider::{adapter_for, compatible_wire_shapes},
     request_protocol::RequestProtocolDialect,
+    types::ToolDefinition,
 };
 
 /// Builds message content: returns a string for text-only models or no images; otherwise,
@@ -324,6 +325,57 @@ fn estimate_tools_tokens(tools: Option<&Value>) -> usize {
     compact_json_char_len(tools).div_ceil(CHARS_PER_TOKEN_CONSERVATIVE)
 }
 
+/// Compact-JSON character length of `serde_json::to_value(defs)` computed
+/// directly from the definitions, without building the intermediate `Value`.
+/// Mirrors serde's struct layout field-for-field (`preserve_order` keeps
+/// declaration order): each tool is
+/// `{"type":..,"function":{"name":..,"description":..,"parameters":..}}`.
+/// The token-estimation caller only consumes this count; the parity test below
+/// pins it against the real serialization so the preview path can skip the
+/// per-request deep clone of the whole tool schema.
+pub(super) fn tools_definitions_compact_json_char_len(defs: &[ToolDefinition]) -> usize {
+    2 + defs
+        .iter()
+        .map(|def| {
+            let function = 2
+                + (json_string_char_len("name") + 1 + json_string_char_len(&def.function.name))
+                + 1
+                + (json_string_char_len("description")
+                    + 1
+                    + json_string_char_len(&def.function.description))
+                + 1
+                + (json_string_char_len("parameters")
+                    + 1
+                    + compact_json_char_len(&def.function.parameters));
+            2 + (json_string_char_len("type") + 1 + json_string_char_len(&def.tool_type))
+                + 1
+                + (json_string_char_len("function") + 1 + function)
+        })
+        .sum::<usize>()
+        + defs.len().saturating_sub(1)
+}
+
+/// Token estimate for tool schemas without serializing them: `Some` carries
+/// the definitions the wire body would send (non-empty by construction, matching
+/// `agent_tools_for_request` which yields `None` for empty tool sets), `None`
+/// contributes 0 — mirroring `estimate_tools_tokens`' `None`-vs-`Some` split.
+pub(super) fn estimate_tools_tokens_from_definitions(defs: Option<&[ToolDefinition]>) -> usize {
+    let Some(defs) = defs else {
+        return 0;
+    };
+    tools_definitions_compact_json_char_len(defs).div_ceil(CHARS_PER_TOKEN_CONSERVATIVE)
+}
+
+/// Preview-path prompt estimate: messages plus tool schemas, neither
+/// materialized as JSON. Matches `estimate_request_prompt_tokens` on the
+/// equivalent wire body (parity-tested) while skipping the schema deep clone.
+pub(super) fn estimate_request_prompt_tokens_from_definitions(
+    messages: &[Message],
+    defs: Option<&[ToolDefinition]>,
+) -> usize {
+    estimate_prompt_tokens(messages) + estimate_tools_tokens_from_definitions(defs)
+}
+
 /// Estimates input tokens for this request: messages + tool schemas.
 /// The request transport's TPM preflight gate and max_tokens clamp share this path so
 /// context-window and rate budgets do not diverge because of different estimates.
@@ -360,6 +412,27 @@ pub(super) fn clamp_with_estimated_prompt(model: &str, est_prompt: usize, model_
     model_max.min(remaining).max(MIN_OUTPUT_TOKENS_FLOOR)
 }
 
+/// Resolve the wire `enable_search` field shared by body assembly and the
+/// tool-schema-free preview estimate. Responses keeps the caller flag, plain
+/// OpenAI-compatible endpoints split by endpoint shape, every other adapter
+/// decides via its own `enable_search_field`. Extracted so both paths cannot
+/// diverge on search-gated fingerprints.
+pub(super) fn resolve_wire_enable_search(
+    model: &str,
+    endpoint: &str,
+    enable_search: Option<bool>,
+) -> Option<bool> {
+    let adapter_kind = models::model_adapter(model);
+    if models::request_protocol_dialect(model, endpoint) == RequestProtocolDialect::Responses {
+        return enable_search;
+    }
+    if adapter_kind == crate::ai::provider::ApiProvider::Compatible {
+        let (enable_search, _, _) = compatible_wire_shapes(endpoint, enable_search, None);
+        return enable_search;
+    }
+    adapter_for(adapter_kind, endpoint).enable_search_field(enable_search)
+}
+
 /// Assembles the HTTP request body (`RequestBody`), adding thinking / reasoning /
 /// search / stream_options / max_tokens per model capabilities and clamping max_tokens to fit the window.
 #[allow(clippy::too_many_arguments)]
@@ -376,23 +449,13 @@ pub(super) fn build_request_body<'a>(
     current_prompt_tokens: Option<u64>,
     reasoning_items: Option<&'a rustc_hash::FxHashMap<String, Vec<Value>>>,
 ) -> RequestBody<'a> {
-    let adapter_kind = models::model_adapter(model);
     let endpoint = models::endpoint_for_model(model, "");
-    let adapter = adapter_for(adapter_kind, &endpoint);
     let request_model = models::request_model_name(model);
     let (thinking, reasoning_effort, reasoning) =
         resolve_reasoning_wire_controls(model, &endpoint, enable_thinking, reasoning_effort);
     // Responses maps search to the built-in web_search tool; for Chat Completions,
     // the provider dialect still decides whether to retain `enable_search`.
-    let request_protocol = models::request_protocol_dialect(model, &endpoint);
-    let enable_search = if request_protocol == RequestProtocolDialect::Responses {
-        enable_search
-    } else if adapter_kind == crate::ai::provider::ApiProvider::Compatible {
-        let (es, _, _) = compatible_wire_shapes(&endpoint, enable_search, None);
-        es
-    } else {
-        adapter.enable_search_field(enable_search)
-    };
+    let enable_search = resolve_wire_enable_search(model, &endpoint, enable_search);
     // Explicitly request streaming usage: some adapters (DashScope compatible-mode) omit
     // usage by default and require stream_options.include_usage for token accounting.
     let stream_options = stream.then(|| json!({ "include_usage": true }));
@@ -569,5 +632,64 @@ mod compact_json_char_len_tests {
             let value = build(&mut next, 5);
             assert_parity(&value);
         }
+    }
+
+    #[test]
+    fn tool_definitions_estimate_matches_serialized_schema() {
+        use super::{
+            estimate_tools_tokens_from_definitions, tools_definitions_compact_json_char_len,
+        };
+        use crate::ai::types::{FunctionDefinition, ToolDefinition};
+
+        fn tool(name: &str, description: &str, parameters: Value) -> ToolDefinition {
+            ToolDefinition {
+                tool_type: "function".to_owned(),
+                function: FunctionDefinition {
+                    name: name.to_owned(),
+                    description: description.to_owned(),
+                    parameters,
+                },
+            }
+        }
+
+        fn assert_defs_parity(defs: &[ToolDefinition]) {
+            let serialized = serde_json::to_value(defs).expect("tool defs must serialize");
+            assert_eq!(
+                tools_definitions_compact_json_char_len(defs),
+                compact_json_char_len(&serialized),
+                "defs char-len parity failed"
+            );
+            // Byte-level ground truth, not just walker-vs-walker.
+            assert_eq!(
+                tools_definitions_compact_json_char_len(defs),
+                serde_json::to_string(&serialized)
+                    .expect("tool defs must serialize")
+                    .chars()
+                    .count(),
+                "defs char-len must match compact JSON text"
+            );
+            assert_eq!(
+                estimate_tools_tokens_from_definitions(Some(defs)),
+                super::estimate_tools_tokens(Some(&serialized)),
+                "defs token parity failed"
+            );
+        }
+
+        assert_defs_parity(&[]);
+        assert_defs_parity(&[tool("read_file", "read a file", json!({"type": "object"}))]);
+        assert_defs_parity(&[
+            tool(
+                "a\"b\\c\n",
+                "desc with \"quotes\", \\backslash\\, \u{1}control, 中文, 🙂",
+                json!({"type": "object", "properties": {"p": {"type": "string"}}}),
+            ),
+            tool("", "", Value::Null),
+            tool(
+                "mcp__server__long_tool_name___with_many_chars",
+                &"x".repeat(5_000),
+                json!([1, "two", {"three": [true, null, 1.5]}]),
+            ),
+        ]);
+        assert_eq!(estimate_tools_tokens_from_definitions(None), 0);
     }
 }

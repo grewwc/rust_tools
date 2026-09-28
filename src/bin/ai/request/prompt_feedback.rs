@@ -1,12 +1,12 @@
 //! Request-local context calibration. Cache discounts belong only to TPM.
 
 use std::hash::{Hash, Hasher};
-use std::io::{self, Write};
-
-use serde::Serialize;
 
 use super::RequestBody;
+use crate::ai::history::Message;
 use crate::ai::models;
+use crate::ai::types::ToolDefinition;
+use serde_json::{Map, Value};
 
 /// A pending request becomes usable feedback only after its own response reports
 /// nonzero prompt usage. Fingerprints avoid retaining another copy of history.
@@ -27,23 +27,168 @@ pub(crate) struct PromptTokenFeedback {
     supports_calibration: bool,
 }
 
-struct FingerprintWriter(rustc_hash::FxHasher);
-
-impl Write for FingerprintWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.write(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+/// Hash a JSON value without serializing it: no JSON escaping, no transient
+/// string allocation. Object iteration follows the map's own order, which is
+/// deterministic for a given value, so equal values hash equally. Numbers use
+/// their display form (tiny, one numeric leaf at a time).
+fn hash_value(value: &Value, state: &mut impl Hasher) {
+    match value {
+        Value::Null => 0u8.hash(state),
+        Value::Bool(flag) => {
+            1u8.hash(state);
+            flag.hash(state);
+        }
+        Value::Number(number) => {
+            2u8.hash(state);
+            number.to_string().hash(state);
+        }
+        Value::String(text) => {
+            3u8.hash(state);
+            text.hash(state);
+        }
+        Value::Array(items) => {
+            4u8.hash(state);
+            items.len().hash(state);
+            for item in items {
+                hash_value(item, state);
+            }
+        }
+        Value::Object(map) => {
+            5u8.hash(state);
+            map.len().hash(state);
+            for (key, item) in map.iter() {
+                key.hash(state);
+                hash_value(item, state);
+            }
+        }
     }
 }
 
-fn fingerprint(value: &impl Serialize) -> Option<u64> {
-    let mut writer = FingerprintWriter(rustc_hash::FxHasher::default());
-    serde_json::to_writer(&mut writer, value).ok()?;
-    Some(writer.0.finish())
+/// Hash one request message without JSON-serializing it. Field order follows
+/// the `Message` shape (`role`, `content`, `tool_calls`, `tool_call_id`,
+/// `reasoning_content`); `None` vs `Some` discriminants are hashed explicitly
+/// so absent and empty fields never collide.
+fn fingerprint_message(message: &Message) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    message.role.hash(&mut hasher);
+    hash_value(&message.content, &mut hasher);
+    if let Some(calls) = message.tool_calls.as_ref() {
+        true.hash(&mut hasher);
+        calls.len().hash(&mut hasher);
+        for call in calls {
+            call.id.hash(&mut hasher);
+            call.tool_type.hash(&mut hasher);
+            call.function.name.hash(&mut hasher);
+            call.function.arguments.hash(&mut hasher);
+        }
+    } else {
+        false.hash(&mut hasher);
+    }
+    message.tool_call_id.hash(&mut hasher);
+    message.reasoning_content.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Hash the request settings side of the calibration identity without
+/// serializing the (potentially large) tool schema. Covers the same fields as
+/// the previous serialized tuple: model, thinking map, search flag, tools,
+/// tool choice, reasoning effort/reasoning, encrypted-replay flag, stream.
+fn fingerprint_settings(body: &RequestBody<'_>) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    hash_settings_head(
+        &mut hasher,
+        &body.model,
+        &body.thinking,
+        body.enable_search,
+    );
+    if let Some(tools) = body.tools.as_ref() {
+        true.hash(&mut hasher);
+        hash_value(tools, &mut hasher);
+    } else {
+        false.hash(&mut hasher);
+    }
+    hash_settings_tail(
+        &mut hasher,
+        body.tool_choice.as_ref(),
+        body.reasoning_effort,
+        body.reasoning.as_ref(),
+        body.reasoning_encrypted_replay,
+        body.stream,
+    );
+    hasher.finish()
+}
+
+/// Settings fields hashed before the tools entry, shared by the body-based and
+/// definitions-based fingerprints so field order cannot diverge between them.
+fn hash_settings_head(
+    state: &mut impl Hasher,
+    model: &str,
+    thinking: &Map<String, Value>,
+    enable_search: Option<bool>,
+) {
+    model.hash(state);
+    thinking.len().hash(state);
+    for (key, value) in thinking.iter() {
+        key.hash(state);
+        hash_value(value, state);
+    }
+    enable_search.hash(state);
+}
+
+/// Settings fields hashed after the tools entry, shared like the head above.
+fn hash_settings_tail(
+    state: &mut impl Hasher,
+    tool_choice: Option<&Value>,
+    reasoning_effort: Option<&str>,
+    reasoning: Option<&Value>,
+    reasoning_encrypted_replay: bool,
+    stream: bool,
+) {
+    if let Some(choice) = tool_choice {
+        true.hash(state);
+        hash_value(choice, state);
+    } else {
+        false.hash(state);
+    }
+    reasoning_effort.hash(state);
+    if let Some(reasoning) = reasoning {
+        true.hash(state);
+        hash_value(reasoning, state);
+    } else {
+        false.hash(state);
+    }
+    reasoning_encrypted_replay.hash(state);
+    stream.hash(state);
+}
+
+/// Hash tool definitions exactly as `hash_value(&serde_json::to_value(defs))`
+/// would, without building the intermediate `Value`. Mirrors serde's struct
+/// layout in declaration order (`preserve_order`): each tool is an object with
+/// `type` then `function`, whose value is an object with `name`,
+/// `description`, then `parameters`. Discriminant bytes match `hash_value`
+/// (`4` = array, `5` = object, `3` = string). The parity test below pins this
+/// against the real serialization so preview and send fingerprints agree.
+pub(super) fn hash_tool_definitions(defs: &[ToolDefinition], state: &mut impl Hasher) {
+    4u8.hash(state);
+    defs.len().hash(state);
+    for def in defs {
+        5u8.hash(state);
+        2usize.hash(state);
+        "type".hash(state);
+        3u8.hash(state);
+        def.tool_type.hash(state);
+        "function".hash(state);
+        5u8.hash(state);
+        3usize.hash(state);
+        "name".hash(state);
+        3u8.hash(state);
+        def.function.name.hash(state);
+        "description".hash(state);
+        3u8.hash(state);
+        def.function.description.hash(state);
+        "parameters".hash(state);
+        hash_value(&def.function.parameters, state);
+    }
 }
 
 fn cache_key_fingerprint(api_key: &str) -> u64 {
@@ -65,18 +210,8 @@ impl PromptTokenFeedback {
             endpoint: endpoint.to_owned(),
             protocol: format!("{:?}", models::request_protocol_dialect(model, endpoint)),
             context_window: models::context_window_tokens(model),
-            settings: fingerprint(&(
-                &body.model,
-                &body.thinking,
-                body.enable_search,
-                &body.tools,
-                &body.tool_choice,
-                body.reasoning_effort,
-                &body.reasoning,
-                body.reasoning_encrypted_replay,
-                body.stream,
-            )),
-            messages: body.messages.iter().map(fingerprint).collect(),
+            settings: Some(fingerprint_settings(body)),
+            messages: Some(body.messages.iter().map(fingerprint_message).collect()),
             estimated_prompt_tokens: body.estimated_prompt_tokens,
             actual_prompt_tokens: None,
             awaiting_usage: true,
@@ -84,6 +219,64 @@ impl PromptTokenFeedback {
             // The character estimator does not measure opaque reasoning replay.
             // Do not extrapolate its ratio when that side channel is present.
             supports_calibration: body.reasoning_items.is_none_or(|items| items.is_empty()),
+        }
+    }
+
+    /// Preview-path capture that avoids serializing the tool schema to `Value`.
+    /// `tools_defs` must be `Some` exactly when the wire body would carry tools
+    /// (non-empty and model-enabled, as in `agent_tools_for_request`); the
+    /// settings hash and token estimate are identical to `capture` on the
+    /// equivalent body (parity-tested below), so calibration continuity holds.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn capture_preview(
+        session_id: &str,
+        model: &str,
+        endpoint: &str,
+        messages: &[Message],
+        thinking: &Map<String, Value>,
+        enable_search: Option<bool>,
+        tools_defs: Option<&[ToolDefinition]>,
+        tool_choice: Option<&Value>,
+        reasoning_effort: Option<&str>,
+        reasoning: Option<&Value>,
+        reasoning_encrypted_replay: bool,
+        stream: bool,
+        estimated_prompt_tokens: usize,
+        supports_calibration: bool,
+    ) -> Self {
+        let mut hasher = rustc_hash::FxHasher::default();
+        // The body carries the request (possibly rewritten) model name, not the
+        // registry key: match `fingerprint_settings` exactly, or calibration
+        // continuity between preview and send budgets silently breaks.
+        let request_model = models::request_model_name(model);
+        hash_settings_head(&mut hasher, &request_model, thinking, enable_search);
+        if let Some(defs) = tools_defs {
+            true.hash(&mut hasher);
+            hash_tool_definitions(defs, &mut hasher);
+        } else {
+            false.hash(&mut hasher);
+        }
+        hash_settings_tail(
+            &mut hasher,
+            tool_choice,
+            reasoning_effort,
+            reasoning,
+            reasoning_encrypted_replay,
+            stream,
+        );
+        Self {
+            session_id: session_id.to_owned(),
+            model: model.to_owned(),
+            endpoint: endpoint.to_owned(),
+            protocol: format!("{:?}", models::request_protocol_dialect(model, endpoint)),
+            context_window: models::context_window_tokens(model),
+            settings: Some(hasher.finish()),
+            messages: Some(messages.iter().map(fingerprint_message).collect()),
+            estimated_prompt_tokens,
+            actual_prompt_tokens: None,
+            awaiting_usage: true,
+            cache_key: None,
+            supports_calibration,
         }
     }
 
@@ -410,5 +603,108 @@ mod tests {
             clamp_with_estimated_prompt(&model, usize::MAX, cap),
             super::super::builder::MIN_OUTPUT_TOKENS_FLOOR
         );
+    }
+
+    #[test]
+    fn tool_definitions_hash_matches_serialized_schema() {
+        use crate::ai::types::{FunctionDefinition, ToolDefinition};
+
+        fn tool(name: &str, description: &str, parameters: Value) -> ToolDefinition {
+            ToolDefinition {
+                tool_type: "function".to_owned(),
+                function: FunctionDefinition {
+                    name: name.to_owned(),
+                    description: description.to_owned(),
+                    parameters,
+                },
+            }
+        }
+
+        fn assert_hash_parity(defs: &[ToolDefinition]) {
+            let serialized = serde_json::to_value(defs).expect("tool defs must serialize");
+            let mut direct = rustc_hash::FxHasher::default();
+            super::hash_tool_definitions(defs, &mut direct);
+            let mut through_value = rustc_hash::FxHasher::default();
+            super::hash_value(&serialized, &mut through_value);
+            assert_eq!(direct.finish(), through_value.finish());
+        }
+
+        assert_hash_parity(&[]);
+        assert_hash_parity(&[tool("read_file", "read a file", json!({"type": "object"}))]);
+        assert_hash_parity(&[
+            tool(
+                "a\"b\\c\n",
+                "desc with \"quotes\", \\backslash\\, \u{1}control, 中文, 🙂",
+                json!({"type": "object", "properties": {"p": {"type": "string"}}}),
+            ),
+            tool("", "", Value::Null),
+            tool(
+                "mcp__server__long_tool_name",
+                &"x".repeat(5_000),
+                json!([1, "two", {"three": [true, null, 1.5]}]),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn preview_capture_matches_body_capture_with_and_without_tools() {
+        use crate::ai::types::{FunctionDefinition, ToolDefinition};
+
+        let model = model();
+        let endpoint = "https://example.invalid/v1/chat/completions";
+        let messages = vec![message("user", "unchanged")];
+        let defs = vec![ToolDefinition {
+            tool_type: "function".to_owned(),
+            function: FunctionDefinition {
+                name: "budget_fixture".to_owned(),
+                description: "large schema content ".repeat(100),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+        }];
+        for tools_defs in [None, Some(defs.as_slice())] {
+            let tools = tools_defs.map(|defs| serde_json::to_value(defs).unwrap());
+            let tool_choice = tools
+                .as_ref()
+                .map(|_| Value::String("auto".to_owned()));
+            let body = build_request_body(
+                &model, &messages, true, false, None, tools, tool_choice, None, None, None,
+                None,
+            );
+            let expected = PromptTokenFeedback::capture("session", &model, endpoint, &body);
+            // The definitions-based estimate must agree with the body's own
+            // estimate, which the send path derives from the serialized value.
+            assert_eq!(
+                super::super::builder::estimate_request_prompt_tokens_from_definitions(
+                    &messages, tools_defs
+                ),
+                body.estimated_prompt_tokens,
+            );
+            let actual = PromptTokenFeedback::capture_preview(
+                "session",
+                &model,
+                endpoint,
+                &messages,
+                &body.thinking,
+                body.enable_search,
+                tools_defs,
+                body.tool_choice.as_ref(),
+                body.reasoning_effort,
+                body.reasoning.as_ref(),
+                body.reasoning_encrypted_replay,
+                body.stream,
+                body.estimated_prompt_tokens,
+                body.reasoning_items.is_none_or(|items| items.is_empty()),
+            );
+            assert_eq!(actual.settings, expected.settings);
+            assert_eq!(actual.messages, expected.messages);
+            assert_eq!(
+                actual.estimated_prompt_tokens,
+                expected.estimated_prompt_tokens
+            );
+            assert_eq!(
+                actual.supports_calibration,
+                expected.supports_calibration
+            );
+        }
     }
 }

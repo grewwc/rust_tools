@@ -1,6 +1,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
+    sync::{LazyLock, Mutex},
 };
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -83,6 +84,63 @@ pub(in crate::ai) fn append_interrupted_stream_diagnostic_sqlite(
         tx.commit()
             .map_err(|error| io::Error::other(error.to_string()))
     })
+}
+
+/// In-process cache of tool execution outcomes keyed by history path, validated
+/// against `history_revision`.
+///
+/// The request projection reads this table on every preview and every send
+/// (several times per tool round), yet the table only changes when outcomes are
+/// appended or pruned — and every such mutation bumps `history_revision` in the
+/// same transaction. The revision itself is fingerprint-cached (no SQLite open
+/// on the happy path), so a cache hit avoids the per-preview
+/// `Connection::open` + full-table scan entirely.
+static TOOL_EXECUTION_OUTCOMES_CACHE: LazyLock<
+    Mutex<FxHashMap<PathBuf, (i64, Vec<ToolExecutionOutcome>)>>,
+> = LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+/// Revision-validated cached read for the request projection hot path.
+/// Semantics match `read_tool_execution_outcomes_sqlite`, including the
+/// degrade-to-empty behavior for non-SQLite/missing history (which bypasses the
+/// cache: the file may be created later). Read failures are never cached, so a
+/// broken DB keeps the caller's retry-on-next-preview behavior.
+///
+/// The revision is checked both before and after the table scan and the result
+/// is cached only when both agree. `history_revision` is monotonically
+/// increasing, so agreement proves the scan saw the latest committed state; a
+/// concurrent append racing the read merely delays caching by one preview and
+/// can never pin stale rows.
+pub(in crate::ai) fn read_tool_execution_outcomes_cached(
+    path: &Path,
+) -> io::Result<Vec<ToolExecutionOutcome>> {
+    if !blob::is_sqlite_path(path) || !path.exists() {
+        return Ok(Vec::new());
+    }
+    let Some(revision_before) = super::revision::read_history_revision(path) else {
+        return read_tool_execution_outcomes_sqlite(path);
+    };
+    if let Ok(cache) = TOOL_EXECUTION_OUTCOMES_CACHE.lock()
+        && let Some((cached_revision, outcomes)) = cache.get(path)
+        && *cached_revision == revision_before
+    {
+        return Ok(outcomes.clone());
+    }
+    let outcomes = read_tool_execution_outcomes_sqlite(path)?;
+    if super::revision::read_history_revision(path) == Some(revision_before)
+        && let Ok(mut cache) = TOOL_EXECUTION_OUTCOMES_CACHE.lock()
+    {
+        cache.insert(path.to_path_buf(), (revision_before, outcomes.clone()));
+    }
+    Ok(outcomes)
+}
+
+/// Drop the cached outcomes for a history path. Called together with the
+/// revision-cache eviction when a history file is deleted or renamed, so a new
+/// file reused at the same path can never inherit the old rows.
+pub(super) fn evict_tool_execution_outcomes_cache(path: &Path) {
+    if let Ok(mut cache) = TOOL_EXECUTION_OUTCOMES_CACHE.lock() {
+        cache.remove(path);
+    }
 }
 
 /// Read the structured tool results needed by the request projection. Older sessions without the side table safely degrade to an empty set,

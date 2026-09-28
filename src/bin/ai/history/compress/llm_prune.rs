@@ -564,15 +564,21 @@ pub(crate) fn ensure_prune_protocol_prompt(
     {
         if should_inject_prune_prompt(messages) {
             let prompt = build_prune_protocol_prompt(messages, prune_marks);
+            // Refreshing identical text is not a mutation: callers reuse the
+            // previous token estimate when nothing actually changed.
+            if messages[existing_idx].content.as_str() == Some(prompt.as_str()) {
+                return false;
+            }
             messages[existing_idx].content = Value::String(prompt);
+            return true;
         } else {
             // No prunable candidates remain in this projection: the candidate
             // list inside the protocol message would now name ids that are no
             // longer present, which misleads the model into re-marking them.
             // Remove the stale message instead of leaving it in place.
             messages.remove(existing_idx);
+            return true;
         }
-        return false;
     }
     if !should_inject_prune_prompt(messages) {
         return false;
@@ -1427,7 +1433,9 @@ mod tests {
         // so the existing protocol message must be refreshed in place (updated
         // counter), never duplicated.
         let marks = [("call_old".to_string(), 1u8)].into_iter().collect();
-        assert!(!ensure_prune_protocol_prompt(&mut messages, &marks));
+        // The counter changed, so the refresh mutates the message and reports
+        // true; callers rebuild the token estimate only on true.
+        assert!(ensure_prune_protocol_prompt(&mut messages, &marks));
         assert_eq!(
             messages
                 .iter()
@@ -1443,6 +1451,9 @@ mod tests {
             .expect("protocol prompt still present");
         assert!(prompt.contains("marks 1/2"));
         assert_ne!(prompt_before, prompt);
+        // Refreshing with identical marks changes nothing and reports false,
+        // letting callers reuse the previous token estimate.
+        assert!(!ensure_prune_protocol_prompt(&mut messages, &marks));
     }
 
     #[test]
@@ -1473,7 +1484,9 @@ mod tests {
         // rewritten), so no prunable candidate remains. The stale protocol
         // message must be removed, not left behind with an outdated list.
         messages.retain(|message| message.tool_call_id.as_deref() != Some("call_old"));
-        assert!(!ensure_prune_protocol_prompt(
+        // Removal mutates the projection, so it reports true and the caller
+        // remeasures.
+        assert!(ensure_prune_protocol_prompt(
             &mut messages,
             &FxHashMap::default()
         ));

@@ -97,6 +97,10 @@ pub(in crate::ai) fn remove_history_revision_cache_entry(path: &Path) {
     if let Ok(mut cache) = HISTORY_REVISION_CACHE.lock() {
         cache.remove(path);
     }
+    // The outcomes cache is validated against the revision, so it must go at
+    // the same time: a new file reused at this path restarts its revision
+    // counter and must never inherit the deleted file's rows.
+    super::outcomes::evict_tool_execution_outcomes_cache(path);
 }
 
 #[cfg(test)]

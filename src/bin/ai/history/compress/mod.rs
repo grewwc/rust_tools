@@ -226,11 +226,7 @@ pub(in crate::ai) fn message_billable_chars(m: &Message) -> usize {
     let tool_call_chars = m
         .tool_calls
         .as_ref()
-        .map(|tc| {
-            serde_json::to_string(tc)
-                .map(|s| s.chars().count())
-                .unwrap_or(0)
-        })
+        .map(|calls| tool_calls_billable_chars(calls))
         .unwrap_or(0);
     let reasoning_chars = m
         .reasoning_content
@@ -238,6 +234,47 @@ pub(in crate::ai) fn message_billable_chars(m: &Message) -> usize {
         .map(|s| s.chars().count())
         .unwrap_or(0);
     content_chars + tool_call_chars + reasoning_chars
+}
+
+/// Character count of the compact JSON encoding of `tool_calls`, without
+/// materializing the encoded string. The result is identical to
+/// `serde_json::to_string(calls).chars().count()` by construction: struct
+/// field order follows the `ToolCall`/`FunctionCall` declarations (`id`,
+/// `type`, `function.name`, `function.arguments`), and string bodies use the
+/// same escaping as serde_json's compact formatter (see `json_string_char_len`).
+/// Avoids a potentially large transient allocation per message on every request
+/// projection rebuild (`apply_patch` arguments can be a whole patch).
+fn tool_calls_billable_chars(calls: &[crate::ai::types::ToolCall]) -> usize {
+    if calls.is_empty() {
+        return 2; // `[]`
+    }
+    let mut len = 2 + calls.len() - 1; // brackets + inter-item commas
+    for call in calls {
+        // `{"id":X,"type":Y,"function":{"name":Z,"arguments":W}}`
+        len += "{\"id\":".len();
+        len += json_string_char_len(&call.id);
+        len += ",\"type\":".len();
+        len += json_string_char_len(&call.tool_type);
+        len += ",\"function\":{\"name\":".len();
+        len += json_string_char_len(&call.function.name);
+        len += ",\"arguments\":".len();
+        len += json_string_char_len(&call.function.arguments);
+        len += "}}".len();
+    }
+    len
+}
+
+/// Character count of serde_json's compact string encoding of `text`
+/// (2 quotes + per-char escaping), mirroring `request::builder`'s counter.
+fn json_string_char_len(text: &str) -> usize {
+    2 + text
+        .chars()
+        .map(|ch| match ch {
+            '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+            ch if (ch as u32) < 0x20 => 6,
+            _ => 1,
+        })
+        .sum::<usize>()
 }
 
 pub(in crate::ai) fn value_to_string(v: &Value) -> String {
@@ -399,5 +436,39 @@ mod shrink_successful_write_arguments_tests;
 mod tail_window_tests;
 #[cfg(test)]
 mod tool_overflow_tests;
+#[cfg(test)]
+mod tool_calls_billable_tests {
+    use super::tool_calls_billable_chars;
+    use crate::ai::types::{FunctionCall, ToolCall};
+
+    fn call(id: &str, tool_type: &str, name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            tool_type: tool_type.to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    fn assert_parity(calls: &[ToolCall]) {
+        let expected = serde_json::to_string(calls)
+            .expect("tool calls must serialize")
+            .chars()
+            .count();
+        assert_eq!(tool_calls_billable_chars(calls), expected);
+    }
+
+    #[test]
+    fn tool_calls_char_len_matches_serde_json() {
+        assert_parity(&[]);
+        assert_parity(&[call("1", "function", "read_file", "{}")]);
+        assert_parity(&[
+            call("a\"b\\c", "function", "apply_patch", "{\"p\":1}"),
+            call("2", "function", "run", "line\nbreak\u{1}中文🙂"),
+        ]);
+    }
+}
 #[cfg(test)]
 mod truncate_last_real_user_message_tests;

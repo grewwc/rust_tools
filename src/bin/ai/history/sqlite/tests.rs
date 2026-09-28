@@ -98,6 +98,61 @@ fn outcome(id: &str) -> ToolExecutionOutcome {
 }
 
 #[test]
+fn cached_outcomes_track_appends_and_prunes_without_stale_hits() {
+    let dir = std::env::temp_dir().join(format!(
+        "tool_outcome_cache_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    append_history_sqlite(&path, vec![tool_msg("call-1", "first")]).unwrap();
+
+    // Miss then hit: the second read serves the same rows from the cache.
+    append_tool_execution_outcomes_sqlite(&path, &[outcome("call-1")]).unwrap();
+    assert_eq!(
+        read_tool_execution_outcomes_cached(&path).unwrap(),
+        vec![outcome("call-1")]
+    );
+    assert_eq!(
+        read_tool_execution_outcomes_cached(&path).unwrap(),
+        vec![outcome("call-1")]
+    );
+
+    // A new append bumps the revision, so the next read re-scans instead of
+    // returning the cached rows.
+    append_history_sqlite(&path, vec![tool_msg("call-2", "second")]).unwrap();
+    append_tool_execution_outcomes_sqlite(&path, &[outcome("call-2")]).unwrap();
+    assert_eq!(
+        read_tool_execution_outcomes_cached(&path).unwrap(),
+        vec![outcome("call-1"), outcome("call-2")]
+    );
+
+    // History rewrites prune orphaned rows and bump the revision as well.
+    replace_all_messages_sqlite(&path, &[tool_msg("call-2", "second")]).unwrap();
+    assert_eq!(
+        read_tool_execution_outcomes_cached(&path).unwrap(),
+        vec![outcome("call-2")]
+    );
+
+    // Eviction (delete/rename path) drops cached rows even if a later file
+    // reuses the same path with a restarted revision counter.
+    remove_history_revision_cache_entry(&path);
+    let _ = std::fs::remove_file(&path);
+    append_history_sqlite(&path, vec![tool_msg("call-9", "ninth")]).unwrap();
+    assert!(
+        read_tool_execution_outcomes_cached(&path)
+            .unwrap()
+            .is_empty()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn turn_sequence_is_atomic_and_survives_history_clear() {
     let dir = std::env::temp_dir().join(format!(
         "turn_sequence_test_{}_{}",

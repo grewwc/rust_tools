@@ -16,9 +16,13 @@ use super::super::{
     types::App,
 };
 use crate::ai::theme::{self, RESET};
+use crate::ai::types::ToolDefinition;
 
 use super::aux::charge_llm_usage_to_kernel;
-use super::builder::{build_request_body, clamp_with_estimated_prompt};
+use super::builder::{
+    build_request_body, clamp_with_estimated_prompt,
+    estimate_request_prompt_tokens_from_definitions, resolve_wire_enable_search,
+};
 use super::current_budget::CurrentRequestBudget;
 use super::error::{
     REQUEST_MAX_ATTEMPTS, RequestError, RequestErrorKind, RequestRetryPolicy,
@@ -37,7 +41,7 @@ use super::reasoning::{
     apply_prompt_cache_breakpoint, apply_thinking_force_off_effort, model_effort_graded,
     model_thinking_off_capability, normalize_reasoning_content_replay_for_model,
     prompt_cache_enabled_for_model, reconstruct_encrypted_reasoning_items_for_model,
-    resolve_reasoning_effort,
+    resolve_reasoning_effort, resolve_reasoning_wire_controls,
 };
 use super::thinking::resolve_thinking;
 use super::token_budget;
@@ -463,9 +467,72 @@ pub(crate) async fn preview_request_budget(
     stream: bool,
     tools_enabled: bool,
 ) -> CurrentRequestBudget {
-    let mut projection = prepare_request_projection(app, model, messages, tools_enabled).await;
-    let (_, _, budget) = projection.measure(app, model, stream, app.last_known_prompt_tokens.as_ref());
-    budget
+    // Preview estimates skip the tool-schema `Value`: the send path still builds
+    // it once for the wire body, but budgets only need its token estimate and
+    // settings fingerprint, both derived directly from the definitions
+    // (parity-tested in builder/prompt_feedback).
+    let core = prepare_projection_core(app, model, messages, tools_enabled).await;
+    // `Some` exactly when the send path would carry tools (non-empty and
+    // model-enabled, as in `agent_tools_for_request`), so effort-conflict
+    // handling and fingerprints agree between preview and send.
+    let tools_defs: Option<&[ToolDefinition]> = if tools_enabled {
+        app.agent_context
+            .as_ref()
+            .filter(|ctx| !ctx.tools.is_empty() && models::tools_enabled(model))
+            .map(|ctx| ctx.tools.as_slice())
+    } else {
+        None
+    };
+    let reasoning_effort = if core.reasoning_effort.is_some()
+        && tools_defs.is_some()
+        && models::reasoning_effort_conflicts_with_tools(model)
+    {
+        None
+    } else {
+        core.reasoning_effort
+    };
+    let reasoning_effort = apply_thinking_force_off_effort(
+        app.cli.thinking_disabled_override,
+        models::model_adapter(model),
+        model,
+        &core.endpoint,
+        reasoning_effort,
+    );
+    // `build_request_body` resolves thinking/search wire controls against the
+    // registry endpoint (`endpoint_for_model(model, "")`), while calibration
+    // identity uses the request endpoint: mirror each call site exactly.
+    let wire_endpoint = models::endpoint_for_model(model, "");
+    let (thinking, wire_effort, reasoning) =
+        resolve_reasoning_wire_controls(model, &wire_endpoint, core.enable_thinking, reasoning_effort);
+    let enable_search = resolve_wire_enable_search(
+        model,
+        &wire_endpoint,
+        models::search_enabled(model).then_some(true),
+    );
+    let tool_choice = tools_defs.map(|_| Value::String("auto".to_string()));
+    let estimated = estimate_request_prompt_tokens_from_definitions(&core.messages, tools_defs);
+    let feedback = PromptTokenFeedback::capture_preview(
+        &app.session_id,
+        model,
+        &core.endpoint,
+        &core.messages,
+        &thinking,
+        enable_search,
+        tools_defs,
+        tool_choice.as_ref(),
+        wire_effort,
+        reasoning.as_ref(),
+        models::reasoning_encrypted_replay_enabled(model),
+        stream,
+        estimated,
+        core.reasoning_items.is_empty(),
+    );
+    CurrentRequestBudget::measure(
+        model,
+        app.cli.max_tokens_override,
+        &feedback,
+        app.last_known_prompt_tokens.as_ref(),
+    )
 }
 
 /// Owns the wire projection so measurement can borrow it without borrowing App
@@ -480,15 +547,34 @@ struct RequestProjection {
     endpoint: String,
 }
 
-async fn prepare_request_projection(
+/// Normalized wire projection shared by preview estimates and the send path,
+/// minus the tool schema value (built only for sends). Preview budgets derive
+/// their token estimate and settings fingerprint directly from the tool
+/// definitions, skipping the per-request `to_value` deep clone.
+struct ProjectionCore {
+    messages: Vec<Message>,
+    enable_thinking: bool,
+    reasoning_effort: Option<&'static str>,
+    reasoning_items: rustc_hash::FxHashMap<String, Vec<Value>>,
+    endpoint: String,
+}
+
+/// Message normalization plus thinking/reasoning/endpoint resolution shared by
+/// both projection paths. No `tools` value is built here: the send path adds
+/// it for the wire body, the preview path reads the definitions directly.
+async fn prepare_projection_core(
     app: &App,
     model: &str,
     messages: &[Message],
     tools_enabled: bool,
-) -> RequestProjection {
+) -> ProjectionCore {
     let mut normalized_messages = normalize_messages_for_model(model, messages);
+    // Revision-cached: the outcomes table only changes when a tool result is
+    // appended or history is rewritten (both bump `history_revision`), so
+    // repeated previews within a tool round hit the in-process cache instead of
+    // reopening SQLite and rescanning the table.
     if let Ok(outcomes) =
-        crate::ai::history::read_tool_execution_outcomes_sqlite(&app.session_history_file)
+        crate::ai::history::read_tool_execution_outcomes_cached(&app.session_history_file)
     {
         fold_resolved_tool_failures(&mut normalized_messages, &outcomes);
     }
@@ -499,11 +585,6 @@ async fn prepare_request_projection(
     if prompt_cache_enabled_for_model(model) {
         apply_prompt_cache_breakpoint(&mut normalized_messages);
     }
-    let (tools_value, tool_choice) = if tools_enabled {
-        agent_tools_for_request(app, model)
-    } else {
-        (None, None)
-    };
     let thinking_start = Instant::now();
     let enable_thinking = resolve_thinking(app, model, &normalized_messages).await;
     crate::ai::agent_hang_debug!(
@@ -529,19 +610,40 @@ async fn prepare_request_projection(
     // Unlike this turn's enable_thinking gate, this must be unified before every request.
     normalize_reasoning_content_replay_for_model(model, &mut normalized_messages);
     let reasoning_effort = resolve_reasoning_effort(app, model).map(|e| e.as_str());
+    let endpoint = endpoint_for_request_model(app, model);
+    ProjectionCore {
+        messages: normalized_messages,
+        enable_thinking,
+        reasoning_effort,
+        reasoning_items: turn_reasoning_items,
+        endpoint,
+    }
+}
+
+async fn prepare_request_projection(
+    app: &App,
+    model: &str,
+    messages: &[Message],
+    tools_enabled: bool,
+) -> RequestProjection {
+    let core = prepare_projection_core(app, model, messages, tools_enabled).await;
+    let (tools_value, tool_choice) = if tools_enabled {
+        agent_tools_for_request(app, model)
+    } else {
+        (None, None)
+    };
     // Some gateways (e.g. bytedance modelhub) reject /v1/chat/completions requests that carry
     // `tools` + `reasoning_effort` together (returning 400). When the model declares
     // `reasoning_effort_conflicts_with_tools` and this turn's request carries tools,
     // reasoning_effort is omitted automatically to avoid the 400; requests without tools keep it to preserve thinking.
-    let reasoning_effort = if reasoning_effort.is_some()
+    let reasoning_effort = if core.reasoning_effort.is_some()
         && tools_value.is_some()
         && models::reasoning_effort_conflicts_with_tools(model)
     {
         None
     } else {
-        reasoning_effort
+        core.reasoning_effort
     };
-    let endpoint = endpoint_for_request_model(app, model);
     // Truncation-ladder force-off fallback (orchestrator.rs): after repeated truncation the
     // ladder sets thinking_disabled_override to force thinking off. For effort-only dialects
     // (OpenAI family / Responses) resolve_thinking=false emits nothing on the wire
@@ -553,17 +655,17 @@ async fn prepare_request_projection(
         app.cli.thinking_disabled_override,
         models::model_adapter(model),
         model,
-        &endpoint,
+        &core.endpoint,
         reasoning_effort,
     );
     RequestProjection {
-        messages: normalized_messages,
+        messages: core.messages,
         tools: tools_value,
         tool_choice,
-        enable_thinking,
+        enable_thinking: core.enable_thinking,
         reasoning_effort,
-        reasoning_items: turn_reasoning_items,
-        endpoint,
+        reasoning_items: core.reasoning_items,
+        endpoint: core.endpoint,
     }
 }
 

@@ -93,7 +93,10 @@ impl CompactionAttempt {
     /// writes, rejected candidates and no-op summaries leave it unchanged.
     pub(super) fn finish(self, session_id: &str, iteration: usize, model: &str,
         after: CurrentRequestBudget, messages: &[Message], accepted: bool) {
-        let replaced = accepted && self.fingerprint != projection_fingerprint(messages);
+        // Skip the second full serialization when the candidate was rejected:
+        // `replaced` stays false regardless of the fingerprint in that case.
+        let replaced =
+            if accepted { self.fingerprint != projection_fingerprint(messages) } else { false };
         let window = {
             let key = (session_id.to_string(), crate::ai::driver::current_task_pid());
             let mut cycles = COMPACTION_CYCLES.lock().unwrap_or_else(|e| e.into_inner());
