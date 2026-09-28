@@ -896,6 +896,10 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     // must keep rendering.
     assert!(prompt.contains("MUST trace to evidence observed in this session"));
     assert!(prompt.contains("targeted lookup; otherwise state what is verified"));
+    // Subject-scope bullet: set-level aggregates never describe a single
+    // member; evidence about one file/run/turn never proves a claim about
+    // another.
+    assert!(prompt.contains("Evidence stays with the subject it was measured on"));
     assert!(prompt.contains("Do not pursue perfect certainty or unrelated detail"));
 }
 

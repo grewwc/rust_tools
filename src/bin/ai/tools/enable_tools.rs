@@ -533,7 +533,10 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                 msg.push(format!("Expanded group shortcut(s): {}", parts.join(", ")));
             }
             if !already.is_empty() {
-                msg.push(format!("Already active: {}", already.join(", ")));
+                msg.push(format!(
+                    "Already active (already in this turn's tool set, call it directly): {}",
+                    already.join(", ")
+                ));
             }
             if !unknown.is_empty() {
                 msg.push(format!("Unknown tools (ignored): {}", unknown.join(", ")));
