@@ -324,6 +324,23 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 }
                 CompletionEvidenceGateAction::Warn => true,
             };
+            let warn_unretried_pause = match recoverable_pause_gate_action(
+                messages,
+                turn_messages,
+                !final_gate_reopen_allowed,
+                iteration,
+                max_iterations,
+            ) {
+                RecoverablePauseGateAction::Allow => false,
+                RecoverablePauseGateAction::Reopen => {
+                    final_gate_state.consume_retry();
+                    // Completed drafts are transactionally deferred and were never
+                    // user-visible, so they must not become a dedupe candidate.
+                    *terminal_dedupe_candidate = None;
+                    return Ok(TurnLoopStep::Continue);
+                }
+                RecoverablePauseGateAction::Warn => true,
+            };
             let effective_cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
             let warn_unverified_audit_evidence = match audit_evidence_gate_action(
                 app.current_agent.as_str(),
@@ -421,6 +438,17 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     COMPLETION_EVIDENCE_WARNING,
                 );
                 record_hidden_self_note(app, turn_messages, COMPLETION_EVIDENCE_UNVERIFIED_NOTE);
+            }
+            if warn_unretried_pause {
+                append_runtime_warning_once(
+                    &mut stream_result.assistant_text,
+                    RECOVERABLE_PAUSE_WARNING,
+                );
+                append_user_visible_final_notice(
+                    terminal_dedupe_candidate,
+                    RECOVERABLE_PAUSE_WARNING,
+                );
+                record_hidden_self_note(app, turn_messages, RECOVERABLE_PAUSE_UNVERIFIED_NOTE);
             }
             if warn_unverified_audit_evidence {
                 record_hidden_self_note(app, turn_messages, AUDIT_EVIDENCE_UNVERIFIED_NOTE);

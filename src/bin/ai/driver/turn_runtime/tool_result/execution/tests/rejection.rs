@@ -97,6 +97,29 @@ fn scoped_instruction_preflight_blocks_first_mutation_until_rules_are_loaded() {
             &messages,
             std::slice::from_ref(&mutation)
         ));
+        // A pause names the paused target as a target and lists the rules that
+        // apply to it separately: labelling the target file itself an
+        // "instruction document" sends the caller looking for rules inside the
+        // source file it was about to change.
+        let paused = rejected_tool_call_message(
+            "execute_command",
+            ToolCallRejectionReason::ScopedInstructionsNeedReload(vec![target.clone()]),
+        );
+        assert!(
+            paused.contains(&format!("Paused target(s): {}", target.display())),
+            "{paused}"
+        );
+        assert!(
+            paused.contains("Applicable instruction documents: "),
+            "{paused}"
+        );
+        for doc in &docs {
+            assert!(
+                paused.contains(&doc.path),
+                "{} must be listed as an instruction document: {paused}",
+                doc.path
+            );
+        }
     });
     assert!(
         rejected_tool_call_message(
@@ -108,14 +131,19 @@ fn scoped_instruction_preflight_blocks_first_mutation_until_rules_are_loaded() {
         )
         .contains("No file was changed")
     );
+    let paused_outside_project = rejected_tool_call_message(
+        "execute_command",
+        ToolCallRejectionReason::ScopedInstructionsNeedReload(vec![
+            std::path::PathBuf::from("/tmp/demo/AGENTS.md"),
+        ]),
+    );
     assert!(
-        rejected_tool_call_message(
-            "execute_command",
-            ToolCallRejectionReason::ScopedInstructionsNeedReload(vec![
-                std::path::PathBuf::from("/tmp/demo/AGENTS.md")
-            ])
-        )
-        .contains("Missing instruction documents: /tmp/demo/AGENTS.md")
+        paused_outside_project.contains("Paused target(s): /tmp/demo/AGENTS.md"),
+        "{paused_outside_project}"
+    );
+    assert!(
+        !paused_outside_project.contains("Missing instruction documents"),
+        "{paused_outside_project}"
     );
 
     let _ = fs::remove_dir_all(root);

@@ -292,3 +292,102 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_gate_action(
     });
     CompletionEvidenceGateAction::Reopen
 }
+
+/// Marker and texts of the recoverable-pause gate.
+///
+/// A pre-execution pause is a runtime-side condition the paused call is expected
+/// to survive inside the same turn: the scoped-instruction pause is self-healing
+/// (the missing documents are added on the next model step), while the
+/// patch-retry pause clears only once the caller re-reads the target — which is
+/// why the reopen note defers to the recovery the pause reply prescribed instead
+/// of promising that a bare retry succeeds. The completion gate cannot see this
+/// state — a paused call mutates nothing, so its evidence stays empty — and the
+/// turn can otherwise end with "I will retry next round" and no trace that the
+/// action never ran; the user has to ask again for work the runtime was ready
+/// to do.
+pub(in crate::ai::driver::turn_runtime) const RECOVERABLE_PAUSE_RETRY_MARKER: &str =
+    "[recoverable-pause-retry]";
+pub(in crate::ai::driver::turn_runtime) const RECOVERABLE_PAUSE_RETRY_NOTE: &str =
+    "[recoverable-pause-retry]\n\
+     A tool call was paused before execution in the current user turn and nothing ran after it.\n\
+     This is not a final answer. Complete the recovery the pause reply prescribed (loading the instruction documents it named, or reading the target before retrying the patch), then re-issue the paused call in this turn; report a blocker only if that retry fails too.";
+pub(in crate::ai::driver::turn_runtime) const RECOVERABLE_PAUSE_WARNING: &str =
+    "[Runtime warning] A tool call was paused before execution and the turn ended without retrying it, so the requested action was most likely never performed.";
+pub(in crate::ai::driver::turn_runtime) const RECOVERABLE_PAUSE_UNVERIFIED_NOTE: &str =
+    "runtime:recoverable_pause_unretried\nA final response was recorded after a recoverable pre-execution pause without a retry.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::ai::driver::turn_runtime) enum RecoverablePauseGateAction {
+    Allow,
+    Reopen,
+    Warn,
+}
+
+/// Whether a tool result is one of the runtime's recoverable pause replies.
+///
+/// The sentence alone does not identify one: both prefixes also exist as source
+/// text in this repository, so a `read_file`/`grep` result can quote them
+/// verbatim. Every reply `rejection.rs` builds is an error result, and an error
+/// result always starts with `Error: ` — file and command output does not.
+fn is_recoverable_pause_reply(text: &str) -> bool {
+    text.starts_with("Error: ")
+        && (text.contains(SCOPED_INSTRUCTIONS_PAUSE_PREFIX)
+            || text.contains(PATCH_RETRY_PAUSE_PREFIX))
+}
+
+/// Whether a recoverable pause in this turn is still unretried.
+///
+/// The pause replies are runtime-authored (`rejection.rs` builds them from the
+/// same prefixes), so this is a structural check of the tool record, never a
+/// classification of the model's wording. Any successful tool result after the
+/// pause clears the condition: only a pause followed by provable zero activity
+/// reopens, because demanding a retry of the same tool would reopen turns that
+/// recovered another way.
+fn recoverable_pause_unretried(turn_messages: &[Message]) -> bool {
+    let mut paused = false;
+    let mut progressed = false;
+    for message in turn_messages {
+        if message.role != "tool" {
+            continue;
+        }
+        let text = message.content.as_str().unwrap_or_default();
+        if is_recoverable_pause_reply(text) {
+            paused = true;
+            progressed = false;
+            continue;
+        }
+        if paused && completion_tool_result_succeeded(&message.content) {
+            progressed = true;
+        }
+    }
+    paused && !progressed
+}
+
+pub(in crate::ai::driver::turn_runtime) fn recoverable_pause_gate_action(
+    messages: &mut Vec<Message>,
+    turn_messages: &[Message],
+    force_final_response: bool,
+    iteration: usize,
+    max_iterations: usize,
+) -> RecoverablePauseGateAction {
+    if !recoverable_pause_unretried(turn_messages) {
+        return RecoverablePauseGateAction::Allow;
+    }
+    // One reopen per turn, shared with the other final gates: the caller passes
+    // `!final_gate_reopen_allowed` in and consumes the retry on Reopen, exactly
+    // as it does for `completion_evidence_gate_action`.
+    if current_turn_has_internal_marker(messages, RECOVERABLE_PAUSE_RETRY_MARKER)
+        || force_final_response
+        || iteration >= max_iterations
+    {
+        return RecoverablePauseGateAction::Warn;
+    }
+    messages.push(Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: serde_json::Value::String(RECOVERABLE_PAUSE_RETRY_NOTE.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+    RecoverablePauseGateAction::Reopen
+}

@@ -338,6 +338,32 @@ fn available_tools_not_active() -> Vec<(String, String)> {
     result
 }
 
+/// Every enable-able member of `group`, in registration order.
+///
+/// Membership comes from the `groups` array in `tool_descriptions/<tool>.json`,
+/// the same source the group-shortcut catalog line counts, so an expansion
+/// loads exactly what the catalog advertises.
+fn group_members(group: ToolGroup) -> Vec<String> {
+    let mut members = Vec::new();
+    for reg in inventory::iter::<ToolRegistration> {
+        let tags = crate::ai::tools::registry::tool_metadata::tool_groups(reg.spec.name);
+        if tags.contains(&ToolGroup::Builtin) && tags.contains(&group) {
+            members.push(reg.spec.name.to_string());
+        }
+    }
+    members
+}
+
+/// Whether a registered tool carries this exact name.
+///
+/// A name can be both a tool and a group shortcut (`task`); callers use this to
+/// notice the collision instead of silently resolving only one meaning.
+fn tool_is_registered(name: &str) -> bool {
+    inventory::iter::<ToolRegistration>
+        .into_iter()
+        .any(|reg| reg.spec.name == name)
+}
+
 fn execute_enable_tools(args: &Value) -> Result<String, String> {
     let operation = args["operation"]
         .as_str()
@@ -383,6 +409,31 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                     "Group shortcuts (a group name may be passed to 'enable'): {}",
                     parts.join(", ")
                 ));
+                // A shortcut name can also be a registered tool (`task`). Such a
+                // name never shows up in the enumeration above — either because
+                // it is active already or because 'enable' resolves it as the
+                // tool — so the model reads the reply as "this family is
+                // unavailable". The catalog is the last output before that call,
+                // so name the collision here.
+                let collided: Vec<&str> = group_counts
+                    .keys()
+                    .copied()
+                    .filter(|group| {
+                        // Only advertise a collision this context can act on: the
+                        // enumeration above is gated the same way, so naming a
+                        // shortcut that 'enable' would reject (subagent context,
+                        // hidden-group gate) only costs a wasted call.
+                        tool_is_registered(group)
+                            && subagent_may_enable_tool(group)
+                            && agent_may_enable_tool(group)
+                    })
+                    .collect();
+                if !collided.is_empty() {
+                    lines.push(format!(
+                        "Also registered tool names (enabling such a name loads the tool and expands the group): {}",
+                        collided.join(", ")
+                    ));
+                }
             }
             Ok(lines.join("\n"))
         }
@@ -396,45 +447,45 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
             if tool_names.is_empty() {
                 return Err("'tools' array is empty".to_string());
             }
-            // Group shortcuts: an entry that matches no registered tool but
-            // names a group expands to every enable-able tool carrying that
-            // tag. `builtin` is the enable-ability flag rather than a loadable
-            // unit and never expands, so a single entry can never dump the
-            // whole catalog; per-name enables stay the fine-grained path.
+            // Group shortcuts: an entry that names a group expands to every
+            // enable-able tool carrying that tag. `builtin` is the
+            // enable-ability flag rather than a loadable unit and never
+            // expands, so a single entry can never dump the whole catalog;
+            // per-name enables stay the fine-grained path. A name that is both
+            // a registered tool and a group (`task`) resolves both ways:
+            // answering a request for the family with "already active" for the
+            // tool alone reads as "the family is unavailable", so the reply
+            // names the collision and the expansion.
             let mut expanded_from_groups: Vec<(String, usize)> = Vec::new();
+            let mut collided_names: Vec<String> = Vec::new();
             let mut resolved_names: Vec<String> = Vec::new();
             for entry in tool_names {
-                let mut is_tool = false;
-                for reg in inventory::iter::<ToolRegistration> {
-                    if reg.spec.name == entry {
-                        is_tool = true;
-                        break;
-                    }
-                }
+                let is_tool = tool_is_registered(&entry);
+                let members: Vec<String> = ToolGroup::from_name(&entry)
+                    .filter(|group| {
+                        !group.is_enable_ability_flag() && group_visible_to_agent(*group)
+                    })
+                    .map(group_members)
+                    .unwrap_or_default();
                 if is_tool {
-                    resolved_names.push(entry);
+                    resolved_names.push(entry.clone());
+                }
+                if members.is_empty() {
+                    if !is_tool {
+                        // Not a tool and not a known group: keep as-is so the
+                        // existing unknown/MCP handling below reports it.
+                        resolved_names.push(entry);
+                    }
                     continue;
                 }
-                let mut members: Vec<String> = Vec::new();
-                if let Some(group) = ToolGroup::from_name(&entry)
-                    && !group.is_enable_ability_flag()
-                    && group_visible_to_agent(group)
-                {
-                    for reg in inventory::iter::<ToolRegistration> {
-                        let tags =
-                            crate::ai::tools::registry::tool_metadata::tool_groups(reg.spec.name);
-                        if tags.contains(&ToolGroup::Builtin) && tags.contains(&group) {
-                            members.push(reg.spec.name.to_string());
-                        }
-                    }
+                if is_tool {
+                    collided_names.push(entry.clone());
                 }
-                if !members.is_empty() {
-                    expanded_from_groups.push((entry.clone(), members.len()));
-                    resolved_names.extend(members);
-                } else {
-                    // Not a tool and not a known group: keep as-is so the
-                    // existing unknown/MCP handling below reports it.
-                    resolved_names.push(entry);
+                expanded_from_groups.push((entry.clone(), members.len()));
+                for member in members {
+                    if !resolved_names.contains(&member) {
+                        resolved_names.push(member);
+                    }
                 }
             }
             let tool_names = resolved_names;
@@ -448,8 +499,10 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                 .filter(|name| !agent_may_enable_tool(name))
                 .cloned()
                 .collect();
-            // 一次写锁内完成读 active/known_mcp + 写 pending_enable/pending_mcp_enable
-            // + mark_explicitly_enabled，避免多次锁切换造成的状态拼接错位。
+            // Read active/known_mcp and write pending_enable/pending_mcp_enable
+            // plus mark_explicitly_enabled inside a single write lock: building
+            // the reply across several lock acquisitions can interleave with
+            // another turn's state and splice mismatched halves together.
             let mut known_builtin: Vec<&str> = Vec::new();
             for reg in inventory::iter::<ToolRegistration> {
                 if registration_may_be_dynamically_enabled(reg) {
@@ -518,6 +571,12 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
             mark_explicitly_enabled_tools(&mut s, owner, &explicitly_requested);
             drop(s);
             let mut msg = Vec::new();
+            if !collided_names.is_empty() {
+                msg.push(format!(
+                    "Name is both a tool and a group shortcut (resolved both ways): {}",
+                    collided_names.join(", ")
+                ));
+            }
             if !to_enable.is_empty() {
                 msg.push(format!(
                     "Enabled {} tool(s): {}. They will be available in your next call.",
@@ -677,6 +736,62 @@ mod tests {
             listed.contains("skills(") && listed.contains("task("),
             "{listed}"
         );
+    }
+
+    #[test]
+    fn tool_name_that_is_also_a_group_shortcut_resolves_both_ways() {
+        // `task` names both a registered tool and a group. Resolving the name as
+        // the tool alone answers a request for the family with "already active"
+        // while the rest of the family stays unloaded, which reads as "this
+        // family is unavailable"; the name must load the tool and expand the
+        // group, and the reply must state which of the two happened.
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_state_for_tests();
+        set_active_tool_names(vec!["enable_tools".to_string(), "task".to_string()]);
+
+        let listed = execute_enable_tools(&json!({"operation": "list"})).unwrap();
+        assert!(
+            !listed.contains("  - task:"),
+            "a loaded tool is not part of the available enumeration: {listed}"
+        );
+        assert!(
+            listed.contains(
+                "Also registered tool names (enabling such a name loads the tool and expands the group): task"
+            ),
+            "the catalog must still disclose the collision: {listed}"
+        );
+
+        let enabled =
+            execute_enable_tools(&json!({"operation": "enable", "tools": ["task"]})).unwrap();
+        assert!(
+            enabled.contains("Name is both a tool and a group shortcut (resolved both ways): task"),
+            "{enabled}"
+        );
+        assert!(
+            enabled.contains("Expanded group shortcut(s): task (11 tools)"),
+            "{enabled}"
+        );
+        assert!(
+            enabled.contains(
+                "Already active (already in this turn's tool set, call it directly): task"
+            ),
+            "{enabled}"
+        );
+        // 11 group members minus the already-loaded `task` itself, each once.
+        assert!(enabled.contains("Enabled 10 tool(s)"), "{enabled}");
+        for name in [
+            "task_audit",
+            "task_evidence_read",
+            "task_retry",
+            "send_side_note",
+        ] {
+            assert!(
+                enabled.contains(name),
+                "{name} must load with the group: {enabled}"
+            );
+        }
     }
 
     #[test]

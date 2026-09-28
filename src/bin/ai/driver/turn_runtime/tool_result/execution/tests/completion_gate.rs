@@ -136,6 +136,136 @@ fn completion_evidence_gate_reopens_once_then_warns_on_second_final() {
 }
 
 #[test]
+fn recoverable_pause_gate_reopens_the_turn_until_the_paused_call_is_retried() {
+    // A paused mutation is recoverable: the runtime removes the blocker on the
+    // next model step, so a final that only announces the retry leaves the
+    // requested action unperformed. The completion gate cannot see this state
+    // (a paused call mutates nothing), so the pause needs its own one-time
+    // reopen — and its own warning once the reopen budget is spent.
+    let paused_call = test_tool_call(
+        "call_pause",
+        "execute_command",
+        serde_json::json!({"command": "git add src/lib.rs && git commit -m x", "pty": false}),
+    );
+    let pause_result = rejected_tool_call_message(
+        "execute_command",
+        ToolCallRejectionReason::ScopedInstructionsNeedReload(vec![std::path::PathBuf::from(
+            "/tmp/project/src/lib.rs",
+        )]),
+    );
+    let evidence_messages = vec![
+        assistant_tool_call_message(paused_call),
+        tool_result_message("call_pause", &pause_result),
+    ];
+    let mut app = test_app_with_tools(&["execute_command"]);
+    let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+    let mut messages = evidence_messages.clone();
+    let mut turn_messages = evidence_messages.clone();
+    let mut persisted_turn_messages = 0usize;
+    let mut final_assistant_text = String::new();
+    let mut final_assistant_recorded = false;
+    let mut force_final_response = false;
+    let mut terminal_dedupe_candidate = None;
+    let mut turn_had_tool_error = false;
+
+    let final_response = || {
+        IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+            outcome: crate::ai::types::StreamOutcome::Completed,
+            assistant_text: "Preflight wants the instruction documents loaded; I will retry the commit next round.".to_string(),
+            skip_response_drain: true,
+            ..Default::default()
+        })
+    };
+
+    let first_step = handle_iteration_execution(
+        &mut app,
+        "commit the change",
+        &mcp_snapshot(&shared_mcp),
+        &shared_mcp,
+        final_response(),
+        &mut messages,
+        &mut turn_messages,
+        false,
+        &mut persisted_turn_messages,
+        &mut final_assistant_text,
+        &mut final_assistant_recorded,
+        &mut force_final_response,
+        &mut terminal_dedupe_candidate,
+        false,
+        2,
+        16,
+        0,
+        &mut turn_had_tool_error,
+    )
+    .unwrap();
+
+    assert!(
+        matches!(first_step, TurnLoopStep::Continue),
+        "a paused call must be retried before the turn may end"
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| {
+                message.role == ROLE_INTERNAL_NOTE
+                    && message
+                        .content
+                        .as_str()
+                        .is_some_and(|text| text.starts_with(RECOVERABLE_PAUSE_RETRY_MARKER))
+            })
+            .count(),
+        1
+    );
+
+    let second_step = handle_iteration_execution(
+        &mut app,
+        "commit the change",
+        &mcp_snapshot(&shared_mcp),
+        &shared_mcp,
+        final_response(),
+        &mut messages,
+        &mut turn_messages,
+        false,
+        &mut persisted_turn_messages,
+        &mut final_assistant_text,
+        &mut final_assistant_recorded,
+        &mut force_final_response,
+        &mut terminal_dedupe_candidate,
+        false,
+        3,
+        16,
+        0,
+        &mut turn_had_tool_error,
+    )
+    .unwrap();
+
+    assert!(matches!(second_step, TurnLoopStep::Break));
+    assert!(
+        final_assistant_text.ends_with(RECOVERABLE_PAUSE_WARNING),
+        "{final_assistant_text}"
+    );
+
+    // A tool result that merely quotes the pause sentence is not a pause: these
+    // prefixes are source text in this repository, so a read of the rejection
+    // module reproduces them verbatim and must not fabricate a reopen.
+    let quoted = vec![
+        assistant_tool_call_message(test_tool_call(
+            "call_read",
+            "read_file",
+            serde_json::json!({"file_path": "/repo/src/bin/ai/driver/turn_runtime/tool_result/execution/rejection.rs"}),
+        )),
+        tool_result_message(
+            "call_read",
+            "70\tpub(in crate::ai::driver::turn_runtime) const SCOPED_INSTRUCTIONS_PAUSE_PREFIX: &str =\n71\t    \"was paused before execution because target-scoped project instructions were not loaded yet\";",
+        ),
+    ];
+    assert_eq!(
+        recoverable_pause_gate_action(&mut messages, &quoted, false, 4, 16),
+        RecoverablePauseGateAction::Allow
+    );
+}
+
+#[test]
 fn completion_evidence_gate_allows_unrecognized_post_mutation_activity_silently() {
     // The model verified after the mutation only with commands the classifier cannot
     // recognize (python3 scripts): there is real post-mutation activity but no

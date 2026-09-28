@@ -62,6 +62,16 @@ pub(in crate::ai::driver::turn_runtime) fn reject_tool_calls(
     }
 }
 
+/// Stable lead of the recoverable pre-execution pauses.
+///
+/// The final-response gate detects "a paused call that was never retried" from
+/// the tool record, so it must recognize these replies by text; the message
+/// builders and that matcher read the same constants so the two cannot drift.
+pub(in crate::ai::driver::turn_runtime) const SCOPED_INSTRUCTIONS_PAUSE_PREFIX: &str =
+    "was paused before execution because target-scoped project instructions were not loaded yet";
+pub(in crate::ai::driver::turn_runtime) const PATCH_RETRY_PAUSE_PREFIX: &str =
+    "apply_patch retry blocked";
+
 pub(in crate::ai::driver::turn_runtime) fn rejected_tool_call_message(
     tool_name: &str,
     reason: ToolCallRejectionReason,
@@ -72,19 +82,37 @@ pub(in crate::ai::driver::turn_runtime) fn rejected_tool_call_message(
 Do not call '{tool_name}' again; instead summarize confirmed facts, answer what you can, and explain the remaining work / blockers / next steps."
         ),
         ToolCallRejectionReason::PatchRetryNeedsFreshRead => format!(
-            "Error: apply_patch retry blocked. The previous patch for this file failed with `ambiguous patch`, so the matched text was not unique. \
+            "Error: {PATCH_RETRY_PAUSE_PREFIX}. The previous patch for this file failed with `ambiguous patch`, so the matched text was not unique. \
 Do NOT retry patches in this batch — doing so will only fail again. Required recovery steps: (1) call `read_file` on the SAME target path with use_line_numbers=false to get the current raw file content (no line-number prefixes, so you can copy exact text into the patch); (2) copy context lines DIRECTLY from that fresh output, including function names or distinctive surrounding lines to ensure each hunk matches exactly ONE location; (3) call `apply_patch` only in a LATER tool round after you have successfully read the file."
         ),
-        ToolCallRejectionReason::ScopedInstructionsNeedReload(targets) => format!(
-            "Error: '{tool_name}' was paused before execution because target-scoped project instructions were not loaded yet. \
-Missing instruction documents: {}\n\
-No file was changed. The runtime will add the applicable instruction documents on the next model step. Review those rules, then retry the mutation in a later tool round; do not repeat it in this batch.",
-            targets
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        ToolCallRejectionReason::ScopedInstructionsNeedReload(targets) => {
+            let joined = |items: Vec<String>| items.join(", ");
+            let target_list = joined(
+                targets
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
+            );
+            // The pause is decided on the mutation targets, but the rules the
+            // model is asked to review live in the instruction documents those
+            // targets resolve to. Labelling the targets themselves as
+            // "instruction documents" sends the caller looking for rules inside
+            // the source file it was about to commit, so name each list for what
+            // it is.
+            let docs = crate::ai::agents::load_scoped_project_instruction_docs_for_targets(&targets);
+            let doc_line = if docs.is_empty() {
+                String::new()
+            } else {
+                let doc_list = joined(docs.iter().map(|doc| doc.path.clone()).collect::<Vec<_>>());
+                format!("Applicable instruction documents: {doc_list}\n")
+            };
+            format!(
+                "Error: '{tool_name}' {SCOPED_INSTRUCTIONS_PAUSE_PREFIX}. \
+Paused target(s): {target_list}\n\
+{doc_line}\
+No file was changed. The runtime will add the applicable instruction documents on the next model step. Review those rules, then retry the mutation in a later tool round; do not repeat it in this batch."
+            )
+        }
     }
 }
 
