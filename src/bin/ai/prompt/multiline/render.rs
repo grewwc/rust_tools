@@ -647,38 +647,72 @@ fn count_trailing_blank_lines(lines: &[String]) -> usize {
         .count()
 }
 
+/// Truncate a line to `max_width` display columns, ending a cut with `…`.
+///
+/// The marker is reserved before the text is measured, so a marked row never
+/// paints wider than `max_width` (the budget `MODEL_LINE_MAX_COLUMNS` enforces
+/// for reflow safety). Without it the trailing field is cut mid-phrase and
+/// reads as a typo instead of as clipped text: the session title stops at a
+/// character the user cannot tell apart from a truncated word.
 fn truncate_line_to_width<'a>(line: &Line<'a>, max_width: usize) -> Line<'a> {
     if max_width == 0 {
         return Line::default();
     }
+    let total_width = line
+        .spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width_cjk(span.content.as_ref()))
+        .sum::<usize>();
+    if total_width <= max_width {
+        return line.clone();
+    }
+    // Measure the marker with the same width table as the text it replaces, so
+    // the reservation can never disagree with the line's own column accounting.
+    let ellipsis = "…";
+    let ellipsis_width = UnicodeWidthStr::width_cjk(ellipsis);
+    // A row too narrow for text plus marker is cut hard: overflowing the budget
+    // is worse than an unmarked cut.
+    let reserve = if max_width > ellipsis_width {
+        ellipsis_width
+    } else {
+        0
+    };
+    let budget = max_width - reserve;
     let mut current_width = 0;
     let mut truncated_spans = Vec::new();
+    let mut cut_style = None;
 
     for span in &line.spans {
         let span_str = span.content.as_ref();
         let span_w = UnicodeWidthStr::width_cjk(span_str);
-        if current_width + span_w <= max_width {
+        if current_width + span_w <= budget {
             truncated_spans.push(span.clone());
             current_width += span_w;
-        } else {
-            let remaining = max_width.saturating_sub(current_width);
-            if remaining > 0 {
-                let mut partial = String::new();
-                let mut w = 0;
-                for ch in span_str.chars() {
-                    let ch_w = UnicodeWidthChar::width_cjk(ch).unwrap_or(1);
-                    if w + ch_w > remaining {
-                        break;
-                    }
-                    partial.push(ch);
-                    w += ch_w;
-                }
-                if !partial.is_empty() {
-                    truncated_spans.push(Span::styled(partial, span.style));
-                }
-            }
-            break;
+            continue;
         }
+        let remaining = budget.saturating_sub(current_width);
+        if remaining > 0 {
+            let mut partial = String::new();
+            let mut w = 0;
+            for ch in span_str.chars() {
+                let ch_w = UnicodeWidthChar::width_cjk(ch).unwrap_or(1);
+                if w + ch_w > remaining {
+                    break;
+                }
+                partial.push(ch);
+                w += ch_w;
+            }
+            if !partial.is_empty() {
+                truncated_spans.push(Span::styled(partial, span.style));
+            }
+        }
+        cut_style = Some(span.style);
+        break;
+    }
+    if reserve > 0 {
+        // Inherit the style of the span carrying the cut, so the marker reads as
+        // part of the clipped field rather than as a separate one.
+        truncated_spans.push(Span::styled(ellipsis, cut_style.unwrap_or_default()));
     }
 
     Line::from(truncated_spans)
@@ -779,14 +813,21 @@ mod tests {
             Span::styled("glm-5.2-super-relay", Style::default().fg(Color::Green)),
             Span::styled(" | reasoning: max", Style::default().fg(Color::Blue)),
         ]);
+        // Reserving the marker's columns shows one character less than an
+        // unmarked hard cut would within the same budget.
         let truncated = truncate_line_to_width(&line, 10);
         let rendered_text = truncated
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect::<String>();
-        assert_eq!(rendered_text, "model: glm");
+        assert_eq!(rendered_text, "model: g…");
         assert_eq!(display_width(&rendered_text), 10);
+        assert_eq!(
+            truncated.spans.last().map(|span| span.style),
+            Some(Style::default().fg(Color::Green)),
+            "the marker belongs to the clipped span"
+        );
     }
 
     #[test]
@@ -898,12 +939,99 @@ mod tests {
         // The model line is the row above the help row, which is the viewport tail.
         let model_row_y = viewport_area.bottom() - 2;
         let row = buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
-        let painted = row.trim_end().len();
+        // The reflow budget counts terminal columns, not bytes: the marker is a
+        // two-column glyph that costs three bytes.
+        let painted = display_width(row.trim_end());
         assert!(row.contains("reasoning: max"));
         assert!(
             painted <= popup_x as usize + 1 + MODEL_LINE_MAX_COLUMNS as usize,
             "model line painted {painted} columns: {row:?}"
         );
+    }
+
+    /// The session title is the trailing field of the model line and the only
+    /// one that can exceed the reflow budget. A hard cut leaves a partial CJK
+    /// phrase that reads as a typo, so the row has to end with the marker.
+    #[test]
+    fn model_line_marks_a_truncated_topic_with_an_ellipsis() {
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(200, 12),
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .unwrap();
+        let mut textarea = TextArea::default();
+        let topic = "排查模型频繁中断并自称不能做";
+        let mut viewport_area = Rect::ZERO;
+
+        terminal
+            .draw(|f| {
+                viewport_area = f.area();
+                render_multiline_popup(
+                    f,
+                    &mut textarea,
+                    None,
+                    None,
+                    "deepseek-v4.1-flash-volcano",
+                    "max",
+                    Some(topic),
+                );
+            })
+            .unwrap();
+
+        // The model line is the row above the help row, which is the viewport tail.
+        let model_row_y = viewport_area.bottom() - 2;
+        let row = buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
+        // Cells holding a wide character exist per column, so compare the row
+        // with its whitespace removed instead of as a contiguous substring.
+        let dense: String = row.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(row.contains('…'), "truncated topic without a marker: {row:?}");
+        // The 59-column prefix leaves 21 columns of the 80-column cap: ten title
+        // characters fit, and the marker takes the twenty-first column.
+        assert!(dense.ends_with("|排查模型频繁中断并…"), "{row:?}");
+        assert!(
+            !dense.contains("不能做"),
+            "model line paints past its budget: {row:?}"
+        );
+    }
+
+    #[test]
+    fn truncate_line_to_width_keeps_the_marker_inside_the_budget() {
+        let line = Line::from(vec![
+            Span::raw(" model: deepseek-v4.1-flash-volcano  |  reasoning: max  |  "),
+            Span::raw("排查模型频繁中断并自称不能做"),
+        ]);
+        let rendered = |max_width: usize| -> String {
+            truncate_line_to_width(&line, max_width)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+
+        let truncated = rendered(MODEL_LINE_MAX_COLUMNS as usize);
+        assert!(truncated.ends_with('…'), "{truncated}");
+        assert!(!truncated.contains("不能做"), "{truncated}");
+        assert!(
+            display_width(&truncated) <= MODEL_LINE_MAX_COLUMNS as usize,
+            "painted {} columns: {truncated}",
+            display_width(&truncated)
+        );
+
+        // A budget too narrow for text plus marker is cut hard, never overflowed.
+        assert_eq!(display_width(&rendered(1)), 1);
+    }
+
+    #[test]
+    fn truncate_line_to_width_keeps_lines_that_already_fit() {
+        let line = Line::from(vec![Span::raw(" model: m  |  "), Span::raw("topic")]);
+        let kept: String = truncate_line_to_width(&line, MODEL_LINE_MAX_COLUMNS as usize)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(kept, " model: m  |  topic");
     }
 
     #[test]
