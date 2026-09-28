@@ -201,8 +201,17 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
                 "expected read_file recall archive path after mid-turn compression: {compressed:#?}"
             )
         });
-    let archived = std::fs::read(file_path).unwrap_or_else(|e| {
-        panic!("overflow file referenced by recall anchor should exist: {file_path}: {e}")
+    // Shortened stubs carry only the archive file name; resolve it against the
+    // temp overflow dir (see `stub_archive_display_path`).
+    let archive_path = if std::path::Path::new(file_path).is_absolute() {
+        std::path::PathBuf::from(file_path)
+    } else {
+        overflow_dir
+            .join(super::super::history::compress::PRESERVED_TOOL_OVERFLOW_DIR)
+            .join(file_path)
+    };
+    let archived = std::fs::read(&archive_path).unwrap_or_else(|e| {
+        panic!("overflow file referenced by recall anchor should exist: {archive_path:?}: {e}")
     });
     assert!(
         archived.len() >= 8000,

@@ -704,7 +704,7 @@ fn path_c_spills_all_protected_precision_groups_without_recent_group_cap() {
             .lines()
             .find_map(|line| line.strip_prefix("- file_path: "))
             .expect("minimal overflow stub must retain file_path");
-        assert!(Path::new(file_path).is_file());
+        assert!(resolve_stub_archive_path(file_path, &overflow_dir).is_file());
         assert!(!stub.contains("Preview ("));
     }
     assert!(super::messages_total_chars(&messages) <= 4_000);
@@ -753,7 +753,12 @@ fn path_c_reuses_reread_session_asset_instead_of_rearchiving_it() {
         .lines()
         .find_map(|line| line.trim_start().strip_prefix("- file_path: "))
         .expect("reused stub must retain the existing archive pointer");
-    assert_eq!(Path::new(file_path), archive_path.canonicalize().unwrap());
+    assert_eq!(
+        resolve_stub_archive_path(file_path, &overflow_dir)
+            .canonicalize()
+            .unwrap(),
+        archive_path.canonicalize().unwrap()
+    );
     assert!(stub.contains("- original_range: lines=1..10000"));
     assert_eq!(std::fs::read_dir(&archive_dir).unwrap().count(), 1);
     assert_eq!(std::fs::read_to_string(&archive_path).unwrap(), content);
@@ -803,6 +808,11 @@ fn path_c_snapshots_mutable_session_temp_asset_instead_of_reusing_it() {
         .find_map(|line| line.trim_start().strip_prefix("- file_path: "))
         .map(PathBuf::from)
         .expect("mutable session file must be snapshotted into an overflow archive");
+    let snapshot_path = if snapshot_path.is_absolute() {
+        snapshot_path
+    } else {
+        overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR).join(snapshot_path)
+    };
     assert_ne!(snapshot_path, temp_path.canonicalize().unwrap());
     assert!(snapshot_path.starts_with(overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR)));
     assert_eq!(std::fs::read_to_string(&snapshot_path).unwrap(), content);
@@ -842,7 +852,10 @@ fn path_c_spills_aggregated_task_wait_result_losslessly() {
         .lines()
         .find_map(|line| line.trim_start().strip_prefix("- file_path: "))
         .expect("overflow stub 必须保留可召回的 file_path 指针");
-    assert!(Path::new(file_path.trim()).is_file(), "外溢原文必须落盘");
+    assert!(
+        resolve_stub_archive_path(file_path, &overflow_dir).is_file(),
+        "外溢原文必须落盘"
+    );
     let _ = std::fs::remove_dir_all(overflow_dir);
 }
 
@@ -881,6 +894,18 @@ fn user_msg(text: &str) -> Message {
 
 /// Builds a stub in its "first spill" shape (with a multi-line Preview
 /// body), for fold testing.
+/// Resolves a stub `- file_path:` value to an on-disk archive path: absolute
+/// (legacy) stubs directly, shortened bare names against the temp overflow dir
+/// (see `stub_archive_display_path`).
+fn resolve_stub_archive_path(raw: &str, overflow_dir: &std::path::Path) -> std::path::PathBuf {
+    let raw = raw.trim();
+    let path = std::path::Path::new(raw);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR).join(raw)
+}
+
 fn overflow_stub_with_preview(file_path: &str, tool_name: &str) -> String {
     let full = (0..40)
         .map(|i| format!("line {i}: some content"))
@@ -1123,5 +1148,69 @@ fn cap_no_oversized_returns_zero_and_keeps_messages_unchanged() {
     assert_eq!(capped, 0);
     assert!(!is_preserved_tool_overflow_stub(&value_to_string(&messages[2].content)));
     assert!(!is_preserved_tool_overflow_stub(&value_to_string(&messages[5].content)));
+    let _ = std::fs::remove_dir_all(&overflow_dir);
+}
+
+#[test]
+fn shortened_stub_carries_bare_archive_name_for_session_archives() {
+    // Archive children must drop the long repeating session directory prefix;
+    // any other layout keeps the full path so read-back never breaks.
+    let archive_child = std::path::Path::new("/sessions/abc.assets")
+        .join(PRESERVED_TOOL_OVERFLOW_DIR)
+        .join("spilled-read_file-deadbeef12345678.txt");
+    assert_eq!(
+        super::tool_overflow::stub_archive_display_path(&archive_child),
+        "spilled-read_file-deadbeef12345678.txt"
+    );
+    let plain = std::path::PathBuf::from("/tmp/result.txt");
+    assert_eq!(
+        super::tool_overflow::stub_archive_display_path(&plain),
+        "/tmp/result.txt"
+    );
+    // A directory merely named like the archive dir elsewhere still shortens
+    // (names are content-addressed); resolution safety lives in the reader.
+    let stub = super::tool_overflow::build_preserved_tool_overflow_stub(
+        &archive_child,
+        "read_file",
+        "line\n".repeat(50).as_str(),
+        &[],
+    );
+    assert!(stub.contains("- file_path: spilled-read_file-deadbeef12345678.txt"));
+    assert!(!stub.contains("/sessions/abc.assets"));
+}
+
+#[test]
+fn archived_asset_reuse_accepts_shortened_bare_names_safely() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-bare-name-reuse-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    let archived = archive_dir.join("spilled-read_file-aaaaaaaaaaaaaaaa.txt");
+    std::fs::write(&archived, "evidence\n").unwrap();
+    let canonical = archived.canonicalize().unwrap();
+
+    // Legacy absolute stubs keep working.
+    assert_eq!(
+        super::tool_overflow::archived_asset_path_from_raw(&canonical.to_string_lossy(), &overflow_dir),
+        Some(canonical.clone())
+    );
+    // Shortened bare names resolve under this session's overflow dir.
+    assert_eq!(
+        super::tool_overflow::archived_asset_path_from_raw("spilled-read_file-aaaaaaaaaaaaaaaa.txt", &overflow_dir),
+        Some(canonical)
+    );
+    // Traversal, absolute outsiders, and missing files stay rejected.
+    assert_eq!(super::tool_overflow::archived_asset_path_from_raw("../evil.txt", &overflow_dir), None);
+    assert_eq!(
+        super::tool_overflow::archived_asset_path_from_raw("sub/dir.txt", &overflow_dir),
+        None
+    );
+    assert_eq!(super::tool_overflow::archived_asset_path_from_raw("/tmp/elsewhere.txt", &overflow_dir), None);
+    assert_eq!(
+        super::tool_overflow::archived_asset_path_from_raw("spilled-missing-bbbbbbbbbbbbbbbb.txt", &overflow_dir),
+        None
+    );
     let _ = std::fs::remove_dir_all(&overflow_dir);
 }

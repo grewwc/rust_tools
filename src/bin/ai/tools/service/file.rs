@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::ai::tools::common::ToolStreamWriter;
-use crate::ai::tools::storage::file_store::{FileStore, is_read_file_overflow_artifact};
+use crate::ai::tools::storage::file_store::{
+    FileStore, current_session_assets_dir, is_read_file_overflow_artifact,
+    session_overflow_asset_for_bare_name,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RenderedLineExcerpt {
@@ -189,6 +192,15 @@ fn resolve_file_path_arg(args: &Value) -> Result<&str, String> {
         .ok_or_else(|| "Missing file_path".to_string())
 }
 
+/// Resolves a bare archive file name from a shortened overflow stub against the
+/// current session's `tool-overflow-compressed` dir. Returns `None` when there
+/// is no driver session context or the name is not a bare file name; the caller
+/// then falls back to the original store (and its original error).
+fn current_session_overflow_asset(file_path: &str) -> Option<PathBuf> {
+    let assets = current_session_assets_dir()?;
+    session_overflow_asset_for_bare_name(file_path, &assets)
+}
+
 /// Normalizes file_path when temp=true: rejects absolute paths and out-of-bounds parent references, keeping only the file name.
 ///
 /// This avoids `PathBuf::join` replacing the whole base when given an absolute path, writing the file into the
@@ -216,6 +228,18 @@ fn emit_stream_line(on_chunk: &mut ToolStreamWriter<'_>, line: &str) {
 pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
     let file_path = resolve_file_path_arg(args)?;
     let store = FileStore::new(PathBuf::from(file_path));
+    // Shortened overflow stubs carry only the archive file name (no session
+    // directory prefix), which does not resolve under effective_cwd. Retry such
+    // bare names against the current session's `tool-overflow-compressed` dir;
+    // every other input keeps its original resolution and error behavior.
+    let store = if store.ensure_exists().is_err() {
+        match current_session_overflow_asset(file_path).map(FileStore::new) {
+            Some(candidate) if candidate.ensure_exists().is_ok() => candidate,
+            _ => store,
+        }
+    } else {
+        store
+    };
     store.validate_read_access().map_err(|e| e.to_string())?;
     store.ensure_exists().map_err(|e| e.to_string())?;
     if crate::ai::files::is_image_path(file_path) {

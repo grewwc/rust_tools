@@ -660,6 +660,46 @@ pub(crate) fn current_session_assets_dir() -> Option<PathBuf> {
     )
 }
 
+/// Whether `raw` is a bare file name: a single relative path component with no
+/// directory parts.
+///
+/// Shortened overflow stubs carry only the archive file name instead of the
+/// absolute session path (the directory prefix repeats verbatim across hundreds
+/// of stubs while carrying no per-stub information). A bare name cannot
+/// traverse directories, so resolving it against a known session asset dir is
+/// safe; anything else must keep the original resolution rules.
+pub(crate) fn is_bare_file_name(raw: &str) -> bool {
+    if raw.is_empty() {
+        return false;
+    }
+    let path = Path::new(raw);
+    path.is_relative()
+        && path.file_name().is_some()
+        && path
+            .parent()
+            .is_none_or(|parent| parent.as_os_str().is_empty())
+}
+
+/// Resolves a bare archive file name against `<session_assets>/tool-overflow-compressed`.
+///
+/// Pure join with no existence check: callers apply their own canonicalization /
+/// existence / boundary checks so read-back and compression-reuse keep their
+/// existing guarantees. Returns `None` for anything that is not a bare file
+/// name (see [`is_bare_file_name`]).
+pub(crate) fn session_overflow_asset_for_bare_name(
+    name: &str,
+    session_assets: &Path,
+) -> Option<PathBuf> {
+    if !is_bare_file_name(name) {
+        return None;
+    }
+    Some(
+        session_assets
+            .join("tool-overflow-compressed")
+            .join(name),
+    )
+}
+
 fn blocked_overflow_read_reason(path: &Path) -> Option<String> {
     blocked_overflow_read_reason_for_assets(path, current_session_assets_dir().as_deref())
 }
@@ -898,6 +938,7 @@ mod tests {
         FileStore, blocked_overflow_read_reason_for_assets, is_read_file_overflow_artifact,
         is_sensitive_fs_path, is_session_overflow_asset_path, normalize_lexical,
         overflow_artifact_tool_name, path_within_allowed_roots, path_within_roots, remove_partial_create_file,
+        is_bare_file_name, session_overflow_asset_for_bare_name,
         temp_registry,
     };
     use crate::ai::test_support::ENV_LOCK;
@@ -962,6 +1003,30 @@ mod tests {
         assert!(is_sensitive_fs_path(Path::new("/home/u/.ssh/id_rsa")));
         assert!(is_sensitive_fs_path(Path::new("/home/u/.aws/credentials")));
         assert!(!is_sensitive_fs_path(Path::new("/home/u/proj/src/main.rs")));
+    }
+
+    #[test]
+    fn bare_file_name_detection_rejects_paths_with_directories() {
+        assert!(is_bare_file_name("spilled-read_file-deadbeef12345678.txt"));
+        assert!(!is_bare_file_name(""));
+        assert!(!is_bare_file_name("/tmp/spilled.txt"));
+        assert!(!is_bare_file_name("sub/dir.txt"));
+        assert!(!is_bare_file_name("../evil.txt"));
+        assert!(is_bare_file_name("a"));
+    }
+
+    #[test]
+    fn overflow_asset_join_stays_under_the_archive_dir() {
+        let assets = Path::new("/sessions/abc.assets");
+        assert_eq!(
+            session_overflow_asset_for_bare_name("spilled-x.txt", assets),
+            Some(assets.join("tool-overflow-compressed").join("spilled-x.txt"))
+        );
+        assert_eq!(session_overflow_asset_for_bare_name("../evil.txt", assets), None);
+        assert_eq!(
+            session_overflow_asset_for_bare_name("/tmp/spilled-x.txt", assets),
+            None
+        );
     }
 
     #[test]

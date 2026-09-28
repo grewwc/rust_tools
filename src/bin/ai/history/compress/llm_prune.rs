@@ -902,7 +902,15 @@ mod tests {
             .lines()
             .find_map(|line| line.trim().strip_prefix("- file_path: "))
             .expect("stub must carry an archived file_path");
-        let archived = std::fs::read_to_string(path_line.trim()).unwrap();
+        // Shortened stubs carry only the archive file name; resolve it against
+        // the temp overflow dir (see `stub_archive_display_path`).
+        let raw = path_line.trim();
+        let archived_path = if std::path::Path::new(raw).is_absolute() {
+            std::path::PathBuf::from(raw)
+        } else {
+            overflow_dir.join(super::super::PRESERVED_TOOL_OVERFLOW_DIR).join(raw)
+        };
+        let archived = std::fs::read_to_string(&archived_path).unwrap();
         assert!(archived.contains("very long outdated result that should be pruned"));
         // call_keep's content unchanged (count < threshold)
         assert_eq!(

@@ -520,8 +520,15 @@ fn folded_command_failure_keeps_diagnostics_and_full_output_pointer() {
         .lines()
         .find_map(|line| line.trim().strip_prefix("- file_path: "))
         .expect("folded command must retain a full-output file path");
+    // Shortened stubs carry only the archive file name; resolve it against the
+    // temp overflow dir (see `stub_archive_display_path`).
+    let archive_path = if std::path::Path::new(path).is_absolute() {
+        std::path::PathBuf::from(path)
+    } else {
+        overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR).join(path)
+    };
     assert_eq!(
-        std::fs::read_to_string(path).expect("archived command output should be readable"),
+        std::fs::read_to_string(&archive_path).expect("archived command output should be readable"),
         command_output
     );
 

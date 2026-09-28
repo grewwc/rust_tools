@@ -563,7 +563,7 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
     }
 
     let compressed =
-        compress_messages_for_context(messages, 20_000, 2, 400, Some(overflow_dir), None);
+        compress_messages_for_context(messages, 20_000, 2, 400, Some(overflow_dir.clone()), None);
 
     let stub = compressed
         .iter()
@@ -578,8 +578,17 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
         .lines()
         .find_map(|line| line.trim().strip_prefix("- file_path: "))
         .expect("stub should contain overflow file path");
+    // Shortened stubs carry only the archive file name; resolve it against the
+    // temp overflow dir (see `stub_archive_display_path`).
+    let archive_path = if std::path::Path::new(file_path).is_absolute() {
+        std::path::PathBuf::from(file_path)
+    } else {
+        overflow_dir
+            .join(super::super::history::compress::PRESERVED_TOOL_OVERFLOW_DIR)
+            .join(file_path)
+    };
     assert!(
-        std::path::Path::new(file_path).exists(),
+        archive_path.exists(),
         "overflow file path from stub should exist: {file_path}"
     );
     // The stub must keep a content preview as a recall anchor so later turns do not "forget".

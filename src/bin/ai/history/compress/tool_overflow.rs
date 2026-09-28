@@ -15,7 +15,10 @@ use serde_json::Value;
 use crate::ai::files::extract_key_lines;
 use crate::ai::{
     history::HistoryMessageSummarizer,
-    tools::{storage::file_store::FileStore, tool_history_policy},
+    tools::{
+        storage::file_store::{FileStore, is_bare_file_name},
+        tool_history_policy,
+    },
     types::App,
 };
 
@@ -649,7 +652,7 @@ fn preserved_tool_overflow_path_in_arguments(
 
 /// Validates that a raw path is a direct child of `tool-overflow-compressed`;
 /// both ends are canonicalized.
-fn archived_asset_path_from_raw(raw_path: &str, overflow_dir: &Path) -> Option<PathBuf> {
+pub(super) fn archived_asset_path_from_raw(raw_path: &str, overflow_dir: &Path) -> Option<PathBuf> {
     let preserved_dir = overflow_dir
         .join(PRESERVED_TOOL_OVERFLOW_DIR)
         .canonicalize()
@@ -657,14 +660,56 @@ fn archived_asset_path_from_raw(raw_path: &str, overflow_dir: &Path) -> Option<P
     // Must share the same relative-path resolution rules as read_file;
     // canonicalizing directly would wrongly anchor at the process cwd and
     // ignore the subagent's effective_cwd.
-    let source_path = FileStore::new(PathBuf::from(raw_path))
+    let reused = FileStore::new(PathBuf::from(raw_path))
         .path()
         .canonicalize()
-        .ok()?;
-    if !source_path.is_file() || source_path.parent() != Some(preserved_dir.as_path()) {
+        .ok()
+        .filter(|source| source.is_file() && source.parent() == Some(preserved_dir.as_path()));
+    if reused.is_some() {
+        return reused;
+    }
+    // Shortened stubs carry only the archive file name (no session directory
+    // prefix). Resolve it directly under this session's overflow dir with the
+    // same canonicalization + direct-child checks as the absolute path above.
+    archived_asset_bare_name_from_raw(raw_path, &preserved_dir)
+}
+
+/// Short display form for the archive path carried by a tool overflow stub.
+///
+/// Archive files are direct children of `<session>.assets/tool-overflow-compressed/`
+/// with content-addressed unique names, so the directory prefix repeats verbatim
+/// across hundreds of stubs while carrying no per-stub information. Emit only
+/// the file name in that case; `read_file` (plus the compression reuse check
+/// above) resolves bare names against the current session's overflow dir. Any
+/// other layout keeps the full path so read-back never breaks.
+pub(super) fn stub_archive_display_path(path: &Path) -> String {
+    let is_session_archive_child = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        == Some(PRESERVED_TOOL_OVERFLOW_DIR);
+    if is_session_archive_child
+        && let Some(name) = path.file_name().and_then(|name| name.to_str())
+    {
+        return name.to_string();
+    }
+    path.to_string_lossy().into_owned()
+}
+
+/// Resolves a bare archive file name (emitted by shortened stubs) against an
+/// already-canonicalized `tool-overflow-compressed` dir. The single-component
+/// guard rules out `..`/separators, and the canonical parent check keeps
+/// symlinks from crossing the boundary — same guarantees as the absolute path
+/// above. Returns `None` for anything else, preserving the old behavior.
+fn archived_asset_bare_name_from_raw(raw_path: &str, preserved_dir: &Path) -> Option<PathBuf> {
+    if !is_bare_file_name(raw_path) {
         return None;
     }
-    Some(source_path)
+    let canonical = preserved_dir.join(raw_path).canonicalize().ok()?;
+    if !canonical.is_file() || canonical.parent() != Some(preserved_dir) {
+        return None;
+    }
+    Some(canonical)
 }
 
 /// Recognizes paths that "read this session's archived asset" inside the
@@ -893,6 +938,7 @@ pub(super) fn build_preserved_tool_overflow_stub(
     full_content: &str,
     recall_lines: &[String],
 ) -> String {
+    let archive_display = stub_archive_display_path(path);
     // The full text is still spilled to disk to control context size, but the
     // stub keeps a head+tail preview so later turns own a "recall anchor" — the
     // model can judge whether it really needs to read_file again, avoiding the
@@ -907,7 +953,7 @@ pub(super) fn build_preserved_tool_overflow_stub(
         "{PRESERVED_TOOL_OVERFLOW_STUB_PREFIX}\n\
          Output preserved for tool `{tool_name}` (context-budget fold). Full historical result saved to session asset:\n\
          - file_path: {}",
-        path.display(),
+        archive_display,
     );
     if let Some(fingerprint) = stub_fingerprint_line(full_content) {
         out.push('\n');
