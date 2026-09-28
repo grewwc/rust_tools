@@ -28,7 +28,15 @@ const COMPLETION_WINDOW: usize = 12;
 /// only: the row also carries the centered popup's left offset, which is 1-2
 /// columns up to ~182-column terminals and grows by one column per two columns
 /// of terminal width beyond that.
-const MODEL_LINE_MAX_COLUMNS: u16 = 80;
+///
+/// 120 was chosen over the original 80 so a typical session title (~15 CJK
+/// characters = ~30 columns after the 59-column prefix) renders in full: the
+/// trade-off is that the no-reflow floor rises from ~82 to ~122 terminal
+/// columns, so an IDE terminal narrowed below 122 columns re-wraps this one
+/// row once (transcript shifts up a line until the next repaint). That is the
+/// explicit cost of showing longer titles; keep this number as low as the
+/// longest title users actually need.
+const MODEL_LINE_MAX_COLUMNS: u16 = 120;
 
 /// Styles only cells occupied by input text.
 ///
@@ -939,13 +947,23 @@ mod tests {
         // The model line is the row above the help row, which is the viewport tail.
         let model_row_y = viewport_area.bottom() - 2;
         let row = buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
-        // The reflow budget counts terminal columns, not bytes: the marker is a
-        // two-column glyph that costs three bytes.
+        // The reflow budget counts terminal columns, not bytes: U+2026 is
+        // East-Asian-ambiguous, so width_cjk charges it two columns even though
+        // it costs three bytes.
         let painted = display_width(row.trim_end());
         assert!(row.contains("reasoning: max"));
         assert!(
             painted <= popup_x as usize + 1 + MODEL_LINE_MAX_COLUMNS as usize,
             "model line painted {painted} columns: {row:?}"
+        );
+        // The real reflow invariant: the row's right edge must never cross the
+        // terminal width. The popup is centered and the line is capped, so the
+        // right edge lands at popup_x + 1 + min(popup_width - 2, cap), which is
+        // always at most one column short of the terminal width. Asserting it
+        // directly guards future cap increases that would re-wrap on narrowing.
+        assert!(
+            painted as u16 <= viewport_area.width,
+            "model line crosses the terminal width: {row:?}"
         );
     }
 
@@ -954,6 +972,60 @@ mod tests {
     /// phrase that reads as a typo, so the row has to end with the marker.
     #[test]
     fn model_line_marks_a_truncated_topic_with_an_ellipsis() {
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(200, 12),
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .unwrap();
+        let mut textarea = TextArea::default();
+        // 31 full-width characters = 62 columns, one past the 61 columns the
+        // 120-column budget leaves for the topic (59-column prefix, one column
+        // reserved for the marker).
+        let topic = "这是一个用于验证超长会话标题在模型行中被截断并标记省略号的测试";
+        let mut viewport_area = Rect::ZERO;
+
+        terminal
+            .draw(|f| {
+                viewport_area = f.area();
+                render_multiline_popup(
+                    f,
+                    &mut textarea,
+                    None,
+                    None,
+                    "deepseek-v4.1-flash-volcano",
+                    "max",
+                    Some(topic),
+                );
+            })
+            .unwrap();
+
+        // The model line is the row above the help row, which is the viewport tail.
+        let model_row_y = viewport_area.bottom() - 2;
+        let row = buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
+        // Cells holding a wide character exist per column, so compare the row
+        // with its whitespace removed instead of as a contiguous substring.
+        let dense: String = row.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(row.contains('…'), "truncated topic without a marker: {row:?}");
+        // 29 full-width characters (58 columns) fit after the 59-column prefix;
+        // the two-column marker completes the 120-column row. A 30th character
+        // would overflow the 118-column text budget.
+        let cut_at = topic.char_indices().nth(29).unwrap().0;
+        assert!(
+            dense.ends_with(&format!("|{}…", &topic[..cut_at])),
+            "{row:?}"
+        );
+        assert!(
+            !dense.contains("的测试"),
+            "model line paints past its budget: {row:?}"
+        );
+    }
+
+    /// A typical session title (14 CJK characters, 28 columns) fits inside the
+    /// 120-column budget next to the 59-column prefix, so it renders verbatim.
+    #[test]
+    fn model_line_shows_a_typical_topic_in_full() {
         let mut terminal = Terminal::with_options(
             TestBackend::new(200, 12),
             TerminalOptions {
@@ -983,16 +1055,11 @@ mod tests {
         // The model line is the row above the help row, which is the viewport tail.
         let model_row_y = viewport_area.bottom() - 2;
         let row = buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
-        // Cells holding a wide character exist per column, so compare the row
-        // with its whitespace removed instead of as a contiguous substring.
         let dense: String = row.chars().filter(|ch| !ch.is_whitespace()).collect();
-        assert!(row.contains('…'), "truncated topic without a marker: {row:?}");
-        // The 59-column prefix leaves 21 columns of the 80-column cap: ten title
-        // characters fit, and the marker takes the twenty-first column.
-        assert!(dense.ends_with("|排查模型频繁中断并…"), "{row:?}");
+        assert!(dense.ends_with(&format!("|{topic}")), "{row:?}");
         assert!(
-            !dense.contains("不能做"),
-            "model line paints past its budget: {row:?}"
+            !dense.contains('…'),
+            "title fits the budget, no marker expected: {row:?}"
         );
     }
 
@@ -1000,7 +1067,7 @@ mod tests {
     fn truncate_line_to_width_keeps_the_marker_inside_the_budget() {
         let line = Line::from(vec![
             Span::raw(" model: deepseek-v4.1-flash-volcano  |  reasoning: max  |  "),
-            Span::raw("排查模型频繁中断并自称不能做"),
+            Span::raw("这是一个用于验证超长会话标题在模型行中被截断并标记省略号的测试"),
         ]);
         let rendered = |max_width: usize| -> String {
             truncate_line_to_width(&line, max_width)
@@ -1012,7 +1079,7 @@ mod tests {
 
         let truncated = rendered(MODEL_LINE_MAX_COLUMNS as usize);
         assert!(truncated.ends_with('…'), "{truncated}");
-        assert!(!truncated.contains("不能做"), "{truncated}");
+        assert!(!truncated.contains("的测试"), "{truncated}");
         assert!(
             display_width(&truncated) <= MODEL_LINE_MAX_COLUMNS as usize,
             "painted {} columns: {truncated}",
