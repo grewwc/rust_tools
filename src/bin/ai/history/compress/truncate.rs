@@ -40,6 +40,7 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
     // parseable file_path pointer; the later generic head+tail truncation must
     // never touch that minimal protocol.
     minimize_overflow_stubs_for_hard_budget(messages);
+    minimize_truncated_previews_for_hard_budget(messages);
     if messages_total_chars(messages) <= max_chars {
         return true;
     }
@@ -157,6 +158,7 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
     protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
 ) -> bool {
     minimize_overflow_stubs_for_hard_budget(messages);
+    minimize_truncated_previews_for_hard_budget(messages);
     let mut truncated_any = false;
     for message in messages.iter_mut() {
         if is_system_like_role(&message.role)
@@ -222,6 +224,64 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
         protected_tool_call_ids,
     );
     truncated_any || inner
+}
+
+/// Hard-budget de-preview: collapse already-truncated previews to minimal
+/// archive pointers. The generic per-field loop sizes the pointer against a
+/// computed `target` and refuses when the pointer is larger than that target,
+/// even though swapping an 8K preview for a ~250-char pointer still saves
+/// budget. Run this before that loop so Path C always reaches the smallest
+/// recoverable form first; both replacements keep the archive path and stay
+/// strictly smaller than the preview they replace.
+fn minimize_truncated_previews_for_hard_budget(messages: &mut [Message]) {
+    for message in messages.iter_mut() {
+        // Fold stubs are system-like and never enter the generic truncation loop,
+        // but their two guidance lines are static boilerplate (~350 chars per
+        // stub), not evidence: the full group content lives behind
+        // archive_file_path. Shrink them to short budget notes so the hard
+        // target stays reachable when several folded groups accumulate.
+        if message.role == crate::ai::history::ROLE_INTERNAL_NOTE
+            && let Value::String(text) = &message.content
+            && text.contains("compressed_tool_round")
+            && text.contains("context_budget_note:")
+        {
+            let shortened = text
+                .replace(
+                    "context_budget_note: earlier tool outputs were folded out of inline context because the request exceeded its tool/context budget; this does not mean the target file or command output is too large or broken.",
+                    "context_budget_note: folded for budget; not a file/command limit.",
+                )
+                .replace(
+                    "recovery_guidance: use the evidence, previews, and original_* anchors before repeating tools. For code edits, continue with smaller targeted reads and split patches instead of re-reading the same archive/log.",
+                    "recovery_guidance: use evidence/archive before re-running; split large reads/patches.",
+                );
+            if shortened.chars().count() < text.chars().count() {
+                message.content = Value::String(shortened);
+            }
+        }
+        if is_system_like_role(&message.role) || message.role == "user" {
+            continue;
+        }
+        if let Value::String(text) = &message.content
+            && is_context_overflow_truncated_stub(text)
+            && let Some(pointer) = build_context_overflow_pointer(text, usize::MAX)
+            && pointer.chars().count() < text.chars().count()
+        {
+            message.content = Value::String(pointer);
+        }
+        if let Some(calls) = message.tool_calls.as_mut() {
+            for call in calls.iter_mut() {
+                if is_context_overflow_truncated_tool_arguments(&call.function.arguments)
+                    && let Some(pointer) = build_context_overflow_tool_arguments_pointer(
+                        &call.function.arguments,
+                        usize::MAX,
+                    )
+                    && pointer.chars().count() < call.function.arguments.chars().count()
+                {
+                    call.function.arguments = pointer;
+                }
+            }
+        }
+    }
 }
 
 pub(in crate::ai) fn choose_larger_mutable_field(
