@@ -139,6 +139,16 @@ pub(super) fn reasoning_in_content_enabled(model: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Per-model silence allowance for the response stream, declared as `stream_silence_timeout_secs`
+/// in the model registry. `None` keeps the runtime's calibrated default; a declared value widens the
+/// window for silence with no provider-declared work in progress, which some gateways hide long
+/// thinking behind.
+pub(super) fn stream_silence_timeout_for_model(model: &str) -> Option<u64> {
+    model_def(model)
+        .and_then(|m| m.stream_silence_timeout_secs)
+        .filter(|secs| *secs > 0)
+}
+
 pub(super) fn model_adapter(model: &str) -> ApiProvider {
     model_def(model).map(|m| m.adapter).unwrap_or_default()
 }

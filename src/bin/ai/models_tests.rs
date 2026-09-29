@@ -161,6 +161,39 @@ fn model_def_defaults_request_tpm_limit_to_none() {
 }
 
 #[test]
+fn model_def_parses_stream_silence_timeout_when_present() {
+    let def: ModelDef = serde_json::from_value(json!({
+        "key": "demo",
+        "name": "demo-model",
+        "adapter": "compatible",
+        "quality_tier": "strong",
+        "is_vl": false,
+        "search_enabled": true,
+        "tools_default_enabled": true,
+        "enable_thinking": false,
+        "stream_silence_timeout_secs": 180
+    }))
+    .unwrap();
+    assert_eq!(def.stream_silence_timeout_secs, Some(180));
+}
+
+#[test]
+fn model_def_defaults_stream_silence_timeout_to_none() {
+    let def: ModelDef = serde_json::from_value(json!({
+        "key": "demo",
+        "name": "demo-model",
+        "adapter": "compatible",
+        "quality_tier": "strong",
+        "is_vl": false,
+        "search_enabled": true,
+        "tools_default_enabled": true,
+        "enable_thinking": false
+    }))
+    .unwrap();
+    assert_eq!(def.stream_silence_timeout_secs, None);
+}
+
+#[test]
 fn model_def_parses_request_protocol_when_present() {
     let def: ModelDef = serde_json::from_value(json!({
         "key": "demo",

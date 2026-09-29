@@ -171,6 +171,17 @@ fn deferred_rate_refresh_is_gated_and_throttled() {
 /// place the arrival rate of a large payload (apply_patch / execute_command / task / …) shows.
 #[test]
 fn tool_call_rate_hint_reports_argument_throughput() {
+    // Hermetic width: sibling fold tests narrow the process-global COLUMNS to 60
+    // while holding ENV_LOCK. Without the lock this assertion can observe that
+    // width mid-run and truncate the expected row, so pin a wide terminal here.
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let _columns = SavedColumns(std::env::var_os("COLUMNS"));
+    crate::ai::stream::side_note_input::set_scripted_true_width(None);
+    unsafe {
+        std::env::set_var("COLUMNS", "100");
+    }
     let mut state = StreamProcessingState::new();
     state.render.waiting_hint_active = true;
     state.render.waiting_hint_tool_call = true;
@@ -1101,6 +1112,154 @@ fn response_completed_event_does_not_block_late_snapshot_text() {
 
     assert_eq!(current_history, "hello world");
     assert_eq!(state.content.assistant_text, "hello world");
+}
+
+#[test]
+fn hidden_thinking_item_keeps_the_long_allowance_and_counts_as_liveness() {
+    // The Responses wire streams no content for hidden thinking: the provider opens a reasoning
+    // item and then goes quiet for a long stretch (measured 111s on muse-spark xhigh). That silence
+    // is work in progress, not a stalled stream, so a provider-held open item already selects the
+    // long allowance, and both the opening and closing events count as liveness (restarting the timer).
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    assert_eq!(
+        stream_silence_timeout_secs(&state),
+        STREAM_FIRST_CHUNK_TIMEOUT_SECS
+    );
+
+    let opened = process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_item.added"),
+        r#"{"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning","status":"in_progress","summary":[]}}"#,
+    )
+    .unwrap();
+    assert!(!opened.should_stop);
+    assert!(opened.meaningful_progress);
+    assert_eq!(state.content.open_output_items, 1);
+    assert_eq!(
+        stream_silence_timeout_secs(&state),
+        STREAM_DECLARED_ITEM_TIMEOUT_SECS
+    );
+    assert!(
+        state.content.reasoning_items.is_empty(),
+        "a content-free `.added` stub is not replayable and must not be captured"
+    );
+
+    let closed = process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_item.done"),
+        r#"{"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","status":"completed","encrypted_content":"enc-xyz"}}"#,
+    )
+    .unwrap();
+    assert!(closed.meaningful_progress);
+    assert_eq!(state.content.open_output_items, 0);
+    assert_eq!(state.content.reasoning_items.len(), 1);
+    assert_eq!(
+        stream_silence_timeout_secs(&state),
+        STREAM_FIRST_CHUNK_TIMEOUT_SECS
+    );
+
+    // A close without a matching open must saturate instead of underflowing.
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_item.done"),
+        r#"{"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","status":"completed","encrypted_content":"enc-xyz"}}"#,
+    )
+    .unwrap();
+    assert_eq!(state.content.open_output_items, 0);
+}
+
+#[test]
+fn silence_window_selection_uses_the_connection_bound_once_output_arrived() {
+    let mut state = StreamProcessingState::new();
+    assert_eq!(
+        stream_silence_timeout_secs(&state),
+        STREAM_FIRST_CHUNK_TIMEOUT_SECS
+    );
+    state.content.assistant_text.push_str("working");
+    assert_eq!(stream_silence_timeout_secs(&state), STREAM_IDLE_TIMEOUT_SECS);
+    state.content.assistant_text.clear();
+    state.content.finish_reason_seen = true;
+    assert_eq!(stream_silence_timeout_secs(&state), STREAM_IDLE_TIMEOUT_SECS);
+
+    // A model that declares a longer allowance (`stream_silence_timeout_secs`) widens only the
+    // no-declaration case; a provider-held open item keeps the declared-item allowance.
+    state.model_silence_timeout_secs = Some(180);
+    assert_eq!(stream_silence_timeout_secs(&state), 180);
+    state.content.open_output_items = 1;
+    assert_eq!(
+        stream_silence_timeout_secs(&state),
+        STREAM_DECLARED_ITEM_TIMEOUT_SECS
+    );
+}
+
+#[test]
+fn open_function_call_item_selects_the_declared_item_allowance() {
+    // Incident shape (muse-spark-1.3, single-file artifact): the model streams one narration sentence, closes
+    // the message item, opens a `function_call` item and then generates ~20KB of arguments server-side, sending
+    // nothing until that payload is ready. Tracking only reasoning items left that silence to the connection
+    // bound, which cut the response 45s after the narration and replayed the whole generation.
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_item.added"),
+        r#"{"type":"response.output_item.added","output_index":2,"item":{"id":"fc_1","type":"function_call","status":"in_progress","name":"write_file","call_id":"call_1","arguments":""}}"#,
+    )
+    .unwrap();
+    assert_eq!(state.content.open_output_items, 1);
+    assert_eq!(
+        stream_silence_timeout_secs(&state),
+        STREAM_DECLARED_ITEM_TIMEOUT_SECS
+    );
+
+    // Argument deltas carry the payload, not the item lifecycle: they must not count the same item twice.
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.function_call_arguments.delta"),
+        r#"{"type":"response.function_call_arguments.delta","output_index":2,"delta":"{\"file_path\":"}"#,
+    )
+    .unwrap();
+    assert_eq!(state.content.open_output_items, 1);
+
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_item.done"),
+        r#"{"type":"response.output_item.done","output_index":2,"item":{"id":"fc_1","type":"function_call","status":"completed","name":"write_file","call_id":"call_1","arguments":"{\"file_path\":\"/tmp/pelican.html\",\"content\":\"hi\"}"}}"#,
+    )
+    .unwrap();
+    assert_eq!(state.content.open_output_items, 0);
+    assert_eq!(stream_silence_timeout_secs(&state), STREAM_IDLE_TIMEOUT_SECS);
 }
 
 #[test]
@@ -2428,6 +2587,10 @@ fn thinking_fold_reclaims_rows_stranded_by_a_resize_reported_after_the_reflow() 
         1,
         "reclaiming the stranded rows ate the transcript row above the fold:\n{screen}"
     );
+    // Reset the thread-local scripted width: it outlives this test on its worker
+    // thread, and a later width-sensitive test on the same thread would otherwise
+    // inherit 60 columns and truncate its assertions.
+    crate::ai::stream::side_note_input::set_scripted_true_width(None);
 }
 
 /// L=0 timing: the reflow and the winsize update both land between frames, so no frame ever
@@ -2535,6 +2698,9 @@ fn thinking_fold_reclaims_every_header_stranded_by_multiple_lag_frames() {
         1,
         "reclaiming the stranded rows ate the transcript row above the fold:\n{screen}"
     );
+    // Same thread-local cleanup as above: do not leak the scripted 60-column width
+    // into width-sensitive tests that later reuse this worker thread.
+    crate::ai::stream::side_note_input::set_scripted_true_width(None);
 }
 
 /// A mid-stream warning printed while the fold is live must not strand the header: parking
@@ -3753,6 +3919,226 @@ async fn stream_response_marks_length_finish_reason_as_truncated() {
 }
 
 #[tokio::test]
+async fn stream_response_escalates_provider_incomplete_with_visible_text() {
+    // Silent-stop regression: the provider stopped the model at the output cap while the visible
+    // body already contained text (typically an announcement such as "starting the code change").
+    // Reading that as Completed ends the turn with the work never started, so the provider's own
+    // incomplete declaration must escalate to the retryable truncation path instead.
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request_buf = [0u8; 1024];
+        let _ = stream.read(&mut request_buf);
+        stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .unwrap();
+        write_http_chunk(
+            &mut stream,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"starting the code change\"}}]}\n\n",
+        )
+        .unwrap();
+        write_http_chunk(
+            &mut stream,
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":9}}}\n\n",
+        )
+        .unwrap();
+        let _ = done_rx.recv_timeout(Duration::from_secs(2));
+    });
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut response = client
+        .post(format!("http://{addr}/responses"))
+        .send()
+        .await
+        .unwrap();
+    let mut app = test_app();
+    init_os_tools_globals(app.os.clone());
+    crate::ai::driver::signal::clear_request_interrupt();
+    let mut current_history = String::new();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        stream_response(&mut app, &mut response, &mut current_history, None),
+    )
+    .await
+    .expect("stream_response should return after finish_reason grace window")
+    .unwrap();
+
+    assert_eq!(result.outcome, StreamOutcome::Truncated);
+    assert_eq!(result.assistant_text, "starting the code change");
+    assert!(result.truncated_by_length);
+    assert!(!result.stream_error);
+
+    drop(response);
+    let _ = done_tx.send(());
+    server.join().unwrap();
+    crate::ai::driver::signal::clear_request_interrupt();
+    if let Ok(mut guard) = GLOBAL_OS.lock() {
+        *guard = None;
+    }
+}
+
+#[tokio::test]
+async fn stream_response_retries_unattributed_provider_incomplete() {
+    // The gateway kept the non-`completed` status but dropped the reason (real shape on this wire:
+    // `incomplete_details` present but null). The stop is still the provider's own declaration, and
+    // because nothing named it as a policy stop the turn must stay retryable instead of ending as a
+    // terminal stream error that discards the partial body. The server also holds the socket open
+    // after the declaration: a provider-declared end must stop at its own marker instead of letting
+    // the idle timer report the stop as a stream failure.
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request_buf = [0u8; 1024];
+        let _ = stream.read(&mut request_buf);
+        stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .unwrap();
+        write_http_chunk(
+            &mut stream,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"starting the code change\"}}]}\n\n",
+        )
+        .unwrap();
+        write_http_chunk(
+            &mut stream,
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":9}}}\n\n",
+        )
+        .unwrap();
+        // Hold the socket well past the client-side timeout: returning early can then only come from
+        // the declared stop's grace window, never from the connection closing.
+        let _ = done_rx.recv_timeout(Duration::from_secs(10));
+    });
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut response = client
+        .post(format!("http://{addr}/responses"))
+        .send()
+        .await
+        .unwrap();
+    let mut app = test_app();
+    init_os_tools_globals(app.os.clone());
+    crate::ai::driver::signal::clear_request_interrupt();
+    let mut current_history = String::new();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        stream_response(&mut app, &mut response, &mut current_history, None),
+    )
+    .await
+    .expect("a declared stop must end at the grace window, not wait for the socket to close")
+    .unwrap();
+
+    assert_eq!(result.outcome, StreamOutcome::Truncated);
+    assert_eq!(result.assistant_text, "starting the code change");
+    assert!(!result.truncated_by_length);
+    assert!(!result.stream_error);
+
+    drop(response);
+    let _ = done_tx.send(());
+    server.join().unwrap();
+    crate::ai::driver::signal::clear_request_interrupt();
+    if let Ok(mut guard) = GLOBAL_OS.lock() {
+        *guard = None;
+    }
+}
+
+#[tokio::test]
+async fn stream_response_keeps_tool_call_delivered_before_provider_completed() {
+    // The server holds the socket open after `response.completed`. The provider declared the
+    // response finished, so the runtime must end at that marker (grace window) instead of waiting
+    // for the close: waiting would let the idle timer cut the stream and drop the tool call that
+    // was already delivered in full.
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request_buf = [0u8; 1024];
+        let _ = stream.read(&mut request_buf);
+        stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .unwrap();
+        write_http_chunk(
+            &mut stream,
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"status\":\"in_progress\",\"name\":\"run_shell\",\"call_id\":\"call_1\",\"arguments\":\"\"}}\n\n",
+        )
+        .unwrap();
+        write_http_chunk(
+            &mut stream,
+            "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"item_id\":\"fc_1\",\"delta\":\"{\\\"command\\\":\\\"ls\\\"}\"}\n\n",
+        )
+        .unwrap();
+        write_http_chunk(
+            &mut stream,
+            "event: response.function_call_arguments.done\ndata: {\"type\":\"response.function_call_arguments.done\",\"output_index\":2,\"item_id\":\"fc_1\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\",\"name\":\"run_shell\"}\n\n",
+        )
+        .unwrap();
+        write_http_chunk(
+            &mut stream,
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"status\":\"completed\",\"name\":\"run_shell\",\"call_id\":\"call_1\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}\n\n",
+        )
+        .unwrap();
+        write_http_chunk(
+            &mut stream,
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"error\":null,\"incomplete_details\":null,\"usage\":{\"input_tokens\":40,\"output_tokens\":12,\"total_tokens\":52}}}\n\n",
+        )
+        .unwrap();
+        let _ = done_rx.recv_timeout(Duration::from_secs(2));
+    });
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut response = client
+        .post(format!("http://{addr}/responses"))
+        .send()
+        .await
+        .unwrap();
+    let mut app = test_app();
+    init_os_tools_globals(app.os.clone());
+    crate::ai::driver::signal::clear_request_interrupt();
+    let mut current_history = String::new();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        stream_response(&mut app, &mut response, &mut current_history, None),
+    )
+    .await
+    .expect("a provider-declared completion must end the stream without waiting for the socket")
+    .unwrap();
+
+    assert_eq!(result.outcome, StreamOutcome::ToolCall);
+    assert_eq!(result.tool_calls.len(), 1);
+    assert_eq!(result.tool_calls[0].function.name, "run_shell");
+    assert!(!result.stream_error);
+
+    drop(response);
+    let _ = done_tx.send(());
+    server.join().unwrap();
+    crate::ai::driver::signal::clear_request_interrupt();
+    if let Ok(mut guard) = GLOBAL_OS.lock() {
+        *guard = None;
+    }
+}
+
+#[tokio::test]
 async fn stream_response_marks_reasoning_only_early_stop_as_truncated() {
     let _signal_guard = crate::ai::test_support::ENV_LOCK
         .lock()
@@ -4190,6 +4576,27 @@ fn unarmed_demuxer_leaves_content_untouched() {
 // New golden cases only add fixtures; the harness is fixed.
 mod golden_wire {
     use super::*;
+    #[test]
+    fn model_silence_timeout_is_resolved_from_the_registry() {
+        // The per-model allowance travels through the registry accessor: every declared entry resolves
+        // to its declared value, and a model without an entry keeps the runtime default instead of
+        // failing. Nothing pins a model name, so registry churn cannot break this test.
+        let registry = crate::ai::model_names::all();
+        assert!(
+            !registry.is_empty(),
+            "the model registry must load for this check to mean anything"
+        );
+        for def in registry {
+            assert_eq!(
+                crate::ai::models::stream_silence_timeout_for_model(&def.key),
+                def.stream_silence_timeout_secs.filter(|secs| *secs > 0)
+            );
+        }
+        assert_eq!(
+            crate::ai::models::stream_silence_timeout_for_model("no-such-model"),
+            None
+        );
+    }
 
     /// One scripted SSE server for a single response. Splits each event across
     /// its own HTTP chunk so the framing/boundary logic is exercised the same way
@@ -4395,26 +4802,22 @@ mod golden_wire {
         assert!(!tool_args_stream_stalled(None, now, timeout));
         // Still inside the window: not stalled.
         assert!(!tool_args_stream_stalled(
-            Some(now - Duration::from_secs(179)),
+            Some(now - timeout + Duration::from_secs(1)),
             now,
             timeout
         ));
         // Just below the boundary: not stalled.
         assert!(!tool_args_stream_stalled(
-            Some(now - Duration::from_secs(180) + Duration::from_millis(1)),
+            Some(now - timeout + Duration::from_millis(1)),
             now,
             timeout
         ));
         // At and beyond the boundary: stalled — this is the trickle-stream
         // case where the idle timer never fires because every delta counts
         // as meaningful progress.
+        assert!(tool_args_stream_stalled(Some(now - timeout), now, timeout));
         assert!(tool_args_stream_stalled(
-            Some(now - Duration::from_secs(180)),
-            now,
-            timeout
-        ));
-        assert!(tool_args_stream_stalled(
-            Some(now - Duration::from_secs(181)),
+            Some(now - timeout - Duration::from_secs(1)),
             now,
             timeout
         ));

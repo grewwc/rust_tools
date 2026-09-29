@@ -22,15 +22,15 @@ use super::{
     extract::{StreamTextEvent, extract_chunk_events_streaming, normalize_stream_text},
     framing, normalize,
     render::markdown::{
-        clamp_line_to_terminal_row, clamp_line_to_terminal_row_with_reserve, live_preview_cursor_rows,
-        raw_terminal_rows,
-        wrap_line_to_terminal_rows_with_reserve,
+        clamp_line_to_terminal_row, clamp_line_to_terminal_row_with_reserve,
+        live_preview_cursor_rows, raw_terminal_rows, wrap_line_to_terminal_rows_with_reserve,
     },
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
     state::{
         StreamChunkStep, StreamContentState, StreamMarkers, StreamProcessingState,
         TerminalDedupeState, ToolCallBuilder,
     },
+    wire_log::WireOutcomeNote,
 };
 
 /// Maximum number of decode errors before giving up and returning partial content
@@ -42,18 +42,44 @@ const DECODE_ERROR_RETRY_DELAY_MS: u64 = 100;
 /// final snapshot immediately after the finish chunk.
 const FINISH_REASON_GRACE_MS: u64 = 750;
 
-/// Idle timeout: after some content arrived, a long stretch without a new chunk means the server has silently finished.
-/// Some providers send neither finish_reason nor close the connection after finishing; only this timeout catches that.
+/// Silence allowance on a connection with no provider-declared work in progress.
+///
+/// This stays a *connection* bound: a stream that already delivered something is worth preserving through a quiet
+/// stretch, but not indefinitely — after this much silence it is treated as stalled and the attempt replays
+/// through the retry ladder. Healthy streams on this wire keep refreshing it (visible text, reasoning summaries,
+/// tool-argument deltas, item open/close events), so a provider that really stopped sending is discovered
+/// quickly. Silences that are *expected* because the provider declared work are covered by
+/// `STREAM_DECLARED_ITEM_TIMEOUT_SECS` instead of by widening this bound.
+///
+/// A model whose gateway hides long stretches of work behind silence without opening an output item may widen
+/// this default per model (`stream_silence_timeout_secs` in the model registry).
 const STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
-/// Tool-call argument stall timeout: once a tool call opens, its arguments must finish within this window even if
-/// the provider keeps trickling argument deltas. The idle timeout only catches total silence; a server that sends one
-/// small delta every <45s refreshes the meaningful-progress timer forever, leaving the terminal stuck on
-/// "receiving `tool` arguments…" (observed incident: an apply_patch call whose arguments never completed for 13+
-/// minutes). Normal tool arguments stream to completion in seconds, so this bound is generous and only fires on
-/// pathological streams; it falls through to the same truncation path as the idle timeout.
+/// Silence allowance while the provider holds an open output item (`response.output_item.added` without its
+/// matching `.done`).
+///
+/// An open item is the provider's own declaration that work is under way, and both shapes this wire produces can
+/// then stay completely quiet: hidden thinking streams no content at all (measured 111s of total wire silence
+/// inside one reasoning item, and ~285s before the first output item, on muse-spark-1.3 at xhigh effort), and a
+/// large tool-argument payload is generated server-side before it is delivered (a 20KB `write_file` argument
+/// arrives as a single late delta).
+///
+/// Only that declared state gets the allowance: with no item open, silence is still cut by the connection bound
+/// above, so a dead connection is normally discovered in seconds rather than minutes. Inside an open item a dead
+/// connection is indistinguishable from a slow provider — no bytes arrive either way — so this is the accepted
+/// cost of not discarding healthy generations; `MAX_TOOL_ARG_BYTES` and the tool-argument stall bound below stay
+/// as the runaway guards for tool calls.
+const STREAM_DECLARED_ITEM_TIMEOUT_SECS: u64 = 300;
+/// Tool-call argument stall timeout: an absolute bound on how long one tool call may stay open, even if the provider
+/// keeps trickling argument deltas (the silence allowance only catches total silence; a server sending one small
+/// delta every few minutes refreshes the meaningful-progress timer forever, leaving the terminal stuck on
+/// "receiving `tool` arguments…" — observed incident: an apply_patch call whose arguments never completed for 13+
+/// minutes). Generating the arguments of a large artifact is legitimate work that can take minutes, so this is a
+/// backstop against a stream that never finishes, not a normal-path timeout; `MAX_TOOL_ARG_BYTES` remains the primary
+/// runaway guard. On expiry the open call is dropped and the attempt replays through the truncation path.
 const STREAM_TOOL_ARGS_STALL_TIMEOUT_SECS: u64 = 180;
 /// First-chunk timeout: the request was sent but the server never sends the first byte (queued, stuck gateway, ...).
-/// Longer than the idle timeout, since some models take time to cold-start or queue.
+/// A stream that produced nothing yet gets this shorter window: unlike a stall after work has been delivered, there
+/// is nothing to preserve by waiting longer, so the retry may start earlier.
 const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 90;
 /// Default visible-window height for `thinking` in the terminal. Only affects display, not reasoning accumulation.
 /// Streaming shows the most recent N lines (default 2); when thinking ends, `finalize_fold` forces a pure-summary
@@ -105,19 +131,63 @@ impl StreamPayloadOutcome {
             meaningful_progress: true,
         }
     }
+
+    /// Not a stop: the payload carried no content but advanced the provider's declared work state
+    /// (a reasoning item opening or closing), which refreshes the silence timer.
+    fn progress() -> Self {
+        Self {
+            should_stop: false,
+            meaningful_progress: true,
+        }
+    }
+}
+
+/// Silence allowance for the current stream state.
+///
+/// A held open output item is a state the provider declared, so it selects the declared-item allowance (reasoning
+/// items stream no content while they are open, and an open `function_call` item is an argument payload being
+/// generated server-side). Every other case is a connection bound: anything delivered makes the stream worth
+/// preserving through a quiet stretch, while a stream that has produced nothing at all gets the shorter
+/// first-chunk window because there is nothing to preserve. Empty packets, usage-only and heartbeat events do not
+/// refresh the timer, so a provider pushing useless packets cannot keep the stream open forever.
+///
+/// A model may widen the connection bound through the registry (`stream_silence_timeout_secs`); the declared-item
+/// and first-chunk allowances stay global.
+fn stream_silence_timeout_secs(state: &StreamProcessingState) -> u64 {
+    if state.content.open_output_items > 0 {
+        return STREAM_DECLARED_ITEM_TIMEOUT_SECS;
+    }
+    let produced_something = !state.content.assistant_text.is_empty()
+        || !state.content.tool_calls_map.is_empty()
+        || state.content.finish_reason_seen;
+    if produced_something {
+        state
+            .model_silence_timeout_secs
+            .unwrap_or(STREAM_IDLE_TIMEOUT_SECS)
+    } else {
+        STREAM_FIRST_CHUNK_TIMEOUT_SECS
+    }
 }
 
 fn initial_stream_processing_state(app: &App) -> StreamProcessingState {
-    StreamProcessingState::with_filters(app.hooks.stream_filters().clone())
+    let mut state = StreamProcessingState::with_filters(app.hooks.stream_filters().clone());
+    state.wire_log.arm(&app.current_model);
+    state.model_silence_timeout_secs = models::stream_silence_timeout_for_model(&app.current_model);
+    state
 }
 
 /// Update the tool-argument stall timer: starts it when a tool call opens, resets it once no
-/// tool call is open or the stream already finished. See `STREAM_TOOL_ARGS_STALL_TIMEOUT_SECS`.
+/// tool call is open or the provider already declared how the response ended. See
+/// `STREAM_TOOL_ARGS_STALL_TIMEOUT_SECS`.
 fn update_tool_args_open_at(
     state: &StreamContentState,
     open_at: Option<Instant>,
 ) -> Option<Instant> {
-    if state.finish_reason_seen || state.tool_calls_map.is_empty() {
+    if state.finish_reason_seen
+        || state.response_completed
+        || state.response_incomplete
+        || state.tool_calls_map.is_empty()
+    {
         None
     } else {
         Some(open_at.unwrap_or_else(Instant::now))
@@ -125,8 +195,39 @@ fn update_tool_args_open_at(
 }
 
 /// Whether an open tool call has been receiving arguments for at least `stall_timeout` without finishing.
-fn tool_args_stream_stalled(open_at: Option<Instant>, now: Instant, stall_timeout: Duration) -> bool {
+fn tool_args_stream_stalled(
+    open_at: Option<Instant>,
+    now: Instant,
+    stall_timeout: Duration,
+) -> bool {
     open_at.is_some_and(|open_at| now.duration_since(open_at) >= stall_timeout)
+}
+
+/// Track an open `function_call` output item from the Responses item events.
+///
+/// The provider declaring a tool call in progress means that call's arguments are being generated server-side, and
+/// this wire can deliver the whole payload as one late delta (a 20KB `write_file` argument) with no event in
+/// between, so that silence must not be read as a stalled connection. Reasoning items carry the same open/closed
+/// state in their own parse result, which also resolves an `.added` line whose item status is already terminal;
+/// only chunks can come from a `function_call` item here, so the two paths cannot double count.
+fn note_function_call_item_lifecycle(
+    event_type: Option<&str>,
+    parsed: &super::state::ParsedStreamPayload,
+    content: &mut StreamContentState,
+) {
+    if !matches!(
+        parsed,
+        super::state::ParsedStreamPayload::Chunk(_)
+            | super::state::ParsedStreamPayload::SnapshotChunk(_)
+    ) {
+        return;
+    }
+    let Some(name) = event_type else { return };
+    if name.eq_ignore_ascii_case("response.output_item.added") {
+        content.open_output_items = content.open_output_items.saturating_add(1);
+    } else if name.eq_ignore_ascii_case("response.output_item.done") {
+        content.open_output_items = content.open_output_items.saturating_sub(1);
+    }
 }
 
 pub(super) async fn stream_response(
@@ -160,17 +261,13 @@ pub(super) async fn stream_response(
         models::model_adapter(&app.current_model),
         &models::endpoint_for_model(&app.current_model, &app.config.endpoint),
     );
+    state.wire_log.set_wire(adapter.label());
 
     if should_show_waiting_hint(app) {
         print_waiting_hint(&mut state)?;
     }
 
     let mut last_meaningful_progress_at = Instant::now();
-    let has_meaningful_progress = |s: &StreamProcessingState| -> bool {
-        !s.content.assistant_text.is_empty()
-            || !s.content.tool_calls_map.is_empty()
-            || s.content.finish_reason_seen
-    };
     let mut idle_timeout_secs = None;
     let mut tool_args_open_at = None;
     let mut tool_args_stalled = false;
@@ -195,14 +292,15 @@ pub(super) async fn stream_response(
             break;
         }
 
-        // Use a shorter idle timeout when there is executable/visible progress; empty packets, usage-only and heartbeat
-        // do not refresh this timer, so a provider pushing useless packets cannot keep the stream open forever.
-        let timeout_secs = if has_meaningful_progress(&state) {
-            STREAM_IDLE_TIMEOUT_SECS
-        } else {
-            STREAM_FIRST_CHUNK_TIMEOUT_SECS
-        };
-        let chunk_result = if state.content.finish_reason_seen {
+        let timeout_secs = stream_silence_timeout_secs(&state);
+        // A provider-declared end (`response.completed`, or a stop declared as incomplete) also ends
+        // the response, so only the grace window is still waited for: a socket that stays open after
+        // the provider said the response is over cannot be read as a stalled stream and discard
+        // delivered tool calls.
+        let chunk_result = if state.content.finish_reason_seen
+            || state.content.response_completed
+            || state.content.response_incomplete
+        {
             tokio::select! {
                 chunk = response.chunk() => chunk,
                 _ = wait_for_interrupt(app) => {
@@ -279,7 +377,14 @@ pub(super) async fn stream_response(
         return Ok(result);
     }
 
-    let idle_timeout_secs = idle_timeout_secs.filter(|_| !state.content.finish_reason_seen);
+    // A provider-declared end (a completion, or a declared incomplete stop) already delivered
+    // everything it had, so silence after it is the socket closing rather than a stream failure, and
+    // must not be reported as one. A stalled tool-argument stream is a runtime-side cut regardless
+    // (`tool_args_stalled`), and stays an error so half-generated arguments are never executed.
+    let provider_declared_end =
+        (state.content.response_completed || state.content.response_incomplete) && !tool_args_stalled;
+    let idle_timeout_secs =
+        idle_timeout_secs.filter(|_| !state.content.finish_reason_seen && !provider_declared_end);
     if idle_timeout_secs.is_some() {
         state.content.stream_idle_timed_out = true;
     }
@@ -640,6 +745,7 @@ fn flush_inline_markup_normalizer_on_cancel(state: &mut StreamProcessingState) {
 /// thinking window stays on screen, and the fresh state of the next retry draws a
 /// new header below it — stacking into a "duplicate header + large blank area".
 fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
+    state.wire_log.note_cancelled();
     flush_inline_markup_normalizer_on_cancel(state);
     // A content-channel reasoner can keep all received text inside the demuxer until
     // it observes its response delimiter. Ctrl+C must not discard that received
@@ -942,6 +1048,18 @@ fn finalize_stream_response(
             StreamOutcome::Truncated
         } else if state.content.dropped_malformed_tool_call {
             StreamOutcome::Truncated
+        } else if state.content.response_incomplete {
+            // The provider itself declared this response incomplete (Responses wire
+            // `response.incomplete`, or a terminal event whose status is not `completed`). That is
+            // the server stating the model was stopped rather than finished, so the visible text is
+            // a partial generation — treating it as Completed is what ends a cut-off "announced the
+            // work, then stopped" turn silently. Escalate to retryable Truncated so the upper layer
+            // injects the shrink hint and retries.
+            //
+            // The `finish_reason=length` rule below keeps its existing scope: several reasoning
+            // models report `length` on top of a complete visible body, and only the provider's own
+            // terminal declaration separates those from a generation that was actually cut.
+            StreamOutcome::Truncated
         } else if truncated_by_length && !has_text {
             // finish_reason=length with no visible text: the model may have produced only reasoning
             // before being cut off, or produced nothing. Retry at a lower effort so budget goes to actual content.
@@ -975,6 +1093,22 @@ fn finalize_stream_response(
             super::render_markdown_block(&visible_text)?;
         }
     }
+
+    state.wire_log.note_outcome(WireOutcomeNote {
+        outcome: outcome.clone(),
+        truncated_by_length,
+        stream_error,
+        finish_reason: state.content.finish_reason_value.as_deref(),
+        dropped_malformed_tool_call: state.content.dropped_malformed_tool_call,
+        tool_calls: tool_calls.len(),
+        assistant_chars: state.content.assistant_text.chars().count(),
+        reasoning_chars: state.content.reasoning_text.chars().count(),
+        response_completed: state.content.response_completed,
+        response_incomplete: state.content.response_incomplete,
+        tool_args_cap_exceeded: state.content.tool_args_cap_exceeded,
+        decode_errors: state.framing.decode_error_count,
+        usage: usage_snapshot,
+    });
 
     Ok(StreamResult {
         outcome,
@@ -1315,6 +1449,8 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
             let _ = super::render_markdown_block(&visible_text);
         }
     }
+
+    state.wire_log.note_stream_cut(state.framing.decode_error_count);
 
     Some(StreamResult {
         outcome,
@@ -1871,7 +2007,10 @@ fn write_thinking_content_folded(
             }
             fold.active = true;
         }
-        return thinking_fold_redraw(fold_header_rate(&state.content, Instant::now()).as_deref(), fold);
+        return thinking_fold_redraw(
+            fold_header_rate(&state.content, Instant::now()).as_deref(),
+            fold,
+        );
     }
 
     if !fold.active {
@@ -1880,7 +2019,10 @@ fn write_thinking_content_folded(
 
     append_fold_content(fold, content);
 
-    thinking_fold_redraw(fold_header_rate(&state.content, Instant::now()).as_deref(), fold)
+    thinking_fold_redraw(
+        fold_header_rate(&state.content, Instant::now()).as_deref(),
+        fold,
+    )
 }
 
 fn write_subagent_content_folded(
@@ -2517,8 +2659,11 @@ fn process_stream_payload(
     event_type: Option<&str>,
     payload: &str,
 ) -> Result<StreamPayloadOutcome, Box<dyn std::error::Error>> {
+    state.wire_log.observe(event_type, payload);
+    let parsed = normalize::parse_stream_payload(adapter, payload, event_type);
+    note_function_call_item_lifecycle(event_type, &parsed, &mut state.content);
     let (mut chunk, merge_mode, is_replayed) =
-        match normalize::parse_stream_payload(adapter, payload, event_type) {
+        match parsed {
             super::state::ParsedStreamPayload::Ignore => {
                 return Ok(StreamPayloadOutcome::default());
             }
@@ -2526,21 +2671,47 @@ fn process_stream_payload(
             super::state::ParsedStreamPayload::Error(msg) => {
                 return Err(format!("provider stream error: {msg}").into());
             }
-            super::state::ParsedStreamPayload::ReasoningItem(item) => {
-                // Capture the full reasoning item (incl. encrypted_content) for same-turn tool-chain replay.
-                // Produces no visible output and never enters persisted history. Models like Spark may emit multiple
-                // reasoning segments (different ids) before one tool_call; all must be kept. The gateway re-sends the same
-                // reasoning resource in .added (partial payload) and .done (full payload) with identical ids but
-                // different content, so whole-field equality dedup would judge them unequal; converge by id and keep the
-                // later one (.done always comes after .added and is the protocol's authoritative final state), otherwise the same
-                // resource id appears twice during replay and modelhub returns 400 (-4003).
-                state.content.reasoning_items.push(item);
-                crate::ai::history::compress::dedup_reasoning_items_by_id(
-                    &mut state.content.reasoning_items,
-                );
-                return Ok(StreamPayloadOutcome::default());
+            super::state::ParsedStreamPayload::ReasoningItem { item, open } => {
+                // Track the provider's open items: while one is open the model is thinking, and this
+                // wire streams nothing for that thinking, so the silence must not be read as a stalled
+                // stream (see `stream_silence_timeout_secs`).
+                if open {
+                    state.content.open_output_items =
+                        state.content.open_output_items.saturating_add(1);
+                } else {
+                    state.content.open_output_items =
+                        state.content.open_output_items.saturating_sub(1);
+                }
+                if let Some(item) = item {
+                    // Capture the full reasoning item (incl. encrypted_content) for same-turn tool-chain replay.
+                    // Produces no visible output and never enters persisted history. Models like Spark may emit multiple
+                    // reasoning segments (different ids) before one tool_call; all must be kept. The gateway re-sends the same
+                    // reasoning resource in .added (partial payload) and .done (full payload) with identical ids but
+                    // different content, so whole-field equality dedup would judge them unequal; converge by id and keep the
+                    // later one (.done always comes after .added and is the protocol's authoritative final state), otherwise the same
+                    // resource id appears twice during replay and modelhub returns 400 (-4003).
+                    state.content.reasoning_items.push(item);
+                    crate::ai::history::compress::dedup_reasoning_items_by_id(
+                        &mut state.content.reasoning_items,
+                    );
+                }
+                return Ok(StreamPayloadOutcome::progress());
             }
             super::state::ParsedStreamPayload::Chunk(chunk) => {
+                (chunk, StreamEventMergeMode::Append, false)
+            }
+            super::state::ParsedStreamPayload::ResponseTerminal { status, chunk } => {
+                // The provider declared how this response ended (Responses wire). Record it before
+                // the chunk is processed: a completed response ends at its own marker (`response.completed`),
+                // and an incomplete one must stay retryable even when partial visible text exists.
+                match status {
+                    crate::ai::request::ResponseTerminalStatus::Completed => {
+                        state.content.response_completed = true;
+                    }
+                    crate::ai::request::ResponseTerminalStatus::Incomplete => {
+                        state.content.response_incomplete = true;
+                    }
+                }
                 (chunk, StreamEventMergeMode::Append, false)
             }
             super::state::ParsedStreamPayload::ReplayedChunk(chunk) => {

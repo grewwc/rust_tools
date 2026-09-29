@@ -67,7 +67,8 @@ pub(crate) use types::{
     StreamUsage, merge_reasoning_fragments,
 };
 pub(in crate::ai) use wire_parse::{
-    ParsedStreamPayload, try_parse_stream_chunk_from_value, try_parse_stream_chunk_loose,
+    ParsedStreamPayload, ResponseTerminalStatus, try_parse_stream_chunk_from_value,
+    try_parse_stream_chunk_loose,
 };
 // External re-exports (build_content is called from several places in the driver)
 #[allow(unused_imports)]

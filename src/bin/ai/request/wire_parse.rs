@@ -11,10 +11,31 @@
 
 use super::StreamChunk;
 
+/// How a provider declared a whole response ended, for wires whose end-of-response marker is not
+/// a chat-completions `finish_reason` (OpenAI Responses: `response.completed` /
+/// `response.incomplete`). It lets the stream layer tell "everything has been delivered" from "the
+/// model was stopped early" without inspecting model names.
+#[derive(Clone, Copy)]
+pub(in crate::ai) enum ResponseTerminalStatus {
+    /// The response finished normally: text, tool calls and usage have all been delivered.
+    Completed,
+    /// The provider stopped the response early (typically the output cap). The partial output is a
+    /// truncated generation, not an answer.
+    Incomplete,
+}
+
 pub(in crate::ai) enum ParsedStreamPayload {
     Ignore,
     Done,
     Chunk(StreamChunk),
+    /// A provider terminal-state declaration. `chunk` carries what the plain [`Self::Chunk`]
+    /// variant would have carried (usage when the terminal event reports it, and
+    /// `finish_reason=length` for a response stopped at the output cap); the status only describes
+    /// how the response ended, so a stop that named no reason carries neither field.
+    ResponseTerminal {
+        status: ResponseTerminalStatus,
+        chunk: StreamChunk,
+    },
     /// `content_part.added` (output_text type) carries the complete text that currently
     /// exists in that part, overlapping with the incremental `output_text.delta`. This is
     /// a multi-path protocol re-delivery rather than new model content. It is still parsed
@@ -23,11 +44,16 @@ pub(in crate::ai) enum ParsedStreamPayload {
     /// body twice across event paths.
     ReplayedChunk(StreamChunk),
     SnapshotChunk(StreamChunk),
-    /// A complete `reasoning` output item returned by the Responses protocol (with `id` /
-    /// `encrypted_content` / `summary`). Used for same-turn tool-chain replay: passed
-    /// through verbatim into the next request's input so the model retains the previous
-    /// hop's reasoning context. Never persisted into history.
-    ReasoningItem(serde_json::Value),
+    /// A `reasoning` output item of the Responses protocol, opened or finished. `item` carries the
+    /// payload only when it is replayable (`.done`, or an `.added` with a real `encrypted_content`
+    /// block); a replayable item is passed through verbatim into the next request's input so the
+    /// model retains the previous hop's reasoning context, and is never persisted into history.
+    /// `open` reports whether the provider still holds the item: this wire streams no content for
+    /// the thinking itself, so silence while an item is open is work in progress, not a stall.
+    ReasoningItem {
+        item: Option<serde_json::Value>,
+        open: bool,
+    },
     /// The provider returned an error object or error event mid-stream, carrying a
     /// human-readable error message.
     Error(String),

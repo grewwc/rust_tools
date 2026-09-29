@@ -17,6 +17,7 @@ use super::{
         InternalToolCallStreamer, StreamSplitter,
     },
     think_demux::ContentThinkDemuxer,
+    wire_log::StreamWireLog,
 };
 
 /// Stream text protocol markers (embedded into history / assistant_text, and re-mapped to
@@ -71,6 +72,12 @@ pub(super) struct StreamProcessingState {
     /// Last-seen `(echoed_model, usage)` from any chunk during this stream.
     /// Handed to the kernel's `/dev/llm` when the stream finalizes.
     pub(super) pending_llm_usage: Option<(String, super::super::request::StreamUsage)>,
+    /// Opt-in raw-wire recorder (see `wire_log`): inert unless the
+    /// `AIOS_STREAM_WIRE_LOG` switch is set when the response stream starts.
+    pub(super) wire_log: StreamWireLog,
+    /// Per-model silence allowance (`models/*.json` → `stream_silence_timeout_secs`) resolved when
+    /// the response stream starts; `None` keeps the runtime's calibrated connection bound.
+    pub(super) model_silence_timeout_secs: Option<u64>,
 }
 
 impl StreamProcessingState {
@@ -85,6 +92,8 @@ impl StreamProcessingState {
             content: StreamContentState::new(),
             filters,
             pending_llm_usage: None,
+            wire_log: StreamWireLog::disabled(),
+            model_silence_timeout_secs: None,
         }
     }
 }
@@ -359,6 +368,14 @@ pub(super) struct StreamContentState {
     /// hits the output limit and gets truncated: half a JSON → dropped → the turn has no valid tool calls.
     /// Judging only by "no tool calls + some text" would misread it as normal completion and end silently.
     pub(super) dropped_malformed_tool_call: bool,
+    /// The provider declared this response finished (`response.completed`): every item has been
+    /// delivered, so the silence that follows is the socket closing rather than a stalled stream.
+    /// It must neither be reported as a stream failure nor discard the tool calls already received.
+    pub(super) response_completed: bool,
+    /// The provider declared this response incomplete (`response.incomplete`, or a terminal event
+    /// whose status is not `completed`): the model was stopped, not finished, so partial visible
+    /// text is not an answer and the turn must stay retryable.
+    pub(super) response_incomplete: bool,
     /// Accumulated tool-call arguments exceeded the `MAX_TOOL_ARG_BYTES` cap and the stream was force-stopped. Same reasoning as
     /// `stream_idle_timed_out`: the stream was cut off by the runtime and the model may still be generating,
     /// so JSON that merely happens to be valid at the cut-off moment must not be handed to the execution layer as a complete tool call.
@@ -404,6 +421,13 @@ pub(super) struct StreamContentState {
     /// turn (including encrypted_content). Only used for same-turn tool-chain
     /// replay; never persisted to history.
     pub(super) reasoning_items: Vec<serde_json::Value>,
+    /// Output items the provider declared open (`response.output_item.added`) and has not closed
+    /// yet, of any kind: a reasoning item while the model thinks (this wire streams no content for
+    /// the thinking itself) or a `function_call` item while that call's argument payload is
+    /// generated server-side. While this is non-zero the silence is declared work, so the stream
+    /// layer allows it the window documented at `STREAM_DECLARED_ITEM_TIMEOUT_SECS` instead of the
+    /// connection bound.
+    pub(super) open_output_items: usize,
     pub(super) hidden_meta_parse: HiddenMetaParseState,
     pub(super) internal_tool_call_idx: usize,
     pub(super) internal_tool_call_streamer: InternalToolCallStreamer,
@@ -427,6 +451,8 @@ impl StreamContentState {
             stream_idle_timed_out: false,
             finish_reason_value: None,
             dropped_malformed_tool_call: false,
+            response_completed: false,
+            response_incomplete: false,
             tool_args_cap_exceeded: false,
             saw_reasoning_output: false,
             reasoning_started_at: None,
@@ -442,6 +468,7 @@ impl StreamContentState {
             hidden_meta: String::new(),
             reasoning_text: String::new(),
             reasoning_items: Vec::new(),
+            open_output_items: 0,
             hidden_meta_parse: HiddenMetaParseState::default(),
             internal_tool_call_idx: 0,
             internal_tool_call_streamer: InternalToolCallStreamer::new(),

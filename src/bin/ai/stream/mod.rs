@@ -8,6 +8,7 @@ pub(crate) mod side_note_input;
 mod splitter;
 mod state;
 mod think_demux;
+mod wire_log;
 
 pub(super) use render::markdown::MarkdownStreamRenderer;
 pub(in crate::ai) use render::markdown::clamp_line_to_terminal_row_with_reserve;

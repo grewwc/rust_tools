@@ -948,11 +948,6 @@ mod budget_tests {
 }
 
 pub(crate) fn print_info(app: &App, model: &str) {
-    let search = if models::search_enabled(model) {
-        "true"
-    } else {
-        "false"
-    };
     let effort_label = if app.cli.thinking_disabled_override
         || app.cli.reasoning_effort_override == Some(None)
     {
@@ -1009,12 +1004,10 @@ pub(crate) fn print_info(app: &App, model: &str) {
 
     // Use println! to avoid manual-flush permission issues; model and session are merged into one line.
     println!(
-        "{}[{}{}{} (search: {}{search}{}, effort: {}{effort_label}{}){session_part}{}]{RESET}",
+        "{}[{}{}{} (effort: {}{effort_label}{}){session_part}{}]{RESET}",
         theme::current().accent_muted,
         theme::current().accent_success,
         models::model_display_label(model),
-        theme::current().accent_muted,
-        theme::current().accent_warn,
         theme::current().accent_muted,
         theme::current().accent_primary,
         theme::current().accent_muted,

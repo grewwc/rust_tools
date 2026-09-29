@@ -227,6 +227,19 @@ pub struct ModelDef {
     #[serde(default)]
     pub subagent_priority: i32,
 
+    /// Optional: how long the response stream may stay silent while *no* provider-declared work is
+    /// in progress before the attempt is treated as a stalled connection (seconds). Unset keeps the
+    /// runtime's calibrated connection bound (45s).
+    ///
+    /// Declare this for models whose gateway hides long stretches of work behind total wire silence:
+    /// hidden thinking streams no content at all, and the quiet stretch does not always hold an open
+    /// output item, so the default bound cuts healthy generations that would have continued (observed
+    /// repeatedly on muse-spark-1.3 at xhigh effort, where the wire stayed silent past 45s after the
+    /// narration and the whole generation was replayed). It widens only that no-declaration case: a
+    /// provider-held open item and a stream that produced nothing yet keep their own allowances.
+    #[serde(default)]
+    pub stream_silence_timeout_secs: Option<u64>,
+
     /// Optional: override the adapter's reasoning-effort wire shape. Different model families behind the same gateway may use
     /// different fields (e.g. DashScope DeepSeek / GLM use the top-level `reasoning_effort`;
     /// undeclared Alibaba models do not send unconfirmed reasoning-effort fields).
@@ -484,6 +497,12 @@ fn validate_model_def(model: &ModelDef, path: &Path) -> Result<(), String> {
             }
         }
         None => {}
+    }
+    if model.stream_silence_timeout_secs == Some(0) {
+        return Err(format!(
+            "model '{}' declares stream_silence_timeout_secs 0; omit the field to keep the default connection bound",
+            model.key
+        ));
     }
     if let Some(endpoint) = model.endpoint.as_deref()
         && endpoint.trim().is_empty()

@@ -1,8 +1,8 @@
 use crate::ai::{
     provider::ProviderAdapter,
     request::{
-        StreamChoice, StreamChunk, StreamDelta, StreamFunctionCall, StreamToolCall,
-        try_parse_stream_chunk_from_value,
+        ResponseTerminalStatus, StreamChoice, StreamChunk, StreamDelta, StreamFunctionCall,
+        StreamToolCall, try_parse_stream_chunk_from_value,
     },
 };
 
@@ -17,7 +17,9 @@ pub(super) fn parse_stream_payload(
     if payload.is_empty() {
         return ParsedStreamPayload::Ignore;
     }
-    if payload == "[DONE]" {
+    // Sentinel compared ASCII-case-insensitively, matching the `done` / `[done]` SSE event-name
+    // handling: a body-only stream that varies the sentinel's case must still stop the loop.
+    if payload.eq_ignore_ascii_case("[DONE]") {
         return ParsedStreamPayload::Done;
     }
     if let Some(event_type) = event_type {
@@ -36,38 +38,50 @@ pub(super) fn parse_stream_payload(
         }
     }
 
-    // 部分网关（opencode zen / enc 加密通道）缺少准确的 SSE `event:` 名，事件类型仅
-    // 内嵌在 JSON 顶层 `type` 字段里。`response.output_item.done` 携带的
-    // encrypted reasoning 会被 event 名分支忽略或被 adapter 宽松 chunk 解析静默吞掉，
-    // 导致无法在下一轮 tool 请求中回放；未来网关若把完整载荷移到 `.added` 也需覆盖。
-    // 这里先按 JSON type 补一次 output_item 解析，仅 reasoning 捕获会命中，其余 item
-    // 类型维持既有路径；用 contains 预筛避免对普通 delta chunk 多做 JSON 解析。
-    if payload.contains("response.output_item.done")
-        || payload.contains("response.output_item.added")
+    // Some gateways (opencode zen / encrypted channel) omit a usable SSE `event:` name and carry
+    // the event type only in the JSON top-level `type` field. The `response.output_item.done`
+    // payload holding the encrypted reasoning would otherwise be ignored by the event-name branch
+    // or silently swallowed by the adapter's loose chunk parse, which breaks replaying it in the
+    // next tool request; a future gateway moving the full payload into `.added` is covered too.
+    // Only the reasoning capture reacts to the JSON `type` fallback added here, other item types
+    // keep their existing path. The pre-screen and the `type` comparisons it guards are
+    // ASCII-case-insensitive, like every other protocol token in this file: a gateway that varies
+    // the case of these markers reaches the same branches, while ordinary delta chunks still skip
+    // the JSON parse.
+    if ascii_contains(payload, "response.output_item.done")
+        || ascii_contains(payload, "response.output_item.added")
+        || ascii_contains(payload, "response.completed")
+        || ascii_contains(payload, "response.incomplete")
+        || ascii_contains(payload, "response.failed")
     {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
             if let Some(err_msg) = value.get("error").and_then(extract_error_message) {
                 return ParsedStreamPayload::Error(err_msg);
             }
             if let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) {
-                if event_type == "response.output_item.done"
-                    || event_type == "response.output_item.added"
+                // Terminal events can also arrive without a usable SSE `event:` name; missing them
+                // would turn a stopped response into an empty chunk that is silently swallowed
+                // (same reasoning as the output_item branch below).
+                let is_terminal_event = event_type.eq_ignore_ascii_case("response.completed")
+                    || event_type.eq_ignore_ascii_case("response.incomplete")
+                    || event_type.eq_ignore_ascii_case("response.failed");
+                if is_terminal_event
+                    && let Some(parsed) = parse_sse_event_payload(event_type, payload)
+                {
+                    return parsed;
+                }
+                if event_type.eq_ignore_ascii_case("response.output_item.done")
+                    || event_type.eq_ignore_ascii_case("response.output_item.added")
                 {
                     if let Some(parsed) = parse_output_item_event(event_type, &value) {
                         match &parsed {
-                            ParsedStreamPayload::ReasoningItem(_) => return parsed,
-                            ParsedStreamPayload::Ignore => {
-                                // 仅 reasoning 的 stub 需要在此截获为 Ignore；其余类型（如 message）
-                                // 必须落回 adapter 宽松解析，避免把 message done 吞成 Ignore。
-                                let is_reasoning = value
-                                    .get("item")
-                                    .and_then(|v| v.get("type"))
-                                    .and_then(serde_json::Value::as_str)
-                                    .is_some_and(|t| t.eq_ignore_ascii_case("reasoning"));
-                                if is_reasoning {
-                                    return parsed;
-                                }
-                            }
+                            // Reasoning items are terminal for this parse: they never fall through to
+                            // the adapter's loose parse, and the open/closed state must reach the stream
+                            // layer even when the payload itself is a non-replayable stub.
+                            ParsedStreamPayload::ReasoningItem { .. } => return parsed,
+                            // Other ignored items (e.g. a message) must fall back to the adapter's
+                            // loose parse so a message `.done` is not swallowed as an ignored chunk.
+                            ParsedStreamPayload::Ignore => {}
                             _ => {}
                         }
                     }
@@ -117,15 +131,37 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
         return Some(ParsedStreamPayload::Error(err_msg));
     }
     if event_type.eq_ignore_ascii_case("response.completed") {
-        // Responses API 的最终用量嵌在 response.usage，而不是兼容流的顶层
-        // usage。将其包装成普通 chunk，复用既有的用量落账路径；仍不能把该
-        // 事件视为 [DONE]，因为连接关闭才是流结束信号。
-        let usage = value.get("response")?.get("usage")?.clone();
-        let usage = serde_json::from_value(usage).ok()?;
-        return Some(ParsedStreamPayload::Chunk(StreamChunk {
-            usage: Some(usage),
-            ..Default::default()
-        }));
+        // Some gateways report the terminal state inside this event instead of emitting a
+        // dedicated `response.incomplete` / `response.failed` (status other than `completed`, an
+        // `incomplete_details` block, or an error object). Such a response was stopped early, so it
+        // must be surfaced as such: reading it as a normal completion is what leaves a cut-off
+        // turn looking finished.
+        if let Some(response) = value.get("response") {
+            if let Some(err_msg) = response.get("error").and_then(extract_error_message) {
+                return Some(ParsedStreamPayload::Error(err_msg));
+            }
+            if response_declares_incomplete(response) {
+                return Some(incomplete_response_payload(response));
+            }
+        }
+        // The Responses API puts the final usage in response.usage instead of the top-level usage
+        // of compatible streams. Wrap it in an ordinary chunk to reuse the existing usage
+        // accounting, and record the declared terminal state: the stream layer uses it to stop at
+        // the response's own end marker rather than waiting for the socket to close, so a
+        // connection that stays open afterwards cannot discard the tool calls already delivered.
+        // The marker must not depend on the usage block: a gateway that omits usage still declared
+        // the response finished, and the stream layer needs that declaration to end here.
+        let usage = value
+            .get("response")
+            .and_then(|response| response.get("usage"))
+            .and_then(|usage| serde_json::from_value(usage.clone()).ok());
+        return Some(ParsedStreamPayload::ResponseTerminal {
+            status: ResponseTerminalStatus::Completed,
+            chunk: StreamChunk {
+                usage,
+                ..Default::default()
+            },
+        });
     }
     // OpenAI Responses API 错误/不完整事件——必须显式处理，否则会 fallthrough
     // 到 parse_provider_chunk 被当成空 chunk 静默丢弃。
@@ -138,31 +174,9 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
         return Some(ParsedStreamPayload::Error(msg));
     }
     if event_type.eq_ignore_ascii_case("response.incomplete") {
-        let reason = value
-            .get("response")
-            .and_then(|r| r.get("incomplete_details"))
-            .and_then(|d| d.get("reason"))
-            .and_then(|r| r.as_str())
-            .unwrap_or("unknown");
-        // Mirrors @ai-sdk/openai's mapOpenAIResponseFinishReason: max_output_tokens
-        // truncation maps to finish_reason=length, keeping the partial text
-        // produced so far; usage is embedded in response.usage just like
-        // response.completed. Reuses the existing length-truncation decision:
-        // visible text finishes as a normal completion; only with no visible
-        // output at all does it escalate to a retryable Truncated.
-        if reason.eq_ignore_ascii_case("max_output_tokens") {
-            let mut chunk = stream_chunk_with_delta(StreamDelta::default());
-            if let Some(choice) = chunk.choices.first_mut() {
-                choice.finish_reason = Some("length".to_string());
-            }
-            if let Some(usage) = value.get("response").and_then(|r| r.get("usage")) {
-                chunk.usage = serde_json::from_value(usage.clone()).ok();
-            }
-            return Some(ParsedStreamPayload::Chunk(chunk));
-        }
-        return Some(ParsedStreamPayload::Error(format!(
-            "response incomplete: {reason}"
-        )));
+        let fallback = serde_json::Value::Null;
+        let response = value.get("response").unwrap_or(&fallback);
+        return Some(incomplete_response_payload(response));
     }
     // 部分 provider 用 SSE event: error 携带错误对象
     if event_type.eq_ignore_ascii_case("error") {
@@ -293,26 +307,36 @@ fn parse_output_item_event(
     // `.added` 需前向兼容。约定阈值：real 载荷实测 900-1500 长度，stub 恒为短串
     // （<100），以 256 为分界足以区分二者且不误伤短推理链的加密块。
     if item_type == "reasoning" {
+        // Capture the item for same-turn tool-chain replay: a `.done` payload carries the real
+        // `encrypted_content`, an `.added` payload is a fixed short stub in production (not
+        // replayable — replaying it returns 400) but is captured too in case a future gateway moves
+        // the full payload there. Fixed threshold: real payloads measure 900-1500 chars while stubs
+        // stay short (<100), so 256 separates them without misjudging a short chain's encrypted block.
         let encrypted_len = item
             .get("encrypted_content")
             .and_then(serde_json::Value::as_str)
             .map(|s| s.len())
             .unwrap_or(0);
-        if encrypted_len == 0 {
-            return Some(ParsedStreamPayload::Ignore);
-        }
         const REASONING_ENCRYPTED_ADDED_MIN_LEN: usize = 256;
-        let is_real = if event_type.eq_ignore_ascii_case("response.output_item.done") {
-            true
-        } else if event_type.eq_ignore_ascii_case("response.output_item.added") {
-            encrypted_len >= REASONING_ENCRYPTED_ADDED_MIN_LEN
-        } else {
-            false
-        };
-        if is_real {
-            return Some(ParsedStreamPayload::ReasoningItem(item.clone()));
-        }
-        return Some(ParsedStreamPayload::Ignore);
+        let is_done_event = event_type.eq_ignore_ascii_case("response.output_item.done");
+        let is_real = encrypted_len > 0
+            && (is_done_event || encrypted_len >= REASONING_ENCRYPTED_ADDED_MIN_LEN);
+        // The event name is the primary open/close signal; a terminal item status closes the item
+        // too, so a provider that reports the final state on an `.added` line still resolves.
+        let terminal_status = item
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|status| {
+                matches!(
+                    status.trim().to_ascii_lowercase().as_str(),
+                    "completed" | "incomplete" | "failed"
+                )
+            });
+        let open = !is_done_event && !terminal_status;
+        return Some(ParsedStreamPayload::ReasoningItem {
+            item: is_real.then(|| item.clone()),
+            open,
+        });
     }
 
     if item_type != "function_call" && item_type != "function" {
@@ -420,6 +444,61 @@ fn tool_call_event_chunk(event_type: &str, tool_call: StreamToolCall) -> ParsedS
         ParsedStreamPayload::SnapshotChunk(chunk)
     } else {
         ParsedStreamPayload::Chunk(chunk)
+    }
+}
+
+/// Whether a Responses payload declares the response stopped rather than finished: a populated
+/// `incomplete_details` block, or any status other than `completed`. Gateways differ on where the
+/// terminal state is carried (a dedicated `response.incomplete` event, or the final event's own
+/// payload), and a stopped response must never be read as a normal end.
+fn response_declares_incomplete(response: &serde_json::Value) -> bool {
+    // The field is present-but-null on a normal completion, so presence alone must not count.
+    if response
+        .get("incomplete_details")
+        .is_some_and(|details| !details.is_null())
+    {
+        return true;
+    }
+    response
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| !status.trim().eq_ignore_ascii_case("completed"))
+}
+
+/// Payload for a response the provider declared incomplete. `max_output_tokens` maps onto
+/// `finish_reason=length` (mirrors @ai-sdk/openai's mapOpenAIResponseFinishReason): the partial
+/// text produced so far is kept, usage stays available like on a completed response, and the
+/// existing truncation ladders keep reading the shape they already handle.
+///
+/// A *named* stop reason other than the output cap stays an error, because a retry cannot fix a
+/// content filter or a server-side cancel. A stop declared without any reason (a gateway that keeps
+/// a non-`completed` status while dropping `incomplete_details`) is reported as a declared stop
+/// instead: nothing proves a retry is useless there, and turning it into a terminal error is what
+/// ends a turn whose partial body was already produced.
+fn incomplete_response_payload(response: &serde_json::Value) -> ParsedStreamPayload {
+    let reason = response
+        .get("incomplete_details")
+        .and_then(|details| details.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|reason| !reason.trim().is_empty());
+    if let Some(reason) = reason.filter(|reason| !reason.eq_ignore_ascii_case("max_output_tokens")) {
+        return ParsedStreamPayload::Error(format!("response incomplete: {reason}"));
+    }
+    // Reaching here means the output cap (named in `reason`) or an unnamed stop. Only the output cap
+    // claims `finish_reason=length`; an unnamed stop leaves the field unset, because the provider
+    // never said the model hit the cap and a fabricated `length` would drive cap-specific repair
+    // (halving max_tokens on a zero-output stop) for a cause that was never reported.
+    let finish_reason = reason.is_some().then(|| "length".to_string());
+    let mut chunk = stream_chunk_with_delta(StreamDelta::default());
+    if let Some(choice) = chunk.choices.first_mut() {
+        choice.finish_reason = finish_reason;
+    }
+    if let Some(usage) = response.get("usage") {
+        chunk.usage = serde_json::from_value(usage.clone()).ok();
+    }
+    ParsedStreamPayload::ResponseTerminal {
+        status: ResponseTerminalStatus::Incomplete,
+        chunk,
     }
 }
 
@@ -590,7 +669,11 @@ fn extract_error_message(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::parse_stream_payload;
-    use crate::ai::{provider, stream::state::ParsedStreamPayload};
+    use crate::ai::{
+        provider,
+        request::ResponseTerminalStatus,
+        stream::state::ParsedStreamPayload,
+    };
 
     #[test]
     fn parse_stream_payload_accepts_plain_json_payload() {
@@ -605,13 +688,16 @@ mod tests {
 
     #[test]
     fn embedded_output_item_done_captures_reasoning_despite_sse_event_name() {
-        // 模拟缺少或发送不准确 SSE `event:` 名的网关：事件类型内嵌在 JSON 顶层
-        // `type` 字段，encrypted reasoning 必须仍能被捕获，否则无法在下一轮
-        // tool 请求中回放。`unknown.done` 还覆盖通用 SSE 分支提前 Ignore 的情况。
+        // Gateways that omit or mislabel the SSE `event:` name embed the type in the JSON `type`
+        // field; the encrypted reasoning item must still be captured, otherwise it cannot be
+        // replayed on the next tool request. `unknown.done` also covers the generic SSE branch that
+        // would otherwise resolve to an ignored chunk first. The closed state travels with the
+        // payload (see `StreamContentState::open_output_items`).
         let payload = r#"{"type":"response.output_item.done","sequence_number":1,"item":{"id":"rs_reason","type":"reasoning","encrypted_content":"enc-xyz"}}"#;
         for event_type in [None, Some(""), Some("message"), Some("unknown.done")] {
             match parse_stream_payload(provider::opencode_adapter(), payload, event_type) {
-                ParsedStreamPayload::ReasoningItem(item) => {
+                ParsedStreamPayload::ReasoningItem { item: Some(item), open } => {
+                    assert!(!open, "a `.done` item is closed");
                     assert_eq!(item["type"], "reasoning");
                     assert_eq!(item["encrypted_content"], "enc-xyz");
                 }
@@ -645,12 +731,23 @@ mod tests {
     #[test]
     fn sse_error_event_name_takes_precedence_over_embedded_reasoning_item() {
         let payload = r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"enc-xyz"}}"#;
-        for event_type in ["error", "response.failed", "response.incomplete"] {
+        for event_type in ["error", "response.failed"] {
             assert!(matches!(
                 parse_stream_payload(provider::opencode_adapter(), payload, Some(event_type)),
                 ParsedStreamPayload::Error(_)
             ));
         }
+        // The `response.incomplete` event name still wins over the embedded item, but it declares a
+        // stop rather than an error: with no reason in the payload there is nothing proving a retry
+        // is useless, so the caller must be able to retry instead of failing the turn.
+        assert!(matches!(
+            parse_stream_payload(
+                provider::opencode_adapter(),
+                payload,
+                Some("response.incomplete")
+            ),
+            ParsedStreamPayload::ResponseTerminal { .. }
+        ));
     }
 
     #[test]
@@ -660,6 +757,40 @@ mod tests {
         match parse_stream_payload(provider::opencode_adapter(), payload, None) {
             ParsedStreamPayload::Chunk(_) => {}
             _ => panic!("expected chunk from adapter path"),
+        }
+    }
+
+    #[test]
+    fn body_type_markers_match_ascii_case_insensitively() {
+        // A gateway that omits the SSE `event:` name may vary the case of the JSON `type` marker
+        // too. Such a payload must reach the same branch as its lowercase form instead of falling
+        // through to the loose parse, which turns a stopped response into an empty chunk that is
+        // silently swallowed (leaving the stream to end on the socket instead of on the provider's
+        // own end marker).
+        let payload = r#"{"type":"RESPONSE.COMPLETED","response":{"id":"r1","status":"INCOMPLETE","incomplete_details":{"reason":"MAX_OUTPUT_TOKENS"}}}"#;
+        assert!(matches!(
+            parse_stream_payload(provider::opencode_adapter(), payload, None),
+            ParsedStreamPayload::ResponseTerminal {
+                status: ResponseTerminalStatus::Incomplete,
+                ..
+            }
+        ));
+
+        // The output_item capture branch exists for the same no-event-name gateways.
+        let payload = r#"{"type":"RESPONSE.OUTPUT_ITEM.DONE","item":{"type":"REASONING","encrypted_content":"enc-xyz"}}"#;
+        assert!(matches!(
+            parse_stream_payload(provider::opencode_adapter(), payload, None),
+            ParsedStreamPayload::ReasoningItem { .. }
+        ));
+    }
+
+    #[test]
+    fn body_done_sentinel_matches_ascii_case_insensitively() {
+        for payload in ["[DONE]", "[done]", "[Done]"] {
+            assert!(matches!(
+                parse_stream_payload(provider::opencode_adapter(), payload, None),
+                ParsedStreamPayload::Done
+            ));
         }
     }
 
@@ -682,8 +813,10 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_added_with_short_stub_is_ignored() {
-        // 现网 `.added` 为短 stub，不可回放；长度 <256 应被忽略
+    fn reasoning_added_with_short_stub_reports_open_item_without_replay_payload() {
+        // The live `.added` payload is a short stub (not replayable — replaying it returns 400), so
+        // no payload is captured, but the open state must still be reported: the stream layer uses
+        // it to keep a hidden-thinking silence from being read as a stalled stream.
         let payload = r#"{"type":"response.output_item.added","item":{"type":"reasoning","encrypted_content":"short-stub"}}"#;
         for event_type in [
             Some("response.output_item.added"),
@@ -692,15 +825,16 @@ mod tests {
             Some("message"),
         ] {
             match parse_stream_payload(provider::opencode_adapter(), payload, event_type) {
-                ParsedStreamPayload::Ignore => {}
-                _ => panic!("expected Ignore for short stub added for {event_type:?}"),
+                ParsedStreamPayload::ReasoningItem { item: None, open: true } => {}
+                _ => panic!("expected an open, non-replayable reasoning item for {event_type:?}"),
             }
         }
     }
 
     #[test]
     fn reasoning_added_with_long_encrypted_content_is_captured_via_fallback() {
-        // 前向兼容：若网关把完整加密载荷移到 `.added`，长度 >=256 应被捕获
+        // Forward compatibility: if a gateway moves the full encrypted payload to `.added`
+        // (>=256 chars), it must be captured for replay and reported as an open item.
         let long = "a".repeat(512);
         let payload = format!(
             r#"{{"type":"response.output_item.added","item":{{"id":"rs_1","type":"reasoning","encrypted_content":"{long}"}}}}"#
@@ -712,12 +846,67 @@ mod tests {
             Some("message"),
         ] {
             match parse_stream_payload(provider::opencode_adapter(), &payload, event_type) {
-                ParsedStreamPayload::ReasoningItem(item) => {
+                ParsedStreamPayload::ReasoningItem { item: Some(item), open: true } => {
                     assert_eq!(item["type"], "reasoning");
                     assert_eq!(item["encrypted_content"].as_str().unwrap().len(), 512);
                 }
-                _ => panic!("expected ReasoningItem for long added for {event_type:?}"),
+                _ => panic!("expected an open reasoning item for long added for {event_type:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn reasoning_added_without_encrypted_content_reports_open_item() {
+        // Thinking whose content is not streamed at all (no encrypted block, empty summary): the
+        // item still reports that the provider holds it open.
+        let payload = r#"{"type":"response.output_item.added","item":{"id":"rs_1","type":"reasoning","status":"in_progress","summary":[]}}"#;
+        match parse_stream_payload(
+            provider::opencode_adapter(),
+            payload,
+            Some("response.output_item.added"),
+        ) {
+            ParsedStreamPayload::ReasoningItem {
+                item: None,
+                open: true,
+            } => {}
+            _ => panic!("expected an open reasoning item without a replay payload"),
+        }
+    }
+
+    #[test]
+    fn reasoning_done_without_encrypted_content_reports_closed_item() {
+        let payload = r#"{"type":"response.output_item.done","item":{"id":"rs_1","type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":"done"}]}}"#;
+        match parse_stream_payload(
+            provider::opencode_adapter(),
+            payload,
+            Some("response.output_item.done"),
+        ) {
+            ParsedStreamPayload::ReasoningItem {
+                item: None,
+                open: false,
+            } => {}
+            _ => panic!("expected a closed reasoning item without a replay payload"),
+        }
+    }
+
+    #[test]
+    fn reasoning_added_with_terminal_status_reports_closed_item() {
+        // A provider that reports the final state on the `.added` line must not leave the item open
+        // forever: a terminal status closes it.
+        let long = "a".repeat(512);
+        let payload = format!(
+            r#"{{"type":"response.output_item.added","item":{{"id":"rs_1","type":"reasoning","status":"completed","encrypted_content":"{long}"}}}}"#
+        );
+        match parse_stream_payload(
+            provider::opencode_adapter(),
+            &payload,
+            Some("response.output_item.added"),
+        ) {
+            ParsedStreamPayload::ReasoningItem {
+                item: Some(_),
+                open: false,
+            } => {}
+            _ => panic!("expected a closed reasoning item for a terminal status"),
         }
     }
 
@@ -882,11 +1071,14 @@ mod tests {
             payload,
             Some("response.incomplete"),
         ) {
-            ParsedStreamPayload::Chunk(chunk) => {
+            ParsedStreamPayload::ResponseTerminal {
+                status: ResponseTerminalStatus::Incomplete,
+                chunk,
+            } => {
                 assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
                 assert!(chunk.usage.is_some());
             }
-            _ => panic!("expected length-truncation chunk"),
+            _ => panic!("expected an incomplete terminal declaration"),
         }
     }
 
@@ -1032,7 +1224,10 @@ mod tests {
             payload,
             Some("response.completed"),
         ) {
-            ParsedStreamPayload::Chunk(chunk) => {
+            ParsedStreamPayload::ResponseTerminal {
+                status: ResponseTerminalStatus::Completed,
+                chunk,
+            } => {
                 assert!(chunk.choices.is_empty());
                 let usage = chunk
                     .usage
@@ -1055,7 +1250,100 @@ mod tests {
                     48
                 );
             }
-            _ => panic!("response.completed should yield a usage chunk"),
+            _ => panic!("response.completed should declare a completed terminal state"),
+        }
+    }
+
+    #[test]
+    fn response_completed_with_null_incomplete_details_stays_completed() {
+        // Real gateway shape: the completed event carries `incomplete_details` as an explicit null
+        // (and `error` as null) while the status is `completed`. Presence alone must not be read as
+        // an incomplete declaration, or every completed turn would abort as a stream error.
+        let payload = r#"{
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "error": null,
+                "incomplete_details": null,
+                "usage": {"input_tokens": 40, "output_tokens": 12}
+            }
+        }"#;
+        match parse_stream_payload(
+            provider::openai_adapter(),
+            payload,
+            Some("response.completed"),
+        ) {
+            ParsedStreamPayload::ResponseTerminal {
+                status: ResponseTerminalStatus::Completed,
+                chunk,
+            } => {
+                assert!(chunk.usage.is_some());
+            }
+            _ => panic!("a completed response with null details must stay completed"),
+        }
+    }
+
+    #[test]
+    fn response_completed_without_usage_still_declares_completion() {
+        let payload = r#"{"type":"response.completed","response":{"status":"completed","incomplete_details":null}}"#;
+        match parse_stream_payload(
+            provider::openai_adapter(),
+            payload,
+            Some("response.completed"),
+        ) {
+            ParsedStreamPayload::ResponseTerminal {
+                status: ResponseTerminalStatus::Completed,
+                chunk,
+            } => {
+                assert!(chunk.usage.is_none());
+            }
+            _ => panic!("the completion marker must not depend on a usage block"),
+        }
+    }
+
+    #[test]
+    fn response_completed_with_incomplete_status_maps_to_incomplete_terminal() {
+        // Gateways may report the terminal state inside `response.completed` instead of emitting a
+        // dedicated `response.incomplete`; reading it as a normal completion is what ends a cut-off
+        // turn silently, so it must surface as an incomplete declaration.
+        let payload = r#"{
+            "type": "response.completed",
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {"input_tokens": 5, "output_tokens": 9}
+            }
+        }"#;
+        match parse_stream_payload(
+            provider::openai_adapter(),
+            payload,
+            Some("response.completed"),
+        ) {
+            ParsedStreamPayload::ResponseTerminal {
+                status: ResponseTerminalStatus::Incomplete,
+                chunk,
+            } => {
+                assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
+                assert!(chunk.usage.is_some());
+            }
+            _ => panic!("an incomplete response must not be read as a normal completion"),
+        }
+    }
+
+    #[test]
+    fn response_incomplete_without_event_name_is_not_swallowed() {
+        // Same signal with no usable SSE `event:` name: the type has to be read from the JSON body,
+        // otherwise the payload deserializes into an empty chunk and the cut disappears.
+        let payload =
+            r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}"#;
+        match parse_stream_payload(provider::openai_adapter(), payload, None) {
+            ParsedStreamPayload::ResponseTerminal {
+                status: ResponseTerminalStatus::Incomplete,
+                chunk,
+            } => {
+                assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
+            }
+            _ => panic!("response.incomplete without an event name must still surface"),
         }
     }
 
@@ -1135,8 +1423,8 @@ mod tests {
     #[test]
     fn response_incomplete_event_surfaces_reason() {
         // max_output_tokens truncation is already mapped to finish_reason=length
-        // (see the dedicated test above); other unknown reasons still surface as
-        // hard errors, keeping the reason text for debugging.
+        // (see the dedicated test above); a named policy stop still surfaces as a
+        // hard error, keeping the reason text for debugging.
         let payload = r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#;
         match parse_stream_payload(
             provider::openai_adapter(),
@@ -1147,6 +1435,48 @@ mod tests {
                 assert!(msg.contains("content_filter"), "msg was: {msg}");
             }
             _ => panic!("response.incomplete should surface as Error"),
+        }
+    }
+
+    #[test]
+    fn response_incomplete_without_a_reason_is_a_declared_stop() {
+        // A gateway can declare the stop while dropping the reason (on this wire even a normal
+        // completion carries `incomplete_details: null`, so an absent or empty block must not become
+        // a terminal error). Nothing proves a retry is useless for an unnamed stop, so it stays a
+        // declared stop instead of ending a turn whose partial body was already produced.
+        for (event_type, payload) in [
+            (
+                "response.incomplete",
+                r#"{"type":"response.incomplete","response":{"status":"incomplete"}}"#,
+            ),
+            (
+                "response.incomplete",
+                r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":null}}"#,
+            ),
+            (
+                "response.incomplete",
+                r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"   "}}}"#,
+            ),
+            ("response.incomplete", r#"{"type":"response.incomplete"}"#),
+            (
+                "response.completed",
+                r#"{"type":"response.completed","response":{"status":"incomplete","incomplete_details":null,"usage":{"input_tokens":5,"output_tokens":9}}}"#,
+            ),
+        ] {
+            match parse_stream_payload(provider::openai_adapter(), payload, Some(event_type)) {
+                ParsedStreamPayload::ResponseTerminal {
+                    status: ResponseTerminalStatus::Incomplete,
+                    chunk,
+                } => {
+                    // The unnamed stop must not claim the output cap: no fabricated finish reason,
+                    // otherwise cap-specific repair would run for a cause nobody reported.
+                    assert!(
+                        chunk.choices[0].finish_reason.is_none(),
+                        "an unnamed stop must not fabricate a finish reason: {payload}"
+                    );
+                }
+                _ => panic!("an unnamed stop must stay a declared stop, not an error: {payload}"),
+            }
         }
     }
 }
