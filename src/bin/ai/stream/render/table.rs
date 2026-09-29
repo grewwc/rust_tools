@@ -422,9 +422,9 @@ fn pad_cell(s: &str, width: usize, align: TableAlign) -> String {
 /// unclosed markers verbatim as literal characters, making the real width exceed the estimate and misaligning table borders.
 fn render_and_pad_cell(cell_line: &str, width: usize, align: TableAlign, base: &str) -> String {
     let mut rendered = render_inline_md(cell_line, base);
-    // Strip redundant VS16 from the rendered text. When VS16 follows an
-    // is_ambiguous_emoji_block_char, the base already renders as 2-col emoji;
-    // keeping VS16 in the string would add an extra column in the terminal.
+    // Strip redundant VS16 from the rendered text. When VS16 follows a base
+    // that already renders as 2-col emoji, keeping VS16 in the string would
+    // add an extra column in the terminal.
     // Only rebuild when a VS16 is actually present (rare).
     if rendered.contains('\u{fe0f}') {
         rendered = strip_redundant_vs16(&rendered);

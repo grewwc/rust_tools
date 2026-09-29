@@ -16,49 +16,72 @@ pub(super) fn terminal_cell_width(ch: char) -> usize {
     if is_single_width_terminal_symbol(ch) {
         return 1;
     }
-    // Modern macOS terminals render Miscellaneous Symbols (U+2600-U+26FF),
-    // Miscellaneous Technical (U+2300-U+23FF), Dingbats (U+2700-U+27BF),
-    // and the ambiguous-width symbols in some blocks such as Geometric Shapes rating/up-down markers (△▽▲▼)
-    // as emoji at 2 columns. unicode-width
-    // returns 1 (ambiguous) for these characters, but the terminal actually uses 2. Without a fix, cells containing ⚠ ☎ ✂
-    // or `4.0→4.0 △`-style markers get their right border dragged off line by line.
-    if is_ambiguous_emoji_block_char(ch) {
-        return 2;
-    }
+    // No block-level override here: emoji-presentation symbols (East Asian
+    // Wide, e.g. ⚡ ☔ ✨ ✅ ⌚) already return 2 from unicode-width, while
+    // text-presentation symbols (⚠ ☀ ☎ ☐ ☑ ★ ♻ ✂ ✈ ✓ △ ...) are
+    // Neutral/Ambiguous width and correctly count as 1. Forcing a whole
+    // block to 2 drags the right border of cells containing such symbols one
+    // column left per symbol. Expansion to emoji via VS16 is handled in
+    // `terminal_display_width`, and redundant VS16 in `strip_redundant_vs16`.
     unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
 pub(super) fn terminal_display_width(s: &str) -> usize {
-    let mut total = 0;
-    let mut prev_was_emoji_block = false;
+    let mut total: usize = 0;
+    // Width of the last non-selector char: VS16/VS15 modify the base width
+    // only relative to an immediately preceding base.
+    let mut prev_base_width: Option<usize> = None;
     for ch in s.chars() {
-        if ch == '\u{fe0f}' && prev_was_emoji_block {
-            // The previous char is already an emoji-block character (counted as 2 columns); VS16 adds no extra width
-            prev_was_emoji_block = false;
+        if ch == '\u{fe0f}' {
+            // VS16 after a double-width base is redundant (already counted 2).
+            // After a single-width text-presentation base it expands the base
+            // into emoji presentation (⚠ 1 -> ⚠️ 2), so it takes 1 column.
+            if prev_base_width == Some(2) {
+                prev_base_width = None;
+                continue;
+            }
+            total += 1;
+            prev_base_width = None;
             continue;
         }
-        total += terminal_cell_width(ch);
-        prev_was_emoji_block = is_ambiguous_emoji_block_char(ch);
+        if ch == '\u{fe0e}' {
+            // VS15 forces text presentation: an emoji-presentation base (2)
+            // drops back to 1 column.
+            if prev_base_width == Some(2) {
+                total = total.saturating_sub(1);
+            }
+            prev_base_width = None;
+            continue;
+        }
+        let w = terminal_cell_width(ch);
+        total += w;
+        prev_base_width = Some(w);
     }
     total
 }
 
 /// Strip redundant U+FE0F (VS16) from visible text.
 ///
-/// When VS16 follows an `is_ambiguous_emoji_block_char` (e.g. ⚠ U+26A0), the base
-/// already renders as 2-column emoji without VS16. Keeping VS16 in the string causes
-/// `render_and_pad_cell` to undercount by 1 column (VS16 takes 1 cell in the terminal
-/// but `terminal_display_width` skips it), shifting table borders right.
+/// When VS16 follows a base that already renders as 2-column emoji (e.g. ⚡
+/// U+26A1), the selector adds no width and keeping it would make
+/// `render_and_pad_cell` count one column too many, shifting table borders
+/// right. VS16 after a single-width text-presentation base (e.g. ⚠ U+26A0)
+/// is what expands it to 2 columns and must be kept.
 pub(super) fn strip_redundant_vs16(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut prev_was_emoji_block = false;
+    let mut prev_base: Option<char> = None;
     for ch in s.chars() {
-        if ch == '\u{fe0f}' && prev_was_emoji_block {
-            prev_was_emoji_block = false;
-            continue; // drop redundant VS16
+        if ch == '\u{fe0f}' {
+            if prev_base.map(terminal_cell_width) == Some(2) {
+                continue; // drop redundant VS16
+            }
+            out.push(ch);
+            continue; // a kept VS16 never becomes the base for a following one
         }
         out.push(ch);
-        prev_was_emoji_block = is_ambiguous_emoji_block_char(ch);
+        if ch != '\u{fe0e}' {
+            prev_base = Some(ch);
+        }
     }
     out
 }
@@ -71,25 +94,12 @@ fn is_single_width_terminal_symbol(ch: char) -> bool {
     )
 }
 
-/// Whether the character belongs to a Unicode block the terminal renders as emoji at 2 columns.
-///
-/// Characters in these blocks are East Asian Ambiguous width in Unicode (unicode-width returns 1),
-/// but modern macOS terminals render them with the Apple Color Emoji font, actually using 2 columns.
-/// Inherently Wide emoji (✅ ❌, etc.) already return 2 from unicode-width and need no handling.
-fn is_ambiguous_emoji_block_char(ch: char) -> bool {
-    let c = ch as u32;
-    matches!(
-        c,
-        // Miscellaneous Technical: ⌚ ⌛ ⏰ etc.
-        0x2300..=0x23FF
-            // Miscellaneous Symbols: ☀ ☁ ⚠ ☎ ⚡ etc.
-            | 0x2600..=0x26FF
-            // Dingbats: ✂ ✆ ✈ ✉ ✌ ✍ ✎ ✏ ✓ ✔ ✨ etc.
-            | 0x2700..=0x27BF
-            // Common rating/up-down triangle markers in Geometric Shapes: △ ▲ ▽ ▼
-            | 0x25B2 | 0x25B3 | 0x25BC | 0x25BD
-    )
-}
+// Width model note: do NOT force whole symbol blocks (U+2300-U+23FF,
+// U+2600-U+26FF, U+2700-U+27BF) to 2 columns. Only the East Asian Wide
+// members (⚡ ☔ ✨ ✅ ⌚, ...) occupy 2 columns; the text-presentation
+// members (⚠ ☀ ☎ ☐ ☑ ★ ♻ ✂ ✈ ✓ △ ...) occupy 1. `unicode-width`
+// already encodes this split, and `terminal_display_width` handles the
+// VS16/VS15 presentation selectors explicitly.
 
 /// Convert CJK punctuation (`：` `，` `。`) adjacent to file names / links into their ASCII forms (`:` `,` `.`).
 ///
@@ -886,36 +896,75 @@ mod tests {
         }
         // A result cell containing an arrow: 3 visible chars (→ space x) should be 3 columns, not 4.
         assert_eq!(terminal_display_width("→ x"), 3);
-        // Ambiguous emoji-block characters (⚠ ☎ ✂) render at 2 columns in modern terminals.
-        for ch in ['⚠', '☎', '✂', '☀', '✈'] {
+        // Emoji-presentation symbols (East Asian Wide) render at 2 columns.
+        // Verified against the OS `wcwidth`, which agrees with Unicode
+        // Emoji_Presentation=Yes for these codepoints.
+        for ch in ['⚡', '☔', '☕', '✨', '⌚'] {
             assert_eq!(
                 terminal_cell_width(ch),
                 2,
-                "emoji-block symbol {ch:?} must render as double width"
+                "emoji-presentation symbol {ch:?} must render as double width"
             );
         }
-        // Emoji-block char + digit = 3 columns (emoji 2 + digit 1).
-        assert_eq!(terminal_display_width("⚠1"), 3);
+        // Emoji-presentation char + digit = 3 columns (emoji 2 + digit 1).
+        assert_eq!(terminal_display_width("⚡1"), 3);
+        // Text-presentation symbols stay single-width: warning/sun/cloud/phone/
+        // ballot-box/star/recycle/scissors/plane markers all render with a
+        // text font at 1 column (the OS `wcwidth` returns 1 for each), as do
+        // the Geometric Shapes rating/up-down triangles.
+        for ch in [
+            '⚠', '☀', '☁', '☎', '☐', '☑', '★', '♻', '✂', '✈', '△', '▲', '▽', '▼',
+        ] {
+            assert_eq!(
+                terminal_cell_width(ch),
+                1,
+                "text-presentation symbol {ch:?} must render as a single terminal column"
+            );
+        }
+        // Text-presentation char + digit = 2 columns (symbol 1 + digit 1).
+        assert_eq!(terminal_display_width("⚠1"), 2);
+        // Text-presentation check/cross markers stay single-width: a status cell
+        // like `完整合法解 ✓` must not drag its right border one column left.
+        for ch in ['✓', '✔', '✕', '✖', '✗', '✘'] {
+            assert_eq!(
+                terminal_cell_width(ch),
+                1,
+                "check/cross marker {ch:?} must render as a single terminal column"
+            );
+        }
+        assert_eq!(terminal_display_width("完整合法解 ✓"), 12);
+        // With VS16 they expand to emoji presentation at 2 columns.
+        assert_eq!(terminal_display_width("✓\u{fe0f}"), 2);
     }
 
     #[test]
     fn terminal_width_counts_emoji_presentation_as_double_width() {
-        // A symbol with an emoji variation selector (U+FE0F) takes 2 columns via emoji presentation in real terminals.
-        // `⚠️` = U+26A0 + U+FE0F: base is ambiguous(1) + VS16(adds 1) = 2 columns.
-        assert_eq!(terminal_display_width("⚠️"), 2);
-        // Modern macOS terminals render Miscellaneous Symbols block characters as emoji at 2 columns,
-        // even without VS16. ⚠ (U+26A0) belongs to this block.
-        assert_eq!(terminal_display_width("⚠"), 2);
+        // A text-presentation base expands to 2 columns with VS16 (U+FE0F):
+        // base(1) + VS16(1) = 2 columns.
+        assert_eq!(terminal_display_width("⚠\u{fe0f}"), 2);
+        assert_eq!(terminal_display_width("☀\u{fe0f}"), 2);
+        assert_eq!(terminal_display_width("✈\u{fe0f}"), 2);
+        // The same bases without VS16 stay at 1 column.
+        assert_eq!(terminal_display_width("⚠"), 1);
+        assert_eq!(terminal_display_width("☀"), 1);
         // Characters with inherent emoji presentation (unicode-width says 2) are unaffected.
         assert_eq!(terminal_display_width("✅"), 2);
         assert_eq!(terminal_display_width("❌"), 2);
-        // Up-down / rating triangle markers also take 2 columns in macOS terminals.
-        assert_eq!(terminal_display_width("△"), 2);
-        assert_eq!(terminal_display_width("▲"), 2);
-        assert_eq!(terminal_display_width("▽"), 2);
-        assert_eq!(terminal_display_width("▼"), 2);
+        // VS16 after an emoji-presentation base is redundant (already 2).
+        assert_eq!(terminal_display_width("⚡\u{fe0f}"), 2);
+        // VS15 (U+FE0E) forces text presentation: an emoji base drops to 1.
+        assert_eq!(terminal_display_width("⚡\u{fe0e}"), 1);
         // A lone VS16 contributes 1 column (equivalent to giving the adjacent base the column it expands into).
         assert_eq!(terminal_cell_width('\u{fe0f}'), 1);
+    }
+
+    #[test]
+    fn strip_redundant_vs16_keeps_expanding_selectors() {
+        // Redundant after an emoji-presentation base: dropping it changes nothing.
+        assert_eq!(strip_redundant_vs16("⚡\u{fe0f}"), "⚡");
+        // Required after a text-presentation base: dropping it would change
+        // the rendering from 2-column emoji back to 1-column text.
+        assert_eq!(strip_redundant_vs16("⚠\u{fe0f}"), "⚠\u{fe0f}");
     }
 
     #[test]
