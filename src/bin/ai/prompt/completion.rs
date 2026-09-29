@@ -82,6 +82,8 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":mark",
         "/unmark",
         ":unmark",
+        "/theme",
+        ":theme",
     ] {
         trie.insert(cmd);
     }
@@ -225,6 +227,8 @@ impl CommandCompleter {
             ":mark",
             "/unmark",
             ":unmark",
+            "/theme",
+            ":theme",
         ]
     }
 
@@ -587,6 +591,12 @@ impl CommandCompleter {
         &["list", "current", "use", "help"]
     }
 
+    /// Subcommand literals of `/theme` / `:theme` (theme names complete
+    /// alongside these; the literals live with the command implementation).
+    fn theme_subcommands() -> &'static [&'static str] {
+        crate::ai::driver::commands::theme::THEME_SUBCOMMANDS
+    }
+
     fn skill_candidates_from_manifests(
         manifests: &[crate::ai::skills::SkillManifest],
     ) -> Vec<CompletionCandidate> {
@@ -761,6 +771,28 @@ impl CommandCompleter {
                                 .filter(|c| c.starts_with(token))
                                 .map(|c| c.to_string()),
                         )
+                    }
+                    _ => Vec::new(),
+                }
+            } else if matches!(first, "/theme" | ":theme") {
+                match words.next() {
+                    None => {
+                        // Theme names (built-ins; user `~/.config/.../themes/*.json`
+                        // names appear via `/theme list`) complete alongside the
+                        // subcommand literals.
+                        let mut candidates = Self::plain_candidates(
+                            crate::ai::theme::BUILTIN_THEME_NAMES
+                                .iter()
+                                .filter(|name| name.starts_with(token))
+                                .map(|name| (*name).to_string()),
+                        );
+                        candidates.extend(Self::plain_candidates(
+                            Self::theme_subcommands()
+                                .iter()
+                                .filter(|sub| sub.starts_with(token))
+                                .map(|sub| (*sub).to_string()),
+                        ));
+                        candidates
                     }
                     _ => Vec::new(),
                 }
@@ -1354,6 +1386,37 @@ mod tests {
             .complete(":ma", 3, &Context::new(&history))
             .unwrap();
         assert!(pairs.iter().any(|pair| pair.replacement == ":mark"));
+    }
+
+    #[test]
+    fn command_completion_expands_top_level_theme_command() {
+        let completer = CommandCompleter;
+        let history = DefaultHistory::new();
+        let (_, pairs) = completer
+            .complete("/the", 4, &Context::new(&history))
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == "/theme"));
+        let (_, pairs) = completer
+            .complete(":the", 4, &Context::new(&history))
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == ":theme"));
+    }
+
+    #[test]
+    fn theme_completion_lists_names_and_subcommands() {
+        let completer = CommandCompleter;
+        let history = DefaultHistory::new();
+        let (start, pairs) = completer
+            .complete("/theme mo", 9, &Context::new(&history))
+            .unwrap();
+        assert_eq!(start, 7);
+        assert!(pairs.iter().any(|pair| pair.replacement == "monokai"));
+        let (_, pairs) = completer
+            .complete("/theme c", 8, &Context::new(&history))
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == "current"));
+        assert!(pairs.iter().any(|pair| pair.replacement == "clear"));
+        assert!(pairs.iter().any(|pair| pair.replacement == "catppuccin"));
     }
 
     #[test]

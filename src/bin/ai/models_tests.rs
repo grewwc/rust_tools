@@ -729,3 +729,75 @@ fn api_key_config_key_decrypts_before_configw_lookup() {
              and resolve from configw, not fall through to global fallback"
     );
 }
+
+#[test]
+fn minimal_model_config_omits_capability_flags_with_matching_defaults() {
+    // Compatibility: user configs that predate `is_vl` / `search_enabled` /
+    // `tools_default_enabled` (or simply omit them) must parse with the same
+    // defaults the `models.rs` fallbacks use for unknown models.
+    let def: ModelDef =
+        serde_json::from_str(r#"{"key":"X","name":"x"}"#).expect("minimal config parses");
+    assert!(!def.is_vl);
+    assert!(def.search_enabled);
+    assert!(def.tools_default_enabled);
+}
+
+#[test]
+fn token_counts_accept_numeric_strings() {
+    // Robustness: `"131072"` parses like `131072`; explicit numbers are unchanged.
+    let from_string: ModelDef = serde_json::from_str(
+        r#"{"key":"X","name":"x","context_window_tokens":"1048576","max_output_tokens":"131072"}"#,
+    )
+    .expect("numeric strings parse");
+    assert_eq!(from_string.context_window_tokens, Some(1_048_576));
+    assert_eq!(from_string.max_output_tokens, Some(131_072));
+    let from_number: ModelDef = serde_json::from_str(
+        r#"{"key":"X","name":"x","context_window_tokens":1048576,"max_output_tokens":131072}"#,
+    )
+    .expect("numbers still parse");
+    assert_eq!(from_number.context_window_tokens, Some(1_048_576));
+    assert_eq!(from_number.max_output_tokens, Some(131_072));
+}
+
+#[test]
+fn token_counts_reject_non_numeric_strings() {
+    // Fail fast is preserved: a typo like `"131x"` must not silently become a default.
+    let err = serde_json::from_str::<ModelDef>(
+        r#"{"key":"X","name":"x","max_output_tokens":"131x"}"#,
+    )
+    .expect_err("non-numeric string must fail");
+    assert!(err.to_string().contains("invalid token count"), "{err}");
+}
+
+#[test]
+fn token_counts_accept_magnitude_suffixes() {
+    // Human-friendly spellings: `128k` = 131072, `1M` = 1048576; grouped
+    // digits keep working.
+    let def: ModelDef = serde_json::from_str(
+        r#"{"key":"X","name":"x","context_window_tokens":"1M","max_output_tokens":"128k"}"#,
+    )
+    .expect("magnitude suffixes parse");
+    assert_eq!(def.context_window_tokens, Some(1_048_576));
+    assert_eq!(def.max_output_tokens, Some(131_072));
+    let grouped: ModelDef = serde_json::from_str(
+        r#"{"key":"X","name":"x","context_window_tokens":"1_048_576"}"#,
+    )
+    .expect("grouped digits parse");
+    assert_eq!(grouped.context_window_tokens, Some(1_048_576));
+}
+
+#[test]
+fn model_def_rejects_unknown_fields_but_allows_comment() {
+    // A misspelled field name fails instead of silently falling back to the default.
+    let err = serde_json::from_str::<ModelDef>(
+        r#"{"key":"X","name":"x","tools_enabled":false}"#,
+    )
+    .expect_err("unknown field must fail");
+    assert!(err.to_string().contains("unknown field"), "{err}");
+    // Reviewer notes have an explicit escape hatch.
+    let def: ModelDef = serde_json::from_str(
+        r#"{"key":"X","name":"x","_comment":"copied from provider docs"}"#,
+    )
+    .expect("_comment parses");
+    assert_eq!(def.key, "X");
+}

@@ -1238,7 +1238,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
 ) -> Option<StreamResult> {
     state.framing.decode_error_count += 1;
     if runtime_ctx::terminal_output_enabled() {
-        let _ = clear_waiting_hint(state);
+        let _ = suspend_live_terminal_regions(state);
         eprintln!(
             "[Warning] 读取响应流时出错：{} (错误次数：{}/{})",
             err, state.framing.decode_error_count, MAX_DECODE_ERRORS
@@ -1264,7 +1264,12 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         return None;
     }
 
+    let mut fold_settled = false;
     if runtime_ctx::terminal_output_enabled() {
+        if state.content.thinking_open {
+            let _ = flush_digest_filter_to_terminal(markers, state, true);
+        }
+        fold_settled = finalize_live_folds_before_diagnostic(state);
         eprintln!("[Error] 响应流读取失败，返回已收集的内容");
     }
 
@@ -1272,7 +1277,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         if state.content.thinking_open {
             let _ = flush_digest_filter_to_terminal(markers, state, true);
         }
-        if state.content.thinking_open {
+        if state.content.thinking_open && !fold_settled {
             let _ = write_stream_content(
                 &format!("\n{}\n", markers.end_thinking_tag),
                 &mut state.render.markdown,
@@ -2263,6 +2268,72 @@ fn erase_rows_above_cursor(out: &mut impl Write, rows: usize) -> io::Result<()> 
     Ok(())
 }
 
+/// Park a live fold frame before an out-of-band terminal line (a mid-stream warning the
+/// stream then continues past). Fold redraws erase relative to the current cursor, so any
+/// line printed while a frame is live desyncs the cursor: every later redraw then misses the
+/// old header and stacks another full `○ thinking` row below it. Erasing the frame here keeps
+/// buffers and `active`, so the next redraw draws one fresh frame below the intruder line.
+/// Mirrors the erase half of `finalize_fold_to`; the resume half is the normal redraw.
+fn suspend_fold_frame(
+    out: &mut impl Write,
+    fold: &mut super::state::ThinkingFoldState,
+) -> io::Result<()> {
+    if !fold.active {
+        return Ok(());
+    }
+    super::side_note_input::refresh_true_width();
+    let body_rows = thinking_fold_rendered_body_rows(fold).max(fold.window_rows);
+    let erase_rows = if fold.header_drawn {
+        body_rows
+            .max(1)
+            .saturating_add(thinking_fold_header_rendered_rows(fold))
+    } else {
+        body_rows
+    };
+    erase_fold_body(out, erase_rows)?;
+    out.flush()?;
+    fold.header_drawn = false;
+    fold.window_rows = 0;
+    fold.rendered_body_lines.clear();
+    Ok(())
+}
+
+/// Park every live terminal region immediately before a mid-stream diagnostic line, while the
+/// cursor is still where the live regions left it. Folds are suspended (see
+/// `suspend_fold_frame`); the waiting hint is cleared.
+fn suspend_live_terminal_regions(state: &mut StreamProcessingState) -> io::Result<()> {
+    if !runtime_ctx::terminal_output_enabled() {
+        return Ok(());
+    }
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    suspend_fold_frame(&mut out, &mut state.render.thinking_fold)?;
+    suspend_fold_frame(&mut out, &mut state.render.subagent_fold)?;
+    drop(out);
+    clear_waiting_hint(state)
+}
+
+/// Settle every live terminal region before a stream-stopping diagnostic line: same
+/// cursor-desync hazard as `suspend_live_terminal_regions`, but the stream ends here, so close
+/// the frames with their completion headers instead of parking them for a redraw that never
+/// comes. Returns whether the thinking fold was closed, so the caller can skip the plain
+/// (non-fold) end-of-thinking marker it would otherwise print below the completion header.
+fn finalize_live_folds_before_diagnostic(state: &mut StreamProcessingState) -> bool {
+    if !runtime_ctx::terminal_output_enabled() {
+        return false;
+    }
+    let mut settled = false;
+    if state.render.thinking_fold.active {
+        let _ = finalize_thinking_fold(state);
+        settled = true;
+    }
+    if state.render.subagent_fold.active {
+        let _ = finalize_subagent_preview_fold(state);
+    }
+    let _ = clear_waiting_hint(state);
+    settled
+}
+
 fn thinking_fold_window_lines(fold: &super::state::ThinkingFoldState) -> (Vec<String>, usize) {
     let hidden_count = thinking_fold_hidden_count(fold);
     let visible_lines = thinking_fold_visible_lines(fold);
@@ -2612,6 +2683,7 @@ fn process_stream_payload(
             state.content.finish_reason_value =
                 Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
             if runtime_ctx::terminal_output_enabled() {
+                let _ = finalize_live_folds_before_diagnostic(state);
                 eprintln!("\n  ⚠ 检测到模型推理重复循环，停止当前响应并自动重试…");
             }
             return Ok(StreamPayloadOutcome::stop_with_progress());
@@ -2657,6 +2729,7 @@ fn process_stream_payload(
         state.content.finish_reason_seen = true;
         state.content.finish_reason_value = Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
         if runtime_ctx::terminal_output_enabled() {
+            let _ = finalize_live_folds_before_diagnostic(state);
             eprintln!("\n  ⚠ 检测到模型伪造工具结果标记（输出退化），停止当前响应并自动重试…");
         }
         return Ok(StreamPayloadOutcome::stop_with_progress());
@@ -2680,6 +2753,7 @@ fn process_stream_payload(
         // the cut instant must not run as a complete tool call (same principle as stream_idle_timed_out).
         state.content.tool_args_cap_exceeded = true;
         if runtime_ctx::terminal_output_enabled() {
+            let _ = finalize_live_folds_before_diagnostic(state);
             eprintln!(
                 "\n  ⚠ 工具调用参数累积超过上限（{tool_arg_bytes} 字节 > {MAX_TOOL_ARG_BYTES}），判定输出退化，停止当前响应并自动重试…"
             );
@@ -2747,6 +2821,7 @@ fn process_stream_payload(
                     state.content.finish_reason_value =
                         Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
                     if runtime_ctx::terminal_output_enabled() {
+                        let _ = finalize_live_folds_before_diagnostic(state);
                         eprintln!("\n  ⚠ 检测到模型输出重复循环，停止当前响应并自动重试…");
                     }
                     return Ok(StreamPayloadOutcome::stop_with_progress());

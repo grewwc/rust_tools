@@ -2537,6 +2537,122 @@ fn thinking_fold_reclaims_every_header_stranded_by_multiple_lag_frames() {
     );
 }
 
+/// A mid-stream warning printed while the fold is live must not strand the header: parking
+/// the frame before the intruder line lets the next redraw draw one fresh header below it
+/// instead of stacking a stranded `○ thinking` per frame.
+#[test]
+fn thinking_fold_survives_mid_stream_warning_without_stacking_headers() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let _columns = SavedColumns(std::env::var_os("COLUMNS"));
+    crate::ai::stream::side_note_input::set_scripted_true_width(None);
+
+    unsafe {
+        std::env::set_var("COLUMNS", "100");
+    }
+    let mut grid = ReflowGrid::new(100, 30);
+    grid.feed("transcript\r\n");
+    let mut state = StreamProcessingState::new();
+    let fold = &mut state.render.thinking_fold;
+    fold.active = true;
+    fold.max_visible_lines = 2;
+    fold.rewrite_right_margin_cols = FOLD_REWRITE_RIGHT_MARGIN_COLS;
+    append_fold_content(fold, &"reasoning ".repeat(20));
+    for rate in ["~1.8k tok @ 147 tok/s", "~1.8k tok @ 146 tok/s"] {
+        let mut bytes = Vec::new();
+        thinking_fold_redraw_to(&mut bytes, Some(rate), fold).unwrap();
+        grid.feed(&String::from_utf8(bytes).unwrap());
+    }
+    assert_eq!(grid.text().matches("○ thinking").count(), 1, "steady state");
+
+    // The warning path: park the live frame, then print the intruder line below it.
+    let mut bytes = Vec::new();
+    suspend_fold_frame(&mut bytes, fold).unwrap();
+    grid.feed(&String::from_utf8(bytes).unwrap());
+    grid.feed("  ⚠ warning\r\n");
+
+    append_fold_content(fold, &"more reasoning ".repeat(20));
+    for rate in ["~1.9k tok @ 147 tok/s", "~3.8k tok @ 142 tok/s"] {
+        let mut bytes = Vec::new();
+        thinking_fold_redraw_to(&mut bytes, Some(rate), fold).unwrap();
+        grid.feed(&String::from_utf8(bytes).unwrap());
+    }
+
+    let screen = grid.text();
+    assert_eq!(
+        screen.matches("○ thinking").count(),
+        1,
+        "the header stranded by the warning survived later redraws:\n{screen}"
+    );
+    assert_eq!(
+        screen.matches("transcript").count(),
+        1,
+        "parking the frame ate the transcript row above the fold:\n{screen}"
+    );
+    assert!(
+        screen.contains("⚠ warning"),
+        "the intruder line did not survive the resume:\n{screen}"
+    );
+}
+
+/// A stream-stopping warning closes the live fold first, so the completion header replaces
+/// the frame in place and the diagnostic prints below it: no stranded `○ thinking` rows.
+#[test]
+fn thinking_fold_finalized_before_stop_warning_leaves_no_live_header() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let _columns = SavedColumns(std::env::var_os("COLUMNS"));
+    crate::ai::stream::side_note_input::set_scripted_true_width(None);
+
+    unsafe {
+        std::env::set_var("COLUMNS", "100");
+    }
+    let mut grid = ReflowGrid::new(100, 30);
+    grid.feed("transcript\r\n");
+    let mut state = StreamProcessingState::new();
+    let fold = &mut state.render.thinking_fold;
+    fold.active = true;
+    fold.max_visible_lines = 2;
+    fold.rewrite_right_margin_cols = FOLD_REWRITE_RIGHT_MARGIN_COLS;
+    append_fold_content(fold, &"reasoning ".repeat(20));
+    for rate in ["~1.8k tok @ 147 tok/s", "~1.8k tok @ 146 tok/s"] {
+        let mut bytes = Vec::new();
+        thinking_fold_redraw_to(&mut bytes, Some(rate), fold).unwrap();
+        grid.feed(&String::from_utf8(bytes).unwrap());
+    }
+    assert_eq!(grid.text().matches("○ thinking").count(), 1, "steady state");
+
+    // The stop path: close the fold (as `finalize_live_folds_before_diagnostic` does),
+    // then print the warning below the completion header.
+    let mut bytes = Vec::new();
+    finalize_fold_to(&mut bytes, fold, true).unwrap();
+    grid.feed(&String::from_utf8(bytes).unwrap());
+    grid.feed("  ⚠ 检测到模型推理重复循环，停止当前响应并自动重试…\r\n");
+
+    let screen = grid.text();
+    assert_eq!(
+        screen.matches("○ thinking").count(),
+        0,
+        "finalizing the fold left a live header above the warning:\n{screen}"
+    );
+    assert_eq!(
+        screen.matches("✓ thinking").count(),
+        1,
+        "the completion header did not replace the frame:\n{screen}"
+    );
+    assert_eq!(
+        screen.matches("transcript").count(),
+        1,
+        "closing the fold ate the transcript row above it:\n{screen}"
+    );
+    assert!(
+        screen.contains("重复循环"),
+        "the warning line did not survive below the completion header:\n{screen}"
+    );
+}
+
 #[test]
 fn thinking_fold_terminal_grid_refresh_does_not_accumulate_headers() {
     // Accept only the fold/footer control sequences, including scroll margins,

@@ -10,6 +10,7 @@ pub fn print_interactive_help() {
     println!(
         "    /effort [level]           show or set reasoning effort (shortcut for /model effort)"
     );
+    println!("    /theme [name]             list or switch terminal themes live (session-only)");
     println!("    /audit <instruction>      run the audit subagent synchronously (up to 15 min)");
     println!(
         "    /changes [/diff] [--stat|--json|--patch|--open]  show session file changes & open diff externally"

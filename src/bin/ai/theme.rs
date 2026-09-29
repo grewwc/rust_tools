@@ -42,6 +42,10 @@
 //! `ai.theme` / `ai.theme.file` edits — or edits to a custom theme JSON —
 //! apply on the next user message without restarting the process.
 //!
+//! `/theme` sets a session-scoped override that takes precedence over the
+//! config resolution above (and therefore survives turn-boundary refreshes)
+//! without touching the config file; `/theme clear` drops it.
+//!
 //! # Style codes vs. colors
 //!
 //! `RESET`/`BOLD`/`DIM` are SGR style parameters, not colors, so they stay
@@ -133,11 +137,11 @@ impl Theme {
             accent_danger: "\x1b[38;2;251;113;133m",
             accent_marked: "\x1b[38;2;255;150;150m",
             accent_rule: "\x1b[38;2;71;85;105m",
-            accent_submitted: "\x1b[38;2;245;158;11m",
+            accent_submitted: "\x1b[38;2;230;219;116m",
             accent_submitted_bar: "\x1b[38;2;224;108;117m",
             markdown_body: "\x1b[38;2;212;209;203m",
             markdown_strong: "\x1b[38;2;229;223;213m",
-            markdown_heading: "\x1b[38;2;221;215;204m",
+            markdown_heading: "\x1b[38;2;242;236;223m",
             markdown_accent: "\x1b[38;2;190;203;219m",
             markdown_code_fg: "\x1b[38;2;195;188;220m",
             markdown_math: "\x1b[38;2;229;115;158m",
@@ -222,6 +226,11 @@ impl Theme {
 
     /// Resolve the active theme from config (see module docs for the order).
     fn load_from_config() -> Theme {
+        // A live `/theme` override wins over config so it survives the
+        // turn-boundary `refresh()` that re-runs this resolution.
+        if let Some((_, theme)) = THEME_OVERRIDE.lock().unwrap().as_ref() {
+            return theme.clone();
+        }
         let cfg = configw::get_all_config();
         if let Some(path) = cfg.get_opt(AiConfig::THEME_FILE) {
             if let Ok(content) = fs::read_to_string(expanduser(&path).as_ref())
@@ -262,8 +271,37 @@ pub(crate) fn refresh() {
     *CURRENT_THEME.lock().unwrap() = Some(fresh);
 }
 
+/// Session-scoped live override set by `/theme` (labelled for `/theme current`
+/// display). It never touches the config file: set `ai.theme` in config to make
+/// a choice permanent.
+static THEME_OVERRIDE: Mutex<Option<(String, Theme)>> = Mutex::new(None);
+
+/// Switch the live palette immediately; paint code reads `current()`, so the
+/// next terminal output already uses the new theme.
+pub(crate) fn set_override(label: String, theme: Theme) {
+    let fresh = Box::leak(Box::new(theme.clone()));
+    *CURRENT_THEME.lock().unwrap() = Some(fresh);
+    *THEME_OVERRIDE.lock().unwrap() = Some((label, theme));
+}
+
+/// Drop the session override and re-resolve from config.
+pub(crate) fn clear_override() {
+    THEME_OVERRIDE.lock().unwrap().take();
+    refresh();
+}
+
+/// Label of the live override (`/theme <name>` argument or `file:<path>`),
+/// or `None` when the theme comes from config.
+pub(crate) fn override_label() -> Option<String> {
+    THEME_OVERRIDE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|(label, _)| label.clone())
+}
+
 /// Resolve a theme by name: user override dir first, then built-ins.
-fn theme_from_name(name: &str) -> Option<Theme> {
+pub(crate) fn theme_from_name(name: &str) -> Option<Theme> {
     let user_path = user_themes_dir().join(format!("{name}.json"));
     if let Ok(content) = fs::read_to_string(&user_path)
         && let Some(theme) = Theme::from_json(&content)
@@ -273,6 +311,20 @@ fn theme_from_name(name: &str) -> Option<Theme> {
     let json = builtin_theme_json(name)?;
     Theme::from_json(json)
 }
+
+/// Built-in theme names: the single source for `/theme` listing, tab
+/// completion, and the parse test below (a name missing from the `match` in
+/// `builtin_theme_json` fails that test).
+pub(crate) const BUILTIN_THEME_NAMES: &[&str] = &[
+    "default",
+    "monokai",
+    "light",
+    "dracula",
+    "one-dark",
+    "tokyo-night",
+    "nord",
+    "catppuccin",
+];
 
 fn builtin_theme_json(name: &str) -> Option<&'static str> {
     match name {
@@ -289,8 +341,28 @@ fn builtin_theme_json(name: &str) -> Option<&'static str> {
 }
 
 /// User theme override directory: `~/.config/rust_tools/themes/`.
-fn user_themes_dir() -> PathBuf {
+pub(crate) fn user_themes_dir() -> PathBuf {
     PathBuf::from(expanduser("~/.config/rust_tools/themes").as_ref())
+}
+
+/// Every theme name `/theme` can switch to: built-ins plus the `*.json` stems
+/// in the user override dir (a user file shadows the built-in of the same
+/// name). Sorted for stable display.
+pub(crate) fn available_theme_names() -> Vec<String> {
+    let mut names: Vec<String> = BUILTIN_THEME_NAMES.iter().map(|s| s.to_string()).collect();
+    if let Ok(entries) = fs::read_dir(user_themes_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                && !names.iter().any(|n| n == stem)
+            {
+                names.push(stem.to_string());
+            }
+        }
+    }
+    names.sort();
+    names
 }
 
 fn set_fg(field: &mut &'static str, raw: &str) {
@@ -431,15 +503,12 @@ mod tests {
 
     #[test]
     fn all_builtin_themes_parse_and_differ_from_default() {
-        for name in [
-            "monokai",
-            "light",
-            "dracula",
-            "one-dark",
-            "tokyo-night",
-            "nord",
-            "catppuccin",
-        ] {
+        // Iterating the shared name table also locks it to the `match` in
+        // `builtin_theme_json`: an unregistered name panics below.
+        for name in BUILTIN_THEME_NAMES {
+            if *name == "default" {
+                continue;
+            }
             let json = builtin_theme_json(name).unwrap_or_else(|| panic!("{name} must be registered"));
             let t = Theme::from_json(json).unwrap_or_else(|| panic!("{name} must parse"));
             assert_ne!(t.code_background, Theme::default_theme().code_background);

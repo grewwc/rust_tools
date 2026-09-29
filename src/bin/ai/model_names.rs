@@ -8,6 +8,104 @@ use rust_tools::cw::SkipSet;
 use super::provider::{ApiProvider, ModelQualityTier, ReasoningEffort};
 use super::request_protocol::RequestProtocolDialect;
 
+/// Default `true` for opt-in capability flags. Matches the `models.rs` fallback
+/// used when a registry entry omits the field, so minimal user configs keep
+/// working instead of failing to parse.
+fn default_true() -> bool {
+    true
+}
+
+/// Parse a human-friendly token count: plain numbers (`131072`), grouped
+/// digits (`1_048_576`, `1,048,576`), or `k`/`M` magnitudes (`128k` = 131072,
+/// `1M` = 1048576; `k` = 1024, `M` = 1024*1024, matching how providers quote
+/// context/output limits). Anything else is rejected so typos fail fast
+/// instead of silently becoming a default.
+fn parse_token_count(text: &str) -> Result<u64, String> {
+    let trimmed = text.trim();
+    let (digits, multiplier) = if let Some(rest) = trimmed
+        .strip_suffix('k')
+        .or_else(|| trimmed.strip_suffix('K'))
+    {
+        (rest, 1024u64)
+    } else if let Some(rest) = trimmed
+        .strip_suffix('m')
+        .or_else(|| trimmed.strip_suffix('M'))
+    {
+        (rest, 1024 * 1024u64)
+    } else {
+        (trimmed, 1u64)
+    };
+    let cleaned: String = digits
+        .chars()
+        .filter(|ch| *ch != '_' && *ch != ',')
+        .collect();
+    let base: u64 = cleaned
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid token count '{text}'"))?;
+    base.checked_mul(multiplier)
+        .ok_or_else(|| format!("invalid token count '{text}'"))
+}
+
+/// Parse an optional token count from a JSON number or a human-friendly string
+/// (see `parse_token_count`). Missing/null stays `None`; any other shape
+/// is a hard parse error so typos still fail fast instead of silently
+/// becoming a default.
+fn deserialize_optional_usize_string_or_number<'de, D>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match raw {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .and_then(|v| usize::try_from(v).ok())
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid token count {n}"))),
+        Some(serde_json::Value::String(s)) => {
+            let value = parse_token_count(&s).map_err(serde::de::Error::custom)?;
+            usize::try_from(value)
+                .map(Some)
+                .map_err(|_| serde::de::Error::custom(format!("invalid token count '{s}'")))
+        }
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "invalid token count {other}"
+        ))),
+    }
+}
+
+/// Same tolerance as the `usize` variant, for the per-response output cap.
+fn deserialize_optional_u32_string_or_number<'de, D>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match raw {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid token count {n}"))),
+        Some(serde_json::Value::String(s)) => {
+            let value = parse_token_count(&s).map_err(serde::de::Error::custom)?;
+            u32::try_from(value)
+                .map(Some)
+                .map_err(|_| serde::de::Error::custom(format!("invalid token count '{s}'")))
+        }
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "invalid token count {other}"
+        ))),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffortWire {
@@ -16,6 +114,7 @@ pub enum ReasoningEffortWire {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelDef {
     pub key: String,
     #[serde(default)]
@@ -39,11 +138,17 @@ pub struct ModelDef {
     pub api_key: Option<String>,
     #[serde(default)]
     pub quality_tier: ModelQualityTier,
+    /// Defaults to false, matching the `models::is_vl_model` fallback for unknown models.
+    #[serde(default)]
     pub is_vl: bool,
     /// Provider-native web search. Enable only when the request protocol has a clear wire mapping:
     /// DashScope Chat Completions uses `enable_search`, OpenAI Responses uses the built-in
     /// `web_search` tool; client-side tools are not part of this field.
+    /// Defaults to true, matching the `models::search_enabled` fallback for unknown models.
+    #[serde(default = "default_true")]
     pub search_enabled: bool,
+    /// Defaults to true, matching the `models::tools_enabled` fallback for unknown models.
+    #[serde(default = "default_true")]
     pub tools_default_enabled: bool,
     /// Whether `cache_control: {"type":"ephemeral"}` can be injected onto message content blocks
     /// to enable explicit prompt caching.
@@ -51,15 +156,39 @@ pub struct ModelDef {
     pub explicit_prompt_cache: bool,
     #[serde(default)]
     pub enable_thinking: bool,
-    /// Optional: model context window (in tokens).
-    /// Used for the driver's dynamic compression budget estimation; falls back by quality_tier when unset.
-    #[serde(default, alias = "context_window", alias = "max_context_tokens")]
+    /// Total token budget for one request: prompt + reserved output combined.
+    /// Copy the provider's "context" number here (e.g. `1048576` for a 1M model;
+    /// `"1M"` / `"128k"` spellings are accepted). Rough scale: ~2 characters per
+    /// token on Chinese-heavy text, so 1M tokens hold about 2MB of text.
+    /// Used for the driver's dynamic compression budget estimation and for
+    /// clamping `max_output_tokens` to what still fits (see
+    /// `clamp_max_tokens_for_prompt`): when unset, a conservative per-tier
+    /// fallback applies (flagship 256k / strong 200k / standard 128k / basic
+    /// 100k), which over-compresses history and squeezes the output cap on
+    /// large-context tasks. Always declare this together with
+    /// `max_output_tokens`, with a window strictly larger than the cap.
+    #[serde(
+        default,
+        alias = "context_window",
+        alias = "max_context_tokens",
+        deserialize_with = "deserialize_optional_usize_string_or_number"
+    )]
     pub context_window_tokens: Option<usize>,
-    /// Optional: maximum output tokens per response, sent as the request's `max_tokens`.
+    /// Maximum tokens for a single response (visible text + hidden reasoning
+    /// combined), sent as the request's `max_tokens`. Copy the provider's
+    /// "output" number here (e.g. `131072`; `"128k"` accepted).
     /// Many OpenAI-compatible providers apply a conservative completion cap when the client does not specify one,
     /// truncating large `write_file` payloads / long documents mid-generation. Declaring a value close to the
     /// model's real limit mitigates truncation; when unset (None), `max_tokens` is not sent, preserving historical behavior.
-    #[serde(default, alias = "max_tokens", alias = "max_completion_tokens")]
+    /// Must stay strictly below `context_window_tokens`: declare both together,
+    /// otherwise the prompt clamp squeezes the cap to the 1024 floor on long
+    /// tasks and every response truncates.
+    #[serde(
+        default,
+        alias = "max_tokens",
+        alias = "max_completion_tokens",
+        deserialize_with = "deserialize_optional_u32_string_or_number"
+    )]
     pub max_output_tokens: Option<u32>,
     /// Optional: request-layer prompt-token-per-minute preflight budget. Only when the model registry
     /// explicitly sets this field does the request layer wait before sending; when unset (or 0) the TPM preflight is
@@ -127,6 +256,11 @@ pub struct ModelDef {
     /// preserving thinking capability.
     #[serde(default)]
     pub reasoning_effort_conflicts_with_tools: bool,
+    /// Ignored annotation slot so JSON files can carry reviewer notes
+    /// (`"_comment": "..."`) without tripping `deny_unknown_fields`.
+    /// Never read at runtime.
+    #[serde(default)]
+    pub _comment: Option<serde_json::Value>,
 }
 
 /// Deserialize a reasoning effort tier from a string; accepts literals such as `auto` / `none` / `off` as
@@ -265,7 +399,7 @@ fn builtin_config_dir() -> PathBuf {
 }
 
 /// Parse a single model file: supports both a single object `{...}` and an object array `[{...}]`.
-/// Returns `None` on read/parse failure (error already printed).
+/// Returns `None` on read/parse/validation failure (error already printed).
 fn load_models_from_file(path: &Path) -> Option<Vec<ModelDef>> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
@@ -276,15 +410,91 @@ fn load_models_from_file(path: &Path) -> Option<Vec<ModelDef>> {
     };
     // Parse as an array first (for merged files), then as a single object on failure.
     if let Ok(models) = serde_json::from_str::<Vec<ModelDef>>(&content) {
+        for model in &models {
+            if let Err(reason) = validate_model_def(model, path) {
+                eprintln!("[model_names] invalid model in {}: {}", path.display(), reason);
+                return None;
+            }
+        }
         return Some(models);
     }
     match serde_json::from_str::<ModelDef>(&content) {
-        Ok(model) => Some(vec![model]),
+        Ok(model) => {
+            if let Err(reason) = validate_model_def(&model, path) {
+                eprintln!("[model_names] invalid model in {}: {}", path.display(), reason);
+                return None;
+            }
+            Some(vec![model])
+        }
         Err(e) => {
             eprintln!("[model_names] failed to parse {}: {}", path.display(), e);
             None
         }
     }
+}
+
+/// Load-time validation: hard errors for values that cannot work (the caller
+/// fails the file so misconfigurations surface at startup, not mid-task),
+/// warnings only for merely suspicious ones. In particular the
+/// silent-truncation pairing (`max_output_tokens` must stay below the
+/// effective window, see the `clamp_max_tokens_for_prompt` guard) is rejected
+/// here instead of truncating every long response.
+fn validate_model_def(model: &ModelDef, path: &Path) -> Result<(), String> {
+    if model.key.trim().is_empty() {
+        return Err(
+            "model with empty `key` will never resolve; check for a typo".to_string(),
+        );
+    }
+    if model.name.trim().is_empty() {
+        eprintln!(
+            "[model_names] {}: model '{}' has an empty `name`; request routing falls back to the key",
+            path.display(),
+            model.key
+        );
+    }
+    if let Some(window) = model.context_window_tokens {
+        if window == 0 {
+            return Err(format!(
+                "model '{}' declares context_window_tokens 0; omit the field for the tier fallback or declare the provider's context number",
+                model.key
+            ));
+        } else if window < 8_192 {
+            eprintln!(
+                "[model_names] {}: model '{}' declares a suspiciously small window {window}; prompt clamping may squeeze max_tokens to the floor",
+                path.display(),
+                model.key
+            );
+        }
+    }
+    match model.max_output_tokens {
+        Some(0) => {
+            return Err(format!(
+                "model '{}' declares max_output_tokens 0; omit the field to send no cap or declare the provider's output number",
+                model.key
+            ));
+        }
+        Some(out) => {
+            if let Some(window) = model.context_window_tokens.filter(|w| *w > 0)
+                && (out as usize) >= window
+            {
+                return Err(format!(
+                    "model '{}' declares max_output_tokens {out} >= context window {window}; the cap is unreachable and long generations truncate early. Declare a window strictly larger than the cap",
+                    model.key
+                ));
+            }
+        }
+        None => {}
+    }
+    if let Some(endpoint) = model.endpoint.as_deref()
+        && endpoint.trim().is_empty()
+    {
+        eprintln!(
+            "[model_names] {}: model '{}' declares an empty `endpoint`; it is treated as unset",
+            path.display(),
+            model.key
+        );
+    }
+    Ok(())
 }
 
 /// Read all `*.json` model files in the directory (sorted by filename for a deterministic load order).
@@ -317,18 +527,48 @@ fn load_models_from_dir(dir: &Path, strict: bool) -> Option<Vec<ModelDef>> {
             None => {}
         }
     }
+    // Duplicate keys in one directory shadow each other in the key index (last
+    // file wins). Reject so a copy-paste `key` does not silently hide a model.
+    // User-overrides-builtin shadowing across registries is intentional and
+    // not affected here.
+    let mut keys: Vec<String> = models.iter().map(|m| lookup_key(&m.key)).collect();
+    keys.sort();
+    for pair in keys.windows(2) {
+        if !pair[0].is_empty() && pair[0] == pair[1] {
+            eprintln!(
+                "[model_names] duplicate model key '{}' in {}; fix the copy-paste `key`",
+                pair[0],
+                dir.display()
+            );
+            return None;
+        }
+    }
     Some(models)
 }
 
 fn load_user_models() -> Vec<ModelDef> {
     // New-format directory takes precedence; fall back to the legacy single-file override when absent.
+    // Fail fast like the builtin registry: a broken user file exits with the
+    // file-specific reason already printed, instead of silently skipping it.
     let dir = user_config_dir();
     if dir.is_dir() {
-        return load_models_from_dir(&dir, false).unwrap_or_default();
+        return load_models_from_dir(&dir, true).unwrap_or_else(|| {
+            eprintln!(
+                "[model_names] failed to load user models from {}",
+                dir.display()
+            );
+            std::process::exit(1)
+        });
     }
     let legacy = legacy_user_config_path();
     if legacy.exists() {
-        load_models_from_file(&legacy).unwrap_or_default()
+        load_models_from_file(&legacy).unwrap_or_else(|| {
+            eprintln!(
+                "[model_names] failed to load user models from {}",
+                legacy.display()
+            );
+            std::process::exit(1)
+        })
     } else {
         Vec::new()
     }

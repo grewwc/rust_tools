@@ -11,5 +11,7 @@
   "default_reasoning_effort": "xhigh",
   "subagent_priority": 80,
   "reasoning_encrypted_replay": true,
+  "context_window_tokens": 1048576,
+  "max_output_tokens": 131072,
   "endpoint": "https://opencode.ai/zen/go/v1/responses"
 }

@@ -870,19 +870,21 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     assert!(prompt.contains("<correctness_guardrails>"));
     assert!(prompt.contains("Ground factual claims in observed evidence"));
     assert!(prompt.contains("state what is verified, what is unknown"));
-    assert!(prompt.contains("Calibrate verification effort to a claim's consequence"));
-    assert!(prompt.contains("prefer direct evidence when reasonably accessible"));
-    assert!(prompt.contains("separate evidence-backed premises from judgment"));
-    assert!(prompt.contains("navigation aids rather than independent proof"));
-    assert!(prompt.contains("reopen underlying evidence only when it could materially change"));
     assert!(prompt.contains("limit absence claims to the scope actually searched"));
     assert!(prompt.contains("locate relevant callers and dependents"));
     assert!(prompt.contains("compilation and tests prove only covered behavior"));
-    assert!(prompt.contains("consequences supported by traced evidence"));
-    assert!(prompt.contains("keep unresolved hypotheses separate"));
-    assert!(prompt.contains("distinguish introduced behavior from pre-existing behavior"));
     assert!(prompt.contains("reset, checkout, restore, stash drop"));
     assert!(prompt.contains("temporary branch/worktree or stash push then pop"));
+    // Slimmed guardrails: the calibration meta-heading, the "prefer direct
+    // evidence" / "reopen only when material" soft rules, and the
+    // premises-vs-judgment / traced-consequences / hypotheses-separation /
+    // introduced-vs-pre-existing restatements were dropped as accepted
+    // slimming risk — they are only partially covered by
+    // intellectual_honesty's conclusion gate and task_convergence's stopping
+    // rule, which still render. The navigation-aids rule below is kept
+    // because nothing else owns it, and the hard anti-hallucination asserts
+    // stay pinned.
+    assert!(prompt.contains("navigation aids rather than independent proof"));
     // Anti-hallucination bullet: every concrete specific must trace to
     // session-observed evidence; when evidence is insufficient, one
     // targeted lookup first, otherwise report verified / unknown / next
@@ -955,13 +957,18 @@ fn system_prompt_groups_guardrails_under_topic_headings() {
     let available = SkipSet::new(16);
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
+    // Slimmed guardrails: the Conclusions section was folded into
+    // intellectual_honesty (conclusion gate) and task_convergence (stopping
+    // rule), so only three topic headings remain.
     for heading in [
         "### Scope and change impact",
         "### Evidence and verification",
-        "### Conclusions and reporting",
         "### Code comments",
     ] {
-        assert!(prompt.contains(heading), "missing guardrails heading: {heading}");
+        assert!(
+            prompt.contains(heading),
+            "missing guardrails heading: {heading}"
+        );
     }
 }
 
