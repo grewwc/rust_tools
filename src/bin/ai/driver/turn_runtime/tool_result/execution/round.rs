@@ -119,10 +119,11 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round(
     suppressed_read_only_results: &HashMap<String, String>,
     turn_had_tool_error: &mut bool,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let remaining_meta = parse_prune_meta_and_update_marks(
+    let (remaining_meta, cleaned_assistant_text) = parse_prune_meta_and_update_marks(
         app,
         messages,
         &tool_call_execution.stream_result.hidden_meta,
+        &tool_call_execution.stream_result.assistant_text,
     );
     let mut exec_result = if let Some(reason) = rejection_reason {
         reject_tool_calls(&tool_call_execution.stream_result.tool_calls, reason)
@@ -205,7 +206,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round(
     append_tool_result_messages_for_model(
         app,
         source_model,
-        &tool_call_execution.stream_result.assistant_text,
+        &cleaned_assistant_text,
         &tool_call_execution.stream_result.reasoning_text,
         &tool_call_execution.stream_result.reasoning_items,
         &exec_result,
@@ -243,7 +244,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round(
     }
 
     Ok(terminal_dedupe_candidate_from_assistant_text(
-        &tool_call_execution.stream_result.assistant_text,
+        &cleaned_assistant_text,
     ))
 }
 

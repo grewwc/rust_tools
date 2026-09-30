@@ -20,8 +20,10 @@ use incremental::{
     INCREMENTAL_SUMMARY_PREFIX, plan_incremental_summary_with_app,
     plan_incremental_summary_without_app, summary_delta_messages,
 };
+mod folded_prune;
 pub(crate) mod llm_prune;
 mod overflow_sink;
+mod prune_authorization;
 mod text_utils;
 mod tool_groups;
 mod tool_overflow;
@@ -53,6 +55,7 @@ use tool_overflow::{
     try_spill_preserved_message_to_stub,
 };
 pub(in crate::ai) use tool_overflow::cap_oversized_tool_results_for_context;
+pub(in crate::ai) use prune_authorization::PruneAuthorization;
 
 mod persisted;
 pub(in crate::ai) use persisted::*;

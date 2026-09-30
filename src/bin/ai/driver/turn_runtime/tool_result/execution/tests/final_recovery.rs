@@ -116,6 +116,74 @@ fn reasoning_only_final_response_retries_once_with_full_capabilities() {
 }
 
 #[test]
+fn final_response_control_directive_is_stripped_from_history_and_terminal_body() {
+    let mut app = test_app_with_tools(&["read_file"]);
+    let mcp = crate::ai::mcp::McpClient::new();
+    let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
+    let mut messages = Vec::new();
+    let mut turn_messages = Vec::new();
+    let mut persisted_turn_messages = 0usize;
+    let mut final_assistant_text = String::new();
+    let mut final_assistant_recorded = false;
+    let mut force_final_response = false;
+    let mut terminal_dedupe_candidate = None;
+
+    let step = handle_iteration_execution(
+        &mut app,
+        "summarize findings",
+        &mcp_snapshot(&shared_mcp),
+        &shared_mcp,
+        IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+            outcome: crate::ai::types::StreamOutcome::Completed,
+            tool_calls: Vec::new(),
+            assistant_text: "<<<prune:call_missing>>>\n\nFinal summary line.".to_string(),
+            hidden_meta: String::new(),
+            reasoning_text: String::new(),
+            reasoning_items: Vec::new(),
+            skip_response_drain: true,
+            truncated_by_length: false,
+            stream_error: false,
+            finish_reason_value: None,
+            usage_prompt_tokens: 0,
+            usage_cached_prompt_tokens: 0,
+            usage_completion_tokens: 0,
+            usage_reasoning_tokens: 0,
+        }),
+        &mut messages,
+        &mut turn_messages,
+        false,
+        &mut persisted_turn_messages,
+        &mut final_assistant_text,
+        &mut final_assistant_recorded,
+        &mut force_final_response,
+        &mut terminal_dedupe_candidate,
+        true,
+        1,
+        16,
+        0,
+        &mut false,
+    )
+    .unwrap();
+
+    assert!(matches!(step, TurnLoopStep::Break));
+    assert!(final_assistant_recorded);
+    // The consumed directive reaches neither canonical history, nor the final answer,
+    // nor the terminal redraw slot.
+    assert_eq!(final_assistant_text, "\nFinal summary line.");
+    assert_eq!(
+        terminal_dedupe_candidate.as_deref(),
+        Some("\nFinal summary line.")
+    );
+    let canonical = turn_messages
+        .iter()
+        .map(|message| message.content.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!canonical.contains("<<<prune"), "{canonical}");
+    assert!(canonical.contains("Final summary line."));
+}
+
+#[test]
 fn reasoning_only_final_response_forces_no_thinking_synthesis_after_normal_retry() {
     let mut app = test_app_with_tools(&["read_file"]);
     let mcp = crate::ai::mcp::McpClient::new();

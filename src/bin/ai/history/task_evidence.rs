@@ -360,6 +360,31 @@ pub(in crate::ai) fn read_task_spawn_audit(
     read_records(history_file, session_id, false)
 }
 
+/// Task ids the durable ledger records as integrated for this session.
+///
+/// Integration is the boundary that makes a delivered subagent result unloadable
+/// from the request projection: before it, the parent may still need the result
+/// verbatim; after it, the ledger keeps the byte-identical payload retrievable
+/// through [`read_task_evidence_status_payload`]. Undelivered spawn placeholders
+/// and un-integrated deliveries are excluded.
+pub(in crate::ai) fn read_integrated_task_ids(
+    history_file: &Path,
+    session_id: &str,
+) -> io::Result<rustc_hash::FxHashSet<String>> {
+    Ok(read_records(history_file, session_id, false)?
+        .into_iter()
+        .filter(|record| record.integrated_at_unix_ms.is_some())
+        .map(|record| record.task_id)
+        .collect())
+}
+
+/// Records that the parent has integrated a delivered subagent result.
+///
+/// Integration is what unlocks offloading for that result's text, so it
+/// requires the delivery itself: a `task_id` the ledger only knows as a spawn
+/// placeholder (`delivered_at_unix_ms = 0`) has nothing the parent could have
+/// read yet. `false` means "no delivered evidence for this id", which callers
+/// report as an unknown id.
 pub(in crate::ai) fn integrate_task_evidence(
     history_file: &Path,
     session_id: &str,
@@ -369,26 +394,17 @@ pub(in crate::ai) fn integrate_task_evidence(
 ) -> io::Result<bool> {
     with_store_lock(history_file, session_id, || {
         let connection = open_store(history_file, session_id)?;
-        let exists = connection
-            .query_row(
-                "SELECT 1 FROM task_evidence WHERE task_id = ?1",
-                [task_id],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(|error| sqlite_error("find task evidence for integration", error))?
-            .is_some();
-        if !exists {
-            return Ok(false);
-        }
-        connection
+        let changed = connection
             .execute(
                 "UPDATE task_evidence
                  SET integrated_at_unix_ms = ?2, disposition = ?3, integration_summary = ?4
-                 WHERE task_id = ?1",
+                 WHERE task_id = ?1 AND delivered_at_unix_ms > 0",
                 params![task_id, unix_timestamp_ms(), disposition, summary],
             )
             .map_err(|error| sqlite_error("integrate task evidence", error))?;
+        if changed == 0 {
+            return Ok(false);
+        }
         refresh_task_evidence_checkpoint(&connection, history_file, session_id)?;
         Ok(true)
     })
@@ -1107,6 +1123,73 @@ mod tests {
             read_unintegrated_task_evidence(&history_file, session_id)
                 .unwrap()
                 .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn integration_requires_a_delivered_result() {
+        let root = std::env::temp_dir().join(format!(
+            "task-evidence-integration-gate-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let history_file = root.join("history.sqlite");
+        let session_id = "task-evidence-integration-gate";
+
+        // A spawn placeholder proves the task exists, not that its result ever
+        // reached the parent, so it carries nothing to integrate.
+        record_task_spawn_audit(
+            &history_file,
+            session_id,
+            "task-pending",
+            "still running",
+            "build",
+            "test-model",
+        )
+        .unwrap();
+        assert!(
+            !integrate_task_evidence(&history_file, session_id, "task-pending", "accepted", "no")
+                .unwrap()
+        );
+        assert_eq!(
+            read_task_spawn_audit(&history_file, session_id).unwrap()[0].integrated_at_unix_ms,
+            None
+        );
+        assert!(
+            read_integrated_task_ids(&history_file, session_id)
+                .unwrap()
+                .is_empty()
+        );
+
+        // An id the ledger never recorded is not integrable either.
+        assert!(
+            !integrate_task_evidence(&history_file, session_id, "task-ghost", "accepted", "no")
+                .unwrap()
+        );
+
+        // Delivery turns the placeholder into evidence, which is integrable.
+        record_delivered_task_evidence(
+            &history_file,
+            session_id,
+            DeliveredTaskEvidence {
+                task_id: "task-pending",
+                description: "still running",
+                agent_name: "build",
+                model: "test-model",
+                status: "completed",
+                payload: "[Subagent final answer]\nfinished",
+            },
+        )
+        .unwrap();
+        assert!(
+            integrate_task_evidence(&history_file, session_id, "task-pending", "accepted", "used")
+                .unwrap()
+        );
+        assert!(
+            read_integrated_task_ids(&history_file, session_id)
+                .unwrap()
+                .contains("task-pending")
         );
 
         let _ = fs::remove_dir_all(root);

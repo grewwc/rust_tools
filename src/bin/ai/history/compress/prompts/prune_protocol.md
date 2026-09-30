@@ -1,17 +1,24 @@
 
 ## Context Management Protocol
-When your context holds outdated tool results, actively reclaim space by marking them.
-Each tool result in the history has a stable id (the `call_id` / `tool_call_id` shown on
-that tool output). Include a hidden self-note listing the ids to prune:
-`<meta:self_note>prune:call_abc,call_xyz</meta:self_note>`
-Mark any tool result that is now superseded or no longer needed — including old file
-reads and code/search results whose content you have already used, that you have since
-re-read, or that describe code you have already edited.
-Rules:
-- Never mark user messages, system instructions, assistant messages, plans, or the most recent tool results.
-- Marking is safe and reversible: pruning is loss-free — the full result is archived to a
-session file and the kept stub shows its `file_path`, so you can re-read it anytime if you
-turn out to still need it. Marks accumulate across turns and need not be consecutive: a result
-offloads only once it reaches its threshold (`marks n/threshold` in the candidate list), except
-that very large results offload after a single mark. Recent results and plans are always protected.
-- Put the `prune:` directive on its own line; if you also write a normal self_note, keep it in the same hidden note.
+Mark a candidate only when you have finished using it and it is fully superseded;
+age, compression, an edited file, or a shorter replacement alone does not qualify. Put the
+candidate's exact id — a `tool_call_id`, or a `fold_...` id for a folded group — on its own
+`prune:` line holding nothing but comma-separated ids, inside a hidden self-note written as
+plain text in your reply (never as a tool call):
+
+<meta:self_note>
+prune:call_abc,call_xyz
+</meta:self_note>
+
+The note is not shown to the user; its non-directive lines stay in your context as your
+self-note, so keep any normal self_note content in the same note.
+Only ids present in this request can be marked — the list below shows the largest eligible
+ones, and a mark that cannot be applied is reported back with its reason. Never mark
+user/system/assistant messages, checkpoints, plans, unknown-source evidence, or recent tool
+results; a fold holding any protected tool is ineligible; a subagent result appears only
+after its task is integrated.
+Do not mark findings, decisions, constraints, or verification evidence you still need:
+offloading is lossless (exact text archived, recallable stub, canonical history unchanged),
+but hiding evidence can still affect reasoning.
+Marks accumulate across turns (need not be consecutive); offloading requires the listed
+threshold (`marks n/threshold`); a folded group always needs two distinct responses.

@@ -118,7 +118,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     name: "task",
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
-        prune: ToolPrunePolicy::Never,
+        prune: ToolPrunePolicy::AfterIntegration,
         counts_toward_precision_inline_budget: false,
     },
 });
@@ -149,7 +149,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     name: "task_spawn",
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
-        prune: ToolPrunePolicy::Never,
+        prune: ToolPrunePolicy::AfterIntegration,
         counts_toward_precision_inline_budget: false,
     },
 });
@@ -158,7 +158,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     name: "task_spawn_batch",
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
-        prune: ToolPrunePolicy::Never,
+        prune: ToolPrunePolicy::AfterIntegration,
         counts_toward_precision_inline_budget: false,
     },
 });

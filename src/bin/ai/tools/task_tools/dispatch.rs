@@ -9,6 +9,15 @@ inventory::submit!(ToolRegistration {
     }
 });
 
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "task_retry",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::AfterIntegration,
+        counts_toward_precision_inline_budget: false,
+    },
+});
+
 pub(super) fn execute_task_retry(args: &Value) -> Result<String, String> {
     ensure_top_level_task_orchestration("task_retry")?;
     let task_id = args
@@ -73,7 +82,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     name: "task_wait",
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
-        prune: ToolPrunePolicy::Never,
+        prune: ToolPrunePolicy::AfterIntegration,
         counts_toward_precision_inline_budget: false,
     },
 });
@@ -178,7 +187,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     name: "task_status",
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
-        prune: ToolPrunePolicy::Never,
+        prune: ToolPrunePolicy::AfterIntegration,
         counts_toward_precision_inline_budget: false,
     },
 });
@@ -270,7 +279,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     name: "task_evidence_read",
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
-        prune: ToolPrunePolicy::Never,
+        prune: ToolPrunePolicy::AfterIntegration,
         counts_toward_precision_inline_budget: false,
     },
 });
@@ -389,7 +398,7 @@ pub(super) fn execute_task_integrate(args: &Value) -> Result<String, String> {
         .map_err(|error| format!("failed to integrate {task_id}: {error}"))?;
         if !found {
             return Err(format!(
-                "Unknown task_id in durable task evidence ledger: {task_id}"
+                "Unknown task_id in durable task evidence ledger (no delivered result): {task_id}"
             ));
         }
         integrated.push(task_id.to_string());

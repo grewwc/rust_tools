@@ -300,9 +300,9 @@ pub(in crate::ai) use suspended::{
 #[cfg(test)]
 pub(in crate::ai) use task_evidence::render_unintegrated_task_evidence;
 pub(in crate::ai) use task_evidence::{
-    DeliveredTaskEvidence, integrate_task_evidence, read_task_evidence_status_payload,
-    read_task_spawn_audit, record_delivered_task_evidence, record_task_spawn_audit,
-    render_unintegrated_task_evidence_resilient, task_evidence_exists,
+    DeliveredTaskEvidence, integrate_task_evidence, read_integrated_task_ids,
+    read_task_evidence_status_payload, read_task_spawn_audit, record_delivered_task_evidence,
+    record_task_spawn_audit, render_unintegrated_task_evidence_resilient, task_evidence_exists,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use types::{
@@ -612,7 +612,8 @@ fn context_projection_fingerprint(
     // require source recovery before their judgments can be used as premises.
     // v8: the resident incremental-summary window shrank from ~16K to ~8K chars;
     // older records are archived behind the same single back-reference.
-    const PROJECTION_VERSION: u8 = 8;
+    // v9: folded tool evidence carries complete, content-bound prune provenance.
+    const PROJECTION_VERSION: u8 = 9;
     let overflow_dir = overflow_dir
         .map(|path| path.to_string_lossy())
         .unwrap_or_default();

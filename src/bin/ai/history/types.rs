@@ -44,6 +44,9 @@ pub(in crate::ai) struct SkillActivationEvent {
 /// recognizing by content would forge turn boundaries.
 const RUNTIME_SYNTHETIC_USER_ORIGIN: &str = "runtime-origin:synthetic-user:v1";
 
+/// Runtime-authored fold provenance; persisted but never sent to a provider.
+pub(super) const FOLDED_TOOL_ORIGIN: &str = "runtime-origin:folded-tool-evidence:v1:";
+
 /// Builds a runtime-synthesized user message. All user messages injected mid-turn
 /// must go through this entry point.
 pub(in crate::ai) fn runtime_synthetic_user_message(content: Value) -> Message {
@@ -66,7 +69,13 @@ pub(in crate::ai) fn is_runtime_synthetic_user_message(message: &Message) -> boo
 /// Clears the runtime-only message origin side channel, preventing internal markers
 /// from leaking to the provider.
 pub(in crate::ai) fn clear_runtime_message_metadata(message: &mut Message) {
-    if is_runtime_synthetic_user_message(message) {
+    if is_runtime_synthetic_user_message(message)
+        || (message.role == ROLE_INTERNAL_NOTE
+            && message
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|text| text.starts_with(FOLDED_TOOL_ORIGIN)))
+    {
         message.reasoning_content = None;
     }
 }

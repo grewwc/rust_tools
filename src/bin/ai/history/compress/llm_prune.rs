@@ -27,6 +27,12 @@
 //!   this round" (different ids each round), so decay would zero counts before reaching the threshold and the mechanism would
 //!   almost never fire in the most typical usage. See [`update_prune_marks`].
 //!
+//! Model marks are optional for the model to emit, so the runtime also reclaims on its own once the
+//! eligible backlog exceeds [`PRESSURE_RECLAIM_MIN_TOTAL_CHARS`]: it tops the largest candidates up to
+//! their required count and offloads them through the same lossless path
+//! ([`reclaim_under_pressure_authorized`]). Every safety guarantee below is enforced by the shared
+//! eligibility check rather than by the mark path, so it holds for reclaimed items as well.
+//!
 //! ## Safety guarantees (no loss of real information)
 //!
 //! 1. No message is deleted; the messages array length and order are unchanged.
@@ -38,6 +44,10 @@
 //! 5. `apply_pruning` only touches the temporary `messages` projection used per model request; persistence uses the separate
 //!    canonical `turn_messages`, so offloading never pollutes the real history.
 //! 6. The most recent `KEEP_RECENT_TOOL_GROUPS` groups of tool results are always protected, to avoid wrongly pruning results the current round still needs.
+//! 7. Tools whose policy defers to session state (`ToolPrunePolicy::AfterIntegration`, i.e. subagent
+//!    results) become eligible only while [`PruneAuthorization`] proves the durable ledger recorded
+//!    every task the result refers to as integrated. An unreadable ledger authorizes nothing, so those
+//!    results stay inline rather than being unloaded on an unverified assumption.
 
 use std::path::Path;
 
@@ -46,18 +56,11 @@ use serde_json::Value;
 
 use crate::ai::history::types::Message;
 
+use super::PruneAuthorization;
 use super::tool_overflow::{
     build_tool_call_arguments_index, build_tool_call_name_index, build_tool_overflow_recall_lines,
     is_preserved_tool_overflow_stub, preserve_pruned_tool_result_stable,
 };
-
-/// Returns whether a tool result is marked "never LLM-pruned" by its registered policy.
-/// Consults the [`ToolHistoryPolicy`] the tool itself declares (see each tool's registration file),
-/// rather than hardcoding tool names. By default (unregistered) pruning is allowed; only tools that
-/// explicitly declare `prune: Never` (e.g. `plan`) return true.
-fn is_prune_protected_tool(tool_name: &str) -> bool {
-    !crate::ai::tools::registry::common::tool_history_policy(tool_name).allows_prune()
-}
 
 /// How many cumulative marks are needed before a message is offloaded/pruned.
 ///
@@ -112,6 +115,29 @@ pub(crate) fn needed_marks_for(messages: &[Message], tool_call_id: &str) -> u8 {
 /// largest results are listed first because they free the most context.
 const PRUNE_PROMPT_MAX_CANDIDATES: usize = 8;
 
+/// Total inline size of the currently eligible tool evidence above which the
+/// runtime reclaims the largest candidates on its own, without waiting for a
+/// model mark (see [`reclaim_under_pressure_authorized`]).
+///
+/// Marks stay the fine-grained signal; this is the fallback for models that
+/// rarely emit them, where the eligible backlog otherwise grows while every
+/// request keeps re-sending it in full. The threshold is deliberately
+/// conservative (≈16K tokens of eligible evidence), so ordinary sessions keep
+/// the marking contract unchanged.
+const PRESSURE_RECLAIM_MIN_TOTAL_CHARS: usize = 65_536;
+
+/// Per-request cap on how many candidates one pressure reclaim offloads, kept
+/// equal to [`PRUNE_PROMPT_MAX_CANDIDATES`]: the runtime reclaims at most the
+/// same largest items the model itself was shown for this request.
+const PRESSURE_RECLAIM_MAX_ITEMS: usize = PRUNE_PROMPT_MAX_CANDIDATES;
+
+/// Per-request cap on reclaimed characters. The largest candidate is always
+/// included (so one oversized item can never block reclamation); capping every
+/// request bounds how much of the projection prefix — and with it the prompt
+/// cache — a single request rewrites, and successive requests converge until
+/// the backlog falls below the trigger.
+const PRESSURE_RECLAIM_MAX_CHARS: usize = 32_768;
+
 /// The pruning-protocol instructions injected into the system prompt.
 /// Kept short to avoid consuming too many tokens.
 pub(crate) const PRUNE_PROTOCOL_PROMPT: &str = include_str!("prompts/prune_protocol.md");
@@ -127,31 +153,74 @@ fn is_prunable_message(msg: &Message) -> bool {
     msg.role == "tool" && msg.tool_call_id.is_some()
 }
 
+/// Every id a prune mark written in this request can name: the tool_call ids the
+/// projection carries (call side and raw result side) plus the fold ids of the
+/// folded notes in it.
+///
+/// Identity comes from the context rather than from the token's spelling, so a
+/// provider-issued id outside the ASCII id shape — or longer than the shape bound —
+/// still resolves; the shape rule only classifies tokens that name nothing here.
+pub(crate) fn nameable_prune_ids(messages: &[Message]) -> FxHashSet<String> {
+    let mut ids = FxHashSet::default();
+    for message in messages {
+        if let Some(id) = message.tool_call_id.as_deref() {
+            ids.insert(id.to_string());
+        }
+        if let Some(calls) = message.tool_calls.as_deref() {
+            for call in calls {
+                ids.insert(call.id.clone());
+            }
+        }
+        if let Some(meta) = super::folded_prune::provenance(message) {
+            // The fold note and its offloaded stub render the constituent call ids, so
+            // those stay nameable as well: a mark on one reaches its own rejection
+            // report instead of being read as prose.
+            ids.extend(meta.source_ids().map(str::to_string));
+            ids.insert(meta.id());
+        }
+    }
+    ids
+}
+
 /// Parses prune marks from the hidden_meta of a model response.
 ///
-/// hidden_meta may span multiple lines; lines starting with `prune:` are pruning directives,
-/// the rest is regular self_note content (handled by the caller).
+/// hidden_meta may span multiple lines; lines starting with `prune:` are pruning
+/// directives, the rest is regular self_note content (handled by the caller). The
+/// `<<<prune:ids>>>` compatibility marker is accepted here as well, so a note that
+/// mixes both forms still lands every mark.
+///
+/// A directive line counts only when its payload is nothing but id tokens, as
+/// resolved by [`resolve_id_token`] against `known_ids`: a line mixing ids with
+/// prose is kept as note text for [`unrecognized_prune_fragments`] to report,
+/// instead of being split into garbage ids that look like rejected marks.
+///
+/// `known_ids` is the id set of the request the note belongs to
+/// ([`nameable_prune_ids`]); it decides which tokens are ids.
 ///
 /// Returns `(prune_ids, remaining_meta)`:
 /// - `prune_ids`: the list of marked tool_call_ids
 /// - `remaining_meta`: the hidden_meta left after removing the prune lines (for the self_note)
-pub(crate) fn parse_prune_from_hidden_meta(hidden_meta: &str) -> (Vec<String>, String) {
-    let mut prune_ids = Vec::new();
+pub(crate) fn parse_prune_from_hidden_meta(
+    hidden_meta: &str,
+    known_ids: &FxHashSet<String>,
+) -> (Vec<String>, String) {
+    // Strip the compatibility marker first: the line scan below then only has to
+    // deal with `prune:` lines, and a mixed-form note keeps every mark.
+    let (mut prune_ids, hidden_meta) = parse_embedded_prune_directives(hidden_meta, known_ids);
+    let hidden_meta = hidden_meta.as_str();
     let mut remaining_lines = Vec::new();
     let mut saw_prune = false;
 
     for line in hidden_meta.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("prune:") {
+        if let Some(rest) = trimmed.strip_prefix("prune:")
+            && let Some(ids) = directive_payload_ids(rest, known_ids)
+        {
             saw_prune = true;
-            // Parse the comma-separated tool_call_id list
-            for id in rest.split(',') {
-                let id = id.trim();
-                if !id.is_empty() {
-                    prune_ids.push(id.to_string());
-                }
-            }
-        } else if !trimmed.is_empty() {
+            prune_ids.extend(ids);
+            continue;
+        }
+        if !trimmed.is_empty() {
             remaining_lines.push(line.to_string());
         }
     }
@@ -162,6 +231,189 @@ pub(crate) fn parse_prune_from_hidden_meta(hidden_meta: &str) -> (Vec<String>, S
         hidden_meta.to_string()
     };
     (prune_ids, remaining)
+}
+
+/// Marker some models emit instead of the documented overflow channel (a `prune:`
+/// line inside `<meta:self_note>`); accepting it keeps a mark written in this shape
+/// from being dropped without a trace.
+const EMBEDDED_PRUNE_OPEN: &str = "<<<prune:";
+
+/// Closing marker of [`EMBEDDED_PRUNE_OPEN`].
+const EMBEDDED_PRUNE_CLOSE: &str = ">>>";
+
+/// Wrapping characters a model may put around an id when writing prose; stripped
+/// before matching so `` `call_abc` `` and `(call_abc)` still resolve.
+const ID_TOKEN_DECORATION: &[char] = &['`', '"', '\'', '*', '(', ')', '[', ']', '<', '>'];
+
+/// Sentence punctuation glued to the last id of a directive line.
+const ID_TOKEN_TRAILING: &[char] = &['.', ',', ';', ':', '!', '?'];
+
+/// Resolves one comma-separated payload token to the id it names, `None` when the
+/// token carries prose.
+///
+/// Membership in the ids the request carries ([`nameable_prune_ids`]) is
+/// authoritative: an id the model can see in this request must resolve however it is
+/// spelled. The shape rule only classifies tokens that name nothing in the context,
+/// where an id-looking token is still reported as a rejected mark rather than read
+/// as prose. The raw token is tried before the de-decorated form, so an id that
+/// itself contains a decoration character is not mangled.
+fn resolve_id_token<'a>(token: &'a str, known_ids: &FxHashSet<String>) -> Option<&'a str> {
+    let raw = token.trim();
+    if known_ids.contains(raw) {
+        return Some(raw);
+    }
+    let normalized = normalize_id_token(raw);
+    if known_ids.contains(normalized) {
+        return Some(normalized);
+    }
+    id_shape_matches(normalized).then_some(normalized)
+}
+
+/// Strips the wrapping characters a model may put around an id when writing prose,
+/// plus sentence punctuation glued to the end of a directive line, so
+/// `` `call_abc` `` and `call_abc.` still resolve.
+fn normalize_id_token(token: &str) -> &str {
+    token
+        .trim()
+        .trim_matches(ID_TOKEN_DECORATION)
+        .trim_end_matches(ID_TOKEN_TRAILING)
+}
+
+/// Whether a token that names nothing in the context can still be an id. A token
+/// that cannot be an id must never be reported as one: quoting the protocol
+/// otherwise turns whole sentences into "rejected marks".
+fn id_shape_matches(token: &str) -> bool {
+    /// Longer than any provider-issued tool_call_id; keeps a runaway token bounded.
+    const MAX_ID_CHARS: usize = 128;
+    !token.is_empty()
+        && token.len() <= MAX_ID_CHARS
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+/// Splits a directive payload into ids, or returns `None` when the payload is empty
+/// or any comma-separated token is not an id. All-or-nothing keeps a prose fragment
+/// from being applied as a partial mark and keeps the reported ids trustworthy.
+fn directive_payload_ids(payload: &str, known_ids: &FxHashSet<String>) -> Option<Vec<String>> {
+    let tokens = payload
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return None;
+    }
+    let ids = tokens
+        .into_iter()
+        .map(|token| resolve_id_token(token, known_ids))
+        .collect::<Option<Vec<_>>>()?;
+    Some(ids.into_iter().map(str::to_string).collect())
+}
+
+/// Extracts `<<<prune:ids>>>` directives from model-authored text.
+///
+/// Only a line that starts with the marker is a directive, so the marker merely
+/// quoted inside a sentence never turns into a mark. Within such a line every
+/// well-formed span whose payload is a clean id list is consumed; a span that is
+/// malformed or carries prose stays in the text for [`unrecognized_prune_fragments`]
+/// to report.
+///
+/// Returns `(ids, cleaned_text)`: the marked ids in order, and the text with the
+/// consumed spans removed (a line that did not carry anything else disappears
+/// instead of leaving a blank gap in the narration).
+///
+/// `known_ids` is the id set of the request the text belongs to
+/// ([`nameable_prune_ids`]); it decides which tokens are ids.
+pub(crate) fn parse_embedded_prune_directives(
+    text: &str,
+    known_ids: &FxHashSet<String>,
+) -> (Vec<String>, String) {
+    let mut ids = Vec::new();
+    let mut cleaned = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if !line.trim_start().starts_with(EMBEDDED_PRUNE_OPEN) {
+            cleaned.push_str(line);
+            continue;
+        }
+        let mut rest = line;
+        let mut line_out = String::with_capacity(line.len());
+        let mut consumed_span = false;
+        let mut kept_span = false;
+        while let Some(start) = rest.find(EMBEDDED_PRUNE_OPEN) {
+            let after_open = &rest[start + EMBEDDED_PRUNE_OPEN.len()..];
+            let Some(end) = after_open.find(EMBEDDED_PRUNE_CLOSE) else {
+                // Unclosed marker: keep it verbatim so it can be reported.
+                kept_span = true;
+                break;
+            };
+            let Some(span_ids) = directive_payload_ids(&after_open[..end], known_ids) else {
+                // Payload with prose in it: same, keep the span for the report.
+                kept_span = true;
+                line_out.push_str(&rest[..start + EMBEDDED_PRUNE_OPEN.len()]);
+                rest = after_open;
+                continue;
+            };
+            line_out.push_str(&rest[..start]);
+            ids.extend(span_ids);
+            consumed_span = true;
+            rest = &after_open[end + EMBEDDED_PRUNE_CLOSE.len()..];
+            // Removing a span between two spaces would otherwise leave a double space.
+            if line_out.ends_with(' ') && rest.starts_with(' ') {
+                rest = &rest[1..];
+            }
+        }
+        line_out.push_str(rest);
+        if consumed_span && !kept_span && line_out.trim().is_empty() {
+            continue;
+        }
+        cleaned.push_str(&line_out);
+    }
+    (ids, cleaned)
+}
+
+/// Directive-looking text that no accepted form parses, so the runtime can quote it
+/// back to the model instead of dropping the attempt silently.
+///
+/// Recognizes the two shapes of an attempted mark left in the text: a line starting
+/// with the `<<<prune:` marker whose span did not parse (missing closer, prose in the
+/// payload), and a `prune:` line whose payload still holds an id. A marker merely
+/// quoted inside a sentence is not an attempt and stays unreported.
+///
+/// An id counts when [`resolve_id_token`] resolves it against `known_ids`.
+pub(crate) fn unrecognized_prune_fragments(
+    text: &str,
+    known_ids: &FxHashSet<String>,
+) -> Vec<String> {
+    /// Cap on reported snippets; the notice stays bounded and shows the shape.
+    const MAX_FRAGMENTS: usize = 4;
+    /// Cap on a reported snippet's length.
+    const MAX_FRAGMENT_CHARS: usize = 80;
+    let mut fragments: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let attempted = if trimmed.starts_with(EMBEDDED_PRUNE_OPEN) {
+            true
+        } else {
+            trimmed.strip_prefix("prune:").is_some_and(|payload| {
+                payload
+                    .split(',')
+                    .map(str::trim)
+                    .any(|token| resolve_id_token(token, known_ids).is_some())
+            })
+        };
+        if !attempted {
+            continue;
+        }
+        let snippet = trimmed.chars().take(MAX_FRAGMENT_CHARS).collect::<String>();
+        if !fragments.iter().any(|existing| *existing == snippet) {
+            fragments.push(snippet);
+        }
+        if fragments.len() >= MAX_FRAGMENTS {
+            break;
+        }
+    }
+    fragments
 }
 
 /// Updates the pruning counters ("tolerate silent rounds + monotonic
@@ -234,8 +486,35 @@ pub(crate) fn update_prune_marks(
 ///   `plan`) are never pruned.
 ///   Note `read_file` / retrieval-like tools, though "not lossy-compressible",
 ///   **are** allowed to be pruned.
+/// - Results of tools declaring `prune: AfterIntegration` (subagent results)
+///   additionally require `authorization`, which carries the ledger-derived
+///   integration state this function cannot read from `messages`.
+pub(crate) fn active_prunable_tool_ids_authorized(
+    messages: &[Message],
+    authorization: &PruneAuthorization,
+) -> FxHashSet<String> {
+    let mut ids = active_raw_prunable_tool_ids(messages, authorization);
+    ids.extend(
+        super::folded_prune::candidates(messages)
+            .into_iter()
+            .map(|(_, meta)| meta.id()),
+    );
+    ids
+}
+
+/// Fail-closed entry point kept for tests: it authorizes no conditional result,
+/// so production callers must use [`active_prunable_tool_ids_authorized`].
+#[cfg(test)]
 pub(crate) fn active_prunable_tool_ids(messages: &[Message]) -> FxHashSet<String> {
-    let protected_ids = protected_tool_call_ids(messages);
+    active_prunable_tool_ids_authorized(messages, &PruneAuthorization::default())
+}
+
+fn active_raw_prunable_tool_ids(
+    messages: &[Message],
+    authorization: &PruneAuthorization,
+) -> FxHashSet<String> {
+    let protected_ids = protected_tool_call_ids(messages, authorization);
+    let id_to_tool_name = build_tool_call_name_index(messages);
     messages
         .iter()
         .filter_map(|message| {
@@ -257,33 +536,145 @@ pub(crate) fn active_prunable_tool_ids(messages: &[Message]) -> FxHashSet<String
                 return None;
             }
             let id = message.tool_call_id.as_ref()?;
-            (!protected_ids.contains(id)).then(|| id.clone())
+            // Fold consent must never become raw-result consent after replay.
+            if id.starts_with(super::folded_prune::FOLD_ID_PREFIX) || protected_ids.contains(id) {
+                return None;
+            }
+            // A tool whose policy defers to session state consults the live
+            // authorization; an unresolvable name never reaches this point
+            // because `protected_tool_call_ids` already protects it.
+            let name = id_to_tool_name.get(id)?;
+            super::folded_prune::tool_allows_explicit_prune_now(
+                name,
+                message.content.as_str()?,
+                authorization,
+            )
+            .then(|| id.clone())
         })
         .collect()
 }
 
-fn protected_tool_call_ids(messages: &[Message]) -> FxHashSet<String> {
-    let id_to_tool_name = build_tool_call_name_index(messages);
-    let protected_indices = super::tool_groups::recent_tool_group_message_indices(
-        messages,
-        super::KEEP_RECENT_TOOL_GROUPS,
+/// Retention is separate from authorization: a completed offload must survive
+/// silent rounds and canonical replay without making its stub a new candidate.
+pub(crate) fn retained_prune_ids_authorized(
+    messages: &[Message],
+    authorization: &PruneAuthorization,
+) -> FxHashSet<String> {
+    // An id several items answer to cannot be resolved by a textual mark, so its
+    // accumulated consent is withdrawn instead of being carried into a later state
+    // where the id resolves again and would offload a note the model never saw.
+    let ambiguous = super::folded_prune::ambiguous_fold_ids(messages);
+    let mut ids = active_prunable_tool_ids_authorized(messages, authorization);
+    ids.extend(
+        super::folded_prune::canonical_fold_ids(messages)
+            .into_iter()
+            .filter(|id| !ambiguous.contains(id)),
     );
+    let names = build_tool_call_name_index(messages);
+    for message in messages {
+        if let Some(meta) = super::folded_prune::provenance(message) {
+            if meta.allows_prune() && !ambiguous.contains(&meta.id()) {
+                ids.insert(meta.id());
+            }
+        }
+        if message.role == "tool"
+            && message
+                .content
+                .as_str()
+                .is_some_and(is_preserved_tool_overflow_stub)
+        {
+            if let Some(id) = message.tool_call_id.as_ref() {
+                // Retention follows how the stub was created, not current
+                // eligibility: the stub no longer carries the task markers that
+                // a conditional decision needs, and a conditional result could
+                // only have reached a stub while it was authorized.
+                if names
+                    .get(id)
+                    .is_some_and(|name| super::folded_prune::tool_retains_stub_mark(name))
+                {
+                    ids.insert(id.clone());
+                }
+            }
+        }
+    }
+    ids
+}
 
+/// Fail-closed entry point kept for tests: it authorizes no conditional result,
+/// so production callers must use [`update_prune_marks_for_messages_authorized`].
+#[cfg(test)]
+pub(crate) fn retained_prune_ids(messages: &[Message]) -> FxHashSet<String> {
+    retained_prune_ids_authorized(messages, &PruneAuthorization::default())
+}
+
+pub(crate) fn update_prune_marks_for_messages_authorized(
+    current_marks: &mut FxHashMap<String, u8>,
+    prune_ids: &[String],
+    messages: &[Message],
+    authorization: &PruneAuthorization,
+) -> bool {
+    let active = active_prunable_tool_ids_authorized(messages, authorization);
+    let accepted = prune_ids
+        .iter()
+        .filter(|id| active.contains(*id))
+        .cloned()
+        .collect::<Vec<_>>();
+    update_prune_marks(
+        current_marks,
+        &accepted,
+        &retained_prune_ids_authorized(messages, authorization),
+    )
+}
+
+/// Fail-closed entry point kept for tests: it authorizes no conditional result,
+/// so production callers must use [`update_prune_marks_for_messages_authorized`].
+#[cfg(test)]
+pub(crate) fn update_prune_marks_for_messages(
+    current_marks: &mut FxHashMap<String, u8>,
+    prune_ids: &[String],
+    messages: &[Message],
+) -> bool {
+    update_prune_marks_for_messages_authorized(
+        current_marks,
+        prune_ids,
+        messages,
+        &PruneAuthorization::default(),
+    )
+}
+
+fn protected_tool_call_ids(
+    messages: &[Message],
+    authorization: &PruneAuthorization,
+) -> FxHashSet<String> {
+    let id_to_tool_name = build_tool_call_name_index(messages);
     let mut protected = FxHashSet::default();
-    for (idx, message) in messages.iter().enumerate() {
+    for index in super::folded_prune::recent_group_indices(messages) {
+        if let Some(calls) = &messages[index].tool_calls {
+            protected.extend(calls.iter().map(|call| call.id.clone()));
+        }
+    }
+    for message in messages {
         if message.role != "tool" {
             continue;
         }
         let Some(tool_call_id) = message.tool_call_id.as_ref() else {
             continue;
         };
-        if protected_indices.contains(&idx) {
-            protected.insert(tool_call_id.clone());
+        if protected.contains(tool_call_id) {
             continue;
         }
+        // Protection is decided per result, not per tool name: a tool whose
+        // policy defers to session state (subagent results) is protected only
+        // while the authorization withholds it. Unknown tools stay protected.
         if id_to_tool_name
             .get(tool_call_id)
-            .is_some_and(|name| is_prune_protected_tool(name))
+            .is_none_or(|name| {
+                !super::folded_prune::tool_allows_explicit_prune_now(
+                    name,
+                    message.content.as_str().unwrap_or_default(),
+                    authorization,
+                )
+            })
         {
             protected.insert(tool_call_id.clone());
         }
@@ -298,12 +689,24 @@ fn protected_tool_call_ids(messages: &[Message]) -> FxHashSet<String> {
 ///
 /// Deliberately per-id (rebuilds the small indexes on each call): rejections
 /// are rare (usually 0-2 per round), so clarity beats batching here. The
-/// checks mirror [`active_prunable_tool_ids`] but are ordered for message
+/// checks mirror [`active_prunable_tool_ids_authorized`] but are ordered for message
 /// quality (why exactly, not merely that it is ineligible).
-pub(crate) fn explain_rejected_prune_mark(
+pub(crate) fn explain_rejected_prune_mark_authorized(
     messages: &[Message],
     tool_call_id: &str,
+    authorization: &PruneAuthorization,
 ) -> Option<&'static str> {
+    if tool_call_id.starts_with(super::folded_prune::FOLD_ID_PREFIX) {
+        if active_prunable_tool_ids_authorized(messages, authorization).contains(tool_call_id) {
+            return None;
+        }
+        if super::folded_prune::ambiguous_fold_ids(messages).contains(tool_call_id) {
+            return Some("fold id is shared by more than one evidence item");
+        }
+        return Some(
+            "fold is protected, recent, already offloaded, too small, or lacks valid provenance",
+        );
+    }
     let Some(message) = messages.iter().find(|message| {
         message.role == "tool" && message.tool_call_id.as_deref() == Some(tool_call_id)
     }) else {
@@ -317,13 +720,19 @@ pub(crate) fn explain_rejected_prune_mark(
         return Some("already offloaded to the session archive");
     }
     let id_to_tool_name = build_tool_call_name_index(messages);
-    if id_to_tool_name
-        .get(tool_call_id)
-        .is_some_and(|name| is_prune_protected_tool(name))
+    let content = message.content.as_str().unwrap_or_default();
+    if let Some(name) = id_to_tool_name.get(tool_call_id)
+        && !super::folded_prune::tool_allows_explicit_prune_now(name, content, authorization)
     {
-        return Some("tool declares prune:Never");
+        // Conditional tools report their own reason: their policy is not
+        // "Never", it is "not yet" (see `ToolPrunePolicy::AfterIntegration`).
+        return Some(if super::folded_prune::tool_prune_is_conditional(name) {
+            "subagent result is not integrated yet"
+        } else {
+            "tool declares prune:Never"
+        });
     }
-    if protected_tool_call_ids(messages).contains(&tool_call_id.to_string()) {
+    if protected_tool_call_ids(messages, authorization).contains(&tool_call_id.to_string()) {
         return Some("inside the recent-results protection window");
     }
     if message
@@ -335,25 +744,54 @@ pub(crate) fn explain_rejected_prune_mark(
     }
     // All specific checks passed; re-consult the authoritative eligibility
     // set so the "None means prunable" contract cannot drift from
-    // [`active_prunable_tool_ids`] (it may gain conditions later).
-    if active_prunable_tool_ids(messages).contains(tool_call_id) {
+    // [`active_prunable_tool_ids_authorized`] (it may gain conditions later).
+    if active_prunable_tool_ids_authorized(messages, authorization).contains(tool_call_id) {
         None
     } else {
         Some("not currently eligible")
     }
 }
 
+/// Fail-closed entry point kept for tests: it authorizes no conditional result,
+/// so production callers must use [`explain_rejected_prune_mark_authorized`].
+#[cfg(test)]
+pub(crate) fn explain_rejected_prune_mark(
+    messages: &[Message],
+    tool_call_id: &str,
+) -> Option<&'static str> {
+    explain_rejected_prune_mark_authorized(messages, tool_call_id, &PruneAuthorization::default())
+}
+
 /// Pruning statistics of a single `apply_pruning` call, for the caller to
 /// print a terminal notice.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct PruneReport {
-    /// Number of tool results offloaded to disk this time and inline-replaced
+    /// Number of tool results or folded groups offloaded and inline-replaced
     /// with a recall stub.
     pub(crate) pruned_count: usize,
     /// Net characters freed (sum of original content lengths minus stub lengths).
     pub(crate) freed_chars: usize,
     /// Tool names involved (deduplicated, in first-appearance order).
     pub(crate) tools: Vec<String>,
+    /// Subset of `pruned_count` that the runtime reclaimed under context
+    /// pressure without a model mark (see [`reclaim_under_pressure_authorized`]),
+    /// so a caller can attribute the offload honestly in its notice.
+    pub(crate) pressure_count: usize,
+}
+
+impl PruneReport {
+    /// Folds another report into this one, so a request that both applied model
+    /// marks and reclaimed under pressure presents a single aggregate.
+    pub(crate) fn merge(&mut self, other: PruneReport) {
+        self.pruned_count += other.pruned_count;
+        self.freed_chars += other.freed_chars;
+        self.pressure_count += other.pressure_count;
+        for tool in other.tools {
+            if !self.tools.contains(&tool) {
+                self.tools.push(tool);
+            }
+        }
+    }
 }
 
 /// Applies pruning to the messages array (lossless, recallable offload).
@@ -378,10 +816,11 @@ pub(crate) struct PruneReport {
 ///
 /// Returns the statistics report of this pruning run (for the caller to print
 /// a terminal notice).
-pub(crate) fn apply_pruning(
+pub(crate) fn apply_pruning_authorized(
     messages: &mut [Message],
     prune_marks: &FxHashMap<String, u8>,
     overflow_dir: Option<&Path>,
+    authorization: &PruneAuthorization,
 ) -> PruneReport {
     let mut report = PruneReport::default();
     if prune_marks.is_empty() {
@@ -395,7 +834,9 @@ pub(crate) fn apply_pruning(
 
     let id_to_tool_name = build_tool_call_name_index(messages);
     let id_to_tool_args = build_tool_call_arguments_index(messages);
-    let protected_ids = protected_tool_call_ids(messages);
+    // Replaying an accepted raw decision does not depend on the candidate-list
+    // size cutoff. Recheck raw authorization without importing fold consent.
+    let protected_ids = protected_tool_call_ids(messages, authorization);
 
     for msg in messages.iter_mut() {
         if !is_prunable_message(msg) {
@@ -406,7 +847,9 @@ pub(crate) fn apply_pruning(
             continue;
         };
 
-        if protected_ids.contains(&tool_call_id) {
+        if tool_call_id.starts_with(super::folded_prune::FOLD_ID_PREFIX)
+            || protected_ids.contains(&tool_call_id)
+        {
             continue;
         }
 
@@ -426,6 +869,20 @@ pub(crate) fn apply_pruning(
         // The request projection is reused across multiple model rounds; an
         // already-offloaded stub must not be counted again in the pruning report.
         if is_preserved_tool_overflow_stub(content) {
+            continue;
+        }
+        // Re-derive session authorization at offload time, not only when marks
+        // were recorded: a mark restored from session state (or written before
+        // this policy existed) must not unload a subagent result whose task was
+        // never integrated.
+        if !super::folded_prune::tool_allows_explicit_prune_now(
+            id_to_tool_name
+                .get(&tool_call_id)
+                .map(String::as_str)
+                .unwrap_or("tool"),
+            content,
+            authorization,
+        ) {
             continue;
         }
         let freed = content.chars().count();
@@ -467,7 +924,139 @@ pub(crate) fn apply_pruning(
         report.pruned_count += 1;
     }
 
+    // A folded group always requires two independent model responses, even if
+    // its preview is large. Ordinary notes have no provenance and cannot enter.
+    if let Some(dir) = overflow_dir {
+        for (index, meta) in super::folded_prune::candidates(messages) {
+            if prune_marks.get(&meta.id()).copied().unwrap_or(0) < PRUNE_THRESHOLD {
+                continue;
+            }
+            let label = meta.label();
+            if let Some(freed) = super::folded_prune::offload(&mut messages[index], meta, dir) {
+                report.pruned_count += 1;
+                report.freed_chars += freed;
+                if !report.tools.contains(&label) {
+                    report.tools.push(label);
+                }
+            }
+        }
+    }
     report
+}
+
+/// Fail-closed entry point kept for tests: it authorizes no conditional result,
+/// so production callers must use [`apply_pruning_authorized`].
+#[cfg(test)]
+pub(crate) fn apply_pruning(
+    messages: &mut [Message],
+    prune_marks: &FxHashMap<String, u8>,
+    overflow_dir: Option<&Path>,
+) -> PruneReport {
+    apply_pruning_authorized(
+        messages,
+        prune_marks,
+        overflow_dir,
+        &PruneAuthorization::default(),
+    )
+}
+
+/// Reclaims the largest eligible tool evidence under context pressure, without
+/// waiting for the model to mark it.
+///
+/// Model marks remain the fine-grained signal, but emitting them is optional
+/// and some models never do; without this fallback the eligible backlog grows
+/// while every request keeps re-sending it in full. The candidate set is
+/// exactly [`active_prunable_tool_ids_authorized`], so the most recent
+/// `KEEP_RECENT_TOOL_GROUPS` groups, `prune: Never` tools, and un-integrated
+/// subagent results keep every protection they have under model marks: the
+/// runtime only decides *when* an eligible item is reclaimed, never *whether*
+/// it is protected.
+///
+/// The offload itself runs through [`apply_pruning_authorized`] with a local
+/// marks map that tops each selected id up to its required count
+/// ([`needed_marks`] for raw results, [`PRUNE_THRESHOLD`] for folded groups).
+/// The caller's persisted mark map is never touched: a reclaim leaves no
+/// consent behind that a later request could mistake for a model mark.
+///
+/// At most [`PRESSURE_RECLAIM_MAX_ITEMS`] items and
+/// [`PRESSURE_RECLAIM_MAX_CHARS`] characters are reclaimed per request (largest
+/// first, and always at least one item, so a single oversized candidate cannot
+/// block reclamation). Successive requests converge until the eligible backlog
+/// falls below [`PRESSURE_RECLAIM_MIN_TOTAL_CHARS`].
+///
+/// Returns a report whose `pressure_count` attributes the offloads to this
+/// path. Without an archive directory it reclaims nothing: the lossless floor
+/// of [`apply_pruning_authorized`] applies here too.
+pub(crate) fn reclaim_under_pressure_authorized(
+    messages: &mut [Message],
+    overflow_dir: Option<&Path>,
+    authorization: &PruneAuthorization,
+) -> PruneReport {
+    // Same safety floor as `apply_pruning_authorized`: with no archive
+    // directory there is no lossless recall, so nothing may be offloaded.
+    if overflow_dir.is_none() {
+        return PruneReport::default();
+    }
+    let mut sized = eligible_candidate_sizes(messages, authorization);
+    let total_chars: usize = sized.iter().map(|(_, chars)| *chars).sum();
+    if total_chars < PRESSURE_RECLAIM_MIN_TOTAL_CHARS {
+        return PruneReport::default();
+    }
+    // Largest first (frees the most context); tie-break by id for determinism.
+    sized.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut top_up: FxHashMap<String, u8> = FxHashMap::default();
+    let mut selected_chars = 0usize;
+    for (id, chars) in sized {
+        if top_up.len() >= PRESSURE_RECLAIM_MAX_ITEMS
+            || (!top_up.is_empty() && selected_chars >= PRESSURE_RECLAIM_MAX_CHARS)
+        {
+            break;
+        }
+        let marks = if id.starts_with(super::folded_prune::FOLD_ID_PREFIX) {
+            PRUNE_THRESHOLD
+        } else {
+            needed_marks(chars)
+        };
+        top_up.insert(id, marks);
+        selected_chars = selected_chars.saturating_add(chars);
+    }
+
+    let mut report = apply_pruning_authorized(messages, &top_up, overflow_dir, authorization);
+    report.pressure_count = report.pruned_count;
+    report
+}
+
+/// Inline size (characters) of every eligible candidate in this projection:
+/// raw results through their `tool_call_id`, folded notes through the note body
+/// their provenance points at. Mirrors the candidate collection of
+/// [`build_prune_protocol_prompt`], so pressure reclaim weighs the same items
+/// the model was shown.
+fn eligible_candidate_sizes(
+    messages: &[Message],
+    authorization: &PruneAuthorization,
+) -> Vec<(String, usize)> {
+    let active_ids = active_prunable_tool_ids_authorized(messages, authorization);
+    let mut sizes: FxHashMap<String, usize> = FxHashMap::default();
+    for message in messages {
+        let (Some(id), Some(content)) = (message.tool_call_id.as_deref(), message.content.as_str())
+        else {
+            continue;
+        };
+        if active_ids.contains(id) {
+            sizes.insert(id.to_string(), content.chars().count());
+        }
+    }
+    for (index, meta) in super::folded_prune::candidates(messages) {
+        let id = meta.id();
+        if !active_ids.contains(&id) {
+            continue;
+        }
+        if let Some(content) = messages[index].content.as_str() {
+            sizes.insert(id, content.chars().count());
+        }
+    }
+    sizes.into_iter().collect()
 }
 
 /// Injects the protocol only when the current request actually contains
@@ -476,8 +1065,18 @@ pub(crate) fn apply_pruning(
 /// This tracks the capability boundary better than a fixed message-count
 /// threshold: oversized old results in a short conversation get reclaimed
 /// promptly, while long tool-less conversations waste no prompt tokens.
+pub(crate) fn should_inject_prune_prompt_authorized(
+    messages: &[Message],
+    authorization: &PruneAuthorization,
+) -> bool {
+    !active_prunable_tool_ids_authorized(messages, authorization).is_empty()
+}
+
+/// Fail-closed entry point kept for tests: it authorizes no conditional result,
+/// so production callers must use [`should_inject_prune_prompt_authorized`].
+#[cfg(test)]
 pub(crate) fn should_inject_prune_prompt(messages: &[Message]) -> bool {
-    !active_prunable_tool_ids(messages).is_empty()
+    should_inject_prune_prompt_authorized(messages, &PruneAuthorization::default())
 }
 
 /// Injects the pruning protocol into the model request projection on demand,
@@ -502,13 +1101,14 @@ pub(crate) fn is_prune_protocol_message(message: &Message) -> bool {
 fn build_prune_protocol_prompt(
     messages: &[Message],
     prune_marks: &FxHashMap<String, u8>,
+    authorization: &PruneAuthorization,
 ) -> String {
-    let active_ids = active_prunable_tool_ids(messages);
+    let active_ids = active_prunable_tool_ids_authorized(messages, authorization);
     if active_ids.is_empty() {
         return PRUNE_PROTOCOL_PROMPT.to_string();
     }
     let id_to_tool_name = build_tool_call_name_index(messages);
-    let mut candidates: Vec<(String, &str, usize)> = messages
+    let mut candidates: Vec<(String, String, usize, u8)> = messages
         .iter()
         .filter_map(|message| {
             let id = message.tool_call_id.as_ref()?;
@@ -520,20 +1120,30 @@ fn build_prune_protocol_prompt(
                 .get(id)
                 .map(String::as_str)
                 .unwrap_or("tool");
-            Some((id.clone(), tool, chars))
+            Some((id.clone(), tool.to_string(), chars, needed_marks(chars)))
         })
         .collect();
+    candidates.extend(super::folded_prune::candidates(messages).into_iter().map(
+        |(index, meta)| {
+            (
+                meta.id(),
+                meta.label(),
+                messages[index].content.as_str().unwrap().chars().count(),
+                PRUNE_THRESHOLD,
+            )
+        },
+    ));
     // Largest first (most context freed); tie-break by id for determinism.
     candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
     let mut section = String::from(
         "\n### Prunable candidates in this request (id · tool · size · marks/threshold)\n",
     );
-    for (id, tool, chars) in candidates.iter().take(PRUNE_PROMPT_MAX_CANDIDATES) {
+    for (id, tool, chars, threshold) in candidates.iter().take(PRUNE_PROMPT_MAX_CANDIDATES) {
         let count = prune_marks.get(id).copied().unwrap_or(0);
         section.push_str(&format!(
             "- {id} · {tool} · {chars} chars · marks {count}/{}\n",
-            needed_marks(*chars)
+            threshold
         ));
     }
     let hidden = candidates.len().saturating_sub(PRUNE_PROMPT_MAX_CANDIDATES);
@@ -554,16 +1164,17 @@ fn build_prune_protocol_prompt(
 /// candidate list is refreshed in place instead; when no prunable candidates
 /// remain, the stale protocol message (with its outdated candidate list) is
 /// removed so the model never sees ids that no longer exist.
-pub(crate) fn ensure_prune_protocol_prompt(
+pub(crate) fn ensure_prune_protocol_prompt_authorized(
     messages: &mut Vec<Message>,
     prune_marks: &FxHashMap<String, u8>,
+    authorization: &PruneAuthorization,
 ) -> bool {
     if let Some(existing_idx) = messages
         .iter()
         .position(|message| is_prune_protocol_message(message))
     {
-        if should_inject_prune_prompt(messages) {
-            let prompt = build_prune_protocol_prompt(messages, prune_marks);
+        if should_inject_prune_prompt_authorized(messages, authorization) {
+            let prompt = build_prune_protocol_prompt(messages, prune_marks, authorization);
             // Refreshing identical text is not a mutation: callers reuse the
             // previous token estimate when nothing actually changed.
             if messages[existing_idx].content.as_str() == Some(prompt.as_str()) {
@@ -580,7 +1191,7 @@ pub(crate) fn ensure_prune_protocol_prompt(
             return true;
         }
     }
-    if !should_inject_prune_prompt(messages) {
+    if !should_inject_prune_prompt_authorized(messages, authorization) {
         return false;
     }
 
@@ -588,7 +1199,7 @@ pub(crate) fn ensure_prune_protocol_prompt(
         .iter()
         .position(|message| message.role != "system")
         .unwrap_or(messages.len());
-    let prompt = build_prune_protocol_prompt(messages, prune_marks);
+    let prompt = build_prune_protocol_prompt(messages, prune_marks, authorization);
     messages.insert(
         insert_at,
         Message {
@@ -602,20 +1213,60 @@ pub(crate) fn ensure_prune_protocol_prompt(
     true
 }
 
+/// Fail-closed entry point kept for tests: it authorizes no conditional result,
+/// so production callers must use [`ensure_prune_protocol_prompt_authorized`].
+#[cfg(test)]
+pub(crate) fn ensure_prune_protocol_prompt(
+    messages: &mut Vec<Message>,
+    prune_marks: &FxHashMap<String, u8>,
+) -> bool {
+    ensure_prune_protocol_prompt_authorized(
+        messages,
+        prune_marks,
+        &PruneAuthorization::default(),
+    )
+}
+
 /// Updates the transient projection before every model request: first
 /// losslessly offload old tool results that reached the threshold, then inject
 /// the protocol on demand.
 ///
+/// Which results may be offloaded also depends on the session authorization:
+/// tools whose policy defers to session state (subagent results) are unloaded
+/// only while their evidence is integrated.
+///
 /// The caller must pass a request projection kept separate from the canonical
 /// `turn_messages`.
+pub(crate) fn prepare_request_projection_authorized(
+    messages: &mut Vec<Message>,
+    prune_marks: &FxHashMap<String, u8>,
+    overflow_dir: Option<&Path>,
+    authorization: &PruneAuthorization,
+) -> PruneReport {
+    let report = apply_pruning_authorized(
+        messages.as_mut_slice(),
+        prune_marks,
+        overflow_dir,
+        authorization,
+    );
+    ensure_prune_protocol_prompt_authorized(messages, prune_marks, authorization);
+    report
+}
+
+/// Fail-closed entry point kept for tests: it authorizes no conditional result,
+/// so production callers must use [`prepare_request_projection_authorized`].
+#[cfg(test)]
 pub(crate) fn prepare_request_projection(
     messages: &mut Vec<Message>,
     prune_marks: &FxHashMap<String, u8>,
     overflow_dir: Option<&Path>,
 ) -> PruneReport {
-    let report = apply_pruning(messages.as_mut_slice(), prune_marks, overflow_dir);
-    ensure_prune_protocol_prompt(messages, prune_marks);
-    report
+    prepare_request_projection_authorized(
+        messages,
+        prune_marks,
+        overflow_dir,
+        &PruneAuthorization::default(),
+    )
 }
 
 #[cfg(test)]
@@ -705,7 +1356,7 @@ mod tests {
     #[test]
     fn test_parse_prune_from_hidden_meta() {
         let hidden_meta = "prune:call_abc,call_xyz\nDo: be concise\nAvoid: verbosity";
-        let (ids, remaining) = parse_prune_from_hidden_meta(hidden_meta);
+        let (ids, remaining) = parse_prune_from_hidden_meta(hidden_meta, &FxHashSet::default());
 
         assert_eq!(ids, vec!["call_abc", "call_xyz"]);
         assert!(remaining.contains("Do: be concise"));
@@ -716,7 +1367,7 @@ mod tests {
     #[test]
     fn test_parse_prune_only() {
         let hidden_meta = "prune:call_1,call_2";
-        let (ids, remaining) = parse_prune_from_hidden_meta(hidden_meta);
+        let (ids, remaining) = parse_prune_from_hidden_meta(hidden_meta, &FxHashSet::default());
 
         assert_eq!(ids.len(), 2);
         assert!(remaining.is_empty());
@@ -725,7 +1376,7 @@ mod tests {
     #[test]
     fn test_parse_no_prune() {
         let hidden_meta = "Do: be focused\nAvoid: tangents";
-        let (ids, remaining) = parse_prune_from_hidden_meta(hidden_meta);
+        let (ids, remaining) = parse_prune_from_hidden_meta(hidden_meta, &FxHashSet::default());
 
         assert!(ids.is_empty());
         assert_eq!(remaining, "Do: be focused\nAvoid: tangents");
@@ -733,9 +1384,151 @@ mod tests {
 
     #[test]
     fn test_parse_empty() {
-        let (ids, remaining) = parse_prune_from_hidden_meta("");
+        let (ids, remaining) = parse_prune_from_hidden_meta("", &FxHashSet::default());
         assert!(ids.is_empty());
         assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_parse_prune_from_hidden_meta_accepts_compat_marker() {
+        let hidden_meta = "<<<prune:call_a,call_b>>>\nDo: be concise";
+        let (ids, remaining) = parse_prune_from_hidden_meta(hidden_meta, &FxHashSet::default());
+
+        assert_eq!(ids, vec!["call_a", "call_b"]);
+        assert_eq!(remaining, "Do: be concise");
+    }
+
+    #[test]
+    fn test_parse_prune_from_hidden_meta_keeps_mixed_payload_as_text() {
+        // Ids mixed with prose are not applied and not invented: the line survives
+        // for the rejection report instead of splitting into garbage ids.
+        let hidden_meta = "prune:call_a, see the log\nkeep me";
+        let (ids, remaining) = parse_prune_from_hidden_meta(hidden_meta, &FxHashSet::default());
+
+        assert!(ids.is_empty());
+        assert_eq!(remaining, hidden_meta);
+    }
+
+    #[test]
+    fn test_parse_embedded_prune_directives_directive_line_is_consumed() {
+        let text = "<<<prune:call_1,call_2>>>\n\nNext paragraph.";
+        let (ids, cleaned) = parse_embedded_prune_directives(text, &FxHashSet::default());
+
+        assert_eq!(ids, vec!["call_1", "call_2"]);
+        assert_eq!(cleaned, "\nNext paragraph.");
+    }
+
+    #[test]
+    fn test_parse_embedded_prune_directives_inline_mention_is_not_a_directive() {
+        let text = "The model wrote <<<prune:call_1>>> in its reply.";
+        let (ids, cleaned) = parse_embedded_prune_directives(text, &FxHashSet::default());
+
+        assert!(ids.is_empty());
+        assert_eq!(cleaned, text);
+    }
+
+    #[test]
+    fn test_parse_embedded_prune_directives_prose_payload_stays_for_report() {
+        let text = "<<<prune:call_1, the older results>>>\n";
+        let (ids, cleaned) = parse_embedded_prune_directives(text, &FxHashSet::default());
+
+        assert!(ids.is_empty());
+        assert_eq!(cleaned, text);
+        assert_eq!(
+            unrecognized_prune_fragments(text, &FxHashSet::default()).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_unrecognized_prune_fragments_reports_attempted_marks_only() {
+        // An unclosed marker and a `prune:` line carrying ids plus prose are attempts.
+        assert_eq!(
+            unrecognized_prune_fragments("<<<prune:call_1", &FxHashSet::default()),
+            vec!["<<<prune:call_1".to_string()]
+        );
+        assert_eq!(
+            unrecognized_prune_fragments("prune:call_1, see the log", &FxHashSet::default()),
+            vec!["prune:call_1, see the log".to_string()]
+        );
+        // Quoting the marker mid-sentence and `prune:` prose without ids are not.
+        assert!(
+            unrecognized_prune_fragments("write <<<prune:call_1>>> to mark", &FxHashSet::default())
+                .is_empty()
+        );
+        assert!(
+            unrecognized_prune_fragments("prune: see the protocol", &FxHashSet::default()).is_empty()
+        );
+    }
+
+    #[test]
+    fn test_known_ids_resolve_regardless_of_their_shape() {
+        // A mark must land on an id the request carries even when the id sits outside
+        // the fallback shape: providers are not bound by this parser's charset rule.
+        let known: FxHashSet<String> = ["call:weird/0".to_string()].into_iter().collect();
+
+        let (ids, remaining) = parse_prune_from_hidden_meta("prune:call:weird/0", &known);
+        assert_eq!(ids, vec!["call:weird/0"]);
+        assert!(remaining.is_empty());
+
+        let (ids, cleaned) = parse_embedded_prune_directives("<<<prune:call:weird/0>>>", &known);
+        assert_eq!(ids, vec!["call:weird/0"]);
+        assert!(cleaned.is_empty());
+
+        // In a request that does not carry the id the text names nothing; the marker
+        // line is still reported as an attempt instead of vanishing silently.
+        let empty = FxHashSet::default();
+        let (ids, _) = parse_prune_from_hidden_meta("prune:call:weird/0", &empty);
+        assert!(ids.is_empty());
+        let (ids, _) = parse_embedded_prune_directives("<<<prune:call:weird/0>>>", &empty);
+        assert!(ids.is_empty());
+        assert_eq!(
+            unrecognized_prune_fragments("<<<prune:call:weird/0>>>", &empty).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_known_id_keeps_its_decoration_characters_and_length() {
+        let decorated = "call_(weird)";
+        let long = "x".repeat(200);
+        let known: FxHashSet<String> = [decorated.to_string(), long.clone()].into_iter().collect();
+
+        // The raw token wins over the de-decorated form: trimming `(`/`)` would
+        // otherwise corrupt an id that itself contains them.
+        let (ids, _) = parse_prune_from_hidden_meta(&format!("prune:{decorated}"), &known);
+        assert_eq!(ids, vec![decorated]);
+
+        // The shape length bound exists to bound runaway prose tokens, not to reject
+        // an id the request carries.
+        let (ids, _) = parse_prune_from_hidden_meta(&format!("prune:{long}"), &known);
+        assert_eq!(ids, vec![long]);
+
+        // A decorated spelling still resolves through the normalized form.
+        let quoted: FxHashSet<String> = ["call:weird/0".to_string()].into_iter().collect();
+        let (ids, _) = parse_prune_from_hidden_meta("prune:`call:weird/0`", &quoted);
+        assert_eq!(ids, vec!["call:weird/0"]);
+    }
+
+    #[test]
+    fn test_known_id_mixed_with_prose_still_all_or_nothing() {
+        let known: FxHashSet<String> = ["call:weird/0".to_string()].into_iter().collect();
+        let hidden_meta = "prune:call:weird/0, use the older result\nkeep me";
+
+        let (ids, remaining) = parse_prune_from_hidden_meta(hidden_meta, &known);
+
+        assert!(ids.is_empty());
+        assert_eq!(remaining, hidden_meta);
+    }
+
+    #[test]
+    fn test_unrecognized_prune_fragments_reports_a_known_id_line_as_an_attempt() {
+        let known: FxHashSet<String> = ["call:weird/0".to_string()].into_iter().collect();
+
+        assert_eq!(
+            unrecognized_prune_fragments("prune:call:weird/0, see the log", &known),
+            vec!["prune:call:weird/0, see the log".to_string()]
+        );
     }
 
     #[test]
@@ -908,7 +1701,9 @@ mod tests {
         let archived_path = if std::path::Path::new(raw).is_absolute() {
             std::path::PathBuf::from(raw)
         } else {
-            overflow_dir.join(super::super::PRESERVED_TOOL_OVERFLOW_DIR).join(raw)
+            overflow_dir
+                .join(super::super::PRESERVED_TOOL_OVERFLOW_DIR)
+                .join(raw)
         };
         let archived = std::fs::read_to_string(&archived_path).unwrap();
         assert!(archived.contains("very long outdated result that should be pruned"));
@@ -1606,5 +2401,417 @@ mod tests {
             None,
             "eligible ids get no rejection reason"
         );
+    }
+
+    // ---- Subagent results (`ToolPrunePolicy::AfterIntegration`) ----
+
+    use super::PruneAuthorization;
+
+    fn integration_authorization(task_ids: &[&str]) -> PruneAuthorization {
+        PruneAuthorization::from_integrated_task_ids(
+            task_ids.iter().map(|id| id.to_string()).collect(),
+        )
+    }
+
+    /// A large subagent delivery shaped like the runtime's own `task_wait` output.
+    fn subagent_result(task_ids: &[&str]) -> String {
+        let mut content = String::new();
+        for task_id in task_ids {
+            content.push_str(&format!("[task_id={task_id}]\n"));
+            content.push_str(&"subagent conclusion line\n".repeat(300));
+        }
+        content
+    }
+
+    /// One old subagent group plus four recent groups, so the subagent group sits
+    /// outside the recent-results protection window.
+    fn subagent_conversation(task_ids: &[&str]) -> Vec<Message> {
+        let mut messages = vec![
+            make_assistant_tool_call("call_sub", "task_wait"),
+            make_tool_message("call_sub", &subagent_result(task_ids)),
+        ];
+        for index in 0..4 {
+            let id = format!("call_recent_{index}");
+            messages.push(make_assistant_tool_call(&id, "execute_command"));
+            messages.push(make_tool_message(&id, "recent result"));
+        }
+        messages
+    }
+
+    #[test]
+    fn test_subagent_result_is_eligible_only_after_integration() {
+        let messages = subagent_conversation(&["task_a"]);
+
+        // Un-integrated delivery: live state, so neither a candidate nor
+        // advertised to the model.
+        assert!(
+            !active_prunable_tool_ids_authorized(&messages, &PruneAuthorization::default())
+                .contains("call_sub")
+        );
+        assert!(!should_inject_prune_prompt_authorized(
+            &messages,
+            &PruneAuthorization::default()
+        ));
+
+        let integrated = integration_authorization(&["task_a"]);
+        assert!(active_prunable_tool_ids_authorized(&messages, &integrated).contains("call_sub"));
+        assert!(should_inject_prune_prompt_authorized(
+            &messages, &integrated
+        ));
+    }
+
+    #[test]
+    fn test_subagent_result_with_one_unintegrated_task_stays_eligible_free() {
+        let messages = subagent_conversation(&["task_a", "task_b"]);
+        assert!(
+            !active_prunable_tool_ids_authorized(
+                &messages,
+                &integration_authorization(&["task_a"])
+            )
+            .contains("call_sub")
+        );
+        assert!(
+            active_prunable_tool_ids_authorized(
+                &messages,
+                &integration_authorization(&["task_a", "task_b"])
+            )
+            .contains("call_sub")
+        );
+    }
+
+    #[test]
+    fn test_unintegrated_subagent_result_reports_its_own_rejection_reason() {
+        let messages = subagent_conversation(&["task_a"]);
+        assert_eq!(
+            explain_rejected_prune_mark_authorized(
+                &messages,
+                "call_sub",
+                &PruneAuthorization::default()
+            ),
+            Some("subagent result is not integrated yet")
+        );
+        assert_eq!(
+            explain_rejected_prune_mark_authorized(
+                &messages,
+                "call_sub",
+                &integration_authorization(&["task_a"])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_offload_rechecks_authorization_against_restored_marks() {
+        let overflow_dir = make_overflow_dir();
+        let mut messages = subagent_conversation(&["task_a"]);
+        let marks = [("call_sub".to_string(), PRUNE_THRESHOLD)]
+            .into_iter()
+            .collect();
+
+        // A mark restored from session state must not unload evidence whose task
+        // was never integrated.
+        assert_eq!(
+            apply_pruning_authorized(
+                &mut messages,
+                &marks,
+                Some(overflow_dir.as_path()),
+                &PruneAuthorization::default(),
+            )
+            .pruned_count,
+            0
+        );
+        assert!(
+            messages[1]
+                .content
+                .as_str()
+                .unwrap()
+                .contains("task_id=task_a")
+        );
+
+        let authorization = integration_authorization(&["task_a"]);
+        assert_eq!(
+            apply_pruning_authorized(
+                &mut messages,
+                &marks,
+                Some(overflow_dir.as_path()),
+                &authorization,
+            )
+            .pruned_count,
+            1
+        );
+
+        // The stub no longer carries the task markers, so retention follows how
+        // the stub was created; deriving it from the stub text instead would drop
+        // the mark and make the offload flap on the next request.
+        assert!(retained_prune_ids_authorized(&messages, &authorization).contains("call_sub"));
+        assert!(
+            !active_prunable_tool_ids_authorized(&messages, &authorization).contains("call_sub")
+        );
+
+        std::fs::remove_dir_all(&overflow_dir).ok();
+    }
+
+    // ---- pressure reclaim: runtime-side offloading without a model mark ----
+
+    /// Below the trigger the marking contract is unchanged: a model that casts
+    /// no mark leaves the eligible backlog inline.
+    #[test]
+    fn test_pressure_reclaim_stays_silent_below_the_trigger() {
+        let overflow_dir = make_overflow_dir();
+        let mut messages = vec![
+            make_assistant_tool_call("call_old", "execute_command"),
+            make_tool_message("call_old", &"old command output\n".repeat(1_000)),
+            make_assistant_tool_call("call_recent_1", "execute_command"),
+            make_tool_message("call_recent_1", "recent 1"),
+            make_assistant_tool_call("call_recent_2", "execute_command"),
+            make_tool_message("call_recent_2", "recent 2"),
+            make_assistant_tool_call("call_recent_3", "execute_command"),
+            make_tool_message("call_recent_3", "recent 3"),
+            make_assistant_tool_call("call_recent_4", "execute_command"),
+            make_tool_message("call_recent_4", "recent 4"),
+        ];
+
+        let report = reclaim_under_pressure_authorized(
+            &mut messages,
+            Some(overflow_dir.as_path()),
+            &PruneAuthorization::default(),
+        );
+
+        assert_eq!(report.pruned_count, 0);
+        assert_eq!(report.pressure_count, 0);
+        assert_eq!(report.freed_chars, 0);
+        assert!(
+            messages[1]
+                .content
+                .as_str()
+                .unwrap()
+                .starts_with("old command output")
+        );
+
+        std::fs::remove_dir_all(&overflow_dir).ok();
+    }
+
+    /// Above the trigger the runtime offloads the largest eligible results
+    /// through the same lossless path (full text archived, recallable stub),
+    /// reports them as auto-reclaimed, and stops at the per-request character
+    /// cap instead of rewriting the whole backlog at once.
+    #[test]
+    fn test_pressure_reclaim_offloads_largest_within_the_per_request_cap() {
+        let overflow_dir = make_overflow_dir();
+        let mut messages = vec![
+            make_assistant_tool_call("call_a", "execute_command"),
+            make_tool_message("call_a", &"a stale output\n".repeat(2_000)),
+            make_assistant_tool_call("call_b", "read_file"),
+            make_tool_message("call_b", &"b stale file body\n".repeat(1_500)),
+            make_assistant_tool_call("call_c", "execute_command"),
+            make_tool_message("call_c", &"c stale output\n".repeat(1_000)),
+            make_assistant_tool_call("call_recent_1", "execute_command"),
+            make_tool_message("call_recent_1", "recent 1"),
+            make_assistant_tool_call("call_recent_2", "execute_command"),
+            make_tool_message("call_recent_2", "recent 2"),
+            make_assistant_tool_call("call_recent_3", "execute_command"),
+            make_tool_message("call_recent_3", "recent 3"),
+            make_assistant_tool_call("call_recent_4", "execute_command"),
+            make_tool_message("call_recent_4", "recent 4"),
+        ];
+        // 30K + 27K + 15K eligible chars: above the trigger, above one cap.
+
+        let report = reclaim_under_pressure_authorized(
+            &mut messages,
+            Some(overflow_dir.as_path()),
+            &PruneAuthorization::default(),
+        );
+
+        assert_eq!(report.pruned_count, 2, "largest first, up to the cap");
+        assert_eq!(report.pressure_count, 2);
+        assert!(report.freed_chars > 0);
+        let stub_a = messages[1].content.as_str().unwrap();
+        assert!(stub_a.contains("file_path:"));
+        assert!(messages[3].content.as_str().unwrap().contains("file_path:"));
+        // `call_c` is eligible, but the per-request cap stopped the reclaim.
+        assert!(
+            messages[5]
+                .content
+                .as_str()
+                .unwrap()
+                .starts_with("c stale output")
+        );
+        // The archived full text really is recallable.
+        let raw = stub_a
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("- file_path: "))
+            .expect("stub must carry an archived file_path")
+            .trim();
+        let archived_path = if std::path::Path::new(raw).is_absolute() {
+            std::path::PathBuf::from(raw)
+        } else {
+            overflow_dir
+                .join(super::super::PRESERVED_TOOL_OVERFLOW_DIR)
+                .join(raw)
+        };
+        assert!(
+            std::fs::read_to_string(&archived_path)
+                .unwrap()
+                .contains("a stale output")
+        );
+
+        // The next request finds the remainder below the trigger: reclamation
+        // converges instead of re-offloading or flapping.
+        let repeat = reclaim_under_pressure_authorized(
+            &mut messages,
+            Some(overflow_dir.as_path()),
+            &PruneAuthorization::default(),
+        );
+        assert_eq!(repeat.pruned_count, 0);
+        assert_eq!(repeat.pressure_count, 0);
+
+        std::fs::remove_dir_all(&overflow_dir).ok();
+    }
+
+    /// Pressure never widens eligibility: the recent-results window, `prune:
+    /// Never` tools, and un-integrated subagent deliveries stay inline while
+    /// the runtime reclaims around them.
+    ///
+    /// Every protected item is larger than the largest eligible candidate, so
+    /// a hole in any single protection would move that item to the front of the
+    /// selection and fail its assertion instead of hiding behind the cap.
+    #[test]
+    fn test_pressure_reclaim_respects_protection_and_authorization() {
+        let overflow_dir = make_overflow_dir();
+        let mut subagent_delivery = subagent_result(&["task_a"]);
+        subagent_delivery.push_str(&"\nun-integrated padding\n".repeat(2_500));
+        let mut messages = vec![
+            make_assistant_tool_call("call_plan", "plan"),
+            make_tool_message("call_plan", &"plan body\n".repeat(6_000)),
+            make_assistant_tool_call("call_sub", "task_wait"),
+            make_tool_message("call_sub", &subagent_delivery),
+            make_assistant_tool_call("call_old", "execute_command"),
+            make_tool_message("call_old", &"old output\n".repeat(4_000)),
+            make_assistant_tool_call("call_old_2", "read_file"),
+            make_tool_message("call_old_2", &"old file body\n".repeat(2_500)),
+            make_assistant_tool_call("call_recent_1", "execute_command"),
+            make_tool_message("call_recent_1", &"recent window body\n".repeat(3_000)),
+            make_assistant_tool_call("call_recent_2", "execute_command"),
+            make_tool_message("call_recent_2", "recent 2"),
+            make_assistant_tool_call("call_recent_3", "execute_command"),
+            make_tool_message("call_recent_3", "recent 3"),
+            make_assistant_tool_call("call_recent_4", "execute_command"),
+            make_tool_message("call_recent_4", "recent 4"),
+        ];
+        // Eligible backlog: 44K + 35K. The plan body (60K), the subagent
+        // delivery (~60K), and the newest-window result (57K) are all larger
+        // than the first eligible pick.
+
+        let report = reclaim_under_pressure_authorized(
+            &mut messages,
+            Some(overflow_dir.as_path()),
+            &PruneAuthorization::default(),
+        );
+
+        // 44K already reaches the per-request cap, so exactly one item is
+        // reclaimed: the largest eligible candidate.
+        assert_eq!(report.pruned_count, 1);
+        assert_eq!(report.pressure_count, 1);
+        assert!(
+            messages[1]
+                .content
+                .as_str()
+                .unwrap()
+                .starts_with("plan body"),
+            "prune: Never results are never reclaimed"
+        );
+        assert!(
+            messages[3]
+                .content
+                .as_str()
+                .unwrap()
+                .contains("task_id=task_a"),
+            "an un-integrated subagent delivery stays inline in full"
+        );
+        assert!(
+            messages[5].content.as_str().unwrap().contains("file_path:"),
+            "the largest eligible candidate is reclaimed"
+        );
+        assert!(
+            messages[7]
+                .content
+                .as_str()
+                .unwrap()
+                .starts_with("old file body"),
+            "the per-request cap stopped the reclaim before this candidate"
+        );
+        assert!(
+            messages[9]
+                .content
+                .as_str()
+                .unwrap()
+                .starts_with("recent window body"),
+            "results inside the recent-results protection window stay inline"
+        );
+
+        std::fs::remove_dir_all(&overflow_dir).ok();
+    }
+
+    /// The lossless floor outranks the pressure trigger: with no archive
+    /// directory nothing is reclaimed, however large the backlog is.
+    #[test]
+    fn test_pressure_reclaim_requires_an_archive_directory() {
+        let mut messages = vec![
+            make_assistant_tool_call("call_old", "execute_command"),
+            make_tool_message("call_old", &"irrecoverable if dropped\n".repeat(4_000)),
+            make_assistant_tool_call("call_recent_1", "execute_command"),
+            make_tool_message("call_recent_1", "recent 1"),
+            make_assistant_tool_call("call_recent_2", "execute_command"),
+            make_tool_message("call_recent_2", "recent 2"),
+            make_assistant_tool_call("call_recent_3", "execute_command"),
+            make_tool_message("call_recent_3", "recent 3"),
+            make_assistant_tool_call("call_recent_4", "execute_command"),
+            make_tool_message("call_recent_4", "recent 4"),
+        ];
+
+        let report =
+            reclaim_under_pressure_authorized(&mut messages, None, &PruneAuthorization::default());
+
+        assert_eq!(report.pruned_count, 0);
+        assert_eq!(report.freed_chars, 0);
+        assert!(
+            messages[1]
+                .content
+                .as_str()
+                .unwrap()
+                .starts_with("irrecoverable if dropped")
+        );
+    }
+
+    /// A candidate larger than the whole per-request cap is still reclaimed:
+    /// the largest pick is always included, so one oversized result cannot
+    /// block reclamation.
+    #[test]
+    fn test_pressure_reclaim_always_includes_the_largest_candidate() {
+        let overflow_dir = make_overflow_dir();
+        let mut messages = vec![
+            make_assistant_tool_call("call_huge", "execute_command"),
+            make_tool_message("call_huge", &"huge stale output\n".repeat(5_000)),
+            make_assistant_tool_call("call_recent_1", "execute_command"),
+            make_tool_message("call_recent_1", "recent 1"),
+            make_assistant_tool_call("call_recent_2", "execute_command"),
+            make_tool_message("call_recent_2", "recent 2"),
+            make_assistant_tool_call("call_recent_3", "execute_command"),
+            make_tool_message("call_recent_3", "recent 3"),
+            make_assistant_tool_call("call_recent_4", "execute_command"),
+            make_tool_message("call_recent_4", "recent 4"),
+        ];
+
+        let report = reclaim_under_pressure_authorized(
+            &mut messages,
+            Some(overflow_dir.as_path()),
+            &PruneAuthorization::default(),
+        );
+
+        assert_eq!(report.pruned_count, 1);
+        assert_eq!(report.pressure_count, 1);
+        assert!(messages[1].content.as_str().unwrap().contains("file_path:"));
+
+        std::fs::remove_dir_all(&overflow_dir).ok();
     }
 }

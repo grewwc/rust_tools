@@ -471,9 +471,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     append_user_visible_final_notice(terminal_dedupe_candidate, &notice);
                 }
             }
-            if !previously_rendered_body_matches {
-                *terminal_dedupe_candidate = Some(stream_result.assistant_text.clone());
-            }
             let was_truncated_by_length = stream_result.truncated_by_length;
             record_final_stream_response(
                 app,
@@ -483,6 +480,12 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 final_assistant_text,
                 final_assistant_recorded,
             );
+            // Redraw exactly the body history now holds: recording the response strips
+            // consumed control directives, so filling the terminal slot from the raw text
+            // would show the user a line that neither history nor the final answer carries.
+            if !previously_rendered_body_matches {
+                *terminal_dedupe_candidate = Some(final_assistant_text.clone());
+            }
             // finish_reason=length but with visible text: accept as Completed, but inject
             // a light hint so the model knows the output may be incomplete. No retry is
             // triggered (avoiding a pointless loop when a reasoning model fills its budget

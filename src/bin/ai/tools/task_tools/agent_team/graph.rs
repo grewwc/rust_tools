@@ -42,7 +42,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     name: "run_agent_graph",
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
-        prune: ToolPrunePolicy::Never,
+        prune: ToolPrunePolicy::AfterIntegration,
         counts_toward_precision_inline_budget: false,
     },
 });

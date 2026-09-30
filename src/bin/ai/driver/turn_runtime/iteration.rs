@@ -17,8 +17,8 @@ use crate::ai::{
 };
 
 use super::{
-    CompressionReport, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
-    MID_TURN_LLM_SUMMARY_MAX_CHARS, TurnOutcome, context_budget,
+    CompressionReport, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS, MID_TURN_LLM_SUMMARY_MAX_CHARS,
+    TurnOutcome, context_budget,
     persistence::persist_pending_turn_messages,
     record_llm_summary_attempt_chars, should_try_llm_summary,
     types::{IterationExecution, ToolCallExecution},
@@ -1081,24 +1081,52 @@ fn apply_model_guided_pruning_before_request(app: &App, messages: &mut Vec<Messa
     };
     // The prompt embeds a dynamic candidate list, so recognize the protocol
     // message structurally instead of by full-text equality.
-    let had_protocol = messages.iter().any(llm_prune::is_prune_protocol_message);
-    let report = llm_prune::prepare_request_projection(
+    let previous_protocol = messages
+        .iter()
+        .find(|message| llm_prune::is_prune_protocol_message(message))
+        .map(|message| message.content.clone());
+    let authorization = crate::ai::driver::commands::session::current_prune_authorization(app);
+    let mut report = llm_prune::prepare_request_projection_authorized(
         messages,
         &app.prune_marks,
         Some(overflow_dir.as_path()),
+        &authorization,
     );
-    let protocol_injected =
-        !had_protocol && messages.iter().any(llm_prune::is_prune_protocol_message);
-    if protocol_injected && crate::ai::driver::runtime_ctx::terminal_output_enabled() {
-        // Counted after the projection update so results offloaded by this
-        // very call are not advertised as still-listed candidates.
-        let candidate_count = llm_prune::active_prunable_tool_ids(messages).len();
-        crate::ai::driver::print::print_tool_note_line(
-            "context-prune",
-            &format!("protocol armed: {candidate_count} prunable candidate(s)"),
+    // Model marks are the fine-grained signal, not a guaranteed one: a model
+    // that never marks would let the eligible backlog grow while every request
+    // re-sends it in full. Under pressure the runtime reclaims the largest
+    // eligible items through the same lossless path, then regenerates the
+    // candidate list so it cannot advertise ids that just left the projection.
+    let pressure = llm_prune::reclaim_under_pressure_authorized(
+        messages,
+        Some(overflow_dir.as_path()),
+        &authorization,
+    );
+    if pressure.pruned_count > 0 {
+        llm_prune::ensure_prune_protocol_prompt_authorized(
+            messages,
+            &app.prune_marks,
+            &authorization,
         );
     }
-    if report.pruned_count == 0 {
+    report.merge(pressure);
+    let current_protocol = messages
+        .iter()
+        .find(|message| llm_prune::is_prune_protocol_message(message))
+        .map(|message| &message.content);
+    if previous_protocol.as_ref() != current_protocol
+        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+    {
+        // Counted after the projection update so results offloaded by this
+        // very call are not advertised as still-listed candidates.
+        let candidate_count =
+            llm_prune::active_prunable_tool_ids_authorized(messages, &authorization).len();
+        crate::ai::driver::print::print_tool_note_line(
+            "context-prune",
+            &format!("candidate list updated: {candidate_count} eligible tool evidence item(s)"),
+        );
+    }
+    if report.pruned_count == 0 || !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
         return;
     }
 
@@ -1107,10 +1135,18 @@ fn apply_model_guided_pruning_before_request(app: &App, messages: &mut Vec<Messa
     } else {
         format!(" [{}]", report.tools.join(", "))
     };
+    let auto_reclaimed = if report.pressure_count == 0 {
+        String::new()
+    } else {
+        format!(
+            ", {} auto-reclaimed under context pressure",
+            report.pressure_count
+        )
+    };
     crate::ai::driver::print::print_tool_note_line(
         "context-pruned",
         &format!(
-            "{} tool result(s){}, ~{} chars freed",
+            "{} tool evidence item(s){}, ~{} chars freed{auto_reclaimed}",
             report.pruned_count, tools, report.freed_chars
         ),
     );
@@ -1216,13 +1252,20 @@ async fn apply_request_budget(
     } else {
         request::preview_request_budget(app, model, messages, true, tools_enabled).await
     };
-    attempt.finish(&app.session_id, iteration, model, budget, messages,
-        report.rollback_reason.is_none() || report.changed);
+    attempt.finish(
+        &app.session_id,
+        iteration,
+        model,
+        budget,
+        messages,
+        report.rollback_reason.is_none() || report.changed,
+    );
     if let Some(reason) = report.rollback_reason {
         crate::ai::driver::print::print_tool_note_line("context-budget", reason.note());
     } else if report.changed {
         crate::ai::driver::print::print_tool_note_line(
-            "context-budget", &format_context_budget_change(report.before_chars, report.after_chars),
+            "context-budget",
+            &format_context_budget_change(report.before_chars, report.after_chars),
         );
     }
 
@@ -1241,11 +1284,18 @@ async fn apply_request_budget(
         let mut summary_messages = messages.clone();
         let active_plan = context_budget::ActivePlanProjection::take(&mut summary_messages);
         let target = budget.compression_target_chars(chars);
-        let (mut candidate, _, _, effective, inserted) = crate::ai::history::mid_turn_llm_summarize(
-            app, summary_messages, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
-            MID_TURN_LLM_SUMMARY_MAX_CHARS, active_plan.remaining_target(target),
-            crate::ai::driver::runtime_ctx::effective_cwd().ok().as_deref(),
-        ).await;
+        let (mut candidate, _, _, effective, inserted) =
+            crate::ai::history::mid_turn_llm_summarize(
+                app,
+                summary_messages,
+                MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
+                MID_TURN_LLM_SUMMARY_MAX_CHARS,
+                active_plan.remaining_target(target),
+                crate::ai::driver::runtime_ctx::effective_cwd()
+                    .ok()
+                    .as_deref(),
+            )
+            .await;
         active_plan.restore(&mut candidate);
         // The history pipeline has already committed archive guards before
         // returning a replacement. Its effectiveness flag is not an identity test.
@@ -1254,8 +1304,14 @@ async fn apply_request_budget(
         budget = request::preview_request_budget(app, model, messages, true, tools_enabled).await;
         attempt.finish(&app.session_id, iteration, model, budget, messages, true);
         compression_report.record_llm_summary_attempt(
-            format!("pre-request LLM ({} tokens)", budget.limits.input_allowance_tokens),
-            chars, after_chars, effective, inserted,
+            format!(
+                "pre-request LLM ({} tokens)",
+                budget.limits.input_allowance_tokens
+            ),
+            chars,
+            after_chars,
+            effective,
+            inserted,
         );
         record_llm_summary_attempt_chars(&app.session_id, after_chars);
         chars = after_chars;
@@ -1264,7 +1320,11 @@ async fn apply_request_budget(
     // than carrying a pre-replacement token estimate to transport.
     // The common case leaves the projection untouched, so reuse the current
     // budget instead of rebuilding the full projection a third time.
-    if llm_prune::ensure_prune_protocol_prompt(messages, &app.prune_marks) {
+    if llm_prune::ensure_prune_protocol_prompt_authorized(
+        messages,
+        &app.prune_marks,
+        &crate::ai::driver::commands::session::current_prune_authorization(app),
+    ) {
         request::preview_request_budget(app, model, messages, true, tools_enabled).await
     } else {
         // `chars` is unused after this point; keep the assignment for clarity
@@ -1318,10 +1378,19 @@ async fn request_model_response(
     apply_model_guided_pruning_before_request(app, messages);
     context_budget::refresh_active_plan(app, messages);
     let context_before = super::context_metrics::ContextSizeBreakdown::measure(messages);
-    let before_budget = request::preview_request_budget(app, next_model, messages, true, !force_final_response).await;
+    let before_budget =
+        request::preview_request_budget(app, next_model, messages, true, !force_final_response)
+            .await;
     let mut request_budget = apply_request_budget(
-        app, next_model, messages, !force_final_response, _iteration, &mut compression_report, before_budget.clone(),
-    ).await;
+        app,
+        next_model,
+        messages,
+        !force_final_response,
+        _iteration,
+        &mut compression_report,
+        before_budget.clone(),
+    )
+    .await;
     compression_report.emit();
 
     let auto_model_fallback_spec = crate::ai::driver::runtime_ctx::auto_model_fallback_spec();
@@ -1371,12 +1440,23 @@ async fn request_model_response(
                 actual_model = fallback_model.clone();
                 let mut fallback_report = CompressionReport::default();
                 let fallback_before = request::preview_request_budget(
-                    app, &fallback_model, messages, true, !force_final_response,
-                ).await;
+                    app,
+                    &fallback_model,
+                    messages,
+                    true,
+                    !force_final_response,
+                )
+                .await;
                 request_budget = apply_request_budget(
-                    app, &fallback_model, messages, !force_final_response, _iteration, &mut fallback_report,
+                    app,
+                    &fallback_model,
+                    messages,
+                    !force_final_response,
+                    _iteration,
+                    &mut fallback_report,
                     fallback_before,
-                ).await;
+                )
+                .await;
                 fallback_report.emit();
                 request_result = if force_final_response {
                     send_llm_request(&*llm_client, app, &fallback_model, messages, false).await
@@ -1412,24 +1492,48 @@ async fn request_model_response(
                 request_budget.limits.soft_target_tokens,
             );
             let attempt = super::context_metrics::CompactionAttempt::start(
-                "provider_overflow", request_budget, messages,
+                "provider_overflow",
+                request_budget,
+                messages,
             );
             // A failed send consumes usage feedback. Remeasure before shrinking
             // so both sides use the same normalized estimate, rather than
             // comparing a calibrated pre-send count with an uncalibrated one.
             let before_tokens = request::preview_request_budget(
-                app, &actual_model, messages, true, !force_final_response,
-            ).await.prompt_tokens;
+                app,
+                &actual_model,
+                messages,
+                true,
+                !force_final_response,
+            )
+            .await
+            .prompt_tokens;
             let after = reactive_shrink_context_after_overflow(app, messages, target);
-            llm_prune::ensure_prune_protocol_prompt(messages, &app.prune_marks);
+            llm_prune::ensure_prune_protocol_prompt_authorized(
+                messages,
+                &app.prune_marks,
+                &crate::ai::driver::commands::session::current_prune_authorization(app),
+            );
             request_budget = request::preview_request_budget(
-                app, &actual_model, messages, true, !force_final_response,
-            ).await;
+                app,
+                &actual_model,
+                messages,
+                true,
+                !force_final_response,
+            )
+            .await;
             // Accept only a rescue that actually shrank the prompt: a rejected
             // send whose projection survived unchanged must be logged as such
             // (mirrors apply_request_budget's rollback/changed acceptance).
             let progressed = request_budget.prompt_tokens < before_tokens;
-            attempt.finish(&app.session_id, _iteration, &actual_model, request_budget, messages, progressed);
+            attempt.finish(
+                &app.session_id,
+                _iteration,
+                &actual_model,
+                request_budget,
+                messages,
+                progressed,
+            );
             overflow_retries += 1;
             if progressed {
                 overflow_request_retries += 1;
@@ -1443,8 +1547,13 @@ async fn request_model_response(
                 // The next retry starts with the selected model again, not
                 // necessarily the fallback whose provider rejected this request.
                 request_budget = request::preview_request_budget(
-                    app, next_model, messages, true, !force_final_response,
-                ).await;
+                    app,
+                    next_model,
+                    messages,
+                    true,
+                    !force_final_response,
+                )
+                .await;
                 continue;
             }
             // No progress even after the current-user-message rescue: retrying
@@ -1814,9 +1923,9 @@ mod tests {
     use super::super::{record_llm_summary_attempt_chars, should_try_llm_summary};
     use super::{
         App, LlmClient, LlmRequest, StreamingFlagGuard, build_llm_request_client,
-        context_overflow_target_chars, reactive_shrink_context_after_overflow,
-        no_tool_handoff_note, project_instruction_target_paths, refresh_outstanding_task_anchor,
-        request, request_interrupt_pending, send_llm_request,
+        context_overflow_target_chars, no_tool_handoff_note, project_instruction_target_paths,
+        reactive_shrink_context_after_overflow, refresh_outstanding_task_anchor, request,
+        request_interrupt_pending, send_llm_request,
     };
     use crate::ai::history::{Message, ROLE_INTERNAL_NOTE};
     use crate::ai::middleware::RequestMiddleware;
@@ -1845,8 +1954,14 @@ mod tests {
 
     #[test]
     fn context_overflow_target_keeps_tightening_above_floor() {
-        assert_eq!(context_overflow_target_chars(100_000, 100_000, 80_000), 75_000);
-        assert_eq!(context_overflow_target_chars(100_000, 60_000, 80_000), 60_000);
+        assert_eq!(
+            context_overflow_target_chars(100_000, 100_000, 80_000),
+            75_000
+        );
+        assert_eq!(
+            context_overflow_target_chars(100_000, 60_000, 80_000),
+            60_000
+        );
     }
 
     #[test]
@@ -1894,9 +2009,12 @@ mod tests {
             let stub = messages[index].content.as_str().unwrap();
             assert!(stub.contains("head+tail preview:"));
             assert!(stub.chars().filter(|&ch| ch == '\u{4e2d}').count() > 30_000);
-            let archive_path = stub.lines().next().unwrap().strip_prefix(
-                "[context-overflow-truncated] full original archived at: ",
-            ).unwrap();
+            let archive_path = stub
+                .lines()
+                .next()
+                .unwrap()
+                .strip_prefix("[context-overflow-truncated] full original archived at: ")
+                .unwrap();
             let archive = std::fs::read_to_string(archive_path).unwrap();
             assert!(archive.contains(&original));
             if let Some(previous) = &prior_stub {

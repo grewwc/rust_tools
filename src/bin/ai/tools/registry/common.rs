@@ -152,6 +152,15 @@ pub(crate) enum ToolPrunePolicy {
     Allow,
     /// Never pruned (e.g. `plan`).
     Never,
+    /// Prunable only once the durable subagent evidence ledger records every task
+    /// the result refers to as integrated (see `PruneAuthorization`).
+    ///
+    /// A delivered subagent result is live state until the parent integrates its
+    /// conclusion: the parent may still quote, cross-check, or re-read it
+    /// verbatim. Integration moves it into history, where the ledger keeps the
+    /// byte-identical payload retrievable through `task_evidence_read`. Callers
+    /// that cannot read the ledger fail closed rather than treat this as `Allow`.
+    AfterIntegration,
 }
 
 /// Tool history retention policy: declares both orthogonal dimensions, "lossy
@@ -175,9 +184,28 @@ impl ToolHistoryPolicy {
         matches!(self.lossy_compress, ToolLossyCompressPolicy::Allow)
     }
 
-    /// Whether this tool's results may be pruned under LLM guidance.
+    /// Whether this tool's results may be pruned under LLM guidance *without
+    /// consulting session state*. [`ToolPrunePolicy::AfterIntegration`] is
+    /// deliberately excluded: callers that cannot read the evidence ledger must
+    /// fail closed. Use [`ToolHistoryPolicy::prune_policy`] when they can.
     pub(crate) fn allows_prune(&self) -> bool {
         matches!(self.prune, ToolPrunePolicy::Allow)
+    }
+
+    /// The declared prune policy, for callers that can consult session state.
+    pub(crate) fn prune_policy(&self) -> ToolPrunePolicy {
+        self.prune
+    }
+
+    /// Whether a stub created by an earlier offload keeps its mark.
+    ///
+    /// This states how the stub was created, not current eligibility: an
+    /// `AfterIntegration` result reached a stub only while authorized, so
+    /// re-deriving authorization from a stub (which no longer carries the task
+    /// markers of the original text) must not drop the mark and make the offload
+    /// flap. `Never` tools can never reach a stub through this path.
+    pub(crate) fn retains_stub_mark(&self) -> bool {
+        !matches!(self.prune, ToolPrunePolicy::Never)
     }
 
     pub(crate) fn counts_toward_precision_inline_budget(&self) -> bool {
@@ -774,21 +802,31 @@ mod history_policy_tests {
     }
 
     #[test]
-    fn subagent_spawn_tools_block_lossy_and_prune() {
+    fn subagent_spawn_tools_block_lossy_and_gate_prune_on_integration() {
         // task_spawn / task_spawn_batch arguments (subagent prompt / response
         // schema) and return values (task_id list) are required inputs for
         // later wait/status/integrate. Missing registration would fall back to
         // the default policy (Allow/Allow); after folding, evidence degrades
         // to the first characters of the result (the original args do not
         // participate in recall), and the main agent loses grounding on
-        // already-spawned subtasks. This assertion pins the contract.
+        // already-spawned subtasks. Pruning stays possible, but only after
+        // integration: see `ToolPrunePolicy::AfterIntegration`. This assertion
+        // pins the contract.
         for name in ["task_spawn", "task_spawn_batch"] {
             let policy = tool_history_policy(name);
             assert!(
                 !policy.allows_lossy_compress(),
                 "{name} must block lossy compress"
             );
-            assert!(!policy.allows_prune(), "{name} must block prune");
+            assert!(
+                !policy.allows_prune(),
+                "{name} must not be prunable without consulting the evidence ledger"
+            );
+            assert_eq!(
+                policy.prune_policy(),
+                ToolPrunePolicy::AfterIntegration,
+                "{name} must gate pruning on integration"
+            );
         }
     }
 }

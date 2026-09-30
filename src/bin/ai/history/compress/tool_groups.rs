@@ -349,16 +349,20 @@ fn plan_tool_call_group_fold(
         lines.push("compression_decision: no archive was written for this fold (overflow disabled); the evidence above is the only record. Re-run the affected tool for current output.".to_string());
     }
 
-    Some((
-        Message {
-            role: ROLE_INTERNAL_NOTE.to_string(),
-            content: Value::String(lines.join("\n")),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        },
-        archives,
-    ))
+    let mut note = Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(lines.join("\n")),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    };
+    super::folded_prune::attach_provenance(
+        &mut note,
+        messages,
+        group,
+        archive_file_path.as_deref(),
+    );
+    Some((note, archives))
 }
 
 fn parsed_tool_args(tool_call: &ToolCall) -> Option<Value> {

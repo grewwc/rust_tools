@@ -122,6 +122,22 @@ pub(in crate::ai) fn restore_session_local_runtime_state(app: &mut App) -> std::
     restore_prune_marks_for_history(app)
 }
 
+/// Session-derived prune authorization for the current request projection.
+///
+/// Reads the integrated task ids of the durable evidence ledger. A read failure
+/// yields the empty authorization, which keeps subagent evidence inline instead
+/// of unloading it on an unverified integration state.
+pub(in crate::ai) fn current_prune_authorization(
+    app: &App,
+) -> crate::ai::history::compress::PruneAuthorization {
+    let integrated = crate::ai::history::read_integrated_task_ids(
+        app.config.history_file.as_path(),
+        &app.session_id,
+    )
+    .unwrap_or_default();
+    crate::ai::history::compress::PruneAuthorization::from_integrated_task_ids(integrated)
+}
+
 /// Restores model prune counters from the current `session_history_file`.
 /// Sub-agents own an independent history and must not reuse the parent session's
 /// in-memory state from `App::clone`; resume must also restore from the child
@@ -140,9 +156,9 @@ pub(in crate::ai) fn restore_prune_marks_for_history(app: &mut App) -> std::io::
         };
     if !prune_marks.is_empty() {
         // Meta may come from a longer pre-rewind/branch history. Before restoring,
-        // keep only ids that still exist in the target session's current projection
-        // and are prunable, so old counters do not bind wrongly to deleted or
-        // protected results.
+        // keep only ids backed by surviving eligible results or complete folded
+        // source groups. Offloaded stubs retain decisions but cannot accept new
+        // marks; deleted and protected sources cannot inherit old counters.
         let messages =
             match crate::ai::history::build_message_arr(usize::MAX, &app.session_history_file) {
                 Ok(messages) => messages,
@@ -153,10 +169,12 @@ pub(in crate::ai) fn restore_prune_marks_for_history(app: &mut App) -> std::io::
                     return Ok(());
                 }
             };
-        let active_ids =
-            crate::ai::history::compress::llm_prune::active_prunable_tool_ids(&messages);
+        let retained_ids = crate::ai::history::compress::llm_prune::retained_prune_ids_authorized(
+            &messages,
+            &current_prune_authorization(app),
+        );
         let before = prune_marks.len();
-        prune_marks.retain(|id, count| *count > 0 && active_ids.contains(id));
+        prune_marks.retain(|id, count| *count > 0 && retained_ids.contains(id));
         if prune_marks.len() != before {
             if let Err(error) = crate::ai::history::write_llm_prune_marks_sqlite(
                 &app.session_history_file,

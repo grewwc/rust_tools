@@ -2326,8 +2326,21 @@ async fn task_wait_wall_clock_timeout_aborts_worker_before_publishing_result() {
 }
 
 #[test]
-fn subagent_result_tools_are_never_lossy_or_pruned() {
-    for name in ["task", "task_wait", "task_status", "task_integrate"] {
+fn subagent_result_tools_are_never_lossy_and_gate_evidence_pruning_on_integration() {
+    // Evidence-bearing results become unloadable only once the durable ledger
+    // records their task as integrated; without that session fact they are live
+    // state. The integration call itself is a plain acknowledgement and stays
+    // outside the pruning protocol entirely.
+    let gated = [
+        "task",
+        "task_wait",
+        "task_status",
+        "task_retry",
+        "task_spawn",
+        "task_spawn_batch",
+        "task_evidence_read",
+    ];
+    for name in gated {
         let policy = tool_history_policy(name);
         assert!(
             !policy.allows_lossy_compress(),
@@ -2335,9 +2348,18 @@ fn subagent_result_tools_are_never_lossy_or_pruned() {
         );
         assert!(
             !policy.allows_prune(),
-            "{name} result must not be LLM-pruned"
+            "{name} must not be prunable without consulting the evidence ledger"
+        );
+        assert_eq!(
+            policy.prune_policy(),
+            crate::ai::tools::registry::common::ToolPrunePolicy::AfterIntegration,
+            "{name} must gate pruning on integration"
         );
     }
+    assert_eq!(
+        tool_history_policy("task_integrate").prune_policy(),
+        crate::ai::tools::registry::common::ToolPrunePolicy::Never
+    );
 }
 
 #[test]

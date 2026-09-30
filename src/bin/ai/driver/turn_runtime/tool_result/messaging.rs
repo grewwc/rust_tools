@@ -290,8 +290,7 @@ fn working_checkpoint_message_for_plan(
         state.as_ref(),
         result_content,
     ));
-    let body =
-        build_plan_working_checkpoint_body(app, tool_call, args.as_ref(), state.as_ref());
+    let body = build_plan_working_checkpoint_body(app, tool_call, args.as_ref(), state.as_ref());
     let marker = match save_working_context_checkpoint(app, &summary, &body) {
         Ok(path) => {
             crate::ai::driver::runtime_ctx::publish_subagent_checkpoint_summary(&summary);
@@ -499,22 +498,53 @@ fn render_plan_steps(args: Option<&Value>) -> Option<String> {
     Some(rendered)
 }
 
+/// Parses the prune directives out of one model response — the hidden self-note
+/// (`prune:` lines, or the `<<<prune:ids>>>` compatibility marker) and the visible
+/// narration (compatibility marker on its own line only) — then updates the mark
+/// counters, persists them, and reports the outcome.
+///
+/// Returns `(remaining_meta, cleaned_visible_text)`: the note with its directives
+/// removed (persisted as the model's self-note) and the narration with every
+/// recognized directive removed, so control markers never reach history or the
+/// final body.
 pub(super) fn parse_prune_meta_and_update_marks(
     app: &mut App,
-    messages: &[Message],
+    messages: &mut Vec<Message>,
     hidden_meta: &str,
-) -> String {
-    let (prune_ids, remaining_meta) =
-        crate::ai::history::compress::llm_prune::parse_prune_from_hidden_meta(hidden_meta);
+    visible_text: &str,
+) -> (String, String) {
+    // Resolve marks against the ids this request actually carries: identity comes
+    // from the context, not from the id's spelling.
+    let known_ids = crate::ai::history::compress::llm_prune::nameable_prune_ids(messages);
+    let (mut prune_ids, remaining_meta) =
+        crate::ai::history::compress::llm_prune::parse_prune_from_hidden_meta(
+            hidden_meta,
+            &known_ids,
+        );
+    let (embedded_ids, cleaned_visible_text) =
+        crate::ai::history::compress::llm_prune::parse_embedded_prune_directives(
+            visible_text,
+            &known_ids,
+        );
+    prune_ids.extend(embedded_ids);
+    // Subagent results become eligible only once the ledger records their task as
+    // integrated; read the authorization once for the mark update, the reported
+    // candidates, and the rejection reasons below.
+    let authorization = crate::ai::driver::commands::session::current_prune_authorization(app);
     let active_tool_ids =
-        crate::ai::history::compress::llm_prune::active_prunable_tool_ids(messages);
-    // `update_prune_marks` reports whether the mark map changed, avoiding a full
+        crate::ai::history::compress::llm_prune::active_prunable_tool_ids_authorized(
+            messages,
+            &authorization,
+        );
+    // The update reports whether the mark map changed, avoiding a full
     // `app.prune_marks.clone()` just to diff it afterwards.
-    let prune_marks_changed = crate::ai::history::compress::llm_prune::update_prune_marks(
-        &mut app.prune_marks,
-        &prune_ids,
-        &active_tool_ids,
-    );
+    let prune_marks_changed =
+        crate::ai::history::compress::llm_prune::update_prune_marks_for_messages_authorized(
+            &mut app.prune_marks,
+            &prune_ids,
+            messages,
+            &authorization,
+        );
     if prune_marks_changed
         && let Err(error) = crate::ai::history::write_llm_prune_marks_sqlite(
             &app.session_history_file,
@@ -533,7 +563,7 @@ pub(super) fn parse_prune_meta_and_update_marks(
         .into_iter()
         .collect::<Vec<_>>();
     accepted.sort();
-    if !accepted.is_empty() && crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+    let accepted_summary = (!accepted.is_empty()).then(|| {
         let shown = accepted
             .iter()
             .take(4)
@@ -549,9 +579,14 @@ pub(super) fn parse_prune_meta_and_update_marks(
         let suffix = (accepted.len() > 4)
             .then(|| format!(", +{} more", accepted.len() - 4))
             .unwrap_or_default();
+        format!("{shown}{suffix}")
+    });
+    if let Some(shown) = &accepted_summary
+        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+    {
         crate::ai::driver::print::print_tool_note_line(
             "context-prune",
-            &format!("model marked {shown}{suffix}"),
+            &format!("model marked {shown}"),
         );
     }
 
@@ -563,15 +598,18 @@ pub(super) fn parse_prune_meta_and_update_marks(
             rejected.push(id);
         }
     }
-    if !rejected.is_empty() && crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+    let rejected_summary = (!rejected.is_empty()).then(|| {
         let shown = rejected
             .iter()
             .take(4)
             .map(|id| {
-                let reason = crate::ai::history::compress::llm_prune::explain_rejected_prune_mark(
-                    messages, id,
-                )
-                .unwrap_or("not currently eligible");
+                let reason =
+                    crate::ai::history::compress::llm_prune::explain_rejected_prune_mark_authorized(
+                        messages,
+                        id,
+                        &authorization,
+                    )
+                    .unwrap_or("not currently eligible");
                 format!("{id} ({reason})")
             })
             .collect::<Vec<_>>()
@@ -579,12 +617,56 @@ pub(super) fn parse_prune_meta_and_update_marks(
         let suffix = (rejected.len() > 4)
             .then(|| format!(", +{} more", rejected.len() - 4))
             .unwrap_or_default();
+        format!("{shown}{suffix}")
+    });
+    if let Some(shown) = &rejected_summary
+        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+    {
         crate::ai::driver::print::print_tool_note_line(
             "context-prune",
-            &format!("ignored mark(s): {shown}{suffix}"),
+            &format!("ignored mark(s): {shown}"),
         );
     }
-    remaining_meta
+
+    // A mark the model cannot see failing is a mark it repeats: report rejected ids
+    // and directive text that never resolved into ids on the model-visible channel,
+    // not only the terminal line.
+    let mut fragments = crate::ai::history::compress::llm_prune::unrecognized_prune_fragments(
+        &cleaned_visible_text,
+        &known_ids,
+    );
+    fragments.extend(
+        crate::ai::history::compress::llm_prune::unrecognized_prune_fragments(
+            &remaining_meta,
+            &known_ids,
+        ),
+    );
+    if !rejected.is_empty() || !fragments.is_empty() {
+        let mut parts = Vec::new();
+        if let Some(shown) = &accepted_summary {
+            parts.push(format!("applied: {shown}"));
+        }
+        if let Some(shown) = &rejected_summary {
+            parts.push(format!("ignored: {shown}"));
+        }
+        for fragment in &fragments {
+            parts.push(format!("unrecognized directive text: `{fragment}`"));
+        }
+        let note = format!(
+            "[context-prune] Not all prune marks from your last message were applied — {}. \
+             A mark counts only as `<<<prune:id1,id2>>>` starting its own line, or as a \
+             `prune:id1,id2` line inside `<meta:self_note>...</meta:self_note>`.",
+            parts.join("; ")
+        );
+        messages.push(Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(note),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+    }
+    (remaining_meta, cleaned_visible_text)
 }
 
 pub(super) fn append_cached_tool_results_note(
@@ -1256,13 +1338,18 @@ pub(super) fn record_final_stream_response(
     final_assistant_text: &mut String,
     final_assistant_recorded: &mut bool,
 ) {
-    // 解析模型在 hidden_meta 中的 prune 标记，更新连续裁剪计数表，并剥离
-    // prune 行，避免把裁剪协议持久化成普通 self_note。
-    let remaining_meta =
-        parse_prune_meta_and_update_marks(app, messages, &stream_result.hidden_meta);
+    // Parse prune directives (hidden note and in-band marker), update the mark
+    // counters, and strip the directives so the protocol never persists as a plain
+    // self_note nor reaches the visible body.
+    let (remaining_meta, cleaned_assistant_text) = parse_prune_meta_and_update_marks(
+        app,
+        messages,
+        &stream_result.hidden_meta,
+        &stream_result.assistant_text,
+    );
     let assistant_msg = Message {
         role: "assistant".to_string(),
-        content: Value::String(stream_result.assistant_text.clone()),
+        content: Value::String(cleaned_assistant_text.clone()),
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: (!stream_result.reasoning_text.is_empty())
@@ -1270,7 +1357,7 @@ pub(super) fn record_final_stream_response(
     };
     messages.push(assistant_msg.clone());
     turn_messages.push(assistant_msg);
-    *final_assistant_text = stream_result.assistant_text;
+    *final_assistant_text = cleaned_assistant_text;
     *final_assistant_recorded = true;
     record_hidden_self_note(app, turn_messages, &remaining_meta);
 }
@@ -1513,9 +1600,9 @@ mod tests {
         parse_prune_meta_and_update_marks, prepare_tool_results_for_history,
     };
     use super::{
-        WORKING_CHECKPOINT_FILE_NAME, extract_context_checkpoints, save_context_checkpoint_in_dir,
-        refresh_working_checkpoint_after_plan_update, smart_truncate_to_sentence,
-        truncate_checkpoint_summary,
+        WORKING_CHECKPOINT_FILE_NAME, extract_context_checkpoints,
+        refresh_working_checkpoint_after_plan_update, save_context_checkpoint_in_dir,
+        smart_truncate_to_sentence, truncate_checkpoint_summary,
         working_checkpoint_message_for_plan,
     };
     use std::sync::{Arc, atomic::AtomicBool};
@@ -1633,32 +1720,16 @@ mod tests {
             std::env::temp_dir().join(format!("ai-prune-meta-persist-{}", uuid::Uuid::new_v4()));
         let mut app = test_app(history_root.join("history.sqlite"));
         let _ = std::fs::remove_file(&app.session_history_file);
-        let mut messages = Vec::new();
-        for index in 0..5 {
-            let id = format!("call_{index}");
-            messages.push(Message {
-                role: "assistant".to_string(),
-                content: Value::String(String::new()),
-                tool_calls: Some(vec![tool_call(
-                    &id,
-                    "execute_command",
-                    serde_json::json!({}),
-                )]),
-                tool_call_id: None,
-                reasoning_content: None,
-            });
-            messages.push(Message {
-                role: "tool".to_string(),
-                content: Value::String("old output\n".repeat(500)),
-                tool_calls: None,
-                tool_call_id: Some(id),
-                reasoning_content: None,
-            });
-        }
+        let mut messages = prune_candidate_messages();
 
-        let remaining =
-            parse_prune_meta_and_update_marks(&mut app, &messages, "prune:call_0\nkeep this note");
+        let (remaining, cleaned) = parse_prune_meta_and_update_marks(
+            &mut app,
+            &mut messages,
+            "prune:call_0\nkeep this note",
+            "",
+        );
         assert_eq!(remaining, "keep this note");
+        assert!(cleaned.is_empty());
         assert_eq!(app.prune_marks.get("call_0"), Some(&1));
         assert_eq!(
             crate::ai::history::read_llm_prune_marks_sqlite(&app.session_history_file)
@@ -1667,13 +1738,158 @@ mod tests {
             Some(&1)
         );
 
-        parse_prune_meta_and_update_marks(&mut app, &messages, "prune:call_0");
+        parse_prune_meta_and_update_marks(&mut app, &mut messages, "prune:call_0", "");
         assert_eq!(
             crate::ai::history::read_llm_prune_marks_sqlite(&app.session_history_file)
                 .unwrap()
                 .get("call_0"),
             Some(&crate::ai::history::compress::llm_prune::PRUNE_THRESHOLD)
         );
+        let _ = std::fs::remove_dir_all(history_root);
+    }
+
+    /// Five old, large tool results; the recent-results window stays protected, so
+    /// the earliest results (`call_0`, `call_1`) are the authorized candidates.
+    fn prune_candidate_messages() -> Vec<Message> {
+        prune_candidate_messages_with_ids(&["call_0", "call_1", "call_2", "call_3", "call_4"])
+    }
+
+    /// The same fixture with caller-chosen ids, so a test can mark a provider id whose
+    /// spelling falls outside the parser's fallback id shape.
+    fn prune_candidate_messages_with_ids(ids: &[&str]) -> Vec<Message> {
+        let mut messages = Vec::new();
+        for id in ids {
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: Value::String(String::new()),
+                tool_calls: Some(vec![tool_call(*id, "execute_command", serde_json::json!({}))]),
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+            messages.push(Message {
+                role: "tool".to_string(),
+                content: Value::String("old output\n".repeat(500)),
+                tool_calls: None,
+                tool_call_id: Some((*id).to_string()),
+                reasoning_content: None,
+            });
+        }
+        messages
+    }
+
+    #[test]
+    fn prune_mark_resolves_a_provider_id_outside_the_ascii_shape() {
+        let history_root =
+            std::env::temp_dir().join(format!("ai-prune-exotic-id-{}", uuid::Uuid::new_v4()));
+        let mut app = test_app(history_root.join("history.sqlite"));
+        let _ = std::fs::remove_file(&app.session_history_file);
+        let mut messages = prune_candidate_messages_with_ids(&[
+            "call:opaque/id.0",
+            "call_1",
+            "call_2",
+            "call_3",
+            "call_4",
+        ]);
+
+        let (remaining, cleaned) = parse_prune_meta_and_update_marks(
+            &mut app,
+            &mut messages,
+            "prune:call:opaque/id.0",
+            "",
+        );
+
+        // Identity comes from the request, not from the id's spelling.
+        assert_eq!(app.prune_marks.get("call:opaque/id.0"), Some(&1));
+        assert!(remaining.is_empty());
+        assert!(cleaned.is_empty());
+        // The mark applied, so no correction note is needed.
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.role == crate::ai::history::ROLE_INTERNAL_NOTE)
+        );
+        let _ = std::fs::remove_dir_all(history_root);
+    }
+
+    #[test]
+    fn visible_compat_marker_counts_as_a_mark_and_leaves_the_narration() {
+        let history_root =
+            std::env::temp_dir().join(format!("ai-prune-visible-marker-{}", uuid::Uuid::new_v4()));
+        let mut app = test_app(history_root.join("history.sqlite"));
+        let _ = std::fs::remove_file(&app.session_history_file);
+        let mut messages = prune_candidate_messages();
+
+        let (remaining, cleaned) = parse_prune_meta_and_update_marks(
+            &mut app,
+            &mut messages,
+            "",
+            "<<<prune:call_0>>>\n\nChecking the regression tests next.",
+        );
+
+        assert!(remaining.is_empty());
+        assert_eq!(cleaned, "\nChecking the regression tests next.");
+        assert_eq!(app.prune_marks.get("call_0"), Some(&1));
+        // A mark that applies needs no correction note.
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.role == crate::ai::history::ROLE_INTERNAL_NOTE)
+        );
+        let _ = std::fs::remove_dir_all(history_root);
+    }
+
+    #[test]
+    fn rejected_mark_is_reported_in_the_model_visible_note() {
+        let history_root =
+            std::env::temp_dir().join(format!("ai-prune-rejected-mark-{}", uuid::Uuid::new_v4()));
+        let mut app = test_app(history_root.join("history.sqlite"));
+        let _ = std::fs::remove_file(&app.session_history_file);
+        let mut messages = prune_candidate_messages();
+
+        parse_prune_meta_and_update_marks(&mut app, &mut messages, "prune:call_missing", "");
+
+        assert_eq!(app.prune_marks.get("call_missing"), None);
+        let note = messages
+            .iter()
+            .find(|message| message.role == crate::ai::history::ROLE_INTERNAL_NOTE)
+            .expect("a model-visible context-prune note")
+            .content
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(note.contains("ignored: call_missing"), "{note}");
+        let _ = std::fs::remove_dir_all(history_root);
+    }
+
+    #[test]
+    fn mixed_payload_note_line_is_reported_instead_of_split_into_ids() {
+        let history_root =
+            std::env::temp_dir().join(format!("ai-prune-mixed-payload-{}", uuid::Uuid::new_v4()));
+        let mut app = test_app(history_root.join("history.sqlite"));
+        let _ = std::fs::remove_file(&app.session_history_file);
+        let mut messages = prune_candidate_messages();
+
+        parse_prune_meta_and_update_marks(
+            &mut app,
+            &mut messages,
+            "prune:call_0, use the older result",
+            "",
+        );
+
+        // No mark applied, no id invented from the prose fragment, and the model is
+        // told about the directive text that did not resolve.
+        assert_eq!(app.prune_marks.get("call_0"), None);
+        let note = messages
+            .iter()
+            .find(|message| message.role == crate::ai::history::ROLE_INTERNAL_NOTE)
+            .expect("a model-visible context-prune note")
+            .content
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(note.starts_with("[context-prune]"), "{note}");
+        assert!(note.contains("use the older result"), "{note}");
+        assert!(!note.contains("ignored:"), "{note}");
         let _ = std::fs::remove_dir_all(history_root);
     }
 
@@ -1908,7 +2124,10 @@ mod tests {
         assert!(body.contains("plan-state.json"));
         assert!(!body.contains("## Raw Plan Output"));
         // The plan appears exactly once: the step list is not repeated in a second copy.
-        assert_eq!(body.matches("Read driver checkpoint persistence").count(), 1);
+        assert_eq!(
+            body.matches("Read driver checkpoint persistence").count(),
+            1
+        );
 
         crate::ai::tools::plan_state::update_plan_step(
             &app,
@@ -1933,12 +2152,18 @@ mod tests {
         );
         refresh_working_checkpoint_after_plan_update(&app, &update_call);
 
-        let refreshed =
-            std::fs::read_to_string(&path).expect("refreshed working checkpoint body");
+        let refreshed = std::fs::read_to_string(&path).expect("refreshed working checkpoint body");
         assert!(refreshed.contains("Progress: 1/2 steps done."));
-        assert!(refreshed.contains("Step 1. [read_file] Read driver checkpoint persistence (done)"));
+        assert!(
+            refreshed.contains("Step 1. [read_file] Read driver checkpoint persistence (done)")
+        );
         // The refresh still keeps a single copy of the step list.
-        assert_eq!(refreshed.matches("Read driver checkpoint persistence").count(), 1);
+        assert_eq!(
+            refreshed
+                .matches("Read driver checkpoint persistence")
+                .count(),
+            1
+        );
     }
 
     #[test]

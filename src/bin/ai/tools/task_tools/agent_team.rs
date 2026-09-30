@@ -47,7 +47,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     name: "manage_team",
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
-        prune: ToolPrunePolicy::Never,
+        prune: ToolPrunePolicy::AfterIntegration,
         counts_toward_precision_inline_budget: false,
     },
 });
