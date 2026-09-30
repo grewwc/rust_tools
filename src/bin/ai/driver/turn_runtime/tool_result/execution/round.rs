@@ -119,8 +119,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round(
     suppressed_read_only_results: &HashMap<String, String>,
     turn_had_tool_error: &mut bool,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let (remaining_meta, cleaned_assistant_text) = parse_prune_meta_and_update_marks(
-        app,
+    let (remaining_meta, cleaned_assistant_text) = strip_legacy_prune_directives(
         messages,
         &tool_call_execution.stream_result.hidden_meta,
         &tool_call_execution.stream_result.assistant_text,

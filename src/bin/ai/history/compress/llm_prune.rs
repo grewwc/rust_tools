@@ -1,47 +1,24 @@
-//! LLM-guided context pruning (model marks → deferred offloading).
-//!
-//! This is a **supplement** to the existing compression logic; it does not modify any existing compression code.
+//! Runtime-owned, lossless reclamation of old eligible tool evidence.
 //!
 //! ## How it works
 //!
-//! On every model call, a short prompt is appended to the system prompt asking the model to
-//! use `<meta:self_note>prune:tool_call_id1,tool_call_id2</meta:self_note>` in its response to
-//! mark tool messages that are no longer needed (usually stale ordinary tool results).
-//! The prompt ends with a dynamic per-request section listing the exact eligible ids (see
-//! [`build_prune_protocol_prompt`]), so the model does not have to recall ids from history.
-//!
-//! - Roles such as user / system / assistant / internal_note are never pruned even if
-//!   they are marked (see `is_protected_role`).
-//! - Only messages with `role == "tool"` and a `tool_call_id` can be pruned.
-//! - Results whose tool declares `prune: Never` via `ToolHistoryPolicyRegistration`
-//!   (e.g. `plan`) are never pruned; `read_file` / retrieval / `execute_command` results
-//!   are "lossy-incompressible" but **may** still be pruned by the LLM once stale (the two dimensions are orthogonal).
-//! - After being marked **PRUNE_THRESHOLD** times cumulatively, the message content is offloaded to the session asset disk and
-//!   the inline text is replaced with a **recallable stub** (keeping `file_path` + a recall anchor + head/tail preview,
-//!   preserving the message structure without deletion, to avoid breaking the tool_call ↔ tool_response pairing).
-//!   Exception: results at or above [`PRUNE_SINGLE_MARK_OFFLOAD_CHARS`] offload after a single mark (see [`needed_marks`]).
-//! - Counting semantics are "silence-tolerant + monotonically accumulating" rather than "consecutive": if the model produces no prune
-//!   directives this round, the counts stay untouched (intermediate tool-only rounds do not wrongly reset them); marked ids only increase
-//!   (+1), and unmarked existing entries stay **unchanged, without decay**, until the id actually leaves the context or is
-//!   excluded by a protection policy. Why no decay: each round the model usually marks the results that "just became stale
-//!   this round" (different ids each round), so decay would zero counts before reaching the threshold and the mechanism would
-//!   almost never fire in the most typical usage. See [`update_prune_marks`].
-//!
-//! Model marks are optional for the model to emit, so the runtime also reclaims on its own once the
-//! eligible backlog exceeds [`PRESSURE_RECLAIM_MIN_TOTAL_CHARS`]: it tops the largest candidates up to
-//! their required count and offloads them through the same lossless path
-//! ([`reclaim_under_pressure_authorized`]). Every safety guarantee below is enforced by the shared
-//! eligibility check rather than by the mark path, so it holds for reclaimed items as well.
+//! Each request boundary offloads a bounded batch of eligible old tool results
+//! through the shared overflow archive, leaving smaller recallable stubs. Folded
+//! evidence uses its verified provenance and archive. No model marks, candidate
+//! list, or total-backlog threshold are needed. Existing overflow stubs are skipped.
+//! Legacy directive parsing is retained to consume old housekeeping text without
+//! making it an instruction or authorization for new reclamation.
 //!
 //! ## Safety guarantees (no loss of real information)
 //!
-//! 1. No message is deleted; the messages array length and order are unchanged.
+//! 1. Evidence messages keep their order and tool-call pairing; only obsolete
+//!    runtime protocol notes are removed.
 //! 2. The existing `compress/mod.rs` / `context_budget.rs` logic is not modified.
 //! 3. Pruning is **lossless and recallable**: the full pruned tool result is first written to the session asset, and the inline text
 //!    is replaced only by a recall stub carrying `file_path`; the model can `read_file` the full original at any time.
 //! 4. **Never prune when there is no archive directory (`overflow_dir=None`)**: prefer not compressing over doing
 //!    an irreversible content drop.
-//! 5. `apply_pruning` only touches the temporary `messages` projection used per model request; persistence uses the separate
+//! 5. Reclamation only touches the temporary `messages` projection used per model request; persistence uses the separate
 //!    canonical `turn_messages`, so offloading never pollutes the real history.
 //! 6. The most recent `KEEP_RECENT_TOOL_GROUPS` groups of tool results are always protected, to avoid wrongly pruning results the current round still needs.
 //! 7. Tools whose policy defers to session state (`ToolPrunePolicy::AfterIntegration`, i.e. subagent
@@ -72,7 +49,7 @@ use super::tool_overflow::{
 /// mark (see [`needed_marks`]).
 pub(crate) const PRUNE_THRESHOLD: u8 = 2;
 
-/// Only old tool results reaching this size are worth exposing the pruning protocol to the model.
+/// Minimum inline size worth offloading after the recent-results window expires.
 /// The actual replacement still compares against the generated stub, ensuring the text only ever shrinks on every path.
 const PRUNE_MIN_CONTENT_CHARS: usize = 4_096;
 
@@ -87,8 +64,7 @@ const PRUNE_SINGLE_MARK_OFFLOAD_CHARS: usize = 16_384;
 
 /// Marks required before a result of this size is offloaded: one for very
 /// large results (see [`PRUNE_SINGLE_MARK_OFFLOAD_CHARS`]), [`PRUNE_THRESHOLD`]
-/// otherwise. Shared by `apply_pruning` (the actual gate) and
-/// [`build_prune_protocol_prompt`] (the per-candidate annotation the model sees).
+/// otherwise. Used only by the legacy mark compatibility path.
 fn needed_marks(content_chars: usize) -> u8 {
     if content_chars >= PRUNE_SINGLE_MARK_OFFLOAD_CHARS {
         1
@@ -111,36 +87,22 @@ pub(crate) fn needed_marks_for(messages: &[Message], tool_call_id: &str) -> u8 {
         .unwrap_or(PRUNE_THRESHOLD)
 }
 
-/// Maximum candidates rendered into the per-request protocol section; the
-/// largest results are listed first because they free the most context.
-const PRUNE_PROMPT_MAX_CANDIDATES: usize = 8;
-
-/// Total inline size of the currently eligible tool evidence above which the
-/// runtime reclaims the largest candidates on its own, without waiting for a
-/// model mark (see [`reclaim_under_pressure_authorized`]).
-///
-/// Marks stay the fine-grained signal; this is the fallback for models that
-/// rarely emit them, where the eligible backlog otherwise grows while every
-/// request keeps re-sending it in full. The threshold is deliberately
-/// conservative (≈16K tokens of eligible evidence), so ordinary sessions keep
-/// the marking contract unchanged.
+/// Former backlog gate, retained only as a regression-test boundary.
+#[cfg(test)]
 const PRESSURE_RECLAIM_MIN_TOTAL_CHARS: usize = 65_536;
 
-/// Per-request cap on how many candidates one pressure reclaim offloads, kept
-/// equal to [`PRUNE_PROMPT_MAX_CANDIDATES`]: the runtime reclaims at most the
-/// same largest items the model itself was shown for this request.
-const PRESSURE_RECLAIM_MAX_ITEMS: usize = PRUNE_PROMPT_MAX_CANDIDATES;
+/// Bound the number of successful replacements at a request boundary.
+const PRESSURE_RECLAIM_MAX_ITEMS: usize = 8;
 
 /// Per-request cap on reclaimed characters. The largest candidate is always
 /// included (so one oversized item can never block reclamation); capping every
 /// request bounds how much of the projection prefix — and with it the prompt
 /// cache — a single request rewrites, and successive requests converge until
-/// the backlog falls below the trigger.
+/// no eligible backlog remains.
 const PRESSURE_RECLAIM_MAX_CHARS: usize = 32_768;
 
-/// The pruning-protocol instructions injected into the system prompt.
-/// Kept short to avoid consuming too many tokens.
-pub(crate) const PRUNE_PROTOCOL_PROMPT: &str = include_str!("prompts/prune_protocol.md");
+/// Stable header used only to recognize and remove legacy protocol notes.
+pub(crate) const PRUNE_PROTOCOL_PROMPT: &str = "\n## Context Management Protocol\n";
 
 /// Returns whether messages of this role are protected (never pruned).
 fn is_protected_role(role: &str) -> bool {
@@ -477,8 +439,7 @@ pub(crate) fn update_prune_marks(
     changed
 }
 
-/// Collects the tool_call_ids in the current context that may be pruned under
-/// LLM guidance.
+/// Collects the evidence ids eligible for lossless runtime reclamation.
 ///
 /// Protection policy:
 /// - Results of the most recent complete tool group keep their full text.
@@ -666,16 +627,13 @@ fn protected_tool_call_ids(
         // Protection is decided per result, not per tool name: a tool whose
         // policy defers to session state (subagent results) is protected only
         // while the authorization withholds it. Unknown tools stay protected.
-        if id_to_tool_name
-            .get(tool_call_id)
-            .is_none_or(|name| {
-                !super::folded_prune::tool_allows_explicit_prune_now(
-                    name,
-                    message.content.as_str().unwrap_or_default(),
-                    authorization,
-                )
-            })
-        {
+        if id_to_tool_name.get(tool_call_id).is_none_or(|name| {
+            !super::folded_prune::tool_allows_explicit_prune_now(
+                name,
+                message.content.as_str().unwrap_or_default(),
+                authorization,
+            )
+        }) {
             protected.insert(tool_call_id.clone());
         }
     }
@@ -871,56 +829,24 @@ pub(crate) fn apply_pruning_authorized(
         if is_preserved_tool_overflow_stub(content) {
             continue;
         }
-        // Re-derive session authorization at offload time, not only when marks
-        // were recorded: a mark restored from session state (or written before
-        // this policy existed) must not unload a subagent result whose task was
-        // never integrated.
-        if !super::folded_prune::tool_allows_explicit_prune_now(
-            id_to_tool_name
-                .get(&tool_call_id)
-                .map(String::as_str)
-                .unwrap_or("tool"),
-            content,
-            authorization,
-        ) {
-            continue;
-        }
-        let freed = content.chars().count();
         let tool_name = id_to_tool_name
             .get(&tool_call_id)
             .map(String::as_str)
             .unwrap_or("tool");
-        let recall_lines = id_to_tool_args
-            .get(&tool_call_id)
-            .map(|args| build_tool_overflow_recall_lines(tool_name, args))
-            .unwrap_or_default();
-
-        // Lossless offload: full text to disk + generate a recall stub. If
-        // archiving fails (including overflow_dir=None, which returned early
-        // above), keep the original text and skip the entry — never drop
-        // irreversibly.
-        let Some(stub) = preserve_pruned_tool_result_stable(
+        let Some(freed) = offload_raw_result(
+            msg,
             overflow_dir,
-            &tool_call_id,
             tool_name,
-            content,
-            &recall_lines,
+            id_to_tool_args.get(&tool_call_id).map(String::as_str),
+            authorization,
         ) else {
             continue;
         };
-        // The goal of pruning is to reclaim context; swapping a short result for
-        // a longer path stub would only bloat it.
-        // The archive is content-addressed and idempotent, so no duplicate copies
-        // are created in later requests even if already written.
-        if stub.chars().count() >= freed {
-            continue;
-        }
 
         if !report.tools.iter().any(|name| name == tool_name) {
             report.tools.push(tool_name.to_string());
         }
-        report.freed_chars += freed.saturating_sub(stub.chars().count());
-        msg.content = Value::String(stub);
+        report.freed_chars += freed;
         report.pruned_count += 1;
     }
 
@@ -944,8 +870,40 @@ pub(crate) fn apply_pruning_authorized(
     report
 }
 
-/// Fail-closed entry point kept for tests: it authorizes no conditional result,
-/// so production callers must use [`apply_pruning_authorized`].
+/// Archives a raw result before replacing it with a strictly smaller recall stub.
+/// Authorization is checked again here so legacy decisions cannot bypass it.
+fn offload_raw_result(
+    message: &mut Message,
+    overflow_dir: Option<&Path>,
+    tool_name: &str,
+    arguments: Option<&str>,
+    authorization: &PruneAuthorization,
+) -> Option<usize> {
+    if !is_prunable_message(message) {
+        return None;
+    }
+    let id = message.tool_call_id.as_deref()?;
+    let content = message.content.as_str()?;
+    if is_preserved_tool_overflow_stub(content)
+        || !super::folded_prune::tool_allows_explicit_prune_now(tool_name, content, authorization)
+    {
+        return None;
+    }
+    let recall_lines = arguments
+        .map(|args| build_tool_overflow_recall_lines(tool_name, args))
+        .unwrap_or_default();
+    let stub =
+        preserve_pruned_tool_result_stable(overflow_dir, id, tool_name, content, &recall_lines)?;
+    let original_chars = content.chars().count();
+    let stub_chars = stub.chars().count();
+    if stub_chars >= original_chars {
+        return None;
+    }
+    message.content = Value::String(stub);
+    Some(original_chars - stub_chars)
+}
+
+/// Fail-closed compatibility entry point kept for legacy mark tests.
 #[cfg(test)]
 pub(crate) fn apply_pruning(
     messages: &mut [Message],
@@ -960,116 +918,98 @@ pub(crate) fn apply_pruning(
     )
 }
 
-/// Reclaims the largest eligible tool evidence under context pressure, without
-/// waiting for the model to mark it.
-///
-/// Model marks remain the fine-grained signal, but emitting them is optional
-/// and some models never do; without this fallback the eligible backlog grows
-/// while every request keeps re-sending it in full. The candidate set is
-/// exactly [`active_prunable_tool_ids_authorized`], so the most recent
-/// `KEEP_RECENT_TOOL_GROUPS` groups, `prune: Never` tools, and un-integrated
-/// subagent results keep every protection they have under model marks: the
-/// runtime only decides *when* an eligible item is reclaimed, never *whether*
-/// it is protected.
-///
-/// The offload itself runs through [`apply_pruning_authorized`] with a local
-/// marks map that tops each selected id up to its required count
-/// ([`needed_marks`] for raw results, [`PRUNE_THRESHOLD`] for folded groups).
-/// The caller's persisted mark map is never touched: a reclaim leaves no
-/// consent behind that a later request could mistake for a model mark.
-///
-/// At most [`PRESSURE_RECLAIM_MAX_ITEMS`] items and
-/// [`PRESSURE_RECLAIM_MAX_CHARS`] characters are reclaimed per request (largest
-/// first, and always at least one item, so a single oversized candidate cannot
-/// block reclamation). Successive requests converge until the eligible backlog
-/// falls below [`PRESSURE_RECLAIM_MIN_TOTAL_CHARS`].
-///
-/// Returns a report whose `pressure_count` attributes the offloads to this
-/// path. Without an archive directory it reclaims nothing: the lossless floor
-/// of [`apply_pruning_authorized`] applies here too.
+/// Reclaims old eligible evidence, including small backlogs, without model marks.
+/// Only successful replacements consume the bounded batch budget. One oversized
+/// result may make progress alone; failed archives never starve later candidates.
+/// The historical name remains for compatibility; pressure is not a prerequisite.
 pub(crate) fn reclaim_under_pressure_authorized(
     messages: &mut [Message],
     overflow_dir: Option<&Path>,
     authorization: &PruneAuthorization,
 ) -> PruneReport {
-    // Same safety floor as `apply_pruning_authorized`: with no archive
-    // directory there is no lossless recall, so nothing may be offloaded.
-    if overflow_dir.is_none() {
+    let Some(dir) = overflow_dir else {
         return PruneReport::default();
-    }
-    let mut sized = eligible_candidate_sizes(messages, authorization);
-    let total_chars: usize = sized.iter().map(|(_, chars)| *chars).sum();
-    if total_chars < PRESSURE_RECLAIM_MIN_TOTAL_CHARS {
-        return PruneReport::default();
-    }
-    // Largest first (frees the most context); tie-break by id for determinism.
-    sized.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-    let mut top_up: FxHashMap<String, u8> = FxHashMap::default();
-    let mut selected_chars = 0usize;
-    for (id, chars) in sized {
-        if top_up.len() >= PRESSURE_RECLAIM_MAX_ITEMS
-            || (!top_up.is_empty() && selected_chars >= PRESSURE_RECLAIM_MAX_CHARS)
-        {
-            break;
-        }
-        let marks = if id.starts_with(super::folded_prune::FOLD_ID_PREFIX) {
-            PRUNE_THRESHOLD
-        } else {
-            needed_marks(chars)
-        };
-        top_up.insert(id, marks);
-        selected_chars = selected_chars.saturating_add(chars);
-    }
-
-    let mut report = apply_pruning_authorized(messages, &top_up, overflow_dir, authorization);
-    report.pressure_count = report.pruned_count;
-    report
-}
-
-/// Inline size (characters) of every eligible candidate in this projection:
-/// raw results through their `tool_call_id`, folded notes through the note body
-/// their provenance points at. Mirrors the candidate collection of
-/// [`build_prune_protocol_prompt`], so pressure reclaim weighs the same items
-/// the model was shown.
-fn eligible_candidate_sizes(
-    messages: &[Message],
-    authorization: &PruneAuthorization,
-) -> Vec<(String, usize)> {
-    let active_ids = active_prunable_tool_ids_authorized(messages, authorization);
-    let mut sizes: FxHashMap<String, usize> = FxHashMap::default();
-    for message in messages {
+    };
+    let active_ids = active_raw_prunable_tool_ids(messages, authorization);
+    let mut candidates = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
         let (Some(id), Some(content)) = (message.tool_call_id.as_deref(), message.content.as_str())
         else {
             continue;
         };
-        if active_ids.contains(id) {
-            sizes.insert(id.to_string(), content.chars().count());
+        let chars = content.chars().count();
+        if active_ids.contains(id)
+            && is_prunable_message(message)
+            && !id.starts_with(super::folded_prune::FOLD_ID_PREFIX)
+            && !is_preserved_tool_overflow_stub(content)
+            && chars >= PRUNE_MIN_CONTENT_CHARS
+        {
+            candidates.push((index, id.to_string(), chars, None));
         }
     }
     for (index, meta) in super::folded_prune::candidates(messages) {
-        let id = meta.id();
-        if !active_ids.contains(&id) {
-            continue;
-        }
         if let Some(content) = messages[index].content.as_str() {
-            sizes.insert(id, content.chars().count());
+            candidates.push((index, meta.id(), content.chars().count(), Some(meta)));
         }
     }
-    sizes.into_iter().collect()
+    // Stable ordering does not depend on hash-map iteration or restored marks.
+    candidates.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let names = build_tool_call_name_index(messages);
+    let arguments = build_tool_call_arguments_index(messages);
+    let mut report = PruneReport::default();
+    let mut reclaimed_chars = 0usize;
+    for (index, id, chars, folded) in candidates {
+        if report.pruned_count >= PRESSURE_RECLAIM_MAX_ITEMS
+            || reclaimed_chars >= PRESSURE_RECLAIM_MAX_CHARS
+        {
+            break;
+        }
+        if report.pruned_count > 0
+            && reclaimed_chars.saturating_add(chars) > PRESSURE_RECLAIM_MAX_CHARS
+        {
+            continue;
+        }
+        let (tool, freed) = if let Some(meta) = folded {
+            let label = meta.label();
+            (
+                label,
+                super::folded_prune::offload(&mut messages[index], meta, dir),
+            )
+        } else {
+            let tool = names.get(&id).map(String::as_str).unwrap_or("tool");
+            let freed = offload_raw_result(
+                &mut messages[index],
+                Some(dir),
+                tool,
+                arguments.get(&id).map(String::as_str),
+                authorization,
+            );
+            (tool.to_string(), freed)
+        };
+        let Some(freed) = freed else {
+            continue;
+        };
+        reclaimed_chars = reclaimed_chars.saturating_add(chars);
+        report.pruned_count += 1;
+        report.freed_chars += freed;
+        if !report.tools.contains(&tool) {
+            report.tools.push(tool);
+        }
+    }
+    report.pressure_count = report.pruned_count;
+    report
 }
 
-/// Injects the protocol only when the current request actually contains
-/// prunable old tool results.
-///
-/// This tracks the capability boundary better than a fixed message-count
-/// threshold: oversized old results in a short conversation get reclaimed
-/// promptly, while long tool-less conversations waste no prompt tokens.
+/// Legacy query: runtime-owned reclamation never needs a model protocol.
 pub(crate) fn should_inject_prune_prompt_authorized(
-    messages: &[Message],
-    authorization: &PruneAuthorization,
+    _messages: &[Message],
+    _authorization: &PruneAuthorization,
 ) -> bool {
-    !active_prunable_tool_ids_authorized(messages, authorization).is_empty()
+    false
 }
 
 /// Fail-closed entry point kept for tests: it authorizes no conditional result,
@@ -1079,138 +1019,27 @@ pub(crate) fn should_inject_prune_prompt(messages: &[Message]) -> bool {
     should_inject_prune_prompt_authorized(messages, &PruneAuthorization::default())
 }
 
-/// Injects the pruning protocol into the model request projection on demand,
-/// guaranteeing repeated calls never duplicate the prompt.
-/// Recognizes the protocol message regardless of which candidate list was
-/// rendered into it: the prompt is static instructions plus a dynamic
-/// per-request section, so full-text equality no longer identifies it.
+/// Recognizes legacy protocol notes, including previously rendered candidate lists.
 pub(crate) fn is_prune_protocol_message(message: &Message) -> bool {
     message.role == "system"
-        && matches!(&message.content, Value::String(text) if text.starts_with(PRUNE_PROTOCOL_PROMPT))
+        && matches!(&message.content, Value::String(text)
+            if text.trim_start().starts_with(PRUNE_PROTOCOL_PROMPT.trim_start()))
 }
 
-/// Builds the full protocol prompt for this request: the static instructions
-/// plus a dynamic section listing the currently prunable candidates (largest
-/// first, capped at [`PRUNE_PROMPT_MAX_CANDIDATES`]). `prune_marks` annotates
-/// each candidate with its accumulated counter (`marks/threshold`) so the
-/// model can see how close a result is to being offloaded.
-///
-/// Listing exact ids is the main fix for the earlier static-prompt version,
-/// where the model had to recall `tool_call_id`s from history and rarely
-/// emitted valid marks.
-fn build_prune_protocol_prompt(
-    messages: &[Message],
-    prune_marks: &FxHashMap<String, u8>,
-    authorization: &PruneAuthorization,
-) -> String {
-    let active_ids = active_prunable_tool_ids_authorized(messages, authorization);
-    if active_ids.is_empty() {
-        return PRUNE_PROTOCOL_PROMPT.to_string();
-    }
-    let id_to_tool_name = build_tool_call_name_index(messages);
-    let mut candidates: Vec<(String, String, usize, u8)> = messages
-        .iter()
-        .filter_map(|message| {
-            let id = message.tool_call_id.as_ref()?;
-            if !active_ids.contains(id) {
-                return None;
-            }
-            let chars = message.content.as_str()?.chars().count();
-            let tool = id_to_tool_name
-                .get(id)
-                .map(String::as_str)
-                .unwrap_or("tool");
-            Some((id.clone(), tool.to_string(), chars, needed_marks(chars)))
-        })
-        .collect();
-    candidates.extend(super::folded_prune::candidates(messages).into_iter().map(
-        |(index, meta)| {
-            (
-                meta.id(),
-                meta.label(),
-                messages[index].content.as_str().unwrap().chars().count(),
-                PRUNE_THRESHOLD,
-            )
-        },
-    ));
-    // Largest first (most context freed); tie-break by id for determinism.
-    candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-
-    let mut section = String::from(
-        "\n### Prunable candidates in this request (id · tool · size · marks/threshold)\n",
-    );
-    for (id, tool, chars, threshold) in candidates.iter().take(PRUNE_PROMPT_MAX_CANDIDATES) {
-        let count = prune_marks.get(id).copied().unwrap_or(0);
-        section.push_str(&format!(
-            "- {id} · {tool} · {chars} chars · marks {count}/{}\n",
-            threshold
-        ));
-    }
-    let hidden = candidates.len().saturating_sub(PRUNE_PROMPT_MAX_CANDIDATES);
-    if hidden > 0 {
-        section.push_str(&format!(
-            "(+{hidden} more eligible candidates not listed)\n"
-        ));
-    }
-
-    let mut prompt = PRUNE_PROTOCOL_PROMPT.to_string();
-    prompt.push_str(&section);
-    prompt
+/// Removes every stale protocol note without touching ordinary system messages.
+pub(crate) fn remove_prune_protocol_prompt(messages: &mut Vec<Message>) -> bool {
+    let previous_len = messages.len();
+    messages.retain(|message| !is_prune_protocol_message(message));
+    messages.len() != previous_len
 }
 
-/// Injects the pruning protocol into the model request projection on demand,
-/// guaranteeing repeated calls never duplicate the prompt message. When the
-/// protocol is already present and candidates still exist, the dynamic
-/// candidate list is refreshed in place instead; when no prunable candidates
-/// remain, the stale protocol message (with its outdated candidate list) is
-/// removed so the model never sees ids that no longer exist.
+/// Compatibility helper: only removes legacy notes; never injects instructions.
 pub(crate) fn ensure_prune_protocol_prompt_authorized(
     messages: &mut Vec<Message>,
-    prune_marks: &FxHashMap<String, u8>,
-    authorization: &PruneAuthorization,
+    _prune_marks: &FxHashMap<String, u8>,
+    _authorization: &PruneAuthorization,
 ) -> bool {
-    if let Some(existing_idx) = messages
-        .iter()
-        .position(|message| is_prune_protocol_message(message))
-    {
-        if should_inject_prune_prompt_authorized(messages, authorization) {
-            let prompt = build_prune_protocol_prompt(messages, prune_marks, authorization);
-            // Refreshing identical text is not a mutation: callers reuse the
-            // previous token estimate when nothing actually changed.
-            if messages[existing_idx].content.as_str() == Some(prompt.as_str()) {
-                return false;
-            }
-            messages[existing_idx].content = Value::String(prompt);
-            return true;
-        } else {
-            // No prunable candidates remain in this projection: the candidate
-            // list inside the protocol message would now name ids that are no
-            // longer present, which misleads the model into re-marking them.
-            // Remove the stale message instead of leaving it in place.
-            messages.remove(existing_idx);
-            return true;
-        }
-    }
-    if !should_inject_prune_prompt_authorized(messages, authorization) {
-        return false;
-    }
-
-    let insert_at = messages
-        .iter()
-        .position(|message| message.role != "system")
-        .unwrap_or(messages.len());
-    let prompt = build_prune_protocol_prompt(messages, prune_marks, authorization);
-    messages.insert(
-        insert_at,
-        Message {
-            role: "system".to_string(),
-            content: Value::String(prompt),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        },
-    );
-    true
+    remove_prune_protocol_prompt(messages)
 }
 
 /// Fail-closed entry point kept for tests: it authorizes no conditional result,
@@ -1220,16 +1049,11 @@ pub(crate) fn ensure_prune_protocol_prompt(
     messages: &mut Vec<Message>,
     prune_marks: &FxHashMap<String, u8>,
 ) -> bool {
-    ensure_prune_protocol_prompt_authorized(
-        messages,
-        prune_marks,
-        &PruneAuthorization::default(),
-    )
+    ensure_prune_protocol_prompt_authorized(messages, prune_marks, &PruneAuthorization::default())
 }
 
-/// Updates the transient projection before every model request: first
-/// losslessly offload old tool results that reached the threshold, then inject
-/// the protocol on demand.
+/// Cleans legacy protocol notes and losslessly reclaims old eligible evidence.
+/// Selection is entirely runtime-owned; persisted model marks are not inputs.
 ///
 /// Which results may be offloaded also depends on the session authorization:
 /// tools whose policy defers to session state (subagent results) are unloaded
@@ -1239,18 +1063,11 @@ pub(crate) fn ensure_prune_protocol_prompt(
 /// `turn_messages`.
 pub(crate) fn prepare_request_projection_authorized(
     messages: &mut Vec<Message>,
-    prune_marks: &FxHashMap<String, u8>,
     overflow_dir: Option<&Path>,
     authorization: &PruneAuthorization,
 ) -> PruneReport {
-    let report = apply_pruning_authorized(
-        messages.as_mut_slice(),
-        prune_marks,
-        overflow_dir,
-        authorization,
-    );
-    ensure_prune_protocol_prompt_authorized(messages, prune_marks, authorization);
-    report
+    remove_prune_protocol_prompt(messages);
+    reclaim_under_pressure_authorized(messages.as_mut_slice(), overflow_dir, authorization)
 }
 
 /// Fail-closed entry point kept for tests: it authorizes no conditional result,
@@ -1258,15 +1075,9 @@ pub(crate) fn prepare_request_projection_authorized(
 #[cfg(test)]
 pub(crate) fn prepare_request_projection(
     messages: &mut Vec<Message>,
-    prune_marks: &FxHashMap<String, u8>,
     overflow_dir: Option<&Path>,
 ) -> PruneReport {
-    prepare_request_projection_authorized(
-        messages,
-        prune_marks,
-        overflow_dir,
-        &PruneAuthorization::default(),
-    )
+    prepare_request_projection_authorized(messages, overflow_dir, &PruneAuthorization::default())
 }
 
 #[cfg(test)]
@@ -1457,7 +1268,8 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            unrecognized_prune_fragments("prune: see the protocol", &FxHashSet::default()).is_empty()
+            unrecognized_prune_fragments("prune: see the protocol", &FxHashSet::default())
+                .is_empty()
         );
     }
 
@@ -1982,13 +1794,13 @@ mod tests {
         messages.push(make_assistant_tool_call("call_4", "execute_command"));
         messages.push(make_tool_message("call_4", &"newest result ".repeat(500)));
         assert!(
-            should_inject_prune_prompt(&messages),
-            "once a fifth group makes an old result eligible, inject the protocol"
+            !should_inject_prune_prompt(&messages),
+            "eligible evidence does not require a model protocol"
         );
     }
 
     #[test]
-    fn test_prune_protocol_activates_at_same_turn_request_boundary_once() {
+    fn test_prune_protocol_never_activates_at_request_boundaries() {
         let mut messages = vec![make_user_message("same-turn request")];
         for index in 0..4 {
             let id = format!("call_{index}");
@@ -2002,7 +1814,7 @@ mod tests {
         ));
         messages.push(make_assistant_tool_call("call_4", "execute_command"));
         messages.push(make_tool_message("call_4", &"newest result ".repeat(500)));
-        assert!(ensure_prune_protocol_prompt(
+        assert!(!ensure_prune_protocol_prompt(
             &mut messages,
             &FxHashMap::default()
         ));
@@ -2015,7 +1827,7 @@ mod tests {
                 .iter()
                 .filter(|message| is_prune_protocol_message(message))
                 .count(),
-            1
+            0
         );
     }
 
@@ -2023,7 +1835,7 @@ mod tests {
     fn test_prepare_request_projection_prunes_without_mutating_canonical_copy() {
         let overflow_dir = make_overflow_dir();
         let mut request_messages = vec![make_user_message("system-sized request")];
-        let old_result = "old result that reached the prune threshold\n".repeat(1_000);
+        let old_result = "old eligible result without model marks\n".repeat(200);
         request_messages.extend([
             make_assistant_tool_call("call_old", "execute_command"),
             make_tool_message("call_old", &old_result),
@@ -2034,14 +1846,10 @@ mod tests {
             request_messages.push(make_tool_message(&id, "recent result"));
         }
         let canonical_messages = request_messages.clone();
-        let marks = [("call_old".to_string(), PRUNE_THRESHOLD)]
-            .into_iter()
-            .collect();
 
-        let first =
-            prepare_request_projection(&mut request_messages, &marks, Some(overflow_dir.as_path()));
+        let first = prepare_request_projection(&mut request_messages, Some(overflow_dir.as_path()));
         let second =
-            prepare_request_projection(&mut request_messages, &marks, Some(overflow_dir.as_path()));
+            prepare_request_projection(&mut request_messages, Some(overflow_dir.as_path()));
 
         assert_eq!(first.pruned_count, 1);
         assert_eq!(second.pruned_count, 0);
@@ -2061,7 +1869,15 @@ mod tests {
                 .filter(|message| is_prune_protocol_message(message))
                 .count(),
             0,
-            "after the only old candidate is pruned, the protocol prompt is no longer needed"
+            "runtime reclamation never injects a model protocol"
+        );
+        let mut rebuilt = canonical_messages.clone();
+        let third = prepare_request_projection(&mut rebuilt, Some(overflow_dir.as_path()));
+        assert_eq!(third.pruned_count, 1);
+        assert_eq!(
+            serde_json::to_value(&rebuilt).unwrap(),
+            serde_json::to_value(&request_messages).unwrap(),
+            "canonical rebuilds must reuse the same archive and stub"
         );
 
         std::fs::remove_dir_all(&overflow_dir).ok();
@@ -2166,7 +1982,7 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_prompt_lists_candidates_with_marks() {
+    fn test_protocol_prompt_is_not_injected_despite_candidates_and_legacy_marks() {
         let mut messages = vec![make_user_message("request")];
         messages.extend([
             make_assistant_tool_call("call_big", "read_file"),
@@ -2181,34 +1997,14 @@ mod tests {
         }
         let marks = [("call_small_old".to_string(), 1u8)].into_iter().collect();
 
-        assert!(ensure_prune_protocol_prompt(&mut messages, &marks));
-        let prompt = messages
-            .iter()
-            .find(|message| is_prune_protocol_message(message))
-            .and_then(|message| message.content.as_str())
-            .expect("protocol prompt injected");
-        assert!(prompt.starts_with(PRUNE_PROTOCOL_PROMPT));
-        let big_pos = prompt.find("call_big").expect("large candidate listed");
-        let small_pos = prompt
-            .find("call_small_old")
-            .expect("small candidate listed");
-        assert!(big_pos < small_pos, "largest candidates are listed first");
-        assert!(
-            prompt.contains("marks 0/1"),
-            "very large result shows the single-mark threshold"
-        );
-        assert!(
-            prompt.contains("marks 1/2"),
-            "small result shows the accumulated counter against the normal threshold"
-        );
-        assert!(
-            !prompt.contains("call_recent_0"),
-            "protected recent results are not listed as candidates"
-        );
+        let before = serde_json::to_value(&messages).unwrap();
+        assert!(!ensure_prune_protocol_prompt(&mut messages, &marks));
+        assert!(!messages.iter().any(is_prune_protocol_message));
+        assert_eq!(serde_json::to_value(&messages).unwrap(), before);
     }
 
     #[test]
-    fn test_ensure_refreshes_candidate_list_in_place() {
+    fn test_ensure_removes_all_legacy_notes_without_refreshing() {
         let mut messages = vec![make_user_message("request")];
         messages.extend([
             make_assistant_tool_call("call_old", "execute_command"),
@@ -2219,43 +2015,29 @@ mod tests {
             messages.push(make_assistant_tool_call(&id, "execute_command"));
             messages.push(make_tool_message(&id, "recent result"));
         }
-        assert!(ensure_prune_protocol_prompt(
-            &mut messages,
-            &FxHashMap::default()
+        let mut legacy = make_assistant_message(&format!(
+            "{PRUNE_PROTOCOL_PROMPT}Legacy candidate call_old; marks 0/2"
         ));
-
-        let prompt_before = messages
+        legacy.role = "system".to_string();
+        messages.insert(0, legacy.clone());
+        messages.push(legacy.clone());
+        // The same text in user or assistant evidence is not a runtime note.
+        legacy.role = "user".to_string();
+        messages.push(legacy.clone());
+        legacy.role = "assistant".to_string();
+        messages.push(legacy);
+        let expected: Vec<_> = messages
             .iter()
-            .find(|message| is_prune_protocol_message(message))
-            .and_then(|message| message.content.as_str())
-            .expect("protocol prompt injected")
-            .to_string();
-        assert!(prompt_before.contains("marks 0/2"));
-
-        // A later round of the same turn: the model has marked call_old once,
-        // so the existing protocol message must be refreshed in place (updated
-        // counter), never duplicated.
+            .filter(|message| !is_prune_protocol_message(message))
+            .cloned()
+            .collect();
         let marks = [("call_old".to_string(), 1u8)].into_iter().collect();
-        // The counter changed, so the refresh mutates the message and reports
-        // true; callers rebuild the token estimate only on true.
         assert!(ensure_prune_protocol_prompt(&mut messages, &marks));
+        assert!(!messages.iter().any(is_prune_protocol_message));
         assert_eq!(
-            messages
-                .iter()
-                .filter(|message| is_prune_protocol_message(message))
-                .count(),
-            1,
-            "refresh must never duplicate the protocol message"
+            serde_json::to_value(&messages).unwrap(),
+            serde_json::to_value(&expected).unwrap()
         );
-        let prompt = messages
-            .iter()
-            .find(|message| is_prune_protocol_message(message))
-            .and_then(|message| message.content.as_str())
-            .expect("protocol prompt still present");
-        assert!(prompt.contains("marks 1/2"));
-        assert_ne!(prompt_before, prompt);
-        // Refreshing with identical marks changes nothing and reports false,
-        // letting callers reuse the previous token estimate.
         assert!(!ensure_prune_protocol_prompt(&mut messages, &marks));
     }
 
@@ -2271,17 +2053,9 @@ mod tests {
             messages.push(make_assistant_tool_call(&id, "execute_command"));
             messages.push(make_tool_message(&id, "recent result"));
         }
-        assert!(ensure_prune_protocol_prompt(
-            &mut messages,
-            &FxHashMap::default()
-        ));
-        assert_eq!(
-            messages
-                .iter()
-                .filter(|message| is_prune_protocol_message(message))
-                .count(),
-            1
-        );
+        let mut legacy = make_assistant_message(PRUNE_PROTOCOL_PROMPT);
+        legacy.role = "system".to_string();
+        messages.insert(0, legacy);
 
         // A later round of the same turn: the old result is gone (offloaded or
         // rewritten), so no prunable candidate remains. The stale protocol
@@ -2455,8 +2229,9 @@ mod tests {
 
         let integrated = integration_authorization(&["task_a"]);
         assert!(active_prunable_tool_ids_authorized(&messages, &integrated).contains("call_sub"));
-        assert!(should_inject_prune_prompt_authorized(
-            &messages, &integrated
+        assert!(!should_inject_prune_prompt_authorized(
+            &messages,
+            &integrated
         ));
     }
 
@@ -2553,14 +2328,15 @@ mod tests {
 
     // ---- pressure reclaim: runtime-side offloading without a model mark ----
 
-    /// Below the trigger the marking contract is unchanged: a model that casts
-    /// no mark leaves the eligible backlog inline.
+    /// Even a single small eligible result must shrink without model consent.
     #[test]
-    fn test_pressure_reclaim_stays_silent_below_the_trigger() {
+    fn test_pressure_reclaim_offloads_small_backlog_without_marks() {
         let overflow_dir = make_overflow_dir();
+        let original = "old command output\n".repeat(400);
+        assert!(original.len() < PRESSURE_RECLAIM_MIN_TOTAL_CHARS);
         let mut messages = vec![
             make_assistant_tool_call("call_old", "execute_command"),
-            make_tool_message("call_old", &"old command output\n".repeat(1_000)),
+            make_tool_message("call_old", &original),
             make_assistant_tool_call("call_recent_1", "execute_command"),
             make_tool_message("call_recent_1", "recent 1"),
             make_assistant_tool_call("call_recent_2", "execute_command"),
@@ -2577,21 +2353,38 @@ mod tests {
             &PruneAuthorization::default(),
         );
 
-        assert_eq!(report.pruned_count, 0);
-        assert_eq!(report.pressure_count, 0);
-        assert_eq!(report.freed_chars, 0);
-        assert!(
-            messages[1]
-                .content
-                .as_str()
-                .unwrap()
-                .starts_with("old command output")
+        assert_eq!(report.pruned_count, 1);
+        assert_eq!(report.pressure_count, 1);
+        let stub = messages[1].content.as_str().unwrap();
+        assert!(is_preserved_tool_overflow_stub(stub));
+        assert_eq!(
+            report.freed_chars,
+            original.chars().count() - stub.chars().count()
         );
+        let raw = stub
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("- file_path: "))
+            .unwrap();
+        let path = overflow_dir
+            .join(super::super::PRESERVED_TOOL_OVERFLOW_DIR)
+            .join(raw);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+        let unchanged = serde_json::to_value(&messages).unwrap();
+        assert_eq!(
+            reclaim_under_pressure_authorized(
+                &mut messages,
+                Some(overflow_dir.as_path()),
+                &PruneAuthorization::default(),
+            )
+            .pruned_count,
+            0
+        );
+        assert_eq!(serde_json::to_value(&messages).unwrap(), unchanged);
 
         std::fs::remove_dir_all(&overflow_dir).ok();
     }
 
-    /// Above the trigger the runtime offloads the largest eligible results
+    /// The runtime offloads the largest eligible results
     /// through the same lossless path (full text archived, recallable stub),
     /// reports them as auto-reclaimed, and stops at the per-request character
     /// cap instead of rewriting the whole backlog at once.
@@ -2614,7 +2407,7 @@ mod tests {
             make_assistant_tool_call("call_recent_4", "execute_command"),
             make_tool_message("call_recent_4", "recent 4"),
         ];
-        // 30K + 27K + 15K eligible chars: above the trigger, above one cap.
+        // 30K + 27K + 15K eligible chars: more than one request's budget.
 
         let report = reclaim_under_pressure_authorized(
             &mut messages,
@@ -2622,12 +2415,21 @@ mod tests {
             &PruneAuthorization::default(),
         );
 
-        assert_eq!(report.pruned_count, 2, "largest first, up to the cap");
-        assert_eq!(report.pressure_count, 2);
+        assert_eq!(
+            report.pruned_count, 1,
+            "largest first, without overshooting the cap"
+        );
+        assert_eq!(report.pressure_count, 1);
         assert!(report.freed_chars > 0);
         let stub_a = messages[1].content.as_str().unwrap();
         assert!(stub_a.contains("file_path:"));
-        assert!(messages[3].content.as_str().unwrap().contains("file_path:"));
+        assert!(
+            messages[3]
+                .content
+                .as_str()
+                .unwrap()
+                .starts_with("b stale file body")
+        );
         // `call_c` is eligible, but the per-request cap stopped the reclaim.
         assert!(
             messages[5]
@@ -2655,15 +2457,36 @@ mod tests {
                 .contains("a stale output")
         );
 
-        // The next request finds the remainder below the trigger: reclamation
-        // converges instead of re-offloading or flapping.
+        // Later requests drain the remainder even below the former trigger.
         let repeat = reclaim_under_pressure_authorized(
             &mut messages,
             Some(overflow_dir.as_path()),
             &PruneAuthorization::default(),
         );
-        assert_eq!(repeat.pruned_count, 0);
-        assert_eq!(repeat.pressure_count, 0);
+        assert_eq!(repeat.pruned_count, 1);
+        assert_eq!(repeat.pressure_count, 1);
+        assert!(messages[3].content.as_str().unwrap().contains("file_path:"));
+        assert_eq!(
+            reclaim_under_pressure_authorized(
+                &mut messages,
+                Some(overflow_dir.as_path()),
+                &PruneAuthorization::default(),
+            )
+            .pruned_count,
+            1
+        );
+        assert!(messages[5].content.as_str().unwrap().contains("file_path:"));
+        let drained = serde_json::to_value(&messages).unwrap();
+        assert_eq!(
+            reclaim_under_pressure_authorized(
+                &mut messages,
+                Some(overflow_dir.as_path()),
+                &PruneAuthorization::default(),
+            )
+            .pruned_count,
+            0
+        );
+        assert_eq!(serde_json::to_value(&messages).unwrap(), drained);
 
         std::fs::remove_dir_all(&overflow_dir).ok();
     }
@@ -2781,6 +2604,38 @@ mod tests {
                 .unwrap()
                 .starts_with("irrecoverable if dropped")
         );
+    }
+
+    #[test]
+    fn test_pressure_reclaim_archive_failure_preserves_all_messages() {
+        let overflow_dir = make_overflow_dir();
+        let blocked_dir = overflow_dir.join("blocked-archive-directory");
+        std::fs::write(&blocked_dir, "not a directory").unwrap();
+        let mut messages = vec![
+            make_assistant_tool_call("call_old", "execute_command"),
+            make_tool_message("call_old", &"unarchived evidence\n".repeat(400)),
+        ];
+        for index in 0..4 {
+            let id = format!("call_recent_{index}");
+            messages.push(make_assistant_tool_call(&id, "execute_command"));
+            messages.push(make_tool_message(&id, "recent"));
+        }
+        let original = serde_json::to_value(&messages).unwrap();
+
+        let report = reclaim_under_pressure_authorized(
+            &mut messages,
+            Some(&blocked_dir),
+            &PruneAuthorization::default(),
+        );
+
+        assert_eq!(report.pruned_count, 0);
+        assert_eq!(report.freed_chars, 0);
+        assert_eq!(serde_json::to_value(&messages).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(&blocked_dir).unwrap(),
+            "not a directory"
+        );
+        std::fs::remove_dir_all(&overflow_dir).ok();
     }
 
     /// A candidate larger than the whole per-request cap is still reclaimed:

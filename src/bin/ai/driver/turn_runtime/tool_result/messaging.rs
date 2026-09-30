@@ -498,174 +498,30 @@ fn render_plan_steps(args: Option<&Value>) -> Option<String> {
     Some(rendered)
 }
 
-/// Parses the prune directives out of one model response — the hidden self-note
-/// (`prune:` lines, or the `<<<prune:ids>>>` compatibility marker) and the visible
-/// narration (compatibility marker on its own line only) — then updates the mark
-/// counters, persists them, and reports the outcome.
+/// Strips legacy prune directives from hidden metadata and standalone visible
+/// compatibility markers without updating marks or emitting feedback.
 ///
 /// Returns `(remaining_meta, cleaned_visible_text)`: the note with its directives
 /// removed (persisted as the model's self-note) and the narration with every
 /// recognized directive removed, so control markers never reach history or the
 /// final body.
-pub(super) fn parse_prune_meta_and_update_marks(
-    app: &mut App,
-    messages: &mut Vec<Message>,
+pub(super) fn strip_legacy_prune_directives(
+    messages: &[Message],
     hidden_meta: &str,
     visible_text: &str,
 ) -> (String, String) {
-    // Resolve marks against the ids this request actually carries: identity comes
+    // Resolve directives against the ids this request actually carries: identity comes
     // from the context, not from the id's spelling.
     let known_ids = crate::ai::history::compress::llm_prune::nameable_prune_ids(messages);
-    let (mut prune_ids, remaining_meta) =
-        crate::ai::history::compress::llm_prune::parse_prune_from_hidden_meta(
-            hidden_meta,
-            &known_ids,
-        );
-    let (embedded_ids, cleaned_visible_text) =
+    let (_, remaining_meta) = crate::ai::history::compress::llm_prune::parse_prune_from_hidden_meta(
+        hidden_meta,
+        &known_ids,
+    );
+    let (_, cleaned_visible_text) =
         crate::ai::history::compress::llm_prune::parse_embedded_prune_directives(
             visible_text,
             &known_ids,
         );
-    prune_ids.extend(embedded_ids);
-    // Subagent results become eligible only once the ledger records their task as
-    // integrated; read the authorization once for the mark update, the reported
-    // candidates, and the rejection reasons below.
-    let authorization = crate::ai::driver::commands::session::current_prune_authorization(app);
-    let active_tool_ids =
-        crate::ai::history::compress::llm_prune::active_prunable_tool_ids_authorized(
-            messages,
-            &authorization,
-        );
-    // The update reports whether the mark map changed, avoiding a full
-    // `app.prune_marks.clone()` just to diff it afterwards.
-    let prune_marks_changed =
-        crate::ai::history::compress::llm_prune::update_prune_marks_for_messages_authorized(
-            &mut app.prune_marks,
-            &prune_ids,
-            messages,
-            &authorization,
-        );
-    if prune_marks_changed
-        && let Err(error) = crate::ai::history::write_llm_prune_marks_sqlite(
-            &app.session_history_file,
-            &app.prune_marks,
-        )
-        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
-    {
-        eprintln!("[context-prune] failed to persist mark state: {error}");
-    }
-
-    let mut accepted = prune_ids
-        .iter()
-        .filter(|id| active_tool_ids.contains(*id))
-        .cloned()
-        .collect::<FxHashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    accepted.sort();
-    let accepted_summary = (!accepted.is_empty()).then(|| {
-        let shown = accepted
-            .iter()
-            .take(4)
-            .map(|id| {
-                let count = app.prune_marks.get(id).copied().unwrap_or(0);
-                format!(
-                    "{id} ({count}/{})",
-                    crate::ai::history::compress::llm_prune::needed_marks_for(messages, id)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let suffix = (accepted.len() > 4)
-            .then(|| format!(", +{} more", accepted.len() - 4))
-            .unwrap_or_default();
-        format!("{shown}{suffix}")
-    });
-    if let Some(shown) = &accepted_summary
-        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
-    {
-        crate::ai::driver::print::print_tool_note_line(
-            "context-prune",
-            &format!("model marked {shown}"),
-        );
-    }
-
-    // Unexplained rejections make the model repeat useless marks; surface the
-    // reason so the model-facing user sees why a mark did not count.
-    let mut rejected: Vec<&String> = Vec::new();
-    for id in &prune_ids {
-        if !active_tool_ids.contains(id) && !rejected.contains(&id) {
-            rejected.push(id);
-        }
-    }
-    let rejected_summary = (!rejected.is_empty()).then(|| {
-        let shown = rejected
-            .iter()
-            .take(4)
-            .map(|id| {
-                let reason =
-                    crate::ai::history::compress::llm_prune::explain_rejected_prune_mark_authorized(
-                        messages,
-                        id,
-                        &authorization,
-                    )
-                    .unwrap_or("not currently eligible");
-                format!("{id} ({reason})")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let suffix = (rejected.len() > 4)
-            .then(|| format!(", +{} more", rejected.len() - 4))
-            .unwrap_or_default();
-        format!("{shown}{suffix}")
-    });
-    if let Some(shown) = &rejected_summary
-        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
-    {
-        crate::ai::driver::print::print_tool_note_line(
-            "context-prune",
-            &format!("ignored mark(s): {shown}"),
-        );
-    }
-
-    // A mark the model cannot see failing is a mark it repeats: report rejected ids
-    // and directive text that never resolved into ids on the model-visible channel,
-    // not only the terminal line.
-    let mut fragments = crate::ai::history::compress::llm_prune::unrecognized_prune_fragments(
-        &cleaned_visible_text,
-        &known_ids,
-    );
-    fragments.extend(
-        crate::ai::history::compress::llm_prune::unrecognized_prune_fragments(
-            &remaining_meta,
-            &known_ids,
-        ),
-    );
-    if !rejected.is_empty() || !fragments.is_empty() {
-        let mut parts = Vec::new();
-        if let Some(shown) = &accepted_summary {
-            parts.push(format!("applied: {shown}"));
-        }
-        if let Some(shown) = &rejected_summary {
-            parts.push(format!("ignored: {shown}"));
-        }
-        for fragment in &fragments {
-            parts.push(format!("unrecognized directive text: `{fragment}`"));
-        }
-        let note = format!(
-            "[context-prune] Not all prune marks from your last message were applied — {}. \
-             A mark counts only as `<<<prune:id1,id2>>>` starting its own line, or as a \
-             `prune:id1,id2` line inside `<meta:self_note>...</meta:self_note>`.",
-            parts.join("; ")
-        );
-        messages.push(Message {
-            role: ROLE_INTERNAL_NOTE.to_string(),
-            content: Value::String(note),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        });
-    }
     (remaining_meta, cleaned_visible_text)
 }
 
@@ -1338,11 +1194,8 @@ pub(super) fn record_final_stream_response(
     final_assistant_text: &mut String,
     final_assistant_recorded: &mut bool,
 ) {
-    // Parse prune directives (hidden note and in-band marker), update the mark
-    // counters, and strip the directives so the protocol never persists as a plain
-    // self_note nor reaches the visible body.
-    let (remaining_meta, cleaned_assistant_text) = parse_prune_meta_and_update_marks(
-        app,
+    // Strip legacy control syntax without altering ordinary self-notes or narration.
+    let (remaining_meta, cleaned_assistant_text) = strip_legacy_prune_directives(
         messages,
         &stream_result.hidden_meta,
         &stream_result.assistant_text,
@@ -1597,7 +1450,7 @@ mod tests {
         TOOL_RESULT_RAW_HARD_CAP_CHARS, append_tool_result_messages,
         append_tool_result_messages_for_model, build_code_inspection_working_memory,
         collect_repo_inspection_findings, describe_tool_call, is_repo_inspection_tool,
-        parse_prune_meta_and_update_marks, prepare_tool_results_for_history,
+        prepare_tool_results_for_history, strip_legacy_prune_directives,
     };
     use super::{
         WORKING_CHECKPOINT_FILE_NAME, extract_context_checkpoints,
@@ -1715,46 +1568,34 @@ mod tests {
     }
 
     #[test]
-    fn prune_hidden_meta_updates_and_persists_session_marks() {
+    fn legacy_prune_hidden_meta_does_not_update_or_persist_marks() {
         let history_root =
             std::env::temp_dir().join(format!("ai-prune-meta-persist-{}", uuid::Uuid::new_v4()));
-        let mut app = test_app(history_root.join("history.sqlite"));
-        let _ = std::fs::remove_file(&app.session_history_file);
-        let mut messages = prune_candidate_messages();
+        let app = test_app(history_root.join("history.sqlite"));
+        let original_history = std::fs::read(&app.session_history_file).ok();
+        let messages = prune_candidate_messages();
+        let original_messages = serde_json::to_value(&messages).unwrap();
 
-        let (remaining, cleaned) = parse_prune_meta_and_update_marks(
-            &mut app,
-            &mut messages,
-            "prune:call_0\nkeep this note",
-            "",
-        );
+        let (remaining, cleaned) =
+            strip_legacy_prune_directives(&messages, "prune:call_0\nkeep this note", "");
         assert_eq!(remaining, "keep this note");
         assert!(cleaned.is_empty());
-        assert_eq!(app.prune_marks.get("call_0"), Some(&1));
+        strip_legacy_prune_directives(&messages, "prune:call_0", "");
+        assert!(app.prune_marks.is_empty());
+        assert_eq!(serde_json::to_value(&messages).unwrap(), original_messages);
         assert_eq!(
-            crate::ai::history::read_llm_prune_marks_sqlite(&app.session_history_file)
-                .unwrap()
-                .get("call_0"),
-            Some(&1)
-        );
-
-        parse_prune_meta_and_update_marks(&mut app, &mut messages, "prune:call_0", "");
-        assert_eq!(
-            crate::ai::history::read_llm_prune_marks_sqlite(&app.session_history_file)
-                .unwrap()
-                .get("call_0"),
-            Some(&crate::ai::history::compress::llm_prune::PRUNE_THRESHOLD)
+            std::fs::read(&app.session_history_file).ok(),
+            original_history
         );
         let _ = std::fs::remove_dir_all(history_root);
     }
 
-    /// Five old, large tool results; the recent-results window stays protected, so
-    /// the earliest results (`call_0`, `call_1`) are the authorized candidates.
+    /// Tool results supplying known ids for legacy directive recognition.
     fn prune_candidate_messages() -> Vec<Message> {
         prune_candidate_messages_with_ids(&["call_0", "call_1", "call_2", "call_3", "call_4"])
     }
 
-    /// The same fixture with caller-chosen ids, so a test can mark a provider id whose
+    /// The same fixture with caller-chosen ids, so a test can strip a provider id whose
     /// spelling falls outside the parser's fallback id shape.
     fn prune_candidate_messages_with_ids(ids: &[&str]) -> Vec<Message> {
         let mut messages = Vec::new();
@@ -1762,7 +1603,11 @@ mod tests {
             messages.push(Message {
                 role: "assistant".to_string(),
                 content: Value::String(String::new()),
-                tool_calls: Some(vec![tool_call(*id, "execute_command", serde_json::json!({}))]),
+                tool_calls: Some(vec![tool_call(
+                    *id,
+                    "execute_command",
+                    serde_json::json!({}),
+                )]),
                 tool_call_id: None,
                 reasoning_content: None,
             });
@@ -1778,12 +1623,8 @@ mod tests {
     }
 
     #[test]
-    fn prune_mark_resolves_a_provider_id_outside_the_ascii_shape() {
-        let history_root =
-            std::env::temp_dir().join(format!("ai-prune-exotic-id-{}", uuid::Uuid::new_v4()));
-        let mut app = test_app(history_root.join("history.sqlite"));
-        let _ = std::fs::remove_file(&app.session_history_file);
-        let mut messages = prune_candidate_messages_with_ids(&[
+    fn legacy_prune_strips_a_provider_id_outside_the_ascii_shape() {
+        let messages = prune_candidate_messages_with_ids(&[
             "call:opaque/id.0",
             "call_1",
             "call_2",
@@ -1791,106 +1632,66 @@ mod tests {
             "call_4",
         ]);
 
-        let (remaining, cleaned) = parse_prune_meta_and_update_marks(
-            &mut app,
-            &mut messages,
+        let (remaining, cleaned) = strip_legacy_prune_directives(
+            &messages,
             "prune:call:opaque/id.0",
-            "",
+            "<<<prune:call:opaque/id.0>>>",
         );
 
         // Identity comes from the request, not from the id's spelling.
-        assert_eq!(app.prune_marks.get("call:opaque/id.0"), Some(&1));
         assert!(remaining.is_empty());
         assert!(cleaned.is_empty());
-        // The mark applied, so no correction note is needed.
+        // Compatibility stripping never injects feedback notes.
         assert!(
             !messages
                 .iter()
                 .any(|message| message.role == crate::ai::history::ROLE_INTERNAL_NOTE)
         );
-        let _ = std::fs::remove_dir_all(history_root);
     }
 
     #[test]
-    fn visible_compat_marker_counts_as_a_mark_and_leaves_the_narration() {
-        let history_root =
-            std::env::temp_dir().join(format!("ai-prune-visible-marker-{}", uuid::Uuid::new_v4()));
-        let mut app = test_app(history_root.join("history.sqlite"));
-        let _ = std::fs::remove_file(&app.session_history_file);
-        let mut messages = prune_candidate_messages();
+    fn legacy_prune_visible_marker_preserves_narration_without_feedback() {
+        let messages = prune_candidate_messages();
 
-        let (remaining, cleaned) = parse_prune_meta_and_update_marks(
-            &mut app,
-            &mut messages,
+        let (remaining, cleaned) = strip_legacy_prune_directives(
+            &messages,
             "",
             "<<<prune:call_0>>>\n\nChecking the regression tests next.",
         );
 
         assert!(remaining.is_empty());
         assert_eq!(cleaned, "\nChecking the regression tests next.");
-        assert_eq!(app.prune_marks.get("call_0"), Some(&1));
-        // A mark that applies needs no correction note.
+        // Compatibility stripping never injects feedback notes.
         assert!(
             !messages
                 .iter()
                 .any(|message| message.role == crate::ai::history::ROLE_INTERNAL_NOTE)
         );
-        let _ = std::fs::remove_dir_all(history_root);
     }
 
     #[test]
-    fn rejected_mark_is_reported_in_the_model_visible_note() {
-        let history_root =
-            std::env::temp_dir().join(format!("ai-prune-rejected-mark-{}", uuid::Uuid::new_v4()));
-        let mut app = test_app(history_root.join("history.sqlite"));
-        let _ = std::fs::remove_file(&app.session_history_file);
-        let mut messages = prune_candidate_messages();
+    fn legacy_prune_unknown_id_is_stripped_without_feedback() {
+        let messages = prune_candidate_messages();
+        let original_messages = serde_json::to_value(&messages).unwrap();
+        let (remaining, cleaned) =
+            strip_legacy_prune_directives(&messages, "prune:call_missing", "");
 
-        parse_prune_meta_and_update_marks(&mut app, &mut messages, "prune:call_missing", "");
-
-        assert_eq!(app.prune_marks.get("call_missing"), None);
-        let note = messages
-            .iter()
-            .find(|message| message.role == crate::ai::history::ROLE_INTERNAL_NOTE)
-            .expect("a model-visible context-prune note")
-            .content
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        assert!(note.contains("ignored: call_missing"), "{note}");
-        let _ = std::fs::remove_dir_all(history_root);
+        assert!(remaining.is_empty());
+        assert!(cleaned.is_empty());
+        assert_eq!(serde_json::to_value(&messages).unwrap(), original_messages);
     }
 
     #[test]
-    fn mixed_payload_note_line_is_reported_instead_of_split_into_ids() {
-        let history_root =
-            std::env::temp_dir().join(format!("ai-prune-mixed-payload-{}", uuid::Uuid::new_v4()));
-        let mut app = test_app(history_root.join("history.sqlite"));
-        let _ = std::fs::remove_file(&app.session_history_file);
-        let mut messages = prune_candidate_messages();
+    fn legacy_prune_mixed_payload_prose_is_preserved_without_feedback() {
+        let messages = prune_candidate_messages();
+        let original_messages = serde_json::to_value(&messages).unwrap();
 
-        parse_prune_meta_and_update_marks(
-            &mut app,
-            &mut messages,
-            "prune:call_0, use the older result",
-            "",
-        );
+        let (remaining, cleaned) =
+            strip_legacy_prune_directives(&messages, "prune:call_0, use the older result", "");
 
-        // No mark applied, no id invented from the prose fragment, and the model is
-        // told about the directive text that did not resolve.
-        assert_eq!(app.prune_marks.get("call_0"), None);
-        let note = messages
-            .iter()
-            .find(|message| message.role == crate::ai::history::ROLE_INTERNAL_NOTE)
-            .expect("a model-visible context-prune note")
-            .content
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        assert!(note.starts_with("[context-prune]"), "{note}");
-        assert!(note.contains("use the older result"), "{note}");
-        assert!(!note.contains("ignored:"), "{note}");
-        let _ = std::fs::remove_dir_all(history_root);
+        assert_eq!(remaining, "prune:call_0, use the older result");
+        assert!(cleaned.is_empty());
+        assert_eq!(serde_json::to_value(&messages).unwrap(), original_messages);
     }
 
     #[test]

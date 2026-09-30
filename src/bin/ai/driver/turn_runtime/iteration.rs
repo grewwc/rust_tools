@@ -1073,59 +1073,18 @@ fn context_overflow_target_chars(
 }
 
 /// Update the temporary context projection at every model request boundary without touching canonical `turn_messages`.
-fn apply_model_guided_pruning_before_request(app: &App, messages: &mut Vec<Message>) {
+fn reclaim_tool_evidence_before_request(app: &App, messages: &mut Vec<Message>) {
     let overflow_dir = {
         use crate::ai::history::SessionStore;
         let store = SessionStore::new(app.config.history_file.as_path());
         store.session_assets_dir(&app.session_id)
     };
-    // The prompt embeds a dynamic candidate list, so recognize the protocol
-    // message structurally instead of by full-text equality.
-    let previous_protocol = messages
-        .iter()
-        .find(|message| llm_prune::is_prune_protocol_message(message))
-        .map(|message| message.content.clone());
     let authorization = crate::ai::driver::commands::session::current_prune_authorization(app);
-    let mut report = llm_prune::prepare_request_projection_authorized(
-        messages,
-        &app.prune_marks,
-        Some(overflow_dir.as_path()),
-        &authorization,
-    );
-    // Model marks are the fine-grained signal, not a guaranteed one: a model
-    // that never marks would let the eligible backlog grow while every request
-    // re-sends it in full. Under pressure the runtime reclaims the largest
-    // eligible items through the same lossless path, then regenerates the
-    // candidate list so it cannot advertise ids that just left the projection.
-    let pressure = llm_prune::reclaim_under_pressure_authorized(
+    let report = llm_prune::prepare_request_projection_authorized(
         messages,
         Some(overflow_dir.as_path()),
         &authorization,
     );
-    if pressure.pruned_count > 0 {
-        llm_prune::ensure_prune_protocol_prompt_authorized(
-            messages,
-            &app.prune_marks,
-            &authorization,
-        );
-    }
-    report.merge(pressure);
-    let current_protocol = messages
-        .iter()
-        .find(|message| llm_prune::is_prune_protocol_message(message))
-        .map(|message| &message.content);
-    if previous_protocol.as_ref() != current_protocol
-        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
-    {
-        // Counted after the projection update so results offloaded by this
-        // very call are not advertised as still-listed candidates.
-        let candidate_count =
-            llm_prune::active_prunable_tool_ids_authorized(messages, &authorization).len();
-        crate::ai::driver::print::print_tool_note_line(
-            "context-prune",
-            &format!("candidate list updated: {candidate_count} eligible tool evidence item(s)"),
-        );
-    }
     if report.pruned_count == 0 || !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
         return;
     }
@@ -1135,18 +1094,10 @@ fn apply_model_guided_pruning_before_request(app: &App, messages: &mut Vec<Messa
     } else {
         format!(" [{}]", report.tools.join(", "))
     };
-    let auto_reclaimed = if report.pressure_count == 0 {
-        String::new()
-    } else {
-        format!(
-            ", {} auto-reclaimed under context pressure",
-            report.pressure_count
-        )
-    };
     crate::ai::driver::print::print_tool_note_line(
         "context-pruned",
         &format!(
-            "{} tool evidence item(s){}, ~{} chars freed{auto_reclaimed}",
+            "{} tool evidence item(s){}, ~{} chars freed",
             report.pruned_count, tools, report.freed_chars
         ),
     );
@@ -1316,22 +1267,8 @@ async fn apply_request_budget(
         record_llm_summary_attempt_chars(&app.session_id, after_chars);
         chars = after_chars;
     }
-    // Recreating a protocol note changes normalized input too; measure it rather
-    // than carrying a pre-replacement token estimate to transport.
-    // The common case leaves the projection untouched, so reuse the current
-    // budget instead of rebuilding the full projection a third time.
-    if llm_prune::ensure_prune_protocol_prompt_authorized(
-        messages,
-        &app.prune_marks,
-        &crate::ai::driver::commands::session::current_prune_authorization(app),
-    ) {
-        request::preview_request_budget(app, model, messages, true, tools_enabled).await
-    } else {
-        // `chars` is unused after this point; keep the assignment for clarity
-        // if later code needs the post-ensure size.
-        let _ = chars;
-        budget
-    }
+    let _ = chars;
+    budget
 }
 
 async fn request_model_response(
@@ -1373,9 +1310,9 @@ async fn request_model_response(
         });
     }
 
-    // Process before every request, not just at turn initialization, so later tool rounds within the same
-    // turn can also consume prune markers that just crossed the threshold and offload losslessly before context compression.
-    apply_model_guided_pruning_before_request(app, messages);
+    // Reclaim eligible old evidence before budget compression on every request,
+    // including later tool rounds. The model has no housekeeping protocol to follow.
+    reclaim_tool_evidence_before_request(app, messages);
     context_budget::refresh_active_plan(app, messages);
     let context_before = super::context_metrics::ContextSizeBreakdown::measure(messages);
     let before_budget =
@@ -1509,11 +1446,6 @@ async fn request_model_response(
             .await
             .prompt_tokens;
             let after = reactive_shrink_context_after_overflow(app, messages, target);
-            llm_prune::ensure_prune_protocol_prompt_authorized(
-                messages,
-                &app.prune_marks,
-                &crate::ai::driver::commands::session::current_prune_authorization(app),
-            );
             request_budget = request::preview_request_budget(
                 app,
                 &actual_model,
@@ -1936,6 +1868,60 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, atomic::Ordering};
+
+    #[test]
+    fn request_boundary_reclaims_small_backlog_without_model_marks() {
+        let dir = std::env::temp_dir().join(format!("ai-runtime-reclaim-{}", uuid::Uuid::new_v4()));
+        let mut app = crate::ai::middleware::test_util::test_app();
+        app.config.history_file = dir.join("history.sqlite");
+        app.session_id = "runtime-reclaim".to_string();
+        app.prune_marks.clear();
+        let original = "old verified tool evidence\n".repeat(240);
+        let mut messages = Vec::new();
+        for index in 0..8 {
+            let id = format!("call_runtime_reclaim_{index}");
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: Value::Null,
+                tool_calls: Some(vec![ToolCall {
+                    id: id.clone(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: "{\"file_path\":\"src/lib.rs\"}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+            messages.push(Message {
+                role: "tool".to_string(),
+                content: Value::String(if index == 0 {
+                    original.clone()
+                } else {
+                    format!("recent evidence {index}")
+                }),
+                tool_calls: None,
+                tool_call_id: Some(id),
+                reasoning_content: None,
+            });
+        }
+        let canonical = messages.clone();
+        super::reclaim_tool_evidence_before_request(&app, &mut messages);
+        assert_eq!(messages.len(), canonical.len());
+        assert!(messages[1].content.as_str().unwrap().len() < original.len());
+        assert_eq!(messages[1].tool_call_id, canonical[1].tool_call_id);
+        assert_eq!(messages[0].tool_calls, canonical[0].tool_calls);
+        assert_eq!(canonical[1].content.as_str().unwrap(), original);
+        for (actual, expected) in messages.iter().zip(&canonical).skip(2) {
+            assert_eq!(actual.content, expected.content);
+        }
+        assert!(app.prune_marks.is_empty());
+        let first_projection = serde_json::to_value(&messages).unwrap();
+        super::reclaim_tool_evidence_before_request(&app, &mut messages);
+        assert_eq!(serde_json::to_value(&messages).unwrap(), first_projection);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn context_overflow_target_preserves_floor_for_exhausted_estimate() {

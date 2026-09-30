@@ -120,14 +120,6 @@ fn old_fold_projection(note: Message) -> Vec<Message> {
     messages
 }
 
-fn without_protocol(messages: &[Message]) -> Vec<Message> {
-    messages
-        .iter()
-        .filter(|message| !llm_prune::is_prune_protocol_message(message))
-        .cloned()
-        .collect()
-}
-
 fn fold_note(messages: &[Message]) -> &Message {
     messages
         .iter()
@@ -235,20 +227,11 @@ fn folded_prune_two_independent_marks_archive_exact_note_and_leave_canonical_unc
         Some(&1),
         "duplicates in one response count once"
     );
-    let first = llm_prune::prepare_request_projection(&mut request, &marks, Some(dir.path()));
+    let first = llm_prune::apply_pruning(&mut request, &marks, Some(dir.path()));
     assert_eq!(first.pruned_count, 0);
     assert_eq!(first.freed_chars, 0);
-    assert_eq!(without_protocol(&request), projection_before);
+    assert_eq!(request, projection_before);
     assert!(!dir.path().join("pruned-folds").exists());
-    let protocol = request
-        .iter()
-        .find(|message| llm_prune::is_prune_protocol_message(message))
-        .unwrap()
-        .content
-        .as_str()
-        .unwrap();
-    assert!(protocol.contains(&id));
-    assert!(protocol.contains("marks 1/2"));
 
     assert!(!llm_prune::update_prune_marks_for_messages(
         &mut marks,
@@ -262,7 +245,7 @@ fn folded_prune_two_independent_marks_archive_exact_note_and_leave_canonical_unc
         &request,
     ));
     assert_eq!(marks.get(&id), Some(&llm_prune::PRUNE_THRESHOLD));
-    let report = llm_prune::prepare_request_projection(&mut request, &marks, Some(dir.path()));
+    let report = llm_prune::apply_pruning(&mut request, &marks, Some(dir.path()));
     assert_eq!(report.pruned_count, 1);
     let stub = fold_note(&request);
     let stub_text = stub.content.as_str().unwrap();
@@ -309,7 +292,7 @@ fn folded_prune_two_independent_marks_archive_exact_note_and_leave_canonical_unc
         &request,
     ));
     assert_eq!(marks.get(&id), Some(&llm_prune::PRUNE_THRESHOLD));
-    let repeat = llm_prune::prepare_request_projection(&mut request, &marks, Some(dir.path()));
+    let repeat = llm_prune::apply_pruning(&mut request, &marks, Some(dir.path()));
     assert_eq!(repeat.pruned_count, 0);
     assert_eq!(repeat.freed_chars, 0);
     assert_eq!(request, completed_request);
@@ -342,11 +325,69 @@ fn folded_prune_large_note_does_not_inherit_raw_single_mark_exception() {
     assert_eq!(marks.get(&id), Some(&1));
     assert_eq!(llm_prune::needed_marks_for(&request, &id), 2);
     assert_eq!(
-        llm_prune::prepare_request_projection(&mut request, &marks, Some(dir.path())).pruned_count,
+        llm_prune::apply_pruning(&mut request, &marks, Some(dir.path())).pruned_count,
         0
     );
     assert_eq!(fold_note(&request), &note);
     assert!(!dir.path().join("pruned-folds").exists());
+}
+
+#[test]
+fn folded_prune_automatically_archives_without_marks_and_is_idempotent() {
+    let dir = TestDir::new();
+    let mut canonical = raw_group("automatic-fold", &["read_file", "execute_command"]);
+    let note = fold_group(&canonical, dir.path());
+    let id = provenance(&note).unwrap().id();
+    let original_text = note.content.as_str().unwrap().to_string();
+    let source_archive = archive_path(&note);
+    append_recent_raw(&mut canonical, KEEP_RECENT_TOOL_GROUPS);
+    let canonical_before = canonical.clone();
+    let projection_before = old_fold_projection(note);
+    let mut request = projection_before.clone();
+
+    let first = llm_prune::prepare_request_projection(&mut request, Some(dir.path()));
+    assert_eq!(first.pruned_count, 1);
+    assert_eq!(first.pressure_count, 1);
+    let stub = fold_note(&request);
+    let stub_text = stub.content.as_str().unwrap();
+    let exact_archive = archive_path(stub);
+    assert_eq!(std::fs::read(&exact_archive).unwrap(), original_text.as_bytes());
+    assert_ne!(exact_archive, source_archive);
+    assert!(source_archive.is_file());
+    assert!(stub_text.contains(&format!(
+        "source_projection_archive: {}",
+        source_archive.display()
+    )));
+    assert_eq!(
+        first.freed_chars,
+        original_text.chars().count() - stub_text.chars().count()
+    );
+    assert!(first.freed_chars > 0);
+    let meta = provenance(stub).unwrap();
+    assert!(meta.is_offloaded());
+    assert_eq!(meta.id(), id);
+    assert_eq!(canonical, canonical_before);
+    assert_eq!(request.len(), projection_before.len());
+    assert_eq!(request[0..2], projection_before[0..2]);
+    assert_eq!(request[3..], projection_before[3..]);
+    assert!(!request.iter().any(llm_prune::is_prune_protocol_message));
+    assert_complete_pairs(&request);
+    assert_complete_pairs(&canonical);
+
+    let completed_request = request.clone();
+    let repeat = llm_prune::prepare_request_projection(&mut request, Some(dir.path()));
+    assert_eq!(repeat.pruned_count, 0);
+    assert_eq!(repeat.pressure_count, 0);
+    assert_eq!(repeat.freed_chars, 0);
+    assert_eq!(request, completed_request);
+    assert_eq!(std::fs::read(&exact_archive).unwrap(), original_text.as_bytes());
+
+    let mut rebuilt = projection_before;
+    let rebuilt_report = llm_prune::prepare_request_projection(&mut rebuilt, Some(dir.path()));
+    assert_eq!(rebuilt_report.pruned_count, 1);
+    assert_eq!(rebuilt, completed_request);
+    assert_eq!(archive_path(fold_note(&rebuilt)), exact_archive);
+    assert_eq!(std::fs::read(exact_archive).unwrap(), original_text.as_bytes());
 }
 
 #[test]
@@ -394,8 +435,12 @@ fn folded_prune_protects_plan_task_unknown_and_mixed_groups_past_preview_cutoff(
             assert!(llm_prune::active_prunable_tool_ids(&request).is_empty());
             assert!(!llm_prune::retained_prune_ids(&request).contains(&id));
             let marks = FxHashMap::from_iter([(id, u8::MAX)]);
-            let report =
-                llm_prune::prepare_request_projection(&mut request, &marks, Some(dir.path()));
+            assert_eq!(
+                llm_prune::apply_pruning(&mut request, &marks, Some(dir.path())).pruned_count,
+                0,
+                "{protected}, mixed={mixed}"
+            );
+            let report = llm_prune::prepare_request_projection(&mut request, Some(dir.path()));
             assert_eq!(report.pruned_count, 0, "{protected}, mixed={mixed}");
             assert_eq!(request, before, "{protected}, mixed={mixed}");
         }
@@ -447,8 +492,11 @@ fn folded_prune_rejects_legacy_folds_ordinary_notes_checkpoints_and_role_spoofin
         assert!(llm_prune::active_prunable_tool_ids(&request).is_empty());
         let marks = FxHashMap::from_iter([(id.clone(), u8::MAX)]);
         assert_eq!(
-            llm_prune::prepare_request_projection(&mut request, &marks, Some(dir.path()))
-                .pruned_count,
+            llm_prune::apply_pruning(&mut request, &marks, Some(dir.path())).pruned_count,
+            0
+        );
+        assert_eq!(
+            llm_prune::prepare_request_projection(&mut request, Some(dir.path())).pruned_count,
             0
         );
         assert_eq!(request, before);
@@ -601,8 +649,11 @@ fn folded_prune_rejects_changed_content_and_malformed_persisted_metadata() {
         assert!(llm_prune::active_prunable_tool_ids(&request).is_empty());
         let marks = FxHashMap::from_iter([(id.clone(), u8::MAX)]);
         assert_eq!(
-            llm_prune::prepare_request_projection(&mut request, &marks, Some(dir.path()))
-                .pruned_count,
+            llm_prune::apply_pruning(&mut request, &marks, Some(dir.path())).pruned_count,
+            0
+        );
+        assert_eq!(
+            llm_prune::prepare_request_projection(&mut request, Some(dir.path())).pruned_count,
             0
         );
         assert_eq!(request, before);
@@ -677,9 +728,15 @@ fn folded_prune_recent_window_counts_raw_folded_and_legacy_groups() {
         marks.insert(id, u8::MAX);
     }
     let protected_tail = request[1..].to_vec();
-    let report = llm_prune::prepare_request_projection(&mut request, &marks, Some(dir.path()));
+    let mut legacy_request = request.clone();
+    assert_eq!(
+        llm_prune::apply_pruning(&mut legacy_request, &marks, Some(dir.path())).pruned_count,
+        1
+    );
+    let report = llm_prune::prepare_request_projection(&mut request, Some(dir.path()));
     assert_eq!(report.pruned_count, 1);
-    assert_eq!(without_protocol(&request)[1..], protected_tail);
+    assert_eq!(request[1..], protected_tail);
+    assert_eq!(request, legacy_request);
     assert_complete_pairs(&request);
 }
 
@@ -705,24 +762,22 @@ fn folded_prune_missing_or_failed_archive_keeps_exact_note_and_metadata() {
     let dir = TestDir::new();
     let raw = raw_group("archive-failure", &["read_file", "execute_command"]);
     let note = fold_group(&raw, dir.path());
-    let id = provenance(&note).unwrap().id();
     let before = old_fold_projection(note);
-    let marks = FxHashMap::from_iter([(id, llm_prune::PRUNE_THRESHOLD)]);
 
     let mut without_dir = before.clone();
-    let report = llm_prune::prepare_request_projection(&mut without_dir, &marks, None);
+    let report = llm_prune::prepare_request_projection(&mut without_dir, None);
     assert_eq!(report.pruned_count, 0);
     assert_eq!(report.freed_chars, 0);
-    assert_eq!(without_protocol(&without_dir), before);
+    assert_eq!(without_dir, before);
     assert!(!dir.path().join("pruned-folds").exists());
 
     let blocker = dir.path().join("pruned-folds");
     std::fs::write(&blocker, "This fixture blocks the archive directory.").unwrap();
     let mut failed = before.clone();
-    let report = llm_prune::prepare_request_projection(&mut failed, &marks, Some(dir.path()));
+    let report = llm_prune::prepare_request_projection(&mut failed, Some(dir.path()));
     assert_eq!(report.pruned_count, 0);
     assert_eq!(report.freed_chars, 0);
-    assert_eq!(without_protocol(&failed), before);
+    assert_eq!(failed, before);
     assert!(!provenance(fold_note(&failed)).unwrap().is_offloaded());
     assert_eq!(
         std::fs::read_to_string(blocker).unwrap(),
@@ -764,10 +819,14 @@ fn folded_prune_indistinguishable_fold_identity_fails_closed_for_every_note() {
     assert!(!llm_prune::active_prunable_tool_ids(&ambiguous).contains(&id));
     let marks = FxHashMap::from_iter([(id.clone(), u8::MAX)]);
     let before = ambiguous.clone();
-    let report = llm_prune::prepare_request_projection(&mut ambiguous, &marks, Some(dir.path()));
+    assert_eq!(
+        llm_prune::apply_pruning(&mut ambiguous, &marks, Some(dir.path())).pruned_count,
+        0
+    );
+    let report = llm_prune::prepare_request_projection(&mut ambiguous, Some(dir.path()));
     assert_eq!(report.pruned_count, 0);
     assert_eq!(report.freed_chars, 0);
-    assert_eq!(without_protocol(&ambiguous), before);
+    assert_eq!(ambiguous, before);
     assert!(ambiguous
         .iter()
         .filter_map(provenance)
@@ -781,9 +840,7 @@ fn folded_prune_indistinguishable_fold_identity_fails_closed_for_every_note() {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, 2);
         assert_eq!(found[0].1.id(), id);
-        let control_marks = FxHashMap::from_iter([(id.clone(), llm_prune::PRUNE_THRESHOLD)]);
-        let report =
-            llm_prune::prepare_request_projection(&mut request, &control_marks, Some(dir.path()));
+        let report = llm_prune::prepare_request_projection(&mut request, Some(dir.path()));
         assert_eq!(report.pruned_count, 1);
         assert!(provenance(fold_note(&request)).unwrap().is_offloaded());
     }
@@ -840,11 +897,11 @@ fn folded_prune_ambiguous_marks_do_not_carry_into_a_later_resolved_state() {
         "an unresolvable id must lose its accumulated consent: {marks:?}"
     );
 
-    // Even after the twin is gone, the withdrawn consent stays gone: the note
-    // needs two fresh decisions before it can be offloaded again.
+    // In the legacy mark path, removing the twin cannot restore withdrawn
+    // consent: two fresh decisions are required before offloading the note.
     let mut resolved = old_fold_projection(note.clone());
     assert_eq!(
-        llm_prune::prepare_request_projection(&mut resolved, &marks, Some(dir.path())).pruned_count,
+        llm_prune::apply_pruning(&mut resolved, &marks, Some(dir.path())).pruned_count,
         0
     );
     assert!(!provenance(fold_note(&resolved)).unwrap().is_offloaded());
@@ -854,8 +911,7 @@ fn folded_prune_ambiguous_marks_do_not_carry_into_a_later_resolved_state() {
     let mut stale = old_fold_projection(note.clone());
     let stale_marks = FxHashMap::from_iter([(id.clone(), llm_prune::PRUNE_THRESHOLD)]);
     assert_eq!(
-        llm_prune::prepare_request_projection(&mut stale, &stale_marks, Some(dir.path()))
-            .pruned_count,
+        llm_prune::apply_pruning(&mut stale, &stale_marks, Some(dir.path())).pruned_count,
         1
     );
     let mut fresh = old_fold_projection(note);
@@ -868,8 +924,7 @@ fn folded_prune_ambiguous_marks_do_not_carry_into_a_later_resolved_state() {
         ));
     }
     assert_eq!(
-        llm_prune::prepare_request_projection(&mut fresh, &fresh_marks, Some(dir.path()))
-            .pruned_count,
+        llm_prune::apply_pruning(&mut fresh, &fresh_marks, Some(dir.path())).pruned_count,
         1
     );
 }
@@ -1024,10 +1079,10 @@ fn folded_prune_consent_is_bound_to_the_observed_result_not_reused_call_ids() {
     let mut request = old_fold_projection(replacement);
     let before = request.clone();
     assert_eq!(
-        llm_prune::prepare_request_projection(&mut request, &marks, Some(dir.path())).pruned_count,
+        llm_prune::apply_pruning(&mut request, &marks, Some(dir.path())).pruned_count,
         0
     );
-    assert_eq!(without_protocol(&request), before);
+    assert_eq!(request, before);
     let mut restored_marks = marks;
     assert!(llm_prune::update_prune_marks_for_messages(
         &mut restored_marks,
@@ -1058,12 +1113,16 @@ fn folded_prune_id_collisions_never_authorize_raw_or_ambiguous_evidence() {
             let before = request.clone();
             assert!(!llm_prune::active_prunable_tool_ids(&request).contains(&id));
             assert_eq!(
-                llm_prune::prepare_request_projection(&mut request, &marks, Some(dir.path()))
-                    .pruned_count,
+                llm_prune::apply_pruning(&mut request, &marks, Some(dir.path())).pruned_count,
                 0,
                 "fold consent must not apply to {name} (include_fold={include_fold})"
             );
-            assert_eq!(without_protocol(&request), before);
+            assert_eq!(
+                llm_prune::prepare_request_projection(&mut request, Some(dir.path())).pruned_count,
+                0,
+                "automatic reclamation must reject {name} (include_fold={include_fold})"
+            );
+            assert_eq!(request, before);
             assert_complete_pairs(&request);
         }
     }
@@ -1081,10 +1140,8 @@ fn folded_prune_provenance_survives_serialization_but_not_provider_normalization
     assert_eq!(restored, note);
     assert_eq!(provenance(&restored).unwrap().id(), id);
     let mut projection = old_fold_projection(restored);
-    let marks = FxHashMap::from_iter([(id.clone(), llm_prune::PRUNE_THRESHOLD)]);
     assert_eq!(
-        llm_prune::prepare_request_projection(&mut projection, &marks, Some(dir.path()))
-            .pruned_count,
+        llm_prune::prepare_request_projection(&mut projection, Some(dir.path())).pruned_count,
         1
     );
     let encoded_stub = serde_json::to_string(fold_note(&projection)).unwrap();

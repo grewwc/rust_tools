@@ -42,8 +42,8 @@ pub(super) use super::super::{
 pub(super) use super::{
     messaging::{
         append_cached_tool_results_note, append_message_pair,
-        append_tool_result_messages_for_model, parse_prune_meta_and_update_marks,
-        record_final_stream_response, record_hidden_self_note, record_tool_inspection_artifacts,
+        append_tool_result_messages_for_model, record_final_stream_response,
+        record_hidden_self_note, record_tool_inspection_artifacts, strip_legacy_prune_directives,
     },
     overflow::{build_model_overflow_stub, summarize_large_tool_output, write_tool_overflow_file},
     preview::{build_terminal_preview, tail_chars},
