@@ -642,6 +642,49 @@ fn effort_defaults_to_registry_when_no_override() {
 }
 
 #[test]
+fn sharp_agent_implies_low_effort_from_live_agent() {
+    // Regression: the sharp `low` used to be written into the override at CLI
+    // parse, so a live `/agent sharp` never picked it up while `/agent build`
+    // (and startup fallbacks to build) kept a stale `low`. It is now derived
+    // from the live agent at resolve time, so no switch path can go stale.
+    let mut app = test_app();
+    // Live `/agent sharp` with no explicit override.
+    app.current_agent = "sharp".to_string();
+    assert_eq!(
+        super::reasoning::resolve_reasoning_effort(&app, "deepseek-v4-flash-volcano"),
+        Some(crate::ai::provider::ReasoningEffort::Low),
+    );
+    assert_eq!(
+        super::reasoning::reasoning_effort_display_label(&app, "deepseek-v4-flash-volcano"),
+        "low",
+    );
+    // Switching back (`/agent build`, or a startup fallback to build after an
+    // unresolvable `--agent sharp`) drops the implied low with no state to clear.
+    app.current_agent = "build".to_string();
+    assert_eq!(
+        super::reasoning::resolve_reasoning_effort(&app, "deepseek-v4-flash-volcano"),
+        Some(crate::ai::provider::ReasoningEffort::Max),
+    );
+}
+
+#[test]
+fn explicit_effort_override_wins_over_sharp_default() {
+    let mut app = test_app();
+    app.current_agent = "sharp".to_string();
+    app.cli.reasoning_effort_override = Some(Some(crate::ai::provider::ReasoningEffort::Max));
+    assert_eq!(
+        super::reasoning::resolve_reasoning_effort(&app, "deepseek-v4-flash-volcano"),
+        Some(crate::ai::provider::ReasoningEffort::Max),
+    );
+    // Explicit off also wins over the sharp default.
+    app.cli.reasoning_effort_override = Some(None);
+    assert_eq!(
+        super::reasoning::resolve_reasoning_effort(&app, "deepseek-v4-flash-0731-alibaba"),
+        None,
+    );
+}
+
+#[test]
 fn test_parse_thinking_gate_output_string_bool() {
     let s = r#"{"thinking":"false","confidence":0.8}"#;
     assert_eq!(parse_thinking_gate_output(s), Some((false, 0.8)));

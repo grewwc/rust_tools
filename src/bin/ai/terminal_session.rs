@@ -4,8 +4,10 @@
 //! Replay is an in-memory, 256 KiB sanitized terminal transcript, not a VT screen
 //! emulator. It omits terminal queries, OSC/DCS strings and unsafe controls. After
 //! truncation, old screen contents may be incomplete; live bytes are never filtered.
-//! Completed sessions remain attachable for ten minutes. No output/history files
-//! are written. Lock files deliberately persist so flock always names one inode.
+//! Completed sessions remain attachable for ten minutes, and a host whose worker
+//! has no attached frontend for ten minutes is reaped (closed terminals must not
+//! leak worker processes). No output/history files are written. Lock files
+//! deliberately persist so flock always names one inode.
 
 #[cfg(unix)]
 mod client;

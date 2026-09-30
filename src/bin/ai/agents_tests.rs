@@ -99,16 +99,35 @@ fn builtin_agents_do_not_mount_mcp_tools_by_default() {
 fn builtin_audit_agents_opt_out_of_task_auto_selection() {
     // Audit agents ship a fixed output contract (<audit_report>) and a read-only
     // default, so auto-selection must never hand them writing work; the
-    // general-purpose build agent stays eligible.
+    // general-purpose build and sharp agents stay eligible.
     for (filename, content) in BUILTIN_AGENTS {
         let agent = parse_agent_front_matter(content).unwrap();
-        let expect_eligible = agent.name == "build";
+        let expect_eligible = matches!(agent.name.as_str(), "build" | "sharp");
         assert_eq!(
             agent.auto_select, expect_eligible,
             "{filename} (agent {}): expected auto_select={expect_eligible}",
             agent.name
         );
     }
+}
+
+#[test]
+fn builtin_sharp_agent_pins_no_task_tools_resident() {
+    // Explicitly named tools ride along in every turn, and resident task_*
+    // tools inject the subagent-orchestration prose ("delegate every step",
+    // "task_status before finishing"), which defeats a decisive single-pass
+    // agent. Sharp keeps core only; task tools load on demand via enable_tools.
+    let (_, content) = BUILTIN_AGENTS
+        .iter()
+        .find(|(filename, _)| *filename == "sharp.agent")
+        .expect("sharp agent should be registered");
+    let agent = parse_agent_front_matter(content).unwrap();
+    assert!(
+        agent.tools.is_empty(),
+        "sharp must not pin resident tools, got {:?}",
+        agent.tools
+    );
+    assert_eq!(agent.tool_groups, vec!["core".to_string()]);
 }
 
 #[test]

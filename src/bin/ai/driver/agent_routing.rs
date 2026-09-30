@@ -217,13 +217,28 @@ pub(super) fn install_runtime_manifests(
                     "[Warning] Agent '{}' is not available, using default",
                     agent_name
                 );
+                fallback_to_default_agent(app, agent_manifests);
             }
         } else {
             eprintln!("[Warning] Agent '{}' not found, using default", agent_name);
+            fallback_to_default_agent(app, agent_manifests);
         }
     }
 
     *manifests_loaded = true;
+}
+
+/// Re-activate the default agent after a `--agent` value failed to resolve.
+/// Startup presets `current_agent` from `cli.agent` so the first screen shows
+/// the requested agent; without this fallback the label would keep a name
+/// that has no active manifest behind it.
+fn fallback_to_default_agent(app: &mut App, agent_manifests: &[AgentManifest]) {
+    if let Some(default_agent) = agents::find_agent_by_name(agent_manifests, "build")
+        && default_agent.is_primary()
+        && !default_agent.disabled
+    {
+        activate_primary_agent(app, default_agent);
+    }
 }
 
 #[cfg(test)]

@@ -132,6 +132,109 @@ fn parse_cli_args_reads_stop_flag() {
 }
 
 #[test]
+fn parse_cli_args_sharp_shortcut_selects_sharp_agent() {
+    // `-s` selects the sharp agent and keeps the prompt.
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "-s".to_string(),
+            "quick question".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(cli.agent.as_deref(), Some("sharp"));
+    assert_eq!(cli.args, vec!["quick question".to_string()]);
+
+    // Long form behaves the same.
+    let cli = super::parse_cli_args(
+        ["a".to_string(), "--sharp".to_string()].into_iter(),
+    );
+    assert_eq!(cli.agent.as_deref(), Some("sharp"));
+
+    // `-s` selects sharp; the implied low reasoning effort is derived at
+    // request time from the live agent, so parsing stores no override (this
+    // keeps `/agent` switches and startup fallbacks from going stale).
+    let cli = super::parse_cli_args(["a".to_string(), "-s".to_string()].into_iter());
+    assert_eq!(cli.agent.as_deref(), Some("sharp"));
+    assert!(cli.reasoning_effort_override.is_none());
+
+    // An explicit `--reasoning-effort` always wins over the `-s` default.
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "-s".to_string(),
+            "--reasoning-effort".to_string(),
+            "max".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(cli.agent.as_deref(), Some("sharp"));
+    assert_eq!(
+        cli.reasoning_effort_override,
+        Some(Some(super::ReasoningEffort::Max))
+    );
+
+    // An explicit `--agent` value wins over `-s`.
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "-s".to_string(),
+            "--agent".to_string(),
+            "build".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(cli.agent.as_deref(), Some("build"));
+    // `-s` did not select sharp here, so it must not touch the effort default.
+    assert!(cli.reasoning_effort_override.is_none());
+
+    // `--agent sharp` without `-s` selects sharp the same way — still no
+    // stored override; the low default is derived at resolve time.
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "--agent".to_string(),
+            "sharp".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(cli.agent.as_deref(), Some("sharp"));
+    assert!(cli.reasoning_effort_override.is_none());
+
+    // A non-sharp agent never gets the low-effort default.
+    let cli = super::parse_cli_args(
+        ["a".to_string(), "--agent".to_string(), "build".to_string()].into_iter(),
+    );
+    assert_eq!(cli.agent.as_deref(), Some("build"));
+    assert!(cli.reasoning_effort_override.is_none());
+
+    // `-s` must not steal `-ss` (session).
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "-ss".to_string(),
+            "my-session".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(cli.session.as_deref(), Some("my-session"));
+    assert!(cli.agent.is_none());
+
+    // `-s` also works after a slash command (same bool-flag path as `-bg`).
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "/sessions".to_string(),
+            "list".to_string(),
+            "-s".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(cli.agent.as_deref(), Some("sharp"));
+    assert_eq!(cli.args, vec!["/sessions list".to_string()]);
+}
+
+#[test]
 fn parse_cli_args_passes_slash_command_flags_through_verbatim() {
     // Unregistered command flags (e.g. `--prefix`) must survive argv parsing;
     // the command dispatcher owns the command grammar.
@@ -149,6 +252,55 @@ fn parse_cli_args_passes_slash_command_flags_through_verbatim() {
         cli.args,
         vec!["/sessions delete prompt-eval-20260924 --prefix".to_string()]
     );
+}
+
+#[test]
+fn parse_cli_args_keeps_changes_short_flags_verbatim() {
+    // `/changes -s` is `--stat`, not the global `--sharp` alias; `-h` is
+    // command help, not global help. Neither may leak into `a`'s own options.
+    for flag in ["-s", "-h"] {
+        let cli = super::parse_cli_args(
+            ["a".to_string(), "/changes".to_string(), flag.to_string()].into_iter(),
+        );
+        assert_eq!(cli.args, vec![format!("/changes {flag}")]);
+        assert!(cli.agent.is_none());
+        assert!(cli.reasoning_effort_override.is_none());
+    }
+    // `/diff` shares the changes grammar.
+    let cli = super::parse_cli_args(
+        ["a".to_string(), "/diff".to_string(), "-s".to_string()].into_iter(),
+    );
+    assert_eq!(cli.args, vec!["/diff -s".to_string()]);
+    assert!(cli.agent.is_none());
+    // A global flag before the command still applies.
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "-s".to_string(),
+            "/changes".to_string(),
+            "-s".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(cli.agent.as_deref(), Some("sharp"));
+    assert_eq!(cli.args, vec!["/changes -s".to_string()]);
+}
+
+#[test]
+fn parse_cli_args_keeps_audit_fast_flag_verbatim() {
+    // `/audit -f` is fast mode, not the global `--files` alias (which would
+    // additionally swallow the following token as a file path).
+    let cli = super::parse_cli_args(
+        [
+            "a".to_string(),
+            "/audit".to_string(),
+            "-f".to_string(),
+            "review this".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(cli.args, vec!["/audit -f review this".to_string()]);
+    assert!(cli.files.is_empty());
 }
 
 #[test]

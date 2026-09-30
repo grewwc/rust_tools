@@ -74,6 +74,9 @@ pub(super) struct PromptEditor {
     /// Current model display name, shown as a model hint above the input box
     /// (so the model in use is visible while typing).
     current_model_label: String,
+    /// Current agent name, shown on the same line as the model hint above the
+    /// input box.
+    current_agent_label: String,
     /// Reasoning effort active for the current request, shown on the same line
     /// as the model hint above the input box.
     current_reasoning_effort_label: String,
@@ -153,6 +156,7 @@ impl PromptEditor {
             pending_prefill: None,
             pending_status_msg: None,
             current_model_label: String::new(),
+            current_agent_label: String::new(),
             current_reasoning_effort_label: String::new(),
             session_topic: None,
             session_title_update_subscription,
@@ -189,6 +193,12 @@ impl PromptEditor {
     /// above the input box.
     pub(super) fn set_current_model_label(&mut self, label: impl Into<String>) {
         self.current_model_label = label.into();
+    }
+
+    /// Set the current agent name; the next `read_multi_line` shows it on the
+    /// same line as the model hint.
+    pub(super) fn set_current_agent_label(&mut self, label: impl Into<String>) {
+        self.current_agent_label = label.into();
     }
 
     /// Set the reasoning effort active for the current request; the next

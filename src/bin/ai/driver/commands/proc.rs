@@ -14,6 +14,11 @@
 //! 3. **`pgrep` count**: counts all processes named `a`, to hint
 //!    "N `a` processes are running, but only M sessions were identified".
 //!
+//! Sessions whose last recorded activity is older than `STALE_AFTER_HOURS` are
+//! tagged `stale`: the process may still be alive (e.g. an orphaned terminal
+//! host/worker pair after the terminal closed), but no agent work is happening,
+//! so it must not look identical to an active session.
+//!
 //! Note: sessions suspended via `/bg`, `/suspend`, etc. are **not** active:
 //! their processes have exited, only their state was saved for later recovery.
 //! Use `/sessions list` to see all saved sessions.
@@ -21,7 +26,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::process;
 
+use chrono::{DateTime, Local};
+
 use crate::ai::{driver::session_pid, history::SessionStore, types::App};
+
+/// A session whose last recorded activity is older than this many hours is
+/// tagged `stale` in the listing: its process may still be alive, but no
+/// agent work has happened recently.
+const STALE_AFTER_HOURS: i64 = 24;
 
 /// Merged active-session record.
 struct ActiveSession {
@@ -106,9 +118,6 @@ pub fn try_handle_proc_command(app: &App, input: &str) -> Result<bool, Box<dyn s
         return Ok(true);
     }
 
-    println!("Active main agents ({identified}):");
-    println!();
-
     // Query the tty of all active sessions in one batch: a single `ps` call
     // instead of per-process fork/exec.
     let active_pids: Vec<i32> = sessions.iter().map(|s| s.pid).collect();
@@ -118,7 +127,8 @@ pub fn try_handle_proc_command(app: &App, input: &str) -> Result<bool, Box<dyn s
     // list_sessions(): it opens the .sqlite of every saved session and
     // recursively counts each session's assets/checkpoints directory sizes,
     // while /proc only needs a text preview of a few active sessions.
-    let previews: BTreeMap<String, (Option<String>, Option<String>)> = sessions
+    let stale_cutoff = Local::now() - chrono::Duration::hours(STALE_AFTER_HOURS);
+    let previews: BTreeMap<String, (Option<String>, Option<DateTime<Local>>)> = sessions
         .iter()
         .map(|s| {
             let (summary, modified) = store
@@ -126,23 +136,41 @@ pub fn try_handle_proc_command(app: &App, input: &str) -> Result<bool, Box<dyn s
                 .ok()
                 .flatten()
                 .unwrap_or((None, None));
-            let modified = modified.map(|t| t.format("%Y-%m-%d %H:%M").to_string());
             (s.session_id.clone(), (summary, modified))
         })
         .collect();
+    let stale_count = sessions
+        .iter()
+        .filter(|s| {
+            is_stale(
+                previews.get(&s.session_id).and_then(|(_, modified)| modified.as_ref()),
+                stale_cutoff,
+            )
+        })
+        .count();
+
+    if stale_count > 0 {
+        println!("Active main agents ({identified}, {stale_count} stale):");
+        println!("  (stale: process alive, but no recorded activity for > {STALE_AFTER_HOURS}h)");
+    } else {
+        println!("Active main agents ({identified}):");
+    }
+    println!();
 
     for s in &sessions {
-        let tag = if *tty_map.get(&s.pid).unwrap_or(&false) {
+        let (summary, modified) = previews.get(&s.session_id).cloned().unwrap_or((None, None));
+        let stale = is_stale(modified.as_ref(), stale_cutoff);
+        let tag = if stale {
+            "stale"
+        } else if *tty_map.get(&s.pid).unwrap_or(&false) {
             "interactive"
         } else {
             "background"
         };
 
-        let (summary, modified) = previews.get(&s.session_id).cloned().unwrap_or((None, None));
-
         println!("  [{tag:<11}]  pid={:<8}  session={}", s.pid, s.session_id);
         if let Some(m) = &modified {
-            println!("                modified: {m}");
+            println!("                modified: {}", m.format("%Y-%m-%d %H:%M"));
         }
         println!(
             "                summary : {}",
@@ -159,6 +187,13 @@ pub fn try_handle_proc_command(app: &App, input: &str) -> Result<bool, Box<dyn s
                 println!("                {line}");
             }
         }
+        println!();
+    }
+
+    if stale_count > 0 {
+        println!("Note: {stale_count} stale session(s): process alive, but no recorded activity for > {STALE_AFTER_HOURS}h.");
+        println!("      Likely orphaned terminal sessions (closed tab) or abandoned sessions.");
+        println!("      Re-attach with `a -ss <id>`; manage with /sessions list and /sessions close.");
         println!();
     }
 
@@ -186,6 +221,13 @@ fn insert_active_session(
             pid,
             source,
         });
+}
+
+/// A session counts as stale when its last recorded activity predates the
+/// cutoff: its process may still be alive, but no agent work is happening.
+/// Sessions whose activity cannot be determined are never stale.
+fn is_stale(modified: Option<&DateTime<Local>>, cutoff: DateTime<Local>) -> bool {
+    modified.is_some_and(|modified| *modified < cutoff)
 }
 
 fn format_subagent_tree(snapshots: &[session_pid::AgentSnapshot]) -> Vec<String> {
@@ -269,6 +311,8 @@ fn print_proc_help() {
     println!("  /proc list                same as /proc");
     println!("  /proc help                show this help message");
     println!();
+    println!("Sessions idle for more than {STALE_AFTER_HOURS}h are tagged stale (process alive, no activity).");
+    println!();
     println!("Note: sessions suspended via /bg or /suspend are NOT shown here -");
     println!("      their processes have exited. Use /sessions list to see all saved sessions.");
     println!();
@@ -319,5 +363,14 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[&("shared-session".to_string(), 101)].pid, 101);
         assert_eq!(sessions[&("shared-session".to_string(), 202)].pid, 202);
+    }
+
+    #[test]
+    fn stale_detection_uses_last_activity_cutoff() {
+        let now = Local::now();
+        let cutoff = now - chrono::Duration::hours(STALE_AFTER_HOURS);
+        assert!(is_stale(Some(&(now - chrono::Duration::hours(25))), cutoff));
+        assert!(!is_stale(Some(&(now - chrono::Duration::hours(23))), cutoff));
+        assert!(!is_stale(None, cutoff));
     }
 }

@@ -207,6 +207,12 @@ fn register_cli_flags(parser: &mut TermParser) {
     parser.alias("m", "model");
     parser.add_string("agent", "", "agent name");
     parser.alias("a", "agent");
+    parser.add_bool(
+        "sharp",
+        false,
+        "use sharp agent with low reasoning effort (shortcut for --agent sharp --reasoning-effort low)",
+    );
+    parser.alias("s", "sharp");
     parser.add_string("session", "", "session id");
     parser.alias("ss", "session");
     parser.add_string("files", "", FILES_USAGE);
@@ -287,6 +293,17 @@ fn option_token_kind(tok: &str, kinds: &FastMap<String, CliOptionKind>) -> Optio
     kinds.get(bare).copied()
 }
 
+/// True when `tok` (ignoring any `=value` suffix) is a dash-flag the slash
+/// command owns itself. Such tokens are never `a` options even if a global
+/// alias collides: `-s` behind `/changes` is `--stat`, not `--sharp`.
+fn is_reserved_command_flag(tok: &str, reserved: &[&str]) -> bool {
+    if !tok.starts_with('-') || tok.len() <= 1 {
+        return false;
+    }
+    let bare = tok.split('=').next().unwrap_or(tok);
+    reserved.contains(&bare)
+}
+
 /// Index of the first local-command token. A token claimed as a preceding
 /// option's value is part of that option, never a command start: in
 /// `a --model /sessions list`, `/sessions` is the model value. The claim rules
@@ -330,16 +347,24 @@ fn find_command_start(argv: &[String], kinds: &FastMap<String, CliOptionKind>) -
 /// the command (`a /sessions list --model x` still selects the model) while
 /// unknown flags stay verbatim with the command. Option names match exactly;
 /// a bool cluster such as `-hi` behind the command passes through as command
-/// text.
+/// text. Tokens the command owns itself (`commands::local_command_reserved_flags`,
+/// e.g. `-s` behind `/changes`) are never extracted even when a global alias
+/// collides.
 fn protect_slash_command_args(argv: &mut Vec<String>, kinds: &FastMap<String, CliOptionKind>) {
     let Some(idx) = find_command_start(argv, kinds) else {
         return;
     };
+    let reserved = crate::ai::driver::commands::local_command_reserved_flags(&argv[idx]);
     let mut command_text: Vec<&str> = Vec::new();
     let mut extracted: Vec<String> = Vec::new();
     let mut i = idx;
     while i < argv.len() {
         let tok = argv[i].as_str();
+        if is_reserved_command_flag(tok, reserved) {
+            command_text.push(tok);
+            i += 1;
+            continue;
+        }
         let Some(kind) = option_token_kind(tok, kinds) else {
             command_text.push(tok);
             i += 1;
@@ -544,6 +569,11 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
             cli.agent = Some(val);
         }
     }
+    // Handle sharp shortcut: `-s` / `--sharp` selects the sharp agent unless
+    // an explicit `--agent` value already wins.
+    if parser.contains_flag_strict("sharp") && cli.agent.is_none() {
+        cli.agent = Some("sharp".to_string());
+    }
 
     // Handle clear (combined with --session, clears the given session's history).
     cli.clear = parser.contains_flag_strict("clear");
@@ -641,6 +671,13 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         }
     }
 
+    // The sharp agent implies low reasoning effort, but it is derived at
+    // request time from the live agent (`request::reasoning::
+    // resolve_reasoning_effort`), not stored here: writing it into the
+    // override at parse time would leave a stale `low` behind after `/agent
+    // build` and miss `/agent sharp` switches. An explicit
+    // `--reasoning-effort` above always wins over the derivation.
+
     // Handle positional arguments (prompt args).
     cli.args = parser.positional_args(false);
 
@@ -660,6 +697,7 @@ pub(super) fn print_help() {
     println!("QUICK START:");
     println!("  a fix the bug in main.rs      One-shot prompt");
     println!("  a -i \"explain this code\"      Start REPL after prompt");
+    println!("  a -s \"quick question\"         One-shot with the sharp agent (low reasoning)");
     println!("  a -bg refactor the auth       Run in background (logs to <id>.log)");
     println!("  a --stop <session-id>         Stop a background session");
     println!("  a -n \"TODO: remember this\"    Save a memo and exit");

@@ -139,6 +139,10 @@ impl App {
     ///   still opt into a tier explicitly via the `reasoning_effort` task arg.
     /// - `thinking_disabled_override`: turn-scoped truncation-ladder state
     ///   (documented as restored at turn end); a child must never see it.
+    /// Agent-implied defaults (e.g. the sharp agent's `low`, derived from the
+    /// live `current_agent` at resolve time) intentionally survive: the child
+    /// runs under the same agent identity, and an explicit `reasoning_effort`
+    /// task arg still wins over the implication.
     fn reset_child_reasoning_controls(app: &mut Self) {
         app.cli.reasoning_effort_override = None;
         app.cli.thinking_disabled_override = false;

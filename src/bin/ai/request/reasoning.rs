@@ -317,8 +317,11 @@ pub(crate) fn model_effort_graded(model: &str) -> bool {
 /// 1. CLI argument `--reasoning-effort` or the `/model effort <x>` override
 ///    stored in [`App.cli.reasoning_effort_override`] (`Some(None)` = user
 ///    explicitly disabled; `None` = not set);
-/// 2. The model registry ([models/](../../../../models)) default `reasoning_effort`;
-/// 3. `None` -- no field injected, server default applies.
+/// 2. The sharp agent's implied `low` (derived from the live `current_agent`,
+///    so `/agent` switches and startup fallbacks take effect with no state
+///    sync — an explicit override above always wins over it);
+/// 3. The model registry ([models/](../../../../models)) default `reasoning_effort`;
+/// 4. `None` -- no field injected, server default applies.
 ///
 /// An explicit "off" (`Some(None)`) is treated as a request to actually turn
 /// thinking off. Per-vendor adaptation, driven by the dialect's declared off
@@ -343,6 +346,14 @@ pub(crate) fn resolve_reasoning_effort(app: &App, model: &str) -> Option<Reasoni
             }
             _ => return None,
         }
+    }
+    if app.current_agent == "sharp" {
+        // Sharp means minimal deliberation; the configured default (often
+        // `max`) would defeat it. Derived here — not stored in the override
+        // at CLI parse — so switching agents mid-session (`/agent sharp` /
+        // `/agent build`) and startup fallbacks immediately change the
+        // effective tier instead of leaving a stale value behind.
+        return Some(ReasoningEffort::Low);
     }
     models::default_reasoning_effort(model)
 }

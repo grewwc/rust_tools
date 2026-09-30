@@ -589,6 +589,46 @@ fn system_prompt_only_mentions_tools_available_this_turn() {
 }
 
 #[test]
+fn system_prompt_keeps_subagent_orchestration_lazy_without_task_tools() {
+    // Sharp-style turns (core tools only, no pinned task_* tools) must not
+    // carry the subagent-orchestration prose: resident task tools inject the
+    // "delegate every step" / "task_status before finishing" guidance, which
+    // directly fights a decisive single-pass agent. Task tools stay
+    // discoverable via enable_tools instead.
+    let mut core_only = SkipSet::new(16);
+    for name in ["read_file", "apply_patch", "enable_tools", "plan"] {
+        core_only.insert(name.to_string());
+    }
+    let lean = build_system_prompt(None, &[], &Box::new(core_only), &PromptContext::default())
+        .render_system_prompt();
+    assert!(!lean.contains("<async_subagent_orchestration>"));
+    assert!(!lean.contains("mark `delegate: true`"));
+
+    let mut with_tasks = SkipSet::new(16);
+    for name in [
+        "read_file",
+        "apply_patch",
+        "enable_tools",
+        "plan",
+        "task_spawn",
+        "task_wait",
+        "task_status",
+        "task_integrate",
+    ] {
+        with_tasks.insert(name.to_string());
+    }
+    let heavy =
+        build_system_prompt(None, &[], &Box::new(with_tasks), &PromptContext::default())
+            .render_system_prompt();
+    assert!(heavy.contains("<async_subagent_orchestration>"));
+    let saved = heavy.len().saturating_sub(lean.len());
+    assert!(
+        saved >= 1000,
+        "expected >=1000 chars of orchestration prose kept out of lean turns, got {saved}"
+    );
+}
+
+#[test]
 fn system_prompt_forbids_breaking_other_modules_to_satisfy_a_requirement() {
     // Unconditionally rendered system constraint: implementing a requirement must not come at the cost of breaking other modules; conflicts must be reported, not silently broken.
     // Goal mode is the most likely to "sacrifice existing functionality to reach the goal", so both the default and goal paths must verify the constraint is present.

@@ -49,6 +49,12 @@ struct Host {
     completed: Option<(i32, Instant)>,
     completion_delivered: bool,
     started: Instant,
+    /// When the worker last had zero attached frontends (or `None` while a
+    /// frontend is attached / no worker exists). Drives idle reaping.
+    idle_since: Option<Instant>,
+    /// How long a completed or frontend-less host/worker pair is retained.
+    /// `COMPLETED_RETENTION` in production; shortened in tests.
+    retention: Duration,
 }
 
 pub(super) fn run(root: PathBuf, name: String, token: String, worker_args: Vec<String>) -> io::Result<i32> {
@@ -60,13 +66,14 @@ impl Host {
         let bootstrap = Lease::bind(root.join(&name))?;
         Ok(Self { root, name, token, bootstrap, current: None, pending: None, terminal: None,
             peers: Vec::new(), worker: None, command, worker_args, replay: Replay::default(),
-            completed: None, completion_delivered: false, started: Instant::now() })
+            completed: None, completion_delivered: false, started: Instant::now(),
+            idle_since: None, retention: COMPLETED_RETENTION })
     }
 
     fn run(mut self) -> io::Result<i32> {
         loop {
             if let Some((code, ended)) = self.completed {
-                if self.completion_delivered || ended.elapsed() >= COMPLETED_RETENTION { return Ok(code); }
+                if self.completion_delivered || ended.elapsed() >= self.retention { return Ok(code); }
             } else if self.worker.is_none() && self.started.elapsed() > Duration::from_secs(15) {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "terminal client did not attach"));
             }
@@ -102,6 +109,17 @@ impl Host {
                 if peer.role != Role::Attached && peer.since.elapsed() > CONNECT_TIMEOUT { peer.alive = false; }
             }
             self.peers.retain(|peer| peer.alive);
+            // A worker with no attached frontend for the retention window is
+            // an abandoned session: its client is gone (closed terminal or
+            // killed shell) and without reaping the host+worker pair would
+            // leak forever, waiting on a dead PTY. Reap it like a normal
+            // completion, so re-attach stays possible until this point.
+            let idle = self.worker.is_some() && self.completed.is_none() && self.peers.is_empty();
+            if idle && self.idle_since.is_none() { self.idle_since = Some(Instant::now()); }
+            if !idle { self.idle_since = None; }
+            if let Some(since) = self.idle_since {
+                if since.elapsed() >= self.retention { return self.reap_idle_worker(); }
+            }
         }
     }
 
@@ -328,6 +346,35 @@ impl Host {
             }
         }
     }
+
+    /// Terminate an idle worker and exit the host. The worker has had no
+    /// attached frontend for the retention window, so nobody can receive its
+    /// output; SIGTERM first lets the agent persist in-flight state, SIGKILL
+    /// after a short grace so the pair cannot leak.
+    fn reap_idle_worker(&mut self) -> io::Result<i32> {
+        let Some(worker) = &mut self.worker else { return Ok(0); };
+        let code = match worker.child.try_wait() {
+            Ok(Some(status)) => status.code().unwrap_or(128 + status.signal().unwrap_or(libc::SIGTERM)),
+            _ => {
+                unsafe { libc::kill(worker.child.id() as libc::pid_t, libc::SIGTERM) };
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let code = loop {
+                    if let Ok(Some(status)) = worker.child.try_wait() {
+                        break status.code().unwrap_or(128 + status.signal().unwrap_or(libc::SIGTERM));
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = worker.child.kill();
+                        let _ = worker.child.wait();
+                        break 128 + libc::SIGKILL;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                };
+                code
+            }
+        };
+        self.worker = None;
+        Ok(code)
+    }
 }
 
 impl Drop for Host {
@@ -474,5 +521,59 @@ mod tests {
             "attaching to an already-finished worker must not reprint its transcript, got: {}",
             String::from_utf8_lossy(&output),
         );
+    }
+
+    #[test]
+    fn idle_worker_without_frontend_is_reaped_after_retention() {
+        // Short retention so the test runs in seconds instead of 10 minutes.
+        let tag: String = uuid::Uuid::new_v4().simple().to_string()[..8].into();
+        let root = std::env::temp_dir().join(format!("a-pty-t-{tag}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let name = format!("tt-{tag}");
+        let socket = root.join(&name);
+        let (root2, name2) = (root.clone(), name.clone());
+        let mut worker = Command::new("/bin/sh");
+        worker.args(["-c", "printf 'hi\\n'; read line"]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = std::thread::spawn(move || {
+            let mut host = Host::new(root2, name2, "tok".into(), Vec::new(), Some(worker)).unwrap();
+            host.retention = Duration::from_millis(300);
+            let _ = tx.send(host.run());
+        });
+        // Attach a real client so the worker spawns, then drop the connection
+        // like a closed terminal: the host must reap the idle pair and exit.
+        let stream = connect_socket_retry(&socket, StdDuration::from_secs(5));
+        let reply = wire::rpc(&socket, Request::Attach {
+            terminal: "test-terminal".into(),
+            window: Window { rows: 24, cols: 80 },
+        })
+        .unwrap();
+        assert!(reply.error.is_none());
+        drop(stream);
+        // Bound the wait so a wedged host fails the test instead of hanging
+        // the whole suite.
+        rx.recv_timeout(StdDuration::from_secs(10))
+            .expect("host must exit after reaping the idle worker")
+            .expect("host.run must succeed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Retry-connect to a fresh host socket, tolerating the bind/chmod race
+    /// between the listener socket file appearing and becoming 0600.
+    fn connect_socket_retry(socket: &std::path::Path, timeout: StdDuration) -> UnixStream {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match UnixStream::connect(socket) {
+                Ok(stream) => return stream,
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        || error.kind() == io::ErrorKind::PermissionDenied => {}
+                Err(error) => panic!("connect failed: {error}"),
+            }
+            if Instant::now() >= deadline {
+                panic!("timed out connecting to {}", socket.display());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }

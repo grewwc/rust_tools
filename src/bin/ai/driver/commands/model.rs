@@ -22,7 +22,7 @@ fn print_model_help() {
     println!("                                      override reasoning effort");
     println!("  /model effort off|none             disable thinking (per-vendor wire adaptation)");
     println!("  /model effort auto|clear|default|reset");
-    println!("                                      clear override (use model default)");
+    println!("                                      clear override (use agent/model default)");
     println!("  /effort <level|off|auto>            standalone shortcut for /model effort");
     println!();
 }
@@ -105,7 +105,7 @@ fn print_model_list(app: &App) {
 /// standalone `/effort <level>` command. `arg` is everything after the subcommand:
 ///
 /// - empty → show the current effective effort and override state
-/// - `auto|clear|default|reset` → clear the override (use the model default)
+/// - `auto|clear|default|reset` → clear the override (use the agent/model default)
 /// - `off|none|no|false|disable|disabled` → force the effort field off entirely
 /// - a tier name → set the override to that tier
 ///
@@ -128,8 +128,10 @@ fn handle_effort_arg(app: &mut App, arg: &str) -> Result<bool, Box<dyn std::erro
         "auto" | "clear" | "default" | "reset" => {
             app.cli.reasoning_effort_override = None;
             println!(
-                "Cleared reasoning_effort override; now using model default ({}).",
-                format_effort(models::default_reasoning_effort(&app.current_model))
+                "Cleared reasoning_effort override; now using {}.",
+                // Effective tier, not the registry default: on the sharp agent
+                // the clear falls back to the implied `low`.
+                reasoning_effort_display_label(app, &app.current_model)
             );
             return Ok(true);
         }

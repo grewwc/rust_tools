@@ -15,6 +15,8 @@
 // Builtin agents:
 //   - build: Default unified development agent (planning, code-writing, execution, prompt engineering, exploration)
 //   - audit: Evidence-driven code, configuration, prompt, and behavior reviewer
+//   - audit-fast: Bounded quick review for light/simple changes
+//   - sharp: Fast decisive answers and fixes with minimal reasoning overhead
 // =============================================================================
 
 use rust_tools::cw::SkipMap;
@@ -33,6 +35,7 @@ const BUILTIN_AGENTS: &[(&str, &str)] = &[
         "audit-fast.agent",
         include_str!("builtin_agents/audit-fast.agent"),
     ),
+    ("sharp.agent", include_str!("builtin_agents/sharp.agent")),
 ];
 const PROJECT_INSTRUCTION_FILENAMES: &[&str] = &[
     "AGENTS.md",

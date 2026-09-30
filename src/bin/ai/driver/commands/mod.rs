@@ -103,6 +103,38 @@ pub fn is_local_command_start(token: &str) -> bool {
     )
 }
 
+/// Dash-flag tokens owned by the named local command's own grammar.
+///
+/// The one-shot CLI (`cli.rs::protect_slash_command_args`) extracts registered
+/// `a` options from behind a slash command, but a token the command itself
+/// interprets must stay verbatim: `/changes -s` means `--stat`, not `--sharp`,
+/// and `/changes -h` means command help, not global help. Keep each entry in
+/// sync with that command's parser (`changes.rs` here): a missing entry
+/// silently re-enables the steal. Tokens match without any `=value` suffix, so
+/// `--open=vscode` is covered by `--open`.
+pub fn local_command_reserved_flags(head: &str) -> &'static [&'static str] {
+    let trimmed = head.trim();
+    let word = trimmed
+        .strip_prefix('/')
+        .or_else(|| trimmed.strip_prefix(':'))
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or("");
+    match word {
+        "changes" | "diff" => &[
+            "-h", "--help", "--stat", "-s", "--json", "--patch", "--open",
+        ],
+        // `/audit -f` is fast mode (`audit.rs::strip_fast_flag`); `-f` also
+        // collides with the global `--files` alias, which would additionally
+        // swallow the following token as a file path.
+        "audit" => &["-f", "--fast"],
+        // `--prefix` is not a registered global today, so this entry changes
+        // no current behavior; it only guards the `sessions delete --prefix`
+        // grammar against a future global collision of the same shape.
+        "sessions" | "session" | "ss" => &["--prefix"],
+        _ => &[],
+    }
+}
+
 /// Handle local slash commands that do not depend on skill/agent manifests.
 ///
 /// These commands (/usage, /help, /model, /goal, ...) can be dispatched before

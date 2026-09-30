@@ -2257,6 +2257,7 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
     if let Some(editor) = app.prompt_editor.as_mut() {
         crate::ai::prompt::completion::CommandCompleter::set_current_model_hint(&app.current_model);
         editor.set_current_model_label(&model_label);
+        editor.set_current_agent_label(&app.current_agent);
         editor.set_current_reasoning_effort_label(reasoning_effort_label);
         editor.set_session_id(app.session_id.clone());
         // 设置 session 主题：从当前 session 的首条用户消息生成概括性标题。

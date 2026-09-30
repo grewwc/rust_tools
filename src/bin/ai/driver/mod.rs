@@ -599,7 +599,14 @@ pub(in crate::ai) async fn run_with_cli(
         pending_skill_continuation: None,
         forced_question: None,
         current_model,
-        current_agent: "build".to_string(),
+        // Preset the CLI-selected agent so the first screen already shows it:
+        // manifests load in the background and `install_runtime_manifests` only
+        // applies `cli.agent` after that scan, which previously left the status
+        // bar on "build" for `a -s` / `--agent` launches.
+        current_agent: cli
+            .agent
+            .clone()
+            .unwrap_or_else(|| "build".to_string()),
         current_agent_manifest: None,
         session_id: session_id.clone(),
         session_history_file: session_store.session_history_file(&session_id),

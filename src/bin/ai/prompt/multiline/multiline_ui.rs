@@ -1553,6 +1553,7 @@ impl PromptEditor {
                                 &mut textarea,
                                 status_msg.as_deref(),
                                 completion_panel.as_ref(),
+                                &self.current_agent_label,
                                 &self.current_model_label,
                                 &self.current_reasoning_effort_label,
                                 self.session_topic.as_deref(),
@@ -1795,6 +1796,7 @@ mod tests {
             pending_prefill: None,
             pending_status_msg: None,
             current_model_label: "fixture-model".to_string(),
+            current_agent_label: "fixture-agent".to_string(),
             current_reasoning_effort_label: "high".to_string(),
             session_topic: Some("fixture-topic".to_string()),
             session_title_update_subscription: subscription,
@@ -1907,7 +1909,7 @@ mod tests {
             terminal.draw(|frame| {
                 area = frame.area();
                 caret = super::render_multiline_popup(
-                    frame, &mut textarea, None, None, "fixture-model", "high",
+                    frame, &mut textarea, None, None, "", "fixture-model", "high",
                     Some("fixture-topic"),
                 );
                 screen.box_row_widths = super::painted_row_widths(frame.buffer_mut(), area);

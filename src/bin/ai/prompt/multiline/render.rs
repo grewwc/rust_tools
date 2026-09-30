@@ -218,6 +218,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     textarea: &mut TextArea<'_>,
     status_msg: Option<&str>,
     completion_panel: Option<&CompletionPanel>,
+    agent_label: &str,
     model_label: &str,
     reasoning_effort_label: &str,
     session_topic: Option<&str>,
@@ -233,7 +234,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         trailing_blank_lines,
         completion_panel.map(|panel| panel.items.len()),
         status_msg.is_some(),
-        !model_label.is_empty(),
+        !model_label.is_empty() || !agent_label.is_empty(),
     );
     let popup = geometry.popup;
     let chunks = geometry.chunks;
@@ -242,20 +243,39 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // Clear the popup area so old borders/text do not linger after a resize
     f.render_widget(Clear, popup);
 
-    // Bottom model/topic info line: lets the user see the current model and session topic while typing.
+    // Bottom agent/model/topic info line: lets the user see the current agent, model and session topic while typing.
     // Draw it in the dedicated bottom chunk (chunks[3], above the help line) so
     // textarea growth does not move it through the editing region.
     if chunks[3].height > 0 {
         let header_area = chunks[3];
-        let mut spans = vec![
-            Span::styled(" model: ", Style::default().fg(Color::Rgb(148, 163, 184))),
-            Span::styled(
-                model_label,
+        let mut spans = Vec::new();
+        if !agent_label.is_empty() {
+            spans.push(Span::styled(
+                " agent: ",
+                Style::default().fg(Color::Rgb(148, 163, 184)),
+            ));
+            spans.push(Span::styled(
+                agent_label,
                 Style::default()
                     .fg(Color::Rgb(134, 194, 166))
                     .add_modifier(Modifier::BOLD),
-            ),
-        ];
+            ));
+            spans.push(Span::styled(
+                "  |  model: ",
+                Style::default().fg(Color::Rgb(100, 116, 139)),
+            ));
+        } else {
+            spans.push(Span::styled(
+                " model: ",
+                Style::default().fg(Color::Rgb(148, 163, 184)),
+            ));
+        }
+        spans.push(Span::styled(
+            model_label,
+            Style::default()
+                .fg(Color::Rgb(134, 194, 166))
+                .add_modifier(Modifier::BOLD),
+        ));
         if !reasoning_effort_label.is_empty() {
             spans.push(Span::styled(
                 "  |  reasoning: ",
@@ -570,6 +590,7 @@ pub(in crate::ai::prompt::multiline) fn measure_multiline_cursor_offset(
     viewport_size: Size,
     status_msg: Option<&str>,
     completion_panel: Option<&CompletionPanel>,
+    agent_label: &str,
     model_label: &str,
 ) -> Option<Position> {
     let area = Rect::new(0, 0, viewport_size.width, viewport_size.height);
@@ -582,7 +603,7 @@ pub(in crate::ai::prompt::multiline) fn measure_multiline_cursor_offset(
         count_trailing_blank_lines(&current_lines),
         completion_panel.map(|panel| panel.items.len()),
         status_msg.is_some(),
-        !model_label.is_empty(),
+        !model_label.is_empty() || !agent_label.is_empty(),
     );
     let mut measured = textarea.clone();
     measured.set_alignment(Alignment::Left);
@@ -805,7 +826,7 @@ mod tests {
             terminal
                 .draw(|frame| {
                     render_multiline_popup(
-                        frame, &mut textarea, None, None, "model", "high", None,
+                        frame, &mut textarea, None, None, "", "model", "high", None,
                     );
                 })
                 .unwrap();
@@ -931,6 +952,7 @@ mod tests {
                     &mut textarea,
                     None,
                     None,
+                    "",
                     "glm-5.2-super-relay",
                     "max",
                     Some(&long_topic),
@@ -994,6 +1016,7 @@ mod tests {
                     &mut textarea,
                     None,
                     None,
+                    "",
                     "deepseek-v4.1-flash-volcano",
                     "max",
                     Some(topic),
@@ -1045,6 +1068,7 @@ mod tests {
                     &mut textarea,
                     None,
                     None,
+                    "",
                     "deepseek-v4.1-flash-volcano",
                     "max",
                     Some(topic),
@@ -1123,6 +1147,7 @@ mod tests {
                     &mut textarea,
                     None,
                     None,
+                    "",
                     "glm-5.2-super-relay",
                     "max",
                     None,
@@ -1160,6 +1185,44 @@ mod tests {
     }
 
     #[test]
+    fn model_line_shows_current_agent_label() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .unwrap();
+        let mut textarea = TextArea::default();
+        let mut viewport_area = Rect::ZERO;
+
+        terminal
+            .draw(|f| {
+                viewport_area = f.area();
+                let _ = render_multiline_popup(
+                    f,
+                    &mut textarea,
+                    None,
+                    None,
+                    "build",
+                    "glm-5.2-super-relay",
+                    "max",
+                    None,
+                );
+            })
+            .unwrap();
+
+        let rendered = (viewport_area.y..viewport_area.bottom())
+            .map(|y| buffer_row(terminal.backend(), y, viewport_area.x, viewport_area.width))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("agent:"));
+        assert!(rendered.contains("build"));
+        assert!(rendered.contains("model:"));
+    }
+
+    #[test]
     fn normal_editor_renders_without_decorative_divider_rows() {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::with_options(
@@ -1180,6 +1243,7 @@ mod tests {
                     &mut textarea,
                     None,
                     None,
+                    "",
                     "glm-5.2-super-relay",
                     "max",
                     None,
@@ -1225,6 +1289,7 @@ mod tests {
                     &mut textarea,
                     Some("已补全为 gpt-6-astra"),
                     None,
+                    "",
                     "deepseek-v4-flash-volcano",
                     "max",
                     Some("将kernel.rs中文注释改为英文"),
@@ -1264,6 +1329,7 @@ mod tests {
                     &mut textarea,
                     None,
                     None,
+                    "",
                     "glm-5.2-super-relay",
                     "max",
                     None,
@@ -1305,6 +1371,7 @@ mod tests {
                     &mut textarea,
                     None,
                     None,
+                    "",
                     "glm-5.2-super-relay",
                     "max",
                     None,
@@ -1349,6 +1416,7 @@ mod tests {
                     &mut textarea,
                     None,
                     None,
+                    "",
                     "glm-5.2-super-relay",
                     "max",
                     None,
