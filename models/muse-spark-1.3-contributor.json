@@ -13,6 +13,6 @@
   "reasoning_encrypted_replay": true,
   "context_window_tokens": 1048576,
   "max_output_tokens": 131072,
-  "stream_silence_timeout_secs": 180,
+  "stream_silence_timeout_secs": 360,
   "endpoint": "https://opencode.ai/zen/go/v1/responses"
 }
