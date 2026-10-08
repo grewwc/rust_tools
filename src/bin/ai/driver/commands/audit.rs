@@ -17,6 +17,8 @@ pub(crate) const FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME: Duration = Duration::fro
 
 const SUBAGENT_FINAL_ANSWER_MARKER: &str = "[Subagent final answer]\n";
 const AUDIT_PROGRESS_PROTOCOL: &str = include_str!("prompts/audit_progress_protocol.md");
+/// Builtin skill whose procedure the self-generated `/audit` note quotes.
+const AUDIT_PROCEDURE_SKILL: &str = "audit_own_changes";
 
 /// `/audit` 需要在已有 DRIVER_CTX 的 turn 内启动同步子代理，因此这里只识别命令，
 /// 实际执行由 turn_runtime 在进入模型循环前完成。
@@ -76,40 +78,40 @@ fn strip_fast_flag(instruction: &str) -> Option<&str> {
     Some(rest.trim_start())
 }
 
-/// 缺省 `/audit`（无指令）时注入 lead agent 的模型可见指引：审查范围由 lead agent
-/// 自行决定（只有它清楚本会话改动的细节），生成自包含的审计 prompt 后通过 `task`
-/// 工具启动 audit / audit-fast 子代理——与 `audit_own_changes` skill 的自主路径一致。
-/// 只写入 `messages` 投影（如同 loop 提示），不进入持久化的 turn_messages。
+/// Guidance injected for `/audit` without an instruction: the audit scope is left to the lead
+/// agent (only it knows what changed in this session), which builds the self-contained audit
+/// prompt and starts the `audit` / `audit-fast` subagent through the `task` tool.
+///
+/// The procedure is not restated here: it is quoted verbatim from the builtin
+/// `audit_own_changes` skill, so the command path and the skill text cannot drift apart.
+/// Written to the `messages` projection only (like loop notes), never to persisted turn messages.
 pub(crate) fn inject_self_generated_audit_note(
     messages: &mut Vec<crate::ai::history::Message>,
     fast: bool,
 ) {
     let mode = if fast { "/audit -f (fast)" } else { "/audit" };
     let agent = if fast { "audit-fast" } else { "audit" };
+    let procedure = match crate::ai::skills::builtin_skill_body(AUDIT_PROCEDURE_SKILL) {
+        Some(body) => format!(
+            "Follow the `{AUDIT_PROCEDURE_SKILL}` skill quoted below verbatim:\n\
+             ----- begin `{AUDIT_PROCEDURE_SKILL}` -----\n\
+             {body}\n\
+             ----- end `{AUDIT_PROCEDURE_SKILL}` -----"
+        ),
+        None => format!(
+            "The builtin `{AUDIT_PROCEDURE_SKILL}` skill text is unavailable; activate that skill \
+             (`enable_tools` -> `list_skills` -> `activate_skill`) and follow it, or ask the user \
+             to re-run `/audit <audit_prompt>` with the audit scope spelled out."
+        ),
+    };
     let note = format!(
         "[audit-self-generated] The user invoked {mode} without an audit instruction: the audit \
          scope is left to you, the lead agent, because only you know the details of what you \
-         changed in this session.\n\
+         changed in this session. This explicit invocation, not any skill's activation criteria, \
+         decides that an audit runs now, and it starts agent=\"{agent}\" instead of letting the \
+         skill pick the tier.\n\
          \n\
-         Build a self-contained audit prompt yourself:\n\
-         1. Scope: cover ONLY the changes you made for the current request; list the changed \
-         files, and tell the auditor to ignore other workspace changes, concurrent work, or \
-         pre-existing issues unless they directly affect these changes.\n\
-         2. Change summary: for each changed file, state what changed and why, so the auditor \
-         can distinguish your intent from unrelated diffs.\n\
-         3. Verification focus: list the invariants, edge cases, and regression risks to check \
-         (compilation, behavior changes, error handling, concurrency or side effects, \
-         configuration impact).\n\
-         \n\
-         Then start the audit:\n\
-         - If `task` is not in your available tools, first call `enable_tools` with \
-         {{\"operation\":\"enable\",\"tools\":[\"task\"]}}.\n\
-         - Call `task` with agent=\"{agent}\" and the self-contained prompt as `prompt`. The \
-         audit subagent cannot see this conversation, so the prompt must stand alone; require it \
-         to inspect the relevant files / git diff itself when needed.\n\
-         - After the audit subagent returns, verify every finding against the code, fix \
-         confirmed issues, re-run the appropriate verification, then report the outcome to the \
-         user."
+         {procedure}"
     );
     messages.push(crate::ai::history::Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
@@ -330,8 +332,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AUDIT_SUBAGENT_HARD_TIMEOUT, AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME, AuditCommand,
-        FAST_AUDIT_SUBAGENT_HARD_TIMEOUT, FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME,
+        AUDIT_PROCEDURE_SKILL, AUDIT_SUBAGENT_HARD_TIMEOUT, AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME,
+        AuditCommand, FAST_AUDIT_SUBAGENT_HARD_TIMEOUT, FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME,
         compose_audit_prompt, format_mutation_log, inject_self_generated_audit_note,
         parse_audit_command, terminal_audit_result,
     };
@@ -429,8 +431,15 @@ mod tests {
     }
 
     #[test]
-    fn inject_self_generated_audit_note_injects_internal_note_with_steps() {
+    fn inject_self_generated_audit_note_quotes_the_builtin_skill() {
         use crate::ai::history::ROLE_INTERNAL_NOTE;
+        use crate::ai::skills::builtin_skill_body;
+
+        let body = builtin_skill_body(AUDIT_PROCEDURE_SKILL)
+            .expect("the builtin audit_own_changes skill is compiled in");
+        // Pin the source independently of the note, so quoting the wrong builtin cannot pass.
+        assert!(body.starts_with("# Self-audit"), "{body}");
+
         let mut messages = Vec::new();
         inject_self_generated_audit_note(&mut messages, false);
         assert_eq!(messages.len(), 1);
@@ -438,12 +447,10 @@ mod tests {
         let note = messages[0].content.as_str().unwrap();
         assert!(note.contains("[audit-self-generated]"), "{note}");
         assert!(note.contains("agent=\"audit\""), "{note}");
-        assert!(note.contains("enable_tools"), "{note}");
-        assert!(note.contains("Scope: cover ONLY the changes"), "{note}");
-        assert!(note.contains("Change summary"), "{note}");
-        assert!(note.contains("Verification focus"), "{note}");
+        // The note quotes the shipped skill text verbatim instead of restating the procedure.
+        assert_eq!(note.matches(body.as_str()).count(), 1, "{note}");
 
-        // fast 模式指明 audit-fast 子代理。
+        // Fast mode names the audit-fast subagent.
         let mut fast_messages = Vec::new();
         inject_self_generated_audit_note(&mut fast_messages, true);
         let fast_note = fast_messages[0].content.as_str().unwrap();

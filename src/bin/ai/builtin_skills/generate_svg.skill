@@ -1,0 +1,76 @@
+---
+name: generate_svg
+version: 1.0.0
+description: "Generate SVG images directly from code. Use when the user asks for an image, icon, logo, diagram, flowchart, chart, or illustration that can be expressed as vector graphics. Produces a complete, well-formed SVG file in one shot, then verifies and iterates."
+author: rust_tools
+priority: 0
+tool_groups:
+  - "core"
+---
+# SVG generation from code
+
+## When to use
+
+Activate when the user asks for a vector image — icon, logo, diagram, flowchart,
+chart, banner, or illustration. SVG is plain text (XML), so it is generated with
+`write_file`, not with an image model. If the user wants a raster (photo-like)
+image, say so and do not force SVG.
+
+## Workflow
+
+1. **Pin the output format before drawing.** If the request does not state what
+   kind of image it wants (icon / logo / diagram / flowchart / chart /
+   illustration), ask ONE focused question offering the plausible options — a
+   wrong format guess invalidates the whole draft and costs extra rounds.
+   Once the format is pinned, default the remaining parameters (size, palette,
+   style) to sensible values, state them in the delivery, and let feedback
+   adjust them cheaply.
+2. **Write the complete SVG in one pass** with `write_file`. Target a single,
+   coherent design: one palette, consistent stroke widths and radii, aligned
+   layout. Plan coordinates on the `viewBox` grid before writing; compute
+   centers, widths, and text baselines so elements align rather than eyeballing.
+3. **Verify** the file is well-formed XML (`xmllint --noout <file>.svg`); if the
+   tool is unavailable, render or parse it by another means (e.g. open in a
+   browser, or `read_file` the result). Report the path and what the image shows.
+4. **Iterate on feedback in small steps.** One revision at a time (color, layout,
+   label, style) — do not rewrite the whole file for a single tweak.
+
+## Design principles
+
+- **Simple beats clever.** Flat fills, 2–4 colors, one accent hue. Avoid
+  gratuitous gradients, shadows, and decorations; add them only when asked.
+- **Self-contained.** Use only primitives and inline `defs` (`marker`,
+  `linearGradient`). Do not reference external images, fonts, or stylesheets —
+  the file must render anywhere with no network.
+- **Text legibility.** Choose font-family stacks that cover the glyphs used:
+  Latin text: `Helvetica, Arial, sans-serif`; CJK text: `"PingFang SC",
+  "Hiragino Sans GB", "Microsoft YaHei", sans-serif`. Use `text-anchor="middle"`
+  (with matching `x` = center) for centered labels; set `dominant-baseline` or
+  a manual baseline `y` so text sits inside its box. Never let a label overflow
+  its box — size the text to the widest label.
+- **Arrows and markers.** Define one arrowhead `<marker>` in `defs` with
+  `orient="auto"`, reference it via `marker-end`, and end each arrow line
+  exactly at the target shape's edge (not its center) so the head is not buried.
+- **XML escaping.** Escape `&` as `&amp;`, `<` as `&lt;`, `>` as `&gt;` in all
+  text content and attributes. Prefer ASCII attribute values; keep raw CJK only
+  in text content (valid UTF-8 XML).
+
+## Layout tips
+
+- Declare `width`, `height`, and `viewBox` together; draw against `viewBox`
+  coordinates so the art scales cleanly.
+- Round rectangles with a small `rx` (≈ `height/8`) for a modern look; use
+  `stroke-linecap="round"` for line-based art.
+- For icons: a filled rounded-square or circle badge plus a light glyph reads
+  better than thin outlines at small sizes. Center the glyph, leave margin.
+- For diagrams: name every node, connect with labeled arrows, keep one reading
+  direction (left→right or top→bottom), and put the loop/decision clearly
+  labeled.
+
+## Verification checklist
+
+- File exists at the reported path and `xmllint --noout` passes.
+- No external references; all `id`/`url(#...)` pairs resolve to local `defs`.
+- Text fits its container; arrows touch shapes at the edge, not floating or
+  buried.
+- `width`/`height`/`viewBox` agree in aspect ratio.

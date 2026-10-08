@@ -24,6 +24,27 @@ fn seed_skills_dir_creates_dir_but_does_not_copy_builtins() {
 }
 
 #[test]
+fn all_builtin_skills_parse_with_valid_front_matter() {
+    // Every entry in BUILTIN_SKILLS must parse through the same front-matter
+    // parser the load path uses; a manifest that fails to parse is silently
+    // skipped at load time (load_all_skills uses `if let Ok`), so a parse
+    // failure here would ship a skill that never activates.
+    for (filename, content) in BUILTIN_SKILLS {
+        let skill = parse_skill_front_matter(content)
+            .unwrap_or_else(|e| panic!("builtin skill {filename} failed to parse: {e}"));
+        assert!(
+            !skill.prompt.trim().is_empty(),
+            "builtin skill {filename} has an empty body"
+        );
+        assert_eq!(
+            skill.name,
+            filename.trim_end_matches(".skill"),
+            "builtin skill {filename} name must match its file stem"
+        );
+    }
+}
+
+#[test]
 fn load_all_skills_loads_user_skill_without_builtins() {
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()

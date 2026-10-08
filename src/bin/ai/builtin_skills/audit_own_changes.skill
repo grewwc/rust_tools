@@ -1,7 +1,7 @@
 ---
 name: audit_own_changes
 version: 1.0.0
-description: "Use after the main agent has completed and verified changes for a user request. Build a self-contained audit prompt covering only those changes; start a full `audit` subagent with `task` (`audit-fast` only for a low-risk lightweight review), or tell an attending user to run `/audit`. Then verify findings and make any needed follow-up changes."
+description: "Use after you have finished and verified non-trivial code or file changes for a user request, and before reporting completion: build a self-contained audit prompt covering only those changes and start a full `audit` subagent with `task` (`audit-fast` only for a small low-risk review), or hand an attending user the same prompt for `/audit`. Then verify the findings and fix what is confirmed."
 author: rust_tools
 priority: 0
 tool_groups:
@@ -18,6 +18,8 @@ Activate after you have made and persisted code or file changes for a user reque
 
 ### 1. Build a self-contained audit prompt
 
+Start from the recorded change list instead of memory: call `show_changes` for the files written in this session, and fall back to `git status --porcelain` / `git diff --stat` when the log is empty (for example when the change came from `execute_command`). Compression drops earlier turns, so recollection alone under-reports scope, and the log also records parallel subagent writes — list only the files you changed for this request.
+
 Create an `audit_prompt` from the changes you made for this request. It must include:
 
 - **Scope (most important):** Start by stating that the audit covers only the main agent's changes for this request. List the changed files. Tell the auditor not to audit or report other workspace changes, concurrent work, or pre-existing issues unless they directly affect the correctness of these changes.
@@ -30,8 +32,8 @@ A task subagent cannot see your conversation history. The `/audit` path adds thi
 
 `/audit [-f] <audit_prompt>` is an interactive command typed by the user before the model loop. The model cannot invoke it, and it is not a shell command; never run it through `execute_command`.
 
-- **Autonomous path:** Call `task` with `audit_prompt`. Use `agent: "audit"` for a full audit. Use `agent: "audit-fast"` only for a small, low-risk lightweight review; never downgrade a user-requested audit. This path does not inject the current session's change context, so require the subagent to inspect `git diff` or relevant files when needed.
-- **User-assisted path:** If the user is present, offer `audit_prompt` for `/audit <audit_prompt>`. Suggest `/audit -f <audit_prompt>` only for a small, low-risk lightweight review. The runtime adds the current session's main-agent change context.
+- **Autonomous path:** Call `task` with `audit_prompt` and `agent: "audit"` (full audit) or `agent: "audit-fast"` (small, low-risk review only; never downgrade a user-requested audit). Leave `inherit` at its default so the auditor reasons independently and never reads your conversation; do not widen it to `"all"`. If `task` is missing from the available tools, enable it first via `enable_tools` (`{"operation":"enable","tools":["task"]}`). If the task family is hidden entirely — inside a subagent turn, for example — do not claim an audit happened: report the change as un-audited or hand the user the `/audit` prompt. This path injects no change context, so tell the subagent that a finding is only published when every cited line range comes from its own `read_file` call in that turn; diff output is a lead, not evidence.
+- **User-assisted path:** If the user is present, offer `audit_prompt` for `/audit <audit_prompt>`. Suggest `/audit -f <audit_prompt>` only for a small, low-risk lightweight review. The runtime already appends this session's main-agent change context, so keep the instruction on scope, intent, and verification goals rather than repeating the diff.
 
 ### 3. Verify findings and take ownership
 
@@ -46,3 +48,4 @@ After the audit subagent returns, continue the work rather than forwarding its r
 - Address only issues related to this request's changes. Do not attribute others' changes or pre-existing issues to your work.
 - Treat subagent output as evidence, not authority: a clean audit is not sufficient proof, and a reported issue is not automatically correct.
 - Never use a vague audit prompt such as "review my changes". Include the changed-file list and concrete verification goals so the auditor can distinguish your changes from unrelated work.
+- Keep it proportionate: full `audit` for substantive changes, `audit-fast` for a small low-risk edit, and no self-audit at all when this request changed no code or files.

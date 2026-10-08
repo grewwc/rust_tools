@@ -54,7 +54,23 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
         "agent-team.skill",
         include_str!("builtin_skills/agent-team.skill"),
     ),
+    (
+        "generate_svg.skill",
+        include_str!("builtin_skills/generate_svg.skill"),
+    ),
 ];
+
+/// Body of a builtin skill (front matter stripped), resolved through the same parser the
+/// builtin load path uses. Runtime notes that must stay in sync with a shipped skill quote
+/// this text instead of restating it, so editing the `.skill` file updates both readers.
+pub(super) fn builtin_skill_body(name: &str) -> Option<String> {
+    BUILTIN_SKILLS
+        .iter()
+        .filter_map(|(_, content)| parse_skill_front_matter(content).ok())
+        .find(|manifest| manifest.name == name)
+        .map(|manifest| manifest.prompt)
+        .filter(|body| !body.trim().is_empty())
+}
 
 fn default_skill_version() -> String {
     "1.0.0".to_string()
