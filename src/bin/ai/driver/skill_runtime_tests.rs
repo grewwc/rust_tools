@@ -592,9 +592,9 @@ fn system_prompt_only_mentions_tools_available_this_turn() {
 fn system_prompt_keeps_subagent_orchestration_lazy_without_task_tools() {
     // Sharp-style turns (core tools only, no pinned task_* tools) must not
     // carry the subagent-orchestration prose: resident task tools inject the
-    // "delegate every step" / "task_status before finishing" guidance, which
-    // directly fights a decisive single-pass agent. Task tools stay
-    // discoverable via enable_tools instead.
+    // delegation criteria and subagent lifecycle guidance, which directly
+    // fights a decisive single-pass agent. Task tools stay discoverable via
+    // enable_tools instead.
     let mut core_only = SkipSet::new(16);
     for name in ["read_file", "apply_patch", "enable_tools", "plan"] {
         core_only.insert(name.to_string());
@@ -809,13 +809,15 @@ fn system_prompt_uses_criterion_based_parallel_delegation() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
 
-    // Delegation is the default choice for substantive steps (serial or parallel), but with clear boundaries; the parent keeps
-    // trivial steps, tightly coupled edits, and final review, and never runs dependent steps concurrently.
+    // The Planning section defers the delegation decision to the async_subagent_orchestration
+    // section (the single decision source) and keeps only the plan-schema field semantics.
     assert!(prompt.contains("fan out MULTIPLE focused, independent subtasks concurrently"));
-    assert!(prompt.contains("mark `delegate: true` on every substantive step"));
+    assert!(prompt.contains("decide delegation per the async_subagent_orchestration guidance"));
     assert!(
         prompt.contains("delegated steps without it run one at a time via the synchronous `task`")
     );
+    // No longer mandates delegation for every substantive step.
+    assert!(!prompt.contains("on every substantive step"));
     assert!(prompt.contains("distinct, bounded goal"));
     assert!(prompt.contains("latency or context-isolation benefit outweighs handoff overhead"));
     // Pre-division shared discovery must complete serially; never run
@@ -836,8 +838,16 @@ fn system_prompt_uses_criterion_based_parallel_delegation() {
     assert!(prompt.contains("experiments out of the parent context"));
     assert!(prompt.contains("parallel branches are not required"));
     assert!(prompt.contains("continue every independent parent-side step while they run"));
-    assert!(prompt.contains("only when the parent is blocked on subagent results"));
-    assert!(prompt.contains("Use `task_status` for a non-blocking peek while continuing"));
+    // Tool-local semantics (task_wait blocking/timeout/wait_policy, the
+    // task_status peek, model/inherit defaults, task_integrate disposition,
+    // task_cancel collect-later) stay in the always-visible tool schemas and
+    // runtime follow-ups; the prompt keeps only cross-tool decisions plus the
+    // final no-dropped-task check, which no schema or runtime gate owns.
+    assert!(prompt.contains("never spawn-wait-spawn-wait serially"));
+    assert!(prompt.contains("Never silently drop a spawned task"));
+    assert!(!prompt.contains("non-blocking peek while continuing"));
+    assert!(!prompt.contains("wait_policy"));
+    assert!(!prompt.contains("reuses your (parent) model"));
     assert!(!prompt.contains("certainty is not required"));
 }
 
@@ -869,7 +879,7 @@ fn system_prompt_routes_single_delegation_to_sync_task_when_available() {
     assert!(prompt.contains(
         "Simple tasks: act directly. Complex ones: call `plan` first — before the first tool call"
     ));
-    assert!(prompt.contains("mark `delegate: true` on every substantive step"));
+    assert!(prompt.contains("decide delegation per the async_subagent_orchestration guidance"));
 }
 
 #[test]

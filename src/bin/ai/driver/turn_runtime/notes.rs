@@ -238,6 +238,7 @@ pub(super) fn inject_coarse_hard_loop_stop_note(messages: &mut Vec<crate::ai::hi
 pub(super) const SELF_NOTE_REFLECTION_CHANNEL_HINT: &str = "\n\
     Important (placement constraint): the ledger / summary asked for above is internal self-reflection; write it in full \
     between `<meta:self_note>` and `</meta:self_note>`; it is not shown to the user but stays in your subsequent context.\n\
+    `<meta:self_note>` is a plain-text marker, not a tool: never emit it as a tool_call or `<invoke>`; write the tags directly in the message body.\n\
     Keep the user-facing text of this round empty or limited to the next step you are continuing with; write a real final conclusion only when you are genuinely wrapping up.";
 
 /// Reflective notice that does not block tools -- gives the model the right to explain "why

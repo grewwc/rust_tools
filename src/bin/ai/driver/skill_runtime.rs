@@ -1358,12 +1358,12 @@ fn build_system_prompt(
             }
             lines.push("Treat the plan as a living roadmap: when findings, changed requirements, or a dead end reshape the task, call `plan` again instead of drifting; the latest plan is preserved in full as the task anchor while older versions may be summarized.".to_string());
             if has_tool(available_tools, "task_spawn") {
-                // Delegation policy lives here (always-on). The parent-side boundary is
-                // stated once in the async_subagent_orchestration section (rendered under
-                // the same `task_spawn` gate below), and the per-shape orchestration
-                // mechanics come from the plan-time footer in
-                // `plan_state::render::delegation_guidance`, so neither is repeated here.
-                lines.push("When planning, mark `delegate: true` on every substantive step, serial or parallel: subagents start with a clean, focused context and the parent reviews results. `parallelizable: true` means no dependency on earlier steps (run those concurrently via `task_spawn`); delegated steps without it run one at a time via the synchronous `task`.".to_string());
+                // The delegation decision is owned by the async_subagent_orchestration
+                // section (rendered under the same `task_spawn` gate below); this line
+                // defers to it and keeps only the plan-schema field semantics. Per-shape
+                // orchestration mechanics come from the plan-time footer in
+                // `plan_state::render::delegation_guidance`.
+                lines.push("When planning, decide delegation per the async_subagent_orchestration guidance below. A delegated step runs in a subagent with a clean, focused context and the parent reviews its result; `parallelizable: true` means no dependency on earlier steps (run those concurrently via `task_spawn`); delegated steps without it run one at a time via the synchronous `task`.".to_string());
             }
         }
         if has_tool(available_tools, "spawn_process") {
@@ -1397,11 +1397,13 @@ fn build_system_prompt(
         );
     }
 
-    if has_tool(available_tools, "task_spawn")
-        || has_tool(available_tools, "task_wait")
-        || has_tool(available_tools, "task_status")
-        || has_tool(available_tools, "task_integrate")
-    {
+    if has_tool(available_tools, "task_spawn") || has_tool(available_tools, "task_status") {
+        // Cross-tool delegation decisions only. Tool-local semantics (task vs
+        // task_spawn routing, model/inherit defaults, wait timeout/wait_policy,
+        // task_integrate disposition, task_cancel collect-later) live in the
+        // always-visible tool schemas and runtime follow-ups, so repeating them
+        // here would add resident tokens without adding constraints. The final
+        // `task_status` check below stays: no schema or runtime gate owns it.
         let mut lines = Vec::new();
         if has_tool(available_tools, "task_spawn") {
             if has_tool(available_tools, "task") {
@@ -1414,31 +1416,13 @@ fn build_system_prompt(
             lines.push("Prefer delegating broad read-only discovery, cross-module caller or consumer mapping, noisy log or dependency research, and independent adversarial verification. Keep final decisions, tightly coupled overlapping edits, unresolved coupled work, and end-to-end synthesis in the parent; iteration limits, tool failures, and recovery steps are not delegation benefits.".to_string());
             lines.push("Give each subagent an explicit result contract: return a concise conclusion, the key evidence paths/lines or commands, remaining uncertainty, and suggested verification; do not return raw logs, exhaustive search output, or large source excerpts unless requested.".to_string());
             if has_tool(available_tools, "task_spawn_batch") {
-                lines.push("Once you identify multiple qualifying subtasks with no data dependency, prefer one `task_spawn_batch` call so dispatch and returned task ids preserve input order. Then continue every independent parent-side step while they run. Do NOT call `task_wait` merely because tasks are running, and do not spawn-wait-spawn-wait serially.".to_string());
+                lines.push("Once you identify multiple qualifying subtasks with no data dependency, prefer one `task_spawn_batch` call so dispatch and returned task ids preserve input order, and continue every independent parent-side step while they run — never spawn-wait-spawn-wait serially.".to_string());
             } else {
-                lines.push("Once you identify multiple qualifying subtasks with no data dependency, spawn ALL of them in the same response (multiple `task_spawn` calls in one turn). Then continue every independent parent-side step while they run. Do NOT call `task_wait` merely because tasks are running, and do not spawn-wait-spawn-wait serially.".to_string());
+                lines.push("Once you identify multiple qualifying subtasks with no data dependency, spawn ALL of them in the same response (multiple `task_spawn` calls in one turn), and continue every independent parent-side step while they run — never spawn-wait-spawn-wait serially.".to_string());
             }
         }
-        if has_tool(available_tools, "task_wait") {
-            lines.push("Call `task_wait` only when the parent is blocked on subagent results or has no productive independent work left. Keep its per-call timeout short (normally 30-60 seconds) and prefer `wait_policy=\"any\"` so the parent resumes on the first useful result.".to_string());
-        }
         if has_tool(available_tools, "task_status") {
-            lines.push(
-                "Use `task_status` for a non-blocking peek while continuing parent-side work."
-                    .to_string(),
-            );
             lines.push("Before finishing your answer, call `task_status` to confirm no spawned subagent is still running. Never silently drop a spawned task.".to_string());
-        }
-        if has_tool(available_tools, "task_integrate") {
-            lines.push("After `task`, `task_wait`, or `task_status` delivers a result, call `task_integrate` with that task_id, a disposition, and the parent conclusion. Delivery alone is not integration, and normal final answers are blocked while delivered results remain unintegrated.".to_string());
-        }
-        if has_tool(available_tools, "task_cancel") {
-            lines.push("Use `task_cancel` to abandon a stuck or no-longer-needed background subagent instead of repeatedly calling `task_wait` - it terminates the subagent process and writes a cancelled terminal result, but you still must collect that result later with `task_wait` or `task_status`.".to_string());
-        }
-
-        if has_tool(available_tools, "task_spawn") {
-            lines.push("By default a subagent reuses your (parent) model; only override the `model` field when the subtask is clearly lighter or heavier than your own.".to_string());
-            lines.push("Give each subagent a focused context: omitting `inherit` applies the default \"cwd,skills\" (no history/memory), which is right for delegated steps that touch the workspace; use `inherit=\"none\"` only for pure analysis that never touches the workspace; use `inherit=\"all\"` only when the subtask genuinely needs the full conversation.".to_string());
         }
         push_tool_guidance_section(
             &mut b,

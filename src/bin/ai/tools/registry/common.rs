@@ -585,6 +585,15 @@ mod manifest_tool_name_tests {
             Some("nope, also_nope".to_string())
         );
     }
+
+    #[test]
+    fn meta_prefixed_unknown_tool_gets_correction_message() {
+        let msg = unknown_tool_error_message("meta:self_note");
+        assert!(msg.contains("not a tool"));
+        assert!(msg.contains("<meta:self_note>"));
+        assert!(!msg.starts_with("Unknown tool"));
+        assert_eq!(unknown_tool_error_message("nope"), "Unknown tool: nope");
+    }
 }
 
 /// Normalize deprecated/merged historical tool names to their current
@@ -594,6 +603,21 @@ fn canonical_tool_name(name: &str) -> &str {
     match name {
         "read_file_lines" => "read_file",
         other => other,
+    }
+}
+
+/// Error message for an unregistered tool name. `meta:*` names (e.g. the
+/// hidden `<meta:self_note>` channel) are plain-text markers, not tools:
+/// issuing one as a tool call is a serialization mistake, so the error tells
+/// the model to write the tags in the message body instead of a tool_call.
+fn unknown_tool_error_message(name: &str) -> String {
+    if name.starts_with("meta:") {
+        format!(
+            "`{name}` is not a tool; it is a plain-text marker. Write the content between \
+             `<{name}>` and `</{name}>` in the message body instead of issuing a tool call."
+        )
+    } else {
+        format!("Unknown tool: {}", name)
     }
 }
 
@@ -641,7 +665,7 @@ fn execute_tool_call_with_args_impl(
     let Some(spec) = TOOL_INDEX.get_ref(&name.to_string()).copied() else {
         record_tool_stat(name, false);
         record_tool_decision(name, false, "unknown_tool");
-        return Err(format!("Unknown tool: {}", name));
+        return Err(unknown_tool_error_message(name));
     };
     let started = std::time::Instant::now();
     let exec = if let Some(stream_exec) = TOOL_STREAM_INDEX.get_ref(&name.to_string()).copied() {

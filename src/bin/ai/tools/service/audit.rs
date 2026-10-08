@@ -1637,10 +1637,19 @@ pub(crate) fn safe_shell_substitutions(command: &str) -> Vec<SafeShellSubstituti
 /// directly and never feed arguments to a shell, so `<<` / `$()` are just plain
 /// text.
 ///
-/// Command substitution (`$(...)` / `` `...` ``) can generate the program name at
-/// runtime and stays banned. Process substitution `<(...)` / `>(...)` is allowed
-/// after recursively validating the inner command, avoiding false blocks on
-/// common usages like diff/sort.
+    /// Command substitution `$(...)` is allowed after recursively validating the
+    /// inner command (same trust model as process substitution), so quoted data
+    /// usages like `echo "$(date)"` and `for i in $(seq 1 40)` loops work while
+    /// `$(rm ...)` stays blocked. The inner check alone cannot see where the
+    /// output lands, so `validate_substitution_positions` additionally restricts
+    /// every substitution to a materializable whole-word `"$(...)"` or a
+    /// literal-`seq` loop list. Generating the *program name* from a
+    /// substitution remains banned — its output is word-split into command
+    /// words, so `$(echo r)m -rf /` could run `rm` at runtime; that guard lives
+    /// in `validate_single_segment`. Backticks stay banned (legacy form).
+    /// Process substitution `<(...)` / `>(...)` is allowed after recursively
+    /// validating the inner command, avoiding false blocks on common usages
+    /// like diff/sort.
 fn validate_no_injection_surface(command: &str) -> Result<(), String> {
     let bytes = command.as_bytes();
     let mut i = 0;
@@ -1731,10 +1740,28 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
                 i += 3;
                 continue;
             }
-            return Err(
-                "command substitution `$(...)` is not allowed; pass a literal command instead"
-                    .to_string(),
-            );
+            // Nested `$(` inside arithmetic expansion stays blocked.
+            if arith_depth > 0 {
+                return Err(
+                    "command substitution `$(...)` inside arithmetic expansion is not allowed"
+                        .to_string(),
+                );
+            }
+            // Same trust model as process substitution below: the inner command
+            // itself must pass the whole safety check, so `echo "$(date)"` and
+            // `for i in $(seq 1 40)` work while `$(rm ...)` stays blocked. Where
+            // the output lands is checked separately by
+            // `validate_substitution_positions`. Generating the *program name*
+            // from a substitution is still banned (its output is word-split
+            // into command words) — that guard lives in `validate_single_segment`.
+            let close = find_matching_shell_paren(command, i + 1).ok_or_else(|| {
+                "unterminated command substitution `$(...)`".to_string()
+            })?;
+            let inner = command[i + 2..close].trim();
+            validate_execute_command(inner)
+                .map_err(|reason| format!("unsafe command substitution `$(...)`: {reason}"))?;
+            i = close + 1;
+            continue;
         }
         // Process substitution `<(...)` / `>(...)` has shell semantics only
         // outside quotes. Recursively validate the full inner command instead of
@@ -1850,6 +1877,295 @@ fn expand_tilde_and_home(arg: &str) -> Result<String, String> {
 }
 
 /// Validate a single command segment against the program/argument blacklist.
+/// True when `b` terminates a shell word for the purpose of locating which word
+/// contains a command substitution (control operators and unquoted whitespace;
+/// quote, `$`, `=`, and pathname-expansion characters stay part of the word).
+fn is_substitution_word_boundary(b: u8) -> bool {
+    b.is_ascii_whitespace() || matches!(b, b';' | b'|' | b'&' | b'<' | b'>')
+}
+
+/// For `for VAR in ...` prefixes, return the byte index just past the `in`
+/// keyword, so list elements (where `$(...)` is allowed) can be distinguished
+/// from every other argument position.
+fn for_in_list_prefix_end(command: &str) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if !command[i..].starts_with("for") {
+        return None;
+    }
+    i += 3;
+    if !bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    // Variable name (one word).
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    // The `in` keyword.
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if !command[i..].starts_with("in") {
+        return None;
+    }
+    i += 2;
+    if !bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    Some(i)
+}
+
+/// Whether the inner command of a `$(...)` is exactly `seq` with one to three
+/// literal integer bounds (`seq 40`, `seq 1 40`, `seq 1 2 40`). Such output is
+/// provably numeric, so storing it in a loop variable cannot smuggle a program
+/// name or an audited argument value past the checks below.
+fn is_literal_seq_substitution(command: &str, dollar_at: usize, close: usize) -> bool {
+    let inner = command[dollar_at + 2..close].trim();
+    let mut words = inner.split_whitespace();
+    if words.next() != Some("seq") {
+        return false;
+    }
+    let mut count = 0u32;
+    for word in words {
+        let digits = word
+            .strip_prefix('+')
+            .or_else(|| word.strip_prefix('-'))
+            .unwrap_or(word);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        count += 1;
+    }
+    (1..=3).contains(&count)
+}
+
+/// Reject a single active `$(...)` whose runtime output could reach a position
+/// the audit semantically checks (the program name, a `git` subcommand, an
+/// interpreter `-c` flag, a path or glob subject to scope confinement). The
+/// output is unverifiable runtime data, so `git "pu$(printf sh)"` would execute
+/// `git push` at runtime and bypass the literal-token checks below. Worse, any
+/// substitution stored in a shell variable escapes per-segment analysis
+/// entirely: `for cmd in $(printf rm); do $cmd -rf target; done` and
+/// `cmd=$(printf rm); $cmd -rf target` split into individually innocent
+/// segments while the shell executes the banned program. Shell variables are
+/// not tracked, so only two positions pass: a `for ... in` list word holding
+/// exactly `$(seq FIRST LAST)` with literal integer bounds (provably numeric
+/// output), and a complete double-quoted word `"$(...)"` in an argument of a
+/// pure-data program (`echo`/`printf`/`seq`/`date`, which command.rs
+/// materializes before execution). Every other form is rejected.
+fn check_substitution_at(
+    command: &str,
+    dollar_at: usize,
+    program: &str,
+    eff_program: &str,
+) -> Result<(), String> {
+    let bytes = command.as_bytes();
+    let mut word_start = dollar_at;
+    while word_start > 0 && !is_substitution_word_boundary(bytes[word_start - 1]) {
+        word_start -= 1;
+    }
+    // Assignment values (including `VAR=...` env prefixes) flow into shell
+    // variables the audit cannot track: `cmd=$(printf rm); $cmd ...` would
+    // execute `rm` without any segment seeing it. Banned in every form.
+    if let Some((name, _)) = command[word_start..dollar_at].split_once('=') {
+        let mut chars = name.chars();
+        let is_name = chars
+            .next()
+            .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+            && chars.all(|c| c == '_' || c.is_ascii_alphanumeric());
+        if is_name {
+            return Err(
+                "command substitution `$(...)` may not appear in an assignment value; its \
+                 output flows into a shell variable, which the audit cannot track. Use a \
+                 literal value or a `for i in $(seq FIRST LAST)` loop instead"
+                    .to_string(),
+            );
+        }
+    }
+    // The substitution sits inside the very first word, so it can generate the
+    // program name at runtime (`$(echo rm) -rf /`).
+    let first_word_start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(0);
+    if word_start == first_word_start {
+        return Err(
+            "command substitution `$(...)` cannot generate the program name; pass a literal \
+             program instead"
+                .to_string(),
+        );
+    }
+    let Some(close) = find_matching_shell_paren(command, dollar_at + 1) else {
+        return Err("unbalanced command substitution `$(...)`".to_string());
+    };
+    let mut word_end = close + 1;
+    while word_end < bytes.len() && !is_substitution_word_boundary(bytes[word_end]) {
+        word_end += 1;
+    }
+    // Exact-word shapes. Only a complete double-quoted word `"$(...)"` is
+    // materialized by command.rs; any other form reaches the shell raw, where
+    // its output undergoes word-splitting and glob expansion.
+    let bare_exact = word_start == dollar_at && word_end == close + 1;
+    let quoted_exact = dollar_at == word_start + 1
+        && word_end == close + 2
+        && bytes.get(word_start) == Some(&b'"')
+        && bytes.get(close + 1) == Some(&b'"');
+    // `for ... in` list elements feed the loop variable, which the audit
+    // cannot track — only provably numeric `seq` output is safe there, as an
+    // exact list word (so digit output cannot fuse with literal affixes).
+    if eff_program == "for" {
+        if let Some(prefix_end) = for_in_list_prefix_end(command) {
+            if word_start >= prefix_end {
+                if (bare_exact || quoted_exact)
+                    && is_literal_seq_substitution(command, dollar_at, close)
+                {
+                    return Ok(());
+                }
+                return Err(
+                    "command substitution `$(...)` in a `for ... in` list must be exactly \
+                     `$(seq FIRST LAST)` with literal integer bounds; its output flows into \
+                     the loop variable, which the audit cannot track"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    // Pure-data programs whose arguments the audit never inspects — but only
+    // for the materializable whole-word form. An unquoted or partial-word
+    // substitution would execute its inner command raw (e.g. `echo $(git
+    // commit ...)` runs the commit without the confirmation gate) or let the
+    // output split into extra words.
+    if quoted_exact && matches!(eff_program, "echo" | "printf" | "seq" | "date") {
+        return Ok(());
+    }
+    Err(format!(
+        "command substitution `$(...)` may not generate an argument for `{program}`: its \
+         runtime output cannot be verified, so it could bypass the sandbox checks (git \
+         subcommand blocks, interpreter `-c`, path/glob scope). Use a literal argument, a \
+         complete double-quoted word (`\"$(...)\"`) with `echo`/`printf`, or a \
+         `for i in $(seq FIRST LAST)` loop instead"
+    ))
+}
+
+/// Fail-closed position guard for command substitutions in a segment: every
+/// active `$(...)` must occupy an allowed position (see `check_substitution_at`).
+/// `validate_no_injection_surface` only proves the inner command is safe; this
+/// closes the remaining gap where the substitution's *output* lands in a
+/// checked slot. Heredoc bodies are skipped so literal `$(` inside quoted
+/// bodies is not mistaken for an active substitution, and herestrings (`<<<`)
+/// are scanned (their content is subject to expansion too).
+fn validate_substitution_positions(command: &str, program: &str) -> Result<(), String> {
+    let eff_program = effective_command_tokens(command)
+        .first()
+        .and_then(|token| std::path::Path::new(token).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+
+    let bytes = command.as_bytes();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut pending_heredocs: Vec<HereDocSpec> = Vec::new();
+    let mut active_body: Option<HereDocSpec> = None;
+
+    while i < bytes.len() {
+        if let Some(spec) = &active_body {
+            let line_end = command[i..]
+                .find('\n')
+                .map(|offset| i + offset)
+                .unwrap_or(bytes.len());
+            let line = &command[i..line_end];
+            if matches_heredoc_terminator(line, spec) {
+                active_body = None;
+                i = line_end;
+            } else {
+                i = if line_end < bytes.len() {
+                    line_end + 1
+                } else {
+                    line_end
+                };
+            }
+            continue;
+        }
+
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            match b {
+                b'\\' => {
+                    escaped = true;
+                }
+                b'"' => {
+                    in_double = false;
+                }
+                // `$(( ... ))` is arithmetic expansion, not a substitution.
+                b'$'
+                    if bytes.get(i + 1) == Some(&b'(') && bytes.get(i + 2) != Some(&b'(') =>
+                {
+                    check_substitution_at(command, i, program, &eff_program)?;
+                }
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\\' => {
+                escaped = true;
+            }
+            b'\'' => {
+                in_single = true;
+            }
+            b'"' => {
+                in_double = true;
+            }
+            b'$'
+                if bytes.get(i + 1) == Some(&b'(') && bytes.get(i + 2) != Some(&b'(') =>
+            {
+                check_substitution_at(command, i, program, &eff_program)?;
+            }
+            // `<<<` herestrings are not heredocs; their content still undergoes
+            // expansion, so it must be scanned rather than skipped.
+            b'<'
+                if bytes.get(i + 1) == Some(&b'<') && bytes.get(i + 2) != Some(&b'<') =>
+            {
+                if let Some((end, spec)) = parse_heredoc_at(command, i) {
+                    pending_heredocs.push(spec);
+                    i = end;
+                    continue;
+                }
+            }
+            b'\n' => {
+                if let Some(spec) = pending_heredocs.pop() {
+                    active_body = Some(spec);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 fn validate_single_segment(command: &str) -> Result<(), String> {
     let command = command.trim();
     if command.is_empty() {
@@ -1867,6 +2183,11 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         .collect::<Vec<_>>();
     let shell_context = crate::cmd::run::command_requires_shell(command);
     let Some(command_idx) = command_word_index(&tokens, shell_context) else {
+        // Pure-assignment segments (`FOO=bar`) carry no program, but an
+        // assignment value can still smuggle `$(...)` into a shell variable
+        // (`cmd=$(printf rm)`), so the substitution position guard must still
+        // run before accepting the segment.
+        validate_substitution_positions(command, "")?;
         return Ok(());
     };
     let command_tokens = &lower_tokens[command_idx..];
@@ -1893,6 +2214,12 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
             expand_tilde_and_home(token)?;
         }
     }
+
+    // Fail-closed guard for command-substitution positions: `$(...)` output is
+    // unverifiable runtime data, so it may not occupy any argument position the
+    // audit semantically checks. Runs before the `mv` branch because that
+    // branch returns early once its own path checks pass.
+    validate_substitution_positions(command, program)?;
 
     if program == "mv" {
         let base_dir = crate::ai::driver::runtime_ctx::effective_cwd()
@@ -2183,6 +2510,22 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
     // peel past the single-level indirect checks above: deep-unwrap to the
     // innermost command with effective_command_tokens and validate once more.
     let effective = effective_command_tokens(command);
+    // Command substitution in the *program-name* slot is banned even when the
+    // inner command is itself harmless: the substitution output is word-split
+    // into command words, so `$(echo r)m -rf /` would execute `rm -rf /` at
+    // runtime and bypass the program blacklist. Only materializable whole-word
+    // `"$(...)"` data arguments and literal-`seq` loop lists (see
+    // `check_substitution_at`) may carry a substitution; anything else in
+    // argument position is rejected there. Check the deep-unwrapped program so wrappers (`env`, `exec`,
+    // `command`, `timeout`, ...) cannot smuggle in a generated program name.
+    if let Some(program_word) = effective.first() {
+        if program_word.contains("$(") || program_word.contains('`') {
+            return Err(format!(
+                "command substitution cannot generate the program name; pass a literal \
+                 program instead (`{program_word}`)"
+            ));
+        }
+    }
     if let Some(eff_program) = effective.first() {
         if is_python_program(eff_program) {
             match python_c_argument(&effective) {
@@ -2551,9 +2894,10 @@ pub(crate) fn validate_execute_command(command: &str) -> Result<(), String> {
         return Err("empty command".to_string());
     }
 
-    // First line of defense: block shell injection surfaces (command substitution
-    // / process substitution). Letting these through renders the segment
-    // blacklist pointless.
+    // First line of defense: block shell injection surfaces (unvalidated command
+    // substitution, backticks, subshell grouping). `$(...)` / `<(...)` pass only
+    // after their inner command passes the same validation; letting unvalidated
+    // substitutions through would render the segment blacklist pointless.
     validate_no_injection_surface(command)?;
 
     // Second line of defense: split the chained command into segments and run the
@@ -2692,8 +3036,15 @@ mod tests {
     // ---- injection surface ----
 
     #[test]
-    fn injection_blocks_dollar_paren() {
-        assert!(validate_no_injection_surface("echo $(whoami)").is_err());
+    fn injection_allows_validated_dollar_paren() {
+        // `$()` passes when the inner command itself passes the safety check.
+        assert!(validate_no_injection_surface("echo $(whoami)").is_ok());
+        assert!(validate_no_injection_surface("for i in $(seq 1 40); do echo $i; done").is_ok());
+        // Unsafe or unterminated inner commands stay blocked.
+        let err = validate_no_injection_surface("echo $(rm -rf /)").unwrap_err();
+        assert!(err.contains("command substitution"), "got: {err}");
+        let err = validate_no_injection_surface("echo $(seq 1 40").unwrap_err();
+        assert!(err.contains("command substitution"), "got: {err}");
     }
 
     #[test]
@@ -2758,8 +3109,11 @@ mod tests {
     }
 
     #[test]
-    fn injection_still_blocks_substitution_inside_double_quotes() {
-        assert!(validate_no_injection_surface(r#"echo "user=$(whoami)""#).is_err());
+    fn injection_validates_substitution_inside_double_quotes() {
+        // `$()` inside double quotes is still a command substitution (not
+        // literal text): harmless inners pass, unsafe inners stay blocked.
+        assert!(validate_no_injection_surface(r#"echo "user=$(whoami)""#).is_ok());
+        assert!(validate_no_injection_surface(r#"echo "user=$(rm -rf /)""#).is_err());
     }
 
     // ---- end-to-end validate_execute_command ----
@@ -2818,12 +3172,79 @@ mod tests {
     }
 
     #[test]
-    fn blocks_command_substitution() {
-        let err = validate("echo $(whoami)").unwrap_err();
-        assert!(
-            err.contains("command substitution"),
-            "expected $(...) blocked, got: {err}"
-        );
+    fn command_substitution_validates_inner_and_blocks_program_name_generation() {
+        // Quoted data substitutions and literal-seq loops whose inner command
+        // passes the safety check are allowed end-to-end.
+        assert!(validate("for i in $(seq 1 40); do echo $i; done").is_ok());
+        assert!(validate(r#"echo "$(date)""#).is_ok());
+        // Unquoted substitutions reach the shell raw and stay blocked even
+        // with a harmless inner.
+        let err = validate("echo $(date)").unwrap_err();
+        assert!(err.contains("command substitution"), "got: {err}");
+        // Unsafe inner commands stay blocked.
+        let err = validate("echo $(rm -rf /)").unwrap_err();
+        assert!(err.contains("command substitution"), "got: {err}");
+        // Program-name generation stays banned even with a harmless inner:
+        // `$(echo rm) -rf /` would execute `rm -rf /` at runtime.
+        let err = validate("$(echo rm) -rf /").unwrap_err();
+        assert!(err.contains("command substitution"), "got: {err}");
+        let err = validate("env $(echo rm) -rf /").unwrap_err();
+        assert!(err.contains("command substitution"), "got: {err}");
+        // Backticks remain banned.
+        let err = validate("echo `whoami`").unwrap_err();
+        assert!(err.contains("backtick"), "got: {err}");
+    }
+
+    #[test]
+    fn blocks_substitution_generated_sensitive_arguments() {
+        // `$()` output is unverifiable, so it must not land in a position the
+        // audit semantically checks: `git "pu$(printf sh)"` would run `git
+        // push` at runtime, `bash "$(printf -- '-c')" ...` would re-interpret
+        // code, and `rm -rf "$(printf '*')"` would glob-expand out of scope.
+        let err = validate(r#"git "pu$(printf sh)""#).unwrap_err();
+        assert!(err.contains("command substitution"), "got: {err}");
+        for cmd in [
+            r#"git "$(printf 'push')""#,
+            r#"git "$(printf 'pu')sh""#,
+            "git $(printf 'push')",
+            r#"git status $(whoami)"#,
+            r#"bash "$(printf -- '-c')" 'echo x'"#,
+            r#"python3 "$(printf -- '-c')" 'print(1)'"#,
+            r#"find "$(printf '.')" -name x"#,
+            r#"rm -rf "$(printf '*')""#,
+            "mv \"$(printf 'x')\" y",
+            // Variable-channel escapes: the output would flow into `$cmd` /
+            // `$i`, which no segment can audit.
+            "for cmd in $(printf rm); do $cmd -rf target; done",
+            r#"for f in "$(printf 'a b')"; do echo $f; done"#,
+            "cmd=$(printf rm); $cmd -rf target",
+            "cmd=$(printf rm)",
+            "FOO=$(mktemp) git status",
+            "FOO=bar$(seq 1 5) git status",
+            // Unquoted inner with confirmation-gated side effects: runs the
+            // commit without the confirmation gate.
+            "echo $(git commit -am x)",
+            // Partial-word quoted form is not materializable.
+            r#"echo "user=$(whoami)""#,
+            // Condition position would execute the output as a command.
+            r#"while "$(printf true)"; do echo x; done"#,
+        ] {
+            assert!(validate(cmd).is_err(), "expected blocked: {cmd}");
+        }
+        // Safe positions stay allowed: literal-seq loop lists (bare or quoted
+        // whole-word), materializable whole-word `"$(...)"` data arguments for
+        // echo/printf; quoted-heredoc bodies hold literal text, and single
+        // quotes keep `$(` literal.
+        for cmd in [
+            "for i in $(seq 1 40); do echo $i; done",
+            r#"for i in "$(seq 1 5)"; do echo $i; done"#,
+            r#"echo "$(date)""#,
+            r#"printf "%s\n" "$(cat /tmp/x)""#,
+            "cat <<'EOF'\n$(whoami)\nEOF",
+            "echo 'price: $(100)'",
+        ] {
+            assert!(validate(cmd).is_ok(), "expected allowed: {cmd}");
+        }
     }
 
     #[test]
@@ -2866,10 +3287,16 @@ mod tests {
         // substitution
         assert!(safe_shell_substitutions(r#"echo "$(cat /tmp/dsl.json)" | jq ."#).is_empty());
         assert!(safe_shell_substitutions(r#"echo "$(cat /tmp/dsl.json)" && id"#).is_empty());
-        // A $() that is not a complete word is still an injection surface
-        assert!(validate(r#"echo "$(cat /tmp/dsl.json)""#).is_err());
+        // Complete-word or embedded `$()` are only allowed end-to-end for
+        // pure-data programs (`echo`): the inner command is validated (`cat`
+        // of a literal absolute path) and the program name is unaffected.
+        // For any other program the raw audit is fail-closed without
+        // materialization — production executes the safe FileRead whole-word
+        // form via command.rs materialization before this audit runs.
+        assert!(validate(r#"echo "$(cat /tmp/dsl.json)""#).is_ok());
         assert!(validate(r#"bytedcli --dsl "prefix$(cat /tmp/dsl.json)""#).is_err());
         assert!(validate(r#"bytedcli --dsl "$(cat /tmp/dsl.json)suffix""#).is_err());
+        assert!(validate(r#"bytedcli --dsl "$(cat /tmp/dsl.json)""#).is_err());
     }
 
     #[test]
