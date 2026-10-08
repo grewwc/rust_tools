@@ -29,6 +29,15 @@ pub fn print_interactive_help() {
     println!(
         "    /history replay              replay the last turn's assistant conclusion (text only)"
     );
+    println!(
+        "    /history <session> [N]         show last N messages of another session (no switch; Tab completes ids)"
+    );
+    println!(
+        "    /history <session> last [N]    replay the Nth recent assistant message of another session with markdown rendering"
+    );
+    println!(
+        "    /history <session> replay     replay the last assistant conclusion of another session"
+    );
     println!("    /feishu-auth              authenticate with Feishu");
     println!("    /share [output.md]        export current session as shareable markdown");
     println!("    /close                    close and delete current session, then exit");

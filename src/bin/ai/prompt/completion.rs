@@ -586,6 +586,44 @@ impl CommandCompleter {
         ]
     }
 
+    /// Session-id candidates for `/history <session> ...` (best-effort).
+    /// Lists persisted session databases under the sessions root derived
+    /// from the configured history file; an unreadable root yields no
+    /// candidates instead of failing completion. Results are capped so a
+    /// large session directory never floods the candidate list.
+    fn history_session_id_candidates(token: &str) -> Vec<CompletionCandidate> {
+        let configured = crate::commonw::configw::get_all_config()
+            .get_opt("history_file")
+            .unwrap_or_else(|| "~/.history_file.sqlite".to_string());
+        let history_file =
+            std::path::PathBuf::from(crate::commonw::utils::expanduser(&configured).as_ref());
+        let parent = history_file.parent();
+        let stem = history_file.file_stem().and_then(|stem| stem.to_str());
+        let (Some(parent), Some(stem)) = (parent, stem) else {
+            return Vec::new();
+        };
+        let root = parent.join(format!("{stem}.sessions"));
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return Vec::new();
+        };
+        let mut ids = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_string();
+                name.strip_suffix(".sqlite").map(str::to_string)
+            })
+            .filter(|id| id.starts_with(token))
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.truncate(50);
+        ids.into_iter()
+            .map(|id| CompletionCandidate {
+                display: format!("{id} · session"),
+                replacement: id,
+            })
+            .collect()
+    }
+
     /// Subcommand literals of `/skills` / `/skill`.
     fn skills_subcommands() -> &'static [&'static str] {
         &["list", "current", "use", "help"]
@@ -796,6 +834,33 @@ impl CommandCompleter {
                     }
                     _ => Vec::new(),
                 }
+            } else if matches!(first, "/history" | ":history") {
+                match words.next() {
+                    // `/history <TAB>`: subcommands plus session ids, so a stored
+                    // session can be picked without leaving the line.
+                    None => {
+                        let mut candidates = Self::plain_candidates(
+                            Self::history_subcommands()
+                                .iter()
+                                .filter(|c| c.starts_with(token))
+                                .map(|c| c.to_string()),
+                        );
+                        candidates.extend(Self::history_session_id_candidates(token));
+                        candidates
+                    }
+                    // `/history <session> <TAB>`: complete the second-position
+                    // display verbs (`last`, `replay`, filters, `grep`, ...).
+                    // `rewind` is intentionally omitted: cross-session history
+                    // is read-only and the parser rejects it.
+                    Some(_) if words.next().is_none() => Self::plain_candidates(
+                        Self::history_subcommands()
+                            .iter()
+                            .filter(|c| **c != "rewind")
+                            .filter(|c| c.starts_with(token))
+                            .map(|c| c.to_string()),
+                    ),
+                    _ => Vec::new(),
+                }
             } else {
                 let sources: &[&str] = match first {
                     "/skills" | ":skills" | "/skill" | ":skill" => {
@@ -838,7 +903,6 @@ impl CommandCompleter {
                         return (token_start, candidates);
                     }
                     "/sessions" | ":sessions" | "/ss" | ":ss" => Self::session_subcommands(),
-                    "/history" | ":history" => Self::history_subcommands(),
                     "/personas" | ":personas" => Self::persona_subcommands(),
                     "/usage" | ":usage" => Self::usage_subcommands(),
                     "/checkpoint" | ":checkpoint" | "/cp" | ":cp" => Self::checkpoint_subcommands(),

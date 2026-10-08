@@ -888,6 +888,20 @@ fn generate_bash(
     println!("      /checkpoint|:checkpoint|/cp|:cp)");
     println!("        COMPREPLY=($(compgen -W \"$checkpoint_sub\" -- \"$cur\")); return 0 ;;");
     println!("      /history|:history)");
+    // First argument completes subcommands plus stored session ids
+    // (`a /history <session> last <N>`); deeper positions complete the
+    // display verbs again. Session ids come from the default sessions dir
+    // (best-effort: non-default `--history-file` roots still complete in
+    // the interactive REPL).
+    println!("        if [ \"$COMP_CWORD\" -eq 2 ]; then");
+    println!("          local _a_hist_sess=''");
+    println!("          for _a_hist_f in \"$HOME\"/.history_file.sessions/*.sqlite; do");
+    println!("            [ -e \"$_a_hist_f\" ] || continue");
+    println!("            _a_hist_f=\"${{_a_hist_f##*/}}\"");
+    println!("            _a_hist_sess=\"$_a_hist_sess ${{_a_hist_f%.sqlite}}\"");
+    println!("          done");
+    println!("          COMPREPLY=($(compgen -W \"$history_sub $_a_hist_sess\" -- \"$cur\")); return 0");
+    println!("        fi");
     println!("        COMPREPLY=($(compgen -W \"$history_sub\" -- \"$cur\")); return 0 ;;");
     println!("      /sessions|:sessions|/ss|:ss)");
     println!("        COMPREPLY=($(compgen -W \"$session_sub\" -- \"$cur\")); return 0 ;;");
@@ -1153,7 +1167,12 @@ fn generate_zsh(
     println!("        _describe 'checkpoint subcommand' _a_checkpoint_subcmds && return");
     println!("        ;;");
     println!("      /history|:history)");
-    println!("        _describe 'history subcommand' _a_history_subcmds && return");
+    println!("        _describe 'history subcommand' _a_history_subcmds");
+    // Stored session ids (best-effort default sessions dir; non-default
+    // roots still complete in the interactive REPL).
+    println!("        local -a _a_hist_sess");
+    println!("        _a_hist_sess=($HOME/.history_file.sessions/*.sqlite(N:t:r))");
+    println!("        (( ${{#_a_hist_sess}} )) && compadd -a _a_hist_sess");
     println!("        ;;");
     println!("      /sessions|:sessions|/ss|:ss)");
     println!("        _describe 'session subcommand' _a_session_subcmds && return");
@@ -1270,6 +1289,16 @@ fn generate_fish(
     println!(
         "complete -c a -n '__fish_seen_subcommand_from /agent :agent /agents :agents' -a '{}' -d 'agent name'",
         agent_names().replace('\'', "\\'")
+    );
+    // `/history` subcommands complete at every depth, so both
+    // `a /history <TAB>` and `a /history <session> <TAB>` offer the display
+    // verbs (`last`, `replay`, filters, ...).
+    println!(
+        "complete -c a -n '__fish_seen_subcommand_from /history :history' -a 'full user assistant tool system grep rewind export copy last replay help 3 6 10 20' -d 'history subcommand'"
+    );
+    // Stored session ids (best-effort default sessions dir).
+    println!(
+        "complete -c a -n '__fish_seen_subcommand_from /history :history' -a '(for f in ~/.history_file.sessions/*.sqlite; test -e \"$f\" && basename -s .sqlite \"$f\"; end 2>/dev/null)' -d 'session id'"
     );
 }
 

@@ -23,7 +23,7 @@ const HISTORY_GREP_HIGHLIGHT_END: &str = "\x1b[0m";
 
 fn print_history_help() {
     println!(
-        "/history usage:\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history grep <keyword>  Search messages\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history export [path] Export to file\n  /history copy          Copy to clipboard\n  /history last          Replay the last assistant message with markdown rendering\n  /history replay        Replay the last turn's assistant conclusion (text only)\n  /history help            Show this help",
+        "/history usage:\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history grep <keyword>  Search messages\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history export [path] Export to file\n  /history copy          Copy to clipboard\n  /history last          Replay the last assistant message with markdown rendering\n  /history replay        Replay the last turn's assistant conclusion (text only)\n  /history <session> [N] Show last N messages of another session (no switch)\n  /history <session> last [N]\n                         Replay the Nth recent assistant message of another session with markdown rendering\n  /history <session> replay\n                         Replay the last assistant conclusion of another session\n  /history help            Show this help",
         HISTORY_PREVIEW_DEFAULT_COUNT
     );
 }
@@ -120,6 +120,26 @@ enum LocalCommand {
     RewindHistory(HistoryRewindTarget),
     RenderHistoryMessageAt(usize),
     ReplayHistory,
+    ShowOtherSessionHistory {
+        session_id: String,
+        options: HistoryPreviewOptions,
+    },
+    ExportOtherSessionHistory {
+        session_id: String,
+        options: HistoryPreviewOptions,
+        path: Option<PathBuf>,
+    },
+    CopyOtherSessionHistory {
+        session_id: String,
+        options: HistoryPreviewOptions,
+    },
+    ReplayOtherSessionHistory {
+        session_id: String,
+    },
+    RenderOtherSessionMessageAt {
+        session_id: String,
+        nth_back: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +200,58 @@ fn handle_local_command_inner(app: &mut App, input: &str) -> Result<bool, Box<dy
         }
         LocalCommand::ReplayHistory => {
             println!("{}", render_history_replay(app)?);
+        }
+        LocalCommand::ShowOtherSessionHistory {
+            session_id,
+            options,
+        } => {
+            let (resolved_id, history_file) =
+                resolve_other_session_history_file(app, &session_id)?;
+            println!(
+                "{}",
+                render_history_preview_for_path(Some(&resolved_id), &history_file, options)?
+            );
+        }
+        LocalCommand::ExportOtherSessionHistory {
+            session_id,
+            options,
+            path,
+        } => {
+            let (resolved_id, history_file) =
+                resolve_other_session_history_file(app, &session_id)?;
+            let path =
+                path.unwrap_or_else(|| default_other_session_export_path(&resolved_id));
+            let rendered =
+                render_history_preview_for_path(Some(&resolved_id), &history_file, options)?;
+            fs::write(&path, rendered)?;
+            println!("[history] Exported session {resolved_id} to {}", path.display());
+        }
+        LocalCommand::CopyOtherSessionHistory {
+            session_id,
+            options,
+        } => {
+            let (resolved_id, history_file) =
+                resolve_other_session_history_file(app, &session_id)?;
+            let rendered =
+                render_history_preview_for_path(Some(&resolved_id), &history_file, options)?;
+            string_content::set_clipboard_content(&rendered)?;
+            println!("[history] Copied session {resolved_id} preview to clipboard.");
+        }
+        LocalCommand::ReplayOtherSessionHistory { session_id } => {
+            let (resolved_id, history_file) =
+                resolve_other_session_history_file(app, &session_id)?;
+            println!(
+                "{}",
+                render_history_replay_for_path(Some(&resolved_id), &history_file)?
+            );
+        }
+        LocalCommand::RenderOtherSessionMessageAt {
+            session_id,
+            nth_back,
+        } => {
+            let (resolved_id, history_file) =
+                resolve_other_session_history_file(app, &session_id)?;
+            render_other_session_message_at(&resolved_id, &history_file, nth_back)?;
         }
         LocalCommand::HelpHistory => {
             print_history_help();
@@ -243,6 +315,11 @@ fn parse_history_local_command(args: &[&str]) -> Result<Option<LocalCommand>, Bo
         return parse_history_rewind_command(&args[1..])
             .map(|target| Some(LocalCommand::RewindHistory(target)));
     }
+    if let Some(&first) = args.first()
+        && is_history_session_selector(first)
+    {
+        return parse_other_session_history_command(first.to_string(), &args[1..]).map(Some);
+    }
     // `/history last [N]`: replay the Nth most recent assistant conclusion
     // message (1 = latest) through the markdown renderer.
     if args.first().copied() == Some("last") {
@@ -278,6 +355,158 @@ fn parse_history_local_command(args: &[&str]) -> Result<Option<LocalCommand>, Bo
         }
         HistoryAction::Copy => LocalCommand::CopyHistory(options),
     }))
+}
+
+/// True when `token` can start a cross-session `/history <session-id> ...`
+/// selector. Reserved preview keywords and bare numbers keep their existing
+/// current-session meaning, so `/history last 3` and `/history 10` never
+/// become a session lookup; anything else is treated as a session-id
+/// candidate and validated on resolve.
+fn is_history_session_selector(token: &str) -> bool {
+    if token.trim().is_empty() {
+        return false;
+    }
+    if token.parse::<usize>().is_ok() {
+        return false;
+    }
+    !matches!(
+        token,
+        "full"
+            | "user"
+            | "assistant"
+            | "tool"
+            | "system"
+            | "grep"
+            | "rewind"
+            | "export"
+            | "copy"
+            | "last"
+            | "replay"
+            | "help"
+    )
+}
+
+/// Parses `/history <session-id> ...` without touching the current session.
+/// `last [N]` replays the Nth most recent assistant conclusion with markdown
+/// rendering (same as `/history last [N]`); other forms show a message
+/// preview. Single-message text-only replay uses the explicit `replay` form.
+/// Mutations are rejected here so cross-session history stays read-only.
+fn parse_other_session_history_command(
+    session_id: String,
+    rest: &[&str],
+) -> Result<LocalCommand, Box<dyn Error>> {
+    if rest.first().copied() == Some("replay") {
+        if rest.len() > 1 {
+            return Err("`/history <session> replay` takes no arguments".into());
+        }
+        return Ok(LocalCommand::ReplayOtherSessionHistory { session_id });
+    }
+    if rest.first().copied() == Some("rewind") {
+        return Err(
+            "cross-session history is read-only; `/history rewind` only affects the current session"
+                .into(),
+        );
+    }
+    if rest.first().copied() == Some("last") {
+        let nth_back = match rest.len() {
+            1 => 1,
+            2 => rest[1]
+                .parse::<usize>()
+                .map_err(|_| {
+                    "`/history <session> last` expects an optional positive number, e.g. /history <session> last 3"
+                })?,
+            _ => return Err("`/history <session> last` takes at most one argument".into()),
+        };
+        if nth_back < 1 {
+            return Err("`/history <session> last` index must be >= 1".into());
+        }
+        return Ok(LocalCommand::RenderOtherSessionMessageAt {
+            session_id,
+            nth_back,
+        });
+    }
+    let (options, action) = parse_history_preview_options(rest)?;
+    Ok(match action {
+        HistoryAction::Show => LocalCommand::ShowOtherSessionHistory {
+            session_id,
+            options,
+        },
+        HistoryAction::Help => LocalCommand::HelpHistory,
+        HistoryAction::Export(path) => LocalCommand::ExportOtherSessionHistory {
+            session_id,
+            options,
+            path: path.map(PathBuf::from),
+        },
+        HistoryAction::Copy => LocalCommand::CopyOtherSessionHistory {
+            session_id,
+            options,
+        },
+    })
+}
+
+/// Resolves a `/history <session-id>` selector to its persisted history file.
+/// Accepts an exact id, the `current` alias, or a unique id prefix; anything
+/// else reports the closest matches so a short id remains usable. (`last`
+/// stays a current-session replay verb and never reaches this resolver.)
+fn resolve_other_session_history_file(
+    app: &App,
+    selector: &str,
+) -> Result<(String, PathBuf), Box<dyn Error>> {
+    use crate::ai::history::SessionStore;
+
+    let store = SessionStore::new(app.config.history_file.as_path());
+    let selector = selector.trim();
+    if selector == "current" {
+        return Ok((
+            app.session_id.clone(),
+            store.session_history_file(&app.session_id),
+        ));
+    }
+    if let Err(error) = SessionStore::validate_session_id(selector) {
+        return Err(format!("invalid session id '{selector}': {error}").into());
+    }
+    if store.session_exists(selector)? {
+        let path = store.session_history_file(selector);
+        return Ok((selector.to_string(), path));
+    }
+    let matches = store
+        .list_sessions()?
+        .into_iter()
+        .filter(|session| session.id.starts_with(selector))
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => Err(format!(
+            "session '{selector}' not found; list sessions with /sessions"
+        )
+        .into()),
+        1 => {
+            let id = matches[0].id.clone();
+            let path = store.session_history_file(&id);
+            Ok((id, path))
+        }
+        _ => {
+            let mut hint = matches
+                .iter()
+                .take(5)
+                .map(|session| session.id.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if matches.len() > 5 {
+                hint.push_str(", ...");
+            }
+            Err(format!(
+                "session prefix '{selector}' matches {} sessions: {hint}",
+                matches.len()
+            )
+            .into())
+        }
+    }
+}
+
+fn default_other_session_export_path(session_id: &str) -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(format!("history-{session_id}.txt"))
 }
 
 fn parse_history_rewind_command(args: &[&str]) -> Result<HistoryRewindTarget, Box<dyn Error>> {
@@ -511,6 +740,35 @@ fn render_history_message_at(app: &App, nth_back: usize) -> Result<(), Box<dyn E
     }
 }
 
+/// `/history <session> last [N]`: replay the Nth most recent assistant
+/// conclusion from another session, rendered through the same terminal
+/// markdown renderer as `/history last [N]`.
+fn render_other_session_message_at(
+    session_id: &str,
+    history_file: &Path,
+    nth_back: usize,
+) -> Result<(), Box<dyn Error>> {
+    match assistant_conclusion_text_at_path(history_file, nth_back)? {
+        Some((text, source_model)) => {
+            match source_model {
+                Some(model) => println!(
+                    "[history] Session {session_id} message was produced by model: {model}"
+                ),
+                None => println!("[history] Session {session_id} message (last {nth_back}):"),
+            }
+            let text = super::turn_runtime::postprocess_terminal_text(text);
+            crate::ai::stream::render_markdown_block(&text)?;
+            Ok(())
+        }
+        None => {
+            println!(
+                "[history] No assistant conclusion found at index {nth_back} in session {session_id}."
+            );
+            Ok(())
+        }
+    }
+}
+
 /// 渲染 `/history replay` 的输出：只取最后一轮 assistant 的结论文本，
 /// 跳过 tool_calls（工具调用步骤）与 reasoning_content（thinking）。
 fn render_history_replay(app: &App) -> Result<String, Box<dyn Error>> {
@@ -518,6 +776,172 @@ fn render_history_replay(app: &App) -> Result<String, Box<dyn Error>> {
         Some(text) => text,
         None => "[history] No assistant conclusion found in recent history.".to_string(),
     })
+}
+
+/// Renders a history preview from an explicit history file. `session_label`
+/// is `None` for the current session and `Some(id)` for cross-session reads,
+/// so the header always states which session is shown.
+fn render_history_preview_for_path(
+    session_label: Option<&str>,
+    history_file: &Path,
+    options: HistoryPreviewOptions,
+) -> Result<String, Box<dyn Error>> {
+    let grep = options.grep.clone();
+    let full = options.full;
+    let label = match options.role_filter {
+        HistoryRoleFilter::All => "message(s)",
+        HistoryRoleFilter::User => "user message(s)",
+        HistoryRoleFilter::Assistant => "assistant message(s)",
+        HistoryRoleFilter::Tool => "tool message(s)",
+        HistoryRoleFilter::System => "system message(s)",
+    };
+    let grep_suffix = options
+        .grep
+        .as_deref()
+        .map(|grep| format!(" matching \"{}\"", grep))
+        .unwrap_or_default();
+    let shown = collect_history_messages_for_path(history_file, options)?;
+    if shown.is_empty() {
+        return Ok(match session_label {
+            Some(id) => format!("[history] No recent messages in session {id}."),
+            None => "[history] No recent messages.".to_string(),
+        });
+    }
+    let total = shown.len();
+    // Keep the exact current-session wording, and append the session scope
+    // for cross-session reads.
+    let mut out = match session_label {
+        Some(id) => format!(
+            "[history] Showing {} recent {}{} in session {}:\n",
+            total, label, grep_suffix, id
+        ),
+        None => format!(
+            "[history] Showing {} recent {}{}:\n",
+            total, label, grep_suffix
+        ),
+    };
+    for (idx, item) in shown.iter().enumerate() {
+        let content = if full {
+            highlight_history_keyword(
+                &searchable_history_content(&item.message.content),
+                grep.as_deref(),
+            )
+        } else {
+            summarize_history_content(
+                &item.message.content,
+                HISTORY_PREVIEW_MAX_CHARS,
+                grep.as_deref(),
+            )
+        };
+        let marker = item
+            .user_ordinal
+            .map(|ordinal| format!(" (u{ordinal})"))
+            .unwrap_or_default();
+        let model_tag = if item.message.role == "assistant" {
+            item.source_model
+                .as_deref()
+                .map(|model| format!(" (model: {model})"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "{}. [{}] {}{}{}\n",
+            idx + 1,
+            item.message.role,
+            content,
+            marker,
+            model_tag,
+        ));
+    }
+    Ok(out.trim_end().to_string())
+}
+
+/// Reads the last assistant conclusion from an explicit history file.
+fn assistant_conclusion_text_at_path(
+    history_file: &Path,
+    nth_back: usize,
+) -> Result<Option<(String, Option<String>)>, Box<dyn Error>> {
+    let messages = history::build_message_arr_with_models(history_file)?;
+    let mut seen = 0usize;
+    Ok(messages.iter().rev().find_map(|(message, source_model)| {
+        if message.role != "assistant" {
+            return None;
+        }
+        let has_tool_calls = message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty());
+        if has_tool_calls {
+            return None;
+        }
+        let text = searchable_history_content(&message.content);
+        if text.trim().is_empty() {
+            return None;
+        }
+        seen += 1;
+        (seen == nth_back).then_some((text, source_model.clone()))
+    }))
+}
+
+fn render_history_replay_for_path(
+    session_label: Option<&str>,
+    history_file: &Path,
+) -> Result<String, Box<dyn Error>> {
+    Ok(match assistant_conclusion_text_at_path(history_file, 1)? {
+        Some((text, _)) => match session_label {
+            Some(id) => format!("[history] Latest assistant conclusion in session {id}:\n{text}"),
+            None => text,
+        },
+        None => match session_label {
+            Some(id) => format!("[history] No assistant conclusion found in session {id}."),
+            None => "[history] No assistant conclusion found in recent history.".to_string(),
+        },
+    })
+}
+
+fn collect_history_messages_for_path(
+    history_file: &Path,
+    options: HistoryPreviewOptions,
+) -> Result<Vec<HistoryPreviewItem>, Box<dyn Error>> {
+    let messages = history::build_message_arr_for_history_view(history_file)?;
+    let mut user_ordinal = 0usize;
+    let filtered = messages
+        .into_iter()
+        .filter_map(|(message, source_model)| {
+            let ordinal = if message.role == "user" {
+                user_ordinal += 1;
+                Some(user_ordinal)
+            } else {
+                None
+            };
+            let role_matches = match options.role_filter {
+                HistoryRoleFilter::All => true,
+                HistoryRoleFilter::User => message.role == "user",
+                HistoryRoleFilter::Assistant => message.role == "assistant",
+                HistoryRoleFilter::Tool => message.role == "tool",
+                HistoryRoleFilter::System => crate::ai::history::is_system_like_role(&message.role),
+            };
+            role_matches.then_some(HistoryPreviewItem {
+                message,
+                user_ordinal: ordinal,
+                source_model,
+            })
+        })
+        .filter(|item| {
+            options.grep.as_deref().is_none_or(|needle| {
+                let haystack =
+                    searchable_history_content(&item.message.content).to_ascii_lowercase();
+                haystack.contains(&needle.to_ascii_lowercase())
+            })
+        })
+        .collect::<Vec<_>>();
+    let shown = if filtered.len() > options.count {
+        filtered[filtered.len() - options.count..].to_vec()
+    } else {
+        filtered
+    };
+    Ok(shown)
 }
 
 fn collect_history_messages(
@@ -1523,6 +1947,69 @@ mod tests {
         );
         assert!(parse_local_command("/history undo u3").is_err());
         assert_eq!(parse_local_command("hello").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_history_other_session_targets_another_session_without_switching() {
+        assert_eq!(
+            parse_local_command("/history abc123").unwrap(),
+            Some(LocalCommand::ShowOtherSessionHistory {
+                session_id: "abc123".to_string(),
+                options: HistoryPreviewOptions {
+                    count: 6,
+                    role_filter: HistoryRoleFilter::All,
+                    full: false,
+                    grep: None,
+                },
+            })
+        );
+        // Cross-session `last [N]` matches `/history last [N]`: it replays one
+        // assistant conclusion with markdown rendering.
+        assert_eq!(
+            parse_local_command("/history abc123 last 5").unwrap(),
+            Some(LocalCommand::RenderOtherSessionMessageAt {
+                session_id: "abc123".to_string(),
+                nth_back: 5,
+            })
+        );
+        assert_eq!(
+            parse_local_command("/history abc123 last").unwrap(),
+            Some(LocalCommand::RenderOtherSessionMessageAt {
+                session_id: "abc123".to_string(),
+                nth_back: 1,
+            })
+        );
+        assert!(parse_local_command("/history abc123 last 0").is_err());
+        assert!(parse_local_command("/history abc123 last x").is_err());
+        assert!(parse_local_command("/history abc123 last 2 3").is_err());
+        assert_eq!(
+            parse_local_command("/history abc123 5").unwrap(),
+            Some(LocalCommand::ShowOtherSessionHistory {
+                session_id: "abc123".to_string(),
+                options: HistoryPreviewOptions {
+                    count: 5,
+                    role_filter: HistoryRoleFilter::All,
+                    full: false,
+                    grep: None,
+                },
+            })
+        );
+        assert_eq!(
+            parse_local_command("/history abc123 replay").unwrap(),
+            Some(LocalCommand::ReplayOtherSessionHistory {
+                session_id: "abc123".to_string(),
+            })
+        );
+        assert!(parse_local_command("/history abc123 rewind u3").is_err());
+        // Bare numbers and reserved words keep their current-session meaning.
+        assert!(matches!(
+            parse_local_command("/history 10").unwrap(),
+            Some(LocalCommand::ShowHistory(_))
+        ));
+        assert_eq!(
+            parse_local_command("/history last 3").unwrap(),
+            Some(LocalCommand::RenderHistoryMessageAt(3))
+        );
     }
 
     #[test]
