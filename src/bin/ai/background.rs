@@ -892,6 +892,15 @@ pub(crate) fn build_daemon_args(cli: &ParsedCli, session_id: &str) -> Vec<std::f
     if cli.consolidate_knowledge {
         args.push(OsString::from("--consolidate-knowledge"));
     }
+    if let Some(ref v) = cli.distill_session {
+        args.push(OsString::from("--distill-session"));
+        args.push(OsString::from(v));
+        if cli.distill_dry_run {
+            args.push(OsString::from("--distill-dry-run"));
+        }
+        args.push(OsString::from("--distill-limit"));
+        args.push(OsString::from(cli.distill_limit.to_string()));
+    }
     if cli.generate_completions {
         args.push(OsString::from("--generate-completions"));
     }

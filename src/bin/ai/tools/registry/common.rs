@@ -727,6 +727,7 @@ fn record_tool_stat(name: &str, ok: bool) {
         ],
         source: None,
         priority: Some(50),
+        distilled: None,
         owner_pid: None,
         owner_pgid: None,
         image_path: None,

@@ -674,6 +674,51 @@ fn subagent_tool_phase(tool_name: &str, args: &Value) -> String {
     }
 }
 
+/// Model-backed distillation uses the same preflight and budget as synchronous tools.
+pub(super) async fn run_session_distill(
+    app: &crate::ai::types::App,
+    mcp_client: &McpClient,
+    session_id: &str,
+    tool_call: &ToolCall,
+    allowed_tool_names: &FastSet<String>,
+) -> RunOneResult {
+    let prepared = match prepare_tool_call(mcp_client, tool_call, Some(allowed_tool_names)) {
+        Ok(prepared) => prepared,
+        Err(tool_result) => return RunOneResult {
+            tool_result, ok: false, executed: false, cached: false,
+        },
+    };
+    if let Err(result) = confirm_tool_execution(tool_call, &prepared.args) {
+        return result;
+    }
+    if let Some(result) = process_tool_denial(tool_call) {
+        return result;
+    }
+    if let Err(result) = reserve_current_process_tool_call_budget(tool_call) {
+        return result;
+    }
+    let result = crate::ai::tools::session_distill_tools::execute_with_app(app, &prepared.args)
+        .await
+        .map(|content| ToolResult { tool_call_id: tool_call.id.clone(), content });
+    finalize_execution_result(session_id, tool_call, &prepared, result, Some(allowed_tool_names), true, false)
+}
+
+fn process_tool_denial(tool_call: &ToolCall) -> Option<RunOneResult> {
+    let guard = GLOBAL_OS.lock().ok()?;
+    let os = guard.as_ref()?.lock().ok()?;
+    let proc = os.get_process(os.current_process_id()?)?;
+    if proc.allowed_tools.is_empty() || proc.allowed_tools.contains(&tool_call.function.name) {
+        return None;
+    }
+    Some(RunOneResult {
+        tool_result: ToolResult {
+            tool_call_id: tool_call.id.clone(),
+            content: format!("Error: tool '{}' is not in the allowed whitelist for this process.", tool_call.function.name),
+        },
+        ok: false, executed: false, cached: false,
+    })
+}
+
 fn run_one(
     mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,
@@ -701,7 +746,7 @@ fn run_one(
         return (prepared.route, result);
     }
 
-    // 实时 side-note：lead-agent → subagent（或前景）。在工具分发层直接处理，无需 MCP 往返。
+    // Handle lead-agent side notes directly, without an MCP round trip.
     if tool_call.function.name == "send_side_note" {
         let res = crate::ai::tools::service::side_note::handle_send_side_note(
             &tool_call.id,
@@ -719,35 +764,8 @@ fn run_one(
         return (prepared.route, run_result);
     }
 
-    if let Ok(guard) = GLOBAL_OS.lock() {
-        if let Some(os_arc) = guard.as_ref() {
-            if let Ok(os) = os_arc.lock() {
-                if let Some(current_pid) = os.current_process_id() {
-                    if let Some(proc) = os.get_process(current_pid) {
-                        if !proc.allowed_tools.is_empty()
-                            && !proc.allowed_tools.contains(&tool_call.function.name)
-                        {
-                            let content = format!(
-                                "Error: tool '{}' is not in the allowed whitelist for this process.",
-                                tool_call.function.name
-                            );
-                            return (
-                                prepared.route,
-                                RunOneResult {
-                                    tool_result: ToolResult {
-                                        tool_call_id: tool_call.id.clone(),
-                                        content,
-                                    },
-                                    ok: false,
-                                    executed: false,
-                                    cached: false,
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-        }
+    if let Some(result) = process_tool_denial(tool_call) {
+        return (prepared.route, result);
     }
 
     if let Some(tool_result) = load_cached_tool_result(session_id, tool_call, &prepared.args) {
@@ -766,7 +784,7 @@ fn run_one(
     crate::ai::driver::runtime_ctx::publish_subagent_phase(&progress);
 
     if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
-        // 不换行，以便完成状态用 \r 覆盖在同一行
+        // Keep the line open so completion can replace it with a carriage return.
         print!("{}", format_tool_status_running(&tool_call.function.name));
         let _ = std::io::stdout().flush();
     }
@@ -1237,6 +1255,7 @@ fn store_tool_cache_result(
         note,
         tags: vec![tool_call.function.name.clone(), cache_key],
         source: Some(format!("session:{session_id}")),
+        distilled: None,
         priority: Some(80),
         owner_pid: None,
         owner_pgid: None,

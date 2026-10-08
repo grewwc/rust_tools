@@ -75,13 +75,13 @@ fn is_memory_visible_to(entry: &AgentMemoryEntry, viewer_pid: Option<u64>) -> bo
     false
 }
 
-struct ViewerContext {
+pub(crate) struct ViewerContext {
     viewer_pid: Option<u64>,
     viewer_pgid: Option<u64>,
 }
 
 impl ViewerContext {
-    fn current() -> Self {
+    pub(crate) fn current() -> Self {
         let (pid, pgid) = current_owner_tags();
         Self {
             viewer_pid: pid,
@@ -89,7 +89,7 @@ impl ViewerContext {
         }
     }
 
-    fn can_see(&self, entry: &AgentMemoryEntry) -> bool {
+    pub(crate) fn can_see(&self, entry: &AgentMemoryEntry) -> bool {
         let Some(viewer) = self.viewer_pid else {
             return true;
         };
@@ -337,6 +337,7 @@ pub(crate) fn prepare_memory_save_entry(
             note: content.to_string(),
             tags,
             source,
+            distilled: None,
             priority,
             owner_pid,
             owner_pgid,
@@ -402,6 +403,7 @@ pub(crate) fn execute_memory_append(args: &Value) -> Result<String, String> {
         note: note.to_string(),
         tags,
         source,
+        distilled: None,
         priority,
         owner_pid,
         owner_pgid,
@@ -899,6 +901,7 @@ fn build_gc_summaries(evicted: &[AgentMemoryEntry], max_days: i64) -> Vec<AgentM
             tags,
             source,
             priority: Some(max_prio.max(150)),
+            distilled: None,
             owner_pid: None,
             owner_pgid: None,
             image_path: None,
@@ -1451,6 +1454,7 @@ mod tests {
             note: "ida 交接文档 原始内容".to_string(),
             tags: vec!["handoff".to_string()],
             source: None,
+            distilled: None,
             priority: None,
             owner_pid: None,
             owner_pgid: None,
@@ -1495,6 +1499,7 @@ mod tests {
             note: "AeolusLLM Copilot 二次分析问题排查：项目自动写回记录。".to_string(),
             tags: vec!["aeolusllm".to_string(), "copilot".to_string()],
             source: Some("project_writeback:aeolus".to_string()),
+            distilled: None,
             priority: Some(180),
             owner_pid: None,
             owner_pgid: None,
@@ -1507,6 +1512,7 @@ mod tests {
             note: "AeolusLLM Copilot 二次分析：通过 trace_id 在数据库检索原始问题。".to_string(),
             tags: vec!["aeolusllm".to_string(), "copilot".to_string()],
             source: Some("cli_note".to_string()),
+            distilled: None,
             priority: Some(150),
             owner_pid: None,
             owner_pgid: None,
@@ -1525,6 +1531,7 @@ mod tests {
                 note: "无关的手工笔记".to_string(),
                 tags: vec![],
                 source: Some("cli_note".to_string()),
+                distilled: None,
                 priority: Some(150),
                 owner_pid: None,
                 owner_pgid: None,
@@ -1575,6 +1582,7 @@ mod tests {
             note: "归档中的待删笔记 二次分析问题排查".to_string(),
             tags: vec!["aeolusllm".to_string()],
             source: Some("cli_note".to_string()),
+            distilled: None,
             priority: Some(150),
             owner_pid: None,
             owner_pgid: None,
@@ -1595,6 +1603,7 @@ mod tests {
                 note: "当前文件中的笔记 二次分析问题排查".to_string(),
                 tags: vec!["aeolusllm".to_string()],
                 source: Some("cli_note".to_string()),
+                distilled: None,
                 priority: Some(150),
                 owner_pid: None,
                 owner_pgid: None,
@@ -1700,6 +1709,7 @@ mod tests {
             note: "public note".to_string(),
             tags: vec![],
             source: None,
+            distilled: None,
             priority: Some(100),
             owner_pid: None,
             owner_pgid: None,
@@ -1719,6 +1729,7 @@ mod tests {
             note: "my note".to_string(),
             tags: vec![],
             source: None,
+            distilled: None,
             priority: Some(100),
             owner_pid: Some(42),
             owner_pgid: None,
@@ -1737,6 +1748,7 @@ mod tests {
             note: "tagged note".to_string(),
             tags: vec![],
             source: None,
+            distilled: None,
             priority: Some(100),
             owner_pid: Some(42),
             owner_pgid: Some(10),
@@ -1788,6 +1800,7 @@ mod tests {
             note: "a's note".to_string(),
             tags: vec![],
             source: None,
+            distilled: None,
             priority: Some(100),
             owner_pid: Some(child_a),
             owner_pgid: Some(100),
@@ -1833,6 +1846,7 @@ mod tests {
             note: "child's secret".to_string(),
             tags: vec![],
             source: None,
+            distilled: None,
             priority: Some(100),
             owner_pid: Some(child),
             owner_pgid: None,
@@ -1892,6 +1906,7 @@ mod tests {
             note: "a's private note".to_string(),
             tags: vec![],
             source: None,
+            distilled: None,
             priority: Some(100),
             owner_pid: Some(child_a),
             owner_pgid: None,

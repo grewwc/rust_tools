@@ -646,6 +646,20 @@ pub(super) async fn prepare_turn(
             other => other,
         };
     }
+    // Recalled knowledge is historical reference data for this request only.
+    // It never enters turn_messages, which is the canonical persistence track.
+    if !prev_assistant_in_tool_loop
+        && app.goal_mode.is_none()
+        && let Some(reference) = super::super::distilled_recall::select(app, question).await
+    {
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::String(reference),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+    }
     // VL image digest protocol: if the request projection's user message
     // contains inline images, inject a fixed "image handling protocol"
     // instruction asking the model to produce a reusable image digest this very

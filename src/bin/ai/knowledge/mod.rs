@@ -12,6 +12,7 @@
 //! merge live in `tools/storage/rag_store.rs`.
 
 pub mod config;
+pub(crate) mod distilled;
 pub mod entry;
 pub mod indexing;
 pub mod storage;

@@ -47,6 +47,7 @@ use crate::commonw::configw;
 
 mod agent_routing;
 mod background_dispatch;
+mod distilled_recall;
 pub mod commands;
 pub mod decision_log;
 pub mod hook_registry;
@@ -700,6 +701,14 @@ pub(in crate::ai) async fn run_with_cli(
             .scope(
                 app.current_persona_memory_file(),
                 note_search::handle_consolidate_knowledge(&app),
+            )
+            .await;
+    }
+    if app.cli.distill_session.is_some() {
+        return runtime_ctx::PERSONA_MEMORY_PATH
+            .scope(
+                app.current_persona_memory_file(),
+                note_search::handle_distill_session(&app),
             )
             .await;
     }

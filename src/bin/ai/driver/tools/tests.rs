@@ -348,6 +348,7 @@ fn tool_cache_entry_obeys_ttl() {
         note: "{}".to_string(),
         tags: Vec::new(),
         source: None,
+        distilled: None,
         priority: Some(80),
         owner_pid: None,
         owner_pgid: None,

@@ -1458,6 +1458,10 @@ fn build_system_prompt(
                 format_tool_names(&search_tools)
             ));
             lines.push(
+                "Exception: when the current task concerns past project decisions, preferences, or architecture, one proactive search using task keywords is allowed (entries distilled from session archives carry a session-distill source tag); reuse its result for the rest of the turn."
+                    .to_string(),
+            );
+            lines.push(
                 "Reuse a successful knowledge search for the rest of the turn. Search again only after knowledge changes or when the query is materially different."
                     .to_string(),
             );

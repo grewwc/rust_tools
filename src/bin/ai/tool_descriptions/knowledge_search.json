@@ -1,6 +1,6 @@
 {
   "name": "knowledge_search",
-  "description": "Search saved knowledge by keywords (BM25 + lexical similarity).",
+  "description": "Search saved knowledge by keywords (BM25 + lexical similarity), including entries distilled from session archives (session-distill source tag).",
   "parameters": {
     "type": "object",
     "properties": {

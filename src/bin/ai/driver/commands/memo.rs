@@ -100,6 +100,7 @@ async fn execute_memo_save(app: &mut App, arg: String) -> Result<(), Box<dyn std
         note: note_content.clone(),
         tags: vec![],
         source: Some("interactive_memo".to_string()),
+        distilled: None,
         priority: Some(150),
         owner_pid: None,
         owner_pgid: None,

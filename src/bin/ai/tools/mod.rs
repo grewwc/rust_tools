@@ -13,6 +13,7 @@ mod plan_tools;
 mod rag_tools;
 pub(crate) mod registry;
 pub(crate) mod service;
+pub(crate) mod session_distill_tools;
 pub(crate) mod skill_tools;
 pub(crate) mod storage;
 pub(crate) mod task_tools;

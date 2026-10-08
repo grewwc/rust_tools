@@ -232,6 +232,7 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
         owner_pid: None,
         owner_pgid: None,
         image_path: clipboard_image_path.clone(),
+        distilled: None,
     };
 
     match store.append(&entry) {
@@ -690,6 +691,7 @@ fn build_consolidation_merge_entries(
             owner_pid: None,
             owner_pgid: None,
             image_path: None,
+            distilled: None,
         });
     }
 
@@ -901,6 +903,26 @@ pub(super) async fn handle_consolidate_knowledge(
     }
 
     println!("\n✨ Done.");
+    Ok(())
+}
+
+/// Handle --distill-session <zip|session-id>: distill a session into knowledge
+/// entries and exit. Uses model-backed verification inside the persona
+/// memory scope like the other knowledge one-shot commands.
+pub(super) async fn handle_distill_session(
+    app: &App,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::ai::history::SessionStore;
+    use crate::ai::tools::service::session_distill::{DistillInput, run_distill_source_command};
+
+    let Some(value) = app.cli.distill_session.as_deref() else {
+        return Err("Missing --distill-session <archive.zip|session-id>".into());
+    };
+    let store = SessionStore::new(app.config.history_file.as_path());
+    let input = DistillInput::resolve(value, &super::runtime_ctx::effective_cwd()?, &store)?;
+    let report = run_distill_source_command(app, &input, app.cli.distill_limit, app.cli.distill_dry_run)
+        .await?;
+    println!("{}", crate::ai::tools::service::session_distill::format_report(&report, input.path()));
     Ok(())
 }
 
@@ -1481,6 +1503,7 @@ mod tests {
         // Source entry text: must be preserved losslessly after merging, not just
         // the model summary.
         let entry_a = AgentMemoryEntry {
+            distilled: None,
             id: Some("id_a".to_string()),
             timestamp: "2026-07-24T00:00:00Z".to_string(),
             category: "memo".to_string(),
@@ -1493,6 +1516,7 @@ mod tests {
             image_path: None,
         };
         let entry_b = AgentMemoryEntry {
+            distilled: None,
             id: Some("id_b".to_string()),
             timestamp: "2026-07-24T00:00:00Z".to_string(),
             category: "memo".to_string(),
@@ -1536,6 +1560,7 @@ mod tests {
     #[test]
     fn memo_consolidation_isolated_from_other_categories() {
         let entry = |id: &str, category: &str, image_path: Option<&str>| AgentMemoryEntry {
+            distilled: None,
             id: Some(id.to_string()),
             timestamp: "2026-07-24T00:00:00Z".to_string(),
             category: category.to_string(),

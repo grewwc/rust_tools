@@ -541,6 +541,7 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
             note,
             tags,
             source,
+            distilled: None,
             priority: Some(priority),
             owner_pid: None,
             owner_pgid: None,
@@ -634,6 +635,7 @@ mod tests {
             note: note.to_string(),
             tags: Vec::new(),
             source: None,
+            distilled: None,
             priority: Some(100),
             owner_pid: None,
             owner_pgid: None,
@@ -972,6 +974,7 @@ mod tests {
         let seed = [
             AgentMemoryEntry {
                 id: Some("mem_old_1".to_string()),
+                distilled: None,
                 timestamp: "2025-01-01T00:00:00Z".to_string(),
                 category: "user_memory".to_string(),
                 note: "old memo 1".to_string(),
@@ -984,6 +987,7 @@ mod tests {
             },
             AgentMemoryEntry {
                 id: Some("mem_old_2".to_string()),
+                distilled: None,
                 timestamp: "2025-01-01T00:00:01Z".to_string(),
                 category: "user_memory".to_string(),
                 note: "old memo 2".to_string(),
@@ -1060,6 +1064,7 @@ mod tests {
         let seed = [
             AgentMemoryEntry {
                 id: Some("mem_src_1".to_string()),
+                distilled: None,
                 timestamp: "2025-01-01T00:00:00Z".to_string(),
                 category: "user_memory".to_string(),
                 note: long_note_1.clone(),
@@ -1072,6 +1077,7 @@ mod tests {
             },
             AgentMemoryEntry {
                 id: Some("mem_src_2".to_string()),
+                distilled: None,
                 timestamp: "2025-01-01T00:00:01Z".to_string(),
                 category: "user_memory".to_string(),
                 note: long_note_2.to_string(),
@@ -1090,7 +1096,7 @@ mod tests {
         }
         std::fs::write(&path, buf).unwrap();
 
-        // 只给 source_ids，不给 delete_ids：源条目应被自动删除并替换为合并条目。
+        // Source IDs alone replace the original entries with the lossless merge.
         let report = execute_consolidation(&serde_json::json!({
             "save_entries": [{
                 "content": "合并后的简短摘要",

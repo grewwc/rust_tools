@@ -1,6 +1,26 @@
 use std::fs;
 use std::path::PathBuf;
 
+#[test]
+fn parse_cli_args_distill_session_accepts_zip_and_session_id() {
+    for input in ["./archive.zip", "6e969353-01f4-40c2-bddb-59fae9970ad3"] {
+        let cli = super::parse_cli_args(
+            ["a", "--distill-session", input, "--distill-dry-run", "--distill-limit", "10"]
+                .into_iter().map(str::to_owned),
+        );
+        assert_eq!(cli.distill_session.as_deref(), Some(input));
+        assert!(cli.distill_dry_run);
+        assert_eq!(cli.distill_limit, 10);
+        assert!(cli.args.is_empty());
+    }
+}
+
+#[test]
+fn parse_cli_args_distill_session_preserves_missing_value_for_driver_error() {
+    let cli = super::parse_cli_args(["a", "--distill-session"].into_iter().map(str::to_owned));
+    assert_eq!(cli.distill_session.as_deref(), Some(""));
+}
+
 fn make_temp_file(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!("ai-cli-{name}-{}.txt", uuid::Uuid::new_v4()));

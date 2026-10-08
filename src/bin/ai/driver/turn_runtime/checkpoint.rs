@@ -53,7 +53,7 @@ impl ToolRoundCheckpointPhase {
     pub(super) fn guidance(self) -> &'static str {
         match self {
             Self::Explore => {
-                "Still in the read-only evidence-gathering phase: summarize confirmed facts and the single remaining gap, then pick only the one next step with the highest information gain; prefer a precise search or one sufficiently large read, and stop expanding the unrelated evidence surface."
+                "Still in the read-only evidence-gathering phase: summarize confirmed facts and the single remaining gap, then pick only the one next step with the highest information gain; prefer a precise search or one sufficiently large read, and stop expanding the unrelated evidence surface. Then execute that step and continue the loop; do not stop after merely naming it."
             }
             Self::ImplementedNeedsVerification => {
                 "State has recently been modified successfully: do not resume exploration or continue unrelated changes; run the narrowest check/test that covers the change, check diff/status if needed, then wrap up immediately."
@@ -95,7 +95,7 @@ impl ToolRoundCheckpointLevel {
     pub(super) fn guidance(self) -> &'static str {
         match self {
             Self::Review => {
-                "This is a one-time phase checkpoint that is not an error or a tool failure."
+                "This is a one-time phase checkpoint that is not an error or a tool failure; it is a pacing reminder only. Do not end the turn or write a final answer because of this checkpoint: choose the next step, execute it, and keep working until the task is complete or you are genuinely blocked."
             }
             Self::Restrict => {
                 "This is the second-level checkpoint: first list the remaining necessary work, then only complete critical fixes and minimal verification; do not expand the task scope."

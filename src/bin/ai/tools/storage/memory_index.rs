@@ -464,6 +464,7 @@ mod tests {
 
     fn entry(id: &str, cat: &str, note: &str, prio: u8) -> AgentMemoryEntry {
         AgentMemoryEntry {
+            distilled: None,
             id: Some(id.to_string()),
             timestamp: "2025-03-01T00:00:00Z".to_string(),
             category: cat.to_string(),

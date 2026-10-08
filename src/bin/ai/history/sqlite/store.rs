@@ -435,9 +435,18 @@ pub(super) fn decode_tool_calls(tool_calls: Option<&str>) -> Option<Vec<ToolCall
 
 pub(in crate::ai) fn read_all_messages_sqlite(path: &Path) -> io::Result<Vec<Message>> {
     let conn = open_history_db(path)?;
+    read_canonical_messages(&conn)
+}
 
+/// Read a source session without creating it, migrating it, or changing its journal mode.
+pub(in crate::ai) fn read_all_messages_sqlite_read_only(path: &Path) -> io::Result<Vec<Message>> {
+    let conn = super::connection::open_history_db_read_only(path)?;
+    read_canonical_messages(&conn)
+}
+
+fn read_canonical_messages(conn: &Connection) -> io::Result<Vec<Message>> {
     read_messages_with_sql(
-        &conn,
+        conn,
         "SELECT role, content, tool_calls, tool_call_id, reasoning_content
          FROM messages
          ORDER BY id ASC",

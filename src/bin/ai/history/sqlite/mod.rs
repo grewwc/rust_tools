@@ -64,6 +64,7 @@ pub(in crate::ai) use rollback::{
 pub(in crate::ai) use store::{
     ContextHistory, SessionListMetadata, append_history_sqlite, append_history_sqlite_for_model,
     coalesce_repeated_wait_wake_notes_sqlite, count_user_turns_sqlite, read_all_messages_sqlite,
+    read_all_messages_sqlite_read_only,
     read_all_messages_with_models_sqlite, replace_all_messages_sqlite, reserve_turn_index_sqlite,
 };
 pub(in crate::ai) use trim::{

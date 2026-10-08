@@ -108,7 +108,8 @@ pub(super) fn record_hidden_self_note(
         note: hidden_meta.to_string(),
         tags: vec!["agent".to_string(), "policy".to_string()],
         source: Some(format!("session:{}", app.session_id)),
-        // self_note 是会话期经验，不是永久记忆；保持可 GC，避免旧的自我反思污染后续会话。
+        distilled: None,
+        // Self-notes are session-scoped, not permanent; allow GC to avoid polluting later sessions.
         priority: Some(120),
         owner_pid: None,
         owner_pgid: None,

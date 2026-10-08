@@ -80,6 +80,13 @@ pub(super) struct ParsedCli {
     /// AI-driven knowledge base consolidation: read all entries → model analysis
     /// → perform consolidation.
     pub(super) consolidate_knowledge: bool,
+    /// Distill a session archive zip into knowledge entries and exit.
+    /// Enabled via `--distill-session <zip|session-id>`; requires model-backed verification.
+    pub(super) distill_session: Option<String>,
+    /// With `--distill-session`: extract and verify without writing.
+    pub(super) distill_dry_run: bool,
+    /// With `--distill-session`: max entries to distill (default: 20).
+    pub(super) distill_limit: usize,
     /// --generate-completions
     pub(super) generate_completions: bool,
     /// Whether to run in background mode (`--background` / `-bg`).
@@ -183,6 +190,21 @@ fn register_cli_flags(parser: &mut TermParser) {
         "consolidate-knowledge",
         false,
         "AI-driven consolidation of all knowledge entries",
+    );
+    parser.add_string(
+        "distill-session",
+        "",
+        "distill a session ZIP archive or complete local session ID into knowledge entries and exit",
+    );
+    parser.add_bool(
+        "distill-dry-run",
+        false,
+        "with --distill-session: extract and verify without writing",
+    );
+    parser.add_string(
+        "distill-limit",
+        "",
+        "with --distill-session: max entries to distill (default: 20)",
     );
     parser.add_bool("note-search", false, NOTE_SEARCH_USAGE);
     parser.add_bool("generate-completions", false, GENERATE_COMPLETIONS_USAGE);
@@ -526,6 +548,9 @@ impl Default for ParsedCli {
             note_delete: None,
             note_edit: None,
             consolidate_knowledge: false,
+            distill_session: None,
+            distill_dry_run: false,
+            distill_limit: 20,
             generate_completions: false,
             background: false,
             stop_session: None,
@@ -593,6 +618,21 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 
     // Handle consolidate-knowledge.
     cli.consolidate_knowledge = parser.contains_flag_strict("consolidate-knowledge");
+
+    // Handle distill-session.
+    if parser.contains_flag_strict("distill-session") {
+        let val = parser.flag_value_or_default("distill-session");
+        // Record presence even when empty: the driver then fails fast with a
+        // clear error instead of silently starting a normal session.
+        cli.distill_session = Some(val.trim().to_string());
+        cli.distill_dry_run = parser.contains_flag_strict("distill-dry-run");
+        if parser.contains_flag_strict("distill-limit") {
+            let raw = parser.flag_value_or_default("distill-limit");
+            if let Ok(n) = raw.trim().parse::<usize>() {
+                cli.distill_limit = n.clamp(1, 100);
+            }
+        }
+    }
 
     // Handle generate-completions.
     cli.generate_completions = parser.contains_flag_strict("generate-completions");

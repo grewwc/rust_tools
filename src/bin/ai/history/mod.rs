@@ -66,6 +66,8 @@ pub(in crate::ai) use sessions::{
 pub(in crate::ai) use sqlite::MarkMessageUpdate;
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::fork_history_for_subagent;
+#[allow(unused_imports)]
+pub(in crate::ai) use sqlite::{read_all_messages_sqlite, read_all_messages_sqlite_read_only};
 
 /// Prepare an independent history file for a sub-agent. First dispatch forks
 /// the parent history on demand; resume only reuses the existing child file

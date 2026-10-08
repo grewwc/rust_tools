@@ -1,0 +1,27 @@
+{
+  "name": "session_distill",
+  "description": "Semantically distill a /sessions archive zip into evidence-backed, revisioned knowledge. Only call when the user explicitly asks to distill an archive. Scans the complete supported source text, resolves corrections, and independently checks conclusions against source evidence before committing atomically. Reports saved/updated/duplicates/rejected; dry_run previews without writes. Verified current-project conclusions can be selectively recalled on new tasks; legacy snippets are excluded.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "archive": {
+        "type": "string",
+        "description": "Path to the session archive zip (produced by /sessions archive)."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Max entries to distill (default: 20)."
+      },
+      "dry_run": {
+        "type": "boolean",
+        "description": "Run semantic extraction and evidence verification without writing (default: false)."
+      }
+    },
+    "required": [
+      "archive"
+    ]
+  },
+  "groups": [
+    "knowledge"
+  ]
+}

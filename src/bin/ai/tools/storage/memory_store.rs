@@ -184,6 +184,9 @@ pub(crate) struct AgentMemoryEntry {
     /// When set, OCR text is extracted and stored in `note` for search indexing.
     #[serde(default)]
     pub(crate) image_path: Option<String>,
+    /// Verified provenance and historical revisions are not searchable note text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) distilled: Option<crate::ai::knowledge::distilled::DistilledMetadata>,
 }
 
 fn default_priority() -> Option<u8> {
@@ -199,6 +202,7 @@ impl Default for AgentMemoryEntry {
             note: String::new(),
             tags: Vec::new(),
             source: None,
+            distilled: None,
             priority: Some(100),
             owner_pid: None,
             owner_pgid: None,
@@ -215,6 +219,14 @@ pub(crate) struct MemoryStore {
 pub(crate) struct MemoryBatchUpdateReport {
     pub(crate) deleted: usize,
     pub(crate) appended: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DistilledUpsertReport {
+    pub(crate) inserted: bool,
+    pub(crate) updated: bool,
+    pub(crate) duplicate: bool,
+    pub(crate) entry_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +289,199 @@ impl MemoryStore {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Commit one verified revision after comparing its canonical ID and revision.
+    /// Archived entries are never candidates for updates or duplicate detection.
+    #[cfg(test)]
+    pub(crate) fn upsert_distilled(
+        &self,
+        entry: AgentMemoryEntry,
+        expected: Option<(String, u32)>,
+    ) -> Result<DistilledUpsertReport, String> {
+        self.upsert_distilled_batch(vec![(entry, expected)], false)?
+            .pop()
+            .ok_or_else(|| "Missing distilled batch result".to_string())
+    }
+
+    /// Validate the complete batch against one canonical snapshot, then commit once.
+    /// Preview uses the same staging logic, without creating or writing any store files.
+    pub(crate) fn upsert_distilled_batch(
+        &self,
+        pending: Vec<(AgentMemoryEntry, Option<(String, u32)>)>,
+        dry_run: bool,
+    ) -> Result<Vec<DistilledUpsertReport>, String> {
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !dry_run {
+            self.ensure_memory_file_for_lock()?;
+        }
+        super::with_memory_file_lock(&self.path, || {
+            let mut entries = self.current_entries_while_locked()?;
+            let mut reports = Vec::with_capacity(pending.len());
+            let mut touched_ids = FxHashSet::default();
+            for (entry, expected) in pending {
+                let report = Self::stage_distilled_upsert(&mut entries, entry, expected)?;
+                if !touched_ids.insert(report.entry_id.clone()) {
+                    return Err("Distilled batch contains a repeated canonical ID".to_string());
+                }
+                reports.push(report);
+            }
+            if !dry_run {
+                let delete_ids: Vec<_> = reports.iter()
+                    .filter(|report| report.updated)
+                    .map(|report| report.entry_id.as_str())
+                    .collect();
+                let changed_ids: FxHashSet<_> = reports.iter()
+                    .filter(|report| !report.duplicate)
+                    .map(|report| report.entry_id.as_str())
+                    .collect();
+                let new_entries: Vec<_> = entries.into_iter()
+                    .filter(|entry| entry.id.as_deref().is_some_and(|id| changed_ids.contains(id)))
+                    .collect();
+                if !new_entries.is_empty() {
+                    self.apply_batch_update_while_locked(&delete_ids, &new_entries, false)?;
+                }
+            }
+            Ok(reports)
+        })
+    }
+
+    /// Stage an upsert in memory only; callers persist only after every item passes.
+    fn stage_distilled_upsert(
+        entries: &mut Vec<AgentMemoryEntry>,
+        mut entry: AgentMemoryEntry,
+        expected: Option<(String, u32)>,
+    ) -> Result<DistilledUpsertReport, String> {
+        use crate::ai::knowledge::distilled::{DistilledRevision, active_distilled_metadata};
+
+        let mut metadata = active_distilled_metadata(&entry)
+            .ok_or_else(|| "Invalid distilled metadata or content digest".to_string())?;
+        let viewer = crate::ai::tools::service::memory::ViewerContext::current();
+        if !viewer.can_see(&entry) {
+            return Err("Distilled entry is outside the current owner scope".to_string());
+        }
+        {
+            let same_key = |existing: &&AgentMemoryEntry| {
+                existing.owner_pid == entry.owner_pid
+                    && existing.owner_pgid == entry.owner_pgid
+                    && existing.distilled.as_ref().is_some_and(|old| {
+                        old.scope == metadata.scope && old.topic_key == metadata.topic_key
+                    })
+            };
+            let collisions: Vec<_> = entries.iter().filter(same_key).collect();
+            let previous = if let Some((id, revision)) = &expected {
+                let matching: Vec<_> = entries
+                    .iter()
+                    .filter(|existing| existing.id.as_deref() == Some(id.as_str()))
+                    .collect();
+                if matching.len() != 1 {
+                    return Err("Stale or ambiguous distilled entry ID".to_string());
+                }
+                let existing = matching[0];
+                let old = active_distilled_metadata(existing)
+                    .ok_or_else(|| "Expected entry is not active distilled memory".to_string())?;
+                if old.revision != *revision {
+                    return Err("Stale distilled revision".to_string());
+                }
+                if !viewer.can_see(existing) || !same_key(&existing) {
+                    return Err("Distilled scope, topic or owner cannot change".to_string());
+                }
+                if collisions.len() != 1 {
+                    return Err("Distilled scope/topic/owner collision".to_string());
+                }
+                Some((existing, old))
+            } else {
+                if collisions.len() > 1 {
+                    return Err("Distilled scope/topic/owner collision".to_string());
+                }
+                collisions.first().and_then(|existing| {
+                    active_distilled_metadata(existing).map(|old| (*existing, old))
+                })
+            };
+            if let Some((existing, old)) = &previous {
+                // A consumed archive is not new evidence. Re-running extraction
+                // must never roll back a newer revision, even with fresh CAS data.
+                if old.content_digest != metadata.content_digest
+                    && metadata.source_digests.iter().all(|digest| old.source_digests.contains(digest))
+                {
+                    return Err("Previously consumed source cannot replace current distilled knowledge".to_string());
+                }
+                if old.content_digest == metadata.content_digest
+                    && metadata.source_digests.iter().all(|digest| old.source_digests.contains(digest))
+                {
+                    let entry_id = existing.id.as_ref().filter(|id| !id.is_empty())
+                        .ok_or_else(|| "Distilled entry is missing its canonical ID".to_string())?;
+                    return Ok(DistilledUpsertReport {
+                        inserted: false, updated: false, duplicate: true, entry_id: entry_id.clone(),
+                    });
+                }
+            }
+            if expected.is_none() && !collisions.is_empty() {
+                return Err("Distilled topic already exists; an expected revision is required".to_string());
+            }
+            let entry_id = if let Some((existing, old)) = previous {
+                metadata.revision = old.revision.checked_add(1)
+                    .ok_or_else(|| "Distilled revision overflow".to_string())?;
+                metadata.previous_revisions = old.previous_revisions;
+                metadata.previous_revisions.push(DistilledRevision {
+                    revision: old.revision,
+                    note: existing.note.clone(),
+                    content_digest: old.content_digest,
+                    evidence: old.evidence,
+                });
+                for digest in old.source_digests {
+                    if !metadata.source_digests.contains(&digest) {
+                        metadata.source_digests.push(digest);
+                    }
+                }
+                expected.as_ref().expect("updates require an expected revision").0.clone()
+            } else {
+                metadata.revision = 1;
+                metadata.previous_revisions.clear();
+                let id = entry.id.clone().filter(|id| !id.trim().is_empty())
+                    .unwrap_or_else(crate::ai::tools::service::memory::next_memory_id);
+                if entries.iter().any(|existing| existing.id.as_ref() == Some(&id)) {
+                    return Err("Distilled entry ID collides with an existing entry".to_string());
+                }
+                id
+            };
+            entry.id = Some(entry_id.clone());
+            entry.distilled = Some(metadata);
+            if expected.is_some() {
+                entries.retain(|existing| existing.id.as_ref() != Some(&entry_id));
+            }
+            entries.push(entry);
+            Ok(DistilledUpsertReport {
+                inserted: expected.is_none(), updated: expected.is_some(), duplicate: false, entry_id,
+            })
+        }
+    }
+
+    /// Read verified canonical rows using the same owner visibility as explicit memory tools.
+    pub(crate) fn active_distilled_entries(&self, scope: &str) -> Result<Vec<AgentMemoryEntry>, String> {
+        let viewer = crate::ai::tools::service::memory::ViewerContext::current();
+        super::with_memory_file_lock(&self.path, || {
+            Ok(self.current_entries_while_locked()?.into_iter().filter(|entry| {
+                viewer.can_see(entry)
+                    && crate::ai::knowledge::distilled::active_distilled_metadata(entry)
+                        .is_some_and(|metadata| metadata.scope == scope)
+            }).collect())
+        })
+    }
+
+    /// Fail closed on malformed rows so revision commits cannot discard unrelated data.
+    fn current_entries_while_locked(&self) -> Result<Vec<AgentMemoryEntry>, String> {
+        let content = match fs::read_to_string(&self.path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(format!("Failed to read canonical memory: {err}")),
+        };
+        content.lines().enumerate().filter(|(_, line)| !line.trim().is_empty())
+            .map(|(index, line)| serde_json::from_str(line)
+                .map_err(|err| format!("Invalid canonical memory row {}: {err}", index + 1)))
+            .collect()
     }
 
     pub(crate) fn append(&self, entry: &AgentMemoryEntry) -> Result<(), String> {
@@ -619,13 +824,24 @@ impl MemoryStore {
                 appended: 0,
             });
         }
-        let id_set: FxHashSet<&str> = delete_ids.iter().copied().collect();
         super::with_memory_file_lock(&self.path, || {
+            self.apply_batch_update_while_locked(delete_ids, new_entries, true)
+        })
+    }
+
+    /// The caller holds the canonical memory lock across validation and commit.
+    fn apply_batch_update_while_locked(
+        &self,
+        delete_ids: &[&str],
+        new_entries: &[AgentMemoryEntry],
+        include_archives: bool,
+    ) -> Result<MemoryBatchUpdateReport, String> {
+            let id_set: FxHashSet<&str> = delete_ids.iter().copied().collect();
             if let Some(parent) = self.path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|err| format!("Failed to create memory dir: {err}"))?;
             }
-            let mut paths = if id_set.is_empty() {
+            let mut paths = if id_set.is_empty() || !include_archives {
                 vec![self.path.clone()]
             } else {
                 self.memory_files_to_scan_consolidate()?
@@ -722,7 +938,6 @@ impl MemoryStore {
                 deleted: deleted_total,
                 appended: new_entries.len(),
             })
-        })
     }
 
     fn memory_files_to_scan(&self, include_archives: bool) -> Result<Vec<PathBuf>, String> {
@@ -1148,6 +1363,301 @@ pub(crate) fn store_for_path(path: PathBuf) -> MemoryStore {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn distilled_test_store(label: &str) -> MemoryStore {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        MemoryStore::for_tests_with_path(std::env::temp_dir().join(format!(
+            "rt_distilled_{label}_{stamp}.jsonl"
+        )))
+    }
+
+    fn distilled_test_entry(id: &str, note: &str, source: &str) -> AgentMemoryEntry {
+        use crate::ai::knowledge::distilled::{
+            DISTILLED_SCHEMA, DistilledEvidence, DistilledMetadata, digest, entry_content_digest,
+        };
+        let mut entry = AgentMemoryEntry {
+            id: Some(id.to_string()),
+            category: "project_memory".to_string(),
+            note: note.to_string(),
+            ..AgentMemoryEntry::default()
+        };
+        entry.distilled = Some(DistilledMetadata {
+            schema: DISTILLED_SCHEMA,
+            scope: "/project".to_string(),
+            revision: 1,
+            topic_key: "build".to_string(),
+            verified: true,
+            content_digest: entry_content_digest(&entry),
+            evidence: vec![DistilledEvidence {
+                source_digest: digest(source),
+                message_id: "message-1".to_string(),
+                role: "user".to_string(),
+                quote: note.to_string(),
+                text_digest: digest(note),
+            }],
+            source_digests: vec![digest(source)],
+            previous_revisions: Vec::new(),
+        });
+        entry
+    }
+
+    #[test]
+    fn distilled_batch_late_failure_preserves_all_canonical_rows() {
+        let store = distilled_test_store("batch_failure");
+        store.upsert_distilled(distilled_test_entry("build", "Use cargo check", "source-1"), None).unwrap();
+        let before = fs::read(store.path()).unwrap();
+        let mut first = distilled_test_entry("tests", "Run focused tests", "source-2");
+        first.distilled.as_mut().unwrap().topic_key = "testing".to_string();
+        let second = distilled_test_entry("build", "Use cargo test", "source-3");
+        let mut invalid = second.clone();
+        invalid.distilled = None;
+        let failures = [
+            (second.clone(), Some(("build".to_string(), 2))),
+            (second, None),
+            (invalid, None),
+        ];
+        for (entry, expected) in failures {
+            for dry_run in [true, false] {
+                assert!(store.upsert_distilled_batch(
+                    vec![(first.clone(), None), (entry.clone(), expected.clone())], dry_run,
+                ).is_err());
+                assert_eq!(fs::read(store.path()).unwrap(), before);
+            }
+        }
+        let committed = store.upsert_distilled_batch(vec![(first, None)], false).unwrap();
+        assert!(committed[0].inserted);
+        assert_eq!(store.active_distilled_entries("/project").unwrap().len(), 2);
+        let _ = fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn distilled_batch_preview_matches_commit_with_new_source_and_unchanged_note() {
+        let store = distilled_test_store("batch_preview");
+        store.upsert_distilled(distilled_test_entry("build", "Use cargo check", "source-1"), None).unwrap();
+        let mut duplicate = distilled_test_entry("lint", "Run clippy", "lint-source");
+        duplicate.distilled.as_mut().unwrap().topic_key = "lint".to_string();
+        store.upsert_distilled(duplicate.clone(), None).unwrap();
+        let before = fs::read(store.path()).unwrap();
+        let new_evidence = distilled_test_entry("build", "Use cargo check", "source-2");
+        let mut inserted = distilled_test_entry("tests", "Run focused tests", "test-source");
+        inserted.distilled.as_mut().unwrap().topic_key = "testing".to_string();
+        let pending = vec![
+            (new_evidence.clone(), Some(("build".to_string(), 1))),
+            (inserted, None),
+            (duplicate, Some(("lint".to_string(), 1))),
+        ];
+        let preview = store.upsert_distilled_batch(pending.clone(), true).unwrap();
+        assert!(preview[0].updated && !preview[0].duplicate);
+        assert!(preview[1].inserted);
+        assert!(preview[2].duplicate);
+        assert_eq!(fs::read(store.path()).unwrap(), before);
+        assert_eq!(preview, store.upsert_distilled_batch(pending, false).unwrap());
+        let active = store.active_distilled_entries("/project").unwrap();
+        assert_eq!(active.len(), 3);
+        let metadata = active.iter().find(|entry| entry.id.as_deref() == Some("build"))
+            .unwrap().distilled.as_ref().unwrap();
+        assert_eq!(metadata.revision, 2);
+        assert_eq!(metadata.source_digests.len(), 2);
+        assert_eq!(metadata.previous_revisions.len(), 1);
+        assert_eq!(metadata.evidence, new_evidence.distilled.as_ref().unwrap().evidence);
+        let stable = fs::read(store.path()).unwrap();
+        let replay = vec![(new_evidence, Some(("build".to_string(), 2)))];
+        let preview = store.upsert_distilled_batch(replay.clone(), true).unwrap();
+        assert!(preview[0].duplicate);
+        assert_eq!(preview, store.upsert_distilled_batch(replay, false).unwrap());
+        assert_eq!(fs::read(store.path()).unwrap(), stable);
+        let _ = fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn distilled_batch_preview_does_not_create_store_or_parent_directory() {
+        let path = distilled_test_store("preview_missing").path().join("memory.jsonl");
+        let store = MemoryStore::for_tests_with_path(path.clone());
+        assert!(!path.parent().unwrap().exists());
+        let reports = store.upsert_distilled_batch(
+            vec![(distilled_test_entry("build", "Use cargo check", "source-1"), None)], true,
+        ).unwrap();
+        assert!(reports[0].inserted);
+        assert!(!path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn distilled_batch_repeated_identity_is_rejected_before_commit() {
+        let store = distilled_test_store("batch_repeated");
+        let original = distilled_test_entry("build", "Use cargo check", "source-1");
+        store.upsert_distilled(original.clone(), None).unwrap();
+        let before = fs::read(store.path()).unwrap();
+        for dry_run in [true, false] {
+            assert!(store.upsert_distilled_batch(
+                vec![(original.clone(), None), (original.clone(), None)], dry_run,
+            ).unwrap_err().contains("repeated canonical ID"));
+            assert_eq!(fs::read(store.path()).unwrap(), before);
+        }
+        let _ = fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn distilled_batch_concurrent_stale_writer_cannot_commit_its_other_entry() {
+        let store = distilled_test_store("batch_concurrent");
+        store.upsert_distilled(distilled_test_entry("build", "Use cargo check", "source-1"), None).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2).map(|index| {
+            let store = MemoryStore::for_tests_with_path(store.path().to_path_buf());
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let id = format!("extra-{index}");
+                let mut extra = distilled_test_entry(&id, "Run focused tests", &id);
+                extra.distilled.as_mut().unwrap().topic_key = id.clone();
+                let update = distilled_test_entry("build", &format!("Build choice {index}"), &id);
+                barrier.wait();
+                (id, store.upsert_distilled_batch(vec![
+                    (extra, None), (update, Some(("build".to_string(), 1))),
+                ], false))
+            })
+        }).collect();
+        let results: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|(_, result)| result.is_ok()).count(), 1);
+        let (losing_id, result) = results.iter().find(|(_, result)| result.is_err()).unwrap();
+        assert!(result.as_ref().unwrap_err().contains("Stale"));
+        let active = store.active_distilled_entries("/project").unwrap();
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().all(|entry| entry.id.as_ref() != Some(losing_id)));
+        let _ = fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn distilled_revision_insert_update_duplicate_and_stale_preserves_rows() {
+        let store = distilled_test_store("revisions");
+        let ordinary = AgentMemoryEntry {
+            id: Some("ordinary".to_string()),
+            note: "Keep this non-distilled note".to_string(),
+            ..AgentMemoryEntry::default()
+        };
+        store.append(&ordinary).unwrap();
+        let original = distilled_test_entry("canonical", "Use cargo check", "source-1");
+        let inserted = store.upsert_distilled(original.clone(), None).unwrap();
+        assert_eq!(inserted, DistilledUpsertReport {
+            inserted: true, updated: false, duplicate: false, entry_id: "canonical".to_string(),
+        });
+        let bytes_before_duplicate = fs::read(store.path()).unwrap();
+        let mut retry = original.clone();
+        retry.id = Some("retry-id".to_string());
+        assert!(store.upsert_distilled(retry, None).unwrap().duplicate);
+        assert_eq!(fs::read(store.path()).unwrap(), bytes_before_duplicate);
+
+        let updated_entry = distilled_test_entry("ignored-new-id", "Use a focused test", "source-2");
+        let updated = store.upsert_distilled(updated_entry.clone(), Some(("canonical".to_string(), 1))).unwrap();
+        assert_eq!(updated, DistilledUpsertReport {
+            inserted: false, updated: true, duplicate: false, entry_id: "canonical".to_string(),
+        });
+        let active = store.active_distilled_entries("/project").unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id.as_deref(), Some("canonical"));
+        assert_eq!(active[0].note, updated_entry.note);
+        let metadata = active[0].distilled.as_ref().unwrap();
+        assert_eq!(metadata.revision, 2);
+        assert_eq!(metadata.previous_revisions.len(), 1);
+        assert_eq!(metadata.previous_revisions[0].revision, 1);
+        assert_eq!(metadata.previous_revisions[0].note, original.note);
+        assert_eq!(metadata.previous_revisions[0].evidence, original.distilled.as_ref().unwrap().evidence);
+        assert_eq!(metadata.source_digests.len(), 2);
+        let stable_bytes = fs::read(store.path()).unwrap();
+        assert!(store.upsert_distilled(original.clone(), Some(("canonical".to_string(), 2)))
+            .unwrap_err().contains("Previously consumed source"));
+        assert_eq!(fs::read(store.path()).unwrap(), stable_bytes);
+        assert!(store.upsert_distilled(updated_entry.clone(), Some(("canonical".to_string(), 1))).unwrap_err().contains("Stale"));
+        assert!(store.upsert_distilled(updated_entry, Some(("canonical".to_string(), 2))).unwrap().duplicate);
+        assert_eq!(fs::read(store.path()).unwrap(), stable_bytes);
+        let all = store.current_entries_while_locked().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(serde_json::to_value(all.iter().find(|entry| entry.id == ordinary.id).unwrap()).unwrap(), serde_json::to_value(ordinary).unwrap());
+
+        let next = distilled_test_entry("ignored", "Use targeted test names", "source-3");
+        store.upsert_distilled(next, Some(("canonical".to_string(), 2))).unwrap();
+        let active = store.active_distilled_entries("/project").unwrap();
+        let metadata = active[0].distilled.as_ref().unwrap();
+        assert_eq!(metadata.revision, 3);
+        assert_eq!(metadata.previous_revisions.len(), 2);
+        assert_eq!(metadata.previous_revisions[0].note, original.note);
+        let _ = fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn distilled_revision_rejects_collisions_and_invalid_content_without_mutation() {
+        let store = distilled_test_store("collisions");
+        let original = distilled_test_entry("canonical", "Original note", "source-1");
+        store.upsert_distilled(original.clone(), None).unwrap();
+        let stable_bytes = fs::read(store.path()).unwrap();
+        let mut invalid = original.clone();
+        invalid.note = "Manual edit without updating the digest".to_string();
+        assert!(store.upsert_distilled(invalid, Some(("canonical".to_string(), 1))).is_err());
+        let replacement = distilled_test_entry("other", "Another note", "source-2");
+        assert!(store.upsert_distilled(replacement.clone(), None).is_err());
+        assert!(store.upsert_distilled(replacement, Some(("missing".to_string(), 1))).is_err());
+        let mut other_scope = original.clone();
+        other_scope.distilled.as_mut().unwrap().scope = "/other-project".to_string();
+        assert!(store.upsert_distilled(other_scope.clone(), Some(("canonical".to_string(), 1))).is_err());
+        assert!(store.upsert_distilled(other_scope, None).is_err());
+        let mut other_owner = original.clone();
+        other_owner.owner_pid = Some(u64::MAX);
+        assert!(store.upsert_distilled(other_owner, Some(("canonical".to_string(), 1))).is_err());
+        assert_eq!(fs::read(store.path()).unwrap(), stable_bytes);
+        let _ = fs::remove_file(store.path());
+    }
+
+    #[test]
+    fn distilled_revision_reads_only_verified_current_scope_and_keeps_archive() {
+        let store = distilled_test_store("canonical");
+        let original = distilled_test_entry("canonical", "Current note", "source-1");
+        store.upsert_distilled(original.clone(), None).unwrap();
+        let archive = store.path().with_extension("jsonl.1");
+        let archived = serde_json::to_string(&original).unwrap();
+        fs::write(&archive, format!("{archived}\n")).unwrap();
+        let archive_bytes = fs::read(&archive).unwrap();
+        let changed = distilled_test_entry("ignored", "New current note", "source-2");
+        store.upsert_distilled(changed, Some(("canonical".to_string(), 1))).unwrap();
+        assert_eq!(fs::read(&archive).unwrap(), archive_bytes);
+        let mut invalid = distilled_test_entry("manual", "Verified then edited", "source-3");
+        invalid.note = "Manual edit".to_string();
+        store.apply_batch_update(&[], &[invalid]).unwrap();
+        let mut other_scope = distilled_test_entry("other-project", "Other project note", "source-4");
+        other_scope.distilled.as_mut().unwrap().scope = "/other-project".to_string();
+        store.upsert_distilled(other_scope, None).unwrap();
+        assert_eq!(store.active_distilled_entries("/project").unwrap().len(), 1);
+        assert_eq!(store.active_distilled_entries("/other-project").unwrap().len(), 1);
+        store.apply_batch_update_while_locked(&["canonical"], &[], false).unwrap();
+        assert!(store.active_distilled_entries("/project").unwrap().is_empty());
+        assert!(store.upsert_distilled(original, Some(("canonical".to_string(), 1))).is_err());
+        assert_eq!(fs::read(&archive).unwrap(), archive_bytes);
+        let _ = fs::remove_file(store.path());
+        let _ = fs::remove_file(archive);
+    }
+
+    #[test]
+    fn distilled_revision_concurrent_compare_and_swap_has_one_winner() {
+        let store = distilled_test_store("concurrent");
+        store.upsert_distilled(distilled_test_entry("canonical", "Original", "source-1"), None).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2).map(|index| {
+            let barrier = barrier.clone();
+            let path = store.path().to_path_buf();
+            std::thread::spawn(move || {
+                let store = MemoryStore::for_tests_with_path(path);
+                let entry = distilled_test_entry("ignored", &format!("Revision {index}"), &format!("source-{index}"));
+                barrier.wait();
+                store.upsert_distilled(entry, Some(("canonical".to_string(), 1)))
+            })
+        }).collect();
+        let results: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        // The loser can fail with a lock/IO error under load, not only with the
+        // Stale message; only the one-winner invariant and the revision bump
+        // are under test, so any single error satisfies the loser assertion.
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert_eq!(store.active_distilled_entries("/project").unwrap()[0].distilled.as_ref().unwrap().revision, 2);
+        let _ = fs::remove_file(store.path());
+    }
+
     #[test]
     fn test_search_recall_ngram() {
         let ts = SystemTime::now()
@@ -1161,6 +1671,7 @@ mod tests {
             timestamp: "2025-01-01T00:00:00Z".to_string(),
             category: "log".to_string(),
             note: "parsing login error occurred".to_string(),
+            distilled: None,
             tags: vec!["auth".to_string()],
             source: Some("svc".to_string()),
             priority: Some(100),
@@ -1173,6 +1684,7 @@ mod tests {
             timestamp: "2025-01-02T00:00:00Z".to_string(),
             category: "info".to_string(),
             note: "user profile updated".to_string(),
+            distilled: None,
             tags: vec!["user".to_string()],
             source: Some("svc".to_string()),
             priority: Some(100),
@@ -1201,6 +1713,7 @@ mod tests {
             timestamp: "2025-01-03T00:00:00Z".to_string(),
             category: "auth".to_string(),
             note: "user login failed due to authentication error".to_string(),
+            distilled: None,
             tags: vec!["login".to_string()],
             source: None,
             priority: Some(100),
@@ -1228,6 +1741,7 @@ mod tests {
             timestamp: "2025-01-04T00:00:00Z".to_string(),
             category: "auth".to_string(),
             note: "登录失败，密码错误".to_string(),
+            distilled: None,
             tags: vec!["登录".to_string()],
             source: None,
             priority: Some(100),
@@ -1253,6 +1767,7 @@ mod tests {
         ));
         let store = MemoryStore::for_tests_with_path(path.clone());
         let mk = |note: &str| AgentMemoryEntry {
+            distilled: None,
             id: None,
             timestamp: "2025-01-01T00:00:00Z".to_string(),
             category: "self_note".to_string(),
@@ -1303,6 +1818,7 @@ mod tests {
             timestamp: "2025-01-05T00:00:00Z".to_string(),
             category: "self_note".to_string(),
             note: "Do: verify before write".to_string(),
+            distilled: None,
             tags: vec!["agent".to_string()],
             source: Some("session:test".to_string()),
             priority: Some(120),
@@ -1339,6 +1855,7 @@ mod tests {
             timestamp: "2025-01-05T00:00:00Z".to_string(),
             category: "user_memory".to_string(),
             note: "Keep project decisions in the architecture log.".to_string(),
+            distilled: None,
             tags: vec!["architecture".to_string(), "decision".to_string()],
             source: Some("project:demo".to_string()),
             priority: Some(150),
@@ -1351,6 +1868,7 @@ mod tests {
             timestamp: "2025-01-06T00:00:00Z".to_string(),
             category: " USER_MEMORY ".to_string(),
             note: "  keep project decisions in the architecture log.  ".to_string(),
+            distilled: None,
             tags: vec!["decision".to_string(), "ARCHITECTURE".to_string()],
             source: Some(" PROJECT:DEMO ".to_string()),
             priority: Some(200),
@@ -1390,6 +1908,7 @@ mod tests {
             timestamp: "2025-01-05T00:00:00Z".to_string(),
             category: "user_memory".to_string(),
             note: "Cache lifecycle test entry.".to_string(),
+            distilled: None,
             tags: vec!["test".to_string()],
             source: Some("test".to_string()),
             priority: Some(100),
@@ -1433,6 +1952,7 @@ mod tests {
                 .as_nanos()
         ));
         let entry_with_id = |id: &str, note: &str, ts: &str| AgentMemoryEntry {
+            distilled: None,
             id: Some(id.to_string()),
             timestamp: ts.to_string(),
             category: "user_memory".to_string(),
@@ -1516,6 +2036,7 @@ mod tests {
         let current = dir.join("agent_memory.jsonl");
         let archive = dir.join("agent_memory.jsonl.20260101000000");
         let entry_with_id = |id: &str, note: &str, ts: &str| AgentMemoryEntry {
+            distilled: None,
             id: Some(id.to_string()),
             timestamp: ts.to_string(),
             category: "user_memory".to_string(),
@@ -2395,6 +2916,7 @@ mod retention_tests {
 
     fn entry(category: &str, note: &str, ts: &str, priority: u8) -> AgentMemoryEntry {
         AgentMemoryEntry {
+            distilled: None,
             id: None,
             timestamp: ts.to_string(),
             category: category.to_string(),

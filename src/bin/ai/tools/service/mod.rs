@@ -4,4 +4,5 @@ pub(crate) mod command;
 pub(crate) mod file;
 pub(crate) mod memory;
 pub(crate) mod reads;
+pub(crate) mod session_distill;
 pub(crate) mod side_note;
