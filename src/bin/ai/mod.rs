@@ -24,6 +24,7 @@ mod request;
 mod request_protocol;
 #[cfg(feature = "serve")]
 pub(in crate::ai) mod serve;
+mod serve_confirm;
 mod skills;
 mod stream;
 mod theme;
