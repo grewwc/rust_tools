@@ -301,7 +301,7 @@ fn vl_model_search_candidates() -> Vec<(String, String)> {
         .collect()
 }
 
-fn default_model() -> String {
+pub(super) fn default_model() -> String {
     // 依赖前置 [`ensure_models_available`] 在 run() 入口就检查过模型注册表（models/），
     // 这里的 fallback 路径（vl 模型缺失时）总会拿到至少一个候选。
     // 最后兜底返回空串避免 process::exit；上层若真的拿到空串会立即报错。

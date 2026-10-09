@@ -13,10 +13,10 @@ use serde::Deserialize;
 use crate::commonw::configw;
 
 use super::super::{
-    cli::ParsedCli, config_schema::AiConfig, driver::input::inline_image_filenames,
-    history::SessionStore, prompt::PromptEditor,
+    agents, cli::ParsedCli, config_schema::AiConfig, driver::input::inline_image_filenames,
+    history::SessionStore, model_names, models,
+    prompt::{completion::CommandCompleter, PromptEditor},
 };
-use super::DEFAULT_BIND;
 
 #[derive(Debug, Deserialize)]
 struct CreatedSession {
@@ -37,11 +37,9 @@ struct RemoteSession {
     marked: bool,
 }
 
-/// Max rows `GET /sessions` asks for: enough to find a recent session after
-/// a client restart, small enough to print as one screen.
-const SESSION_LIST_LIMIT: usize = 20;
-
-/// Fetch the newest remote sessions (`GET /sessions?limit=`). Thin network
+/// Fetch all remote sessions (`GET /sessions`, newest first). No client-side
+/// cap: the local REPL lists every session, and a capped list would hide
+/// exactly the older session a reconnect is looking for. Thin network
 /// glue; parsing and display live in the pure helpers below so tests stay
 /// offline except for this one loopback round-trip.
 fn fetch_remote_sessions(
@@ -50,7 +48,7 @@ fn fetch_remote_sessions(
     token: &str,
 ) -> Result<Vec<RemoteSession>, String> {
     let resp = auth(
-        client.get(format!("{base}/sessions?limit={SESSION_LIST_LIMIT}")),
+        client.get(format!("{base}/sessions")),
         token,
     )
     .send()
@@ -70,6 +68,333 @@ fn parse_remote_sessions(text: &str) -> Result<Vec<RemoteSession>, String> {
         .map_err(|err| format!("serve returned an unexpected session list: {err}"))?;
     items.retain(|s| !s.id.trim().is_empty());
     Ok(items)
+}
+
+/// Runtime labels the connected server turns run with (`GET /info`).
+/// Every field defaults so an older server (no `/info` route, or a thinner
+/// body) degrades to the previous blank-header behavior instead of failing
+/// the whole chat.
+#[derive(Debug, Deserialize, Default)]
+struct ServerInfo {
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    model_label: String,
+    #[serde(default)]
+    agent: String,
+    #[serde(default)]
+    reasoning_effort: String,
+    #[serde(default)]
+    version: String,
+}
+
+/// Parse a `GET /info` body. Pure helper so tests stay offline.
+fn parse_server_info(text: &str) -> Result<ServerInfo, String> {
+    serde_json::from_str(text)
+        .map_err(|err| format!("serve returned an unexpected info body: {err}"))
+}
+
+/// Fetch the server runtime info. `None` means "predates `/info` or
+/// unreachable": the caller keeps blank labels (today's behavior).
+fn fetch_server_info(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+) -> Option<ServerInfo> {
+    let text = auth(client.get(format!("{base}/info")), token)
+        .send()
+        .ok()
+        .filter(|resp| resp.status().is_success())?
+        .text()
+        .unwrap_or_default();
+    parse_server_info(&text).ok()
+}
+
+/// Title row for the current remote session from the last listing, mirroring
+/// the local REPL's session-topic line (generated title, else first prompt).
+fn current_remote_title(listed: &[RemoteSession], session_id: &str) -> Option<String> {
+    listed
+        .iter()
+        .find(|s| s.id == session_id)
+        .map(remote_session_title)
+}
+
+/// Mirror the local REPL header (`prompt_user` in `driver/input.rs`): model,
+/// agent, reasoning-effort and session topic above the input box. The model
+/// label carries a `(remote)` suffix as the persistent remote-mode marker;
+/// the completion hint keeps the raw server model id.
+fn apply_remote_header(editor: &mut PromptEditor, info: &ServerInfo, topic: Option<String>) {
+    if !info.model_label.is_empty() {
+        editor.set_current_model_label(format!("{} (remote)", info.model_label));
+    }
+    if !info.agent.is_empty() {
+        editor.set_current_agent_label(&info.agent);
+    }
+    if !info.reasoning_effort.is_empty() {
+        editor.set_current_reasoning_effort_label(&info.reasoning_effort);
+    }
+    if !info.model.is_empty() {
+        CommandCompleter::set_current_model_hint(&info.model);
+    }
+    editor.set_session_topic(topic);
+}
+
+/// Client-side per-turn selection for serve-chat `/model`/`/effort`/`/agent`
+/// switching. The server stays stateless: the selected values travel with
+/// every turn request (`TurnReq` overrides) and the child CLI resolves them
+/// through the same registry path as the local REPL. `reasoning_effort` is
+/// `None` when cleared (server default), `Some("off")` when disabled, else
+/// the explicit tier.
+#[derive(Debug, Clone)]
+struct ServeTurnSelection {
+    model: String,
+    agent: String,
+    reasoning_effort: Option<String>,
+}
+
+impl ServeTurnSelection {
+    fn from_info(info: &ServerInfo) -> Self {
+        Self {
+            model: info.model.clone(),
+            agent: info.agent.clone(),
+            reasoning_effort: match info.reasoning_effort.trim().to_ascii_lowercase().as_str() {
+                "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "off" => {
+                    Some(info.reasoning_effort.trim().to_ascii_lowercase())
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// Effective effort label for the input-box header: the explicit
+    /// override when set, else the registry default for the current model.
+    fn effective_effort_label(&self) -> String {
+        if let Some(effort) = self.reasoning_effort.as_deref() {
+            return effort.to_string();
+        }
+        models::default_reasoning_effort(&self.model)
+            .map(|e| e.as_str().to_string())
+            .unwrap_or_else(|| "server default".to_string())
+    }
+
+    /// Refresh the input-box header after a local switch, mirroring
+    /// `apply_remote_header` but driven by the client selection instead of a
+    /// fresh `GET /info` (the server has no session state to update).
+    fn apply_header(&self, editor: &mut PromptEditor) {
+        if !self.model.is_empty() {
+            let label = models::model_display_label(&self.model);
+            if !label.is_empty() {
+                editor.set_current_model_label(format!("{label} (remote)"));
+            }
+            CommandCompleter::set_current_model_hint(&self.model);
+        }
+        if !self.agent.is_empty() {
+            editor.set_current_agent_label(&self.agent);
+        }
+        editor.set_current_reasoning_effort_label(self.effective_effort_label());
+    }
+}
+
+/// Normalize a non-empty `/effort` argument to the stored override value.
+/// Mirrors the local `/effort` and `/model effort` branches
+/// (`driver/commands/model.rs::handle_effort_arg`): `auto|clear|default|reset`
+/// clears the override (server default), `off`-family disables, a tier name
+/// sets the tier. `Err` carries the human-readable rejection.
+fn normalize_serve_effort_arg(arg: &str) -> Result<Option<String>, String> {
+    match arg.trim().to_ascii_lowercase().as_str() {
+        "auto" | "clear" | "default" | "reset" => Ok(None),
+        "off" | "none" | "no" | "false" | "disable" | "disabled" => Ok(Some("off".to_string())),
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => {
+            Ok(Some(arg.trim().to_ascii_lowercase()))
+        }
+        _ => Err(
+            "unknown effort; expected minimal|low|medium|high|xhigh|max|off|auto"
+                .to_string(),
+        ),
+    }
+}
+
+/// Split a `/model <selector> [question...]` remainder: the first token is
+/// the model selector, the rest (when non-empty) is sent as the turn prompt
+/// immediately, mirroring the local forced-question form.
+fn split_serve_model_inline(arg: &str) -> (String, Option<String>) {
+    let arg = arg.trim();
+    match arg.split_once(char::is_whitespace) {
+        Some((selector, rest)) => {
+            let question = rest.trim();
+            if question.is_empty() {
+                (selector.to_string(), None)
+            } else {
+                (selector.to_string(), Some(question.to_string()))
+            }
+        }
+        None => (arg.to_string(), None),
+    }
+}
+
+/// Handle `/model` in serve-chat. Returns a pending prompt when the command
+/// carries an inline question (`/model foo <question>` switches and sends).
+/// Mirrors the local `/model` branches (`driver/commands/model.rs`):
+/// `list|current|help`, `effort <level>`, else a registry selector.
+fn run_serve_model_command(
+    arg: &str,
+    selection: &mut ServeTurnSelection,
+    editor: &mut PromptEditor,
+) -> Option<String> {
+    let arg = arg.trim();
+    if arg.is_empty() || arg.eq_ignore_ascii_case("current") || arg.eq_ignore_ascii_case("cur") {
+        if selection.model.is_empty() {
+            println!("(remote) model: unknown");
+        } else if let Some(def) = model_names::find_by_identifier(&selection.model) {
+            let handle = model_names::model_handle(def);
+            println!("(remote) current model: {}", models::model_display_label(&handle));
+        } else {
+            println!("(remote) current model: {}", selection.model);
+        }
+        println!("(remote) effort: {}", selection.effective_effort_label());
+        return None;
+    }
+    if arg.eq_ignore_ascii_case("list") || arg.eq_ignore_ascii_case("ls") {
+        let current_handle = model_names::find_by_identifier(&selection.model)
+            .map(model_names::model_handle)
+            .unwrap_or_else(|| selection.model.trim().to_string())
+            .to_ascii_lowercase();
+        for def in model_names::all() {
+            let handle = model_names::model_handle(def);
+            let marker = if handle.eq_ignore_ascii_case(&current_handle) {
+                "*"
+            } else {
+                " "
+            };
+            println!("{marker} {}", models::model_display_label(&handle));
+        }
+        return None;
+    }
+    if arg.eq_ignore_ascii_case("help") || arg.eq_ignore_ascii_case("h") {
+        println!("(remote) /model <selector> [question] - switch remote model");
+        println!("(remote) /model list|current|help - inspect remote models");
+        println!("(remote) /model effort <level> - same as /effort <level>");
+        return None;
+    }
+    let (head, head_rest) = match arg.split_once(char::is_whitespace) {
+        Some((h, r)) => (h, r.trim()),
+        None => (arg, ""),
+    };
+    if head.eq_ignore_ascii_case("effort") {
+        if head_rest.is_empty() {
+            println!("(remote) effort: {}", selection.effective_effort_label());
+            return None;
+        }
+        run_serve_effort_command(head_rest, selection, editor);
+        return None;
+    }
+    let (selector, question) = split_serve_model_inline(arg);
+    match model_names::find_by_identifier(&selector) {
+        Some(def) => {
+            let handle = model_names::model_handle(def);
+            selection.model = handle.clone();
+            selection.apply_header(editor);
+            println!("(remote) switched model to {}", models::model_display_label(&handle));
+            question
+        }
+        None => {
+            println!("(remote) unknown model {selector:?}; see /model list");
+            None
+        }
+    }
+}
+
+/// Handle `/effort` in serve-chat (always consumes the line; the switch
+/// applies to the next turn).
+fn run_serve_effort_command(
+    arg: &str,
+    selection: &mut ServeTurnSelection,
+    editor: &mut PromptEditor,
+) -> Option<String> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        println!("(remote) effort: {}", selection.effective_effort_label());
+        return None;
+    }
+    match normalize_serve_effort_arg(arg) {
+        Ok(override_value) => {
+            selection.reasoning_effort = override_value;
+            selection.apply_header(editor);
+            println!("(remote) effort: {}", selection.effective_effort_label());
+        }
+        Err(err) => println!("(remote) {err}"),
+    }
+    None
+}
+
+/// Handle `/agent` in serve-chat. Mirrors the local `/agent` branches
+/// (`driver/commands/agent.rs`): bare/list/current/help plus `<name>` (an
+/// agent-implied model also moves the model selection, like
+/// `activate_primary_agent` does locally). Non-primary and disabled agents
+/// are refused exactly like the local `switch_agent`.
+fn run_serve_agent_command(
+    arg: &str,
+    selection: &mut ServeTurnSelection,
+    agent_manifests: &[agents::AgentManifest],
+    editor: &mut PromptEditor,
+) {
+    let arg = arg.trim();
+    if arg.is_empty() || arg.eq_ignore_ascii_case("list") || arg.eq_ignore_ascii_case("ls") {
+        let primary = agents::get_primary_agents(agent_manifests);
+        for agent in &primary {
+            let marker = if agent.name == selection.agent { "*" } else { " " };
+            println!("{marker} {} - {}", agent.name, agent.description);
+        }
+        return;
+    }
+    if arg.eq_ignore_ascii_case("current") || arg.eq_ignore_ascii_case("cur") {
+        println!("(remote) current agent: {}", selection.agent);
+        return;
+    }
+    if arg.eq_ignore_ascii_case("help") || arg.eq_ignore_ascii_case("h") {
+        println!("(remote) /agent <name> - switch remote agent (primary only)");
+        return;
+    }
+    if arg.eq_ignore_ascii_case("reload") {
+        println!("(remote) agent reload is server-side; reconnect to refresh");
+        return;
+    }
+    match agents::find_agent_by_name(agent_manifests, arg) {
+        Some(manifest) => {
+            if !manifest.is_primary() {
+                println!("(remote) agent {:?} is not switchable", manifest.name);
+                return;
+            }
+            if manifest.disabled {
+                println!("(remote) agent {:?} is disabled", manifest.name);
+                return;
+            }
+            selection.agent = manifest.name.clone();
+            if let Some(model) = manifest.model.as_deref().filter(|m| !m.trim().is_empty()) {
+                selection.model = models::determine_model(model);
+            }
+            selection.apply_header(editor);
+            println!("(remote) switched agent to {}", manifest.name);
+        }
+        None => println!("(remote) unknown agent {arg:?}; see /agent list"),
+    }
+}
+
+/// Best-effort listing refresh before each input box (short timeout, errors
+/// swallowed): picks up server-generated titles after a turn and keeps
+/// `/resume` completion fresh. Never disturbs the prompt on failure.
+fn refresh_listing_quiet(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+) -> Option<Vec<RemoteSession>> {
+    let resp = auth(client.get(format!("{base}/sessions")), token)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .ok()
+        .filter(|resp| resp.status().is_success())?;
+    let text = resp.text().unwrap_or_default();
+    parse_remote_sessions(&text).ok()
 }
 
 /// Printable one-row title: generated summary first, else the first user
@@ -99,7 +424,7 @@ fn remote_session_title(item: &RemoteSession) -> String {
 
 /// Resolve a `/resume` argument against the last `/sessions` listing:
 /// 1-based row number, unique id prefix, or full id. A full id that was
-/// never listed (older than the list limit, or pasted from elsewhere) passes
+/// never listed (created after the listing, or pasted from elsewhere) passes
 /// through verbatim; the server validates it on the next turn.
 fn resolve_session_ref(arg: &str, listed: &[RemoteSession]) -> Result<String, String> {
     let arg = arg.trim();
@@ -533,13 +858,60 @@ fn post_turn_stream(
     session_id: &str,
     prompt: &str,
     history_file: &Path,
+    selection: &ServeTurnSelection,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let images = collect_image_uploads(prompt, history_file, session_id);
+    {
+        // A bare `[[image:name]]` with no local file uploads nothing, and the
+        // server then fails the turn with a bare os-error-2. Warn here where
+        // the cause (usually a paste saved under a previous session before
+        // `/resume`/`/new`) is still actionable.
+        let uploaded: std::collections::HashSet<&str> = images
+            .iter()
+            .filter_map(|v| v.get("filename").and_then(|f| f.as_str()))
+            .collect();
+        let mut missing = Vec::new();
+        for name in inline_image_filenames(prompt) {
+            if name.contains('/') || name.contains('\\') {
+                continue;
+            }
+            if uploaded.contains(name.as_str()) || missing.iter().any(|m| m == &name) {
+                continue;
+            }
+            missing.push(name);
+        }
+        if !missing.is_empty() {
+            let assets_dir =
+                SessionStore::new(history_file).session_assets_dir(session_id);
+            eprintln!(
+                "[serve-chat] warning: image file(s) {} missing, empty, or unreadable in local session assets ({}); re-paste the image in this session before sending.",
+                missing.join(", "),
+                assets_dir.display()
+            );
+        }
+    }
     let resp = auth(
         client.post(format!("{base}/sessions/{session_id}/turns/stream")),
         token,
     )
-    .json(&serde_json::json!({ "prompt": prompt, "images": images }))
+    .json(&serde_json::json!({
+        "prompt": prompt,
+        "images": images,
+        "model": if selection.model.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(selection.model.clone())
+        },
+        "agent": if selection.agent.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(selection.agent.clone())
+        },
+        "reasoning_effort": match selection.reasoning_effort.as_deref() {
+            Some(effort) => serde_json::Value::String(effort.to_string()),
+            None => serde_json::Value::Null,
+        },
+    }))
     .send()?;
     let status = resp.status();
     if !status.is_success() {
@@ -549,27 +921,21 @@ fn post_turn_stream(
     render_turn_stream(resp)
 }
 
-/// Run the interactive serve chat: connect to a running serve instance and
-/// loop over multiline prompts until `/quit`. Input uses the same editor as
-/// the local REPL, so Enter/movement/completion behave identically.
-pub(in crate::ai) fn run_serve_chat(
-    cli: ParsedCli,
-) -> Result<(), Box<dyn std::error::Error>> {
+/// Shared `--serve-chat` / `--serve-sessions` dial-up: resolve the bind,
+/// build the client, and fail fast with a copy-pasteable hint when the
+/// server is not up. `tool` names the caller in error hints only.
+fn serve_connection(
+    cli: &ParsedCli,
+    tool: &str,
+) -> Result<(reqwest::blocking::Client, String, String), Box<dyn std::error::Error>> {
     rust_tools::ensure_rustls_provider();
     let cfg = configw::get_all_config();
-    let bind = if !cli.serve_bind.trim().is_empty() {
-        cli.serve_bind.trim().to_string()
-    } else {
-        let from_cfg = cfg.get_opt(AiConfig::SERVE_BIND).unwrap_or_default();
-        if from_cfg.trim().is_empty() {
-            DEFAULT_BIND.to_string()
-        } else {
-            from_cfg
-        }
-    };
+    // Same precedence as the server and the management commands: explicit
+    // `--serve-bind` wins, then `ai.serve.bind`, then the default.
+    let from_cfg = cfg.get_opt(AiConfig::SERVE_BIND).unwrap_or_default();
+    let bind = super::resolve_serve_bind(&cli.serve_bind, &from_cfg);
     let base = normalize_base(&bind);
     let token = cfg.get_opt(AiConfig::SERVE_TOKEN).unwrap_or_default();
-    let app_config = super::super::config::load_config()?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()?;
@@ -580,18 +946,54 @@ pub(in crate::ai) fn run_serve_chat(
         Ok(resp) if resp.status().is_success() => {}
         Ok(resp) => {
             return Err(format!(
-                "serve-chat: serve at {base} answered {}; is `a --serve` running there?",
+                "{tool}: serve at {base} answered {}; is `a --serve` running there?",
                 resp.status()
             )
             .into());
         }
         Err(err) => {
             return Err(format!(
-                "serve-chat: cannot reach serve at {base} ({err}); start it first with `a --serve --serve-bind <addr>`"
+                "{tool}: cannot reach serve at {base} ({err}); start it first with `a --serve --serve-bind <addr>`"
             )
             .into());
         }
     }
+    Ok((client, base, token))
+}
+
+/// Print one `GET /sessions` listing as `N. <id>  <title>` rows (newest
+/// first) on stdout, so `--serve-sessions` output stays pipeable for scripts
+/// and later mobile clients; the interactive client reuses the same format.
+fn print_remote_sessions(items: &[RemoteSession]) {
+    if items.is_empty() {
+        println!("No remote sessions.");
+    } else {
+        for (i, item) in items.iter().enumerate() {
+            println!("{}. {}  {}", i + 1, item.id, remote_session_title(item));
+        }
+    }
+}
+
+/// Non-interactive `--serve-sessions`: print the remote session list and
+/// exit, so the session can be picked before opening the interactive client.
+pub(in crate::ai) fn run_serve_sessions(
+    cli: &ParsedCli,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client, base, token) = serve_connection(cli, "serve-sessions")?;
+    let items = fetch_remote_sessions(&client, &base, &token)
+        .map_err(|err| format!("[serve-sessions] {err}"))?;
+    print_remote_sessions(&items);
+    Ok(())
+}
+
+/// Run the interactive serve chat: connect to a running serve instance and
+/// loop over multiline prompts until `/quit`. Input uses the same editor as
+/// the local REPL, so Enter/movement/completion behave identically.
+pub(in crate::ai) fn run_serve_chat(
+    cli: ParsedCli,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client, base, token) = serve_connection(&cli, "serve-chat")?;
+    let app_config = super::super::config::load_config()?;
 
     let mut session_id = match cli.session {
         Some(id) if !id.trim().is_empty() => id.trim().to_string(),
@@ -599,11 +1001,36 @@ pub(in crate::ai) fn run_serve_chat(
     };
 
     println!("Connected to {base}, session {session_id}.");
-    println!("Enter inserts a newline, Esc or Alt+Enter submits; /quit exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions, /fork branches the current session, /close deletes it and exits.");
+    println!("Enter inserts a newline, Esc or Alt+Enter submits; /quit exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions, /fork branches the current session, /close deletes it and exits. /model, /effort, /agent switch the remote turn like the local REPL.");
     let mut editor = PromptEditor::new(&session_id, &app_config.history_file);
     // Last `/sessions` output: backs `/resume <number|id-prefix>`.
     let mut listed: Vec<RemoteSession> = Vec::new();
+    // Client-side per-turn selection, seeded from the server (`GET /info`)
+    // and switched locally by `/model`/`/effort`/`/agent`; every turn carries
+    // the selection as request overrides so the child CLI resolves the same
+    // registry path as the local REPL. The model label keeps a persistent
+    // `(remote)` marker. An unreachable `/info` keeps blank labels; chat
+    // still works.
+    let info = fetch_server_info(&client, &base, &token).unwrap_or_default();
+    apply_remote_header(&mut editor, &info, None);
+    let mut selection = ServeTurnSelection::from_info(&info);
+    selection.apply_header(&mut editor);
+    let agent_manifests = agents::load_all_agents();
     loop {
+        // Silent live refresh before every input box: server-generated titles
+        // (they appear after the first turn) and fresh `/resume` completion
+        // candidates. Failures keep the previous listing; the prompt is never
+        // blocked by this.
+        if let Some(items) = refresh_listing_quiet(&client, &base, &token) {
+            CommandCompleter::set_serve_session_candidates(
+                items
+                    .iter()
+                    .map(|s| (s.id.clone(), remote_session_title(s)))
+                    .collect(),
+            );
+            editor.set_session_topic(current_remote_title(&items, &session_id));
+            listed = items;
+        }
         let input = match editor.read_multi_line() {
             Ok(Some(text)) => text,
             Ok(None) => break,
@@ -626,7 +1053,7 @@ pub(in crate::ai) fn run_serve_chat(
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first)\n/resume <number|id-prefix|id> - continue a listed session\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first)\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)"
                 );
                 continue;
             }
@@ -642,13 +1069,14 @@ pub(in crate::ai) fn run_serve_chat(
             // list), so the same muscle memory works on both sides.
             "/sessions" | "/ss" | "/ls" => match fetch_remote_sessions(&client, &base, &token) {
                 Ok(items) => {
-                    if items.is_empty() {
-                        println!("No remote sessions.");
-                    } else {
-                        for (i, item) in items.iter().enumerate() {
-                            println!("{}. {}  {}", i + 1, item.id, remote_session_title(item));
-                        }
-                    }
+                    print_remote_sessions(&items);
+                    // Back `/resume` Tab-completion until the next listing.
+                    CommandCompleter::set_serve_session_candidates(
+                        items
+                            .iter()
+                            .map(|s| (s.id.clone(), remote_session_title(s)))
+                            .collect(),
+                    );
                     listed = items;
                 }
                 Err(err) => eprintln!("[serve-chat] {err}"),
@@ -683,6 +1111,33 @@ pub(in crate::ai) fn run_serve_chat(
                 }
                 Err(err) => eprintln!("[serve-chat] {err}"),
             },
+            // Remote switching parity: like the local REPL, `/model <sel>
+            // [question]` switches and optionally sends, `/effort <level>`
+            // and `/agent <name>` switch for the next turn. Both `/` and `:`
+            // prefixes work, matching the local command forms.
+            "/model" | ":model" | "/models" => {
+                if let Some(question) =
+                    run_serve_model_command(arg, &mut selection, &mut editor)
+                {
+                    if let Err(err) = post_turn_stream(
+                        &client,
+                        &base,
+                        &token,
+                        &session_id,
+                        &question,
+                        &app_config.history_file,
+                        &selection,
+                    ) {
+                        eprintln!("[serve-chat] {err}");
+                    }
+                }
+            }
+            "/effort" | ":effort" => {
+                run_serve_effort_command(arg, &mut selection, &mut editor);
+            }
+            "/agent" | ":agent" => {
+                run_serve_agent_command(arg, &mut selection, &agent_manifests, &mut editor);
+            }
             _ => {
                 if let Err(err) =
                     post_turn_stream(
@@ -692,6 +1147,7 @@ pub(in crate::ai) fn run_serve_chat(
                         &session_id,
                         &trimmed,
                         &app_config.history_file,
+                        &selection,
                     )
                 {
                     eprintln!("[serve-chat] {err}");
@@ -767,6 +1223,80 @@ mod tests {
         let resp = reqwest::blocking::get(url).expect("get canned SSE");
         let err = render_turn_stream(resp).expect_err("error event must fail");
         assert!(err.to_string().contains("boom"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn serve_effort_arg_normalizes_like_local() {
+        assert_eq!(normalize_serve_effort_arg("low"), Ok(Some("low".to_string())));
+        assert_eq!(normalize_serve_effort_arg(" HIGH "), Ok(Some("high".to_string())));
+        assert_eq!(normalize_serve_effort_arg("off"), Ok(Some("off".to_string())));
+        assert_eq!(normalize_serve_effort_arg("disabled"), Ok(Some("off".to_string())));
+        assert_eq!(normalize_serve_effort_arg("auto"), Ok(None));
+        assert_eq!(normalize_serve_effort_arg("clear"), Ok(None));
+        assert!(normalize_serve_effort_arg("ultra").is_err());
+        assert!(normalize_serve_effort_arg("").is_err());
+    }
+
+    #[test]
+    fn serve_model_inline_split_matches_local_form() {
+        let (selector, question) = split_serve_model_inline("deepseek");
+        assert_eq!(selector, "deepseek");
+        assert_eq!(question, None);
+        let (selector, question) =
+            split_serve_model_inline("deepseek   explain this code");
+        assert_eq!(selector, "deepseek");
+        assert_eq!(question.as_deref(), Some("explain this code"));
+    }
+
+    fn agent_fixture(
+        name: &str,
+        mode: agents::AgentMode,
+        disabled: bool,
+        hidden: bool,
+    ) -> agents::AgentManifest {
+        agents::AgentManifest {
+            name: name.to_string(),
+            description: format!("{name} agent"),
+            mode,
+            model: None,
+            temperature: None,
+            max_steps: None,
+            prompt: String::new(),
+            system_prompt: None,
+            tools: Vec::new(),
+            tool_groups: Vec::new(),
+            mcp_servers: Vec::new(),
+            disable_mcp_tools: false,
+            model_tier: None,
+            disabled,
+            hidden,
+            auto_select: false,
+            color: None,
+            source_path: None,
+        }
+    }
+
+    #[test]
+    fn serve_agent_switch_rejects_disabled_like_local() {
+        let manifests = vec![
+            agent_fixture("build", agents::AgentMode::Primary, false, false),
+            agent_fixture("sharp", agents::AgentMode::Primary, false, false),
+            agent_fixture("off", agents::AgentMode::Primary, true, false),
+            agent_fixture("helper", agents::AgentMode::Subagent, false, false),
+        ];
+        let mut selection = ServeTurnSelection {
+            model: "m".to_string(),
+            agent: "build".to_string(),
+            reasoning_effort: None,
+        };
+        let mut editor =
+            PromptEditor::new("test", std::path::Path::new("/tmp/a-serve-agent-test-history"));
+        run_serve_agent_command("off", &mut selection, &manifests, &mut editor);
+        assert_eq!(selection.agent, "build");
+        run_serve_agent_command("helper", &mut selection, &manifests, &mut editor);
+        assert_eq!(selection.agent, "build");
+        run_serve_agent_command("sharp", &mut selection, &manifests, &mut editor);
+        assert_eq!(selection.agent, "sharp");
     }
 
     #[test]
@@ -993,5 +1523,55 @@ mod tests {
         let items = fetch_remote_sessions(&client, base, "").expect("fetch");
         assert_eq!(items.len(), 1);
         assert_eq!(remote_session_title(&items[0]), "Hello ★");
+    }
+
+    #[test]
+    fn parse_server_info_reads_full_body() {
+        let info = parse_server_info(
+            r#"{"model":"m","model_label":"M","agent":"build","reasoning_effort":"max","version":"0.1.0"}"#,
+        )
+        .expect("parse");
+        assert_eq!(info.model, "m");
+        assert_eq!(info.model_label, "M");
+        assert_eq!(info.agent, "build");
+        assert_eq!(info.reasoning_effort, "max");
+        assert_eq!(info.version, "0.1.0");
+    }
+
+    #[test]
+    fn parse_server_info_tolerates_thin_body() {
+        // Older servers have no `/info`: missing fields default to blank so
+        // the chat keeps its previous header behavior instead of failing.
+        let info = parse_server_info("{}").expect("parse");
+        assert!(info.model.is_empty());
+        assert!(info.model_label.is_empty());
+        assert!(parse_server_info("not json").is_err());
+    }
+
+    #[test]
+    fn current_remote_title_resolves_listed_session() {
+        let listed = vec![
+            RemoteSession {
+                id: "s1".to_string(),
+                summary: Some("Hello".to_string()),
+                first_user_prompt: None,
+                marked: false,
+            },
+            RemoteSession {
+                id: "s2".to_string(),
+                summary: None,
+                first_user_prompt: Some("question\nbody".to_string()),
+                marked: false,
+            },
+        ];
+        assert_eq!(
+            current_remote_title(&listed, "s1").as_deref(),
+            Some("Hello")
+        );
+        assert_eq!(
+            current_remote_title(&listed, "s2").as_deref(),
+            Some("question")
+        );
+        assert_eq!(current_remote_title(&listed, "missing"), None);
     }
 }

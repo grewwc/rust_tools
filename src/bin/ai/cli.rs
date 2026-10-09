@@ -105,8 +105,18 @@ pub(super) struct ParsedCli {
     pub(super) serve: bool,
     /// Whether to run the interactive serve client (`--serve-chat`).
     pub(super) serve_chat: bool,
+    /// Whether to only list remote sessions and exit (`--serve-sessions`).
+    pub(super) serve_sessions: bool,
     /// Bind address override for `--serve-bind` (empty = config/default).
     pub(super) serve_bind: String,
+    /// Whether to start the serve daemon in the background (`--serve-start`).
+    pub(super) serve_start: bool,
+    /// Whether to stop the serve daemon (`--serve-stop`).
+    pub(super) serve_stop: bool,
+    /// Whether to restart the serve daemon (`--serve-restart`).
+    pub(super) serve_restart: bool,
+    /// Whether to report the serve daemon status (`--serve-status`).
+    pub(super) serve_status: bool,
 }
 
 /// List of `a` internal "/" / ":" commands, used for shell completion.
@@ -241,10 +251,35 @@ fn register_cli_flags(parser: &mut TermParser) {
         false,
         "open an interactive chat against a running --serve instance",
     );
+    parser.add_bool(
+        "serve-sessions",
+        false,
+        "list remote sessions on a running --serve instance and exit (non-interactive)",
+    );
     parser.add_string(
         "serve-bind",
         "",
         "address of the --serve instance (e.g. 127.0.0.1:8080; default from ai.serve.bind)",
+    );
+    parser.add_bool(
+        "serve-start",
+        false,
+        "start the --serve HTTP daemon in the background (pid file + log under the config dir)",
+    );
+    parser.add_bool(
+        "serve-stop",
+        false,
+        "stop the background --serve daemon (SIGTERM, SIGKILL fallback)",
+    );
+    parser.add_bool(
+        "serve-restart",
+        false,
+        "restart the background --serve daemon (reuses the previous bind unless --serve-bind is given)",
+    );
+    parser.add_bool(
+        "serve-status",
+        false,
+        "report whether the background --serve daemon is running (pid + /healthz check)",
     );
     parser.add_string("model", "", "model name");
     parser.alias("m", "model");
@@ -577,7 +612,12 @@ impl Default for ParsedCli {
             stop_session: None,
             serve: false,
             serve_chat: false,
+            serve_sessions: false,
             serve_bind: String::new(),
+            serve_start: false,
+            serve_stop: false,
+            serve_restart: false,
+            serve_status: false,
         }
     }
 }
@@ -673,11 +713,22 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     // Handle --serve / --serve-chat / --serve-bind.
     cli.serve = parser.contains_flag_strict("serve");
     cli.serve_chat = parser.contains_flag_strict("serve-chat");
+    cli.serve_sessions = parser.contains_flag_strict("serve-sessions");
+    cli.serve_start = parser.contains_flag_strict("serve-start");
+    cli.serve_stop = parser.contains_flag_strict("serve-stop");
+    cli.serve_restart = parser.contains_flag_strict("serve-restart");
+    cli.serve_status = parser.contains_flag_strict("serve-status");
     if parser.contains_flag_strict("serve-bind") {
         cli.serve_bind = parser.flag_value_or_default("serve-bind");
     }
-    if !cli.serve && !cli.serve_chat && !cli.serve_bind.trim().is_empty() {
-        eprintln!("[serve] warning: --serve-bind is set without --serve/--serve-chat; it will be ignored");
+    if !cli.serve
+        && !cli.serve_chat
+        && !cli.serve_sessions
+        && !cli.serve_start
+        && !cli.serve_restart
+        && !cli.serve_bind.trim().is_empty()
+    {
+        eprintln!("[serve] warning: --serve-bind is set without --serve/--serve-chat/--serve-sessions/--serve-start/--serve-restart; it will be ignored");
     }
 
     // Handle list-tools.

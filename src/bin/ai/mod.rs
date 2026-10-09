@@ -81,6 +81,15 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
         return background::resume_detached_parent();
     }
 
+    // Internal daemon marker for `a --serve-start`: the parent re-execs
+    // `<exe> --serve-detached --serve [--serve-bind <addr>]`; strip it here so
+    // the child parses the rest normally, then detaches below like the
+    // `--daemon-child` worker.
+    let serve_detached = args.get(1).map(String::as_str) == Some("--serve-detached");
+    if serve_detached {
+        args.remove(1);
+    }
+
     // Internal daemon marker: the background-mode parent prepends
     // `--daemon-child <session_id>` to the arguments; strip it here, parse the rest
     // normally, then route to the daemon child entry point
@@ -93,10 +102,11 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    if daemon_session.is_some() {
-        // The freshly exec'd child must establish its own session before parsing the
-        // CLI / creating the runtime. `process_group(0)` is not a substitute: it only
-        // sets the PGID and would make `setsid` fail.
+    // The freshly exec'd children (`--daemon-child` worker and `--serve-detached`
+    // server alike) must establish their own session before parsing the
+    // CLI / creating the runtime. `process_group(0)` is not a substitute: it only
+    // sets the PGID and would make `setsid` fail.
+    if daemon_session.is_some() || serve_detached {
         background::detach_daemon_session()?;
     }
 
@@ -105,6 +115,7 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
     // Attach before loading session history or creating a runtime: a live worker
     // remains the sole owner of its conversation and in-flight model request.
     if daemon_session.is_none()
+        && !serve_detached
         && let Some(code) = terminal_session::maybe_run_client(&cli, &args)?
     {
         std::process::exit(code);
@@ -125,13 +136,40 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if cli.serve && cli.serve_chat {
-        return Err("cannot combine --serve and --serve-chat; run the server in one terminal and the chat client in another".into());
+    if cli.serve_start || cli.serve_stop || cli.serve_restart || cli.serve_status {
+        #[cfg(feature = "serve")]
+        {
+            return serve::ctl::run_serve_ctl(&cli);
+        }
+        #[cfg(not(feature = "serve"))]
+        {
+            return Err("this binary was built without the `serve` feature; rebuild with --features serve".into());
+        }
+    }
+
+    if cli.serve && (cli.serve_chat || cli.serve_sessions) {
+        return Err("cannot combine --serve with --serve-chat/--serve-sessions; run the server in one terminal and the client in another".into());
+    }
+    if cli.serve_chat && cli.serve_sessions {
+        return Err(
+            "cannot combine --serve-chat and --serve-sessions; --serve-sessions already lists sessions non-interactively"
+                .into(),
+        );
     }
     if cli.serve_chat {
         #[cfg(feature = "serve")]
         {
             return serve::chat::run_serve_chat(cli);
+        }
+        #[cfg(not(feature = "serve"))]
+        {
+            return Err("this binary was built without the `serve` feature; rebuild with --features serve".into());
+        }
+    }
+    if cli.serve_sessions {
+        #[cfg(feature = "serve")]
+        {
+            return serve::chat::run_serve_sessions(&cli);
         }
         #[cfg(not(feature = "serve"))]
         {

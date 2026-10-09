@@ -181,6 +181,11 @@ fn default_cli() -> ParsedCli {
         serve: false,
         serve_bind: String::new(),
         serve_chat: false,
+        serve_sessions: false,
+        serve_start: false,
+        serve_stop: false,
+        serve_restart: false,
+        serve_status: false,
     }
 }
 

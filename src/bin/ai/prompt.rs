@@ -211,6 +211,10 @@ impl PromptEditor {
     /// so it must be synced to the app's current session before entering the input box.
     pub(super) fn set_session_id(&mut self, session_id: impl Into<String>) {
         self.session_id = session_id.into();
+        // Pasted images are saved under the bound session's assets dir; keep the
+        // save location in sync or later pastes land in the previous session and
+        // the next turn cannot find them.
+        self.session_image_dir = self.session_store.session_assets_dir(&self.session_id);
     }
 
     /// Set the current session topic; the next `read_multi_line` shows it on the

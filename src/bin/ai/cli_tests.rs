@@ -108,6 +108,17 @@ fn parse_cli_args_reads_resume_flag() {
 }
 
 #[test]
+fn parse_cli_args_reads_serve_sessions_flag() {
+    let cli =
+        super::parse_cli_args(["a".to_string(), "--serve-sessions".to_string()].into_iter());
+    assert!(cli.serve_sessions);
+
+    // Defaults to false when --serve-sessions is not given.
+    let cli = super::parse_cli_args(["a".to_string()].into_iter());
+    assert!(!cli.serve_sessions);
+}
+
+#[test]
 fn parse_cli_args_reads_background_flag() {
     // Long form --background
     let cli = super::parse_cli_args(

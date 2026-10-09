@@ -27,6 +27,12 @@ static SKILL_NAME_CANDIDATES: LazyLock<RwLock<Option<Vec<CompletionCandidate>>>>
 /// and agent-name completion then falls back synchronously to a disk scan (otherwise Tab before the first input of a new session has no candidates).
 static AGENT_NAME_CANDIDATES: LazyLock<RwLock<Option<Vec<CompletionCandidate>>>> =
     LazyLock::new(|| RwLock::new(None));
+/// Remote serve sessions from the last `/sessions` listing in serve-chat:
+/// `(id, title)` pairs in listing order (row number = index + 1). Written by
+/// the serve-chat client after each successful listing; empty in the local
+/// REPL, where no `/resume` command exists, so completion there is a no-op.
+static SERVE_SESSION_CANDIDATES: LazyLock<RwLock<Vec<(String, String)>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
 
 /// Trie holding all top-level commands starting with "/" and ":", replacing the previous linear starts_with filtering.
 static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
@@ -177,6 +183,14 @@ impl CommandCompleter {
     pub(in crate::ai) fn set_agent_manifests(manifests: &[crate::ai::agents::AgentManifest]) {
         if let Ok(mut guard) = AGENT_NAME_CANDIDATES.write() {
             *guard = Some(Self::agent_candidates_from_manifests(manifests));
+        }
+    }
+
+    /// Update the serve-session completion cache from the last `/sessions`
+    /// listing (serve-chat only). Entries are `(id, title)` in listing order.
+    pub(in crate::ai) fn set_serve_session_candidates(entries: Vec<(String, String)>) {
+        if let Ok(mut guard) = SERVE_SESSION_CANDIDATES.write() {
+            *guard = entries;
         }
     }
 
@@ -524,6 +538,33 @@ impl CommandCompleter {
             .collect()
     }
 
+    /// Row-number and id-prefix candidates for serve-chat `/resume`, backed by
+    /// the last `/sessions` listing. Numbers match on row prefix; ids need a
+    /// non-empty prefix (an empty token already lists every row by number,
+    /// so id duplicates would only add noise).
+    fn serve_session_candidates(token: &str) -> Vec<CompletionCandidate> {
+        let entries = SERVE_SESSION_CANDIDATES
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for (index, (id, title)) in entries.iter().enumerate() {
+            let number = (index + 1).to_string();
+            if number.starts_with(token) {
+                out.push(CompletionCandidate {
+                    display: format!("{number} · {title}"),
+                    replacement: number,
+                });
+            } else if !token.is_empty() && id.starts_with(token) {
+                out.push(CompletionCandidate {
+                    display: format!("{id} · {title}"),
+                    replacement: id.clone(),
+                });
+            }
+        }
+        out
+    }
+
     /// Second-level subcommand literals of `/model`. Note: these subcommands and "model names" occupy
     /// the second token mutually exclusively; so Tab can complete both subcommands and model names,
     /// `complete_for_line` merges them into one candidate list (prefix-filtered).
@@ -780,6 +821,14 @@ impl CommandCompleter {
                     }
                     Some("use") if words.next().is_none() => Self::agent_name_candidates(token),
                     _ => Vec::new(),
+                }
+            } else if matches!(first, "/resume") {
+                // Serve-chat only: the local REPL has no `/resume` command, and
+                // its cache stays empty, so this branch is a no-op there.
+                if words.next().is_none() {
+                    Self::serve_session_candidates(token)
+                } else {
+                    Vec::new()
                 }
             } else if matches!(first, "/changes" | ":changes" | "/diff" | ":diff") {
                 match words.next() {
@@ -1317,6 +1366,53 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.replacement == "audit")
         );
+    }
+
+    #[test]
+    fn command_completion_resume_completes_row_numbers() {
+        // Both resume tests share the global serve-session cache; serialize
+        // them so a parallel reset cannot empty the cache mid-assertion.
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        CommandCompleter::set_serve_session_candidates(vec![
+            ("b2b23f0c-1".to_string(), "fix login bug".to_string()),
+            ("aa11bb22-2".to_string(), "write docs".to_string()),
+        ]);
+        let (_, candidates) = CommandCompleter::complete_for_line("/resume ", 8);
+        let replacements: Vec<&str> = candidates
+            .iter()
+            .map(|c| c.replacement.as_str())
+            .collect();
+        assert_eq!(replacements, vec!["1", "2"]);
+        assert!(candidates[0].display.contains("fix login bug"));
+        // A digit prefix narrows to the matching row.
+        let (_, narrowed) = CommandCompleter::complete_for_line("/resume 2", 9);
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].replacement, "2");
+        CommandCompleter::set_serve_session_candidates(Vec::new());
+    }
+
+    #[test]
+    fn command_completion_resume_completes_id_prefix_to_full_id() {
+        // See above: serialize with the sibling resume test on the shared cache.
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        CommandCompleter::set_serve_session_candidates(vec![
+            ("b2b23f0c-1".to_string(), "fix login bug".to_string()),
+            ("aa11bb22-2".to_string(), "write docs".to_string()),
+        ]);
+        let (_, candidates) = CommandCompleter::complete_for_line("/resume b2", 10);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "b2b23f0c-1");
+        assert!(candidates[0].display.contains("fix login bug"));
+        // No listing yet (local REPL): no candidates, no crash.
+        CommandCompleter::set_serve_session_candidates(Vec::new());
+        let (_, empty) = CommandCompleter::complete_for_line("/resume ", 8);
+        assert!(empty.is_empty());
+        let (_, after_arg) = CommandCompleter::complete_for_line("/resume 1 ", 10);
+        assert!(after_arg.is_empty());
     }
 
     #[test]

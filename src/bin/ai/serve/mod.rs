@@ -26,6 +26,7 @@ use crate::commonw::configw;
 use super::{config_schema::AiConfig, history::SessionStore};
 
 pub(in crate::ai) mod chat;
+pub(in crate::ai) mod ctl;
 
 const DEFAULT_BIND: &str = "127.0.0.1:8080";
 
@@ -70,6 +71,22 @@ struct HistoryQuery {
 #[derive(Debug, Deserialize)]
 struct TurnReq {
     prompt: String,
+    /// Per-turn model override for serve-chat `/model` switching. `None`
+    /// (or absent, for old clients) keeps the server default reported by
+    /// `GET /info`; `Some(id)` is forwarded as the child `--model` flag so
+    /// the turn resolves through the same registry path as the local REPL.
+    #[serde(default)]
+    model: Option<String>,
+    /// Per-turn agent override for serve-chat `/agent` switching. Forwarded
+    /// as the child `--agent` flag; absent keeps the `"build"` fallback.
+    #[serde(default)]
+    agent: Option<String>,
+    /// Per-turn reasoning-effort override for serve-chat `/effort`
+    /// switching (`minimal|low|medium|high|xhigh|max|off`, case-insensitive).
+    /// Absent (cleared) keeps the server default; forwarded as the child
+    /// `--reasoning-effort` flag.
+    #[serde(default)]
+    reasoning_effort: Option<String>,
     /// Client-uploaded images for `[[image:name]]` placeholders in `prompt`.
     /// A remote serve-chat client shares no filesystem with the server, so
     /// pasted images travel inside the request (base64) and are staged under
@@ -77,6 +94,81 @@ struct TurnReq {
     /// for text-only turns.
     #[serde(default)]
     images: Vec<ServeImageUpload>,
+}
+
+/// Max length for one per-turn model/agent override: identifiers are short
+/// registry names; the cap keeps a chatty client from bloating argv.
+const MAX_TURN_OVERRIDE_CHARS: usize = 128;
+
+/// Validated per-turn overrides extracted from [`TurnReq`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TurnOverrides {
+    model: Option<String>,
+    agent: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+/// Validate one free-form model/agent override: non-empty after trim, short,
+/// and never flag-shaped (a `--x` value would confuse the child CLI parser,
+/// which only claims non-`-` tokens for `--model`/`--agent` values).
+fn sanitize_turn_name_override(value: Option<String>, field: &str) -> Result<Option<String>, String> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > MAX_TURN_OVERRIDE_CHARS {
+        return Err(format!("{field} override is too long"));
+    }
+    if trimmed.starts_with('-') {
+        return Err(format!("{field} override must not start with '-'"));
+    }
+    Ok(Some(trimmed))
+}
+
+/// Validate the `--reasoning-effort` override against the child CLI's
+/// accepted values (tiers plus `off`; clearing is expressed by omitting the
+/// field, matching the local `/effort auto` semantics).
+fn sanitize_turn_effort_override(value: Option<String>) -> Result<Option<String>, String> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    match normalized.as_str() {
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "off" => Ok(Some(normalized)),
+        _ => Err(format!(
+            "reasoning_effort override must be minimal|low|medium|high|xhigh|max|off, got {raw:?}"
+        )),
+    }
+}
+
+/// Validate the three per-turn overrides of a turn request.
+fn turn_overrides(req: &TurnReq) -> Result<TurnOverrides, String> {
+    Ok(TurnOverrides {
+        model: sanitize_turn_name_override(req.model.clone(), "model")?,
+        agent: sanitize_turn_name_override(req.agent.clone(), "agent")?,
+        reasoning_effort: sanitize_turn_effort_override(req.reasoning_effort.clone())?,
+    })
+}
+
+/// Append validated per-turn overrides as child CLI flags. Empty means
+/// "server default", so no flag is emitted and old bare-`--session` behavior
+/// is preserved.
+fn push_turn_override_args(cmd: &mut std::process::Command, overrides: &TurnOverrides) {
+    if let Some(model) = &overrides.model {
+        cmd.arg("--model").arg(model);
+    }
+    if let Some(agent) = &overrides.agent {
+        cmd.arg("--agent").arg(agent);
+    }
+    if let Some(effort) = &overrides.reasoning_effort {
+        cmd.arg("--reasoning-effort").arg(effort);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,6 +316,58 @@ async fn healthz() -> Json<Healthz> {
 }
 // Note: /healthz is intentionally public (liveness only, no session data).
 // All session/skill/agent routes enforce check_auth.
+
+/// Runtime info for remote clients (`GET /info`, authed): the exact
+/// model/agent/reasoning-effort labels the next turn will run with, so a
+/// remote input header can mirror the local REPL instead of guessing from
+/// the client's own flags. The turn child is spawned as bare
+/// `--session <id> <prompt>` with no `--model`/`--agent` passthrough, so
+/// client-side flags never reach it — only server-side truth is displayed.
+#[derive(Debug, Serialize)]
+struct ServerInfo {
+    model: String,
+    model_label: String,
+    agent: String,
+    reasoning_effort: String,
+    version: String,
+}
+
+async fn server_info(State(state): State<ServeState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    // Mirror `models::initial_model` minus its CLI-override branch: the
+    // child CLI carries no `--model`, so the config default (resolved
+    // through the registry, falling back to the registry default) is what
+    // the turn uses.
+    let cfg = configw::get_all_config();
+    let model = cfg
+        .get_opt(AiConfig::MODEL_DEFAULT)
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| super::models::determine_model(&v))
+        .unwrap_or_else(super::models::default_model);
+    // Mirror `driver/mod.rs` App construction: the child CLI carries no
+    // `--agent`, so the hardcoded `"build"` fallback is what the turn uses.
+    let agent = "build".to_string();
+    // Mirror `request::reasoning::reasoning_effort_display_label` for the
+    // serve case: no CLI effort override exists server-side and the agent is
+    // never `"sharp"`, so the registry default (or "server default") is the
+    // displayed tier.
+    let reasoning_effort = super::models::default_reasoning_effort(&model)
+        .map(|e| e.as_str().to_string())
+        .unwrap_or_else(|| "server default".to_string());
+    (
+        StatusCode::OK,
+        Json(ServerInfo {
+            model_label: super::models::model_display_label(&model),
+            model,
+            agent,
+            reasoning_effort,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }),
+    )
+        .into_response()
+}
 
 async fn list_sessions(
     State(state): State<ServeState>,
@@ -397,12 +541,18 @@ const MAX_TURN_ERROR_CHARS: usize = 4096;
 /// up the SSE frame budget.
 const MAX_SSE_LINE_CHARS: usize = 8192;
 
-fn run_one_shot_turn(session_id: &str, prompt: &str) -> std::io::Result<String> {
+fn run_one_shot_turn(
+    session_id: &str,
+    prompt: &str,
+    overrides: &TurnOverrides,
+) -> std::io::Result<String> {
     let exe = std::env::current_exe()?;
-    let out = std::process::Command::new(exe)
-        .arg("--session")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--session")
         .arg(session_id)
-        .arg(prompt)
+        .arg(prompt);
+    push_turn_override_args(&mut cmd, overrides);
+    let out = cmd
         // Marks the child as serve-spawned (title skip); the FIFO env stays
         // unset here, so streaming paths keep seeing a plain child.
         .env(background::SERVE_CHILD_ENV, "1")
@@ -446,10 +596,16 @@ async fn post_turn(
     ) {
         return bad_request(err).into_response();
     }
+    let overrides = match turn_overrides(&req) {
+        Ok(overrides) => overrides,
+        Err(err) => return bad_request(err).into_response(),
+    };
     let lock = session_lock(&state, &id).await;
     let _guard = lock.lock().await;
     let session_id = id.clone();
-    let output = tokio::task::spawn_blocking(move || run_one_shot_turn(&session_id, &prompt))
+    let output = tokio::task::spawn_blocking(move || {
+        run_one_shot_turn(&session_id, &prompt, &overrides)
+    })
         .await
         .map_err(|err| {
             (
@@ -500,6 +656,10 @@ async fn post_turn_sse(
     ) {
         return bad_request(err).into_response();
     }
+    let overrides = match turn_overrides(&req) {
+        Ok(overrides) => overrides,
+        Err(err) => return bad_request(err).into_response(),
+    };
     let lock = session_lock(&state, &id).await;
     // Chunk-level streaming: the child publishes framed live events
     // (assistant-text deltas, thinking lifecycle, output-complete marker)
@@ -519,7 +679,7 @@ async fn post_turn_sse(
     tokio::task::spawn(async move {
         let _guard = lock.lock().await;
         let _ = tokio::task::spawn_blocking(move || {
-            stream_child_turn(session_id, prompt, tx, live_fifo)
+            stream_child_turn(session_id, prompt, overrides, tx, live_fifo)
         })
         .await;
     });
@@ -571,6 +731,7 @@ impl TurnSendTiming {
 fn stream_child_turn(
     session_id: String,
     prompt: String,
+    overrides: TurnOverrides,
     tx: mpsc::Sender<Result<Event, std::convert::Infallible>>,
     mut live_fifo: Option<LiveFifo>,
 ) {
@@ -603,8 +764,9 @@ fn stream_child_turn(
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--session")
         .arg(&session_id)
-        .arg(&prompt)
-        .stdout(Stdio::piped())
+        .arg(&prompt);
+    push_turn_override_args(&mut cmd, &overrides);
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Marks the child as serve-spawned even when no FIFO is set up
         // (fallback line pump): the title skip must not depend on streaming.
@@ -934,6 +1096,7 @@ fn delta_event(delta: String) -> Event {
 mod tests {
     use super::{ServeFrameDecoder, ServeImageUpload, ServeLiveEvent, setup_live_fifo};
     use super::{MAX_TURN_IMAGES, clean_sse_line, stage_turn_images};
+    use super::{TurnReq, turn_overrides};
     #[cfg(unix)]
     use super::pump_live_fifo;
     use std::sync::Arc;
@@ -1008,6 +1171,73 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn server_info_reports_runtime_labels() {
+        use axum::{
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        let resp = super::server_info(State(lifecycle_test_state()), HeaderMap::new())
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let info: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        for key in ["model", "model_label", "agent", "reasoning_effort", "version"] {
+            assert!(
+                info.get(key).and_then(|v| v.as_str()).is_some(),
+                "missing {key}"
+            );
+        }
+        assert_eq!(info["agent"], "build");
+        assert!(!info["version"].as_str().unwrap_or_default().is_empty());
+    }
+
+    fn turn_req(
+        model: Option<&str>,
+        agent: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> TurnReq {
+        TurnReq {
+            prompt: "hi".to_string(),
+            model: model.map(str::to_string),
+            agent: agent.map(str::to_string),
+            reasoning_effort: reasoning_effort.map(str::to_string),
+            images: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn turn_overrides_default_to_absent() {
+        let overrides = turn_overrides(&turn_req(None, None, None)).expect("valid");
+        assert_eq!(overrides.model, None);
+        assert_eq!(overrides.agent, None);
+        assert_eq!(overrides.reasoning_effort, None);
+        // Empty/blank strings also mean "server default", never a flag.
+        let overrides =
+            turn_overrides(&turn_req(Some("  "), Some(""), Some(""))).expect("valid");
+        assert_eq!(overrides.model, None);
+        assert_eq!(overrides.agent, None);
+        assert_eq!(overrides.reasoning_effort, None);
+    }
+
+    #[test]
+    fn turn_overrides_normalize_and_reject() {
+        let overrides =
+            turn_overrides(&turn_req(Some(" foo "), Some("build"), Some("LOW"))).expect("valid");
+        assert_eq!(overrides.model.as_deref(), Some("foo"));
+        assert_eq!(overrides.agent.as_deref(), Some("build"));
+        assert_eq!(overrides.reasoning_effort.as_deref(), Some("low"));
+        assert!(turn_overrides(&turn_req(Some("--evil"), None, None)).is_err());
+        assert!(turn_overrides(&turn_req(None, Some("-x"), None)).is_err());
+        assert!(turn_overrides(&turn_req(None, None, Some("ultra"))).is_err());
+        let long = "m".repeat(super::MAX_TURN_OVERRIDE_CHARS + 1);
+        assert!(turn_overrides(&turn_req(Some(&long), None, None)).is_err());
     }
 
     fn upload(name: &str, bytes: &[u8]) -> ServeImageUpload {
@@ -1314,6 +1544,20 @@ fn is_loopback_bind(bind: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Effective serve bind: an explicit `--serve-bind` wins, then
+/// `ai.serve.bind`, then [`DEFAULT_BIND`]. Shared by `run_serve` and the
+/// `--serve-*` management commands so status/start always probe the same
+/// address the server listens on.
+pub(in crate::ai) fn resolve_serve_bind(cli_bind: &str, cfg_bind: &str) -> String {
+    if !cli_bind.trim().is_empty() {
+        cli_bind.trim().to_string()
+    } else if !cfg_bind.trim().is_empty() {
+        cfg_bind.trim().to_string()
+    } else {
+        DEFAULT_BIND.to_string()
+    }
+}
+
 pub(in crate::ai) async fn run_serve(
     cli: super::cli::ParsedCli,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1322,16 +1566,8 @@ pub(in crate::ai) async fn run_serve(
     let app_config = super::config::load_config()?;
     let history_file = app_config.history_file.clone();
     let cfg = configw::get_all_config();
-    let bind = if !cli.serve_bind.trim().is_empty() {
-        cli.serve_bind.trim().to_string()
-    } else {
-        let from_cfg = cfg.get_opt(AiConfig::SERVE_BIND).unwrap_or_default();
-        if from_cfg.trim().is_empty() {
-            DEFAULT_BIND.to_string()
-        } else {
-            from_cfg
-        }
-    };
+    let from_cfg = cfg.get_opt(AiConfig::SERVE_BIND).unwrap_or_default();
+    let bind = resolve_serve_bind(&cli.serve_bind, &from_cfg);
     let token = cfg.get_opt(AiConfig::SERVE_TOKEN).unwrap_or_default();
     if token.is_empty() && !is_loopback_bind(&bind) {
         return Err(
@@ -1350,6 +1586,7 @@ pub(in crate::ai) async fn run_serve(
     };
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/info", get(server_info))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/fork", post(fork_session))
         .route("/sessions/{id}", delete(delete_session))
@@ -1366,7 +1603,15 @@ pub(in crate::ai) async fn run_serve(
         .route("/agents", get(list_agents))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
+    // Record this process in the global serve state file so `--serve-status`
+    // and `--serve-stop` see a foreground server too. Best-effort: a missing
+    // state file only costs manageability, never availability.
+    ctl::note_foreground_serve(&bind);
     eprintln!("[serve] listening on http://{bind}");
     axum::serve(listener, app).await?;
+    // The listener shut down cleanly; drop our claim so a later status does
+    // not report a stale pid. (A signal-killed server leaves a stale file
+    // behind; status/start self-heal by reaping it.)
+    ctl::clear_foreground_serve();
     Ok(())
 }
