@@ -23,6 +23,108 @@ struct CreatedSession {
     id: String,
 }
 
+/// One entry of `GET /sessions` (newest first). `summary` is the generated
+/// title when the server has one; otherwise the client falls back to the
+/// first user prompt. Optional fields default so older servers still parse.
+#[derive(Debug, Deserialize)]
+struct RemoteSession {
+    id: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    first_user_prompt: Option<String>,
+    #[serde(default)]
+    marked: bool,
+}
+
+/// Max rows `GET /sessions` asks for: enough to find a recent session after
+/// a client restart, small enough to print as one screen.
+const SESSION_LIST_LIMIT: usize = 20;
+
+/// Fetch the newest remote sessions (`GET /sessions?limit=`). Thin network
+/// glue; parsing and display live in the pure helpers below so tests stay
+/// offline except for this one loopback round-trip.
+fn fetch_remote_sessions(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+) -> Result<Vec<RemoteSession>, String> {
+    let resp = auth(
+        client.get(format!("{base}/sessions?limit={SESSION_LIST_LIMIT}")),
+        token,
+    )
+    .send()
+    .map_err(|err| format!("cannot reach serve at {base} ({err})"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(server_error_message(status, &text));
+    }
+    parse_remote_sessions(&text)
+}
+
+/// Parse a `GET /sessions` body. Entries with an empty id are dropped —
+/// they can never be resumed.
+fn parse_remote_sessions(text: &str) -> Result<Vec<RemoteSession>, String> {
+    let mut items: Vec<RemoteSession> = serde_json::from_str(text)
+        .map_err(|err| format!("serve returned an unexpected session list: {err}"))?;
+    items.retain(|s| !s.id.trim().is_empty());
+    Ok(items)
+}
+
+/// Printable one-row title: generated summary first, else the first user
+/// prompt's first line, truncated with an ellipsis.
+fn remote_session_title(item: &RemoteSession) -> String {
+    const MAX_TITLE_CHARS: usize = 60;
+    let raw = item
+        .summary
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            item.first_user_prompt
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or("(untitled)");
+    let first_line = raw.lines().next().unwrap_or(raw).trim();
+    let mut title: String = first_line.chars().take(MAX_TITLE_CHARS).collect();
+    if first_line.chars().count() > MAX_TITLE_CHARS {
+        title.push('…');
+    }
+    if item.marked {
+        title.push_str(" ★");
+    }
+    title
+}
+
+/// Resolve a `/resume` argument against the last `/sessions` listing:
+/// 1-based row number, unique id prefix, or full id. A full id that was
+/// never listed (older than the list limit, or pasted from elsewhere) passes
+/// through verbatim; the server validates it on the next turn.
+fn resolve_session_ref(arg: &str, listed: &[RemoteSession]) -> Result<String, String> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return Err("usage: /resume <number|id-prefix|id> (see /sessions)".to_string());
+    }
+    if let Ok(n) = arg.parse::<usize>() {
+        return listed.get(n.wrapping_sub(1)).map(|s| s.id.clone()).ok_or_else(|| {
+            if listed.is_empty() {
+                "no session listing yet; run /sessions first".to_string()
+            } else {
+                format!("session number out of range (1-{})", listed.len())
+            }
+        });
+    }
+    let mut prefix_hits = listed.iter().filter(|s| s.id.starts_with(arg));
+    match (prefix_hits.next(), prefix_hits.next()) {
+        (Some(one), None) => Ok(one.id.clone()),
+        (Some(_), Some(_)) => Err(format!(
+            "id prefix {arg:?} matches several listed sessions; use more characters"
+        )),
+        (None, _) => Ok(arg.to_string()),
+    }
+}
+
 fn normalize_base(bind: &str) -> String {
     let trimmed = bind.trim().trim_end_matches('/');
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -74,6 +176,64 @@ fn create_session(
         return Err("serve returned an empty session id".into());
     }
     Ok(created.id)
+}
+
+/// Fork the current remote session (`POST /sessions/{id}/fork`). Returns the
+/// new session id; the forked copy is title-marked server-side, same as the
+/// local `/fork`. Network glue only — the loopback test below covers the
+/// wire shape.
+fn fork_remote_session(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let resp = auth(
+        client.post(format!("{base}/sessions/{session_id}/fork")),
+        token,
+    )
+    .send()?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(server_error_message(status, &text).into());
+    }
+    let created: CreatedSession = serde_json::from_str(&text)
+        .map_err(|err| format!("serve returned an unexpected fork body: {err}"))?;
+    if created.id.trim().is_empty() {
+        return Err("serve returned an empty fork session id".into());
+    }
+    Ok(created.id)
+}
+
+#[derive(Debug, Deserialize)]
+struct DeletedSession {
+    #[serde(default)]
+    deleted: bool,
+}
+
+/// Delete a remote session (`DELETE /sessions/{id}`). Idempotent: deleting a
+/// missing session still succeeds, so a retry after a dropped connection is
+/// safe. Returns the server-reported `deleted` flag.
+fn delete_remote_session(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let resp = auth(
+        client.delete(format!("{base}/sessions/{session_id}")),
+        token,
+    )
+    .send()?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(server_error_message(status, &text).into());
+    }
+    let deleted: DeletedSession = serde_json::from_str(&text)
+        .map_err(|err| format!("serve returned an unexpected delete body: {err}"))?;
+    Ok(deleted.deleted)
 }
 
 /// Render one SSE turn stream progressively: message lines print as they
@@ -439,8 +599,10 @@ pub(in crate::ai) fn run_serve_chat(
     };
 
     println!("Connected to {base}, session {session_id}.");
-    println!("Enter inserts a newline, Esc or Alt+Enter submits; /quit exits, /new starts a new session.");
+    println!("Enter inserts a newline, Esc or Alt+Enter submits; /quit exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions, /fork branches the current session, /close deletes it and exits.");
     let mut editor = PromptEditor::new(&session_id, &app_config.history_file);
+    // Last `/sessions` output: backs `/resume <number|id-prefix>`.
+    let mut listed: Vec<RemoteSession> = Vec::new();
     loop {
         let input = match editor.read_multi_line() {
             Ok(Some(text)) => text,
@@ -454,11 +616,17 @@ pub(in crate::ai) fn run_serve_chat(
         if trimmed.is_empty() {
             continue;
         }
-        match trimmed.as_str() {
+        // Split the command word from its argument so `/resume <id>` works;
+        // anything else keeps the full text (prompts starting with `/` still
+        // send verbatim, exactly as before).
+        let mut words = trimmed.splitn(2, char::is_whitespace);
+        let cmd = words.next().unwrap_or("");
+        let arg = words.next().unwrap_or("").trim();
+        match cmd {
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first)\n/resume <number|id-prefix|id> - continue a listed session\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit"
                 );
                 continue;
             }
@@ -467,6 +635,51 @@ pub(in crate::ai) fn run_serve_chat(
                     session_id = id;
                     editor.set_session_id(session_id.as_str());
                     println!("New session {session_id}.");
+                }
+                Err(err) => eprintln!("[serve-chat] {err}"),
+            },
+            // `/ss` matches the local REPL shorthand (`/ss` === `/sessions`
+            // list), so the same muscle memory works on both sides.
+            "/sessions" | "/ss" | "/ls" => match fetch_remote_sessions(&client, &base, &token) {
+                Ok(items) => {
+                    if items.is_empty() {
+                        println!("No remote sessions.");
+                    } else {
+                        for (i, item) in items.iter().enumerate() {
+                            println!("{}. {}  {}", i + 1, item.id, remote_session_title(item));
+                        }
+                    }
+                    listed = items;
+                }
+                Err(err) => eprintln!("[serve-chat] {err}"),
+            },
+            "/resume" => match resolve_session_ref(arg, &listed) {
+                Ok(id) => {
+                    let title = listed.iter().find(|s| s.id == id).map(remote_session_title);
+                    session_id = id;
+                    editor.set_session_id(session_id.as_str());
+                    match title {
+                        Some(t) => println!("Resumed session {session_id} ({t})."),
+                        None => println!("Resumed session {session_id}."),
+                    }
+                }
+                Err(err) => eprintln!("[serve-chat] {err}"),
+            },
+            "/fork" => match fork_remote_session(&client, &base, &token, &session_id) {
+                Ok(id) => {
+                    println!("Forked '{session_id}' -> '{id}', switched to new branch.");
+                    session_id = id;
+                    editor.set_session_id(session_id.as_str());
+                }
+                Err(err) => eprintln!("[serve-chat] {err}"),
+            },
+            // Local `/close` deletes the session and exits; the suspended-
+            // binding cleanup it also does is local-terminal state with no
+            // remote equivalent, so DELETE + break is the full parity here.
+            "/close" => match delete_remote_session(&client, &base, &token, &session_id) {
+                Ok(_) => {
+                    println!("Closed remote session {session_id}.");
+                    break;
                 }
                 Err(err) => eprintln!("[serve-chat] {err}"),
             },
@@ -664,5 +877,121 @@ mod tests {
         let resp = reqwest::blocking::get(url).expect("get canned SSE");
         let err = render_turn_stream(resp).expect_err("error event must fail");
         assert!(err.to_string().contains("boom"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn fork_remote_session_parses_new_id() {
+        // serve_body_once ignores the request path and method, so the
+        // canned fork body stands in for POST /sessions/{id}/fork.
+        let url = serve_body_once(r#"{"id":"f1"}"#);
+        let base = url.split("/sessions/").next().unwrap_or(&url);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let id = fork_remote_session(&client, base, "", "cur").expect("fork");
+        assert_eq!(id, "f1");
+    }
+
+    #[test]
+    fn delete_remote_session_reports_server_flag() {
+        let url = serve_body_once(r#"{"deleted":true}"#);
+        let base = url.split("/sessions/").next().unwrap_or(&url);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        assert!(delete_remote_session(&client, base, "", "cur").expect("delete"));
+    }
+
+    fn listed_session(id: &str, summary: Option<&str>, prompt: Option<&str>) -> RemoteSession {
+        RemoteSession {
+            id: id.to_string(),
+            summary: summary.map(str::to_string),
+            first_user_prompt: prompt.map(str::to_string),
+            marked: false,
+        }
+    }
+
+    #[test]
+    fn parse_remote_sessions_drops_empty_ids() {
+        let items = parse_remote_sessions(
+            r#"[{"id":"a1","summary":"Fix bug","size_bytes":10,"marked":false},{"id":"  "}]"#,
+        )
+        .expect("parse");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "a1");
+        assert_eq!(items[0].summary.as_deref(), Some("Fix bug"));
+        parse_remote_sessions("not json").expect_err("malformed must fail");
+        // Older servers without the optional fields still parse.
+        let legacy = parse_remote_sessions(r#"[{"id":"old"}]"#).expect("legacy");
+        assert!(legacy[0].summary.is_none());
+        assert!(!legacy[0].marked);
+    }
+
+    #[test]
+    fn remote_session_title_prefers_summary_then_prompt() {
+        assert_eq!(
+            remote_session_title(&listed_session("x", Some("T"), Some("P"))),
+            "T"
+        );
+        // First prompt falls back to its first line only.
+        assert_eq!(
+            remote_session_title(&listed_session("x", None, Some("hello\nworld"))),
+            "hello"
+        );
+        assert_eq!(
+            remote_session_title(&listed_session("x", Some("  "), None)),
+            "(untitled)"
+        );
+        // Long titles truncate with an ellipsis at a char boundary.
+        let long = "字".repeat(100);
+        let title = remote_session_title(&listed_session("x", Some(&long), None));
+        assert_eq!(title.chars().count(), 61, "unexpected: {title}");
+        assert!(title.ends_with('…'));
+        let mut marked = listed_session("x", Some("T"), None);
+        marked.marked = true;
+        assert_eq!(remote_session_title(&marked), "T ★");
+    }
+
+    #[test]
+    fn resolve_session_ref_accepts_number_prefix_or_id() {
+        let listed = vec![
+            listed_session("b2b23f0c-aaaa", Some("A"), None),
+            listed_session("b2b23f0c-bbbb", Some("B"), None),
+        ];
+        assert_eq!(resolve_session_ref("1", &listed).unwrap(), "b2b23f0c-aaaa");
+        assert_eq!(resolve_session_ref("2", &listed).unwrap(), "b2b23f0c-bbbb");
+        assert!(resolve_session_ref("3", &listed).is_err());
+        assert!(resolve_session_ref("", &listed).is_err());
+        // Unique prefix resolves; ambiguous prefix errors.
+        assert_eq!(
+            resolve_session_ref("b2b23f0c-aaaa", &listed).unwrap(),
+            "b2b23f0c-aaaa"
+        );
+        assert!(resolve_session_ref("b2b23f0c", &listed).is_err());
+        // A full id that was never listed passes through for the server to check.
+        assert_eq!(
+            resolve_session_ref("elsewhere-id", &listed).unwrap(),
+            "elsewhere-id"
+        );
+        assert!(resolve_session_ref("1", &[]).is_err());
+    }
+
+    #[test]
+    fn fetch_remote_sessions_parses_canned_list() {
+        // serve_body_once ignores the request path, so the canned session
+        // list stands in for GET /sessions over loopback.
+        let url = serve_body_once(
+            r#"[{"id":"s1","summary":"Hello","size_bytes":7,"marked":true}]"#,
+        );
+        let base = url.rsplit_once('/').map(|(b, _)| b).unwrap_or(&url);
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let items = fetch_remote_sessions(&client, base, "").expect("fetch");
+        assert_eq!(items.len(), 1);
+        assert_eq!(remote_session_title(&items[0]), "Hello ★");
     }
 }

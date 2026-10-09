@@ -1503,7 +1503,7 @@ fn session_title_base(store: &SessionStore, session_id: &str) -> String {
 
 /// Rewrites the dst session's title to the fork-marked version, with depth
 /// incremented from the source session's title.
-fn apply_fork_title(store: &SessionStore, src_id: &str, dst_id: &str) -> std::io::Result<()> {
+pub(in crate::ai) fn apply_fork_title(store: &SessionStore, src_id: &str, dst_id: &str) -> std::io::Result<()> {
     let base = session_title_base(store, src_id);
     let (depth, inner) = parse_fork_marker(&base);
     let new_title = format_fork_title(depth + 1, inner);

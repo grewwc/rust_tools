@@ -1,9 +1,9 @@
 //! Serve mode: local HTTP API with parity to the CLI personal assistant.
 //!
 //! v1 scope: HTTP on loopback, Bearer auth (optional), session list/history,
-//! one-shot turns via subprocess (same binary, `--session <id>`), skills/agents
-//! listing. Turn execution reuses the existing one-shot path so behavior stays
-//! identical to `a --session <id> "<prompt>"`.
+//! one-shot turns via subprocess (same binary, `--session <id>`), session
+//! fork/delete, skills/agents listing. Turn execution reuses the existing
+//! one-shot path so behavior stays identical to `a --session <id> "<prompt>"`.
 
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
 
@@ -14,7 +14,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Sse, sse::Event},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use futures_util::stream;
 use serde::{Deserialize, Serialize};
@@ -282,6 +282,78 @@ async fn create_session(
     // GET history 404s, matching CLI one-shot semantics.
     debug_assert!(SessionStore::validate_session_id(&id).is_ok());
     (StatusCode::OK, Json(CreateSessionResp { id })).into_response()
+}
+
+/// Fork session `{id}` into a new branch, mirroring the local `/fork`:
+/// wholesale copy (messages, assets, checkpoints) plus a depth-tagged fork
+/// marker title, then the client switches to the new id. Refuses a missing
+/// source with 404; a failed title write warns but never fails the fork.
+async fn fork_session(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if SessionStore::validate_session_id(&id).is_err() {
+        return bad_request(format!("invalid session id: {id}")).into_response();
+    }
+    let store = SessionStore::new(state.history_file.as_path());
+    let dst = uuid::Uuid::new_v4().to_string();
+    match store.fork_session(&id, &dst) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    }
+    if let Err(err) =
+        crate::ai::driver::commands::session::apply_fork_title(&store, &id, &dst)
+    {
+        eprintln!("[serve] fork title for session {dst}: {err}");
+    }
+    (StatusCode::OK, Json(CreateSessionResp { id: dst })).into_response()
+}
+
+/// Delete session `{id}`, mirroring the local `/close` (minus the local
+/// suspended-binding cleanup and process exit, which stay client-side).
+/// Idempotent: deleting a missing session still succeeds so client retries
+/// after a dropped connection stay safe.
+async fn delete_session(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if SessionStore::validate_session_id(&id).is_err() {
+        return bad_request(format!("invalid session id: {id}")).into_response();
+    }
+    let store = SessionStore::new(state.history_file.as_path());
+    match store.delete_session(&id) {
+        Ok(deleted) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"deleted": deleted})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 async fn read_history(
@@ -579,7 +651,7 @@ fn stream_child_turn(
             .lines()
             .map_while(Result::ok)
         {
-            send(Event::default().data(truncate_line(&line)));
+            send(Event::default().data(clean_sse_line(&line)));
         }
     }
     let status = child.wait();
@@ -861,12 +933,82 @@ fn delta_event(delta: String) -> Event {
 #[cfg(test)]
 mod tests {
     use super::{ServeFrameDecoder, ServeImageUpload, ServeLiveEvent, setup_live_fifo};
-    use super::{MAX_TURN_IMAGES, stage_turn_images};
+    use super::{MAX_TURN_IMAGES, clean_sse_line, stage_turn_images};
     #[cfg(unix)]
     use super::pump_live_fifo;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use uuid::Uuid;
+
+    /// Handler-level coverage for the two session-lifecycle routes: a
+    /// missing fork source 404s, a malformed id 400s, and deleting a
+    /// missing session still succeeds (idempotent, so client retries after
+    /// a dropped connection stay safe). Body shapes are covered by the
+    /// client loopback tests in `chat.rs`; store behavior by the
+    /// `SessionStore` fork/delete tests.
+    fn lifecycle_test_state() -> super::ServeState {
+        let root = std::env::temp_dir().join(format!(
+            "a-serve-lifecycle-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        super::ServeState {
+            history_file: root.join("history.sqlite"),
+            token: String::new(),
+            locks: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_missing_source_returns_not_found() {
+        use axum::{
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        let resp = super::fork_session(
+            State(lifecycle_test_state()),
+            HeaderMap::new(),
+            Path("missing".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn fork_invalid_id_is_rejected() {
+        use axum::{
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        let resp = super::fork_session(
+            State(lifecycle_test_state()),
+            HeaderMap::new(),
+            Path("../evil".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_session_still_succeeds() {
+        use axum::{
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        let resp = super::delete_session(
+            State(lifecycle_test_state()),
+            HeaderMap::new(),
+            Path("missing".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 
     fn upload(name: &str, bytes: &[u8]) -> ServeImageUpload {
         use base64::Engine as _;
@@ -888,6 +1030,23 @@ mod tests {
         stage_turn_images(&untouched, &[]).expect("empty ok");
         assert!(!untouched.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clean_sse_line_strips_the_overwrite_prefix() {
+        // Completed/failed tool rows carry `\r\x1b[2K` to redraw the running
+        // row on a live terminal; on the append-only SSE wire the prefix must
+        // go, while the row indent and content stay byte-identical.
+        assert_eq!(
+            clean_sse_line("\r\x1b[2K  \u{1b}[32m✓\u{1b}[0m task_integrate"),
+            "  \u{1b}[32m✓\u{1b}[0m task_integrate"
+        );
+        // A bare `\r` alone is still the overwrite control, not content.
+        assert_eq!(clean_sse_line("\r[header]"), "[header]");
+        // Ordinary rows (indented or not) pass through untouched.
+        assert_eq!(clean_sse_line("  ● task_integrate"), "  ● task_integrate");
+        assert_eq!(clean_sse_line("↳ speed · x"), "↳ speed · x");
+        assert_eq!(clean_sse_line(""), "");
     }
 
     #[test]
@@ -1088,6 +1247,20 @@ fn truncate_line(line: &str) -> String {
     }
 }
 
+/// Normalize one child-stdout row for SSE transport: strip the live-terminal
+/// overwrite prefix (`\r\x1b[2K`) that completed/failed tool rows carry to
+/// redraw the `running` row in place. SSE rows are append-only, so the
+/// prefix is meaningless on the wire; worse, the bare `\r` makes axum split
+/// the row and re-prefix `data:`, injecting a literal `data: ` fragment that
+/// only a terminal honoring the erase escape can hide again. `BufRead::lines`
+/// already removed the line ending, so a leading `\r` here is always the
+/// overwrite control, never content.
+fn clean_sse_line(line: &str) -> String {
+    let line = line.strip_prefix('\r').unwrap_or(line);
+    let line = line.strip_prefix("\x1b[2K").unwrap_or(line);
+    truncate_line(line)
+}
+
 fn last_chars(text: &str, limit: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= limit {
@@ -1178,6 +1351,8 @@ pub(in crate::ai) async fn run_serve(
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/sessions/{id}/fork", post(fork_session))
+        .route("/sessions/{id}", delete(delete_session))
         .route("/sessions/{id}/history", get(read_history))
         .route(
             "/sessions/{id}/turns",
