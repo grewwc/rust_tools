@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn non_utf8_deleted_path_still_recovers() {
         use std::ffi::OsString;
-        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+        use std::os::unix::ffi::OsStringExt as _;
 
         let mut raw = scratch_dir("non-utf8").into_os_string().into_vec();
         raw.extend_from_slice(b"/pro\xffbe");

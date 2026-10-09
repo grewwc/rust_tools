@@ -75,6 +75,9 @@ async fn backfill_pending_image_digests(
     source: DigestSource<'_>,
 ) -> usize {
     let mut stored = 0usize;
+    // The batch position is read only by the test stand-in arm below, so a non-test build would
+    // otherwise flag the binding as unused.
+    #[cfg_attr(not(test), allow(unused_variables))]
     for (index, entry) in crate::ai::request::backfill_batch(pending, model, limit)
         .iter()
         .enumerate()
