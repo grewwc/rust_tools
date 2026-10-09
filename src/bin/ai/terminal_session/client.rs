@@ -186,7 +186,7 @@ fn connect_with_retry(target: &Path, deadline: Option<Instant>) -> io::Result<Op
 fn spawn_host(original_args: &[String]) -> io::Result<(String, String)> {
     let name = uuid::Uuid::new_v4().to_string();
     let token = uuid::Uuid::new_v4().to_string();
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = Command::new(crate::ai::exe_path::runtime_exe()?);
     command
         .arg("--terminal-host")
         .arg(&name)

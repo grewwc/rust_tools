@@ -704,7 +704,7 @@ fn close_live_output_fifo() {
 
 #[cfg(unix)]
 fn spawn_resume_helper() -> std::io::Result<()> {
-    let exe = std::env::current_exe()?;
+    let exe = crate::ai::exe_path::runtime_exe()?;
     let dev_null = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1063,7 +1063,7 @@ pub(crate) fn build_daemon_args(cli: &ParsedCli, session_id: &str) -> Vec<std::f
 fn spawn_daemon_child(cli: &ParsedCli, session_id: &str, log_path: &Path) -> std::io::Result<()> {
     use std::ffi::OsString;
 
-    let exe = std::env::current_exe()?;
+    let exe = crate::ai::exe_path::runtime_exe()?;
     let args: Vec<OsString> = build_daemon_args(cli, session_id);
 
     let dev_null = std::fs::OpenOptions::new().read(true).open("/dev/null")?;

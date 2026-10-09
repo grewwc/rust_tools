@@ -12,9 +12,22 @@
 //! `a --serve-detached --serve --serve-bind <addr>` process through
 //! `fork_guard::spawn`, and the child detaches its own session on startup via
 //! `background::detach_daemon_session`, mirroring `--daemon-child`.
+//!
+//! The re-exec runs a frozen copy of the binary (`run/a-<hash>` under the
+//! state dir) rather than the path the user launched: a serve daemon starts
+//! one fresh process per turn from its own file, so a rebuild that replaces
+//! that path would leave every later turn failing with `ENOENT`.
+//!
+//! The copy is what `current_exe()` reports for the daemon and its turns, so
+//! `current_exe()`-relative lookups (`tool_descriptions` next to the binary,
+//! the lowest-priority metadata source) resolve under `run/` instead of the
+//! install dir, and the state dir must be executable (no `noexec` mount).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use crate::ai::cli::ParsedCli;
 use crate::commonw::configw;
@@ -23,6 +36,17 @@ use crate::commonw::configw;
 const STATE_DIR_ENV: &str = "A_SERVE_STATE_DIR";
 const PID_FILE: &str = "serve.pid";
 const LOG_FILE: &str = "serve.log";
+/// Frozen daemon copies (`a-<content hash>`), see [`freeze_daemon_exe`].
+#[cfg(unix)]
+const RUN_DIR: &str = "run";
+/// Frozen copies kept on disk: the running one plus its predecessor, so a
+/// rollback target survives one upgrade.
+#[cfg(unix)]
+const KEEP_RUN_COPIES: usize = 2;
+/// Age after which a `.a-*.tmp` copy left behind by an interrupted start is
+/// reclaimed; a younger one may belong to a start that is still copying.
+#[cfg(unix)]
+const STALE_COPY_TEMP_AGE: Duration = Duration::from_secs(600);
 /// How long `--serve-start` waits for `/healthz` before reporting success anyway.
 #[cfg(unix)]
 const STARTUP_WAIT: Duration = Duration::from_secs(6);
@@ -239,7 +263,8 @@ fn start_daemon(
     Err("--serve-start is unix-only (posix daemonize)".into())
 }
 
-/// Start the serve daemon: re-exec this binary detached, then record its pid.
+/// Start the serve daemon: re-exec a frozen copy of this binary detached, then
+/// record its pid.
 #[cfg(unix)]
 fn start_daemon(
     cli: &ParsedCli,
@@ -260,14 +285,16 @@ fn start_daemon(
         let _ = std::fs::remove_file(&pid_path);
     }
     let bind = resolve_ctl_bind(cli, forced_bind);
-    let exe = std::env::current_exe()?;
+    // Freeze first: the daemon re-execs its own file for every turn, so it
+    // must not run from a path that a rebuild can replace.
+    let exe = freeze_daemon_exe(&dir)?;
     let log_path = dir.join(LOG_FILE);
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)?;
     let dev_null = std::fs::OpenOptions::new().read(true).open("/dev/null")?;
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = std::process::Command::new(&exe);
     cmd.arg("--serve-detached")
         .arg("--serve")
         .arg("--serve-bind")
@@ -288,9 +315,10 @@ fn start_daemon(
         Ok(version) => {
             let version = version.map(|v| format!(" version={v}")).unwrap_or_default();
             println!(
-                "[serve] started pid={} bind=http://{bind}{version} log={}",
+                "[serve] started pid={} bind=http://{bind}{version} log={} exe={}",
                 child.id(),
-                log_path.display()
+                log_path.display(),
+                exe.display()
             );
         }
         Err(_) => println!(
@@ -300,6 +328,146 @@ fn start_daemon(
         ),
     }
     Ok(())
+}
+
+/// Copy the running binary into `<dir>/run/` and return the frozen copy.
+///
+/// The daemon is started from this copy, so replacing the install path (a
+/// rebuild, `cp --remove-destination`) cannot unlink the file every turn
+/// re-execs. Copies are keyed by content: an unchanged binary reuses its copy,
+/// and pruning keeps [`KEEP_RUN_COPIES`] generations without ever unlinking a
+/// file some live process is executing. (The state file also blocks a second
+/// start while a daemon runs, but it can be missing or hand-deleted, so
+/// pruning does not rely on it.) The state dir must allow exec: the daemon
+/// runs from this copy, not from the install path.
+#[cfg(unix)]
+fn freeze_daemon_exe(dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    freeze_copy(&crate::ai::exe_path::runtime_exe()?, dir)
+}
+
+/// [`freeze_daemon_exe`] against an explicit source, so tests can freeze a
+/// scratch file instead of the test binary.
+#[cfg(unix)]
+fn freeze_copy(src: &Path, dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let run_dir = dir.join(RUN_DIR);
+    std::fs::create_dir_all(&run_dir)?;
+    let hash = file_hash(src)?;
+    let dst = run_dir.join(format!("a-{hash:016x}"));
+    if !dst.is_file() {
+        // Copy under a temporary name and rename into place: a partial copy
+        // (disk full, interrupted start) must never be trusted as the frozen
+        // binary, and the rename publishes it only once it is complete.
+        let tmp = run_dir.join(format!(".a-{hash:016x}-{}.tmp", std::process::id()));
+        if let Err(err) = publish_copy(src, &tmp, &dst) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
+        }
+    }
+    prune_run_copies(&run_dir, &dst);
+    Ok(dst)
+}
+
+/// Write `src` to `tmp`, then publish it as `dst`.
+#[cfg(unix)]
+fn publish_copy(src: &Path, tmp: &Path, dst: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::copy(src, tmp)?;
+    // `fs::copy` carries the source mode; force the exec bits so a copy made
+    // under a restrictive umask still runs.
+    std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::rename(tmp, dst)?;
+    Ok(())
+}
+
+/// Content hash naming a frozen copy, so rebuilt binaries never overwrite the
+/// copy a running daemon re-execs.
+#[cfg(unix)]
+fn file_hash(path: &Path) -> std::io::Result<u64> {
+    use std::hash::Hasher as _;
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.write(&buf[..read]);
+    }
+    Ok(hasher.finish())
+}
+
+/// Drop older frozen copies, keeping `keep` and the newest other generation
+/// that no live process is executing. Best effort: a leftover copy only costs
+/// disk space, while dropping an executing one would cost a daemon its binary.
+#[cfg(unix)]
+fn prune_run_copies(run_dir: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(run_dir) else {
+        return;
+    };
+    let executing = executing_paths();
+    let mut others: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let Some(modified) = entry.metadata().ok().and_then(|meta| meta.modified().ok()) else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if name.starts_with(".a-") && name.ends_with(".tmp") {
+            // Interrupted copy; reclaimed once it is clearly abandoned.
+            let stale = SystemTime::now()
+                .duration_since(modified)
+                .is_ok_and(|age| age > STALE_COPY_TEMP_AGE);
+            if stale {
+                let _ = std::fs::remove_file(path);
+            }
+            continue;
+        }
+        if !name.starts_with("a-") || path == keep || is_executing(&path, &executing) {
+            continue;
+        }
+        others.push((modified, path));
+    }
+    others.sort_by(|left, right| right.0.cmp(&left.0));
+    for (_, path) in others.into_iter().skip(KEEP_RUN_COPIES.saturating_sub(1)) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Whether some live process is executing `path`.
+#[cfg(unix)]
+fn is_executing(path: &Path, executing: &[PathBuf]) -> bool {
+    std::fs::canonicalize(path).is_ok_and(|canonical| executing.contains(&canonical))
+}
+
+/// Executable paths of live processes (Linux `/proc/<pid>/exe`). Empty where
+/// there is no cheap equivalent, which only widens what may be pruned.
+#[cfg(target_os = "linux")]
+fn executing_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return paths;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+        {
+            continue;
+        }
+        if let Ok(target) = std::fs::read_link(entry.path().join("exe")) {
+            paths.push(target);
+        }
+    }
+    paths
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn executing_paths() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 #[cfg(not(unix))]
@@ -461,6 +629,83 @@ pub(in crate::ai) fn clear_foreground_serve() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("a-serve-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// Pin a file's mtime so pruning order does not depend on clock resolution.
+    #[cfg(unix)]
+    fn set_mtime(path: &Path, unix_secs: u64) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for mtime");
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(unix_secs))
+            .expect("set mtime");
+    }
+
+    /// A frozen copy must be exec-ready, and freezing the same bytes again must
+    /// reuse it instead of piling up duplicates.
+    #[cfg(unix)]
+    #[test]
+    fn frozen_copy_is_executable_and_reused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = scratch_dir("freeze");
+        let src = dir.join("src-bin");
+        std::fs::write(&src, b"#!/bin/true\n").expect("write source");
+        let frozen = freeze_copy(&src, &dir).expect("freeze");
+        assert!(frozen.is_file(), "copy missing at {}", frozen.display());
+        let mode = std::fs::metadata(&frozen)
+            .expect("copy metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "frozen copy must be executable");
+        assert_eq!(freeze_copy(&src, &dir).expect("freeze again"), frozen);
+    }
+
+    /// Rollback needs the previous generation, but copies must not accumulate.
+    #[cfg(unix)]
+    #[test]
+    fn freezing_prunes_all_but_one_predecessor() {
+        let dir = scratch_dir("prune");
+        let run_dir = dir.join(RUN_DIR);
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let older = run_dir.join("a-0000000000000001");
+        let previous = run_dir.join("a-0000000000000002");
+        std::fs::write(&older, b"old").expect("seed older");
+        std::fs::write(&previous, b"previous").expect("seed previous");
+        set_mtime(&older, 1_000);
+        set_mtime(&previous, 2_000);
+        let src = dir.join("src-bin");
+        std::fs::write(&src, b"#!/bin/true\n").expect("write source");
+
+        let frozen = freeze_copy(&src, &dir).expect("freeze");
+        assert!(frozen.is_file());
+        assert!(
+            previous.is_file(),
+            "previous copy stays available for rollback"
+        );
+        assert!(!older.is_file(), "older copies are pruned");
+    }
+
+    /// The prune guard must recognize the file a live process executes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn executing_paths_include_the_test_binary() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let executing = executing_paths();
+        assert!(
+            is_executing(&exe, &executing),
+            "{} runs this test",
+            exe.display()
+        );
+    }
 
     fn ctl_args(extra: &[&str]) -> ParsedCli {
         let mut raw = vec!["a".to_string()];

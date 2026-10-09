@@ -290,7 +290,7 @@ impl Host {
     fn spawn_worker(&mut self, window: Window, terminal: &str) -> io::Result<()> {
         let (master, slave) = open_pty(window)?;
         let mut command = if let Some(command) = self.command.take() { command } else {
-            let mut command = Command::new(std::env::current_exe()?);
+            let mut command = Command::new(crate::ai::exe_path::runtime_exe()?);
             let id = &self.name[2..self.name.len() - 5];
             command.args(["--terminal-worker", id, &self.token, terminal]);
             command.args(self.worker_args.iter().skip(1));

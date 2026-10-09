@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::ai::background;
+use crate::ai::exe_path::runtime_exe;
 use crate::commonw::configw;
 
 use super::{agents, config_schema::AiConfig, history::SessionStore, model_names, models};
@@ -608,7 +609,7 @@ fn run_one_shot_turn(
     prompt: &str,
     overrides: &TurnOverrides,
 ) -> std::io::Result<String> {
-    let exe = std::env::current_exe()?;
+    let exe = runtime_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--session")
         .arg(session_id)
@@ -903,7 +904,7 @@ fn stream_child_turn(
     // status below. Guards against a duplicated `done`; the per-session lock
     // stays held until the child is reaped either way.
     let turn_done = Arc::new(AtomicBool::new(false));
-    let exe = match std::env::current_exe() {
+    let exe = match runtime_exe() {
         Ok(exe) => exe,
         Err(err) => {
             send(error_event(format!("cannot locate current binary: {err}")));
@@ -911,7 +912,7 @@ fn stream_child_turn(
             return;
         }
     };
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = std::process::Command::new(&exe);
     cmd.arg("--session")
         .arg(&session_id)
         .arg(&prompt);
@@ -927,7 +928,11 @@ fn stream_child_turn(
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
-            send(error_event(format!("cannot start turn process: {err}")));
+            // Every turn re-execs the daemon's own binary, so a spawn failure
+            // here is most often that file having been replaced.
+            send(error_event(format!(
+                "cannot start turn process: {err}; if the daemon binary was replaced, restart it with `a --serve-restart`"
+            )));
             send_done();
             return;
         }

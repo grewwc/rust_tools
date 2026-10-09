@@ -7,6 +7,7 @@ mod config;
 pub mod config_schema;
 mod driver;
 mod errors;
+mod exe_path;
 mod files;
 mod history;
 mod knowledge;
