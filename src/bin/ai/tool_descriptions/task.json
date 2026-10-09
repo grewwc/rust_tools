@@ -1,6 +1,7 @@
 {
   "name": "task",
-  "description": "Run one subagent synchronously and return its final output. Use when one delegated result is needed before continuing; use `task_spawn` for independent concurrent work. Top-level agents only.",
+  "description": "Run one subagent synchronously: the call blocks the turn, so no parent-side work runs until it returns. Use when one delegated result is needed before continuing; use `task_spawn` when parent work should continue in parallel. Top-level agents only.",
+  "first_use_guidance": "Guidance for later `task` calls in this turn:\n- `task` is synchronous: the turn waited for it and did no other work meanwhile. Describe such a call as sequential; never describe parent-side work as running in parallel with it.\n- Tool calls in the same assistant message do not overlap with it either — they run one after another.",
   "parameters": {
     "type": "object",
     "properties": {

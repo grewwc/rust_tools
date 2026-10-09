@@ -368,6 +368,33 @@ mod tests {
     }
 
     #[test]
+    fn task_metadata_states_its_blocking_semantics_where_the_model_reads_them() {
+        // enable_tools discovery lines render only the first 80 description chars, so the
+        // blocking consequence has to survive that truncation: a model comparing `task`
+        // against `task_spawn` at discovery time must not mistake the synchronous tool for
+        // concurrent delegation.
+        let metadata = load_builtin_metadata();
+        let task = &metadata["task"];
+        let discovery_line: String = task.description.chars().take(80).collect();
+        assert!(
+            discovery_line.contains("no parent-side work"),
+            "task description must state the blocking consequence within the first 80 chars: {discovery_line}"
+        );
+        let guidance = task
+            .first_use_guidance
+            .as_deref()
+            .expect("task must carry first-use guidance");
+        assert!(
+            guidance.contains("sequential"),
+            "task guidance must require sequential narration: {guidance}"
+        );
+        assert!(
+            guidance.contains("do not overlap"),
+            "task guidance must state that same-message calls do not overlap: {guidance}"
+        );
+    }
+
+    #[test]
     fn resolve_description_falls_back_when_absent() {
         let resolved = tool_description("__definitely_missing_tool__", "fallback text");
         assert_eq!(resolved, "fallback text");
