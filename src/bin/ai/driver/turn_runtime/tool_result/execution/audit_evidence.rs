@@ -73,7 +73,7 @@ struct ObservedRead {
 
 /// Only the dedicated review agents are constrained by this protocol. Normal
 /// conversations retain their existing final-response behavior.
-pub(in crate::ai::driver::turn_runtime) fn is_evidence_gated_audit_agent(agent_name: &str) -> bool {
+pub(in crate::ai) fn is_evidence_gated_audit_agent(agent_name: &str) -> bool {
     matches!(agent_name, "audit" | "audit-fast")
 }
 
@@ -98,7 +98,7 @@ pub(in crate::ai::driver::turn_runtime) fn audit_evidence_gate_action(
             return audit_evidence_retry_or_withhold(
                 messages,
                 final_text,
-                reason,
+                &reason,
                 force_final_response,
                 iteration,
                 max_iterations,
@@ -124,7 +124,11 @@ pub(in crate::ai::driver::turn_runtime) fn audit_evidence_gate_action(
     audit_evidence_retry_or_withhold(
         messages,
         final_text,
-        "one or more findings lack a complete evidence chain",
+        &format!(
+            "{} of {} findings lack a complete, current-turn evidence chain",
+            report.findings.len() - valid_findings.len(),
+            report.findings.len(),
+        ),
         force_final_response,
         iteration,
         max_iterations,
@@ -162,9 +166,17 @@ fn audit_evidence_retry_or_withhold(
         content: serde_json::Value::String(format!(
             "{AUDIT_EVIDENCE_RETRY_MARKER}\n\
              This is not a final answer. The audit draft is not publishable because {reason}.\n\
-             Return exactly one `<audit_report>{{...}}</audit_report>` JSON payload and no text outside it.\n\
-             Every verified finding needs non-empty `source_evidence`, `semantic_evidence`, and `falsification_checks` arrays. Each evidence item needs `path`, `start_line`, optional `end_line`, and `explanation`; every cited range must have been successfully read in this user turn after the last direct mutation.\n\
-             Findings without that complete chain must be omitted or moved to `open_questions` / `coverage_gaps`."
+             Return exactly one `<audit_report>{{...}}</audit_report>` JSON payload and no text outside it; one broken limit rejects the whole report, valid findings included.\n\
+             Limits: report body at most {max_body} bytes, each text field at most {max_text} bytes, at most {max_findings} findings, at most {max_items} items per list, at most {max_evidence} items per evidence array, at most {max_lines} lines per cited range.\n\
+             `title`, `claim`, `trigger`, `impact`, every evidence `explanation`, and every `open_questions` / `coverage_gaps` item are republished verbatim, so they must not contain `path:line` text: an exact range belongs only in an evidence item's `path` plus `start_line` / `end_line`.\n\
+             Every verified finding needs a `severity` of `P0`, `P1`, `P2`, or `P3`, and non-empty `source_evidence`, `semantic_evidence`, and `falsification_checks`; each evidence item needs `path`, `start_line`, optional `end_line`, and a non-empty, citation-free `explanation`, and every cited range must have been successfully read in this user turn after the last direct mutation.\n\
+             Omit a finding that cannot satisfy all of this; keep a located but unproven suspicion in `open_questions` as citation-free prose.",
+            max_body = MAX_AUDIT_REPORT_BYTES,
+            max_text = MAX_AUDIT_TEXT_BYTES,
+            max_findings = MAX_AUDIT_FINDINGS,
+            max_items = MAX_AUDIT_LIST_ITEMS,
+            max_evidence = MAX_AUDIT_EVIDENCE_PER_KIND,
+            max_lines = MAX_AUDIT_EVIDENCE_LINES,
         )),
         tool_calls: None,
         tool_call_id: None,
@@ -173,25 +185,63 @@ fn audit_evidence_retry_or_withhold(
     AuditEvidenceGateAction::Reopen
 }
 
-fn parse_audit_report(text: &str) -> Result<AuditReport, &'static str> {
+fn parse_audit_report(text: &str) -> Result<AuditReport, String> {
     let Some(body) = extract_audit_report_body(text) else {
-        return Err("the audit report protocol is missing");
+        return Err(
+            "no `<audit_report>...</audit_report>` block was found in the final response"
+                .to_string(),
+        );
     };
     if body.len() > MAX_AUDIT_REPORT_BYTES {
-        return Err("the audit report exceeds the protocol size limit");
+        return Err(format!(
+            "the report body is {} bytes and the protocol limit is {} bytes; publish fewer or \
+             shorter findings instead of truncating the JSON",
+            body.len(),
+            MAX_AUDIT_REPORT_BYTES,
+        ));
     }
     let report: AuditReport = serde_json::from_str(body.trim())
-        .map_err(|_| "the audit report is not valid protocol JSON")?;
-    if report.findings.len() > MAX_AUDIT_FINDINGS
-        || report.open_questions.len() > MAX_AUDIT_LIST_ITEMS
-        || report.coverage_gaps.len() > MAX_AUDIT_LIST_ITEMS
-        || report
-            .open_questions
-            .iter()
-            .chain(report.coverage_gaps.iter())
-            .any(|item| !bounded_text(item))
-    {
-        return Err("the audit report exceeds a protocol size limit");
+        .map_err(|error| format!("the report body is not valid JSON: {error}"))?;
+    if report.findings.len() > MAX_AUDIT_FINDINGS {
+        return Err(format!(
+            "the report has {} findings and the protocol limit is {}",
+            report.findings.len(),
+            MAX_AUDIT_FINDINGS,
+        ));
+    }
+    for (list, items) in [
+        ("open_questions", report.open_questions.as_slice()),
+        ("coverage_gaps", report.coverage_gaps.as_slice()),
+    ] {
+        if items.len() > MAX_AUDIT_LIST_ITEMS {
+            return Err(format!(
+                "`{list}` has {} items and the protocol limit is {} per list",
+                items.len(),
+                MAX_AUDIT_LIST_ITEMS,
+            ));
+        }
+        for (index, item) in items.iter().enumerate() {
+            if item.trim().is_empty() {
+                return Err(format!(
+                    "`{list}[{index}]` is empty; drop it or describe the gap"
+                ));
+            }
+            if item.len() > MAX_AUDIT_TEXT_BYTES {
+                return Err(format!(
+                    "`{list}[{index}]` is {} bytes and the per-text limit is {} bytes",
+                    item.len(),
+                    MAX_AUDIT_TEXT_BYTES,
+                ));
+            }
+            if let Some(citation) = PATH_LINE_CITATION_RE.find(item) {
+                return Err(format!(
+                    "`{list}[{index}]` contains the file:line reference `{}`; these lists are \
+                     citation-free prose, so move the range into a finding's evidence arrays or \
+                     drop it",
+                    citation.as_str(),
+                ));
+            }
+        }
     }
     Ok(report)
 }

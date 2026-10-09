@@ -673,8 +673,10 @@ async fn generate_session_title_if_missing(app: &App, pending_user_input: Option
     // even though `done` already streamed. This covers both turn endpoints
     // (SSE with or without a live FIFO, and plain turns), which all set
     // `A_SERVE_CHILD`. Serve sessions keep the cheap local fallback title
-    // written below; opening the same session locally later still upgrades
-    // it to a model title.
+    // written below; the serve daemon generates the model title once this
+    // child was reaped and the lock released
+    // (`generate_session_title_outside_turn`), and opening the session locally
+    // upgrades it the same way.
     let model_title = if crate::ai::background::is_serve_child() {
         None
     } else {
@@ -732,6 +734,112 @@ async fn generate_session_title_if_missing(app: &App, pending_user_input: Option
             crate::ai::prompt::notify_session_title_updated(&app.session_id, &fallback_title);
         }
     }
+}
+
+/// Generate and persist the model session title for a session whose turn child
+/// has already exited.
+///
+/// The serve daemon calls this after the turn's child was reaped and its
+/// per-session lock released — see the `is_serve_child` branch in
+/// `generate_session_title_if_missing` for why the child must not make this
+/// request itself. The request never needed that lock (only the child's
+/// session writes do), so running it here gives served sessions a model title
+/// without standing in any turn's way.
+///
+/// Best-effort: any failure keeps the child's fallback title and the next turn
+/// end retries. Returns true when a model title was written.
+pub(crate) async fn generate_session_title_outside_turn(
+    history_file: &std::path::Path,
+    session_id: &str,
+    current_model: &str,
+) -> bool {
+    let store = session_title_store(history_file);
+    // Settle the cheap cases before decoding the canonical history: the daemon
+    // runs this after every served turn, and a title that is already
+    // authoritative produces no request, so the read would be pure overhead.
+    // A low-quality model title still falls through to regeneration below.
+    let existing = store
+        .read_session_title_with_origin(session_id)
+        .ok()
+        .flatten();
+    if existing.as_ref().is_some_and(|title| {
+        title.origin == SessionTitleOrigin::User
+            || (title.origin == SessionTitleOrigin::Model
+                && !is_low_quality_session_title(&title.text))
+    }) {
+        return false;
+    }
+    let Ok(config) = crate::ai::config::load_config() else {
+        return false;
+    };
+    let Ok(messages) = store.read_all_messages(session_id) else {
+        return false;
+    };
+    if !has_session_title_source(&messages) {
+        return false;
+    }
+    let fallback_title = fallback_session_title(&messages);
+    if !should_generate_model_session_title(existing.as_ref(), &fallback_title) {
+        return false;
+    }
+    // One request per session at a time: turns that end back to back must not
+    // each pay a model round-trip for the same title.
+    if !mark_session_title_generation_started(session_id) {
+        return false;
+    }
+    let generated = request_outside_turn_title(session_id, current_model, &config, &messages).await;
+    mark_session_title_generation_finished(session_id);
+
+    let Some(title) = generated else {
+        return false;
+    };
+    let title = normalize_generated_session_title(&title);
+    if title.is_empty() || is_low_quality_session_title(&title) {
+        crate::ai::driver::decision_log::log_session_title_failure(
+            crate::ai::driver::decision_log::get_decision_log_store(),
+            session_id,
+            crate::ai::driver::runtime_ctx::current_turn_id_or_zero(),
+            "low_quality_filtered",
+            &title,
+        );
+        return false;
+    }
+    // Re-read: a local turn or an explicit `/title` may have settled the title
+    // while this request was in flight.
+    let current = store
+        .read_session_title_with_origin(session_id)
+        .ok()
+        .flatten();
+    if !should_generate_model_session_title(current.as_ref(), &fallback_title) {
+        return false;
+    }
+    store
+        .write_session_title_with_origin(session_id, &title, SessionTitleOrigin::Model)
+        .is_ok()
+}
+
+/// Issue the title request for [`generate_session_title_outside_turn`]; split
+/// out so the in-flight marker is cleared on every exit path.
+async fn request_outside_turn_title(
+    session_id: &str,
+    current_model: &str,
+    config: &crate::ai::types::AppConfig,
+    messages: &[Message],
+) -> Option<String> {
+    // Same client shape as the turn path (driver/mod.rs): a bare reqwest client
+    // plus the aux timeouts applied per request.
+    let Ok(client) = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+    else {
+        return None;
+    };
+    let ctx = crate::ai::request::AuxRequestContext {
+        config,
+        client: &client,
+        session_id,
+    };
+    crate::ai::request::generate_session_title_with_context(&ctx, current_model, messages).await
 }
 
 #[cfg(test)]

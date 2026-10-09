@@ -52,3 +52,5 @@ Use this shape:
 ```
 
 Every evidence range must be from a successful `read_file` call in this user turn and must be after the latest direct source mutation. Each verified finding needs all three non-empty evidence arrays; omit it or place it in `open_questions` when that cannot be proven. If there are no verified findings, return an empty `findings` array and describe only real coverage gaps. A clean review is better than unsupported findings.
+
+**Protocol limits (one broken limit rejects the whole report).** At most 32 findings, at most 64 items per list, at most 16 items per evidence array, at most 256 lines per cited range; the report body must be at most 64 KiB and every republished text field at most 8 KiB. `title`, `claim`, `trigger`, `impact`, every evidence `explanation`, and every `open_questions` / `coverage_gaps` entry are republished verbatim, so they must contain no file:line text: an exact range belongs only in an evidence entry's `path` and `start_line` / `end_line`.

@@ -1,4 +1,5 @@
 use super::*;
+use crate::ai::driver::turn_runtime::is_evidence_gated_audit_agent;
 
 pub(super) fn next_task_id() -> String {
     format!("task_{}", Uuid::new_v4().simple())
@@ -285,6 +286,15 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
         &owned_fallback
     };
     let selected = select_subagent(all_agents, agent, description, prompt)?;
+    if response_schema.is_some() && is_evidence_gated_audit_agent(&selected.agent.name) {
+        // The review agents publish a machine-checked `<audit_report>` envelope as their
+        // final response; a `response_schema` contract on the same body contradicts it.
+        return Err(format!(
+            "agent `{}` publishes a machine-checked `<audit_report>` envelope; call it without \
+             `response_schema` and read the envelope from the returned result",
+            selected.agent.name,
+        ));
+    }
     let (selected_model, is_model_auto_selected, auto_model_fallback, inherited_parent_model) =
         if let Some(model_override) = model_override {
             (models::determine_model(model_override), false, None, false)

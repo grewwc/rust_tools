@@ -366,7 +366,9 @@ pub(crate) const SERVE_LIVE_FIFO_ENV: &str = "A_SERVE_LIVE_FIFO";
 /// plain turn endpoints). Unlike [`SERVE_LIVE_FIFO_ENV`], it is set even when
 /// no live FIFO exists, so serve children can skip work that would otherwise
 /// hold the server's per-session lock (model session titles) without changing
-/// local CLI behavior. Never set by users; only by `serve`.
+/// local CLI behavior. Skipped work is not dropped: the serve daemon generates
+/// the session title itself once the child has been reaped and the lock
+/// released. Never set by users; only by `serve`.
 pub(crate) const SERVE_CHILD_ENV: &str = "A_SERVE_CHILD";
 
 /// Set while this process is a serve-spawned turn child (see [`SERVE_CHILD_ENV`]).

@@ -210,7 +210,10 @@ pub(crate) fn materialize_references(
 
 /// Resolves an opaque session-relative asset key without allowing references to
 /// escape the active session's assets directory.
-fn resolve_attachment_asset(root: Option<&Path>, asset: Option<&str>) -> std::io::Result<PathBuf> {
+pub(super) fn resolve_attachment_asset(
+    root: Option<&Path>,
+    asset: Option<&str>,
+) -> std::io::Result<PathBuf> {
     let root = root.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,

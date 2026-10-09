@@ -10,19 +10,30 @@ use serde_json::Value;
 use super::builder::build_request_body;
 use super::types::StreamUsage;
 use super::{
-    apply_request_auth, control_model_for_aux_tasks, endpoint_for_request_model,
-    extract_router_content,
+    apply_request_auth, control_model_for_aux_tasks, control_model_for_aux_tasks_from,
+    endpoint_for_request_model, extract_router_content,
 };
 use crate::ai::{
     history::{HistoryMessageSummarizer, Message, is_runtime_synthetic_user_message},
     models,
     provider::adapter_for,
-    types::App,
+    types::{App, AppConfig},
 };
 
 /// 会话标题请求的超时（秒）。后台辅助任务，用宽松超时避免阻塞主流程。
 pub(super) const SESSION_TITLE_REQUEST_TIMEOUT_SECS: u64 = 90;
 pub(super) const SESSION_TITLE_BODY_TIMEOUT_SECS: u64 = 45;
+
+/// Caller-provided runtime pieces an auxiliary model request needs.
+///
+/// Deliberately narrower than `App`: the serve daemon generates a session
+/// title once the turn child has exited, where no `App` exists but the config,
+/// an HTTP client, and the session id do.
+pub(crate) struct AuxRequestContext<'a> {
+    pub(crate) config: &'a AppConfig,
+    pub(crate) client: &'a reqwest::Client,
+    pub(crate) session_id: &'a str,
+}
 
 /// 辅助请求（标题/摘要）的 API key 轮换候选列表。
 ///
@@ -35,20 +46,21 @@ fn aux_request_key_candidates(model: &str, endpoint: &str, global_fallback: &str
     adapter_for(models::model_adapter(model), endpoint).collect_api_keys(&primary)
 }
 
-/// 发送辅助 LLM 请求（POST chat/completions），key 轮换直到成功。
+/// Send an auxiliary LLM request (POST chat/completions) with key rotation until one succeeds.
 ///
-/// 对每个 key 单独套用超时，避免单个 key 挂起拖慢后台辅助任务。
-/// 返回 2xx 响应体文本；全部 key 失败时返回最后一个错误的 (kind, message)，
-/// kind 与 record_title_failure 的错误分类一致。
+/// Each key gets its own timeout so one hung key cannot stall a background
+/// auxiliary task. Returns the 2xx response body; when every key fails it
+/// returns the last error as (kind, message), with the same kind classification
+/// as [`record_title_failure`].
 async fn send_aux_chat_request_with_key_rotation(
-    app: &App,
+    ctx: &AuxRequestContext<'_>,
     model: &str,
     endpoint: &str,
     http_body: Vec<u8>,
     header_timeout: Duration,
     body_timeout: Duration,
 ) -> Result<String, (String, String)> {
-    let keys = aux_request_key_candidates(model, endpoint, &app.config.api_key);
+    let keys = aux_request_key_candidates(model, endpoint, &ctx.config.api_key);
     let mut last_err: (String, String) = ("http_error".to_string(), "unknown".to_string());
 
     for (idx, api_key) in keys.iter().enumerate() {
@@ -61,11 +73,15 @@ async fn send_aux_chat_request_with_key_rotation(
             ));
         }
 
-        let send_future =
-            apply_request_auth(app.client.post(endpoint), endpoint, api_key, &app.session_id)
-                .header("Content-Type", "application/json")
-                .body(http_body.clone())
-                .send();
+        let send_future = apply_request_auth(
+            ctx.client.post(endpoint),
+            endpoint,
+            api_key,
+            ctx.session_id,
+        )
+        .header("Content-Type", "application/json")
+        .body(http_body.clone())
+        .send();
 
         let response = match tokio::time::timeout(header_timeout, send_future).await {
             Ok(Ok(r)) => r,
@@ -474,8 +490,13 @@ pub(crate) async fn summarize_history_via_model(
     // Auxiliary summaries have explicit deadlines so a stalled provider cannot
     // block return to the prompt. Rotate the same configured key candidates as
     // main requests; timeout or exhaustion preserves the original history.
+    let ctx = AuxRequestContext {
+        config: &app.config,
+        client: &app.client,
+        session_id: &app.session_id,
+    };
     let text = match send_aux_chat_request_with_key_rotation(
-        app,
+        &ctx,
         &control_model,
         &endpoint,
         http_body,
@@ -576,10 +597,12 @@ fn session_title_dialog_lines(messages: &[crate::ai::history::Message]) -> Vec<S
 
 /// 把会话标题生成的静默失败写入决策日志，替代被注释掉的 eprintln。
 /// 标题任务在后台 spawn 中执行，eprintln 不可见；决策日志是唯一可观测渠道。
-fn record_title_failure(app: &App, reason: &str, detail: &str) {
+/// Record a failed title request in the decision log, so a transport failure is
+/// distinguishable from "model answered but the quality filter rejected it".
+fn record_title_failure(ctx: &AuxRequestContext<'_>, reason: &str, detail: &str) {
     crate::ai::driver::decision_log::log_session_title_failure(
         crate::ai::driver::decision_log::get_decision_log_store(),
-        &app.session_id,
+        ctx.session_id,
         crate::ai::driver::runtime_ctx::current_turn_id_or_zero(),
         reason,
         detail,
@@ -880,18 +903,37 @@ mod session_title_tests {
     }
 }
 
-/// 用 LLM 为当前对话生成一个简短的概括性标题（不超过 20 字）。
-/// 供 session 列表和输入框顶部展示使用。
+/// Generate a short summarizing title (<= 20 chars) for the conversation with the LLM.
+/// Feeds the session list and the prompt's top line.
 pub(crate) async fn generate_session_title_via_model(
     app: &App,
+    messages: &[crate::ai::history::Message],
+) -> Option<String> {
+    let ctx = AuxRequestContext {
+        config: &app.config,
+        client: &app.client,
+        session_id: &app.session_id,
+    };
+    generate_session_title_with_context(&ctx, &app.current_model, messages).await
+}
+
+/// [`generate_session_title_via_model`] for callers that hold an
+/// [`AuxRequestContext`] instead of an `App` (the serve daemon generates the
+/// title once the turn child has exited; see
+/// `driver::turn_runtime::generate_session_title_outside_turn`).
+pub(crate) async fn generate_session_title_with_context(
+    ctx: &AuxRequestContext<'_>,
+    current_model: &str,
     messages: &[crate::ai::history::Message],
 ) -> Option<String> {
     if messages.is_empty() {
         return None;
     }
 
-    // 只取用户意图和助手最终回答用于生成标题。图片内容不参与标题生成，避免模型被截图
-    // 里的无关 UI 文案干扰；图片请求依赖用户同时输入的文字来概括主题。
+    // Only the user's intent and the assistant's final answer feed the title.
+    // Image parts stay out of it so unrelated UI text inside a screenshot
+    // cannot skew the title; an image-only request relies on the text the user
+    // typed alongside it.
     let dialog = session_title_dialog_lines(messages);
 
     if dialog.is_empty() {
@@ -904,7 +946,7 @@ pub(crate) async fn generate_session_title_via_model(
 
     let user_prompt = format!("Conversation:\n\n{transcript}\n\nGenerate the title:");
 
-    let control_model = control_model_for_aux_tasks(app);
+    let control_model = control_model_for_aux_tasks_from(ctx.config, current_model);
     let title_model = control_model;
     let user_content = Value::String(user_prompt);
 
@@ -938,15 +980,16 @@ pub(crate) async fn generate_session_title_via_model(
         None,
         None,
     );
-    let endpoint = endpoint_for_request_model(app, &title_model);
+    let endpoint = models::endpoint_for_model(&title_model, &ctx.config.endpoint);
     let http_body =
         super::protocol::build_http_body_for_request(&title_model, &endpoint, &mut request_body);
 
-    // key 按 collect_api_keys 轮换（与主请求链路一致）：命名 key
-    // （opencode.api_key_xxx）配置下仅用 primary key 会对网关 401 静默失败，
-    // 导致 session 标题长期停留在 fallback。失败时记录最后一个 key 的错误。
+    // Rotate keys exactly like the main request path (`collect_api_keys`):
+    // under a named-key configuration (`opencode.api_key_xxx`) using only the
+    // primary key silently fails with a gateway 401 and the session title
+    // stays on the fallback forever. The last key's error is what gets logged.
     let text = match send_aux_chat_request_with_key_rotation(
-        app,
+        ctx,
         &title_model,
         &endpoint,
         http_body,
@@ -957,7 +1000,7 @@ pub(crate) async fn generate_session_title_via_model(
     {
         Ok(text) => text,
         Err((kind, msg)) => {
-            record_title_failure(app, &kind, &msg);
+            record_title_failure(ctx, &kind, &msg);
             return None;
         }
     };
@@ -965,24 +1008,26 @@ pub(crate) async fn generate_session_title_via_model(
     let v: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(e) => {
-            record_title_failure(app, "json_parse_error", &e.to_string());
+            record_title_failure(ctx, "json_parse_error", &e.to_string());
             return None;
         }
     };
     let content = match extract_router_content(&v) {
         Some(c) => c,
         None => {
-            record_title_failure(app, "extract_router_content_none", "");
+            record_title_failure(ctx, "extract_router_content_none", "");
             return None;
         }
     };
-    // 先剥离 `<think>...</think>` 思维链，再做行拆分/清洗。thinking 模式模型会
-    // 把思维链连同答案一起返回，若不先剥离，下面的 `.lines().next()` 会截到
-    // `<think>` 首行，把思维链碎片当成合格标题写库。必须在 line 拆分之前完成。
+    // Strip the `<think>...</think>` chain of thought before line splitting and
+    // cleaning. A thinking-mode model returns the chain together with the
+    // answer, so without stripping first the `.lines().next()` below would cut
+    // at the `<think>` first line and persist a reasoning fragment as a valid
+    // title. This has to happen before the line split.
     let content = crate::ai::history::strip_think_tags(&content);
     let trimmed = content.trim().to_string();
 
-    // 清理：去掉引号、去掉换行、截断到 30 字符
+    // Clean: drop quotes, keep the first line, then cap the length below.
     let cleaned = trimmed
         .trim_matches(|c: char| {
             c == '"' || c == '「' || c == '」' || c == '\'' || c.is_whitespace()
@@ -993,11 +1038,11 @@ pub(crate) async fn generate_session_title_via_model(
         .to_string();
 
     if cleaned.is_empty() {
-        record_title_failure(app, "empty_title_after_cleanup", &trimmed);
+        record_title_failure(ctx, "empty_title_after_cleanup", &trimmed);
         return None;
     }
 
-    // 截断到 30 字符（中文一个字算一个 char）
+    // Cap at 30 characters (a CJK glyph counts as one char).
     let result: String = if cleaned.chars().count() > 30 {
         cleaned.chars().take(30).collect()
     } else {

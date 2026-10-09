@@ -46,6 +46,59 @@ use super::{
 ///   tool loop
 const TOOL_LOOP_SOFT_WINDOW: usize = 4;
 const TOOL_LOOP_HARD_WINDOW: usize = 6;
+/// Upper bound on history-image digest backfills per turn. A digest that never reached
+/// history metadata is retried on every later turn (natural backoff, never a per-round
+/// retry loop), a few at a time so one repair turn cannot fire an unbounded burst of
+/// vision-model requests.
+const MAX_IMAGE_DIGEST_BACKFILLS_PER_TURN: usize = 2;
+
+/// Where a backfilled digest comes from.
+enum DigestSource<'a> {
+    /// Production: one dedicated, tool-disabled VL request per pending image.
+    Vl { app: &'a App, model: &'a str },
+    /// Test stand-in: canned digest per batch entry, so the consume -> persist contract can
+    /// be exercised without a network round trip or a vision-capable registered model.
+    #[cfg(test)]
+    Canned { values: &'a [Option<String>] },
+}
+
+/// Persists digests for this turn's pending image messages, bounded by
+/// `MAX_IMAGE_DIGEST_BACKFILLS_PER_TURN` and skipped entirely for models that cannot see
+/// images. Each digest is written as soon as it is obtained, so the next turn's load
+/// replaces that image instead of re-sending it; an entry whose fetch fails is not written
+/// and stays on the caller's pending list for a later turn.
+async fn backfill_pending_image_digests(
+    history_file: &std::path::Path,
+    pending: &[crate::ai::request::PendingImageDigest],
+    model: &str,
+    limit: usize,
+    source: DigestSource<'_>,
+) -> usize {
+    let mut stored = 0usize;
+    for (index, entry) in crate::ai::request::backfill_batch(pending, model, limit)
+        .iter()
+        .enumerate()
+    {
+        let digest = match &source {
+            DigestSource::Vl { app, model } => {
+                crate::ai::request::describe_image_for_digest(app, model, &entry.image_paths).await
+            }
+            #[cfg(test)]
+            DigestSource::Canned { values } => values.get(index).cloned().flatten(),
+        };
+        if let Some(digest) = digest {
+            let _ = history::upsert_image_digest_sqlite(
+                history_file,
+                &entry.fingerprint,
+                &digest,
+                &entry.image_paths,
+            );
+            stored += 1;
+        }
+    }
+    stored
+}
+
 /// Approximate low-yield repetition window: N consecutive rounds that call the same tool on the
 /// same target resource (ignoring paging args such as offset/limit) count as a hit. This catches
 /// real bloat that byte-exact detection misses, such as repeatedly paging through the same file or
@@ -209,6 +262,10 @@ use progress::*;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "digest_backfill_tests.rs"]
+mod digest_backfill_tests;
 
 #[derive(Default)]
 struct TurnOutputState {
@@ -1149,6 +1206,7 @@ async fn run_turn_body(
         mut turn_messages,
         mut persisted_turn_messages,
         max_iterations,
+       pending_image_digests,
     } = match prepare_turn(
         app,
         mcp_client,
@@ -2301,6 +2359,31 @@ async fn run_turn_body(
                     &fp,
                     &digest,
                     &paths,
+                );
+            }
+
+            // Cross-turn digest backfill: an image message whose digest never reached the
+            // database (the carrying turn was interrupted, both digest paths failed, or the
+            // metadata write failed) would otherwise be re-sent in full on every later
+            // turn. Retry through the same fallback path and persist each digest as soon as
+            // it is obtained, so the next turn's load replaces the image with its digest;
+            // entries that still fail stay on the list for the next turn.
+            let backfilled_digests = backfill_pending_image_digests(
+                &app.session_history_file,
+                &pending_image_digests,
+                &next_model,
+                MAX_IMAGE_DIGEST_BACKFILLS_PER_TURN,
+                DigestSource::Vl {
+                    app,
+                    model: next_model.as_str(),
+                },
+            )
+            .await;
+            if backfilled_digests > 0
+                && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+            {
+                eprintln!(
+                    "[image] backfilled {backfilled_digests} image digest(s) into history metadata"
                 );
             }
             finalize_turn(

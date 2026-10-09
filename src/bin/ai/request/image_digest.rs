@@ -32,12 +32,12 @@ use std::{
 use rustc_hash::FxHasher;
 use serde_json::{Value, json};
 
-use super::builder::{build_content, build_request_body};
+use super::builder::{build_content, build_request_body, resolve_attachment_asset};
 use super::{
     api_key_for_request_model, apply_request_auth, endpoint_for_request_model,
     extract_router_content,
 };
-use crate::ai::{history::Message, types::App};
+use crate::ai::{history::Message, models, types::App};
 
 /// Begin sentinel of the digest body. The model must emit this line verbatim;
 /// the agent locates the digest by it.
@@ -218,36 +218,111 @@ pub(crate) fn last_image_user_message_fingerprint(messages: &[Message]) -> Optio
         .map(|m| image_message_fingerprint(&m.content))
 }
 
+/// A history image message whose digest was never persisted: the carrying turn was
+/// interrupted, both digest paths failed, or the metadata write failed.
+///
+/// The fingerprint is computed on the canonical persisted content, so the same key
+/// identifies the message on every later load; `image_paths` are readable absolute paths
+/// to the original image assets, used both for the fallback VL request and for the digest
+/// text (the model can still open the source image).
+#[derive(Debug)]
+pub(crate) struct PendingImageDigest {
+    pub(crate) fingerprint: String,
+    pub(crate) image_paths: Vec<String>,
+}
+
+/// Result of the cross-turn digest pass over freshly loaded history.
+#[derive(Debug, Default)]
+pub(crate) struct ImageDigestLoadOutcome {
+    /// How many messages had their images replaced with a persisted digest.
+    pub(crate) replaced: usize,
+    /// Image messages that still lack a digest and therefore keep first-send semantics;
+    /// candidates for the bounded backfill retry.
+    pub(crate) pending: Vec<PendingImageDigest>,
+}
+
+/// Absolute paths of the original image assets referenced by a persisted message's
+/// content. Only `reference` parts carry a recoverable asset key; legacy inline image
+/// parts (data URLs) have no source file, and a reference whose asset is missing on disk
+/// has nothing left to describe, so both are skipped.
+fn reference_image_paths(content: &Value, assets_dir: Option<&Path>) -> Vec<String> {
+    let Value::Array(parts) = content else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some("reference")
+            || part.get("kind").and_then(Value::as_str) != Some("image")
+        {
+            continue;
+        }
+        let asset = part.get("asset").and_then(Value::as_str);
+        if let Ok(path) = resolve_attachment_asset(assets_dir, asset)
+            && path.is_file()
+        {
+            paths.push(path.to_string_lossy().into_owned());
+        }
+    }
+    paths
+}
+
+/// Selects the pending digests to retry on one turn: at most `limit` of them, and none at
+/// all when the current model cannot see images (the raw image never reaches such a model,
+/// so describing it would be wasted work).
+pub(crate) fn backfill_batch<'a>(
+    pending: &'a [PendingImageDigest],
+    model: &str,
+    limit: usize,
+) -> &'a [PendingImageDigest] {
+    if !models::supports_image_input(model) {
+        return &[];
+    }
+    &pending[..pending.len().min(limit)]
+}
+
 /// Cross-turn image digest: after loading history, replaces old image messages
 /// that have a persisted digest with the digest text.
 /// Only the request projection (history just loaded in the prepare phase)
 /// changes; the canonical database is untouched; messages without a persisted
-/// digest keep their original image (first-send semantics).
+/// digest keep their original image (first-send semantics) and are reported in
+/// `ImageDigestLoadOutcome::pending`, so the turn can retry persisting a digest instead of
+/// re-sending that image on every later turn.
 pub(crate) fn replace_old_images_with_persisted_digests(
     history_file: &Path,
     messages: &mut [Message],
-) -> io::Result<usize> {
+    assets_dir: Option<&Path>,
+) -> io::Result<ImageDigestLoadOutcome> {
     if !messages
         .iter()
         .any(|m| m.role == "user" && content_has_image(&m.content))
     {
-        return Ok(0);
+        return Ok(ImageDigestLoadOutcome::default());
     }
     let mut replaced = 0;
+    let mut pending = Vec::new();
     for m in messages
         .iter_mut()
         .filter(|m| m.role == "user" && content_has_image(&m.content))
     {
         let fp = image_message_fingerprint(&m.content);
-        if let Some((digest, paths)) =
-            crate::ai::history::read_image_digest_sqlite(history_file, &fp)?
-        {
-            if swap_images_with_digest(&mut m.content, &digest, &paths) {
-                replaced += 1;
+        match crate::ai::history::read_image_digest_sqlite(history_file, &fp)? {
+            Some((digest, paths)) => {
+                if swap_images_with_digest(&mut m.content, &digest, &paths) {
+                    replaced += 1;
+                }
+            }
+            None => {
+                let image_paths = reference_image_paths(&m.content, assets_dir);
+                if !image_paths.is_empty() {
+                    pending.push(PendingImageDigest {
+                        fingerprint: fp,
+                        image_paths,
+                    });
+                }
             }
         }
     }
-    Ok(replaced)
+    Ok(ImageDigestLoadOutcome { replaced, pending })
 }
 
 /// Fallback: sends one dedicated, tool-disabled, one-shot VL request to force
@@ -601,8 +676,9 @@ mod tests {
         .expect("upsert digest");
         // Replacement on load: old images with a persisted digest are swapped for
         // the digest text.
-        let replaced = replace_old_images_with_persisted_digests(&db, &mut msgs).expect("replace");
-        assert_eq!(replaced, 1);
+        let outcome =
+            replace_old_images_with_persisted_digests(&db, &mut msgs, None).expect("replace");
+        assert_eq!(outcome.replaced, 1);
         assert!(!content_has_image(&msgs[1].content));
         let joined = msgs[1].content.to_string();
         assert!(joined.contains("顶部是标题栏，左侧是导航"));
@@ -616,15 +692,146 @@ mod tests {
             "user",
             image_content("data:image/png;base64,BBBB", "另一张"),
         )];
-        let replaced_none =
-            replace_old_images_with_persisted_digests(&db, &mut fresh).expect("replace");
-        assert_eq!(replaced_none, 0);
+        let fresh_outcome =
+            replace_old_images_with_persisted_digests(&db, &mut fresh, None).expect("replace");
+        assert_eq!(fresh_outcome.replaced, 0);
         assert!(content_has_image(&fresh[0].content));
+        // A legacy inline image has no source file to describe, so it is not queued for
+        // the backfill retry either.
+        assert!(fresh_outcome.pending.is_empty());
 
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_file(db.with_file_name(format!(
             ".{}.state.lock",
             db.file_name().unwrap().to_string_lossy()
         )));
+    }
+
+    #[test]
+    fn undigested_reference_images_are_reported_as_pending() {
+        let db = std::env::temp_dir().join(format!(
+            "image_digest_pending_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let assets_dir = std::env::temp_dir().join(format!(
+            "image_digest_assets_{}",
+            std::process::id()
+        ));
+        let image_path = assets_dir.join("attachments").join("shot.png");
+        std::fs::create_dir_all(image_path.parent().unwrap()).unwrap();
+        std::fs::write(&image_path, b"png-bytes").unwrap();
+        let content = json!([
+            {
+                "type": "reference",
+                "kind": "image",
+                "name": "shot.png",
+                "asset": "attachments/shot.png",
+            },
+            { "type": "text", "text": "看这张图" },
+        ]);
+        let mut msgs = vec![test_msg("user", content.clone())];
+        assert!(content_has_image(&content));
+        let expected_fp = image_message_fingerprint(&content);
+
+        // No digest persisted: the message keeps its image (first-send semantics) and is
+        // reported, so a later turn can retry persisting the digest instead of re-sending
+        // this image on every turn.
+        let outcome =
+            replace_old_images_with_persisted_digests(&db, &mut msgs, Some(assets_dir.as_path()))
+                .expect("pass");
+        assert_eq!(outcome.replaced, 0);
+        assert!(content_has_image(&msgs[0].content));
+        assert_eq!(outcome.pending.len(), 1);
+        assert_eq!(outcome.pending[0].fingerprint, expected_fp);
+        let expected_path = image_path
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(outcome.pending[0].image_paths, vec![expected_path.clone()]);
+
+        // After the backfill persists the digest under that same fingerprint, the next
+        // load swaps the image for the digest text (including the readable original path)
+        // and stops reporting it.
+        crate::ai::history::upsert_image_digest_sqlite(
+            &db,
+            &expected_fp,
+            "顶部是标题栏",
+            &outcome.pending[0].image_paths,
+        )
+        .expect("backfill upsert");
+        let mut reloaded = vec![test_msg("user", content)];
+        let second =
+            replace_old_images_with_persisted_digests(&db, &mut reloaded, Some(assets_dir.as_path()))
+                .expect("pass");
+        assert_eq!(second.replaced, 1);
+        assert!(second.pending.is_empty());
+        let joined = reloaded[0].content.to_string();
+        assert!(joined.contains("顶部是标题栏"));
+        assert!(joined.contains(&expected_path));
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn image_references_without_a_readable_asset_are_not_reported_as_pending() {
+        let db = std::env::temp_dir().join(format!(
+            "image_digest_no_asset_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        let assets_dir = std::env::temp_dir().join(format!(
+            "image_digest_missing_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&assets_dir).unwrap();
+        // The referenced snapshot is gone: nothing left to describe, and materialization
+        // degrades it to a text marker anyway.
+        let mut missing = vec![test_msg(
+            "user",
+            json!([
+                {
+                    "type": "reference",
+                    "kind": "image",
+                    "name": "gone.png",
+                    "asset": "attachments/missing/gone.png",
+                },
+                { "type": "text", "text": "文件已删" },
+            ]),
+        )];
+        let outcome =
+            replace_old_images_with_persisted_digests(&db, &mut missing, Some(assets_dir.as_path()))
+                .expect("pass");
+        assert_eq!(outcome.replaced, 0);
+        assert!(outcome.pending.is_empty());
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn backfill_batch_is_bounded_and_requires_a_vl_model() {
+        let pending: Vec<PendingImageDigest> = (0..3)
+            .map(|i| PendingImageDigest {
+                fingerprint: format!("fp{i}"),
+                image_paths: vec![format!("/tmp/shot{i}.png")],
+            })
+            .collect();
+        let Some(vl_model) = crate::ai::model_names::all()
+            .iter()
+            .find(|m| models::supports_image_input(&m.name))
+            .map(|m| m.name.clone())
+        else {
+            eprintln!(
+                "[test] skipping backfill_batch_is_bounded_and_requires_a_vl_model: \
+                 no image-capable model present in model registry"
+            );
+            return;
+        };
+        assert_eq!(backfill_batch(&pending, &vl_model, 2).len(), 2);
+        assert_eq!(backfill_batch(&pending, &vl_model, 9).len(), 3);
+        // A model that cannot see images gets no batch: the raw image never reaches it, so
+        // a digest would be wasted work.
+        assert!(backfill_batch(&pending, "model-absent-from-registry", 2).is_empty());
+        assert!(backfill_batch(&[], &vl_model, 2).is_empty());
     }
 }

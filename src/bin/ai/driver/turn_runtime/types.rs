@@ -24,6 +24,11 @@ pub(super) struct TurnPreparation {
     pub(super) turn_messages: Vec<Message>,
     pub(super) persisted_turn_messages: usize,
     pub(super) max_iterations: usize,
+    /// History image messages whose digest never reached history metadata (see
+    /// `request::image_digest`). The turn retries a bounded number of them per turn, so a
+    /// digest lost to an interrupted turn or a failed write does not mean the image is
+    /// re-sent to the model on every later turn.
+    pub(super) pending_image_digests: Vec<crate::ai::request::PendingImageDigest>,
 }
 
 pub(super) struct ToolCallExecution {

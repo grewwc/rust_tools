@@ -131,6 +131,33 @@ fn audit_requires_the_structured_report_protocol_and_reopens_once() {
 }
 
 #[test]
+fn audit_retry_note_names_the_citation_rule_it_violated() {
+    let mut messages = Vec::new();
+    let mut draft = format!(
+        "<audit_report>{}</audit_report>",
+        serde_json::json!({
+            "findings": [],
+            "open_questions": [],
+            "coverage_gaps": ["The new dispatch path in serve/mod.rs:900-959 is untested."],
+        })
+    );
+
+    assert_eq!(
+        audit_evidence_gate_action("audit", &mut messages, &[], &mut draft, None, false, 1, 16),
+        AuditEvidenceGateAction::Reopen
+    );
+    let note = messages
+        .iter()
+        .filter_map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(note.contains("citation-free prose"), "{note}");
+    assert!(note.contains("serve/mod.rs:900-959"), "{note}");
+    assert!(note.contains("must not contain `path:line` text"), "{note}");
+    assert!(note.contains("every evidence `explanation`"), "{note}");
+}
+
+#[test]
 fn audit_accepts_the_report_block_embedded_in_surrounding_prose() {
     let root = temporary_root("embedded-prose");
     write_fixture(&root);

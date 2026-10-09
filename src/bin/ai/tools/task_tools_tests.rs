@@ -379,6 +379,35 @@ fn auto_select_prefers_navigator_for_codebase_investigation() {
 }
 
 #[test]
+fn response_schema_is_rejected_for_evidence_gated_review_agents() {
+    let current_model = crate::ai::model_names::all()
+        .first()
+        .map(|model| crate::ai::model_names::model_handle(model))
+        .expect("model registry must contain at least one model");
+    let audit = manifest("audit", "Deep code review agent", AgentMode::Subagent);
+    let ctx = DriverContext::new(
+        test_app_with_model(current_model),
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(vec![audit]),
+    );
+    let args = serde_json::json!({
+        "description": "Review the current changes",
+        "prompt": "Review the current changes.",
+        "agent": "audit",
+        "response_schema": {"type": "object"},
+    });
+
+    let error = match DRIVER_CTX.sync_scope(ctx, || prepare_subagent_task(&args)) {
+        Ok(_) => panic!("the report envelope and response_schema cannot be combined"),
+        Err(error) => error,
+    };
+
+    assert!(error.contains("<audit_report>"), "{error}");
+    assert!(error.contains("response_schema"), "{error}");
+}
+
+#[test]
 fn prepare_subagent_task_auto_selects_model_and_fallback() {
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()

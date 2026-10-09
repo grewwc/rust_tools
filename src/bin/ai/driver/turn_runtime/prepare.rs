@@ -355,7 +355,8 @@ pub(super) async fn prepare_turn(
     let history_summary_max_chars = app.config.history_summary_max_chars;
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok();
     let reference_assets_dir = attachment_assets_dir.clone();
-    let (history, compression_diagnostic) = tokio::task::spawn_blocking(move || {
+    let (history, compression_diagnostic, pending_image_digests) =
+        tokio::task::spawn_blocking(move || {
         let outcome = build_context_history_with_outcome(
             history_count,
             &history_file,
@@ -373,9 +374,15 @@ pub(super) async fn prepare_turn(
         let mut history = outcome.messages;
         // Cross-turn image digests: replace prior turns' raw images with the
         // digest persisted in history metadata, so a new turn does not re-send
-        // last turn's images to the model (consistent for all VL models).
-        crate::ai::request::replace_old_images_with_persisted_digests(&history_file, &mut history)
-            .map_err(|e| e.to_string())?;
+        // last turn's images to the model (consistent for all VL models). Images
+        // whose digest never reached metadata are reported back so the turn can
+        // retry persisting them instead of re-sending those images forever.
+        let digest_outcome = crate::ai::request::replace_old_images_with_persisted_digests(
+            &history_file,
+            &mut history,
+            Some(reference_assets_dir.as_path()),
+        )
+        .map_err(|e| e.to_string())?;
         // Materialize immutable reference snapshots after digest substitution so
         // digest-bearing turns stay text-only while other image references turn
         // into inline images for the request projection.
@@ -385,7 +392,11 @@ pub(super) async fn prepare_turn(
                 Some(reference_assets_dir.as_path()),
             );
         }
-        Ok::<_, String>((history, compression_diagnostic))
+        Ok::<_, String>((
+            history,
+            compression_diagnostic,
+            digest_outcome.pending,
+        ))
     })
     .await
     .map_err(|e| format!("context history task failed: {e}"))?
@@ -704,6 +715,7 @@ pub(super) async fn prepare_turn(
         turn_messages,
         persisted_turn_messages: 0,
         max_iterations,
+       pending_image_digests,
     })
 }
 

@@ -43,6 +43,7 @@ pub(crate) use orchestrator::{checkpoint, progress};
 #[cfg(test)]
 use persistence::persist_pending_turn_messages;
 pub(crate) use prepare::QuestionShape;
+pub(in crate::ai) use tool_result::is_evidence_gated_audit_agent;
 pub(in crate::ai::driver) use tool_result::stale_patch_targets_from_messages;
 #[cfg(test)]
 use tool_result::{prepare_recent_tool_result, prepare_tool_result};
@@ -121,6 +122,18 @@ pub(super) async fn maybe_generate_session_title(app: &super::App, run_in_backgr
 
 pub(super) async fn maybe_generate_session_title_for_input(app: &super::App, user_input: &str) {
     finalize::maybe_generate_session_title_for_input(app, user_input).await;
+}
+
+/// Generate the model session title for a session whose turn child has already
+/// exited (serve's post-turn title task). See
+/// [`finalize::generate_session_title_outside_turn`] for why this must run
+/// outside the child.
+pub(crate) async fn generate_session_title_outside_turn(
+    history_file: &std::path::Path,
+    session_id: &str,
+    current_model: &str,
+) -> bool {
+    finalize::generate_session_title_outside_turn(history_file, session_id, current_model).await
 }
 
 const MAX_TOOL_RESULT_INLINE_CHARS: usize = 32_000;

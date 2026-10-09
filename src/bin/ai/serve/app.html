@@ -19,6 +19,9 @@ button, select, input, textarea { font:inherit; color:var(--fg); background:#0d1
 button { padding:7px 12px; background:#21262d; cursor:pointer; touch-action:manipulation; }
 button:disabled { opacity:.5; cursor:default; }
 button.primary { background:var(--acc); border-color:var(--acc); color:#fff; }
+/* While a turn runs the same button becomes the stop button; the stop state
+   reuses --err the way .primary reuses --acc, and leaves the idle look alone. */
+button.stop { background:var(--err); border-color:var(--err); color:#fff; }
 #views { flex:1; display:flex; min-height:0; position:relative; }
 #sessions { width:min(78vw,300px); border-right:1px solid var(--line); background:var(--panel); display:none; flex-direction:column; }
 #sessions.open { display:flex; }
@@ -61,6 +64,10 @@ select, summary { touch-action:manipulation; }
 #conn input { flex:1; min-width:0; font-size:13px; padding:6px 8px; }
 #connstat { display:none; padding:2px 12px 6px; font-size:12px; color:var(--dim); background:var(--panel); }
 #connstat.show { display:block; }
+/* Transient status notes (stop turn) must read with the conn panel closed,
+   unlike the diagnostics line above, so this beats the sibling
+   `#conn:not(.open) + #connstat` rule that hides it. */
+#connstat.note { display:block !important; }
 .rowbtns { display:flex; gap:6px; padding:6px 8px; }
 .rowbtns button { font-size:12px; padding:4px 8px; }
 #sessbar { display:flex; align-items:baseline; gap:8px; padding:6px 12px; background:var(--panel); border-bottom:1px solid var(--line); font-size:13px; cursor:pointer; }
@@ -196,6 +203,12 @@ let pendingNew = null;
 let lastItems = []; // latest /sessions payload (newest-first), backing the session bar
 let lastMsgCount = null; // message count from the last history load
 let sending = false;
+// True while the server reports a live turn for the shown session (GET
+// /confirm). Cleared when a stream starts here or an interrupt POST returns;
+// the next poll is the truth again.
+let turnRunning = false;
+let stopBusy = false; // one interrupt POST at a time: a double tap must not send two
+let noteTimer = null; // pending auto-clear of the transient #connstat note
 let pendingImages = []; // {filename, data_base64}
 // A turn stream that dies on the wire (page backgrounded, network switched) is
 // not a failed turn: the turn child keeps running server-side and only this
@@ -639,6 +652,7 @@ async function loadHistory() {
   lastMsgCount = shown.length;
   staleKey = histKey(msgs);
   staleDone = histEndsTurn(msgs);
+  syncStopButton();
   renderSessionBar();
   // The call lives on the assistant message (`tool_calls`), the result is a
   // separate `tool` message carrying only `tool_call_id`; index the window
@@ -691,12 +705,14 @@ function stopStaleFollow() {
   if (staleTimer !== null) { clearInterval(staleTimer); staleTimer = null; }
   staleSession = "";
   staleTries = 0;
+  syncStopButton();
 }
 function startStaleFollow() {
   if (!staleSession || staleSession !== sessionId || staleTimer !== null) return;
   if (document.visibilityState !== "visible") return; // becoming visible again is the other trigger
   staleTimer = setInterval(reloadStale, STALE_FOLLOW_MS);
   reloadStale();
+  syncStopButton();
 }
 
 // --- turn confirmation ----------------------------------------------------
@@ -748,16 +764,72 @@ async function answerConfirm(allow) {
 async function pollConfirm() {
   if (!sessionId || confirmBusy) return;
   const sid = sessionId;
-  let pending;
-  try { pending = (await (await api("/sessions/" + sid + "/confirm")).json()).pending; }
+  let body;
+  try { body = await (await api("/sessions/" + sid + "/confirm")).json(); }
   catch (_) { return; } // transient (hidden mid-flight, server restarting): retry next tick
   // The fetch can outlive what it describes (answered while it was in flight,
   // session switched): re-check before touching the dialog.
   if (confirmBusy || sid !== sessionId) return;
+  // The same poll reports a live turn for this session: the server is the only
+  // source that survives this page losing the stream. A missing field means an
+  // older server, treated as "not running".
+  turnRunning = body.running === true;
+  syncStopButton();
+  const pending = body.pending;
   if (!pending) { if (confirmShown) hideConfirm(); return; }
   // The token, not the id, is the question's identity: child-side ids restart
   // at 1 every turn, so an equal id can still be different text.
   if (!confirmShown || confirmShown.token !== pending.token) showConfirm(pending.id, pending.prompt, pending.token);
+}
+
+// A turn is "running" when any of three independent sources says so: this page
+// owns the live stream, the page lost the stream and is stale-following a turn
+// whose reply has not landed, or the server said so at the last poll. Each is
+// blind to a state the others cover (feed lost, page reloaded, another device).
+function isTurnRunning() {
+  return sending || (staleSession === sessionId && !staleDone) || turnRunning;
+}
+// The one send/stop button reflects that predicate: stop glyph plus the stop
+// class while a turn runs, the plain send look otherwise.
+function syncStopButton() {
+  const b = $("send");
+  const running = isTurnRunning();
+  b.textContent = running ? "⏹" : "➤";
+  b.classList.toggle("stop", running);
+  const label = running ? "stop this turn" : "send";
+  b.setAttribute("aria-label", label);
+  b.title = label;
+}
+// Transient note through the existing #connstat line; no new toast element.
+function note(msg) {
+  const el = $("connstat");
+  el.textContent = msg;
+  el.classList.add("show", "note");
+  if (noteTimer !== null) clearTimeout(noteTimer);
+  noteTimer = setTimeout(() => { el.classList.remove("show", "note"); noteTimer = null; }, 3000);
+}
+async function stopTurn() {
+  if (stopBusy || !sessionId) return;
+  stopBusy = true;
+  let interrupted = false;
+  try {
+    const r = await (await api("/sessions/" + sessionId + "/interrupt", { method: "POST" })).json();
+    interrupted = r.interrupted === true;
+  } catch (e) {
+    // Transport failure: surface it and let the next poll re-derive the state.
+    note("stop failed: " + e.message);
+    stopBusy = false;
+    pollConfirm();
+    return;
+  }
+  stopBusy = false;
+  turnRunning = false; // the POST returned: the next poll re-asserts the truth
+  if (interrupted) note("stopping…");
+  else { note("no turn running"); await loadHistory(); await loadSessions(); }
+  // The server is the truth for both the pending question and `running`, so an
+  // interrupt that cancels a parked question also clears its dialog here.
+  pollConfirm();
+  syncStopButton();
 }
 
 // Parse one SSE block the way serve-chat does: `event: <kind>` plus one or
@@ -803,7 +875,8 @@ async function send() {
 
   stopStaleFollow(); // this turn's own stream owns the view from here on
   sending = true;
-  $("send").disabled = true;
+  turnRunning = false; // this page's own feed is the running-turn truth now
+  syncStopButton();
   // Chronological DOM order: progress and thinking folds are created before
   // (or inserted ahead of) the reply bubble, so the trace reads top-down
   // and the final answer always lands last.
@@ -902,7 +975,7 @@ async function send() {
     } else fail("turn failed: " + e.message);
   }
   sending = false;
-  $("send").disabled = false;
+  syncStopButton();
   $("msgs").scrollTop = $("msgs").scrollHeight;
   loadInfo();
   loadSessions();
@@ -927,7 +1000,8 @@ function wire() {
   $("base").value = localStorage.getItem("serve.base") || "";
   $("token").value = localStorage.getItem("serve.token") || "";
   showStored();
-  $("send").onclick = send;
+  $("send").onclick = () => { if (isTurnRunning()) stopTurn(); else send(); };
+  syncStopButton();
   // The dialog is the only way to unblock a turn that stopped to ask; both
   // answers post to /sessions/{id}/confirm through answerConfirm.
   $("callow").onclick = () => answerConfirm(true);

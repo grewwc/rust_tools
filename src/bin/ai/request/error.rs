@@ -14,7 +14,7 @@ use reqwest::StatusCode;
 
 use crate::ai::config_schema::AiConfig;
 use crate::ai::models;
-use crate::ai::types::App;
+use crate::ai::types::{App, AppConfig};
 use crate::commonw::configw;
 
 #[derive(Debug)]
@@ -326,12 +326,20 @@ pub(crate) fn clear_stale_request_interrupt_before_request(app: &App) {
 }
 
 pub(crate) fn control_model_for_aux_tasks(app: &App) -> String {
-    app.config
+    control_model_for_aux_tasks_from(&app.config, &app.current_model)
+}
+
+/// [`control_model_for_aux_tasks`] for callers with no `App`: the configured
+/// intent/control model wins, otherwise the model the turn ran with. The serve
+/// daemon needs this for its post-turn title task, which runs after the turn
+/// child (and with it the `App`) is gone.
+pub(crate) fn control_model_for_aux_tasks_from(config: &AppConfig, current_model: &str) -> String {
+    config
         .intent_model
         .as_deref()
         .filter(|v| !v.trim().is_empty())
         .map(models::determine_model)
-        .unwrap_or_else(|| app.current_model.trim().to_string())
+        .unwrap_or_else(|| current_model.trim().to_string())
 }
 
 pub(crate) fn is_transient_error(err: &RequestError) -> bool {

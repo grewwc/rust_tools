@@ -403,12 +403,7 @@ async fn server_info(State(state): State<ServeState>, headers: HeaderMap) -> imp
     // child CLI carries no `--model`, so the config default (resolved
     // through the registry, falling back to the registry default) is what
     // the turn uses.
-    let cfg = configw::get_all_config();
-    let model = cfg
-        .get_opt(AiConfig::MODEL_DEFAULT)
-        .filter(|v| !v.trim().is_empty())
-        .map(|v| super::models::determine_model(&v))
-        .unwrap_or_else(super::models::default_model);
+    let model = default_turn_model();
     // Mirror `driver/mod.rs` App construction: the child CLI carries no
     // `--agent`, so the hardcoded `"build"` fallback is what the turn uses.
     let agent = "build".to_string();
@@ -703,6 +698,45 @@ fn run_one_shot_turn(
     }
 }
 
+/// Model a serve turn runs with when the client sent no per-turn override.
+///
+/// Mirrors `models::initial_model` minus its CLI-override branch: the child CLI
+/// carries no `--model`, so the config default (resolved through the registry,
+/// falling back to the registry default) is what the turn uses.
+fn default_turn_model() -> String {
+    let cfg = configw::get_all_config();
+    cfg.get_opt(AiConfig::MODEL_DEFAULT)
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| super::models::determine_model(&v))
+        .unwrap_or_else(super::models::default_model)
+}
+
+/// Generate the session's model title once its turn child has exited.
+///
+/// Turn children deliberately skip the title round-trip: they hold the
+/// session's turn lock until they exit, so the extra request would stall the
+/// session's next turn. Running it here — after the child was reaped and the
+/// lock released — gives served sessions a real title while keeping the
+/// request out of that critical section. Best-effort by construction: it never
+/// delays or fails a turn, and it leaves a session that already has a model
+/// title (or a user-set one) alone.
+fn spawn_session_title_task(history_file: PathBuf, session_id: String, model: Option<String>) {
+    // A per-turn `--model` override is resolved through the registry in the
+    // child too, so resolve it here to keep the title request on the same
+    // model the turn actually ran with.
+    let model = model
+        .map(|model| super::models::determine_model(&model))
+        .unwrap_or_else(default_turn_model);
+    tokio::task::spawn(async move {
+        crate::ai::driver::turn_runtime::generate_session_title_outside_turn(
+            history_file.as_path(),
+            &session_id,
+            &model,
+        )
+        .await;
+    });
+}
+
 async fn post_turn(
     State(state): State<ServeState>,
     headers: HeaderMap,
@@ -729,8 +763,9 @@ async fn post_turn(
         Ok(overrides) => overrides,
         Err(err) => return bad_request(err).into_response(),
     };
+    let title_model = overrides.model.clone();
     let lock = session_lock(&state, &id).await;
-    let _guard = lock.lock().await;
+    let guard = lock.lock().await;
     let session_id = id.clone();
     let output = tokio::task::spawn_blocking(move || {
         run_one_shot_turn(&session_id, &prompt, &overrides)
@@ -753,6 +788,10 @@ async fn post_turn(
         }
         Err(e) => return e.into_response(),
     };
+    // The child is gone: generate the title it skipped, outside the lock it
+    // held for its whole run.
+    drop(guard);
+    spawn_session_title_task(state.history_file.clone(), id.clone(), title_model);
     (
         StatusCode::OK,
         Json(TurnResp {
@@ -792,6 +831,8 @@ fn interrupt_active_turn(
 /// `POST /sessions/{id}/interrupt` (authed): stop this session's in-flight
 /// turn, the remote counterpart of the local REPL's first Ctrl+C. Only this
 /// session's turn child is signalled, so turns on other sessions keep running.
+/// A turn parked on a confirmation question is unblocked as well, by closing
+/// the pipe that its answer would travel on (see [`dismiss_pending_confirm`]).
 /// `{"interrupted": false}` means no turn was running.
 async fn post_interrupt(
     State(state): State<ServeState>,
@@ -805,6 +846,10 @@ async fn post_interrupt(
         return bad_request(format!("invalid session id: {id}")).into_response();
     }
     let interrupted = interrupt_active_turn(&state.active_turns, &id);
+    // A turn can also be parked on a question. SIGINT reaches that child but
+    // not its blocked stdin read, so stopping has to close the pipe as well;
+    // otherwise the button would report success while the turn sits there.
+    dismiss_pending_confirm(&state.confirms, &id);
     (
         StatusCode::OK,
         Json(serde_json::json!({"session_id": id, "interrupted": interrupted})),
@@ -861,8 +906,11 @@ async fn post_turn_sse(
     // the handler returns the SSE response immediately, so holding the guard
     // here would release it before the turn finishes and allow overlapping
     // writers on one session.
+    let history_file = state.history_file.clone();
+    let title_session_id = session_id.clone();
+    let title_model = overrides.model.clone();
     tokio::task::spawn(async move {
-        let _guard = lock.lock().await;
+        let guard = lock.lock().await;
         let _ = tokio::task::spawn_blocking(move || {
             stream_child_turn(
                 session_id,
@@ -876,6 +924,11 @@ async fn post_turn_sse(
             )
         })
         .await;
+        // The child is gone: generate the title it skipped, outside the lock it
+        // held for its whole run. `done` already reached the client, and the
+        // request must not keep this session's next turn waiting.
+        drop(guard);
+        spawn_session_title_task(history_file, title_session_id, title_model);
     });
     let stream = stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|event| (event, rx))
@@ -1020,6 +1073,32 @@ fn confirm_slot(state: &ServeState, id: &str) -> Option<Arc<std::sync::Mutex<Con
     state.confirms.lock().ok()?.get(id).map(Arc::clone)
 }
 
+/// Unblock a turn that is parked on a confirmation question.
+///
+/// The child is blocked reading its own stdin, and neither a delivered SIGINT
+/// nor its own `close(STDIN_FILENO)` wakes that read: what ends it is the write
+/// end going away, because a pipe with no writer reads as EOF. Dropping the
+/// answer pipe therefore makes the child's reader return `None`, which its
+/// gates already report as "canceled" — the same outcome as Ctrl+C at the
+/// local prompt. Clearing the question on the way out is also what lets a
+/// client stop showing it.
+fn dismiss_pending_confirm(
+    confirms: &std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<ConfirmSlot>>>>,
+    session_id: &str,
+) {
+    let Some(slot) = confirms.lock().ok().and_then(|m| m.get(session_id).cloned()) else {
+        return;
+    };
+    let Some(mut slot) = slot.lock().ok() else {
+        return;
+    };
+    // Only a question in flight needs unblocking: dropping the pipe on a turn
+    // that is merely streaming would also cancel the *next* question it asks.
+    if slot.pending.take().is_some() {
+        slot.answers = None;
+    }
+}
+
 fn conflict(msg: String) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::CONFLICT,
@@ -1030,7 +1109,9 @@ fn conflict(msg: String) -> (StatusCode, Json<serde_json::Value>) {
 /// `GET /sessions/{id}/confirm` (authed): the question this session's turn is
 /// waiting on, so a client that missed the `confirm_request` event (page
 /// reloaded, phone woke up) can still show and answer it. `{"pending": null}`
-/// means there is nothing to answer right now.
+/// means there is nothing to answer right now. `running` travels with it
+/// because clients already poll this endpoint: a page that never saw the
+/// stream can still offer to stop a turn that is running here.
 async fn get_confirm(
     State(state): State<ServeState>,
     headers: HeaderMap,
@@ -1043,11 +1124,19 @@ async fn get_confirm(
         return bad_request(format!("invalid session id: {id}")).into_response();
     }
     let pending = confirm_slot(&state, &id).and_then(|slot| slot.lock().ok()?.pending.clone());
+    let running = state
+        .active_turns
+        .lock()
+        .ok()
+        .is_some_and(|turns| turns.contains_key(&id));
     let body = match pending {
         Some(p) => {
-            serde_json::json!({"pending": {"id": p.id, "prompt": p.prompt, "token": p.token}})
+            serde_json::json!({
+                "pending": {"id": p.id, "prompt": p.prompt, "token": p.token},
+                "running": running,
+            })
         }
-        None => serde_json::json!({"pending": null}),
+        None => serde_json::json!({"pending": null, "running": running}),
     };
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -2236,6 +2325,109 @@ mod tests {
             fifo.path.exists(),
             "fifo inode must outlive the pump for writer-drain ordering"
         );
+    }
+
+    /// Stopping a turn that is parked on a question: the interrupt path drops
+    /// the answer pipe, which unblocks the child's stdin read (EOF) and clears
+    /// the question, so a client's dialog disappears instead of waiting on an
+    /// answer nobody can give any more.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_dismisses_the_pending_question_and_unblocks_the_child() {
+        use axum::{
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        // Stand-in turn child: it echoes what its first stdin line turned out
+        // to be. Closing the pipe makes `read` return EOF, so an empty echo is
+        // the proof that the blocked read did come back.
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read line; echo \"read[$line]\"")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn stand-in child");
+        let echo = child.stdout.take().map(|mut out| {
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut text = String::new();
+                let _ = out.read_to_string(&mut text);
+                text
+            })
+        });
+        let state = lifecycle_test_state();
+        state.confirms.lock().expect("confirms").insert(
+            "sid".to_string(),
+            Arc::new(std::sync::Mutex::new(super::ConfirmSlot {
+                pending: Some(super::PendingConfirm {
+                    id: 1,
+                    prompt: "commit?".to_string(),
+                    token: 5,
+                }),
+                answers: child.stdin.take(),
+            })),
+        );
+        // A registered turn child is what `running` reports. The entry is
+        // removed before the interrupt below: this stand-in must not be
+        // signalled, and the stop path is what the test is about, not the
+        // signal.
+        state
+            .active_turns
+            .lock()
+            .expect("active turns")
+            .insert("sid".to_string(), std::process::id());
+        let busy =
+            super::get_confirm(State(state.clone()), HeaderMap::new(), Path("sid".to_string()))
+                .await
+                .into_response();
+        let body = axum::body::to_bytes(busy.into_body(), 4096)
+            .await
+            .expect("body");
+        let view: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(view["running"], true);
+        assert_eq!(view["pending"]["id"], 1);
+        state.active_turns.lock().expect("active turns").remove("sid");
+
+        let stopped = super::post_interrupt(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("sid".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(stopped.status(), StatusCode::OK);
+        assert_eq!(
+            echo.and_then(|handle| handle.join().ok()).as_deref(),
+            Some("read[]\n")
+        );
+
+        let after =
+            super::get_confirm(State(state.clone()), HeaderMap::new(), Path("sid".to_string()))
+                .await
+                .into_response();
+        let body = axum::body::to_bytes(after.into_body(), 4096)
+            .await
+            .expect("body");
+        let view: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(view["pending"], serde_json::Value::Null);
+        assert_eq!(view["running"], false);
+        // The dismissed question can no longer be answered: the dialog a
+        // client rebuilds from a stale view is refused, not silently accepted.
+        let late = super::post_confirm(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("sid".to_string()),
+            axum::Json(super::ConfirmAnswerReq {
+                id: 1,
+                token: 5,
+                allow: true,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(late.status(), StatusCode::CONFLICT);
     }
 
     /// The interrupt endpoint's core: the registered pid is what receives
