@@ -251,8 +251,10 @@ enum CallDecision {
 }
 
 impl PermissionExecutor {
-    /// Resolve each call's decision. `Ask` prompts synchronously; a non-TTY
-    /// context or a declined/interrupted prompt fails closed to `Deny`.
+    /// Resolve each call's decision. `Ask` prompts synchronously on the local
+    /// terminal, or through the serve client when this process has no terminal
+    /// of its own; an unreachable prompt or a declined/interrupted answer
+    /// fails closed to `Deny`.
     fn decide(&self, tool_calls: &[ToolCall]) -> Vec<CallDecision> {
         tool_calls
             .iter()
@@ -260,15 +262,20 @@ impl PermissionExecutor {
                 ToolPermission::Allow => CallDecision::Allow,
                 ToolPermission::Deny => CallDecision::Deny("policy=deny".to_string()),
                 ToolPermission::Ask => {
-                    if !std::io::stdin().is_terminal() {
+                    let question =
+                        format!("Allow tool '{}' to run? (y/n): ", call.function.name);
+                    let answer = if crate::ai::serve_confirm::active() {
+                        // Serve turn children have no terminal; the question travels
+                        // to the web client and the answer comes back on stdin.
+                        crate::ai::serve_confirm::confirm(&question)
+                    } else if !std::io::stdin().is_terminal() {
                         return CallDecision::Deny(
                             "policy=ask but no interactive terminal; failing closed".to_string(),
                         );
-                    }
-                    match crate::commonw::prompt::prompt_yes_or_no_interruptible(&format!(
-                        "Allow tool '{}' to run? (y/n): ",
-                        call.function.name
-                    )) {
+                    } else {
+                        crate::commonw::prompt::prompt_yes_or_no_interruptible(&question)
+                    };
+                    match answer {
                         Some(true) => CallDecision::Allow,
                         Some(false) => CallDecision::Deny("declined by user".to_string()),
                         None => CallDecision::Deny("prompt interrupted".to_string()),

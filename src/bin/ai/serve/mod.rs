@@ -45,6 +45,11 @@ struct ServeState {
     /// `POST /sessions/{id}/interrupt`. `locks` allows at most one live entry
     /// per session; the entry is removed when the child is reaped.
     active_turns: Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    /// Session id -> the running turn's confirmation channel, for
+    /// `GET`/`POST /sessions/{id}/confirm`. Registered before the turn can ask
+    /// anything and removed when its child is reaped, so a question never
+    /// outlives the process that asked it.
+    confirms: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<ConfirmSlot>>>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -103,6 +108,13 @@ struct TurnReq {
     /// for text-only turns.
     #[serde(default)]
     images: Vec<ServeImageUpload>,
+    /// Whether this client renders and answers remote confirmation requests
+    /// (`confirm_request` SSE events plus `GET`/`POST .../confirm`). Only an
+    /// explicit `true` opens the child's channel: a client that cannot answer
+    /// (serve-chat's REPL, older pages) keeps the previous fail-closed
+    /// behavior instead of hanging the turn on a question nobody can see.
+    #[serde(default)]
+    confirm: Option<bool>,
 }
 
 /// Max length for one per-turn model/agent override: identifiers are short
@@ -839,6 +851,12 @@ async fn post_turn_sse(
     let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(128);
     let session_id = id.clone();
     let active_turns = Arc::clone(&state.active_turns);
+    let confirms = Arc::clone(&state.confirms);
+    // Remote confirmation needs both halves of the handoff: a live FIFO to
+    // publish the question and a client that can answer it. Without either,
+    // the child keeps the fail-closed path (a gated command reports to the
+    // model) instead of blocking on a question nobody can see.
+    let confirm_enabled = req.confirm == Some(true) && live_fifo.is_some();
     // The per-session lock moves into the pump task (not the handler scope):
     // the handler returns the SSE response immediately, so holding the guard
     // here would release it before the turn finishes and allow overlapping
@@ -846,7 +864,16 @@ async fn post_turn_sse(
     tokio::task::spawn(async move {
         let _guard = lock.lock().await;
         let _ = tokio::task::spawn_blocking(move || {
-            stream_child_turn(session_id, prompt, overrides, tx, live_fifo, active_turns)
+            stream_child_turn(
+                session_id,
+                prompt,
+                overrides,
+                tx,
+                live_fifo,
+                active_turns,
+                confirms,
+                confirm_enabled,
+            )
         })
         .await;
     });
@@ -895,6 +922,204 @@ impl Drop for ActiveTurnGuard {
     }
 }
 
+/// One unanswered confirmation question, as published by a turn child.
+#[derive(Debug, Clone)]
+struct PendingConfirm {
+    id: u64,
+    prompt: String,
+    /// Token handed to the client with the question; an answer must echo it.
+    /// Child-side ids restart at 1 in every turn, so the id alone cannot tell
+    /// one turn's question from another's.
+    token: u64,
+}
+
+/// Hands out the [`PendingConfirm::token`] values. Comparing the echoed token
+/// is what keeps a dialog left over from an earlier turn from deciding the
+/// question that took its id.
+static NEXT_CONFIRM_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Per-turn confirmation channel: the question the child is blocked on (if
+/// any) and the pipe that answers it. The slot lives in [`ServeState`], not in
+/// the SSE handler, so a question asked while the page is away (phone in the
+/// background, connection dropped) is still there to be answered later.
+#[derive(Debug, Default)]
+struct ConfirmSlot {
+    pending: Option<PendingConfirm>,
+    /// Writing end of the turn child's stdin, taken from the spawned child.
+    /// Held here so the answer path never depends on the client that started
+    /// the turn.
+    answers: Option<std::process::ChildStdin>,
+}
+
+/// Owns the session's confirmation entry for one turn: inserted before the
+/// FIFO pump starts, removed when the turn child is reaped on any exit path.
+struct ConfirmGuard {
+    map: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<ConfirmSlot>>>>>,
+    session_id: String,
+    slot: Arc<std::sync::Mutex<ConfirmSlot>>,
+}
+
+impl ConfirmGuard {
+    fn register(
+        map: &Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<ConfirmSlot>>>>>,
+        session_id: &str,
+        slot: Arc<std::sync::Mutex<ConfirmSlot>>,
+    ) -> Self {
+        if let Ok(mut confirms) = map.lock() {
+            confirms.insert(session_id.to_string(), Arc::clone(&slot));
+        }
+        Self {
+            map: Arc::clone(map),
+            session_id: session_id.to_string(),
+            slot,
+        }
+    }
+
+    fn slot(&self) -> &Arc<std::sync::Mutex<ConfirmSlot>> {
+        &self.slot
+    }
+}
+
+impl Drop for ConfirmGuard {
+    fn drop(&mut self) {
+        if let Ok(mut confirms) = self.map.lock() {
+            // Only clear our own entry: a stale guard must never hide a newer
+            // turn's channel on the same session.
+            if confirms
+                .get(&self.session_id)
+                .is_some_and(|cur| Arc::ptr_eq(cur, &self.slot))
+            {
+                confirms.remove(&self.session_id);
+            }
+        }
+    }
+}
+
+/// Parse `{"id":<u64>,"prompt":"..."}` as published by a turn child. A
+/// malformed frame is dropped rather than stored: the child always publishes
+/// both fields, and a half-parsed question could not be answered.
+fn parse_confirm_request(payload: &str) -> Option<(u64, String)> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    Some((
+        value.get("id")?.as_u64()?,
+        value.get("prompt")?.as_str()?.to_string(),
+    ))
+}
+
+/// Parse the `{"id":<u64>}` frame that closes a confirmation request.
+fn parse_confirm_id(payload: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()?
+        .get("id")?
+        .as_u64()
+}
+
+/// The session's live confirmation channel, if a turn with the channel
+/// enabled is running.
+fn confirm_slot(state: &ServeState, id: &str) -> Option<Arc<std::sync::Mutex<ConfirmSlot>>> {
+    state.confirms.lock().ok()?.get(id).map(Arc::clone)
+}
+
+fn conflict(msg: String) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({"error": msg})),
+    )
+}
+
+/// `GET /sessions/{id}/confirm` (authed): the question this session's turn is
+/// waiting on, so a client that missed the `confirm_request` event (page
+/// reloaded, phone woke up) can still show and answer it. `{"pending": null}`
+/// means there is nothing to answer right now.
+async fn get_confirm(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if SessionStore::validate_session_id(&id).is_err() {
+        return bad_request(format!("invalid session id: {id}")).into_response();
+    }
+    let pending = confirm_slot(&state, &id).and_then(|slot| slot.lock().ok()?.pending.clone());
+    let body = match pending {
+        Some(p) => {
+            serde_json::json!({"pending": {"id": p.id, "prompt": p.prompt, "token": p.token}})
+        }
+        None => serde_json::json!({"pending": null}),
+    };
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Answer body for [`post_confirm`].
+#[derive(Debug, Deserialize)]
+struct ConfirmAnswerReq {
+    id: u64,
+    /// Echo of the token the question was shown with.
+    token: u64,
+    allow: bool,
+}
+
+/// `POST /sessions/{id}/confirm` (authed): answer the pending question, which
+/// the child receives as one `yes`/`no` line on stdin. `409` means the id no
+/// longer names a pending question (answered on another device, superseded, or
+/// the turn ended); clients treat that as terminal, not as a retry.
+async fn post_confirm(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<ConfirmAnswerReq>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if SessionStore::validate_session_id(&id).is_err() {
+        return bad_request(format!("invalid session id: {id}")).into_response();
+    }
+    let Some(slot) = confirm_slot(&state, &id) else {
+        return conflict("no confirmation is pending for this session".to_string()).into_response();
+    };
+    // One lock for the whole answer: two clients answering the same question
+    // must not both write a line into the child's stdin.
+    let mut slot = match slot.lock() {
+        Ok(slot) => slot,
+        Err(_) => {
+            return conflict("confirmation state is unavailable".to_string()).into_response();
+        }
+    };
+    let Some(pending) = slot.pending.as_ref().map(|p| (p.id, p.token)) else {
+        return conflict("no confirmation is pending for this session".to_string()).into_response();
+    };
+    if pending != (req.id, req.token) {
+        // The answer names a question that is already gone, or one shown by a
+        // dialog that outlived it; a newer question stays published for the
+        // client to re-read instead of being decided by stale text.
+        return conflict("no such confirmation is pending".to_string()).into_response();
+    }
+    let line = if req.allow { "yes\n" } else { "no\n" };
+    let write = match slot.answers.as_mut() {
+        Some(stdin) => {
+            use std::io::Write;
+            stdin.write_all(line.as_bytes()).and_then(|()| stdin.flush())
+        }
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "confirmation channel is closed",
+        )),
+    };
+    if let Err(err) = write {
+        // A broken pipe means the question can never be answered (the child is
+        // gone), so drop it instead of leaving the client to retry forever.
+        slot.pending = None;
+        return conflict(format!("confirmation channel closed: {err}")).into_response();
+    }
+    // Cleared only once the answer reached the child; the child's own
+    // `confirm_done` frame is then a no-op.
+    slot.pending = None;
+    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+}
+
 /// Send-side millisecond clock for the per-turn diagnostic line at the end
 /// of [`stream_child_turn`]. Shared by the stdout loop and the FIFO pump
 /// thread; every stamp is first-writer-wins so concurrent forwards cannot
@@ -939,6 +1164,8 @@ fn stream_child_turn(
     tx: mpsc::Sender<Result<Event, std::convert::Infallible>>,
     mut live_fifo: Option<LiveFifo>,
     active_turns: Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    confirms: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<ConfirmSlot>>>>>,
+    confirm_enabled: bool,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -976,6 +1203,13 @@ fn stream_child_turn(
         // Marks the child as serve-spawned even when no FIFO is set up
         // (fallback line pump): the title skip must not depend on streaming.
         .env(background::SERVE_CHILD_ENV, "1");
+    if confirm_enabled {
+        // The child publishes its question on the live FIFO and reads the
+        // answer as one stdin line: the daemon has no terminal for it to
+        // inherit, and a closed stdin would read as an immediate "canceled".
+        cmd.stdin(Stdio::piped())
+            .env(background::SERVE_CONFIRM_ENV, "1");
+    }
     if let Some(fifo) = live_fifo.as_ref() {
         cmd.env(background::SERVE_LIVE_FIFO_ENV, &fifo.path);
     }
@@ -995,6 +1229,24 @@ fn stream_child_turn(
     // exactly this turn; the guard clears the entry when the child is reaped,
     // on every exit path below.
     let _active_turn = ActiveTurnGuard::register(&active_turns, &session_id, child.id());
+    // Registered before the FIFO pump starts so an early question is never
+    // dropped; the child's stdin moves into the slot, where the `/confirm`
+    // endpoint writes the answer. A child without the pipe (spawn did not give
+    // one) is left unpublished rather than published unanswerable.
+    let confirm_guard = if confirm_enabled {
+        child.stdin.take().map(|stdin| {
+            ConfirmGuard::register(
+                &confirms,
+                &session_id,
+                Arc::new(std::sync::Mutex::new(ConfirmSlot {
+                    pending: None,
+                    answers: Some(stdin),
+                })),
+            )
+        })
+    } else {
+        None
+    };
     let stderr_handle = child.stderr.take().map(|stderr| {
         std::thread::spawn(move || {
             use std::io::Read;
@@ -1014,8 +1266,17 @@ fn stream_child_turn(
             let pump_timing = timing.clone();
             let child_done = Arc::clone(&child_done);
             let turn_done = Arc::clone(&turn_done);
+            let pump_confirm = confirm_guard.as_ref().map(|g| Arc::clone(g.slot()));
             std::thread::spawn(move || {
-                pump_live_fifo(reader, &child_done, &turn_done, &tx, pump_timing, t0)
+                pump_live_fifo(
+                    reader,
+                    &child_done,
+                    &turn_done,
+                    &tx,
+                    pump_timing,
+                    t0,
+                    pump_confirm,
+                )
             })
         });
     #[cfg(not(unix))]
@@ -1125,7 +1386,8 @@ fn setup_live_fifo(_session_id: &str) -> Option<LiveFifo> {
 
 /// Serve-live frame kinds, mirroring `background::ServeLiveKind`
 /// discriminants (1 = delta, 2 = thinking start, 3 = thinking chunk,
-/// 4 = thinking done, 5 = output complete).
+/// 4 = thinking done, 5 = output complete, 6 = confirmation request,
+/// 7 = confirmation resolved).
 #[derive(Debug, PartialEq, Eq)]
 enum ServeLiveEvent {
     Delta(String),
@@ -1133,6 +1395,10 @@ enum ServeLiveEvent {
     Thinking(String),
     ThinkingDone,
     OutputComplete,
+    /// Raw JSON payload of a remote confirmation request.
+    ConfirmRequest(String),
+    /// Raw JSON payload closing a confirmation request.
+    ConfirmDone(String),
 }
 
 /// Incremental parser for serve-live frames (`[kind: u8][len: u32 BE][payload]`):
@@ -1161,7 +1427,9 @@ impl ServeFrameDecoder {
                 || kind == background::ServeLiveKind::ThinkingStart as u8
                 || kind == background::ServeLiveKind::Thinking as u8
                 || kind == background::ServeLiveKind::ThinkingDone as u8
-                || kind == background::ServeLiveKind::OutputComplete as u8;
+                || kind == background::ServeLiveKind::OutputComplete as u8
+                || kind == background::ServeLiveKind::ConfirmRequest as u8
+                || kind == background::ServeLiveKind::ConfirmDone as u8;
             if !known || len > background::MAX_SERVE_FRAME_LEN as usize {
                 self.buf.clear();
                 break;
@@ -1182,6 +1450,18 @@ impl ServeFrameDecoder {
                 k if k == background::ServeLiveKind::ThinkingDone as u8 => {
                     ServeLiveEvent::ThinkingDone
                 }
+                k if k == background::ServeLiveKind::ConfirmRequest as u8 => {
+                    ServeLiveEvent::ConfirmRequest(payload)
+                }
+                k if k == background::ServeLiveKind::ConfirmDone as u8 => {
+                    ServeLiveEvent::ConfirmDone(payload)
+                }
+                k if k == background::ServeLiveKind::OutputComplete as u8 => {
+                    ServeLiveEvent::OutputComplete
+                }
+                // Every kind accepted by the `known` gate above must have an
+                // arm here: falling through would end the turn for a frame
+                // that is not an output-complete marker.
                 _ => ServeLiveEvent::OutputComplete,
             });
         }
@@ -1210,6 +1490,9 @@ fn live_event(event: ServeLiveEvent) -> Option<Event> {
         ServeLiveEvent::ThinkingDone => {
             Some(Event::default().event("thinking_done").data(""))
         }
+        // Confirmation frames are built by `forward_live_event`, which holds
+        // the pending state and adds the answer token; they never get here.
+        ServeLiveEvent::ConfirmRequest(_) | ServeLiveEvent::ConfirmDone(_) => None,
         ServeLiveEvent::OutputComplete => None,
     }
 }
@@ -1224,6 +1507,7 @@ fn forward_live_event(
     tx: &mpsc::Sender<Result<Event, std::convert::Infallible>>,
     timing: &TurnSendTiming,
     t0: std::time::Instant,
+    confirm: Option<&std::sync::Mutex<ConfirmSlot>>,
 ) {
     timing.stamp_first(t0);
     if matches!(event, ServeLiveEvent::OutputComplete) {
@@ -1233,9 +1517,52 @@ fn forward_live_event(
         }
         return;
     }
-    if let Some(e) = live_event(event) {
-        let _ = tx.blocking_send(Ok(e));
-    }
+    // Confirmation frames carry live state (the pending question) as well as a
+    // client event, so they are built here; every other kind maps 1:1. The
+    // slot is filled before the send: an answer can only arrive after a client
+    // saw the event, and a client that lost the stream instead of receiving it
+    // reads the slot through `GET .../confirm`.
+    let sse = match event {
+        ServeLiveEvent::ConfirmRequest(payload) => {
+            let Some((id, prompt)) = parse_confirm_request(&payload) else {
+                // A fragment of a split payload names no question; dropping it
+                // must not end the turn, which the fallback mapping would do.
+                return;
+            };
+            let token = NEXT_CONFIRM_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(slot) = confirm {
+                if let Ok(mut slot) = slot.lock() {
+                    slot.pending = Some(PendingConfirm {
+                        id,
+                        prompt: prompt.clone(),
+                        token,
+                    });
+                }
+            }
+            Event::default()
+                .event("confirm_request")
+                .data(serde_json::json!({"id": id, "prompt": prompt, "token": token}).to_string())
+        }
+        ServeLiveEvent::ConfirmDone(payload) => {
+            // A close that cannot name its question must not hide one: only a
+            // matching id clears the slot.
+            if let Some(id) = parse_confirm_id(&payload) {
+                if let Some(slot) = confirm {
+                    if let Ok(mut slot) = slot.lock() {
+                        if slot.pending.as_ref().is_some_and(|p| p.id == id) {
+                            slot.pending = None;
+                        }
+                    }
+                }
+            }
+            Event::default().event("confirm_done").data(payload)
+        }
+        other => match live_event(other) {
+            Some(e) => e,
+            None => return,
+        },
+    };
+    let _ = tx.blocking_send(Ok(sse));
 }
 
 /// Forward live-FIFO frames as SSE events until the child is reaped and the
@@ -1251,6 +1578,7 @@ fn pump_live_fifo(
     tx: &mpsc::Sender<Result<Event, std::convert::Infallible>>,
     timing: TurnSendTiming,
     t0: std::time::Instant,
+    confirm: Option<Arc<std::sync::Mutex<ConfirmSlot>>>,
 ) {
     use std::os::fd::AsRawFd;
     let fd = reader.as_raw_fd();
@@ -1285,7 +1613,7 @@ fn pump_live_fifo(
         if n == 0 {
             if child_done.load(std::sync::atomic::Ordering::SeqCst) {
                 for event in decoder.finish() {
-                    forward_live_event(event, turn_done, tx, &timing, t0);
+                    forward_live_event(event, turn_done, tx, &timing, t0, confirm.as_deref());
                 }
                 break;
             }
@@ -1294,7 +1622,7 @@ fn pump_live_fifo(
             continue;
         }
         for event in decoder.push(&buf[..n as usize]) {
-            forward_live_event(event, turn_done, tx, &timing, t0);
+            forward_live_event(event, turn_done, tx, &timing, t0, confirm.as_deref());
         }
     }
 }
@@ -1333,7 +1661,138 @@ mod tests {
             token: String::new(),
             locks: Default::default(),
             active_turns: Default::default(),
+            confirms: Default::default(),
         }
+    }
+
+    /// Confirmation frames must survive the decoder like any other kind, with
+    /// their JSON payload relayed verbatim (the client parses it as JSON).
+    #[test]
+    fn decoder_passes_confirmation_frames_through() {
+        use crate::ai::background::ServeLiveKind;
+        let wire = [
+            test_frame(
+                ServeLiveKind::ConfirmRequest,
+                br#"{"id":7,"prompt":"proceed?"}"#,
+            ),
+            test_frame(ServeLiveKind::ConfirmDone, br#"{"id":7}"#),
+        ]
+        .concat();
+        let mut decoder = ServeFrameDecoder::default();
+        assert_eq!(
+            decoder.push(&wire),
+            vec![
+                ServeLiveEvent::ConfirmRequest(r#"{"id":7,"prompt":"proceed?"}"#.to_string()),
+                ServeLiveEvent::ConfirmDone(r#"{"id":7}"#.to_string()),
+            ]
+        );
+    }
+
+    /// The `/confirm` route pair: the pending question is readable, an answer
+    /// reaches the turn child's stdin exactly once, and answering the same
+    /// question again is refused instead of writing a second line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirm_answer_reaches_the_child_stdin_once() {
+        use axum::{
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        // Stand-in turn child: consumes one stdin line and echoes it, which is
+        // what the real child's confirmation reader does.
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read line; echo \"$line\"")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn stand-in child");
+        let echo = child.stdout.take().map(|mut out| {
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut text = String::new();
+                let _ = out.read_to_string(&mut text);
+                text
+            })
+        });
+        let state = lifecycle_test_state();
+        state.confirms.lock().expect("confirms").insert(
+            "sid".to_string(),
+            Arc::new(std::sync::Mutex::new(super::ConfirmSlot {
+                pending: Some(super::PendingConfirm {
+                    id: 7,
+                    prompt: "proceed?".to_string(),
+                    token: 11,
+                }),
+                answers: child.stdin.take(),
+            })),
+        );
+
+        let read =
+            super::get_confirm(State(state.clone()), HeaderMap::new(), Path("sid".to_string()))
+                .await
+                .into_response();
+        assert_eq!(read.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(read.into_body(), 4096)
+            .await
+            .expect("body");
+        let view: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(view["pending"]["id"], 7);
+        assert_eq!(view["pending"]["prompt"], "proceed?");
+        assert_eq!(view["pending"]["token"], 11);
+
+        let answer = |allow| super::ConfirmAnswerReq { id: 7, token: 11, allow };
+        let ok = super::post_confirm(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("sid".to_string()),
+            axum::Json(answer(true)),
+        )
+        .await
+        .into_response();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(echo.and_then(|handle| handle.join().ok()).as_deref(), Some("yes\n"));
+        // The question is gone, so a second tap (or a second device) is
+        // refused rather than writing another line.
+        let again = super::post_confirm(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("sid".to_string()),
+            axum::Json(answer(false)),
+        )
+        .await
+        .into_response();
+        assert_eq!(again.status(), StatusCode::CONFLICT);
+        // A later turn numbers its questions from 1 again, so the same id with
+        // a fresh token is a different question: an answer carrying the stale
+        // token must be refused instead of deciding text nobody read.
+        state.confirms.lock().expect("confirms").insert(
+            "sid".to_string(),
+            Arc::new(std::sync::Mutex::new(super::ConfirmSlot {
+                pending: Some(super::PendingConfirm {
+                    id: 7,
+                    prompt: "a different question".to_string(),
+                    token: 12,
+                }),
+                answers: None,
+            })),
+        );
+        let stale = super::post_confirm(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("sid".to_string()),
+            axum::Json(answer(true)),
+        )
+        .await
+        .into_response();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(stale.into_body(), 4096)
+            .await
+            .expect("body");
+        let view: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(view["error"], "no such confirmation is pending");
+        let _ = child.wait();
     }
 
     #[tokio::test]
@@ -1519,6 +1978,7 @@ mod tests {
             agent: agent.map(str::to_string),
             reasoning_effort: reasoning_effort.map(str::to_string),
             images: Vec::new(),
+            confirm: None,
         }
     }
 
@@ -1726,6 +2186,7 @@ mod tests {
                     &tx,
                     super::TurnSendTiming::default(),
                     std::time::Instant::now(),
+                    None,
                 )
             });
         // Fake turn child: a delta frame split mid-header and inside a
@@ -1985,6 +2446,7 @@ pub(in crate::ai) async fn run_serve(
         // Idle eviction is deferred to a later multi-instance pass.
         locks: Arc::new(Mutex::new(HashMap::new())),
         active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        confirms: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -2004,6 +2466,10 @@ pub(in crate::ai) async fn run_serve(
             post(post_turn_sse).layer(DefaultBodyLimit::max(MAX_TURN_REQUEST_BYTES)),
         )
         .route("/sessions/{id}/interrupt", post(post_interrupt))
+        .route(
+            "/sessions/{id}/confirm",
+            get(get_confirm).post(post_confirm),
+        )
         .route("/skills", get(list_skills))
         .route("/agents", get(list_agents))
         .with_state(state);

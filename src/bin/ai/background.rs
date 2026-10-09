@@ -377,16 +377,39 @@ pub(crate) fn is_serve_child() -> bool {
     SERVE_CHILD.load(Ordering::Relaxed)
 }
 
-/// Read [`SERVE_CHILD_ENV`] once at process entry and scrub it, mirroring
-/// [`open_serve_live_fifo_from_env`]: exec'd grandchildren (MCP servers,
-/// nested tool processes, re-exec'd daemons) must not inherit it.
+/// Read [`SERVE_CHILD_ENV`] / [`SERVE_CONFIRM_ENV`] once at process entry and
+/// scrub them, mirroring [`open_serve_live_fifo_from_env`]: exec'd
+/// grandchildren (MCP servers, nested tool processes, re-exec'd daemons) must
+/// not inherit them.
 pub(crate) fn mark_serve_child_from_env() {
     if std::env::var(SERVE_CHILD_ENV).is_ok() {
         SERVE_CHILD.store(true, Ordering::Relaxed);
     }
+    if std::env::var(SERVE_CONFIRM_ENV).is_ok() {
+        SERVE_CONFIRM.store(true, Ordering::Relaxed);
+    }
     // SAFETY: runs once at process entry before any other thread spawns, so
     // no concurrent env access can exist yet.
-    unsafe { std::env::remove_var(SERVE_CHILD_ENV) };
+    unsafe {
+        std::env::remove_var(SERVE_CHILD_ENV);
+        std::env::remove_var(SERVE_CONFIRM_ENV);
+    }
+}
+
+/// Environment handoff for remote confirmations: the serve side sets it while
+/// spawning an SSE turn child whose stdin is a pipe the daemon answers on, so
+/// gated actions (`git commit` / `git stash`) can ask the serve client instead
+/// of failing closed on the missing terminal. See `ai::serve_confirm`.
+pub(crate) const SERVE_CONFIRM_ENV: &str = "A_SERVE_CONFIRM";
+
+/// Set while [`SERVE_CONFIRM_ENV`] marked this process as remotely
+/// confirmable. Requires the live FIFO as well: without it the question could
+/// never reach the client, so waiting on an answer would be pointless.
+static SERVE_CONFIRM: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process can route a confirmation prompt to the serve client.
+pub(crate) fn serve_confirm_channel() -> bool {
+    SERVE_CONFIRM.load(Ordering::Relaxed) && serve_live_streaming()
 }
 
 /// Set while [`open_serve_live_fifo_from_env`] installed a serve FIFO. Tells
@@ -444,12 +467,14 @@ pub(crate) enum ServeLiveKind {
     Thinking = 3,
     ThinkingDone = 4,
     OutputComplete = 5,
+    ConfirmRequest = 6,
+    ConfirmDone = 7,
 }
 
 /// Max payload bytes per serve frame: header (5) + payload stays under the
 /// 4096-byte pipe atomicity bound, so one frame is one `write` syscall and
 /// can never interleave with a concurrent same-process publisher.
-const MAX_SERVE_FRAME_BYTES: usize = 4000;
+pub(crate) const MAX_SERVE_FRAME_BYTES: usize = 4000;
 /// Defensive cap accepted by the serve decoder; larger lengths are dropped.
 pub(crate) const MAX_SERVE_FRAME_LEN: u32 = 16 * 1024 * 1024;
 

@@ -94,6 +94,18 @@ select, summary { touch-action:manipulation; }
 .msg.md .tablewrap { overflow-x:auto; margin:6px 0; }
 .msg.md table { border-collapse:collapse; font-size:13px; }
 .msg.md th, .msg.md td { border:1px solid var(--line); padding:2px 6px; text-align:left; }
+/* A turn can stop and ask before doing something (a tool that needs an
+   explicit yes). The question is modal on purpose: the turn stays blocked
+   until it is answered, and this dialog is the only way to answer it. */
+#confirmwrap { position:fixed; inset:0; z-index:20; display:none; align-items:center; justify-content:center; padding:16px; background:rgba(0,0,0,.55); }
+#confirmwrap.open { display:flex; }
+#confirmbox { width:100%; max-width:440px; max-height:80dvh; overflow-y:auto; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; display:flex; flex-direction:column; gap:10px; box-shadow:0 12px 32px rgba(0,0,0,.6); }
+#confirmtitle { font-size:12px; color:var(--dim); }
+#confirmtext { white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere; font-size:15px; }
+#confirmerr { display:none; color:var(--err); font-size:13px; }
+#confirmerr.show { display:block; }
+#confirmbtns { display:flex; gap:8px; }
+#confirmbtns button { flex:1; min-height:44px; }
 /* ---- phone layout (narrow viewports only; desktop is untouched) ---------- */
 @media (max-width:700px) {
   header button { min-width:44px; min-height:44px; }
@@ -157,6 +169,14 @@ select, summary { touch-action:manipulation; }
 </div>
 </main>
 </div>
+<div id="confirmwrap" role="alertdialog" aria-modal="true" aria-labelledby="confirmtitle">
+<div id="confirmbox">
+<div id="confirmtitle">confirmation needed</div>
+<div id="confirmtext"></div>
+<div id="confirmerr"></div>
+<div id="confirmbtns"><button id="cdeny">Deny</button><button id="callow" class="primary">Allow</button></div>
+</div>
+</div>
 <script>
 "use strict";
 // Minimal mobile client for the serve HTTP API (same routes as serve-chat).
@@ -177,6 +197,24 @@ let lastItems = []; // latest /sessions payload (newest-first), backing the sess
 let lastMsgCount = null; // message count from the last history load
 let sending = false;
 let pendingImages = []; // {filename, data_base64}
+// A turn stream that dies on the wire (page backgrounded, network switched) is
+// not a failed turn: the turn child keeps running server-side and only this
+// page loses the live feed. Such a view is stale, not broken — see
+// startStaleFollow, which reloads it from history.
+let staleSession = ""; // session whose live feed was lost; "" when none
+let staleKey = ""; // fingerprint of the newest history row already rendered
+let staleDone = false; // newest history row is a real assistant reply
+let staleTimer = null; // follow-up reload timer while the reply is pending
+let staleTries = 0; // bounded follow-ups: an idle page must not ask forever
+let staleBusy = false; // one history fetch at a time; ticks may overlap a slow one
+const STALE_FOLLOW_MS = 4000; // follow-up reload interval
+const STALE_FOLLOW_TRIES = 300; // ~20 min of visible following, then ↻ takes over
+
+// A turn can stop and ask for confirmation, and the question is answered over
+// HTTP rather than the stream, so it outlives the feed that delivered it: the
+// same dialog is driven by the SSE `confirm_request` event and by pollConfirm.
+let confirmShown = null; // {id, prompt} currently on screen; null when hidden
+let confirmBusy = false; // one answer POST at a time: a double tap must not send two
 
 function headers(json) {
   const h = {};
@@ -501,7 +539,7 @@ function renderSessionList(items, errText) {
     li.appendChild(sm);
     // Desktop keeps the inline drawer open for repeated switching; the phone
     // drawer floats over the chat, so only it auto-closes after a pick.
-    li.onclick = () => { sessionId = s.id; lastMsgCount = null; localStorage.setItem("serve.session", s.id); if (window.matchMedia && matchMedia("(max-width: 700px)").matches) setDrawer(false); loadSessions(); loadHistory(); };
+    li.onclick = () => { sessionId = s.id; lastMsgCount = null; stopStaleFollow(); localStorage.setItem("serve.session", s.id); if (window.matchMedia && matchMedia("(max-width: 700px)").matches) setDrawer(false); loadSessions(); loadHistory(); };
     ul.appendChild(li);
   }
   if (errText) {
@@ -576,6 +614,17 @@ async function loadSessions() {
   renderSessionList(items);
   renderSessionBar();
 }
+// History is append-only, so "the transcript changed" is one fingerprint of its
+// newest row, and a newest row that is a non-empty assistant message is the
+// reply a lost live feed was waiting for.
+function histKey(msgs) {
+  const tail = msgs[msgs.length - 1];
+  return msgs.length + "|" + (tail ? tail.role + "|" + (tail.tool_call_id || "") + "|" + JSON.stringify(tail.content) : "");
+}
+function histEndsTurn(msgs) {
+  const tail = msgs[msgs.length - 1];
+  return !!tail && tail.role === "assistant" && !!textOf(tail.content).trim();
+}
 async function loadHistory() {
   $("msgs").textContent = "";
   if (!sessionId) { addMsg("asst", "no session yet — tap ＋ to start one.", "asst"); return; }
@@ -588,6 +637,8 @@ async function loadHistory() {
   catch (e) { addMsg("err", "history failed: " + e.message, "asst err"); return; }
   const shown = msgs.slice(-200);
   lastMsgCount = shown.length;
+  staleKey = histKey(msgs);
+  staleDone = histEndsTurn(msgs);
   renderSessionBar();
   // The call lives on the assistant message (`tool_calls`), the result is a
   // separate `tool` message carrying only `tool_call_id`; index the window
@@ -605,6 +656,108 @@ async function loadHistory() {
     }
   }
   $("msgs").scrollTop = $("msgs").scrollHeight;
+}
+
+// The reply to a turn whose live feed died still lands in history, so the page
+// follows it there: ticks with no change are skipped (a re-render pins the
+// transcript to the bottom, which would fight someone scrolling an older
+// session), the loop pauses while the page is hidden (a phone back in another
+// app must not keep asking) and gives up after a bounded number of tries.
+async function reloadStale() {
+  if (!staleSession || staleSession !== sessionId || staleTries >= STALE_FOLLOW_TRIES) { stopStaleFollow(); return; }
+  if (document.visibilityState !== "visible" || staleBusy) return;
+  staleBusy = true;
+  try {
+    staleTries += 1;
+    // The lost feed also loses the question a blocked turn is waiting on, and
+    // the server keeps that question pending until it is answered: rebuild it
+    // here so a reconnect mid-prompt can still answer it. This runs before the
+    // "reply landed" exit below, because a question can stay pending while the
+    // transcript already ends in an assistant message.
+    await pollConfirm();
+    if (staleDone) { stopStaleFollow(); return; }
+    let msgs;
+    try { msgs = await (await api("/sessions/" + sessionId + "/history?limit=201")).json(); }
+    catch (_) { return; } // transient (hidden mid-flight, server restarting): retry next tick
+    // The fetch can outlive the follow it belongs to (a new turn or another
+    // session stops it, the page goes hidden): re-check before re-rendering.
+    if (!staleSession || staleSession !== sessionId || document.visibilityState !== "visible") return;
+    if (histKey(msgs) === staleKey) return;
+    await loadHistory();
+    if (staleDone) stopStaleFollow(); // the reply landed: nothing left to follow
+  } finally { staleBusy = false; }
+}
+function stopStaleFollow() {
+  if (staleTimer !== null) { clearInterval(staleTimer); staleTimer = null; }
+  staleSession = "";
+  staleTries = 0;
+}
+function startStaleFollow() {
+  if (!staleSession || staleSession !== sessionId || staleTimer !== null) return;
+  if (document.visibilityState !== "visible") return; // becoming visible again is the other trigger
+  staleTimer = setInterval(reloadStale, STALE_FOLLOW_MS);
+  reloadStale();
+}
+
+// --- turn confirmation ----------------------------------------------------
+function hideConfirm() {
+  confirmShown = null;
+  $("confirmwrap").classList.remove("open");
+  $("confirmerr").classList.remove("show");
+  $("confirmerr").textContent = "";
+}
+function showConfirm(id, prompt, token) {
+  confirmShown = { id: id, prompt: prompt, token: token };
+  // Server text: textContent only, never innerHTML.
+  $("confirmtext").textContent = prompt || "(no prompt text)";
+  $("confirmerr").classList.remove("show");
+  $("confirmerr").textContent = "";
+  $("callow").disabled = false;
+  $("cdeny").disabled = false;
+  $("confirmwrap").classList.add("open");
+}
+async function answerConfirm(allow) {
+  if (!confirmShown || confirmBusy) return;
+  confirmBusy = true;
+  $("callow").disabled = true;
+  $("cdeny").disabled = true;
+  // Remember which question this answer belongs to: a newer question can
+  // arrive while the POST is in flight, and hiding it would strand the turn
+  // with nothing on screen to answer.
+  const answered = confirmShown.token;
+  let gone = false; // a 409 is terminal: the server holds no such question
+  try {
+    await api("/sessions/" + sessionId + "/confirm", { method: "POST", body: JSON.stringify({ id: confirmShown.id, token: answered, allow: allow }) });
+    if (confirmShown && confirmShown.token === answered) hideConfirm();
+  } catch (e) {
+    // Keep the question on screen: a transport failure must stay retryable.
+    $("confirmerr").textContent = "answer failed: " + e.message;
+    $("confirmerr").classList.add("show");
+    $("callow").disabled = false;
+    $("cdeny").disabled = false;
+    gone = /^409\b/.test(e.message);
+  } finally { confirmBusy = false; }
+  // A 409 means the question is already gone (answered on another device, or
+  // the turn ended): re-read the server state instead of leaving a dialog that
+  // can only fail again. Transient failures stay open for a retry.
+  if (gone) pollConfirm();
+}
+// Render whatever the server currently holds pending. A page that lost the
+// feed (or was reloaded) mid-prompt has no live event to show the question, so
+// it is rebuilt from /confirm through the same path the SSE event uses.
+async function pollConfirm() {
+  if (!sessionId || confirmBusy) return;
+  const sid = sessionId;
+  let pending;
+  try { pending = (await (await api("/sessions/" + sid + "/confirm")).json()).pending; }
+  catch (_) { return; } // transient (hidden mid-flight, server restarting): retry next tick
+  // The fetch can outlive what it describes (answered while it was in flight,
+  // session switched): re-check before touching the dialog.
+  if (confirmBusy || sid !== sessionId) return;
+  if (!pending) { if (confirmShown) hideConfirm(); return; }
+  // The token, not the id, is the question's identity: child-side ids restart
+  // at 1 every turn, so an equal id can still be different text.
+  if (!confirmShown || confirmShown.token !== pending.token) showConfirm(pending.id, pending.prompt, pending.token);
 }
 
 // Parse one SSE block the way serve-chat does: `event: <kind>` plus one or
@@ -636,7 +789,9 @@ async function send() {
   // The file picker previews these same placeholders in the textarea, so
   // only append the ones the user has not already kept (or typed by hand).
   for (const im of images) if (!prompt.includes("[[image:" + im.filename + "]]")) prompt += (prompt && !prompt.endsWith("\n") ? "\n" : "") + "[[image:" + im.filename + "]]";
-  const body = { prompt };
+  // `confirm: true` tells the server this page renders and answers confirmation
+  // requests; clients that cannot answer must not open a question nobody sees.
+  const body = { prompt, confirm: true };
   if ($("omodel").value.trim()) body.model = $("omodel").value.trim();
   if ($("oagent").value.trim()) body.agent = $("oagent").value.trim();
   if ($("oeffort").value.trim()) body.reasoning_effort = $("oeffort").value.trim();
@@ -646,6 +801,7 @@ async function send() {
   if (text) addMsg("user", text, "user");
   else addMsg("user", "(images only)", "user");
 
+  stopStaleFollow(); // this turn's own stream owns the view from here on
   sending = true;
   $("send").disabled = true;
   // Chronological DOM order: progress and thinking folds are created before
@@ -673,6 +829,11 @@ async function send() {
     prog.box.remove();
     if (think) think.box.remove();
   };
+  // The POST is accepted before its first byte arrives, and the server keeps the
+  // turn running even if this page goes away: only a server-sent `error` event is
+  // a real turn failure, while a dead stream leaves a stale view (startStaleFollow).
+  let turnStarted = false;
+  let turnError = false;
   try {
     const res = await fetch(store.base + "/sessions/" + sessionId + "/turns/stream", {
       method: "POST", headers: headers(true), body: JSON.stringify(body),
@@ -682,6 +843,7 @@ async function send() {
       try { detail = (await res.json()).error || detail; } catch (_) {}
       throw new Error(res.status + " " + detail);
     }
+    turnStarted = true;
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -695,7 +857,7 @@ async function send() {
         const { kind, payload } = parseBlock(buf.slice(0, idx));
         buf = buf.slice(idx + 2);
         if (kind === "done") { finished = true; break; }
-        else if (kind === "error") throw new Error(JSON.parse(payload).error || "turn failed");
+        else if (kind === "error") { turnError = true; throw new Error(JSON.parse(payload).error || "turn failed"); }
         else if (kind === "delta") {
           try { raw += JSON.parse(payload).delta || ""; }
           catch (_) { raw += payload; }
@@ -706,6 +868,17 @@ async function send() {
           try { if (think) think.body.textContent += JSON.parse(payload).text || ""; } catch (_) {}
         }
         else if (kind === "thinking_done") { if (think) think.box.querySelector("summary").textContent = "thinking"; }
+        else if (kind === "confirm_request") {
+          // Server text: showConfirm renders the prompt through textContent.
+          try { const c = JSON.parse(payload); showConfirm(c.id, c.prompt, c.token); } catch (_) {}
+        }
+        else if (kind === "confirm_done") {
+          // Only the question this event closes goes away; a newer request can
+          // only follow it, and an id-less event hides whatever is on screen.
+          let cid = null;
+          try { cid = JSON.parse(payload).id; } catch (_) {}
+          if (cid === null || (confirmShown && confirmShown.id === cid)) hideConfirm();
+        }
         else if (payload) { progLines.push(payload); prog.set("progress (" + progLines.length + ")", progLines.slice(-50).join("\n")); }
         $("msgs").scrollTop = $("msgs").scrollHeight;
       }
@@ -714,7 +887,20 @@ async function send() {
     }
     if (paintTimer !== null) { clearTimeout(paintTimer); paint(); } // flush the tail
     if (!raw) bubble.innerHTML = "<span style='color:var(--dim)'>(empty reply)</span>";
-  } catch (e) { fail("turn failed: " + e.message); }
+  } catch (e) {
+    if (turnStarted && !turnError) {
+      // The POST was accepted and no server `error` event arrived, so this is
+      // transport loss: the turn keeps running server-side and the view is
+      // stale. Follow the transcript instead of declaring the turn dead.
+      staleSession = sessionId;
+      staleTries = 0;
+      // Until the first fetch below, staleDone still describes the transcript
+      // from before this turn and would end the follow on its first tick.
+      staleDone = false;
+      fail("connection lost: " + e.message + " — the turn keeps running on the server (following history)");
+      startStaleFollow();
+    } else fail("turn failed: " + e.message);
+  }
   sending = false;
   $("send").disabled = false;
   $("msgs").scrollTop = $("msgs").scrollHeight;
@@ -742,6 +928,16 @@ function wire() {
   $("token").value = localStorage.getItem("serve.token") || "";
   showStored();
   $("send").onclick = send;
+  // The dialog is the only way to unblock a turn that stopped to ask; both
+  // answers post to /sessions/{id}/confirm through answerConfirm.
+  $("callow").onclick = () => answerConfirm(true);
+  $("cdeny").onclick = () => answerConfirm(false);
+  // Android drops a backgrounded page's connections, and a page cannot see that
+  // until it is visible again, so coming back is where recovery has to start.
+  // A question the turn is blocked on survives a reconnect, so coming back to
+  // the page is also where the confirm dialog has to be rebuilt.
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { pollConfirm(); startStaleFollow(); } });
+  window.addEventListener("pageshow", () => { pollConfirm(); startStaleFollow(); }); // bfcache restore fires no visibility change
   if (window.matchMedia && matchMedia("(max-width: 700px)").matches) $("ovrwrap").open = false;
   $("scrim").onclick = () => setDrawer(false);
   $("omodel").onchange = syncOvrSummary;

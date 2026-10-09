@@ -305,22 +305,28 @@ fn confirm_gated_git_subcommand(command: &str) -> Option<&'static str> {
 /// `git stash`) before running them.
 /// - Interactive terminal: red-highlighted prompt; y proceeds, n / Ctrl+C /
 ///   Esc cancels.
-/// - Non-interactive environment: rejected outright (fail-closed), both to
-///   avoid background processes hanging on input and to avoid silent execution.
+/// - Serve turn child with a remote confirmation channel: the question travels
+///   to the serve client (phone/browser) and the answer arrives on stdin.
+/// - Other non-interactive environments: rejected outright (fail-closed), both
+///   to avoid background processes hanging on input and to avoid silent
+///   execution.
 fn confirm_git_confirm_gated_if_needed(command: &str) -> Result<(), String> {
     let Some(subcommand) = confirm_gated_git_subcommand(command) else {
         return Ok(());
     };
-    if !std::io::stdin().is_terminal() {
-        return Err(format!(
-            "Command blocked: git {subcommand} requires user confirmation, but stdin is not an \
-             interactive terminal. Do not retry the command; report to the user and wait for \
-             explicit confirmation (or have them run it in an interactive session)."
-        ));
-    }
-    let confirmed = crate::commonw::prompt::prompt_yes_or_no_danger(&format!(
-        "\nConfirm git {subcommand}:\n{command}\nProceed? (y/n): "
-    ));
+    let prompt = format!("\nConfirm git {subcommand}:\n{command}\nProceed? (y/n): ");
+    let confirmed = if crate::ai::serve_confirm::active() {
+        crate::ai::serve_confirm::confirm(&prompt)
+    } else {
+        if !std::io::stdin().is_terminal() {
+            return Err(format!(
+                "Command blocked: git {subcommand} requires user confirmation, but stdin is not \
+                 an interactive terminal. Do not retry the command; report to the user and wait \
+                 for explicit confirmation (or have them run it in an interactive session)."
+            ));
+        }
+        crate::commonw::prompt::prompt_yes_or_no_danger(&prompt)
+    };
     match confirmed {
         Some(true) => Ok(()),
         Some(false) => Err(format!("git {subcommand} canceled by user")),
