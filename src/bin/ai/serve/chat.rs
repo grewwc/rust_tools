@@ -244,7 +244,9 @@ fn render_turn_stream_to(
                     })
                     .unwrap_or_else(|| payload.to_string());
                 let _ = write!(out, "{text}");
-                line_open = !text.ends_with('\n');
+                if !text.is_empty() {
+                    line_open = !text.ends_with('\n');
+                }
                 let _ = out.flush();
             }
             _ => {
@@ -264,7 +266,9 @@ fn render_turn_stream_to(
                     let _ = writeln!(out);
                 }
                 let _ = writeln!(out, "{payload}");
-                line_open = !payload.ends_with('\n');
+                // The appended newline closes the output line even when the
+                // stdout-derived payload has no line terminator of its own.
+                line_open = false;
                 let _ = out.flush();
             }
         }
@@ -462,7 +466,9 @@ mod tests {
     fn sse_message_lines_render_until_done() {
         let url = serve_body_once("data: hello\n\ndata: world\n\nevent: done\ndata: \n\n");
         let resp = reqwest::blocking::get(url).expect("get canned SSE");
-        assert!(render_turn_stream(resp).is_ok());
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        assert_eq!(buf, b"hello\nworld\n");
     }
 
     #[test]
@@ -496,18 +502,63 @@ mod tests {
 
     #[test]
     fn sse_footer_after_body_starts_on_fresh_line() {
-        // Body deltas carry no trailing newline: the first footer line must
-        // not glue onto the answer's last line (the `吗？  ↳ cache` defect).
+        // The first footer must start on a new line; subsequent footers must
+        // not add another newline after the one the renderer already wrote.
         let url = serve_body_once(
-            "event: delta\ndata: {\"delta\": \"hi there\"}\n\ndata: ↳ cache · 1k\n\nevent: done\ndata: \n\n",
+            "event: delta\ndata: {\"delta\": \"hi there\"}\n\ndata: ↳ cache · 1k\n\ndata: ↳ speed · output 10 tok/s\n\nevent: done\ndata: \n\n",
         );
         let resp = reqwest::blocking::get(url).expect("get canned SSE");
         let mut buf = Vec::new();
         render_turn_stream_to(resp, &mut buf, false).expect("render");
         assert_eq!(
             String::from_utf8(buf).expect("utf8"),
-            "hi there\n↳ cache · 1k\n"
+            "hi there\n↳ cache · 1k\n↳ speed · output 10 tok/s\n"
         );
+    }
+
+    #[test]
+    fn sse_preserves_body_spacing_and_empty_deltas() {
+        let url = serve_body_once(
+            "event: delta\ndata: {\"delta\": \"paragraph\\n\\n| a | b |\\n\"}\n\nevent: delta\ndata: {\"delta\": \"\"}\n\ndata: cache\n\ndata: speed\n\nevent: done\ndata: \n\n",
+        );
+        let resp = reqwest::blocking::get(url).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        assert_eq!(buf, b"paragraph\n\n| a | b |\ncache\nspeed\n");
+    }
+
+    #[test]
+    fn sse_done_returns_before_connection_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let (rendered_tx, rendered_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            let body = "event: delta\ndata: {\"delta\": \"answer\"}\n\nevent: done\ndata: \n\n";
+            // Advertise one more byte than we send so EOF cannot complete the
+            // response. The renderer must return on done while HTTP stays open.
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len() + 1
+            )
+            .expect("write SSE");
+            stream.flush().expect("flush SSE");
+            rendered_rx.recv_timeout(Duration::from_secs(3)).is_ok()
+        });
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let resp = client.get(format!("http://{addr}/")).send().expect("SSE");
+        let mut buf = Vec::new();
+        let result = render_turn_stream_to(resp, &mut buf, false);
+        let _ = rendered_tx.send(());
+        assert!(server.join().expect("server"), "renderer waited for EOF");
+        result.expect("render");
+        assert_eq!(buf, b"answer");
     }
 
     #[test]
