@@ -12,8 +12,8 @@ use base64::Engine as _;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Sse, sse::Event},
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::{Html, IntoResponse, Response, Sse, sse::Event},
     routing::{delete, get, post},
 };
 use futures_util::stream;
@@ -38,6 +38,12 @@ const DEFAULT_BIND: &str = "127.0.0.1:8080";
 #[derive(Debug, Clone)]
 struct ServeState {
     history_file: PathBuf,
+    /// Root for workspace-relative image paths on the read-only preview route
+    /// (`GET /sessions/{id}/file`). Snapshotted at startup from the same
+    /// authority a turn child runs with (`runtime_ctx::effective_cwd`), so a
+    /// path the assistant prints in a reply resolves to the file it wrote.
+    /// This session's assets dir is a second, per-request root.
+    workspace_root: PathBuf,
     token: String,
     /// Per-session async mutex: at most one turn writer per session.
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -653,6 +659,189 @@ async fn read_history(
         }
     }
     (StatusCode::OK, Json(messages)).into_response()
+}
+
+/// Query for the read-only preview route: one image path, either relative to
+/// the workspace root or absolute inside an allowed root.
+#[derive(Debug, Deserialize)]
+struct FileQuery {
+    path: String,
+}
+
+/// Image extensions the preview route serves. Everything else (sources,
+/// configs, dotfiles, keys) stays invisible to remote clients even inside an
+/// allowed root: the route exists so a phone can show pictures the assistant
+/// produced, not to browse the server's filesystem.
+const PREVIEW_IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp"];
+/// One preview is capped like an upload: a client allowed to send 10 MiB must
+/// be able to fetch what it sent.
+const MAX_PREVIEW_BYTES: u64 = MAX_TURN_IMAGE_BYTES as u64;
+/// Long absolute paths are legitimate; unbounded input is not.
+const MAX_PREVIEW_PATH_CHARS: usize = 4096;
+
+/// A resolved, servable preview file.
+#[derive(Debug)]
+struct PreviewFile {
+    path: PathBuf,
+    content_type: &'static str,
+}
+
+/// Why a preview path was refused. Each variant maps to one status code, so a
+/// client can tell "wrong kind of file" (400) from "outside the roots" (403)
+/// and "nothing there" (404) without parsing prose.
+#[derive(Debug, PartialEq, Eq)]
+enum PreviewReject {
+    BadRequest,
+    Outside,
+    Missing,
+    TooLarge,
+}
+
+fn preview_content_type(ext: &str) -> &'static str {
+    match ext {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        _ => "image/bmp",
+    }
+}
+
+/// Resolve one client-supplied path to a servable image inside `roots`.
+///
+/// `canonicalize` normalizes the path before the containment check, so `..`
+/// segments, relative forms and symlinks all resolve together — a symlink
+/// pointing out of the root is rejected exactly like a `..` traversal. The
+/// extension allowlist is applied to the canonical target too, so
+/// `chart.png -> secret.txt` is refused.
+fn resolve_preview(raw: &str, roots: &[PathBuf]) -> Result<PreviewFile, PreviewReject> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > MAX_PREVIEW_PATH_CHARS || raw.contains('\0') {
+        return Err(PreviewReject::BadRequest);
+    }
+    let candidate = if std::path::Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        // Relative paths are workspace-relative: that is the directory the
+        // turn child runs in, i.e. what the assistant means by `out/chart.svg`.
+        let Some(base) = roots.first() else {
+            return Err(PreviewReject::BadRequest);
+        };
+        base.join(raw)
+    };
+    let Ok(path) = candidate.canonicalize() else {
+        return Err(PreviewReject::Missing);
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Err(PreviewReject::Missing);
+    };
+    if !meta.is_file() {
+        return Err(PreviewReject::Missing);
+    }
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !PREVIEW_IMAGE_EXTS.contains(&ext.as_str()) {
+        return Err(PreviewReject::BadRequest);
+    }
+    let inside = roots.iter().any(|root| {
+        root.canonicalize()
+            .map(|root| path.starts_with(&root))
+            .unwrap_or(false)
+    });
+    if !inside {
+        return Err(PreviewReject::Outside);
+    }
+    if meta.len() > MAX_PREVIEW_BYTES {
+        return Err(PreviewReject::TooLarge);
+    }
+    Ok(PreviewFile {
+        path,
+        content_type: preview_content_type(&ext),
+    })
+}
+
+/// `GET /sessions/{id}/file?path=...` (authed): one image from the workspace
+/// root or this session's assets dir, fetched by the mobile page for inline
+/// previews. Read-only and image-only by construction (see `resolve_preview`);
+/// the client sends its bearer token in a `fetch` header, so the token never
+/// appears in a URL.
+async fn get_session_file(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<FileQuery>,
+) -> Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if SessionStore::validate_session_id(&id).is_err() {
+        return bad_request(format!("invalid session id: {id}")).into_response();
+    }
+    let store = SessionStore::new(state.history_file.as_path());
+    let roots = vec![state.workspace_root.clone(), store.session_assets_dir(&id)];
+    let file = match resolve_preview(&q.path, &roots) {
+        Ok(file) => file,
+        Err(reject) => {
+            let (status, msg) = match reject {
+                PreviewReject::BadRequest => {
+                    (StatusCode::BAD_REQUEST, "not a previewable image path")
+                }
+                PreviewReject::Outside => (
+                    StatusCode::FORBIDDEN,
+                    "path is outside the workspace and session assets",
+                ),
+                PreviewReject::Missing => (StatusCode::NOT_FOUND, "no such image"),
+                PreviewReject::TooLarge => {
+                    (StatusCode::PAYLOAD_TOO_LARGE, "image exceeds the preview size cap")
+                }
+            };
+            return (status, Json(serde_json::json!({"error": msg}))).into_response();
+        }
+    };
+    // The size cap bounds this to <= 10 MiB, so one blocking read on a
+    // blocking thread keeps the runtime free without a streaming path.
+    let path = file.path.clone();
+    let bytes = match tokio::task::spawn_blocking(move || std::fs::read(path)).await {
+        Ok(Ok(bytes)) => bytes,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "no such image"})),
+            )
+                .into_response();
+        }
+    };
+    let mut resp = Response::new(axum::body::Body::from(bytes));
+    let h = resp.headers_mut();
+    h.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static(file.content_type),
+    );
+    h.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    // Per-session data behind a bearer token: no shared cache may keep it.
+    h.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=60"),
+    );
+    // SVG is a scriptable document. `<img>` never runs its scripts, but a
+    // direct navigation (opening the URL in a tab) would execute them in this
+    // origin, where the page keeps its bearer token. `sandbox` disables
+    // scripting while still rendering the picture.
+    if file.content_type == "image/svg+xml" {
+        h.insert(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+        );
+    }
+    resp
 }
 
 /// Run one turn by re-executing this binary in one-shot mode. This keeps serve
@@ -1747,11 +1936,232 @@ mod tests {
         ));
         super::ServeState {
             history_file: root.join("history.sqlite"),
+            workspace_root: root.join("workspace"),
             token: String::new(),
             locks: Default::default(),
             active_turns: Default::default(),
             confirms: Default::default(),
         }
+    }
+
+    /// Preview-path resolution is the security-bearing piece of
+    /// `GET /sessions/{id}/file`: both roots accept images, and everything
+    /// else (traversal, foreign paths, non-images, directories, oversized
+    /// files) is refused with a distinguishable reason.
+    #[test]
+    fn resolve_preview_accepts_images_inside_the_roots_only() {
+        use super::{MAX_PREVIEW_BYTES, PreviewReject, resolve_preview};
+        let base = std::env::temp_dir().join(format!(
+            "a-serve-preview-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let workspace = base.join("workspace");
+        let assets = base.join("s1.assets");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&assets).expect("assets");
+        std::fs::write(workspace.join("chart.svg"), b"<svg/>").expect("chart");
+        std::fs::write(workspace.join("shot.PNG"), b"png").expect("shot");
+        std::fs::write(workspace.join("notes.txt"), b"nope").expect("notes");
+        std::fs::write(assets.join("paste-1.webp"), b"webp").expect("paste");
+        std::fs::write(base.join("outside.png"), b"outside").expect("outside");
+        let roots = vec![workspace.clone(), assets.clone()];
+
+        let got = resolve_preview("chart.svg", &roots).expect("relative workspace path");
+        assert_eq!(got.content_type, "image/svg+xml");
+        assert_eq!(
+            got.path,
+            workspace.join("chart.svg").canonicalize().expect("canon")
+        );
+        assert_eq!(
+            resolve_preview("shot.PNG", &roots).expect("uppercase ext").content_type,
+            "image/png",
+            "the allowlist is case-insensitive"
+        );
+        // Absolute paths are checked against the same roots, so a file that
+        // only lives in the session assets dir is still servable.
+        let abs = assets.join("paste-1.webp");
+        assert_eq!(
+            resolve_preview(abs.to_str().expect("utf8"), &roots)
+                .expect("assets path")
+                .content_type,
+            "image/webp"
+        );
+
+        assert_eq!(
+            resolve_preview("", &roots).unwrap_err(),
+            PreviewReject::BadRequest
+        );
+        assert_eq!(
+            resolve_preview("notes.txt", &roots).unwrap_err(),
+            PreviewReject::BadRequest,
+            "non-image extensions stay invisible even inside the root"
+        );
+        assert_eq!(
+            resolve_preview("missing.png", &roots).unwrap_err(),
+            PreviewReject::Missing
+        );
+        assert_eq!(
+            resolve_preview("../outside.png", &roots).unwrap_err(),
+            PreviewReject::Outside,
+            "a traversal out of the root must not resolve"
+        );
+        assert_eq!(
+            resolve_preview(base.join("outside.png").to_str().expect("utf8"), &roots).unwrap_err(),
+            PreviewReject::Outside,
+            "an absolute path outside both roots is refused"
+        );
+        std::fs::create_dir_all(workspace.join("dir.png")).expect("dir");
+        assert_eq!(
+            resolve_preview("dir.png", &roots).unwrap_err(),
+            PreviewReject::Missing,
+            "a directory is not a previewable file"
+        );
+        let big = workspace.join("big.png");
+        std::fs::File::create(&big)
+            .expect("big")
+            .set_len(MAX_PREVIEW_BYTES + 1)
+            .expect("len");
+        assert_eq!(
+            resolve_preview("big.png", &roots).unwrap_err(),
+            PreviewReject::TooLarge
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(base.join("outside.png"), workspace.join("link.png"))
+                .expect("symlink");
+            assert_eq!(
+                resolve_preview("link.png", &roots).unwrap_err(),
+                PreviewReject::Outside,
+                "a symlink out of the root is refused like a traversal"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The preview route end to end: bearer auth, the bytes and content type
+    /// the page needs, SVG hardening, and every request-level refusal.
+    #[tokio::test]
+    async fn file_route_serves_images_and_guards_access() {
+        use axum::{http::StatusCode, response::IntoResponse as _};
+
+        use super::SessionStore;
+
+        async fn call(state: super::ServeState, auth: bool, path: &str) -> super::Response {
+            use axum::response::IntoResponse as _;
+            let mut headers = axum::http::HeaderMap::new();
+            if auth {
+                headers.insert(
+                    axum::http::header::AUTHORIZATION,
+                    axum::http::HeaderValue::from_static("Bearer t"),
+                );
+            }
+            super::get_session_file(
+                axum::extract::State(state),
+                headers,
+                axum::extract::Path("s1".to_string()),
+                axum::extract::Query(super::FileQuery {
+                    path: path.to_string(),
+                }),
+            )
+            .await
+            .into_response()
+        }
+        let base = std::env::temp_dir().join(format!(
+            "a-serve-file-route-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(workspace.join("chart.svg"), b"<svg/>").expect("svg");
+        std::fs::write(workspace.join("notes.txt"), b"nope").expect("notes");
+        std::fs::write(base.join("outside.png"), b"outside").expect("outside");
+        let history_file = base.join("history.sqlite");
+        let assets = SessionStore::new(&history_file).session_assets_dir("s1");
+        std::fs::create_dir_all(&assets).expect("assets");
+        std::fs::write(assets.join("pasted.png"), b"png-bytes").expect("pasted");
+        let state = super::ServeState {
+            history_file,
+            workspace_root: workspace,
+            token: "t".to_string(),
+            locks: Default::default(),
+            active_turns: Default::default(),
+            confirms: Default::default(),
+        };
+
+        let resp = call(state.clone(), false, "chart.svg").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = call(state.clone(), true, "chart.svg").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/svg+xml")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+            "an SVG preview must not be able to script this origin"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1024)
+            .await
+            .expect("body");
+        assert_eq!(&body[..], b"<svg/>");
+
+        let pasted = assets.join("pasted.png");
+        let resp = call(state.clone(), true, pasted.to_str().expect("utf8")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/png"),
+            "session assets are the second allowed root"
+        );
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_SECURITY_POLICY)
+                .is_none(),
+            "only SVG carries the sandbox header"
+        );
+
+        let resp = call(state.clone(), true, "notes.txt").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = call(state.clone(), true, "missing.png").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = call(
+            state.clone(),
+            true,
+            base.join("outside.png").to_str().expect("utf8"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let mut bad_id_state = state.clone();
+        bad_id_state.token = String::new();
+        let resp = super::get_session_file(
+            axum::extract::State(bad_id_state),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path("bad id".to_string()),
+            axum::extract::Query(super::FileQuery {
+                path: "chart.svg".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Confirmation frames must survive the decoder like any other kind, with
@@ -2013,6 +2423,10 @@ mod tests {
         assert!(body.contains("id=\"serve-app\""));
         assert!(body.contains("/sessions/"));
         assert!(body.contains("turns/stream"));
+        assert!(
+            body.contains("/file?path="),
+            "the page must fetch server-side images through the authed preview route"
+        );
     }
 
     #[tokio::test]
@@ -2633,6 +3047,10 @@ pub(in crate::ai) async fn run_serve(
     }
     let state = ServeState {
         history_file,
+        // Same authority the turn child runs with (it inherits this process's
+        // cwd at spawn), so a path the assistant printed resolves here.
+        workspace_root: crate::ai::driver::runtime_ctx::effective_cwd()
+            .unwrap_or_else(|_| PathBuf::from(".")),
         token,
         // One entry per touched session; bounded by session count in practice.
         // Idle eviction is deferred to a later multi-instance pass.
@@ -2658,6 +3076,7 @@ pub(in crate::ai) async fn run_serve(
             post(post_turn_sse).layer(DefaultBodyLimit::max(MAX_TURN_REQUEST_BYTES)),
         )
         .route("/sessions/{id}/interrupt", post(post_interrupt))
+        .route("/sessions/{id}/file", get(get_session_file))
         .route(
             "/sessions/{id}/confirm",
             get(get_confirm).post(post_confirm),

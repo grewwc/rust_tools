@@ -136,6 +136,15 @@ select, summary { touch-action:manipulation; }
   #conn.open input { flex:1 1 100%; padding:10px 8px; }
   #conn.open #save { flex:1; min-height:44px; }
 }
+/* Server-side images in a reply: the path text stays, the fetched picture
+   sits under it (see decorateImages in the script below). */
+.imgprev { display:block; margin:6px 0; }
+.imgprev.loaded { padding:6px; border:1px solid var(--line); border-radius:8px; }
+.imgprev img { display:block; max-width:100%; max-height:52vh; border-radius:6px; }
+.imgprev .imgcap { display:block; margin-top:4px; font-size:11px; color:var(--dim); word-break:break-all; }
+#viewer { display:none; position:fixed; inset:0; z-index:60; background:rgba(0,0,0,.92); align-items:center; justify-content:center; }
+#viewer.on { display:flex; }
+#viewer img { max-width:100vw; max-height:100vh; }
 </style>
 </head>
 <body id="serve-app">
@@ -184,6 +193,7 @@ select, summary { touch-action:manipulation; }
 <div id="confirmbtns"><button id="cdeny">Deny</button><button id="callow" class="primary">Allow</button></div>
 </div>
 </div>
+<div id="viewer"><img id="viewerimg" alt=""></div>
 <script>
 "use strict";
 // Minimal mobile client for the serve HTTP API (same routes as serve-chat).
@@ -418,7 +428,114 @@ function addMsgMd(text) {
   const d = addMsg("assistant", "", "asst md");
   d.innerHTML = text ? renderMarkdown(text) : "";
   $("msgs").scrollTop = $("msgs").scrollHeight;
+  decorateAndLoad(d);
   return d;
+}
+// --- server-side images ---------------------------------------------------
+// A reply that names an image file (the assistant writes e.g. `out/chart.svg`)
+// is only visible on a phone if the bytes come back over HTTP: the preview
+// route is authed and an <img src> cannot carry the bearer token, so the page
+// fetches the file itself and hands the blob to the <img>. A token that is not
+// a servable image (missing, outside the roots, wrong kind) stays plain text.
+let previewUrls = [];
+const IMG_TOKEN_G = /[\w.@~+\/-]*[\w@~+\/-]\.(?:png|jpe?g|gif|webp|svg|avif|bmp)\b/gi;
+const MAX_PREVIEWS_PER_MSG = 4;
+// Standalone path tokens only: a run of path characters that keeps its
+// directory prefixes (`out/chart.svg`, `rust_tools/chart.svg`, bare
+// `chart.svg`) and ends in an image extension; `xchart.svg` and `chart.svgz`
+// do not. A leading `/` is deliberately excluded, so `/tmp/chart.svg` stays
+// plain text: the route serves workspace-relative paths only, and a path that
+// 404s is then retried once as its basename (loadPreviews), which needs the
+// prefixed token to survive intact without a root ambiguity.
+function imageTokensIn(text) {
+  const found = [];
+  IMG_TOKEN_G.lastIndex = 0;
+  let m;
+  while ((m = IMG_TOKEN_G.exec(text))) {
+    const token = m[0];
+    if (token.length > 200) continue;
+    if (token.startsWith("/")) continue; // absolute paths: never workspace-relative
+    const before = m.index ? text[m.index - 1] : "";
+    const after = text[m.index + token.length] || "";
+    if (before && !/[\s`'"(\[（【:]/.test(before)) continue;
+    if (after && !/[\s`'")，。、\]】）:]/.test(after)) continue;
+    found.push({ at: m.index, token: token });
+  }
+  return found;
+}
+function decorateImages(root) {
+  const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  while (tw.nextNode()) nodes.push(tw.currentNode);
+  let budget = MAX_PREVIEWS_PER_MSG;
+  for (const node of nodes) {
+    const text = node.nodeValue || "";
+    if (!budget || text.indexOf(".") === -1) continue;
+    const hits = imageTokensIn(text).filter(() => budget-- > 0);
+    if (!hits.length) continue;
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    for (const hit of hits) {
+      frag.appendChild(document.createTextNode(text.slice(last, hit.at)));
+      const slot = document.createElement("span");
+      slot.className = "imgprev";
+      slot.dataset.path = hit.token;
+      frag.appendChild(slot);
+      last = hit.at + hit.token.length;
+    }
+    frag.appendChild(document.createTextNode(text.slice(last)));
+    node.parentNode.replaceChild(frag, node);
+  }
+}
+async function loadPreviews(root) {
+  if (!root.querySelectorAll) return;
+  for (const slot of root.querySelectorAll("span.imgprev:not([data-held])")) {
+    slot.dataset.held = "1"; // one fetch per slot, however often the view repaints
+    const path = slot.dataset.path;
+    // Assistants print both workspace-relative paths and bare names, and the
+    // printed prefix need not match the served root; a path that fails is
+    // retried once as a basename before the token falls back to plain text.
+    const attempt = async (p) => {
+      const res = await api("/sessions/" + sessionId + "/file?path=" + encodeURIComponent(p));
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return URL.createObjectURL(await res.blob());
+    };
+    try {
+      let url;
+      try {
+        url = await attempt(path);
+      } catch (e) {
+        const cut = path.lastIndexOf("/");
+        if (cut <= 0) throw e;
+        url = await attempt(path.slice(cut + 1));
+      }
+      previewUrls.push(url);
+      const img = document.createElement("img");
+      img.src = url;
+      img.alt = path;
+      img.loading = "lazy";
+      img.onclick = () => showViewer(url);
+      const cap = document.createElement("span");
+      cap.className = "imgcap";
+      cap.textContent = path;
+      slot.append(img, cap);
+      slot.classList.add("loaded");
+    } catch (e) {
+      slot.replaceWith(document.createTextNode(path));
+    }
+  }
+}
+function decorateAndLoad(root) {
+  decorateImages(root);
+  loadPreviews(root);
+}
+function showViewer(url) {
+  $("viewerimg").src = url;
+  $("viewer").classList.add("on");
+}
+function revokePreviews() {
+  for (const url of previewUrls) URL.revokeObjectURL(url);
+  previewUrls = [];
 }
 // A history fold is titled by what produced it. Tool results are stored as
 // their own `tool`-role messages, so titling them with the raw role printed a
@@ -640,6 +757,7 @@ function histEndsTurn(msgs) {
 }
 async function loadHistory() {
   $("msgs").textContent = "";
+  revokePreviews(); // the transcript's previews belong to the session being left
   if (!sessionId) { addMsg("asst", "no session yet — tap ＋ to start one.", "asst"); return; }
   let msgs = [];
   // One message beyond the rendered window: a tool result sitting at the edge
@@ -983,6 +1101,7 @@ async function send() {
     }
     clearTimeout(stallTimer);
     if (paintTimer !== null) { clearTimeout(paintTimer); paint(); } // flush the tail
+    decorateAndLoad(bubble); // reply paths become previews only once it is final
     if (stalled && !finished && !turnError) goStale("stream stalled (no updates for 60s) — the turn keeps running on the server (following history)");
     else if (!raw) bubble.innerHTML = "<span style='color:var(--dim)'>(empty reply)</span>";
   } catch (e) {
@@ -1105,6 +1224,7 @@ function wire() {
     } catch (e) { addMsg("err", "delete failed: " + e.message, "asst err"); }
   };
   $("img").onclick = () => $("file").click();
+  $("viewer").onclick = () => { $("viewer").classList.remove("on"); $("viewerimg").src = ""; };
   $("file").onchange = async () => {
     for (const f of $("file").files) {
       if (pendingImages.length >= 10) break;
