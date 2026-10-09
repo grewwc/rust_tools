@@ -101,6 +101,12 @@ pub(super) struct ParsedCli {
     /// it. Background mode writes a <sessionid>.pid file in the current directory;
     /// --stop reads it and kills the process.
     pub(super) stop_session: Option<String>,
+    /// Whether to run in HTTP serve mode (`--serve`).
+    pub(super) serve: bool,
+    /// Whether to run the interactive serve client (`--serve-chat`).
+    pub(super) serve_chat: bool,
+    /// Bind address override for `--serve-bind` (empty = config/default).
+    pub(super) serve_bind: String,
 }
 
 /// List of `a` internal "/" / ":" commands, used for shell completion.
@@ -224,6 +230,21 @@ fn register_cli_flags(parser: &mut TermParser) {
         "stop",
         "",
         "stop a background session by session id (e.g. a --stop <sessionid>)",
+    );
+    parser.add_bool(
+        "serve",
+        false,
+        "run in HTTP serve mode (local API for phone/remote client)",
+    );
+    parser.add_bool(
+        "serve-chat",
+        false,
+        "open an interactive chat against a running --serve instance",
+    );
+    parser.add_string(
+        "serve-bind",
+        "",
+        "address of the --serve instance (e.g. 127.0.0.1:8080; default from ai.serve.bind)",
     );
     parser.add_string("model", "", "model name");
     parser.alias("m", "model");
@@ -554,6 +575,9 @@ impl Default for ParsedCli {
             generate_completions: false,
             background: false,
             stop_session: None,
+            serve: false,
+            serve_chat: false,
+            serve_bind: String::new(),
         }
     }
 }
@@ -644,6 +668,16 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     if parser.contains_flag_strict("stop") {
         let val = parser.flag_value_or_default("stop");
         cli.stop_session = Some(val.trim().to_string());
+    }
+
+    // Handle --serve / --serve-chat / --serve-bind.
+    cli.serve = parser.contains_flag_strict("serve");
+    cli.serve_chat = parser.contains_flag_strict("serve-chat");
+    if parser.contains_flag_strict("serve-bind") {
+        cli.serve_bind = parser.flag_value_or_default("serve-bind");
+    }
+    if !cli.serve && !cli.serve_chat && !cli.serve_bind.trim().is_empty() {
+        eprintln!("[serve] warning: --serve-bind is set without --serve/--serve-chat; it will be ignored");
     }
 
     // Handle list-tools.

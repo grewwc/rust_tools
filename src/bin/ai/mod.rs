@@ -21,6 +21,8 @@ mod prompt;
 mod provider;
 mod request;
 mod request_protocol;
+#[cfg(feature = "serve")]
+pub(in crate::ai) mod serve;
 mod skills;
 mod stream;
 mod theme;
@@ -58,6 +60,9 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
     // reqwest is built with rustls-no-provider (no built-in crypto provider);
     // install ring so any code path in this process can build TLS clients.
     rust_tools::ensure_rustls_provider();
+    // Serve-mode chunk streaming handoff: no-op unless this process was
+    // spawned by the serve SSE endpoint with `A_SERVE_LIVE_FIFO` set.
+    background::open_serve_live_fifo_from_env();
     // Internal helper used only by a live side-note `/bg` handoff. It is a fresh
     // process so it can safely resume the still-running parent without inheriting
     // the parent's runtime state; it must not parse normal CLI arguments.
@@ -114,6 +119,33 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[stop] 正在停止 session {session_id}...");
         background::stop_background(session_id)?;
         return Ok(());
+    }
+
+    if cli.serve && cli.serve_chat {
+        return Err("cannot combine --serve and --serve-chat; run the server in one terminal and the chat client in another".into());
+    }
+    if cli.serve_chat {
+        #[cfg(feature = "serve")]
+        {
+            return serve::chat::run_serve_chat(cli);
+        }
+        #[cfg(not(feature = "serve"))]
+        {
+            return Err("this binary was built without the `serve` feature; rebuild with --features serve".into());
+        }
+    }
+    if cli.serve {
+        #[cfg(feature = "serve")]
+        {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            return runtime.block_on(serve::run_serve(cli));
+        }
+        #[cfg(not(feature = "serve"))]
+        {
+            return Err("this binary was built without the `serve` feature; rebuild with --features serve".into());
+        }
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

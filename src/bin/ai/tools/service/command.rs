@@ -10,16 +10,20 @@ use crate::ai::tools::storage::command_runner;
 use crate::cmd::run::CommandRunResult;
 
 const MAX_COMMAND_OUTPUT_CHARS: usize = 16_000;
-/// 将 `$(cat /absolute/literal/path)` 物化为一个普通 shell 参数时的读取上限。
-/// 限制可防止工具在校验之前意外读取无限流或超大文件；常规 JSON / DSL 参数远小于此值。
+/// Read cap when materializing `$(cat /absolute/literal/path)` into a plain
+/// shell argument. The limit stops the tool from accidentally reading an
+/// unbounded stream or an oversized file before validation; regular JSON/DSL
+/// arguments are far smaller.
 const MAX_LITERAL_FILE_SUBSTITUTION_BYTES: usize = 64 * 1024;
 
-/// 内置默认超时与上限（秒），可被 sandbox 配置覆盖。
+/// Built-in default timeout and ceiling (seconds), overridable via sandbox
+/// config.
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_COMMAND_TIMEOUT_MAX_SECS: u64 = 300;
 
-/// 返回 `execute_command` 的 (默认超时, 超时上限)，由 sandbox 配置覆盖。
-/// 非法/缺省值回退到内置常量；上限至少为 1 秒且不小于默认值。
+/// Returns `execute_command`'s (default timeout, timeout ceiling), overridden
+/// by sandbox config. Invalid/missing values fall back to the built-in
+/// constants; the ceiling is at least 1s and never below the default.
 fn config_command_timeout_bounds() -> (u64, u64) {
     let cfg = crate::commonw::configw::get_all_config();
     let default_timeout = cfg
@@ -40,13 +44,16 @@ fn config_command_timeout_bounds() -> (u64, u64) {
     (default_timeout, max_timeout)
 }
 
-/// 纯函数：把请求的超时秒数夹在 `[1, max]` 范围内，缺省时用 `default`。
+/// Pure function: clamp the requested timeout seconds into `[1, max]`, using
+/// `default` when unset.
 fn resolve_command_timeout(requested: Option<u64>, default: u64, max: u64) -> u64 {
     requested.unwrap_or(default).clamp(1, max)
 }
 
-/// 把 UTF-8 数据编码成一个完整的 POSIX shell 单词。单引号内不发生展开；遇到单引号时
-/// 用 `'<backslash><quote>'` 过渡到下一段单引号字面量，文件内容不会成为 shell 代码。
+/// Encode UTF-8 data as a complete POSIX shell word. Inside single quotes no
+/// expansion happens; embedded single quotes are bridged with
+/// `'<backslash><quote>'` into the next single-quoted literal, so file contents
+/// can never become shell code.
 fn shell_single_quote(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('\'');
@@ -100,9 +107,11 @@ fn read_literal_file_substitution(path: &str) -> Result<String, String> {
     Ok(contents)
 }
 
-/// 执行无害命令替换的内部命令并捕获输出，用于物化 `"$(harmless_cmd)"`。
+/// Run the inner command of a harmless command substitution and capture its
+/// output, used to materialize `"$(harmless_cmd)"`.
 fn execute_inner_shell_command(inner: &str, cwd: Option<&str>) -> Result<String, String> {
-    // 复用现有 runner，超时 10s 足以覆盖 date/echo/git 等短命令，又避免长阻塞
+    // Reuse the existing runner; a 10s timeout covers short commands like
+    // date/echo/git while avoiding long blocks.
     let output = crate::ai::tools::storage::command_runner::run_command(inner, cwd, 10)
         .map_err(|err| format!("failed to execute substitution '{inner}': {err}"))?;
     if !output.status.success() {
@@ -122,21 +131,24 @@ fn execute_inner_shell_command(inner: &str, cwd: Option<&str>) -> Result<String,
     if stdout.contains('\0') {
         return Err(format!("substitution '{inner}' output contains NUL bytes"));
     }
-    // bash 的 $(...) 会剥离所有末尾换行，这里复刻该语义
+    // bash's $(...) strips all trailing newlines; replicate that behavior.
     Ok(stdout
         .trim_end_matches(|c| c == '\n' || c == '\r')
         .to_string())
 }
 
-/// 对审计层已证明安全的无害 `"$(...)"` 做数据物化，支持 `cat` 字面量与通用无害命令。
-/// 随后仍对替换后的命令做完整审计，因此替换结果若成为被禁程序名或危险参数仍会被拦截。
+/// Materialize harmless `"$(...)"` substitutions proven safe by the audit
+/// layer as plain data, supporting `cat` literals and generic harmless
+/// commands. The substituted command is still fully audited afterwards, so a
+/// replacement that turns into a blocked program name or dangerous argument is
+/// still rejected.
 fn materialize_safe_shell_substitutions(
     command: &str,
     cwd: Option<&str>,
 ) -> Result<String, String> {
     let substitutions = super::audit::safe_shell_substitutions(command);
     if substitutions.is_empty() {
-        // 回退到旧的 cat 物化以兼容仅含 cat 的历史路径（实际上 safe_shell 已覆盖 cat，此分支仅为无替换时的快速返回）
+        // Fast path: nothing to materialize; return the command unchanged.
         return Ok(command.to_string());
     }
     let mut materialized = command.to_string();
@@ -146,13 +158,17 @@ fn materialize_safe_shell_substitutions(
                 read_literal_file_substitution(&path)?
             }
             super::audit::SafeShellSubstitutionKind::Command { inner } => {
-                // 内层同样需经过完整的门禁：先重做 validate（防分类放宽），再做 git commit 确认（fail-closed）。
-                // 审计算法的 Command 分类仅保证内层曾通过 validate，但不拦截 git commit；若此处
-                // 不单独确认，则 `echo "$(git commit -am x)"` 会在外层确认前已提交，物化后外层
-                // 仅剩 `echo '...'`，导致确认门被绕过。
+                // The inner command must pass the full gate too: re-run
+                // validate first (guards against relaxed classification), then
+                // the git confirmation gate (commit/stash, fail-closed). The
+                // audit classifier only proves the inner command passed
+                // validate; it does not intercept confirm-gated git commands.
+                // Without this, `echo "$(git commit -am x)"` would commit
+                // before the outer confirmation, leaving only `echo '...'`
+                // after materialization and bypassing the gate.
                 super::audit::validate_execute_command(&inner)
                     .map_err(|reason| format!("inner substitution blocked: {reason}"))?;
-                confirm_git_commit_if_needed(&inner)?;
+                confirm_git_confirm_gated_if_needed(&inner)?;
                 execute_inner_shell_command(&inner, cwd)?
             }
         };
@@ -164,13 +180,17 @@ fn materialize_safe_shell_substitutions(
     Ok(materialized)
 }
 
-/// 截断过长输出时同时保留头尾，并在中间附带**可操作的元信息**：总量、已显示量，
-/// 以及一句明确警告——被省略的中段可能包含调用方要找的行，"没看到"不等于"不存在"。
+/// Truncate over-long output keeping head and tail, with **actionable
+/// metadata** in the middle: total count, shown count, and an explicit warning
+/// that the omitted middle may contain the lines the caller is looking for —
+/// "not seen" does not mean "not present".
 ///
-/// 根因背景：`execute_command` 成功路径此前只裸截断加 `... (truncated)`，模型
-/// 无法判断它要找的匹配是否被砍在了未显示部分，于是不断换姿势重试同一条
-/// grep（history.json 的重复调用即源于此）。带上计数与分页提示后，重试动机
-/// 从"信息不全的猜测"变成"有依据的收敛"。
+/// Background: the `execute_command` success path used to truncate silently
+/// with `... (truncated)`, so the model could not tell whether its target
+/// match was cut off in the hidden part and kept retrying near-identical
+/// greps (the repeated calls in history.json come from this). With counts and
+/// a paging hint, the retry motive changes from guessing with incomplete
+/// information to converging on evidence.
 fn truncate_chars(content: &str, max_chars: usize) -> String {
     let total_chars = content.chars().count();
     if total_chars <= max_chars {
@@ -202,13 +222,24 @@ Do not re-run near-identical variants; narrow the query instead (e.g. `grep -c` 
 }
 
 // =========================================================================
-// 执行逻辑（校验已移至 audit 模块）
+// Execution logic (validation moved to the audit module)
 // =========================================================================
 
-/// 判断命令是否为 git 提交类命令（`git commit` / `git -C <dir> commit` 等），
-/// 命中后需要先向用户确认再执行。复用审计层词法解析，保证物化后的带引号参数也不会
-/// 绕过确认，并避免把 `echo 'git commit'` 之类的数据误判为真实命令。
-fn is_git_commit_command(command: &str) -> bool {
+/// `git stash` subactions that are read-only — they touch neither the working
+/// tree nor stash entries, so they need no confirmation. A word only counts as
+/// the subaction when it directly follows `stash` (first positional): in
+/// `git stash push list` the `list` is a path argument and still requires
+/// confirmation.
+const READ_ONLY_GIT_STASH_SUBACTIONS: &[&str] = &["list", "show"];
+
+/// Git subcommands that must be confirmed by the user before running
+/// (`git commit`; `git stash` and its subactions that change the working tree
+/// or stash entries, e.g. pop/drop/clear — read-only `git stash list`/`show`
+/// need no confirmation). Reuses the audit layer's lexical parsing so
+/// materialized quoted arguments cannot bypass confirmation, and data like
+/// `echo 'git commit'` is not mistaken for a real command. Returns the matched
+/// subcommand name (`commit` / `stash`) for prompt and error wording.
+fn confirm_gated_git_subcommand(command: &str) -> Option<&'static str> {
     for segment in super::audit::split_unquoted_segments(command) {
         let tokens = super::audit::effective_command_tokens(&segment);
         let Some(program) = tokens
@@ -221,8 +252,9 @@ fn is_git_commit_command(command: &str) -> bool {
             continue;
         }
 
-        // 跳过 git 全局选项及其取值（-C <path>、-c <key>=<val>、--git-dir=... 等），
-        // 它们可能出现在 `git` 与子命令之间。
+        // Skip git global options and their values (-C <path>,
+        // -c <key>=<val>, --git-dir=..., etc.), which may sit between `git`
+        // and the subcommand.
         let mut j = 1usize;
         loop {
             match tokens.get(j).map(String::as_str) {
@@ -245,35 +277,54 @@ fn is_git_commit_command(command: &str) -> bool {
                 _ => break,
             }
         }
-        if tokens.get(j).map(String::as_str) == Some("commit") {
-            return true;
+        if let Some(sub) = tokens.get(j).map(String::as_str) {
+            // `sub` borrows the local `tokens`; return the matching static
+            // instead so the signature (`Option<&'static str>`) holds.
+            if sub == "commit" {
+                return Some("commit");
+            }
+            if sub == "stash" {
+                // Read-only subactions (list/show) directly after `stash`
+                // need no confirmation; everything else (bare `git stash`=push,
+                // `git stash -- <path>`, or stash options like `git stash -q
+                // list`) still goes through the confirmation gate (fail-closed).
+                if matches!(
+                    tokens.get(j + 1).map(String::as_str),
+                    Some("list") | Some("show")
+                ) {
+                    continue;
+                }
+                return Some("stash");
+            }
         }
     }
-    false
+    None
 }
 
-/// git 提交前请求用户确认。
-/// - 交互终端：红色高亮提示，y 放行，n / Ctrl+C / Esc 取消。
-/// - 非交互环境：直接拒绝（fail-closed），既避免后台进程挂在读输入上，也避免静默提交。
-fn confirm_git_commit_if_needed(command: &str) -> Result<(), String> {
-    if !is_git_commit_command(command) {
+/// Ask the user to confirm confirm-gated git subcommands (`git commit` /
+/// `git stash`) before running them.
+/// - Interactive terminal: red-highlighted prompt; y proceeds, n / Ctrl+C /
+///   Esc cancels.
+/// - Non-interactive environment: rejected outright (fail-closed), both to
+///   avoid background processes hanging on input and to avoid silent execution.
+fn confirm_git_confirm_gated_if_needed(command: &str) -> Result<(), String> {
+    let Some(subcommand) = confirm_gated_git_subcommand(command) else {
         return Ok(());
-    }
+    };
     if !std::io::stdin().is_terminal() {
-        return Err(
-            "Command blocked: git commit requires user confirmation, but stdin is not an \
-             interactive terminal. Do not retry the commit; report to the user and wait for \
+        return Err(format!(
+            "Command blocked: git {subcommand} requires user confirmation, but stdin is not an \
+             interactive terminal. Do not retry the command; report to the user and wait for \
              explicit confirmation (or have them run it in an interactive session)."
-                .to_string(),
-        );
+        ));
     }
     let confirmed = crate::commonw::prompt::prompt_yes_or_no_danger(&format!(
-        "\nConfirm git commit:\n{command}\nProceed? (y/n): "
+        "\nConfirm git {subcommand}:\n{command}\nProceed? (y/n): "
     ));
     match confirmed {
         Some(true) => Ok(()),
-        Some(false) => Err("git commit canceled by user".to_string()),
-        None => Err("git commit canceled by user (Ctrl+C)".to_string()),
+        Some(false) => Err(format!("git {subcommand} canceled by user")),
+        None => Err(format!("git {subcommand} canceled by user (Ctrl+C)")),
     }
 }
 
@@ -291,10 +342,13 @@ fn format_command_result(output: CommandRunResult, timeout_secs: u64) -> String 
     };
 
     if output.stalled {
-        // PTY 交互命令停滞：命令存活但长时间没有输出，几乎可以断定它在等待人类输入
-        // （扫码、密码、菜单），agent 无法提供输入；输出被管道（如 `| tail`）缓冲时
-        // 更是从头到尾都看不到。给出明确诊断 + 已捕获的部分输出（典型：二维码），
-        // 而不是让模型把结果误解为普通超时后盲目重试同一条命令。
+        // PTY interactive command stalled: the process is alive but produced
+        // no output for a long time, which almost certainly means it waits for
+        // human input (QR scan, password, menu) the agent cannot provide; when
+        // output is buffered by a pipe (e.g. `| tail`) nothing shows at all.
+        // Give an explicit diagnosis plus any captured partial output (often
+        // the QR code) instead of letting the model misread this as a plain
+        // timeout and blindly retry the same command.
         let partial = if combined.trim().is_empty() {
             "(no output was captured before termination)".to_string()
         } else {
@@ -329,8 +383,9 @@ fn format_command_result(output: CommandRunResult, timeout_secs: u64) -> String 
         .expect("completed command must carry a status");
     if status.success() {
         let combined = combined.trim();
-        // 空输出但成功退出：显式说明，避免模型把"命令成功、零匹配"误读为
-        // "调用没生效"而反复重试同一条 grep。
+        // Empty output with successful exit: say so explicitly so the model
+        // does not misread "command succeeded, zero matches" as "the call did
+        // not take effect" and retry the same grep repeatedly.
         if combined.is_empty() {
             "(command succeeded with exit code 0 and produced no output)".to_string()
         } else {
@@ -399,19 +454,21 @@ where
 {
     let raw_command = args["command"].as_str().ok_or("Missing command")?;
     let cwd = args["cwd"].as_str().filter(|dir| !dir.trim().is_empty());
-    // 优先物化无害的 "$(...)"（含 cat 字面量与通用无害命令），物化后仍做完整审计
+    // Materialize harmless "$(...)" first (cat literals and generic harmless
+    // commands); the result is still fully audited afterwards.
     let command = materialize_safe_shell_substitutions(raw_command, cwd)
         .map_err(|reason| format!("Command blocked: {reason}"))?;
     let pseudo_terminal = args["pty"].as_bool().unwrap_or(false);
     let (default_timeout, max_timeout) = config_command_timeout_bounds();
     let timeout = resolve_command_timeout(args["timeout"].as_u64(), default_timeout, max_timeout);
 
-    // 命令安全校验委托给 audit 模块。
+    // Command safety validation is delegated to the audit module.
     super::audit::validate_execute_command(&command)
         .map_err(|reason| format!("Command blocked: {reason}"))?;
 
-    // git 提交类命令先向用户确认（非交互环境 fail-closed）。
-    confirm_git_commit_if_needed(&command)?;
+    // Confirm-gated git subcommands (commit/stash) ask the user first
+    // (fail-closed in non-interactive environments).
+    confirm_git_confirm_gated_if_needed(&command)?;
 
     let output =
         command_runner::run_command_streaming(&command, cwd, timeout, pseudo_terminal, on_chunk)?;
@@ -441,9 +498,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_COMMAND_OUTPUT_CHARS, SLEEP_WARNING, confirm_git_commit_if_needed, contains_sleep,
-        execute_command, format_command_result, is_git_commit_command, resolve_command_timeout,
-        truncate_chars,
+        MAX_COMMAND_OUTPUT_CHARS, SLEEP_WARNING, confirm_gated_git_subcommand,
+        confirm_git_confirm_gated_if_needed, contains_sleep, execute_command, format_command_result,
+        resolve_command_timeout, truncate_chars,
     };
     use crate::cmd::run::CommandRunResult;
     use serde_json::json;
@@ -464,52 +521,124 @@ mod tests {
         ))
     }
 
-    // ---- is_git_commit_command ----
+    // ---- confirm-gated git subcommands (commit / stash) ----
 
     #[test]
     fn commit_detection_matches_plain_git_commit() {
-        assert!(is_git_commit_command("git commit -m \"fix x\""));
-        assert!(is_git_commit_command("git commit"));
-        assert!(is_git_commit_command("git commit --amend"));
-        assert!(is_git_commit_command("git 'commit' -m message"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git commit -m \"fix x\""),
+            Some("commit")
+        );
+        assert_eq!(confirm_gated_git_subcommand("git commit"), Some("commit"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git commit --amend"),
+            Some("commit")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git 'commit' -m message"),
+            Some("commit")
+        );
     }
 
     #[test]
     fn commit_detection_skips_global_options() {
-        assert!(is_git_commit_command("git -C /repo commit -m x"));
-        assert!(is_git_commit_command("git --git-dir=/repo/.git commit"));
-        assert!(is_git_commit_command("git -c user.name=X commit"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git -C /repo commit -m x"),
+            Some("commit")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git --git-dir=/repo/.git commit"),
+            Some("commit")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git -c user.name=X commit"),
+            Some("commit")
+        );
     }
 
     #[test]
     fn commit_detection_finds_commit_in_command_chains() {
-        assert!(is_git_commit_command("git add -A && git commit -m x"));
-        assert!(is_git_commit_command(
-            "git -C /repo add . && git -C /repo commit"
-        ));
+        assert_eq!(
+            confirm_gated_git_subcommand("git add -A && git commit -m x"),
+            Some("commit")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git -C /repo add . && git -C /repo commit"),
+            Some("commit")
+        );
     }
 
     #[test]
-    fn commit_detection_ignores_non_commit_commands() {
-        assert!(!is_git_commit_command("git status"));
-        assert!(!is_git_commit_command("git log --oneline | grep commit"));
-        assert!(!is_git_commit_command("git svn commit"));
-        assert!(!is_git_commit_command("echo 'git commit' > note.txt"));
-        assert!(!is_git_commit_command("git commitmessage"));
+    fn stash_detection_matches_all_stash_forms() {
+        assert_eq!(confirm_gated_git_subcommand("git stash"), Some("stash"));
+        assert_eq!(confirm_gated_git_subcommand("git stash pop"), Some("stash"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git stash drop stash@{0}"),
+            Some("stash")
+        );
+        assert_eq!(confirm_gated_git_subcommand("git stash clear"), Some("stash"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git -C /repo stash push -m wip"),
+            Some("stash")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git stash && echo done"),
+            Some("stash")
+        );
+        assert_eq!(confirm_gated_git_subcommand("env git stash"), Some("stash"));
+        assert_eq!(confirm_gated_git_subcommand("xargs git stash"), Some("stash"));
+        assert_eq!(confirm_gated_git_subcommand("nohup git stash"), Some("stash"));
+        assert_eq!(confirm_gated_git_subcommand("command git stash"), Some("stash"));
+        // Read-only subactions (list/show) directly after `stash` need no
+        // confirmation.
+        assert_eq!(confirm_gated_git_subcommand("git stash list"), None);
+        assert_eq!(confirm_gated_git_subcommand("git stash show"), None);
+        assert_eq!(confirm_gated_git_subcommand("git stash show stash@{0}"), None);
+        assert_eq!(confirm_gated_git_subcommand("git stash list --format='%gd'"), None);
+        // `list`/`show` outside the subaction position (`--` followed by a
+        // path, `-q` a stash option, or coexisting with a confirm-gated
+        // subaction) still require confirmation.
+        assert_eq!(confirm_gated_git_subcommand("git stash -- list"), Some("stash"));
+        assert_eq!(confirm_gated_git_subcommand("git stash -q list"), Some("stash"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git stash list && git stash drop"),
+            Some("stash")
+        );
     }
 
     #[test]
-    fn commit_confirmation_fails_closed_without_terminal() {
-        // 测试环境 stdin 非终端：提交类命令必须被拒绝，且不挂起。
-        let err = confirm_git_commit_if_needed("git commit -m x").unwrap_err();
-        assert!(err.contains("blocked"), "err: {err}");
-        assert!(err.contains("confirmation"), "err: {err}");
+    fn confirm_gated_detection_ignores_non_gated_commands() {
+        assert_eq!(confirm_gated_git_subcommand("git status"), None);
+        assert_eq!(confirm_gated_git_subcommand("git log --oneline | grep commit"), None);
+        assert_eq!(confirm_gated_git_subcommand("git svn commit"), None);
+        assert_eq!(confirm_gated_git_subcommand("echo 'git commit' > note.txt"), None);
+        assert_eq!(confirm_gated_git_subcommand("git commitmessage"), None);
+        assert_eq!(confirm_gated_git_subcommand("git stashlist"), None);
+        assert_eq!(confirm_gated_git_subcommand("echo 'git stash' > note.txt"), None);
+    }
+
+    #[test]
+    fn confirm_gated_fails_closed_without_terminal() {
+        // Test stdin is not a terminal: confirm-gated git subcommands must be
+        // rejected without hanging.
+        for (command, sub) in [
+            ("git commit -m x", "commit"),
+            ("git stash", "stash"),
+            ("git stash drop stash@{0}", "stash"),
+            ("git -C /repo stash clear", "stash"),
+        ] {
+            let err = confirm_git_confirm_gated_if_needed(command).unwrap_err();
+            assert!(err.contains("blocked"), "{command}: {err}");
+            assert!(err.contains("confirmation"), "{command}: {err}");
+            assert!(err.contains(sub), "{command}: {err}");
+        }
     }
 
     #[test]
     fn execute_command_blocks_git_commit_inside_substitution_without_terminal() {
-        // P0 回归：非 TTY 下 `echo "$(git commit ...)"` 必须被 fail-closed 拦截，
-        // 不能通过命令替换绕过确认门禁静默执行。
+        // P0 regression: without a TTY, `echo "$(git commit ...)"` must be
+        // rejected fail-closed; command substitution must not silently bypass
+        // the confirmation gate.
         let err = execute_command(&json!({
             "command": r#"echo "$(git commit -am x)""#,
             "pty": false,
@@ -521,9 +650,28 @@ mod tests {
     }
 
     #[test]
-    fn commit_confirmation_passes_through_non_commit_commands() {
-        assert!(confirm_git_commit_if_needed("git status").is_ok());
-        assert!(confirm_git_commit_if_needed("echo hello").is_ok());
+    fn execute_command_blocks_git_stash_inside_substitution_without_terminal() {
+        // Same as commit: without a TTY, `echo "$(git stash)"` must fail
+        // closed; command substitution must not silently bypass the
+        // confirmation gate.
+        let err = execute_command(&json!({
+            "command": r#"echo "$(git stash)""#,
+            "pty": false,
+            "timeout": 5,
+        }))
+        .unwrap_err();
+        assert!(err.contains("blocked"), "err: {err}");
+        assert!(err.contains("confirmation"), "err: {err}");
+    }
+
+    #[test]
+    fn confirm_gated_passes_through_non_gated_commands() {
+        assert!(confirm_git_confirm_gated_if_needed("git status").is_ok());
+        assert!(confirm_git_confirm_gated_if_needed("echo hello").is_ok());
+        // Read-only stash subactions pass through even in non-interactive
+        // environments without triggering confirmation.
+        assert!(confirm_git_confirm_gated_if_needed("git stash list").is_ok());
+        assert!(confirm_git_confirm_gated_if_needed("git stash show stash@{0}").is_ok());
     }
 
     // ---- contains_sleep ----
@@ -610,10 +758,12 @@ mod tests {
 
     #[test]
     fn truncate_emits_actionable_metadata_when_over_limit() {
-        // 1000 行，每行较短，整体远超小上限，触发截断。
+        // 1000 short lines total far more than the small cap, triggering
+        // truncation.
         let content: String = (0..1000).map(|i| format!("line{i}\n")).collect();
         let out = truncate_chars(&content, 100);
-        // 不再是无信息的 "... (truncated)"，而是带总量/已显示/分页提示。
+        // Not a bare "... (truncated)" anymore: the output carries
+        // totals/shown counts and a paging hint.
         assert!(out.contains("truncated: omitted middle"), "out: {out}");
         assert!(out.contains("first 75 and last 25"), "out: {out}");
         assert!(out.contains("of 1000 lines"), "out: {out}");

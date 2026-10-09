@@ -721,7 +721,19 @@ pub(super) fn ensure_tool_calls_section_open(
 
     if state.content.thinking_open {
         // If fold mode is active, render the fold ending first
-        if state.render.thinking_fold.active {
+        if crate::ai::background::serve_live_streaming() {
+            // Serve children have no local fold: thinking arrives through
+            // frames, so the fold is never active here and the else branch
+            // below would print the raw close marker to child stdout, where
+            // the SSE line pump forwards it as a plain message (a stray
+            // `╰─ done thinking` row under the chat client's folded
+            // `✓ thinking` summary on every tool round). Close the remote
+            // fold instead; the chat-side close is idempotent.
+            crate::ai::background::publish_serve_frame(
+                crate::ai::background::ServeLiveKind::ThinkingDone,
+                "",
+            );
+        } else if state.render.thinking_fold.active {
             let _ = finalize_thinking_fold(state);
         } else {
             let _ = write_stream_content(

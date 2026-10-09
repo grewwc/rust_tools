@@ -906,6 +906,15 @@ fn finalize_stream_response(
         flush_digest_filter_to_terminal(markers, &mut state, true)?;
         if state.render.thinking_fold.active {
             finalize_thinking_fold(&mut state)?;
+        } else if crate::ai::background::serve_live_streaming() {
+            // Truncated stream with no local fold: close the remote fold
+            // instead of leaking the end marker to child stdout (the SSE
+            // line pump would forward it as a plain message). Local piped
+            // runs keep printing the marker, as before.
+            crate::ai::background::publish_serve_frame(
+                crate::ai::background::ServeLiveKind::ThinkingDone,
+                "",
+            );
         } else {
             write_stream_content(
                 &format!("\n{}\n", markers.end_thinking_tag),
@@ -1083,8 +1092,11 @@ fn finalize_stream_response(
             StreamOutcome::Completed
         }
     };
-
-    if render_terminal && state.render.defer_assistant_body && outcome != StreamOutcome::Completed {
+    // Serve-streamed turns already delivered this text through the live FIFO;
+    // re-printing a truncated tail would show it twice.
+    if render_terminal && state.render.defer_assistant_body && outcome != StreamOutcome::Completed
+        && !crate::ai::background::serve_live_streaming()
+    {
         let visible_text = crate::ai::request::strip_digest_blocks(&state.content.assistant_text);
         let duplicate = deferred_dedupe_candidate
             .as_deref()
@@ -1412,13 +1424,23 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
             let _ = flush_digest_filter_to_terminal(markers, state, true);
         }
         if state.content.thinking_open && !fold_settled {
-            let _ = write_stream_content(
-                &format!("\n{}\n", markers.end_thinking_tag),
-                &mut state.render.markdown,
-                false,
-            );
-            print!("\x1b[0m");
-            let _ = io::stdout().flush();
+            if crate::ai::background::serve_live_streaming() {
+                // Same off-stdout rule as the splitter Marker arm: close the
+                // remote fold instead of printing the marker where the SSE
+                // line pump would forward it as a plain message.
+                crate::ai::background::publish_serve_frame(
+                    crate::ai::background::ServeLiveKind::ThinkingDone,
+                    "",
+                );
+            } else {
+                let _ = write_stream_content(
+                    &format!("\n{}\n", markers.end_thinking_tag),
+                    &mut state.render.markdown,
+                    false,
+                );
+                print!("\x1b[0m");
+                let _ = io::stdout().flush();
+            }
         }
         if state.render.subagent_fold.active {
             let _ = finalize_subagent_preview_fold(state);
@@ -1440,9 +1462,12 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         StreamOutcome::Completed
     };
     let assistant_text = std::mem::take(&mut state.content.assistant_text);
+    // Serve-streamed turns already delivered this text through the live FIFO;
+    // re-printing a truncated tail would show it twice.
     if runtime_ctx::terminal_output_enabled()
         && state.render.defer_assistant_body
         && outcome != StreamOutcome::Completed
+        && !crate::ai::background::serve_live_streaming()
     {
         let visible_text = crate::ai::request::strip_digest_blocks(&assistant_text);
         if !visible_text.trim().is_empty() {
@@ -1888,6 +1913,21 @@ fn write_stream_split_segment(
         } => {
             let suppress_duplicate = terminal_dedupe_buffer_is_complete_match(state);
             disable_terminal_dedupe(state, suppress_duplicate)?;
+            if crate::ai::background::serve_live_streaming() {
+                // Serve children have no local fold: a marker reaching the
+                // body path means thinking already closed when the chunk
+                // arrived (typical for tool-call rounds), or a late splitter
+                // flush. Keep it off child stdout — the SSE line pump would
+                // forward it as a plain message and the chat client would
+                // print a second close line under its folded `✓ thinking`
+                // summary. The chat-side close is idempotent, so this also
+                // safely covers markers the CloseThinking event reported.
+                crate::ai::background::publish_serve_frame(
+                    crate::ai::background::ServeLiveKind::ThinkingDone,
+                    "",
+                );
+                return Ok(());
+            }
             write_stream_content_to_terminal(&text, &mut state.render.markdown, false)
         }
     }
@@ -1993,6 +2033,14 @@ fn write_thinking_content_folded(
     if content.is_empty() {
         return Ok(());
     }
+    if crate::ai::background::serve_live_streaming() {
+        // Serve children stream to a chat client, not a terminal: cursor
+        // rewrites are meaningless across the process boundary, and unfolded
+        // thinking lines would be indistinguishable from the answer. Frame
+        // the thinking lifecycle instead and keep it off stdout (the SSE
+        // line pump would otherwise forward it as plain message events).
+        return write_thinking_content_serve(content, markers);
+    }
     let fold = &mut state.render.thinking_fold;
 
     if fold.max_visible_lines == usize::MAX {
@@ -2023,6 +2071,57 @@ fn write_thinking_content_folded(
         fold_header_rate(&state.content, Instant::now()).as_deref(),
         fold,
     )
+}
+
+/// Classify one serve-mode thinking chunk into an ordered frame sequence.
+///
+/// The common cases are a standalone open/close marker or a plain body
+/// chunk. Chunk granularity is model-driven rather than line-driven, so the
+/// close marker can also arrive glued to body text; a standalone-only check
+/// would miss it and leave the remote fold open until end-of-stream, letting
+/// the answer interleave with the chat client's thinking status line.
+/// Splitting here keeps the close on time. Text after the marker is already
+/// answer text (the content path never sees this chunk), so it is returned
+/// as a delta instead of being swallowed by the fold.
+fn split_serve_thinking_chunk<'a>(
+    content: &'a str,
+    thinking_tag: &str,
+    end_thinking_tag: &str,
+) -> Vec<(crate::ai::background::ServeLiveKind, &'a str)> {
+    use crate::ai::background::ServeLiveKind;
+    if is_standalone_stream_marker(content, thinking_tag) {
+        return vec![(ServeLiveKind::ThinkingStart, "")];
+    }
+    if is_standalone_stream_marker(content, end_thinking_tag) {
+        return vec![(ServeLiveKind::ThinkingDone, "")];
+    }
+    if !end_thinking_tag.is_empty() {
+        if let Some((head, tail)) = content.split_once(end_thinking_tag) {
+            let mut out = Vec::with_capacity(3);
+            if !head.is_empty() {
+                out.push((ServeLiveKind::Thinking, head));
+            }
+            out.push((ServeLiveKind::ThinkingDone, ""));
+            if !tail.trim().is_empty() {
+                out.push((ServeLiveKind::Delta, tail));
+            }
+            return out;
+        }
+    }
+    vec![(ServeLiveKind::Thinking, content)]
+}
+
+/// Serve-mode thinking sink: publish the classified frames for the chat
+/// client to fold remotely. Everything returns here, so nothing thinking
+/// related reaches child stdout.
+fn write_thinking_content_serve(content: &str, markers: &StreamMarkers) -> io::Result<()> {
+    use crate::ai::background::publish_serve_frame;
+    for (kind, text) in
+        split_serve_thinking_chunk(content, &markers.thinking_tag, &markers.end_thinking_tag)
+    {
+        publish_serve_frame(kind, text);
+    }
+    Ok(())
 }
 
 fn write_subagent_content_folded(

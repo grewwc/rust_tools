@@ -292,6 +292,9 @@ fn open_live_output_fifo(_session_id: &str) -> std::io::Result<()> {
 /// Publish one committed assistant-text chunk to the live-output FIFO opened
 /// by a real-time `/bg` handoff. Best-effort by contract: never blocks, never
 /// fails the caller, and silently drops chunks while nobody is attached.
+/// When this process streams through a serve-owned FIFO (see
+/// [`SERVE_LIVE_FIFO_ENV`]), the same chunk is framed as a `Delta` event
+/// instead of raw bytes; the `/bg` byte protocol is untouched.
 pub(crate) fn publish_live_output(text: &str) {
     if text.is_empty() {
         return;
@@ -300,6 +303,10 @@ pub(crate) fn publish_live_output(text: &str) {
         // After live `/bg` handoff stdout/stderr are already mirrored through the
         // relay pipe. Suppress legacy assistant-chunk publishing to avoid
         // duplicating visible assistant text on reattach.
+        return;
+    }
+    if serve_live_streaming() {
+        publish_serve_frame(ServeLiveKind::Delta, text);
         return;
     }
     publish_live_output_bytes(text.as_bytes());
@@ -344,6 +351,109 @@ fn publish_live_output_bytes(bytes: &[u8]) {
             break; // EAGAIN (no reader) / EPIPE / other: drop the rest
         }
         written += n as usize;
+    }
+}
+
+/// Environment handoff for serve-mode chunk streaming: the serve SSE endpoint
+/// pre-creates a per-turn FIFO and passes its path here before spawning a
+/// one-shot child. The child then publishes every committed assistant-text
+/// chunk into that pipe through the existing [`publish_live_output`] path, so
+/// the server can forward token-level deltas without re-running the turn
+/// in-process. Never set by users; only by `serve::post_turn_sse`.
+pub(crate) const SERVE_LIVE_FIFO_ENV: &str = "A_SERVE_LIVE_FIFO";
+
+/// Set while [`open_serve_live_fifo_from_env`] installed a serve FIFO. Tells
+/// the final-echo sites (driver finalize, stream truncation paths) to stay
+/// quiet: the same text already streamed through the pipe chunk by chunk, and
+/// printing it again would show the answer twice.
+static SERVE_LIVE_STREAMING: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process streams its turn through a serve-owned live FIFO.
+pub(crate) fn serve_live_streaming() -> bool {
+    SERVE_LIVE_STREAMING.load(Ordering::Relaxed)
+}
+
+/// Install the serve-owned live FIFO passed via [`SERVE_LIVE_FIFO_ENV`].
+/// No-op when the variable is absent (normal CLI runs). The inode itself is
+/// created by the serve side before this process spawns; the writer fd is
+/// still opened on demand by [`publish_live_output`], so a missing inode only
+/// drops chunks, never fails the turn.
+#[cfg(unix)]
+pub(crate) fn open_serve_live_fifo_from_env() {
+    let Ok(path) = std::env::var(SERVE_LIVE_FIFO_ENV) else {
+        return;
+    };
+    // Internal handoff only: scrub it so exec'd grandchildren (MCP servers,
+    // nested tool processes) never mistake it for their own channel.
+    // SAFETY: runs once at process entry before any other thread spawns, so
+    // no concurrent env access can exist yet.
+    unsafe { std::env::remove_var(SERVE_LIVE_FIFO_ENV) };
+    if path.is_empty() {
+        return;
+    }
+    let mut guard = LIVE_OUTPUT_FIFO.lock().unwrap_or_else(|p| p.into_inner());
+    *guard = Some(LiveOutputFifo {
+        fd: None,
+        path: PathBuf::from(path),
+    });
+    SERVE_LIVE_STREAMING.store(true, Ordering::Relaxed);
+}
+
+
+/// Non-unix processes have no FIFO: scrub the handoff and keep CLI behavior.
+#[cfg(not(unix))]
+pub(crate) fn open_serve_live_fifo_from_env() {
+    // SAFETY: runs once at process entry before any other thread spawns, so
+    // no concurrent env access can exist yet.
+    unsafe { std::env::remove_var(SERVE_LIVE_FIFO_ENV) };
+}
+
+/// Event kinds carried by the serve-owned live FIFO. The decoder lives in
+/// `serve` (`ServeFrameDecoder`); keep the discriminants in sync.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServeLiveKind {
+    Delta = 1,
+    ThinkingStart = 2,
+    Thinking = 3,
+    ThinkingDone = 4,
+    OutputComplete = 5,
+}
+
+/// Max payload bytes per serve frame: header (5) + payload stays under the
+/// 4096-byte pipe atomicity bound, so one frame is one `write` syscall and
+/// can never interleave with a concurrent same-process publisher.
+const MAX_SERVE_FRAME_BYTES: usize = 4000;
+/// Defensive cap accepted by the serve decoder; larger lengths are dropped.
+pub(crate) const MAX_SERVE_FRAME_LEN: u32 = 16 * 1024 * 1024;
+
+/// Publish one framed event to the serve-owned live FIFO. No-op unless
+/// [`open_serve_live_fifo_from_env`] installed a serve FIFO (normal CLI and
+/// `/bg` runs never take this path). Best-effort like [`publish_live_output`]:
+/// oversized payloads are split at char boundaries, a missing reader drops
+/// the frame, never fails the turn.
+pub(crate) fn publish_serve_frame(kind: ServeLiveKind, text: &str) {
+    if !serve_live_streaming() {
+        return;
+    }
+    if text.is_empty() {
+        let frame = [kind as u8, 0, 0, 0, 0];
+        publish_live_output_bytes(&frame);
+        return;
+    }
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        let mut end = (start + MAX_SERVE_FRAME_BYTES).min(bytes.len());
+        while end < bytes.len() && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let payload = &bytes[start..end];
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(kind as u8);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        publish_live_output_bytes(&frame);
+        start = end;
     }
 }
 

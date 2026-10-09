@@ -4574,6 +4574,45 @@ fn unarmed_demuxer_leaves_content_untouched() {
 // payloads (JSON strings, or the literal "[DONE]") and serves them over a real
 // loopback socket; `drive(events)` runs the parser and returns the StreamResult.
 // New golden cases only add fixtures; the harness is fixed.
+#[test]
+fn serve_thinking_chunk_split_keeps_glued_close_marker_on_time() {
+    use crate::ai::background::ServeLiveKind;
+
+    let open = "╭─ thinking";
+    let close = "╰─ done thinking";
+    // Standalone markers keep their one-frame mapping.
+    let open_case = format!("\n{open}\n");
+    assert_eq!(
+        split_serve_thinking_chunk(&open_case, open, close),
+        vec![(ServeLiveKind::ThinkingStart, "")]
+    );
+    let close_case = format!("{close}\n");
+    assert_eq!(
+        split_serve_thinking_chunk(&close_case, open, close),
+        vec![(ServeLiveKind::ThinkingDone, "")]
+    );
+    // Plain body passes through untouched.
+    assert_eq!(
+        split_serve_thinking_chunk("half a thought", open, close),
+        vec![(ServeLiveKind::Thinking, "half a thought")]
+    );
+    // A close marker glued to body text still closes on time: the head stays
+    // thinking and the answer tail becomes a delta instead of being swallowed
+    // by the fold.
+    assert_eq!(
+        split_serve_thinking_chunk(
+            "half a thought\n╰─ done thinking\nAnd the answer",
+            open,
+            close
+        ),
+        vec![
+            (ServeLiveKind::Thinking, "half a thought\n"),
+            (ServeLiveKind::ThinkingDone, ""),
+            (ServeLiveKind::Delta, "\nAnd the answer"),
+        ]
+    );
+}
+
 mod golden_wire {
     use super::*;
     #[test]

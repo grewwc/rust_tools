@@ -35,6 +35,22 @@ pub(crate) fn register(session_id: &str, pgid: u32) {
         .insert(pgid);
 }
 
+/// True when `pgid` is a registered background process group of `session_id`.
+/// Read-only probe used by the command sandbox to decide whether a
+/// `kill`/`pkill`/`killall` target may be signaled: only process groups this
+/// session started via `execute_command` are killable, everything else stays
+/// blocked.
+pub(crate) fn is_registered_pgid(session_id: &str, pgid: u32) -> bool {
+    if session_id.is_empty() || pgid == 0 {
+        return false;
+    }
+    REGISTRY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(session_id)
+        .is_some_and(|pgids| pgids.contains(&pgid))
+}
+
 /// 清理指定会话登记的所有后台进程组：先 `SIGTERM` 给存活组一次优雅退出的机会，
 /// 短暂等待后对仍存活的组补 `SIGKILL`。返回实际发出终止信号的进程组数量。
 pub(crate) fn kill_session(session_id: &str) -> usize {

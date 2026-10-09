@@ -435,7 +435,10 @@ pub(super) async fn finalize_turn(
             final_assistant_recorded,
             turn_messages,
         );
+        // Serve-streamed turns already delivered this text chunk by chunk
+        // through the live FIFO; re-printing would show the answer twice.
         if crate::ai::driver::runtime_ctx::terminal_output_enabled()
+            && !crate::ai::background::serve_live_streaming()
             && let Some(visible_text) = terminal_final_text_to_render(
                 final_assistant_text,
                 final_assistant_recorded,
@@ -473,29 +476,6 @@ pub(super) async fn finalize_turn(
         // In goal mode, run_loop uses this flag to decide whether the goal is complete:
         // no tool calls at the end of a round = the agent delivered its final result.
         app.last_turn_had_tool_calls = had_tool_calls;
-        // Persisted compression: foreground interactive turns dispatch to the background to avoid waiting
-        // on CPU compression + a SQLite write transaction after the answer is delivered (the snapshot is only
-        // a write-back cache; the next round recomputes from canonical).
-        // One-shot runs, soon-to-exit processes, and subagent turns take the current future so the owning
-        // history does not end its lifetime first.
-        // `at_boundary` = no tool calls this round (answer delivered), using the more aggressive threshold.
-        dispatch_finalize_compaction(
-            app,
-            !had_tool_calls,
-            should_compact_session_history_in_background(
-                one_shot_mode,
-                should_quit,
-                crate::ai::driver::runtime_ctx::has_subagent_result_slot(),
-            ),
-        )
-        .await;
-        // Try to generate an LLM summary title for the current conversation (when none exists and there is enough context).
-        // Interactive foreground turns must not wait here on a background quality task.
-        maybe_generate_session_title(
-            app,
-            should_generate_session_title_in_background(one_shot_mode, should_quit),
-        )
-        .await;
         // println!();
 
         let mut first_observer_emitted = false;
@@ -540,6 +520,51 @@ pub(super) async fn finalize_turn(
             }
         }
         let _ = poisoned;
+        // Serve streaming: everything user-visible (answer, observer footers)
+        // is printed above. Emit the marker so the server can end the SSE
+        // turn now instead of waiting for process exit (a first turn would
+        // otherwise idle behind the silent bookkeeping below). The publish is a
+        // no-op unless a serve FIFO is installed; the one-shot + terminal
+        // gates scope it to the top-level serve child turn (background
+        // subagent scopes suppress terminal output, interactive turns are
+        // not one-shot).
+        if one_shot_mode && crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+            crate::ai::background::publish_serve_frame(
+                crate::ai::background::ServeLiveKind::OutputComplete,
+                "",
+            );
+        }
+        // Persisted compression runs after the early-done marker above: the
+        // snapshot is only a write-back cache (the next round recomputes from
+        // canonical), so the user-visible turn must not wait on CPU
+        // compression plus a SQLite write transaction. Foreground interactive
+        // turns still dispatch to the background; one-shot runs, soon-to-exit
+        // processes, and subagent turns still take the current future so the
+        // owning history does not end its lifetime first.
+        // `at_boundary` = no tool calls this round (answer delivered), using
+        // the more aggressive threshold.
+        dispatch_finalize_compaction(
+            app,
+            !had_tool_calls,
+            should_compact_session_history_in_background(
+                one_shot_mode,
+                should_quit,
+                crate::ai::driver::runtime_ctx::has_subagent_result_slot(),
+            ),
+        )
+        .await;
+        // Try to generate an LLM summary title for the current conversation (when none exists and there is enough context).
+        // Interactive foreground turns must not wait here on a background quality task.
+        // Runs after the user-visible output (and the serve early-done marker
+        // above): title generation prints nothing and observers don't consult
+        // it, so this order is unobservable to single-machine runs but keeps
+        // the SSE turn from idling behind the title LLM call. Stays in this
+        // arm so no-response turns keep skipping title generation, as before.
+        maybe_generate_session_title(
+            app,
+            should_generate_session_title_in_background(one_shot_mode, should_quit),
+        )
+        .await;
     } else {
         if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
             println!("{}", format_empty_state("no response"));

@@ -265,4 +265,10 @@ impl AiConfig {
     /// directly (true) or opens per-file `before/after` temp copies via
     /// `code --diff` (false, default).
     pub const DIFF_OPEN_PATCH_FILE: &str = "ai.diff.open_patch_file";
+
+    // ── Serve (HTTP) ───────────────────────────────────────
+    /// Bind address for `a --serve` (default "127.0.0.1:8080").
+    pub const SERVE_BIND: &str = "ai.serve.bind";
+    /// Bearer token for `a --serve`. Empty = no auth (loopback only).
+    pub const SERVE_TOKEN: &str = "ai.serve.token";
 }

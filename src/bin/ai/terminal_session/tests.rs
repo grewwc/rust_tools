@@ -178,6 +178,9 @@ fn default_cli() -> ParsedCli {
         generate_completions: false,
         background: false,
         stop_session: None,
+        serve: false,
+        serve_bind: String::new(),
+        serve_chat: false,
     }
 }
 

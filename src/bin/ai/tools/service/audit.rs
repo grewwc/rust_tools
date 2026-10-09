@@ -8,6 +8,7 @@
 ///   execution logic.
 use crate::ai::config_schema::AiConfig;
 use crate::ai::tools::storage::file_store::path_within_allowed_roots;
+use crate::ai::tools::storage::process_registry;
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -750,7 +751,11 @@ fn indirect_command_index(
 
 pub(crate) fn effective_command_tokens(segment: &str) -> Vec<String> {
     let tokens = tokenize_shell_words(segment);
-    let Some(start) = command_word_index(&tokens, true) else {
+    // Env-assignment prefixes (`FOO=1 rm ...`) only have shell meaning when
+    // the command is shell-executed; a no-shell segment execs `FOO=1` as the
+    // literal program and fails, so it must not be skipped here.
+    let shell_context = crate::cmd::run::command_requires_shell(segment);
+    let Some(start) = command_word_index(&tokens, shell_context) else {
         return Vec::new();
     };
     let mut current = tokens[start..].to_vec();
@@ -773,6 +778,43 @@ pub(crate) fn effective_command_tokens(segment: &str) -> Vec<String> {
         current = current[index..].to_vec();
     }
     current
+}
+
+/// True when the wrapper chain of `segment` (peeled like
+/// `effective_command_tokens`) contains `xargs`, directly or behind further
+/// wrappers (`timeout 5 xargs kill 123`). `xargs` appends stdin items as
+/// extra arguments at runtime, so the final command's argument set is never
+/// fully visible on the command line; callers use this to fail closed for
+/// commands whose runtime arguments cannot be audited.
+fn effective_chain_uses_xargs(segment: &str) -> bool {
+    let tokens = tokenize_shell_words(segment);
+    let shell_context = crate::cmd::run::command_requires_shell(segment);
+    let Some(start) = command_word_index(&tokens, shell_context) else {
+        return false;
+    };
+    let mut current = tokens[start..].to_vec();
+    for _ in 0..4 {
+        let Some(program) = current.first().and_then(|token| {
+            std::path::Path::new(token)
+                .file_name()
+                .and_then(|name| name.to_str())
+        }) else {
+            break;
+        };
+        if program.eq_ignore_ascii_case("xargs") {
+            return true;
+        }
+        let lower = current
+            .iter()
+            .map(|token| token.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let Some(index) = indirect_command_index(&program.to_ascii_lowercase(), &lower, &current)
+        else {
+            break;
+        };
+        current = current[index..].to_vec();
+    }
+    false
 }
 
 fn is_shell_program(program: &str) -> bool {
@@ -1191,17 +1233,13 @@ pub(crate) fn command_subcommand_index(command_tokens: &[String]) -> Option<usiz
 const BLOCKED_GIT_SUBCOMMANDS: &[(&str, &str)] = &[
     // Prevent pushing local commits to a remote repository.
     ("push", "git push is blocked by sandbox policy"),
-    // `git stash` (including pop/drop/clear subactions) stashes or even discards
-    // working-tree changes and can easily lose uncommitted work; the agent may
-    // not invoke it on its own.
-    ("stash", "git stash is blocked by sandbox policy"),
     // `git rm` physically deletes files from the working tree, unrecoverable;
     // `git rm --cached` only removes the index entry, but blocking outright is
     // safer than per-argument analysis. Use safe tools like `trash` to delete
     // files.
     (
         "rm",
-        "git rm is blocked by sandbox policy; use trash or similar safe-delete tool",
+        "git rm is blocked by sandbox policy; delete project files with apply_patch `*** Delete File:`",
     ),
 ];
 
@@ -1218,7 +1256,7 @@ fn blocked_git_subcommand(command_tokens: &[String]) -> Option<&'static str> {
 /// Decide which `git` subcommands would irreversibly discard or delete
 /// uncommitted work.
 ///
-/// Unlike `BLOCKED_GIT_SUBCOMMANDS` (globally banned ones like push/stash), the
+/// Unlike `BLOCKED_GIT_SUBCOMMANDS` (globally banned ones like push), the
 /// subcommands below are harmless under some argument combinations (e.g. `git
 /// switch` branch switching, `git restore --staged` unstaging), so block only
 /// when they would truly destroy uncommitted changes (working-tree/staged
@@ -2302,14 +2340,10 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
     let denied_programs = [
         "fish",
         "jshell",
-        "rm",
         "dd",
         "chmod",
         "chown",
         "chgrp",
-        "kill",
-        "pkill",
-        "killall",
         "sudo",
         "su",
         "passwd",
@@ -2348,6 +2382,22 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         return Err(format!(
             "program '{program}' is blocked by sandbox policy (ai.sandbox.blocked_commands)"
         ));
+    }
+
+    // `kill` / `pkill` / `killall` are allowed only against processes this
+    // agent session started itself (background process groups registered by
+    // `execute_command`); signaling any external process stays blocked. See
+    // `validate_kill_targets` below for the per-target verification.
+    if is_kill_program(program) {
+        return validate_kill_targets(program, raw_command_tokens);
+    }
+
+    // `rm` is allowed only against files inside this session's private temp
+    // dir (everything there is session-owned by construction); deleting
+    // anything else — project or user files — stays blocked. See
+    // `validate_rm_targets` below for the per-target verification.
+    if program == "rm" {
+        return validate_rm_targets(raw_command_tokens);
     }
 
     // Safety policy: block destructive/privilege-escalating `git` subcommands
@@ -2441,7 +2491,6 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
     // ordinary content arguments (like the `rm` inside `printf '%s' rm`) as
     // dangerous commands.
     const DANGEROUS_PROGRAM_NAMES: &[&str] = &[
-        "rm",
         "mv",
         "chmod",
         "chown",
@@ -2452,9 +2501,6 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         "scp",
         "rsync",
         "dd",
-        "kill",
-        "pkill",
-        "killall",
         "shutdown",
         "reboot",
         "eval",
@@ -2483,6 +2529,27 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
             if let Some(reason) = blocked_git_destructive(&raw_command_tokens[idx..]) {
                 return Err(reason.to_string());
             }
+        }
+        // Kill tools behind wrappers (`env kill 123`, `timeout 5 pkill -f x`)
+        // get the same per-target verification as the direct path, otherwise
+        // a wrapper would bypass the sandbox gate.
+        if is_kill_program(nested) {
+            // `xargs` appends stdin items as extra runtime arguments, so the
+            // kill target set is never fully visible on the command line.
+            if program == "xargs" {
+                return Err(xargs_kill_blocked_message());
+            }
+            validate_kill_targets(nested, &raw_command_tokens[idx..])?;
+        }
+        // `rm` behind wrappers gets the same temp-dir scoping as the direct
+        // path, otherwise `env rm ...` would bypass the sandbox gate. `xargs
+        // rm` stays blocked: xargs appends stdin items as extra deletion
+        // targets invisible on the command line.
+        if nested == "rm" {
+            if program == "xargs" {
+                return Err(xargs_rm_blocked_message());
+            }
+            validate_rm_targets(&raw_command_tokens[idx..])?;
         }
         // Interpreter `-c` / `-e` behind wrappers needs the same validation,
         // otherwise `env bash -c '...'` / `env perl -e '...'` /
@@ -2544,9 +2611,368 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
             return Err(format!(
                 "nested `{eff_program} -c` re-interpretation inside '{command}' is blocked"
             ));
+        } else if is_kill_program(eff_program) {
+            // `xargs` (possibly behind further wrappers, e.g.
+            // `timeout 5 xargs kill 123`) appends stdin items as extra
+            // arguments at runtime, so the kill target set is not fully
+            // visible on the command line: such kills stay blocked.
+            if effective_chain_uses_xargs(command) {
+                return Err(xargs_kill_blocked_message());
+            }
+            validate_kill_targets(eff_program, &effective)?;
+        } else if eff_program == "rm" {
+            // `xargs` (possibly behind further wrappers, e.g.
+            // `timeout 5 env xargs rm <tmp>/x`) appends stdin items as extra
+            // deletion targets at runtime, so the removal set is not fully
+            // visible on the command line: such removals stay blocked.
+            if effective_chain_uses_xargs(command) {
+                return Err(xargs_rm_blocked_message());
+            }
+            validate_rm_targets(&effective)?;
         }
     }
 
+    Ok(())
+}
+
+// =========================================================================
+// Kill-target verification (kill / pkill / killall)
+// =========================================================================
+//
+// The kill family is not blanket-blocked: the agent routinely needs to stop
+// services it started itself (`python app.py &` -> `kill <pid>` /
+// `pkill -f app.py`). The guarantee the sandbox can give instead: every
+// process the invocation would signal must belong to a background process
+// group this session registered via `execute_command` (see
+// `tools::storage::process_registry`). Targets are resolved with `pgrep` /
+// `ps` at validation time, so only live, verifiably-ours processes pass;
+// anything unverifiable fails closed.
+
+fn is_kill_program(program: &str) -> bool {
+    matches!(
+        program.to_ascii_lowercase().as_str(),
+        "kill" | "pkill" | "killall"
+    )
+}
+
+fn xargs_kill_blocked_message() -> String {
+    "kill tools behind 'xargs' are blocked: xargs appends stdin items as \
+     additional targets the sandbox cannot verify"
+        .to_string()
+}
+
+/// Largest plausible signal number. `kill -<n>` reads `n` as a signal when it
+/// is a valid signal number and as a process group otherwise; real pids are
+/// far larger than any signal, so values up to this bound are parsed as
+/// signal options and larger negative values as process-group targets.
+const MAX_SIGNAL_NUMBER: i64 = 128;
+
+fn validate_kill_targets(program: &str, raw_tokens: &[String]) -> Result<(), String> {
+    let session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
+    match program.to_ascii_lowercase().as_str() {
+        "kill" => validate_kill_pids(raw_tokens, &session_id),
+        "pkill" => validate_pattern_kill(raw_tokens, &session_id, "pkill", PgrepMode::Pkill),
+        "killall" => validate_pattern_kill(raw_tokens, &session_id, "killall", PgrepMode::Killall),
+        _ => Ok(()),
+    }
+}
+
+/// `kill [options] pid...`: options (`-<signal>`, `-s`/`-n <signal>`,
+/// `--signal=...`, `-l`, `-L`, `-t`, `--`) are skipped; every remaining token
+/// must be a literal integer pid (negative = process group).
+fn validate_kill_pids(raw_tokens: &[String], session_id: &str) -> Result<(), String> {
+    let mut targets: Vec<i64> = Vec::new();
+    let mut options_ended = false;
+    let mut i = 1usize;
+    while i < raw_tokens.len() {
+        let token = raw_tokens[i].as_str();
+        if !options_ended && token == "--" {
+            options_ended = true;
+        } else if !options_ended && token.starts_with('-') && token.len() > 1 {
+            let rest = &token[1..];
+            if let Ok(value) = rest.parse::<i64>() {
+                if value > MAX_SIGNAL_NUMBER {
+                    // Negative integer beyond any signal: a process-group kill.
+                    targets.push(-value);
+                }
+                // `-9` (signal) and `-0` (liveness probe) carry no target.
+            } else if rest == "s" || rest == "n" {
+                // `-s` / `-n` take the signal name as their operand.
+                i += 1;
+            }
+            // Other options (`-l`, `-L`, `-t`, `-KILL`, `--signal=...`):
+            // no operand, no target.
+        } else {
+            match token.parse::<i64>() {
+                Ok(pid) if pid > 0 => targets.push(pid),
+                Ok(0) => {
+                    return Err(
+                        "kill target '0' (the command's own process group) cannot be verified"
+                            .to_string(),
+                    )
+                }
+                Ok(_) => {
+                    return Err(format!("kill target '{token}' is not a valid positive pid"))
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "kill target '{token}' is not a literal pid; the sandbox can only \
+                         verify literal numeric targets (run `pgrep` first and pass the pid)"
+                    ))
+                }
+            }
+        }
+        i += 1;
+    }
+    if targets.is_empty() {
+        return Err("kill: no verifiable target process given".to_string());
+    }
+    for target in targets {
+        if !kill_target_verified(target, session_id) {
+            return Err(kill_target_denied_message(target));
+        }
+    }
+    Ok(())
+}
+
+enum PgrepMode {
+    /// `pkill`: pattern matches process name (or full command line with `-f`).
+    Pkill,
+    /// `killall`: process names only (mirrored as `pgrep -x`).
+    Killall,
+}
+
+/// `pkill [options] pattern` / `killall [options] name...`: accept the
+/// pattern-narrowing flags that map 1:1 onto `pgrep` plus signal options;
+/// reject every other option, because the killed set could then differ from
+/// what `pgrep` reports and the verification would be unsound.
+fn validate_pattern_kill(
+    raw_tokens: &[String],
+    session_id: &str,
+    program: &str,
+    mode: PgrepMode,
+) -> Result<(), String> {
+    let mut filters: Vec<String> = Vec::new();
+    let mut patterns: Vec<String> = Vec::new();
+    let mut options_ended = false;
+    let mut i = 1usize;
+    while i < raw_tokens.len() {
+        let token = raw_tokens[i].as_str();
+        if !options_ended && token == "--" {
+            options_ended = true;
+        } else if !options_ended && token.starts_with('-') && token.len() > 1 {
+            let supported = match mode {
+                PgrepMode::Pkill => matches!(token, "-f" | "-x" | "-i" | "-n" | "-o"),
+                PgrepMode::Killall => token == "-e",
+            };
+            if supported {
+                // `killall -e` (exact name) maps to `pgrep -x`.
+                filters.push(if token == "-e" { "-x" } else { token }.to_string());
+            } else if is_signal_option(token) {
+                // Signal specification: does not change the target set.
+            } else {
+                return Err(format!(
+                    "{program} option '{token}' cannot be verified by the sandbox; use a \
+                     plain name{} pattern instead",
+                    if matches!(mode, PgrepMode::Pkill) {
+                        " / -f / -x / -i"
+                    } else {
+                        " (or `pkill -f` for pattern matching)"
+                    }
+                ));
+            }
+        } else {
+            patterns.push(token.to_string());
+        }
+        i += 1;
+    }
+    if patterns.is_empty() {
+        return Err(match mode {
+            PgrepMode::Pkill => "pkill: no pattern given".to_string(),
+            PgrepMode::Killall => "killall: no process name given".to_string(),
+        });
+    }
+    // Resolve each pattern to the exact pid set the kill would signal (pgrep
+    // and pkill share their matching engine) and verify every pid.
+    for pattern in &patterns {
+        for pid in resolve_pattern_pids(&filters, pattern, program)? {
+            if !kill_target_verified(pid as i64, session_id) {
+                return Err(format!(
+                    "{program} pattern '{pattern}' matches pid {pid}, which is not a process \
+                     started by this agent session; refusing to signal external processes"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run `pgrep [filters] <pattern>` and return the matched pids. Exit status
+/// 0 = matched, 1 = no match (empty set, nothing to kill), anything else is a
+/// resolution failure that fails closed.
+fn resolve_pattern_pids(
+    filters: &[String],
+    pattern: &str,
+    program: &str,
+) -> Result<Vec<u32>, String> {
+    let mut command = std::process::Command::new("pgrep");
+    command.args(filters).arg(pattern);
+    let output = command
+        .output()
+        .map_err(|err| format!("{program}: failed to resolve pattern '{pattern}': {err}"))?;
+    match output.status.code() {
+        Some(0) => {}
+        Some(1) => return Ok(Vec::new()),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.trim();
+            return Err(format!(
+                "{program}: cannot verify pattern '{pattern}' (pgrep exited with {}); \
+                 refusing to run an unverifiable kill{}",
+                output.status,
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            ));
+        }
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect())
+}
+
+/// True for `kill`-family signal specifications (`-9`, `-SIGTERM`,
+/// `--signal=9`). Bare alphabetic options like `-v` are deliberately NOT
+/// treated as signals: they are `pkill`/`killall` match modifiers that change
+/// the target set in ways `pgrep` cannot mirror.
+fn is_signal_option(token: &str) -> bool {
+    if let Some(rest) = token.strip_prefix("--signal=") {
+        return !rest.is_empty();
+    }
+    let Some(rest) = token.strip_prefix('-') else {
+        return false;
+    };
+    rest.parse::<u64>().is_ok() || rest.starts_with("SIG")
+}
+
+/// A target is killable iff it is itself a registered pgid of this session,
+/// or (for a pid) its process group is one. `ps` fails when the process no
+/// longer exists, which fails closed (nothing to signal anyway).
+fn kill_target_verified(target: i64, session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+    let pgid = target.unsigned_abs() as u32;
+    if process_registry::is_registered_pgid(session_id, pgid) {
+        return true;
+    }
+    if target > 0 {
+        if let Some(actual_pgid) = process_group_of(target as u32) {
+            return process_registry::is_registered_pgid(session_id, actual_pgid);
+        }
+    }
+    false
+}
+
+/// Resolve a pid's process group id via `ps -o pgid= -p <pid>`.
+fn process_group_of(pid: u32) -> Option<u32> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim().parse::<u32>().ok().filter(|&pgid| pgid > 0)
+}
+
+fn kill_target_denied_message(target: i64) -> String {
+    let subject = if target > 0 {
+        format!("pid {target}")
+    } else {
+        format!("process group {}", -target)
+    };
+    format!(
+        "cannot signal {subject}: not a process started by this agent session \
+         (only background processes launched via execute_command are killable)"
+    )
+}
+
+// =========================================================================
+// rm target verification
+// =========================================================================
+//
+// `rm` is not blanket-blocked: the agent routinely needs to clean up files it
+// created (build outputs, downloaded archives, scratch files). The guarantee
+// the sandbox can give instead: every path the invocation would delete must
+// resolve inside the session's private temp dir (`runtime_ctx::temp_dir()`),
+// where every file is session-owned by construction. Anything else — project
+// files, user files, system paths — stays blocked; delete project files with
+// `apply_patch`'s `*** Delete File:` envelope instead.
+
+/// Message for `xargs rm`: stdin items would append extra deletion targets the
+/// sandbox cannot see on the command line.
+fn xargs_rm_blocked_message() -> String {
+    "'rm' behind 'xargs' is blocked: xargs appends stdin items as extra \
+     deletion targets the sandbox cannot verify"
+        .to_string()
+}
+
+/// `rm [options] path...`: options (`-f`, `-r`, `-R`, `-d`, `-i`, `-v`,
+/// `--force`, `--recursive`, ...) and the `--` separator are skipped (none of
+/// them takes an operand, so the skip is unambiguous); every remaining token
+/// must resolve inside the session temp dir. Glob metacharacters in a target
+/// are safe only because the lexical prefix is verified first:
+/// `normalize_path` collapses `..` before the prefix check, and shell globbing
+/// cannot escape the directory the pattern is anchored in.
+fn validate_rm_targets(raw_tokens: &[String]) -> Result<(), String> {
+    let temp_root = crate::ai::driver::runtime_ctx::temp_dir()
+        .map_err(|err| format!("cannot resolve session temp dir: {err}"))?;
+    let temp_root = normalize_path(&temp_root);
+    let base_dir = crate::ai::driver::runtime_ctx::effective_cwd()
+        .map_err(|err| format!("failed to resolve current directory: {err}"))?;
+    let base_dir = normalize_path(&base_dir);
+
+    let mut options_ended = false;
+    let mut target_count = 0usize;
+    for token in &raw_tokens[1..] {
+        if !options_ended && token == "--" {
+            options_ended = true;
+            continue;
+        }
+        if !options_ended && token.starts_with('-') && token.len() > 1 {
+            // rm option; skip.
+            continue;
+        }
+        let raw_path = strip_quotes(token.trim());
+        if raw_path.is_empty() {
+            return Err("rm contains an empty path".to_string());
+        }
+        // `~` / `$HOME` prefix: expand for resolution (`expand_tilde_and_home`
+        // already rejected `~/..` escapes earlier in validation).
+        let expanded = expand_tilde_and_home(raw_path)?;
+        let resolved = if std::path::Path::new(&expanded).is_absolute() {
+            normalize_path(std::path::Path::new(&expanded))
+        } else {
+            normalize_path(&base_dir.join(expanded))
+        };
+        if !resolved.starts_with(&temp_root) {
+            return Err(format!(
+                "rm target '{raw_path}' is outside the session temp dir: the sandbox only \
+                 allows deleting files this session created (project files: use apply_patch \
+                 `*** Delete File:`)"
+            ));
+        }
+        target_count += 1;
+    }
+    if target_count == 0 {
+        return Err("rm: no verifiable target path given".to_string());
+    }
     Ok(())
 }
 
@@ -3129,7 +3555,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_rm_even_within_current_directory() {
+    fn blocks_rm_outside_session_temp_dir() {
         let err = validate("rm -rf ./target").unwrap_err();
         assert!(err.contains("rm"), "expected rm blocked, got: {err}");
     }
@@ -3390,25 +3816,30 @@ mod tests {
     }
 
     #[test]
-    fn blocks_git_stash_in_all_common_forms() {
-        assert!(validate("git stash").is_err());
-        assert!(validate("git stash list").is_err());
-        assert!(validate("git stash pop").is_err());
-        assert!(validate("git stash drop").is_err());
-        assert!(validate("git stash clear").is_err());
-        assert!(validate("git stash push -m wip").is_err());
-        assert!(validate("git -C /repo stash").is_err());
-        assert!(validate("git -c user.email=a@b.c stash").is_err());
-        assert!(validate("git --git-dir=/repo stash").is_err());
-        assert!(validate("git --no-pager stash").is_err());
-        assert!(validate("git STASH").is_err());
-        assert!(validate("/usr/bin/git stash").is_err());
-        assert!(validate("git status && git stash").is_err());
-        assert!(validate("git stash && echo done").is_err());
-        assert!(validate("env git stash").is_err());
-        assert!(validate("xargs git stash").is_err());
-        assert!(validate("nohup git stash").is_err());
-        assert!(validate("command git stash").is_err());
+    fn allows_git_stash_forms_at_audit_level() {
+        // `git stash` is no longer hard-blocked here: the whole stash family is
+        // gated by user confirmation in `service/command.rs` (same as `git
+        // commit`), which prompts on an interactive terminal and fails closed
+        // otherwise. The audit layer must therefore let every form through so
+        // the confirmation gate downstream is the single decision point.
+        assert!(validate("git stash").is_ok());
+        assert!(validate("git stash list").is_ok());
+        assert!(validate("git stash pop").is_ok());
+        assert!(validate("git stash drop").is_ok());
+        assert!(validate("git stash clear").is_ok());
+        assert!(validate("git stash push -m wip").is_ok());
+        assert!(validate("git -C /repo stash").is_ok());
+        assert!(validate("git -c user.email=a@b.c stash").is_ok());
+        assert!(validate("git --git-dir=/repo stash").is_ok());
+        assert!(validate("git --no-pager stash").is_ok());
+        assert!(validate("git STASH").is_ok());
+        assert!(validate("/usr/bin/git stash").is_ok());
+        assert!(validate("git status && git stash").is_ok());
+        assert!(validate("git stash && echo done").is_ok());
+        assert!(validate("env git stash").is_ok());
+        assert!(validate("xargs git stash").is_ok());
+        assert!(validate("nohup git stash").is_ok());
+        assert!(validate("command git stash").is_ok());
         assert!(validate("echo git stash").is_ok());
         assert!(validate("printf '%s' stash").is_ok());
     }
@@ -3787,5 +4218,313 @@ mod search_scope_tests {
         // paths; they must not be rejected as escaping globs.
         allowed("rg --glob /etc/*.conf pattern src");
         allowed("grep -rn --include /usr/*.h pattern src");
+    }
+}
+
+#[cfg(test)]
+mod kill_target_tests {
+    use super::*;
+    use crate::ai::tools::storage::process_registry;
+
+    fn tokens(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    // Kill validation is session-scoped: register the fake/real pgids under a
+    // dedicated session id and validate against it, so tests never depend on
+    // a live DRIVER_CTX and never touch other tests' entries.
+    const TEST_SESSION: &str = "kill-target-test-session";
+
+    #[test]
+    fn kill_of_registered_pgid_is_allowed() {
+        process_registry::register(TEST_SESSION, 4242);
+        validate_kill_pids(&tokens(&["kill", "4242"]), TEST_SESSION).unwrap();
+        validate_kill_pids(&tokens(&["kill", "-9", "4242"]), TEST_SESSION).unwrap();
+        validate_kill_pids(&tokens(&["kill", "-s", "TERM", "4242"]), TEST_SESSION).unwrap();
+        validate_kill_pids(&tokens(&["kill", "--signal=KILL", "4242"]), TEST_SESSION).unwrap();
+        // Negative pid kills the whole registered group.
+        validate_kill_pids(&tokens(&["kill", "-4242"]), TEST_SESSION).unwrap();
+        // `--` ends option parsing; following tokens are still targets.
+        validate_kill_pids(&tokens(&["kill", "--", "4242"]), TEST_SESSION).unwrap();
+    }
+
+    #[test]
+    fn kill_of_unregistered_target_is_denied() {
+        let err = validate_kill_pids(&tokens(&["kill", "4243"]), TEST_SESSION).unwrap_err();
+        assert!(
+            err.contains("not a process started by this agent session"),
+            "got: {err}"
+        );
+        let err = validate_kill_pids(&tokens(&["kill", "-4243"]), TEST_SESSION).unwrap_err();
+        assert!(
+            err.contains("not a process started by this agent session"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn kill_of_descendant_in_registered_group_is_allowed() {
+        // The test process itself: register its process group, then kill its
+        // own pid. The pid is not the pgid, so this exercises the `ps`
+        // pgid-resolution path end to end.
+        let pid = std::process::id();
+        let pgid = process_group_of(pid).expect("ps must resolve the test process pgid");
+        process_registry::register(TEST_SESSION, pgid);
+        validate_kill_pids(&tokens(&["kill", &pid.to_string()]), TEST_SESSION).unwrap();
+    }
+
+    #[test]
+    fn kill_parse_failures_fail_closed() {
+        let err = validate_kill_pids(&tokens(&["kill"]), TEST_SESSION).unwrap_err();
+        assert!(err.contains("no verifiable target"), "got: {err}");
+        let err = validate_kill_pids(&tokens(&["kill", "$$"]), TEST_SESSION).unwrap_err();
+        assert!(err.contains("not a literal pid"), "got: {err}");
+        let err = validate_kill_pids(&tokens(&["kill", "0"]), TEST_SESSION).unwrap_err();
+        assert!(err.contains("cannot be verified"), "got: {err}");
+        let err = validate_kill_pids(&tokens(&["kill", "abc"]), TEST_SESSION).unwrap_err();
+        assert!(err.contains("not a literal pid"), "got: {err}");
+        // No session at all fails closed.
+        let err = validate_kill_pids(&tokens(&["kill", "4242"]), "").unwrap_err();
+        assert!(
+            err.contains("not a process started by this agent session"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn pkill_unsupported_options_are_denied() {
+        let err =
+            validate_pattern_kill(&tokens(&["pkill", "-v", "app"]), TEST_SESSION, "pkill", PgrepMode::Pkill)
+                .unwrap_err();
+        assert!(err.contains("cannot be verified"), "got: {err}");
+        let err =
+            validate_pattern_kill(&tokens(&["pkill", "-u", "root", "app"]), TEST_SESSION, "pkill", PgrepMode::Pkill)
+                .unwrap_err();
+        assert!(err.contains("cannot be verified"), "got: {err}");
+        let err =
+            validate_pattern_kill(&tokens(&["pkill"]), TEST_SESSION, "pkill", PgrepMode::Pkill)
+                .unwrap_err();
+        assert!(err.contains("no pattern given"), "got: {err}");
+        let err = validate_pattern_kill(
+            &tokens(&["killall", "-m", "py.*"]),
+            TEST_SESSION,
+            "killall",
+            PgrepMode::Killall,
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot be verified"), "got: {err}");
+    }
+
+    #[test]
+    fn pkill_matching_external_process_is_denied() {
+        // `.` matches every process's command line (including pgrep's own
+        // caller), and none of them is registered in this session.
+        let err = validate_pattern_kill(
+            &tokens(&["pkill", "-f", "."]),
+            TEST_SESSION,
+            "pkill",
+            PgrepMode::Pkill,
+        )
+        .unwrap_err();
+        assert!(err.contains("refusing to signal external processes"), "got: {err}");
+    }
+
+    #[test]
+    fn pkill_matching_registered_process_is_allowed() {
+        // Kill the test process itself by its exact executable path: register
+        // its pgid, then `pkill -f <binary path>` must pass verification.
+        let pgid = process_group_of(std::process::id()).expect("ps must resolve the test pgid");
+        process_registry::register(TEST_SESSION, pgid);
+        let binary = std::env::current_exe()
+            .expect("test binary path")
+            .to_string_lossy()
+            .to_string();
+        validate_pattern_kill(
+            &tokens(&["pkill", "-f", &binary]),
+            TEST_SESSION,
+            "pkill",
+            PgrepMode::Pkill,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pkill_with_no_matches_is_allowed() {
+        // A pattern nothing is running matches: the kill would signal zero
+        // processes, so there is nothing to refuse.
+        let name = format!("definitely-not-running-{}", std::process::id());
+        validate_pattern_kill(
+            &tokens(&["pkill", "-x", &name]),
+            TEST_SESSION,
+            "pkill",
+            PgrepMode::Pkill,
+        )
+        .unwrap();
+        validate_pattern_kill(
+            &tokens(&["killall", &name]),
+            TEST_SESSION,
+            "killall",
+            PgrepMode::Killall,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn kill_is_no_longer_blanket_blocked() {
+        // Without a session context every kill fails closed, but with the
+        // target-verification message, not the old blanket block.
+        let err = validate_execute_command("kill 4242").unwrap_err();
+        assert!(
+            err.contains("not a process started by this agent session"),
+            "got: {err}"
+        );
+        // Wrappers run the same verification instead of a blanket block.
+        let err = validate_execute_command("env kill 4242").unwrap_err();
+        assert!(
+            err.contains("not a process started by this agent session"),
+            "got: {err}"
+        );
+        // xargs-driven kills cannot be verified from the command line.
+        let err = validate_execute_command("echo 4242 | xargs kill").unwrap_err();
+        assert!(err.contains("behind 'xargs'"), "got: {err}");
+    }
+
+    #[test]
+    fn kill_through_xargs_is_blocked() {
+        // xargs appends stdin items as extra runtime arguments, so the kill
+        // target set is never fully visible on the command line: the whole
+        // invocation must be refused even when a literal pid is present.
+        let err = validate_execute_command("xargs kill 123").unwrap_err();
+        assert!(err.contains("behind 'xargs'"), "got: {err}");
+        let err = validate_execute_command("timeout 5 xargs kill 123").unwrap_err();
+        assert!(err.contains("behind 'xargs'"), "got: {err}");
+        let err = validate_execute_command("xargs pkill -f app.py").unwrap_err();
+        assert!(err.contains("behind 'xargs'"), "got: {err}");
+        // A pattern argument named `xargs` is not a wrapper: `pkill -f xargs`
+        // kills processes whose command line contains "xargs", so it must not
+        // hit the xargs block (the pattern is still target-verified).
+        assert!(!effective_chain_uses_xargs("pkill -f xargs"));
+        assert!(!effective_chain_uses_xargs("kill 123"));
+        assert!(effective_chain_uses_xargs("xargs kill 123"));
+        assert!(effective_chain_uses_xargs("env xargs kill 123"));
+        assert!(effective_chain_uses_xargs("timeout 5 xargs kill 123"));
+    }
+}
+
+#[cfg(test)]
+mod rm_target_tests {
+    use super::*;
+
+    fn tokens(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    // Temp-dir resolution is session-scoped (`.agent_tmp/<session>/` without a
+    // live DRIVER_CTX); pin a dedicated session so tests never depend on a
+    // live DRIVER_CTX and never touch other tests' entries.
+    const TEST_SESSION: &str = "rm-target-test-session";
+
+    fn with_temp_dir<F: FnOnce(&std::path::Path)>(f: F) {
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+            (TEST_SESSION.to_string(), 0),
+            || {
+                let tmp = crate::ai::driver::runtime_ctx::temp_dir()
+                    .expect("session temp dir must resolve in tests");
+                f(&tmp);
+            },
+        );
+    }
+
+    #[test]
+    fn rm_inside_temp_dir_is_allowed() {
+        with_temp_dir(|tmp| {
+            let target = tmp.join("build-output.bin").display().to_string();
+            validate_rm_targets(&tokens(&["rm", "-f", &target])).unwrap();
+            validate_rm_targets(&tokens(&["rm", "--", &target])).unwrap();
+            // Recursive removal under the temp dir.
+            let dir = tmp.join("scratch").display().to_string();
+            validate_rm_targets(&tokens(&["rm", "-rf", &dir])).unwrap();
+            // Quoted targets are stripped like the shell would.
+            let quoted = format!("'{target}'");
+            validate_rm_targets(&tokens(&["rm", "-f", &quoted])).unwrap();
+        });
+    }
+
+    #[test]
+    fn rm_temp_globs_stay_confined() {
+        with_temp_dir(|tmp| {
+            let glob = tmp.join("*.log").display().to_string();
+            validate_rm_targets(&tokens(&["rm", "-f", &glob])).unwrap();
+            // `..` in the pattern collapses before the prefix check, so an
+            // escape attempt is caught even when it is lexically "inside".
+            let escape = tmp.join("..").join("x").display().to_string();
+            let err = validate_rm_targets(&tokens(&["rm", "-rf", &escape])).unwrap_err();
+            assert!(err.contains("outside the session temp dir"), "got: {err}");
+        });
+    }
+
+    #[test]
+    fn rm_outside_temp_dir_is_denied() {
+        with_temp_dir(|tmp| {
+            for cmd in [
+                format!("rm -rf {}", tmp.join("..").join("target").display()),
+                "rm -rf /etc/passwd".to_string(),
+                "rm -f ./target".to_string(),
+                "rm -rf *.zcompdump".to_string(),
+            ] {
+                let err = validate_execute_command(&cmd).unwrap_err();
+                assert!(
+                    err.contains("outside the session temp dir"),
+                    "cmd `{cmd}`: got: {err}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn rm_parse_failures_fail_closed() {
+        with_temp_dir(|_| {
+            let err = validate_rm_targets(&tokens(&["rm"])).unwrap_err();
+            assert!(err.contains("no verifiable target"), "got: {err}");
+            let err = validate_rm_targets(&tokens(&["rm", "-rf"])).unwrap_err();
+            assert!(err.contains("no verifiable target"), "got: {err}");
+            let err = validate_rm_targets(&tokens(&["rm", ""])).unwrap_err();
+            assert!(err.contains("empty path"), "got: {err}");
+        });
+    }
+
+    #[test]
+    fn rm_through_wrappers_is_scoped() {
+        with_temp_dir(|tmp| {
+            let target = tmp.join("x").display().to_string();
+            // Wrappers run the same verification.
+            validate_execute_command(&format!("env rm -f {target}")).unwrap();
+            validate_execute_command(&format!("timeout 5 env rm -f {target}")).unwrap();
+            // Outside the temp dir stays blocked through wrappers.
+            let err = validate_execute_command("env rm -f /etc/passwd").unwrap_err();
+            assert!(err.contains("outside the session temp dir"), "got: {err}");
+            let err = validate_execute_command("timeout 5 env rm -f /etc/passwd").unwrap_err();
+            assert!(err.contains("outside the session temp dir"), "got: {err}");
+        });
+    }
+
+    #[test]
+    fn xargs_rm_is_blocked() {
+        with_temp_dir(|tmp| {
+            let target = tmp.join("x").display().to_string();
+            let err = validate_execute_command(&format!("xargs rm -f {target}")).unwrap_err();
+            assert!(err.contains("behind 'xargs'"), "got: {err}");
+            let err =
+                validate_execute_command(&format!("timeout 5 xargs rm {target}")).unwrap_err();
+            assert!(err.contains("behind 'xargs'"), "got: {err}");
+        });
+    }
+
+    #[test]
+    fn rm_is_no_longer_blanket_blocked() {
+        // Outside a session context every rm fails closed, but with the
+        // temp-dir verification message rather than a blanket program block.
+        let err = validate_execute_command("rm -rf /tmp/x").unwrap_err();
+        assert!(err.contains("outside the session temp dir"), "got: {err}");
     }
 }

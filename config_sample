@@ -51,3 +51,6 @@ ai.output.postprocess_command = python3 /path/to/rust_tools/scripts/postprocess_
 
 ai.theme = monokai        # 内置主题
 ai.theme.file = ~/my.json # 或自定义文件(优先级更高)
+
+ai.serve.bind = 127.0.0.1:8080
+ai.serve.token = 换成你的长随机串
