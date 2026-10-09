@@ -74,6 +74,10 @@ pub(super) struct PromptEditor {
     /// Current model display name, shown as a model hint above the input box
     /// (so the model in use is visible while typing).
     current_model_label: String,
+    /// Whether the model runs on a remote serve backend. serve-chat sets
+    /// this; the renderer then paints its own `(remote)` marker in a style
+    /// distinct from the model name.
+    model_remote: bool,
     /// Current agent name, shown on the same line as the model hint above the
     /// input box.
     current_agent_label: String,
@@ -156,6 +160,7 @@ impl PromptEditor {
             pending_prefill: None,
             pending_status_msg: None,
             current_model_label: String::new(),
+            model_remote: false,
             current_agent_label: String::new(),
             current_reasoning_effort_label: String::new(),
             session_topic: None,
@@ -193,6 +198,12 @@ impl PromptEditor {
     /// above the input box.
     pub(super) fn set_current_model_label(&mut self, label: impl Into<String>) {
         self.current_model_label = label.into();
+    }
+
+    /// Mark the model as remote (serve-chat only); the next `read_multi_line`
+    /// shows a distinctly styled `(remote)` marker after the model name.
+    pub(super) fn set_model_remote(&mut self, remote: bool) {
+        self.model_remote = remote;
     }
 
     /// Set the current agent name; the next `read_multi_line` shows it on the

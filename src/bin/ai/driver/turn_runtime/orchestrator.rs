@@ -961,7 +961,8 @@ pub(in crate::ai::driver) async fn run_turn(
         crate::ai::driver::runtime_ctx::TURN_IDENTITY
             .scope((session_id, turn_id), async {
                 if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0
-                    && crate::ai::driver::commands::compact::try_handle_compact_command(app, &question).await?
+                    && (crate::ai::driver::commands::compact::try_handle_compact_command(app, &question).await?
+                        || crate::ai::driver::commands::distill_session::try_handle_distill_session_command(app, &question).await)
                 {
                     return Ok(if should_quit { TurnOutcome::Quit } else { TurnOutcome::Continue });
                 }

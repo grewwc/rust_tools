@@ -3,6 +3,8 @@ pub(crate) mod audit;
 pub(crate) mod changes;
 pub mod checkpoint;
 pub(crate) mod compact;
+pub(crate) mod distill_session;
+pub mod cwd;
 pub mod export;
 pub mod feishu;
 pub mod goal;
@@ -25,6 +27,7 @@ use crate::ai::{agents::AgentManifest, mcp::SharedMcpClient, skills::SkillManife
 
 pub use agent::try_handle_agent_command;
 pub use checkpoint::try_handle_checkpoint_command;
+pub use cwd::try_handle_cwd_command;
 pub use export::try_handle_export_command;
 pub use feishu::try_handle_feishu_auth_command;
 pub use goal::try_handle_goal_command;
@@ -62,14 +65,17 @@ pub fn is_local_command_start(token: &str) -> bool {
     };
     matches!(
         word,
-        "agent" | "agents"
+        "agent"
+            | "agents"
             | "audit"
             | "bg"
+            | "cd"
             | "changes"
             | "checkpoint"
             | "clear"
             | "close"
             | "compact"
+            | "distill-session"
             | "cp"
             | "detach"
             | "diff"
@@ -130,6 +136,7 @@ pub fn local_command_reserved_flags(head: &str) -> &'static [&'static str] {
         // collides with the global `--files` alias, which would additionally
         // swallow the following token as a file path.
         "audit" => &["-f", "--fast"],
+        "distill-session" => distill_session::FLAGS,
         // `--prefix` is not a registered global today, so this entry changes
         // no current behavior; it only guards the `sessions delete --prefix`
         // grammar against a future global collision of the same shape.
@@ -153,6 +160,9 @@ pub fn try_handle_local_command(
         return Ok(true);
     }
     if try_handle_clear_command(input) {
+        return Ok(true);
+    }
+    if try_handle_cwd_command(input) {
         return Ok(true);
     }
     if changes::try_handle_changes_command(input)? {

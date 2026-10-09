@@ -220,6 +220,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     completion_panel: Option<&CompletionPanel>,
     agent_label: &str,
     model_label: &str,
+    model_remote: bool,
     reasoning_effort_label: &str,
     session_topic: Option<&str>,
 ) -> Option<Position> {
@@ -276,6 +277,16 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                 .fg(Color::Rgb(134, 194, 166))
                 .add_modifier(Modifier::BOLD),
         ));
+        // Remote-mode marker (serve-chat): its own span in lavender bold so it
+        // stands out from the model-name green instead of blending into it.
+        if model_remote {
+            spans.push(Span::styled(
+                " (remote)",
+                Style::default()
+                    .fg(Color::Rgb(196, 181, 253))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if !reasoning_effort_label.is_empty() {
             spans.push(Span::styled(
                 "  |  reasoning: ",
@@ -826,7 +837,7 @@ mod tests {
             terminal
                 .draw(|frame| {
                     render_multiline_popup(
-                        frame, &mut textarea, None, None, "", "model", "high", None,
+                        frame, &mut textarea, None, None, "", "model", false, "high", None,
                     );
                 })
                 .unwrap();
@@ -954,6 +965,7 @@ mod tests {
                     None,
                     "",
                     "glm-5.2-super-relay",
+                    false,
                     "max",
                     Some(&long_topic),
                 );
@@ -1018,6 +1030,7 @@ mod tests {
                     None,
                     "",
                     "deepseek-v4.1-flash-volcano",
+                    false,
                     "max",
                     Some(topic),
                 );
@@ -1070,6 +1083,7 @@ mod tests {
                     None,
                     "",
                     "deepseek-v4.1-flash-volcano",
+                    false,
                     "max",
                     Some(topic),
                 );
@@ -1149,6 +1163,7 @@ mod tests {
                     None,
                     "",
                     "glm-5.2-super-relay",
+                    false,
                     "max",
                     None,
                 );
@@ -1207,6 +1222,7 @@ mod tests {
                     None,
                     "build",
                     "glm-5.2-super-relay",
+                    false,
                     "max",
                     None,
                 );
@@ -1245,6 +1261,7 @@ mod tests {
                     None,
                     "",
                     "glm-5.2-super-relay",
+                    false,
                     "max",
                     None,
                 );
@@ -1291,6 +1308,7 @@ mod tests {
                     None,
                     "",
                     "deepseek-v4-flash-volcano",
+                    false,
                     "max",
                     Some("将kernel.rs中文注释改为英文"),
                 );
@@ -1331,6 +1349,7 @@ mod tests {
                     None,
                     "",
                     "glm-5.2-super-relay",
+                    false,
                     "max",
                     None,
                 );
@@ -1373,6 +1392,7 @@ mod tests {
                     None,
                     "",
                     "glm-5.2-super-relay",
+                    false,
                     "max",
                     None,
                 );
@@ -1418,6 +1438,7 @@ mod tests {
                     None,
                     "",
                     "glm-5.2-super-relay",
+                    false,
                     "max",
                     None,
                 );
@@ -1448,6 +1469,59 @@ mod tests {
         let caret_cell = &terminal.backend().buffer()[(expected.x, expected.y)];
         assert_eq!(caret_cell.symbol(), " ");
         assert!(caret_cell.modifier.contains(Modifier::REVERSED));
+    }
+
+    /// The serve-chat remote-mode marker renders in its own lavender-bold
+    /// span, distinct from the model-name green, so `(remote)` no longer
+    /// blends into the model it follows.
+    #[test]
+    fn remote_model_marker_uses_distinct_style() {
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(200, 12),
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .unwrap();
+        let mut textarea = TextArea::default();
+        let mut viewport_area = Rect::ZERO;
+
+        terminal
+            .draw(|f| {
+                viewport_area = f.area();
+                render_multiline_popup(
+                    f,
+                    &mut textarea,
+                    None,
+                    None,
+                    "build",
+                    "deepseek-v4.1-flash-volcano",
+                    true,
+                    "max",
+                    None,
+                );
+            })
+            .unwrap();
+
+        // The model line is the row above the help row, which is the viewport tail.
+        let model_row_y = viewport_area.bottom() - 2;
+        let row = buffer_row(
+            terminal.backend(),
+            model_row_y,
+            viewport_area.x,
+            viewport_area.width,
+        );
+        let marker_at = row.find("(remote)").expect("remote marker renders");
+        let name_at = row
+            .find("deepseek-v4.1-flash-volcano")
+            .expect("model name renders");
+        let buffer = terminal.backend().buffer();
+        let marker_cell = &buffer[(viewport_area.x + marker_at as u16, model_row_y)];
+        assert_eq!(marker_cell.fg, Color::Rgb(196, 181, 253));
+        assert!(marker_cell.modifier.contains(Modifier::BOLD));
+        // The marker restyle must not swallow the preceding model-name span.
+        let name_cell = &buffer[(viewport_area.x + name_at as u16, model_row_y)];
+        assert_eq!(name_cell.fg, Color::Rgb(134, 194, 166));
     }
 
 }

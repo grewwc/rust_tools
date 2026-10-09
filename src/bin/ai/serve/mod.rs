@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Sse, sse::Event},
+    response::{Html, IntoResponse, Sse, sse::Event},
     routing::{delete, get, post},
 };
 use futures_util::stream;
@@ -23,7 +23,7 @@ use tokio::sync::{Mutex, mpsc};
 use crate::ai::background;
 use crate::commonw::configw;
 
-use super::{config_schema::AiConfig, history::SessionStore};
+use super::{agents, config_schema::AiConfig, history::SessionStore, model_names, models};
 
 pub(in crate::ai) mod chat;
 pub(in crate::ai) mod ctl;
@@ -36,6 +36,10 @@ struct ServeState {
     token: String,
     /// Per-session async mutex: at most one turn writer per session.
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Session id -> pid of the running turn child, for
+    /// `POST /sessions/{id}/interrupt`. `locks` allows at most one live entry
+    /// per session; the entry is removed when the child is reaped.
+    active_turns: Arc<std::sync::Mutex<HashMap<String, u32>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,9 +132,14 @@ fn sanitize_turn_name_override(value: Option<String>, field: &str) -> Result<Opt
     Ok(Some(trimmed))
 }
 
+/// Effort levels a remote client may offer per turn. Single source of truth
+/// for the `sanitize_turn_effort_override` whitelist below and the `efforts`
+/// list published via `GET /info` (`off` included; clearing is expressed by
+/// omitting the field, matching the local `/effort auto` semantics).
+const SERVE_EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max", "off"];
+
 /// Validate the `--reasoning-effort` override against the child CLI's
-/// accepted values (tiers plus `off`; clearing is expressed by omitting the
-/// field, matching the local `/effort auto` semantics).
+/// accepted values (see `SERVE_EFFORT_LEVELS`).
 fn sanitize_turn_effort_override(value: Option<String>) -> Result<Option<String>, String> {
     let Some(raw) = value else {
         return Ok(None);
@@ -139,11 +148,12 @@ fn sanitize_turn_effort_override(value: Option<String>) -> Result<Option<String>
     if normalized.is_empty() {
         return Ok(None);
     }
-    match normalized.as_str() {
-        "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "off" => Ok(Some(normalized)),
-        _ => Err(format!(
+    if SERVE_EFFORT_LEVELS.contains(&normalized.as_str()) {
+        Ok(Some(normalized))
+    } else {
+        Err(format!(
             "reasoning_effort override must be minimal|low|medium|high|xhigh|max|off, got {raw:?}"
-        )),
+        ))
     }
 }
 
@@ -293,6 +303,13 @@ fn check_auth(state: &ServeState, headers: &HeaderMap) -> Result<(), (StatusCode
     if ok {
         Ok(())
     } else {
+        // Log only lengths, never secret content: separates "client sent
+        // nothing" (0) from "wrong value with the right length" (typo/case).
+        eprintln!(
+            "[serve] auth rejected: got {} chars, want {} chars",
+            got.len(),
+            want.len()
+        );
         Err(unauthorized("invalid bearer token"))
     }
 }
@@ -314,6 +331,23 @@ async fn healthz() -> Json<Healthz> {
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
+/// Mobile web client (`GET /app`, public like `/healthz`): a single-file
+/// chat UI compiled in via `include_str!`, so Android phones just open
+/// `http://<host>:<port>/app` in Chrome with no app install. The page
+/// itself carries no session data; the bearer token lives in the phone's
+/// `localStorage` and every API call reuses the existing authed routes.
+// `no-store` keeps phones from running a stale cached copy of this page
+// after an upgrade (a stale page hides new diagnostics like the stored
+// token length below the save row).
+async fn serve_app() -> (
+    [(axum::http::header::HeaderName, &'static str); 1],
+    Html<&'static str>,
+) {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Html(include_str!("app.html")),
+    )
+}
 // Note: /healthz is intentionally public (liveness only, no session data).
 // All session/skill/agent routes enforce check_auth.
 
@@ -323,6 +357,15 @@ async fn healthz() -> Json<Healthz> {
 /// the client's own flags. The turn child is spawned as bare
 /// `--session <id> <prompt>` with no `--model`/`--agent` passthrough, so
 /// client-side flags never reach it — only server-side truth is displayed.
+/// The `models`/`agents`/`efforts` option lists drive the mobile client's
+/// dropdowns; an empty per-turn override keeps meaning "server default".
+#[derive(Debug, Serialize)]
+struct ServerModelOption {
+    /// Value to send back as the per-turn override (registry handle).
+    id: String,
+    /// Human-readable label for the dropdown row.
+    label: String,
+}
 #[derive(Debug, Serialize)]
 struct ServerInfo {
     model: String,
@@ -330,6 +373,9 @@ struct ServerInfo {
     agent: String,
     reasoning_effort: String,
     version: String,
+    models: Vec<ServerModelOption>,
+    agents: Vec<String>,
+    efforts: Vec<&'static str>,
 }
 
 async fn server_info(State(state): State<ServeState>, headers: HeaderMap) -> impl IntoResponse {
@@ -356,6 +402,19 @@ async fn server_info(State(state): State<ServeState>, headers: HeaderMap) -> imp
     let reasoning_effort = super::models::default_reasoning_effort(&model)
         .map(|e| e.as_str().to_string())
         .unwrap_or_else(|| "server default".to_string());
+    let models = model_names::all()
+        .into_iter()
+        .map(|def| {
+            let id = model_names::model_handle(def);
+            let label = models::model_display_label(&id);
+            ServerModelOption { id, label }
+        })
+        .collect();
+    // Same switchable set as serve-chat `/agent list` (primary, enabled).
+    let agents = agents::get_primary_agents(&agents::load_all_agents())
+        .iter()
+        .map(|manifest| manifest.name.clone())
+        .collect();
     (
         StatusCode::OK,
         Json(ServerInfo {
@@ -364,6 +423,9 @@ async fn server_info(State(state): State<ServeState>, headers: HeaderMap) -> imp
             agent,
             reasoning_effort,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            models,
+            agents,
+            efforts: SERVE_EFFORT_LEVELS.to_vec(),
         }),
     )
         .into_response()
@@ -634,6 +696,55 @@ async fn post_turn(
         .into_response()
 }
 
+/// Ask the in-flight turn child for `session_id` to stop early by delivering
+/// SIGINT to it. The child is the same one-shot binary the local REPL runs, so
+/// it takes the local first-Ctrl+C path (cancel the stream, finalize the
+/// partial turn) instead of being killed. `false` means no turn child is
+/// registered: the turn already finished, which is a normal answer for an
+/// interrupt that raced the end of the stream.
+fn interrupt_active_turn(
+    active_turns: &std::sync::Mutex<HashMap<String, u32>>,
+    session_id: &str,
+) -> bool {
+    let pid = active_turns
+        .lock()
+        .ok()
+        .and_then(|turns| turns.get(session_id).copied());
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // SAFETY: `kill` only delivers a signal. A child that exited between
+        // the lookup above and here yields ESRCH, reported as "not
+        // interrupted" rather than an error.
+        return unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) == 0 };
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+    false
+}
+
+/// `POST /sessions/{id}/interrupt` (authed): stop this session's in-flight
+/// turn, the remote counterpart of the local REPL's first Ctrl+C. Only this
+/// session's turn child is signalled, so turns on other sessions keep running.
+/// `{"interrupted": false}` means no turn was running.
+async fn post_interrupt(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if SessionStore::validate_session_id(&id).is_err() {
+        return bad_request(format!("invalid session id: {id}")).into_response();
+    }
+    let interrupted = interrupt_active_turn(&state.active_turns, &id);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"session_id": id, "interrupted": interrupted})),
+    )
+        .into_response()
+}
+
 async fn post_turn_sse(
     State(state): State<ServeState>,
     headers: HeaderMap,
@@ -672,6 +783,7 @@ async fn post_turn_sse(
     let live_fifo = setup_live_fifo(&id);
     let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(128);
     let session_id = id.clone();
+    let active_turns = Arc::clone(&state.active_turns);
     // The per-session lock moves into the pump task (not the handler scope):
     // the handler returns the SSE response immediately, so holding the guard
     // here would release it before the turn finishes and allow overlapping
@@ -679,7 +791,7 @@ async fn post_turn_sse(
     tokio::task::spawn(async move {
         let _guard = lock.lock().await;
         let _ = tokio::task::spawn_blocking(move || {
-            stream_child_turn(session_id, prompt, overrides, tx, live_fifo)
+            stream_child_turn(session_id, prompt, overrides, tx, live_fifo, active_turns)
         })
         .await;
     });
@@ -689,6 +801,43 @@ async fn post_turn_sse(
     Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
+}
+
+/// Removes the session's entry from the active-turn registry when the turn
+/// child is reaped, so an interrupt can only ever reach a live process.
+struct ActiveTurnGuard {
+    map: Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    session_id: String,
+    pid: u32,
+}
+
+impl ActiveTurnGuard {
+    fn register(
+        map: &Arc<std::sync::Mutex<HashMap<String, u32>>>,
+        session_id: &str,
+        pid: u32,
+    ) -> Self {
+        if let Ok(mut turns) = map.lock() {
+            turns.insert(session_id.to_string(), pid);
+        }
+        Self {
+            map: Arc::clone(map),
+            session_id: session_id.to_string(),
+            pid,
+        }
+    }
+}
+
+impl Drop for ActiveTurnGuard {
+    fn drop(&mut self) {
+        if let Ok(mut turns) = self.map.lock() {
+            // Only clear our own entry: a stale guard must never hide a newer
+            // turn on the same session.
+            if turns.get(&self.session_id).copied() == Some(self.pid) {
+                turns.remove(&self.session_id);
+            }
+        }
+    }
 }
 
 /// Send-side millisecond clock for the per-turn diagnostic line at the end
@@ -734,6 +883,7 @@ fn stream_child_turn(
     overrides: TurnOverrides,
     tx: mpsc::Sender<Result<Event, std::convert::Infallible>>,
     mut live_fifo: Option<LiveFifo>,
+    active_turns: Arc<std::sync::Mutex<HashMap<String, u32>>>,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -782,6 +932,10 @@ fn stream_child_turn(
             return;
         }
     };
+    // Registered for as long as the child runs, so an interrupt reaches
+    // exactly this turn; the guard clears the entry when the child is reaped,
+    // on every exit path below.
+    let _active_turn = ActiveTurnGuard::register(&active_turns, &session_id, child.id());
     let stderr_handle = child.stderr.take().map(|stderr| {
         std::thread::spawn(move || {
             use std::io::Read;
@@ -1119,6 +1273,7 @@ mod tests {
             history_file: root.join("history.sqlite"),
             token: String::new(),
             locks: Default::default(),
+            active_turns: Default::default(),
         }
     }
 
@@ -1174,6 +1329,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_app_returns_mobile_client() {
+        let resp = super::serve_app().await;
+        assert!(resp
+            .0
+            .iter()
+            .any(|(k, v)| *k == axum::http::header::CACHE_CONTROL && *v == "no-store"));
+        let body = resp.1.0;
+        assert!(body.contains("id=\"serve-app\""));
+        assert!(body.contains("/sessions/"));
+        assert!(body.contains("turns/stream"));
+    }
+
+    #[tokio::test]
     async fn server_info_reports_runtime_labels() {
         use axum::{
             extract::State,
@@ -1194,6 +1362,22 @@ mod tests {
                 "missing {key}"
             );
         }
+        for key in ["models", "agents", "efforts"] {
+            assert!(
+                info.get(key).and_then(|v| v.as_array()).is_some(),
+                "missing {key}"
+            );
+        }
+        assert_eq!(
+            info["efforts"],
+            serde_json::json!(["minimal", "low", "medium", "high", "xhigh", "max", "off"])
+        );
+        assert!(
+            info["models"].as_array().is_some_and(|options| !options.is_empty()
+                && options.iter().all(|o| o.get("id").and_then(|v| v.as_str()).is_some()
+                    && o.get("label").and_then(|v| v.as_str()).is_some())),
+            "model options need id + label"
+        );
         assert_eq!(info["agent"], "build");
         assert!(!info["version"].as_str().unwrap_or_default().is_empty());
     }
@@ -1466,6 +1650,88 @@ mod tests {
             "fifo inode must outlive the pump for writer-drain ordering"
         );
     }
+
+    /// The interrupt endpoint's core: the registered pid is what receives
+    /// SIGINT, which is the local first-Ctrl+C semantics (cancel the streaming
+    /// turn), not a hard kill, and only the addressed session is signalled.
+    #[cfg(unix)]
+    #[test]
+    fn interrupt_active_turn_signals_the_registered_child() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let active: std::sync::Mutex<std::collections::HashMap<String, u32>> = Default::default();
+        active
+            .lock()
+            .expect("lock registry")
+            .insert("s1".to_string(), child.id());
+        assert!(
+            super::interrupt_active_turn(&active, "s1"),
+            "a registered child must be signalled"
+        );
+        let status = child.wait().expect("reap sleep");
+        assert_eq!(status.signal(), Some(libc::SIGINT));
+        assert!(
+            !super::interrupt_active_turn(&active, "other"),
+            "sessions without a registered child must report no interrupt"
+        );
+    }
+
+    #[test]
+    fn active_turn_guard_clears_its_registry_entry() {
+        let active = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        {
+            let _guard = super::ActiveTurnGuard::register(&active, "s1", 4242);
+            assert_eq!(active.lock().expect("lock").get("s1").copied(), Some(4242));
+        }
+        assert!(
+            active.lock().expect("lock").is_empty(),
+            "a reaped child must not stay interruptible"
+        );
+    }
+
+    /// Route coverage: an idle session answers `{"interrupted": false}` (an
+    /// interrupt that raced the end of the stream), a malformed id is rejected
+    /// before any signal, and a token-protected server rejects missing auth.
+    #[tokio::test]
+    async fn interrupt_route_reports_idle_sessions_and_guards_access() {
+        use axum::{
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        let resp = super::post_interrupt(
+            State(lifecycle_test_state()),
+            HeaderMap::new(),
+            Path("s1".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["interrupted"], serde_json::Value::Bool(false));
+
+        let mut authed = lifecycle_test_state();
+        authed.token = "t".to_string();
+        let resp = super::post_interrupt(State(authed), HeaderMap::new(), Path("s1".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = super::post_interrupt(
+            State(lifecycle_test_state()),
+            HeaderMap::new(),
+            Path("bad id".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }
 
 fn truncate_line(line: &str) -> String {
@@ -1576,6 +1842,15 @@ pub(in crate::ai) async fn run_serve(
     }
     if token.is_empty() {
         eprintln!("[serve] warning: ai.serve.token is empty; listening on loopback without auth");
+    } else {
+        // The token is baked into ServeState at startup: a later
+        // `a config set ai.serve.token` needs a restart to take effect.
+        // Log the length (never the secret) so a 401 can be told apart
+        // from "old process still running".
+        eprintln!(
+            "[serve] token auth enabled ({} chars); clients must send Authorization: Bearer <token>",
+            token.len()
+        );
     }
     let state = ServeState {
         history_file,
@@ -1583,9 +1858,11 @@ pub(in crate::ai) async fn run_serve(
         // One entry per touched session; bounded by session count in practice.
         // Idle eviction is deferred to a later multi-instance pass.
         locks: Arc::new(Mutex::new(HashMap::new())),
+        active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/app", get(serve_app))
         .route("/info", get(server_info))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/fork", post(fork_session))
@@ -1599,6 +1876,7 @@ pub(in crate::ai) async fn run_serve(
             "/sessions/{id}/turns/stream",
             post(post_turn_sse).layer(DefaultBodyLimit::max(MAX_TURN_REQUEST_BYTES)),
         )
+        .route("/sessions/{id}/interrupt", post(post_interrupt))
         .route("/skills", get(list_skills))
         .route("/agents", get(list_agents))
         .with_state(state);

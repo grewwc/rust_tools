@@ -34,6 +34,13 @@ static AGENT_NAME_CANDIDATES: LazyLock<RwLock<Option<Vec<CompletionCandidate>>>>
 static SERVE_SESSION_CANDIDATES: LazyLock<RwLock<Vec<(String, String)>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
 
+/// Command words the running client adds on top of [`COMMANDS_TRIE`]: serve-chat
+/// registers commands of its own (`/resume`, `/bg`, ...), while the local REPL
+/// registers nothing. Kept apart from the trie so neither client is offered the
+/// other's commands.
+static EXTRA_COMMAND_WORDS: LazyLock<RwLock<Vec<String>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+
 /// Trie holding all top-level commands starting with "/" and ":", replacing the previous linear starts_with filtering.
 static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
     let mut trie = Trie::new();
@@ -44,6 +51,8 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":h",
         "/history",
         ":history",
+        "/distill-session",
+        ":distill-session",
         "/usage",
         ":usage",
         "/feishu-auth",
@@ -90,6 +99,8 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":unmark",
         "/title",
         ":title",
+        "/cd",
+        ":cd",
         "/theme",
         ":theme",
     ] {
@@ -194,6 +205,32 @@ impl CommandCompleter {
         }
     }
 
+    /// Replace the client-registered command words used for first-token
+    /// completion (see [`EXTRA_COMMAND_WORDS`]). Called once by a client whose
+    /// command set differs from the shared table; later calls replace the set.
+    pub(in crate::ai) fn set_extra_command_words(words: Vec<String>) {
+        if let Ok(mut guard) = EXTRA_COMMAND_WORDS.write() {
+            let mut words = words;
+            words.sort();
+            words.dedup();
+            *guard = words;
+        }
+    }
+
+    /// Client-registered command words matching `token` (empty when none).
+    fn extra_command_words_with_prefix(token: &str) -> Vec<String> {
+        EXTRA_COMMAND_WORDS
+            .read()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .filter(|word| word.starts_with(token))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn top_level_commands() -> &'static [&'static str] {
         &[
             "/help",
@@ -202,6 +239,8 @@ impl CommandCompleter {
             ":h",
             "/history",
             ":history",
+            "/distill-session",
+            ":distill-session",
             "/usage",
             ":usage",
             "/feishu-auth",
@@ -720,6 +759,9 @@ impl CommandCompleter {
             pos -= 1;
         }
         let before = &line[..pos];
+        if let Some(completion) = Self::complete_distill_session(line, pos) {
+            return completion;
+        }
         // `@skills` / `@skill[:prefix]` trigger skill completion and must be handled before plain `@file` completion,
         // otherwise `complete_file_reference` would treat `@skills` as a file-path fragment.
         if let Some((token_start, candidates)) = complete_skill_reference(before) {
@@ -743,10 +785,13 @@ impl CommandCompleter {
 
         let candidates = if token_start == 0 {
             // Prefix-match with Tries: "/" / ":" go through the command Trie, "--" / "-" through the option Trie;
-            // sort the results for determinism (HashMap iteration order is unordered).
+            // sort the results for determinism (HashMap iteration order is unordered). Client-registered
+            // words (see EXTRA_COMMAND_WORDS) join the command branch and are deduped against the trie.
             if token.starts_with('/') || token.starts_with(':') {
                 let mut words = COMMANDS_TRIE.words_with_prefix(token);
+                words.extend(Self::extra_command_words_with_prefix(token));
                 words.sort();
+                words.dedup();
                 Self::plain_candidates(words)
             } else if token.starts_with('-') {
                 let mut words = FLAGS_TRIE.words_with_prefix(token);
@@ -977,6 +1022,81 @@ impl CommandCompleter {
         (token_start, candidates)
     }
 
+    fn complete_distill_session(
+        line: &str,
+        pos: usize,
+    ) -> Option<(usize, Vec<CompletionCandidate>)> {
+        let before = &line[..pos];
+        let command = before.split_whitespace().next()?;
+        if !matches!(command, "/distill-session" | ":distill-session")
+            || before.trim_start() == command
+        {
+            return None;
+        }
+        let Some((words, token_start, token, open_quote)) = distill_completion_words(before) else {
+            return Some((pos, Vec::new()));
+        };
+        // Both editors replace only the prefix up to the cursor, not a token's suffix.
+        if pos < line.len()
+            && (open_quote
+                || line[pos..]
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| !ch.is_whitespace()))
+        {
+            return Some((token_start, Vec::new()));
+        }
+
+        let mut source_seen = false;
+        let mut options_ended = false;
+        let mut limit_value = false;
+        let mut limit_seen = false;
+        let mut dry_run_seen = false;
+        for word in words.iter().skip(1) {
+            if limit_value {
+                limit_value = false;
+            } else if !options_ended && word == "--" {
+                options_ended = true;
+            } else if !options_ended && word == "--limit" {
+                limit_seen = true;
+                limit_value = true;
+            } else if !options_ended && word.starts_with("--limit=") {
+                limit_seen = true;
+            } else if !options_ended && word == "--dry-run" {
+                dry_run_seen = true;
+            } else if !options_ended && word.starts_with('-') {
+                return Some((token_start, Vec::new()));
+            } else if source_seen {
+                return Some((token_start, Vec::new()));
+            } else {
+                source_seen = true;
+            }
+        }
+        if limit_value || (!options_ended && token.starts_with("--limit=")) {
+            return Some((token_start, Vec::new()));
+        }
+        let mut candidates = Vec::new();
+        if !options_ended && (token.is_empty() || token.starts_with('-')) {
+            candidates.extend(Self::plain_candidates(
+                crate::ai::driver::commands::distill_session::FLAGS
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once("--"))
+                    .filter(|flag| {
+                        flag.starts_with(&token)
+                            && !(limit_seen && *flag == "--limit")
+                            && !(dry_run_seen && *flag == "--dry-run")
+                    })
+                    .map(str::to_string),
+            ));
+        }
+        if !source_seen && (options_ended || !token.starts_with('-')) {
+            candidates.extend(Self::history_session_id_candidates(&token));
+            candidates.extend(distill_zip_candidates(&token));
+        }
+        Some((token_start, candidates))
+    }
+
     fn complete_file_reference(before: &str) -> Option<(usize, Vec<CompletionCandidate>)> {
         let (token_start, raw_token, quote) = find_file_reference_token(before)?;
         let fragment = raw_token.strip_prefix('@')?;
@@ -988,6 +1108,105 @@ impl CommandCompleter {
         let candidates = Self::plain_candidates(complete_path_fragment(fragment, quote));
         Some((token_start, candidates))
     }
+}
+
+/// Decode complete arguments and the current partial token without executing shell syntax.
+/// The quote/escape rules match the interactive command, but an open quote is allowed.
+fn distill_completion_words(before: &str) -> Option<(Vec<String>, usize, String, bool)> {
+    let mut words = Vec::new();
+    let mut token = String::new();
+    let mut token_start = before.len();
+    let mut started = false;
+    let mut quote = None;
+    let mut chars = before.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        if quote.is_none() && ch.is_whitespace() {
+            if started {
+                words.push(std::mem::take(&mut token));
+                started = false;
+            }
+            token_start = index + ch.len_utf8();
+            continue;
+        }
+        if !started {
+            token_start = index;
+            started = true;
+        }
+        match (quote, ch) {
+            (Some(q), c) if q == c => quote = None,
+            (None, '\'' | '"') => quote = Some(ch),
+            (Some('\''), _) => token.push(ch),
+            (_, '\\') => {
+                let (_, next) = chars.next()?;
+                if quote.is_some() && !matches!(next, '"' | '\\') {
+                    token.push('\\');
+                }
+                token.push(next);
+            }
+            _ => token.push(ch),
+        }
+    }
+    Some((words, token_start, token, quote.is_some()))
+}
+
+fn distill_zip_candidates(fragment: &str) -> Vec<CompletionCandidate> {
+    let (dir_part, prefix) = split_fragment(fragment);
+    let path = PathBuf::from(expanduser(dir_part).to_string());
+    let base = if path.is_absolute() {
+        path
+    } else {
+        let Ok(cwd) = crate::ai::driver::runtime_ctx::effective_cwd() else {
+            return Vec::new();
+        };
+        cwd.join(path)
+    };
+    let Ok(entries) = fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !name.starts_with(prefix)
+            || (name.starts_with('.') && !prefix.starts_with('.'))
+            || name.chars().any(char::is_control)
+        {
+            continue;
+        }
+        let is_dir = entry.path().is_dir();
+        if !is_dir && !(name.to_ascii_lowercase().ends_with(".zip") && entry.path().is_file()) {
+            continue;
+        }
+        let mut display = format!("{dir_part}{name}");
+        if is_dir {
+            display.push('/');
+        }
+        // A leading dash must remain a source argument even before the option terminator.
+        if display.starts_with('-') {
+            display.insert_str(0, "./");
+        }
+        paths.push((!is_dir, display));
+    }
+    paths.sort();
+    paths.truncate(50);
+    paths
+        .into_iter()
+        .map(|(_, display)| {
+            let replacement = if display
+                .chars()
+                .any(|ch| ch.is_whitespace() || matches!(ch, '\'' | '"' | '\\'))
+            {
+                format!("\"{}\"", display.replace('\\', "\\\\").replace('"', "\\\""))
+            } else {
+                display.clone()
+            };
+            CompletionCandidate {
+                display,
+                replacement,
+            }
+        })
+        .collect()
 }
 
 /// Skill completion. Trigger and filtering rules (`<filter>` case-insensitive):
@@ -1338,6 +1557,244 @@ mod tests {
     use super::*;
 
     #[test]
+    fn distill_completion_command_prefixes() {
+        let history = DefaultHistory::new();
+        for prefix in ["/dist", ":dist"] {
+            let (start, candidates) = CommandCompleter
+                .complete(prefix, prefix.len(), &Context::new(&history))
+                .unwrap();
+            assert_eq!(start, 0);
+            let expected = format!("{}distill-session", &prefix[..1]);
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.replacement == expected)
+            );
+            assert!(CommandCompleter::top_level_commands().contains(&expected.as_str()));
+        }
+    }
+
+    #[test]
+    fn distill_completion_options_and_limit_positions() {
+        for line in [
+            "/distill-session --li",
+            ":distill-session session --li",
+            "/distill-session 'session name.zip' --li",
+            "/distill-session\u{3000}--li",
+        ] {
+            let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
+            assert_eq!(&line[start..], "--li");
+            assert_eq!(candidates.len(), 1, "{line}");
+            assert_eq!(candidates[0].replacement, "--limit");
+        }
+        for line in [
+            "/distill-session --limit ",
+            "/distill-session --limit 1",
+            ":distill-session session --limit ",
+            "/distill-session --limit=",
+            "/distill-session --limit=10",
+            "/distill-session --dry-run --limit ",
+            "/distill-session session another",
+            "/distill-session session -- another",
+        ] {
+            assert!(
+                CommandCompleter::complete_for_line(line, line.len())
+                    .1
+                    .is_empty(),
+                "{line}"
+            );
+        }
+        let line = "/distill-session --limit 10 session --dry-run --";
+        let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
+        let values: Vec<_> = candidates
+            .iter()
+            .map(|candidate| candidate.replacement.as_str())
+            .collect();
+        assert!(values.contains(&"--help"));
+        assert!(values.contains(&"--"));
+        assert!(!values.contains(&"--limit"));
+        assert!(!values.contains(&"--dry-run"));
+    }
+
+    #[test]
+    fn distill_completion_decodes_quotes_and_preserves_cursor_suffixes() {
+        for (raw, expected) in [
+            ("'archive name", "archive name"),
+            ("\"archive name", "archive name"),
+            ("archive\\ name", "archive name"),
+            ("\"a\\\"b\\\\c.zip\"", "a\"b\\c.zip"),
+            ("'a\\b.zip'", "a\\b.zip"),
+            ("\"a\\b.zip\"", "a\\b.zip"),
+            ("''", ""),
+        ] {
+            let line = format!("/distill-session {raw}");
+            let (words, start, token, _) = distill_completion_words(&line).unwrap();
+            assert_eq!(words, ["/distill-session"]);
+            assert_eq!(start, "/distill-session ".len());
+            assert_eq!(token, expected);
+        }
+        assert!(distill_completion_words("/distill-session archive\\").is_none());
+        for (line, cursor) in [
+            ("/distill-session --limit", "/distill-session --li".len()),
+            (
+                "/distill-session \"archive name.zip\"",
+                "/distill-session \"archive".len(),
+            ),
+            (
+                "/distill-session 'archive.zip'",
+                "/distill-session 'archive.zip".len(),
+            ),
+            ("/distill-session 档案.zip", "/distill-session ".len() + 1),
+        ] {
+            assert!(
+                CommandCompleter::complete_for_line(line, cursor)
+                    .1
+                    .is_empty(),
+                "{line}"
+            );
+        }
+        let line = "/distill-session --dr session";
+        let cursor = "/distill-session --dr".len();
+        let (start, candidates) = CommandCompleter::complete_for_line(line, cursor);
+        assert_eq!(candidates.len(), 1);
+        let completed = format!(
+            "{}{}{}",
+            &line[..start],
+            candidates[0].replacement,
+            &line[cursor..]
+        );
+        assert_eq!(completed, "/distill-session --dry-run session");
+    }
+
+    #[test]
+    fn distill_completion_uses_configured_sessions_and_effective_cwd() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct Fixture {
+            root: PathBuf,
+            old_config: Option<std::ffi::OsString>,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.old_config.take() {
+                        Some(path) => std::env::set_var("CONFIGW_PATH", path),
+                        None => std::env::remove_var("CONFIGW_PATH"),
+                    }
+                }
+                crate::commonw::configw::refresh();
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+        let fixture = Fixture {
+            root: std::env::temp_dir().join(format!(
+                "distill-completion-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )),
+            old_config: std::env::var_os("CONFIGW_PATH"),
+        };
+        let sessions = fixture.root.join("custom.sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("session-target.sqlite"), "").unwrap();
+        fs::write(sessions.join("session-ignored.sqlite-wal"), "").unwrap();
+        let config = fixture.root.join("config");
+        fs::write(
+            &config,
+            format!(
+                "history_file={}\n",
+                fixture.root.join("custom.sqlite").display()
+            ),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("CONFIGW_PATH", &config);
+        }
+        crate::commonw::configw::refresh();
+        for name in [
+            "archive name.zip",
+            "a\"b'c\\d.zip",
+            "档案.zip",
+            "-archive.zip",
+            "not-an-archive.txt",
+        ] {
+            fs::write(fixture.root.join(name), "").unwrap();
+        }
+        fs::create_dir(fixture.root.join("archive dir")).unwrap();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(fixture.root.clone(), || {
+            for line in [
+                "/distill-session session-",
+                ":distill-session session-",
+                "/distill-session --dry-run --limit 10 session-",
+                "/distill-session -- session-",
+            ] {
+                let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
+                assert_eq!(&line[start..], "session-");
+                assert_eq!(candidates.len(), 1, "{line}");
+                assert_eq!(candidates[0].replacement, "session-target");
+            }
+            for raw in [
+                "archive",
+                "\"archive n",
+                "'archive n",
+                "archive\\ n",
+                "\"archive name.zip\"",
+            ] {
+                let line = format!("/distill-session {raw}");
+                let (start, candidates) = CommandCompleter::complete_for_line(&line, line.len());
+                assert_eq!(start, "/distill-session ".len());
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|candidate| candidate.replacement == "\"archive name.zip\""),
+                    "{line}"
+                );
+            }
+            let paths = distill_zip_candidates("");
+            assert!(
+                !paths
+                    .iter()
+                    .any(|candidate| candidate.display.ends_with(".txt"))
+            );
+            assert!(
+                paths
+                    .iter()
+                    .any(|candidate| candidate.replacement == "\"archive dir/\"")
+            );
+            assert!(
+                paths
+                    .iter()
+                    .any(|candidate| candidate.replacement == "档案.zip")
+            );
+            for candidate in paths {
+                let (_, start, token, open_quote) =
+                    distill_completion_words(&candidate.replacement).unwrap();
+                assert_eq!(start, 0);
+                assert_eq!(token, candidate.display);
+                assert!(!open_quote);
+                assert!(!candidate.replacement.starts_with('@'));
+            }
+            let line = "/distill-session -- -arch";
+            let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.replacement == "./-archive.zip")
+            );
+            assert!(
+                !candidates
+                    .iter()
+                    .any(|candidate| candidate.replacement.starts_with("--"))
+            );
+        });
+    }
+
+    #[test]
     fn command_completion_expands_top_level_agent_command() {
         let completer = CommandCompleter;
         let history = DefaultHistory::new();
@@ -1413,6 +1870,33 @@ mod tests {
         assert!(empty.is_empty());
         let (_, after_arg) = CommandCompleter::complete_for_line("/resume 1 ", 10);
         assert!(after_arg.is_empty());
+    }
+
+    #[test]
+    fn command_completion_includes_client_registered_words() {
+        // Shares the process-global completion caches with the resume tests;
+        // serialize on the same lock.
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        CommandCompleter::set_extra_command_words(
+            ["/bg", "/help", "/new", "/quit", "/resume"]
+                .iter()
+                .map(|word| (*word).to_string())
+                .collect(),
+        );
+        // A serve-chat-only command word: absent from the shared trie, still completes.
+        let (token_start, candidates) = CommandCompleter::complete_for_line("/resu", 5);
+        assert_eq!(token_start, 0);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "/resume");
+        // A word the trie already carries is not duplicated by the extra list.
+        let (_, help) = CommandCompleter::complete_for_line("/hel", 4);
+        assert_eq!(help.iter().filter(|c| c.replacement == "/help").count(), 1);
+        // The local REPL registers nothing, so serve-chat commands stay hidden.
+        CommandCompleter::set_extra_command_words(Vec::new());
+        let (_, local) = CommandCompleter::complete_for_line("/resu", 5);
+        assert!(local.is_empty());
     }
 
     #[test]

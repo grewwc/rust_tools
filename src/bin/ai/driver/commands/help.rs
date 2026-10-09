@@ -11,12 +11,16 @@ pub fn print_interactive_help() {
         "    /effort [level]           show or set reasoning effort (shortcut for /model effort)"
     );
     println!("    /theme [name]             list or switch terminal themes live (session-only)");
+    println!(
+        "    /cd [dir]                 show or change the session working directory (\"-\" goes back)"
+    );
     println!("    /audit <instruction>      run the audit subagent synchronously (up to 15 min)");
     println!(
         "    /changes [/diff] [--stat|--json|--patch|--open]  show session file changes & open diff externally"
     );
     println!("    /clear                    clear the terminal screen");
     println!("    /compact                  compact session context; preserve full history");
+    println!("    /distill-session [id|zip] [--dry-run] [--limit N]  distill into the knowledge base (default: current session)");
     println!("    /usage [models|today|7d|30d|all|daily]   show LLM token usage statistics");
     println!("    /history [full|user|assistant|tool|system] [N]     show recent session messages");
     println!("    /history grep <keyword>      search recent messages by keyword");

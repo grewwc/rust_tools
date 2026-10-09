@@ -21,6 +21,26 @@ fn parse_cli_args_distill_session_preserves_missing_value_for_driver_error() {
     assert_eq!(cli.distill_session.as_deref(), Some(""));
 }
 
+#[test]
+fn parse_cli_args_distill_session_slash_options_stay_with_command() {
+    for command in ["/distill-session", ":distill-session"] {
+        let cli = super::parse_cli_args(
+            ["a", command, "session-1", "--dry-run", "--limit", "7"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert_eq!(
+            cli.args,
+            vec![format!("{command} session-1 --dry-run --limit 7")]
+        );
+        assert!(cli.distill_session.is_none());
+        assert!(!cli.distill_dry_run);
+        assert_eq!(cli.distill_limit, 20);
+        let help = super::parse_cli_args(["a", command, "-h"].into_iter().map(str::to_owned));
+        assert_eq!(help.args, vec![format!("{command} -h")]);
+    }
+}
+
 fn make_temp_file(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!("ai-cli-{name}-{}.txt", uuid::Uuid::new_v4()));

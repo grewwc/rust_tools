@@ -6,21 +6,132 @@
 //! to `POST /sessions/{id}/turns/stream`; every SSE event is rendered as it
 //! arrives instead of waiting for the whole turn.
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::commonw::configw;
+use crate::commonw::{
+    configw,
+    utils::{expanduser, get_config_dir},
+};
 
 use super::super::{
     agents, cli::ParsedCli, config_schema::AiConfig, driver::input::inline_image_filenames,
-    history::SessionStore, model_names, models,
+    history::{current_terminal_key, SessionStore},
+    model_names, models,
     prompt::{completion::CommandCompleter, PromptEditor},
+    stream::MarkdownStreamRenderer,
 };
 
 #[derive(Debug, Deserialize)]
 struct CreatedSession {
     id: String,
+}
+
+/// Serve-side counterpart of the local suspended-session binding: remembers
+/// which remote session this terminal backgrounded with `/bg`, so the next
+/// `a --serve-chat` here resumes it instead of opening a fresh session.
+///
+/// Kept in its own directory, never inside `SuspendedSessionStore`: a remote
+/// id stored there would be adopted by plain `a` as a local session on the
+/// next launch in that terminal.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ServeChatSuspendedBinding {
+    base: String,
+    session_id: String,
+    suspended_at: String,
+}
+
+fn serve_chat_suspended_root() -> PathBuf {
+    // Same override seam as the local suspended store: tests point it at a
+    // temp dir. The serve bindings live next to that dir, never inside it.
+    if let Ok(dir) = std::env::var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            let dir = PathBuf::from(expanduser(trimmed).as_ref());
+            match dir.parent() {
+                Some(parent) => return parent.join("serve_chat_suspended"),
+                None => return dir.join("serve_chat_suspended"),
+            }
+        }
+    }
+    get_config_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.config"))
+        .join("rust_tools")
+        .join("serve_chat_suspended")
+}
+
+fn hex_encode_terminal_key(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    out
+}
+
+fn serve_chat_binding_path(root: &Path, terminal_key: &str) -> PathBuf {
+    root.join(format!(
+        "{}.json",
+        hex_encode_terminal_key(terminal_key.as_bytes())
+    ))
+}
+
+fn save_serve_chat_binding_for_key(
+    root: &Path,
+    terminal_key: &str,
+    base: &str,
+    session_id: &str,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let binding = ServeChatSuspendedBinding {
+        base: base.to_string(),
+        session_id: session_id.to_string(),
+        suspended_at: chrono::Local::now().to_rfc3339(),
+    };
+    let content = serde_json::to_string_pretty(&binding).map_err(std::io::Error::other)?;
+    std::fs::write(serve_chat_binding_path(root, terminal_key), content)
+}
+
+fn load_serve_chat_binding_for_key(
+    root: &Path,
+    terminal_key: &str,
+) -> Option<ServeChatSuspendedBinding> {
+    let content = std::fs::read_to_string(serve_chat_binding_path(root, terminal_key)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Record this terminal's backgrounded remote session. Fails when the
+/// terminal is not identifiable; callers still exit, with a manual resume hint.
+fn save_serve_chat_binding(base: &str, session_id: &str) -> std::io::Result<()> {
+    let key = current_terminal_key().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "current terminal is not identifiable",
+        )
+    })?;
+    save_serve_chat_binding_for_key(&serve_chat_suspended_root(), &key, base, session_id)
+}
+
+fn load_serve_chat_binding() -> Option<ServeChatSuspendedBinding> {
+    let key = current_terminal_key()?;
+    load_serve_chat_binding_for_key(&serve_chat_suspended_root(), &key)
+}
+
+/// Best-effort cleanup (used after `/close` deletes the bound session).
+fn clear_serve_chat_binding() {
+    if let Some(key) = current_terminal_key() {
+        let _ =
+            std::fs::remove_file(serve_chat_binding_path(&serve_chat_suspended_root(), &key));
+    }
 }
 
 /// One entry of `GET /sessions` (newest first). `summary` is the generated
@@ -121,11 +232,13 @@ fn current_remote_title(listed: &[RemoteSession], session_id: &str) -> Option<St
 
 /// Mirror the local REPL header (`prompt_user` in `driver/input.rs`): model,
 /// agent, reasoning-effort and session topic above the input box. The model
-/// label carries a `(remote)` suffix as the persistent remote-mode marker;
-/// the completion hint keeps the raw server model id.
+/// label stays bare; the editor carries a remote-mode flag so the renderer
+/// paints its own distinctly styled `(remote)` marker after the model name.
+/// The completion hint keeps the raw server model id.
 fn apply_remote_header(editor: &mut PromptEditor, info: &ServerInfo, topic: Option<String>) {
     if !info.model_label.is_empty() {
-        editor.set_current_model_label(format!("{} (remote)", info.model_label));
+        editor.set_current_model_label(&info.model_label);
+        editor.set_model_remote(true);
     }
     if !info.agent.is_empty() {
         editor.set_current_agent_label(&info.agent);
@@ -184,7 +297,8 @@ impl ServeTurnSelection {
         if !self.model.is_empty() {
             let label = models::model_display_label(&self.model);
             if !label.is_empty() {
-                editor.set_current_model_label(format!("{label} (remote)"));
+                editor.set_current_model_label(&label);
+                editor.set_model_remote(true);
             }
             CommandCompleter::set_current_model_hint(&self.model);
         }
@@ -597,6 +711,11 @@ fn render_turn_stream_to(
     // newline, or a live thinking status). Footer/message lines must start
     // on a fresh row instead of gluing onto the answer's last line.
     let mut line_open = false;
+    // Local-equivalent Markdown rendering: on a TTY the body deltas go
+    // through the shared streaming renderer (tables, code blocks, math),
+    // exactly like the local turn output. Piped output stays raw so
+    // captures keep clean bytes.
+    let mut markdown = MarkdownStreamRenderer::new_with_tty(tty);
     loop {
         raw.clear();
         if reader.read_line(&mut raw)? == 0 {
@@ -621,6 +740,10 @@ fn render_turn_stream_to(
         let payload = data.strip_prefix(' ').unwrap_or(data);
         match event_kind.as_str() {
             "error" => {
+                // Best effort: surface the partial answer before failing.
+                if tty {
+                    let _ = markdown.flush_pending_to(out);
+                }
                 close_thinking_status(
                     &mut thinking_active,
                     &mut line_open,
@@ -639,6 +762,10 @@ fn render_turn_stream_to(
                 return Err(format!("turn failed: {msg}").into());
             }
             "done" => {
+                // End of turn: emit whatever the renderer still holds.
+                if tty {
+                    let _ = markdown.flush_pending_to(out);
+                }
                 close_thinking_status(
                     &mut thinking_active,
                     &mut line_open,
@@ -651,6 +778,11 @@ fn render_turn_stream_to(
             "thinking_start" => {
                 // A second thinking block in one turn closes the previous
                 // summary first (multi-round model calls).
+                // Flush first: the previous round's body is complete, and the
+                // status line must not glue onto its last row.
+                if tty {
+                    let _ = markdown.flush_pending_to(out);
+                }
                 close_thinking_status(
                     &mut thinking_active,
                     &mut line_open,
@@ -668,6 +800,12 @@ fn render_turn_stream_to(
                 }
             }
             "thinking" => {
+                // A thinking frame arriving after body output (multi-round
+                // calls) must not rewrite the rendered answer's last line.
+                // Mid-thinking this flush is a no-op.
+                if tty {
+                    let _ = markdown.flush_pending_to(out);
+                }
                 let text = serde_json::from_str::<serde_json::Value>(payload)
                     .ok()
                     .and_then(|v| {
@@ -701,6 +839,11 @@ fn render_turn_stream_to(
                 }
             }
             "thinking_done" => {
+                // The buffered body (if any) is complete: render it before
+                // the fold summary row.
+                if tty {
+                    let _ = markdown.flush_pending_to(out);
+                }
                 close_thinking_status(
                     &mut thinking_active,
                     &mut line_open,
@@ -716,6 +859,11 @@ fn render_turn_stream_to(
                 // was glued to body text upstream). Body text must never share
                 // the live thinking status line, so fold it first here,
                 // unconditionally.
+                // A late close can arrive after body output started; fold it
+                // on a fresh row before the renderer continues.
+                if tty && thinking_active {
+                    let _ = markdown.flush_pending_to(out);
+                }
                 close_thinking_status(
                     &mut thinking_active,
                     &mut line_open,
@@ -731,7 +879,13 @@ fn render_turn_stream_to(
                             .map(str::to_string)
                     })
                     .unwrap_or_else(|| payload.to_string());
-                let _ = write!(out, "{text}");
+                if tty {
+                    // Same renderer as the local turn output: tables, code
+                    // blocks and math render progressively, not as raw source.
+                    let _ = markdown.write_chunk_to(out, &text, false);
+                } else {
+                    let _ = write!(out, "{text}");
+                }
                 if !text.is_empty() {
                     line_open = !text.ends_with('\n');
                 }
@@ -741,6 +895,14 @@ fn render_turn_stream_to(
                 // Same ordering guarantee as the `delta` arm: observer footers
                 // arriving while a fold is still open must not slip between the
                 // answer and its thinking summary.
+                if tty {
+                    // Flush first so the footer starts after the rendered
+                    // body; a completed row means no extra guard newline.
+                    let _ = markdown.flush_pending_to(out);
+                    if markdown.at_line_start() {
+                        line_open = false;
+                    }
+                }
                 close_thinking_status(
                     &mut thinking_active,
                     &mut line_open,
@@ -760,6 +922,10 @@ fn render_turn_stream_to(
                 let _ = out.flush();
             }
         }
+    }
+    // Stream ended without a `done` event: same end-of-turn flush.
+    if tty {
+        let _ = markdown.flush_pending_to(out);
     }
     close_thinking_status(
         &mut thinking_active,
@@ -851,6 +1017,133 @@ fn collect_image_uploads(
     uploads
 }
 
+/// Whether a remote turn is streaming right now, i.e. the client is inside
+/// [`post_turn_stream`]. The SIGINT handler runs on its own thread and cannot
+/// see the loop's locals, so the flag lives at module scope.
+static REMOTE_TURN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// Whether the in-flight turn already got its interrupt request: the first
+/// Ctrl+C asks the server to stop it, a further one exits locally — the local
+/// REPL's second-press escape hatch.
+static REMOTE_TURN_INTERRUPT_SENT: AtomicBool = AtomicBool::new(false);
+
+/// Connection and current session for the SIGINT handler. The session id is
+/// rebound once per input box, which covers every path that starts a turn.
+struct ServeSigintState {
+    client: reqwest::blocking::Client,
+    base: String,
+    token: String,
+    session_id: std::sync::Mutex<String>,
+}
+
+impl ServeSigintState {
+    fn bind_session(&self, session_id: &str) {
+        if let Ok(mut current) = self.session_id.lock() {
+            current.clear();
+            current.push_str(session_id);
+        }
+    }
+
+    fn current_session(&self) -> String {
+        self.session_id
+            .lock()
+            .map(|current| current.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// What one Ctrl+C in serve-chat should do: while a remote turn runs and has
+/// not been interrupted yet, stop that turn; otherwise leave the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeSigintAction {
+    InterruptRemoteTurn,
+    ExitLocal,
+}
+
+fn serve_sigint_action(turn_in_flight: bool, interrupt_sent: bool) -> ServeSigintAction {
+    if turn_in_flight && !interrupt_sent {
+        ServeSigintAction::InterruptRemoteTurn
+    } else {
+        ServeSigintAction::ExitLocal
+    }
+}
+
+/// SIGINT handler for `--serve-chat`. The client is a thin shell around the
+/// server, so Ctrl+C must reach the remote turn instead of killing this
+/// process: without a handler the default action exits the client mid-stream
+/// and leaves the turn running to completion on the server.
+fn handle_serve_sigint(state: &ServeSigintState) {
+    match serve_sigint_action(
+        REMOTE_TURN_IN_FLIGHT.load(Ordering::SeqCst),
+        REMOTE_TURN_INTERRUPT_SENT.load(Ordering::SeqCst),
+    ) {
+        ServeSigintAction::InterruptRemoteTurn => {
+            REMOTE_TURN_INTERRUPT_SENT.store(true, Ordering::SeqCst);
+            let session_id = state.current_session();
+            match interrupt_remote_turn(&state.client, &state.base, &state.token, &session_id) {
+                // The turn ends through the SSE stream; the loop reports the
+                // outcome once the stream returns.
+                Ok(true) => {}
+                Ok(false) => eprintln!(
+                    "\n[serve-chat] no remote turn running for {session_id}; nothing to interrupt."
+                ),
+                Err(err) => eprintln!("\n[serve-chat] interrupt request failed: {err}"),
+            }
+        }
+        ServeSigintAction::ExitLocal => {
+            // Nothing to interrupt (or the turn is already stopping): mirror
+            // the local REPL, which exits on Ctrl+C in the idle state.
+            eprintln!("\n[serve-chat] exit.");
+            std::process::exit(130);
+        }
+    }
+}
+
+/// Ask the server to stop the in-flight turn for `session_id`: the remote
+/// counterpart of the local first Ctrl+C. `Ok(false)` means the server had no
+/// turn to interrupt (it already finished), which is not an error.
+fn interrupt_remote_turn(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let resp = auth(
+        client.post(format!("{base}/sessions/{session_id}/interrupt")),
+        token,
+    )
+    // Short timeout: this runs on the SIGINT handler thread while the main
+    // thread keeps reading the SSE body, so a wedged server must not pin it.
+    .timeout(Duration::from_secs(10))
+    .send()?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(server_error_message(status, &text).into());
+    }
+    Ok(serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value.get("interrupted").and_then(|v| v.as_bool()))
+        .unwrap_or(false))
+}
+
+/// Marks a remote turn as in flight for the SIGINT handler; the mark drops
+/// when the stream returns, including the error paths.
+struct RemoteTurnScope;
+
+impl RemoteTurnScope {
+    fn enter() -> Self {
+        REMOTE_TURN_INTERRUPT_SENT.store(false, Ordering::SeqCst);
+        REMOTE_TURN_IN_FLIGHT.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for RemoteTurnScope {
+    fn drop(&mut self) {
+        REMOTE_TURN_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
+
 fn post_turn_stream(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -860,6 +1153,8 @@ fn post_turn_stream(
     history_file: &Path,
     selection: &ServeTurnSelection,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // From here until the stream returns, Ctrl+C belongs to the remote turn.
+    let _turn_scope = RemoteTurnScope::enter();
     let images = collect_image_uploads(prompt, history_file, session_id);
     {
         // A bare `[[image:name]]` with no local file uploads nothing, and the
@@ -918,7 +1213,13 @@ fn post_turn_stream(
         let text = resp.text().unwrap_or_default();
         return Err(server_error_message(status, &text).into());
     }
-    render_turn_stream(resp)
+    let outcome = render_turn_stream(resp);
+    if REMOTE_TURN_INTERRUPT_SENT.swap(false, Ordering::SeqCst) {
+        // Leading newline: `delta` events print without a trailing newline, so
+        // the note would otherwise land mid-line.
+        println!("\n[serve-chat] interrupt sent; remote turn stopped.");
+    }
+    outcome
 }
 
 /// Shared `--serve-chat` / `--serve-sessions` dial-up: resolve the bind,
@@ -993,16 +1294,63 @@ pub(in crate::ai) fn run_serve_chat(
     cli: ParsedCli,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (client, base, token) = serve_connection(&cli, "serve-chat")?;
+    // Ctrl+C must stop the remote turn rather than this client: without a
+    // handler, SIGINT's default action would exit mid-stream and leave the
+    // turn running on the server.
+    let sigint_state = Arc::new(ServeSigintState {
+        client: client.clone(),
+        base: base.clone(),
+        token: token.clone(),
+        session_id: std::sync::Mutex::new(String::new()),
+    });
+    {
+        let sigint_state = Arc::clone(&sigint_state);
+        ctrlc::set_handler(move || handle_serve_sigint(&sigint_state))?;
+    }
     let app_config = super::super::config::load_config()?;
 
     let mut session_id = match cli.session {
         Some(id) if !id.trim().is_empty() => id.trim().to_string(),
-        _ => create_session(&client, &base, &token)?,
+        // No explicit session: pick up the `/bg` binding this terminal left
+        // behind, provided it still points at a live session on this server.
+        _ => match load_serve_chat_binding() {
+            Some(binding) if binding.base == base => {
+                match fetch_remote_sessions(&client, &base, &token) {
+                    Ok(items) if items.iter().any(|s| s.id == binding.session_id) => {
+                        println!(
+                            "Resumed backgrounded remote session {}.",
+                            binding.session_id
+                        );
+                        binding.session_id
+                    }
+                    Ok(_) => {
+                        println!(
+                            "Backgrounded remote session {} is gone; starting a new session.",
+                            binding.session_id
+                        );
+                        create_session(&client, &base, &token)?
+                    }
+                    // Unreachable list: keep the bound id optimistically; the
+                    // per-input refresh heals or replaces it once reachable.
+                    Err(_) => binding.session_id,
+                }
+            }
+            _ => create_session(&client, &base, &token)?,
+        },
     };
 
     println!("Connected to {base}, session {session_id}.");
-    println!("Enter inserts a newline, Esc or Alt+Enter submits; /quit exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions, /fork branches the current session, /close deletes it and exits. /model, /effort, /agent switch the remote turn like the local REPL.");
+    println!("Enter inserts a newline, Esc or Alt+Enter submits; Ctrl+C interrupts the running remote turn (a second Ctrl+C exits); /quit exits, /bg backgrounds the current session and exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions, /fork branches the current session, /close deletes it and exits. /model, /effort, /agent switch the remote turn like the local REPL.");
     let mut editor = PromptEditor::new(&session_id, &app_config.history_file);
+    // Command words the shared completion table does not carry: serve-chat-only
+    // commands plus shared ones missing from the trie. Registered per client
+    // process, so the local REPL never suggests them.
+    CommandCompleter::set_extra_command_words(
+        ["/bg", "/new", "/quit", "/resume"]
+            .iter()
+            .map(|word| (*word).to_string())
+            .collect(),
+    );
     // Last `/sessions` output: backs `/resume <number|id-prefix>`.
     let mut listed: Vec<RemoteSession> = Vec::new();
     // Client-side per-turn selection, seeded from the server (`GET /info`)
@@ -1017,6 +1365,7 @@ pub(in crate::ai) fn run_serve_chat(
     selection.apply_header(&mut editor);
     let agent_manifests = agents::load_all_agents();
     loop {
+        sigint_state.bind_session(&session_id);
         // Silent live refresh before every input box: server-generated titles
         // (they appear after the first turn) and fresh `/resume` completion
         // candidates. Failures keep the previous listing; the prompt is never
@@ -1034,6 +1383,12 @@ pub(in crate::ai) fn run_serve_chat(
         let input = match editor.read_multi_line() {
             Ok(Some(text)) => text,
             Ok(None) => break,
+            // Ctrl+C in the input box: the same exit as the local REPL's
+            // prompt interrupt, not an error report.
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                println!("Exit.");
+                break;
+            }
             Err(err) => {
                 eprintln!("[serve-chat] input error: {err}");
                 break;
@@ -1053,7 +1408,7 @@ pub(in crate::ai) fn run_serve_chat(
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first)\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first)\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
                 );
                 continue;
             }
@@ -1101,16 +1456,35 @@ pub(in crate::ai) fn run_serve_chat(
                 }
                 Err(err) => eprintln!("[serve-chat] {err}"),
             },
-            // Local `/close` deletes the session and exits; the suspended-
-            // binding cleanup it also does is local-terminal state with no
-            // remote equivalent, so DELETE + break is the full parity here.
+            // Local `/close` deletes the session and exits; it also drops
+            // that session's suspended bindings, whose remote equivalent is
+            // this terminal's `/bg` binding file (the startup existence check
+            // would heal it anyway, but an explicit delete should not leave a
+            // dangling pointer).
             "/close" => match delete_remote_session(&client, &base, &token, &session_id) {
                 Ok(_) => {
                     println!("Closed remote session {session_id}.");
+                    clear_serve_chat_binding();
                     break;
                 }
                 Err(err) => eprintln!("[serve-chat] {err}"),
             },
+            // Local parity for the suspend family (`/bg`, `/suspend`,
+            // `/detach`, `/susp`, with `/` or `:` prefix): exit the
+            // interactive input and bind this terminal to the current remote
+            // session, so the next `a --serve-chat` here resumes it.
+            "/bg" | ":bg" | "/suspend" | ":suspend" | "/detach" | ":detach" | "/susp" | ":susp" => {
+                let resume = format!("a --serve-chat --session {session_id}");
+                match save_serve_chat_binding(&base, &session_id) {
+                    Ok(()) => println!(
+                        "Backgrounded remote session {session_id}; resume with `{resume}` (or just `a --serve-chat` in this terminal)."
+                    ),
+                    Err(err) => println!(
+                        "Backgrounded remote session {session_id} (binding not saved: {err}); resume with `{resume}`."
+                    ),
+                }
+                break;
+            }
             // Remote switching parity: like the local REPL, `/model <sel>
             // [question]` switches and optionally sends, `/effort <level>`
             // and `/agent <name>` switch for the next turn. Both `/` and `:`
@@ -1180,6 +1554,43 @@ mod tests {
             let _ = stream.write_all(response.as_bytes());
         });
         format!("http://{addr}/sessions/x/turns/stream")
+    }
+
+    /// Same canned-response trick, but also captures the request head (request
+    /// line + headers) so the interrupt route and its auth header can be
+    /// asserted offline.
+    fn serve_capture_once(
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
+        use std::io::BufRead;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = std::sync::Arc::clone(&captured);
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut head = String::new();
+            {
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone stream"));
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+            }
+            if let Ok(mut sink) = sink.lock() {
+                *sink = head;
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (format!("http://{addr}"), captured)
     }
 
     #[test]
@@ -1337,6 +1748,55 @@ mod tests {
     }
 
     #[test]
+    fn sse_tool_rows_keep_child_indent_verbatim() {
+        // Regression net for the serve-chat indent report: footer/message rows
+        // (tool status, cache/speed metrics, long command echoes) must reach
+        // the terminal byte-identical to the child bytes the server forwarded:
+        // leading two-space indent, inline ANSI, and over-long rows included.
+        // The client neither re-indents nor clamps these rows; soft-wrap of a
+        // row wider than the terminal is the terminal's own layout, identical
+        // to a local run of the same turn.
+        let cache = "  \u{1b}[2m↳ cache · 4.1k/22.0k tokens · 19% hit\u{1b}[0m";
+        let speed = "  \u{1b}[2m↳ speed · reasoning 1.6k tok @ 48.4 tok/s\u{1b}[0m";
+        let done = "  \u{1b}[32m✓\u{1b}[0m read_file  \u{1b}[2m·\u{1b}[0m target";
+        let running = "  \u{1b}[34m●\u{1b}[0m execute_command";
+        let long_cmd = format!("  │ $ {}", "cd /data00/x; ".repeat(20));
+        assert!(long_cmd.chars().count() > 200);
+        let failed = "  \u{1b}[31m✕\u{1b}[0m execute_command";
+        let expected =
+            format!("ok\n{cache}\n{speed}\n{done}\n{running}\n{long_cmd}\n{failed}\n");
+        let body = format!(
+            "event: delta\ndata: {{\"delta\": \"ok\"}}\n\ndata: {cache}\n\ndata: {speed}\n\ndata: {done}\n\ndata: {running}\n\ndata: {long_cmd}\n\ndata: {failed}\n\nevent: done\ndata: \n\n"
+        );
+        // Piped output: exact bytes, the long row is not clamped.
+        // `serve_body_once` keeps the body for the whole test server lifetime.
+        let canned: &'static str = Box::leak(body.into_boxed_str());
+        let url = serve_body_once(canned);
+        let resp = reqwest::blocking::get(url).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        assert_eq!(String::from_utf8(buf).expect("utf8"), expected);
+        // TTY output: the shared markdown renderer only owns body deltas, so
+        // message rows stay byte-identical here too. (Body deltas go through
+        // the live preview with styling/redraw sequences that only resolve on
+        // a real terminal, so the TTY assertion is containment per row, not
+        // whole-buffer equality.)
+        let url = serve_body_once(canned);
+        let resp = reqwest::blocking::get(url).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, true).expect("render");
+        let out = String::from_utf8(buf).expect("utf8");
+        for row in [cache, speed, done, running, long_cmd.as_str(), failed] {
+            assert!(row.starts_with("  "), "fixture lost indent: {row:?}");
+            assert!(!row.starts_with("   "), "fixture gained indent: {row:?}");
+            assert!(
+                out.lines().any(|line| line == row),
+                "message row mangled or missing on TTY: {row:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sse_preserves_body_spacing_and_empty_deltas() {
         let url = serve_body_once(
             "event: delta\ndata: {\"delta\": \"paragraph\\n\\n| a | b |\\n\"}\n\nevent: delta\ndata: {\"delta\": \"\"}\n\ndata: cache\n\ndata: speed\n\nevent: done\ndata: \n\n",
@@ -1345,6 +1805,27 @@ mod tests {
         let mut buf = Vec::new();
         render_turn_stream_to(resp, &mut buf, false).expect("render");
         assert_eq!(buf, b"paragraph\n\n| a | b |\ncache\nspeed\n");
+    }
+
+    #[test]
+    fn sse_tty_renders_table_through_shared_markdown_renderer() {
+        // Same table source as the piped case above, split across two chunks:
+        // on a TTY the body must render as a box table, not raw pipes.
+        let url = serve_body_once(
+            "event: delta\ndata: {\"delta\": \"| a | b |\\n| --- | --- |\\n\"}\n\nevent: delta\ndata: {\"delta\": \"| 1 | 2 |\\n\"}\n\nevent: done\ndata: \n\n",
+        );
+        let resp = reqwest::blocking::get(url).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, true).expect("render");
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(
+            out.contains('─'),
+            "table must render as a box, got: {out}"
+        );
+        assert!(
+            !out.contains("| ---"),
+            "raw separator must not leak, got: {out}"
+        );
     }
 
     #[test]
@@ -1573,5 +2054,111 @@ mod tests {
             Some("question")
         );
         assert_eq!(current_remote_title(&listed, "missing"), None);
+    }
+
+    #[test]
+    fn serve_chat_bg_binding_roundtrips_per_terminal() {
+        let root = std::env::temp_dir().join(format!(
+            "serve-chat-bg-test-{}-roundtrip",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        save_serve_chat_binding_for_key(&root, "terminal:term-1", "http://127.0.0.1:8080", "sess-1")
+            .expect("save");
+        let loaded =
+            load_serve_chat_binding_for_key(&root, "terminal:term-1").expect("load");
+        assert_eq!(loaded.base, "http://127.0.0.1:8080");
+        assert_eq!(loaded.session_id, "sess-1");
+        // A different terminal key sees nothing: bindings are per-terminal,
+        // like the local suspended store.
+        assert_eq!(
+            load_serve_chat_binding_for_key(&root, "terminal:term-2"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn serve_chat_bg_binding_rejects_corrupt_file() {
+        let root = std::env::temp_dir().join(format!(
+            "serve-chat-bg-test-{}-corrupt",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(
+            serve_chat_binding_path(&root, "terminal:term-1"),
+            "not json",
+        )
+        .expect("write");
+        assert_eq!(
+            load_serve_chat_binding_for_key(&root, "terminal:term-1"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn serve_chat_suspended_root_honors_override_next_to_it() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "serve-chat-bg-test-{}-override",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let suspended = dir.join("suspended_sessions");
+        unsafe {
+            std::env::set_var(
+                "RUST_TOOLS_SUSPENDED_SESSIONS_DIR",
+                suspended.to_str().expect("utf8"),
+            );
+        }
+        let root = serve_chat_suspended_root();
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");
+        }
+        assert_eq!(root, dir.join("serve_chat_suspended"));
+    }
+
+    #[test]
+    fn serve_sigint_stops_the_turn_before_exiting() {
+        use super::{ServeSigintAction, serve_sigint_action};
+        // A running turn claims the first press; anything else falls through to
+        // the local-exit behaviour.
+        assert_eq!(
+            serve_sigint_action(true, false),
+            ServeSigintAction::InterruptRemoteTurn
+        );
+        assert_eq!(serve_sigint_action(true, true), ServeSigintAction::ExitLocal);
+        assert_eq!(
+            serve_sigint_action(false, false),
+            ServeSigintAction::ExitLocal
+        );
+        assert_eq!(serve_sigint_action(false, true), ServeSigintAction::ExitLocal);
+    }
+
+    /// The interrupt must address the session-scoped route with the bearer
+    /// header, and an "already finished" answer must surface as `false`
+    /// instead of an error.
+    #[test]
+    fn interrupt_request_targets_the_session_route() {
+        rust_tools::ensure_rustls_provider();
+        let (base, captured) = serve_capture_once("{\"session_id\":\"s1\",\"interrupted\":true}");
+        let client = reqwest::blocking::Client::new();
+        let interrupted = interrupt_remote_turn(&client, &base, "tk", "s1").expect("request");
+        assert!(interrupted);
+        let head = captured.lock().expect("capture").clone().to_lowercase();
+        assert!(
+            head.starts_with("post /sessions/s1/interrupt http/1.1"),
+            "request head: {head}"
+        );
+        assert!(
+            head.contains("authorization: bearer tk"),
+            "request head: {head}"
+        );
+
+        let (base, _) = serve_capture_once("{\"session_id\":\"s1\",\"interrupted\":false}");
+        assert!(!interrupt_remote_turn(&client, &base, "tk", "s1").expect("request"));
     }
 }

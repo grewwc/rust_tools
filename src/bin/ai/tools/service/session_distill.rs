@@ -1,8 +1,10 @@
 //! Complete-archive semantic distillation with independent source verification.
-//! Source messages are evidence, never entries. Oversized inputs fail closed
-//! rather than silently distilling a prefix of the conversation.
+//! Source messages are evidence, never entries. Archive size determines the
+//! number of bounded requests, not how much of the conversation is scanned.
 
 mod input;
+mod budget;
+mod pipeline;
 pub(in crate::ai) use input::DistillInput;
 
 use std::fs::{File, OpenOptions};
@@ -21,12 +23,8 @@ use crate::ai::types::App;
 pub(crate) const DEFAULT_DISTILL_LIMIT: usize = 20;
 pub(crate) const DISTILL_TAG: &str = "session-distill";
 const SEGMENT_CHARS: usize = 6000;
-const CHUNK_CHARS: usize = 18000;
-const MAX_SOURCE_CHARS: usize = 4_000_000;
-const MAX_REDUCE_CHARS: usize = 100_000;
-const MAX_CATALOG_CHARS: usize = 24_000;
 const MODEL_RULES: &str = include_str!("prompts/session_distill_rules.md");
-const EXTRACTION_SCHEMA: &str = r#"{"conclusions":[{"topic_key":"stable-lowercase-topic-key","category":"architecture|decision_log|user_preference|project_info|user_memory","note":"one self-contained durable conclusion","evidence":[{"message_id":"m1p1","quote":"exact source quote"}],"replaces":null}]}"#;
+const EXTRACTION_SCHEMA: &str = r#"{"complete":true,"conclusions":[{"topic_key":"stable-lowercase-topic-key","category":"architecture|decision_log|user_preference|project_info|user_memory","note":"one self-contained durable conclusion","evidence":[{"message_id":"m1p1","quote":"exact source quote"}],"replaces":null}]}"#;
 
 #[derive(Debug, Clone, Serialize)]
 struct SourceSegment { id: String, role: String, text: String }
@@ -41,7 +39,7 @@ struct Conclusion {
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Extraction { conclusions: Vec<Conclusion> }
+struct Extraction { complete: bool, conclusions: Vec<Conclusion> }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Verification { verdicts: Vec<Verdict> }
@@ -71,37 +69,17 @@ fn parse_json<T: serde::de::DeserializeOwned>(raw: &str) -> Result<T, String> {
 
 fn source_segments(messages: &[Message]) -> Result<Vec<SourceSegment>, String> {
     let mut segments = Vec::new();
-    let mut count = 0usize;
     for (index, message) in messages.iter().enumerate() {
         if !matches!(message.role.as_str(), "user" | "assistant" | "tool")
             || is_runtime_synthetic_user_message(message) { continue; }
         let text = value_to_string(&message.content);
         let chars: Vec<char> = text.chars().collect();
-        count = count.saturating_add(chars.len());
-        if count > MAX_SOURCE_CHARS {
-            return Err("Archive exceeds the full-coverage source budget; nothing saved. Split the archive explicitly.".into());
-        }
         for (part, chars) in chars.chunks(SEGMENT_CHARS).enumerate() {
             segments.push(SourceSegment { id: format!("m{}p{}", index + 1, part + 1),
                 role: message.role.clone(), text: chars.iter().collect() });
         }
     }
     Ok(segments)
-}
-
-fn source_chunks(segments: &[SourceSegment]) -> Vec<&[SourceSegment]> {
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    let mut size = 0;
-    for (index, segment) in segments.iter().enumerate() {
-        let len = segment.text.chars().count();
-        if index > start && size + len > CHUNK_CHARS {
-            chunks.push(&segments[start..index]); start = index; size = 0;
-        }
-        size += len;
-    }
-    if start < segments.len() { chunks.push(&segments[start..]); }
-    chunks
 }
 
 fn resolve_evidence(conclusion: &Conclusion, segments: &[SourceSegment], source_digest: &str)
@@ -127,86 +105,10 @@ fn resolve_evidence(conclusion: &Conclusion, segments: &[SourceSegment], source_
 
 /// The callback seam tests coverage and rejection without a live provider.
 async fn semantic_conclusions<F, Fut>(segments: &[SourceSegment], existing: &[AgentMemoryEntry],
-    limit: usize, mut ask: F) -> Result<(Vec<Conclusion>, usize), String>
+    limit: usize, budget: &budget::RequestBudget, ask: F) -> Result<(Vec<Conclusion>, usize), String>
 where F: FnMut(Value) -> Fut, Fut: Future<Output = Result<String, String>>,
 {
-    let chunks = source_chunks(segments);
-    let mut proposals = Vec::new();
-    for (index, chunk) in chunks.iter().enumerate() {
-        let response = ask(json!({"phase":"extract", "segment_batch":index+1, "total_batches":chunks.len(),
-            "instruction":"Extract at most 12 meaningful durable conclusions from this batch. Include explicit corrections, not tentative plans. This is partial context; merge and verification will resolve the full conversation.",
-            "schema":EXTRACTION_SCHEMA, "source":chunk})).await?;
-        let extraction: Extraction = parse_json(&response)?;
-        if extraction.conclusions.len() > 12 {
-            return Err("Extraction exceeded the candidate budget; nothing saved".into());
-        }
-        proposals.extend(extraction.conclusions);
-        if serde_json::to_string(&proposals).map_err(|e| e.to_string())?.chars().count() > MAX_REDUCE_CHARS {
-            return Err("Complete merge exceeds the context budget; nothing saved. Split the archive explicitly.".into());
-        }
-    }
-    if proposals.is_empty() { return Ok((Vec::new(), 0)); }
-    let catalog: Vec<_> = existing.iter().filter_map(|entry| {
-        let metadata = active_distilled_metadata(entry)?;
-        Some(json!({"id":entry.id,"topic_key":metadata.topic_key,"revision":metadata.revision,"note":entry.note}))
-    }).collect();
-    if serde_json::to_string(&catalog).map_err(|e| e.to_string())?.chars().count() > MAX_CATALOG_CHARS {
-        return Err("Existing-topic catalog exceeds the safe merge budget; nothing saved".into());
-    }
-    let response = ask(json!({"phase":"merge", "schema":EXTRACTION_SCHEMA, "limit":limit,
-        "instruction":include_str!("prompts/session_distill_merge.md"),
-        "proposals":proposals, "existing":catalog})).await?;
-    let merged: Extraction = parse_json(&response)?;
-    if merged.conclusions.len() > limit { return Err("Merge exceeded the requested limit; nothing saved".into()); }
-    let proposed_count = merged.conclusions.len();
-    let source_digest = digest(serde_json::to_vec(segments).map_err(|e| e.to_string())?);
-    let mut conclusions = Vec::new();
-    let mut topic_keys = std::collections::BTreeSet::new();
-    for conclusion in merged.conclusions {
-        if resolve_evidence(&conclusion, segments, &source_digest).is_err() { continue; }
-        if !topic_keys.insert(conclusion.topic_key.clone()) {
-            return Err("Merge returned conflicting duplicate topics; nothing saved".into());
-        }
-        if let Some(id) = &conclusion.replaces {
-            if !existing.iter().any(|entry| entry.id.as_ref() == Some(id)
-                && active_distilled_metadata(entry).is_some_and(|metadata| metadata.topic_key == conclusion.topic_key))
-            { return Err("Merge targeted an unknown topic or revision; nothing saved".into()); }
-        }
-        conclusions.push(conclusion);
-    }
-    let mut accepted = Vec::new();
-    // Re-check every original segment, not merely extractor summaries.
-    for batch in conclusions.chunks(6) {
-        let mut supported = vec![false; batch.len()];
-        let mut vetoed = vec![false; batch.len()];
-        for (index, chunk) in chunks.iter().enumerate() {
-            let response = ask(json!({"phase":"verify", "segment_batch":index+1, "total_batches":chunks.len(),
-                "instruction":include_str!("prompts/session_distill_verify.md"),
-                "schema":{"verdicts":[{"id":0,"status":"supported|irrelevant|contradiction|uncertain"}]},
-                "conclusions":batch.iter().enumerate().map(|(id,item)|json!({"id":id,"conclusion":item})).collect::<Vec<_>>(),
-                "existing":catalog, "source":chunk})).await?;
-            let verification: Verification = parse_json(&response)?;
-            let mut seen = vec![false; batch.len()];
-            for verdict in verification.verdicts {
-                if verdict.id >= batch.len() || seen[verdict.id] {
-                    return Err("Incomplete or duplicate verification coverage; nothing saved".into());
-                }
-                seen[verdict.id] = true;
-                match verdict.status.as_str() {
-                    "supported" => supported[verdict.id] = true,
-                    "irrelevant" => {},
-                    "contradiction" | "uncertain" => vetoed[verdict.id] = true,
-                    _ => return Err("Unknown verification verdict; nothing saved".into()),
-                }
-            }
-            if seen.contains(&false) { return Err("Incomplete verification coverage; nothing saved".into()); }
-        }
-        for (index, conclusion) in batch.iter().enumerate() {
-            if supported[index] && !vetoed[index] { accepted.push(conclusion.clone()); }
-        }
-    }
-    let rejected = proposed_count - accepted.len();
-    Ok((accepted, rejected))
+    pipeline::run(segments, existing, limit, budget, ask).await
 }
 
 pub(in crate::ai) async fn run_distill_command(app: &App, zip_path: &Path, limit: usize, dry_run: bool)
@@ -227,7 +129,10 @@ pub(in crate::ai) async fn run_distill_source_command(app: &App, input: &Distill
     let store = MemoryStore::from_env_or_config();
     let existing = store.active_distilled_entries(&scope)?;
     let model = crate::ai::models::initial_model(&app.cli);
-    let (conclusions, rejected) = semantic_conclusions(&segments, &existing, limit, |payload| {
+    let budget = budget::RequestBudget::for_model(&model)?;
+    let mut extraction_requests = 0;
+    let (conclusions, rejected) = semantic_conclusions(&segments, &existing, limit, &budget, |payload| {
+        if payload["phase"] == "extract" { extraction_requests += 1; }
         let model = model.clone();
         async move {
             let messages = vec![json!({"role":"system","content":MODEL_RULES}), json!({"role":"user","content":payload.to_string()})];
@@ -236,7 +141,7 @@ pub(in crate::ai) async fn run_distill_source_command(app: &App, input: &Distill
         }
     }).await?;
     let mut report = DistillReport { session_id: session_id.clone(), extracted: conclusions.len(), saved:0,
-        updated:0, duplicates:0, rejected, chunks:source_chunks(&segments).len(), dry_run };
+        updated:0, duplicates:0, rejected, chunks:extraction_requests, dry_run };
     let source = format!("session-distill:{session_id}");
     let mut pending = Vec::new();
     for conclusion in conclusions {
@@ -275,7 +180,7 @@ fn text_message(role: &str, text: impl Into<String>) -> Message {
 }
 
 pub(crate) fn format_report(report: &DistillReport, path: &Path) -> String {
-    format!("Session distill {}: {}\n  session: {}\n  fully scanned batches: {}\n  verified conclusions: {}\n  {}: {}\n  updated: {}\n  duplicates: {}\n  rejected: {}\nVerified current-project conclusions are eligible for bounded automatic task recall; uncertain or unrelated results are not loaded.",
+    format!("Session distill {}: {}\n  session: {}\n  extraction requests (complete source scan): {}\n  verified conclusions: {}\n  {}: {}\n  updated: {}\n  duplicates: {}\n  rejected: {}\nVerified current-project conclusions are eligible for bounded automatic task recall; uncertain or unrelated results are not loaded.",
         if report.dry_run {"preview"} else {"complete"}, path.display(), report.session_id, report.chunks,
         report.extracted, if report.dry_run {"would save"} else {"saved"}, report.saved,
         report.updated, report.duplicates, report.rejected)
@@ -340,35 +245,62 @@ mod tests {
     }
     #[tokio::test]
     async fn session_distill_late_correction_vetoes_stale_conclusion() {
-        let segments = source_segments(&[text_message("user","x".repeat(CHUNK_CHARS)),
+        let segments = source_segments(&[text_message("user","x".repeat(SEGMENT_CHARS * 3)),
             text_message("user","Use SQLite as the canonical store instead of Redis."),
             text_message("user","Correction: the final decision is PostgreSQL, not SQLite.")]).unwrap();
-        let total = source_chunks(&segments).len();
-        let mut extract_calls = 0;
-        let mut verify_calls = 0;
-        let (accepted,rejected) = semantic_conclusions(&segments,&[],1,|payload| {
+        let expected = segments.iter().map(|s| s.text.as_str()).collect::<String>();
+        let mut extracted_text = String::new();
+        let mut verified_text = String::new();
+        let budget = budget::RequestBudget::for_test(12_000);
+        let (accepted,rejected) = semantic_conclusions(&segments,&[],1,&budget,|payload| {
             let response = match payload["phase"].as_str().unwrap() {
-                "extract" => { extract_calls += 1; json!({"conclusions":[conclusion()]}) },
-                "merge" => json!({"conclusions":[conclusion()]}),
-                "verify" => { verify_calls += 1; json!({"verdicts":[{"id":0,
-                    "status":if verify_calls == total {"contradiction"} else {"supported"}}]}) },
-                _ => unreachable!(),
+                "extract" => {
+                    extracted_text.push_str(&batch_text(&payload, "source"));
+                    selection_response(&payload)
+                },
+                "verify" => {
+                    let text = batch_text(&payload, "source");
+                    verified_text.push_str(&text);
+                    json!({"verdicts":[{"id":0,"status":if text.contains("PostgreSQL") {
+                        "contradiction"
+                    } else if text.contains("Use SQLite") { "supported" } else { "irrelevant" }}]})
+                },
+                _ => selection_response(&payload),
             };
             std::future::ready(Ok(response.to_string()))
         }).await.unwrap();
-        assert_eq!(extract_calls,total);
-        assert_eq!(verify_calls,total);
+        assert_eq!(extracted_text,expected);
+        assert_eq!(verified_text,expected);
         assert!(accepted.is_empty());
         assert_eq!(rejected,1);
+    }
+    fn batch_text(payload: &Value, key: &str) -> String {
+        payload[key].as_array().unwrap().iter()
+            .map(|item| item["text"].as_str().unwrap()).collect()
+    }
+    fn selection_response(payload: &Value) -> Value {
+        match payload["phase"].as_str().unwrap() {
+            "extract" => json!({"complete":true,"conclusions":if batch_text(payload, "source")
+                .contains("Use SQLite as the canonical store instead of Redis.") {
+                vec![conclusion()]
+            } else { vec![] }}),
+            "rank" => json!({"scores":payload["proposals"].as_array().unwrap().iter()
+                .map(|v| json!({"id":v["id"],"utility":80})).collect::<Vec<_>>()}),
+            "group" => json!({"decisions":payload["proposals"].as_array().unwrap().iter()
+                .map(|v| json!({"id":v["id"],"related":true})).collect::<Vec<_>>()}),
+            "merge" => json!({"complete":true,"conclusions":[conclusion()]}),
+            _ => unreachable!(),
+        }
     }
     #[tokio::test]
     async fn session_distill_incomplete_verifier_fails_closed() {
         let segments = source_segments(&[text_message("user","Other discussion"),
             text_message("user","Use SQLite as the canonical store instead of Redis.")]).unwrap();
-        let result = semantic_conclusions(&segments,&[],1,|payload| {
+        let budget = budget::RequestBudget::for_test(12_000);
+        let result = semantic_conclusions(&segments,&[],1,&budget,|payload| {
             std::future::ready(Ok(if payload["phase"] == "verify" { json!({"verdicts":[]}) }
-                else { json!({"conclusions":[conclusion()]}) }.to_string()))
+                else { selection_response(&payload) }.to_string()))
         }).await;
-        assert!(result.unwrap_err().contains("Incomplete verification"));
+        assert!(result.unwrap_err().contains("Incomplete decision coverage"));
     }
 }

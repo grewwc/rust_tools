@@ -61,15 +61,18 @@ fn build_multiline_completion_context(textarea: &TextArea<'_>) -> Option<Pending
 
 fn should_open_popup_on_first_tab(ctx: &PendingTabCompletion) -> bool {
     let trimmed = ctx.line[..ctx.col].trim();
-    // `/model` (including its `effort` subcommand) and `/effort` both pick one value
-    // from a fixed candidate list, so the first Tab opens the panel directly instead
-    // of the silent-first-then-popup flow used for ambiguous completions.
+    // `/model` (including its `effort` subcommand), `/effort` and serve-chat
+    // `/resume` all pick one value from a fixed candidate list, so the first Tab
+    // opens the panel directly instead of the silent-first-then-popup flow used
+    // for ambiguous completions.
     (matches!(trimmed, "/model" | ":model")
         || trimmed.starts_with("/model ")
         || trimmed.starts_with(":model ")
         || matches!(trimmed, "/effort" | ":effort")
         || trimmed.starts_with("/effort ")
-        || trimmed.starts_with(":effort "))
+        || trimmed.starts_with(":effort ")
+        || matches!(trimmed, "/resume")
+        || trimmed.starts_with("/resume "))
         || is_skill_reference_trigger(trimmed)
 }
 
@@ -273,6 +276,33 @@ mod tests {
         assert_eq!(panel.items.len(), 8);
         assert!(panel.items.iter().any(|item| item.replacement == "high"));
         assert!(panel.items.iter().any(|item| item.replacement == "auto"));
+    }
+
+    #[test]
+    fn serve_resume_opens_popup_on_first_tab() {
+        // Shares the global serve-session cache with the `prompt::completion`
+        // resume tests; serialize on the same lock.
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        CommandCompleter::set_serve_session_candidates(vec![
+            ("b2b23f0c-1".to_string(), "fix login bug".to_string()),
+            ("aa11bb22-2".to_string(), "write docs".to_string()),
+        ]);
+
+        let mut textarea = TextArea::new(vec!["/resume ".to_string()]);
+        textarea.move_cursor(CursorMove::End);
+        let mut pending = None;
+        let mut panel = None;
+
+        let status = apply_multiline_completion(&mut textarea, &mut pending, &mut panel).unwrap();
+
+        assert!(status.contains("发现"));
+        let panel = panel.expect("serve-chat /resume should list sessions on the first tab");
+        assert_eq!(panel.items.len(), 2);
+        assert_eq!(panel.items[0].replacement, "1");
+        assert!(panel.items[0].display.contains("fix login bug"));
+        CommandCompleter::set_serve_session_candidates(Vec::new());
     }
 
     #[test]

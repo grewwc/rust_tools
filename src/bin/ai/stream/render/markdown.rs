@@ -276,6 +276,13 @@ impl MarkdownStreamRenderer {
         true
     }
 
+    /// Whether the rendered output currently sits at a line start. Callers
+    /// that interleave their own lines with renderer output use this to
+    /// decide if a guard newline is still needed after a flush.
+    pub(in crate::ai) fn at_line_start(&self) -> bool {
+        self.bol
+    }
+
     pub(in crate::ai::stream) fn write_chunk(
         &mut self,
         chunk: &str,
@@ -290,7 +297,12 @@ impl MarkdownStreamRenderer {
         self.write_block_to(&mut out, text, dimmed)
     }
 
-    fn write_chunk_to(&mut self, out: &mut dyn Write, chunk: &str, dimmed: bool) -> io::Result<()> {
+    pub(in crate::ai) fn write_chunk_to(
+        &mut self,
+        out: &mut dyn Write,
+        chunk: &str,
+        dimmed: bool,
+    ) -> io::Result<()> {
         self.dimmed = dimmed;
         for ch in chunk.chars() {
             if ch == '\n' {
@@ -721,8 +733,15 @@ impl MarkdownStreamRenderer {
         out.write_all(ch.encode_utf8(&mut buf).as_bytes())
     }
 
-    pub(in crate::ai::stream) fn flush_pending(&mut self) -> io::Result<()> {
+    pub(in crate::ai) fn flush_pending(&mut self) -> io::Result<()> {
         let mut out = io::stdout();
+        self.flush_pending_to(&mut out)
+    }
+
+    /// Same body as `flush_pending`, but writes to the given sink instead of
+    /// stdout, so callers rendering into another buffer (serve chat output)
+    /// share the exact streaming behavior.
+    pub(in crate::ai) fn flush_pending_to(&mut self, out: &mut dyn Write) -> io::Result<()> {
 
         // Blank lines still cached at flush time are trailing blanks; discard (do not emit).
         self.deferred_blank_lines = 0;
