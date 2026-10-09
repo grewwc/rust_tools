@@ -132,6 +132,10 @@ impl AiConfig {
     /// Comma-separated extra path substrings to treat as sensitive (blocked
     /// for file read/write), merged with the built-in sensitive list.
     pub const SANDBOX_EXTRA_SENSITIVE_PATHS: &str = "ai.sandbox.extra_sensitive_paths";
+    /// Comma-separated directory names the `grep` scope guard treats as build
+    /// output, merged with the built-in cross-ecosystem list. A `-` prefix
+    /// removes a built-in name, e.g. `bazel-bin, -build`. Empty = built-ins.
+    pub const SANDBOX_SEARCH_SKIP_DIRS: &str = "ai.sandbox.search_skip_dirs";
 
     // ── Tool permissions ───────────────────────────────────
     /// Per-tool execution policy applied to the foreground turn via a

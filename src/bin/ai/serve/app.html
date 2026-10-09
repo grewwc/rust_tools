@@ -840,7 +840,7 @@ function parseBlock(raw) {
   for (const line of raw.split("\n")) {
     if (line.startsWith("event:")) kind = line.slice(6).trim();
     else if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
-    else if (line.trim() === "") continue;
+    else if (line.trim() === "" || line.startsWith(":")) continue; // blank or SSE keep-alive comment, never progress
     else data.push(line);
   }
   return { kind, payload: data.join("\n") };
@@ -905,8 +905,29 @@ async function send() {
   // The POST is accepted before its first byte arrives, and the server keeps the
   // turn running even if this page goes away: only a server-sent `error` event is
   // a real turn failure, while a dead stream leaves a stale view (startStaleFollow).
+  // A stream can also stall silently in the foreground (lost tail, half-dead
+  // connection): reader.read() never resolves and no error ever fires, so the
+  // page would wait forever on progress (N) + thinking. The watchdog below moves
+  // such a stall to the same history-follow path as transport loss.
   let turnStarted = false;
   let turnError = false;
+  const STREAM_STALL_MS = 60000; // no meaningful block for this long => stalled
+  let stalled = false; // set by the watchdog; the read loop then exits via cancel
+  let stallTimer = null;
+  let reader = null; // assigned once the stream opens, so the watchdog can cancel it
+  const armStall = () => {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => { stalled = true; try { if (reader) reader.cancel(); } catch (_) {} }, STREAM_STALL_MS);
+  };
+  const goStale = (msg) => {
+    staleSession = sessionId;
+    staleTries = 0;
+    // Until the first fetch below, staleDone still describes the transcript
+    // from before this turn and would end the follow on its first tick.
+    staleDone = false;
+    fail(msg);
+    startStaleFollow();
+  };
   try {
     const res = await fetch(store.base + "/sessions/" + sessionId + "/turns/stream", {
       method: "POST", headers: headers(true), body: JSON.stringify(body),
@@ -917,9 +938,10 @@ async function send() {
       throw new Error(res.status + " " + detail);
     }
     turnStarted = true;
-    const reader = res.body.getReader();
+    reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
+    armStall(); // the first meaningful block must arrive within STREAM_STALL_MS
     let finished = false;
     for (;;) {
       const { done, value } = await reader.read();
@@ -929,6 +951,7 @@ async function send() {
       while ((idx = buf.indexOf("\n\n")) >= 0) {
         const { kind, payload } = parseBlock(buf.slice(0, idx));
         buf = buf.slice(idx + 2);
+        if (kind !== "" || payload) armStall(); // keep-alive comments (empty) must not mask a stalled turn
         if (kind === "done") { finished = true; break; }
         else if (kind === "error") { turnError = true; throw new Error(JSON.parse(payload).error || "turn failed"); }
         else if (kind === "delta") {
@@ -958,20 +981,17 @@ async function send() {
       if (finished) break;
       if (done) break;
     }
+    clearTimeout(stallTimer);
     if (paintTimer !== null) { clearTimeout(paintTimer); paint(); } // flush the tail
-    if (!raw) bubble.innerHTML = "<span style='color:var(--dim)'>(empty reply)</span>";
+    if (stalled && !finished && !turnError) goStale("stream stalled (no updates for 60s) — the turn keeps running on the server (following history)");
+    else if (!raw) bubble.innerHTML = "<span style='color:var(--dim)'>(empty reply)</span>";
   } catch (e) {
+    clearTimeout(stallTimer);
     if (turnStarted && !turnError) {
       // The POST was accepted and no server `error` event arrived, so this is
       // transport loss: the turn keeps running server-side and the view is
       // stale. Follow the transcript instead of declaring the turn dead.
-      staleSession = sessionId;
-      staleTries = 0;
-      // Until the first fetch below, staleDone still describes the transcript
-      // from before this turn and would end the follow on its first tick.
-      staleDone = false;
-      fail("connection lost: " + e.message + " — the turn keeps running on the server (following history)");
-      startStaleFollow();
+      goStale("connection lost: " + e.message + " — the turn keeps running on the server (following history)");
     } else fail("turn failed: " + e.message);
   }
   sending = false;

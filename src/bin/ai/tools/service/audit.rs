@@ -3270,7 +3270,211 @@ fn validate_grep_scope(
             ));
         }
     }
+    // Recursive `grep` reads every file it walks and has no ignore support, so
+    // a root above build output costs minutes and buries the answer in matches
+    // from object files and binaries. `rg` / `ag` / `ack` honour ignore files
+    // and stay unrestricted.
+    if matches!(program, "grep" | "egrep" | "fgrep") {
+        validate_grep_heavy_dirs(program, command_tokens, path_args, base_dir)?;
+    }
     Ok(())
+}
+
+/// Directories a recursive `grep` should never walk: build output and
+/// dependency trees hold the object files, archives and binaries that dominate
+/// the walk while containing no source. The names cover the common ecosystems
+/// (Rust, JS/TS, Python, JVM, .NET, Apple, Dart, Zig, vendored Go/PHP
+/// dependencies, Haskell, OCaml/Elixir) and stay tunable through
+/// `AiConfig::SANDBOX_SEARCH_SKIP_DIRS`. VCS internals are left out on purpose
+/// (they exist in every repository, so listing `.git` would reject every
+/// bare-`grep` search); the navigation tools carry their own, wider display
+/// skip list (`tools/tree_tools.rs::SKIP_DIRS`).
+const HEAVY_SEARCH_DIRS: &[&str] = &[
+    ".dart_tool",
+    ".gradle",
+    ".mypy_cache",
+    ".next",
+    ".nuxt",
+    ".parcel-cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".svelte-kit",
+    ".terraform",
+    ".tox",
+    ".turbo",
+    ".venv",
+    "__pycache__",
+    "_build",
+    "bower_components",
+    "build",
+    "coverage",
+    "DerivedData",
+    "dist",
+    "dist-newstyle",
+    "node_modules",
+    "obj",
+    "Pods",
+    "target",
+    "vendor",
+    "venv",
+    "zig-cache",
+    "zig-out",
+];
+
+/// How deep below the searched root the pre-flight scan looks for heavy
+/// directories (monorepos nest them: `packages/web/node_modules`) and how many
+/// directory entries it may visit. Both bounds keep the check itself far
+/// cheaper than the walk it prevents.
+const HEAVY_SEARCH_SCAN_DEPTH: usize = 3;
+const HEAVY_SEARCH_SCAN_BUDGET: usize = 4096;
+
+/// Built-in heavy directory names merged with `ai.sandbox.search_skip_dirs`:
+/// an entry adds a name, a `-`-prefixed entry removes a built-in one.
+fn heavy_search_dir_names() -> Vec<String> {
+    let configured =
+        crate::commonw::configw::get_all_config().get(AiConfig::SANDBOX_SEARCH_SKIP_DIRS, "");
+    merge_heavy_search_dirs(&configured)
+}
+
+/// Pure half of `heavy_search_dir_names`, so the merge rules are testable
+/// without touching configuration.
+fn merge_heavy_search_dirs(configured: &str) -> Vec<String> {
+    let mut names: Vec<String> = HEAVY_SEARCH_DIRS.iter().map(|name| name.to_string()).collect();
+    for raw in configured.split(',') {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if let Some(removed) = entry.strip_prefix('-') {
+            names.retain(|name| name != removed);
+        } else if !names.iter().any(|name| name == entry) {
+            names.push(entry.to_string());
+        }
+    }
+    names
+}
+
+/// Heavy directory names present at or below `root`, sorted and deduplicated.
+/// A matched directory is never descended into, and symlinked directories are
+/// skipped because a `grep -r` walk does not follow them either.
+fn heavy_dirs_under(root: &std::path::Path, names: &[String]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut pending = vec![(root.to_path_buf(), 0usize)];
+    let mut budget = HEAVY_SEARCH_SCAN_BUDGET;
+    'scan: while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                break 'scan;
+            }
+            budget -= 1;
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if names.iter().any(|heavy| heavy == &name) {
+                if !found.iter().any(|seen| seen == &name) {
+                    found.push(name);
+                }
+                continue;
+            }
+            if depth + 1 < HEAVY_SEARCH_SCAN_DEPTH && !name.starts_with('.') {
+                pending.push((entry.path(), depth + 1));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// True when the command already excludes `dir` from the search, either
+/// attached (`--exclude-dir=target`) or spaced (`--exclude-dir target`).
+fn grep_excludes_dir(command_tokens: &[String], dir: &str) -> bool {
+    let excluding_options = ["--exclude", "--exclude-dir", "--exclude-from"];
+    let mut spaced_value = false;
+    for tok in command_tokens.iter().skip(1) {
+        let attached = excluding_options
+            .iter()
+            .any(|opt| tok.strip_prefix(opt).is_some_and(|rest| rest.starts_with('=')));
+        if (spaced_value || attached) && tok.contains(dir) {
+            return true;
+        }
+        spaced_value = excluding_options.contains(&tok.as_str());
+    }
+    false
+}
+
+/// Reject a recursive `grep` whose root still contains, within
+/// `HEAVY_SEARCH_SCAN_DEPTH` levels, a build-output directory the command does
+/// not exclude: `grep` has no ignore-file support, so it reads the whole tree.
+/// An explicit `--exclude-dir`, a narrower root, or a root at or inside a build
+/// directory (searching it on purpose) all pass; `rg` / `ag` / `ack` are not
+/// inspected because they honour ignore files by default.
+fn validate_grep_heavy_dirs(
+    program: &str,
+    command_tokens: &[String],
+    path_args: &[&str],
+    base_dir: &std::path::Path,
+) -> Result<(), String> {
+    let names = heavy_search_dir_names();
+    // Without a path argument the search starts at the current directory.
+    let implicit_root = ["."];
+    let roots: &[&str] = if path_args.is_empty() {
+        &implicit_root
+    } else {
+        path_args
+    };
+    for raw_root in roots {
+        // Shell-expanded roots are handled by `validate_glob_scope`.
+        if raw_root.is_empty() || has_glob_metachar(raw_root) {
+            continue;
+        }
+        let Ok(root) = resolve_path_arg(raw_root, base_dir) else {
+            continue;
+        };
+        // Searching a heavy directory on purpose is fine, so a root that names
+        // one anywhere below the base (`target`, `target/debug`) passes, while
+        // `.` does not.
+        let relative = root.strip_prefix(base_dir).unwrap_or(root.as_path());
+        if relative.components().any(|part| {
+            let part = part.as_os_str().to_string_lossy();
+            names.iter().any(|name| name == part.as_ref())
+        }) {
+            continue;
+        }
+        let walked: Vec<String> = heavy_dirs_under(&root, &names)
+            .into_iter()
+            .filter(|name| !grep_excludes_dir(command_tokens, name))
+            .collect();
+        if walked.is_empty() {
+            continue;
+        }
+        let fix = walked
+            .iter()
+            .map(|name| format!("`--exclude-dir={name}`"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(format!(
+            "recursive `{program}` from '{raw_root}' would walk {} (build output or \
+             dependencies); grep has no ignore support — retry with {fix}, a narrower \
+             root, or `rg` / `git grep`. To search inside build output on purpose, \
+             root the search there; `rg` needs `--no-ignore` for it",
+            summarize_dirs(&walked)
+        ));
+    }
+    Ok(())
+}
+
+/// Up to three quoted directory names plus the remainder count, so the message
+/// stays one line even when a root holds many heavy directories.
+fn summarize_dirs(names: &[String]) -> String {
+    let mut listed: Vec<String> = names.iter().take(3).map(|name| format!("'{name}/'")).collect();
+    if names.len() > listed.len() {
+        listed.push(format!("and {} more", names.len() - listed.len()));
+    }
+    listed.join(", ")
 }
 
 /// `locate` searches a whole-disk name index; reject it unless the bare name
@@ -4151,12 +4355,106 @@ mod search_scope_tests {
 
     #[test]
     fn grep_within_cwd_is_allowed() {
-        allowed("grep -rn pattern .");
         allowed("grep -rn pattern src");
         allowed("grep -rn --include='*.rs' pattern src");
         allowed("grep -e foo -e bar src");
         // Non-recursive single-file reads stay unrestricted.
         allowed("grep -n pattern /etc/hosts");
+    }
+
+    /// A throwaway project root under the session temp dir (always an allowed
+    /// search root) holding a build directory and a source directory. Each test
+    /// names its own fixture, since the tests run in parallel.
+    fn with_temp_search_root<F: FnOnce(&std::path::Path)>(fixture: &str, f: F) {
+        const TEST_SESSION: &str = "grep-build-dir-test-session";
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY
+            .sync_scope((TEST_SESSION.to_string(), 0), || {
+                let tmp = crate::ai::driver::runtime_ctx::temp_dir()
+                    .expect("session temp dir must resolve in tests");
+                let root = tmp.join(fixture);
+                // A previous run may have left the fixture (and other tests'
+                // additions) behind: start from a known state.
+                let _ = std::fs::remove_dir_all(&root);
+                std::fs::create_dir_all(root.join("target")).unwrap();
+                std::fs::create_dir_all(root.join("src")).unwrap();
+                f(&root);
+            });
+    }
+
+    #[test]
+    fn recursive_grep_that_would_walk_build_output_is_blocked() {
+        with_temp_search_root("grep-build-dir-fixture", |root| {
+            // A build directory nested inside another one: rooting the search
+            // above it (`target/debug`) must still count as deliberate.
+            std::fs::create_dir_all(root.join("target/debug/build")).unwrap();
+            let root = root.display().to_string();
+            let err = blocked(&format!("grep -rn pattern {root}"));
+            assert!(err.contains("'target/'"), "got: {err}");
+            assert!(err.contains("on purpose"), "got: {err}");
+            // Attached and spaced exclusions, a narrower root, a root inside the
+            // build output, and ignore-aware tools all pass.
+            allowed(&format!("grep -rn --exclude-dir=target pattern {root}"));
+            allowed(&format!("grep -rn --exclude-dir target pattern {root}"));
+            allowed(&format!("grep -rn pattern {root}/src"));
+            allowed(&format!("grep -rn pattern {root}/target"));
+            allowed(&format!("grep -rn pattern {root}/target/debug"));
+            allowed(&format!("rg pattern {root}"));
+        });
+    }
+
+    #[test]
+    fn recursive_grep_needs_every_build_dir_excluded() {
+        with_temp_search_root("grep-multi-build-dir-fixture", |root| {
+            std::fs::create_dir_all(root.join("node_modules")).unwrap();
+            let root = root.display().to_string();
+            // Excluding only `target` still leaves `node_modules` in the walk.
+            let err = blocked(&format!("grep -rn --exclude-dir=target pattern {root}"));
+            assert!(err.contains("'node_modules/'"), "got: {err}");
+            allowed(&format!(
+                "grep -rn --exclude-dir=target --exclude-dir=node_modules pattern {root}"
+            ));
+        });
+    }
+
+    #[test]
+    fn recursive_grep_finds_build_dirs_nested_in_a_workspace() {
+        with_temp_search_root("grep-workspace-fixture", |root| {
+            // Monorepo layout: the heavy directories sit three levels down.
+            std::fs::create_dir_all(root.join("packages/web/node_modules")).unwrap();
+            std::fs::create_dir_all(root.join("apps/api/.venv")).unwrap();
+            // Beyond the scan's depth bound: the check stays cheap, and probing
+            // this one stays the model's own decision.
+            std::fs::create_dir_all(root.join("deep/one/two/venv")).unwrap();
+            let root = root.display().to_string();
+            let err = blocked(&format!("grep -rn pattern {root}"));
+            assert!(err.contains("'node_modules/'"), "got: {err}");
+            assert!(err.contains("'.venv/'"), "got: {err}");
+            assert!(err.contains("'target/'"), "got: {err}");
+            assert!(!err.contains("'venv/'"), "got: {err}");
+            // Excluding every reported name lets the retry through.
+            allowed(&format!(
+                "grep -rn --exclude-dir=target --exclude-dir=node_modules \
+                 --exclude-dir=.venv pattern {root}"
+            ));
+            // Rooting the search inside one of them is the deliberate path.
+            allowed(&format!("grep -rn pattern {root}/packages/web/node_modules"));
+        });
+    }
+
+    #[test]
+    fn search_skip_dirs_config_extends_and_trims_the_builtin_list() {
+        let defaults = merge_heavy_search_dirs("");
+        assert!(defaults.iter().any(|name| name == "node_modules"));
+        let merged = merge_heavy_search_dirs(" bazel-bin, -build, bazel-bin ");
+        assert!(merged.iter().any(|name| name == "bazel-bin"));
+        assert!(!merged.iter().any(|name| name == "build"));
+        assert_eq!(merged.iter().filter(|name| *name == "bazel-bin").count(), 1);
+    }
+
+    #[test]
+    fn long_directory_lists_are_summarized() {
+        let names: Vec<String> = ["a", "b", "c", "d"].iter().map(|name| name.to_string()).collect();
+        assert_eq!(summarize_dirs(&names), "'a/', 'b/', 'c/', and 1 more");
     }
 
     // ---- locate ----
