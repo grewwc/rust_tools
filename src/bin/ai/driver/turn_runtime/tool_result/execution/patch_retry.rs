@@ -106,7 +106,7 @@ pub(in crate::ai::driver::turn_runtime) fn update_stale_patch_targets(
 /// New sessions restore directly from the SQLite meta; this only serves old stores that
 /// predate the meta upgrade, and it writes back immediately after the first load so later
 /// history compression never drops the tool-call pairings needed for the rebuild.
-pub(in crate::ai::driver) fn stale_patch_targets_from_messages(
+pub(in crate::ai) fn stale_patch_targets_from_messages(
     messages: &[Message],
 ) -> rustc_hash::FxHashSet<PathBuf> {
     let mut tool_calls = Vec::new();

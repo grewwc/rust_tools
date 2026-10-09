@@ -74,7 +74,7 @@ pub(in crate::ai::driver::turn_runtime) use completion_gate::{
 };
 pub(in crate::ai::driver::turn_runtime) use evidence_status::annotate_tool_result_evidence_status;
 pub(in crate::ai::driver::turn_runtime) use iteration::handle_iteration_execution_for_model;
-pub(in crate::ai::driver) use patch_retry::stale_patch_targets_from_messages;
+pub(in crate::ai) use patch_retry::stale_patch_targets_from_messages;
 pub(in crate::ai::driver::turn_runtime) use prepare::prepare_recent_tool_result;
 // The task tool rejects `response_schema` on agents whose final response is the
 // machine-checked `<audit_report>` envelope, so this predicate reaches beyond the driver.

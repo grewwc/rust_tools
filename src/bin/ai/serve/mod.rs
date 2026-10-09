@@ -27,9 +27,14 @@ use crate::commonw::configw;
 use super::{
     agents,
     config_schema::AiConfig,
-    history::{SessionStore, SessionTitleOrigin},
+    history::{
+        SessionStore, SessionTitleOrigin, invalidate_context_history_cache_for,
+        is_runtime_synthetic_user_message, truncate_history_messages,
+        write_stale_patch_targets_sqlite,
+    },
     model_names, models,
 };
+use super::driver::turn_runtime::stale_patch_targets_from_messages;
 pub(in crate::ai) mod chat;
 pub(in crate::ai) mod ctl;
 
@@ -624,6 +629,100 @@ async fn set_session_title(
     }
 }
 
+/// Request body for `POST /sessions/{id}/rewind`: the canonical (0-based)
+/// index into the session's full message list of the user message to rewind
+/// to. The mobile client learns that index as
+/// `X-History-Total - shown.length + bubble_index` (see `read_history`).
+#[derive(Debug, Deserialize)]
+struct RewindReq {
+    message_index: usize,
+}
+
+/// Rewind session `{id}` to just before the anchored user message, mirroring
+/// the local `/history rewind u<N>`: the anchored user message and everything
+/// after it is removed, while titles and other metadata are untouched. The
+/// anchor must be a real user turn boundary: assistant/tool messages and
+/// runtime-injected user messages are rejected with 400, because rewinding to
+/// those would split a turn in the middle. Holds the session lock, so a
+/// rewind tapped during an active turn waits for the turn to finish instead
+/// of racing it. Like the local rewind, the stale-patch ledger is rebuilt
+/// from the surviving messages (keeping pre-rewind entries would let the next
+/// patch bypass the fresh-read gate) and the context cache is invalidated.
+async fn rewind_history(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<RewindReq>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if SessionStore::validate_session_id(&id).is_err() {
+        return bad_request(format!("invalid session id: {id}")).into_response();
+    }
+    let store = SessionStore::new(state.history_file.as_path());
+    let session_file = store.session_history_file(&id);
+    // Serialize with turns (see `post_turn_sse`): the anchored index points
+    // into the message prefix, which a running turn only appends to, so the
+    // truncate below lands on a quiescent file.
+    let lock = session_lock(&state, &id).await;
+    let _guard = lock.lock().await;
+    let messages = match store.read_all_messages(&id) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let Some(anchor) = messages.get(req.message_index) else {
+        return bad_request(format!(
+            "message_index {} out of range (session has {} messages)",
+            req.message_index,
+            messages.len()
+        ))
+        .into_response();
+    };
+    if anchor.role != "user" {
+        return bad_request(format!(
+            "message {} is '{}', not a user message: rewind anchors on a user input bubble",
+            req.message_index, anchor.role
+        ))
+        .into_response();
+    };
+    if is_runtime_synthetic_user_message(anchor) {
+        return bad_request(format!(
+            "message {} is runtime-injected, not a real user input: pick a user input bubble",
+            req.message_index
+        ))
+        .into_response();
+    }
+    let removed = messages.len() - req.message_index;
+    if let Err(err) = truncate_history_messages(&session_file, req.message_index) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response();
+    }
+    let targets = stale_patch_targets_from_messages(&messages[..req.message_index]);
+    if let Err(err) = write_stale_patch_targets_sqlite(&session_file, &targets) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response();
+    }
+    invalidate_context_history_cache_for(&session_file);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"removed": removed, "kept": req.message_index})),
+    )
+        .into_response()
+}
+
 async fn read_history(
     State(state): State<ServeState>,
     headers: HeaderMap,
@@ -647,12 +746,23 @@ async fn read_history(
                 .into_response();
         }
     };
+    // Total before the tail cut: the mobile client maps a tapped user bubble
+    // back to its canonical index as `total - shown.length + bubble_index`
+    // for `POST /rewind`. A header keeps the body shape (a bare message
+    // array) unchanged, so older cached pages keep parsing.
+    let total = messages.len();
     if let Some(limit) = q.limit {
         if messages.len() > limit {
             messages = messages.split_off(messages.len() - limit);
         }
     }
-    (StatusCode::OK, Json(messages)).into_response()
+    let mut resp = (StatusCode::OK, Json(messages)).into_response();
+    resp.headers_mut().insert(
+        "x-history-total",
+        axum::http::HeaderValue::from_str(&total.to_string())
+            .unwrap_or(axum::http::HeaderValue::from_static("0")),
+    );
+    resp
 }
 
 /// Run one turn by re-executing this binary in one-shot mode. This keeps serve
@@ -2002,6 +2112,143 @@ mod tests {
         }
     }
 
+    /// Seed helper for the rewind tests: a fixed-id session holding the
+    /// given roles in order, like one built by real chat traffic.
+    fn seed_rewind_session(state: &super::ServeState, id: &str, roles: &[&str]) {
+        use crate::ai::history::{Message, append_history_messages};
+        let store = super::SessionStore::new(state.history_file.as_path());
+        store.ensure_root_dir().expect("root dir");
+        let path = store.session_history_file(id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("session dir");
+        }
+        let messages: Vec<Message> = roles
+            .iter()
+            .map(|role| Message {
+                role: role.to_string(),
+                content: serde_json::Value::String(format!("{role} says hi")),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            })
+            .collect();
+        append_history_messages(&path, &messages).expect("seed messages");
+    }
+
+    #[tokio::test]
+    async fn rewind_removes_anchor_and_everything_after_it() {
+        use axum::{
+            Json,
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        let state = lifecycle_test_state();
+        seed_rewind_session(&state, "s1", &["user", "assistant", "user", "assistant"]);
+        let resp = super::rewind_history(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("s1".to_string()),
+            Json(super::RewindReq { message_index: 2 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v.get("removed").and_then(|n| n.as_u64()), Some(2));
+        assert_eq!(v.get("kept").and_then(|n| n.as_u64()), Some(2));
+        let store = super::SessionStore::new(state.history_file.as_path());
+        let rest = store.read_all_messages("s1").expect("read back");
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0].role, "user");
+        assert_eq!(rest[1].role, "assistant");
+    }
+
+    #[tokio::test]
+    async fn rewind_rejects_non_user_out_of_range_and_missing() {
+        use axum::{
+            Json,
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        let state = lifecycle_test_state();
+        seed_rewind_session(&state, "s1", &["user", "assistant"]);
+        // Assistant anchor and past-the-end indexes must not truncate.
+        for index in [1usize, 2, 99] {
+            let resp = super::rewind_history(
+                State(state.clone()),
+                HeaderMap::new(),
+                Path("s1".to_string()),
+                Json(super::RewindReq {
+                    message_index: index,
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "index={index}");
+        }
+        // A missing session reads back as empty history (same as `read_history`),
+        // so rewinding it is an out-of-range anchor, not a 404.
+        let resp = super::rewind_history(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("missing".to_string()),
+            Json(super::RewindReq { message_index: 0 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // Failed rewinds leave the session untouched.
+        let store = super::SessionStore::new(state.history_file.as_path());
+        assert_eq!(store.read_all_messages("s1").expect("read back").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rewind_rejects_runtime_injected_user_anchor() {
+        use axum::{
+            Json,
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        use crate::ai::history::{append_history_messages, runtime_synthetic_user_message};
+        let state = lifecycle_test_state();
+        seed_rewind_session(&state, "s1", &["user"]);
+        let store = super::SessionStore::new(state.history_file.as_path());
+        append_history_messages(
+            &store.session_history_file("s1"),
+            &[runtime_synthetic_user_message(serde_json::Value::String(
+                "handoff".to_string(),
+            ))],
+        )
+        .expect("seed synthetic");
+        // The injected handoff is a user row but not a real turn boundary.
+        let resp = super::rewind_history(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("s1".to_string()),
+            Json(super::RewindReq { message_index: 1 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // The real user input next to it still rewinds.
+        let resp = super::rewind_history(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("s1".to_string()),
+            Json(super::RewindReq { message_index: 0 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(store.read_all_messages("s1").expect("read back").is_empty());
+    }
+
     #[tokio::test]
     async fn serve_app_returns_mobile_client() {
         let resp = super::serve_app().await;
@@ -2013,6 +2260,41 @@ mod tests {
         assert!(body.contains("id=\"serve-app\""));
         assert!(body.contains("/sessions/"));
         assert!(body.contains("turns/stream"));
+        assert!(body.contains("/rewind"));
+    }
+
+    #[tokio::test]
+    async fn history_total_header_reports_precut_count() {
+        use axum::{
+            extract::{Path, Query, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        let state = lifecycle_test_state();
+        seed_rewind_session(&state, "s1", &["user", "assistant", "user"]);
+        let resp = super::read_history(
+            State(state),
+            HeaderMap::new(),
+            Path("s1".to_string()),
+            Query(super::HistoryQuery { limit: Some(1) }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The mobile client maps a tapped bubble to its canonical index as
+        // `total - shown.length + bubble_index`, so the header must describe
+        // the full session even when the body is a tail cut.
+        assert_eq!(
+            resp.headers()
+                .get("x-history-total")
+                .and_then(|v| v.to_str().ok()),
+            Some("3")
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let v: Vec<serde_json::Value> = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v.len(), 1);
     }
 
     #[tokio::test]
@@ -2648,7 +2930,7 @@ pub(in crate::ai) async fn run_serve(
         .route("/sessions/{id}/fork", post(fork_session))
         .route("/sessions/{id}/title", post(set_session_title))
         .route("/sessions/{id}", delete(delete_session))
-        .route("/sessions/{id}/history", get(read_history))
+        .route("/sessions/{id}/history", get(read_history)).route("/sessions/{id}/rewind", post(rewind_history))
         .route(
             "/sessions/{id}/turns",
             post(post_turn).layer(DefaultBodyLimit::max(MAX_TURN_REQUEST_BYTES)),

@@ -4,7 +4,7 @@ pub(in crate::ai) mod overflow;
 mod preview;
 
 pub(in crate::ai) use execution::is_evidence_gated_audit_agent;
-pub(in crate::ai::driver) use execution::stale_patch_targets_from_messages;
+pub(in crate::ai) use execution::stale_patch_targets_from_messages;
 pub(super) use execution::{
     append_empty_response_retry_note, DEGENERATE_REPETITION_FINISH_REASON, FinalGateState,
     audit_evidence_gate_action, completion_evidence_state, completion_tool_result_succeeded,

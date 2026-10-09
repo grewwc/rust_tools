@@ -53,6 +53,9 @@ select, summary { touch-action:manipulation; }
 .msg.user { align-self:flex-end; background:#1f6feb; color:#fff; }
 .msg.asst { align-self:flex-start; background:var(--panel); border:1px solid var(--line); }
 .msg details { font-size:13px; color:var(--dim); }
+/* Rewindable user bubbles invite a tap (mirrors `/history rewind`); the
+   pointer is the only affordance so the transcript stays uncluttered. */
+.msg.rewindable { cursor:pointer; }
 .msg .prog { font-size:13px; color:var(--dim); }
 .msg.err { border-color:var(--err); color:var(--err); }
 #ovr { display:flex; gap:6px; padding:8px 12px 0; }
@@ -646,7 +649,15 @@ async function loadHistory() {
   // would otherwise be titled with a bare role name, because the call that
   // produced it is the message just outside. The extra one only feeds the call
   // index below, never the transcript.
-  try { msgs = await (await api("/sessions/" + sessionId + "/history?limit=201")).json(); }
+  // Canonical message count backing the shown window: a tapped user bubble
+  // maps to `histTotal - shown.length + bubble_index` for `POST /rewind`.
+  // Older servers omit the header, so fall back to the fetched length.
+  let histTotal = 0;
+  try {
+    const res = await api("/sessions/" + sessionId + "/history?limit=201");
+    histTotal = Number(res.headers.get("x-history-total")) || 0;
+    msgs = await res.json();
+  }
   catch (e) { addMsg("err", "history failed: " + e.message, "asst err"); return; }
   const shown = msgs.slice(-200);
   lastMsgCount = shown.length;
@@ -659,10 +670,16 @@ async function loadHistory() {
   // first so each result can be titled by its call.
   const calls = new Map();
   for (const m of msgs) for (const c of m.tool_calls || []) if (c && c.id) calls.set(c.id, c);
-  for (const m of shown) {
+  const histBase = Math.max(0, (histTotal || msgs.length) - shown.length);
+  for (let i = 0; i < shown.length; i++) {
+    const m = shown[i];
     const t = textOf(m.content).trim();
     if (!t) continue;
-    if (m.role === "user") addMsg("user", t, "user");
+    // Only real user inputs are rewind anchors: runtime-injected user
+    // messages carry a `reasoning_content` side channel (user text never
+    // does), and the server re-validates the anchor anyway.
+    if (m.role === "user" && !m.reasoning_content) addUserBubble(t, histBase + i);
+    else if (m.role === "user") addMsg("user", t, "user");
     else if (m.role === "assistant") addMsgMd(t);
     else {
       const call = m.tool_call_id ? calls.get(m.tool_call_id) : null;
@@ -670,6 +687,28 @@ async function loadHistory() {
     }
   }
   $("msgs").scrollTop = $("msgs").scrollHeight;
+}
+// Tapping a user input bubble offers a rewind to just before it, mirroring
+// the local `/history rewind u<N>`: that message and everything after it is
+// removed, titles and other metadata are untouched. The server holds the
+// session lock, so tapping during an active turn waits for it to finish.
+function addUserBubble(text, index) {
+  const d = addMsg("user", text, "user rewindable");
+  d.title = "tap to rewind to just before this message";
+  d.onclick = () => rewindTo(index, text);
+  return d;
+}
+async function rewindTo(index, preview) {
+  const short = preview.length > 80 ? preview.slice(0, 79) + "…" : preview;
+  if (!confirm("Rewind to just before:\n\n\"" + short + "\"\n\nThis message and everything after it will be removed. Continue?")) return;
+  try {
+    const res = await (await api("/sessions/" + sessionId + "/rewind", {
+      method: "POST", body: JSON.stringify({ message_index: index }),
+    })).json();
+    await loadSessions();
+    await loadHistory();
+    addMsg("ok", "rewound: removed " + res.removed + " message(s).", "asst");
+  } catch (e) { addMsg("err", "rewind failed: " + e.message, "asst err"); }
 }
 
 // The reply to a turn whose live feed died still lands in history, so the page
