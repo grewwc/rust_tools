@@ -1202,8 +1202,32 @@ fn default_history_export_path(app: &App) -> PathBuf {
         .join(file_name)
 }
 
-const IMAGE_PLACEHOLDER_PREFIX: &str = "[[image:";
-const IMAGE_PLACEHOLDER_SUFFIX: &str = "]]";
+pub(in crate::ai) const IMAGE_PLACEHOLDER_PREFIX: &str = "[[image:";
+pub(in crate::ai) const IMAGE_PLACEHOLDER_SUFFIX: &str = "]]";
+
+/// Bare filenames referenced by `[[image:name]]` placeholders in `prompt`,
+/// in order of first appearance, deduplicated. The prompt itself is left
+/// untouched. Serve-chat clients reuse this to upload pasted images with the
+/// turn: a remote server shares no filesystem with the client, so the files
+/// must travel inside the request; the server stages them under the same
+/// names before running, and the existing placeholder resolution then finds
+/// them unchanged.
+pub(in crate::ai) fn inline_image_filenames(prompt: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = prompt;
+    while let Some(start) = rest.find(IMAGE_PLACEHOLDER_PREFIX) {
+        let search_start = start + IMAGE_PLACEHOLDER_PREFIX.len();
+        let Some(end_rel) = rest[search_start..].find(IMAGE_PLACEHOLDER_SUFFIX) else {
+            break;
+        };
+        let name = rest[search_start..search_start + end_rel].trim().to_string();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+        rest = &rest[search_start + end_rel + IMAGE_PLACEHOLDER_SUFFIX.len()..];
+    }
+    names
+}
 
 fn extract_at_file_references(question: &mut String) -> crate::ai::types::FileParseResult {
     let mut parsed = crate::ai::types::FileParseResult::default();
@@ -1587,7 +1611,8 @@ mod tests {
         extract_forced_skill_references, finalize_question, highlight_history_keyword,
         last_assistant_conclusion_text, parse_history_preview_options, parse_local_command,
         plan_history_rewind, render_history_preview, render_history_replay,
-        resolve_inline_image_path, searchable_history_content, summarize_history_content,
+        inline_image_filenames, resolve_inline_image_path, searchable_history_content,
+        summarize_history_content,
         truncate_for_terminal,
     };
     use crate::ai::{
@@ -1601,6 +1626,21 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
     use uuid::Uuid;
+
+    #[test]
+    fn inline_image_filenames_lists_placeholders_in_order_deduped() {
+        let prompt = "look [[image:paste-a.png]] and [[image:paste-b.png]] \
+            plus [[image:paste-a.png]] again [[image:/abs/x.png]] [[image:]] [[image:broken";
+        assert_eq!(
+            inline_image_filenames(prompt),
+            vec![
+                "paste-a.png".to_string(),
+                "paste-b.png".to_string(),
+                "/abs/x.png".to_string(),
+            ]
+        );
+        assert!(inline_image_filenames("no placeholders here").is_empty());
+    }
 
     #[test]
     fn resolve_inline_image_remaps_bare_filename_to_assets_dir() {

@@ -63,6 +63,10 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
     // Serve-mode chunk streaming handoff: no-op unless this process was
     // spawned by the serve SSE endpoint with `A_SERVE_LIVE_FIFO` set.
     background::open_serve_live_fifo_from_env();
+    // Serve-child marker: no-op unless spawned by either serve turn endpoint
+    // with `A_SERVE_CHILD` set. Read (and scrubbed) here alongside the FIFO
+    // handoff so the flag is settled before any thread spawns.
+    background::mark_serve_child_from_env();
     // Internal helper used only by a live side-note `/bg` handoff. It is a fresh
     // process so it can safely resume the still-running parent without inheriting
     // the parent's runtime state; it must not parse normal CLI arguments.

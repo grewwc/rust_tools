@@ -8,6 +8,11 @@ ALL_BINS ?= $(INSTALL_BINS) c
 .PHONY: $(INSTALL_BINS)
 $(INSTALL_BINS): install ; @:
 
+# Release features enabled by `install-all`. `agent-hang-debug` is
+# deliberately excluded: Cargo.toml marks it as off-limits for normal and
+# release builds.
+RELEASE_FEATURES := serve
+
 RELEASE_DIR := target/release
 DEBUG_DIR := target/debug
 INSTALLW := $(DEBUG_DIR)/installw
@@ -127,3 +132,15 @@ install-completions:
 		esac; \
 	done
 .PHONY: test test-a test-fk clean
+
+# Like `install`, but builds every bin with all release features (incl. `serve`).
+# It builds unconditionally instead of asking installw which bins are stale:
+# a feature change does not touch source mtimes, so installw would wrongly
+# report a previously installed bin as up-to-date and skip the rebuild.
+.PHONY: install-all
+install-all: $(addprefix $(RELEASE_DIR)/,$(MCP_BINS))
+	cargo build --release --features $(RELEASE_FEATURES) $(addprefix --bin ,$(filter-out $(MCP_BINS),$(INSTALL_BINS)))
+	cargo build --release -p re
+	sh ./move_executable.sh --force $(INSTALL_BINS)
+	sh ./move_executable.sh --force re
+	@$(MAKE) install-completions

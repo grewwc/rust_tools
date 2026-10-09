@@ -94,6 +94,9 @@ pub fn print_interactive_help() {
     println!("    /sessions import <file.zip> [as=<id>]           import session from archive");
     println!("    /sessions fork [src=<id>] [as=<id>]      copy session to a new branch");
     println!("    /sessions branch <keep_turns> [src=<id>] [as=<id>] retain complete user turns");
+    println!(
+        "    /title [text]             set or show the current session title (bare /title shows it)"
+    );
     println!();
     println!("  Notes:");
     println!("    - Commands support both / and : prefix (e.g., /help or :help)");

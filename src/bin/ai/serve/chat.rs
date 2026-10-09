@@ -6,13 +6,16 @@
 //! to `POST /sessions/{id}/turns/stream`; every SSE event is rendered as it
 //! arrives instead of waiting for the whole turn.
 
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use serde::Deserialize;
 
 use crate::commonw::configw;
 
-use super::super::{cli::ParsedCli, config_schema::AiConfig, prompt::PromptEditor};
+use super::super::{
+    cli::ParsedCli, config_schema::AiConfig, driver::input::inline_image_filenames,
+    history::SessionStore, prompt::PromptEditor,
+};
 use super::DEFAULT_BIND;
 
 #[derive(Debug, Deserialize)]
@@ -324,18 +327,59 @@ fn close_thinking_status(
     let _ = out.flush();
 }
 
+/// Package client-local `[[image:name]]` files for upload with the turn.
+/// The server shares no filesystem with this client, so every bare pasted
+/// filename that resolves inside the client session assets dir is read and
+/// base64-encoded here; the server stages the bytes under the same filename
+/// before running, and its placeholder resolution then works unchanged.
+/// Entries that are not bare names (explicit user paths stay server-side
+/// references) or that have no local file are skipped — the server resolves
+/// or reports those exactly as before. Repeated placeholders upload once.
+fn collect_image_uploads(
+    prompt: &str,
+    history_file: &Path,
+    session_id: &str,
+) -> Vec<serde_json::Value> {
+    use base64::Engine as _;
+
+    let assets_dir = SessionStore::new(history_file).session_assets_dir(session_id);
+    let mut uploads = Vec::new();
+    for name in inline_image_filenames(prompt) {
+        if name.contains('/') || name.contains('\\') {
+            continue;
+        }
+        let path = assets_dir.join(&name);
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        uploads.push(serde_json::json!({
+            "filename": name,
+            "data_base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+        }));
+    }
+    uploads
+}
+
 fn post_turn_stream(
     client: &reqwest::blocking::Client,
     base: &str,
     token: &str,
     session_id: &str,
     prompt: &str,
+    history_file: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let images = collect_image_uploads(prompt, history_file, session_id);
     let resp = auth(
         client.post(format!("{base}/sessions/{session_id}/turns/stream")),
         token,
     )
-    .json(&serde_json::json!({ "prompt": prompt }))
+    .json(&serde_json::json!({ "prompt": prompt, "images": images }))
     .send()?;
     let status = resp.status();
     if !status.is_success() {
@@ -428,7 +472,14 @@ pub(in crate::ai) fn run_serve_chat(
             },
             _ => {
                 if let Err(err) =
-                    post_turn_stream(&client, &base, &token, &session_id, &trimmed)
+                    post_turn_stream(
+                        &client,
+                        &base,
+                        &token,
+                        &session_id,
+                        &trimmed,
+                        &app_config.history_file,
+                    )
                 {
                     eprintln!("[serve-chat] {err}");
                 }
@@ -469,6 +520,32 @@ mod tests {
         let mut buf = Vec::new();
         render_turn_stream_to(resp, &mut buf, false).expect("render");
         assert_eq!(buf, b"hello\nworld\n");
+    }
+
+    #[test]
+    fn collect_image_uploads_packages_multiple_local_files() {
+        // Client assets layout: <tmp>/<stem>.sessions/<session>.assets/.
+        let root =
+            std::env::temp_dir().join(format!("a-serve-chat-img-{}", uuid::Uuid::new_v4()));
+        let history = root.join("history.jsonl");
+        let assets = SessionStore::new(&history).session_assets_dir("sess-1");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("paste-a.png"), b"AAA").unwrap();
+        std::fs::write(assets.join("paste-b.png"), b"BB").unwrap();
+        let prompt = "what [[image:paste-a.png]] and [[image:paste-b.png]] \
+            plus [[image:paste-a.png]] again, missing [[image:paste-missing.png]], \
+            server-side [[image:/srv/x.png]]?";
+        let uploads = collect_image_uploads(prompt, &history, "sess-1");
+        assert_eq!(uploads.len(), 2, "unexpected: {uploads:?}");
+        assert_eq!(uploads[0]["filename"], serde_json::json!("paste-a.png"));
+        // The payload must round-trip to the staged file bytes.
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(uploads[0]["data_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(raw, b"AAA");
+        assert_eq!(uploads[1]["filename"], serde_json::json!("paste-b.png"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -5,16 +5,13 @@
 //! listing. Turn execution reuses the existing one-shot path so behavior stays
 //! identical to `a --session <id> "<prompt>"`.
 
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    process::Stdio,
-    sync::Arc,
-};
+use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
+
+use base64::Engine as _;
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Sse, sse::Event},
     routing::{get, post},
@@ -73,6 +70,100 @@ struct HistoryQuery {
 #[derive(Debug, Deserialize)]
 struct TurnReq {
     prompt: String,
+    /// Client-uploaded images for `[[image:name]]` placeholders in `prompt`.
+    /// A remote serve-chat client shares no filesystem with the server, so
+    /// pasted images travel inside the request (base64) and are staged under
+    /// the same filenames before the turn runs. Absent for old clients and
+    /// for text-only turns.
+    #[serde(default)]
+    images: Vec<ServeImageUpload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServeImageUpload {
+    filename: String,
+    data_base64: String,
+}
+
+/// Per-turn image upload caps: pasted screenshots are small, but the API
+/// must not become an arbitrary file drop. The child resolves placeholders
+/// against the session assets dir, so only bare filenames with an image
+/// extension are accepted — never a path.
+const MAX_TURN_IMAGES: usize = 10;
+const MAX_TURN_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_TURN_IMAGES_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const TURN_IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
+/// Max JSON body for the two turn endpoints. Images travel base64 (~4/3
+/// overhead) inside the request, so the framework default (2MB) would reject
+/// legitimate multi-image turns with 413 before the handler caps run.
+/// Handler-level caps (10MiB per file, 32MiB total decoded) still enforce the
+/// real policy; this only lets those requests reach the handler.
+const MAX_TURN_REQUEST_BYTES: usize = 48 * 1024 * 1024;
+
+/// Stage uploaded turn images into the session assets dir under the uploaded
+/// filenames, so the one-shot child's existing `[[image:name]]` resolution
+/// finds them exactly as if they had been pasted locally. Pure filesystem
+/// work; runs before the per-session lock is taken.
+fn stage_turn_images(
+    assets_dir: &std::path::Path,
+    images: &[ServeImageUpload],
+) -> Result<(), String> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    if images.len() > MAX_TURN_IMAGES {
+        return Err(format!(
+            "too many images: {} (max {MAX_TURN_IMAGES})",
+            images.len()
+        ));
+    }
+    // Validate and decode everything before touching the filesystem: a late
+    // rejection must not leave a directory or partially staged files behind.
+    let mut staged: Vec<(&str, Vec<u8>)> = Vec::with_capacity(images.len());
+    let mut total_bytes = 0usize;
+    for image in images {
+        let name = image.filename.trim();
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+        {
+            return Err(format!("invalid image filename: {:?}", image.filename));
+        }
+        let ext = std::path::Path::new(name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !TURN_IMAGE_EXTS.contains(&ext.as_str()) {
+            return Err(format!("unsupported image type for {name:?}"));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(image.data_base64.trim())
+            .map_err(|_| format!("image {name:?} is not valid base64"))?;
+        if bytes.is_empty() || bytes.len() > MAX_TURN_IMAGE_BYTES {
+            return Err(format!(
+                "image {name:?} is {} bytes (max {MAX_TURN_IMAGE_BYTES})",
+                bytes.len()
+            ));
+        }
+        total_bytes += bytes.len();
+        if total_bytes > MAX_TURN_IMAGES_TOTAL_BYTES {
+            return Err(format!(
+                "images exceed {MAX_TURN_IMAGES_TOTAL_BYTES} bytes in total"
+            ));
+        }
+        staged.push((name, bytes));
+    }
+    std::fs::create_dir_all(assets_dir)
+        .map_err(|err| format!("cannot prepare session assets dir: {err}"))?;
+    for (name, bytes) in &staged {
+        std::fs::write(assets_dir.join(name), bytes)
+            .map_err(|err| format!("cannot stage image {name:?}: {err}"))?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -240,6 +331,9 @@ fn run_one_shot_turn(session_id: &str, prompt: &str) -> std::io::Result<String> 
         .arg("--session")
         .arg(session_id)
         .arg(prompt)
+        // Marks the child as serve-spawned (title skip); the FIFO env stays
+        // unset here, so streaming paths keep seeing a plain child.
+        .env(background::SERVE_CHILD_ENV, "1")
         .output()?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
@@ -273,6 +367,12 @@ async fn post_turn(
     let prompt = req.prompt.trim().to_string();
     if prompt.is_empty() {
         return bad_request("prompt is empty".to_string()).into_response();
+    }
+    if let Err(err) = stage_turn_images(
+        &SessionStore::new(&state.history_file).session_assets_dir(&id),
+        &req.images,
+    ) {
+        return bad_request(err).into_response();
     }
     let lock = session_lock(&state, &id).await;
     let _guard = lock.lock().await;
@@ -321,6 +421,12 @@ async fn post_turn_sse(
     let prompt = req.prompt.trim().to_string();
     if prompt.is_empty() {
         return bad_request("prompt is empty".to_string()).into_response();
+    }
+    if let Err(err) = stage_turn_images(
+        &SessionStore::new(&state.history_file).session_assets_dir(&id),
+        &req.images,
+    ) {
+        return bad_request(err).into_response();
     }
     let lock = session_lock(&state, &id).await;
     // Chunk-level streaming: the child publishes framed live events
@@ -427,7 +533,10 @@ fn stream_child_turn(
         .arg(&session_id)
         .arg(&prompt)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Marks the child as serve-spawned even when no FIFO is set up
+        // (fallback line pump): the title skip must not depend on streaming.
+        .env(background::SERVE_CHILD_ENV, "1");
     if let Some(fifo) = live_fifo.as_ref() {
         cmd.env(background::SERVE_LIVE_FIFO_ENV, &fifo.path);
     }
@@ -751,11 +860,98 @@ fn delta_event(delta: String) -> Event {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServeFrameDecoder, ServeLiveEvent, setup_live_fifo};
+    use super::{ServeFrameDecoder, ServeImageUpload, ServeLiveEvent, setup_live_fifo};
+    use super::{MAX_TURN_IMAGES, stage_turn_images};
     #[cfg(unix)]
     use super::pump_live_fifo;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use uuid::Uuid;
+
+    fn upload(name: &str, bytes: &[u8]) -> ServeImageUpload {
+        use base64::Engine as _;
+        ServeImageUpload {
+            filename: name.to_string(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+
+    #[test]
+    fn stage_turn_images_stages_multiple_files() {
+        let dir = std::env::temp_dir().join(format!("a-serve-stage-{}", Uuid::new_v4()));
+        let images = vec![upload("paste-a.png", b"aaa"), upload("paste-b.jpg", b"bb")];
+        stage_turn_images(&dir, &images).expect("stage");
+        assert_eq!(std::fs::read(dir.join("paste-a.png")).unwrap(), b"aaa");
+        assert_eq!(std::fs::read(dir.join("paste-b.jpg")).unwrap(), b"bb");
+        // An empty upload list is a no-op and creates nothing.
+        let untouched = dir.join("untouched");
+        stage_turn_images(&untouched, &[]).expect("empty ok");
+        assert!(!untouched.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stage_turn_images_rejects_unsafe_uploads() {
+        let dir = std::env::temp_dir().join(format!("a-serve-stage-{}", Uuid::new_v4()));
+        // Path traversal, nested names, non-image extensions and empty names.
+        // Double extensions resolve by the final suffix; case is folded.
+        for bad in [
+            "../evil.png",
+            "sub/dir.png",
+            "note.txt",
+            "x.png.exe",
+            "",
+            ".",
+            "..",
+        ] {
+            let err =
+                stage_turn_images(&dir, &[upload(bad, b"x")]).expect_err("must reject");
+            assert!(!err.is_empty(), "empty error for {bad:?}");
+        }
+        // Uppercase image extensions are accepted (folders stay lowercase-safe).
+        let upper = std::env::temp_dir().join(format!("a-serve-stage-{}", Uuid::new_v4()));
+        stage_turn_images(&upper, &[upload("PHOTO.PNG", b"x")]).expect("uppercase ext ok");
+        assert!(upper.join("PHOTO.PNG").is_file());
+        let _ = std::fs::remove_dir_all(&upper);
+        // Malformed base64.
+        let bad_payload = ServeImageUpload {
+            filename: "a.png".to_string(),
+            data_base64: "!!!".to_string(),
+        };
+        stage_turn_images(&dir, std::slice::from_ref(&bad_payload))
+            .expect_err("bad base64 must fail");
+        // Image count cap (size caps share the same validated path).
+        let many: Vec<_> = (0..MAX_TURN_IMAGES + 1)
+            .map(|i| upload(&format!("f{i}.png"), b"x"))
+            .collect();
+        stage_turn_images(&dir, &many).expect_err("too many must fail");
+        assert!(
+            !dir.join("f0.png").exists(),
+            "count rejection must stage nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stage_turn_images_is_atomic_and_enforces_size_caps() {
+        use super::MAX_TURN_IMAGE_BYTES;
+
+        // A late rejection must not leave the earlier valid file behind, nor
+        // even create the assets dir.
+        let dir = std::env::temp_dir().join(format!("a-serve-stage-{}", Uuid::new_v4()));
+        let mixed = vec![upload("good.png", b"good"), upload("../evil.png", b"evil")];
+        stage_turn_images(&dir, &mixed).expect_err("late entry must fail the turn");
+        assert!(
+            !dir.exists(),
+            "validation must run before any filesystem write"
+        );
+        // Per-file cap: one byte over the limit is rejected.
+        let big = vec![0u8; MAX_TURN_IMAGE_BYTES + 1];
+        let dir2 = std::env::temp_dir().join(format!("a-serve-stage-{}", Uuid::new_v4()));
+        stage_turn_images(&dir2, &[upload("big.png", &big)])
+            .expect_err("oversized file must fail");
+        assert!(!dir2.exists());
+    }
 
     #[cfg(test)]
     fn test_frame(
@@ -983,8 +1179,14 @@ pub(in crate::ai) async fn run_serve(
         .route("/healthz", get(healthz))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/history", get(read_history))
-        .route("/sessions/{id}/turns", post(post_turn))
-        .route("/sessions/{id}/turns/stream", post(post_turn_sse))
+        .route(
+            "/sessions/{id}/turns",
+            post(post_turn).layer(DefaultBodyLimit::max(MAX_TURN_REQUEST_BYTES)),
+        )
+        .route(
+            "/sessions/{id}/turns/stream",
+            post(post_turn_sse).layer(DefaultBodyLimit::max(MAX_TURN_REQUEST_BYTES)),
+        )
         .route("/skills", get(list_skills))
         .route("/agents", get(list_agents))
         .with_state(state);

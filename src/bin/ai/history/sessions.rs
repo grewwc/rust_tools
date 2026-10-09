@@ -106,6 +106,9 @@ pub(in crate::ai) enum PruneSessionDeleteResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::ai) enum SessionTitleOrigin {
     Model,
+    /// Explicitly set by the user (e.g. via `/title`). Never overwritten by
+    /// background auto-generation.
+    User,
     Fallback,
     Legacy,
 }
@@ -114,6 +117,7 @@ impl SessionTitleOrigin {
     fn from_persisted(value: Option<&str>) -> Self {
         match value {
             Some("model") => Self::Model,
+            Some("user") => Self::User,
             Some("fallback") => Self::Fallback,
             _ => Self::Legacy,
         }
@@ -122,6 +126,7 @@ impl SessionTitleOrigin {
     fn persisted_value(self) -> &'static str {
         match self {
             Self::Model => "model",
+            Self::User => "user",
             Self::Fallback => "fallback",
             // Legacy is only for reading old data; new writes must explicitly
             // mark the real origin.

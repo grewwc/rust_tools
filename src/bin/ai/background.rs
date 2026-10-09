@@ -362,6 +362,33 @@ fn publish_live_output_bytes(bytes: &[u8]) {
 /// in-process. Never set by users; only by `serve::post_turn_sse`.
 pub(crate) const SERVE_LIVE_FIFO_ENV: &str = "A_SERVE_LIVE_FIFO";
 
+/// Marker for any one-shot child spawned by `serve` (both the SSE and the
+/// plain turn endpoints). Unlike [`SERVE_LIVE_FIFO_ENV`], it is set even when
+/// no live FIFO exists, so serve children can skip work that would otherwise
+/// hold the server's per-session lock (model session titles) without changing
+/// local CLI behavior. Never set by users; only by `serve`.
+pub(crate) const SERVE_CHILD_ENV: &str = "A_SERVE_CHILD";
+
+/// Set while this process is a serve-spawned turn child (see [`SERVE_CHILD_ENV`]).
+static SERVE_CHILD: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process runs as a serve-spawned turn child.
+pub(crate) fn is_serve_child() -> bool {
+    SERVE_CHILD.load(Ordering::Relaxed)
+}
+
+/// Read [`SERVE_CHILD_ENV`] once at process entry and scrub it, mirroring
+/// [`open_serve_live_fifo_from_env`]: exec'd grandchildren (MCP servers,
+/// nested tool processes, re-exec'd daemons) must not inherit it.
+pub(crate) fn mark_serve_child_from_env() {
+    if std::env::var(SERVE_CHILD_ENV).is_ok() {
+        SERVE_CHILD.store(true, Ordering::Relaxed);
+    }
+    // SAFETY: runs once at process entry before any other thread spawns, so
+    // no concurrent env access can exist yet.
+    unsafe { std::env::remove_var(SERVE_CHILD_ENV) };
+}
+
 /// Set while [`open_serve_live_fifo_from_env`] installed a serve FIFO. Tells
 /// the final-echo sites (driver finalize, stream truncation paths) to stay
 /// quiet: the same text already streamed through the pipe chunk by chunk, and

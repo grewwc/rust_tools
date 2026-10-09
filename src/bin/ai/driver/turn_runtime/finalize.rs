@@ -370,6 +370,12 @@ fn should_generate_model_session_title(
     let Some(existing) = existing else {
         return true;
     };
+    // A user-set title is authoritative: the raw-fragment quality heuristics
+    // below apply to auto-generated titles only, never to an explicit user
+    // choice (a long or filler-prefixed user title must not be regenerated).
+    if existing.origin == SessionTitleOrigin::User {
+        return false;
+    }
     if is_low_quality_session_title(&existing.text) {
         return true;
     }
@@ -382,7 +388,10 @@ fn should_generate_model_session_title(
             !fallback_title.is_empty()
                 && normalize_generated_session_title(&existing.text) == fallback_title
         }
+        // Model-set titles are authoritative; never regenerate over them.
         SessionTitleOrigin::Model => false,
+        // Unreachable: User was returned above. Kept for exhaustive matching.
+        SessionTitleOrigin::User => false,
     }
 }
 
@@ -392,6 +401,8 @@ fn should_write_fallback_session_title(
 ) -> bool {
     match existing {
         None => true,
+        // A user-set title is authoritative; never replace it with a fallback.
+        Some(existing) if existing.origin == SessionTitleOrigin::User => false,
         Some(existing) if is_low_quality_session_title(&existing.text) => true,
         // Stamp provenance when migrating a legacy fallback; model-based upgrades can then be retried reliably.
         Some(existing) => {
@@ -656,9 +667,21 @@ async fn generate_session_title_if_missing(app: &App, pending_user_input: Option
         return;
     }
 
-    let model_title = crate::ai::request::generate_session_title_via_model(app, &all_messages)
-        .await
-        .map(|title| normalize_generated_session_title(&title));
+    // Serve-spawned children hold the server's per-session lock until they
+    // exit, so a model title round-trip here (the whole first-turn
+    // `total_ms - done_ms` tail in the serve log) would stall the next turn
+    // even though `done` already streamed. This covers both turn endpoints
+    // (SSE with or without a live FIFO, and plain turns), which all set
+    // `A_SERVE_CHILD`. Serve sessions keep the cheap local fallback title
+    // written below; opening the same session locally later still upgrades
+    // it to a model title.
+    let model_title = if crate::ai::background::is_serve_child() {
+        None
+    } else {
+        crate::ai::request::generate_session_title_via_model(app, &all_messages)
+            .await
+            .map(|title| normalize_generated_session_title(&title))
+    };
 
     // The model returned a title but the quality filter rejected it — a silent "request made, no result"
     // path that must be recorded in the decision log; otherwise a transport failure and a low-quality
@@ -902,6 +925,16 @@ mod tests {
             text: "完成标题生成修复".to_string(),
             origin: SessionTitleOrigin::Model,
         };
+        let user_title = SessionTitle {
+            text: "用户手动指定的标题".to_string(),
+            origin: SessionTitleOrigin::User,
+        };
+        // A long user title is classified "low quality" by the raw-fragment
+        // heuristics, but an explicit user choice must stay authoritative.
+        let long_user_title = SessionTitle {
+            text: "这是一个用户手动设置的很长标题，远远超过四十个字符的上限".to_string(),
+            origin: SessionTitleOrigin::User,
+        };
 
         assert!(should_generate_model_session_title(
             Some(&fallback_title),
@@ -913,6 +946,18 @@ mod tests {
         ));
         assert!(!should_generate_model_session_title(
             Some(&model_title),
+            fallback
+        ));
+        assert!(!should_generate_model_session_title(
+            Some(&user_title),
+            fallback
+        ));
+        assert!(!should_generate_model_session_title(
+            Some(&long_user_title),
+            fallback
+        ));
+        assert!(!should_write_fallback_session_title(
+            Some(&long_user_title),
             fallback
         ));
     }

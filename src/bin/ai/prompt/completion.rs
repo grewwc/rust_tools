@@ -82,6 +82,8 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":mark",
         "/unmark",
         ":unmark",
+        "/title",
+        ":title",
         "/theme",
         ":theme",
     ] {

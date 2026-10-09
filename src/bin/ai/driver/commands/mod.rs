@@ -16,6 +16,7 @@ pub mod share;
 pub mod skills;
 pub mod status_line;
 pub mod theme;
+pub mod title;
 pub mod usage;
 
 use std::sync::Arc;
@@ -36,6 +37,7 @@ pub use session::try_handle_session_command;
 pub use share::try_handle_share_command;
 pub use skills::try_handle_skills_command;
 pub use theme::try_handle_theme_command;
+pub use title::try_handle_title_command;
 pub use usage::try_handle_usage_command;
 
 /// True when `token` begins a local slash command (e.g. `/sessions`, `:bg`).
@@ -96,6 +98,7 @@ pub fn is_local_command_start(token: &str) -> bool {
             | "suspend"
             | "susp"
             | "theme"
+            | "title"
             | "token"
             | "tokens"
             | "unmark"
@@ -168,6 +171,9 @@ pub fn try_handle_local_command(
         return Ok(true);
     }
     if try_handle_usage_command(input)? {
+        return Ok(true);
+    }
+    if try_handle_title_command(app, input)? {
         return Ok(true);
     }
     if try_handle_session_command(app, input)? {
