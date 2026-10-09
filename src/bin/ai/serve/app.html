@@ -16,20 +16,36 @@ header { display:flex; align-items:center; gap:8px; padding:10px 12px; backgroun
 header b { font-size:15px; }
 #info { font-size:12px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1; }
 button, select, input, textarea { font:inherit; color:var(--fg); background:#0d1117; border:1px solid var(--line); border-radius:8px; }
-button { padding:7px 12px; background:#21262d; cursor:pointer; }
+button { padding:7px 12px; background:#21262d; cursor:pointer; touch-action:manipulation; }
 button:disabled { opacity:.5; cursor:default; }
 button.primary { background:var(--acc); border-color:var(--acc); color:#fff; }
-#views { flex:1; display:flex; min-height:0; }
+#views { flex:1; display:flex; min-height:0; position:relative; }
 #sessions { width:min(78vw,300px); border-right:1px solid var(--line); background:var(--panel); display:none; flex-direction:column; }
 #sessions.open { display:flex; }
 #sessions ul { list-style:none; margin:0; padding:8px; overflow-y:auto; flex:1; }
 #sessions li { padding:8px; border-radius:8px; font-size:14px; }
 #sessions li.cur { background:#1f6feb33; }
 #sessions li small { color:var(--dim); display:block; font-size:12px; }
+#sessions li .rn { float:right; background:none; border:none; color:var(--dim); font-size:14px; padding:4px 10px; cursor:pointer; }
+#sessions li .rnm { width:100%; font-size:inherit; box-sizing:border-box; }
 #sessfilter { margin:8px 8px 0; padding:6px 8px; font-size:13px; width:calc(100% - 16px); box-sizing:border-box; }
 #sesscount { padding:4px 12px 0; color:var(--dim); font-size:12px; }
+#scrim { display:none; }
+/* Desktop renders the override row exactly as before: the wrapper is
+   transparent and its summary hidden (the phone query below undoes both). */
+#ovrwrap { display:contents; }
+#ovrwrap > summary { display:none; }
+html { -webkit-text-size-adjust:100%; }
+select, summary { touch-action:manipulation; }
+.msg details summary { padding:10px 4px; cursor:pointer; }
+/* 16px form text stops iOS Safari auto-zooming into focused fields;
+   padding keeps the visual size small. */
+#ovr select, #conn input, #sessfilter { font-size:16px; }
+/* The token-length line is diagnostics: show it only while the conn panel
+   is open instead of spending a permanent row on it. */
+#conn:not(.open) + #connstat { display:none; }
 #chat { flex:1; display:flex; flex-direction:column; min-width:0; }
-#msgs { flex:1; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:10px; }
+#msgs { flex:1; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:10px; overscroll-behavior-y:contain; }
 .msg { max-width:92%; padding:8px 12px; border-radius:12px; white-space:pre-wrap; word-break:break-word; font-size:15px; }
 .msg.user { align-self:flex-end; background:#1f6feb; color:#fff; }
 .msg.asst { align-self:flex-start; background:var(--panel); border:1px solid var(--line); }
@@ -50,6 +66,57 @@ button.primary { background:var(--acc); border-color:var(--acc); color:#fff; }
 #sessbar { display:flex; align-items:baseline; gap:8px; padding:6px 12px; background:var(--panel); border-bottom:1px solid var(--line); font-size:13px; cursor:pointer; }
 #sesstitle { font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1; }
 #sessmeta { color:var(--dim); font-size:12px; white-space:nowrap; }
+/* Rendered markdown for assistant replies (.md): block layout instead of the
+   pre-wrap source view the other bubbles keep. */
+.msg.md { white-space:normal; }
+.msg.md .p { margin:3px 0; }
+.msg.md .h { font-weight:700; margin:6px 0 2px; }
+.msg.md .h.lv1 { font-size:19px; }
+.msg.md .h.lv2 { font-size:17px; }
+.msg.md .h.lv3 { font-size:16px; }
+.msg.md .h.lv4, .msg.md .h.lv5, .msg.md .h.lv6 { font-size:15px; }
+.msg.md .li { display:flex; gap:6px; margin:3px 0; }
+.msg.md .li > .bullet { flex:0 0 auto; color:var(--dim); min-width:14px; }
+/* A flex item refuses to shrink below its min-content width by default, so one
+   unbreakable inline code token would push the bubble past the phone viewport.
+   min-width:0 lets it shrink; anywhere lets the token itself wrap. */
+.msg.md .li > span:not(.bullet) { min-width:0; overflow-wrap:anywhere; }
+.msg.md blockquote { margin:4px 0; padding:2px 0 2px 8px; border-left:3px solid var(--line); color:var(--dim); }
+.msg.md hr { border:0; border-top:1px solid var(--line); margin:8px 0; }
+.msg.md a { color:var(--acc); }
+.msg.md code { font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:13px;
+  background:#0d1117; border:1px solid var(--line); border-radius:5px; padding:0 4px; overflow-wrap:anywhere; }
+.msg.md pre { margin:6px 0; padding:8px; background:#0d1117; border:1px solid var(--line);
+  border-radius:8px; overflow-x:auto; }
+/* Wrap code instead of scrolling it: a phone cannot hover, and a horizontal
+   scroll region hides the tail of a line behind an easy-to-miss gesture. */
+.msg.md pre code { background:none; border:0; padding:0; white-space:pre-wrap; overflow-wrap:anywhere; }
+.msg.md .tablewrap { overflow-x:auto; margin:6px 0; }
+.msg.md table { border-collapse:collapse; font-size:13px; }
+.msg.md th, .msg.md td { border:1px solid var(--line); padding:2px 6px; text-align:left; }
+/* ---- phone layout (narrow viewports only; desktop is untouched) ---------- */
+@media (max-width:700px) {
+  header button { min-width:44px; min-height:44px; }
+  /* The drawer floats over the chat instead of squeezing it; tapping the
+     dimmed remainder (the scrim) closes it. */
+  #sessions { position:absolute; top:0; bottom:0; left:0; z-index:10; width:min(86vw,320px); box-shadow:8px 0 24px rgba(0,0,0,.55); }
+  #scrim.on { display:block; position:absolute; inset:0; z-index:5; background:rgba(0,0,0,.45); }
+  #sessions li { padding:12px 10px; font-size:15px; }
+  .rowbtns button { flex:1; min-height:42px; font-size:13px; }
+  #sessfilter { padding:10px 8px; }
+  /* Override picks collapse into one summary row showing the current picks. */
+  #ovrwrap { display:block; border-top:1px solid var(--line); }
+  #ovrwrap > summary { display:block; padding:8px 12px; font-size:12px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #ovr { flex-direction:column; padding:8px 12px 10px; }
+  #ovr select { width:100%; padding:10px 8px; }
+  #msgs { padding:10px; }
+  .msg { max-width:94%; }
+  #composer { gap:10px; }
+  #img, #send { min-width:52px; min-height:48px; font-size:18px; }
+  #conn.open { flex-wrap:wrap; }
+  #conn.open input { flex:1 1 100%; padding:10px 8px; }
+  #conn.open #save { flex:1; min-height:44px; }
+}
 </style>
 </head>
 <body id="serve-app">
@@ -67,17 +134,21 @@ button.primary { background:var(--acc); border-color:var(--acc); color:#fff; }
 </div>
 <div id="connstat"></div>
 <div id="views">
+<div id="scrim"></div>
 <nav id="sessions"><input id="sessfilter" placeholder="filter sessions…" autocomplete="off">
 <div id="sesscount"></div><ul id="sesslist"></ul>
 <div class="rowbtns"><button id="fork">fork</button><button id="del">delete</button><button id="refresh">refresh</button></div>
 </nav>
 <main id="chat">
 <div id="msgs"></div>
+<details id="ovrwrap" open>
+<summary id="ovrsummary">model · agent · effort</summary>
 <div id="ovr">
 <select id="omodel" aria-label="model override"></select>
 <select id="oagent" aria-label="agent override"></select>
 <select id="oeffort" aria-label="reasoning effort override"></select>
 </div>
+</details>
 <div id="composer">
 <button id="img" aria-label="attach image">🖼</button>
 <input id="file" type="file" accept="image/*" multiple hidden>
@@ -102,7 +173,7 @@ let sessionId = localStorage.getItem("serve.session") || "";
 // GET /sessions until then. While set, loadSessions keeps it selected
 // instead of jumping to the first stored session.
 let pendingNew = null;
-let lastItems = []; // latest /sessions payload, backing the session bar
+let lastItems = []; // latest /sessions payload (newest-first), backing the session bar
 let lastMsgCount = null; // message count from the last history load
 let sending = false;
 let pendingImages = []; // {filename, data_base64}
@@ -129,8 +200,145 @@ async function api(path, opts) {
 }
 const esc = (s) => s.replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
+// --- markdown -------------------------------------------------------------
+// Replies arrive as markdown source; the terminal client renders the same text
+// through MarkdownStreamRenderer, so a phone showing the raw source looked
+// broken next to it (literal `**`, backticks and "- " bullets). Every rule
+// below escapes before it emits markup, so reply text can never inject tags,
+// and a construct that is not covered here stays visible as plain text rather
+// than being dropped.
+const mdText = (s) => s
+  .replace(/\*\*([^*\n]+?)\*\*/g, "<b>$1</b>")
+  .replace(/~~([^~\n]+?)~~/g, "<s>$1</s>")
+  .replace(/\*([^\s*][^*\n]*?)\*/g, "<i>$1</i>")
+  // Parens inside a link destination are balanced, so a URL like wiki/Foo_(bar)
+  // does not end the link at the first ")".
+  .replace(/\[([^\]\n]+?)\]\((https?:\/\/(?:[^()\s]|\([^()\s]*\))+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+  .replace(/&lt;(https?:\/\/[^\s&]+)&gt;/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+// Code spans are literal, so they are cut out before the inline rules run.
+const mdInline = (src) => {
+  let html = "", last = 0, m;
+  const re = /`([^`]+)`/g;
+  while ((m = re.exec(src))) {
+    html += mdText(src.slice(last, m.index)) + "<code>" + m[1] + "</code>";
+    last = m.index + m[0].length;
+  }
+  return html + mdText(src.slice(last));
+};
+// Whole-reply renderer: blocks are recognised on the raw lines (a quote marker
+// is still ">" here, not "&gt;") and each block's text is escaped on the way
+// out. Blank lines inside one paragraph run become the <br> gaps between them.
+function renderMarkdown(src) {
+  const lines = String(src).replace(/\r\n?/g, "\n").split("\n");
+  const inline = (s) => mdInline(esc(s));
+  const out = [];
+  let text = [];
+  const flushText = () => {
+    while (text.length && !text[0]) text.shift();
+    while (text.length && !text[text.length - 1]) text.pop();
+    if (text.length) out.push('<div class="p">' + text.map(inline).join("<br>") + "</div>");
+    text = [];
+  };
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const fence = /^\s*(`{3,}|~{3,})\s*([^\s`]*)\s*$/.exec(line);
+    if (fence) {
+      const closer = new RegExp("^\\s*" + fence[1][0] + "{3,}\\s*$");
+      const body = [];
+      for (i++; i < lines.length && !closer.test(lines[i]); i++) body.push(lines[i]);
+      i++; // skip the closing fence: a stream cut mid-block has none yet
+      flushText();
+      out.push("<pre" + (fence[2] ? ' data-lang="' + esc(fence[2]) + '"' : "") +
+        "><code>" + esc(body.join("\n")) + "</code></pre>");
+      continue;
+    }
+    const head = /^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
+    if (head) {
+      flushText();
+      out.push('<div class="h lv' + head[1].length + '">' + inline(head[2]) + "</div>");
+      i++;
+      continue;
+    }
+    if (/^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      flushText();
+      out.push("<hr>");
+      i++;
+      continue;
+    }
+    if (/^\s{0,3}>/.test(line)) {
+      flushText();
+      const quoted = [];
+      for (; i < lines.length && /^\s{0,3}>/.test(lines[i]); i++) quoted.push(lines[i].replace(/^\s{0,3}>\s?/, ""));
+      out.push("<blockquote>" + quoted.map(inline).join("<br>") + "</blockquote>");
+      continue;
+    }
+    if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+      flushText();
+      const cells = (l) => l.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+      const ths = cells(line);
+      i += 2; // the delimiter row is markup, not content
+      const rows = [];
+      for (; i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]); i++) rows.push(cells(lines[i]));
+      out.push('<div class="tablewrap"><table><thead><tr>' +
+        ths.map((c) => "<th>" + inline(c) + "</th>").join("") + "</tr></thead><tbody>" +
+        rows.map((r) => "<tr>" + r.map((c) => "<td>" + inline(c) + "</td>").join("") + "</tr>").join("") +
+        "</tbody></table></div>");
+      continue;
+    }
+    const item = /^([ \t]*)([-*+]|\d{1,3}[.)])\s+(.*)$/.exec(line);
+    if (item) {
+      flushText();
+      const indent = item[1].replace(/\t/g, "  ").length;
+      const body = [inline(item[3])];
+      // A deeper-indented plain line continues this bullet; anything else ends
+      // it, so the next line starts its own block.
+      for (i++; i < lines.length; i++) {
+        const cont = /^([ \t]+)(\S.*)$/.exec(lines[i]);
+        if (!cont || cont[1].replace(/\t/g, "  ").length <= indent) break;
+        // A deeper-indented list marker starts a nested bullet: stop consuming,
+        // so the main loop renders it as its own item instead of a literal "-"
+        // glued to the end of this one.
+        if (/^([-*+]|\d{1,3}[.)])(\s|$)/.test(cont[2])) break;
+        body.push(inline(cont[2]));
+      }
+      // Cap the indent: replies routinely nest 6+ spaces deep, which on a phone
+      // (92% of ~360px) would leave almost no room for the text itself.
+      const pad = Math.min(indent, 6) * 8;
+      out.push('<div class="li" style="padding-left:' + pad + 'px"><span class="bullet">' +
+        (/^\d/.test(item[2]) ? esc(item[2]) : "•") + '</span><span>' + body.join("<br>") + "</span></div>");
+      continue;
+    }
+    text.push(line);
+    i++;
+  }
+  flushText();
+  return out.join("");
+}
+
 function sessionTitle(s) {
   return s.summary || s.first_user_prompt || ("new session · " + s.id.slice(0, 8));
+}
+// Phone drawer floats over the chat (see the media query): the scrim tracks
+// the drawer so tapping outside it closes it. Desktop keeps the inline
+// drawer and never shows the scrim.
+function setDrawer(open) {
+  $("sessions").classList.toggle("open", open);
+  $("scrim").classList.toggle("on", open);
+  if (open) loadSessions();
+}
+// The override row is a collapsed <details> on phones, so its summary
+// mirrors the current picks; "default" means the server value is used.
+function syncOvrSummary() {
+  const t = (s) => { const o = s.options[s.selectedIndex]; return (o && s.value) ? o.textContent : "default"; };
+  $("ovrsummary").textContent = "model " + t($("omodel")) + " · agent " + t($("oagent")) + " · effort " + t($("oeffort"));
+}
+// The composer grows with its content (up to the CSS cap) instead of
+// trapping multi-line input in a 44px box with an inner scroll.
+function growPrompt() {
+  const p = $("prompt");
+  p.style.height = "auto";
+  p.style.height = Math.min(p.scrollHeight, Math.round(window.innerHeight * 0.3)) + "px";
 }
 function textOf(content) {
   if (typeof content === "string") return content;
@@ -153,6 +361,50 @@ function addMsg(role, text, cls) {
   $("msgs").scrollTop = $("msgs").scrollHeight;
   return d;
 }
+// Assistant replies render as markdown; addMsg stays the plain (escaped,
+// pre-wrap) path for user text, progress traces, errors and notices.
+function addMsgMd(text) {
+  const d = addMsg("assistant", "", "asst md");
+  d.innerHTML = text ? renderMarkdown(text) : "";
+  $("msgs").scrollTop = $("msgs").scrollHeight;
+  return d;
+}
+// A history fold is titled by what produced it. Tool results are stored as
+// their own `tool`-role messages, so titling them with the raw role printed a
+// bare "tool" above e.g. a file dump; `callLabel` rejoins the result to the
+// call that produced it (name + most identifying argument).
+function toolArgsOf(call) {
+  const raw = call && call.function ? call.function.arguments : null;
+  if (raw && typeof raw === "object") return raw;
+  try { return JSON.parse(raw || "{}"); } catch (e) { return {}; }
+}
+function shortLine(v, max) {
+  const line = String(v === undefined || v === null ? "" : v).split("\n")[0].trim();
+  return line.length > max ? line.slice(0, max - 1) + "…" : line;
+}
+function baseNameOf(p) {
+  const parts = String(p).split("/");
+  return parts[parts.length - 1] || String(p);
+}
+function callLabel(call) {
+  const name = (call && call.function && call.function.name) || "tool";
+  const a = toolArgsOf(call);
+  const path = a.file_path || a.path || a.file;
+  if (path) {
+    let s = name + " " + baseNameOf(path);
+    // read_file takes 1-based line numbers, so show the covered range.
+    if (a.offset) s += ":" + a.offset + (a.limit ? "-" + (Number(a.offset) + Number(a.limit) - 1) : "-");
+    return s;
+  }
+  const cmd = a.command || a.cmd;
+  if (cmd) return name + " " + shortLine(cmd, 64);
+  const other = a.query || a.pattern || a.url || a.text || a.prompt;
+  if (other) return name + " " + shortLine(other, 64);
+  return name;
+}
+// Roles that reach the fold path and deserve a readable title.
+const FOLD_ROLE_LABELS = { tool: "tool", internal_note: "internal note" };
+
 function addFold(title, bodyText) {
   const d = document.createElement("div");
   d.className = "msg asst";
@@ -177,7 +429,13 @@ function fillSelect(sel, entries, currentLabel, kind) {
   sel.innerHTML = "";
   const def = document.createElement("option");
   def.value = "";
-  def.textContent = kind + ": server default" + (currentLabel ? " (" + currentLabel + ")" : "");
+  // A phone-width select clips its text with no ellipsis, so the option keeps
+  // only the short form: "model: server default (deepseek-…)" was reading as a
+  // truncated "model: serve". The full label stays in the header line.
+  const full = kind + ": server default" + (currentLabel ? " (" + currentLabel + ")" : "");
+  def.textContent = kind + ": default";
+  def.title = full;
+  sel.title = full;
   sel.appendChild(def);
   for (const [v, label] of entries) {
     const o = document.createElement("option");
@@ -195,6 +453,7 @@ async function loadInfo() {
     fillSelect($("omodel"), (info.models || []).map((m) => [m.id, m.label || m.id]), info.model_label || info.model, "model");
     fillSelect($("oagent"), (info.agents || []).map((a) => [a, a]), info.agent, "agent");
     fillSelect($("oeffort"), (info.efforts || []).map((e) => [e, e]), info.reasoning_effort, "effort");
+    syncOvrSummary();
   } catch (e) {
     let msg = "offline: " + e.message;
     if (/401/.test(e.message)) msg += " (re-save the token; serve reads ai.serve.token only at startup, so restart it after changing the token)";
@@ -228,11 +487,21 @@ function renderSessionList(items, errText) {
   for (const s of shown) {
     const li = document.createElement("li");
     if (s.id === sessionId) li.className = "cur";
-    li.textContent = sessionTitle(s);
+    const t = document.createElement("span");
+    t.textContent = sessionTitle(s);
+    const rn = document.createElement("button");
+    rn.className = "rn";
+    rn.textContent = "✎";
+    rn.title = "rename";
+    rn.onclick = (ev) => { ev.stopPropagation(); startRename(li, s); };
     const sm = document.createElement("small");
     sm.textContent = s.id.slice(0, 8);
+    li.appendChild(rn);
+    li.appendChild(t);
     li.appendChild(sm);
-    li.onclick = () => { sessionId = s.id; lastMsgCount = null; localStorage.setItem("serve.session", s.id); $("sessions").classList.remove("open"); loadSessions(); loadHistory(); };
+    // Desktop keeps the inline drawer open for repeated switching; the phone
+    // drawer floats over the chat, so only it auto-closes after a pick.
+    li.onclick = () => { sessionId = s.id; lastMsgCount = null; localStorage.setItem("serve.session", s.id); if (window.matchMedia && matchMedia("(max-width: 700px)").matches) setDrawer(false); loadSessions(); loadHistory(); };
     ul.appendChild(li);
   }
   if (errText) {
@@ -241,6 +510,39 @@ function renderSessionList(items, errText) {
     ul.appendChild(li);
   }
   $("sesscount").textContent = q ? items.length + " sessions · showing " + shown.length : items.length + " sessions";
+}
+// Swap one drawer row title for an inline editor: Enter/blur commits via
+// POST /sessions/{id}/title, Esc cancels. A failed commit keeps the old
+// title and surfaces as a tail row instead of silently sticking.
+function startRename(li, s) {
+  const old = sessionTitle(s);
+  const inp = document.createElement("input");
+  inp.className = "rnm";
+  inp.value = old;
+  inp.maxLength = 200;
+  li.replaceChild(inp, li.querySelector("span"));
+  inp.focus();
+  inp.select();
+  let done = false;
+  const cancel = () => { if (done) return; done = true; renderSessionList(lastItems); };
+  const commit = async () => {
+    if (done) return; done = true;
+    const v = inp.value.trim();
+    if (!v || v === old) { renderSessionList(lastItems); return; }
+    try {
+      await api("/sessions/" + s.id + "/title", { method: "POST", body: JSON.stringify({ title: v }) });
+      await loadSessions();
+    } catch (e) {
+      renderSessionList(lastItems, "rename failed: " + e.message);
+    }
+  };
+  inp.onkeydown = (ev) => {
+    if (ev.key === "Enter") commit();
+    else if (ev.key === "Escape") cancel();
+    ev.stopPropagation();
+  };
+  inp.onclick = (ev) => ev.stopPropagation();
+  inp.onblur = commit;
 }
 async function loadSessions() {
   let items;
@@ -252,6 +554,12 @@ async function loadSessions() {
     renderSessionList(lastItems, "sessions refresh failed: " + e.message);
     return;
   }
+  // `/sessions` returns store order, which is oldest-first (the same order
+  // `a /ss` prints and the server keeps unchanged). The drawer reads
+  // newest-first, and the session auto-selected below is `items[0]`, so flip
+  // the payload once here instead of in the renderer: the drawer, the filter
+  // re-render, and the error path all then share one newest-first list.
+  items.reverse();
   if (items.some((s) => s.id === sessionId)) { pendingNew = null; }
   else if (sessionId === pendingNew && sessionId) {
     // Fresh id, not yet materialized: stay on it; the first turn persists
@@ -272,16 +580,29 @@ async function loadHistory() {
   $("msgs").textContent = "";
   if (!sessionId) { addMsg("asst", "no session yet — tap ＋ to start one.", "asst"); return; }
   let msgs = [];
-  try { msgs = await (await api("/sessions/" + sessionId + "/history?limit=200")).json(); }
+  // One message beyond the rendered window: a tool result sitting at the edge
+  // would otherwise be titled with a bare role name, because the call that
+  // produced it is the message just outside. The extra one only feeds the call
+  // index below, never the transcript.
+  try { msgs = await (await api("/sessions/" + sessionId + "/history?limit=201")).json(); }
   catch (e) { addMsg("err", "history failed: " + e.message, "asst err"); return; }
-  lastMsgCount = msgs.length;
+  const shown = msgs.slice(-200);
+  lastMsgCount = shown.length;
   renderSessionBar();
-  for (const m of msgs) {
+  // The call lives on the assistant message (`tool_calls`), the result is a
+  // separate `tool` message carrying only `tool_call_id`; index the window
+  // first so each result can be titled by its call.
+  const calls = new Map();
+  for (const m of msgs) for (const c of m.tool_calls || []) if (c && c.id) calls.set(c.id, c);
+  for (const m of shown) {
     const t = textOf(m.content).trim();
     if (!t) continue;
     if (m.role === "user") addMsg("user", t, "user");
-    else if (m.role === "assistant") addMsg("assistant", t, "asst");
-    else addFold(m.role, t.slice(0, 2000));
+    else if (m.role === "assistant") addMsgMd(t);
+    else {
+      const call = m.tool_call_id ? calls.get(m.tool_call_id) : null;
+      addFold(call ? callLabel(call) : FOLD_ROLE_LABELS[m.role] || m.role, t.slice(0, 2000));
+    }
   }
   $("msgs").scrollTop = $("msgs").scrollHeight;
 }
@@ -321,6 +642,7 @@ async function send() {
   if ($("oeffort").value.trim()) body.reasoning_effort = $("oeffort").value.trim();
   if (images.length) body.images = images;
   $("prompt").value = "";
+  $("prompt").style.height = "auto";
   if (text) addMsg("user", text, "user");
   else addMsg("user", "(images only)", "user");
 
@@ -330,11 +652,22 @@ async function send() {
   // (or inserted ahead of) the reply bubble, so the trace reads top-down
   // and the final answer always lands last.
   const prog = addFold("progress", "");
-  const bubble = addMsg("assistant", "", "asst");
-  bubble.textContent = ""; // drop addMsg's "(empty)" stand-in: deltas append below
+  const bubble = addMsgMd("");
   let progLines = [];
   let think = null;
+  // Reply text arrives token by token, and markdown has to be parsed over the
+  // whole reply (an unterminated fence changes how every later line reads), so
+  // deltas are coalesced into one repaint per interval instead of one per token.
+  let raw = "";
+  let paintTimer = null;
+  const paint = () => {
+    paintTimer = null;
+    bubble.innerHTML = renderMarkdown(raw);
+    $("msgs").scrollTop = $("msgs").scrollHeight;
+  };
+  const schedulePaint = () => { if (paintTimer === null) paintTimer = setTimeout(paint, 50); };
   const fail = (msg) => {
+    if (paintTimer !== null) { clearTimeout(paintTimer); paintTimer = null; }
     bubble.classList.add("err");
     bubble.textContent = msg;
     prog.box.remove();
@@ -364,8 +697,9 @@ async function send() {
         if (kind === "done") { finished = true; break; }
         else if (kind === "error") throw new Error(JSON.parse(payload).error || "turn failed");
         else if (kind === "delta") {
-          try { bubble.textContent += JSON.parse(payload).delta || ""; }
-          catch (_) { bubble.textContent += payload; }
+          try { raw += JSON.parse(payload).delta || ""; }
+          catch (_) { raw += payload; }
+          schedulePaint();
         }
         else if (kind === "thinking_start") { think = addFold("thinking…", ""); $("msgs").insertBefore(think.box, bubble); }
         else if (kind === "thinking") {
@@ -378,7 +712,8 @@ async function send() {
       if (finished) break;
       if (done) break;
     }
-    if (!bubble.textContent) bubble.innerHTML = "<span style='color:var(--dim)'>(empty reply)</span>";
+    if (paintTimer !== null) { clearTimeout(paintTimer); paint(); } // flush the tail
+    if (!raw) bubble.innerHTML = "<span style='color:var(--dim)'>(empty reply)</span>";
   } catch (e) { fail("turn failed: " + e.message); }
   sending = false;
   $("send").disabled = false;
@@ -407,12 +742,18 @@ function wire() {
   $("token").value = localStorage.getItem("serve.token") || "";
   showStored();
   $("send").onclick = send;
+  if (window.matchMedia && matchMedia("(max-width: 700px)").matches) $("ovrwrap").open = false;
+  $("scrim").onclick = () => setDrawer(false);
+  $("omodel").onchange = syncOvrSummary;
+  $("oagent").onchange = syncOvrSummary;
+  $("oeffort").onchange = syncOvrSummary;
+  $("prompt").addEventListener("input", growPrompt);
   $("prompt").addEventListener("keydown", (e) => {
     // Plain Enter inserts a newline (mobile keyboards included); only the
     // send button — or Ctrl/Cmd+Enter for hardware keyboards — submits.
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
   });
-  const toggleSessions = () => { const n = $("sessions"); n.classList.toggle("open"); if (n.classList.contains("open")) loadSessions(); };
+  const toggleSessions = () => setDrawer(!$("sessions").classList.contains("open"));;
   $("menu").onclick = toggleSessions;
   $("sessbar").onclick = toggleSessions;
   $("sessfilter").oninput = (e) => { sessFilter = e.target.value; renderSessionList(lastItems); };
@@ -463,7 +804,8 @@ function wire() {
     } catch (e) { addMsg("err", "fork failed: " + e.message, "asst err"); }
   };
   $("del").onclick = async () => {
-    if (!sessionId || !confirm("delete this session?")) return;
+    const cur = lastItems.find((x) => x.id === sessionId);
+    if (!sessionId || !confirm("delete \"" + (cur ? sessionTitle(cur) : sessionId) + "\"?")) return;
     try {
       await api("/sessions/" + sessionId, { method: "DELETE" });
       sessionId = "";

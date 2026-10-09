@@ -23,8 +23,12 @@ use tokio::sync::{Mutex, mpsc};
 use crate::ai::background;
 use crate::commonw::configw;
 
-use super::{agents, config_schema::AiConfig, history::SessionStore, model_names, models};
-
+use super::{
+    agents,
+    config_schema::AiConfig,
+    history::{SessionStore, SessionTitleOrigin},
+    model_names, models,
+};
 pub(in crate::ai) mod chat;
 pub(in crate::ai) mod ctl;
 
@@ -552,6 +556,56 @@ async fn delete_session(
         Ok(deleted) => (
             StatusCode::OK,
             Json(serde_json::json!({"deleted": deleted})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Cap for a user-supplied session title (`POST /sessions/{id}/title`). The
+/// local `/title` command accepts anything, but the network API caps input so
+/// one bad request cannot stuff megabytes into session metadata.
+const MAX_SESSION_TITLE_CHARS: usize = 200;
+
+#[derive(Debug, Deserialize)]
+struct SetTitleReq {
+    #[serde(default)]
+    title: String,
+}
+
+/// Rename session `{id}`, mirroring the local `/title <text>`: the title is
+/// persisted with the `User` origin, so background auto-generation never
+/// overwrites it. Like `/title`, renaming a not-yet-materialized (lazy)
+/// session creates its store entry.
+async fn set_session_title(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SetTitleReq>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if SessionStore::validate_session_id(&id).is_err() {
+        return bad_request(format!("invalid session id: {id}")).into_response();
+    }
+    let title = req.title.trim().to_string();
+    if title.is_empty() {
+        return bad_request("title must not be empty".to_string()).into_response();
+    }
+    if title.chars().count() > MAX_SESSION_TITLE_CHARS {
+        return bad_request(format!("title exceeds {MAX_SESSION_TITLE_CHARS} chars"))
+            .into_response();
+    }
+    let store = SessionStore::new(state.history_file.as_path());
+    match store.write_session_title_with_origin(&id, &title, SessionTitleOrigin::User) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"title": title})),
         )
             .into_response(),
         Err(err) => (
@@ -1329,6 +1383,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_session_persists_user_title() {
+        use axum::{
+            Json,
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        let state = lifecycle_test_state();
+        let resp = super::set_session_title(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("rename-me".to_string()),
+            Json(super::SetTitleReq {
+                title: "  我的新标题  ".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v.get("title").and_then(|t| t.as_str()), Some("我的新标题"));
+        let store = super::SessionStore::new(state.history_file.as_path());
+        let saved = store
+            .read_session_title_with_origin("rename-me")
+            .expect("read title");
+        let saved = saved.expect("title persisted");
+        assert_eq!(saved.text, "我的新标题");
+        assert_eq!(
+            saved.origin,
+            super::SessionTitleOrigin::User,
+            "renamed title must survive background auto-generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_session_rejects_bad_input() {
+        use axum::{
+            Json,
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        let overlong = "x".repeat(super::MAX_SESSION_TITLE_CHARS + 1);
+        for (id, title, want) in [
+            ("ok-id", "", StatusCode::BAD_REQUEST),
+            ("ok-id", "   ", StatusCode::BAD_REQUEST),
+            ("ok-id", overlong.as_str(), StatusCode::BAD_REQUEST),
+            ("../evil", "hi", StatusCode::BAD_REQUEST),
+        ] {
+            let resp = super::set_session_title(
+                State(lifecycle_test_state()),
+                HeaderMap::new(),
+                Path(id.to_string()),
+                Json(super::SetTitleReq {
+                    title: title.to_string(),
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), want, "id={id:?} title_len={}", title.len());
+        }
+    }
+
+    #[tokio::test]
     async fn serve_app_returns_mobile_client() {
         let resp = super::serve_app().await;
         assert!(resp
@@ -1866,6 +1987,7 @@ pub(in crate::ai) async fn run_serve(
         .route("/info", get(server_info))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/fork", post(fork_session))
+        .route("/sessions/{id}/title", post(set_session_title))
         .route("/sessions/{id}", delete(delete_session))
         .route("/sessions/{id}/history", get(read_history))
         .route(
