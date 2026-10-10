@@ -736,15 +736,16 @@ async fn generate_session_title_if_missing(app: &App, pending_user_input: Option
     }
 }
 
-/// Generate and persist the model session title for a session whose turn child
-/// has already exited.
+/// Generate and persist the model session title for a served session.
 ///
-/// The serve daemon calls this after the turn's child was reaped and its
-/// per-session lock released — see the `is_serve_child` branch in
-/// `generate_session_title_if_missing` for why the child must not make this
-/// request itself. The request never needed that lock (only the child's
-/// session writes do), so running it here gives served sessions a model title
-/// without standing in any turn's way.
+/// The serve daemon calls this both at the start of a turn — in parallel with
+/// the turn child, seeding the request with `pending_user_input` so it does not
+/// depend on the child's writes — and once the child was reaped and its
+/// per-session lock released, as a retry when the parallel attempt failed. See
+/// the `is_serve_child` branch in `generate_session_title_if_missing` for why
+/// the child itself must not make this request. The request never needed that
+/// lock (only the child's session writes do), so running it outside the child
+/// never stands in any turn's way.
 ///
 /// Best-effort: any failure keeps the child's fallback title and the next turn
 /// end retries. Returns true when a model title was written.
@@ -752,6 +753,7 @@ pub(crate) async fn generate_session_title_outside_turn(
     history_file: &std::path::Path,
     session_id: &str,
     current_model: &str,
+    pending_user_input: Option<&str>,
 ) -> bool {
     let store = session_title_store(history_file);
     // Settle the cheap cases before decoding the canonical history: the daemon
@@ -772,9 +774,25 @@ pub(crate) async fn generate_session_title_outside_turn(
     let Ok(config) = crate::ai::config::load_config() else {
         return false;
     };
-    let Ok(messages) = store.read_all_messages(session_id) else {
-        return false;
+    let messages = match store.read_all_messages(session_id) {
+        Ok(messages) => messages,
+        // The parallel pre-turn call can race the child's first write (the
+        // session file may not exist yet); the pending input alone still seeds
+        // the request, mirroring `generate_session_title_if_missing`.
+        Err(_) if pending_user_input.map(str::trim).is_some_and(|s| !s.is_empty()) => Vec::new(),
+        Err(_) => return false,
     };
+    // The child may already have persisted this input by now; avoid seeding the
+    // title request with a duplicate user message.
+    let pending = pending_user_input
+        .map(str::trim)
+        .filter(|input| !input.is_empty())
+        .filter(|input| {
+            !messages.last().is_some_and(|m| {
+                m.role == "user" && value_to_string(&m.content).trim() == *input
+            })
+        });
+    let messages = session_title_messages(messages, pending.as_deref());
     if !has_session_title_source(&messages) {
         return false;
     }

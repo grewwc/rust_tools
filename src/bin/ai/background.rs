@@ -379,6 +379,13 @@ pub(crate) fn is_serve_child() -> bool {
     SERVE_CHILD.load(Ordering::Relaxed)
 }
 
+/// Test-only control for the serve-child marker; production sets it once at
+/// process entry via [`mark_serve_child_from_env`].
+#[cfg(test)]
+pub(crate) fn set_serve_child_for_test(value: bool) {
+    SERVE_CHILD.store(value, Ordering::Relaxed);
+}
+
 /// Read [`SERVE_CHILD_ENV`] / [`SERVE_CONFIRM_ENV`] once at process entry and
 /// scrub them, mirroring [`open_serve_live_fifo_from_env`]: exec'd
 /// grandchildren (MCP servers, nested tool processes, re-exec'd daemons) must

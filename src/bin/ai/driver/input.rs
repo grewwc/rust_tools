@@ -74,6 +74,20 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
         return Ok(Some(ctx));
     }
 
+    // Serve-spawned turn children consume their prompt from the CLI args and
+    // must not fall through to the interactive stdin prompt afterwards: the
+    // daemon keeps the child's stdin pipe open (the remote-confirm slot) until
+    // the child is reaped, so a blocking read here would never see EOF, the
+    // daemon would never reap the child or complete the turn, and the serve
+    // client would stay stuck on a stop button it can never release. Exit
+    // cleanly instead, mirroring the EOF path below. Non-serve processes are
+    // unaffected (`is_serve_child` is only set by serve-spawned children).
+    if crate::ai::background::is_serve_child() {
+        app.ignore_next_prompt_interrupt = false;
+        crate::ai::driver::signal::request_shutdown(app.shutdown.as_ref());
+        return Ok(None);
+    }
+
     let question = loop {
         match prompt_user(app) {
             Ok(v) => {
@@ -2774,6 +2788,39 @@ mod tests {
         assert!(!rendered.contains("stable note"));
 
         let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn serve_child_with_empty_args_exits_without_reading_stdin() {
+        // Regression for the serve turn hang: a serve-spawned turn child's
+        // stdin is a pipe the daemon keeps open (remote-confirm slot) until
+        // the child is reaped, so the post-turn interactive prompt would block
+        // forever, the daemon would never complete the turn, and the serve
+        // client would stay stuck on a non-releasable stop button. With no CLI
+        // args left, the serve-child marker must return Ok(None) (clean exit)
+        // without touching stdin.
+        crate::ai::background::set_serve_child_for_test(true);
+        let mut app = test_app();
+        assert!(app.cli.args.is_empty());
+        let result = super::next_question(&mut app);
+        crate::ai::background::set_serve_child_for_test(false);
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn serve_child_first_turn_still_consumes_cli_args() {
+        // The serve-child guard must not fire while CLI args remain: a serve
+        // child's only turn reads its prompt from the args, so a non-empty arg
+        // list must still produce a question.
+        crate::ai::background::set_serve_child_for_test(true);
+        let mut app = test_app();
+        app.cli.args.push("hello".to_string());
+        app.session_id = "sess-serve-guard".to_string();
+        app.config.history_file = std::env::temp_dir().join("serve-guard-history.sqlite");
+        let result = super::next_question(&mut app);
+        crate::ai::background::set_serve_child_for_test(false);
+        let ctx = result.expect("serve child first question").expect("question");
+        assert_eq!(ctx.question, "hello");
     }
 }
 

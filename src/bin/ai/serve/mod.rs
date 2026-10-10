@@ -1010,16 +1010,22 @@ fn default_turn_model() -> String {
         .unwrap_or_else(super::models::default_model)
 }
 
-/// Generate the session's model title once its turn child has exited.
+/// Generate the session's model title for a served turn.
 ///
-/// Turn children deliberately skip the title round-trip: they hold the
-/// session's turn lock until they exit, so the extra request would stall the
-/// session's next turn. Running it here — after the child was reaped and the
-/// lock released — gives served sessions a real title while keeping the
-/// request out of that critical section. Best-effort by construction: it never
-/// delays or fails a turn, and it leaves a session that already has a model
-/// title (or a user-set one) alone.
-fn spawn_session_title_task(history_file: PathBuf, session_id: String, model: Option<String>) {
+/// The daemon calls this twice per turn: at the start, in parallel with the
+/// turn child (`pending_prompt` seeds the request so it does not wait for the
+/// child's writes), and after the child was reaped, as a retry when the
+/// parallel attempt failed. Turn children deliberately skip the title
+/// round-trip: they hold the session's turn lock until they exit, so the extra
+/// request would stall the session's next turn. Best-effort by construction:
+/// it never delays or fails a turn, and it leaves a session that already has a
+/// model title (or a user-set one) alone.
+fn spawn_session_title_task(
+    history_file: PathBuf,
+    session_id: String,
+    model: Option<String>,
+    pending_prompt: Option<String>,
+) {
     // A per-turn `--model` override is resolved through the registry in the
     // child too, so resolve it here to keep the title request on the same
     // model the turn actually ran with.
@@ -1031,6 +1037,7 @@ fn spawn_session_title_task(history_file: PathBuf, session_id: String, model: Op
             history_file.as_path(),
             &session_id,
             &model,
+            pending_prompt.as_deref(),
         )
         .await;
     });
@@ -1065,6 +1072,15 @@ async fn post_turn(
     let title_model = overrides.model.clone();
     let lock = session_lock(&state, &id).await;
     let guard = lock.lock().await;
+    // Kick off the model title request in parallel with the turn child: the
+    // title task never takes the session lock, and the pending prompt seeds it
+    // before the child persists its first message.
+    spawn_session_title_task(
+        state.history_file.clone(),
+        id.clone(),
+        title_model.clone(),
+        Some(prompt.clone()),
+    );
     let session_id = id.clone();
     let output = tokio::task::spawn_blocking(move || {
         run_one_shot_turn(&session_id, &prompt, &overrides)
@@ -1087,10 +1103,11 @@ async fn post_turn(
         }
         Err(e) => return e.into_response(),
     };
-    // The child is gone: generate the title it skipped, outside the lock it
-    // held for its whole run.
+    // The child is gone: retry the title request outside the lock it held for
+    // its whole run, in case the parallel attempt above failed or raced an
+    // empty history. No-ops when a title already settled.
     drop(guard);
-    spawn_session_title_task(state.history_file.clone(), id.clone(), title_model);
+    spawn_session_title_task(state.history_file.clone(), id.clone(), title_model, None);
     (
         StatusCode::OK,
         Json(TurnResp {
@@ -1208,6 +1225,14 @@ async fn post_turn_sse(
     let history_file = state.history_file.clone();
     let title_session_id = session_id.clone();
     let title_model = overrides.model.clone();
+    // Kick off the model title request in parallel with the turn child; the
+    // pending prompt seeds it before the child persists its first message.
+    spawn_session_title_task(
+        state.history_file.clone(),
+        id.clone(),
+        title_model.clone(),
+        Some(prompt.clone()),
+    );
     tokio::task::spawn(async move {
         let guard = lock.lock().await;
         let _ = tokio::task::spawn_blocking(move || {
@@ -1223,11 +1248,11 @@ async fn post_turn_sse(
             )
         })
         .await;
-        // The child is gone: generate the title it skipped, outside the lock it
-        // held for its whole run. `done` already reached the client, and the
-        // request must not keep this session's next turn waiting.
+        // The child is gone: retry the title request outside the lock it held
+        // for its whole run, in case the parallel attempt failed. No-ops when
+        // a title already settled.
         drop(guard);
-        spawn_session_title_task(history_file, title_session_id, title_model);
+        spawn_session_title_task(history_file, title_session_id, title_model, None);
     });
     let stream = stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|event| (event, rx))

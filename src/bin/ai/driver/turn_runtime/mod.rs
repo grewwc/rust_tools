@@ -124,16 +124,23 @@ pub(super) async fn maybe_generate_session_title_for_input(app: &super::App, use
     finalize::maybe_generate_session_title_for_input(app, user_input).await;
 }
 
-/// Generate the model session title for a session whose turn child has already
-/// exited (serve's post-turn title task). See
-/// [`finalize::generate_session_title_outside_turn`] for why this must run
-/// outside the child.
+/// Generate the model session title for a served session, outside its turn
+/// child. See [`finalize::generate_session_title_outside_turn`] for why this
+/// must run outside the child. `pending_user_input` seeds the request when the
+/// child has not persisted it yet (the parallel pre-turn spawn).
 pub(crate) async fn generate_session_title_outside_turn(
     history_file: &std::path::Path,
     session_id: &str,
     current_model: &str,
+    pending_user_input: Option<&str>,
 ) -> bool {
-    finalize::generate_session_title_outside_turn(history_file, session_id, current_model).await
+    finalize::generate_session_title_outside_turn(
+        history_file,
+        session_id,
+        current_model,
+        pending_user_input,
+    )
+    .await
 }
 
 const MAX_TOOL_RESULT_INLINE_CHARS: usize = 32_000;
