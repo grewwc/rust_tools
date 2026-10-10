@@ -287,6 +287,7 @@ impl PromptScreen {
         mode: ViewportRebuildMode,
         clear_existing_viewport: bool,
         previous_top_row: Option<u16>,
+        verify_anchor: bool,
     ) -> io::Result<Rect> {
         // Single funnel for the painted-row record: this call is about to clear
         // the box's rows, so nothing on screen carries their widths forward.
@@ -302,16 +303,18 @@ impl PromptScreen {
                 cursor_offset_row,
                 mode,
                 clear_existing_viewport,
+                verify_anchor,
                 &mut self.pending_cpr_replies,
             ) {
                 Ok(area) => return Ok(area),
                 Err(err) if PromptEditor::is_cursor_position_timeout(&err) => {
                     // A stalled round-trip is usually a transient link hiccup, so
                     // retry once before paying for the alternate screen. Fresh
-                    // anchors verify the reply stream again; rebuilds query the
-                    // same parked row. A reflow invalidates the parked row, so
-                    // retry only while the terminal size is unchanged. Both
-                    // attempts share the same outstanding-reply accounting.
+                    // anchors and deferred rebuilds verify the reply stream
+                    // again; the other rebuilds query the same parked row. A
+                    // reflow invalidates the parked row, so retry only while the
+                    // terminal size is unchanged. Both attempts share the same
+                    // outstanding-reply accounting.
                     if !self.retry_used && backend.size().ok() == Some(terminal_size) {
                         self.retry_used = true;
                         match prepare_anchored_viewport(
@@ -321,6 +324,7 @@ impl PromptScreen {
                             cursor_offset_row,
                             mode,
                             clear_existing_viewport,
+                            verify_anchor,
                             &mut self.pending_cpr_replies,
                         ) {
                             Ok(area) => return Ok(area),
@@ -630,9 +634,9 @@ fn prepare_fixed_viewport<B: Backend>(
 ) -> Result<Rect, B::Error> {
     // One synchronous DSR query is the authoritative cursor position for this
     // rebuild. A fresh anchor does not trust a single reply and verifies the
-    // reply stream first (see `prepare_anchored_viewport`); reflows and height
-    // rebuilds keep the one round trip because they run on every panel height
-    // change.
+    // reply stream first (see `prepare_anchored_viewport`); height rebuilds and
+    // the keystroke-driven reflow rebuild keep the one round trip because the
+    // frame that follows is already on its way to the user.
     let cursor_position = tracked_cursor_query(pending, || backend.get_cursor_position())?;
     prepare_fixed_viewport_at(
         backend,
@@ -686,15 +690,31 @@ fn prepare_fixed_viewport_at<B: Backend>(
     Ok(area)
 }
 
+/// Whether a rebuild must verify the DSR reply stream before trusting its row.
+///
+/// A fresh anchor is the box top itself, and the deferred reflow rebuild has no
+/// frame waiting on it. Height rebuilds (which run on every panel change) and the
+/// keystroke-driven reflow rebuild accept the single round trip.
+fn reply_stream_is_verified(
+    cursor_offset_row: u16,
+    mode: ViewportRebuildMode,
+    verify_anchor: bool,
+) -> bool {
+    verify_anchor || (cursor_offset_row == 0 && mode == ViewportRebuildMode::ReserveMissingRows)
+}
+
 /// Runs the inline-anchor build, verifying the DSR reply stream first when this
-/// is a fresh anchor.
+/// is a fresh anchor, unless the caller accepts a single round trip.
 ///
 /// A fresh anchor (`cursor_offset_row == 0`) is taken as the box top directly,
 /// so a reply left over from an earlier query anchors the box on the row that
 /// earlier query reported — in practice the previous prompt's parked bottom row
 /// — and the exit clear then strands blank rows above the submitted preview. A
 /// rebuild instead recovers its top as `parked row - offset`, where the same
-/// stale reply only shifts the box inside rows that are already reserved.
+/// stale reply only shifts the box inside rows that are already reserved, which
+/// is why a rebuild normally keeps one round trip. `verify_anchor` buys the same
+/// protection for a rebuild whose reply was parked by the box the terminal is
+/// still re-wrapping.
 fn prepare_anchored_viewport(
     backend: &mut CrosstermBackend<io::Stdout>,
     terminal_size: Size,
@@ -702,9 +722,10 @@ fn prepare_anchored_viewport(
     cursor_offset_row: u16,
     mode: ViewportRebuildMode,
     clear_existing_viewport: bool,
+    verify_anchor: bool,
     pending: &mut VecDeque<Instant>,
 ) -> io::Result<Rect> {
-    if cursor_offset_row != 0 || mode != ViewportRebuildMode::ReserveMissingRows {
+    if !reply_stream_is_verified(cursor_offset_row, mode, verify_anchor) {
         return prepare_fixed_viewport(
             backend,
             terminal_size,
@@ -787,6 +808,38 @@ fn parked_anchor_offset(last_drawn_area: Option<Rect>, new_height: u16) -> u16 {
         .unwrap_or_else(|| new_height.saturating_sub(1))
 }
 
+/// Whether a reflow rebuild must return the box to the screen's last row.
+///
+/// A width re-wrap is the one resize that can strand a box that was flush with
+/// the screen bottom before it: the transcript above re-wraps into fewer rows and
+/// the rows released by that wrap stay below the box, so the parked row recovers
+/// a top further up the screen than where the input area was. Rebuilding there
+/// leaves the box floating above a blank gap, and the next re-wrap strands it
+/// again from that higher row. A box that was already flush with the bottom goes
+/// back to the bottom instead; the rows between the recovered top and the new
+/// bottom hold nothing but the old box's own rows, which the rebuild clears.
+fn reflow_pins_box_to_bottom(
+    previous_size: Size,
+    terminal_size: Size,
+    last_drawn_area: Option<Rect>,
+    alternate: bool,
+) -> bool {
+    !alternate
+        && terminal_size.width != previous_size.width
+        && last_drawn_area
+            .is_some_and(|area| area.y.saturating_add(area.height) >= previous_size.height)
+}
+
+/// Moves `area` down to the screen's last row, keeping its width and height.
+fn bottom_glued_area(area: Rect, screen_height: u16) -> Rect {
+    Rect::new(
+        area.x,
+        screen_height.saturating_sub(area.height),
+        area.width,
+        area.height,
+    )
+}
+
 /// Builds a fixed viewport immediately below the preceding output.
 ///
 /// Ratatui's inline viewport calls `append_lines` on every real terminal resize,
@@ -820,6 +873,7 @@ fn build_fixed_terminal(
         ViewportRebuildMode::ReserveMissingRows,
         false,
         None,
+        false,
     )?;
     let terminal = terminal_with_fixed_viewport(backend, area)
         .map_err(|err| io::Error::other(err.to_string()))?;
@@ -851,6 +905,12 @@ fn clear_row_range<B: Backend>(
 /// longer covers must be blanked. Width reflow moves the whole box together
 /// with the transcript above it, so resize handling must leave it false —
 /// clearing the previous extent there would erase re-wrapped transcript.
+///
+/// `pin_to_bottom` is set by the width-reflow caller for a box that was flush
+/// with the screen bottom before the re-wrap (see `reflow_pins_box_to_bottom`).
+/// That build blanked every row from the recovered top downwards, so moving the
+/// frame onto the last rows repaints over the old box's own rows and the rows the
+/// re-wrap released below it — never over transcript.
 fn rebuild_fixed_viewport(
     terminal: &mut MultilineTerminal,
     screen: &mut PromptScreen,
@@ -860,6 +920,8 @@ fn rebuild_fixed_viewport(
     mode: ViewportRebuildMode,
     previous_top_row: Option<u16>,
     clear_previous_extent: bool,
+    pin_to_bottom: bool,
+    verify_anchor: bool,
 ) -> io::Result<Rect> {
     let area = screen.prepare_viewport(
         terminal.backend_mut(),
@@ -869,7 +931,13 @@ fn rebuild_fixed_viewport(
         mode,
         true,
         previous_top_row,
+        verify_anchor,
     )?;
+    let area = if pin_to_bottom {
+        bottom_glued_area(area, terminal_size.height)
+    } else {
+        area
+    };
     *terminal = terminal_with_fixed_viewport(CrosstermBackend::new(io::stdout()), area)
         .map_err(|err| io::Error::other(err.to_string()))?;
     // A height change keeps the box top fixed, so a SHRINKING box leaves its
@@ -899,8 +967,15 @@ fn rebuild_after_terminal_reflow(
     base_viewport_height: u16,
     fitted_completion_items: Option<usize>,
     last_drawn_area: Option<Rect>,
+    previous_size: Size,
+    verify_anchor: bool,
 ) -> io::Result<(Rect, Size)> {
     let terminal_size = terminal.backend().size()?;
+    // `previous_size` is the geometry the last frame was built for, which is what
+    // tells a box that was flush with the bottom apart from one that already sat
+    // above it. See `reflow_pins_box_to_bottom` for why that decides the row.
+    let pin_to_bottom =
+        reflow_pins_box_to_bottom(previous_size, terminal_size, last_drawn_area, screen.alternate);
     let requested_height = viewport_height_with_completion(
         terminal_size.height,
         base_viewport_height,
@@ -933,6 +1008,8 @@ fn rebuild_after_terminal_reflow(
         ViewportRebuildMode::ReflowOnly,
         last_drawn_area.map(|area| area.y),
         false,
+        pin_to_bottom,
+        verify_anchor,
     )?;
     park_reflow_anchor(terminal, rebuilt_area)?;
     // A resize during the blocking cursor query belongs to the next rebuild;
@@ -1298,6 +1375,61 @@ fn resize_redraw_after_idle(
     pending_resize_rebuild && pending_events.is_empty()
 }
 
+/// Whether a changed live geometry may rebuild the viewport now.
+///
+/// Every sighting counts, including one that reads the already-applied size
+/// again: geometry that moved back is a move, and it restarts the window instead
+/// of leaving the earlier sightings standing. A geometry that matches the applied
+/// one still asks for no rebuild. Both the draw path and the idle poll ask this
+/// question, so the window is shared: a foreground redraw (keystroke, background
+/// title update, status-message change) must not re-anchor on the first sight of a
+/// new size either.
+fn resize_rebuild_is_due(
+    settle: &mut ResizeSettle,
+    now: Instant,
+    live_size: Size,
+    applied_size: Size,
+) -> bool {
+    settle.observe(now, live_size) && live_size != applied_size
+}
+
+/// How long the live geometry must hold still before a resize rebuild may run.
+///
+/// The emulator re-wraps its scrollback asynchronously after the resize events,
+/// so a rebuild issued while that re-wrap is still pending computes its clear on
+/// the pre-reflow layout and paints the box at a width the emulator has not
+/// adopted yet: the re-wrap that follows then moves the box out from under the
+/// frame just painted and leaves the old frame above the new one, its widest rows
+/// re-wrapped into fragments. Wall clock rather than poll count, because the draw
+/// path and the idle poll both observe this window at unrelated rates.
+const RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+/// Live geometry seen for a pending resize, and since when it has held still.
+#[derive(Default)]
+struct ResizeSettle {
+    size: Option<Size>,
+    since: Option<Instant>,
+}
+
+impl ResizeSettle {
+    /// Records one sighting of `size` and reports whether the geometry has held
+    /// still for `RESIZE_SETTLE_DELAY`.
+    fn observe(&mut self, now: Instant, size: Size) -> bool {
+        if self.size != Some(size) {
+            self.size = Some(size);
+            self.since = Some(now);
+        }
+        self.since
+            .is_some_and(|since| now.saturating_duration_since(since) >= RESIZE_SETTLE_DELAY)
+    }
+
+    /// Restarts the window after a notification announced a new geometry.
+    fn restart(&mut self) {
+        self.size = None;
+        self.since = None;
+    }
+}
+
 /// Consume a deferred resize at a redraw safe point.
 ///
 /// This must run before height or completion changes clear the old painted-row
@@ -1442,6 +1574,9 @@ impl PromptEditor {
             // (including a background title update), or before non-resize input.
             // The idle poll coalesces a resize burst without waiting for a key.
             let mut pending_resize_rebuild = false;
+            // How long the live geometry has held still for that pending
+            // rebuild; see `ResizeSettle`.
+            let mut resize_settle = ResizeSettle::default();
             #[cfg(test)]
             let mut fixture_frame_sequence = 0_u64;
 
@@ -1456,16 +1591,34 @@ impl PromptEditor {
                     // content-height rebuild clears its painted-width record.
                     // A foreground redraw can beat the queued Resize event.
                     let mut terminal_size = last_applied_terminal_size;
-                    if take_standalone_resize_rebuild(&mut pending_resize_rebuild, false)
-                        || terminal.backend().size()? != last_applied_terminal_size
-                    {
+                    // A resize notification is not on its own evidence that the
+                    // emulator reflowed: it can be a delayed duplicate for a size
+                    // that was already applied, and rebuilding for it re-anchors
+                    // the box without any real reflow and leaves the drawn caret
+                    // behind. Only the live geometry decides whether a rebuild may
+                    // run, and only once it held still: the emulator re-wraps its
+                    // scrollback asynchronously, so rebuilding on the first sight
+                    // of a new size computes the clear from the pre-reflow layout.
+                    let live_size = terminal.backend().size()?;
+                    if live_size == last_applied_terminal_size {
+                        let _ = take_standalone_resize_rebuild(&mut pending_resize_rebuild, false);
+                    }
+                    if resize_rebuild_is_due(
+                        &mut resize_settle,
+                        Instant::now(),
+                        live_size,
+                        last_applied_terminal_size,
+                    ) {
                         let (rebuilt_area, sampled_size) = rebuild_after_terminal_reflow(
                             &mut terminal,
                             &mut screen,
                             base_viewport_height,
                             fitted_completion_items,
                             last_drawn_area,
+                            last_applied_terminal_size,
+                            true,
                         )?;
+                        let _ = take_standalone_resize_rebuild(&mut pending_resize_rebuild, false);
                         last_drawn_area = Some(rebuilt_area);
                         last_applied_terminal_size = sampled_size;
                         terminal_size = sampled_size;
@@ -1489,6 +1642,8 @@ impl PromptEditor {
                             ViewportRebuildMode::ReserveMissingRows,
                             last_drawn_area.map(|area| area.y),
                             true,
+                            false,
+                            false,
                         )?;
                         // Re-park immediately: the rebuild moved the hardware
                         // cursor, and a resize arriving before the next draw
@@ -1526,6 +1681,8 @@ impl PromptEditor {
                                 ViewportRebuildMode::ReserveMissingRows,
                                 last_drawn_area.map(|area| area.y),
                                 true,
+                                false,
+                                false,
                             )?;
                             park_reflow_anchor(&mut terminal, rebuilt_area)?;
                             last_drawn_area = Some(rebuilt_area);
@@ -1619,7 +1776,27 @@ impl PromptEditor {
                         pending_resize_rebuild,
                         &self.pending_terminal_events,
                     ) {
-                        redraw_requested = true;
+                        // The notification alone does not prove a reflow: an
+                        // emulator that restored the previous size can still
+                        // deliver a delayed duplicate, and redrawing for it moves
+                        // the box across a screen it no longer matches, leaving
+                        // its old caret ink behind. Only a live geometry that
+                        // differs from the applied one and has stopped moving may
+                        // re-anchor the box, and only while nobody waits for the
+                        // frame.
+                        let live_size = terminal.backend().size()?;
+                        if resize_rebuild_is_due(
+                            &mut resize_settle,
+                            Instant::now(),
+                            live_size,
+                            last_applied_terminal_size,
+                        ) {
+                            redraw_requested = true;
+                        }
+                    } else {
+                        // Nothing left to settle: either no rebuild is pending or
+                        // a foreground path already consumed the notification.
+                        resize_settle.restart();
                     }
                     // Keep the active fallback visible and responsive. A cursor
                     // query may block, so recovery waits for the next prompt.
@@ -1637,6 +1814,9 @@ impl PromptEditor {
                         last_applied_terminal_size,
                         Size::new(width, height),
                     );
+                    // A new notification restarts the window, so a sighting from
+                    // an earlier resize cannot shorten it.
+                    resize_settle.restart();
                     continue;
                 }
                 if pending_resize_rebuild {
@@ -1647,6 +1827,8 @@ impl PromptEditor {
                         base_viewport_height,
                         fitted_completion_items,
                         last_drawn_area,
+                        last_applied_terminal_size,
+                        false,
                     )?;
                     last_drawn_area = Some(rebuilt_area);
                     last_applied_terminal_size = sampled_size;
@@ -1720,16 +1902,17 @@ mod tests {
         Terminal,
         backend::{Backend, TestBackend},
         buffer::Cell,
-        layout::{Position, Rect},
+        layout::{Position, Rect, Size},
         widgets::Paragraph,
     };
 
     use super::{
-        VERIFIED_ANCHOR_ATTEMPTS, ViewportRebuildMode, clear_fixed_viewport, clear_row_range,
-        fixed_viewport_area, force_frame_repaint, multiline_viewport_height, park_reflow_anchor,
-        parked_anchor_offset, prepare_fixed_viewport, submitted_input_preview_lines,
-        take_redraw_request, take_standalone_resize_rebuild, terminal_with_fixed_viewport,
-        update_pending_resize_rebuild, verified_cursor_row, viewport_height_with_completion,
+        VERIFIED_ANCHOR_ATTEMPTS, ViewportRebuildMode, bottom_glued_area, clear_fixed_viewport,
+        clear_row_range, fixed_viewport_area, force_frame_repaint, multiline_viewport_height,
+        park_reflow_anchor, parked_anchor_offset, prepare_fixed_viewport,
+        reflow_pins_box_to_bottom, submitted_input_preview_lines, take_redraw_request,
+        take_standalone_resize_rebuild, terminal_with_fixed_viewport, update_pending_resize_rebuild,
+        verified_cursor_row, viewport_height_with_completion,
     };
 
     fn key(code: KeyCode) -> Event {
@@ -1949,7 +2132,13 @@ mod tests {
                         match key.code {
                             KeyCode::Char('r') => {
                                 (area, sampled_size) = super::rebuild_after_terminal_reflow(
-                                    &mut terminal, &mut screen, base_height, None, Some(area),
+                                    &mut terminal,
+                                    &mut screen,
+                                    base_height,
+                                    None,
+                                    Some(area),
+                                    sampled_size,
+                                    false,
                                 )?;
                                 phase = "resized";
                                 break;
@@ -2380,7 +2569,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_resize_requests_one_idle_redraw_without_keyboard_input() {
+    fn pending_resize_is_due_for_an_idle_redraw_without_keyboard_input() {
         let mut redraw_requested = true;
 
         assert!(take_redraw_request(&mut redraw_requested, false));
@@ -2452,6 +2641,125 @@ mod tests {
         // rebuild must cancel the stale intermediate notification.
         update_pending_resize_rebuild(&mut pending, applied, applied);
         assert!(!pending);
+    }
+
+    #[test]
+    fn only_fresh_anchors_and_deferred_rebuilds_verify_the_reply_stream() {
+        use super::{ViewportRebuildMode, reply_stream_is_verified};
+
+        // A fresh anchor is taken as the box top, so one reply is never trusted.
+        assert!(reply_stream_is_verified(
+            0,
+            ViewportRebuildMode::ReserveMissingRows,
+            false
+        ));
+        // Height rebuilds run on every panel change and keep one round trip.
+        assert!(!reply_stream_is_verified(
+            3,
+            ViewportRebuildMode::ReserveMissingRows,
+            false
+        ));
+        // The keystroke-driven reflow rebuild keeps it too: the user is waiting.
+        assert!(!reply_stream_is_verified(
+            3,
+            ViewportRebuildMode::ReflowOnly,
+            false
+        ));
+        // A rebuild at offset zero is still a rebuild, not a fresh anchor.
+        assert!(!reply_stream_is_verified(
+            0,
+            ViewportRebuildMode::ReflowOnly,
+            false
+        ));
+        // The deferred reflow rebuild opts in: nobody waits for that frame.
+        assert!(reply_stream_is_verified(
+            3,
+            ViewportRebuildMode::ReflowOnly,
+            true
+        ));
+        // The flag forces verification whatever the mode would have chosen.
+        assert!(reply_stream_is_verified(
+            3,
+            ViewportRebuildMode::ReserveMissingRows,
+            true
+        ));
+    }
+
+    #[test]
+    fn idle_resize_waits_for_a_settled_geometry_before_rebuilding() {
+        use ratatui::layout::Size;
+        use std::time::{Duration, Instant};
+
+        let size = Size::new(80, 24);
+        let start = Instant::now();
+        let mut settle = super::ResizeSettle::default();
+        // A pending resize may rebuild only after the geometry held still long
+        // enough for the emulator to finish re-wrapping its scrollback.
+        assert!(!settle.observe(start, size));
+        assert!(!settle.observe(start + Duration::from_millis(250), size));
+        assert!(settle.observe(start + Duration::from_millis(600), size));
+        // Geometry that moves again restarts the window.
+        let moved = start + Duration::from_millis(700);
+        assert!(!settle.observe(moved, Size::new(80, 25)));
+        assert!(!settle.observe(moved + Duration::from_millis(250), Size::new(80, 25)));
+        assert!(settle.observe(moved + Duration::from_millis(600), Size::new(80, 25)));
+        // A fresh notification must not inherit sightings of the same size.
+        settle.restart();
+        assert!(!settle.observe(moved + Duration::from_millis(600), Size::new(80, 25)));
+    }
+
+    #[test]
+    fn foreground_redraw_waits_for_a_still_geometry_before_rebuilding() {
+        use ratatui::layout::Size;
+        use std::time::{Duration, Instant};
+
+        let applied = Size::new(80, 24);
+        let narrowed = Size::new(60, 24);
+        let start = Instant::now();
+        let mut settle = super::ResizeSettle::default();
+        // A foreground redraw can beat the queued Resize event, and the emulator
+        // re-wraps its scrollback after the size it announces. Rebuilding on that
+        // first sight computes the clear from the pre-reflow layout and paints the
+        // box where the coming re-wrap then moves it, leaving the previous frame
+        // on screen above the new one.
+        assert!(!super::resize_rebuild_is_due(
+            &mut settle,
+            start,
+            narrowed,
+            applied
+        ));
+        assert!(!super::resize_rebuild_is_due(
+            &mut settle,
+            start + Duration::from_millis(250),
+            narrowed,
+            applied
+        ));
+        assert!(super::resize_rebuild_is_due(
+            &mut settle,
+            start + Duration::from_millis(600),
+            narrowed,
+            applied
+        ));
+        // A geometry that matches the applied one never owes a rebuild, and seeing
+        // it again restarts the window for the next move.
+        assert!(!super::resize_rebuild_is_due(
+            &mut settle,
+            start + Duration::from_millis(900),
+            applied,
+            applied
+        ));
+        assert!(!super::resize_rebuild_is_due(
+            &mut settle,
+            start + Duration::from_millis(1000),
+            narrowed,
+            applied
+        ));
+        assert!(super::resize_rebuild_is_due(
+            &mut settle,
+            start + Duration::from_millis(1600),
+            narrowed,
+            applied
+        ));
     }
 
     #[test]
@@ -2624,6 +2932,59 @@ mod tests {
     }
 
     #[test]
+    fn width_reflow_pins_only_a_box_that_was_flush_with_the_bottom() {
+        let previous = Size::new(80, 24);
+        // Flush with the last row: the re-wrap released rows under the box, so
+        // the input area goes back to the bottom instead of floating above them.
+        assert!(reflow_pins_box_to_bottom(
+            previous,
+            Size::new(120, 24),
+            Some(Rect::new(0, 20, 80, 4)),
+            false,
+        ));
+        // Already above the bottom row: the recovered top is where it belongs.
+        assert!(!reflow_pins_box_to_bottom(
+            previous,
+            Size::new(120, 24),
+            Some(Rect::new(0, 12, 80, 4)),
+            false,
+        ));
+        // A height-only change keeps the anchor's row untouched.
+        assert!(!reflow_pins_box_to_bottom(
+            previous,
+            Size::new(80, 30),
+            Some(Rect::new(0, 20, 80, 4)),
+            false,
+        ));
+        // Nothing drawn yet, and the alternate screen, never pin.
+        assert!(!reflow_pins_box_to_bottom(
+            previous,
+            Size::new(120, 24),
+            None,
+            false
+        ));
+        assert!(!reflow_pins_box_to_bottom(
+            previous,
+            Size::new(120, 24),
+            Some(Rect::new(0, 20, 80, 4)),
+            true,
+        ));
+    }
+
+    #[test]
+    fn bottom_glued_area_moves_the_frame_onto_the_last_row() {
+        assert_eq!(
+            bottom_glued_area(Rect::new(0, 9, 20, 4), 24),
+            Rect::new(0, 20, 20, 4)
+        );
+        // A box taller than the screen saturates at the top row.
+        assert_eq!(
+            bottom_glued_area(Rect::new(0, 0, 20, 30), 24),
+            Rect::new(0, 0, 20, 30)
+        );
+    }
+
+    #[test]
     fn bottom_cursor_anchor_tracks_width_reflow_without_growing_scrollback() {
         let mut backend = TestBackend::new(12, 10);
         let scrollback_height = backend.scrollback().area.height;
@@ -2726,6 +3087,9 @@ mod tests {
         // Widening reflow: the transcript re-wraps and shrinks, so the box moves
         // up. Clearing from the new top down must wipe the old (now lower)
         // viewport copy while keeping the shorter transcript visible.
+        // The reflow caller pins a box that was already flush with the screen
+        // bottom (see `reflow_pins_box_to_bottom`); this primitive keeps the row
+        // the parked anchor recovers.
         let mut backend = TestBackend::new(12, 10);
 
         // Old layout before widening: transcript rows [0,5), viewport [5,9).
