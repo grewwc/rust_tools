@@ -52,16 +52,24 @@ impl MemoryStore {
                 reports.push(report);
             }
             if !dry_run {
-                let delete_ids: Vec<_> = reports.iter()
+                let delete_ids: Vec<_> = reports
+                    .iter()
                     .filter(|report| report.updated)
                     .map(|report| report.entry_id.as_str())
                     .collect();
-                let changed_ids: FxHashSet<_> = reports.iter()
+                let changed_ids: FxHashSet<_> = reports
+                    .iter()
                     .filter(|report| !report.duplicate)
                     .map(|report| report.entry_id.as_str())
                     .collect();
-                let new_entries: Vec<_> = entries.into_iter()
-                    .filter(|entry| entry.id.as_deref().is_some_and(|id| changed_ids.contains(id)))
+                let new_entries: Vec<_> = entries
+                    .into_iter()
+                    .filter(|entry| {
+                        entry
+                            .id
+                            .as_deref()
+                            .is_some_and(|id| changed_ids.contains(id))
+                    })
                     .collect();
                 if !new_entries.is_empty() {
                     self.apply_batch_update_while_locked(&delete_ids, &new_entries, false)?;
@@ -127,25 +135,44 @@ impl MemoryStore {
                 // A consumed archive is not new evidence. Re-running extraction
                 // must never roll back a newer revision, even with fresh CAS data.
                 if old.content_digest != metadata.content_digest
-                    && metadata.source_digests.iter().all(|digest| old.source_digests.contains(digest))
+                    && metadata
+                        .source_digests
+                        .iter()
+                        .all(|digest| old.source_digests.contains(digest))
                 {
-                    return Err("Previously consumed source cannot replace current distilled knowledge".to_string());
+                    return Err(
+                        "Previously consumed source cannot replace current distilled knowledge"
+                            .to_string(),
+                    );
                 }
                 if old.content_digest == metadata.content_digest
-                    && metadata.source_digests.iter().all(|digest| old.source_digests.contains(digest))
+                    && metadata
+                        .source_digests
+                        .iter()
+                        .all(|digest| old.source_digests.contains(digest))
                 {
-                    let entry_id = existing.id.as_ref().filter(|id| !id.is_empty())
+                    let entry_id = existing
+                        .id
+                        .as_ref()
+                        .filter(|id| !id.is_empty())
                         .ok_or_else(|| "Distilled entry is missing its canonical ID".to_string())?;
                     return Ok(DistilledUpsertReport {
-                        inserted: false, updated: false, duplicate: true, entry_id: entry_id.clone(),
+                        inserted: false,
+                        updated: false,
+                        duplicate: true,
+                        entry_id: entry_id.clone(),
                     });
                 }
             }
             if expected.is_none() && !collisions.is_empty() {
-                return Err("Distilled topic already exists; an expected revision is required".to_string());
+                return Err(
+                    "Distilled topic already exists; an expected revision is required".to_string(),
+                );
             }
             let entry_id = if let Some((existing, old)) = previous {
-                metadata.revision = old.revision.checked_add(1)
+                metadata.revision = old
+                    .revision
+                    .checked_add(1)
                     .ok_or_else(|| "Distilled revision overflow".to_string())?;
                 metadata.previous_revisions = old.previous_revisions;
                 metadata.previous_revisions.push(DistilledRevision {
@@ -159,13 +186,23 @@ impl MemoryStore {
                         metadata.source_digests.push(digest);
                     }
                 }
-                expected.as_ref().expect("updates require an expected revision").0.clone()
+                expected
+                    .as_ref()
+                    .expect("updates require an expected revision")
+                    .0
+                    .clone()
             } else {
                 metadata.revision = 1;
                 metadata.previous_revisions.clear();
-                let id = entry.id.clone().filter(|id| !id.trim().is_empty())
+                let id = entry
+                    .id
+                    .clone()
+                    .filter(|id| !id.trim().is_empty())
                     .unwrap_or_else(crate::ai::tools::service::memory::next_memory_id);
-                if entries.iter().any(|existing| existing.id.as_ref() == Some(&id)) {
+                if entries
+                    .iter()
+                    .any(|existing| existing.id.as_ref() == Some(&id))
+                {
                     return Err("Distilled entry ID collides with an existing entry".to_string());
                 }
                 id
@@ -177,20 +214,30 @@ impl MemoryStore {
             }
             entries.push(entry);
             Ok(DistilledUpsertReport {
-                inserted: expected.is_none(), updated: expected.is_some(), duplicate: false, entry_id,
+                inserted: expected.is_none(),
+                updated: expected.is_some(),
+                duplicate: false,
+                entry_id,
             })
         }
     }
 
     /// Read verified canonical rows using the same owner visibility as explicit memory tools.
-    pub(crate) fn active_distilled_entries(&self, scope: &str) -> Result<Vec<AgentMemoryEntry>, String> {
+    pub(crate) fn active_distilled_entries(
+        &self,
+        scope: &str,
+    ) -> Result<Vec<AgentMemoryEntry>, String> {
         let viewer = crate::ai::tools::service::memory::ViewerContext::current();
         super::super::with_memory_file_lock(&self.path, || {
-            Ok(self.current_entries_while_locked()?.into_iter().filter(|entry| {
-                viewer.can_see(entry)
-                    && crate::ai::knowledge::distilled::active_distilled_metadata(entry)
-                        .is_some_and(|metadata| metadata.scope == scope)
-            }).collect())
+            Ok(self
+                .current_entries_while_locked()?
+                .into_iter()
+                .filter(|entry| {
+                    viewer.can_see(entry)
+                        && crate::ai::knowledge::distilled::active_distilled_metadata(entry)
+                            .is_some_and(|metadata| metadata.scope == scope)
+                })
+                .collect())
         })
     }
 
@@ -201,9 +248,14 @@ impl MemoryStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(format!("Failed to read canonical memory: {err}")),
         };
-        content.lines().enumerate().filter(|(_, line)| !line.trim().is_empty())
-            .map(|(index, line)| serde_json::from_str(line)
-                .map_err(|err| format!("Invalid canonical memory row {}: {err}", index + 1)))
+        content
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(index, line)| {
+                serde_json::from_str(line)
+                    .map_err(|err| format!("Invalid canonical memory row {}: {err}", index + 1))
+            })
             .collect()
     }
 

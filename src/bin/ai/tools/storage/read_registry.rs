@@ -54,8 +54,7 @@ fn load_entries(registry_path: &Path) -> Result<Vec<ReadEntry>, String> {
     }
     let content = std::fs::read_to_string(registry_path)
         .map_err(|e| format!("Failed to read read registry: {e}"))?;
-    serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse read registry: {e}"))
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse read registry: {e}"))
 }
 
 /// Writes the registry back to disk atomically (tmp file in the same directory

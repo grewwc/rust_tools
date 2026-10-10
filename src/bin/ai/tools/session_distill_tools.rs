@@ -9,11 +9,12 @@
 use serde_json::Value;
 
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
-use crate::ai::tools::service::session_distill::{
-    DEFAULT_DISTILL_LIMIT, run_distill_command,
-};
+use crate::ai::tools::service::session_distill::{DEFAULT_DISTILL_LIMIT, run_distill_command};
 
-pub(in crate::ai) async fn execute_with_app(app: &crate::ai::types::App, args: &Value) -> Result<String, String> {
+pub(in crate::ai) async fn execute_with_app(
+    app: &crate::ai::types::App,
+    args: &Value,
+) -> Result<String, String> {
     let archive = args["archive"]
         .as_str()
         .map(str::trim)
@@ -27,7 +28,9 @@ pub(in crate::ai) async fn execute_with_app(app: &crate::ai::types::App, args: &
 
     let path = resolve_archive_path(archive)?;
     let report = run_distill_command(app, &path, limit, dry_run).await?;
-    Ok(crate::ai::tools::service::session_distill::format_report(&report, &path))
+    Ok(crate::ai::tools::service::session_distill::format_report(
+        &report, &path,
+    ))
 }
 
 fn resolve_archive_path(archive: &str) -> Result<std::path::PathBuf, String> {
@@ -54,7 +57,10 @@ mod tests {
         let cwd = std::env::temp_dir().join("distill-cwd-override");
         assert_ne!(cwd, std::env::current_dir().unwrap());
         SUBAGENT_CWD.sync_scope(cwd.clone(), || {
-            assert_eq!(resolve_archive_path("archives/session.zip").unwrap(), cwd.join("archives/session.zip"));
+            assert_eq!(
+                resolve_archive_path("archives/session.zip").unwrap(),
+                cwd.join("archives/session.zip")
+            );
         });
     }
 
@@ -62,13 +68,19 @@ mod tests {
     fn session_distill_absolute_archive_ignores_cwd_override() {
         let archive = std::env::temp_dir().join("session.zip");
         SUBAGENT_CWD.sync_scope(archive.join("other-cwd"), || {
-            assert_eq!(resolve_archive_path(archive.to_str().unwrap()).unwrap(), archive);
+            assert_eq!(
+                resolve_archive_path(archive.to_str().unwrap()).unwrap(),
+                archive
+            );
         });
     }
 
     #[test]
     fn session_distill_relative_archive_without_override_uses_process_cwd() {
-        assert_eq!(resolve_archive_path("session.zip").unwrap(), std::env::current_dir().unwrap().join("session.zip"));
+        assert_eq!(
+            resolve_archive_path("session.zip").unwrap(),
+            std::env::current_dir().unwrap().join("session.zip")
+        );
     }
 }
 

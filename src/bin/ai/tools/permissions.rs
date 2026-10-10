@@ -262,8 +262,7 @@ impl PermissionExecutor {
                 ToolPermission::Allow => CallDecision::Allow,
                 ToolPermission::Deny => CallDecision::Deny("policy=deny".to_string()),
                 ToolPermission::Ask => {
-                    let question =
-                        format!("Allow tool '{}' to run? (y/n): ", call.function.name);
+                    let question = format!("Allow tool '{}' to run? (y/n): ", call.function.name);
                     let answer = if crate::ai::serve_confirm::active() {
                         // Serve turn children have no terminal; the question travels
                         // to the web client and the answer comes back on stdin.

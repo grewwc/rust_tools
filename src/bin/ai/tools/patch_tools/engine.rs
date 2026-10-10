@@ -1,9 +1,9 @@
 use super::*;
-use std::fs;
-use std::path::Path;
-use serde_json::Value;
 use crate::ai::tools::common::ToolStreamWriter;
 use crate::ai::tools::storage::file_store::FileStore;
+use serde_json::Value;
+use std::fs;
+use std::path::Path;
 pub(crate) fn try_apply_hunk_at(
     orig_lines: &[String],
     hunk: &UnifiedHunk,
@@ -683,7 +683,9 @@ pub(crate) fn restore_prepared_patch_write(write: &PreparedPatchWrite) -> Result
     // writes and intervening edits are ambiguous and must be left intact with an error rather
     // than overwritten or deleted in the name of rollback.
     let already_restored = match &write.before {
-        Some(before) => store.read_to_string().is_ok_and(|current| current == *before),
+        Some(before) => store
+            .read_to_string()
+            .is_ok_and(|current| current == *before),
         None => matches!(
             fs::symlink_metadata(&write.path),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound
@@ -697,14 +699,16 @@ pub(crate) fn restore_prepared_patch_write(write: &PreparedPatchWrite) -> Result
             store.write_all_with_before_hint(before, Some(after))
         }
         (Some(before), PreparedPatchAction::Delete) => store.write_new_file_if_absent(before),
-        (None, PreparedPatchAction::Write(after)) => store.remove_file_if_unchanged(after).map(|()| {
-            crate::ai::tools::storage::mutation_log::record(
-                &write.path,
-                "delete",
-                Some(after),
-                None,
-            );
-        }),
+        (None, PreparedPatchAction::Write(after)) => {
+            store.remove_file_if_unchanged(after).map(|()| {
+                crate::ai::tools::storage::mutation_log::record(
+                    &write.path,
+                    "delete",
+                    Some(after),
+                    None,
+                );
+            })
+        }
         (None, PreparedPatchAction::Delete) => {
             return Err(format!(
                 "internal error: rollback of {} has no before snapshot",
@@ -712,7 +716,12 @@ pub(crate) fn restore_prepared_patch_write(write: &PreparedPatchWrite) -> Result
             ));
         }
     };
-    result.map_err(|err| format!("failed to restore {} during rollback: {err}", write.path.display()))
+    result.map_err(|err| {
+        format!(
+            "failed to restore {} during rollback: {err}",
+            write.path.display()
+        )
+    })
 }
 
 pub(crate) fn commit_patch_writes(writes: &[PreparedPatchWrite]) -> Result<(), String> {

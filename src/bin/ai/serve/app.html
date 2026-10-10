@@ -258,6 +258,7 @@ let pendingImages = []; // {filename, data_base64}
 let staleSession = ""; // session whose live feed was lost; "" when none
 let staleKey = ""; // fingerprint of the newest history row already rendered
 let staleDone = false; // newest history row is a real assistant reply
+let staleBox = null; // live turn box to update if the server confirms it ended
 let staleTimer = null; // follow-up reload timer while the reply is pending
 let staleTries = 0; // bounded follow-ups: an idle page must not ask forever
 let staleBusy = false; // one history fetch at a time; ticks may overlap a slow one
@@ -1080,7 +1081,7 @@ async function reloadStale() {
     // here so a reconnect mid-prompt can still answer it. This runs before the
     // "reply landed" exit below, because a question can stay pending while the
     // transcript already ends in an assistant message.
-    await pollConfirm();
+    const running = await pollConfirm();
     if (staleDone) { stopStaleFollow(); return; }
     let msgs;
     try { msgs = await (await api("/sessions/" + sessionId + "/history?limit=201")).json(); }
@@ -1088,14 +1089,26 @@ async function reloadStale() {
     // The fetch can outlive the follow it belongs to (a new turn or another
     // session stops it, the page goes hidden): re-check before re-rendering.
     if (!staleSession || staleSession !== sessionId || document.visibilityState !== "visible") return;
-    if (histKey(msgs) === staleKey) return;
-    await loadHistory();
-    if (staleDone) stopStaleFollow(); // the reply landed: nothing left to follow
+    if (histKey(msgs) !== staleKey) await loadHistory();
+    if (staleDone) { stopStaleFollow(); return; } // the reply landed: nothing left to follow
+    // A successful server poll is authoritative. If it says the turn no longer
+    // exists and history still has no final reply, a daemon restart or crash
+    // ended the turn; do not leave the mobile UI stuck in stale-follow mode.
+    if (running === false) {
+      const box = staleBox;
+      stopStaleFollow();
+      if (box) {
+        const bubble = box.querySelector(".bubble");
+        if (bubble) bubble.textContent = "connection lost; server no longer reports this turn running (it may have restarted before finishing)";
+      }
+      note("turn ended before a final reply; you can send again");
+    }
   } finally { staleBusy = false; }
 }
 function stopStaleFollow() {
   if (staleTimer !== null) { clearInterval(staleTimer); staleTimer = null; }
   staleSession = "";
+  staleBox = null;
   staleTries = 0;
   syncStopButton();
 }
@@ -1152,18 +1165,19 @@ async function answerConfirm(allow) {
 }
 // Render whatever the server currently holds pending. A page that lost the
 // feed (or was reloaded) mid-prompt has no live event to show the question, so
-// it is rebuilt from /confirm through the same path the SSE event uses.
+// it is rebuilt from /confirm through the same path the SSE event uses. Returns
+// the authoritative running state, or null when no current sample was obtained.
 async function pollConfirm() {
-  if (!sessionId || confirmBusy) return;
+  if (!sessionId || confirmBusy) return null;
   const sid = sessionId;
   const epoch = runEpoch;
   let body;
   try { body = await (await api("/sessions/" + sid + "/confirm")).json(); }
-  catch (_) { return; } // transient (hidden mid-flight, server restarting): retry next tick
+  catch (_) { return null; } // transient (hidden mid-flight, server restarting): retry next tick
   // The fetch can outlive what it describes (answered while it was in flight,
   // session switched, newer turn started): re-check before touching anything.
-  if (confirmBusy || sid !== sessionId) return;
-  if (epoch !== runEpoch) return; // a newer turn owns the button and the dialog now
+  if (confirmBusy || sid !== sessionId) return null;
+  if (epoch !== runEpoch) return null; // a newer turn owns the button and the dialog now
   // The same poll reports a live turn for this session: the server is the only
   // source that survives this page losing the stream. A missing field means an
   // older server, treated as "not running".
@@ -1171,10 +1185,11 @@ async function pollConfirm() {
   if (turnRunning) { turnRunningAt = Date.now(); armHistoryFollow(); }
   syncStopButton();
   const pending = body.pending;
-  if (!pending) { if (confirmShown) hideConfirm(); return; }
+  if (!pending) { if (confirmShown) hideConfirm(); return turnRunning; }
   // The token, not the id, is the question's identity: child-side ids restart
   // at 1 every turn, so an equal id can still be different text.
   if (!confirmShown || confirmShown.token !== pending.token) showConfirm(pending.id, pending.prompt, pending.token);
+  return turnRunning;
 }
 
 // A turn is "running" when any of three independent sources says so: this page
@@ -1299,6 +1314,13 @@ async function send() {
   const prog = addFold("progress", "", box);
   const bubble = addMsgMd("", box);
   let progLines = [];
+  let subagentProgress = "";
+  const renderProgress = () => {
+    const visible = progLines.slice(-50);
+    if (subagentProgress) visible.push(subagentProgress);
+    const count = progLines.length + (subagentProgress ? 1 : 0);
+    prog.set("progress (" + count + ")", visible.join("\n"));
+  };
   let think = null;
   // Reply text arrives token by token, and markdown has to be parsed over the
   // whole reply (an unterminated fence changes how every later line reads), so
@@ -1338,6 +1360,7 @@ async function send() {
   };
   const goStale = (msg) => {
     staleSession = sessionId;
+    staleBox = box;
     staleTries = 0;
     // Until the first fetch below, staleDone still describes the transcript
     // from before this turn and would end the follow on its first tick.
@@ -1381,6 +1404,11 @@ async function send() {
           try { if (think) think.body.textContent += JSON.parse(payload).text || ""; } catch (_) {}
         }
         else if (kind === "thinking_done") { if (think) think.box.querySelector("summary").textContent = "thinking"; }
+        else if (kind === "subagent_progress") {
+          subagentProgress = payload;
+          renderProgress();
+          prog.box.querySelector("details").open = true;
+        }
         else if (kind === "confirm_request") {
           // Server text: showConfirm renders the prompt through textContent.
           // Only the session on screen can answer: the dialog answers into
@@ -1396,7 +1424,7 @@ async function send() {
           try { cid = JSON.parse(payload).id; } catch (_) {}
           if (sid === sessionId && (cid === null || (confirmShown && confirmShown.id === cid))) hideConfirm();
         }
-        else if (payload) { progLines.push(payload); prog.set("progress (" + progLines.length + ")", progLines.slice(-50).join("\n")); }
+        else if (payload) { progLines.push(payload); renderProgress(); }
         if (sid === sessionId) $("msgs").scrollTop = $("msgs").scrollHeight;
       }
       if (finished) break;

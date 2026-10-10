@@ -71,7 +71,10 @@ pub(crate) fn preview_patch_body_line(line: &str) -> String {
 ///   and repeated lines are rejected instead of ignored, because silently dropping them would
 ///   apply a partial edit (for example the first line of a multi-line `new:`) while still
 ///   reporting success.
-pub(crate) fn apply_inline_replace(original: &str, envelope: &PatchEnvelope) -> Result<String, String> {
+pub(crate) fn apply_inline_replace(
+    original: &str,
+    envelope: &PatchEnvelope,
+) -> Result<String, String> {
     // --- Parse the three fields: anchor / old / new ---
     let mut fields: [Option<String>; 3] = [None, None, None];
     for line in &envelope.body_lines {

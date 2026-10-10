@@ -1,12 +1,13 @@
 use super::*;
-use std::{fs, io::Write};
 use rusqlite::{Connection, params};
+use std::{fs, io::Write};
 
 struct Fixture(PathBuf);
 
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("distill-input-test-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("distill-input-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
         Self(root)
     }
@@ -41,7 +42,9 @@ impl Fixture {
         let mut archive = zip::ZipWriter::new(fs::File::create(&target).unwrap());
         let options = zip::write::SimpleFileOptions::default();
         archive.start_file("manifest.json", options).unwrap();
-        archive.write_all(serde_json::json!({"session_id": id}).to_string().as_bytes()).unwrap();
+        archive
+            .write_all(serde_json::json!({"session_id": id}).to_string().as_bytes())
+            .unwrap();
         archive.start_file("session.sqlite", options).unwrap();
         archive.write_all(&fs::read(path).unwrap()).unwrap();
         archive.finish().unwrap();
@@ -73,7 +76,10 @@ fn session_distill_input_zip_and_local_id_preserve_identical_evidence() {
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[0].content.as_str(), Some("Use Redis."));
     assert_eq!(messages[1].tool_calls.as_ref().unwrap().len(), 1);
-    assert_eq!(messages[1].reasoning_content.as_deref(), Some("inspect the source"));
+    assert_eq!(
+        messages[1].reasoning_content.as_deref(),
+        Some("inspect the source")
+    );
     assert_eq!(messages[2].content.as_str(), Some("Use SQLite instead."));
     let segments = super::super::source_segments(&messages).unwrap();
     for input in ["source.zip", "./source.zip", zip.to_str().unwrap()] {
@@ -81,9 +87,14 @@ fn session_distill_input_zip_and_local_id_preserve_identical_evidence() {
         assert!(matches!(archive, DistillInput::Archive(_)));
         let (archive_id, archived) = archive.read_messages().unwrap();
         assert_eq!(archive_id, id);
-        assert_eq!(serde_json::to_value(&archived).unwrap(), serde_json::to_value(&messages).unwrap());
-        assert_eq!(serde_json::to_value(super::super::source_segments(&archived).unwrap()).unwrap(),
-            serde_json::to_value(&segments).unwrap());
+        assert_eq!(
+            serde_json::to_value(&archived).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(super::super::source_segments(&archived).unwrap()).unwrap(),
+            serde_json::to_value(&segments).unwrap()
+        );
     }
     assert_eq!(fs::read(&path).unwrap(), before);
     assert!(!PathBuf::from(format!("{}-wal", path.display())).exists());
@@ -100,14 +111,32 @@ fn session_distill_input_existing_path_wins_over_identical_session_id() {
     assert!(matches!(input, DistillInput::Archive(_)));
     assert_eq!(input.read_messages().unwrap().0, "archived-id");
     fs::write(fixture.0.join("ambiguous"), "not a ZIP").unwrap();
-    assert!(fixture.resolve("ambiguous").unwrap().read_messages().is_err());
+    assert!(
+        fixture
+            .resolve("ambiguous")
+            .unwrap()
+            .read_messages()
+            .is_err()
+    );
 }
 
 #[test]
 fn session_distill_input_invalid_and_missing_inputs_do_not_create_sessions() {
     let fixture = Fixture::new();
-    for value in ["", " ", "missing", "missing.zip", "../outside", "a/b", "a.b", "会话"] {
-        assert!(fixture.resolve(value).is_err(), "unexpectedly accepted {value:?}");
+    for value in [
+        "",
+        " ",
+        "missing",
+        "missing.zip",
+        "../outside",
+        "a/b",
+        "a.b",
+        "会话",
+    ] {
+        assert!(
+            fixture.resolve(value).is_err(),
+            "unexpectedly accepted {value:?}"
+        );
     }
     assert!(fixture.resolve(&"a".repeat(129)).is_err());
     assert!(fixture.resolve(".").unwrap_err().contains("not a file"));
@@ -124,8 +153,22 @@ fn session_distill_input_requires_full_id_and_does_not_migrate_source() {
     conn.execute_batch("PRAGMA user_version = 7;").unwrap();
     drop(conn);
     let before = fs::read(&path).unwrap();
-    assert!(fixture.resolve("full-id").unwrap_err().contains("not found"));
-    assert_eq!(fixture.resolve("full-id_123").unwrap().read_messages().unwrap().1.len(), 3);
+    assert!(
+        fixture
+            .resolve("full-id")
+            .unwrap_err()
+            .contains("not found")
+    );
+    assert_eq!(
+        fixture
+            .resolve("full-id_123")
+            .unwrap()
+            .read_messages()
+            .unwrap()
+            .1
+            .len(),
+        3
+    );
     assert_eq!(fs::read(&path).unwrap(), before);
 }
 
@@ -151,12 +194,19 @@ fn session_distill_input_underscore_ids_never_alias_other_sessions() {
 fn session_distill_input_live_wal_reads_latest_commits_not_uncommitted_rows() {
     let fixture = Fixture::new();
     let (_, conn) = fixture.session("live-session");
-    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;").unwrap();
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+        .unwrap();
     let input = fixture.resolve("live-session").unwrap();
     assert_eq!(input.read_messages().unwrap().1.len(), 3);
-    conn.execute_batch("INSERT INTO messages (id, role, content) VALUES (40, 'user', '\"New decision\"');").unwrap();
+    conn.execute_batch(
+        "INSERT INTO messages (id, role, content) VALUES (40, 'user', '\"New decision\"');",
+    )
+    .unwrap();
     assert_eq!(input.read_messages().unwrap().1.len(), 4);
-    conn.execute_batch("BEGIN; INSERT INTO messages (id, role, content) VALUES (50, 'user', '\"Uncommitted\"');").unwrap();
+    conn.execute_batch(
+        "BEGIN; INSERT INTO messages (id, role, content) VALUES (50, 'user', '\"Uncommitted\"');",
+    )
+    .unwrap();
     assert_eq!(input.read_messages().unwrap().1.len(), 4);
     conn.execute_batch("ROLLBACK;").unwrap();
 }
@@ -168,7 +218,11 @@ fn session_distill_input_corrupt_local_session_fails_without_rewriting_it() {
     store.ensure_root_dir().unwrap();
     let path = store.session_history_file("corrupt");
     fs::write(&path, "not a database").unwrap();
-    let error = fixture.resolve("corrupt").unwrap().read_messages().unwrap_err();
+    let error = fixture
+        .resolve("corrupt")
+        .unwrap()
+        .read_messages()
+        .unwrap_err();
     assert!(error.contains("Failed to read local session 'corrupt'"));
     assert_eq!(fs::read(&path).unwrap(), b"not a database");
 }

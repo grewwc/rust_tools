@@ -129,7 +129,7 @@ pub(crate) fn update_plan_step(
                 "{msg}\nCurrent plan:\n{}Plan state persists at {} (plan-state.json, session assets) and survives context compression; read it with read_file if you need the current steps later. `plan` only creates or replaces the plan — use `plan_update` for status changes.\n",
                 state.render(),
                 plan_state_path(app).display()
-            ))
+            ));
         }
     };
     save_plan_state(app, &state)?;
@@ -192,7 +192,10 @@ mod tests {
         update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
 
         let err = update_plan_step(&app, 9, StepStatus::Done, None).unwrap_err();
-        assert!(err.contains("Step 9 not found in the active plan."), "{err}");
+        assert!(
+            err.contains("Step 9 not found in the active plan."),
+            "{err}"
+        );
         assert!(err.contains("Current plan:"), "{err}");
         // Real step numbers and statuses are listed, so the model can pick one instead
         // of guessing (regression: hallucinated step 6/5 after compression).

@@ -263,7 +263,13 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
     // behavior stays unchanged.
     if let Ok(stat) = store.stat() {
         if stat.size > FULL_READ_MAX_BYTES {
-            return execute_read_file_windowed(&store, offset, char_offset, limit, use_line_numbers);
+            return execute_read_file_windowed(
+                &store,
+                offset,
+                char_offset,
+                limit,
+                use_line_numbers,
+            );
         }
     }
 
@@ -717,7 +723,11 @@ fn read_window_lines(
         let probe = store
             .read_range(0, WINDOW_READ_CHUNK_BYTES)
             .map_err(|e| e.to_string())?;
-        let total_lines = if probe.content.is_empty() { Some(0) } else { None };
+        let total_lines = if probe.content.is_empty() {
+            Some(0)
+        } else {
+            None
+        };
         return Ok(WindowedRead {
             content: String::new(),
             total_lines,
@@ -793,8 +803,7 @@ fn read_window_lines(
                             if acc.skip > 0 {
                                 acc.skip -= 1;
                                 acc.pending_cr = PendingCr::Dropped;
-                            } else if acc.kept < WINDOW_LINE_CAP_CHARS
-                                && window_chars < window_cap
+                            } else if acc.kept < WINDOW_LINE_CAP_CHARS && window_chars < window_cap
                             {
                                 acc.buf.push('\r');
                                 acc.kept += 1;
@@ -928,7 +937,10 @@ fn read_window_lines(
 /// gate is evaluated by reading the file's first line (one small bounded read) and the strip is
 /// applied per window line. Stripping is line-local and never changes line boundaries, so the
 /// result matches what the whole-file path would produce for the same window.
-fn strip_window_line_number_layer(store: &FileStore, window_content: &str) -> Result<String, String> {
+fn strip_window_line_number_layer(
+    store: &FileStore,
+    window_content: &str,
+) -> Result<String, String> {
     // Evaluate the whole-file gate: only strip when the archive's first line carries the prefix.
     let gate = store
         .read_range(0, WINDOW_READ_CHUNK_BYTES)
@@ -939,7 +951,11 @@ fn strip_window_line_number_layer(store: &FileStore, window_content: &str) -> Re
     }
     let stripped: Vec<String> = window_content
         .lines()
-        .map(|line| read_file_number_prefix_rest(line).unwrap_or(line).to_string())
+        .map(|line| {
+            read_file_number_prefix_rest(line)
+                .unwrap_or(line)
+                .to_string()
+        })
         .collect();
     Ok(stripped.join("\n"))
 }
@@ -1721,8 +1737,14 @@ mod tests {
             "use_line_numbers": true,
         });
         let output = execute_read_file(&args).unwrap();
-        assert!(output.starts_with("     1\t0123456789abcdef"), "output: {output}");
-        assert!(output.contains("  10\t0123456789abcdef"), "output: {output}");
+        assert!(
+            output.starts_with("     1\t0123456789abcdef"),
+            "output: {output}"
+        );
+        assert!(
+            output.contains("  10\t0123456789abcdef"),
+            "output: {output}"
+        );
         // The window is fully rendered but the file continues: the notice must not claim an exact
         // total, but the continuation offset must be unaffected.
         assert!(
@@ -1794,9 +1816,18 @@ mod tests {
             "use_line_numbers": true,
         });
         let output = execute_read_file(&args).unwrap();
-        assert!(output.starts_with("100000\t0123456789abcdef"), "output: {output}");
-        assert!(output.contains("100001\t0123456789abcdef"), "output: {output}");
-        assert!(output.contains("100002\t0123456789abcdef"), "output: {output}");
+        assert!(
+            output.starts_with("100000\t0123456789abcdef"),
+            "output: {output}"
+        );
+        assert!(
+            output.contains("100001\t0123456789abcdef"),
+            "output: {output}"
+        );
+        assert!(
+            output.contains("100002\t0123456789abcdef"),
+            "output: {output}"
+        );
         assert!(output.contains("offset=100003"), "output: {output}");
         let _ = fs::remove_file(&path);
     }
@@ -1878,7 +1909,10 @@ mod tests {
             output.starts_with("     1\tvalue 1\n     2\tvalue 2"),
             "output: {output}"
         );
-        assert!(!output.contains("     1\t     1\t"), "nested layer: {output}");
+        assert!(
+            !output.contains("     1\t     1\t"),
+            "nested layer: {output}"
+        );
 
         let args = serde_json::json!({
             "file_path": path.to_string_lossy(),
@@ -1944,10 +1978,7 @@ mod tests {
             output.chars().count()
         );
         assert!(
-            output.contains(&format!(
-                "char_offset={}",
-                2 * MAX_READ_FILE_RESULT_CHARS
-            )),
+            output.contains(&format!("char_offset={}", 2 * MAX_READ_FILE_RESULT_CHARS)),
             "output: {output}"
         );
         let _ = fs::remove_file(&path);
@@ -2141,7 +2172,11 @@ mod tests {
         fs::write(&path, &content).unwrap();
         let store = FileStore::new(path.clone());
         let window = read_window_lines(&store, 1, 3, 0).unwrap();
-        assert_eq!(window.total_lines, Some(3), "exact total must survive the cap");
+        assert_eq!(
+            window.total_lines,
+            Some(3),
+            "exact total must survive the cap"
+        );
         assert!(window.truncated_line);
         assert_eq!(window.line_count, 1, "only the huge first line is kept");
         let _ = fs::remove_file(&path);
@@ -2162,7 +2197,10 @@ mod tests {
         fs::write(&path, &content).unwrap();
         let store = FileStore::new(path.clone());
         let window = read_window_lines(&store, 3, 2, 0).unwrap();
-        assert_eq!(window.content, "x\ntail", "CRLF must not leave a '\\r' behind");
+        assert_eq!(
+            window.content, "x\ntail",
+            "CRLF must not leave a '\\r' behind"
+        );
         assert_eq!(window.line_count, 2);
         assert_eq!(window.total_lines, Some(4));
         assert!(!window.content.contains('\r'));

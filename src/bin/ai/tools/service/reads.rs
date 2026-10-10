@@ -41,8 +41,8 @@ pub(crate) fn handle_list_read_files(args: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
-    let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
-        .unwrap_or_else(|_| PathBuf::from("."));
+    let cwd =
+        crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| PathBuf::from("."));
     let all = read_registry::list();
     let total = all.len();
 
@@ -72,11 +72,7 @@ pub(crate) fn handle_list_read_files(args: &Value) -> Value {
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| (d.as_millis() as u64) > e.last_read)
                     .unwrap_or(false);
-                if changed {
-                    "changed"
-                } else {
-                    "unchanged"
-                }
+                if changed { "changed" } else { "unchanged" }
             }
             Err(_) => "missing",
         };
@@ -96,9 +92,7 @@ pub(crate) fn handle_list_read_files(args: &Value) -> Value {
     let note = if files.is_empty() && total == 0 {
         "No read_file calls recorded in this session yet.".to_string()
     } else if files.is_empty() {
-        format!(
-            "No files match the path filter (total read_file calls this session: {total})."
-        )
+        format!("No files match the path filter (total read_file calls this session: {total}).")
     } else if truncated {
         format!(
             "Showing the {MAX_LISTED} most recently read files (total read_file calls this session: {total}); pass a `path` filter to narrow."
@@ -144,7 +138,12 @@ mod tests {
                 // Substring filter narrows the list.
                 let filtered = handle_list_read_files(&json!({ "path": "zzz" }));
                 assert_eq!(filtered["count"], 0);
-                assert!(filtered["note"].as_str().unwrap().contains("No files match"));
+                assert!(
+                    filtered["note"]
+                        .as_str()
+                        .unwrap()
+                        .contains("No files match")
+                );
 
                 // mtime newer than last read => "changed".
                 std::thread::sleep(std::time::Duration::from_millis(1100));

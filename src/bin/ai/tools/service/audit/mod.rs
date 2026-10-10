@@ -20,11 +20,11 @@ fn config_blocked_commands() -> Vec<String> {
         .filter(|s| !s.is_empty())
         .collect()
 }
-mod lexer;
-mod wrapper;
-mod git;
-mod substitute;
 mod exec;
+mod git;
+mod lexer;
+mod substitute;
+mod wrapper;
 
 // Re-export names that sibling modules, the inline tests, and external callers
 // resolve through this module root (`audit::X`). Items stay defined in their
@@ -33,10 +33,10 @@ mod exec;
 pub(crate) use exec::validate_single_segment;
 pub(crate) use git::command_subcommand_index;
 pub(crate) use lexer::{
-    effective_command_tokens, split_unquoted_command_segments, split_unquoted_segments, ShellJoin,
+    ShellJoin, effective_command_tokens, split_unquoted_command_segments, split_unquoted_segments,
 };
 pub(crate) use substitute::{
-    safe_shell_substitutions, SafeShellSubstitutionKind, validate_no_injection_surface,
+    SafeShellSubstitutionKind, safe_shell_substitutions, validate_no_injection_surface,
 };
 
 // Test-only re-exports: the `#[cfg(test)]` modules below resolve these through
@@ -44,12 +44,11 @@ pub(crate) use substitute::{
 // warning-free). Production code reaches the same items via the submodules.
 #[cfg(test)]
 pub(crate) use exec::{
-    merge_heavy_search_dirs, process_group_of, summarize_dirs, validate_kill_pids,
-    validate_pattern_kill, validate_rm_targets, PgrepMode, has_glob_metachar, strip_quotes,
+    PgrepMode, has_glob_metachar, merge_heavy_search_dirs, process_group_of, strip_quotes,
+    summarize_dirs, validate_kill_pids, validate_pattern_kill, validate_rm_targets,
 };
 #[cfg(test)]
 pub(crate) use lexer::{effective_chain_uses_xargs, tokenize_shell_words};
-
 
 // =========================================================================
 // Public entry point
@@ -726,7 +725,9 @@ mod tests {
         assert!(validate("python3 -c 'import os as o; print(o.getcwd())'").is_err());
         assert!(validate("python3 -c 'import shutil as s; s.rmtree(\"d\")'").is_err());
         assert!(validate("python3 -c 'import os; os.__dict__[\"system\"](\"id\")'").is_err());
-        assert!(validate("python3 -c 'import os; os.__getattribute__(\"system\")(\"id\")'").is_err());
+        assert!(
+            validate("python3 -c 'import os; os.__getattribute__(\"system\")(\"id\")'").is_err()
+        );
         // `import os; x = os; x.system(...)` / `vars(os)["system"](...)`
         // (copied reference / vars indirection) are accepted residual blind
         // spots of the relaxed import policy; see validate_python_code.
@@ -863,7 +864,10 @@ mod search_scope_tests {
     #[test]
     fn absolute_glob_outside_cwd_is_blocked() {
         let err = blocked("cat /Users/*/request.txt");
-        assert!(err.contains("glob pattern '/Users/*/request.txt'"), "got: {err}");
+        assert!(
+            err.contains("glob pattern '/Users/*/request.txt'"),
+            "got: {err}"
+        );
         let err = blocked("ls /usr/*");
         assert!(err.contains("outside the current directory"), "got: {err}");
     }
@@ -908,8 +912,9 @@ mod search_scope_tests {
     /// names its own fixture, since the tests run in parallel.
     fn with_temp_search_root<F: FnOnce(&std::path::Path)>(fixture: &str, f: F) {
         const TEST_SESSION: &str = "grep-build-dir-test-session";
-        crate::ai::driver::runtime_ctx::TURN_IDENTITY
-            .sync_scope((TEST_SESSION.to_string(), 0), || {
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+            (TEST_SESSION.to_string(), 0),
+            || {
                 let tmp = crate::ai::driver::runtime_ctx::temp_dir()
                     .expect("session temp dir must resolve in tests");
                 let root = tmp.join(fixture);
@@ -919,7 +924,8 @@ mod search_scope_tests {
                 std::fs::create_dir_all(root.join("target")).unwrap();
                 std::fs::create_dir_all(root.join("src")).unwrap();
                 f(&root);
-            });
+            },
+        );
     }
 
     #[test]
@@ -978,7 +984,9 @@ mod search_scope_tests {
                  --exclude-dir=.venv pattern {root}"
             ));
             // Rooting the search inside one of them is the deliberate path.
-            allowed(&format!("grep -rn pattern {root}/packages/web/node_modules"));
+            allowed(&format!(
+                "grep -rn pattern {root}/packages/web/node_modules"
+            ));
         });
     }
 
@@ -994,7 +1002,10 @@ mod search_scope_tests {
 
     #[test]
     fn long_directory_lists_are_summarized() {
-        let names: Vec<String> = ["a", "b", "c", "d"].iter().map(|name| name.to_string()).collect();
+        let names: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
         assert_eq!(summarize_dirs(&names), "'a/', 'b/', 'c/', and 1 more");
     }
 
@@ -1132,13 +1143,21 @@ mod kill_target_tests {
 
     #[test]
     fn pkill_unsupported_options_are_denied() {
-        let err =
-            validate_pattern_kill(&tokens(&["pkill", "-v", "app"]), TEST_SESSION, "pkill", PgrepMode::Pkill)
-                .unwrap_err();
+        let err = validate_pattern_kill(
+            &tokens(&["pkill", "-v", "app"]),
+            TEST_SESSION,
+            "pkill",
+            PgrepMode::Pkill,
+        )
+        .unwrap_err();
         assert!(err.contains("cannot be verified"), "got: {err}");
-        let err =
-            validate_pattern_kill(&tokens(&["pkill", "-u", "root", "app"]), TEST_SESSION, "pkill", PgrepMode::Pkill)
-                .unwrap_err();
+        let err = validate_pattern_kill(
+            &tokens(&["pkill", "-u", "root", "app"]),
+            TEST_SESSION,
+            "pkill",
+            PgrepMode::Pkill,
+        )
+        .unwrap_err();
         assert!(err.contains("cannot be verified"), "got: {err}");
         let err =
             validate_pattern_kill(&tokens(&["pkill"]), TEST_SESSION, "pkill", PgrepMode::Pkill)
@@ -1165,7 +1184,10 @@ mod kill_target_tests {
             PgrepMode::Pkill,
         )
         .unwrap_err();
-        assert!(err.contains("refusing to signal external processes"), "got: {err}");
+        assert!(
+            err.contains("refusing to signal external processes"),
+            "got: {err}"
+        );
     }
 
     #[test]

@@ -371,6 +371,11 @@ pub(crate) const SERVE_LIVE_FIFO_ENV: &str = "A_SERVE_LIVE_FIFO";
 /// released. Never set by users; only by `serve`.
 pub(crate) const SERVE_CHILD_ENV: &str = "A_SERVE_CHILD";
 
+/// PID of the serve-spawned turn process. Unlike [`SERVE_CHILD_ENV`], this is
+/// intentionally inherited by tool subprocesses so a serve management command
+/// can defer a daemon restart until the turn that requested it has exited.
+pub(crate) const SERVE_TURN_OWNER_PID_ENV: &str = "A_SERVE_TURN_OWNER_PID";
+
 /// Set while this process is a serve-spawned turn child (see [`SERVE_CHILD_ENV`]).
 static SERVE_CHILD: AtomicBool = AtomicBool::new(false);
 
@@ -389,9 +394,11 @@ pub(crate) fn set_serve_child_for_test(value: bool) {
 /// Read [`SERVE_CHILD_ENV`] / [`SERVE_CONFIRM_ENV`] once at process entry and
 /// scrub them, mirroring [`open_serve_live_fifo_from_env`]: exec'd
 /// grandchildren (MCP servers, nested tool processes, re-exec'd daemons) must
-/// not inherit them.
+/// not inherit those role markers. Tool subprocesses intentionally inherit
+/// [`SERVE_TURN_OWNER_PID_ENV`] so a restart can be deferred safely.
 pub(crate) fn mark_serve_child_from_env() {
-    if std::env::var(SERVE_CHILD_ENV).is_ok() {
+    let serve_child = std::env::var(SERVE_CHILD_ENV).is_ok();
+    if serve_child {
         SERVE_CHILD.store(true, Ordering::Relaxed);
     }
     if std::env::var(SERVE_CONFIRM_ENV).is_ok() {
@@ -400,6 +407,9 @@ pub(crate) fn mark_serve_child_from_env() {
     // SAFETY: runs once at process entry before any other thread spawns, so
     // no concurrent env access can exist yet.
     unsafe {
+        if serve_child {
+            std::env::set_var(SERVE_TURN_OWNER_PID_ENV, std::process::id().to_string());
+        }
         std::env::remove_var(SERVE_CHILD_ENV);
         std::env::remove_var(SERVE_CONFIRM_ENV);
     }
@@ -478,6 +488,7 @@ pub(crate) enum ServeLiveKind {
     OutputComplete = 5,
     ConfirmRequest = 6,
     ConfirmDone = 7,
+    SubagentProgress = 8,
 }
 
 /// Max payload bytes per serve frame: header (5) + payload stays under the

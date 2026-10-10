@@ -2,8 +2,8 @@ use super::{
     PatchEnvelopeOp, apply_inline_replace, apply_patch_target_paths_from_patch,
     apply_unified_patch, apply_unified_patch_with_hints, closest_file_lines, execute_apply_patch,
     file_path_from_unified_diff_header, normalize_patch_envelope_body, parse_patch_envelope,
-    parse_patch_envelopes,
-    parse_unified_diff_header_target, parse_unified_hunks, strip_code_fence, truncated_patch_hint,
+    parse_patch_envelopes, parse_unified_diff_header_target, parse_unified_hunks, strip_code_fence,
+    truncated_patch_hint,
 };
 use crate::ai::test_support::ENV_LOCK;
 use std::{fs, path::PathBuf};
@@ -101,7 +101,10 @@ fn envelope_body_marker_text_with_diff_prefixes_is_not_rejected() {
         .expect("envelopes parse")
         .expect("envelope present");
     let normalized = normalize_patch_envelope_body(&envelopes[0]).expect("marker text tolerated");
-    assert!(normalized.contains(" *** Update File: src/a.rs"), "{normalized}");
+    assert!(
+        normalized.contains(" *** Update File: src/a.rs"),
+        "{normalized}"
+    );
     assert!(
         normalized.contains("+*** Replace in line: src/a.rs"),
         "{normalized}"
@@ -2601,7 +2604,10 @@ fn prepared_patch_rollback_restores_only_unchanged_postimages() {
     fs::create_dir_all(&base).unwrap();
 
     for (before, action) in [
-        (Some("original\n"), super::PreparedPatchAction::Write("patched\n".into())),
+        (
+            Some("original\n"),
+            super::PreparedPatchAction::Write("patched\n".into()),
+        ),
         (None, super::PreparedPatchAction::Write("added\n".into())),
         (Some("original\n"), super::PreparedPatchAction::Delete),
     ] {
@@ -2636,7 +2642,10 @@ fn prepared_patch_rollback_preserves_intervening_edits_and_reports_incomplete() 
 
     // Cover restoring an update, removing an addition, and recreating a deletion.
     for (before, action) in [
-        (Some("original\n"), super::PreparedPatchAction::Write("patched\n".into())),
+        (
+            Some("original\n"),
+            super::PreparedPatchAction::Write("patched\n".into()),
+        ),
         (None, super::PreparedPatchAction::Write("added\n".into())),
         (Some("original\n"), super::PreparedPatchAction::Delete),
     ] {
@@ -2666,7 +2675,8 @@ fn prepared_patch_rollback_preserves_intervening_edits_and_reports_incomplete() 
                 fs::write(&first, "external-edit\n").unwrap();
                 Err("injected second-file failure".into())
             }
-        }).expect_err("rollback must report a conflict rather than clobber external content");
+        })
+        .expect_err("rollback must report a conflict rather than clobber external content");
         assert!(err.contains("rollback was incomplete"), "{err}");
         assert!(err.contains("[FILE_CHANGED]"), "{err}");
         assert_eq!(fs::read_to_string(&first).unwrap(), "external-edit\n");
@@ -2706,7 +2716,8 @@ fn prepared_patch_rollback_preserves_partial_write_and_restores_earlier_files() 
             fs::write(&second, "second-a").unwrap();
             Err("injected partial write failure".into())
         }
-    }).unwrap_err();
+    })
+    .unwrap_err();
     assert!(err.contains("rollback was incomplete"), "{err}");
     assert_eq!(fs::read_to_string(&first).unwrap(), "first-before\n");
     assert_eq!(fs::read_to_string(&second).unwrap(), "second-a");
@@ -2720,9 +2731,15 @@ fn first_char_mismatch_reports_column_and_chars() {
         Some((3, Some('c'), Some('x')))
     );
     // Left side longer than right: end-of-line on the actual side.
-    assert_eq!(super::first_char_mismatch("ab", "a"), Some((2, Some('b'), None)));
+    assert_eq!(
+        super::first_char_mismatch("ab", "a"),
+        Some((2, Some('b'), None))
+    );
     // Right side longer than left.
-    assert_eq!(super::first_char_mismatch("a", "ab"), Some((2, None, Some('b'))));
+    assert_eq!(
+        super::first_char_mismatch("a", "ab"),
+        Some((2, None, Some('b')))
+    );
     assert_eq!(super::first_char_mismatch("ab", "ab"), None);
 }
 
@@ -2730,8 +2747,8 @@ fn first_char_mismatch_reports_column_and_chars() {
 fn describe_first_char_mismatch_renders_invisible_chars_visibly() {
     // The exact failure mode from real sessions: the file has '<' where the
     // patch line has a space, and the two full lines otherwise look identical.
-    let detail = super::describe_first_char_mismatch("let x = \"a b\";", "let x = \"a<b\";")
-        .unwrap();
+    let detail =
+        super::describe_first_char_mismatch("let x = \"a b\";", "let x = \"a<b\";").unwrap();
     assert!(detail.contains("column 11"), "{detail}");
     assert!(detail.contains("expected '␣' (U+0020)"), "{detail}");
     assert!(detail.contains("found '<' (U+003C)"), "{detail}");

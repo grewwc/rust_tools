@@ -1,4 +1,6 @@
 use super::*;
+use crate::ai::knowledge::indexing::similarity;
+use crate::commonw::configw;
 use rustc_hash::FxHashSet;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
@@ -6,10 +8,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::SystemTime;
-use crate::ai::knowledge::indexing::similarity;
-use crate::commonw::configw;
 impl MemoryStore {
-
     /// Apply "delete + add" changes in batch. Prepare all target content first, then commit under the same main-file lock;
     /// on mid-way failure the already-committed files are restored, so the current file and rotated archives are never partially updated.
     /// JSONL remains the source of truth; the SQLite index is fully rebuilt best-effort after a successful write-back.
@@ -36,111 +35,112 @@ impl MemoryStore {
         new_entries: &[AgentMemoryEntry],
         include_archives: bool,
     ) -> Result<MemoryBatchUpdateReport, String> {
-            let id_set: FxHashSet<&str> = delete_ids.iter().copied().collect();
-            if let Some(parent) = self.path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|err| format!("Failed to create memory dir: {err}"))?;
-            }
-            let mut paths = if id_set.is_empty() || !include_archives {
-                vec![self.path.clone()]
-            } else {
-                self.memory_files_to_scan_consolidate()?
-            };
-            if !paths.contains(&self.path) {
-                paths.insert(0, self.path.clone());
-            }
+        let id_set: FxHashSet<&str> = delete_ids.iter().copied().collect();
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("Failed to create memory dir: {err}"))?;
+        }
+        let mut paths = if id_set.is_empty() || !include_archives {
+            vec![self.path.clone()]
+        } else {
+            self.memory_files_to_scan_consolidate()?
+        };
+        if !paths.contains(&self.path) {
+            paths.insert(0, self.path.clone());
+        }
 
-            let mut rewrites = Vec::new();
-            let mut deleted_total = 0usize;
-            for path in paths {
-                let is_current = path == self.path;
-                let original = match fs::read(&path) {
-                    Ok(bytes) => Some(bytes),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound && is_current => None,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(err) => {
-                        return Err(format!(
-                            "Failed to read memory file {}: {err}",
-                            path.display()
-                        ));
-                    }
-                };
-                let content = original
-                    .as_deref()
-                    .map(std::str::from_utf8)
-                    .transpose()
-                    .map_err(|err| {
-                        format!("Invalid UTF-8 in memory file {}: {err}", path.display())
-                    })?
-                    .unwrap_or_default();
-                let mut kept = Vec::new();
-                let mut deleted = 0usize;
-                for line in content
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                {
-                    if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) {
-                        if entry.id.as_deref().is_some_and(|id| id_set.contains(id)) {
-                            deleted += 1;
-                        } else {
-                            kept.push(entry);
-                        }
-                    }
-                }
-                if is_current {
-                    kept.extend(new_entries.iter().cloned());
-                }
-                if is_current || deleted > 0 {
-                    deleted_total += deleted;
-                    rewrites.push((path, original, kept));
-                }
-            }
-
-            let mut committed: Vec<usize> = Vec::new();
-            for (path, _, entries) in &rewrites {
-                if let Err(commit_err) = Self::write_all_entries(path, entries) {
-                    let mut rollback_errors = Vec::new();
-                    for &index in committed.iter().rev() {
-                        let (written_path, written_original, _) = &rewrites[index];
-                        let result = match written_original {
-                            Some(bytes) => atomic_write_file(written_path, bytes),
-                            None => match fs::remove_file(written_path) {
-                                Ok(()) => Ok(()),
-                                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                                Err(err) => Err(err),
-                            },
-                        };
-                        if let Err(err) = result {
-                            rollback_errors.push(format!("{}: {err}", written_path.display()));
-                        }
-                    }
-                    let rollback_suffix = if rollback_errors.is_empty() {
-                        String::new()
-                    } else {
-                        format!("; rollback also failed for {}", rollback_errors.join(", "))
-                    };
+        let mut rewrites = Vec::new();
+        let mut deleted_total = 0usize;
+        for path in paths {
+            let is_current = path == self.path;
+            let original = match fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound && is_current => None,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
                     return Err(format!(
-                        "Failed to commit memory batch at {}: {commit_err}{rollback_suffix}",
+                        "Failed to read memory file {}: {err}",
                         path.display()
                     ));
                 }
-                committed.push(committed.len());
-            }
-
-            for (path, _, _) in &rewrites {
-                if path == &self.path || derive_db_path(path).is_some_and(|db| db.exists()) {
-                    rebuild_index_for_path(path);
+            };
+            let content = original
+                .as_deref()
+                .map(std::str::from_utf8)
+                .transpose()
+                .map_err(|err| format!("Invalid UTF-8 in memory file {}: {err}", path.display()))?
+                .unwrap_or_default();
+            let mut kept = Vec::new();
+            let mut deleted = 0usize;
+            for line in content
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+            {
+                if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) {
+                    if entry.id.as_deref().is_some_and(|id| id_set.contains(id)) {
+                        deleted += 1;
+                    } else {
+                        kept.push(entry);
+                    }
                 }
             }
+            if is_current {
+                kept.extend(new_entries.iter().cloned());
+            }
+            if is_current || deleted > 0 {
+                deleted_total += deleted;
+                rewrites.push((path, original, kept));
+            }
+        }
 
-            Ok(MemoryBatchUpdateReport {
-                deleted: deleted_total,
-                appended: new_entries.len(),
-            })
+        let mut committed: Vec<usize> = Vec::new();
+        for (path, _, entries) in &rewrites {
+            if let Err(commit_err) = Self::write_all_entries(path, entries) {
+                let mut rollback_errors = Vec::new();
+                for &index in committed.iter().rev() {
+                    let (written_path, written_original, _) = &rewrites[index];
+                    let result = match written_original {
+                        Some(bytes) => atomic_write_file(written_path, bytes),
+                        None => match fs::remove_file(written_path) {
+                            Ok(()) => Ok(()),
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                            Err(err) => Err(err),
+                        },
+                    };
+                    if let Err(err) = result {
+                        rollback_errors.push(format!("{}: {err}", written_path.display()));
+                    }
+                }
+                let rollback_suffix = if rollback_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!("; rollback also failed for {}", rollback_errors.join(", "))
+                };
+                return Err(format!(
+                    "Failed to commit memory batch at {}: {commit_err}{rollback_suffix}",
+                    path.display()
+                ));
+            }
+            committed.push(committed.len());
+        }
+
+        for (path, _, _) in &rewrites {
+            if path == &self.path || derive_db_path(path).is_some_and(|db| db.exists()) {
+                rebuild_index_for_path(path);
+            }
+        }
+
+        Ok(MemoryBatchUpdateReport {
+            deleted: deleted_total,
+            appended: new_entries.len(),
+        })
     }
 
-    pub(super) fn memory_files_to_scan(&self, include_archives: bool) -> Result<Vec<PathBuf>, String> {
+    pub(super) fn memory_files_to_scan(
+        &self,
+        include_archives: bool,
+    ) -> Result<Vec<PathBuf>, String> {
         let cfg = configw::get_all_config();
         let search_archives = cfg
             .get_opt("ai.memory.search_archives.enable")

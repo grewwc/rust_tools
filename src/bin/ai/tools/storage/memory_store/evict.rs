@@ -1,9 +1,9 @@
 use super::*;
-use std::ffi::OsStr;
-use std::time::{Duration, SystemTime};
 use crate::ai::tools::service::memory::{execute_memory_dedup, execute_memory_gc};
 use crate::commonw::configw;
 use serde_json::json;
+use std::ffi::OsStr;
+use std::time::{Duration, SystemTime};
 impl MemoryStore {
     pub(crate) fn rotate_if_exceeds(&self, max_bytes: u64) -> Result<bool, String> {
         let path = self.path().to_path_buf();
@@ -129,7 +129,11 @@ impl MemoryStore {
         }
     }
 
-    pub(super) fn enforce_max_entries(&self, max_entries: usize, min_keep: usize) -> Result<(), String> {
+    pub(super) fn enforce_max_entries(
+        &self,
+        max_entries: usize,
+        min_keep: usize,
+    ) -> Result<(), String> {
         super::super::with_memory_file_lock(&self.path, || {
             let content = std::fs::read_to_string(&self.path)
                 .map_err(|e| format!("Failed to read memory file: {}", e))?;

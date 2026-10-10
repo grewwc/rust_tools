@@ -99,6 +99,7 @@ impl Drop for BackgroundSubagentHistoryGuard {
 /// concurrent prose or multi-line ANSI redraws never disturb the terminal.
 pub(super) struct SubagentStatusLine {
     last_line: Option<String>,
+    last_serve_line: Option<String>,
     is_tty: bool,
 }
 
@@ -126,6 +127,7 @@ impl SubagentStatusLine {
     pub(super) fn new() -> Self {
         Self {
             last_line: None,
+            last_serve_line: None,
             is_tty: std::io::stdout().is_terminal(),
         }
     }
@@ -189,14 +191,21 @@ impl SubagentStatusLine {
             return;
         }
 
-        let line = crate::ai::stream::clamp_line_to_terminal_row_with_reserve(
-            &render_subagent_status_line(&statuses),
-            0,
-        );
+        let status_line = render_subagent_status_line(&statuses);
+        if crate::ai::background::serve_live_streaming()
+            && self.last_serve_line.as_deref() != Some(status_line.as_str())
+        {
+            crate::ai::background::publish_serve_frame(
+                crate::ai::background::ServeLiveKind::SubagentProgress,
+                &status_line,
+            );
+            self.last_serve_line = Some(status_line.clone());
+        }
+
+        let line = crate::ai::stream::clamp_line_to_terminal_row_with_reserve(&status_line, 0);
         if self.last_line.as_deref() == Some(line.as_str()) {
             return;
         }
-
         if !self.is_tty {
             return;
         }
@@ -208,6 +217,7 @@ impl SubagentStatusLine {
     /// Before the foreground resumes streaming output or the input box, finalize
     /// and end the dynamic line so it no longer occupies a cursor row.
     pub(super) fn finish(&mut self) {
+        self.last_serve_line = None;
         let Some(line) = self.last_line.take() else {
             return;
         };

@@ -32,7 +32,10 @@ impl DistillInput {
             Err(error) => return Err(format!("Cannot inspect {}: {error}", path.display())),
         }
         SessionStore::validate_session_id(value).map_err(|error| {
-            format!("Archive not found at {}; invalid session ID: {error}", path.display())
+            format!(
+                "Archive not found at {}; invalid session ID: {error}",
+                path.display()
+            )
         })?;
         // Resolve the validated ID exactly; legacy filename sanitization trims
         // underscores and can redirect an otherwise valid ID to another session.

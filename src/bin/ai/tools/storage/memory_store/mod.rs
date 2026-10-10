@@ -374,8 +374,8 @@ mod query;
 pub(crate) use importance::MemoryImportance;
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod importance_tests;
 #[cfg(test)]
 mod retention_tests;
+#[cfg(test)]
+mod tests;

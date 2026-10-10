@@ -276,6 +276,21 @@ use super::*;
         );
     }
 
+    #[test]
+    fn decoder_passes_subagent_progress_through() {
+        use crate::ai::background::ServeLiveKind;
+        let mut decoder = ServeFrameDecoder::default();
+        assert_eq!(
+            decoder.push(&test_frame(
+                ServeLiveKind::SubagentProgress,
+                b"[subagents] running: 2 | done: 1",
+            )),
+            vec![ServeLiveEvent::SubagentProgress(
+                "[subagents] running: 2 | done: 1".to_string(),
+            )]
+        );
+    }
+
     /// The `/confirm` route pair: the pending question is readable, an answer
     /// reaches the turn child's stdin exactly once, and answering the same
     /// question again is refused instead of writing a second line.

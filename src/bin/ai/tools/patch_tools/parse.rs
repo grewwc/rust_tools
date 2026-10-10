@@ -1,7 +1,7 @@
 use super::*;
-use std::path::{Path, PathBuf};
-use serde_json::Value;
 use crate::ai::tools::storage::file_store::FileStore;
+use serde_json::Value;
+use std::path::{Path, PathBuf};
 pub(crate) fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
     let mut hunks = Vec::new();
     let mut iter = patch.lines().peekable();
@@ -405,7 +405,10 @@ pub(crate) fn apply_patch_target_paths_from_patch(raw_patch: &str) -> Vec<PathBu
         .collect()
 }
 
-pub(crate) fn ensure_patch_target_matches(target_path: &Path, envelope_path: &str) -> Result<(), String> {
+pub(crate) fn ensure_patch_target_matches(
+    target_path: &Path,
+    envelope_path: &str,
+) -> Result<(), String> {
     let resolved_target = FileStore::new(target_path.to_path_buf())
         .path()
         .to_path_buf();
@@ -666,7 +669,10 @@ pub(crate) fn normalize_patch_envelope_body(envelope: &PatchEnvelope) -> Result<
     })
 }
 
-pub(crate) fn normalize_patch_envelope(path: &Path, envelope: &PatchEnvelope) -> Result<String, String> {
+pub(crate) fn normalize_patch_envelope(
+    path: &Path,
+    envelope: &PatchEnvelope,
+) -> Result<String, String> {
     match envelope.op {
         PatchEnvelopeOp::Update if !path.exists() => Err(format!(
             "Update File patch targets a missing file: {}. Use Add File to create a new file, or correct the target path before retrying.",

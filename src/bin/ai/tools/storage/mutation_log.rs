@@ -616,7 +616,8 @@ mod tests {
             let entry: MutationEntry = serde_json::from_value(serde_json::json!({
                 "seq": 1, "ts": "t", "path": "/proj/a.rs", "op": op,
                 "before": before, "after": after,
-            })).unwrap();
+            }))
+            .unwrap();
             assert_eq!(entry.before_state, None);
             assert_eq!(entry.effective_before_state(), expected);
             assert_eq!(entry.diff, None);
@@ -636,10 +637,20 @@ mod tests {
                 let diff = decoded.diff.unwrap();
                 assert!(diff.contains("before snapshot unavailable"));
                 assert!(diff.contains("not compared"));
-                assert!(!diff.lines().any(|line| line.starts_with("+ ") || line.starts_with("- ")));
+                assert!(
+                    !diff
+                        .lines()
+                        .any(|line| line.starts_with("+ ") || line.starts_with("- "))
+                );
             }
         }
-        let created = make_entry(Path::new("/proj/new.rs"), "write", None, Some("new\n"), BeforeState::Absent);
+        let created = make_entry(
+            Path::new("/proj/new.rs"),
+            "write",
+            None,
+            Some("new\n"),
+            BeforeState::Absent,
+        );
         assert_eq!(created.diff.as_deref(), Some("+ new\n"));
     }
 
@@ -650,7 +661,11 @@ mod tests {
         let diff = entry_diff(Some(&input), Some(&input)).unwrap();
         assert!(diff.contains("remaining content not compared"));
         assert!(!diff.contains("differ beyond"));
-        assert!(!diff.lines().any(|line| line.starts_with("+ ") || line.starts_with("- ")));
+        assert!(
+            !diff
+                .lines()
+                .any(|line| line.starts_with("+ ") || line.starts_with("- "))
+        );
         assert!(diff.len() < 512);
     }
 
@@ -726,6 +741,9 @@ mod tests {
     fn entry_diff_small_content_behavior_is_unchanged() {
         assert_eq!(entry_diff(Some("a\nb\n"), Some("a\nb\n")), None);
         assert_eq!(entry_diff(None, Some("")), None);
-        assert_eq!(entry_diff(Some("a\nb\nc\n"), Some("a\nb\nx\n")), Some("- c\n+ x\n".into()));
+        assert_eq!(
+            entry_diff(Some("a\nb\nc\n"), Some("a\nb\nx\n")),
+            Some("- c\n+ x\n".into())
+        );
     }
 }

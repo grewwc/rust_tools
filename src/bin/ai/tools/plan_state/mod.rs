@@ -244,7 +244,10 @@ Progress: 0/2 steps done, 1 running, 1 pending.";
         DRIVER_CTX.sync_scope(ctx, || {
             let out = execute_plan_update(&json!({"step": 2, "status": "done"})).unwrap();
             assert!(out.starts_with("Plan: Demo\n"), "got: {out}");
-            assert!(out.contains("Step 2. [apply_patch] Patch (done)"), "got: {out}");
+            assert!(
+                out.contains("Step 2. [apply_patch] Patch (done)"),
+                "got: {out}"
+            );
             assert!(out.contains("  Reason: Fix the writer\n"), "got: {out}");
             // Each step appears at most once: the closed-out step is not repeated in the
             // remaining list below.
@@ -267,7 +270,10 @@ Progress: 0/2 steps done, 1 running, 1 pending.";
             let err = execute_plan_update(&json!({"step": 9, "status": "done"})).unwrap_err();
             assert!(err.contains("Step 9 not found"), "got: {err}");
             assert!(err.contains("Current plan:"), "got: {err}");
-            assert!(err.contains("Step 3. [execute_command] Verify"), "got: {err}");
+            assert!(
+                err.contains("Step 3. [execute_command] Verify"),
+                "got: {err}"
+            );
         });
     }
 }

@@ -1845,7 +1845,6 @@ fn task_wait_any_returns_ready_result_without_waiting_for_pending_task() {
     let _ = os.channel_destroy(None, ChannelId(pending_channel));
     let _ = os.futex_destroy(pending_futex);
     drop(os);
-
 }
 
 #[test]
@@ -1919,7 +1918,6 @@ fn task_status_cleans_up_terminated_task_without_result() {
     assert!(os.futex_event_id(completion_futex_addr).is_none());
     assert!(os.get_process(pid).is_none());
     drop(os);
-
 }
 
 #[test]
@@ -2097,7 +2095,6 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
     assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
     assert!(os.futex_event_id(completion_futex_addr).is_none());
     assert!(os.get_process(pid).is_none());
-
 }
 
 #[tokio::test]
@@ -2177,7 +2174,6 @@ async fn discarding_session_tasks_aborts_workers_and_releases_results() {
     assert!(os.futex_event_id(completion_futex_addr).is_none());
     assert!(os.get_process(pid).is_none());
     drop(os);
-
 }
 
 #[tokio::test]
@@ -2265,7 +2261,6 @@ async fn wall_clock_reaper_aborts_worker_and_leaves_timeout_result_collectable()
     assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
     assert!(os.futex_event_id(completion_futex_addr).is_none());
     assert!(os.get_process(pid).is_none());
-
 }
 
 #[tokio::test]

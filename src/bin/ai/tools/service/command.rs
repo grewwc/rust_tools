@@ -419,32 +419,34 @@ fn format_command_result(output: CommandRunResult, timeout_secs: u64) -> String 
 /// hits, `command sleep 5` hits), so data arguments like `grep sleep file` or
 /// `man sleep` do not.
 fn contains_sleep(command: &str) -> bool {
-    super::audit::split_unquoted_segments(command).iter().any(|segment| {
-        let tokens = super::audit::effective_command_tokens(segment);
-        let program = tokens
-            .first()
-            .and_then(|token| Path::new(token).file_name())
-            .and_then(|name| name.to_str());
-        if program == Some("sleep") {
-            return true;
-        }
-        // Shells forwarding a script body via `-c` execute that body directly
-        // (`bash -c "sleep 5"`, `sh -c 'sleep 3'`), so re-parse the body to
-        // find `sleep` instead of treating it as data. `timeout 5 sleep 3`
-        // is already unwrapped by the audit wrapper logic.
-        if matches!(program, Some("bash" | "sh" | "zsh" | "ksh" | "dash")) {
-            let Some(dash_c) = tokens.iter().position(|token| token == "-c") else {
-                return false;
-            };
-            let body = tokens[dash_c + 1..].join(" ");
-            return super::audit::effective_command_tokens(&body)
+    super::audit::split_unquoted_segments(command)
+        .iter()
+        .any(|segment| {
+            let tokens = super::audit::effective_command_tokens(segment);
+            let program = tokens
                 .first()
                 .and_then(|token| Path::new(token).file_name())
-                .and_then(|name| name.to_str())
-                == Some("sleep");
-        }
-        false
-    })
+                .and_then(|name| name.to_str());
+            if program == Some("sleep") {
+                return true;
+            }
+            // Shells forwarding a script body via `-c` execute that body directly
+            // (`bash -c "sleep 5"`, `sh -c 'sleep 3'`), so re-parse the body to
+            // find `sleep` instead of treating it as data. `timeout 5 sleep 3`
+            // is already unwrapped by the audit wrapper logic.
+            if matches!(program, Some("bash" | "sh" | "zsh" | "ksh" | "dash")) {
+                let Some(dash_c) = tokens.iter().position(|token| token == "-c") else {
+                    return false;
+                };
+                let body = tokens[dash_c + 1..].join(" ");
+                return super::audit::effective_command_tokens(&body)
+                    .first()
+                    .and_then(|token| Path::new(token).file_name())
+                    .and_then(|name| name.to_str())
+                    == Some("sleep");
+            }
+            false
+        })
 }
 
 /// Guidance prepended to a `sleep` command's result: the hint lives in the tool
@@ -505,8 +507,8 @@ where
 mod tests {
     use super::{
         MAX_COMMAND_OUTPUT_CHARS, SLEEP_WARNING, confirm_gated_git_subcommand,
-        confirm_git_confirm_gated_if_needed, contains_sleep, execute_command, format_command_result,
-        resolve_command_timeout, truncate_chars,
+        confirm_git_confirm_gated_if_needed, contains_sleep, execute_command,
+        format_command_result, resolve_command_timeout, truncate_chars,
     };
     use crate::cmd::run::CommandRunResult;
     use serde_json::json;
@@ -582,7 +584,10 @@ mod tests {
             confirm_gated_git_subcommand("git stash drop stash@{0}"),
             Some("stash")
         );
-        assert_eq!(confirm_gated_git_subcommand("git stash clear"), Some("stash"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git stash clear"),
+            Some("stash")
+        );
         assert_eq!(
             confirm_gated_git_subcommand("git -C /repo stash push -m wip"),
             Some("stash")
@@ -592,20 +597,41 @@ mod tests {
             Some("stash")
         );
         assert_eq!(confirm_gated_git_subcommand("env git stash"), Some("stash"));
-        assert_eq!(confirm_gated_git_subcommand("xargs git stash"), Some("stash"));
-        assert_eq!(confirm_gated_git_subcommand("nohup git stash"), Some("stash"));
-        assert_eq!(confirm_gated_git_subcommand("command git stash"), Some("stash"));
+        assert_eq!(
+            confirm_gated_git_subcommand("xargs git stash"),
+            Some("stash")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("nohup git stash"),
+            Some("stash")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("command git stash"),
+            Some("stash")
+        );
         // Read-only subactions (list/show) directly after `stash` need no
         // confirmation.
         assert_eq!(confirm_gated_git_subcommand("git stash list"), None);
         assert_eq!(confirm_gated_git_subcommand("git stash show"), None);
-        assert_eq!(confirm_gated_git_subcommand("git stash show stash@{0}"), None);
-        assert_eq!(confirm_gated_git_subcommand("git stash list --format='%gd'"), None);
+        assert_eq!(
+            confirm_gated_git_subcommand("git stash show stash@{0}"),
+            None
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git stash list --format='%gd'"),
+            None
+        );
         // `list`/`show` outside the subaction position (`--` followed by a
         // path, `-q` a stash option, or coexisting with a confirm-gated
         // subaction) still require confirmation.
-        assert_eq!(confirm_gated_git_subcommand("git stash -- list"), Some("stash"));
-        assert_eq!(confirm_gated_git_subcommand("git stash -q list"), Some("stash"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git stash -- list"),
+            Some("stash")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git stash -q list"),
+            Some("stash")
+        );
         assert_eq!(
             confirm_gated_git_subcommand("git stash list && git stash drop"),
             Some("stash")
@@ -615,12 +641,21 @@ mod tests {
     #[test]
     fn confirm_gated_detection_ignores_non_gated_commands() {
         assert_eq!(confirm_gated_git_subcommand("git status"), None);
-        assert_eq!(confirm_gated_git_subcommand("git log --oneline | grep commit"), None);
+        assert_eq!(
+            confirm_gated_git_subcommand("git log --oneline | grep commit"),
+            None
+        );
         assert_eq!(confirm_gated_git_subcommand("git svn commit"), None);
-        assert_eq!(confirm_gated_git_subcommand("echo 'git commit' > note.txt"), None);
+        assert_eq!(
+            confirm_gated_git_subcommand("echo 'git commit' > note.txt"),
+            None
+        );
         assert_eq!(confirm_gated_git_subcommand("git commitmessage"), None);
         assert_eq!(confirm_gated_git_subcommand("git stashlist"), None);
-        assert_eq!(confirm_gated_git_subcommand("echo 'git stash' > note.txt"), None);
+        assert_eq!(
+            confirm_gated_git_subcommand("echo 'git stash' > note.txt"),
+            None
+        );
     }
 
     #[test]

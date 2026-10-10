@@ -1,12 +1,10 @@
+use super::config_blocked_commands;
 use super::git::{blocked_git_destructive, blocked_git_subcommand};
 use super::lexer::{
-    command_word_index, effective_chain_uses_xargs, effective_command_tokens, indirect_command_index,
-    tokenize_shell_words,
+    command_word_index, effective_chain_uses_xargs, effective_command_tokens,
+    indirect_command_index, tokenize_shell_words,
 };
-use super::config_blocked_commands;
-use super::substitute::{
-    expand_tilde_and_home, normalize_path, validate_substitution_positions,
-};
+use super::substitute::{expand_tilde_and_home, normalize_path, validate_substitution_positions};
 use super::wrapper::{
     find_has_blocked_exec_semantics, is_interpreter_program, is_python_program, is_shell_program,
     python_c_argument, shell_c_option_present, validate_python_code,
@@ -520,16 +518,14 @@ pub(crate) fn validate_kill_pids(raw_tokens: &[String], session_id: &str) -> Res
                     return Err(
                         "kill target '0' (the command's own process group) cannot be verified"
                             .to_string(),
-                    )
+                    );
                 }
-                Ok(_) => {
-                    return Err(format!("kill target '{token}' is not a valid positive pid"))
-                }
+                Ok(_) => return Err(format!("kill target '{token}' is not a valid positive pid")),
                 Err(_) => {
                     return Err(format!(
                         "kill target '{token}' is not a literal pid; the sandbox can only \
                          verify literal numeric targets (run `pgrep` first and pass the pid)"
-                    ))
+                    ));
                 }
             }
         }
@@ -991,14 +987,43 @@ fn grep_value_options(program: &str) -> &'static [&'static str] {
     if matches!(program, "rg" | "ag" | "ack") {
         // Note `rg -r` is `--replace` (takes a value), unlike `grep -r`.
         &[
-            "-e", "--regexp", "-f", "--file", "-g", "--glob", "--iglob", "--match", "-t",
-            "--type", "-T", "--type-not", "-r", "--replace",
+            "-e",
+            "--regexp",
+            "-f",
+            "--file",
+            "-g",
+            "--glob",
+            "--iglob",
+            "--match",
+            "-t",
+            "--type",
+            "-T",
+            "--type-not",
+            "-r",
+            "--replace",
         ]
     } else {
         &[
-            "-e", "--regexp", "-f", "--file", "--include", "--exclude", "--exclude-from",
-            "--include-dir", "--exclude-dir", "-d", "--directories", "-A", "--after-context",
-            "-B", "--before-context", "-C", "--context", "-m", "--max-count", "--label",
+            "-e",
+            "--regexp",
+            "-f",
+            "--file",
+            "--include",
+            "--exclude",
+            "--exclude-from",
+            "--include-dir",
+            "--exclude-dir",
+            "-d",
+            "--directories",
+            "-A",
+            "--after-context",
+            "-B",
+            "--before-context",
+            "-C",
+            "--context",
+            "-m",
+            "--max-count",
+            "--label",
         ]
     }
 }
@@ -1150,7 +1175,10 @@ fn heavy_search_dir_names() -> Vec<String> {
 /// Pure half of `heavy_search_dir_names`, so the merge rules are testable
 /// without touching configuration.
 pub(crate) fn merge_heavy_search_dirs(configured: &str) -> Vec<String> {
-    let mut names: Vec<String> = HEAVY_SEARCH_DIRS.iter().map(|name| name.to_string()).collect();
+    let mut names: Vec<String> = HEAVY_SEARCH_DIRS
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
     for raw in configured.split(',') {
         let entry = raw.trim();
         if entry.is_empty() {
@@ -1206,9 +1234,10 @@ fn grep_excludes_dir(command_tokens: &[String], dir: &str) -> bool {
     let excluding_options = ["--exclude", "--exclude-dir", "--exclude-from"];
     let mut spaced_value = false;
     for tok in command_tokens.iter().skip(1) {
-        let attached = excluding_options
-            .iter()
-            .any(|opt| tok.strip_prefix(opt).is_some_and(|rest| rest.starts_with('=')));
+        let attached = excluding_options.iter().any(|opt| {
+            tok.strip_prefix(opt)
+                .is_some_and(|rest| rest.starts_with('='))
+        });
         if (spaced_value || attached) && tok.contains(dir) {
             return true;
         }
@@ -1281,7 +1310,11 @@ fn validate_grep_heavy_dirs(
 /// Up to three quoted directory names plus the remainder count, so the message
 /// stays one line even when a root holds many heavy directories.
 pub(crate) fn summarize_dirs(names: &[String]) -> String {
-    let mut listed: Vec<String> = names.iter().take(3).map(|name| format!("'{name}/'")).collect();
+    let mut listed: Vec<String> = names
+        .iter()
+        .take(3)
+        .map(|name| format!("'{name}/'"))
+        .collect();
     if names.len() > listed.len() {
         listed.push(format!("and {} more", names.len() - listed.len()));
     }

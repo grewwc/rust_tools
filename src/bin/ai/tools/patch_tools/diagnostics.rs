@@ -110,7 +110,11 @@ pub(crate) const PATCH_TEXT_BLOCK_START: &str =
 /// eliminates at the root the frequent error of copying read_file's `<number>\t`
 /// line-number column into the patch. The `<<<PATCH_TEXT` / `PATCH_TEXT>>>` markers
 /// clearly delimit the copyable region.
-pub(crate) fn render_pasteable_current_block(orig_lines: &[String], start: usize, count: usize) -> String {
+pub(crate) fn render_pasteable_current_block(
+    orig_lines: &[String],
+    start: usize,
+    count: usize,
+) -> String {
     let end = start.saturating_add(count).min(orig_lines.len());
     if start >= end {
         return String::new();

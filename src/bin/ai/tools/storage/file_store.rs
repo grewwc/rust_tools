@@ -140,9 +140,8 @@ impl FileStore {
         if let Some(result) = try_vfs_stat(&self.path) {
             return result.map_err(|e| vfs_to_ai_err(&self.path, e));
         }
-        let meta = fs::metadata(&self.path).map_err(|e| {
-            AiError::file(self.path.display().to_string(), e.to_string())
-        })?;
+        let meta = fs::metadata(&self.path)
+            .map_err(|e| AiError::file(self.path.display().to_string(), e.to_string()))?;
         Ok(VfsStat {
             size: meta.len(),
             is_file: meta.is_file(),
@@ -156,7 +155,11 @@ impl FileStore {
     /// in `aios_kernel/src/local/vfs.rs`), so a caller streaming a large file never stalls other
     /// kernel tenants for the whole file. The tail is trimmed at a UTF-8 character boundary and
     /// `next_offset` skips past it, exactly like `vfs_read_range`.
-    pub(crate) fn read_range(&self, offset: u64, max_bytes: usize) -> Result<VfsReadRange, AiError> {
+    pub(crate) fn read_range(
+        &self,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<VfsReadRange, AiError> {
         if let Some(result) = try_vfs_read_range(&self.path, offset, max_bytes) {
             return result.map_err(|e| vfs_to_ai_err(&self.path, e));
         }
@@ -210,9 +213,8 @@ impl FileStore {
             0
         };
         let reached_eof = read < max_bytes || probe_read == 0;
-        let (content, consumed) = decode_range_utf8(&raw, reached_eof).map_err(|msg| {
-            AiError::file(self.path.display().to_string(), msg)
-        })?;
+        let (content, consumed) = decode_range_utf8(&raw, reached_eof)
+            .map_err(|msg| AiError::file(self.path.display().to_string(), msg))?;
         Ok(VfsReadRange {
             content,
             next_offset: offset + consumed as u64,
@@ -296,8 +298,7 @@ impl FileStore {
     /// absence of the file is the enforced precondition. The mutation-log entry records
     /// `before = None` (a brand-new file).
     pub(crate) fn write_new_file_if_absent(&self, content: &str) -> Result<(), AiError> {
-        let result = if let Some(vfs_result) =
-            try_vfs_write_if_unchanged(&self.path, None, content)
+        let result = if let Some(vfs_result) = try_vfs_write_if_unchanged(&self.path, None, content)
         {
             vfs_result.map_err(|e| vfs_to_ai_err(&self.path, e))
         } else {
@@ -693,11 +694,7 @@ pub(crate) fn session_overflow_asset_for_bare_name(
     if !is_bare_file_name(name) {
         return None;
     }
-    Some(
-        session_assets
-            .join("tool-overflow-compressed")
-            .join(name),
-    )
+    Some(session_assets.join("tool-overflow-compressed").join(name))
 }
 
 fn blocked_overflow_read_reason(path: &Path) -> Option<String> {
@@ -935,10 +932,10 @@ pub(crate) fn path_within_roots(path: &Path, base: &Path, roots: &[PathBuf]) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        FileStore, blocked_overflow_read_reason_for_assets, is_read_file_overflow_artifact,
-        is_sensitive_fs_path, is_session_overflow_asset_path, normalize_lexical,
-        overflow_artifact_tool_name, path_within_allowed_roots, path_within_roots, remove_partial_create_file,
-        is_bare_file_name, session_overflow_asset_for_bare_name,
+        FileStore, blocked_overflow_read_reason_for_assets, is_bare_file_name,
+        is_read_file_overflow_artifact, is_sensitive_fs_path, is_session_overflow_asset_path,
+        normalize_lexical, overflow_artifact_tool_name, path_within_allowed_roots,
+        path_within_roots, remove_partial_create_file, session_overflow_asset_for_bare_name,
         temp_registry,
     };
     use crate::ai::test_support::ENV_LOCK;
@@ -1020,9 +1017,16 @@ mod tests {
         let assets = Path::new("/sessions/abc.assets");
         assert_eq!(
             session_overflow_asset_for_bare_name("spilled-x.txt", assets),
-            Some(assets.join("tool-overflow-compressed").join("spilled-x.txt"))
+            Some(
+                assets
+                    .join("tool-overflow-compressed")
+                    .join("spilled-x.txt")
+            )
         );
-        assert_eq!(session_overflow_asset_for_bare_name("../evil.txt", assets), None);
+        assert_eq!(
+            session_overflow_asset_for_bare_name("../evil.txt", assets),
+            None
+        );
         assert_eq!(
             session_overflow_asset_for_bare_name("/tmp/spilled-x.txt", assets),
             None
@@ -1227,11 +1231,13 @@ mod tests {
         let Some(temp_parent) = system_temp.parent() else {
             return;
         };
-        let project_root =
-            temp_parent.join(format!("file-store-shared-temp-project-{}", uuid::Uuid::new_v4()));
+        let project_root = temp_parent.join(format!(
+            "file-store-shared-temp-project-{}",
+            uuid::Uuid::new_v4()
+        ));
         // Classic shared temp dir (`/tmp`), NOT under `std::env::temp_dir()` on macOS.
-        let target = Path::new("/tmp")
-            .join(format!("file-store-shared-{}.txt", uuid::Uuid::new_v4()));
+        let target =
+            Path::new("/tmp").join(format!("file-store-shared-{}.txt", uuid::Uuid::new_v4()));
 
         let old_cfg = std::env::var_os("CONFIGW_PATH");
         unsafe { std::env::set_var("CONFIGW_PATH", project_root.join("empty.configw")) };
@@ -1266,8 +1272,10 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let outside = project_root.join("outside.txt");
-        let link = Path::new("/tmp")
-            .join(format!("file-store-shared-symlink-{}", uuid::Uuid::new_v4()));
+        let link = Path::new("/tmp").join(format!(
+            "file-store-shared-symlink-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::os::unix::fs::symlink(&outside, &link).unwrap();
 
         let old_cfg = std::env::var_os("CONFIGW_PATH");
@@ -1300,10 +1308,12 @@ mod tests {
         let Some(temp_parent) = system_temp.parent() else {
             return;
         };
-        let project_root =
-            temp_parent.join(format!("file-store-patch-temp-project-{}", uuid::Uuid::new_v4()));
-        let target = Path::new("/tmp")
-            .join(format!("file-store-patch-{}.txt", uuid::Uuid::new_v4()));
+        let project_root = temp_parent.join(format!(
+            "file-store-patch-temp-project-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let target =
+            Path::new("/tmp").join(format!("file-store-patch-{}.txt", uuid::Uuid::new_v4()));
 
         let old_cfg = std::env::var_os("CONFIGW_PATH");
         unsafe { std::env::set_var("CONFIGW_PATH", project_root.join("empty.configw")) };
@@ -1428,8 +1438,7 @@ mod tests {
         // inside the leading multibyte char, or max_bytes == 0, must error with an actionable
         // message instead of returning (offset, empty content, hit_eof=false).
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let dir =
-            std::env::temp_dir().join(format!("file-store-range-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("file-store-range-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("tiny.txt");
         // "中" (3 bytes) + "文" (3 bytes).
@@ -1570,10 +1579,8 @@ mod tests {
     #[test]
     fn write_all_with_before_hint_stale_hint_aborts_and_preserves_file() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let path = std::env::temp_dir().join(format!(
-            "file-store-cas-write-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("file-store-cas-write-{}", uuid::Uuid::new_v4()));
         // The kernel is not bound in unit tests, so this exercises the read-compare-write
         // fallback: a stale snapshot must abort without touching the file, then succeed once the
         // snapshot matches the on-disk content.
@@ -1598,10 +1605,8 @@ mod tests {
     #[test]
     fn remove_file_if_unchanged_stale_hint_aborts_and_preserves_file() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let path = std::env::temp_dir().join(format!(
-            "file-store-cas-del-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("file-store-cas-del-{}", uuid::Uuid::new_v4()));
         std::fs::write(&path, "current-on-disk").unwrap();
         let store = FileStore::new(path.clone());
         let err = store
@@ -1609,23 +1614,16 @@ mod tests {
             .expect_err("stale hint must abort the delete");
         assert!(err.to_string().contains("[FILE_CHANGED]"), "err: {err}");
         assert!(path.exists(), "aborted CAS delete must keep the file");
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "current-on-disk"
-        );
-        store
-            .remove_file_if_unchanged("current-on-disk")
-            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "current-on-disk");
+        store.remove_file_if_unchanged("current-on-disk").unwrap();
         assert!(!path.exists());
     }
 
     #[test]
     fn write_new_file_if_absent_requires_absent_target() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let path = std::env::temp_dir().join(format!(
-            "file-store-create-only-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("file-store-create-only-{}", uuid::Uuid::new_v4()));
         // Absent target: the create-only write succeeds.
         FileStore::new(path.clone())
             .write_new_file_if_absent("created\n")
@@ -1650,21 +1648,34 @@ mod tests {
     #[test]
     fn write_new_file_if_absent_concurrent_creators_have_one_winner() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let path = std::env::temp_dir().join(format!("file-store-create-race-{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("file-store-create-race-{}", uuid::Uuid::new_v4()));
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
-        let workers: Vec<_> = (0..8).map(|id| {
-            let path = path.clone();
-            let barrier = barrier.clone();
-            std::thread::spawn(move || {
-                let content = format!("creator-{id}\n");
-                barrier.wait();
-                let result = FileStore::new(path).write_new_file_if_absent(&content);
-                (content, result)
+        let workers: Vec<_> = (0..8)
+            .map(|id| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let content = format!("creator-{id}\n");
+                    barrier.wait();
+                    let result = FileStore::new(path).write_new_file_if_absent(&content);
+                    (content, result)
+                })
             })
-        }).collect();
-        let results: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
-        let winners: Vec<_> = results.iter().filter(|(_, result)| result.is_ok()).collect();
-        assert_eq!(winners.len(), 1, "create-only writes must have exactly one winner");
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        let winners: Vec<_> = results
+            .iter()
+            .filter(|(_, result)| result.is_ok())
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "create-only writes must have exactly one winner"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), winners[0].0);
         for (_, result) in &results {
             if let Err(err) = result {
@@ -1678,22 +1689,31 @@ mod tests {
     #[test]
     fn write_new_file_if_absent_does_not_follow_dangling_symlink() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let dir = std::env::temp_dir().join(format!("file-store-create-link-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("file-store-create-link-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let link = dir.join("link.txt");
         let target = dir.join("missing.txt");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let err = FileStore::new(link.clone()).write_new_file_if_absent("new\n").unwrap_err();
+        let err = FileStore::new(link.clone())
+            .write_new_file_if_absent("new\n")
+            .unwrap_err();
         assert!(err.to_string().contains("[FILE_CHANGED]"), "{err}");
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
-        assert!(!target.exists(), "create-only write must not create the symlink's target");
+        assert!(
+            !target.exists(),
+            "create-only write must not create the symlink's target"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn remove_partial_create_file_cleans_only_own_partial_write() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let base = std::env::temp_dir().join(format!("file-store-partial-cleanup-{}", uuid::Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!(
+            "file-store-partial-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&base).unwrap();
 
         // Own partial write (strict prefix) -> removed.
@@ -1706,7 +1726,10 @@ mod tests {
         let full = base.join("full.txt");
         std::fs::write(&full, "exact match").unwrap();
         remove_partial_create_file(&full, "exact match");
-        assert!(full.exists(), "completed write must be left for CAS rollback");
+        assert!(
+            full.exists(),
+            "completed write must be left for CAS rollback"
+        );
 
         // Foreign content -> preserved, never deleted.
         let foreign = base.join("foreign.txt");

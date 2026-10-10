@@ -490,10 +490,7 @@ fn run_overflow_search(
     // trims to empty is treated as "no filter" — an empty glob would only match
     // a bare relative path "" (the History scope's file root) and silently
     // exclude every file under a directory root.
-    let pattern_filter = params
-        .file_pattern
-        .map(str::trim)
-        .filter(|p| !p.is_empty());
+    let pattern_filter = params.file_pattern.map(str::trim).filter(|p| !p.is_empty());
     let glob = pattern_filter.map(glob_to_regex);
 
     for (root_idx, root) in &roots {
@@ -587,9 +584,9 @@ fn run_overflow_search(
             .collect::<Vec<String>>()
             .join(", ");
         let pattern_note = match pattern_filter {
-            Some(pattern) => format!(
-                "; file_pattern '{pattern}' excluded {files_excluded_by_pattern} file(s)"
-            ),
+            Some(pattern) => {
+                format!("; file_pattern '{pattern}' excluded {files_excluded_by_pattern} file(s)")
+            }
             None => String::new(),
         };
         let unreadable_note = if files_unreadable > 0 {
@@ -1192,7 +1189,11 @@ mod tests {
             "header\nrare_checkpoint_keyword decision\n",
         )
         .unwrap();
-        fs::write(dir.join("tool-overflow/live.txt"), "rare_tool_keyword result\n").unwrap();
+        fs::write(
+            dir.join("tool-overflow/live.txt"),
+            "rare_tool_keyword result\n",
+        )
+        .unwrap();
         for scope in [SearchScope::All, SearchScope::ToolOutputs] {
             let mut p = params("rare_checkpoint_keyword");
             p.scope = scope;
@@ -1200,11 +1201,19 @@ mod tests {
             assert!(out.contains("context-checkpoints/opaque.md"), "{out}");
             assert!(out.contains("2> rare_checkpoint_keyword decision"), "{out}");
             p.query = "rare_tool_keyword";
-            assert!(run_overflow_search(&dir, &p).unwrap().contains("tool-overflow/live.txt"));
+            assert!(
+                run_overflow_search(&dir, &p)
+                    .unwrap()
+                    .contains("tool-overflow/live.txt")
+            );
         }
         let mut p = params("rare_checkpoint_keyword");
         p.scope = SearchScope::History;
-        assert!(run_overflow_search(&dir, &p).unwrap().contains("No matches found"));
+        assert!(
+            run_overflow_search(&dir, &p)
+                .unwrap()
+                .contains("No matches found")
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1223,7 +1232,10 @@ mod tests {
             p.scope = scope;
             p.context_lines = 0;
             let out = run_overflow_search(&dir, &p).unwrap();
-            assert!(out.contains("4098> late_history_keyword recovered decision"), "{out}");
+            assert!(
+                out.contains("4098> late_history_keyword recovered decision"),
+                "{out}"
+            );
             assert!(out.contains("files scanned 1"), "{out}");
         }
         fs::remove_dir_all(&dir).ok();
@@ -1239,7 +1251,11 @@ mod tests {
         for index in 0..1_025 {
             fs::write(snapshots.join(format!("a-{index:04}.txt")), "noise\n").unwrap();
         }
-        fs::write(snapshots.join("zz-target.txt"), "late_path_keyword evidence\n").unwrap();
+        fs::write(
+            snapshots.join("zz-target.txt"),
+            "late_path_keyword evidence\n",
+        )
+        .unwrap();
         let deep = dir.join("context-checkpoints/a/b/c/d/e/f/g/h/i");
         fs::create_dir_all(&deep).unwrap();
         fs::write(deep.join("zz-target.txt"), "late_path_keyword checkpoint\n").unwrap();
@@ -1248,8 +1264,14 @@ mod tests {
         for scope in [SearchScope::All, SearchScope::ToolOutputs] {
             p.scope = scope;
             let out = run_overflow_search(&dir, &p).unwrap();
-            assert!(out.contains("tool-overflow-compressed/zz-target.txt"), "{out}");
-            assert!(out.contains("context-checkpoints/a/b/c/d/e/f/g/h/i/zz-target.txt"), "{out}");
+            assert!(
+                out.contains("tool-overflow-compressed/zz-target.txt"),
+                "{out}"
+            );
+            assert!(
+                out.contains("context-checkpoints/a/b/c/d/e/f/g/h/i/zz-target.txt"),
+                "{out}"
+            );
             assert!(out.contains("files scanned 2"), "{out}");
         }
         fs::remove_dir_all(&dir).ok();
@@ -1294,7 +1316,11 @@ mod tests {
         let outside = make_temp_dir();
         fs::create_dir_all(dir.join("context-checkpoints")).unwrap();
         fs::write(outside.join("external.md"), "external_secret_keyword\n").unwrap();
-        symlink(outside.join("external.md"), dir.join("context-checkpoints/link.md")).unwrap();
+        symlink(
+            outside.join("external.md"),
+            dir.join("context-checkpoints/link.md"),
+        )
+        .unwrap();
         symlink(&outside, dir.join("context-checkpoints/nested")).unwrap();
         symlink(&outside, dir.join("tool-overflow")).unwrap();
         symlink(outside.join("external.md"), dir.join("overflow-history.md")).unwrap();
@@ -1337,7 +1363,10 @@ mod tests {
         let patterns = build_patterns(&needle).unwrap();
         let out = render_selection(vec![file], &needle, &patterns, 1, &archive).unwrap();
         assert!(!out.contains("external_secret_body"), "{out}");
-        assert!(out.contains("file unreadable during excerpt rendering"), "{out}");
+        assert!(
+            out.contains("file unreadable during excerpt rendering"),
+            "{out}"
+        );
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&outside).ok();
     }
@@ -1983,7 +2012,11 @@ mod tests {
         let tool_dir = dir.join("tool-overflow-compressed");
         fs::create_dir_all(&tool_dir).unwrap();
         fs::write(tool_dir.join("literal-run.txt"), "这里讨论压缩的文档结构\n").unwrap();
-        fs::write(tool_dir.join("bigram-only.txt"), "文档目录与压缩无关的说明\n").unwrap();
+        fs::write(
+            tool_dir.join("bigram-only.txt"),
+            "文档目录与压缩无关的说明\n",
+        )
+        .unwrap();
         let out = run_overflow_search(&dir, &params("压缩的文档")).unwrap();
         let literal_at = out
             .find("literal-run.txt")
@@ -2059,9 +2092,7 @@ mod tests {
         let out = run_overflow_search(&dir, &params("压缩的文档")).unwrap();
         assert!(out.contains("No matches found"), "{out}");
         assert!(
-            out.contains(
-                "terms: '压缩的文档'; 4 derived CJK bigram pattern(s) also came up empty"
-            ),
+            out.contains("terms: '压缩的文档'; 4 derived CJK bigram pattern(s) also came up empty"),
             "the typed term is listed and the expansion disclosed separately:\n{out}"
         );
         fs::remove_dir_all(&dir).ok();

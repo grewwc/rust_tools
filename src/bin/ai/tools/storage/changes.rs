@@ -280,7 +280,11 @@ pub fn session_grouped_changes() -> Vec<FileChange> {
 // Patch generation
 // ---------------------------------------------------------------------------
 
-pub(crate) fn diff_snippet(before: Option<&str>, after: Option<&str>, max_lines: usize) -> Option<String> {
+pub(crate) fn diff_snippet(
+    before: Option<&str>,
+    after: Option<&str>,
+    max_lines: usize,
+) -> Option<String> {
     let (b, a): (Vec<&str>, Vec<&str>) = match (before, after) {
         (None, None) => return None,
         (None, Some(a)) => (Vec::new(), a.lines().collect()),
@@ -804,12 +808,22 @@ mod tests {
     fn unavailable_initial_snapshot_survives_later_mutations_and_renderers() {
         for state in [BeforeState::Present, BeforeState::Unknown] {
             let mut entries = vec![MutationEntry {
-                seq: 0, ts: "t".into(), path: "/proj/existing.rs".into(),
-                op: "write".into(), before: None, before_state: Some(state),
-                after: Some("first\n".into()), diff: None,
+                seq: 0,
+                ts: "t".into(),
+                path: "/proj/existing.rs".into(),
+                op: "write".into(),
+                before: None,
+                before_state: Some(state),
+                after: Some("first\n".into()),
+                diff: None,
             }];
             let later = [
-                ("write", Some("first\n"), Some("second\n"), BeforeState::Present),
+                (
+                    "write",
+                    Some("first\n"),
+                    Some("second\n"),
+                    BeforeState::Present,
+                ),
                 ("delete", Some("second\n"), None, BeforeState::Present),
                 ("write", None, Some("recreated\n"), BeforeState::Absent),
             ];
@@ -817,9 +831,13 @@ mod tests {
                 if index > 0 {
                     let (op, before, after, before_state) = later[index - 1];
                     entries.push(MutationEntry {
-                        seq: index as u64, ts: "t".into(), path: entries[0].path.clone(),
-                        op: op.into(), before: before.map(str::to_string),
-                        before_state: Some(before_state), after: after.map(str::to_string),
+                        seq: index as u64,
+                        ts: "t".into(),
+                        path: entries[0].path.clone(),
+                        op: op.into(),
+                        before: before.map(str::to_string),
+                        before_state: Some(before_state),
+                        after: after.map(str::to_string),
                         diff: crate::ai::tools::storage::mutation_log::entry_diff(before, after),
                     });
                 }
@@ -828,14 +846,30 @@ mod tests {
                 assert_eq!(g.before_state, state);
                 assert!(g.before_first.is_none());
                 assert!(!g.snapshots_full());
-                let expected = if index == 2 { "deleted" }
-                    else if state == BeforeState::Present { "modified" } else { "written" };
+                let expected = if index == 2 {
+                    "deleted"
+                } else if state == BeforeState::Present {
+                    "modified"
+                } else {
+                    "written"
+                };
                 assert_eq!(g.net, expected);
-                for rendered in [file_snippet(g, 30).unwrap(), mutation_patch(&entries).unwrap()] {
-                    assert!(rendered.contains("before snapshot unavailable"), "{rendered}");
+                for rendered in [
+                    file_snippet(g, 30).unwrap(),
+                    mutation_patch(&entries).unwrap(),
+                ] {
+                    assert!(
+                        rendered.contains("before snapshot unavailable"),
+                        "{rendered}"
+                    );
                     assert!(rendered.contains("not compared"), "{rendered}");
                     assert!(!rendered.contains("/dev/null"), "{rendered}");
-                    assert!(!rendered.lines().any(|line| line.starts_with('+') || line.starts_with('-')), "{rendered}");
+                    assert!(
+                        !rendered
+                            .lines()
+                            .any(|line| line.starts_with('+') || line.starts_with('-')),
+                        "{rendered}"
+                    );
                 }
             }
         }
@@ -848,9 +882,14 @@ mod tests {
             (BeforeState::Present, Some(""), "modified"),
         ] {
             let entry = MutationEntry {
-                seq: 0, ts: "t".into(), path: "/proj/file.rs".into(), op: "write".into(),
-                before: before.map(str::to_string), before_state: Some(state),
-                after: Some("new\n".into()), diff: None,
+                seq: 0,
+                ts: "t".into(),
+                path: "/proj/file.rs".into(),
+                op: "write".into(),
+                before: before.map(str::to_string),
+                before_state: Some(state),
+                after: Some("new\n".into()),
+                diff: None,
             };
             let grouped = grouped_changes(&[entry]);
             assert_eq!(grouped[0].net, expected);
@@ -865,12 +904,20 @@ mod tests {
         let content = "same line\n".repeat(200_000);
         for diff in [None, entry_diff(Some(&content), Some(&content))] {
             let entry = MutationEntry {
-                seq: 0, ts: "t".into(), path: "/proj/large.rs".into(), op: "write".into(),
-                before: Some(cap_content(&content)), before_state: Some(BeforeState::Present),
-                after: Some(cap_content(&content)), diff,
+                seq: 0,
+                ts: "t".into(),
+                path: "/proj/large.rs".into(),
+                op: "write".into(),
+                before: Some(cap_content(&content)),
+                before_state: Some(BeforeState::Present),
+                after: Some(cap_content(&content)),
+                diff,
             };
             let grouped = grouped_changes(std::slice::from_ref(&entry));
-            for rendered in [file_snippet(&grouped[0], 30).unwrap(), mutation_patch(&[entry]).unwrap()] {
+            for rendered in [
+                file_snippet(&grouped[0], 30).unwrap(),
+                mutation_patch(&[entry]).unwrap(),
+            ] {
                 assert!(rendered.contains("not compared"), "{rendered}");
                 assert!(!rendered.contains("differ beyond"), "{rendered}");
             }

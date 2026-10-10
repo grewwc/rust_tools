@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
+use std::os::fd::AsRawFd as _;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use crate::ai::cli::ParsedCli;
@@ -36,6 +38,19 @@ use crate::commonw::configw;
 const STATE_DIR_ENV: &str = "A_SERVE_STATE_DIR";
 const PID_FILE: &str = "serve.pid";
 const LOG_FILE: &str = "serve.log";
+/// Persistent inode used to serialize daemon management lifecycle transactions.
+#[cfg(unix)]
+const CTL_LOCK_FILE: &str = "serve.ctl.lock";
+/// Latest deferred restart request. Older helpers must not touch the daemon.
+#[cfg(unix)]
+const RESTART_REQUEST_FILE: &str = "serve.restart.request";
+/// Internal handoff used by a detached restart helper. The helper waits for the
+/// serve turn that requested a restart to exit before touching the daemon.
+#[cfg(unix)]
+const RESTART_AFTER_PID_ENV: &str = "A_SERVE_RESTART_AFTER_PID";
+/// Identifies which deferred restart helper is still allowed to run.
+#[cfg(unix)]
+const RESTART_REQUEST_ENV: &str = "A_SERVE_RESTART_REQUEST";
 /// Frozen daemon copies (`a-<content hash>`), see [`freeze_daemon_exe`].
 #[cfg(unix)]
 const RUN_DIR: &str = "run";
@@ -56,6 +71,14 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// Wait after SIGKILL before giving up in `--serve-stop`.
 #[cfg(unix)]
 const KILL_WAIT: Duration = Duration::from_secs(2);
+/// A turn normally exits immediately after its final response. Bound the wait
+/// so a wedged turn cannot leave an immortal restart helper behind.
+#[cfg(unix)]
+const DEFERRED_RESTART_WAIT: Duration = Duration::from_secs(30 * 60);
+/// Give the daemon a short window to flush the completed SSE response after the
+/// turn process exits before the deferred helper sends SIGTERM.
+#[cfg(unix)]
+const RESPONSE_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// On-disk serve state: one value per line (`pid`, `bind`, unix start time).
 struct ServeState {
@@ -67,7 +90,12 @@ struct ServeState {
 /// Entry point for the four `--serve-*` management flags. Synchronous: no
 /// runtime is needed (blocking HTTP at most).
 pub(in crate::ai) fn run_serve_ctl(cli: &ParsedCli) -> Result<(), Box<dyn std::error::Error>> {
-    let verbs = [cli.serve_start, cli.serve_stop, cli.serve_restart, cli.serve_status];
+    let verbs = [
+        cli.serve_start,
+        cli.serve_stop,
+        cli.serve_restart,
+        cli.serve_status,
+    ];
     if verbs.iter().filter(|flag| **flag).count() > 1 {
         return Err(
             "only one of --serve-start/--serve-stop/--serve-restart/--serve-status may be given"
@@ -81,10 +109,10 @@ pub(in crate::ai) fn run_serve_ctl(cli: &ParsedCli) -> Result<(), Box<dyn std::e
         );
     }
     if cli.serve_start {
-        return start_daemon(cli, None);
+        return run_direct_serve_change(|| start_daemon(cli, None));
     }
     if cli.serve_stop {
-        return stop_daemon();
+        return run_direct_serve_change(stop_daemon);
     }
     if cli.serve_restart {
         return restart_daemon(cli);
@@ -108,6 +136,123 @@ fn state_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
         .join("rust_tools"))
 }
 
+/// Run one daemon lifecycle transaction while holding a stable cross-process
+/// lock. The lock file is intentionally never removed: replacing its inode
+/// would let existing waiters and new callers enter different critical sections.
+#[cfg(unix)]
+fn with_serve_ctl_lock_in<T>(
+    dir: &Path,
+    operation: impl FnOnce() -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(dir.join(CTL_LOCK_FILE))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // Closing the descriptor releases flock even when `operation` returns an
+    // error or unwinds, so the lock file itself must remain in place.
+    operation()
+}
+
+#[cfg(unix)]
+fn with_serve_ctl_lock<T>(
+    operation: impl FnOnce(&Path) -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let dir = state_dir()?;
+    with_serve_ctl_lock_in(&dir, || operation(&dir))
+}
+
+#[cfg(unix)]
+fn valid_restart_request(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 128
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-')
+}
+
+#[cfg(unix)]
+fn read_restart_request(dir: &Path) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let path = dir.join(RESTART_REQUEST_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let token = text.trim();
+    if !valid_restart_request(token) {
+        return Err(format!("corrupt deferred restart request at {}", path.display()).into());
+    }
+    Ok(Some(token.to_string()))
+}
+
+#[cfg(unix)]
+fn write_restart_request(dir: &Path, token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if !valid_restart_request(token) {
+        return Err("invalid deferred restart request token".into());
+    }
+    let path = dir.join(RESTART_REQUEST_FILE);
+    let temp = dir.join(format!(".{RESTART_REQUEST_FILE}.{token}.tmp"));
+    std::fs::write(&temp, format!("{token}\n"))?;
+    if let Err(err) = std::fs::rename(&temp, &path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn clear_restart_request(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    match std::fs::remove_file(dir.join(RESTART_REQUEST_FILE)) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Claim the latest request. A stale helper leaves the newer request intact.
+#[cfg(unix)]
+fn claim_restart_request(dir: &Path, token: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    if read_restart_request(dir)?.as_deref() != Some(token) {
+        return Ok(false);
+    }
+    clear_restart_request(dir)?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn new_restart_request() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{nanos}-{sequence}", std::process::id())
+}
+
+/// A direct management command is newer than every queued helper.
+#[cfg(unix)]
+fn run_direct_serve_change<T>(
+    operation: impl FnOnce() -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    with_serve_ctl_lock(|dir| {
+        clear_restart_request(dir)?;
+        operation()
+    })
+}
+
+#[cfg(not(unix))]
+fn run_direct_serve_change<T>(
+    operation: impl FnOnce() -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    operation()
+}
+
 fn parse_state(text: &str) -> Result<ServeState, String> {
     let mut lines = text.lines();
     let pid: u32 = lines
@@ -129,7 +274,11 @@ fn parse_state(text: &str) -> Result<ServeState, String> {
         .trim()
         .parse()
         .map_err(|_| "bad started line".to_string())?;
-    Ok(ServeState { pid, bind, started_unix })
+    Ok(ServeState {
+        pid,
+        bind,
+        started_unix,
+    })
 }
 
 fn format_state(state: &ServeState) -> String {
@@ -144,15 +293,13 @@ fn read_state_file(path: &Path) -> Result<Option<ServeState>, Box<dyn std::error
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    parse_state(&text)
-        .map(Some)
-        .map_err(|err| {
-            format!(
-                "serve state file {} is corrupt ({err}); delete it by hand",
-                path.display()
-            )
-            .into()
-        })
+    parse_state(&text).map(Some).map_err(|err| {
+        format!(
+            "serve state file {} is corrupt ({err}); delete it by hand",
+            path.display()
+        )
+        .into()
+    })
 }
 
 fn write_state_file(path: &Path, state: &ServeState) -> std::io::Result<()> {
@@ -212,18 +359,29 @@ fn healthz_url(bind: &str) -> String {
 }
 
 /// GET the public liveness endpoint. Returns the reported server version.
-fn query_healthz(bind: &str, timeout: Duration) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let client = reqwest::blocking::Client::builder().timeout(timeout).build()?;
+fn query_healthz(
+    bind: &str,
+    timeout: Duration,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()?;
     let resp = client.get(healthz_url(bind)).send()?;
     if !resp.status().is_success() {
         return Err(format!("/healthz returned {}", resp.status()).into());
     }
     let body: serde_json::Value = resp.json()?;
-    Ok(body.get("version").and_then(|v| v.as_str()).map(str::to_string))
+    Ok(body
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(str::to_string))
 }
 
 /// Poll `/healthz` until it answers or the budget runs out.
-fn wait_for_healthz(bind: &str, budget: Duration) -> Result<Option<String>, Box<dyn std::error::Error>> {
+fn wait_for_healthz(
+    bind: &str,
+    budget: Duration,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let start = Instant::now();
     loop {
         match query_healthz(bind, Duration::from_secs(2)) {
@@ -480,11 +638,19 @@ fn stop_daemon() -> Result<(), Box<dyn std::error::Error>> {
 fn stop_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let pid_path = state_dir()?.join(PID_FILE);
     let Some(state) = read_state_file(&pid_path)? else {
-        return Err(format!("serve is not running (no state file at {})", pid_path.display()).into());
+        return Err(format!(
+            "serve is not running (no state file at {})",
+            pid_path.display()
+        )
+        .into());
     };
     if !process_alive(state.pid) {
         let _ = std::fs::remove_file(&pid_path);
-        return Err(format!("serve pid {} is already gone (stale state cleaned up)", state.pid).into());
+        return Err(format!(
+            "serve pid {} is already gone (stale state cleaned up)",
+            state.pid
+        )
+        .into());
     }
     println!("[serve] stopping pid={} ...", state.pid);
     send_signal(state.pid, libc::SIGTERM)?;
@@ -511,10 +677,49 @@ fn stop_daemon() -> Result<(), Box<dyn std::error::Error>> {
     .into())
 }
 
-/// Restart the serve daemon, replaying the previous bind unless `--serve-bind`
+/// Restart the serve daemon. A tool launched by a serve turn inherits that
+/// turn's owner PID, so its restart is handed to a detached helper rather than
+/// terminating the SSE connection that must carry this command's result.
+fn restart_daemon(cli: &ParsedCli) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = env_pid(RESTART_AFTER_PID_ENV) {
+            let request = std::env::var(RESTART_REQUEST_ENV)
+                .map_err(|_| "deferred restart helper is missing its request token")?;
+            println!("[serve] waiting for turn pid={pid} before restart ...");
+            if !wait_for_exit(pid, DEFERRED_RESTART_WAIT) {
+                return Err(format!(
+                    "serve restart abandoned: turn pid {pid} did not exit within {:?}",
+                    DEFERRED_RESTART_WAIT
+                )
+                .into());
+            }
+            std::thread::sleep(RESPONSE_DRAIN_GRACE);
+            // SAFETY: serve management runs before the async runtime or worker
+            // threads start, so no concurrent environment access exists here.
+            unsafe {
+                std::env::remove_var(RESTART_AFTER_PID_ENV);
+                std::env::remove_var(RESTART_REQUEST_ENV);
+            }
+            return with_serve_ctl_lock(|dir| {
+                if !claim_restart_request(dir, &request)? {
+                    println!("[serve] skipped stale deferred restart request");
+                    return Ok(());
+                }
+                restart_daemon_now(cli)
+            });
+        }
+        if let Some(pid) = env_pid(crate::ai::background::SERVE_TURN_OWNER_PID_ENV) {
+            return with_serve_ctl_lock(|dir| schedule_restart_after_turn(cli, pid, dir));
+        }
+    }
+    run_direct_serve_change(|| restart_daemon_now(cli))
+}
+
+/// Restart immediately, replaying the previous bind unless `--serve-bind`
 /// overrides it. A failed stop still falls through to start (a dead daemon's
 /// only residue is its state file, which start reclaims).
-fn restart_daemon(cli: &ParsedCli) -> Result<(), Box<dyn std::error::Error>> {
+fn restart_daemon_now(cli: &ParsedCli) -> Result<(), Box<dyn std::error::Error>> {
     let previous_bind = state_dir()
         .ok()
         .and_then(|dir| read_state_file(&dir.join(PID_FILE)).ok().flatten())
@@ -524,6 +729,57 @@ fn restart_daemon(cli: &ParsedCli) -> Result<(), Box<dyn std::error::Error>> {
         Err(err) => eprintln!("[serve] stop phase: {err} (continuing to start)"),
     }
     start_daemon(cli, previous_bind.as_deref())
+}
+
+#[cfg(unix)]
+fn env_pid(name: &str) -> Option<u32> {
+    parse_pid(std::env::var_os(name).as_deref())
+}
+
+#[cfg(unix)]
+fn parse_pid(value: Option<&std::ffi::OsStr>) -> Option<u32> {
+    value
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|pid| *pid != 0)
+}
+
+/// A restart requested by a tool inside a serve turn cannot synchronously stop
+/// its own daemon: that would cut off the SSE response carrying the result.
+/// Re-exec a detached helper that waits for the owning turn process instead.
+#[cfg(unix)]
+fn schedule_restart_after_turn(
+    cli: &ParsedCli,
+    turn_pid: u32,
+    dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = new_restart_request();
+    let log_path = dir.join(LOG_FILE);
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let mut cmd = std::process::Command::new(crate::ai::exe_path::runtime_exe()?);
+    cmd.arg("--serve-detached").arg("--serve-restart");
+    if !cli.serve_bind.trim().is_empty() {
+        cmd.arg("--serve-bind").arg(&cli.serve_bind);
+    }
+    cmd.env(RESTART_AFTER_PID_ENV, turn_pid.to_string())
+        .env(RESTART_REQUEST_ENV, &request)
+        .env_remove(crate::ai::background::SERVE_TURN_OWNER_PID_ENV)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    let helper = crate::fork_guard::spawn(&mut cmd)?;
+    // Publish only after spawn succeeds. The helper cannot claim the request
+    // before this process releases the lifecycle lock.
+    write_restart_request(dir, &request)?;
+    println!(
+        "[serve] restart scheduled after turn pid={turn_pid} completes (helper pid={}, log={})",
+        helper.id(),
+        log_path.display()
+    );
+    Ok(())
 }
 
 /// Liveness wording differs by platform: non-unix builds cannot signal-check
@@ -539,7 +795,11 @@ fn report_status() -> Result<(), Box<dyn std::error::Error>> {
     let dir = state_dir()?;
     let pid_path = dir.join(PID_FILE);
     let Some(state) = read_state_file(&pid_path)? else {
-        return Err(format!("serve is not running (no state file at {})", pid_path.display()).into());
+        return Err(format!(
+            "serve is not running (no state file at {})",
+            pid_path.display()
+        )
+        .into());
     };
     #[cfg(unix)]
     if !process_alive(state.pid) {
@@ -638,6 +898,101 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn deferred_restart_requests_are_latest_wins() {
+        let dir = scratch_dir("restart-request");
+        write_restart_request(&dir, "1-10-0").expect("first request");
+        write_restart_request(&dir, "1-11-0").expect("newer request");
+
+        assert!(!claim_restart_request(&dir, "1-10-0").expect("stale claim"));
+        assert_eq!(
+            read_restart_request(&dir).expect("read request").as_deref(),
+            Some("1-11-0")
+        );
+        assert!(claim_restart_request(&dir, "1-11-0").expect("latest claim"));
+        assert_eq!(read_restart_request(&dir).expect("request cleared"), None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Child-side probe used by `serve_ctl_lock_serializes_processes`.
+    #[cfg(unix)]
+    #[test]
+    fn serve_ctl_lock_subprocess() {
+        use std::io::Write as _;
+
+        let Some(dir) = std::env::var_os("A_SERVE_CTL_LOCK_TEST_DIR").map(PathBuf::from) else {
+            return;
+        };
+        let role = std::env::var("A_SERVE_CTL_LOCK_TEST_ROLE").expect("lock test role");
+        with_serve_ctl_lock_in(&dir, || {
+            let mut events = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("events"))?;
+            writeln!(events, "{role}-enter")?;
+            events.flush()?;
+            if role == "holder" {
+                std::fs::write(dir.join("holder-entered"), b"ready")?;
+                std::thread::sleep(Duration::from_millis(350));
+            }
+            writeln!(events, "{role}-exit")?;
+            Ok(())
+        })
+        .expect("lock probe");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_ctl_lock_serializes_processes() {
+        let dir = scratch_dir("ctl-lock");
+        let exe = std::env::current_exe().expect("test executable");
+        let spawn_probe = |role: &str| {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.arg("serve_ctl_lock_subprocess")
+                .arg("--test-threads=1")
+                .env("A_SERVE_CTL_LOCK_TEST_DIR", &dir)
+                .env("A_SERVE_CTL_LOCK_TEST_ROLE", role)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            cmd.spawn().expect("spawn lock probe")
+        };
+
+        let mut holder = spawn_probe("holder");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !dir.join("holder-entered").is_file() && Instant::now() < deadline {
+            if let Some(status) = holder.try_wait().expect("poll holder") {
+                panic!("holder exited before acquiring lock: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            dir.join("holder-entered").is_file(),
+            "holder never acquired lock"
+        );
+
+        let contender = spawn_probe("contender");
+        let contender_output = contender.wait_with_output().expect("wait contender");
+        let holder_output = holder.wait_with_output().expect("wait holder");
+        assert!(
+            holder_output.status.success(),
+            "holder failed: {}",
+            String::from_utf8_lossy(&holder_output.stderr)
+        );
+        assert!(
+            contender_output.status.success(),
+            "contender failed: {}",
+            String::from_utf8_lossy(&contender_output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("events")).expect("events"),
+            "holder-enter\nholder-exit\ncontender-enter\ncontender-exit\n"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Pin a file's mtime so pruning order does not depend on clock resolution.
     #[cfg(unix)]
     fn set_mtime(path: &Path, unix_secs: u64) {
@@ -724,7 +1079,10 @@ mod tests {
     fn ctl_rejects_combination_with_serve() {
         let cli = ctl_args(&["--serve", "--serve-status"]);
         let err = run_serve_ctl(&cli).expect_err("serve + verb must be rejected");
-        assert!(err.to_string().contains("cannot combine"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("cannot combine"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
@@ -765,7 +1123,24 @@ mod tests {
     fn restart_replay_is_used_when_no_explicit_bind() {
         let cli = ctl_args(&["--serve-restart"]);
         assert!(cli.serve_bind.trim().is_empty());
-        assert_eq!(resolve_ctl_bind(&cli, Some("127.0.0.1:4321")), "127.0.0.1:4321");
+        assert_eq!(
+            resolve_ctl_bind(&cli, Some("127.0.0.1:4321")),
+            "127.0.0.1:4321"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_restart_pid_requires_a_positive_integer() {
+        assert_eq!(parse_pid(Some(std::ffi::OsStr::new("42"))), Some(42));
+        for invalid in [
+            None,
+            Some(std::ffi::OsStr::new("")),
+            Some(std::ffi::OsStr::new("0")),
+            Some(std::ffi::OsStr::new("nope")),
+        ] {
+            assert_eq!(parse_pid(invalid), None);
+        }
     }
 
     #[test]

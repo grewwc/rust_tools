@@ -609,6 +609,8 @@ enum ServeLiveEvent {
     ConfirmRequest(String),
     /// Raw JSON payload closing a confirmation request.
     ConfirmDone(String),
+    /// Latest compact status-line snapshot for foreground-owned subagents.
+    SubagentProgress(String),
 }
 
 /// Incremental parser for serve-live frames (`[kind: u8][len: u32 BE][payload]`):
@@ -641,7 +643,8 @@ impl ServeFrameDecoder {
                 || kind == background::ServeLiveKind::ThinkingDone as u8
                 || kind == background::ServeLiveKind::OutputComplete as u8
                 || kind == background::ServeLiveKind::ConfirmRequest as u8
-                || kind == background::ServeLiveKind::ConfirmDone as u8;
+                || kind == background::ServeLiveKind::ConfirmDone as u8
+                || kind == background::ServeLiveKind::SubagentProgress as u8;
             if !known || len > background::MAX_SERVE_FRAME_LEN as usize {
                 self.buf.clear();
                 break;
@@ -667,6 +670,9 @@ impl ServeFrameDecoder {
                 }
                 k if k == background::ServeLiveKind::ConfirmDone as u8 => {
                     ServeLiveEvent::ConfirmDone(payload)
+                }
+                k if k == background::ServeLiveKind::SubagentProgress as u8 => {
+                    ServeLiveEvent::SubagentProgress(payload)
                 }
                 k if k == background::ServeLiveKind::OutputComplete as u8 => {
                     ServeLiveEvent::OutputComplete
@@ -706,6 +712,9 @@ fn live_event(event: ServeLiveEvent) -> Option<Event> {
         // Confirmation frames are built by `forward_live_event`, which holds
         // the pending state and adds the answer token; they never get here.
         ServeLiveEvent::ConfirmRequest(_) | ServeLiveEvent::ConfirmDone(_) => None,
+        ServeLiveEvent::SubagentProgress(line) => {
+            Some(Event::default().event("subagent_progress").data(line))
+        }
         ServeLiveEvent::OutputComplete => None,
     }
 }

@@ -157,7 +157,10 @@ pub(crate) fn normalize_confusables(s: &str) -> String {
 /// multiple matches return [`TolerantMatchError::Ambiguous`]. The replacement still slices on the
 /// original byte range; the written content is constructed from `new`, so normalized characters
 /// are never written into the file.
-pub(crate) fn find_tolerant_old_match(line: &str, old: &str) -> Result<(usize, usize), TolerantMatchError> {
+pub(crate) fn find_tolerant_old_match(
+    line: &str,
+    old: &str,
+) -> Result<(usize, usize), TolerantMatchError> {
     let needle: Vec<char> = old.trim().chars().collect();
     let hay: Vec<char> = line.chars().collect();
     if needle.is_empty() || needle.len() > hay.len() {

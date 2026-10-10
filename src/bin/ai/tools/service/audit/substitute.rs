@@ -1,6 +1,6 @@
 use super::lexer::{
-    effective_command_tokens, matches_heredoc_terminator, parse_heredoc_at,
-    validate_and_skip_heredoc_bodies, HereDocSpec,
+    HereDocSpec, effective_command_tokens, matches_heredoc_terminator, parse_heredoc_at,
+    validate_and_skip_heredoc_bodies,
 };
 use super::validate_execute_command;
 
@@ -291,19 +291,19 @@ pub(crate) fn safe_shell_substitutions(command: &str) -> Vec<SafeShellSubstituti
 /// directly and never feed arguments to a shell, so `<<` / `$()` are just plain
 /// text.
 ///
-    /// Command substitution `$(...)` is allowed after recursively validating the
-    /// inner command (same trust model as process substitution), so quoted data
-    /// usages like `echo "$(date)"` and `for i in $(seq 1 40)` loops work while
-    /// `$(rm ...)` stays blocked. The inner check alone cannot see where the
-    /// output lands, so `validate_substitution_positions` additionally restricts
-    /// every substitution to a materializable whole-word `"$(...)"` or a
-    /// literal-`seq` loop list. Generating the *program name* from a
-    /// substitution remains banned — its output is word-split into command
-    /// words, so `$(echo r)m -rf /` could run `rm` at runtime; that guard lives
-    /// in `validate_single_segment`. Backticks stay banned (legacy form).
-    /// Process substitution `<(...)` / `>(...)` is allowed after recursively
-    /// validating the inner command, avoiding false blocks on common usages
-    /// like diff/sort.
+/// Command substitution `$(...)` is allowed after recursively validating the
+/// inner command (same trust model as process substitution), so quoted data
+/// usages like `echo "$(date)"` and `for i in $(seq 1 40)` loops work while
+/// `$(rm ...)` stays blocked. The inner check alone cannot see where the
+/// output lands, so `validate_substitution_positions` additionally restricts
+/// every substitution to a materializable whole-word `"$(...)"` or a
+/// literal-`seq` loop list. Generating the *program name* from a
+/// substitution remains banned — its output is word-split into command
+/// words, so `$(echo r)m -rf /` could run `rm` at runtime; that guard lives
+/// in `validate_single_segment`. Backticks stay banned (legacy form).
+/// Process substitution `<(...)` / `>(...)` is allowed after recursively
+/// validating the inner command, avoiding false blocks on common usages
+/// like diff/sort.
 pub(crate) fn validate_no_injection_surface(command: &str) -> Result<(), String> {
     let bytes = command.as_bytes();
     let mut i = 0;
@@ -408,9 +408,8 @@ pub(crate) fn validate_no_injection_surface(command: &str) -> Result<(), String>
             // `validate_substitution_positions`. Generating the *program name*
             // from a substitution is still banned (its output is word-split
             // into command words) — that guard lives in `validate_single_segment`.
-            let close = find_matching_shell_paren(command, i + 1).ok_or_else(|| {
-                "unterminated command substitution `$(...)`".to_string()
-            })?;
+            let close = find_matching_shell_paren(command, i + 1)
+                .ok_or_else(|| "unterminated command substitution `$(...)`".to_string())?;
             let inner = command[i + 2..close].trim();
             validate_execute_command(inner)
                 .map_err(|reason| format!("unsafe command substitution `$(...)`: {reason}"))?;
@@ -772,9 +771,7 @@ pub(crate) fn validate_substitution_positions(command: &str, program: &str) -> R
                     in_double = false;
                 }
                 // `$(( ... ))` is arithmetic expansion, not a substitution.
-                b'$'
-                    if bytes.get(i + 1) == Some(&b'(') && bytes.get(i + 2) != Some(&b'(') =>
-                {
+                b'$' if bytes.get(i + 1) == Some(&b'(') && bytes.get(i + 2) != Some(&b'(') => {
                     check_substitution_at(command, i, program, &eff_program)?;
                 }
                 _ => {}
@@ -792,16 +789,12 @@ pub(crate) fn validate_substitution_positions(command: &str, program: &str) -> R
             b'"' => {
                 in_double = true;
             }
-            b'$'
-                if bytes.get(i + 1) == Some(&b'(') && bytes.get(i + 2) != Some(&b'(') =>
-            {
+            b'$' if bytes.get(i + 1) == Some(&b'(') && bytes.get(i + 2) != Some(&b'(') => {
                 check_substitution_at(command, i, program, &eff_program)?;
             }
             // `<<<` herestrings are not heredocs; their content still undergoes
             // expansion, so it must be scanned rather than skipped.
-            b'<'
-                if bytes.get(i + 1) == Some(&b'<') && bytes.get(i + 2) != Some(&b'<') =>
-            {
+            b'<' if bytes.get(i + 1) == Some(&b'<') && bytes.get(i + 2) != Some(&b'<') => {
                 if let Some((end, spec)) = parse_heredoc_at(command, i) {
                     pending_heredocs.push(spec);
                     i = end;

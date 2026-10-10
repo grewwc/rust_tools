@@ -413,7 +413,10 @@ mod tests {
     fn rag_distilled_revision_changes_content_fingerprint_even_at_same_length() {
         let before = memory("stable-id", "Use backend A.");
         let after = memory("stable-id", "Use backend B.");
-        assert_ne!(content_fingerprint(&[before]), content_fingerprint(&[after]));
+        assert_ne!(
+            content_fingerprint(&[before]),
+            content_fingerprint(&[after])
+        );
         let first = memory("a", "First decision");
         let second = memory("b", "Second decision");
         assert_eq!(
@@ -433,9 +436,15 @@ mod tests {
             timestamp: 123,
         };
         let mut current = HashMap::default();
-        current.insert("stable-id".to_string(), memory("stable-id", "Use backend A."));
+        current.insert(
+            "stable-id".to_string(),
+            memory("stable-id", "Use backend A."),
+        );
         assert!(vector_is_current(&old_vector, &current));
-        current.insert("stable-id".to_string(), memory("stable-id", "Use backend B."));
+        current.insert(
+            "stable-id".to_string(),
+            memory("stable-id", "Use backend B."),
+        );
         assert!(!vector_is_current(&old_vector, &current));
         current.clear();
         assert!(!vector_is_current(&old_vector, &current));

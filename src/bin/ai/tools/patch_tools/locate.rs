@@ -40,7 +40,10 @@ pub(crate) fn describe_ambiguous_hunk(
 
 pub(crate) const DECLARED_LINE_DISAMBIGUATION_MAX_DRIFT: usize = 12;
 
-pub(crate) fn disambiguate_by_declared_line(positions: &[usize], hunk: &UnifiedHunk) -> Option<usize> {
+pub(crate) fn disambiguate_by_declared_line(
+    positions: &[usize],
+    hunk: &UnifiedHunk,
+) -> Option<usize> {
     if hunk.old_start == 0 || positions.len() < 2 {
         return None;
     }

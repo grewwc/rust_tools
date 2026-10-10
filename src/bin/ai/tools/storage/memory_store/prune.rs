@@ -88,7 +88,10 @@ impl MemoryStore {
     }
 
     /// Rewrite the whole JSONL file (atomic write: tmp → rename).
-    pub(super) fn write_all_entries(path: &Path, entries: &[AgentMemoryEntry]) -> Result<(), String> {
+    pub(super) fn write_all_entries(
+        path: &Path,
+        entries: &[AgentMemoryEntry],
+    ) -> Result<(), String> {
         let mut output = String::new();
         for entry in entries {
             if let Ok(s) = serde_json::to_string(entry) {
