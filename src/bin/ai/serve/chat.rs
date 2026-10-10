@@ -683,17 +683,42 @@ fn delete_remote_session(
 fn render_turn_stream(
     resp: reqwest::blocking::Response,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    render_turn_stream_with_confirm(resp, None)
+}
+
+/// Same as [`render_turn_stream`], but answers remote confirmation requests
+/// through `confirm` (`None` keeps the fail-closed default and only notes an
+/// unanswerable question instead of hanging the turn on it).
+fn render_turn_stream_with_confirm(
+    resp: reqwest::blocking::Response,
+    confirm: Option<&ServeConfirmChannel>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::IsTerminal;
     let tty = std::io::stdout().is_terminal();
-    render_turn_stream_to(resp, &mut std::io::stdout(), tty)
+    render_turn_stream_to_with_confirm(resp, &mut std::io::stdout(), tty, confirm)
 }
 
 /// Same as [`render_turn_stream`], but writes to `out` so tests can assert
 /// the exact bytes (line breaks between body, footers and fold summaries).
+/// Never answers confirmations (`None` channel): tests stay offline and never
+/// touch stdin.
 fn render_turn_stream_to(
     resp: reqwest::blocking::Response,
     out: &mut dyn std::io::Write,
     tty: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    render_turn_stream_to_with_confirm(resp, out, tty, None)
+}
+
+/// Same as [`render_turn_stream_to`], but `confirm` answers remote
+/// confirmation requests (`confirm_request` events) with a local y/n prompt
+/// and a `POST .../confirm` round-trip, so a serve-chat turn can approve the
+/// same gates (today `git commit` / `git stash`) as a local turn.
+fn render_turn_stream_to_with_confirm(
+    resp: reqwest::blocking::Response,
+    out: &mut dyn std::io::Write,
+    tty: bool,
+    confirm: Option<&ServeConfirmChannel>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::BufRead;
     // `blocking::Response` implements `Read`, so lines are parsed (and
@@ -890,6 +915,61 @@ fn render_turn_stream_to(
                     line_open = !text.ends_with('\n');
                 }
                 let _ = out.flush();
+            }
+            "confirm_request" => {
+                // Same ordering guarantee as the `_` arm below: the question
+                // must start on a fresh row, never glued onto answer deltas.
+                if tty {
+                    let _ = markdown.flush_pending_to(out);
+                    if markdown.at_line_start() {
+                        line_open = false;
+                    }
+                }
+                close_thinking_status(
+                    &mut thinking_active,
+                    &mut line_open,
+                    thinking_summary(thinking_newlines, thinking_chars),
+                    tty,
+                    out,
+                );
+                if line_open {
+                    let _ = writeln!(out);
+                }
+                let question = serde_json::from_str::<serde_json::Value>(payload).ok();
+                let parsed = question.as_ref().and_then(|v| {
+                    Some((
+                        v.get("id")?.as_u64()?,
+                        v.get("token")?.as_u64()?,
+                        v.get("prompt")?.as_str()?,
+                    ))
+                });
+                match parsed {
+                    Some((id, token, prompt)) => match confirm {
+                        Some(channel) => channel.answer(id, token, prompt, out),
+                        None => {
+                            let _ = writeln!(
+                                out,
+                                "[serve-chat] warning: the remote turn waits for a \
+                                 confirmation this client cannot answer (stdin is not \
+                                 interactive); the remote command stays blocked until \
+                                 the turn ends."
+                            );
+                        }
+                    },
+                    None => {
+                        let _ = writeln!(
+                            out,
+                            "[serve-chat] warning: ignoring a malformed confirm_request event."
+                        );
+                    }
+                }
+                line_open = false;
+                let _ = out.flush();
+            }
+            "confirm_done" => {
+                // The child's own resolution frame: an answered question already
+                // cleared the slot server-side, so there is nothing to render
+                // (and it must not fall into the `_` arm's footer).
             }
             _ => {
                 // Same ordering guarantee as the `delta` arm: observer footers
@@ -1126,6 +1206,132 @@ fn interrupt_remote_turn(
         .unwrap_or(false))
 }
 
+/// Remote-confirmation answer channel for a serve-chat turn: asks the local
+/// user the question a server-side turn child is blocked on, then POSTs the
+/// answer to `POST /sessions/{id}/confirm`, where the daemon relays it into
+/// the child's stdin. Only built when the turn runs on an interactive
+/// terminal (see [`serve_confirm_channel`]); otherwise the turn is sent
+/// without `"confirm": true` and the child keeps the fail-closed default.
+struct ServeConfirmChannel {
+    poster: reqwest::blocking::Client,
+    base: String,
+    token: String,
+    session_id: String,
+}
+
+/// Build the [`ServeConfirmChannel`] for a turn, or `None` when this client
+/// cannot answer: without a terminal stdin the y/n prompt could neither show
+/// nor read (`prompt_yes_or_no` spins forever on EOF), so opting in would
+/// hang the turn on a question nobody can see.
+fn serve_confirm_channel(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+) -> Option<ServeConfirmChannel> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    // Short timeout: the shared turn client waits up to 10 minutes, which
+    // would pin the render loop on a wedged connection while the child waits.
+    let poster = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| client.clone());
+    Some(ServeConfirmChannel {
+        poster,
+        base: base.to_string(),
+        token: token.to_string(),
+        session_id: session_id.to_string(),
+    })
+}
+
+/// Exact body of `POST /sessions/{id}/confirm` (see `turn::ConfirmAnswerReq`):
+/// the question id, the token it was shown with, and the verdict. Pure so
+/// tests can pin the wire shape without touching stdin or the network.
+fn confirm_answer_body(id: u64, token: u64, allow: bool) -> serde_json::Value {
+    serde_json::json!({"id": id, "token": token, "allow": allow})
+}
+
+impl ServeConfirmChannel {
+    /// Ask the local user and POST the answer. Runs on the render thread: the
+    /// child cannot proceed without the answer, so pausing the stream here is
+    /// correct (pending SSE bytes stay buffered in TCP). The renderer is
+    /// already flushed by the caller, so the question starts on a fresh row.
+    fn answer(
+        &self,
+        id: u64,
+        token: u64,
+        prompt: &str,
+        out: &mut dyn std::io::Write,
+    ) {
+        let allow = crate::commonw::prompt::prompt_yes_or_no_interruptible(&format!(
+            "[serve-chat] remote confirmation: {prompt} [y/n] "
+        ));
+        let allow = match allow {
+            Some(v) => v,
+            // Ctrl+C / Esc / read failure must not leave the child blocked
+            // forever: deny fail-closed, like the local gate cancelling the
+            // command. Send another key (or Ctrl+C during later output) to
+            // interrupt the turn itself.
+            None => {
+                let _ = writeln!(out, "[serve-chat] confirmation dismissed; answering no.");
+                false
+            }
+        };
+        self.post_answer(id, token, allow, out);
+    }
+
+    /// POST one answer; every outcome is reported, none hangs the loop. A 409
+    /// is terminal per the route contract (answered elsewhere, superseded, or
+    /// the turn ended), not a retry. Other failures leave the child blocked
+    /// until the turn ends, which the warning says plainly.
+    fn post_answer(
+        &self,
+        id: u64,
+        token: u64,
+        allow: bool,
+        out: &mut dyn std::io::Write,
+    ) {
+        let url = format!("{}/sessions/{}/confirm", self.base, self.session_id);
+        match auth(self.poster.post(url), &self.token)
+            .json(&confirm_answer_body(id, token, allow))
+            .send()
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let _ = writeln!(
+                    out,
+                    "[serve-chat] confirmation sent ({}).",
+                    if allow { "yes" } else { "no" }
+                );
+            }
+            Ok(resp) if resp.status().as_u16() == 409 => {
+                let _ = writeln!(
+                    out,
+                    "[serve-chat] confirmation already resolved elsewhere; continuing."
+                );
+            }
+            Ok(resp) => {
+                let _ = writeln!(
+                    out,
+                    "[serve-chat] warning: confirmation answer rejected ({}); the remote \
+                     command stays blocked until the turn ends.",
+                    resp.status()
+                );
+            }
+            Err(err) => {
+                let _ = writeln!(
+                    out,
+                    "[serve-chat] warning: confirmation answer not delivered ({err}); the remote \
+                     command stays blocked until the turn ends."
+                );
+            }
+        }
+        let _ = out.flush();
+    }
+}
+
 /// Marks a remote turn as in flight for the SIGINT handler; the mark drops
 /// when the stream returns, including the error paths.
 struct RemoteTurnScope;
@@ -1185,6 +1391,12 @@ fn post_turn_stream(
             );
         }
     }
+    // Remote confirmations are answered on this terminal: opt the child into
+    // the confirm channel only when stdin can actually ask (see
+    // `serve_confirm_channel`). The daemon relays the answer into the child's
+    // stdin, so the same gates as a local turn (`git commit` / `git stash`)
+    // become approvable instead of failing closed.
+    let confirm_channel = serve_confirm_channel(client, base, token, session_id);
     let resp = auth(
         client.post(format!("{base}/sessions/{session_id}/turns/stream")),
         token,
@@ -1206,6 +1418,7 @@ fn post_turn_stream(
             Some(effort) => serde_json::Value::String(effort.to_string()),
             None => serde_json::Value::Null,
         },
+        "confirm": confirm_channel.is_some(),
     }))
     .send()?;
     let status = resp.status();
@@ -1213,7 +1426,7 @@ fn post_turn_stream(
         let text = resp.text().unwrap_or_default();
         return Err(server_error_message(status, &text).into());
     }
-    let outcome = render_turn_stream(resp);
+    let outcome = render_turn_stream_with_confirm(resp, confirm_channel.as_ref());
     if REMOTE_TURN_INTERRUPT_SENT.swap(false, Ordering::SeqCst) {
         // Leading newline: `delta` events print without a trailing newline, so
         // the note would otherwise land mid-line.
@@ -1600,6 +1813,90 @@ mod tests {
         let mut buf = Vec::new();
         render_turn_stream_to(resp, &mut buf, false).expect("render");
         assert_eq!(buf, b"hello\nworld\n");
+    }
+
+    #[test]
+    fn confirm_answer_body_matches_server_shape() {
+        // Wire shape of `turn::ConfirmAnswerReq`: the daemon matches on
+        // (id, token) and relays `allow` as one yes/no line on stdin.
+        assert_eq!(
+            confirm_answer_body(7, 42, true),
+            serde_json::json!({"id": 7, "token": 42, "allow": true})
+        );
+        assert_eq!(
+            confirm_answer_body(7, 42, false),
+            serde_json::json!({"id": 7, "token": 42, "allow": false})
+        );
+    }
+
+    #[test]
+    fn sse_confirm_request_without_channel_warns_and_continues() {
+        // Tests have no interactive stdin (`None` channel): the event must
+        // degrade to a warning, never hang, and never leak as raw JSON.
+        let url = serve_body_once(
+            "event: confirm_request\ndata: {\"id\": 3, \"prompt\": \"Run `git commit`?\", \"token\": 9}\n\nevent: done\ndata: \n\n",
+        );
+        let resp = reqwest::blocking::get(url).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(out.contains("cannot answer"), "unexpected: {out}");
+        assert!(
+            !out.contains("confirm_request"),
+            "raw event leaked: {out}"
+        );
+    }
+
+    #[test]
+    fn sse_malformed_confirm_request_is_ignored() {
+        let url = serve_body_once("event: confirm_request\ndata: not-json\n\nevent: done\ndata: \n\n");
+        let resp = reqwest::blocking::get(url).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(out.contains("malformed"), "unexpected: {out}");
+    }
+
+    #[test]
+    fn sse_confirm_done_is_swallowed() {
+        // The child's own resolution frame carries nothing to render and must
+        // not fall into the `_` arm's footer.
+        let url =
+            serve_body_once("event: confirm_done\ndata: {\"id\": 3}\n\nevent: done\ndata: \n\n");
+        let resp = reqwest::blocking::get(url).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        assert!(
+            buf.is_empty(),
+            "unexpected: {}",
+            String::from_utf8_lossy(&buf)
+        );
+    }
+
+    #[test]
+    fn confirm_post_answer_hits_confirm_route_with_auth() {
+        let (base, captured) = serve_capture_once("{}");
+        let channel = ServeConfirmChannel {
+            poster: reqwest::blocking::Client::builder()
+                .build()
+                .expect("client"),
+            base,
+            token: "sekret".to_string(),
+            session_id: "sess-9".to_string(),
+        };
+        let mut buf = Vec::new();
+        channel.post_answer(3, 9, true, &mut buf);
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(out.contains("confirmation sent (yes)"), "unexpected: {out}");
+        let head = captured.lock().expect("head").clone();
+        assert!(
+            head.contains("POST /sessions/sess-9/confirm "),
+            "unexpected head: {head}"
+        );
+        assert!(
+            head.to_lowercase().contains("authorization: bearer sekret"),
+            "missing bearer auth: {head}"
+        );
     }
 
     #[test]

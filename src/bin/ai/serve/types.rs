@@ -87,7 +87,7 @@ pub(crate) struct TurnReq {
     /// Whether this client renders and answers remote confirmation requests
     /// (`confirm_request` SSE events plus `GET`/`POST .../confirm`). Only an
     /// explicit `true` opens the child's channel: a client that cannot answer
-    /// (serve-chat's REPL, older pages) keeps the previous fail-closed
+    /// (older pages, non-interactive terminals) keeps the previous fail-closed
     /// behavior instead of hanging the turn on a question nobody can see.
     #[serde(default)]
     pub(crate) confirm: Option<bool>,
