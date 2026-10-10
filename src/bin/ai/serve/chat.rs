@@ -23,7 +23,7 @@ use crate::commonw::{
 };
 
 use super::super::{
-    agents, cli::ParsedCli, config_schema::AiConfig, driver::input::inline_image_filenames,
+    agents, cli::ParsedCli, config_schema::AiConfig, driver::{commands::is_local_command_start, input::inline_image_filenames},
     history::{current_terminal_key, SessionStore},
     model_names, models,
     prompt::{completion::CommandCompleter, PromptEditor},
@@ -675,10 +675,844 @@ fn delete_remote_session(
     Ok(deleted.deleted)
 }
 
+// --- Remote `/history`: previews render from `GET /sessions/{id}/history`
+// and rewinds truncate through `POST /sessions/{id}/rewind`, never through a
+// turn child. A turn child would dispatch `/history` as a local command
+// against server-side state: read-only forms only waste a model round-trip,
+// but `rewind` blocks on an interactive stdin confirm that has no writer on
+// the daemon side and hangs the session until restart. ---
+
+/// One row of `GET /sessions/{id}/history`, which serves the canonical
+/// message array 1:1, so an index here is a valid `POST /rewind`
+/// `message_index`. Unknown fields are ignored so a newer server never breaks
+/// this client; `content` is a string for plain messages and structured
+/// blocks otherwise.
+#[derive(Debug, Deserialize)]
+struct RemoteHistoryMessage {
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    content: serde_json::Value,
+    #[serde(default)]
+    tool_calls: Option<Vec<serde_json::Value>>,
+}
+
+const SERVE_HISTORY_DEFAULT_COUNT: usize = 6;
+const SERVE_HISTORY_FULL_COUNT: usize = 20;
+const SERVE_HISTORY_MAX_COUNT: usize = 20;
+const SERVE_HISTORY_MAX_CHARS: usize = 160;
+
+/// Fetch the session's full canonical history. No `limit`: user ordinals
+/// (`u40`) count every stored user message, so a tail cut would renumber the
+/// rows and invalidate rewind anchors. Network glue only; shaping below is
+/// pure and tested offline.
+fn fetch_remote_history(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+) -> Result<Vec<RemoteHistoryMessage>, String> {
+    let resp = auth(
+        client.get(format!("{base}/sessions/{session_id}/history")),
+        token,
+    )
+    .send()
+    .map_err(|err| format!("history request failed: {err}"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(server_error_message(status, &text));
+    }
+    serde_json::from_str(&text)
+        .map_err(|err| format!("serve returned an unexpected history body: {err}"))
+}
+
+/// Searchable text of one stored message, mirroring the local preview:
+/// plain strings verbatim, anything else as compact JSON.
+fn serve_history_searchable_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(text) => text.clone(),
+        other => {
+            serde_json::to_string(other).unwrap_or_else(|_| "<non-string content>".to_string())
+        }
+    }
+}
+
+/// Char-based truncation with the same `...` suffix as the local preview.
+fn serve_truncate_for_terminal(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= max_chars {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
+}
+
+/// Canonical (0-based) index of the Nth stored user message, counting every
+/// `role == "user"` row exactly like the local rewind resolver so ordinals
+/// match on both sides. A runtime-injected row still resolves here; the
+/// server rejects it with 400, same rule as local.
+fn serve_user_message_index(
+    messages: &[RemoteHistoryMessage],
+    ordinal: usize,
+) -> Option<usize> {
+    if ordinal == 0 {
+        return None;
+    }
+    let mut seen = 0usize;
+    for (idx, message) in messages.iter().enumerate() {
+        if message.role != "user" {
+            continue;
+        }
+        seen += 1;
+        if seen == ordinal {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn serve_user_message_count(messages: &[RemoteHistoryMessage]) -> usize {
+    messages.iter().filter(|m| m.role == "user").count()
+}
+
+/// Read-only view selector for the remote `/history` preview. Mirrors the
+/// local preview grammar (`[N]`, `full`, role words, `grep <keyword>`);
+/// `export`/`copy`/other-session stay local-only and report how to get the
+/// same result from here.
+#[derive(Debug, PartialEq, Eq)]
+struct ServeHistoryView {
+    count: usize,
+    role: ServeHistoryRole,
+    full: bool,
+    grep: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ServeHistoryRole {
+    All,
+    User,
+    Assistant,
+    Tool,
+    System,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ServeHistoryAction {
+    Show,
+    Help,
+}
+
+fn parse_serve_history_view(
+    args: &[&str],
+) -> Result<(ServeHistoryView, ServeHistoryAction), String> {
+    let mut view = ServeHistoryView {
+        count: SERVE_HISTORY_DEFAULT_COUNT,
+        role: ServeHistoryRole::All,
+        full: false,
+        grep: None,
+    };
+    let mut idx = 0usize;
+    while idx < args.len() {
+        match args[idx] {
+            "full" => {
+                view.full = true;
+                view.count = SERVE_HISTORY_FULL_COUNT;
+                idx += 1;
+            }
+            "user" => {
+                view.role = ServeHistoryRole::User;
+                idx += 1;
+            }
+            "assistant" => {
+                view.role = ServeHistoryRole::Assistant;
+                idx += 1;
+            }
+            "tool" => {
+                view.role = ServeHistoryRole::Tool;
+                idx += 1;
+            }
+            "system" => {
+                view.role = ServeHistoryRole::System;
+                idx += 1;
+            }
+            "grep" => {
+                let keyword = args[idx + 1..].join(" ");
+                if keyword.trim().is_empty() {
+                    return Err("`/history grep` requires a keyword".into());
+                }
+                view.grep = Some(keyword);
+                break;
+            }
+            "export" => {
+                return Err("`/history export` would write to the server machine, not this one; print the view with `/history` and save the output locally."
+                    .into());
+            }
+            "copy" => {
+                return Err("`/history copy` cannot reach this machine's clipboard from the server; print the view with `/history` and copy it locally."
+                    .into());
+            }
+            "help" => {
+                return Ok((view, ServeHistoryAction::Help));
+            }
+            raw => match raw.parse::<usize>() {
+                Ok(count) => {
+                    view.count = count.clamp(1, SERVE_HISTORY_MAX_COUNT);
+                    idx += 1;
+                }
+                Err(_) if idx == 0 => {
+                    return Err(format!(
+                        "`/history {raw}` addresses another session, which serve-chat does not support; `/resume {raw}` first, then use `/history`."
+                    ));
+                }
+                Err(_) => {
+                    return Err(format!("invalid /history argument: {raw}"));
+                }
+            },
+        }
+    }
+    Ok((view, ServeHistoryAction::Show))
+}
+
+/// Render the preview, mirroring the local `[history] Showing N recent ...`
+/// shape. No model tags: the history route serves bare messages without the
+/// sqlite `source_model` provenance the local preview reads.
+fn render_serve_history(messages: &[RemoteHistoryMessage], view: &ServeHistoryView) -> String {
+    let label = match view.role {
+        ServeHistoryRole::All => "message(s)",
+        ServeHistoryRole::User => "user message(s)",
+        ServeHistoryRole::Assistant => "assistant message(s)",
+        ServeHistoryRole::Tool => "tool message(s)",
+        ServeHistoryRole::System => "system message(s)",
+    };
+    let grep_suffix = view
+        .grep
+        .as_deref()
+        .map(|grep| format!(" matching \"{grep}\""))
+        .unwrap_or_default();
+    // Ordinals count every stored user message before filtering, like local.
+    let mut user_ordinal = 0usize;
+    let mut filtered = Vec::new();
+    for message in messages {
+        let ordinal = if message.role == "user" {
+            user_ordinal += 1;
+            Some(user_ordinal)
+        } else {
+            None
+        };
+        let role_matches = match view.role {
+            ServeHistoryRole::All => true,
+            ServeHistoryRole::User => message.role == "user",
+            ServeHistoryRole::Assistant => message.role == "assistant",
+            ServeHistoryRole::Tool => message.role == "tool",
+            // Same rule as the local system filter (system + internal notes).
+            ServeHistoryRole::System => {
+                message.role == "system" || message.role == "internal_note"
+            }
+        };
+        if !role_matches {
+            continue;
+        }
+        if let Some(needle) = view.grep.as_deref() {
+            let haystack = serve_history_searchable_text(&message.content).to_ascii_lowercase();
+            if !haystack.contains(&needle.to_ascii_lowercase()) {
+                continue;
+            }
+        }
+        filtered.push((message, ordinal));
+    }
+    let shown = if filtered.len() > view.count {
+        &filtered[filtered.len() - view.count..]
+    } else {
+        &filtered[..]
+    };
+    if shown.is_empty() {
+        return "[history] No recent messages.".to_string();
+    }
+    let mut out = format!(
+        "[history] Showing {} recent {}{}:\n",
+        shown.len(),
+        label,
+        grep_suffix
+    );
+    for (row, item) in shown.iter().enumerate() {
+        let (message, ordinal) = *item;
+        let content = if view.full {
+            serve_history_searchable_text(&message.content)
+        } else {
+            serve_truncate_for_terminal(
+                &serve_history_searchable_text(&message.content)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                SERVE_HISTORY_MAX_CHARS,
+            )
+        };
+        let marker = ordinal.map(|n| format!(" (u{n})")).unwrap_or_default();
+        out.push_str(&format!(
+            "{}. [{}] {}{}\n",
+            row + 1,
+            message.role,
+            content,
+            marker
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+/// Render the `nth_back`-most-recent (1 = latest) assistant conclusion, full
+/// text. Mirrors the local conclusion rule (no tool calls, non-empty text);
+/// the model tag is unavailable remotely, so the header carries only the
+/// position.
+fn render_serve_history_last(
+    messages: &[RemoteHistoryMessage],
+    nth_back: usize,
+) -> Result<String, String> {
+    let mut seen = 0usize;
+    let mut found = None;
+    for message in messages.iter().rev() {
+        if message.role != "assistant" {
+            continue;
+        }
+        if !message
+            .tool_calls
+            .as_ref()
+            .is_none_or(|calls| calls.is_empty())
+        {
+            continue;
+        }
+        let text = serve_history_searchable_text(&message.content);
+        if text.trim().is_empty() {
+            continue;
+        }
+        seen += 1;
+        if seen == nth_back {
+            found = Some(text);
+            break;
+        }
+    }
+    let Some(text) = found else {
+        if seen == 0 {
+            return Err("[history] No assistant messages yet.".into());
+        }
+        return Err(format!(
+            "[history] Only {seen} assistant message(s) in history."
+        ));
+    };
+    let header = if nth_back == 1 {
+        "[history] Latest assistant message:".to_string()
+    } else {
+        format!("[history] Assistant message {nth_back} back from latest:")
+    };
+    Ok(format!("{header}\n{text}"))
+}
+
+/// Resolve a rewind target to its user ordinal and canonical index, mirroring
+/// the local resolver's grammar (`u<N>`, bare `N`, `last`/`latest`, single
+/// `grep` match) and error wording.
+fn resolve_serve_rewind_target(
+    messages: &[RemoteHistoryMessage],
+    args: &[&str],
+) -> Result<(usize, usize), String> {
+    let Some(first) = args.first().copied() else {
+        return Err("missing rewind target. try: /history rewind u3".into());
+    };
+    if first == "last" || first == "latest" {
+        let count = serve_user_message_count(messages);
+        if count == 0 {
+            return Err("no user input found in history".into());
+        }
+        let index =
+            serve_user_message_index(messages, count).expect("counted user message resolves");
+        return Ok((count, index));
+    }
+    if first == "grep" {
+        let keyword = args[1..].join(" ");
+        if keyword.trim().is_empty() {
+            return Err("`/history rewind grep` requires a keyword".into());
+        }
+        let mut ordinal = 0usize;
+        let mut matches = Vec::new();
+        for message in messages {
+            if message.role != "user" {
+                continue;
+            }
+            ordinal += 1;
+            let text = serve_history_searchable_text(&message.content);
+            if text
+                .to_ascii_lowercase()
+                .contains(&keyword.to_ascii_lowercase())
+            {
+                matches.push((ordinal, message));
+            }
+        }
+        if matches.is_empty() {
+            return Err(format!("no user input matching {keyword:?}"));
+        }
+        if matches.len() > 1 {
+            // Same disambiguation shape as local: up to 8 `u<N>` candidates.
+            let mut out = format!(
+                "{} user inputs match {keyword:?}; use /history rewind u<N>:",
+                matches.len()
+            );
+            for (ord, message) in matches.iter().take(8) {
+                let preview = serve_truncate_for_terminal(
+                    &serve_history_searchable_text(&message.content)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    120,
+                );
+                out.push_str(&format!("\n  u{ord} {preview}"));
+            }
+            return Err(out);
+        }
+        let (ord, _) = matches[0];
+        let index =
+            serve_user_message_index(messages, ord).expect("matched user message resolves");
+        return Ok((ord, index));
+    }
+    let raw = first
+        .strip_prefix('u')
+        .or_else(|| first.strip_prefix('U'))
+        .unwrap_or(first);
+    let ordinal = raw
+        .parse::<usize>()
+        .map_err(|_| format!("invalid rewind target: {first}. try: /history rewind u3"))?;
+    if ordinal == 0 {
+        return Err("user ordinal must be >= 1".into());
+    }
+    serve_user_message_index(messages, ordinal)
+        .map(|index| (ordinal, index))
+        .ok_or_else(|| format!("user input u{ordinal} not found"))
+}
+
+/// `POST /sessions/{id}/rewind` result: `{"removed": N, "kept": M}`.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct RemoteRewindResult {
+    #[serde(default)]
+    removed: usize,
+    #[serde(default)]
+    kept: usize,
+}
+
+fn post_remote_rewind(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    message_index: usize,
+) -> Result<RemoteRewindResult, String> {
+    let resp = auth(
+        client.post(format!("{base}/sessions/{session_id}/rewind")),
+        token,
+    )
+    .json(&serde_json::json!({"message_index": message_index}))
+    .send()
+    .map_err(|err| format!("rewind request failed: {err}"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(server_error_message(status, &text));
+    }
+    serde_json::from_str(&text)
+        .map_err(|err| format!("serve returned an unexpected rewind body: {err}"))
+}
+
+/// Remote `/history` entry: first-token verbs dispatch like the local
+/// grammar; everything else is a preview. Prints the result; `Err` carries
+/// the detail the caller prefixes with `[serve-chat]`.
+fn run_serve_history_command(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    arg: &str,
+) -> Result<(), String> {
+    let args: Vec<&str> = arg.split_whitespace().collect();
+    let Some(first) = args.first().copied() else {
+        return show_serve_history(client, base, token, session_id, &[]);
+    };
+    match first {
+        "help" => {
+            print_serve_history_help();
+            Ok(())
+        }
+        "rewind" => rewind_serve_history(client, base, token, session_id, &args[1..]),
+        "last" | "replay" => {
+            if first == "replay" && args.len() > 1 {
+                return Err("too many arguments. try: /history replay".into());
+            }
+            if first == "last" && args.len() > 2 {
+                return Err("too many arguments. try: /history last [N]".into());
+            }
+            let nth_back = match args.get(1) {
+                None => 1,
+                Some(raw) => raw.parse::<usize>().map_err(|_| {
+                    format!("invalid /history last argument: {raw}. try: /history last [N]")
+                })?,
+            };
+            if nth_back == 0 {
+                return Err("invalid /history last argument: 0. try: /history last [N]".into());
+            }
+            let messages = fetch_remote_history(client, base, token, session_id)?;
+            println!("{}", render_serve_history_last(&messages, nth_back)?);
+            Ok(())
+        }
+        _ => show_serve_history(client, base, token, session_id, &args),
+    }
+}
+
+fn show_serve_history(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    args: &[&str],
+) -> Result<(), String> {
+    let (view, action) = parse_serve_history_view(args)?;
+    if action == ServeHistoryAction::Help {
+        print_serve_history_help();
+        return Ok(());
+    }
+    let messages = fetch_remote_history(client, base, token, session_id)?;
+    println!("{}", render_serve_history(&messages, &view));
+    Ok(())
+}
+
+fn rewind_serve_history(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    args: &[&str],
+) -> Result<(), String> {
+    // Pure-syntax check first: usage errors must surface before any network
+    // round trip, so a missing or malformed target is never masked by a
+    // transport failure. Range checks still need the fetched messages below.
+    check_serve_rewind_syntax(args)?;
+    let messages = fetch_remote_history(client, base, token, session_id)?;
+    let (ordinal, index) = resolve_serve_rewind_target(&messages, args)?;
+    let removed = messages.len() - index;
+    if removed == 0 {
+        println!("[history] Nothing to rewind.");
+        return Ok(());
+    }
+    // The confirm runs in this client, on this terminal: the turn child this
+    // replaces had nobody to answer it, which is what used to hang.
+    let confirm = crate::commonw::prompt::prompt_yes_or_no_interruptible(&format!(
+        "Rewind from user input u{ordinal} and remove {removed} message(s)? (y/n): "
+    ));
+    if confirm != Some(true) {
+        println!("canceled by user.");
+        return Ok(());
+    }
+    let result = post_remote_rewind(client, base, token, session_id, index)?;
+    println!(
+        "[history] Rewound from u{ordinal} and removed {} message(s); kept {} message(s).",
+        result.removed, result.kept
+    );
+    Ok(())
+}
+
+/// Syntax-only validation of `/history rewind` args: no message list needed,
+/// so callers run this before fetching remote history.
+fn check_serve_rewind_syntax(args: &[&str]) -> Result<(), String> {
+    let Some(first) = args.first().copied() else {
+        return Err("missing rewind target. try: /history rewind u3".into());
+    };
+    if first == "last" || first == "latest" {
+        return Ok(());
+    }
+    if first == "grep" {
+        if args[1..].join(" ").trim().is_empty() {
+            return Err("`/history rewind grep` requires a keyword".into());
+        }
+        return Ok(());
+    }
+    let raw = first
+        .strip_prefix('u')
+        .or_else(|| first.strip_prefix('U'))
+        .unwrap_or(first);
+    let ordinal = raw
+        .parse::<usize>()
+        .map_err(|_| format!("invalid rewind target: {first}. try: /history rewind u3"))?;
+    if ordinal == 0 {
+        return Err("user ordinal must be >= 1".into());
+    }
+    Ok(())
+}
+
+fn print_serve_history_help() {
+    println!(
+        "/history usage (remote session):\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history grep <keyword>  Search messages\n  /history last [N]      Replay the Nth recent assistant conclusion (full text)\n  /history replay        Replay the last assistant conclusion (text only)\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history help          Show this help\n\nCopy/export and other-session views are local-only: print the view here and save or copy it locally. Assistant rows carry no model tag; the history route serves bare messages.",
+        SERVE_HISTORY_DEFAULT_COUNT
+    );
+}
+
+#[cfg(test)]
+mod serve_history_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn test_message(role: &str, text: &str) -> RemoteHistoryMessage {
+        RemoteHistoryMessage {
+            role: role.to_string(),
+            content: json!(text),
+            tool_calls: None,
+        }
+    }
+
+    fn sample_history() -> Vec<RemoteHistoryMessage> {
+        vec![
+            test_message("system", "sys"),
+            test_message("user", "first question"),
+            test_message("assistant", "first answer"),
+            test_message("user", "second question about meego"),
+            test_message("assistant", "second answer"),
+        ]
+    }
+
+    fn default_view() -> ServeHistoryView {
+        ServeHistoryView {
+            count: SERVE_HISTORY_DEFAULT_COUNT,
+            role: ServeHistoryRole::All,
+            full: false,
+            grep: None,
+        }
+    }
+
+    #[test]
+    fn serve_history_view_defaults() {
+        let (view, action) = parse_serve_history_view(&[]).expect("parse");
+        assert_eq!(view, default_view());
+        assert_eq!(action, ServeHistoryAction::Show);
+    }
+
+    #[test]
+    fn serve_history_view_full_roles_and_clamp() {
+        let (view, _) = parse_serve_history_view(&["full"]).expect("parse");
+        assert!(view.full);
+        assert_eq!(view.count, SERVE_HISTORY_FULL_COUNT);
+        let (view, _) = parse_serve_history_view(&["assistant", "8"]).expect("parse");
+        assert_eq!(view.role, ServeHistoryRole::Assistant);
+        assert_eq!(view.count, 8);
+        let (view, _) = parse_serve_history_view(&["999"]).expect("parse");
+        assert_eq!(view.count, SERVE_HISTORY_MAX_COUNT);
+        let (view, _) = parse_serve_history_view(&["0"]).expect("parse");
+        assert_eq!(view.count, 1);
+    }
+
+    #[test]
+    fn serve_history_view_grep_joins_rest() {
+        let (view, _) = parse_serve_history_view(&["user", "grep", "a", "b"]).expect("parse");
+        assert_eq!(view.role, ServeHistoryRole::User);
+        assert_eq!(view.grep.as_deref(), Some("a b"));
+        assert!(parse_serve_history_view(&["grep"]).is_err());
+        assert!(parse_serve_history_view(&["grep", "  "]).is_err());
+    }
+
+    #[test]
+    fn serve_history_view_local_only_forms_error() {
+        let err = parse_serve_history_view(&["export"]).expect_err("export");
+        assert!(err.contains("save the output locally"), "{err}");
+        let err = parse_serve_history_view(&["copy"]).expect_err("copy");
+        assert!(err.contains("copy it locally"), "{err}");
+    }
+
+    #[test]
+    fn serve_history_view_help_and_session_selector() {
+        let (_, action) = parse_serve_history_view(&["user", "help"]).expect("parse");
+        assert_eq!(action, ServeHistoryAction::Help);
+        let err = parse_serve_history_view(&["f830931f"]).expect_err("session");
+        assert!(err.contains("/resume f830931f"), "{err}");
+        let err = parse_serve_history_view(&["user", "bogus"]).expect_err("invalid");
+        assert!(err.contains("invalid /history argument: bogus"), "{err}");
+    }
+
+    #[test]
+    fn serve_user_ordinals_skip_non_user_rows() {
+        let messages = sample_history();
+        assert_eq!(serve_user_message_count(&messages), 2);
+        assert_eq!(serve_user_message_index(&messages, 0), None);
+        assert_eq!(serve_user_message_index(&messages, 1), Some(1));
+        assert_eq!(serve_user_message_index(&messages, 2), Some(3));
+        assert_eq!(serve_user_message_index(&messages, 3), None);
+    }
+
+    #[test]
+    fn serve_history_renders_local_shaped_rows() {
+        let rendered = render_serve_history(&sample_history(), &default_view());
+        assert!(rendered.starts_with("[history] Showing 5 recent message(s):\n"));
+        assert!(rendered.contains("2. [user] first question (u1)\n"));
+        assert!(rendered.contains("4. [user] second question about meego (u2)\n"));
+        assert!(rendered.contains("3. [assistant] first answer\n"));
+        // No model tags: the history route serves bare messages.
+        assert!(!rendered.contains("(model:"));
+    }
+
+    #[test]
+    fn serve_history_preview_truncates_and_collapses() {
+        let long = "word ".repeat(60);
+        let messages = vec![test_message("user", &format!("a\nb  {long}"))];
+        let rendered = render_serve_history(&messages, &default_view());
+        let row = rendered.lines().nth(1).expect("row");
+        assert!(row.starts_with("1. [user] a b word "), "{row}");
+        assert!(row.ends_with("... (u1)"), "{row}");
+        assert!(row.chars().count() < 220, "{row}");
+    }
+
+    #[test]
+    fn serve_history_full_and_filters() {
+        let messages = sample_history();
+        let (mut view, _) = parse_serve_history_view(&["full", "user"]).expect("parse");
+        let rendered = render_serve_history(&messages, &view);
+        assert!(rendered.starts_with("[history] Showing 2 recent user message(s):\n"));
+        view.grep = Some("MEEGO".to_string());
+        let rendered = render_serve_history(&messages, &view);
+        assert!(rendered.contains("matching \"MEEGO\""));
+        assert!(rendered.contains("(u2)"));
+        assert!(!rendered.contains("(u1)"));
+        assert_eq!(
+            render_serve_history(&[], &default_view()),
+            "[history] No recent messages."
+        );
+    }
+
+    #[test]
+    fn serve_history_system_filter_covers_internal_notes() {
+        let messages = vec![
+            test_message("internal_note", "note"),
+            test_message("developer", "dev"),
+        ];
+        let (view, _) = parse_serve_history_view(&["system"]).expect("parse");
+        let rendered = render_serve_history(&messages, &view);
+        assert!(rendered.contains("[internal_note] note"));
+        assert!(!rendered.contains("[developer]"));
+    }
+
+    #[test]
+    fn serve_history_last_skips_tool_calls_and_empty_rows() {
+        let mut messages = sample_history();
+        messages.push(RemoteHistoryMessage {
+            role: "assistant".to_string(),
+            content: json!("tool answer"),
+            tool_calls: Some(vec![json!({"id": "1"})]),
+        });
+        messages.push(test_message("assistant", "   "));
+        let first = render_serve_history_last(&messages, 1).expect("last");
+        assert_eq!(first, "[history] Latest assistant message:\nsecond answer");
+        let second = render_serve_history_last(&messages, 2).expect("last 2");
+        assert!(second.starts_with("[history] Assistant message 2 back from latest:\n"));
+        assert!(second.ends_with("first answer"));
+        assert!(render_serve_history_last(&messages, 3).is_err());
+        assert!(render_serve_history_last(&[], 1).is_err());
+    }
+
+    #[test]
+    fn serve_rewind_target_resolution() {
+        let messages = sample_history();
+        assert!(resolve_serve_rewind_target(&messages, &[]).is_err());
+        assert_eq!(
+            resolve_serve_rewind_target(&messages, &["last"]).expect("last"),
+            (2, 3)
+        );
+        assert_eq!(
+            resolve_serve_rewind_target(&messages, &["latest"]).expect("latest"),
+            (2, 3)
+        );
+        assert_eq!(
+            resolve_serve_rewind_target(&messages, &["u1"]).expect("u1"),
+            (1, 1)
+        );
+        assert_eq!(
+            resolve_serve_rewind_target(&messages, &["2"]).expect("bare"),
+            (2, 3)
+        );
+        assert_eq!(
+            resolve_serve_rewind_target(&messages, &["rewind", "u1"]).expect_err("nested"),
+            "invalid rewind target: rewind. try: /history rewind u3"
+        );
+        assert!(resolve_serve_rewind_target(&messages, &["u0"]).is_err());
+        assert!(resolve_serve_rewind_target(&messages, &["u9"]).is_err());
+        assert!(resolve_serve_rewind_target(&[], &["last"]).is_err());
+    }
+
+    #[test]
+    fn serve_rewind_grep_targets() {
+        let messages = sample_history();
+        assert_eq!(
+            resolve_serve_rewind_target(&messages, &["grep", "meego"]).expect("one match"),
+            (2, 3)
+        );
+        assert!(resolve_serve_rewind_target(&messages, &["grep", "missing"]).is_err());
+        let err =
+            resolve_serve_rewind_target(&messages, &["grep", "question"]).expect_err("multi");
+        assert!(err.contains("2 user inputs match"), "{err}");
+        assert!(err.contains("u1") && err.contains("u2"), "{err}");
+        assert!(resolve_serve_rewind_target(&messages, &["grep"]).is_err());
+    }
+
+    #[test]
+    fn serve_rewind_syntax_precheck_matches_resolver() {
+        // Usage errors must be identical with and without the message list, so
+        // the pre-fetch check never masks or contradicts full resolution.
+        let messages = sample_history();
+        for args in [
+            vec![],
+            vec!["bogus"],
+            vec!["u0"],
+            vec!["grep"],
+            vec!["last"],
+            vec!["u1"],
+            vec!["2"],
+            vec!["grep", "meego"],
+        ] {
+            let pre = check_serve_rewind_syntax(&args);
+            let full = resolve_serve_rewind_target(&messages, &args).map(|_| ());
+            match (pre, full) {
+                (Ok(()), Ok(())) => {}
+                (Err(a), Err(b)) => assert_eq!(a, b, "args: {args:?}"),
+                (a, b) => panic!("syntax/full mismatch for {args:?}: {a:?} vs {b:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn serve_rewind_result_shape() {
+        let result: RemoteRewindResult =
+            serde_json::from_str("{\"removed\": 2, \"kept\": 5}").expect("parse");
+        assert_eq!(
+            result,
+            RemoteRewindResult {
+                removed: 2,
+                kept: 5
+            }
+        );
+    }
+
+    #[test]
+    fn serve_chat_intercepts_local_commands() {
+        // The `_` catch-all must never forward these as turn prompts.
+        assert!(is_local_command_start("/history rewind u40"));
+        assert!(is_local_command_start(":history"));
+        assert!(is_local_command_start("/compact"));
+        assert!(!is_local_command_start("/tmp/foo"));
+        assert!(!is_local_command_start("plain prompt"));
+    }
+}
+
 /// Render one SSE turn stream progressively: message lines print as they
 /// arrive, `delta` events (live body chunks) print without a trailing
-/// newline, thinking frames collapse into one live status line (matching the
-/// local fold: `✓ thinking (N lines)` when closed), error events abort with
+    /// newline, thinking frames collapse into one live status line while the
+    /// block is open and render their buffered body dimmed on close (local-fold
+    /// parity, then the `✓ thinking (N lines)` summary), error events abort with
 /// the server detail, the done event (or the end of the body) ends the turn.
 fn render_turn_stream(
     resp: reqwest::blocking::Response,
@@ -1621,7 +2455,7 @@ pub(in crate::ai) fn run_serve_chat(
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first)\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first)\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/history [N|full|user|assistant|tool|system|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
                 );
                 continue;
             }
@@ -1725,18 +2559,37 @@ pub(in crate::ai) fn run_serve_chat(
             "/agent" | ":agent" => {
                 run_serve_agent_command(arg, &mut selection, &agent_manifests, &mut editor);
             }
-            _ => {
+            // Remote `/history`: previews and rewinds go through the history
+            // HTTP routes, never through a turn child (a child would run the
+            // local command against server state; `rewind` would block on a
+            // stdin confirm nobody can answer and hang the session).
+            "/history" | ":history" => {
                 if let Err(err) =
-                    post_turn_stream(
-                        &client,
-                        &base,
-                        &token,
-                        &session_id,
-                        &trimmed,
-                        &app_config.history_file,
-                        &selection,
-                    )
+                    run_serve_history_command(&client, &base, &token, &session_id, arg)
                 {
+                    eprintln!("[serve-chat] {err}");
+                }
+            }
+            _ => {
+                // A local slash command is never a prompt: the local REPL
+                // would swallow it, so forwarding it as a turn only burns a
+                // model round-trip at best and hangs the session at worst
+                // (`/history rewind` used to block a turn child on stdin).
+                // Anything already handled above never reaches this arm.
+                if is_local_command_start(&trimmed) {
+                    let command = trimmed.split_whitespace().next().unwrap_or(&trimmed);
+                    eprintln!(
+                        "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /history, /model, /effort, /agent, /sessions, /resume, /fork, /close, /bg, /new (see /help)."
+                    );
+                } else if let Err(err) = post_turn_stream(
+                    &client,
+                    &base,
+                    &token,
+                    &session_id,
+                    &trimmed,
+                    &app_config.history_file,
+                    &selection,
+                ) {
                     eprintln!("[serve-chat] {err}");
                 }
             }
