@@ -1,0 +1,22 @@
+{
+  "name": "web_fetch",
+  "description": "Fetch a public HTTP or HTTPS URL without a browser using Jina Reader. Returns bounded Markdown-like text marked as untrusted external content. An optional JINA_API_KEY environment variable enables authenticated upstream access.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string",
+        "description": "Absolute public http:// or https:// URL (maximum 8192 characters).",
+        "minLength": 1,
+        "maxLength": 8192
+      }
+    },
+    "required": [
+      "url"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "core"
+  ]
+}

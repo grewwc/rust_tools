@@ -1,0 +1,22 @@
+{
+  "name": "web_search",
+  "description": "Search the public web without a browser using Jina Search. Returns a bounded text result marked as untrusted external content. An optional JINA_API_KEY environment variable enables authenticated upstream access.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Search query (1-1000 characters).",
+        "minLength": 1,
+        "maxLength": 1000
+      }
+    },
+    "required": [
+      "query"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "core"
+  ]
+}

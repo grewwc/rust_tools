@@ -50,6 +50,14 @@ cargo test --bin a test_name         # run one targeted test in `a`
 cargo test -p aios_kernel test_name  # run one targeted test in a crate
 ```
 
+To deploy changes to the server-capable `a`, build and install all release
+features, then restart the managed server:
+
+```bash
+make install-all
+a --serve-restart
+```
+
 Never run bare `cargo test` / `cargo build --release` / workspace-wide commands
 for routine verification, and never repeat `cargo test` without a code change.
 Prefer an existing focused test before running one.
