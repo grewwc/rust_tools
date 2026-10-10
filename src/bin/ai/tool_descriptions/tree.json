@@ -10,7 +10,9 @@
       },
       "max_depth": {
         "type": "integer",
-        "description": "Maximum depth to recurse (default: 3, max: 6)."
+        "description": "Maximum depth to recurse (default: 3, max: 6).",
+        "minimum": 0,
+        "maximum": 6
       },
       "show_hidden": {
         "type": "boolean",

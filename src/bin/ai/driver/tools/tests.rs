@@ -506,16 +506,20 @@ fn overflow_stub_argument_guard_catches_transcribed_stubs() {
     assert!(super::prepare_tool_call(&mcp, &real, None).is_ok());
     let recovery = tool_call_with_args(
         "apply_patch",
-        r#"{"patch_file": "/tmp/x.patch", "f": true}"#,
+        r#"{"patch_file": "/tmp/x.patch"}"#,
     );
     assert!(super::prepare_tool_call(&mcp, &recovery, None).is_ok());
     // A marker key that is not true-ish (e.g. a nested value named like the
-    // marker with boolean false) must not trip the guard.
+    // marker with boolean false) must not trip the stub guard: it is rejected
+    // as an undeclared argument instead, never as a pointer stub.
     let benign = tool_call_with_args(
         "apply_patch",
         r#"{"_context_overflow_truncated": false, "patch": "x"}"#,
     );
-    assert!(super::prepare_tool_call(&mcp, &benign, None).is_ok());
+    let err = super::prepare_tool_call(&mcp, &benign, None)
+        .expect_err("undeclared marker key must be rejected, but not as a stub");
+    assert!(err.content.contains("unknown argument(s)"), "{err:?}");
+    assert!(!err.content.contains("context-overflow pointer stub"), "{err:?}");
 }
 
 #[test]
@@ -537,4 +541,333 @@ fn plan_update_not_found_gets_plan_specific_hint() {
     let generic = super::remediation_hint("read_file", "no such file: /x/y", None).unwrap();
     assert!(generic.contains("verify the path or identifier"), "{generic}");
     assert!(!generic.contains("plan-state.json"), "{generic}");
+}
+
+#[test]
+fn schema_gate_rejects_wrong_typed_arguments_before_dispatch() {
+    // A present-but-wrongly-typed value must fail at the central dispatch
+    // point instead of reaching the service layer, where `as_u64().unwrap_or`
+    // would silently coerce it into a default (e.g. `offset: "500"` reading
+    // from line 1 while the model believes it read from line 500).
+    let mcp = McpClient::new();
+    let mistyped = tool_call_with_args(
+        "read_file",
+        r#"{"file_path": "src/main.rs", "offset": "500"}"#,
+    );
+    let err = super::prepare_tool_call(&mcp, &mistyped, None)
+        .expect_err("wrong-typed offset must be rejected centrally");
+    assert!(err.content.contains("invalid arguments for 'read_file'"), "{err:?}");
+    // Correctly typed arguments still pass through.
+    let typed = tool_call_with_args(
+        "read_file",
+        r#"{"file_path": "src/main.rs", "offset": 500}"#,
+    );
+    assert!(super::prepare_tool_call(&mcp, &typed, None).is_ok());
+    // Missing required fields are rejected as well.
+    let missing = tool_call_with_args("read_file", r#"{"offset": 500}"#);
+    assert!(super::prepare_tool_call(&mcp, &missing, None).is_err());
+}
+
+#[test]
+fn schema_gate_normalizes_compat_shapes_before_validating() {
+    let mcp = McpClient::new();
+    // Historical `path` alias for `file_path` (accepted by
+    // `resolve_file_path_arg` / `optional_file_path_arg`) must pass the gate.
+    let alias = tool_call_with_args("read_file", r#"{"path": "src/main.rs"}"#);
+    assert!(super::prepare_tool_call(&mcp, &alias, None).is_ok());
+    // Provider-materialized null for an optional field means "not provided".
+    let null_optional = tool_call_with_args(
+        "apply_patch",
+        r#"{"patch": null, "patch_file": "/tmp/compat.patch"}"#,
+    );
+    assert!(super::prepare_tool_call(&mcp, &null_optional, None).is_ok());
+    // Explicit null for a required field is still rejected.
+    let null_required = tool_call_with_args("read_file", r#"{"file_path": null}"#);
+    assert!(super::prepare_tool_call(&mcp, &null_required, None).is_err());
+    // Unknown extra fields are rejected for builtin tools: the published
+    // schema is the whole contract the model sees, and services silently
+    // ignore undeclared keys.
+    let extra = tool_call_with_args(
+        "read_file",
+        r#"{"file_path": "src/main.rs", "note": "junk"}"#,
+    );
+    let err = super::prepare_tool_call(&mcp, &extra, None)
+        .expect_err("undeclared read_file key must be rejected centrally");
+    assert!(err.content.contains("unknown argument(s)"), "{err:?}");
+}
+
+#[test]
+fn schema_gate_resolves_all_declared_compat_aliases() {
+    let mcp = McpClient::new();
+    // `write_file` shares the historical `path` alias via
+    // `resolve_file_path_arg`.
+    let write_alias = tool_call_with_args(
+        "write_file",
+        r#"{"path": "src/main.rs", "content": "hi"}"#,
+    );
+    assert!(super::prepare_tool_call(&mcp, &write_alias, None).is_ok());
+    // `apply_patch` accepts `path` via `optional_file_path_arg`.
+    let patch_alias = tool_call_with_args(
+        "apply_patch",
+        r#"{"path": "/tmp/compat.patch", "patch_file": "/tmp/compat.patch"}"#,
+    );
+    assert!(super::prepare_tool_call(&mcp, &patch_alias, None).is_ok());
+    // `send_side_note` aliases (`content`, `target_task_id`, `target`) are
+    // honored by `execute_send_side_note` but undeclared in the schema.
+    let side_note_alias = tool_call_with_args(
+        "send_side_note",
+        r#"{"content": "steer left", "target_task_id": "task-1"}"#,
+    );
+    assert!(super::prepare_tool_call(&mcp, &side_note_alias, None).is_ok());
+    let side_note_target = tool_call_with_args(
+        "send_side_note",
+        r#"{"note": "steer left", "target": "task-1"}"#,
+    );
+    assert!(super::prepare_tool_call(&mcp, &side_note_target, None).is_ok());
+    // The canonical key wins when both spellings are present; the alias must
+    // not linger as an unknown field.
+    let both = tool_call_with_args(
+        "read_file",
+        r#"{"file_path": "src/main.rs", "path": "other.rs"}"#,
+    );
+    assert!(super::prepare_tool_call(&mcp, &both, None).is_ok());
+    // An alias for another tool's field stays unknown here: `content` is a
+    // real `write_file` parameter, not a `read_file` alias for `note`.
+    let foreign = tool_call_with_args(
+        "read_file",
+        r#"{"file_path": "src/main.rs", "content": "junk"}"#,
+    );
+    assert!(super::prepare_tool_call(&mcp, &foreign, None).is_err());
+}
+
+#[test]
+fn schema_gate_rejects_silent_divergence_beyond_read_file() {
+    let mcp = McpClient::new();
+    // `write_file` ignores undeclared keys while overwriting: a model passing
+    // `append: true` believes it appends but the service truncates.
+    let append = tool_call_with_args(
+        "write_file",
+        r#"{"file_path": "src/main.rs", "content": "hi", "append": true}"#,
+    );
+    let err = super::prepare_tool_call(&mcp, &append, None)
+        .expect_err("write_file append must be rejected centrally");
+    assert!(err.content.contains("unknown argument(s)"), "{err:?}");
+    // Negative integers pass `type: integer` but `as_u64().unwrap_or` silently
+    // coerces them into defaults downstream.
+    let negative_timeout = tool_call_with_args(
+        "execute_command",
+        r#"{"command": "ls", "pty": false, "timeout": -1}"#,
+    );
+    assert!(super::prepare_tool_call(&mcp, &negative_timeout, None).is_err());
+    let negative_depth =
+        tool_call_with_args("tree", r#"{"max_depth": -1}"#);
+    assert!(super::prepare_tool_call(&mcp, &negative_depth, None).is_err());
+    // In-range values still pass.
+    let sane_timeout = tool_call_with_args(
+        "execute_command",
+        r#"{"command": "ls", "pty": false, "timeout": 60}"#,
+    );
+    assert!(super::prepare_tool_call(&mcp, &sane_timeout, None).is_ok());
+    let sane_depth = tool_call_with_args("tree", r#"{"max_depth": 2}"#);
+    assert!(super::prepare_tool_call(&mcp, &sane_depth, None).is_ok());
+}
+
+#[test]
+fn schema_gate_rejects_negative_read_window_before_dispatch() {
+    let mcp = McpClient::new();
+    // Negative integers pass `type: integer`, but the service reads them via
+    // `as_u64().unwrap_or(default)` and would silently coerce them into
+    // defaults; the schema minimums close that hole at the gate.
+    let negative_offset =
+        tool_call_with_args("read_file", r#"{"file_path": "src/main.rs", "offset": -1}"#);
+    assert!(super::prepare_tool_call(&mcp, &negative_offset, None).is_err());
+    let zero_limit =
+        tool_call_with_args("read_file", r#"{"file_path": "src/main.rs", "limit": 0}"#);
+    assert!(super::prepare_tool_call(&mcp, &zero_limit, None).is_err());
+    let sane_window = tool_call_with_args(
+        "read_file",
+        r#"{"file_path": "src/main.rs", "offset": 10, "limit": 20}"#,
+    );
+    assert!(super::prepare_tool_call(&mcp, &sane_window, None).is_ok());
+}
+
+#[test]
+fn schema_gate_rejects_out_of_range_integers_before_dispatch() {
+    // Every optional integer below would otherwise pass `type: integer` and
+    // then be silently coerced by the service layer (`as_u64().unwrap_or`,
+    // `.clamp`, `.min`, or `as u8` truncation), so the model-requested value
+    // and the executed value diverge. The schema bounds close that hole at
+    // the gate with a retryable error.
+    let mcp = McpClient::new();
+    let cases = [
+        ("task_wait", r#"{"task_ids": ["t"], "timeout_secs": -1}"#),
+        ("task_wait", r#"{"task_ids": ["t"], "timeout_secs": 900}"#),
+        ("search_overflow", r#"{"query": "x", "context_lines": -1}"#),
+        ("search_overflow", r#"{"query": "x", "max_results": 0}"#),
+        ("search_overflow", r#"{"query": "x", "max_results": 201}"#),
+        ("knowledge_search", r#"{"query": "x", "limit": 0}"#),
+        ("knowledge_list", r#"{"limit": 101}"#),
+        ("knowledge_semantic_search", r#"{"query": "x", "limit": 21}"#),
+        ("knowledge_save", r#"{"content": "x", "priority": 256}"#),
+        ("knowledge_save", r#"{"content": "x", "priority": -1}"#),
+        ("list_skills", r#"{"limit": 0}"#),
+        ("sleep_process", r#"{"turns": 0}"#),
+        ("spawn_process", r#"{"name": "p", "goal": "g", "priority": 300}"#),
+        ("spawn_process", r#"{"name": "p", "goal": "g", "quota_turns": -1}"#),
+        ("spawn_daemon", r#"{"name": "d", "goal": "g", "max_restarts": -1}"#),
+        ("session_distill", r#"{"archive": "/tmp/a.zip", "limit": 101}"#),
+    ];
+    for (tool, args) in cases {
+        let call = tool_call_with_args(tool, args);
+        assert!(
+            super::prepare_tool_call(&mcp, &call, None).is_err(),
+            "{tool} must reject out-of-range integer: {args}"
+        );
+    }
+    // Boundary values the services honor verbatim still pass the gate: 0
+    // context lines, unlimited quota (0), no restarts (0), and the documented
+    // timeout ceiling are all meaningful calls.
+    let ok_cases = [
+        ("task_wait", r#"{"task_ids": ["t"], "timeout_secs": 60}"#),
+        ("search_overflow", r#"{"query": "x", "context_lines": 0}"#),
+        ("spawn_process", r#"{"name": "p", "goal": "g", "quota_turns": 0}"#),
+        ("spawn_daemon", r#"{"name": "d", "goal": "g", "max_restarts": 0}"#),
+    ];
+    for (tool, args) in ok_cases {
+        let call = tool_call_with_args(tool, args);
+        assert!(
+            super::prepare_tool_call(&mcp, &call, None).is_ok(),
+            "{tool} must accept meaningful boundary value: {args}"
+        );
+    }
+}
+
+/// Registered contract for every builtin integer argument: (tool, path,
+/// minimum, maximum, why). `path` uses `.` for nested objects and `[].` for
+/// array items. A `None` bound is intentional only with a reason:
+/// fail-closed service parsing (`as_u64().ok_or`, loud on any bad value, so
+/// there is no silent-default hole) or signed semantics (`as_i64`, where
+/// negatives are valid). The test below walks the whole registry, so a new
+/// integer parameter fails until its author registers it here.
+const INT_BOUND_REGISTRY: &[(&str, &str, Option<i64>, Option<i64>, &str)] = &[
+    ("execute_command", "timeout", Some(1), Some(300), "service clamps 1-300"),
+    ("task_wait", "timeout_secs", Some(1), Some(60), "service clamps 1-60"),
+    ("search_overflow", "context_lines", Some(0), Some(5), "unwrap_or(2).min(5); 0 is valid"),
+    ("search_overflow", "max_results", Some(1), Some(200), "service clamps 1-200"),
+    ("knowledge_search", "limit", Some(1), None, "no upper clamp; 0 would return empty"),
+    ("knowledge_list", "limit", Some(1), Some(100), "unwrap_or(20).min(100)"),
+    ("knowledge_semantic_search", "limit", Some(1), Some(20), "service clamps 1-20"),
+    ("knowledge_save", "priority", Some(0), Some(255), "u8 range; service rejects >255"),
+    ("knowledge_consolidate", "save_entries[].priority", Some(0), Some(255), "same u8 parser"),
+    ("list_skills", "limit", Some(1), Some(100), "service clamps 1-100"),
+    ("list_skill_resources", "limit", Some(1), Some(200), "pre-existing bound, pinned"),
+    ("read_skill_resource", "limit", Some(1), Some(65536), "pre-existing bound, pinned"),
+    ("read_file", "offset", Some(1), None, "no upper clamp in service"),
+    ("read_file", "char_offset", Some(0), None, "0 is valid; no upper clamp"),
+    ("read_file", "limit", Some(1), None, "no upper clamp in service"),
+    ("run_agent_graph", "max_parallel", Some(1), Some(8), "pre-existing bound, pinned"),
+    ("run_agent_graph", "static_graph.nodes[].max_retries", Some(0), None, "pre-existing, pinned"),
+    ("run_agent_graph", "dynamic_graph.policy.min_selected", Some(2), None, "pre-existing, pinned"),
+    ("run_agent_graph", "dynamic_graph.policy.max_selected", Some(2), None, "pre-existing, pinned"),
+    ("show_changes", "limit_snippet", Some(0), Some(4000), "pre-existing bound, pinned"),
+    ("sleep_process", "turns", Some(1), None, "documented minimum 1; no upper clamp"),
+    ("spawn_process", "priority", Some(0), Some(255), "u8 range; larger values truncate via `as u8`"),
+    ("spawn_process", "quota_turns", Some(0), None, "0 means unlimited per ResourceLimit::from_legacy"),
+    ("spawn_daemon", "priority", Some(0), Some(255), "u8 range, as above"),
+    ("spawn_daemon", "quota_turns", Some(0), None, "0 means unlimited, as above"),
+    ("spawn_daemon", "max_restarts", Some(0), None, "0 disables restarts; no upper clamp"),
+    ("session_distill", "limit", Some(1), Some(100), "service clamps 1-100"),
+    ("tree", "max_depth", Some(0), Some(6), "pre-existing bound, pinned"),
+    ("manage_team", "budget.max_parallel", Some(1), Some(8), "validate_budget enforces 1-8"),
+    ("manage_team", "budget.max_tasks", Some(1), Some(512), "validate_budget enforces 1-512"),
+    ("manage_team", "budget.max_total_attempts", Some(1), Some(4096), "validate_budget enforces <=4096"),
+    ("manage_team", "budget.max_messages", Some(1), Some(2048), "validate_budget enforces 1-2048"),
+    ("manage_team", "lease_secs", Some(1), Some(86400), "service clamps 1-86400"),
+    ("kill_process", "pid", None, None, "service ok_or fails closed; no silent default"),
+    ("reap_process", "pid", None, None, "service ok_or fails closed; no silent default"),
+    ("wait_process", "pid", None, None, "service ok_or fails closed; no silent default"),
+    ("signal_process", "pid", None, None, "service ok_or fails closed; no silent default"),
+    ("send_ipc_message", "pid", None, None, "service ok_or fails closed; no silent default"),
+    ("set_process_group", "pid", None, None, "service ok_or fails closed; no silent default"),
+    ("set_process_group", "pgid", None, None, "service ok_or fails closed; no silent default"),
+    ("signal_process_group", "pgid", None, None, "service ok_or fails closed; no silent default"),
+    ("plan", "steps[].step", None, None, "parse_step_specs ok_or fails closed; labels only"),
+    ("plan_update", "step", None, None, "service ok_or fails closed; unknown steps report not-found"),
+    ("save_skill", "priority", None, None, "signed as_i64; negative precedence is valid"),
+    ("save_skill", "subskills[].priority", None, None, "signed as_i64; negative precedence is valid"),
+];
+
+fn collect_int_bounds(
+    schema: &serde_json::Value,
+    prefix: String,
+    out: &mut Vec<(String, Option<i64>, Option<i64>)>,
+) {
+    let Some(props) = schema.get("properties").and_then(|v| v.as_object()) else {
+        return;
+    };
+    for (name, prop) in props {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        match prop.get("type").and_then(|v| v.as_str()) {
+            Some("integer") => out.push((
+                path,
+                prop.get("minimum").and_then(|v| v.as_i64()),
+                prop.get("maximum").and_then(|v| v.as_i64()),
+            )),
+            Some("object") => collect_int_bounds(prop, path, out),
+            Some("array") => {
+                if let Some(items) = prop.get("items") {
+                    collect_int_bounds(items, format!("{path}[]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn builtin_integer_schemas_match_registered_bounds() {
+    use crate::ai::tools::{ToolGroup, tool_definitions_for_groups};
+    use std::collections::BTreeSet;
+
+    let mut unregistered = Vec::new();
+    let mut drifted = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    // `ToolGroup::ALL` walks every grouped builtin tool; the only ungrouped
+    // tool (`request_user_input`) declares no integer arguments, so it cannot
+    // hide an unregistered bound.
+    for def in tool_definitions_for_groups(ToolGroup::ALL) {
+        let name = def.function.name.as_str();
+        let schema = &def.function.parameters;
+        let mut found = Vec::new();
+        collect_int_bounds(schema, String::new(), &mut found);
+        for (path, min, max) in found {
+            seen.insert((name.to_string(), path.clone()));
+            match INT_BOUND_REGISTRY
+                .iter()
+                .find(|(tool, prop, _, _, _)| *tool == name && *prop == path)
+            {
+                None => unregistered.push(format!("{name}.{path}")),
+                Some((_, _, expected_min, expected_max, _)) => {
+                    if *expected_min != min || *expected_max != max {
+                        drifted.push(format!(
+                            "{name}.{path}: schema=({min:?},{max:?}) registered=({expected_min:?},{expected_max:?})"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let stale: Vec<String> = INT_BOUND_REGISTRY
+        .iter()
+        .filter(|(tool, prop, _, _, _)| !seen.contains(&(tool.to_string(), prop.to_string())))
+        .map(|(tool, prop, _, _, _)| format!("{tool}.{prop}"))
+        .collect();
+    assert!(
+        unregistered.is_empty() && drifted.is_empty() && stale.is_empty(),
+        "integer bound registry mismatch:\nnew unregistered: {unregistered:?}\ndrifted: {drifted:?}\nstale entries: {stale:?}"
+    );
 }

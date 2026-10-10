@@ -574,7 +574,10 @@ pub(super) fn finalize_live_folds_before_diagnostic(state: &mut StreamProcessing
 pub(super) fn thinking_fold_window_lines(fold: &super::state::ThinkingFoldState) -> (Vec<String>, usize) {
     let hidden_count = thinking_fold_hidden_count(fold);
     let visible_lines = thinking_fold_visible_lines(fold);
-    if hidden_count == 0 && visible_lines.is_empty() {
+    // Nothing to show below the header: a `… N earlier lines` marker alone would
+    // repeat the header's own `· N lines` count and point at lines that are
+    // nowhere on screen, so the fold renders header-only in that state.
+    if visible_lines.is_empty() {
         return (Vec::new(), 0);
     }
 

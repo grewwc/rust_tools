@@ -47,26 +47,33 @@ $(INSTALLW): $(INSTALLW_DEPS)
 # `re` lives in crates/re, not src/bin/, so installw's build mode (which
 # resolves src/bin/<bin>.rs dependencies) never emits it; build it explicitly
 # and let move_executable.sh's install mode decide whether to re-copy.
+# bin `a` always builds with `serve-client` so `a --serve-chat` works out of
+# the box; the axum server still needs `install-all` (`serve`). `a` builds
+# separately because `--features` cannot mix with `-p` crate builds.
 .PHONY: install
 install: $(INSTALLW) $(addprefix $(RELEASE_DIR)/,$(MCP_BINS))
 	$(eval REQUESTED := $(filter-out install,$(MAKECMDGOALS)))
 	$(eval BINS := $(or $(REQUESTED),$(INSTALL_BINS)))
 	@set -e; \
 	if [ -n "$(REQUESTED)" ]; then \
-		args=""; \
+		args=""; with_a=""; \
 		for b in $(BINS); do \
+			if [ "$$b" = "a" ]; then with_a="yes"; continue; fi; \
 			case "$$b" in mcp_browser|mcp_computer|mcp_excel|mcp_pdf) args="$$args -p $$b --bin $$b";; *) args="$$args --bin $$b";; esac; \
 		done; \
-		cargo build --release $$args; \
+		if [ -n "$$with_a" ]; then cargo build --release --features serve-client --bin a; fi; \
+		if [ -n "$$args" ]; then cargo build --release $$args; fi; \
 		sh ./move_executable.sh --force $(BINS); \
 	else \
 		bins=$$($(INSTALLW) -- $(BINS)); \
 		if [ -n "$$bins" ]; then \
-			args=""; \
+			args=""; with_a=""; \
 			for b in $$bins; do \
+				if [ "$$b" = "a" ]; then with_a="yes"; continue; fi; \
 				case "$$b" in mcp_browser|mcp_computer|mcp_excel|mcp_pdf) args="$$args -p $$b --bin $$b";; *) args="$$args --bin $$b";; esac; \
 			done; \
-			cargo build --release $$args; \
+			if [ -n "$$with_a" ]; then cargo build --release --features serve-client --bin a; fi; \
+			if [ -n "$$args" ]; then cargo build --release $$args; fi; \
 		fi; \
 		cargo build --release -p re; \
 		sh ./move_executable.sh $(BINS); \

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
-use crate::ai::files::extract_key_lines;
+use crate::ai::files::{extract_key_lines, split_line_number_prefix};
 use crate::ai::{
     history::HistoryMessageSummarizer,
     tools::{
@@ -51,6 +51,9 @@ pub(super) async fn build_persisted_summary_text_with_app(
     prepare_tool_messages_structured(
         &mut prepared,
         360,
+        // No overflow dir here: non-compressible results cannot spill, so the
+        // floor cannot apply.
+        0,
         KEEP_RECENT_TOOL_GROUPS,
         None,
         None,
@@ -77,9 +80,17 @@ pub(super) fn normalize_internal_notes_for_summary_model(messages: &mut Vec<Mess
     *messages = super::summary_delta_messages(messages);
 }
 
+/// Prepare tool messages for a tighter budget: results that compress by line are
+/// trimmed down to `max_chars_per_msg`, while non-compressible results
+/// (`read_file`, `execute_command`, ...) that exceed both `max_chars_per_msg` and
+/// `spill_min_chars` spill to `overflow_dir` as preview stubs.
+///
+/// `spill_min_chars = 0` keeps the legacy threshold, which is what a caller that
+/// must reach a hard target still wants.
 pub(super) fn prepare_tool_messages_structured(
     messages: &mut [Message],
     max_chars_per_msg: usize,
+    spill_min_chars: usize,
     keep_recent_groups: usize,
     overflow_dir: Option<&Path>,
     cwd: Option<&Path>,
@@ -127,6 +138,7 @@ pub(super) fn prepare_tool_messages_structured(
             if !is_explicitly_protected
                 && !protected_indices.contains(&idx)
                 && text.chars().count() > max_chars_per_msg
+                && text.chars().count() >= spill_min_chars
             {
                 // When reading back an asset already archived for this session,
                 // reuse the existing file so "spill → read-back → spill again"
@@ -983,22 +995,22 @@ fn preserved_tool_overflow_hint(
         .any(|line| line.starts_with("- original_command: "));
     match tool_name {
         "read_file" if has_original_file_path && preview_inline => {
-            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Use preview/`original_range` first; for current content, read a smaller range of `original_file_path` and split large patches instead of re-reading the archive. Read `file_path` only for exact historical output."
+            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Use preview/`original_range` first; for current content, read a smaller range of `original_file_path` and split large patches instead of re-reading the archive. Read `file_path` only for exact historical output. The preview is an anchor, not the content: if the task requires following, citing, or transforming what was read, re-read `original_file_path` before proceeding."
         }
         "read_file" if has_original_file_path => {
-            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Use `original_range` first; for current content, read a smaller range of `original_file_path` and split large patches instead of re-reading the archive. Read `file_path` only for exact historical output."
+            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Use `original_range` first; for current content, read a smaller range of `original_file_path` and split large patches instead of re-reading the archive. Read `file_path` only for exact historical output. If the task requires following, citing, or transforming what was read, re-read `original_file_path` before proceeding."
         }
         "read_file" if preview_inline => {
-            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Use preview first; read `file_path` only if exact historical output is required."
+            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Use preview first; read `file_path` only if exact historical output is required. The preview is an anchor, not the content: if the task requires following or citing what was read, re-read the original path before proceeding."
         }
         "read_file" => {
-            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Read `file_path` only if exact historical output is required."
+            "Archived snapshot of an earlier read; folded out of inline context for budget reasons, not a source-file limit. Read `file_path` only if exact historical output is required. If the task requires following or citing what was read, re-read the original path before proceeding."
         }
         "execute_command" if has_original_command => {
-            "Archived command output folded out of inline context for budget reasons. Continue from `original_command` / `original_cwd`; `file_path` is an archive, not a source file - read it only for the full log."
+            "Archived command output folded out of inline context for budget reasons. Continue from `original_command` / `original_cwd`; `file_path` is an archive, not a source file - read it only for the full log. If the task depends on the exact earlier output (parsing, citing, transforming), re-run `original_command` before proceeding."
         }
         _ => {
-            "Archived output folded out of inline context for budget reasons; `file_path` holds full text. Read it only if the preview is insufficient."
+            "Archived output folded out of inline context for budget reasons; `file_path` holds full text. Read it only if the preview is insufficient. The preview is an anchor, not the content: if the task requires the full content, recover it before proceeding."
         }
     }
 }
@@ -1377,6 +1389,10 @@ pub(super) fn build_overflow_content_preview(content: &str) -> String {
     const TAIL_LINES: usize = 2;
     const MAX_LINE_CHARS: usize = 200;
     const MAX_KEY_LINES: usize = 20;
+    // Line-numbered probes spread over the omitted middle. They assume no
+    // format at all, so documents, logs and data dumps stay locatable even
+    // when the structural key_lines index finds nothing.
+    const MID_PROBES: usize = 8;
 
     let truncate_line = |line: &str| -> String {
         if line.chars().count() > MAX_LINE_CHARS {
@@ -1419,6 +1435,37 @@ pub(super) fn build_overflow_content_preview(content: &str) -> String {
             "... [{} line(s) omitted; read the file above for full content] ...\n",
             total - HEAD_LINES - TAIL_LINES
         ));
+        // Probe the omitted middle instead of leaving it invisible: the first
+        // and last omitted lines are always included, so no gap between
+        // samples exceeds `middle_len / (MID_PROBES - 1)` lines.
+        let middle_start = HEAD_LINES;
+        let middle_end = total - TAIL_LINES;
+        let middle_len = middle_end - middle_start;
+        let probes = MID_PROBES.min(middle_len);
+        out.push_str(&format!(
+            "- middle_samples ({probes} line-numbered probes across the omitted middle):\n"
+        ));
+        for k in 0..probes {
+            let idx = if probes == 1 {
+                middle_start
+            } else {
+                middle_start + k * (middle_len - 1) / (probes - 1)
+            };
+            let trimmed = lines[idx].trim();
+            let (label, matched) = match split_line_number_prefix(trimmed) {
+                Some((no, rest)) => (no, rest.trim()),
+                None => (idx, trimmed),
+            };
+            // key_lines prints the same `  L<no>: ` anchors; a probe that would
+            // duplicate one adds nothing.
+            let anchor = format!("  L{label}: ");
+            if out.contains(&anchor) {
+                continue;
+            }
+            out.push_str(&anchor);
+            out.push_str(&truncate_line(matched));
+            out.push('\n');
+        }
         for line in &lines[total - TAIL_LINES..] {
             out.push_str(&truncate_line(line));
             out.push('\n');

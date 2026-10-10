@@ -266,6 +266,9 @@ pub(in crate::ai) fn shrink_messages_to_fit(
     prepare_tool_messages_structured(
         &mut messages,
         480,
+        // Backstop shrink keeps the legacy threshold: it runs only after the
+        // routine tier could not free enough, so the bytes are genuinely needed.
+        0,
         KEEP_RECENT_TOOL_GROUPS,
         overflow_dir,
         cwd,
@@ -678,6 +681,9 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
     prepare_tool_messages_structured(
         &mut messages,
         480,
+        // Same rationale as `shrink_messages_to_fit`: the backstop folds every
+        // result over the legacy threshold.
+        0,
         KEEP_RECENT_TOOL_GROUPS,
         overflow_dir,
         cwd,

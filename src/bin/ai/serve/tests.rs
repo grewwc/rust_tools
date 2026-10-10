@@ -739,6 +739,7 @@ use super::*;
             model: Some("explicit".to_string()),
             agent: None,
             reasoning_effort: None,
+            skills: Vec::new(),
         };
         super::merge_session_config(&mut overrides, &stored);
         assert_eq!(
@@ -997,6 +998,7 @@ use super::*;
             reasoning_effort: reasoning_effort.map(str::to_string),
             images: Vec::new(),
             confirm: None,
+            skills: Vec::new(),
         }
     }
 
@@ -1026,6 +1028,45 @@ use super::*;
         assert!(turn_overrides(&turn_req(None, None, Some("ultra"))).is_err());
         let long = "m".repeat(super::MAX_TURN_OVERRIDE_CHARS + 1);
         assert!(turn_overrides(&turn_req(Some(&long), None, None)).is_err());
+    }
+
+    #[test]
+    fn turn_skills_sanitize_and_reject() {
+        // Trims, drops blanks, dedupes case-insensitively keeping input order.
+        let mut req = turn_req(None, None, None);
+        req.skills = vec![
+            " bytedcli ".to_string(),
+            "ByteDcli".to_string(),
+            "".to_string(),
+            "  ".to_string(),
+        ];
+        let overrides = turn_overrides(&req).expect("valid");
+        assert_eq!(overrides.skills, vec!["bytedcli".to_string()]);
+        // Flag-shaped and non-identifier names are rejected.
+        let mut req = turn_req(None, None, None);
+        req.skills = vec!["--evil".to_string()];
+        assert!(turn_overrides(&req).is_err());
+        let mut req = turn_req(None, None, None);
+        req.skills = vec!["not a name".to_string()];
+        assert!(turn_overrides(&req).is_err());
+        // The count is capped so one request cannot bloat the child prompt.
+        let mut req = turn_req(None, None, None);
+        req.skills = (0..super::MAX_TURN_SKILLS + 1)
+            .map(|i| format!("s{i}"))
+            .collect();
+        assert!(turn_overrides(&req).is_err());
+    }
+
+    #[test]
+    fn turn_skills_prefix_splices_inline_references() {
+        assert_eq!(super::apply_turn_skills_prefix("hi", &[]), "hi");
+        assert_eq!(
+            super::apply_turn_skills_prefix(
+                "hi",
+                &["bytedcli".to_string(), "code-review".to_string()]
+            ),
+            "@skills:bytedcli @skills:code-review hi"
+        );
     }
 
     fn upload(name: &str, bytes: &[u8]) -> ServeImageUpload {

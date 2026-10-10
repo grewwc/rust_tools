@@ -2,6 +2,27 @@ use super::*;
 use crate::ai::types::{FunctionCall, ToolCall};
 use rustc_hash::FxHashSet;
 
+/// Legacy-threshold wrapper: these tests replicate `shrink_messages_to_fit`,
+/// which folds every non-compressible result over the per-message cap.
+fn prepare_tool_messages_structured(
+    messages: &mut [Message],
+    max_chars_per_msg: usize,
+    keep_recent_groups: usize,
+    overflow_dir: Option<&std::path::Path>,
+    cwd: Option<&std::path::Path>,
+    protected_tool_call_ids: &FxHashSet<String>,
+) {
+    super::prepare_tool_messages_structured(
+        messages,
+        max_chars_per_msg,
+        0,
+        keep_recent_groups,
+        overflow_dir,
+        cwd,
+        protected_tool_call_ids,
+    );
+}
+
 fn msg(role: &str, content: &str) -> Message {
     Message {
         role: role.to_string(),

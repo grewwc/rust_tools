@@ -691,6 +691,7 @@ fn build_current_turn_tool_overflow_stub(
             "Output too large for current-turn raw context; full `{tool_name}` result saved to overflow archive.\n\
              The COMPLETE output is NOT in context.\n\
              Do NOT read this overflow file by default; first use summary / key_lines / previews below.\n\
+             The previews are anchors, not the content: when the task requires following, citing, or transforming this output, recover the full text (re-run the original operation or read the original source path) instead of treating the previews as the content.\n\
              - file_path: {}\n",
             path.display()
         )

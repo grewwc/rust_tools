@@ -14,6 +14,8 @@
       },
       "limit": {
         "type": "integer",
+        "minimum": 1,
+        "maximum": 20,
         "description": "Max results (default: 5)."
       },
       "hybrid": {

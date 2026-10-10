@@ -24,7 +24,10 @@ members = [
 default = []
 # Enables agent hang investigation hooks; keep disabled for normal development and release builds.
 agent-hang-debug = []
-serve = ["dep:axum"]
+# Client-only serve support (`a --serve-chat`, `a --serve-sessions`): needs no
+# extra dependencies. The `serve` feature adds the axum HTTP server on top.
+serve-client = []
+serve = ["dep:axum", "serve-client"]
 
 [dependencies]
 arboard = "3.6.1"

@@ -6,7 +6,7 @@ use super::{
     declares_hidden_group, ensure_required_baseline_tools, escape_xml_attr,
     filter_mcp_tools_by_allowed_servers, has_tool, manifest_tool_definitions,
     merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
-    select_mcp_tools, session_context_prompt, tool_uses_mcp_server,
+    select_mcp_tools, session_context_prompt, session_issue_likely, tool_uses_mcp_server,
 };
 use crate::ai::agents::{AgentManifest, AgentMode};
 use crate::ai::driver::runtime_ctx::{SUBAGENT_CWD, SUBAGENT_DEPTH};
@@ -735,6 +735,36 @@ fn session_context_prompt_mentions_id_layout_and_read_only_rule() {
 }
 
 #[test]
+fn session_issue_likely_covers_debugging_intents_in_both_languages() {
+    // Hits: the session-debugging intents the gate must not miss.
+    for question in [
+        "resume the background run",
+        "attach to session f6bb0f1c",
+        "where is my sessionid stored",
+        "list /sessions archives",
+        "历史记录怎么恢复",
+        "会话重连后看不到历史输出",
+        "恢复之前的会话",
+    ] {
+        assert!(
+            session_issue_likely(question),
+            "session debugging intent missed: {question}"
+        );
+    }
+    // Misses: unrelated turns keep the one-line session id.
+    for question in ["write a fizzbuzz", "explain Rust lifetimes"] {
+        assert!(
+            !session_issue_likely(question),
+            "unrelated question over-injected the layout: {question}"
+        );
+    }
+    // Accepted over-injection, pinned: a general knowledge question about
+    // history matches too. A missed debug session costs more than ~500
+    // carried characters, so the gate stays broad on purpose.
+    assert!(session_issue_likely("history of Rust"));
+}
+
+#[test]
 fn system_prompt_routes_project_file_deletes_to_apply_patch() {
     let mut available = SkipSet::new(16);
     available.insert("write_file".to_string());
@@ -1348,7 +1378,7 @@ fn system_prompt_keeps_code_grounding_calls_serial() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
     assert!(prompt.contains("Navigate code serially"));
-    assert!(prompt.contains("read one sufficiently broad needed region, then patch it"));
+    assert!(prompt.contains("read one sufficiently broad needed region, then take the task-appropriate action"));
     assert!(prompt.contains("Do not batch code reads"));
     assert!(
         !prompt.contains("Work in batches: when several independent read-only lookups are needed")

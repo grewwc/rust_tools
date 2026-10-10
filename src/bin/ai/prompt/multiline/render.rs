@@ -38,6 +38,21 @@ const COMPLETION_WINDOW: usize = 12;
 /// longest title users actually need.
 const MODEL_LINE_MAX_COLUMNS: u16 = 120;
 
+/// Columns the chrome rows (model/topic line, help line, transient status
+/// line) deliberately leave clear at the terminal's right edge.
+///
+/// A painted row that reaches the last terminal column is soft-wrapped by the
+/// terminal into two visual rows on the next narrowing, even when the app
+/// repaints nothing: the wrap shows the row's tail as an extra line (the
+/// "folded" status line), the cursor-row probe then reads the wrapped row as
+/// the truth, and the fixed viewport re-anchors one row lower. Rebuilds only
+/// ever move the box down, so every fold cycle strands it one row lower and
+/// the blank gap above the input box grows monotonically while idle. The
+/// live-size jitter tolerance intentionally keeps painting through one-column
+/// narrowings, so the truncation budgets below hold back this margin: a stale
+/// paint stays at least two columns short of even the narrowed edge.
+const CHROME_EDGE_MARGIN: u16 = 2;
+
 /// Styles only cells occupied by input text.
 ///
 /// Applying a foreground color through `TextArea::set_style` styles the whole
@@ -224,7 +239,44 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     reasoning_effort_label: &str,
     session_topic: Option<&str>,
 ) -> Option<Position> {
-    let area = f.area();
+    let frame_width = f.area().width;
+    render_multiline_popup_with_width(
+        f,
+        textarea,
+        status_msg,
+        completion_panel,
+        agent_label,
+        model_label,
+        model_remote,
+        reasoning_effort_label,
+        session_topic,
+        frame_width,
+    )
+}
+
+/// Renders against the live terminal width even while ratatui's fixed viewport
+/// still has the previous width. On a narrowing, painting against that stale
+/// width makes xterm soft-wrap the title before the delayed viewport rebuild
+/// can replace it with an ellipsis.
+pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_width(
+    f: &mut ratatui::Frame<'_>,
+    textarea: &mut TextArea<'_>,
+    status_msg: Option<&str>,
+    completion_panel: Option<&CompletionPanel>,
+    agent_label: &str,
+    model_label: &str,
+    model_remote: bool,
+    reasoning_effort_label: &str,
+    session_topic: Option<&str>,
+    live_width: u16,
+) -> Option<Position> {
+    let frame_area = f.area();
+    let area = Rect::new(
+        frame_area.x,
+        frame_area.y,
+        frame_area.width.min(live_width.max(1)),
+        frame_area.height,
+    );
     let current_lines = textarea.lines().to_vec();
     let current_content = current_lines.join("\n");
     let trailing_blank_lines = count_trailing_blank_lines(&current_lines);
@@ -315,7 +367,12 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                 .add_modifier(Modifier::ITALIC),
         ));
         let header = Line::from(spans);
-        let max_width = (header_area.width as usize).min(MODEL_LINE_MAX_COLUMNS as usize);
+        // Hold back the edge margin so a stale-width paint through a
+        // one-column narrowing can never reach the last terminal column and
+        // soft-wrap (see CHROME_EDGE_MARGIN).
+        let max_width = (header_area.width as usize)
+            .min(MODEL_LINE_MAX_COLUMNS as usize)
+            .saturating_sub(CHROME_EDGE_MARGIN as usize);
         let truncated_header = truncate_line_to_width(&header, max_width);
         f.render_widget(Paragraph::new(truncated_header), header_area);
     }
@@ -557,7 +614,14 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     let help_area = chunks[4];
     let truncated_help_lines = help_lines
         .into_iter()
-        .map(|line| truncate_line_to_width(&line, help_area.width as usize))
+        // Same edge margin as the model line: the help row is equally able to
+        // fold the viewport when it touches the last terminal column.
+        .map(|line| {
+            truncate_line_to_width(
+                &line,
+                (help_area.width as usize).saturating_sub(CHROME_EDGE_MARGIN as usize),
+            )
+        })
         .collect::<Vec<_>>();
     f.render_widget(Paragraph::new(truncated_help_lines), help_area);
 
@@ -573,7 +637,9 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                 clear_area
             };
             if status_area.width > 0 {
-                let status_width = status_area.width as usize;
+                // Same edge margin as the other chrome rows.
+                let status_width = (status_area.width as usize)
+                    .saturating_sub(CHROME_EDGE_MARGIN as usize);
                 let status_text = truncate_with_ellipsis(msg, status_width);
                 let status_para = Paragraph::new(Line::from(Span::styled(
                     status_text,
@@ -797,8 +863,9 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        count_trailing_blank_lines, popup_layout_config, render_multiline_popup,
-        MODEL_LINE_MAX_COLUMNS, truncate_line_to_width, truncate_with_ellipsis,
+        CHROME_EDGE_MARGIN, MODEL_LINE_MAX_COLUMNS, count_trailing_blank_lines,
+        popup_layout_config, render_multiline_popup, render_multiline_popup_with_width,
+        truncate_line_to_width, truncate_with_ellipsis,
     };
     use ratatui::{
         Terminal, TerminalOptions, Viewport,
@@ -808,7 +875,7 @@ mod tests {
         text::{Line, Span},
     };
     use tui_textarea::{CursorMove, TextArea};
-    use unicode_width::UnicodeWidthStr;
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
     fn display_width(s: &str) -> usize {
         UnicodeWidthStr::width_cjk(s)
@@ -992,11 +1059,13 @@ mod tests {
         );
         // The real reflow invariant: the row's right edge must never cross the
         // terminal width. The popup is centered and the line is capped, so the
-        // right edge lands at popup_x + 1 + min(popup_width - 2, cap), which is
-        // always at most one column short of the terminal width. Asserting it
-        // directly guards future cap increases that would re-wrap on narrowing.
+        // right edge lands at popup_x + 1 + min(popup_width - 2, cap) minus the
+        // edge margin, which stays at least two columns short of the terminal
+        // width even after a one-column narrowing the jitter tolerance ignores.
+        // Asserting it directly guards future cap increases that would re-wrap
+        // on narrowing.
         assert!(
-            painted as u16 <= viewport_area.width,
+            painted as u16 + CHROME_EDGE_MARGIN <= viewport_area.width,
             "model line crosses the terminal width: {row:?}"
         );
     }
@@ -1014,9 +1083,9 @@ mod tests {
         )
         .unwrap();
         let mut textarea = TextArea::default();
-        // 31 full-width characters = 62 columns, one past the 61 columns the
-        // 120-column budget leaves for the topic (59-column prefix, one column
-        // reserved for the marker).
+        // 31 full-width characters = 62 columns, past the 57 columns the
+        // 118-column budget leaves for the topic (59-column prefix, two
+        // columns for the marker and two held back for the edge margin).
         let topic = "这是一个用于验证超长会话标题在模型行中被截断并标记省略号的测试";
         let mut viewport_area = Rect::ZERO;
 
@@ -1044,10 +1113,10 @@ mod tests {
         // with its whitespace removed instead of as a contiguous substring.
         let dense: String = row.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert!(row.contains('…'), "truncated topic without a marker: {row:?}");
-        // 29 full-width characters (58 columns) fit after the 59-column prefix;
-        // the two-column marker completes the 120-column row. A 30th character
-        // would overflow the 118-column text budget.
-        let cut_at = topic.char_indices().nth(29).unwrap().0;
+        // 28 full-width characters (56 columns) fit after the 59-column prefix;
+        // the two-column marker ends the row at 117 of the 118 columns. A 29th
+        // character would overflow the 116-column text budget.
+        let cut_at = topic.char_indices().nth(28).unwrap().0;
         assert!(
             dense.ends_with(&format!("|{}…", &topic[..cut_at])),
             "{row:?}"
@@ -1098,6 +1167,137 @@ mod tests {
         assert!(
             !dense.contains('…'),
             "title fits the budget, no marker expected: {row:?}"
+        );
+    }
+
+    /// Chrome rows hold an edge margin on narrow terminals: below ~42 columns
+    /// the popup spans the full terminal width, so without the margin the
+    /// model line would paint into the last column and a single ignored
+    /// one-column narrowing would soft-wrap it into a folded second visual
+    /// row, re-anchoring the viewport one row lower per cycle.
+    #[test]
+    fn chrome_lines_hold_an_edge_margin_on_narrow_terminals() {
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(40, 12),
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .unwrap();
+        let mut textarea = TextArea::default();
+        let topic = "这是一个用于验证超长会话标题在模型行中被截断并标记省略号的测试";
+        let mut viewport_area = Rect::ZERO;
+
+        terminal
+            .draw(|f| {
+                viewport_area = f.area();
+                render_multiline_popup(
+                    f,
+                    &mut textarea,
+                    None,
+                    None,
+                    "",
+                    "deepseek-v4.1-flash-volcano",
+                    false,
+                    "max",
+                    Some(topic),
+                );
+            })
+            .unwrap();
+
+        // The model line is the row above the help row, which is the viewport tail.
+        let model_row = buffer_row(
+            terminal.backend(),
+            viewport_area.bottom() - 2,
+            0,
+            viewport_area.width,
+        );
+        let help_row = buffer_row(
+            terminal.backend(),
+            viewport_area.bottom() - 1,
+            0,
+            viewport_area.width,
+        );
+        // Measure with the renderer's width table, not the CJK one: `↵`
+        // counts two columns under width_cjk but renders as one (both the
+        // test backend and xterm advance a single cell), leaving a blank
+        // cell the CJK measurement would mistake for paint. The truncate
+        // budget still counts two, so production keeps the full margin.
+        // The model row is ASCII at this width (the long topic is fully cut),
+        // so its painted width is exact: it must hold the full edge margin.
+        // This is the reported bug's row — a variable-length topic that used
+        // to paint into the last column and fold on narrowing.
+        let model_painted = UnicodeWidthStr::width(model_row.trim_end());
+        assert!(
+            model_painted as u16 + CHROME_EDGE_MARGIN <= viewport_area.width,
+            "model line touches the edge and would fold on narrowing: painted={model_painted} width={} {model_row:?}",
+            viewport_area.width,
+        );
+        // The help row carries CJK, and joining backend cells overcounts every
+        // CJK by one column against the renderer's own accounting, so a tight
+        // bound is unmeasurable here. Keep the repo's loose overflow guard
+        // (same form as the wide-terminal test above): allow exactly one
+        // phantom column per wide char. The margin itself is enforced by the
+        // shared truncation call site, reviewed alongside the model row.
+        let help_painted = UnicodeWidthStr::width(help_row.trim_end());
+        let wide = help_row
+            .chars()
+            .filter(|c| UnicodeWidthChar::width_cjk(*c).unwrap_or(1) > 1)
+            .count();
+        assert!(
+            help_painted as u16 <= viewport_area.width + wide as u16,
+            "help line overflows the terminal width: painted={help_painted} width={} {help_row:?}",
+            viewport_area.width,
+        );
+        assert!(
+            model_row.contains('…'),
+            "long topic is still truncated, not dropped: {model_row:?}"
+        );
+    }
+
+    #[test]
+    fn live_narrow_width_truncates_the_first_title_paint() {
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(120, 12),
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .unwrap();
+        let mut textarea = TextArea::default();
+        let mut stale_frame_area = Rect::ZERO;
+
+        terminal
+            .draw(|f| {
+                stale_frame_area = f.area();
+                render_multiline_popup_with_width(
+                    f,
+                    &mut textarea,
+                    None,
+                    None,
+                    "build",
+                    "muse-spark-1.3-contributor-opencode",
+                    false,
+                    "xhigh",
+                    Some("这是一个在终端变窄首帧就必须省略而不能折叠的长标题"),
+                    40,
+                );
+            })
+            .unwrap();
+
+        assert_eq!(stale_frame_area.width, 120);
+        let model_y = stale_frame_area.bottom() - 2;
+        let live_row = buffer_row(terminal.backend(), model_y, 0, 40);
+        let stale_tail = buffer_row(terminal.backend(), model_y, 40, 80);
+        let painted = UnicodeWidthStr::width(live_row.trim_end());
+        assert!(live_row.contains('…'), "title was not truncated: {live_row:?}");
+        assert!(
+            painted as u16 + CHROME_EDGE_MARGIN <= 40,
+            "title reaches the live terminal edge: painted={painted} {live_row:?}",
+        );
+        assert!(
+            stale_tail.trim().is_empty(),
+            "the stale viewport width was painted: {stale_tail:?}",
         );
     }
 

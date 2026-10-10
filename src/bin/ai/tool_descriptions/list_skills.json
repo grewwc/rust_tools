@@ -10,6 +10,8 @@
       },
       "limit": {
         "type": "integer",
+        "minimum": 1,
+        "maximum": 100,
         "description": "Maximum number of matching skills to return (default 50, maximum 100)."
       }
     }

@@ -257,12 +257,15 @@ fn apply_remote_header(editor: &mut PromptEditor, info: &ServerInfo, topic: Opti
 /// every turn request (`TurnReq` overrides) and the child CLI resolves them
 /// through the same registry path as the local REPL. `reasoning_effort` is
 /// `None` when cleared (server default), `Some("off")` when disabled, else
-/// the explicit tier.
+/// the explicit tier. `skills` holds the pending forced skills from
+/// `/skills use` (next turn only, like the local REPL): they ride along as
+/// the `skills` turn field and are cleared once the server accepts the turn.
 #[derive(Debug, Clone)]
 struct ServeTurnSelection {
     model: String,
     agent: String,
     reasoning_effort: Option<String>,
+    skills: Vec<String>,
 }
 
 impl ServeTurnSelection {
@@ -276,6 +279,7 @@ impl ServeTurnSelection {
                 }
                 _ => None,
             },
+            skills: Vec::new(),
         }
     }
 
@@ -307,6 +311,116 @@ impl ServeTurnSelection {
         }
         editor.set_current_reasoning_effort_label(self.effective_effort_label());
     }
+}
+
+/// Field-wise update for `POST /sessions/{id}/config` (the shape of
+/// `serve::types::SessionConfigReq`): an absent field keeps the server's
+/// stored value, a blank string clears it, a value sets it. The serve-chat
+/// `/model`/`/effort`/`/agent` handlers return one so the caller persists only
+/// what actually changed — switching the model must not wipe a stored effort.
+#[derive(Debug, Default, Serialize)]
+struct ServeConfigPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+}
+
+impl ServeConfigPatch {
+    fn is_empty(&self) -> bool {
+        self.model.is_none() && self.agent.is_none() && self.reasoning_effort.is_none()
+    }
+}
+
+/// Server-side body of `GET /sessions/{id}/config`: an empty field means
+/// "server default".
+#[derive(Debug, Deserialize, Default)]
+struct ServeSessionConfig {
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    agent: String,
+    #[serde(default)]
+    reasoning_effort: String,
+}
+
+/// Best-effort persist of a selection change to the server's session config,
+/// so a later reconnect (`a --serve-chat --session <id>`) resumes the picks
+/// instead of server defaults. A failure is reported once and never blocks the
+/// chat.
+fn persist_serve_config_patch(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    patch: &ServeConfigPatch,
+) {
+    if patch.is_empty() {
+        return;
+    }
+    let Ok(body) = serde_json::to_string(patch) else {
+        return;
+    };
+    match auth(
+        client.post(format!("{base}/sessions/{session_id}/config")),
+        token,
+    )
+    .header("Content-Type", "application/json")
+    .body(body)
+    .send()
+    {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => eprintln!(
+            "[serve-chat] failed to persist session picks: {}",
+            server_error_message(resp.status(), &resp.text().unwrap_or_default())
+        ),
+        Err(err) => eprintln!("[serve-chat] failed to persist session picks: {err}"),
+    }
+}
+
+/// Fold a server-stored session config into the client selection. Stored
+/// non-empty picks override the `/info` defaults so a reconnect resumes the
+/// last `/model`/`/effort`/`/agent` state. Returns true when something
+/// changed (callers refresh the input-box header in that case).
+fn merge_restored_session_config(cfg: &ServeSessionConfig, selection: &mut ServeTurnSelection) -> bool {
+    let mut changed = false;
+    if !cfg.model.is_empty() && cfg.model != selection.model {
+        selection.model = cfg.model.clone();
+        changed = true;
+    }
+    if !cfg.agent.is_empty() && cfg.agent != selection.agent {
+        selection.agent = cfg.agent.clone();
+        changed = true;
+    }
+    if !cfg.reasoning_effort.is_empty()
+        && selection.reasoning_effort.as_deref() != Some(cfg.reasoning_effort.as_str())
+    {
+        selection.reasoning_effort = Some(cfg.reasoning_effort.clone());
+        changed = true;
+    }
+    changed
+}
+
+/// Fetch and apply the server-stored session picks (`GET /sessions/{id}/config`).
+/// Best-effort: an unreachable or unknown session keeps the `/info` defaults.
+fn restore_serve_session_picks(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    selection: &mut ServeTurnSelection,
+) -> bool {
+    let cfg = auth(client.get(format!("{base}/sessions/{session_id}/config")), token)
+        .send()
+        .ok()
+        .filter(|resp| resp.status().is_success())
+        .and_then(|resp| resp.text().ok())
+        .and_then(|text| serde_json::from_str::<ServeSessionConfig>(&text).ok());
+    cfg.as_ref()
+        .map(|cfg| merge_restored_session_config(cfg, selection))
+        .unwrap_or(false)
 }
 
 /// Normalize a non-empty `/effort` argument to the stored override value.
@@ -354,7 +468,7 @@ fn run_serve_model_command(
     arg: &str,
     selection: &mut ServeTurnSelection,
     editor: &mut PromptEditor,
-) -> Option<String> {
+) -> (Option<String>, ServeConfigPatch) {
     let arg = arg.trim();
     if arg.is_empty() || arg.eq_ignore_ascii_case("current") || arg.eq_ignore_ascii_case("cur") {
         if selection.model.is_empty() {
@@ -366,7 +480,7 @@ fn run_serve_model_command(
             println!("(remote) current model: {}", selection.model);
         }
         println!("(remote) effort: {}", selection.effective_effort_label());
-        return None;
+        return (None, ServeConfigPatch::default());
     }
     if arg.eq_ignore_ascii_case("list") || arg.eq_ignore_ascii_case("ls") {
         let current_handle = model_names::find_by_identifier(&selection.model)
@@ -382,13 +496,13 @@ fn run_serve_model_command(
             };
             println!("{marker} {}", models::model_display_label(&handle));
         }
-        return None;
+        return (None, ServeConfigPatch::default());
     }
     if arg.eq_ignore_ascii_case("help") || arg.eq_ignore_ascii_case("h") {
         println!("(remote) /model <selector> [question] - switch remote model");
         println!("(remote) /model list|current|help - inspect remote models");
         println!("(remote) /model effort <level> - same as /effort <level>");
-        return None;
+        return (None, ServeConfigPatch::default());
     }
     let (head, head_rest) = match arg.split_once(char::is_whitespace) {
         Some((h, r)) => (h, r.trim()),
@@ -397,10 +511,10 @@ fn run_serve_model_command(
     if head.eq_ignore_ascii_case("effort") {
         if head_rest.is_empty() {
             println!("(remote) effort: {}", selection.effective_effort_label());
-            return None;
+            return (None, ServeConfigPatch::default());
         }
-        run_serve_effort_command(head_rest, selection, editor);
-        return None;
+        let patch = run_serve_effort_command(head_rest, selection, editor);
+        return (None, patch);
     }
     let (selector, question) = split_serve_model_inline(arg);
     match model_names::find_by_identifier(&selector) {
@@ -409,11 +523,17 @@ fn run_serve_model_command(
             selection.model = handle.clone();
             selection.apply_header(editor);
             println!("(remote) switched model to {}", models::model_display_label(&handle));
-            question
+            (
+                question,
+                ServeConfigPatch {
+                    model: Some(handle),
+                    ..Default::default()
+                },
+            )
         }
         None => {
             println!("(remote) unknown model {selector:?}; see /model list");
-            None
+            (None, ServeConfigPatch::default())
         }
     }
 }
@@ -424,21 +544,29 @@ fn run_serve_effort_command(
     arg: &str,
     selection: &mut ServeTurnSelection,
     editor: &mut PromptEditor,
-) -> Option<String> {
+) -> ServeConfigPatch {
     let arg = arg.trim();
     if arg.is_empty() {
         println!("(remote) effort: {}", selection.effective_effort_label());
-        return None;
+        return ServeConfigPatch::default();
     }
     match normalize_serve_effort_arg(arg) {
         Ok(override_value) => {
-            selection.reasoning_effort = override_value;
+            selection.reasoning_effort = override_value.clone();
             selection.apply_header(editor);
             println!("(remote) effort: {}", selection.effective_effort_label());
+            // Persist the pick server-side: a blank value clears the stored
+            // effort (`/effort auto`), a tier or "off" stores it.
+            ServeConfigPatch {
+                reasoning_effort: Some(override_value.unwrap_or_default()),
+                ..Default::default()
+            }
         }
-        Err(err) => println!("(remote) {err}"),
+        Err(err) => {
+            println!("(remote) {err}");
+            ServeConfigPatch::default()
+        }
     }
-    None
 }
 
 /// Handle `/agent` in serve-chat. Mirrors the local `/agent` branches
@@ -451,7 +579,7 @@ fn run_serve_agent_command(
     selection: &mut ServeTurnSelection,
     agent_manifests: &[agents::AgentManifest],
     editor: &mut PromptEditor,
-) {
+) -> ServeConfigPatch {
     let arg = arg.trim();
     if arg.is_empty() || arg.eq_ignore_ascii_case("list") || arg.eq_ignore_ascii_case("ls") {
         let primary = agents::get_primary_agents(agent_manifests);
@@ -459,39 +587,225 @@ fn run_serve_agent_command(
             let marker = if agent.name == selection.agent { "*" } else { " " };
             println!("{marker} {} - {}", agent.name, agent.description);
         }
-        return;
+        return ServeConfigPatch::default();
     }
     if arg.eq_ignore_ascii_case("current") || arg.eq_ignore_ascii_case("cur") {
         println!("(remote) current agent: {}", selection.agent);
-        return;
+        return ServeConfigPatch::default();
     }
     if arg.eq_ignore_ascii_case("help") || arg.eq_ignore_ascii_case("h") {
         println!("(remote) /agent <name> - switch remote agent (primary only)");
-        return;
+        return ServeConfigPatch::default();
     }
     if arg.eq_ignore_ascii_case("reload") {
         println!("(remote) agent reload is server-side; reconnect to refresh");
-        return;
+        return ServeConfigPatch::default();
     }
     match agents::find_agent_by_name(agent_manifests, arg) {
         Some(manifest) => {
             if !manifest.is_primary() {
                 println!("(remote) agent {:?} is not switchable", manifest.name);
-                return;
+                return ServeConfigPatch::default();
             }
             if manifest.disabled {
                 println!("(remote) agent {:?} is disabled", manifest.name);
-                return;
+                return ServeConfigPatch::default();
             }
             selection.agent = manifest.name.clone();
+            let mut patch = ServeConfigPatch {
+                agent: Some(manifest.name.clone()),
+                ..Default::default()
+            };
             if let Some(model) = manifest.model.as_deref().filter(|m| !m.trim().is_empty()) {
-                selection.model = models::determine_model(model);
+                let resolved = models::determine_model(model);
+                selection.model = resolved.clone();
+                patch.model = Some(resolved);
             }
             selection.apply_header(editor);
             println!("(remote) switched agent to {}", manifest.name);
+            patch
         }
-        None => println!("(remote) unknown agent {arg:?}; see /agent list"),
+        None => {
+            println!("(remote) unknown agent {arg:?}; see /agent list");
+            ServeConfigPatch::default()
+        }
     }
+}
+
+/// One entry of `GET /skills`: only name + description matter to the client
+/// (unknown manifest fields are ignored by serde).
+#[derive(Debug, Deserialize)]
+struct ServeSkillEntry {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// Fetch the server's skill list: the names a remote turn can actually force.
+/// Errors carry the cause; callers surface them with the `(remote)` prefix.
+fn fetch_serve_skills(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+) -> Result<Vec<ServeSkillEntry>, Box<dyn std::error::Error>> {
+    let resp = auth(client.get(format!("{base}/skills")), token).send()?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().unwrap_or_default();
+        return Err(server_error_message(status, &text).into());
+    }
+    let entries: Vec<ServeSkillEntry> = resp.json()?;
+    Ok(entries
+        .into_iter()
+        .filter(|e| !e.name.trim().is_empty())
+        .collect())
+}
+
+/// Print the server skill list, marking the pending next-turn selection.
+fn print_serve_skills_list(entries: &[ServeSkillEntry], selected: &[String]) {
+    if entries.is_empty() {
+        println!("(remote) no skills available on server");
+        return;
+    }
+    for entry in entries {
+        let marker = if selected.iter().any(|n| n == &entry.name) {
+            "*"
+        } else {
+            " "
+        };
+        let desc = entry.description.trim();
+        if desc.is_empty() {
+            println!("{marker} {}", entry.name);
+        } else {
+            println!("{marker} {}  · {desc}", entry.name);
+        }
+    }
+}
+
+/// Split a `/skills <names...> [question]` remainder against the server skill
+/// list: greedily collect consecutive leading tokens that match a skill name
+/// (case-insensitive, canonicalized to the manifest spelling, deduped, input
+/// order kept); the rest becomes the turn question, verbatim. Pure:
+/// unit-tested below.
+fn split_serve_skills_inline(
+    known: &[ServeSkillEntry],
+    arg: &str,
+) -> (Vec<String>, Option<String>) {
+    let mut names: Vec<String> = Vec::new();
+    let mut rest = arg.trim_start();
+    loop {
+        let token = rest.split_whitespace().next().unwrap_or("");
+        if token.is_empty() {
+            break;
+        }
+        let hit = known.iter().find(|e| e.name.eq_ignore_ascii_case(token));
+        match hit {
+            Some(entry) => {
+                if !names.iter().any(|n| n == &entry.name) {
+                    names.push(entry.name.clone());
+                }
+                rest = rest[token.len()..].trim_start();
+            }
+            None => break,
+        }
+    }
+    let question = if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_string())
+    };
+    (names, question)
+}
+
+/// Handle `/skills` in serve-chat. Mirrors the local `/skills` branches
+/// (`driver/commands/skills.rs`): bare/`list` prints the server skill list,
+/// `current` shows the pending next-turn selection, `use <names>` pins names
+/// for the next turn, `clear` drops the pin, and the implicit
+/// `/skills <names...> [question]` form selects and optionally sends
+/// immediately. Returns a pending prompt for the inline-question form.
+/// Validation runs against the server list: only the server knows which
+/// names its own manifests can force.
+fn run_serve_skills_command(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    arg: &str,
+    selection: &mut ServeTurnSelection,
+) -> Option<String> {
+    let arg = arg.trim();
+    if arg.eq_ignore_ascii_case("current") || arg.eq_ignore_ascii_case("cur") {
+        if selection.skills.is_empty() {
+            println!("(remote) no skills selected for next turn");
+        } else {
+            println!(
+                "(remote) skills for next turn: {}",
+                selection.skills.join(", ")
+            );
+        }
+        return None;
+    }
+    if arg.eq_ignore_ascii_case("help") || arg.eq_ignore_ascii_case("h") {
+        println!("(remote) /skills [list|current|use <name>...|clear|<names...> [question]] - force server skills for the next turn");
+        return None;
+    }
+    if arg.eq_ignore_ascii_case("clear") {
+        selection.skills.clear();
+        println!("(remote) cleared skills for next turn");
+        return None;
+    }
+    let entries = match fetch_serve_skills(client, base, token) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!("[serve-chat] {err}");
+            return None;
+        }
+    };
+    if arg.is_empty() || arg.eq_ignore_ascii_case("list") || arg.eq_ignore_ascii_case("ls") {
+        print_serve_skills_list(&entries, &selection.skills);
+        return None;
+    }
+    if arg.eq_ignore_ascii_case("use") {
+        println!("(remote) Usage: /skills use <skill-name> [<skill-name>...]");
+        print_serve_skills_list(&entries, &selection.skills);
+        return None;
+    }
+    // Explicit `use <names>`: every token must name a server skill (unknown
+    // names abort without touching the pending selection, like the local
+    // command). The implicit form below instead splits names from a trailing
+    // question.
+    let (names, question) = match arg.split_once(char::is_whitespace) {
+        Some((head, tail)) if head.eq_ignore_ascii_case("use") => {
+            let mut names: Vec<String> = Vec::new();
+            let mut missing: Vec<String> = Vec::new();
+            for token in tail.split_whitespace() {
+                match entries.iter().find(|e| e.name.eq_ignore_ascii_case(token)) {
+                    Some(entry) => {
+                        if !names.iter().any(|n| n == &entry.name) {
+                            names.push(entry.name.clone());
+                        }
+                    }
+                    None => missing.push(token.to_string()),
+                }
+            }
+            if !missing.is_empty() {
+                println!(
+                    "(remote) unknown skill(s): {}; see /skills list",
+                    missing.join(", ")
+                );
+                return None;
+            }
+            (names, None)
+        }
+        _ => split_serve_skills_inline(&entries, arg),
+    };
+    if names.is_empty() {
+        println!("(remote) unknown /skills subcommand: {arg:?}; see /skills list");
+        return None;
+    }
+    selection.skills = names.clone();
+    println!("(remote) skills selected for next turn: {}", names.join(", "));
+    question
 }
 
 /// Best-effort listing refresh before each input box (short timeout, errors
@@ -1538,9 +1852,9 @@ mod serve_history_tests {
 
 /// Render one SSE turn stream progressively: message lines print as they
 /// arrive, `delta` events (live body chunks) print without a trailing
-    /// newline, thinking frames collapse into one live status line while the
-    /// block is open and render their buffered body dimmed on close (local-fold
-    /// parity, then the `✓ thinking (N lines)` summary), error events abort with
+/// newline, thinking frames collapse into one live status line while the
+/// block is open and print only the `✓ thinking (N lines)` summary on close
+/// (local-fold parity: the body is discarded), error events abort with
 /// the server detail, the done event (or the end of the body) ends the turn.
 fn render_turn_stream(
     resp: reqwest::blocking::Response,
@@ -1600,6 +1914,13 @@ fn render_turn_stream_to_with_confirm(
     // newline, or a live thinking status). Footer/message lines must start
     // on a fresh row instead of gluing onto the answer's last line.
     let mut line_open = false;
+    // End-of-stream metrics summaries (`↳ cache` / `↳ speed`) buffered instead
+    // of printed inline: a turn can keep streaming body chunks afterwards
+    // (multi-round model calls), and the FIFO/stdout pumps can reorder the two,
+    // so printing one here would tear the answer's open line mid-sentence.
+    // They flush at end-of-turn, like the local client which prints metrics
+    // after the answer completes.
+    let mut deferred_metrics: Vec<String> = Vec::new();
     // Local-equivalent Markdown rendering: on a TTY the body deltas go
     // through the shared streaming renderer (tables, code blocks, math),
     // exactly like the local turn output. Piped output stays raw so
@@ -1641,6 +1962,7 @@ fn render_turn_stream_to_with_confirm(
                     tty,
                     out,
                 );
+                flush_deferred_metrics(&mut deferred_metrics, &mut line_open, out);
                 let msg = serde_json::from_str::<serde_json::Value>(payload)
                     .ok()
                     .and_then(|v| {
@@ -1664,6 +1986,7 @@ fn render_turn_stream_to_with_confirm(
                     tty,
                     out,
                 );
+                flush_deferred_metrics(&mut deferred_metrics, &mut line_open, out);
                 return Ok(());
             }
             "thinking_start" => {
@@ -1734,8 +2057,8 @@ fn render_turn_stream_to_with_confirm(
                 }
             }
             "thinking_done" => {
-                // The buffered body (if any) is complete: render it before
-                // the fold summary row.
+                // The buffered body (if any) is complete: discard it and print
+                // only the fold summary row.
                 if tty {
                     let _ = markdown.flush_pending_to(out);
                 }
@@ -1864,16 +2187,34 @@ fn render_turn_stream_to_with_confirm(
                     tty,
                     out,
                 );
-                // Body deltas carry no trailing newline, so the first footer
-                // line would otherwise glue onto the answer's last line.
-                if line_open {
-                    let _ = writeln!(out);
+                // Metrics summaries must not tear the answer's open line (see
+                // `deferred_metrics`): buffer them for the end-of-turn flush.
+                // Every other observer row keeps the previous inline behavior.
+                if is_deferred_metrics_footer(payload) {
+                    deferred_metrics.push(payload.to_string());
+                    let _ = out.flush();
+                } else {
+                    // Body deltas carry no trailing newline, so the first footer
+                    // line would otherwise glue onto the answer's last line.
+                    if line_open {
+                        let _ = writeln!(out);
+                    }
+                    // The turn header (`print_info` in `request/transport.rs`)
+                    // is forwarded as a plain stdout row, so without a marker
+                    // the serve-chat scrollback is indistinguishable from a
+                    // local run. Annotate only that row; every other observer
+                    // row stays byte-identical.
+                    let row = if is_turn_header_row(payload) {
+                        annotate_remote_turn_header(payload, tty)
+                    } else {
+                        payload.to_string()
+                    };
+                    let _ = writeln!(out, "{row}");
+                    // The appended newline closes the output line even when the
+                    // stdout-derived payload has no line terminator of its own.
+                    line_open = false;
+                    let _ = out.flush();
                 }
-                let _ = writeln!(out, "{payload}");
-                // The appended newline closes the output line even when the
-                // stdout-derived payload has no line terminator of its own.
-                line_open = false;
-                let _ = out.flush();
             }
         }
     }
@@ -1889,6 +2230,7 @@ fn render_turn_stream_to_with_confirm(
         tty,
         out,
     );
+    flush_deferred_metrics(&mut deferred_metrics, &mut line_open, out);
     Ok(())
 }
 
@@ -1901,6 +2243,105 @@ fn thinking_summary(newlines: usize, chars: usize) -> usize {
     }
 }
 
+/// Whether a stdout-derived footer row is an end-of-stream metrics summary.
+/// These (`↳ cache …`, `↳ speed …`) describe a finished stream, but the turn
+/// may keep going; matching on the marker (not the full line) keeps this
+/// robust to the child's indent/ANSI styling. Body text never reaches this
+/// path (it arrives as `delta` events), so a quoted marker in the answer
+/// cannot be misclassified here.
+fn is_deferred_metrics_footer(payload: &str) -> bool {
+    payload.contains("↳ cache") || payload.contains("↳ speed")
+}
+
+/// Whether a stdout-derived row is the turn header printed by `print_info`
+/// (`request/transport.rs`): `[model (effort: …) · topic]`. The child paints
+/// it with theme colors, so detection strips ANSI escapes and matches the
+/// shape, not the raw bytes. Body text never reaches this path (it arrives
+/// as `delta` events), and the `[` + `(effort:` shape is specific to that
+/// header, so tool output cannot realistically collide.
+fn is_turn_header_row(payload: &str) -> bool {
+    if payload.contains("(remote)") {
+        return false;
+    }
+    let plain = strip_ansi_escapes(payload);
+    let trimmed = plain.trim_start();
+    trimmed.starts_with('[') && trimmed.contains("(effort:")
+}
+
+/// Strip ANSI escape sequences for shape matching only; the display bytes
+/// are never rewritten. Handles CSI (`ESC [ … final`) plus the single-char
+/// and OSC-style introducers so a half-kept sequence cannot leak into the
+/// match. Bare `\r` bytes are dropped: the server already turns interior
+/// overwrite controls into row breaks before SSE transport.
+fn strip_ansi_escapes(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            if c != '\r' {
+                plain.push(c);
+            }
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']' | 'P' | 'X' | '^' | '_') => {
+                for next in chars.by_ref() {
+                    if next == '\x07' {
+                        break;
+                    }
+                    if next == '\x1b' {
+                        let _ = chars.next();
+                        break;
+                    }
+                }
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    plain
+}
+
+/// Annotate a forwarded turn-header row as remote. Display bytes stay
+/// untouched; the marker is appended after the child's trailing reset so it
+/// renders identically on every terminal. TTY uses the same lavender bold
+/// as the input-box `(remote)` marker, piped output stays plain text.
+fn annotate_remote_turn_header(payload: &str, tty: bool) -> String {
+    if payload.contains("(remote)") {
+        return payload.to_string();
+    }
+    if tty {
+        format!("{payload}\x1b[1;38;2;196;181;253m (remote)\x1b[0m")
+    } else {
+        format!("{payload} (remote)")
+    }
+}
+
+/// Print buffered metrics footers at end-of-turn, each starting on a fresh
+/// row. Drains the buffer so every path (done/error/truncated stream) emits
+/// each row exactly once, in arrival order.
+fn flush_deferred_metrics(
+    pending: &mut Vec<String>,
+    line_open: &mut bool,
+    out: &mut dyn std::io::Write,
+) {
+    for row in pending.drain(..) {
+        if *line_open {
+            let _ = writeln!(out);
+        }
+        let _ = writeln!(out, "{row}");
+        *line_open = false;
+    }
+    let _ = out.flush();
+}
+
 /// Dim helper: plain text when piped, so non-terminal captures stay clean.
 fn dim(text: &str, tty: bool) -> String {
     if tty {
@@ -1910,22 +2351,12 @@ fn dim(text: &str, tty: bool) -> String {
     }
 }
 
-/// Max thinking-body rows printed when a thinking block closes. The live
-/// status line already scrolled a tail while the block was open, and the
-/// local client erases the fold body entirely (only `✓ thinking (N lines)`
-/// stays on screen), so the close print is a bounded recap, never the full
-/// text: a 100-line block must not dump a wall of dimmed rows into the chat
-/// scrollback.
-const MAX_THINKING_CLOSE_ROWS: usize = 10;
-/// Rows kept from the head of an over-long thinking body; the tail keeps
-/// `MAX_THINKING_CLOSE_ROWS - THINKING_CLOSE_HEAD_ROWS` rows so the
-/// conclusions at the end stay visible.
-const THINKING_CLOSE_HEAD_ROWS: usize = 3;
-
-/// Close the live thinking status line (if open), print a bounded recap of
-/// the buffered thinking body as dimmed lines, then print the folded
-/// summary, mirroring the local `✓ thinking (N lines)` row. No-op when no
-/// thinking block is open. Takes the body so every close path
+/// Close the live thinking status line (if open) and print only the folded
+/// summary, mirroring the local `✓ thinking (N lines)` row. The buffered
+/// thinking body is discarded, never printed: the local client erases the
+/// fold body entirely, and printing even a bounded recap leaves a wall of
+/// dimmed rows in the serve-chat scrollback. No-op when no thinking block
+/// is open. Takes the body so every close path
 /// (done/error/follow-up block/late delta or footer) renders it exactly
 /// once.
 fn close_thinking_status(
@@ -1943,36 +2374,10 @@ fn close_thinking_status(
     if tty {
         let _ = write!(out, "\r\x1b[K");
     }
-    if !body.is_empty() {
-        // Chunks split mid-line, so re-split here: each complete row prints
-        // dimmed (plain when piped, like `dim`), the trailing fragment (if
-        // any) prints as its own row. A lone trailing newline adds no row.
-        let mut rows: Vec<&str> = body.split('\n').collect();
-        if rows.last().is_some_and(|last| last.is_empty()) {
-            rows.pop();
-        }
-        if rows.len() > MAX_THINKING_CLOSE_ROWS {
-            let omitted = rows.len() - MAX_THINKING_CLOSE_ROWS;
-            let tail = MAX_THINKING_CLOSE_ROWS - THINKING_CLOSE_HEAD_ROWS;
-            for row in &rows[..THINKING_CLOSE_HEAD_ROWS] {
-                let _ = writeln!(out, "{}", dim(row, tty));
-            }
-            let marker = if omitted == 1 {
-                "... [1 line omitted]".to_string()
-            } else {
-                format!("... [{omitted} lines omitted]")
-            };
-            let _ = writeln!(out, "{}", dim(&marker, tty));
-            for row in &rows[rows.len() - tail..] {
-                let _ = writeln!(out, "{}", dim(row, tty));
-            }
-        } else {
-            for row in rows {
-                let _ = writeln!(out, "{}", dim(row, tty));
-            }
-        }
-        body.clear();
-    }
+    // Discard the buffered body unread: the live status line already hinted
+    // at progress while the block was open, and the summary below is the
+    // only retained row.
+    body.clear();
     let unit = if lines == 1 { "line" } else { "lines" };
     let _ = writeln!(out, "{}", dim(&format!("✓ thinking ({lines} {unit})"), tty));
     *line_open = false;
@@ -2278,7 +2683,7 @@ fn post_turn_stream(
     session_id: &str,
     prompt: &str,
     history_file: &Path,
-    selection: &ServeTurnSelection,
+    selection: &mut ServeTurnSelection,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // From here until the stream returns, Ctrl+C belongs to the remote turn.
     let _turn_scope = RemoteTurnScope::enter();
@@ -2339,6 +2744,7 @@ fn post_turn_stream(
             Some(effort) => serde_json::Value::String(effort.to_string()),
             None => serde_json::Value::Null,
         },
+        "skills": selection.skills.clone(),
         "confirm": confirm_channel.is_some(),
     }))
     .send()?;
@@ -2347,6 +2753,10 @@ fn post_turn_stream(
         let text = resp.text().unwrap_or_default();
         return Err(server_error_message(status, &text).into());
     }
+    // Next-turn-only parity with the local `/skills use`: once the server
+    // accepted the turn, the pin is consumed by this turn. A refused send
+    // keeps the selection so a retry still carries it.
+    selection.skills.clear();
     // Same Ctrl+G side-note composer as the local REPL: stdin is idle while
     // the stream renders, so the listener owns it until the turn ends. Drafts
     // are POSTed to the serve session; the server-side turn child drains them
@@ -2534,6 +2944,11 @@ pub(in crate::ai) fn run_serve_chat(
     let info = fetch_server_info(&client, &base, &token).unwrap_or_default();
     apply_remote_header(&mut editor, &info, None);
     let mut selection = ServeTurnSelection::from_info(&info);
+    // A reconnect resumes the session's stored picks (`/model`/`/effort`/
+    // `/agent` changes are persisted server-side), so `a --serve-chat
+    // --session <id>` after a ctrl+c keeps the last state instead of falling
+    // back to server defaults.
+    restore_serve_session_picks(&client, &base, &token, &session_id, &mut selection);
     selection.apply_header(&mut editor);
     let agent_manifests = agents::load_all_agents();
     loop {
@@ -2613,6 +3028,10 @@ pub(in crate::ai) fn run_serve_chat(
                     let title = listed.iter().find(|s| s.id == id).map(remote_session_title);
                     session_id = id;
                     editor.set_session_id(session_id.as_str());
+                    if restore_serve_session_picks(&client, &base, &token, &session_id, &mut selection)
+                    {
+                        selection.apply_header(&mut editor);
+                    }
                     match title {
                         Some(t) => println!("Resumed session {session_id} ({t})."),
                         None => println!("Resumed session {session_id}."),
@@ -2662,8 +3081,36 @@ pub(in crate::ai) fn run_serve_chat(
             // and `/agent <name>` switch for the next turn. Both `/` and `:`
             // prefixes work, matching the local command forms.
             "/model" | ":model" | "/models" => {
+                let (question, patch) = run_serve_model_command(arg, &mut selection, &mut editor);
+                persist_serve_config_patch(&client, &base, &token, &session_id, &patch);
+                if let Some(question) = question {
+                    if let Err(err) = post_turn_stream(
+                        &client,
+                        &base,
+                        &token,
+                        &session_id,
+                        &question,
+                        &app_config.history_file,
+                        &mut selection,
+                    ) {
+                        eprintln!("[serve-chat] {err}");
+                    }
+                }
+            }
+            "/effort" | ":effort" => {
+                let patch = run_serve_effort_command(arg, &mut selection, &mut editor);
+                persist_serve_config_patch(&client, &base, &token, &session_id, &patch);
+            }
+            "/agent" | ":agent" => {
+                let patch = run_serve_agent_command(arg, &mut selection, &agent_manifests, &mut editor);
+                persist_serve_config_patch(&client, &base, &token, &session_id, &patch);
+            }
+            // Remote `/skills`: list/use run against the server skill list
+            // (`GET /skills`); the pending selection rides the next turn as
+            // `@skills:` tokens and is consumed once the server accepts it.
+            "/skills" | ":skills" | "/skill" | ":skill" => {
                 if let Some(question) =
-                    run_serve_model_command(arg, &mut selection, &mut editor)
+                    run_serve_skills_command(&client, &base, &token, arg, &mut selection)
                 {
                     if let Err(err) = post_turn_stream(
                         &client,
@@ -2672,17 +3119,11 @@ pub(in crate::ai) fn run_serve_chat(
                         &session_id,
                         &question,
                         &app_config.history_file,
-                        &selection,
+                        &mut selection,
                     ) {
                         eprintln!("[serve-chat] {err}");
                     }
                 }
-            }
-            "/effort" | ":effort" => {
-                run_serve_effort_command(arg, &mut selection, &mut editor);
-            }
-            "/agent" | ":agent" => {
-                run_serve_agent_command(arg, &mut selection, &agent_manifests, &mut editor);
             }
             // Remote `/history`: previews and rewinds go through the history
             // HTTP routes, never through a turn child (a child would run the
@@ -2704,7 +3145,7 @@ pub(in crate::ai) fn run_serve_chat(
                 if is_local_command_start(&trimmed) {
                     let command = trimmed.split_whitespace().next().unwrap_or(&trimmed);
                     eprintln!(
-                        "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /history, /model, /effort, /agent, /sessions, /resume, /fork, /close, /bg, /new (see /help)."
+                        "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /history, /model, /effort, /agent, /skills, /sessions, /resume, /fork, /close, /bg, /new (see /help)."
                     );
                 } else if let Err(err) = post_turn_stream(
                     &client,
@@ -2713,7 +3154,7 @@ pub(in crate::ai) fn run_serve_chat(
                     &session_id,
                     &trimmed,
                     &app_config.history_file,
-                    &selection,
+                    &mut selection,
                 ) {
                     eprintln!("[serve-chat] {err}");
                 }
@@ -2934,6 +3375,37 @@ mod tests {
         assert_eq!(question.as_deref(), Some("explain this code"));
     }
 
+    fn skill_fixture(name: &str) -> ServeSkillEntry {
+        ServeSkillEntry {
+            name: name.to_string(),
+            description: format!("{name} skill"),
+        }
+    }
+
+    #[test]
+    fn serve_skills_inline_split_matches_local_form() {
+        let known = vec![skill_fixture("bytedcli"), skill_fixture("code-review")];
+        let (names, question) = split_serve_skills_inline(&known, "bytedcli");
+        assert_eq!(names, vec!["bytedcli".to_string()]);
+        assert_eq!(question, None);
+        // Case-insensitive match canonicalizes to the manifest spelling and
+        // the trailing question stays verbatim.
+        let (names, question) =
+            split_serve_skills_inline(&known, "ByteDcli CODE-review   explain this");
+        assert_eq!(names, vec!["bytedcli".to_string(), "code-review".to_string()]);
+        assert_eq!(question.as_deref(), Some("explain this"));
+        // Dedupes keeping input order; a non-skill token stops the split and
+        // starts the question.
+        let (names, question) =
+            split_serve_skills_inline(&known, "bytedcli bytedcli ??? nope");
+        assert_eq!(names, vec!["bytedcli".to_string()]);
+        assert_eq!(question.as_deref(), Some("??? nope"));
+        // No leading skill token: pure question, no selection.
+        let (names, question) = split_serve_skills_inline(&known, "hello there");
+        assert!(names.is_empty());
+        assert_eq!(question.as_deref(), Some("hello there"));
+    }
+
     fn agent_fixture(
         name: &str,
         mode: agents::AgentMode,
@@ -2974,6 +3446,7 @@ mod tests {
             model: "m".to_string(),
             agent: "build".to_string(),
             reasoning_effort: None,
+            skills: Vec::new(),
         };
         let mut editor =
             PromptEditor::new("test", std::path::Path::new("/tmp/a-serve-agent-test-history"));
@@ -3023,14 +3496,74 @@ mod tests {
     }
 
     #[test]
+    fn sse_metrics_footer_does_not_split_body() {
+        // Regression net for the serve-chat interleave report: a metrics
+        // footer (`↳ speed`) arriving between two body chunks of one sentence
+        // must not tear the sentence apart (`读` / speed / `不到。`). Metrics
+        // summaries buffer until `done`, so the body stays contiguous and the
+        // footer lands after it, like the local client.
+        let url = serve_body_once(
+            "event: delta\ndata: {\"delta\": \"读\"}\n\ndata: ↳ speed · reasoning 601 tok @ 108 tok/s\n\nevent: delta\ndata: {\"delta\": \"不到。\"}\n\nevent: done\ndata: \n\n",
+        );
+        let resp = reqwest::blocking::get(url).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        assert_eq!(
+            String::from_utf8(buf).expect("utf8"),
+            "读不到。\n↳ speed · reasoning 601 tok @ 108 tok/s\n"
+        );
+    }
+
+    #[test]
+    fn sse_turn_header_row_is_marked_remote() {
+        // Serve-chat scrollback must show which turns ran remotely: the child
+        // header `[model (effort: …) · topic]` is forwarded as a plain stdout
+        // row, so the client appends a piped-safe ` (remote)` marker.
+        let header = "[deepseek-v4-flash-volcano (effort: max) · [fork] 启动服务]";
+        let url = serve_body_once(
+            "data: [deepseek-v4-flash-volcano (effort: max) · [fork] 启动服务]\n\nevent: done\ndata: \n\n",
+        );
+        let resp = reqwest::blocking::get(url).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        assert_eq!(
+            String::from_utf8(buf).expect("utf8"),
+            format!("{header} (remote)\n")
+        );
+    }
+
+    #[test]
+    fn turn_header_detection_ignores_ansi_and_remote() {
+        // Unit net for the matcher: theme colors must not hide the header
+        // shape, an already-marked row stays idempotent, and ordinary rows
+        // (tool output, bracketed text without the effort marker) pass
+        // through untouched.
+        let colored = "\x1b[2m\x1b[32m[model (effort: max) · topic]\x1b[0m";
+        assert!(is_turn_header_row(colored));
+        assert!(!is_turn_header_row("[model (effort: max) · topic] (remote)"));
+        assert!(!is_turn_header_row("  ✕ execute_command"));
+        assert!(!is_turn_header_row("[note] something else"));
+        assert_eq!(
+            annotate_remote_turn_header(colored, false),
+            format!("{colored} (remote)")
+        );
+        assert_eq!(
+            annotate_remote_turn_header(colored, true),
+            format!("{colored}\x1b[1;38;2;196;181;253m (remote)\x1b[0m")
+        );
+    }
+
+    #[test]
     fn sse_tool_rows_keep_child_indent_verbatim() {
         // Regression net for the serve-chat indent report: footer/message rows
-        // (tool status, cache/speed metrics, long command echoes) must reach
-        // the terminal byte-identical to the child bytes the server forwarded:
-        // leading two-space indent, inline ANSI, and over-long rows included.
-        // The client neither re-indents nor clamps these rows; soft-wrap of a
-        // row wider than the terminal is the terminal's own layout, identical
-        // to a local run of the same turn.
+        // (tool status, long command echoes) must reach the terminal
+        // byte-identical to the child bytes the server forwarded: leading
+        // two-space indent, inline ANSI, and over-long rows included. The
+        // client neither re-indents nor clamps these rows; soft-wrap of a row
+        // wider than the terminal is the terminal's own layout, identical to
+        // a local run of the same turn. Metrics summaries (`↳ cache` /
+        // `↳ speed`) stay byte-identical too, but flush at end-of-turn (after
+        // the tool rows) so they can never tear the answer's open line.
         let cache = "  \u{1b}[2m↳ cache · 4.1k/22.0k tokens · 19% hit\u{1b}[0m";
         let speed = "  \u{1b}[2m↳ speed · reasoning 1.6k tok @ 48.4 tok/s\u{1b}[0m";
         let done = "  \u{1b}[32m✓\u{1b}[0m read_file  \u{1b}[2m·\u{1b}[0m target";
@@ -3039,7 +3572,7 @@ mod tests {
         assert!(long_cmd.chars().count() > 200);
         let failed = "  \u{1b}[31m✕\u{1b}[0m execute_command";
         let expected =
-            format!("ok\n{cache}\n{speed}\n{done}\n{running}\n{long_cmd}\n{failed}\n");
+            format!("ok\n{done}\n{running}\n{long_cmd}\n{failed}\n{cache}\n{speed}\n");
         let body = format!(
             "event: delta\ndata: {{\"delta\": \"ok\"}}\n\ndata: {cache}\n\ndata: {speed}\n\ndata: {done}\n\ndata: {running}\n\ndata: {long_cmd}\n\ndata: {failed}\n\nevent: done\ndata: \n\n"
         );
@@ -3141,7 +3674,7 @@ mod tests {
     fn sse_duplicate_thinking_done_prints_single_summary() {
         // A late/duplicate close (body-path marker plus CloseThinking frame
         // for the same round) must not print a second summary row. The
-        // buffered body prints once, dimmed (plain under test: piped).
+        // buffered body is discarded; only the summary row prints once.
         let url = serve_body_once(
             "event: thinking_start\ndata: \n\nevent: thinking\ndata: {\"text\": \"a b\"}\n\nevent: thinking_done\ndata: \n\nevent: thinking_done\ndata: \n\nevent: done\ndata: \n\n",
         );
@@ -3150,7 +3683,7 @@ mod tests {
         render_turn_stream_to(resp, &mut buf, false).expect("render");
         assert_eq!(
             String::from_utf8(buf).expect("utf8"),
-            "a b\n✓ thinking (1 line)\n"
+            "✓ thinking (1 line)\n"
         );
     }
 
@@ -3168,8 +3701,8 @@ mod tests {
 
     #[test]
     fn thinking_close_print_caps_a_long_body() {
-        // A 100-line thinking block must not dump 100 dimmed rows into the
-        // scrollback: head + omission marker + tail, then the true summary.
+        // A 100-line thinking block must not leave any body rows in the
+        // scrollback: only the summary row stays, like the local fold.
         let mut body = (1..=100)
             .map(|i| format!("thought line {i}"))
             .collect::<Vec<_>>()
@@ -3179,30 +3712,20 @@ mod tests {
         let mut buf = Vec::new();
         close_thinking_status(&mut active, &mut line_open, 100, &mut body, false, &mut buf);
         let out = String::from_utf8(buf).expect("utf8");
-        assert!(out.contains("thought line 1"), "head lost: {out}");
-        assert!(out.contains("thought line 100"), "tail lost: {out}");
-        assert!(out.contains("90 lines omitted"), "marker lost: {out}");
-        assert!(
-            !out.contains("thought line 50"),
-            "middle must be capped: {out}"
-        );
-        assert!(
-            out.contains("✓ thinking (100 lines)"),
-            "summary lost: {out}"
-        );
+        assert_eq!(out, "✓ thinking (100 lines)\n");
         assert!(body.is_empty(), "body must drain exactly once");
     }
 
     #[test]
     fn thinking_close_print_keeps_a_short_body_whole() {
-        // At or under the cap the recap stays verbatim (no marker).
+        // Even a short body leaves no body rows: only the summary stays.
         let mut body = "a\nb\nc".to_string();
         let mut active = true;
         let mut line_open = true;
         let mut buf = Vec::new();
         close_thinking_status(&mut active, &mut line_open, 3, &mut body, false, &mut buf);
         let out = String::from_utf8(buf).expect("utf8");
-        assert_eq!(out, "a\nb\nc\n✓ thinking (3 lines)\n");
+        assert_eq!(out, "✓ thinking (3 lines)\n");
     }
 
     #[test]
@@ -3369,6 +3892,48 @@ mod tests {
             Some("question")
         );
         assert_eq!(current_remote_title(&listed, "missing"), None);
+    }
+
+    #[test]
+    fn serve_config_patch_serializes_only_set_fields() {
+        let empty = ServeConfigPatch::default();
+        assert!(empty.is_empty());
+        assert_eq!(serde_json::to_string(&empty).unwrap(), "{}");
+
+        // A blank reasoning_effort clears the stored value server-side; absent
+        // fields (agent here) keep the stored value untouched.
+        let patch = ServeConfigPatch {
+            model: Some("m1".to_string()),
+            reasoning_effort: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(!patch.is_empty());
+        let json = serde_json::to_string(&patch).unwrap();
+        assert!(json.contains(r#""model":"m1""#));
+        assert!(json.contains(r#""reasoning_effort":"""#));
+        assert!(!json.contains("agent"));
+    }
+
+    #[test]
+    fn merge_restored_session_config_fills_only_nonempty_picks() {
+        let mut selection = ServeTurnSelection {
+            model: "default-m".to_string(),
+            agent: "build".to_string(),
+            reasoning_effort: None,
+            skills: Vec::new(),
+        };
+        let cfg = ServeSessionConfig {
+            model: "stored-m".to_string(),
+            agent: String::new(), // empty -> keep the selection's agent
+            reasoning_effort: "high".to_string(),
+        };
+        assert!(merge_restored_session_config(&cfg, &mut selection));
+        assert_eq!(selection.model, "stored-m");
+        assert_eq!(selection.agent, "build");
+        assert_eq!(selection.reasoning_effort.as_deref(), Some("high"));
+
+        // Restoring the same picks again changes nothing.
+        assert!(!merge_restored_session_config(&cfg, &mut selection));
     }
 
     #[test]

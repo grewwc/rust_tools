@@ -127,6 +127,7 @@ fn handle_effort_arg(app: &mut App, arg: &str) -> Result<bool, Box<dyn std::erro
     match arg.to_ascii_lowercase().as_str() {
         "auto" | "clear" | "default" | "reset" => {
             app.cli.reasoning_effort_override = None;
+            super::session::persist_session_runtime_state(app);
             println!(
                 "Cleared reasoning_effort override; now using {}.",
                 // Effective tier, not the registry default: on the sharp agent
@@ -137,6 +138,7 @@ fn handle_effort_arg(app: &mut App, arg: &str) -> Result<bool, Box<dyn std::erro
         }
         "off" | "none" | "no" | "false" | "disable" | "disabled" => {
             app.cli.reasoning_effort_override = Some(None);
+            super::session::persist_session_runtime_state(app);
             match model_thinking_off_capability(&app.current_model) {
                 // No vendor off mechanism: the override is stored but cannot be
                 // expressed on the wire — say so instead of claiming success.
@@ -154,6 +156,7 @@ fn handle_effort_arg(app: &mut App, arg: &str) -> Result<bool, Box<dyn std::erro
     match ReasoningEffort::parse(arg) {
         Some(level) => {
             app.cli.reasoning_effort_override = Some(Some(level));
+            super::session::persist_session_runtime_state(app);
             if model_effort_graded(&app.current_model) {
                 println!("Reasoning effort overridden: {}", level.as_str());
             } else {
@@ -320,6 +323,7 @@ pub fn try_handle_model_command(
 
     app.current_model = next_model.clone();
     app.cli.model = Some(next_model.clone());
+    super::session::persist_session_runtime_state(app);
     println!(
         "Switched model: {} -> {}\nPlatform: {} | Adapter: {} | Capabilities: {}{}{}{}",
         models::model_display_label(&old_model),

@@ -238,7 +238,7 @@ fn thinking_fold_zero_window_is_pure_summary() {
     assert!(thinking_fold_visible_lines(fold).is_empty());
 
     let (window, _) = render_thinking_fold_window(fold);
-    assert!(window.contains("earlier lines"));
+    assert!(window.is_empty());
     assert!(!window.contains("line-1"));
     assert!(!window.contains("line-2"));
     assert!(!window.contains("line-3"));
@@ -573,8 +573,7 @@ fn completed_thinking_fold_replaces_anchored_header_in_place() {
     assert_eq!(
         String::from_utf8(out).unwrap(),
         format!(
-            "\r\x1b[1A\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[1A\r\r\x1b[1A\r\x1b[2K{}  ✓ thinking · 3 lines\x1b[0m\r\n{}    … 3 earlier lines\x1b[0m\r\n",
-            crate::ai::theme::current().accent_muted,
+            "\r\x1b[1A\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[1A\r\r\x1b[1A\r\x1b[2K{}  ✓ thinking · 3 lines\x1b[0m\r\n",
             crate::ai::theme::current().accent_muted,
         )
     );

@@ -5,10 +5,10 @@
 //! fork/delete, skills/agents listing. Turn execution reuses the existing
 //! one-shot path so behavior stays identical to `a --session <id> "<prompt>"`.
 
+#[cfg(feature = "serve")]
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
 
-use base64::Engine as _;
-
+#[cfg(feature = "serve")]
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Query, State},
@@ -16,14 +16,21 @@ use axum::{
     response::{Html, IntoResponse, Response, Sse, sse::Event},
     routing::{delete, get, post},
 };
+#[cfg(feature = "serve")]
 use futures_util::stream;
+#[cfg(feature = "serve")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "serve")]
 use tokio::sync::{Mutex, mpsc};
 
+#[cfg(feature = "serve")]
 use crate::ai::background;
+#[cfg(feature = "serve")]
 use crate::ai::exe_path::runtime_exe;
+#[cfg(feature = "serve")]
 use crate::commonw::configw;
 
+#[cfg(feature = "serve")]
 use super::{
     agents,
     config_schema::AiConfig,
@@ -34,25 +41,38 @@ use super::{
     },
     model_names, models,
 };
+#[cfg(feature = "serve")]
 use super::driver::turn_runtime::stale_patch_targets_from_messages;
+#[cfg(feature = "serve")]
 use super::driver::side_note::push_side_note;
 pub(in crate::ai) mod chat;
+#[cfg(feature = "serve")]
 pub(in crate::ai) mod ctl;
 
 
 mod types;
+#[cfg(feature = "serve")]
 mod info;
+#[cfg(feature = "serve")]
 mod sessions;
+#[cfg(feature = "serve")]
 mod history;
+#[cfg(feature = "serve")]
 mod files;
+#[cfg(feature = "serve")]
 mod turn;
-#[cfg(test)]
+#[cfg(all(test, feature = "serve"))]
 mod tests;
 
+#[cfg(feature = "serve")]
 pub(crate) use files::*;
+#[cfg(feature = "serve")]
 pub(crate) use history::*;
+#[cfg(feature = "serve")]
 pub(crate) use info::*;
+#[cfg(feature = "serve")]
 pub(crate) use sessions::*;
+#[cfg(feature = "serve")]
 pub(crate) use turn::*;
 pub(crate) use types::*;
 
@@ -66,6 +86,7 @@ const MAX_TURN_ERROR_CHARS: usize = 4096;
 /// up the SSE frame budget.
 const MAX_SSE_LINE_CHARS: usize = 8192;
 
+#[cfg(feature = "serve")]
 fn run_one_shot_turn(
     session_id: &str,
     prompt: &str,
@@ -99,6 +120,7 @@ fn run_one_shot_turn(
     }
 }
 
+#[cfg(feature = "serve")]
 async fn post_turn(
     State(state): State<ServeState>,
     headers: HeaderMap,
@@ -130,6 +152,10 @@ async fn post_turn(
     // without client flags still runs with the session's picks.
     let store = SessionStore::new(state.history_file.as_path());
     merge_session_config(&mut overrides, &read_session_config_or_default(&store, &id));
+    // Forced skills ride in the prompt, not argv: the child has no `--skill`
+    // flag, but its input pipeline extracts `@skills:` tokens into forced
+    // skills exactly like the local REPL.
+    let prompt = apply_turn_skills_prefix(&prompt, &overrides.skills);
     let title_model = overrides.model.clone();
     let lock = session_lock(&state, &id).await;
     let guard = lock.lock().await;
@@ -186,6 +212,7 @@ async fn post_turn(
 /// and the drain-side atomic rename compose without loss, so notes sent
 /// mid-turn are seen by the next model request.
 #[derive(Debug, Deserialize)]
+#[cfg(feature = "serve")]
 struct SideNoteReq {
     text: String,
 }
@@ -193,6 +220,7 @@ struct SideNoteReq {
 /// `POST /sessions/{id}/side-notes` (authed): queue one side-note for this
 /// session's in-flight turn. Returns `{"queued": true}` even when no turn is
 /// running; the note then waits in the queue for the next turn.
+#[cfg(feature = "serve")]
 async fn post_side_note(
     State(state): State<ServeState>,
     headers: HeaderMap,
@@ -228,6 +256,7 @@ async fn post_side_note(
         .into_response()
 }
 
+#[cfg(feature = "serve")]
 async fn post_turn_sse(
     State(state): State<ServeState>,
     headers: HeaderMap,
@@ -258,6 +287,9 @@ async fn post_turn_sse(
     // persisted serve config (then to the server default).
     let store = SessionStore::new(state.history_file.as_path());
     merge_session_config(&mut overrides, &read_session_config_or_default(&store, &id));
+    // Same `@skills:` prompt splice as the one-shot route above: the stream
+    // child parses it through the local inline-reference path.
+    let prompt = apply_turn_skills_prefix(&prompt, &overrides.skills);
     let lock = session_lock(&state, &id).await;
     // Chunk-level streaming: the child publishes framed live events
     // (assistant-text deltas, thinking lifecycle, output-complete marker)
@@ -328,6 +360,7 @@ async fn post_turn_sse(
 /// An output-complete frame sends `done` immediately while draining continues
 /// until the child is reaped. Stderr is drained on a side thread so a chatty
 /// child can never block on a full pipe.
+#[cfg(feature = "serve")]
 fn stream_child_turn(
     session_id: String,
     prompt: String,
@@ -501,17 +534,20 @@ fn stream_child_turn(
 
 /// Per-turn live-chunk FIFO: created by the SSE endpoint before spawning the
 /// child, removed on drop (after the pump joins) whatever the outcome.
+#[cfg(feature = "serve")]
 struct LiveFifo {
     path: PathBuf,
     reader: Option<std::fs::File>,
 }
 
+#[cfg(feature = "serve")]
 impl Drop for LiveFifo {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
+#[cfg(feature = "serve")]
 static LIVE_FIFO_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Best-effort per-turn FIFO for chunk streaming. The read end opens here
@@ -519,6 +555,7 @@ static LIVE_FIFO_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// finds a reader. `None` means "fall back to the line pump".
 /// Callers must have validated `session_id` (its charset is filename-safe).
 #[cfg(unix)]
+#[cfg(feature = "serve")]
 fn setup_live_fifo(session_id: &str) -> Option<LiveFifo> {
     use std::os::unix::ffi::OsStrExt;
     let n = LIVE_FIFO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -551,6 +588,7 @@ fn setup_live_fifo(session_id: &str) -> Option<LiveFifo> {
 }
 
 #[cfg(not(unix))]
+#[cfg(feature = "serve")]
 fn setup_live_fifo(_session_id: &str) -> Option<LiveFifo> {
     None
 }
@@ -560,6 +598,7 @@ fn setup_live_fifo(_session_id: &str) -> Option<LiveFifo> {
 /// 4 = thinking done, 5 = output complete, 6 = confirmation request,
 /// 7 = confirmation resolved).
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(feature = "serve")]
 enum ServeLiveEvent {
     Delta(String),
     ThinkingStart,
@@ -579,10 +618,12 @@ enum ServeLiveEvent {
 /// instead of desynchronizing the stream (impossible from our producer, only
 /// from a foreign writer on the same inode).
 #[derive(Default)]
+#[cfg(feature = "serve")]
 struct ServeFrameDecoder {
     buf: Vec<u8>,
 }
 
+#[cfg(feature = "serve")]
 impl ServeFrameDecoder {
     fn push(&mut self, bytes: &[u8]) -> Vec<ServeLiveEvent> {
         self.buf.extend_from_slice(bytes);
@@ -651,6 +692,7 @@ impl ServeFrameDecoder {
 
 /// Map one parsed frame to its SSE event. `OutputComplete` has no event here:
 /// the caller ends the turn with `done` instead (see `forward_live_event`).
+#[cfg(feature = "serve")]
 fn live_event(event: ServeLiveEvent) -> Option<Event> {
     match event {
         ServeLiveEvent::Delta(text) => Some(delta_event(text)),
@@ -672,6 +714,7 @@ fn live_event(event: ServeLiveEvent) -> Option<Event> {
 /// turn immediately (the child only runs silent bookkeeping after that
 /// point); the first frame wins and later ones are no-ops, so the terminal
 /// `done` below is never duplicated.
+#[cfg(feature = "serve")]
 fn forward_live_event(
     event: ServeLiveEvent,
     turn_done: &std::sync::atomic::AtomicBool,
@@ -742,6 +785,7 @@ fn forward_live_event(
 /// first chunk), so it sleeps instead of spinning; after the child exits EOF
 /// is terminal.
 #[cfg(unix)]
+#[cfg(feature = "serve")]
 fn pump_live_fifo(
     reader: std::fs::File,
     child_done: &std::sync::atomic::AtomicBool,
@@ -798,12 +842,14 @@ fn pump_live_fifo(
     }
 }
 
+#[cfg(feature = "serve")]
 fn delta_event(delta: String) -> Event {
     Event::default().event("delta").data(
         serde_json::json!({"delta": delta}).to_string(),
     )
 }
 
+#[cfg(feature = "serve")]
 fn truncate_line(line: &str) -> String {
     if line.chars().count() <= MAX_SSE_LINE_CHARS {
         line.to_string()
@@ -831,6 +877,7 @@ fn truncate_line(line: &str) -> String {
 /// they erase or overwrite unrelated rows (ragged indents,
 /// duplicated-looking status lines). SGR color (`CSI ... m`) is kept: it
 /// styles only the row itself and renders identically everywhere.
+#[cfg(feature = "serve")]
 fn clean_sse_line(line: &str) -> String {
     // Neutralize cursor addressing first: stripping it can reveal a leading
     // `\r` (e.g. `\x1b[1A\r\x1b[2K...`) that the prefix wash below must see.
@@ -843,6 +890,7 @@ fn clean_sse_line(line: &str) -> String {
 /// Remove every ANSI CSI sequence except SGR color (`ESC [ ... m`).
 /// Malformed (unterminated) introducers are dropped: a half-sequence can
 /// never render as intended on the client.
+#[cfg(feature = "serve")]
 fn strip_non_sgr_csi(line: &str) -> String {
     let mut kept = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
@@ -877,6 +925,7 @@ fn strip_non_sgr_csi(line: &str) -> String {
     kept
 }
 
+#[cfg(feature = "serve")]
 fn last_chars(text: &str, limit: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= limit {
@@ -887,16 +936,19 @@ fn last_chars(text: &str, limit: usize) -> String {
     }
 }
 
+#[cfg(feature = "serve")]
 fn error_event(detail: String) -> Event {
     Event::default().event("error").data(
         serde_json::json!({"error": detail}).to_string(),
     )
 }
 
+#[cfg(feature = "serve")]
 fn done_event() -> Event {
     Event::default().event("done").data("")
 }
 
+#[cfg(feature = "serve")]
 async fn list_skills(State(state): State<ServeState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = check_auth(&state, &headers) {
         return e.into_response();
@@ -905,6 +957,7 @@ async fn list_skills(State(state): State<ServeState>, headers: HeaderMap) -> imp
     (StatusCode::OK, Json(manifests)).into_response()
 }
 
+#[cfg(feature = "serve")]
 async fn list_agents(State(state): State<ServeState>, headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = check_auth(&state, &headers) {
         return e.into_response();
@@ -913,6 +966,7 @@ async fn list_agents(State(state): State<ServeState>, headers: HeaderMap) -> imp
     (StatusCode::OK, Json(manifests)).into_response()
 }
 
+#[cfg(feature = "serve")]
 fn is_loopback_bind(bind: &str) -> bool {
     // Parse the host part instead of prefix-matching so that names like
     // "127.x.evil.com" cannot pass the loopback gate.
@@ -944,6 +998,7 @@ pub(in crate::ai) fn resolve_serve_bind(cli_bind: &str, cfg_bind: &str) -> Strin
     }
 }
 
+#[cfg(feature = "serve")]
 pub(in crate::ai) async fn run_serve(
     cli: super::cli::ParsedCli,
 ) -> Result<(), Box<dyn std::error::Error>> {

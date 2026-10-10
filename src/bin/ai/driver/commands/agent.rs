@@ -162,6 +162,7 @@ fn switch_agent(app: &mut App, name: &str, agent_manifests: &[AgentManifest]) {
         if let Some(model) = &agent.model {
             app.current_model = model.clone();
         }
+        super::session::persist_session_runtime_state(app);
 
         println!("Switched agent: {} -> {}", old_agent, agent.name);
         if let Some(model) = &agent.model {

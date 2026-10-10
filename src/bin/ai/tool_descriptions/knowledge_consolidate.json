@@ -52,6 +52,8 @@
             },
             "priority": {
               "type": "integer",
+              "minimum": 0,
+              "maximum": 255,
               "description": "0-255. 255=permanent."
             }
           },

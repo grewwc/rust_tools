@@ -31,8 +31,10 @@ use super::{
     MultilineHistoryState,
     completion_panel::{CompletionPanel, PendingTabCompletion},
     events::{EventLoopAction, RecentTextInput, handle_multiline_event},
-    render::render_multiline_popup,
+    render::render_multiline_popup_with_width,
 };
+#[cfg(test)]
+use super::render::render_multiline_popup;
 use crate::ai::prompt::{PromptEditor, interrupted_error};
 use crate::commonw::prompt::acquire_foreground_stdin;
 
@@ -810,14 +812,24 @@ fn parked_anchor_offset(last_drawn_area: Option<Rect>, new_height: u16) -> u16 {
 
 /// Whether a reflow rebuild must return the box to the screen's last row.
 ///
-/// A width re-wrap is the one resize that can strand a box that was flush with
-/// the screen bottom before it: the transcript above re-wraps into fewer rows and
-/// the rows released by that wrap stay below the box, so the parked row recovers
-/// a top further up the screen than where the input area was. Rebuilding there
-/// leaves the box floating above a blank gap, and the next re-wrap strands it
-/// again from that higher row. A box that was already flush with the bottom goes
-/// back to the bottom instead; the rows between the recovered top and the new
-/// bottom hold nothing but the old box's own rows, which the rebuild clears.
+/// Only a WIDENING re-wrap needs this: the transcript above re-wraps into fewer
+/// rows and the rows released by that wrap stay below the box, so the parked row
+/// can recover a top further up the screen than where the input area was.
+/// Rebuilding there leaves the box floating above a blank gap, and the next
+/// re-wrap strands it again from that higher row. A box that was already flush
+/// with the bottom goes back to the bottom instead; the rows between the
+/// recovered top and the new bottom hold nothing but the old box's own rows,
+/// which the rebuild clears.
+///
+/// A NARROWING must not be glued back to the bottom. The parked offset already
+/// counts the extra rows the old frame's own rows wrap into (see
+/// `reflowed_extra_rows`) before recovering the top, and on a narrowing that
+/// lands exactly on the first row of the reflowed box, flush under the
+/// transcript, because the re-wrap moved both down by the same count. Gluing the
+/// box down to the screen bottom again moves it by those extra rows a second
+/// time and leaves them blank between the transcript and the box; every further
+/// narrowing then adds another blank band, which is the gap that opens above the
+/// input area while a VS Code terminal narrows.
 fn reflow_pins_box_to_bottom(
     previous_size: Size,
     terminal_size: Size,
@@ -825,7 +837,7 @@ fn reflow_pins_box_to_bottom(
     alternate: bool,
 ) -> bool {
     !alternate
-        && terminal_size.width != previous_size.width
+        && terminal_size.width > previous_size.width
         && last_drawn_area
             .is_some_and(|area| area.y.saturating_add(area.height) >= previous_size.height)
 }
@@ -1383,14 +1395,16 @@ fn resize_redraw_after_idle(
 /// one still asks for no rebuild. Both the draw path and the idle poll ask this
 /// question, so the window is shared: a foreground redraw (keystroke, background
 /// title update, status-message change) must not re-anchor on the first sight of a
-/// new size either.
+/// new size either. A live width within one column of the applied width still
+/// asks for no rebuild either (see `live_size_matches_applied`): that is the
+/// emulator's async re-wrap timing, not a real resize.
 fn resize_rebuild_is_due(
     settle: &mut ResizeSettle,
     now: Instant,
     live_size: Size,
     applied_size: Size,
 ) -> bool {
-    settle.observe(now, live_size) && live_size != applied_size
+    settle.observe(now, live_size) && !live_size_matches_applied(live_size, applied_size)
 }
 
 /// How long the live geometry must hold still before a resize rebuild may run.
@@ -1428,6 +1442,21 @@ impl ResizeSettle {
         self.size = None;
         self.since = None;
     }
+}
+
+/// Live-geometry jitter tolerance for rebuild decisions.
+///
+/// VS Code/xterm.js can briefly report a width one column off the applied
+/// geometry without any real reflow (async re-wrap timing). Re-anchoring for
+/// that phantom size moves the box without moving the transcript and strands
+/// the drawn caret; repeated phantom rebuilds accumulate into the slow upward
+/// idle drift. A real one-column resize re-wraps at most one column of ink,
+/// so painting it at the old width until a larger move arrives is harmless,
+/// while a spurious re-anchor is not. Height differences always reflect panel
+/// changes and are never ignored.
+fn live_size_matches_applied(live: Size, applied: Size) -> bool {
+    live == applied
+        || (live.height == applied.height && live.width.abs_diff(applied.width) <= 1)
 }
 
 /// Consume a deferred resize at a redraw safe point.
@@ -1577,6 +1606,38 @@ impl PromptEditor {
             // How long the live geometry has held still for that pending
             // rebuild; see `ResizeSettle`.
             let mut resize_settle = ResizeSettle::default();
+            // A background title update that arrives while a resize is pending
+            // waits for settled geometry instead of painting immediately (see
+            // the deferral at the top of the loop); this carries that owed
+            // repaint across poll iterations until it may paint.
+            let mut title_repaint_owed = false;
+            // Idle-drift field log: while the box drifts in a real terminal,
+            // record what the loop saw so the cause can be read off the file
+            // instead of guessed. File only, never stdout (display-safe); a
+            // no-op unless RUST_TOOLS_EDITOR_DRIFT_LOG points at a path.
+            let drift_log = |event: &str| {
+                let path =
+                    std::env::var("RUST_TOOLS_EDITOR_DRIFT_LOG").unwrap_or_default();
+                if path.is_empty() {
+                    return;
+                }
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let mut file = match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    Ok(file) => file,
+                    Err(_) => return,
+                };
+                let _ = <std::fs::File as std::io::Write>::write_fmt(
+                    &mut file,
+                    format_args!("[{now_ms}] {event}\n"),
+                );
+            };
             #[cfg(test)]
             let mut fixture_frame_sequence = 0_u64;
 
@@ -1585,8 +1646,61 @@ impl PromptEditor {
                 // still redrawn by the foreground input loop at this safe draw
                 // point.
                 let title_changed = self.apply_pending_session_title_updates();
+                if title_changed {
+                    title_repaint_owed = true;
+                    drift_log(&format!(
+                        "title update arrived; repaint owed; topic={:?}",
+                        self.session_topic
+                    ));
+                }
+                // A title-only repaint must yield to a pending resize: the box
+                // is still anchored at the pre-reflow geometry while the
+                // emulator re-wraps, so painting now leaves the old frame above
+                // the new one and strands the drawn caret (idle drift). Gate
+                // the owed repaint on settled geometry and fall through to the
+                // poll below while it settles; the topic value is already
+                // stored. Frames that already owe a redraw (keystroke, status)
+                // are not deferred: input latency matters, and the pre-input
+                // path below re-anchors for those first.
+                let mut paint_title_now = false;
+                if title_repaint_owed && !redraw_requested && pending_resize_rebuild {
+                    let live_size = terminal.backend().size()?;
+                    if live_size_matches_applied(live_size, last_applied_terminal_size) {
+                        // Delayed duplicate: no reflow is coming, drop the flag
+                        // and paint with the stored topic below.
+                        let _ =
+                            take_standalone_resize_rebuild(&mut pending_resize_rebuild, false);
+                        paint_title_now = true;
+                        title_repaint_owed = false;
+                    } else if resize_rebuild_is_due(
+                        &mut resize_settle,
+                        Instant::now(),
+                        live_size,
+                        last_applied_terminal_size,
+                    ) {
+                        // Settled: the draw block below rebuilds first.
+                        paint_title_now = true;
+                        title_repaint_owed = false;
+                    }
+                    // Else still re-wrapping: keep the request owed and wait
+                    // one poll; the next loop top retries this gate.
+                } else if title_repaint_owed {
+                    // No resize pending, or a redraw is already owed: fold the
+                    // stored topic into the normal frame below.
+                    paint_title_now = true;
+                    title_repaint_owed = false;
+                }
+                if title_repaint_owed {
+                    // Still re-wrapping: note each wait so the settle window is
+                    // visible in the log (bounded: clears on paint).
+                    if let Ok(live_size) = terminal.backend().size() {
+                        drift_log(&format!(
+                            "title repaint deferred: live={live_size:?} applied={last_applied_terminal_size:?}"
+                        ));
+                    }
+                }
 
-                if take_redraw_request(&mut redraw_requested, title_changed) {
+                if take_redraw_request(&mut redraw_requested, paint_title_now) {
                     // Consume old-screen width geometry before a completion or
                     // content-height rebuild clears its painted-width record.
                     // A foreground redraw can beat the queued Resize event.
@@ -1600,7 +1714,7 @@ impl PromptEditor {
                     // scrollback asynchronously, so rebuilding on the first sight
                     // of a new size computes the clear from the pre-reflow layout.
                     let live_size = terminal.backend().size()?;
-                    if live_size == last_applied_terminal_size {
+                    if live_size_matches_applied(live_size, last_applied_terminal_size) {
                         let _ = take_standalone_resize_rebuild(&mut pending_resize_rebuild, false);
                     }
                     if resize_rebuild_is_due(
@@ -1693,6 +1807,17 @@ impl PromptEditor {
                     }
 
                     let force_repaint = force_repaint_next_frame;
+                    // A fixed ratatui viewport keeps its old width until the
+                    // settled resize rebuild. Clamp this frame to the current
+                    // terminal width so a narrowing title is ellipsized on the
+                    // first paint instead of soft-wrapping for one frame.
+                    let live_paint_width = terminal
+                        .backend()
+                        .size()
+                        .map(|size| size.width)
+                        .unwrap_or(terminal_size.width)
+                        .min(terminal_size.width)
+                        .max(1);
                     let mut drawn_viewport_area = Rect::ZERO;
                     let mut drawn_row_widths: Vec<u16> = Vec::new();
                     // The visible editing caret is drawn into the buffer (see
@@ -1705,7 +1830,7 @@ impl PromptEditor {
                             let area = f.area();
                             drawn_viewport_area = area;
                             last_drawn_area = Some(area);
-                            let _ = render_multiline_popup(
+                            let _ = render_multiline_popup_with_width(
                                 f,
                                 &mut textarea,
                                 status_msg.as_deref(),
@@ -1715,6 +1840,7 @@ impl PromptEditor {
                                 self.model_remote,
                                 &self.current_reasoning_effort_label,
                                 self.session_topic.as_deref(),
+                                live_paint_width,
                             );
                             drawn_row_widths = if force_repaint {
                                 force_frame_repaint(f, &screen.box_row_widths)
@@ -1733,6 +1859,9 @@ impl PromptEditor {
                         *slot = (*slot).max(*width);
                     }
                     park_reflow_anchor(&mut terminal, drawn_viewport_area)?;
+                    drift_log(&format!(
+                        "frame drawn: area={drawn_viewport_area:?} title={paint_title_now} resize_pending={pending_resize_rebuild} applied={last_applied_terminal_size:?}"
+                    ));
                     self.notify_first_render();
                     // Emit only after the real draw and anchor writes complete,
                     // so an external PTY driver can synchronize without keys.
@@ -1792,6 +1921,9 @@ impl PromptEditor {
                             last_applied_terminal_size,
                         ) {
                             redraw_requested = true;
+                            drift_log(&format!(
+                                "idle poll: resize due, redraw requested: live={live_size:?} applied={last_applied_terminal_size:?}"
+                            ));
                         }
                     } else {
                         // Nothing left to settle: either no rebuild is pending or
@@ -1817,21 +1949,34 @@ impl PromptEditor {
                     // A new notification restarts the window, so a sighting from
                     // an earlier resize cannot shorten it.
                     resize_settle.restart();
+                    drift_log(&format!(
+                        "resize notified: {width}x{height} applied={last_applied_terminal_size:?}"
+                    ));
                     continue;
                 }
                 if pending_resize_rebuild {
                     pending_resize_rebuild = false;
-                    let (rebuilt_area, sampled_size) = rebuild_after_terminal_reflow(
-                        &mut terminal,
-                        &mut screen,
-                        base_viewport_height,
-                        fitted_completion_items,
-                        last_drawn_area,
-                        last_applied_terminal_size,
-                        false,
-                    )?;
-                    last_drawn_area = Some(rebuilt_area);
-                    last_applied_terminal_size = sampled_size;
+                    // Phantom 1-column live jitter must not re-anchor the box:
+                    // without a real reflow the rebuild moves the frame and
+                    // strands the drawn caret. Only a geometry outside the
+                    // jitter tolerance earns a reflow rebuild here.
+                    let live_size = terminal.backend().size()?;
+                    if !live_size_matches_applied(live_size, last_applied_terminal_size) {
+                        let (rebuilt_area, sampled_size) = rebuild_after_terminal_reflow(
+                            &mut terminal,
+                            &mut screen,
+                            base_viewport_height,
+                            fitted_completion_items,
+                            last_drawn_area,
+                            last_applied_terminal_size,
+                            false,
+                        )?;
+                        last_drawn_area = Some(rebuilt_area);
+                        last_applied_terminal_size = sampled_size;
+                        drift_log(&format!(
+                            "reflow rebuild (pre-input): area={rebuilt_area:?} sampled={sampled_size:?}"
+                        ));
+                    }
                 }
 
                 let previous_input_len = textarea_logical_char_count(&textarea);
@@ -2763,6 +2908,59 @@ mod tests {
     }
 
     #[test]
+    fn one_column_live_jitter_never_owes_a_rebuild() {
+        use ratatui::layout::Size;
+        use std::time::{Duration, Instant};
+
+        let applied = Size::new(80, 24);
+        assert!(super::live_size_matches_applied(applied, applied));
+        assert!(super::live_size_matches_applied(Size::new(79, 24), applied));
+        assert!(super::live_size_matches_applied(Size::new(81, 24), applied));
+        assert!(!super::live_size_matches_applied(
+            Size::new(78, 24),
+            applied
+        ));
+        // Height moves are always real.
+        assert!(!super::live_size_matches_applied(
+            Size::new(80, 25),
+            applied
+        ));
+        assert!(!super::live_size_matches_applied(
+            Size::new(79, 25),
+            applied
+        ));
+
+        // Even a settled 1-column sighting owes no rebuild.
+        let start = Instant::now();
+        let mut settle = super::ResizeSettle::default();
+        assert!(!super::resize_rebuild_is_due(
+            &mut settle,
+            start,
+            Size::new(79, 24),
+            applied
+        ));
+        assert!(!super::resize_rebuild_is_due(
+            &mut settle,
+            start + Duration::from_millis(600),
+            Size::new(79, 24),
+            applied
+        ));
+        // A real move observed through the same window still rebuilds.
+        assert!(!super::resize_rebuild_is_due(
+            &mut settle,
+            start + Duration::from_millis(700),
+            Size::new(70, 24),
+            applied
+        ));
+        assert!(super::resize_rebuild_is_due(
+            &mut settle,
+            start + Duration::from_millis(1300),
+            Size::new(70, 24),
+            applied
+        ));
+    }
+
+    #[test]
     fn fixed_viewport_scrolls_only_rows_missing_below_cursor() {
         let size = ratatui::layout::Size {
             width: 80,
@@ -2940,6 +3138,15 @@ mod tests {
             previous,
             Size::new(120, 24),
             Some(Rect::new(0, 20, 80, 4)),
+            false,
+        ));
+        // A narrowing is never glued back to the bottom: the parked offset
+        // already counts the extra rows the old frame's own rows wrap into, so
+        // the recovered top lands flush under the transcript.
+        assert!(!reflow_pins_box_to_bottom(
+            Size::new(120, 24),
+            Size::new(80, 24),
+            Some(Rect::new(0, 20, 120, 4)),
             false,
         ));
         // Already above the bottom row: the recovered top is where it belongs.

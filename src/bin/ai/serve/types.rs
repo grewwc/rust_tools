@@ -1,11 +1,15 @@
 //! Serve-mode HTTP request/response types and pure helpers shared by
 //! the route modules (see `mod.rs`).
 
+#[cfg(feature = "serve")]
 use super::*;
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 
 pub(crate) const DEFAULT_BIND: &str = "127.0.0.1:8080";
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "serve")]
 pub(crate) struct ServeState {
     pub(crate) history_file: PathBuf,
     /// Root for workspace-relative image paths on the read-only preview route
@@ -91,11 +95,23 @@ pub(crate) struct TurnReq {
     /// behavior instead of hanging the turn on a question nobody can see.
     #[serde(default)]
     pub(crate) confirm: Option<bool>,
+    /// Per-turn forced skills for serve-chat `/skills` switching. Each name is
+    /// validated like a skill identifier and prepended to the child prompt as
+    /// an `@skills:<name>` token, so the turn child forces them through the
+    /// same inline-reference path as the local REPL. Empty (or absent, for
+    /// old clients) means "no forced skills". Never persisted: like the local
+    /// `/skills use`, the selection applies to the next turn only and the
+    /// child consumes it.
+    #[serde(default)]
+    pub(crate) skills: Vec<String>,
 }
 
 /// Max length for one per-turn model/agent override: identifiers are short
 /// registry names; the cap keeps a chatty client from bloating argv.
 pub(crate) const MAX_TURN_OVERRIDE_CHARS: usize = 128;
+/// Max forced skills carried by one turn request. Skill names are short
+/// identifiers; the cap keeps a chatty client from bloating the child prompt.
+pub(crate) const MAX_TURN_SKILLS: usize = 8;
 
 /// Validated per-turn overrides extracted from [`TurnReq`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -103,6 +119,7 @@ pub(crate) struct TurnOverrides {
     pub(crate) model: Option<String>,
     pub(crate) agent: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
+    pub(crate) skills: Vec<String>,
 }
 
 /// Validate one free-form model/agent override: non-empty after trim, short,
@@ -157,12 +174,81 @@ pub(crate) fn sanitize_turn_effort_override(value: Option<String>) -> Result<Opt
     }
 }
 
-/// Validate the three per-turn overrides of a turn request.
+/// Validate one skill name for per-turn forcing: a kebab-case identifier
+/// (ASCII letters/digits/`-`/`_`, the same shape skill manifests use), never
+/// flag-shaped (it is spliced into the child prompt, where a `--x` token
+/// could confuse downstream parsing).
+fn validate_turn_skill_value(trimmed: String) -> Result<String, String> {
+    if trimmed.is_empty() {
+        return Err("skills entry is empty".to_string());
+    }
+    if trimmed.len() > MAX_TURN_OVERRIDE_CHARS {
+        return Err(format!("skills entry {trimmed:?} is too long"));
+    }
+    if trimmed.starts_with('-') {
+        return Err(format!("skills entry {trimmed:?} must not be flag-shaped"));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "skills entry {trimmed:?} must be a kebab-case identifier"
+        ));
+    }
+    Ok(trimmed)
+}
+
+/// Validate the per-turn forced skills of a turn request: trims, drops
+/// blanks, dedupes case-insensitively keeping input order, and caps the
+/// count. Existence is deliberately not checked here: the turn child
+/// resolves names against its own manifests and skips unknowns one by one,
+/// exactly like local `@skills:` references.
+pub(crate) fn sanitize_turn_skills(names: Vec<String>) -> Result<Vec<String>, String> {
+    let mut valid: Vec<String> = Vec::new();
+    for raw in names {
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let name = validate_turn_skill_value(trimmed)?;
+        if !valid.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+            valid.push(name);
+        }
+    }
+    if valid.len() > MAX_TURN_SKILLS {
+        return Err(format!(
+            "too many skills: {} (max {MAX_TURN_SKILLS})",
+            valid.len()
+        ));
+    }
+    Ok(valid)
+}
+
+/// Prepend validated forced skills to a child prompt as `@skills:<name>`
+/// tokens. The turn child parses them through the same inline-reference path
+/// as the local REPL (`extract_forced_skill_references`), which strips the
+/// tokens from the model-visible text, so persisted history stays clean.
+/// Empty input returns the prompt unchanged.
+pub(crate) fn apply_turn_skills_prefix(prompt: &str, skills: &[String]) -> String {
+    if skills.is_empty() {
+        return prompt.to_string();
+    }
+    let refs: Vec<String> = skills.iter().map(|s| format!("@skills:{s}")).collect();
+    if prompt.trim().is_empty() {
+        refs.join(" ")
+    } else {
+        format!("{} {prompt}", refs.join(" "))
+    }
+}
+
+/// Validate the per-turn overrides of a turn request.
 pub(crate) fn turn_overrides(req: &TurnReq) -> Result<TurnOverrides, String> {
     Ok(TurnOverrides {
         model: sanitize_turn_name_override(req.model.clone(), "model")?,
         agent: sanitize_turn_name_override(req.agent.clone(), "agent")?,
         reasoning_effort: sanitize_turn_effort_override(req.reasoning_effort.clone())?,
+        skills: sanitize_turn_skills(req.skills.clone())?,
     })
 }
 
@@ -236,6 +322,7 @@ pub(crate) fn sanitize_session_config_effort(
 /// overrides: an explicit per-turn override wins; a field the request left
 /// absent falls back to the session's stored model/agent/effort, so a turn
 /// spawned without client flags still runs with the session's picks.
+#[cfg(feature = "serve")]
 pub(crate) fn merge_session_config(overrides: &mut TurnOverrides, stored: &SessionServeConfig) {
     if overrides.model.is_none() {
         overrides.model = stored.model.clone();
@@ -250,6 +337,7 @@ pub(crate) fn merge_session_config(overrides: &mut TurnOverrides, stored: &Sessi
 
 /// Best-effort read of a session's stored serve config; a read failure must
 /// never fail a turn, so it degrades to defaults.
+#[cfg(feature = "serve")]
 pub(crate) fn read_session_config_or_default(store: &SessionStore, session_id: &str) -> SessionServeConfig {
     match store.read_session_serve_config(session_id) {
         Ok(config) => config,
@@ -353,6 +441,7 @@ pub(crate) struct TurnResp {
     pub(crate) output: String,
 }
 
+#[cfg(feature = "serve")]
 pub(crate) fn unauthorized(msg: &str) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::UNAUTHORIZED,
@@ -360,6 +449,7 @@ pub(crate) fn unauthorized(msg: &str) -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+#[cfg(feature = "serve")]
 pub(crate) fn bad_request(msg: String) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::BAD_REQUEST,
@@ -367,6 +457,7 @@ pub(crate) fn bad_request(msg: String) -> (StatusCode, Json<serde_json::Value>) 
     )
 }
 
+#[cfg(feature = "serve")]
 pub(crate) fn check_auth(state: &ServeState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     if state.token.is_empty() {
         return Ok(());
@@ -393,6 +484,7 @@ pub(crate) fn check_auth(state: &ServeState, headers: &HeaderMap) -> Result<(), 
     }
 }
 
+#[cfg(feature = "serve")]
 pub(crate) async fn session_lock(state: &ServeState, session_id: &str) -> Arc<Mutex<()>> {
     let mut map = state.locks.lock().await;
     map.get(session_id)

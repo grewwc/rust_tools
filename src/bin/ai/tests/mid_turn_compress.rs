@@ -580,3 +580,128 @@ fn mid_turn_compress_keeps_tool_pairs_consistent() {
         );
     }
 }
+
+/// Fold-admission floor: a small reference doc (over the per-message cap, under
+/// `MID_TURN_SPILL_MIN_CHARS`) must survive mid-turn compaction verbatim, while a
+/// genuinely large result still spills. Folding the big result alone brings the
+/// projection back under the soft threshold, so the routine tier never has to
+/// reach for the small ones.
+#[test]
+fn mid_turn_compress_keeps_small_reference_docs_and_still_folds_big_results() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-midturn-floor-{}", uuid::Uuid::new_v4()));
+    let doc_body = |i: usize| {
+        let body = (1..=42)
+            .map(|line| format!("{line}: reference step body text without code markers"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("doc-{i}\n{body}")
+    };
+    let read_file_call = |id: &str| Message {
+        role: "assistant".to_string(),
+        content: Value::String(String::new()),
+        tool_calls: Some(vec![ToolCall {
+            id: id.to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: r#"{"filePath":"docs/guide.md","startLine":1,"endLine":42}"#.to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: None,
+    };
+    let tool_output = |id: &str, content: String| Message {
+        role: "tool".to_string(),
+        content: Value::String(content),
+        tool_calls: None,
+        tool_call_id: Some(id.to_string()),
+        reasoning_content: None,
+    };
+
+    let mut messages = vec![Message {
+        role: "system".to_string(),
+        content: Value::String("system prompt".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    for i in 0..3usize {
+        let id = format!("doc_{i}");
+        messages.push(read_file_call(&id));
+        messages.push(tool_output(&id, doc_body(i)));
+    }
+    // One genuinely large result: this is what the routine tier should fold.
+    messages.push(read_file_call("big"));
+    messages.push(tool_output("big", format!("big\n{}", "y".repeat(30_000))));
+    // Real user turn boundary: everything after it belongs to the current turn /
+    // recent window and stays in full.
+    messages.push(Message {
+        role: "user".to_string(),
+        content: Value::String("continue".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+    for i in 0..6usize {
+        let id = format!("recent_{i}");
+        messages.push(read_file_call(&id));
+        messages.push(tool_output(&id, "recent result".to_string()));
+    }
+
+    let (compressed, before, after) =
+        mid_turn_compress(messages, 20_000, Some(overflow_dir.as_path()), None);
+
+    assert!(
+        after < before,
+        "mid-turn compaction must still free bytes (before={before}, after={after})"
+    );
+    for i in 0..3usize {
+        let id = format!("doc_{i}");
+        let body = doc_body(i);
+        assert!(
+            compressed.iter().any(|m| {
+                m.role == "tool"
+                    && m.tool_call_id.as_deref() == Some(id.as_str())
+                    && m.content.as_str() == Some(body.as_str())
+            }),
+            "small reference doc {i} must stay inline"
+        );
+    }
+    let big = compressed
+        .iter()
+        .find(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("big"))
+        .expect("big result must remain as a tool message");
+    let text = big.content.as_str().unwrap_or_default();
+    assert!(text.len() < 30_000, "big result must be folded: {text}");
+    // Contract: the folded result still points at its zero-compression archive.
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("- archive_file_path: ")
+                .or_else(|| line.strip_prefix("- file_path: "))
+                .map(str::to_string)
+        })
+        .find(|candidate| {
+            // Session archives are referenced by bare file name and live in a
+            // subdirectory of the overflow dir, so search one level down.
+            let name = std::path::Path::new(candidate)
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            let mut dirs = vec![overflow_dir.clone()];
+            if let Ok(entries) = std::fs::read_dir(&overflow_dir) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        dirs.push(entry.path());
+                    }
+                }
+            }
+            dirs.into_iter().any(|dir| {
+                std::fs::read(dir.join(&name))
+                    .map(|bytes| bytes.len() >= 30_000)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or_else(|| panic!("folded big result must point at its full archive: {text}"));
+}

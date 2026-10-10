@@ -14,14 +14,18 @@
       },
       "priority": {
         "type": "integer",
+        "minimum": 0,
+        "maximum": 255,
         "description": "Process scheduling priority 0-255 (0=highest, 255=lowest). Default 10. Lower = more urgent; opposite direction of knowledge_save priority."
       },
       "quota_turns": {
         "type": "integer",
+        "minimum": 0,
         "description": "Maximum tool-calling turns per scheduler run before the daemon yields. Default 10."
       },
       "max_restarts": {
         "type": "integer",
+        "minimum": 0,
         "description": "Max automatic restarts after termination. Default 3."
       }
     },

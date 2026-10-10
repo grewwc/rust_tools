@@ -199,9 +199,13 @@ pub(in crate::ai) fn mid_turn_compress(
     //    leave a head+tail preview stub (consistent with cross-turn compaction),
     //    freeing context without losing information — the model can re-read via
     //    the stub's file_path.
+    //    Results below MID_TURN_SPILL_MIN_CHARS stay inline: folding them frees
+    //    too little budget to pay for the risk that the model trusts the preview
+    //    instead of the original.
     prepare_tool_messages_structured(
         &mut out,
         480,
+        MID_TURN_SPILL_MIN_CHARS,
         KEEP_RECENT_TOOL_GROUPS,
         overflow_dir,
         cwd,
@@ -237,6 +241,15 @@ pub(in crate::ai) const MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS: usize = 4_000;
 /// folding still leaves the context over `hard_target` — prefer truncation over
 /// letting the model 4xx.
 pub(in crate::ai) const PATH_C_PER_MSG_CAP: usize = 8_000;
+
+/// Minimum chars for mid-turn compaction step 2 to replace a non-compressible
+/// tool result (`read_file`, `execute_command`, ...) with a preview stub.
+/// Folding a smaller result frees too little budget to pay for the risk that the
+/// model reads the preview as the content and skips re-reading the original,
+/// while genuine bloat (large file reads, big command output) is far above this
+/// threshold and still folds. Step 3 (`shrink_messages_to_fit`) keeps the legacy
+/// threshold, so the bytes are still available when the budget truly needs them.
+pub(in crate::ai) const MID_TURN_SPILL_MIN_CHARS: usize = 6_000;
 
 /// Mid-turn LLM summary backstop: called when the lossless/weakly-lossy pipeline
 /// still leaves the context over threshold. Three complementary paths:

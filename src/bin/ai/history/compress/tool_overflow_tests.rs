@@ -3,6 +3,118 @@ use super::*;
 use crate::ai::types::{FunctionCall, ToolCall};
 use rustc_hash::FxHashSet;
 
+/// Legacy-threshold wrapper for the tests below: they exercise the spill
+/// mechanics, so every non-compressible result over the per-message cap folds
+/// regardless of size. Floor-aware behavior is asserted by the
+/// `mid_turn_spill_floor_*` tests, which call the parent module directly.
+fn prepare_tool_messages_structured(
+    messages: &mut [Message],
+    max_chars_per_msg: usize,
+    keep_recent_groups: usize,
+    overflow_dir: Option<&std::path::Path>,
+    cwd: Option<&std::path::Path>,
+    protected_tool_call_ids: &FxHashSet<String>,
+) {
+    super::prepare_tool_messages_structured(
+        messages,
+        max_chars_per_msg,
+        0,
+        keep_recent_groups,
+        overflow_dir,
+        cwd,
+        protected_tool_call_ids,
+    );
+}
+
+#[test]
+fn mid_turn_spill_floor_keeps_small_results_inline() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-tool-overflow-floor-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&overflow_dir).unwrap();
+    // ~2.6 KB of plain document text: over the per-message cap, under the
+    // mid-turn floor, and shaped like nothing the key-line index knows.
+    let doc = (1..=42)
+        .map(|i| format!("{i}: reference step body text without any code markers"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(doc.chars().count() > 480);
+    assert!(doc.chars().count() < MID_TURN_SPILL_MIN_CHARS);
+    let mut messages = vec![
+        assistant_call("old", "read_file"),
+        tool_result("old", &doc),
+        assistant_call("recent", "read_file"),
+        tool_result("recent", "recent result"),
+    ];
+
+    super::prepare_tool_messages_structured(
+        &mut messages,
+        480,
+        MID_TURN_SPILL_MIN_CHARS,
+        1,
+        Some(&overflow_dir),
+        None,
+        &FxHashSet::default(),
+    );
+
+    assert_eq!(value_to_string(&messages[1].content), doc);
+    let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
+    assert!(
+        !archive_dir.exists() || std::fs::read_dir(&archive_dir).unwrap().count() == 0,
+        "a below-floor result must not be archived"
+    );
+}
+
+#[test]
+fn mid_turn_spill_floor_still_folds_results_above_it() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-tool-overflow-floor-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&overflow_dir).unwrap();
+    let big = "z".repeat(MID_TURN_SPILL_MIN_CHARS + 1);
+    let mut messages = vec![
+        assistant_call("old", "read_file"),
+        tool_result("old", &big),
+        assistant_call("recent", "read_file"),
+        tool_result("recent", "recent result"),
+    ];
+
+    super::prepare_tool_messages_structured(
+        &mut messages,
+        480,
+        MID_TURN_SPILL_MIN_CHARS,
+        1,
+        Some(&overflow_dir),
+        None,
+        &FxHashSet::default(),
+    );
+
+    let stub = value_to_string(&messages[1].content);
+    assert!(is_preserved_tool_overflow_stub(&stub), "{stub}");
+}
+
+#[test]
+fn overflow_preview_probes_the_omitted_middle_without_format_assumptions() {
+    // Plain document lines: none of them match the code-shaped key-line index,
+    // so the probes are the only anchors showing that the body continues.
+    let doc = (1..=42)
+        .map(|i| format!("{i}. document section {i} body text"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let preview = build_overflow_content_preview(&doc);
+
+    assert!(preview.contains("- middle_samples ("), "{preview}");
+    // The first and last omitted lines are always probed (0-based labels, the
+    // same convention `extract_key_lines` uses for prefix-less content).
+    assert!(preview.contains("  L4: "), "{preview}");
+    assert!(preview.contains("  L39: "), "{preview}");
+    // Deterministic: identical content yields a byte-identical preview.
+    assert_eq!(preview, build_overflow_content_preview(&doc));
+
+    // Short content keeps the legacy head+tail-only shape.
+    let short_preview = build_overflow_content_preview("a\nb\nc\nd\ne\nf");
+    assert!(!short_preview.contains("middle_samples"), "{short_preview}");
+    assert_eq!(short_preview.lines().count(), 7);
+}
+
 fn assistant_call(id: &str, name: &str) -> Message {
     assistant_call_args(id, name, "{}")
 }

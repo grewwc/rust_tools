@@ -22,7 +22,7 @@ mod prompt;
 mod provider;
 mod request;
 mod request_protocol;
-#[cfg(feature = "serve")]
+#[cfg(any(feature = "serve", feature = "serve-client"))]
 pub(in crate::ai) mod serve;
 mod serve_confirm;
 mod skills;
@@ -159,23 +159,23 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     if cli.serve_chat {
-        #[cfg(feature = "serve")]
+        #[cfg(any(feature = "serve", feature = "serve-client"))]
         {
             return serve::chat::run_serve_chat(cli);
         }
-        #[cfg(not(feature = "serve"))]
+        #[cfg(not(any(feature = "serve", feature = "serve-client")))]
         {
-            return Err("this binary was built without the `serve` feature; rebuild with --features serve".into());
+            return Err("this binary was built without serve-chat support; rebuild with --features serve-client or serve".into());
         }
     }
     if cli.serve_sessions {
-        #[cfg(feature = "serve")]
+        #[cfg(any(feature = "serve", feature = "serve-client"))]
         {
             return serve::chat::run_serve_sessions(&cli);
         }
-        #[cfg(not(feature = "serve"))]
+        #[cfg(not(any(feature = "serve", feature = "serve-client")))]
         {
-            return Err("this binary was built without the `serve` feature; rebuild with --features serve".into());
+            return Err("this binary was built without serve-sessions support; rebuild with --features serve-client or serve".into());
         }
     }
     if cli.serve {

@@ -13,6 +13,8 @@
       },
       "timeout_secs": {
         "type": "integer",
+        "minimum": 1,
+        "maximum": 60,
         "description": "Wait budget for THIS call (clamped 1–60, default 30). Suspends the parent — call only after independent work is exhausted. Hitting the budget does NOT cancel or stall subagents; they keep running — use task_status while other work remains."
       },
       "wait_policy": {

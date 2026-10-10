@@ -5,9 +5,10 @@ use uuid::Uuid;
 use crate::ai::{
     history::{
         MarkMessageUpdate, PruneSessionDeleteResult, SessionInfo, SessionStore, SessionTitleOrigin,
-        SuspendedSessionEntry, SuspendedSessionStore, format_suspended_timestamp_label,
-        generate_session_summary,
+        SessionServeConfig, SuspendedSessionEntry, SuspendedSessionStore,
+        format_suspended_timestamp_label, generate_session_summary,
     },
+    provider::ReasoningEffort,
     types::App,
 };
 
@@ -119,7 +120,59 @@ pub(in crate::ai) fn restore_session_local_runtime_state(app: &mut App) -> std::
     let store = SessionStore::new(app.config.history_file.as_path());
     app.stale_patch_targets =
         load_stale_patch_targets(&store, &app.session_id, &app.session_history_file)?;
+    restore_session_model_agent_effort(app, &store);
     restore_prune_marks_for_history(app)
+}
+
+/// Best-effort persist of the session's current model/agent/effort picks into
+/// the session's own meta table (the same `serve_*` keys the serve mode
+/// reads), so reopening the session with `a -ss <id>` — or a remote serve
+/// turn against it — resumes the last picks instead of defaults. Called after
+/// every `/model`/`/effort`/`/agent` change; a write failure is logged and
+/// never fails the command.
+pub(in crate::ai) fn persist_session_runtime_state(app: &App) {
+    let store = SessionStore::new(app.config.history_file.as_path());
+    let config = SessionServeConfig {
+        model: Some(app.current_model.clone()),
+        agent: Some(app.current_agent.clone()),
+        reasoning_effort: match &app.cli.reasoning_effort_override {
+            None => None,
+            Some(None) => Some("off".to_string()),
+            Some(Some(level)) => Some(level.as_str().to_string()),
+        },
+    };
+    if let Err(error) = store.write_session_serve_config(&app.session_id, &config) {
+        eprintln!("[session] failed to persist model/agent/effort picks: {error}");
+    }
+}
+
+/// Restore the session's own model/agent/effort picks (persisted on every
+/// `/model`/`/effort`/`/agent` change). Explicit CLI flags win over the
+/// stored picks, mirroring serve's per-turn override precedence, so
+/// `a -ss <id> --model X` still starts with X.
+fn restore_session_model_agent_effort(app: &mut App, store: &SessionStore) {
+    let Ok(stored) = store.read_session_serve_config(&app.session_id) else {
+        return;
+    };
+    if app.cli.model.is_none() {
+        if let Some(model) = stored.model {
+            app.current_model = model;
+        }
+    }
+    if app.cli.agent.is_none() {
+        if let Some(agent) = stored.agent {
+            app.current_agent = agent;
+        }
+    }
+    if app.cli.reasoning_effort_override.is_none() {
+        if let Some(effort) = stored.reasoning_effort {
+            app.cli.reasoning_effort_override = if effort == "off" {
+                Some(None)
+            } else {
+                ReasoningEffort::parse(&effort).map(Some)
+            };
+        }
+    }
 }
 
 /// Session-derived prune authorization for the current request projection.
@@ -216,6 +269,7 @@ fn switch_app_to_session(
     app.session_id = session_id.to_string();
     app.session_history_file = history_file;
     app.stale_patch_targets = stale_patch_targets;
+    restore_session_model_agent_effort(app, store);
     restore_prune_marks_for_history(app)?;
     app.sync_persona_session_binding();
     Ok(())
@@ -1834,6 +1888,76 @@ mod tests {
 
         assert_eq!(app.prune_marks.len(), 1);
         assert_eq!(app.prune_marks.get("call_0"), Some(&1));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persist_and_restore_session_runtime_state_roundtrip() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let session_id = app.session_id.clone();
+
+        // A fresh session carries no stored picks yet.
+        restore_session_local_runtime_state(&mut app).unwrap();
+        assert_eq!(
+            store.read_session_serve_config(&session_id).unwrap(),
+            SessionServeConfig::default()
+        );
+
+        // Simulate `/model deepseek-v3`, `/effort high`, `/agent helper`.
+        app.current_model = "deepseek-v3".to_string();
+        app.current_agent = "helper".to_string();
+        app.cli.reasoning_effort_override = Some(Some(ReasoningEffort::High));
+        super::persist_session_runtime_state(&app);
+
+        let stored = store.read_session_serve_config(&session_id).unwrap();
+        assert_eq!(stored.model.as_deref(), Some("deepseek-v3"));
+        assert_eq!(stored.agent.as_deref(), Some("helper"));
+        assert_eq!(stored.reasoning_effort.as_deref(), Some("high"));
+
+        // Reopening the session (`a -ss <id>`) restores the picks.
+        let mut reopened = test_app(&root);
+        restore_session_local_runtime_state(&mut reopened).unwrap();
+        assert_eq!(reopened.current_model, "deepseek-v3");
+        assert_eq!(reopened.current_agent, "helper");
+        assert_eq!(
+            reopened.cli.reasoning_effort_override,
+            Some(Some(ReasoningEffort::High))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_session_runtime_state_keeps_explicit_cli_flags() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+
+        app.current_model = "stored-model".to_string();
+        app.current_agent = "stored-agent".to_string();
+        app.cli.reasoning_effort_override = Some(Some(ReasoningEffort::Medium));
+        super::persist_session_runtime_state(&app);
+
+        // Reopen with explicit CLI flags: they win over the stored picks.
+        let mut reopened = test_app(&root);
+        // `App::new` seeds `current_model`/`current_agent` from the CLI flags
+        // (`models::initial_model(&cli)`, `cli.agent` preset) before the
+        // startup restore runs; mirror that here.
+        reopened.cli.model = Some("cli-model".to_string());
+        reopened.current_model = "cli-model".to_string();
+        reopened.cli.agent = Some("cli-agent".to_string());
+        reopened.current_agent = "cli-agent".to_string();
+        reopened.cli.reasoning_effort_override = Some(None);
+        restore_session_local_runtime_state(&mut reopened).unwrap();
+        assert_eq!(reopened.current_model, "cli-model");
+        assert_eq!(reopened.current_agent, "cli-agent");
+        assert_eq!(reopened.cli.reasoning_effort_override, Some(None));
         let _ = fs::remove_dir_all(root);
     }
 

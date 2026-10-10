@@ -205,6 +205,15 @@ pub(super) fn install_runtime_manifests(
         && !default_agent.disabled
     {
         activate_primary_agent(app, default_agent);
+    } else if app.cli.agent.is_none() {
+        // `current_agent` may carry a pick restored from the session's stored
+        // state; if it no longer resolves to a switchable primary agent, drop
+        // back to the default instead of leaving a dangling name active.
+        eprintln!(
+            "[Warning] Agent '{}' not found, using default",
+            app.current_agent
+        );
+        fallback_to_default_agent(app, agent_manifests);
     }
 
     if let Some(agent_name) = &app.cli.agent {

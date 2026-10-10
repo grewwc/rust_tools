@@ -7,7 +7,7 @@ use std::error::Error;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration as StdDuration, UNIX_EPOCH};
 
 use crate::ai::{
@@ -185,9 +185,244 @@ fn prepare_tool_call(
     if let Some(stub_error) = overflow_stub_argument_error(tool_call, &args) {
         return Err(stub_error);
     }
-    Ok(PreparedToolCall {
-        route: route_tool_call(mcp_client, &tool_call.function.name),
-        args,
+    let route = route_tool_call(mcp_client, &tool_call.function.name);
+    validate_tool_call_args(mcp_client, tool_call, &route, &args)?;
+    Ok(PreparedToolCall { route, args })
+}
+
+/// Cache of compiled JSON Schema validators for builtin tools, keyed by tool
+/// name. The effective metadata is itself process-cached (`load_metadata`
+/// holds a `OnceLock`), so a per-name entry stays valid for the process
+/// lifetime. `None` marks a known-unusable schema: the fail-open is logged
+/// once at compile time instead of on every call.
+static BUILTIN_ARG_VALIDATORS: LazyLock<
+    Mutex<std::collections::HashMap<String, Option<Arc<jsonschema::Validator>>>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn builtin_arg_validator(name: &str, schema: &Value) -> Option<Arc<jsonschema::Validator>> {
+    if let Ok(cache) = BUILTIN_ARG_VALIDATORS.lock()
+        && let Some(hit) = cache.get(name).cloned()
+    {
+        return hit;
+    }
+    let compiled = match jsonschema::validator_for(schema) {
+        Ok(validator) => Some(Arc::new(validator)),
+        Err(err) => {
+            eprintln!("[tools] skipping argument validation for '{name}': invalid schema: {err}");
+            None
+        }
+    };
+    if let Ok(mut cache) = BUILTIN_ARG_VALIDATORS.lock() {
+        cache.insert(name.to_string(), compiled.clone());
+    }
+    compiled
+}
+
+/// Per-tool compatibility aliases: (tool name, alias key, canonical key).
+///
+/// Services accept these historical spellings alongside the canonical key
+/// (`resolve_file_path_arg` / `optional_file_path_arg` take `path`;
+/// `execute_send_side_note` takes `content` / `target_task_id` / `target`),
+/// but published schemas only declare the canonical key. The table is
+/// per-tool on purpose: a global alias would collide with declared fields
+/// (`content` is a real parameter of `write_file`, not an alias for `note`).
+const BUILTIN_ARG_ALIASES: &[(&str, &str, &str)] = &[
+    ("read_file", "path", "file_path"),
+    ("write_file", "path", "file_path"),
+    ("apply_patch", "path", "file_path"),
+    ("send_side_note", "content", "note"),
+    ("send_side_note", "target_task_id", "task_id"),
+    ("send_side_note", "target", "task_id"),
+];
+
+/// Normalize a validation-only copy of builtin tool arguments.
+///
+/// Two provider/service realities force this (the service still receives the
+/// original args, so no downstream behavior changes):
+/// - Bridges materialize absent optionals as explicit `null` (observed for
+///   apply_patch `patch`/`patch_file`). Services treat null as "not
+///   provided", while published schemas don't list null types, so drop
+///   null-valued keys that the schema doesn't require before validating.
+/// - Tools listed in `BUILTIN_ARG_ALIASES` accept a historical alias, but
+///   published schemas only declare the canonical key. Copy the alias value
+///   to the canonical key (canonical wins when both are present) and remove
+///   the alias key, so a compatible call isn't rejected at the gate — and the
+///   alias can't linger as an unknown field either.
+/// Never applied to MCP: server schemas keep their original semantics and
+/// the gate validates exactly what the server will receive.
+fn normalize_for_validation(tool_name: &str, args: &Value, schema: &Value) -> Value {
+    let Some(obj) = args.as_object() else {
+        return args.clone();
+    };
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut normalized = obj.clone();
+    normalized.retain(|key, value| !value.is_null() || required.contains(&key.as_str()));
+    for (tool, alias, canonical) in BUILTIN_ARG_ALIASES {
+        if *tool != tool_name {
+            continue;
+        }
+        let Some(alias_value) = normalized.remove(*alias) else {
+            continue;
+        };
+        if !normalized.contains_key(*canonical)
+            && schema
+                .pointer(&format!("/properties/{canonical}"))
+                .is_some()
+        {
+            normalized.insert(canonical.to_string(), alias_value);
+        }
+    }
+    Value::Object(normalized)
+}
+
+/// Unknown-field guard for builtin tools: the published schema is the whole
+/// contract the model sees, so a top-level key it doesn't declare is a
+/// hallucination or a typo — and services silently ignore such keys
+/// (`write_file` overwrites while the model believed `append: true`
+/// appended). Only decidable when the schema declares its property set;
+/// schemas without `properties` fall back to plain schema validation.
+fn unknown_builtin_arg_keys(args: &Value, schema: &Value) -> Vec<String> {
+    let (Some(obj), Some(properties)) = (
+        args.as_object(),
+        schema.get("properties").and_then(Value::as_object),
+    ) else {
+        return Vec::new();
+    };
+    obj.keys()
+        .filter(|key| !properties.contains_key(key.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Central JSON Schema gate for tool arguments.
+///
+/// Every tool publishes its contract as the `parameters` schema sent to the
+/// model; validating here (instead of inside each tool) keeps one enforcement
+/// point for builtin and MCP tools alike. A present-but-wrongly-typed value
+/// must fail loudly so the model retries with the declared type — service
+/// layers may only default fields that are absent, never coerce a wrong type
+/// into a silent default (e.g. `offset: "500"` must not read from line 1).
+/// Builtin schemas are closed at the top level: the published schema is the
+/// whole contract the model sees, so an undeclared key is a hallucination or
+/// a typo that services would silently ignore. MCP keeps the server's
+/// original open/closed semantics — the gate validates exactly what the
+/// server will receive, with no local normalization. An unparsable schema
+/// fails open (logged, call allowed) so broken metadata can never brick tool
+/// use; an invalid instance fails closed with a retryable error. Builtin
+/// validation runs on a normalized copy of the args
+/// (provider-materialized `null` optionals dropped, `BUILTIN_ARG_ALIASES`
+/// resolved); the service still receives the original args. Builtin
+/// validators are compiled once per tool name; MCP schemas are
+/// server-supplied, so only their lookup is cached (Arc snapshot, no clone).
+fn validate_tool_call_args(
+    mcp_client: &McpClient,
+    tool_call: &ToolCall,
+    route: &ToolRoute,
+    args: &Value,
+) -> Result<(), ToolResult> {
+    let schema = match route {
+        ToolRoute::Mcp { .. } => mcp_client
+            .cached_tool_definitions_arc()
+            .iter()
+            .find(|tool| tool.function.name == tool_call.function.name)
+            .map(|tool| tool.function.parameters.clone()),
+        ToolRoute::Builtin => Some(
+            crate::ai::tools::registry::tool_metadata::tool_parameters(
+                &tool_call.function.name,
+            ),
+        ),
+    };
+    let Some(schema) = schema else {
+        return Ok(());
+    };
+    // Unconstrained object schemas accept any arguments; skip validator setup.
+    if schema == json!({"type": "object"}) {
+        return Ok(());
+    }
+    match route {
+        ToolRoute::Builtin => {
+            let normalized =
+                normalize_for_validation(&tool_call.function.name, args, &schema);
+            let unknown = unknown_builtin_arg_keys(&normalized, &schema);
+            if !unknown.is_empty() {
+                let declared = schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .map(|properties| {
+                        let mut names: Vec<&str> =
+                            properties.keys().map(String::as_str).collect();
+                        names.sort_unstable();
+                        names.join(", ")
+                    })
+                    .unwrap_or_else(|| "(none)".to_string());
+                return Err(ToolResult {
+                    tool_call_id: tool_call.id.clone(),
+                    content: format!(
+                        "Error: invalid arguments for '{}': unknown argument(s) {}. Declared parameters are: {declared}. Remove or correct them and retry.",
+                        tool_call.function.name,
+                        unknown.join(", "),
+                    ),
+                });
+            }
+            // Compiled once per tool name (see `BUILTIN_ARG_VALIDATORS`); a
+            // known-bad schema was already logged at compile time, so fail open.
+            match builtin_arg_validator(&tool_call.function.name, &schema) {
+                Some(validator) => reject_invalid_tool_args(tool_call, &validator, &normalized),
+                None => Ok(()),
+            }
+        }
+        // MCP schemas are server-supplied and can change on reconnect, so
+        // they are compiled per call; only the directory lookup is cached.
+        // Validated against the raw args — no local normalization — so the
+        // gate can never bless arguments the server itself would reject.
+        ToolRoute::Mcp { .. } => match jsonschema::validator_for(&schema) {
+            Ok(validator) => {
+                reject_invalid_tool_args(tool_call, &validator, args)
+            }
+            Err(err) => {
+                eprintln!(
+                    "[tools] skipping argument validation for '{}': invalid schema: {err}",
+                    tool_call.function.name
+                );
+                Ok(())
+            }
+        },
+    }
+}
+
+/// Shared fail-closed tail: an invalid instance lists up to three violations
+/// so the model can retry with corrected types.
+fn reject_invalid_tool_args(
+    tool_call: &ToolCall,
+    validator: &jsonschema::Validator,
+    instance: &Value,
+) -> Result<(), ToolResult> {
+    if validator.is_valid(instance) {
+        return Ok(());
+    }
+    let details = validator
+        .iter_errors(instance)
+        .take(3)
+        .map(|err| {
+            let path = err.instance_path().to_string();
+            if path.is_empty() {
+                err.to_string()
+            } else {
+                format!("{path}: {err}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(ToolResult {
+        tool_call_id: tool_call.id.clone(),
+        content: format!(
+            "Error: invalid arguments for '{}': {details}. Fix the types to match the tool schema and retry.",
+            tool_call.function.name
+        ),
     })
 }
 

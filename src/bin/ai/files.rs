@@ -204,7 +204,7 @@ pub(super) fn extract_key_lines(content: &str, max: usize) -> Vec<String> {
 /// Parse read_file output's `{:>6}\t{content}` line-number prefix, returning
 /// (real line number, body after the prefix). Returns None for non-matching formats
 /// (e.g. plain command output), keeping the original `L{idx}` semantics.
-fn split_line_number_prefix(trimmed: &str) -> Option<(usize, &str)> {
+pub(super) fn split_line_number_prefix(trimmed: &str) -> Option<(usize, &str)> {
     let bytes = trimmed.as_bytes();
     let mut i = 0;
     while i < bytes.len() && bytes[i].is_ascii_digit() {

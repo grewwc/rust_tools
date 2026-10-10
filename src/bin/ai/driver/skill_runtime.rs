@@ -988,6 +988,9 @@ fn push_project_context(builder: &mut SystemPromptBuilder) {
 /// Session context: tells the model the current session and its data layout, so that in any project
 /// (even directories unrelated to rust_tools) it can locate and debug sessionid problems and
 /// interact read-only with a given session's content. The model is read-only: no writing, modifying, or deleting session data.
+/// The full layout is injected only when the request looks session-related
+/// (`session_issue_likely`); other turns keep a one-line session id for
+/// grounding (see `build_skill_turn_guard`).
 fn session_context_prompt(
     session_id: &str,
     session_history_file: &Path,
@@ -1003,6 +1006,25 @@ fn session_context_prompt(
         session_history_file.display(),
         sessions_root,
     )
+}
+
+/// Relevance gate for the session-debugging walkthrough: decides whether the
+/// turn injects the full session storage layout or just the one-line session
+/// id. Matching is deliberately broad substring — a missed debug session
+/// costs more than the ~500 carried characters of an occasional
+/// over-injection (a general "history of X" knowledge question also matches
+/// `history`; accepted). Chinese is matched literally here alongside English;
+/// this keyword list is the one place where non-English prompt text is
+/// intentional.
+fn session_issue_likely(question: &str) -> bool {
+    let lowered = question.to_lowercase();
+    [
+        // "session" also covers sessionid, session_id and /sessions paths.
+        "session", "history", "resume", "attach", "background", "会话", "历史",
+        "恢复", "重连",
+    ]
+    .iter()
+    .any(|kw| lowered.contains(kw))
 }
 
 const MAX_SKILL_ACTIVATION_HISTORY_ENTRIES: usize = 6;
@@ -1518,6 +1540,7 @@ fn build_skill_turn_guard(
     app: &mut App,
     mcp_client: &McpClient,
     skills: &[&SkillManifest],
+    question: &str,
 ) -> SkillTurnGuard {
     let all_mcp_tools = mcp_client.get_all_tools();
     super::super::tools::enable_tools::set_available_mcp_tools(all_mcp_tools.clone());
@@ -1577,15 +1600,26 @@ fn build_skill_turn_guard(
         builder.push(ContextKind::Capability, catalog);
     }
     push_project_context(&mut builder);
-    builder.push_labeled(
-        ContextKind::Behavior,
-        "session_context",
-        session_context_prompt(
-            &app.session_id,
-            &app.session_history_file,
-            &app.config.history_file,
-        ),
-    );
+    // Session debugging layout is low-frequency knowledge: every turn keeps a
+    // one-line session id for grounding, while the sessions-root/SQLite/assets
+    // walkthrough is injected only when the request looks session-related.
+    if session_issue_likely(question) {
+        builder.push_labeled(
+            ContextKind::Behavior,
+            "session_context",
+            session_context_prompt(
+                &app.session_id,
+                &app.session_history_file,
+                &app.config.history_file,
+            ),
+        );
+    } else {
+        builder.push_labeled(
+            ContextKind::Fact,
+            "session_context",
+            format!("Session id: {}.", app.session_id),
+        );
+    }
     if let Ok(events) = history::read_skill_activation_events_sqlite(&app.session_history_file)
         && let Some(reminder) = build_skill_activation_history_reminder(&events)
     {
@@ -1626,7 +1660,7 @@ pub(super) fn rebuild_skill_turn_with_existing_selection(
     app: &mut App,
     mcp_client: &McpClient,
     skill_manifests: &[SkillManifest],
-    _question: &str,
+    question: &str,
     preferred_skill_names: &[String],
 ) -> SkillTurnGuard {
     // For iteration > 1, keep the previous turn's skills by name only; no more text-similarity re-routing.
@@ -1635,7 +1669,7 @@ pub(super) fn rebuild_skill_turn_with_existing_selection(
         .iter()
         .filter_map(|name| skill_manifests.iter().find(|s| &s.name == name))
         .collect();
-    build_skill_turn_guard(app, mcp_client, &skills)
+    build_skill_turn_guard(app, mcp_client, &skills, question)
 }
 
 /// Path taken when the model explicitly requests a skill via the `activate_skill` tool: match by name
@@ -1648,7 +1682,7 @@ pub(super) fn force_activate_named_skill(
     app: &mut App,
     mcp_client: &McpClient,
     skill_manifests: &[SkillManifest],
-    _question: &str,
+    question: &str,
     requested_names: &[String],
 ) -> Option<SkillTurnGuard> {
     // Resolve each name into a manifest one by one (skipping misses)
@@ -1659,7 +1693,7 @@ pub(super) fn force_activate_named_skill(
     if skills.is_empty() {
         return None;
     }
-    let mut guard = build_skill_turn_guard(app, mcp_client, &skills);
+    let mut guard = build_skill_turn_guard(app, mcp_client, &skills, question);
     guard.matched_skill_names = skills.iter().map(|s| s.name.clone()).collect();
     Some(guard)
 }
@@ -1816,7 +1850,7 @@ pub(super) fn prepare_skill_for_turn(
     if debug {
         eprintln!("[skills] no auto-activation; explicit activate_skill only");
     }
-    let mut guard = build_skill_turn_guard(app, mcp_client, skills);
+    let mut guard = build_skill_turn_guard(app, mcp_client, skills, question);
     guard.matched_skill_names = Vec::new();
     Ok(guard)
 }

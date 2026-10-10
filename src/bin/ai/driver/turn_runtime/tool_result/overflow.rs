@@ -129,6 +129,7 @@ pub(super) fn build_model_overflow_stub(
             "Output too large; full result saved to a file. The COMPLETE output is NOT in context.\n\
              Do NOT read this overflow file by default. First use the summary / key_lines / head_preview / tail_preview below to decide whether you already have enough evidence.\n\
              Only call read_file on `file_path` when the current question genuinely depends on omitted exact text that is not recoverable from the previews.\n\
+             The previews are anchors, not the content: when the task requires following, citing, or transforming this output, recover the full text (re-run the original operation or read the original source path) instead of treating the previews as the content.\n\
              Treat `file_path` as an overflow archive, not as the original source/document path.\n\
              - file_path: {}\n- summary: {}\n",
             path.display(),
