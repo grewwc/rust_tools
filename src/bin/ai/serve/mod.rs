@@ -813,31 +813,31 @@ fn truncate_line(line: &str) -> String {
     }
 }
 
-/// Normalize one child-stdout row for SSE transport: strip the live-terminal
-/// overwrite prefix (`\r\x1b[2K`) that completed/failed tool rows carry to
-/// redraw the `running` row in place, and neutralize every other
-/// cursor-addressing escape inside the row. SSE rows are append-only, so the
-/// prefix is meaningless on the wire; worse, the bare `\r` makes axum split
-/// the row and re-prefix `data:`, injecting a literal `data: ` fragment that
-/// only a terminal honoring the erase escape can hide again. Cursor moves
-/// (`CSI A/B`), region erases (`CSI J/K`) and friends address screen rows
-/// that only exist on the child's live terminal: replayed verbatim on the
-/// chat client's screen they erase or overwrite unrelated rows (ragged
-/// indents, duplicated-looking status lines). SGR color (`CSI ... m`) is
-/// kept: it styles only the row itself and renders identically everywhere.
-/// A bare mid-line `\r` (same-row overwrite, e.g. progress counters) passes
-/// through: the client's terminal resolves it exactly like the local one,
-/// and splitting on it would destroy echoed tool output that legitimately
-/// contains carriage returns. `BufRead::lines` already removed the line
-/// ending, so a leading `\r` here is always the overwrite control, never
-/// content.
+/// Normalize one child-stdout row for SSE transport: neutralize
+/// cursor-addressing escapes, then eliminate every bare `\r`. SSE rows are
+/// append-only, so same-row overwrite controls are meaningless on the wire;
+/// worse, axum re-prefixes `data: ` after every `\r`/`\n` byte while the chat
+/// client only strips the first one, so any surviving `\r` renders as a
+/// literal `data: ` fragment on the client's screen. `BufRead::lines` glues
+/// redraw bytes into the row (completed/failed tool rows carry
+/// `\r\x1b[2K` to redraw the `running` row in place, fold teardown emits
+/// doubled `\r`s with no `\n` between), so the `\r` is routinely mid-line,
+/// not just a leading prefix. `BufRead::lines` already removed the line
+/// ending, so every `\r` left is an overwrite control, never content:
+/// leading ones are dropped and interior ones become row breaks, which the
+/// client prints as separate lines. Cursor moves (`CSI A/B`), region erases
+/// (`CSI J/K`) and friends address screen rows that only exist on the
+/// child's live terminal: replayed verbatim on the chat client's screen
+/// they erase or overwrite unrelated rows (ragged indents,
+/// duplicated-looking status lines). SGR color (`CSI ... m`) is kept: it
+/// styles only the row itself and renders identically everywhere.
 fn clean_sse_line(line: &str) -> String {
     // Neutralize cursor addressing first: stripping it can reveal a leading
     // `\r` (e.g. `\x1b[1A\r\x1b[2K...`) that the prefix wash below must see.
     let stripped = strip_non_sgr_csi(line);
-    let line = stripped.strip_prefix('\r').unwrap_or(&stripped);
-    let line = line.strip_prefix("\x1b[2K").unwrap_or(line);
-    truncate_line(line)
+    // (`\x1b[2K` is already gone: `strip_non_sgr_csi` drops every non-SGR
+    // CSI sequence.) No bare `\r` may reach `Event::data`.
+    truncate_line(stripped.replace('\r', "\n").trim_matches('\n'))
 }
 
 /// Remove every ANSI CSI sequence except SGR color (`ESC [ ... m`).

@@ -1069,12 +1069,12 @@ use super::*;
 
     #[test]
     fn clean_sse_line_neutralizes_cursor_addressing_escapes() {
-        // A glued running/completed pair keeps its same-row overwrite (the
-        // client terminal resolves it like the local one) but loses the
-        // mid-line erase.
+        // A glued running/completed pair becomes two wire rows: a surviving
+        // mid-line `\r` would make axum re-prefix `data:`, and the client
+        // only strips the first `data: `, so the second prints literally.
         assert_eq!(
             clean_sse_line("  ● task_status\r\u{1b}[2K  \u{1b}[32m✓\u{1b}[0m task_status"),
-            "  ● task_status\r  \u{1b}[32m✓\u{1b}[0m task_status"
+            "  ● task_status\n  \u{1b}[32m✓\u{1b}[0m task_status"
         );
         // Cursor moves and region erases address the child's screen, never
         // the client's: strip them, keep the text and its SGR color.
@@ -1089,6 +1089,30 @@ use super::*;
         // Unterminated introducers and non-CSI escapes never reach the wire.
         assert_eq!(clean_sse_line("ab\u{1b}[2"), "ab");
         assert_eq!(clean_sse_line("ab\u{1b}7cd"), "abcd");
+    }
+
+    #[test]
+    fn clean_sse_line_leaves_no_bare_cr_for_axum_to_reframe() {
+        // Fold teardown emits doubled `\r`s with no `\n` between, and live
+        // rows can end with a bare `\r`: every one must go, or axum's
+        // `data: ` re-prefix after the `\r` prints literally on the client.
+        assert_eq!(
+            clean_sse_line("\r\r\u{1b}[2K  \u{1b}[32m✓\u{1b}[0m thinking (3 lines)"),
+            "  \u{1b}[32m✓\u{1b}[0m thinking (3 lines)"
+        );
+        assert_eq!(clean_sse_line("50%\r51%\r52%"), "50%\n51%\n52%");
+        for input in [
+            "\r\r\u{1b}[2K  ✓ done",
+            "  ○ running\u{1b}[0m\r",
+            "a\rb",
+            "\r",
+        ] {
+            let cleaned = clean_sse_line(input);
+            assert!(
+                !cleaned.contains('\r'),
+                "bare CR survives in {cleaned:?}"
+            );
+        }
     }
 
     #[test]

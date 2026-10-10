@@ -1910,11 +1910,24 @@ fn dim(text: &str, tty: bool) -> String {
     }
 }
 
-/// Close the live thinking status line (if open), print the buffered thinking
-/// body as dimmed lines (local-fold parity), then print the folded summary,
-/// mirroring the local `✓ thinking (N lines)` row. No-op when no thinking
-/// block is open. Takes the body so every close path (done/error/follow-up
-/// block/late delta or footer) renders it exactly once.
+/// Max thinking-body rows printed when a thinking block closes. The live
+/// status line already scrolled a tail while the block was open, and the
+/// local client erases the fold body entirely (only `✓ thinking (N lines)`
+/// stays on screen), so the close print is a bounded recap, never the full
+/// text: a 100-line block must not dump a wall of dimmed rows into the chat
+/// scrollback.
+const MAX_THINKING_CLOSE_ROWS: usize = 10;
+/// Rows kept from the head of an over-long thinking body; the tail keeps
+/// `MAX_THINKING_CLOSE_ROWS - THINKING_CLOSE_HEAD_ROWS` rows so the
+/// conclusions at the end stay visible.
+const THINKING_CLOSE_HEAD_ROWS: usize = 3;
+
+/// Close the live thinking status line (if open), print a bounded recap of
+/// the buffered thinking body as dimmed lines, then print the folded
+/// summary, mirroring the local `✓ thinking (N lines)` row. No-op when no
+/// thinking block is open. Takes the body so every close path
+/// (done/error/follow-up block/late delta or footer) renders it exactly
+/// once.
 fn close_thinking_status(
     active: &mut bool,
     line_open: &mut bool,
@@ -1938,8 +1951,25 @@ fn close_thinking_status(
         if rows.last().is_some_and(|last| last.is_empty()) {
             rows.pop();
         }
-        for row in rows {
-            let _ = writeln!(out, "{}", dim(row, tty));
+        if rows.len() > MAX_THINKING_CLOSE_ROWS {
+            let omitted = rows.len() - MAX_THINKING_CLOSE_ROWS;
+            let tail = MAX_THINKING_CLOSE_ROWS - THINKING_CLOSE_HEAD_ROWS;
+            for row in &rows[..THINKING_CLOSE_HEAD_ROWS] {
+                let _ = writeln!(out, "{}", dim(row, tty));
+            }
+            let marker = if omitted == 1 {
+                "... [1 line omitted]".to_string()
+            } else {
+                format!("... [{omitted} lines omitted]")
+            };
+            let _ = writeln!(out, "{}", dim(&marker, tty));
+            for row in &rows[rows.len() - tail..] {
+                let _ = writeln!(out, "{}", dim(row, tty));
+            }
+        } else {
+            for row in rows {
+                let _ = writeln!(out, "{}", dim(row, tty));
+            }
         }
         body.clear();
     }
@@ -3134,6 +3164,45 @@ mod tests {
         let resp = reqwest::blocking::get(url).expect("get canned SSE");
         let err = render_turn_stream(resp).expect_err("error event must fail");
         assert!(err.to_string().contains("boom"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn thinking_close_print_caps_a_long_body() {
+        // A 100-line thinking block must not dump 100 dimmed rows into the
+        // scrollback: head + omission marker + tail, then the true summary.
+        let mut body = (1..=100)
+            .map(|i| format!("thought line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut active = true;
+        let mut line_open = true;
+        let mut buf = Vec::new();
+        close_thinking_status(&mut active, &mut line_open, 100, &mut body, false, &mut buf);
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(out.contains("thought line 1"), "head lost: {out}");
+        assert!(out.contains("thought line 100"), "tail lost: {out}");
+        assert!(out.contains("90 lines omitted"), "marker lost: {out}");
+        assert!(
+            !out.contains("thought line 50"),
+            "middle must be capped: {out}"
+        );
+        assert!(
+            out.contains("✓ thinking (100 lines)"),
+            "summary lost: {out}"
+        );
+        assert!(body.is_empty(), "body must drain exactly once");
+    }
+
+    #[test]
+    fn thinking_close_print_keeps_a_short_body_whole() {
+        // At or under the cap the recap stays verbatim (no marker).
+        let mut body = "a\nb\nc".to_string();
+        let mut active = true;
+        let mut line_open = true;
+        let mut buf = Vec::new();
+        close_thinking_status(&mut active, &mut line_open, 3, &mut body, false, &mut buf);
+        let out = String::from_utf8(buf).expect("utf8");
+        assert_eq!(out, "a\nb\nc\n✓ thinking (3 lines)\n");
     }
 
     #[test]
