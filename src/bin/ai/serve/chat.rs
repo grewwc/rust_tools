@@ -1013,6 +1013,24 @@ fn render_serve_history_last(
     Ok(format!("{header}\n{text}"))
 }
 
+/// Print the Nth recent assistant conclusion like local `/history last`:
+/// the header stays plain text while the body goes through the same
+/// display-only post-processing and terminal markdown renderer as a live
+/// turn. Keeps `render_serve_history_last` pure (it still returns the raw
+/// `"header\nbody"` string for tests and `/history replay`).
+fn print_serve_history_last_rendered(
+    messages: &[RemoteHistoryMessage],
+    nth_back: usize,
+) -> Result<(), String> {
+    let rendered = render_serve_history_last(messages, nth_back)?;
+    let (header, body) = rendered.split_once('\n').unwrap_or((rendered.as_str(), ""));
+    println!("{header}");
+    let body = super::super::driver::turn_runtime::postprocess_terminal_text(body.to_string());
+    super::super::stream::render_markdown_block(&body)
+        .map_err(|err| format!("history render failed: {err}"))?;
+    Ok(())
+}
+
 /// Resolve a rewind target to its user ordinal and canonical index, mirroring
 /// the local resolver's grammar (`u<N>`, bare `N`, `last`/`latest`, single
 /// `grep` match) and error wording.
@@ -1145,11 +1163,21 @@ fn run_serve_history_command(
             Ok(())
         }
         "rewind" => rewind_serve_history(client, base, token, session_id, &args[1..]),
-        "last" | "replay" => {
-            if first == "replay" && args.len() > 1 {
+        // `/history replay` stays raw text (mirrors local replay, which prints
+        // text only so the output can be piped or copied verbatim).
+        "replay" => {
+            if args.len() > 1 {
                 return Err("too many arguments. try: /history replay".into());
             }
-            if first == "last" && args.len() > 2 {
+            let messages = fetch_remote_history(client, base, token, session_id)?;
+            println!("{}", render_serve_history_last(&messages, 1)?);
+            Ok(())
+        }
+        // `/history last [N]` renders through the terminal markdown renderer
+        // (mirrors local `/history last`, which paints the stored conclusion
+        // like a live turn).
+        "last" => {
+            if args.len() > 2 {
                 return Err("too many arguments. try: /history last [N]".into());
             }
             let nth_back = match args.get(1) {
@@ -1162,7 +1190,7 @@ fn run_serve_history_command(
                 return Err("invalid /history last argument: 0. try: /history last [N]".into());
             }
             let messages = fetch_remote_history(client, base, token, session_id)?;
-            println!("{}", render_serve_history_last(&messages, nth_back)?);
+            print_serve_history_last_rendered(&messages, nth_back)?;
             Ok(())
         }
         _ => show_serve_history(client, base, token, session_id, &args),
