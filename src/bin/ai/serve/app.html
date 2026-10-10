@@ -215,11 +215,32 @@ let sessionId = localStorage.getItem("serve.session") || "";
 let pendingNew = null;
 let lastItems = []; // latest /sessions payload (newest-first), backing the session bar
 let lastMsgCount = null; // message count from the last history load
-let sending = false;
+// Live turns, one entry per session that is streaming right now: the page can
+// hold a turn in one session, switch to another, and start a second turn there.
+// Each entry owns the container its stream writes into, so concurrent streams
+// never interleave into one transcript. A turn whose session is not on screen
+// keeps updating its detached box, and `appendChild` on return re-attaches it
+// with everything that streamed while the user was away.
+let turns = new Map(); // session id -> {box}
+// A browser gives one origin a handful of parallel connections and a live turn
+// holds one open until its stream ends, so the cap keeps session polling and
+// image fetches from starving behind streaming turns.
+const MAX_LIVE_TURNS = 4;
+// Guards one send's own setup (creating the session, waiting for its POST to be
+// accepted); the per-session entry takes over from there, so a turn in another
+// session never waits behind this one.
+let sendBusy = false;
+let runEpoch = 0; // bumped every time this page starts a stream: a poll sent
+// under an older epoch must not revive `turnRunning` after a newer turn.
 // True while the server reports a live turn for the shown session (GET
-// /confirm). Cleared when a stream starts here or an interrupt POST returns;
-// the next poll is the truth again.
+// /confirm). Cleared when a stream starts or ends here, on session switch, or
+// when an interrupt POST returns; the next poll is the truth again. The sample
+// expires (RUNNING_SAMPLE_TTL_MS): stale ticks refresh it every 4s and event
+// polls refresh it on return, so only a dead sample can go stale — and a dead
+// sample must not hold the stop button forever.
 let turnRunning = false;
+let turnRunningAt = 0; // Date.now() of the last poll that reported running
+const RUNNING_SAMPLE_TTL_MS = 60000; // a running sample older than this is stale
 let stopBusy = false; // one interrupt POST at a time: a double tap must not send two
 let noteTimer = null; // pending auto-clear of the transient #connstat note
 let pendingImages = []; // {filename, data_base64}
@@ -416,21 +437,24 @@ function textOf(content) {
   if (content && typeof content === "object") return content.text || "";
   return "";
 }
-function addMsg(role, text, cls) {
+// `parent` mounts the node inside a live turn's own container instead of the
+// transcript: a turn whose session the user has left must keep rendering into
+// its own box, not into whatever the transcript happens to show now.
+function addMsg(role, text, cls, parent) {
   const d = document.createElement("div");
   d.className = "msg " + cls;
   d.dataset.role = role;
   d.innerHTML = esc(text) || "<span style='color:var(--dim)'>(empty)</span>";
-  $("msgs").appendChild(d);
-  $("msgs").scrollTop = $("msgs").scrollHeight;
+  (parent || $("msgs")).appendChild(d);
+  if (!parent) $("msgs").scrollTop = $("msgs").scrollHeight;
   return d;
 }
 // Assistant replies render as markdown; addMsg stays the plain (escaped,
 // pre-wrap) path for user text, progress traces, errors and notices.
-function addMsgMd(text) {
-  const d = addMsg("assistant", "", "asst md");
+function addMsgMd(text, parent) {
+  const d = addMsg("assistant", "", "asst md", parent);
   d.innerHTML = text ? renderMarkdown(text) : "";
-  $("msgs").scrollTop = $("msgs").scrollHeight;
+  if (!parent) $("msgs").scrollTop = $("msgs").scrollHeight;
   decorateAndLoad(d);
   return d;
 }
@@ -576,7 +600,7 @@ function callLabel(call) {
 // Roles that reach the fold path and deserve a readable title.
 const FOLD_ROLE_LABELS = { tool: "tool", internal_note: "internal note" };
 
-function addFold(title, bodyText) {
+function addFold(title, bodyText, parent) {
   const d = document.createElement("div");
   d.className = "msg asst";
   const det = document.createElement("details");
@@ -588,13 +612,33 @@ function addFold(title, bodyText) {
   pre.textContent = bodyText;
   det.appendChild(pre);
   d.appendChild(det);
-  $("msgs").appendChild(d);
+  (parent || $("msgs")).appendChild(d);
   return { box: d, body: pre, set(title2, text2) { sum.textContent = title2; pre.textContent = text2; } };
 }
 
 // Fill a per-turn override dropdown. Entries are [value, label] pairs; the
 // empty value always means "server default" and shows the current server
-// label. A previous user pick survives reloads while still offered.
+// label. A pick the user made is put back from localStorage (restorePick) and
+// kept across refills of this dropdown while the server still offers it.
+const PICK_KEYS = { omodel: "serve.pick.model", oagent: "serve.pick.agent", oeffort: "serve.pick.effort" };
+// Restore after the options exist: assigning a value no option carries reads
+// back as "" (the default), and a pick the server no longer offers is dropped
+// rather than forced.
+function restorePick(sel) {
+  let v = "";
+  try { v = localStorage.getItem(PICK_KEYS[sel.id]) || ""; } catch (_) {}
+  if (!v) return;
+  for (const o of sel.options) if (o.value === v) { sel.value = v; return; }
+}
+// Remember the pick — or forget it when the user goes back to the default — and
+// refresh the collapsed row's summary.
+function savePick(sel) {
+  try {
+    if (sel.value) localStorage.setItem(PICK_KEYS[sel.id], sel.value);
+    else localStorage.removeItem(PICK_KEYS[sel.id]);
+  } catch (_) {}
+  syncOvrSummary();
+}
 function fillSelect(sel, entries, currentLabel, kind) {
   const prev = sel.value;
   sel.innerHTML = "";
@@ -624,6 +668,12 @@ async function loadInfo() {
     fillSelect($("omodel"), (info.models || []).map((m) => [m.id, m.label || m.id]), info.model_label || info.model, "model");
     fillSelect($("oagent"), (info.agents || []).map((a) => [a, a]), info.agent, "agent");
     fillSelect($("oeffort"), (info.efforts || []).map((e) => [e, e]), info.reasoning_effort, "effort");
+    // The three picks belong to the user, not to the page load: put them back
+    // once the options exist, so reopening the page keeps the selection.
+    restorePick($("omodel"));
+    restorePick($("oagent"));
+    restorePick($("oeffort"));
+    syncOvrSummary();
     syncOvrSummary();
   } catch (e) {
     let msg = "offline: " + e.message;
@@ -672,7 +722,20 @@ function renderSessionList(items, errText) {
     li.appendChild(sm);
     // Desktop keeps the inline drawer open for repeated switching; the phone
     // drawer floats over the chat, so only it auto-closes after a pick.
-    li.onclick = () => { sessionId = s.id; lastMsgCount = null; stopStaleFollow(); localStorage.setItem("serve.session", s.id); if (window.matchMedia && matchMedia("(max-width: 700px)").matches) setDrawer(false); loadSessions(); loadHistory(); };
+    li.onclick = () => {
+      sessionId = s.id;
+      lastMsgCount = null;
+      turnRunning = false;
+      stopStaleFollow();
+      // The question on screen belonged to the session being left; the poll
+      // below rebuilds it for the one being opened.
+      hideConfirm();
+      localStorage.setItem("serve.session", s.id);
+      if (window.matchMedia && matchMedia("(max-width: 700px)").matches) setDrawer(false);
+      pollConfirm();
+      loadSessions();
+      loadHistory();
+    };
     ul.appendChild(li);
   }
   if (errText) {
@@ -736,11 +799,15 @@ async function loadSessions() {
     // Fresh id, not yet materialized: stay on it; the first turn persists
     // it and the following loadSessions picks it up normally.
   }
-  else if (!items.length) { sessionId = ""; pendingNew = null; }
+  else if (!items.length) { sessionId = ""; pendingNew = null; turnRunning = false; }
   else {
     pendingNew = null;
     sessionId = items[0].id;
     localStorage.setItem("serve.session", sessionId);
+    // A running sample from the previous session must not leak onto the new
+    // one; re-derive below (the id exists, so a poll is safe here).
+    turnRunning = false;
+    pollConfirm();
     await loadHistory();
   }
   lastItems = items;
@@ -758,10 +825,41 @@ function histEndsTurn(msgs) {
   const tail = msgs[msgs.length - 1];
   return !!tail && tail.role === "assistant" && !!textOf(tail.content).trim();
 }
+// A session the server reports as running while this page holds no stream for
+// it — reloaded mid-turn, the feed of a turn in another session died, or the
+// turn was started elsewhere — is followed from its transcript until the reply
+// lands. startStaleFollow only arms for a session that is already marked stale,
+// so the mark is set here; its own guards (already armed, hidden tab) still
+// apply, and a landed reply behind that mark stops the follow again.
+function armHistoryFollow() {
+  if (!sessionId || turns.has(sessionId) || staleSession === sessionId) return;
+  if (!isTurnRunning()) return;
+  staleSession = sessionId;
+  staleTries = 0;
+  staleDone = false;
+  startStaleFollow();
+}
+// A turn streaming in this session writes into its own box. Rebuilding the
+// transcript leaves that box out (clearing the container detaches it, while the
+// stream keeps updating the live node), so every exit of loadHistory re-attaches
+// it; a session with nothing to attach follows the turn from history instead.
+function attachLiveBox() {
+  const live = turns.get(sessionId);
+  if (!live) { armHistoryFollow(); return; }
+  $("msgs").appendChild(live.box);
+  $("msgs").scrollTop = $("msgs").scrollHeight;
+}
+// A turn the user has left whose feed is gone: its box is retired here, and
+// that session picks the turn up from history when it is opened again.
+function dropBackgroundTurn(box, why) {
+  box.remove();
+  note("a turn in another session is no longer live (" + why + ") — open that session to follow it");
+}
 async function loadHistory() {
   $("msgs").textContent = "";
   revokePreviews(); // the transcript's previews belong to the session being left
   if (!sessionId) { addMsg("asst", "no session yet — tap ＋ to start one.", "asst"); return; }
+  const forSession = sessionId; // the session this fetch describes, checked again before rendering
   let msgs = [];
   // One message beyond the rendered window: a tool result sitting at the edge
   // would otherwise be titled with a bare role name, because the call that
@@ -776,7 +874,13 @@ async function loadHistory() {
     histTotal = Number(res.headers.get("x-history-total")) || 0;
     msgs = await res.json();
   }
-  catch (e) { addMsg("err", "history failed: " + e.message, "asst err"); return; }
+  catch (e) {
+    if (forSession !== sessionId) return; // a switch already re-rendered the transcript
+    addMsg("err", "history failed: " + e.message, "asst err");
+    attachLiveBox();
+    return;
+  }
+  if (forSession !== sessionId) return; // the user switched while the fetch was in flight
   const shown = msgs.slice(-200);
   lastMsgCount = shown.length;
   staleKey = histKey(msgs);
@@ -804,6 +908,7 @@ async function loadHistory() {
       addFold(call ? callLabel(call) : FOLD_ROLE_LABELS[m.role] || m.role, t.slice(0, 2000));
     }
   }
+  attachLiveBox();
   $("msgs").scrollTop = $("msgs").scrollHeight;
 }
 // Tapping a user input bubble offers a rewind to just before it, mirroring
@@ -921,16 +1026,19 @@ async function answerConfirm(allow) {
 async function pollConfirm() {
   if (!sessionId || confirmBusy) return;
   const sid = sessionId;
+  const epoch = runEpoch;
   let body;
   try { body = await (await api("/sessions/" + sid + "/confirm")).json(); }
   catch (_) { return; } // transient (hidden mid-flight, server restarting): retry next tick
   // The fetch can outlive what it describes (answered while it was in flight,
-  // session switched): re-check before touching the dialog.
+  // session switched, newer turn started): re-check before touching anything.
   if (confirmBusy || sid !== sessionId) return;
+  if (epoch !== runEpoch) return; // a newer turn owns the button and the dialog now
   // The same poll reports a live turn for this session: the server is the only
   // source that survives this page losing the stream. A missing field means an
   // older server, treated as "not running".
   turnRunning = body.running === true;
+  if (turnRunning) { turnRunningAt = Date.now(); armHistoryFollow(); }
   syncStopButton();
   const pending = body.pending;
   if (!pending) { if (confirmShown) hideConfirm(); return; }
@@ -941,10 +1049,12 @@ async function pollConfirm() {
 
 // A turn is "running" when any of three independent sources says so: this page
 // owns the live stream, the page lost the stream and is stale-following a turn
-// whose reply has not landed, or the server said so at the last poll. Each is
-// blind to a state the others cover (feed lost, page reloaded, another device).
+// whose reply has not landed, or the server said so at the last poll (and the
+// sample is still fresh). Each is blind to a state the others cover (feed
+// lost, page reloaded, another device).
 function isTurnRunning() {
-  return sending || (staleSession === sessionId && !staleDone) || turnRunning;
+  const freshServerTurn = turnRunning && (Date.now() - turnRunningAt) < RUNNING_SAMPLE_TTL_MS;
+  return turns.has(sessionId) || (staleSession === sessionId && !staleDone) || freshServerTurn;
 }
 // The one send/stop button reflects that predicate: stop glyph plus the stop
 // class while a turn runs, the plain send look otherwise.
@@ -1004,14 +1114,25 @@ function parseBlock(raw) {
 }
 
 async function send() {
-  if (sending) return;
+  if (sendBusy) return; // one send's own setup at a time
   const text = $("prompt").value.trim();
   if (!text && !pendingImages.length) return;
-  if (!sessionId) {
-    try { sessionId = (await (await api("/sessions", { method: "POST" })).json()).id; }
-    catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); return; }
-    localStorage.setItem("serve.session", sessionId);
-  }
+  sendBusy = true;
+  let sid;
+  try {
+    if (!sessionId) {
+      try { sessionId = (await (await api("/sessions", { method: "POST" })).json()).id; }
+      catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); return; }
+      localStorage.setItem("serve.session", sessionId);
+    }
+    sid = sessionId;
+    // One turn per session, but no longer one turn per page: a second session
+    // can start while the first is still streaming (that is what the registry
+    // is for). This session's own turn, or too many live ones, is what makes a
+    // send wait.
+    if (turns.has(sid)) { note("this session is already running a turn — stop it, or send from another session"); return; }
+    if (turns.size >= MAX_LIVE_TURNS) { note("already streaming " + turns.size + " turns — wait for one to finish"); return; }
+  } finally { sendBusy = false; } // the stream below owns itself: other sessions may send now
   let prompt = text;
   const images = pendingImages;
   pendingImages = [];
@@ -1031,14 +1152,21 @@ async function send() {
   else addMsg("user", "(images only)", "user");
 
   stopStaleFollow(); // this turn's own stream owns the view from here on
-  sending = true;
+  runEpoch++; // late polls from any previous turn no longer vote on the button
   turnRunning = false; // this page's own feed is the running-turn truth now
-  syncStopButton();
+  // Everything this turn writes goes into a container of its own, registered
+  // under its session: the stream stays readable while the user works in
+  // another session, and can be parked and re-attached without mixing turns.
+  const box = document.createElement("div");
+  box.className = "turn";
+  $("msgs").appendChild(box);
+  turns.set(sid, { box });
+  syncStopButton(); // only now does isTurnRunning() see this session's own turn
   // Chronological DOM order: progress and thinking folds are created before
   // (or inserted ahead of) the reply bubble, so the trace reads top-down
   // and the final answer always lands last.
-  const prog = addFold("progress", "");
-  const bubble = addMsgMd("");
+  const prog = addFold("progress", "", box);
+  const bubble = addMsgMd("", box);
   let progLines = [];
   let think = null;
   // Reply text arrives token by token, and markdown has to be parsed over the
@@ -1049,7 +1177,7 @@ async function send() {
   const paint = () => {
     paintTimer = null;
     bubble.innerHTML = renderMarkdown(raw);
-    $("msgs").scrollTop = $("msgs").scrollHeight;
+    if (sid === sessionId) $("msgs").scrollTop = $("msgs").scrollHeight;
   };
   const schedulePaint = () => { if (paintTimer === null) paintTimer = setTimeout(paint, 50); };
   const fail = (msg) => {
@@ -1116,24 +1244,28 @@ async function send() {
           catch (_) { raw += payload; }
           schedulePaint();
         }
-        else if (kind === "thinking_start") { think = addFold("thinking…", ""); $("msgs").insertBefore(think.box, bubble); }
+        else if (kind === "thinking_start") { think = addFold("thinking…", "", box); box.insertBefore(think.box, bubble); }
         else if (kind === "thinking") {
           try { if (think) think.body.textContent += JSON.parse(payload).text || ""; } catch (_) {}
         }
         else if (kind === "thinking_done") { if (think) think.box.querySelector("summary").textContent = "thinking"; }
         else if (kind === "confirm_request") {
           // Server text: showConfirm renders the prompt through textContent.
-          try { const c = JSON.parse(payload); showConfirm(c.id, c.prompt, c.token); } catch (_) {}
+          // Only the session on screen can answer: the dialog answers into
+          // `sessionId`, so a question from a turn in another session is left
+          // pending on the server (the dialog shows when that session is
+          // opened, because pollConfirm rebuilds it from /confirm).
+          try { const c = JSON.parse(payload); if (sid === sessionId) showConfirm(c.id, c.prompt, c.token); } catch (_) {}
         }
         else if (kind === "confirm_done") {
           // Only the question this event closes goes away; a newer request can
           // only follow it, and an id-less event hides whatever is on screen.
           let cid = null;
           try { cid = JSON.parse(payload).id; } catch (_) {}
-          if (cid === null || (confirmShown && confirmShown.id === cid)) hideConfirm();
+          if (sid === sessionId && (cid === null || (confirmShown && confirmShown.id === cid))) hideConfirm();
         }
         else if (payload) { progLines.push(payload); prog.set("progress (" + progLines.length + ")", progLines.slice(-50).join("\n")); }
-        $("msgs").scrollTop = $("msgs").scrollHeight;
+        if (sid === sessionId) $("msgs").scrollTop = $("msgs").scrollHeight;
       }
       if (finished) break;
       if (done) break;
@@ -1141,20 +1273,48 @@ async function send() {
     clearTimeout(stallTimer);
     if (paintTimer !== null) { clearTimeout(paintTimer); paint(); } // flush the tail
     decorateAndLoad(bubble); // reply paths become previews only once it is final
-    if (stalled && !finished && !turnError) goStale("stream stalled (no updates for 60s) — the turn keeps running on the server (following history)");
+    if (stalled && !finished && !turnError) {
+      // Only the session on screen can be followed from history here; a stalled
+      // turn in a session the user has left is retired, and its reply is what
+      // that session renders when it is opened again.
+      if (sid === sessionId) goStale("stream stalled (no updates for 60s) — the turn keeps running on the server (following history)");
+      else dropBackgroundTurn(box, "stream stalled");
+    }
     else if (!raw) bubble.innerHTML = "<span style='color:var(--dim)'>(empty reply)</span>";
   } catch (e) {
     clearTimeout(stallTimer);
     if (turnStarted && !turnError) {
       // The POST was accepted and no server `error` event arrived, so this is
       // transport loss: the turn keeps running server-side and the view is
-      // stale. Follow the transcript instead of declaring the turn dead.
-      goStale("connection lost: " + e.message + " — the turn keeps running on the server (following history)");
+      // stale. Follow the transcript instead of declaring the turn dead — for
+      // the session on screen only: a turn the user has left keeps running
+      // unheard, and that session follows it from history when it comes back.
+      if (sid === sessionId) goStale("connection lost: " + e.message + " — the turn keeps running on the server (following history)");
+      else dropBackgroundTurn(box, "connection lost");
     } else fail("turn failed: " + e.message);
   }
-  sending = false;
+  // This turn is over, so its session may send again: the entry goes away
+  // whether or not the box stays on screen.
+  turns.delete(sid);
+  // The feed that just ended owns the truth about the turn it carried, same
+  // as at stream start: the live-stream leg drops with the map entry above,
+  // and a `turnRunning` sample taken mid-turn (screen locked, app switched)
+  // must not outlive the `done` that proved the turn over. No
+  // delayed poll follows on purpose: past `done`, server `running=true` can
+  // only be reap lag (the child is reaped after OutputComplete) or a new
+  // remote turn, and one boolean cannot tell them apart — latching it nailed
+  // the button red for up to RUNNING_SAMPLE_TTL_MS. Event polls (return,
+  // stale ticks, boot) re-derive the truth when there is something to see.
+  // ... only for the session this feed belongs to: a sample that describes the
+  // session on screen (some other session's turn) is not this stream's to clear.
+  if (sid === sessionId) turnRunning = false;
   syncStopButton();
-  $("msgs").scrollTop = $("msgs").scrollHeight;
+  // A box for a turn that finished while the user was elsewhere is dropped:
+  // that session's transcript is rebuilt from history when it is opened, which
+  // is where the finished reply lives. A box on screen stays, so the trace and
+  // the reply remain readable without a reload.
+  if (sid !== sessionId) box.remove();
+  else $("msgs").scrollTop = $("msgs").scrollHeight;
   loadInfo();
   loadSessions();
 }
@@ -1192,9 +1352,9 @@ function wire() {
   window.addEventListener("pageshow", () => { pollConfirm(); startStaleFollow(); }); // bfcache restore fires no visibility change
   if (window.matchMedia && matchMedia("(max-width: 700px)").matches) $("ovrwrap").open = false;
   $("scrim").onclick = () => setDrawer(false);
-  $("omodel").onchange = syncOvrSummary;
-  $("oagent").onchange = syncOvrSummary;
-  $("oeffort").onchange = syncOvrSummary;
+  $("omodel").onchange = () => savePick($("omodel"));
+  $("oagent").onchange = () => savePick($("oagent"));
+  $("oeffort").onchange = () => savePick($("oeffort"));
   $("prompt").addEventListener("input", growPrompt);
   $("prompt").addEventListener("keydown", (e) => {
     // Plain Enter inserts a newline (mobile keyboards included); only the
@@ -1232,6 +1392,7 @@ function wire() {
       sessionId = (await (await api("/sessions", { method: "POST" })).json()).id;
       pendingNew = sessionId;
       lastMsgCount = null;
+      turnRunning = false; // fresh id: no turn can be running here (and it 404s a poll)
       localStorage.setItem("serve.session", sessionId);
       // The id is lazy (no history yet): show it optimistically instead of
       // loadHistory, which would 404 and print a scary red error, and let
@@ -1247,6 +1408,7 @@ function wire() {
     try {
       sessionId = (await (await api("/sessions/" + sessionId + "/fork", { method: "POST" })).json()).id;
       lastMsgCount = null;
+      turnRunning = false; // a running turn (if any) belongs to the source session
       localStorage.setItem("serve.session", sessionId);
       await loadSessions(); await loadHistory();
     } catch (e) { addMsg("err", "fork failed: " + e.message, "asst err"); }
@@ -1258,6 +1420,7 @@ function wire() {
       await api("/sessions/" + sessionId, { method: "DELETE" });
       sessionId = "";
       lastMsgCount = null;
+      turnRunning = false;
       localStorage.removeItem("serve.session");
       await loadSessions(); await loadHistory();
     } catch (e) { addMsg("err", "delete failed: " + e.message, "asst err"); }
@@ -1286,6 +1449,7 @@ async function boot() {
   await loadInfo();
   await loadSessions();
   await loadHistory();
+  pollConfirm(); // cold boot mid-turn (or a remote turn) has no live event; derive once
 }
 boot();
 </script>
