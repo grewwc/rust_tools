@@ -28,6 +28,7 @@ button.stop { background:var(--err); border-color:var(--err); color:#fff; }
 #sessions ul { list-style:none; margin:0; padding:8px; overflow-y:auto; flex:1; }
 #sessions li { padding:8px; border-radius:8px; font-size:14px; }
 #sessions li.cur { background:#1f6feb33; }
+#sessions li.holding { background:#1f6feb55; }
 #sessions li small { color:var(--dim); display:block; font-size:12px; }
 #sessions li .rn { float:right; background:none; border:none; color:var(--dim); font-size:14px; padding:4px 10px; cursor:pointer; }
 #sessions li .rnm { width:100%; font-size:inherit; box-sizing:border-box; }
@@ -48,14 +49,26 @@ select, summary { touch-action:manipulation; }
    is open instead of spending a permanent row on it. */
 #conn:not(.open) + #connstat { display:none; }
 #chat { flex:1; display:flex; flex-direction:column; min-width:0; }
-#msgs { flex:1; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:10px; overscroll-behavior-y:contain; }
+#msgwrap { flex:1; min-height:0; position:relative; }
+#msgs { height:100%; box-sizing:border-box; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:10px; overscroll-behavior-y:contain; }
+#jumpbottom {
+  display:none; position:absolute; right:16px; bottom:14px; z-index:3;
+  width:46px; height:46px; padding:0; place-items:center; border-radius:50%;
+  border:1px solid rgba(255,255,255,.28); background:rgba(31,111,235,.96); color:#fff;
+  box-shadow:0 8px 24px rgba(0,0,0,.38), 0 2px 6px rgba(31,111,235,.28);
+  opacity:0; transform:translateY(8px) scale(.92); pointer-events:none;
+  transition:opacity .18s ease, transform .18s ease, box-shadow .18s ease;
+}
+#jumpbottom svg { width:22px; height:22px; fill:none; stroke:currentColor; stroke-width:2.2; stroke-linecap:round; stroke-linejoin:round; }
+#jumpbottom:active { transform:translateY(1px) scale(.96); box-shadow:0 4px 14px rgba(0,0,0,.34); }
 .msg { max-width:92%; padding:8px 12px; border-radius:12px; white-space:pre-wrap; word-break:break-word; font-size:15px; }
 .msg.user { align-self:flex-end; background:#1f6feb; color:#fff; }
 .msg.asst { align-self:flex-start; background:var(--panel); border:1px solid var(--line); }
 .msg details { font-size:13px; color:var(--dim); }
-/* Rewindable user bubbles invite a tap (mirrors `/history rewind`); the
-   pointer is the only affordance so the transcript stays uncluttered. */
+/* Desktop keeps the compact whole-bubble shortcut; phones use the explicit
+   action below so a normal transcript tap cannot destroy history. */
 .msg.rewindable { cursor:pointer; }
+.rewind-action { display:none; }
 .msg .prog { font-size:13px; color:var(--dim); }
 .msg.err { border-color:var(--err); color:var(--err); }
 #ovr { display:flex; gap:6px; padding:8px 12px 0; }
@@ -130,7 +143,8 @@ select, summary { touch-action:manipulation; }
      dimmed remainder (the scrim) closes it. */
   #sessions { position:absolute; top:0; bottom:0; left:0; z-index:10; width:min(86vw,320px); box-shadow:8px 0 24px rgba(0,0,0,.55); }
   #scrim.on { display:block; position:absolute; inset:0; z-index:5; background:rgba(0,0,0,.45); }
-  #sessions li { padding:12px 10px; font-size:15px; }
+  #sessions li { padding:12px 10px; font-size:15px; touch-action:pan-y; -webkit-user-select:none; user-select:none; }
+  #sessions li .rnm { -webkit-user-select:text; user-select:text; }
   .rowbtns button { flex:1; min-height:42px; font-size:13px; }
   #sessfilter { padding:10px 8px; }
   /* Override picks collapse into one summary row showing the current picks. */
@@ -139,13 +153,24 @@ select, summary { touch-action:manipulation; }
   #ovr { flex-direction:column; padding:8px 12px 10px; }
   #ovr select { width:100%; padding:10px 8px; }
   #msgs { padding:10px; }
+  #jumpbottom { display:grid; }
+  #jumpbottom.show { opacity:1; transform:translateY(0) scale(1); pointer-events:auto; }
   .msg { max-width:94%; }
+  .msg.rewindable { cursor:default; }
+  .msg.rewindable .rewind-action {
+    display:block; min-height:36px; margin:6px 0 -2px auto; padding:5px 10px;
+    border:1px solid rgba(255,255,255,.42); border-radius:999px;
+    background:rgba(13,17,23,.28); color:#fff; font-size:12px; line-height:1;
+    touch-action:manipulation;
+  }
+  .msg.md .math.display { margin:4px 0; padding:0; }
   #composer { gap:10px; }
   #img, #send { min-width:52px; min-height:48px; font-size:18px; }
   #conn.open { flex-wrap:wrap; }
   #conn.open input { flex:1 1 100%; padding:10px 8px; }
   #conn.open #save { flex:1; min-height:44px; }
 }
+@media (prefers-reduced-motion:reduce) { #jumpbottom { transition:none; } }
 /* Server-side images in a reply: the path text stays, the fetched picture
    sits under it (see decorateImages in the script below). */
 .imgprev { display:block; margin:6px 0; }
@@ -178,7 +203,12 @@ select, summary { touch-action:manipulation; }
 <div class="rowbtns"><button id="fork">fork</button><button id="del">delete</button><button id="refresh">refresh</button></div>
 </nav>
 <main id="chat">
+<div id="msgwrap">
 <div id="msgs"></div>
+<button id="jumpbottom" type="button" aria-label="jump to latest message" aria-hidden="true" tabindex="-1" title="jump to latest">
+<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/><path d="M12 4v11"/></svg>
+</button>
+</div>
 <details id="ovrwrap" open>
 <summary id="ovrsummary">model · agent · effort</summary>
 <div id="ovr">
@@ -222,6 +252,8 @@ let sessionId = localStorage.getItem("serve.session") || "";
 let pendingNew = null;
 let lastItems = []; // latest /sessions payload (newest-first), backing the session bar
 let lastMsgCount = null; // message count from the last history load
+let historySession = ""; // session whose canonical rows back historyKeys
+let historyKeys = []; // visible canonical rows currently mounted before any live turn UI
 // Live turns, one entry per session that is streaming right now: the page can
 // hold a turn in one session, switch to another, and start a second turn there.
 // Each entry owns the container its stream writes into, so concurrent streams
@@ -324,7 +356,7 @@ function protectMath(src) {
   // A space prevents a slot from turning an invalid URL into a Markdown link.
   let key = "\uE000math ";
   while (src.includes(key)) key += "X";
-  const slots = [], chunks = [];
+  const slots = [], displaySlots = [], chunks = [];
   let i = 0, last = 0;
   while (i < src.length) {
     const rest = src.slice(i);
@@ -366,10 +398,20 @@ function protectMath(src) {
     const raw = src.slice(i, end + right.length), tex = src.slice(start, end);
     chunks.push(src.slice(last, i), key + slots.length + "\uE001");
     slots.push('<span class="math ' + (display ? "display" : "inline") + '" data-tex="' + esc(tex) + '">' + esc(raw) + '</span>');
+    displaySlots.push(display);
     last = i = end + right.length;
   }
   chunks.push(src.slice(last));
-  return { source: chunks.join(""), restore: (html) => html.replace(new RegExp(key + "(\\d+)\uE001", "g"), (_, n) => slots[Number(n)]) };
+  return {
+    source: chunks.join(""),
+    restore: (html) => html.replace(new RegExp(key + "(\\d+)\uE001", "g"), (_, n) => slots[Number(n)]),
+    displayLine: (line) => {
+      const slot = line.trim();
+      if (!slot.startsWith(key) || !slot.endsWith("\uE001")) return null;
+      const n = Number(slot.slice(key.length, -1));
+      return Number.isInteger(n) && displaySlots[n] ? slots[n] : null;
+    },
+  };
 }
 
 // Load only for mathematical replies. A failed/slow CDN leaves readable source
@@ -432,6 +474,16 @@ function renderMarkdown(src) {
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
+    // A display formula on its own line is a block, not part of the paragraph
+    // around it. Otherwise the source blank lines become two <br> elements on
+    // each side and make a short formula consume several text rows.
+    const displayMath = math.displayLine(line);
+    if (displayMath) {
+      flushText();
+      out.push(displayMath);
+      i++;
+      continue;
+    }
     const fence = /^\s*(`{3,}|~{3,})\s*([^\s`]*)\s*$/.exec(line);
     if (fence) {
       const closer = new RegExp("^\\s*" + fence[1][0] + "{3,}\\s*$");
@@ -542,24 +594,62 @@ function textOf(content) {
   if (content && typeof content === "object") return content.text || "";
   return "";
 }
+const PHONE_LAYOUT_QUERY = "(max-width:700px)";
+const FOLLOW_BOTTOM_GAP = 80;
+let jumpingToBottom = false;
+function isPhoneLayout() {
+  return !!(window.matchMedia && window.matchMedia(PHONE_LAYOUT_QUERY).matches);
+}
+function isNearBottom(root = $("msgs")) {
+  return root.scrollHeight - root.scrollTop - root.clientHeight <= FOLLOW_BOTTOM_GAP;
+}
+// Desktop preserves its existing always-follow behavior. On a phone, new
+// output follows only while the reader is already at the live edge.
+function shouldFollowOutput(root = $("msgs")) {
+  return !isPhoneLayout() || isNearBottom(root);
+}
+function updateJumpButton() {
+  const button = $("jumpbottom");
+  if (!button) return;
+  const show = isPhoneLayout() && !jumpingToBottom && !isNearBottom();
+  button.classList.toggle("show", show);
+  button.setAttribute("aria-hidden", show ? "false" : "true");
+  button.tabIndex = show ? 0 : -1;
+}
+function followOutput(wasFollowing, root = $("msgs")) {
+  if (wasFollowing) root.scrollTop = root.scrollHeight;
+  updateJumpButton();
+}
+function scrollToLatest(smooth = true) {
+  const root = $("msgs");
+  jumpingToBottom = smooth;
+  updateJumpButton();
+  if (smooth && root.scrollTo) root.scrollTo({ top: root.scrollHeight, behavior: "smooth" });
+  else root.scrollTop = root.scrollHeight;
+  if (!smooth) { jumpingToBottom = false; updateJumpButton(); return; }
+  setTimeout(() => { jumpingToBottom = false; updateJumpButton(); }, 450);
+}
 // `parent` mounts the node inside a live turn's own container instead of the
 // transcript: a turn whose session the user has left must keep rendering into
 // its own box, not into whatever the transcript happens to show now.
 function addMsg(role, text, cls, parent) {
+  const root = parent || $("msgs");
+  const follow = !parent && shouldFollowOutput(root);
   const d = document.createElement("div");
   d.className = "msg " + cls;
   d.dataset.role = role;
   d.innerHTML = esc(text) || "<span style='color:var(--dim)'>(empty)</span>";
-  (parent || $("msgs")).appendChild(d);
-  if (!parent) $("msgs").scrollTop = $("msgs").scrollHeight;
+  root.appendChild(d);
+  if (!parent) followOutput(follow, root);
   return d;
 }
 // Assistant replies render as markdown; addMsg stays the plain (escaped,
 // pre-wrap) path for user text, progress traces, errors and notices.
 function addMsgMd(text, parent) {
+  const follow = !parent && shouldFollowOutput();
   const d = addMsg("assistant", "", "asst md", parent);
   d.innerHTML = text ? renderMarkdown(text) : "";
-  if (!parent) $("msgs").scrollTop = $("msgs").scrollHeight;
+  if (!parent) followOutput(follow);
   decorateAndLoad(d);
   return d;
 }
@@ -826,6 +916,68 @@ function renderSessionBar() {
   $("sessmeta").textContent = meta;
 }
 let sessFilter = "";
+const SESSION_HOLD_MS = 650;
+const SESSION_HOLD_MOVE_PX = 12;
+function isPhoneLayout() {
+  return !!(window.matchMedia && window.matchMedia("(max-width: 700px)").matches);
+}
+function sessionHoldConsumed(li) {
+  return Number(li.dataset.holdSuppressUntil || 0) > Date.now();
+}
+// Phones have no hover affordance for per-session actions. A deliberate hold
+// opens the existing destructive confirmation for that exact row; scrolling,
+// mouse input, and controls inside the row never start the hold timer.
+function bindSessionLongPress(li, s) {
+  let timer = null;
+  let startX = 0;
+  let startY = 0;
+  const cancel = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+    li.classList.remove("holding");
+  };
+  li.onpointerdown = (ev) => {
+    if (!isPhoneLayout() || ev.pointerType === "mouse" || ev.isPrimary === false) return;
+    if (ev.button != null && ev.button !== 0) return;
+    if (ev.target && ev.target.closest && ev.target.closest("button,input")) return;
+    startX = ev.clientX;
+    startY = ev.clientY;
+    li.classList.add("holding");
+    timer = setTimeout(() => {
+      timer = null;
+      li.classList.remove("holding");
+      li.dataset.holdSuppressUntil = String(Date.now() + 1200);
+      deleteSession(s.id);
+    }, SESSION_HOLD_MS);
+  };
+  li.onpointermove = (ev) => {
+    if (timer !== null && (Math.abs(ev.clientX - startX) > SESSION_HOLD_MOVE_PX || Math.abs(ev.clientY - startY) > SESSION_HOLD_MOVE_PX)) cancel();
+  };
+  li.onpointerup = cancel;
+  li.onpointercancel = cancel;
+  li.oncontextmenu = (ev) => { if (isPhoneLayout()) ev.preventDefault(); };
+}
+async function deleteSession(targetId) {
+  if (!targetId) return;
+  const target = lastItems.find((x) => x.id === targetId);
+  if (!confirm("delete \"" + (target ? sessionTitle(target) : targetId) + "\"?")) return;
+  try {
+    await api("/sessions/" + targetId, { method: "DELETE" });
+    if (targetId !== sessionId) {
+      await loadSessions();
+      return;
+    }
+    sessionId = "";
+    pendingNew = null;
+    lastMsgCount = null;
+    turnRunning = false;
+    stopStaleFollow();
+    hideConfirm();
+    localStorage.removeItem("serve.session");
+    await loadSessions();
+    await loadHistory();
+  } catch (e) { addMsg("err", "delete failed: " + e.message, "asst err"); }
+}
 // Render the drawer from cached or fresh items: the filter narrows by title
 // or id, the count line proves no session is hidden, and an optional error
 // row keeps a failed refresh visible without wiping the last good list.
@@ -849,9 +1001,11 @@ function renderSessionList(items, errText) {
     li.appendChild(rn);
     li.appendChild(t);
     li.appendChild(sm);
+    bindSessionLongPress(li, s);
     // Desktop keeps the inline drawer open for repeated switching; the phone
     // drawer floats over the chat, so only it auto-closes after a pick.
     li.onclick = () => {
+      if (sessionHoldConsumed(li)) return;
       sessionId = s.id;
       lastMsgCount = null;
       turnRunning = false;
@@ -860,7 +1014,7 @@ function renderSessionList(items, errText) {
       // below rebuilds it for the one being opened.
       hideConfirm();
       localStorage.setItem("serve.session", s.id);
-      if (window.matchMedia && matchMedia("(max-width: 700px)").matches) setDrawer(false);
+      if (isPhoneLayout()) setDrawer(false);
       pollConfirm();
       loadSessions();
       loadHistory();
@@ -956,6 +1110,36 @@ function histEndsTurn(msgs) {
   const tail = msgs[msgs.length - 1];
   return !!tail && tail.role === "assistant" && !!textOf(tail.content).trim();
 }
+function historyRowsOf(msgs, histTotal) {
+  const shown = msgs.slice(-200);
+  const calls = new Map();
+  for (const m of msgs) for (const c of m.tool_calls || []) if (c && c.id) calls.set(c.id, c);
+  const histBase = Math.max(0, (histTotal || msgs.length) - shown.length);
+  const rows = [];
+  for (let i = 0; i < shown.length; i++) {
+    const message = shown[i];
+    const text = textOf(message.content).trim();
+    if (!text) continue;
+    rows.push({
+      message,
+      text,
+      historyIndex: histBase + i,
+      call: message.tool_call_id ? calls.get(message.tool_call_id) : null,
+      key: JSON.stringify([
+        message.role || "", text, !!message.reasoning_content,
+        message.tool_call_id || "",
+      ]),
+    });
+  }
+  return { rows, shownCount: shown.length };
+}
+function renderHistoryRow(row, parent) {
+  const m = row.message;
+  if (m.role === "user" && !m.reasoning_content) addUserBubble(row.text, row.historyIndex, parent);
+  else if (m.role === "user") addMsg("user", row.text, "user", parent);
+  else if (m.role === "assistant") addMsgMd(row.text, parent);
+  else addFold(row.call ? callLabel(row.call) : FOLD_ROLE_LABELS[m.role] || m.role, row.text.slice(0, 2000), parent);
+}
 // A session the server reports as running while this page holds no stream for
 // it — reloaded mid-turn, the feed of a turn in another session died, or the
 // turn was started elsewhere — is followed from its transcript until the reply
@@ -977,8 +1161,14 @@ function armHistoryFollow() {
 function attachLiveBox() {
   const live = turns.get(sessionId);
   if (!live) { armHistoryFollow(); return; }
-  $("msgs").appendChild(live.box);
-  $("msgs").scrollTop = $("msgs").scrollHeight;
+  // A failed feed is now represented by canonical history. reloadStale can
+  // finish before send() removes this map entry, so do not re-attach its
+  // retired live box beside the newly rendered reply.
+  if (live.box === staleBox) return;
+  const root = $("msgs");
+  const follow = shouldFollowOutput(root);
+  root.appendChild(live.box);
+  followOutput(follow, root);
 }
 // A turn the user has left whose feed is gone: its box is retired here, and
 // that session picks the turn up from history when it is opened again.
@@ -986,10 +1176,15 @@ function dropBackgroundTurn(box, why) {
   box.remove();
   note("a turn in another session is no longer live (" + why + ") — open that session to follow it");
 }
-async function loadHistory() {
-  $("msgs").textContent = "";
-  revokePreviews(); // the transcript's previews belong to the session being left
-  if (!sessionId) { addMsg("asst", "no session yet — tap ＋ to start one.", "asst"); return; }
+async function loadHistory(prefetched) {
+  if (!sessionId) {
+    revokePreviews();
+    $("msgs").textContent = "";
+    historySession = "";
+    historyKeys = [];
+    addMsg("asst", "no session yet — tap ＋ to start one.", "asst");
+    return;
+  }
   const forSession = sessionId; // the session this fetch describes, checked again before rendering
   let msgs = [];
   // One message beyond the rendered window: a tool result sitting at the edge
@@ -1000,56 +1195,82 @@ async function loadHistory() {
   // maps to `histTotal - shown.length + bubble_index` for `POST /rewind`.
   // Older servers omit the header, so fall back to the fetched length.
   let histTotal = 0;
-  try {
-    const res = await api("/sessions/" + sessionId + "/history?limit=201");
-    histTotal = Number(res.headers.get("x-history-total")) || 0;
-    msgs = await res.json();
-  }
-  catch (e) {
-    if (forSession !== sessionId) return; // a switch already re-rendered the transcript
-    addMsg("err", "history failed: " + e.message, "asst err");
-    attachLiveBox();
-    return;
+  if (prefetched) {
+    msgs = prefetched.messages;
+    histTotal = prefetched.histTotal;
+  } else {
+    try {
+      const res = await api("/sessions/" + sessionId + "/history?limit=201");
+      histTotal = Number(res.headers.get("x-history-total")) || 0;
+      msgs = await res.json();
+    }
+    catch (e) {
+      if (forSession !== sessionId) return; // a switch already re-rendered the transcript
+      addMsg("err", "history failed: " + e.message, "asst err");
+      attachLiveBox();
+      return;
+    }
   }
   if (forSession !== sessionId) return; // the user switched while the fetch was in flight
-  const shown = msgs.slice(-200);
-  lastMsgCount = shown.length;
+  const history = historyRowsOf(msgs, histTotal);
+  lastMsgCount = history.shownCount;
   staleKey = histKey(msgs);
   staleDone = histEndsTurn(msgs);
   syncStopButton();
   renderSessionBar();
-  // The call lives on the assistant message (`tool_calls`), the result is a
-  // separate `tool` message carrying only `tool_call_id`; index the window
-  // first so each result can be titled by its call.
-  const calls = new Map();
-  for (const m of msgs) for (const c of m.tool_calls || []) if (c && c.id) calls.set(c.id, c);
-  const histBase = Math.max(0, (histTotal || msgs.length) - shown.length);
-  for (let i = 0; i < shown.length; i++) {
-    const m = shown[i];
-    const t = textOf(m.content).trim();
-    if (!t) continue;
-    // Only real user inputs are rewind anchors: runtime-injected user
-    // messages carry a `reasoning_content` side channel (user text never
-    // does), and the server re-validates the anchor anyway.
-    if (m.role === "user" && !m.reasoning_content) addUserBubble(t, histBase + i);
-    else if (m.role === "user") addMsg("user", t, "user");
-    else if (m.role === "assistant") addMsgMd(t);
-    else {
-      const call = m.tool_call_id ? calls.get(m.tool_call_id) : null;
-      addFold(call ? callLabel(call) : FOLD_ROLE_LABELS[m.role] || m.role, t.slice(0, 2000));
-    }
+  const root = $("msgs");
+  const sameSession = historySession === forSession;
+  const follow = !sameSession || shouldFollowOutput(root);
+  const oldScrollTop = root.scrollTop;
+  const nextKeys = history.rows.map((row) => row.key);
+  const appendOnly = !!prefetched && prefetched.appendOnly
+    && historySession === forSession
+    && historyKeys.length <= nextKeys.length
+    && historyKeys.every((key, i) => key === nextKeys[i])
+    && root.children.length >= historyKeys.length
+    // Object URLs are tracked transcript-wide. Keep their existing cleanup
+    // semantics rather than retaining removed live-tail previews indefinitely.
+    && previewUrls.length === 0;
+  if (appendOnly) {
+    // The canonical prefix stays mounted. Remove only the temporary user/live
+    // turn tail, then append rows that became durable since the feed was lost.
+    while (root.children.length > historyKeys.length) root.lastElementChild.remove();
+    for (let i = historyKeys.length; i < history.rows.length; i++) renderHistoryRow(history.rows[i], root);
+  } else {
+    // Fetching has completed, so this synchronous clear-and-render is painted
+    // as one frame instead of exposing an empty transcript during network I/O.
+    revokePreviews();
+    root.textContent = "";
+    for (const row of history.rows) renderHistoryRow(row, root);
   }
+  historySession = forSession;
+  historyKeys = nextKeys;
   attachLiveBox();
-  $("msgs").scrollTop = $("msgs").scrollHeight;
+  if (!follow && !appendOnly) root.scrollTop = oldScrollTop;
+  followOutput(follow, root);
 }
-// Tapping a user input bubble offers a rewind to just before it, mirroring
-// the local `/history rewind u<N>`: that message and everything after it is
+// Historical user inputs offer a rewind to just before them, mirroring the
+// local `/history rewind u<N>`: that message and everything after it is
 // removed, titles and other metadata are untouched. The server holds the
-// session lock, so tapping during an active turn waits for it to finish.
-function addUserBubble(text, index) {
-  const d = addMsg("user", text, "user rewindable");
+// session lock, so an action during an active turn waits for it to finish.
+function addUserBubble(text, index, parent) {
+  const d = addMsg("user", text, "user rewindable", parent);
   d.title = "tap to rewind to just before this message";
-  d.onclick = () => rewindTo(index, text);
+  const action = document.createElement("button");
+  action.type = "button";
+  action.className = "rewind-action";
+  action.textContent = "↶ rewind";
+  action.title = "rewind to before this message";
+  action.setAttribute("aria-label", "rewind to before this message");
+  action.onclick = (ev) => {
+    ev.stopPropagation();
+    rewindTo(index, text);
+  };
+  d.appendChild(action);
+  d.onclick = (ev) => {
+    if (ev.target && ev.target.closest && ev.target.closest(".rewind-action")) return;
+    if (!window.matchMedia || !window.matchMedia("(max-width: 700px)").matches) rewindTo(index, text);
+  };
   return d;
 }
 async function rewindTo(index, preview) {
@@ -1084,12 +1305,17 @@ async function reloadStale() {
     const running = await pollConfirm();
     if (staleDone) { stopStaleFollow(); return; }
     let msgs;
-    try { msgs = await (await api("/sessions/" + sessionId + "/history?limit=201")).json(); }
+    let histTotal = 0;
+    try {
+      const res = await api("/sessions/" + sessionId + "/history?limit=201");
+      histTotal = Number(res.headers.get("x-history-total")) || 0;
+      msgs = await res.json();
+    }
     catch (_) { return; } // transient (hidden mid-flight, server restarting): retry next tick
     // The fetch can outlive the follow it belongs to (a new turn or another
     // session stops it, the page goes hidden): re-check before re-rendering.
     if (!staleSession || staleSession !== sessionId || document.visibilityState !== "visible") return;
-    if (histKey(msgs) !== staleKey) await loadHistory();
+    if (histKey(msgs) !== staleKey) await loadHistory({ messages: msgs, histTotal, appendOnly: true });
     if (staleDone) { stopStaleFollow(); return; } // the reply landed: nothing left to follow
     // A successful server poll is authoritative. If it says the turn no longer
     // exists and history still has no final reply, a daemon restart or crash
@@ -1296,6 +1522,7 @@ async function send() {
   $("prompt").style.height = "auto";
   if (text) addMsg("user", text, "user");
   else addMsg("user", "(images only)", "user");
+  scrollToLatest(false);
 
   stopStaleFollow(); // this turn's own stream owns the view from here on
   runEpoch++; // late polls from any previous turn no longer vote on the button
@@ -1329,9 +1556,10 @@ async function send() {
   let paintTimer = null;
   const paint = () => {
     paintTimer = null;
+    const follow = sid === sessionId && shouldFollowOutput();
     bubble.innerHTML = renderMarkdown(raw);
     decorateMath(bubble);
-    if (sid === sessionId) $("msgs").scrollTop = $("msgs").scrollHeight;
+    if (sid === sessionId) followOutput(follow);
   };
   const schedulePaint = () => { if (paintTimer === null) paintTimer = setTimeout(paint, 50); };
   const fail = (msg) => {
@@ -1350,6 +1578,7 @@ async function send() {
   // such a stall to the same history-follow path as transport loss.
   let turnStarted = false;
   let turnError = false;
+  let finishFollow = false;
   const STREAM_STALL_MS = 60000; // no meaningful block for this long => stalled
   let stalled = false; // set by the watchdog; the read loop then exits via cancel
   let stallTimer = null;
@@ -1391,6 +1620,7 @@ async function send() {
       while ((idx = buf.indexOf("\n\n")) >= 0) {
         const { kind, payload } = parseBlock(buf.slice(0, idx));
         buf = buf.slice(idx + 2);
+        const follow = sid === sessionId && shouldFollowOutput();
         if (kind !== "" || payload) armStall(); // keep-alive comments (empty) must not mask a stalled turn
         if (kind === "done") { finished = true; break; }
         else if (kind === "error") { turnError = true; throw new Error(JSON.parse(payload).error || "turn failed"); }
@@ -1425,13 +1655,14 @@ async function send() {
           if (sid === sessionId && (cid === null || (confirmShown && confirmShown.id === cid))) hideConfirm();
         }
         else if (payload) { progLines.push(payload); renderProgress(); }
-        if (sid === sessionId) $("msgs").scrollTop = $("msgs").scrollHeight;
+        if (sid === sessionId) followOutput(follow);
       }
       if (finished) break;
       if (done) break;
     }
     clearTimeout(stallTimer);
     if (paintTimer !== null) { clearTimeout(paintTimer); paint(); } // flush the tail
+    finishFollow = sid === sessionId && shouldFollowOutput();
     decorateAndLoad(bubble); // reply paths become previews only once it is final
     if (stalled && !finished && !turnError) {
       // Only the session on screen can be followed from history here; a stalled
@@ -1443,6 +1674,7 @@ async function send() {
     else if (!raw) bubble.innerHTML = "<span style='color:var(--dim)'>(empty reply)</span>";
   } catch (e) {
     clearTimeout(stallTimer);
+    finishFollow = sid === sessionId && shouldFollowOutput();
     if (turnStarted && !turnError) {
       // The POST was accepted and no server `error` event arrived, so this is
       // transport loss: the turn keeps running server-side and the view is
@@ -1474,7 +1706,7 @@ async function send() {
   // is where the finished reply lives. A box on screen stays, so the trace and
   // the reply remain readable without a reload.
   if (sid !== sessionId) box.remove();
-  else $("msgs").scrollTop = $("msgs").scrollHeight;
+  else followOutput(finishFollow);
   loadInfo();
   loadSessions();
 }
@@ -1504,6 +1736,9 @@ function wire() {
   // answers post to /sessions/{id}/confirm through answerConfirm.
   $("callow").onclick = () => answerConfirm(true);
   $("cdeny").onclick = () => answerConfirm(false);
+  $("msgs").addEventListener("scroll", updateJumpButton, { passive: true });
+  $("jumpbottom").onclick = () => scrollToLatest(true);
+  window.addEventListener("resize", updateJumpButton);
   // Android drops a backgrounded page's connections, and a page cannot see that
   // until it is visible again, so coming back is where recovery has to start.
   // A question the turn is blocked on survives a reconnect, so coming back to
@@ -1575,18 +1810,7 @@ function wire() {
       await loadSessionConfig(); // the fork inherits the source session's picks
     } catch (e) { addMsg("err", "fork failed: " + e.message, "asst err"); }
   };
-  $("del").onclick = async () => {
-    const cur = lastItems.find((x) => x.id === sessionId);
-    if (!sessionId || !confirm("delete \"" + (cur ? sessionTitle(cur) : sessionId) + "\"?")) return;
-    try {
-      await api("/sessions/" + sessionId, { method: "DELETE" });
-      sessionId = "";
-      lastMsgCount = null;
-      turnRunning = false;
-      localStorage.removeItem("serve.session");
-      await loadSessions(); await loadHistory();
-    } catch (e) { addMsg("err", "delete failed: " + e.message, "asst err"); }
-  };
+  $("del").onclick = () => deleteSession(sessionId);
   $("img").onclick = () => $("file").click();
   $("viewer").onclick = () => { $("viewer").classList.remove("on"); $("viewerimg").src = ""; };
   $("file").onchange = async () => {
