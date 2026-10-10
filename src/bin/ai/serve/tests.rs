@@ -418,6 +418,75 @@ use super::*;
     }
 
     #[tokio::test]
+    async fn side_note_queues_without_prior_history() {
+        use axum::{
+            Json,
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        let state = lifecycle_test_state();
+        // No history file exists yet: the note must still queue, since it can
+        // arrive before the turn child persists its first message.
+        let resp = super::post_side_note(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("fresh".to_string()),
+            Json(super::SideNoteReq {
+                text: "  steer left  ".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["queued"], true);
+        let store = super::SessionStore::new(state.history_file.as_path());
+        let notes = super::super::driver::side_note::drain_side_notes(
+            &store.session_history_file("fresh"),
+            None,
+        );
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].content, "steer left");
+    }
+
+    #[tokio::test]
+    async fn side_note_rejects_empty_text_and_bad_id() {
+        use axum::{
+            Json,
+            extract::{Path, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        let state = lifecycle_test_state();
+        let resp = super::post_side_note(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("fresh".to_string()),
+            Json(super::SideNoteReq {
+                text: "   ".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = super::post_side_note(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("../evil".to_string()),
+            Json(super::SideNoteReq {
+                text: "x".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn delete_unknown_session_still_succeeds() {
         use axum::{
             extract::{Path, State},
@@ -996,6 +1065,30 @@ use super::*;
         assert_eq!(clean_sse_line("  ● task_integrate"), "  ● task_integrate");
         assert_eq!(clean_sse_line("↳ speed · x"), "↳ speed · x");
         assert_eq!(clean_sse_line(""), "");
+    }
+
+    #[test]
+    fn clean_sse_line_neutralizes_cursor_addressing_escapes() {
+        // A glued running/completed pair keeps its same-row overwrite (the
+        // client terminal resolves it like the local one) but loses the
+        // mid-line erase.
+        assert_eq!(
+            clean_sse_line("  ● task_status\r\u{1b}[2K  \u{1b}[32m✓\u{1b}[0m task_status"),
+            "  ● task_status\r  \u{1b}[32m✓\u{1b}[0m task_status"
+        );
+        // Cursor moves and region erases address the child's screen, never
+        // the client's: strip them, keep the text and its SGR color.
+        assert_eq!(
+            clean_sse_line("\u{1b}[1A\r\u{1b}[2K  \u{1b}[32m✓\u{1b}[0m task_status"),
+            "  \u{1b}[32m✓\u{1b}[0m task_status"
+        );
+        assert_eq!(
+            clean_sse_line("↳ cache · 1k\u{1b}[0J"),
+            "↳ cache · 1k"
+        );
+        // Unterminated introducers and non-CSI escapes never reach the wire.
+        assert_eq!(clean_sse_line("ab\u{1b}[2"), "ab");
+        assert_eq!(clean_sse_line("ab\u{1b}7cd"), "abcd");
     }
 
     #[test]

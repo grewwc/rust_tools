@@ -35,6 +35,7 @@ use super::{
     model_names, models,
 };
 use super::driver::turn_runtime::stale_patch_targets_from_messages;
+use super::driver::side_note::push_side_note;
 pub(in crate::ai) mod chat;
 pub(in crate::ai) mod ctl;
 
@@ -174,6 +175,55 @@ async fn post_turn(
             session_id: id,
             output,
         }),
+    )
+        .into_response()
+}
+
+/// Request body for `POST /sessions/{id}/side-notes`: one guidance text for
+/// the running turn, the remote counterpart of the local REPL's Ctrl+G
+/// side-note. The text is appended to the session's side-note file queue,
+/// which the turn child drains at the top of every iteration; queue appends
+/// and the drain-side atomic rename compose without loss, so notes sent
+/// mid-turn are seen by the next model request.
+#[derive(Debug, Deserialize)]
+struct SideNoteReq {
+    text: String,
+}
+
+/// `POST /sessions/{id}/side-notes` (authed): queue one side-note for this
+/// session's in-flight turn. Returns `{"queued": true}` even when no turn is
+/// running; the note then waits in the queue for the next turn.
+async fn post_side_note(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SideNoteReq>,
+) -> impl IntoResponse {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if SessionStore::validate_session_id(&id).is_err() {
+        return bad_request(format!("invalid session id: {id}")).into_response();
+    }
+    if req.text.trim().is_empty() {
+        return bad_request("side-note text is empty".to_string()).into_response();
+    }
+    // No session-file existence check: the queue file is independent of the
+    // message history, and a note may arrive before the turn child persists
+    // its first message. Queue appends and the drain-side atomic rename
+    // compose without loss either way.
+    let store = SessionStore::new(state.history_file.as_path());
+    let session_file = store.session_history_file(&id);
+    if let Err(err) = push_side_note(&session_file, req.text.trim(), "user", None) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"session_id": id, "queued": true})),
     )
         .into_response()
 }
@@ -765,16 +815,66 @@ fn truncate_line(line: &str) -> String {
 
 /// Normalize one child-stdout row for SSE transport: strip the live-terminal
 /// overwrite prefix (`\r\x1b[2K`) that completed/failed tool rows carry to
-/// redraw the `running` row in place. SSE rows are append-only, so the
+/// redraw the `running` row in place, and neutralize every other
+/// cursor-addressing escape inside the row. SSE rows are append-only, so the
 /// prefix is meaningless on the wire; worse, the bare `\r` makes axum split
 /// the row and re-prefix `data:`, injecting a literal `data: ` fragment that
-/// only a terminal honoring the erase escape can hide again. `BufRead::lines`
-/// already removed the line ending, so a leading `\r` here is always the
-/// overwrite control, never content.
+/// only a terminal honoring the erase escape can hide again. Cursor moves
+/// (`CSI A/B`), region erases (`CSI J/K`) and friends address screen rows
+/// that only exist on the child's live terminal: replayed verbatim on the
+/// chat client's screen they erase or overwrite unrelated rows (ragged
+/// indents, duplicated-looking status lines). SGR color (`CSI ... m`) is
+/// kept: it styles only the row itself and renders identically everywhere.
+/// A bare mid-line `\r` (same-row overwrite, e.g. progress counters) passes
+/// through: the client's terminal resolves it exactly like the local one,
+/// and splitting on it would destroy echoed tool output that legitimately
+/// contains carriage returns. `BufRead::lines` already removed the line
+/// ending, so a leading `\r` here is always the overwrite control, never
+/// content.
 fn clean_sse_line(line: &str) -> String {
-    let line = line.strip_prefix('\r').unwrap_or(line);
+    // Neutralize cursor addressing first: stripping it can reveal a leading
+    // `\r` (e.g. `\x1b[1A\r\x1b[2K...`) that the prefix wash below must see.
+    let stripped = strip_non_sgr_csi(line);
+    let line = stripped.strip_prefix('\r').unwrap_or(&stripped);
     let line = line.strip_prefix("\x1b[2K").unwrap_or(line);
     truncate_line(line)
+}
+
+/// Remove every ANSI CSI sequence except SGR color (`ESC [ ... m`).
+/// Malformed (unterminated) introducers are dropped: a half-sequence can
+/// never render as intended on the client.
+fn strip_non_sgr_csi(line: &str) -> String {
+    let mut kept = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            kept.push(ch);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            let mut seq = String::from("[");
+            for ch in chars.by_ref() {
+                seq.push(ch);
+                if ('\x40'..='\x7e').contains(&ch) {
+                    break;
+                }
+            }
+            // SGR color styles only the row itself: keep. Anything else
+            // (erase, cursor moves, scroll) addresses foreign screen rows.
+            if seq.ends_with('m') {
+                kept.push('\x1b');
+                kept.push_str(&seq);
+            }
+        } else {
+            // Single-character non-CSI escape (cursor save/restore `7`/`8`,
+            // `M`, ...): drop the introducer plus its target character.
+            // Multi-character sequences (`(B`, OSC `]...`) have no emitters
+            // on this path, so they are left for a future rule if one appears.
+            chars.next();
+        }
+    }
+    kept
 }
 
 fn last_chars(text: &str, limit: usize) -> String {
@@ -904,6 +1004,7 @@ pub(in crate::ai) async fn run_serve(
             post(post_turn_sse).layer(DefaultBodyLimit::max(MAX_TURN_REQUEST_BYTES)),
         )
         .route("/sessions/{id}/interrupt", post(post_interrupt))
+        .route("/sessions/{id}/side-notes", post(post_side_note))
         .route("/sessions/{id}/file", get(get_session_file))
         .route(
             "/sessions/{id}/confirm",

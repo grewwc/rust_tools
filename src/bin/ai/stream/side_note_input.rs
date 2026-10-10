@@ -25,7 +25,7 @@
 use std::{
     collections::VecDeque,
     io::{self, IsTerminal, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
@@ -355,6 +355,27 @@ pub(crate) struct SideNoteInputGuard {
     task: Option<JoinHandle<()>>,
 }
 
+/// Destination of a submitted side-note draft.
+///
+/// Local turns append to the session's file queue; the serve-chat client has
+/// no local queue (its turn runs in a server-side child), so its drafts are
+/// POSTed to the serve session instead. The listener owns no terminal duties
+/// and only waits on the sink at poll cadence, so a blocking HTTP POST with
+/// its own short timeout composes the same way a filesystem write does.
+#[derive(Clone)]
+pub(crate) enum SideNoteSink {
+    /// `push_side_note` into this history file's queue.
+    Local(PathBuf),
+    /// POST the draft text; returns true when the server queued it.
+    Remote(Arc<dyn Fn(String) -> bool + Send + Sync>),
+}
+
+impl SideNoteSink {
+    fn is_local(&self) -> bool {
+        matches!(self, Self::Local(_))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SideNoteLoopExit {
     Stop,
@@ -383,7 +404,7 @@ impl SideNoteInputGuard {
         model: String,
     ) -> Self {
         Self::spawn_with_background_action(
-            history_file,
+            SideNoteSink::Local(history_file),
             BackgroundRequestAction::LiveHandoff {
                 session_id,
                 persona_id,
@@ -397,13 +418,30 @@ impl SideNoteInputGuard {
     /// attach view and is never injected into the model context.
     pub(crate) fn spawn_for_attach(history_file: PathBuf, shutdown: Arc<AtomicBool>) -> Self {
         Self::spawn_with_background_action(
-            history_file,
+            SideNoteSink::Local(history_file),
             BackgroundRequestAction::DetachAttach { shutdown },
         )
     }
 
+    /// Remote counterpart of [`spawn`](Self::spawn) for the serve-chat client:
+    /// the same footer composer, but drafts are POSTed to the serve session.
+    /// `/bg`-family drafts stay ordinary note text here: there is no local
+    /// attach view to detach, and the draft must never be silently dropped.
+    pub(crate) fn spawn_remote(
+        post: Arc<dyn Fn(String) -> bool + Send + Sync>,
+    ) -> Self {
+        // The action never fires: the loop only reports BackgroundRequested
+        // for local sinks (see `submit_draft`).
+        Self::spawn_with_background_action(
+            SideNoteSink::Remote(post),
+            BackgroundRequestAction::DetachAttach {
+                shutdown: Arc::new(AtomicBool::new(false)),
+            },
+        )
+    }
+
     fn spawn_with_background_action(
-        history_file: PathBuf,
+        sink: SideNoteSink,
         background_action: BackgroundRequestAction,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -451,11 +489,17 @@ impl SideNoteInputGuard {
                         let _ = ready_tx.send(true);
                     }
                     LISTENER_ALIVE.store(true, Ordering::Release);
-                    let exit = side_note_input_loop(&history_file, &task_stop, term);
+                    let exit = side_note_input_loop(&sink, &task_stop, term);
                     drop(stdin_owner);
                     match exit {
                         SideNoteLoopExit::ResumeAfterForeground => continue,
                         SideNoteLoopExit::BackgroundRequested => {
+                            let SideNoteSink::Local(history_file) = &sink else {
+                                // Unreachable: remote sinks never report
+                                // BackgroundRequested (see `submit_draft`).
+                                // Break defensively without touching the terminal.
+                                break;
+                            };
                             if crate::ai::terminal_session::is_worker() {
                                 // Only the client detaches. Keep polling this same PTY
                                 // so Ctrl+G works immediately after every reattach,
@@ -706,17 +750,22 @@ fn refresh_footer(footer: &mut FooterReservation, input: Option<&[char]>) -> io:
 /// soon as stop arrives and enters terminal cleanup, and must not get stuck on
 /// filesystem I/O.
 fn persist_side_note_interruptibly(
-    history_file: &Path,
+    sink: &SideNoteSink,
     content: &str,
     stop: &AtomicBool,
 ) -> Option<bool> {
-    let history_file = history_file.to_path_buf();
+    let sink = sink.clone();
     let content = content.to_owned();
     let (result_tx, result_rx) = mpsc::sync_channel(1);
     if thread::Builder::new()
         .name("a-side-note-persist".to_owned())
         .spawn(move || {
-            let persisted = push_side_note(&history_file, &content, "user", None).is_ok();
+            let persisted = match &sink {
+                SideNoteSink::Local(history_file) => {
+                    push_side_note(history_file, &content, "user", None).is_ok()
+                }
+                SideNoteSink::Remote(post) => post(content),
+            };
             let _ = result_tx.send(persisted);
         })
         .is_err()
@@ -743,7 +792,7 @@ fn persist_side_note_interruptibly(
 /// failure the draft is kept and the composer stays, never silently losing the
 /// instruction.
 fn submit_draft(
-    history_file: &Path,
+    sink: &SideNoteSink,
     stop: &AtomicBool,
     footer: &mut FooterReservation,
     input: &mut Vec<char>,
@@ -759,7 +808,11 @@ fn submit_draft(
         clear_input(footer)?;
         return Ok(false);
     }
-    if crate::ai::driver::commands::session::is_real_time_background_command(&content) {
+    // Remote sinks have no local attach view to detach, so `/bg`-family
+    // drafts fall through as ordinary note text (see `spawn_remote`).
+    if sink.is_local()
+        && crate::ai::driver::commands::session::is_real_time_background_command(&content)
+    {
         input.clear();
         *in_input = false;
         clear_input(footer)?;
@@ -768,7 +821,7 @@ fn submit_draft(
     // Do not insert a confirmation line into the transcript: the model may be mid-way
     // through streaming a Markdown paragraph and an extra newline would change its
     // semantic layout. Clearing the footer is the send feedback.
-    match persist_side_note_interruptibly(history_file, &content, stop) {
+    match persist_side_note_interruptibly(sink, &content, stop) {
         Some(true) => {
             input.clear();
             *in_input = false;
@@ -1009,7 +1062,7 @@ fn service_width_query(replay: &mut VecDeque<u8>) -> Option<u16> {
 }
 
 fn side_note_input_loop(
-    history_file: &PathBuf,
+    sink: &SideNoteSink,
     stop: &AtomicBool,
     _term: CbreakTerm,
 ) -> SideNoteLoopExit {
@@ -1162,7 +1215,7 @@ fn side_note_input_loop(
                         break;
                     };
                     match submit_draft(
-                        history_file,
+                        sink,
                         stop,
                         active_footer,
                         &mut input,

@@ -27,7 +27,7 @@ use super::super::{
     history::{current_terminal_key, SessionStore},
     model_names, models,
     prompt::{completion::CommandCompleter, PromptEditor},
-    stream::MarkdownStreamRenderer,
+    stream::{side_note_input::SideNoteInputGuard, MarkdownStreamRenderer},
 };
 
 #[derive(Debug, Deserialize)]
@@ -1589,11 +1589,13 @@ fn render_turn_stream_to_with_confirm(
     let mut event_kind = String::new();
     let mut raw = String::new();
     // Folded-thinking state: the body text stays buffered in the status
-    // line, so it never mixes with the answer. Line count is approximate
-    // (chunks split mid-line); it only feeds the summary row.
+    // buffer until the block closes, so it never mixes with the answer.
+    // Line count is approximate (chunks split mid-line); it only feeds the
+    // summary row.
     let mut thinking_active = false;
     let mut thinking_newlines = 0usize;
     let mut thinking_chars = 0usize;
+    let mut thinking_body = String::new();
     // Whether the cursor sits mid-line (answer delta without a trailing
     // newline, or a live thinking status). Footer/message lines must start
     // on a fresh row instead of gluing onto the answer's last line.
@@ -1635,6 +1637,7 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_active,
                     &mut line_open,
                     thinking_summary(thinking_newlines, thinking_chars),
+                    &mut thinking_body,
                     tty,
                     out,
                 );
@@ -1657,6 +1660,7 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_active,
                     &mut line_open,
                     thinking_summary(thinking_newlines, thinking_chars),
+                    &mut thinking_body,
                     tty,
                     out,
                 );
@@ -1674,12 +1678,14 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_active,
                     &mut line_open,
                     thinking_summary(thinking_newlines, thinking_chars),
+                    &mut thinking_body,
                     tty,
                     out,
                 );
                 thinking_active = true;
                 thinking_newlines = 0;
                 thinking_chars = 0;
+                thinking_body.clear();
                 if tty {
                     let _ = write!(out, "\x1b[2m◌ thinking…\x1b[0m");
                     let _ = out.flush();
@@ -1707,9 +1713,11 @@ fn render_turn_stream_to_with_confirm(
                     thinking_active = true;
                     thinking_newlines = 0;
                     thinking_chars = 0;
+                    thinking_body.clear();
                 }
                 thinking_newlines += text.matches('\n').count();
                 thinking_chars += text.chars().count();
+                thinking_body.push_str(&text);
                 if tty {
                     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
                     let tail: String = flat
@@ -1735,6 +1743,7 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_active,
                     &mut line_open,
                     thinking_summary(thinking_newlines, thinking_chars),
+                    &mut thinking_body,
                     tty,
                     out,
                 );
@@ -1755,6 +1764,7 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_active,
                     &mut line_open,
                     thinking_summary(thinking_newlines, thinking_chars),
+                    &mut thinking_body,
                     tty,
                     out,
                 );
@@ -1791,6 +1801,7 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_active,
                     &mut line_open,
                     thinking_summary(thinking_newlines, thinking_chars),
+                    &mut thinking_body,
                     tty,
                     out,
                 );
@@ -1849,6 +1860,7 @@ fn render_turn_stream_to_with_confirm(
                     &mut thinking_active,
                     &mut line_open,
                     thinking_summary(thinking_newlines, thinking_chars),
+                    &mut thinking_body,
                     tty,
                     out,
                 );
@@ -1873,6 +1885,7 @@ fn render_turn_stream_to_with_confirm(
         &mut thinking_active,
         &mut line_open,
         thinking_summary(thinking_newlines, thinking_chars),
+        &mut thinking_body,
         tty,
         out,
     );
@@ -1897,13 +1910,16 @@ fn dim(text: &str, tty: bool) -> String {
     }
 }
 
-/// Close the live thinking status line (if open) and print the folded
-/// summary, mirroring the local `✓ thinking (N lines)` row. No-op when no
-/// thinking block is open.
+/// Close the live thinking status line (if open), print the buffered thinking
+/// body as dimmed lines (local-fold parity), then print the folded summary,
+/// mirroring the local `✓ thinking (N lines)` row. No-op when no thinking
+/// block is open. Takes the body so every close path (done/error/follow-up
+/// block/late delta or footer) renders it exactly once.
 fn close_thinking_status(
     active: &mut bool,
     line_open: &mut bool,
     lines: usize,
+    body: &mut String,
     tty: bool,
     out: &mut dyn std::io::Write,
 ) {
@@ -1913,6 +1929,19 @@ fn close_thinking_status(
     *active = false;
     if tty {
         let _ = write!(out, "\r\x1b[K");
+    }
+    if !body.is_empty() {
+        // Chunks split mid-line, so re-split here: each complete row prints
+        // dimmed (plain when piped, like `dim`), the trailing fragment (if
+        // any) prints as its own row. A lone trailing newline adds no row.
+        let mut rows: Vec<&str> = body.split('\n').collect();
+        if rows.last().is_some_and(|last| last.is_empty()) {
+            rows.pop();
+        }
+        for row in rows {
+            let _ = writeln!(out, "{}", dim(row, tty));
+        }
+        body.clear();
     }
     let unit = if lines == 1 { "line" } else { "lines" };
     let _ = writeln!(out, "{}", dim(&format!("✓ thinking ({lines} {unit})"), tty));
@@ -2288,6 +2317,18 @@ fn post_turn_stream(
         let text = resp.text().unwrap_or_default();
         return Err(server_error_message(status, &text).into());
     }
+    // Same Ctrl+G side-note composer as the local REPL: stdin is idle while
+    // the stream renders, so the listener owns it until the turn ends. Drafts
+    // are POSTed to the serve session; the server-side turn child drains them
+    // like local notes. Degrades to a no-op on non-tty stdin.
+    let _side_note_guard =
+        if super::super::stream::side_note_input::side_note_input_enabled() {
+            Some(SideNoteInputGuard::spawn_remote(remote_side_note_sink(
+                client, base, token, session_id,
+            )))
+        } else {
+            None
+        };
     let outcome = render_turn_stream_with_confirm(resp, confirm_channel.as_ref());
     if REMOTE_TURN_INTERRUPT_SENT.swap(false, Ordering::SeqCst) {
         // Leading newline: `delta` events print without a trailing newline, so
@@ -2295,6 +2336,32 @@ fn post_turn_stream(
         println!("\n[serve-chat] interrupt sent; remote turn stopped.");
     }
     outcome
+}
+
+/// Build the remote side-note sink for a serve-chat turn: POST one draft to
+/// `POST /sessions/{id}/side-notes`. Any failure returns false so the
+/// composer keeps the draft for retry instead of silently losing it.
+fn remote_side_note_sink(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+) -> Arc<dyn Fn(String) -> bool + Send + Sync> {
+    let url = format!("{base}/sessions/{session_id}/side-notes");
+    let token = token.to_string();
+    // Short timeout: the shared turn client waits up to 10 minutes, which
+    // would pin the composer's persist worker on a wedged connection.
+    let poster = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| client.clone());
+    Arc::new(move |text: String| {
+        auth(poster.post(url.clone()), &token)
+            .json(&serde_json::json!({"text": text}))
+            .send()
+            .map(|resp| resp.status().is_success())
+            .unwrap_or(false)
+    })
 }
 
 /// Shared `--serve-chat` / `--serve-sessions` dial-up: resolve the bind,
@@ -3043,7 +3110,8 @@ mod tests {
     #[test]
     fn sse_duplicate_thinking_done_prints_single_summary() {
         // A late/duplicate close (body-path marker plus CloseThinking frame
-        // for the same round) must not print a second summary row.
+        // for the same round) must not print a second summary row. The
+        // buffered body prints once, dimmed (plain under test: piped).
         let url = serve_body_once(
             "event: thinking_start\ndata: \n\nevent: thinking\ndata: {\"text\": \"a b\"}\n\nevent: thinking_done\ndata: \n\nevent: thinking_done\ndata: \n\nevent: done\ndata: \n\n",
         );
@@ -3052,7 +3120,7 @@ mod tests {
         render_turn_stream_to(resp, &mut buf, false).expect("render");
         assert_eq!(
             String::from_utf8(buf).expect("utf8"),
-            "✓ thinking (1 line)\n"
+            "a b\n✓ thinking (1 line)\n"
         );
     }
 
