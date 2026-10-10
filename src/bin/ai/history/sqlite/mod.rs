@@ -27,6 +27,9 @@ const LLM_PRUNE_MARKS_META_KEY: &str = "llm_prune_marks_v1";
 const LAST_ACTIVITY_META_KEY: &str = "last_activity_unix_ms";
 const SESSION_MARKED_META_KEY: &str = "session_marked";
 const SESSION_MARK_MESSAGE_META_KEY: &str = "session_mark_message";
+const SESSION_SERVE_MODEL_META_KEY: &str = "serve_model";
+const SESSION_SERVE_AGENT_META_KEY: &str = "serve_agent";
+const SESSION_SERVE_EFFORT_META_KEY: &str = "serve_reasoning_effort";
 
 pub(super) use lock::{
     delete_session_state_lock, remove_session_state_lock_entry, with_session_state_lock,
@@ -43,8 +46,9 @@ pub(in crate::ai) use context::{
 };
 pub(in crate::ai) use metadata::{
     read_first_user_prompt_sqlite, read_session_list_metadata_sqlite, read_session_mark_message_sqlite,
-    read_session_marked_sqlite, read_session_title_origin_sqlite, read_session_title_sqlite,
-    write_session_mark_sqlite, write_session_title_sqlite, MarkMessageUpdate,
+    read_session_marked_sqlite, read_session_serve_config_sqlite, read_session_title_origin_sqlite,
+    read_session_title_sqlite, write_session_mark_sqlite, write_session_serve_config_sqlite,
+    write_session_title_sqlite, MarkMessageUpdate,
 };
 pub(in crate::ai) use outcomes::{
     append_interrupted_stream_diagnostic_sqlite, append_skill_activation_event_sqlite,

@@ -9,7 +9,11 @@ use super::lock::with_session_state_lock;
 use super::migrations::init_history_schema;
 use super::revision::{read_i64_meta_from_conn, touch_session_activity};
 use super::store::{SessionListMetadata, decode_message_content};
-use super::{LAST_ACTIVITY_META_KEY, SESSION_MARKED_META_KEY, SESSION_MARK_MESSAGE_META_KEY};
+use super::{
+    LAST_ACTIVITY_META_KEY, SESSION_MARKED_META_KEY, SESSION_MARK_MESSAGE_META_KEY,
+    SESSION_SERVE_AGENT_META_KEY, SESSION_SERVE_EFFORT_META_KEY, SESSION_SERVE_MODEL_META_KEY,
+};
+use super::super::sessions::SessionServeConfig;
 
 pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Option<String>> {
     let conn = open_history_db(path)?;
@@ -230,6 +234,70 @@ pub(in crate::ai) fn write_session_title_sqlite(
             rusqlite::params![origin],
         )
         .map_err(|e| io::Error::other(e.to_string()))?;
+        touch_session_activity(&tx)?;
+        tx.commit().map_err(|e| io::Error::other(e.to_string()))
+    })
+}
+
+/// Read one meta-table value, treating missing or blank entries as `None`.
+fn read_meta_optional(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key=?1 LIMIT 1",
+        rusqlite::params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .unwrap_or(None)
+    .filter(|value| !value.trim().is_empty())
+}
+
+/// Read the session's persisted serve-mode config (model / agent / reasoning
+/// effort) from the meta table. Missing keys mean "server default".
+pub(in crate::ai) fn read_session_serve_config_sqlite(
+    path: &Path,
+) -> io::Result<SessionServeConfig> {
+    let conn = open_history_db_read_only(path)?;
+    Ok(SessionServeConfig {
+        model: read_meta_optional(&conn, SESSION_SERVE_MODEL_META_KEY),
+        agent: read_meta_optional(&conn, SESSION_SERVE_AGENT_META_KEY),
+        reasoning_effort: read_meta_optional(&conn, SESSION_SERVE_EFFORT_META_KEY),
+    })
+}
+
+/// Atomically persist the session's serve-mode config in one lock + one
+/// transaction: the three keys are one logical value, so a crash mid-write
+/// must not leave a half-updated config (e.g. a new model with the old agent).
+/// The keys live in the meta table, so they survive clear-history and are
+/// copied by fork / import (which copy the whole SQLite file).
+pub(in crate::ai) fn write_session_serve_config_sqlite(
+    path: &Path,
+    config: &SessionServeConfig,
+) -> io::Result<()> {
+    with_session_state_lock(path, || {
+        let mut conn = open_history_db(path)?;
+        init_history_schema(&conn)?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        for (key, value) in [
+            (SESSION_SERVE_MODEL_META_KEY, config.model.as_deref()),
+            (SESSION_SERVE_AGENT_META_KEY, config.agent.as_deref()),
+            (SESSION_SERVE_EFFORT_META_KEY, config.reasoning_effort.as_deref()),
+        ] {
+            match value {
+                Some(value) => {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO meta (key, value, created_at) VALUES (?1, ?2, unixepoch())",
+                        rusqlite::params![key, value],
+                    )
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                }
+                None => {
+                    tx.execute("DELETE FROM meta WHERE key=?1", rusqlite::params![key])
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                }
+            }
+        }
         touch_session_activity(&tx)?;
         tx.commit().map_err(|e| io::Error::other(e.to_string()))
     })

@@ -20,9 +20,11 @@ use super::{
         SessionListMetadata, backup_sqlite, read_all_messages_sqlite,
         read_first_user_prompt_sqlite, read_session_list_metadata_sqlite,
         read_session_mark_message_sqlite, read_session_marked_sqlite,
+        read_session_serve_config_sqlite,
         read_session_title_origin_sqlite, read_session_title_sqlite,
         remap_context_checkpoint_paths_sqlite, with_session_state_lock,
-        write_session_mark_sqlite, write_session_title_sqlite, MarkMessageUpdate,
+        write_session_mark_sqlite, write_session_serve_config_sqlite,
+        write_session_title_sqlite, MarkMessageUpdate,
     },
     types::Message,
 };
@@ -139,6 +141,18 @@ impl SessionTitleOrigin {
 pub(in crate::ai) struct SessionTitle {
     pub(in crate::ai) text: String,
     pub(in crate::ai) origin: SessionTitleOrigin,
+}
+
+/// Per-session serve-mode defaults (model / agent / reasoning effort) for the
+/// mobile serve client. Stored in the session's meta table, so they belong to
+/// the session itself: changing the model in one session never leaks into
+/// another, and reopening a session restores its picks. `None` means "server
+/// default".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(in crate::ai) struct SessionServeConfig {
+    pub model: Option<String>,
+    pub agent: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 impl SessionStore {
@@ -1095,6 +1109,32 @@ impl SessionStore {
     ) -> io::Result<()> {
         Self::validate_session_id(session_id)?;
         write_session_mark_sqlite(&self.session_history_file(session_id), marked, message)
+    }
+
+    /// Read the session's persisted serve-mode config. A missing session (or
+    /// one without stored picks) yields all-defaults, matching how titles and
+    /// marks read as absent for a session that does not exist yet.
+    pub(in crate::ai) fn read_session_serve_config(
+        &self,
+        session_id: &str,
+    ) -> io::Result<SessionServeConfig> {
+        Self::validate_session_id(session_id)?;
+        let path = self.session_history_file(session_id);
+        if !path.exists() {
+            return Ok(SessionServeConfig::default());
+        }
+        read_session_serve_config_sqlite(&path)
+    }
+
+    /// Atomically persist the session's serve-mode config (see
+    /// `write_session_serve_config_sqlite`).
+    pub(in crate::ai) fn write_session_serve_config(
+        &self,
+        session_id: &str,
+        config: &SessionServeConfig,
+    ) -> io::Result<()> {
+        Self::validate_session_id(session_id)?;
+        write_session_serve_config_sqlite(&self.session_history_file(session_id), config)
     }
 
     /// Whether an LLM-generated title already exists.

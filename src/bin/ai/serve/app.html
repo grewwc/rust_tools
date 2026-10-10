@@ -102,6 +102,13 @@ select, summary { touch-action:manipulation; }
    scroll region hides the tail of a line behind an easy-to-miss gesture. */
 .msg.md pre code { background:none; border:0; padding:0; white-space:pre-wrap; overflow-wrap:anywhere; }
 .msg.md .tablewrap { overflow-x:auto; margin:6px 0; }
+/* Keep wide equations scrollable inside the bubble, including flex list items. */
+.msg.md .li > span:last-child { min-width:0; }
+.msg.md .math { max-width:100%; overflow-x:auto; overflow-y:hidden; word-break:normal; }
+.msg.md .math.display { display:block; margin:8px 0; padding:4px 0; }
+.msg.md .math.inline { display:inline-block; vertical-align:middle; }
+.msg.md .math .katex-display { margin:0; text-align:left; }
+.msg.md .math .katex-display > .katex { text-align:left; }
 .msg.md table { border-collapse:collapse; font-size:13px; }
 .msg.md th, .msg.md td { border:1px solid var(--line); padding:2px 6px; text-align:left; }
 /* A turn can stop and ask before doing something (a tool that needs an
@@ -310,12 +317,109 @@ const mdInline = (src) => {
   }
   return html + mdText(src.slice(last));
 };
+// Protect TeX before Markdown can interpret its stars, pipes, or newlines.
+// Slots are collision-free and restored only in text, never in code or URLs.
+function protectMath(src) {
+  // A space prevents a slot from turning an invalid URL into a Markdown link.
+  let key = "\uE000math ";
+  while (src.includes(key)) key += "X";
+  const slots = [], chunks = [];
+  let i = 0, last = 0;
+  while (i < src.length) {
+    const rest = src.slice(i);
+    if (i === 0 || src[i - 1] === "\n") {
+      const fence = /^[ \t]*(`{3,}|~{3,})[ \t]*([^\s`]*)[ \t]*(?:\n|$)/.exec(rest);
+      if (fence) {
+        const tail = src.slice(i + fence[0].length);
+        const close = new RegExp("^[ \\t]*" + fence[1][0] + "{3,}[ \\t]*(?:\\n|$)", "m").exec(tail);
+        i = close ? i + fence[0].length + close.index + close[0].length : src.length;
+        continue;
+      }
+    }
+    const code = /^(`+)(?!`)[\s\S]*?\1(?!`)/.exec(rest);
+    const link = /^(?:\[[^\]\n]+?\]\((?:https?:\/\/(?:[^()\s]|\([^()\s]*\))+)\)|<https?:\/\/[^\s<>]+>)/.exec(rest);
+    if (code || link) { i += (code || link)[0].length; continue; }
+    // An unfinished code span remains literal while the reply is streaming.
+    if (src[i] === "`") { const end = src.indexOf("\n", i); i = end < 0 ? src.length : end; continue; }
+    const left = rest.startsWith("$$") ? "$$" : rest.startsWith("\\[") ? "\\[" :
+      rest.startsWith("\\(") ? "\\(" : src[i] === "$" ? "$" : "";
+    if (!left) { i += src[i] === "\\" ? 2 : 1; continue; }
+    const right = left === "\\[" ? "\\]" : left === "\\(" ? "\\)" : left;
+    const display = left === "$$" || left === "\\[";
+    const start = i + left.length;
+    let end = -1, depth = 0;
+    if (left !== "$" || (start < src.length && !/\s/.test(src[start]))) {
+      for (let j = start; j < src.length; j++) {
+        if (!display && src[j] === "\n") break;
+        if (depth === 0 && src.startsWith(right, j)) {
+          // Avoid pairing currency amounts such as "$5 and $10".
+          if (left !== "$" || (j > start && !/\s/.test(src[j - 1]) && !/\d/.test(src[j + 1] || ""))) end = j;
+          break;
+        }
+        if (src[j] === "\\") { j++; continue; }
+        if (src[j] === "{") depth++;
+        else if (src[j] === "}") depth = Math.max(0, depth - 1);
+      }
+    }
+    if (end < 0 || !src.slice(start, end).trim()) { i += left.length; continue; }
+    const raw = src.slice(i, end + right.length), tex = src.slice(start, end);
+    chunks.push(src.slice(last, i), key + slots.length + "\uE001");
+    slots.push('<span class="math ' + (display ? "display" : "inline") + '" data-tex="' + esc(tex) + '">' + esc(raw) + '</span>');
+    last = i = end + right.length;
+  }
+  chunks.push(src.slice(last));
+  return { source: chunks.join(""), restore: (html) => html.replace(new RegExp(key + "(\\d+)\uE001", "g"), (_, n) => slots[Number(n)]) };
+}
+
+// Load only for mathematical replies. A failed/slow CDN leaves readable source
+// and must not block the chat, retry on every stream paint, or retain old roots.
+let mathLoading = null, mathReady = false;
+function decorateMath(root) {
+  if (!root.querySelector(".math[data-tex]")) return;
+  if (mathReady) { typesetMath(root); return; }
+  if (mathLoading) return;
+  const base = "https://cdn.jsdelivr.net/npm/katex@0.19.0/dist/";
+  const load = (tag, file, integrity) => new Promise((resolve, reject) => {
+    const el = document.createElement(tag);
+    el.crossOrigin = "anonymous";
+    el.integrity = integrity;
+    el.referrerPolicy = "no-referrer";
+    el.onload = resolve;
+    el.onerror = reject;
+    if (tag === "link") { el.rel = "stylesheet"; el.href = base + file; }
+    else { el.async = true; el.src = base + file; }
+    document.head.appendChild(el);
+  });
+  mathLoading = Promise.all([
+    load("link", "katex.min.css", "sha384-3rdsX6e5mueWyoweR9NIVmtEsUkokpBT/0ALqKKIBMr9j4qhHkaIkAcGgsE6uVlp"),
+    load("script", "katex.min.js", "sha384-QFFtAGzvvj+bfgCGxXJlNZZR1nXEZgvG8tDLCCY1F19xl20WlfTYgguB4VcNdxYk"),
+  ]).then(() => {
+    mathReady = true;
+    const msgs = $("msgs");
+    const atBottom = msgs.scrollHeight - msgs.scrollTop - msgs.clientHeight < 80;
+    typesetMath(msgs);
+    if (atBottom) msgs.scrollTop = msgs.scrollHeight;
+  }).catch(() => { /* Source stays visible when either resource fails. */ });
+}
+function typesetMath(root) {
+  for (const node of root.querySelectorAll(".math[data-tex]")) {
+    const raw = node.textContent;
+    try {
+      window.katex.render(node.dataset.tex, node, {
+        displayMode: node.classList.contains("display"),
+        throwOnError: true, trust: false, strict: "ignore", maxExpand: 1000, maxSize: 20,
+      });
+    } catch (_) { node.textContent = raw; }
+    delete node.dataset.tex;
+  }
+}
 // Whole-reply renderer: blocks are recognised on the raw lines (a quote marker
 // is still ">" here, not "&gt;") and each block's text is escaped on the way
 // out. Blank lines inside one paragraph run become the <br> gaps between them.
 function renderMarkdown(src) {
-  const lines = String(src).replace(/\r\n?/g, "\n").split("\n");
-  const inline = (s) => mdInline(esc(s));
+  const math = protectMath(String(src).replace(/\r\n?/g, "\n"));
+  const lines = math.source.split("\n");
+  const inline = (s) => math.restore(mdInline(esc(s)));
   const out = [];
   let text = [];
   const flushText = () => {
@@ -496,6 +600,7 @@ function decorateImages(root) {
   while (tw.nextNode()) nodes.push(tw.currentNode);
   let budget = MAX_PREVIEWS_PER_MSG;
   for (const node of nodes) {
+    if (node.parentElement.closest(".math")) continue;
     const text = node.nodeValue || "";
     if (!budget || text.indexOf(".") === -1) continue;
     const hits = imageTokensIn(text).filter(() => budget-- > 0);
@@ -553,6 +658,7 @@ async function loadPreviews(root) {
   }
 }
 function decorateAndLoad(root) {
+  decorateMath(root);
   decorateImages(root);
   loadPreviews(root);
 }
@@ -616,28 +722,54 @@ function addFold(title, bodyText, parent) {
   return { box: d, body: pre, set(title2, text2) { sum.textContent = title2; pre.textContent = text2; } };
 }
 
-// Fill a per-turn override dropdown. Entries are [value, label] pairs; the
-// empty value always means "server default" and shows the current server
-// label. A pick the user made is put back from localStorage (restorePick) and
-// kept across refills of this dropdown while the server still offers it.
-const PICK_KEYS = { omodel: "serve.pick.model", oagent: "serve.pick.agent", oeffort: "serve.pick.effort" };
-// Restore after the options exist: assigning a value no option carries reads
-// back as "" (the default), and a pick the server no longer offers is dropped
-// rather than forced.
-function restorePick(sel) {
-  let v = "";
-  try { v = localStorage.getItem(PICK_KEYS[sel.id]) || ""; } catch (_) {}
-  if (!v) return;
-  for (const o of sel.options) if (o.value === v) { sel.value = v; return; }
-}
-// Remember the pick — or forget it when the user goes back to the default — and
-// refresh the collapsed row's summary.
-function savePick(sel) {
+// The three override picks are per-session, not per-browser: they live in the
+// session's own config on the server (`GET`/`POST /sessions/{id}/config`), so
+// changing the model in one session never leaks into another, and reopening a
+// session — even after the browser was closed — restores its picks from the
+// server. The empty value always means "server default".
+const PICK_KEYS = { omodel: "model", oagent: "agent", oeffort: "reasoning_effort" };
+// Mirror the current session's stored picks into the three selects. Runs after
+// the dropdown options exist (loadInfo) and whenever the current session
+// changes; a fetch that lost the session switch is dropped instead of painting
+// another session's picks onto this one.
+async function loadSessionConfig() {
+  const sid = sessionId;
+  if (!sid) { resetPicks(); return; }
   try {
-    if (sel.value) localStorage.setItem(PICK_KEYS[sel.id], sel.value);
-    else localStorage.removeItem(PICK_KEYS[sel.id]);
-  } catch (_) {}
+    const cfg = await (await api("/sessions/" + sid + "/config")).json();
+    if (sid !== sessionId) return; // the user switched sessions meanwhile
+    applySessionConfig(cfg);
+  } catch (e) {
+    if (sid !== sessionId) return;
+    note("loading session config failed: " + e.message);
+  }
+}
+// Assigning a value no option carries reads back as "" (the default); a pick
+// the server no longer offers is dropped rather than forced.
+function applySessionConfig(cfg) {
+  const set = (sel, v) => { sel.value = (v && [...sel.options].some((o) => o.value === v)) ? v : ""; };
+  set($("omodel"), cfg.model || "");
+  set($("oagent"), cfg.agent || "");
+  set($("oeffort"), cfg.reasoning_effort || "");
   syncOvrSummary();
+}
+function resetPicks() {
+  applySessionConfig({ model: "", agent: "", reasoning_effort: "" });
+}
+// Persist the current picks as the session's config. With no session yet the
+// picks stay in-page: they travel with the first turn and are stored right
+// after the session is created.
+async function persistPicks() {
+  if (!sessionId) return;
+  const body = { model: $("omodel").value, agent: $("oagent").value, reasoning_effort: $("oeffort").value };
+  try { await api("/sessions/" + sessionId + "/config", { method: "POST", body: JSON.stringify(body) }); }
+  catch (e) { note("saving session config failed: " + e.message); }
+}
+// A changed pick belongs to the session it was changed in: push it to the
+// server instead of this browser's storage, and refresh the collapsed summary.
+function savePick() {
+  syncOvrSummary();
+  persistPicks();
 }
 function fillSelect(sel, entries, currentLabel, kind) {
   const prev = sel.value;
@@ -668,12 +800,8 @@ async function loadInfo() {
     fillSelect($("omodel"), (info.models || []).map((m) => [m.id, m.label || m.id]), info.model_label || info.model, "model");
     fillSelect($("oagent"), (info.agents || []).map((a) => [a, a]), info.agent, "agent");
     fillSelect($("oeffort"), (info.efforts || []).map((e) => [e, e]), info.reasoning_effort, "effort");
-    // The three picks belong to the user, not to the page load: put them back
-    // once the options exist, so reopening the page keeps the selection.
-    restorePick($("omodel"));
-    restorePick($("oagent"));
-    restorePick($("oeffort"));
-    syncOvrSummary();
+    // The three picks are per-session and live on the server; loadSessionConfig
+    // mirrors them into these selects once the current session is known.
     syncOvrSummary();
   } catch (e) {
     let msg = "offline: " + e.message;
@@ -735,6 +863,7 @@ function renderSessionList(items, errText) {
       pollConfirm();
       loadSessions();
       loadHistory();
+      loadSessionConfig();
     };
     ul.appendChild(li);
   }
@@ -799,7 +928,7 @@ async function loadSessions() {
     // Fresh id, not yet materialized: stay on it; the first turn persists
     // it and the following loadSessions picks it up normally.
   }
-  else if (!items.length) { sessionId = ""; pendingNew = null; turnRunning = false; }
+  else if (!items.length) { sessionId = ""; pendingNew = null; turnRunning = false; resetPicks(); }
   else {
     pendingNew = null;
     sessionId = items[0].id;
@@ -809,6 +938,7 @@ async function loadSessions() {
     turnRunning = false;
     pollConfirm();
     await loadHistory();
+    await loadSessionConfig();
   }
   lastItems = items;
   renderSessionList(items);
@@ -1124,6 +1254,7 @@ async function send() {
       try { sessionId = (await (await api("/sessions", { method: "POST" })).json()).id; }
       catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); return; }
       localStorage.setItem("serve.session", sessionId);
+      persistPicks(); // picks made before any session existed belong to this one now
     }
     sid = sessionId;
     // One turn per session, but no longer one turn per page: a second session
@@ -1177,6 +1308,7 @@ async function send() {
   const paint = () => {
     paintTimer = null;
     bubble.innerHTML = renderMarkdown(raw);
+    decorateMath(bubble);
     if (sid === sessionId) $("msgs").scrollTop = $("msgs").scrollHeight;
   };
   const schedulePaint = () => { if (paintTimer === null) paintTimer = setTimeout(paint, 50); };
@@ -1352,9 +1484,9 @@ function wire() {
   window.addEventListener("pageshow", () => { pollConfirm(); startStaleFollow(); }); // bfcache restore fires no visibility change
   if (window.matchMedia && matchMedia("(max-width: 700px)").matches) $("ovrwrap").open = false;
   $("scrim").onclick = () => setDrawer(false);
-  $("omodel").onchange = () => savePick($("omodel"));
-  $("oagent").onchange = () => savePick($("oagent"));
-  $("oeffort").onchange = () => savePick($("oeffort"));
+  $("omodel").onchange = () => savePick();
+  $("oagent").onchange = () => savePick();
+  $("oeffort").onchange = () => savePick();
   $("prompt").addEventListener("input", growPrompt);
   $("prompt").addEventListener("keydown", (e) => {
     // Plain Enter inserts a newline (mobile keyboards included); only the
@@ -1400,6 +1532,7 @@ function wire() {
       $("msgs").textContent = "";
       addMsg("asst", "new session — type below to start.", "asst");
       await loadSessions();
+      loadSessionConfig(); // a fresh session owns no config; clear the picks
     } catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); }
   };
   $("refresh").onclick = async () => { await loadSessions(); await loadHistory(); };
@@ -1411,6 +1544,7 @@ function wire() {
       turnRunning = false; // a running turn (if any) belongs to the source session
       localStorage.setItem("serve.session", sessionId);
       await loadSessions(); await loadHistory();
+      await loadSessionConfig(); // the fork inherits the source session's picks
     } catch (e) { addMsg("err", "fork failed: " + e.message, "asst err"); }
   };
   $("del").onclick = async () => {
@@ -1449,6 +1583,7 @@ async function boot() {
   await loadInfo();
   await loadSessions();
   await loadHistory();
+  await loadSessionConfig(); // restore this session's picks from the server
   pollConfirm(); // cold boot mid-turn (or a remote turn) has no live event; derive once
 }
 boot();

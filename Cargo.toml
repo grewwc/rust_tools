@@ -3,6 +3,10 @@ name = "rust_tools"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "mcp_feishu"
+path = "src/bin/mcp_feishu/mod.rs"
+
 [workspace]
 members = [
     ".",

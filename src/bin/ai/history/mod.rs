@@ -59,8 +59,8 @@ pub(in crate::ai) use sessions::generate_session_summary;
 pub(in crate::ai) use sessions::strip_think_tags;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::{
-    PruneSessionDeleteResult, SessionInfo, SessionStore, SessionTitle, SessionTitleOrigin,
-    with_sessions_lifecycle_lock,
+    PruneSessionDeleteResult, SessionInfo, SessionServeConfig, SessionStore, SessionTitle,
+    SessionTitleOrigin, with_sessions_lifecycle_lock,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::MarkMessageUpdate;

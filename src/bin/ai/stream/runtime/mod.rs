@@ -32,15 +32,31 @@ use super::{
     },
     wire_log::WireOutcomeNote,
 };
+mod metrics;
+mod hints;
+mod tool_calls;
+mod fold_render;
+mod driver;
+
+use metrics::*;
+use tool_calls::*;
+pub(super) use hints::*;
+pub(super) use fold_render::*;
+pub(super) use driver::*;
+
+// Slices under runtime/ still address their old sibling modules via `super::state` and
+// `super::side_note_input` (before the split those paths resolved through `runtime`
+// itself). Re-bind the sibling module names here so the moved code keeps resolving
+// without per-file path edits.
+use crate::ai::stream::side_note_input;
+use crate::ai::stream::state;
+
 
 /// Maximum number of decode errors before giving up and returning partial content
-const MAX_DECODE_ERRORS: usize = 3;
 /// Delay in milliseconds between retry attempts on transient errors
-const DECODE_ERROR_RETRY_DELAY_MS: u64 = 100;
 /// Grace window after an OpenAI-compatible `finish_reason` chunk. Some backends
 /// do not emit `[DONE]` or close the HTTP body, while others can still send a
 /// final snapshot immediately after the finish chunk.
-const FINISH_REASON_GRACE_MS: u64 = 750;
 
 /// Silence allowance on a connection with no provider-declared work in progress.
 ///
@@ -53,7 +69,6 @@ const FINISH_REASON_GRACE_MS: u64 = 750;
 ///
 /// A model whose gateway hides long stretches of work behind silence without opening an output item may widen
 /// this default per model (`stream_silence_timeout_secs` in the model registry).
-const STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
 /// Silence allowance while the provider holds an open output item (`response.output_item.added` without its
 /// matching `.done`).
 ///
@@ -68,7 +83,6 @@ const STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
 /// connection is indistinguishable from a slow provider — no bytes arrive either way — so this is the accepted
 /// cost of not discarding healthy generations; `MAX_TOOL_ARG_BYTES` and the tool-argument stall bound below stay
 /// as the runaway guards for tool calls.
-const STREAM_DECLARED_ITEM_TIMEOUT_SECS: u64 = 300;
 /// Tool-call argument stall timeout: an absolute bound on how long one tool call may stay open, even if the provider
 /// keeps trickling argument deltas (the silence allowance only catches total silence; a server sending one small
 /// delta every few minutes refreshes the meaningful-progress timer forever, leaving the terminal stuck on
@@ -76,40 +90,28 @@ const STREAM_DECLARED_ITEM_TIMEOUT_SECS: u64 = 300;
 /// minutes). Generating the arguments of a large artifact is legitimate work that can take minutes, so this is a
 /// backstop against a stream that never finishes, not a normal-path timeout; `MAX_TOOL_ARG_BYTES` remains the primary
 /// runaway guard. On expiry the open call is dropped and the attempt replays through the truncation path.
-const STREAM_TOOL_ARGS_STALL_TIMEOUT_SECS: u64 = 180;
 /// First-chunk timeout: the request was sent but the server never sends the first byte (queued, stuck gateway, ...).
 /// A stream that produced nothing yet gets this shorter window: unlike a stall after work has been delivered, there
 /// is nothing to preserve by waiting longer, so the retry may start earlier.
-const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 90;
 /// Default visible-window height for `thinking` in the terminal. Only affects display, not reasoning accumulation.
 /// Streaming shows the most recent N lines (default 2); when thinking ends, `finalize_fold` forces a pure-summary
 /// fold (redraws with a 0-line window) so conclusions/questions restated at the tail of thinking are not shown twice
 /// alongside the final answer in the terminal.
-const DEFAULT_THINKING_MAX_VISIBLE_LINES: usize = 2;
 /// Physical rows the live fold window reserves outside its body budget: the anchored header (1), the fold-summary
 /// marker (1), and one row of headroom so the cursor never sits on the very bottom row. Bounding the body to
 /// `viewport_rows - this` keeps the whole window (header + body) inside the visible viewport, so the relative-cursor
 /// erase (`\x1b[nA`) in `erase_fold_body` always reaches the top body row instead of being clamped at the viewport
 /// top once the window scrolls into scrollback — the root cause of stacked `… more` / `… N earlier lines` markers.
-const FOLD_VIEWPORT_RESERVED_ROWS: usize = 3;
 /// Indentation for folded thinking/subagent bodies: header/footer use 2 spaces, body is indented one more level.
-const THINKING_FOLD_BODY_INDENT: &str = "    ";
-const THINKING_FOLD_BODY_INDENT_WIDTH: usize = 4;
 /// Terminals usually wrap at the right edge with delayed-wrap; folded redraws always leave two extra columns so that
 /// a missing terminal flag or a one-column width/char-width drift cannot trigger an implicit wrap that was not counted
 /// in cursor-up, leaving residue from the old window under the `✓`.
-const FOLD_REWRITE_RIGHT_MARGIN_COLS: usize = 2;
 /// Shortest repeated fragment and decision count for reasoning-stream degeneration. Only reasoning is checked, so
 /// legitimately repeated body the model was asked to produce (tables, code, test data) is not misjudged as degeneration.
-const MIN_REASONING_REPEAT_CHARS: usize = 16;
-const MAX_REASONING_REPEAT_CHARS: usize = 512;
-const REASONING_REPEAT_COUNT: usize = 3;
-const DEGENERATE_REPETITION_FINISH_REASON: &str = "degenerate_repetition";
 /// Cap on accumulated streaming tool-call arguments (total across all tool calls in one turn).
 /// Once the model opens a tool call it should close quickly; if arguments keep growing until the cap is hit (e.g.
 /// an endless loop concatenating the same body in apply_patch), the output has degenerated. Existing degeneration
 /// detection only covers reasoning/assistant text, not tool arguments; this total cap is a backstop against infinite waits and memory growth.
-const MAX_TOOL_ARG_BYTES: usize = 1 << 20; // 1 MiB
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct StreamPayloadOutcome {
@@ -179,29 +181,8 @@ fn initial_stream_processing_state(app: &App) -> StreamProcessingState {
 /// Update the tool-argument stall timer: starts it when a tool call opens, resets it once no
 /// tool call is open or the provider already declared how the response ended. See
 /// `STREAM_TOOL_ARGS_STALL_TIMEOUT_SECS`.
-fn update_tool_args_open_at(
-    state: &StreamContentState,
-    open_at: Option<Instant>,
-) -> Option<Instant> {
-    if state.finish_reason_seen
-        || state.response_completed
-        || state.response_incomplete
-        || state.tool_calls_map.is_empty()
-    {
-        None
-    } else {
-        Some(open_at.unwrap_or_else(Instant::now))
-    }
-}
 
 /// Whether an open tool call has been receiving arguments for at least `stall_timeout` without finishing.
-fn tool_args_stream_stalled(
-    open_at: Option<Instant>,
-    now: Instant,
-    stall_timeout: Duration,
-) -> bool {
-    open_at.is_some_and(|open_at| now.duration_since(open_at) >= stall_timeout)
-}
 
 /// Track an open `function_call` output item from the Responses item events.
 ///
@@ -210,25 +191,6 @@ fn tool_args_stream_stalled(
 /// between, so that silence must not be read as a stalled connection. Reasoning items carry the same open/closed
 /// state in their own parse result, which also resolves an `.added` line whose item status is already terminal;
 /// only chunks can come from a `function_call` item here, so the two paths cannot double count.
-fn note_function_call_item_lifecycle(
-    event_type: Option<&str>,
-    parsed: &super::state::ParsedStreamPayload,
-    content: &mut StreamContentState,
-) {
-    if !matches!(
-        parsed,
-        super::state::ParsedStreamPayload::Chunk(_)
-            | super::state::ParsedStreamPayload::SnapshotChunk(_)
-    ) {
-        return;
-    }
-    let Some(name) = event_type else { return };
-    if name.eq_ignore_ascii_case("response.output_item.added") {
-        content.open_output_items = content.open_output_items.saturating_add(1);
-    } else if name.eq_ignore_ascii_case("response.output_item.done") {
-        content.open_output_items = content.open_output_items.saturating_sub(1);
-    }
-}
 
 pub(super) async fn stream_response(
     app: &mut App,
@@ -421,153 +383,27 @@ pub(super) async fn stream_response(
 /// Applies to all TTY sessions. Written and flushed on its own line so it appears
 /// immediately; once the first visible chunk arrives it is erased by moving the cursor back up over
 /// the rows the hint occupies (see `erase_waiting_hint`), leaving no extra lines behind.
-fn should_show_waiting_hint(app: &App) -> bool {
-    runtime_ctx::terminal_output_enabled()
-        && io::stdout().is_terminal()
-        && !app.shutdown.load(std::sync::atomic::Ordering::Relaxed)
-}
 
-fn print_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
-    if state.render.waiting_hint_active {
-        return Ok(());
-    }
-    // Waiting hint on its own line: erased with a cursor-up plus row clears when the first chunk arrives.
-    write_waiting_hint_line(state, "waiting…")?;
-    state.render.waiting_hint_active = true;
-    state.render.waiting_hint_tool_call = false;
-    Ok(())
-}
 
 /// Write the hint as exactly one live-region row and remember its plain text: the hint owns its own line
 /// and is erased by moving the cursor back up over it, and a terminal that narrowed re-wraps the row that
 /// is already on screen, so the erase recomputes the physical row count from the text actually written.
-fn write_waiting_hint_line(state: &mut StreamProcessingState, label: &str) -> io::Result<()> {
-    let row = clamp_line_to_terminal_row(&format!("  ⠋ {label}"));
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    writeln!(out, "{}{row}{RESET}", theme::current().accent_muted)?;
-    out.flush()?;
-    state.render.waiting_hint_line = row;
-    Ok(())
-}
 
 /// Erase the hint row(s) currently on screen and park the cursor where the hint started, so the next
 /// output prints in its place. Clears `waiting_hint_line` but leaves the hint flags to the caller:
 /// `clear_waiting_hint` resets them, while the in-place rewrites (`upgrade_waiting_hint_for_buffering`,
 /// `show_deferred_body_buffering_hint`, `refresh_deferred_body_rate_hint`,
 /// `refresh_tool_call_rate_hint`) keep the hint active.
-fn erase_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
-    if !state.render.waiting_hint_active || state.render.waiting_hint_line.is_empty() {
-        return Ok(());
-    }
-    let rows = live_preview_cursor_rows(&state.render.waiting_hint_line);
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    erase_rows_above_cursor(&mut out, rows)?;
-    out.flush()?;
-    state.render.waiting_hint_line.clear();
-    Ok(())
-}
 
-fn sanitize_waiting_hint_tool_name(function_name: &str) -> String {
-    let sanitized = sanitize_for_terminal(function_name);
-    let single_line = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if single_line.is_empty() {
-        "tool".to_string()
-    } else {
-        single_line
-    }
-}
 
 /// Label for the tool-call receiving hint. `rate_text` is the optional live
 /// argument-throughput suffix: it stays `None` until a measurable argument window
 /// exists, so the row keeps its original wording in the first moments of a call.
-fn tool_call_hint_label(function_name: &str, rate_text: Option<&str>) -> String {
-    let function_name = sanitize_waiting_hint_tool_name(function_name);
-    match rate_text {
-        Some(rate_text) => format!("receiving `{function_name}` arguments… · {rate_text}"),
-        None => format!("receiving `{function_name}` arguments…"),
-    }
-}
 
-fn print_tool_call_waiting_hint(
-    state: &mut StreamProcessingState,
-    function_name: &str,
-) -> io::Result<()> {
-    if state.render.waiting_hint_active {
-        clear_waiting_hint(state)?;
-    }
-    write_waiting_hint_line(state, &tool_call_hint_label(function_name, None))?;
-    state.render.waiting_hint_active = true;
-    state.render.waiting_hint_tool_call = true;
-    Ok(())
-}
 
-fn configure_thinking_fold(state: &mut StreamProcessingState) {
-    state.render.thinking_fold.max_visible_lines = resolve_thinking_fold_max_visible_lines(
-        io::stdout().is_terminal(),
-        configw::get_all_config()
-            .get_opt(AiConfig::OUTPUT_THINKING_MAX_VISIBLE_LINES)
-            .as_deref(),
-    );
-    state.render.thinking_fold.rewrite_right_margin_cols = FOLD_REWRITE_RIGHT_MARGIN_COLS;
-}
 
-fn configure_subagent_preview_fold(
-    app: &App,
-    state: &mut StreamProcessingState,
-    markers: &mut StreamMarkers,
-) {
-    state.render.subagent_fold.rewrite_right_margin_cols = FOLD_REWRITE_RIGHT_MARGIN_COLS;
-    if !io::stdout().is_terminal() || runtime_ctx::current_subagent_depth() == 0 {
-        state.render.subagent_fold.max_visible_lines = usize::MAX;
-        return;
-    }
 
-    state.render.subagent_fold.max_visible_lines = resolve_thinking_fold_max_visible_lines(
-        true,
-        configw::get_all_config()
-            .get_opt(AiConfig::OUTPUT_THINKING_MAX_VISIBLE_LINES)
-            .as_deref(),
-    );
-    markers.enable_subagent_preview(&app.current_agent);
-    if let (Some(header), Some(footer)) = (
-        markers.subagent_fold_header.as_deref(),
-        markers.subagent_fold_footer.as_deref(),
-    ) {
-        state.render.subagent_fold.set_labels(header, footer);
-    }
-}
 
-fn resolve_thinking_fold_max_visible_lines(is_tty: bool, raw: Option<&str>) -> usize {
-    if !is_tty {
-        return usize::MAX;
-    }
-
-    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        return DEFAULT_THINKING_MAX_VISIBLE_LINES;
-    };
-
-    match raw.parse::<usize>() {
-        Ok(0) => usize::MAX,
-        Ok(lines) => lines,
-        Err(_) => DEFAULT_THINKING_MAX_VISIBLE_LINES,
-    }
-}
-
-fn upgrade_waiting_hint_for_buffering(state: &mut StreamProcessingState) -> io::Result<()> {
-    if !state.render.waiting_hint_active
-        || state.render.waiting_hint_buffering
-        || state.render.waiting_hint_tool_call
-    {
-        return Ok(());
-    }
-    // Erase the hint and rewrite it in place so the buffering state stays visible.
-    erase_waiting_hint(state)?;
-    write_waiting_hint_line(state, "buffering…")?;
-    state.render.waiting_hint_buffering = true;
-    Ok(())
-}
 
 /// Show a compact "generating…" hint while the assistant body is being withheld
 /// (defer_assistant_body) and thinking is closed. The final answer is streamed but
@@ -575,28 +411,12 @@ fn upgrade_waiting_hint_for_buffering(state: &mut StreamProcessingState) -> io::
 /// terminal stays blank for the whole generation. Upgrades the initial "waiting…"
 /// line in place (cursor up + clear + rewrite) and stays put until
 /// `clear_waiting_hint` fires — at the next renderable chunk or at stream end.
-fn show_deferred_body_buffering_hint(state: &mut StreamProcessingState) -> io::Result<()> {
-    if !io::stdout().is_terminal()
-        || state.render.waiting_hint_buffering
-        || state.render.waiting_hint_tool_call
-    {
-        return Ok(());
-    }
-    if state.render.waiting_hint_active {
-        erase_waiting_hint(state)?;
-    }
-    write_waiting_hint_line(state, "generating…")?;
-    state.render.waiting_hint_active = true;
-    state.render.waiting_hint_buffering = true;
-    Ok(())
-}
 
 /// Minimum interval between in-place refreshes of a live rate hint, shared by the
 /// deferred-body "generating…" hint and the tool-call "receiving `X` arguments…" hint
 /// (only one of them owns the row at a time). The refresh is chunk-driven (no timer in
 /// the stream loop), so this bounds terminal repaints to ~2 Hz while tokens keep
 /// flowing; a stalled stream keeps the last written rate.
-const LIVE_RATE_HINT_REFRESH_MS: u64 = 500;
 
 /// Real-time output-throughput text for the deferred-body "generating…" hint.
 /// While `defer_assistant_body` withholds the final answer from the terminal until
@@ -606,121 +426,19 @@ const LIVE_RATE_HINT_REFRESH_MS: u64 = 500;
 /// not repainted, so there is no flicker. The `~` prefix marks the estimate as
 /// heuristic; the exact server-reported numbers are printed at stream end by
 /// `maybe_print_token_throughput_metrics`.
-fn refresh_deferred_body_rate_hint(state: &mut StreamProcessingState) -> io::Result<()> {
-    // Never clobber the tool-call hint, and never draw a fresh row under a line
-    // that was already erased (the erase here is a no-op, so a blank line would
-    // duplicate the hint below the cursor).
-    if state.render.waiting_hint_tool_call || state.render.waiting_hint_line.is_empty() {
-        return Ok(());
-    }
-    let Some(started_at) = state.content.output_started_at else {
-        return Ok(());
-    };
-    let tokens = state.content.live_output_tokens;
-    let elapsed = started_at.elapsed();
-    if tokens == 0 || elapsed < MIN_RATE_WINDOW {
-        return Ok(());
-    }
-    if state
-        .render
-        .waiting_hint_rate_refreshed_at
-        .is_some_and(|at| at.elapsed() < Duration::from_millis(LIVE_RATE_HINT_REFRESH_MS))
-    {
-        return Ok(());
-    }
-    let Some(rate_text) = format_live_rate_text(tokens, Some(elapsed)) else {
-        return Ok(());
-    };
-    let label = format!("generating… · {rate_text}");
-    let row = clamp_line_to_terminal_row(&format!("  ⠋ {label}"));
-    if row == state.render.waiting_hint_line {
-        return Ok(());
-    }
-    // In-place rewrite with the same geometry as `upgrade_waiting_hint_for_buffering`:
-    // the erase draws the cursor back to where the hint started, then the rewrite
-    // lands exactly on the same row(s).
-    erase_waiting_hint(state)?;
-    write_waiting_hint_line(state, &label)?;
-    state.render.waiting_hint_rate_refreshed_at = Some(Instant::now());
-    Ok(())
-}
 
 /// Live argument-throughput text for the tool-call receiving hint. Tool-call arguments
 /// are never printed to the terminal (`write_tool_call_arguments_stream` is a no-op), so
 /// this in-place rewrite is the only sign that a large payload — apply_patch,
 /// execute_command, task, … — is still flowing. Throttled and gated exactly like the
 /// deferred-body hint; the `~` prefix marks the count as a text-based estimate.
-fn refresh_tool_call_rate_hint(
-    state: &mut StreamProcessingState,
-    function_name: &str,
-) -> io::Result<()> {
-    // Only the tool-call hint may rewrite this row: never clobber the "waiting…" /
-    // "generating…" hints, and never draw a fresh row under one already erased.
-    if !state.render.waiting_hint_tool_call || state.render.waiting_hint_line.is_empty() {
-        return Ok(());
-    }
-    let Some(started_at) = state.content.tool_args_started_at else {
-        return Ok(());
-    };
-    let tokens = state.content.live_tool_arg_tokens;
-    let elapsed = started_at.elapsed();
-    if tokens == 0 || elapsed < MIN_RATE_WINDOW {
-        return Ok(());
-    }
-    if state
-        .render
-        .waiting_hint_rate_refreshed_at
-        .is_some_and(|at| at.elapsed() < Duration::from_millis(LIVE_RATE_HINT_REFRESH_MS))
-    {
-        return Ok(());
-    }
-    let Some(rate_text) = format_live_rate_text(tokens, Some(elapsed)) else {
-        return Ok(());
-    };
-    let label = tool_call_hint_label(function_name, Some(&rate_text));
-    let row = clamp_line_to_terminal_row(&format!("  ⠋ {label}"));
-    if row == state.render.waiting_hint_line {
-        return Ok(());
-    }
-    // In-place rewrite with the same geometry as `refresh_deferred_body_rate_hint`:
-    // the erase draws the cursor back to where the hint started, then the rewrite
-    // lands exactly on the same row(s).
-    erase_waiting_hint(state)?;
-    write_waiting_hint_line(state, &label)?;
-    state.render.waiting_hint_rate_refreshed_at = Some(Instant::now());
-    Ok(())
-}
 
 /// Pure formatter for a waiting hint's live rate text (`~N tok @ R tok/s`), shared by the
 /// deferred-body "generating…" hint and the tool-call "receiving `X` arguments…" hint.
 /// `None` until the first token of that window and until `MIN_RATE_WINDOW` has elapsed,
 /// mirroring `format_token_rate`'s "—" gate so the very first chunk is not reported as a
 /// misleading burst rate.
-fn format_live_rate_text(tokens: u64, elapsed: Option<Duration>) -> Option<String> {
-    if tokens == 0 {
-        return None;
-    }
-    let rate = format_token_rate(tokens, elapsed);
-    if rate == "—" {
-        return None;
-    }
-    Some(format!(
-        "~{} tok @ {rate} tok/s",
-        format_compact_token_count(tokens),
-    ))
-}
 
-pub(super) fn clear_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
-    if !state.render.waiting_hint_active {
-        return Ok(());
-    }
-    // Erase the standalone hint row(s) so following content prints in place.
-    erase_waiting_hint(state)?;
-    state.render.waiting_hint_active = false;
-    state.render.waiting_hint_buffering = false;
-    state.render.waiting_hint_tool_call = false;
-    Ok(())
-}
 
 fn immediate_cancel_result(app: &App, state: &mut StreamProcessingState) -> Option<StreamResult> {
     stream_interrupt_requested(app).then(|| cancelled_stream_result(state))
@@ -1143,29 +861,6 @@ fn finalize_stream_response(
 /// When `ai.prompt_cache.show_metrics` (default on) is set and this request hit the prompt
 /// cache, print one line of cache-hit metrics. OpenAI / DashScope etc. cache server-side;
 /// this just visualizes the `cached_tokens` they already reported.
-fn maybe_print_prompt_cache_metrics(usage: &crate::ai::request::StreamUsage) {
-    if !runtime_ctx::terminal_output_enabled() {
-        return;
-    }
-    let show = crate::commonw::configw::get_all_config()
-        .get(
-            crate::ai::config_schema::AiConfig::PROMPT_CACHE_SHOW_METRICS,
-            "true",
-        )
-        .trim()
-        .eq_ignore_ascii_case("true");
-    if !show {
-        return;
-    }
-    let cached = usage
-        .prompt_tokens_details
-        .as_ref()
-        .map(|d| d.cached_tokens)
-        .unwrap_or(0);
-    if let Some(line) = format_prompt_cache_metrics(usage.prompt_tokens, cached) {
-        println!("  {}{line}{RESET}", theme::current().accent_muted);
-    }
-}
 
 /// Print a heuristic generation-throughput line after a stream finishes. The timing split is an
 /// estimate, not server-reported: the reasoning window ends at the first visible output token, so
@@ -1173,174 +868,28 @@ fn maybe_print_prompt_cache_metrics(usage: &crate::ai::request::StreamUsage) {
 /// rate. `completion_tokens` includes reasoning tokens and tool-call argument tokens; the output
 /// slice is the non-reasoning remainder after subtracting
 /// `completion_tokens_details.reasoning_tokens`, so it can exceed what was rendered.
-fn maybe_print_token_throughput_metrics(
-    usage: &crate::ai::request::StreamUsage,
-    content: &StreamContentState,
-    finished_at: Instant,
-) {
-    if !runtime_ctx::terminal_output_enabled() {
-        return;
-    }
-
-    let reasoning_tokens = usage
-        .completion_tokens_details
-        .as_ref()
-        .map(|details| details.reasoning_tokens)
-        .unwrap_or(0)
-        .min(usage.completion_tokens);
-    let output_tokens = usage.completion_tokens.saturating_sub(reasoning_tokens);
-    let reasoning_end = content.output_started_at.unwrap_or(finished_at);
-    let reasoning_elapsed = content
-        .reasoning_started_at
-        .map(|started| reasoning_end.saturating_duration_since(started));
-    let output_elapsed = content
-        .output_started_at
-        .map(|started| finished_at.saturating_duration_since(started));
-
-    let Some(line) = format_token_throughput_metrics(
-        reasoning_tokens,
-        output_tokens,
-        reasoning_elapsed,
-        output_elapsed,
-    ) else {
-        return;
-    };
-    println!("  {}{line}{RESET}", theme::current().accent_muted);
-}
 
 /// Live reasoning-rate text for the in-progress thinking-fold header. It is
 /// recomputed on every fold redraw (each thinking chunk) from the approximate
 /// `~`-prefixed token estimate; the exact server-reported metrics are printed
 /// separately at stream end. Returns `None` until the first reasoning token
 /// arrives so the header stays stable during the pre-token window.
-fn fold_header_rate(content: &StreamContentState, now: Instant) -> Option<String> {
-    if content.live_reasoning_tokens == 0 {
-        return None;
-    }
-    let elapsed = content.reasoning_started_at.map(|started| {
-        content
-            .output_started_at
-            .unwrap_or(now)
-            .saturating_duration_since(started)
-    });
-    Some(format!(
-        "~{} tok @ {} tok/s",
-        format_compact_token_count(content.live_reasoning_tokens),
-        format_token_rate(content.live_reasoning_tokens, elapsed),
-    ))
-}
 
 /// Approximate token count for live throughput display (heuristic, prefixed with `~`):
 /// ASCII text averages ~4 chars/token, CJK characters ~1 token each (3 UTF-8 bytes each).
 /// A pure byte/4 estimate under-counts CJK by ~25%, so split by character class instead.
-fn estimate_stream_tokens(text: &str) -> u64 {
-    if text.is_empty() {
-        return 0;
-    }
-    let mut ascii = 0u64;
-    let mut non_ascii = 0u64;
-    for ch in text.chars() {
-        if ch.is_ascii() {
-            ascii += 1;
-        } else {
-            non_ascii += 1;
-        }
-    }
-    non_ascii + ascii.div_ceil(4)
-}
 
 /// Pure formatter for the split reasoning/output throughput line.
 /// A missing timing sample is rendered as an em dash instead of inventing a rate.
-fn format_token_throughput_metrics(
-    reasoning_tokens: u64,
-    output_tokens: u64,
-    reasoning_elapsed: Option<Duration>,
-    output_elapsed: Option<Duration>,
-) -> Option<String> {
-    if reasoning_tokens == 0 && output_tokens == 0 {
-        return None;
-    }
-    if reasoning_elapsed.is_none() && output_elapsed.is_none() {
-        return None;
-    }
-
-    let mut segments = Vec::with_capacity(2);
-    if reasoning_tokens > 0 {
-        segments.push(format!(
-            "reasoning {} tok @ {} tok/s",
-            format_compact_token_count(reasoning_tokens),
-            format_token_rate(reasoning_tokens, reasoning_elapsed)
-        ));
-    }
-    if output_tokens > 0 {
-        segments.push(format!(
-            "output {} tok @ {} tok/s",
-            format_compact_token_count(output_tokens),
-            format_token_rate(output_tokens, output_elapsed)
-        ));
-    }
-    Some(format!("↳ speed · {}", segments.join(" · ")))
-}
 
 /// Minimum elapsed window before an instantaneous rate is reported; shorter windows
 /// (e.g. the first chunk right after output starts) would print misleadingly large rates.
-const MIN_RATE_WINDOW: Duration = Duration::from_millis(500);
 
-fn format_token_rate(tokens: u64, elapsed: Option<Duration>) -> String {
-    let Some(elapsed) = elapsed else {
-        return "—".to_string();
-    };
-    if elapsed < MIN_RATE_WINDOW {
-        return "—".to_string();
-    }
-    let seconds = elapsed.as_secs_f64();
-    if seconds <= 0.0 {
-        return "—".to_string();
-    }
-    format_compact_rate(tokens as f64 / seconds)
-}
 
-fn format_compact_rate(rate: f64) -> String {
-    if rate < 999.5 {
-        // A value >= 999.5 would round to "1000" below; render it in the next unit instead.
-        if rate >= 100.0 {
-            format!("{rate:.0}")
-        } else if rate >= 10.0 {
-            format!("{rate:.1}")
-        } else {
-            format!("{rate:.2}")
-        }
-    } else if rate < 999_950.0 {
-        // k-branch values >= 999_950 round to "1000.0k"; escalate to the m unit instead.
-        format!("{:.1}k", rate / 1_000.0)
-    } else {
-        format!("{:.1}m", rate / 1_000_000.0)
-    }
-}
 
 /// Pure function: build a readable cache-hit line from prompt_tokens / cached_tokens.
 /// Returns Some only when there really was a hit (cached > 0), to avoid pointless noise.
-fn format_prompt_cache_metrics(prompt_tokens: u64, cached_tokens: u64) -> Option<String> {
-    if cached_tokens == 0 || prompt_tokens == 0 {
-        return None;
-    }
-    let pct = (cached_tokens as f64 / prompt_tokens as f64 * 100.0).min(100.0);
-    Some(format!(
-        "↳ cache · {}/{} tokens · {pct:.0}% hit",
-        format_compact_token_count(cached_tokens),
-        format_compact_token_count(prompt_tokens)
-    ))
-}
 
-fn format_compact_token_count(tokens: u64) -> String {
-    if tokens < 1_000 {
-        tokens.to_string()
-    } else if tokens < 1_000_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
-    } else {
-        format!("{:.1}m", tokens as f64 / 1_000_000.0)
-    }
-}
 
 async fn wait_for_interrupt(app: &App) {
     let _ = wait_for_interrupt_or_timeout(app, None).await;
@@ -1496,126 +1045,12 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
     })
 }
 
-struct ToolCallRenderChunk {
-    function_name: String,
-    arguments: String,
-    open_line: bool,
-}
 
-fn take_tool_call_render_chunk(
-    current_printing_index: Option<usize>,
-    index: usize,
-    builder: &mut ToolCallBuilder,
-) -> Option<ToolCallRenderChunk> {
-    if builder.function_name.is_empty() {
-        return None;
-    }
 
-    let start = builder.printed_arguments_len.min(builder.arguments.len());
-    let arguments = builder.arguments[start..].to_string();
-    builder.printed_arguments_len = builder.arguments.len();
-
-    Some(ToolCallRenderChunk {
-        function_name: builder.function_name.clone(),
-        arguments,
-        open_line: current_printing_index != Some(index),
-    })
-}
-
-fn open_tool_call_line(
-    state: &mut StreamProcessingState,
-    index: usize,
-    function_name: &str,
-) -> io::Result<()> {
-    // The hint is about to name this call, so its argument-throughput window restarts here:
-    // whatever the row later reports belongs to the tool call shown on that row.
-    state.content.reset_tool_args_metrics();
-    state.render.current_printing_index = Some(index);
-    if runtime_ctx::terminal_output_enabled() && io::stdout().is_terminal() {
-        print_tool_call_waiting_hint(state, function_name)?;
-    }
-    Ok(())
-}
 
 /// The terminal does not print tool-call arguments; the streaming receive phase only shows an erasable
 /// tool-name status line, while the actual execution lines are printed uniformly by the tool execution layer.
-fn write_tool_call_arguments_stream(_arguments: &str) -> io::Result<()> {
-    Ok(())
-}
 
-fn process_external_tool_calls_delta(
-    app: &mut App,
-    markers: &StreamMarkers,
-    state: &mut StreamProcessingState,
-    chunk: &StreamChunk,
-    merge_mode: StreamEventMergeMode,
-) -> bool {
-    let Some(choice) = chunk.choices.first() else {
-        return false;
-    };
-
-    let mut meaningful_progress = false;
-    for stream_tool_call in &choice.delta.tool_calls {
-        if stream_tool_call.id.is_empty()
-            && stream_tool_call.tool_type.is_empty()
-            && stream_tool_call.function.name.is_empty()
-            && stream_tool_call.function.arguments.is_empty()
-        {
-            continue;
-        }
-        let index = match stream_tool_call.index {
-            Some(idx) => idx,
-            None => resolve_indexless_tool_call_key(&mut state.content, &stream_tool_call.id),
-        };
-        ensure_tool_calls_section_open(app, markers, state);
-
-        let render_chunk = {
-            let builder = state.content.tool_calls_map.entry(index).or_default();
-            let before = (
-                builder.id.len(),
-                builder.tool_type.len(),
-                builder.function_name.len(),
-                builder.arguments.len(),
-            );
-            if !stream_tool_call.id.is_empty() {
-                builder.id.clone_from(&stream_tool_call.id);
-            }
-            if !stream_tool_call.tool_type.is_empty() {
-                builder.tool_type.clone_from(&stream_tool_call.tool_type);
-            }
-            if !stream_tool_call.function.name.is_empty() {
-                builder
-                    .function_name
-                    .clone_from(&stream_tool_call.function.name);
-            }
-            append_tool_call_arguments(
-                &mut builder.arguments,
-                &stream_tool_call.function.arguments,
-                merge_mode,
-            );
-            let after = (
-                builder.id.len(),
-                builder.tool_type.len(),
-                builder.function_name.len(),
-                builder.arguments.len(),
-            );
-            meaningful_progress |= after != before;
-            take_tool_call_render_chunk(state.render.current_printing_index, index, builder)
-        };
-
-        if let Some(render_chunk) = render_chunk {
-            if render_chunk.open_line {
-                let _ = open_tool_call_line(state, index, &render_chunk.function_name);
-            }
-            state
-                .content
-                .count_tool_arg_delta(estimate_stream_tokens(&render_chunk.arguments));
-            let _ = write_tool_call_arguments_stream(&render_chunk.arguments);
-            let _ = refresh_tool_call_rate_hint(state, &render_chunk.function_name);
-        }
-    }
-    meaningful_progress
-}
 
 /// Incrementally resolves cumulative keys for chat-completions tool calls whose
 /// `index` is missing. If everything fell onto the default key 0, parallel tool
@@ -1625,118 +1060,10 @@ fn process_external_tool_calls_delta(
 /// digits, so no collision). Parameter-continuation deltas with neither id nor
 /// index attach to the most recent call without an index; if there is none, fall
 /// back to the old-behavior key 0.
-fn resolve_indexless_tool_call_key(state: &mut StreamContentState, id: &str) -> usize {
-    if !id.is_empty() {
-        for (key, builder) in state.tool_calls_map.iter() {
-            if !builder.id.is_empty() && builder.id == id {
-                return *key;
-            }
-        }
-        let mut hash = 10000u64;
-        for byte in id.bytes() {
-            hash = hash.wrapping_mul(31).wrapping_add(byte as u64);
-        }
-        let key = hash as usize;
-        state.last_indexless_tool_call_key = Some(key);
-        return key;
-    }
-    state.last_indexless_tool_call_key.unwrap_or(0)
-}
 
-fn append_tool_call_arguments(
-    existing: &mut String,
-    incoming: &str,
-    merge_mode: StreamEventMergeMode,
-) {
-    if incoming.is_empty() {
-        return;
-    }
-
-    match merge_mode {
-        StreamEventMergeMode::Append => existing.push_str(incoming),
-        StreamEventMergeMode::AppendMissingSuffix => {
-            let suffix = unseen_suffix(existing, incoming);
-            existing.push_str(&suffix);
-        }
-    }
-}
 
 /// Consume internal tool-call stream events. The return value indicates whether this batch detected a hallucinated
 /// internal tool-protocol marker (`HallucinatedProtocolMarker`) — the caller then stops the stream and retries downgraded.
-fn process_internal_tool_calls(
-    app: &mut App,
-    markers: &StreamMarkers,
-    state: &mut StreamProcessingState,
-    internal_tool_call_events: Vec<InternalToolCallStreamEvent>,
-) -> (bool, bool) {
-    let mut saw_hallucinated_marker = false;
-    let mut meaningful_progress = false;
-    for event in internal_tool_call_events {
-        match event {
-            InternalToolCallStreamEvent::Begin(function_name) => {
-                if function_name.trim().is_empty() {
-                    continue;
-                }
-                meaningful_progress = true;
-                ensure_tool_calls_section_open(app, markers, state);
-
-                let index = state.content.internal_tool_call_idx;
-                let builder = state.content.tool_calls_map.entry(index).or_default();
-                builder.id = format!("internal_{index}");
-                builder.tool_type = "function".to_string();
-                builder.function_name = function_name.clone();
-
-                let _ = open_tool_call_line(state, index, &function_name);
-            }
-            InternalToolCallStreamEvent::Args(chunk) => {
-                if chunk.is_empty() {
-                    continue;
-                }
-                meaningful_progress = true;
-                let index = state.content.internal_tool_call_idx;
-                let function_name = {
-                    let builder = state.content.tool_calls_map.entry(index).or_default();
-                    if builder.function_name.is_empty() {
-                        builder.id = format!("internal_{index}");
-                        builder.tool_type = "function".to_string();
-                    }
-                    builder.arguments.push_str(&chunk);
-                    builder.printed_arguments_len = builder.arguments.len();
-                    builder.function_name.clone()
-                };
-
-                let _ = write_tool_call_arguments_stream(&chunk);
-                state
-                    .content
-                    .count_tool_arg_delta(estimate_stream_tokens(&chunk));
-                let _ = refresh_tool_call_rate_hint(state, &function_name);
-            }
-            InternalToolCallStreamEvent::End => {
-                if state.render.current_printing_index == Some(state.content.internal_tool_call_idx)
-                {
-                    // The streaming phase no longer prints tool name/arguments (open_tool_call_line and
-                    // write_tool_call_arguments_stream are no-ops), so only the color needs resetting here.
-                    // Never use println! — it would insert a blank line between the `✓` and the following output
-                    // (the external delta tool path never prints this line anyway).
-                    if runtime_ctx::terminal_output_enabled() {
-                        print!("\x1b[0m");
-                    }
-                    state.render.current_printing_index = None;
-                    if runtime_ctx::terminal_output_enabled() {
-                        let _ = io::stdout().flush();
-                    }
-                }
-                state.content.internal_tool_call_idx += 1;
-            }
-            InternalToolCallStreamEvent::HallucinatedProtocolMarker => {
-                // The streamer already strips the whole hallucinated "tool result" so nothing is shown; only the signal
-                // is recorded here, and the caller stops the stream and takes the degenerate_repetition downgrade-retry path.
-                saw_hallucinated_marker = true;
-            }
-        }
-    }
-    (saw_hallucinated_marker, meaningful_progress)
-}
 
 fn commit_visible_content(
     _app: &mut App,
@@ -2003,613 +1330,6 @@ fn is_standalone_stream_marker(content: &str, marker: &str) -> bool {
     content.trim_matches('\n') == marker
 }
 
-/// Physical-row budget the live fold body may occupy so the whole window (header + body) stays inside the visible
-/// viewport. Returning `usize::MAX` disables clamping (non-tty / unknown height), preserving the previous behavior
-/// exactly. On a real terminal this is `viewport_rows - FOLD_VIEWPORT_RESERVED_ROWS`, floored at 1 so an extremely
-/// short pane still shows one body row. In normal terminals this budget dwarfs `max_visible_lines`, so the effective
-/// window size — and every rendered byte — is unchanged; it only tightens when the viewport genuinely cannot hold
-/// the configured window, which is exactly the case that used to leak stacked markers.
-fn fold_body_viewport_row_budget() -> usize {
-    let viewport = io::stdout().is_terminal().then(raw_terminal_rows);
-    fold_body_row_budget_for(viewport)
-}
-
-/// Pure viewport-budget arithmetic, split out so the clamp can be unit-tested without a real tty. `None` means the
-/// viewport height is unknown (non-tty / pipe / test) and clamping is disabled.
-fn fold_body_row_budget_for(viewport_rows: Option<usize>) -> usize {
-    match viewport_rows {
-        Some(rows) => rows.saturating_sub(FOLD_VIEWPORT_RESERVED_ROWS).max(1),
-        None => usize::MAX,
-    }
-}
-
-/// Folded rendering of thinking content: maintain a rewritable window starting at the first line,
-/// always showing only the most recent N lines in the terminal and folding the rest into one summary line.
-fn write_thinking_content_folded(
-    content: &str,
-    state: &mut StreamProcessingState,
-    markers: &StreamMarkers,
-) -> io::Result<()> {
-    if content.is_empty() {
-        return Ok(());
-    }
-    if crate::ai::background::serve_live_streaming() {
-        // Serve children stream to a chat client, not a terminal: cursor
-        // rewrites are meaningless across the process boundary, and unfolded
-        // thinking lines would be indistinguishable from the answer. Frame
-        // the thinking lifecycle instead and keep it off stdout (the SSE
-        // line pump would otherwise forward it as plain message events).
-        return write_thinking_content_serve(content, markers);
-    }
-    let fold = &mut state.render.thinking_fold;
-
-    if fold.max_visible_lines == usize::MAX {
-        return write_stream_content_to_terminal(content, &mut state.render.markdown, true);
-    }
-
-    // Control lines must be exclusive markers; they must not be interleaved with body text.
-    if is_standalone_stream_marker(content, &markers.thinking_tag) {
-        if !fold.active {
-            if state.render.markdown.has_unfinished_line() {
-                write_stream_content_to_terminal("\n", &mut state.render.markdown, false)?;
-            }
-            fold.active = true;
-        }
-        return thinking_fold_redraw(
-            fold_header_rate(&state.content, Instant::now()).as_deref(),
-            fold,
-        );
-    }
-
-    if !fold.active {
-        return write_stream_content_to_terminal(content, &mut state.render.markdown, true);
-    }
-
-    append_fold_content(fold, content);
-
-    thinking_fold_redraw(
-        fold_header_rate(&state.content, Instant::now()).as_deref(),
-        fold,
-    )
-}
-
-/// Classify one serve-mode thinking chunk into an ordered frame sequence.
-///
-/// The common cases are a standalone open/close marker or a plain body
-/// chunk. Chunk granularity is model-driven rather than line-driven, so the
-/// close marker can also arrive glued to body text; a standalone-only check
-/// would miss it and leave the remote fold open until end-of-stream, letting
-/// the answer interleave with the chat client's thinking status line.
-/// Splitting here keeps the close on time. Text after the marker is already
-/// answer text (the content path never sees this chunk), so it is returned
-/// as a delta instead of being swallowed by the fold.
-fn split_serve_thinking_chunk<'a>(
-    content: &'a str,
-    thinking_tag: &str,
-    end_thinking_tag: &str,
-) -> Vec<(crate::ai::background::ServeLiveKind, &'a str)> {
-    use crate::ai::background::ServeLiveKind;
-    if is_standalone_stream_marker(content, thinking_tag) {
-        return vec![(ServeLiveKind::ThinkingStart, "")];
-    }
-    if is_standalone_stream_marker(content, end_thinking_tag) {
-        return vec![(ServeLiveKind::ThinkingDone, "")];
-    }
-    if !end_thinking_tag.is_empty() {
-        if let Some((head, tail)) = content.split_once(end_thinking_tag) {
-            let mut out = Vec::with_capacity(3);
-            if !head.is_empty() {
-                out.push((ServeLiveKind::Thinking, head));
-            }
-            out.push((ServeLiveKind::ThinkingDone, ""));
-            if !tail.trim().is_empty() {
-                out.push((ServeLiveKind::Delta, tail));
-            }
-            return out;
-        }
-    }
-    vec![(ServeLiveKind::Thinking, content)]
-}
-
-/// Serve-mode thinking sink: publish the classified frames for the chat
-/// client to fold remotely. Everything returns here, so nothing thinking
-/// related reaches child stdout.
-fn write_thinking_content_serve(content: &str, markers: &StreamMarkers) -> io::Result<()> {
-    use crate::ai::background::publish_serve_frame;
-    for (kind, text) in
-        split_serve_thinking_chunk(content, &markers.thinking_tag, &markers.end_thinking_tag)
-    {
-        publish_serve_frame(kind, text);
-    }
-    Ok(())
-}
-
-fn write_subagent_content_folded(
-    content: &str,
-    state: &mut StreamProcessingState,
-) -> io::Result<()> {
-    if content.is_empty() {
-        return Ok(());
-    }
-
-    let fold = &mut state.render.subagent_fold;
-    if fold.max_visible_lines == usize::MAX {
-        return write_stream_content_to_terminal(content, &mut state.render.markdown, false);
-    }
-
-    if !fold.active {
-        if state.render.markdown.has_unfinished_line() {
-            write_stream_content_to_terminal("\n", &mut state.render.markdown, false)?;
-        }
-        fold.active = true;
-    }
-
-    append_fold_content(fold, content);
-    thinking_fold_redraw(None, fold)
-}
-
-fn append_fold_content(fold: &mut super::state::ThinkingFoldState, content: &str) {
-    for ch in content.chars() {
-        if ch == '\n' {
-            let completed_line = std::mem::take(&mut fold.current_line);
-            if fold.skip_blank_lines && completed_line.trim().is_empty() {
-                continue;
-            }
-            fold.total_lines += 1;
-            fold.recent_lines.push_back(completed_line);
-            while fold.recent_lines.len() > fold.max_visible_lines {
-                fold.recent_lines.pop_front();
-            }
-        } else {
-            fold.current_line.push(ch);
-        }
-    }
-}
-
-/// Redraw the fold header and body within the viewport; cached row counts cover only the body.
-fn thinking_fold_redraw(
-    rate: Option<&str>,
-    fold: &mut super::state::ThinkingFoldState,
-) -> io::Result<()> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    thinking_fold_redraw_to(&mut out, rate, fold)
-}
-
-fn thinking_fold_redraw_to(
-    out: &mut impl Write,
-    rate: Option<&str>,
-    fold: &mut super::state::ThinkingFoldState,
-) -> io::Result<()> {
-    // Measure against the emulator's reflowed width before any counting: inside the
-    // window where xterm.js has already rewrapped the drawn rows but the PTY winsize
-    // has not arrived, ioctl reports the old width and every span below would land
-    // short, stranding the previous header. A no-op when no listener can answer.
-    super::side_note_input::refresh_true_width();
-    // Erase the region currently on screen — header rows plus body rows — and redraw the header on the
-    // region's first row on every redraw, so the window stays anchored where the fold started.
-    //
-    // Both counts are recomputed from the text that was actually written, at the width in force now.
-    // When the refresh answered, that width is the reflowed one; when it could not, the ioctl value
-    // still matches the screen between resizes, and live rows are wrapped at the same width (see
-    // `render::markdown`), so a wide terminal shows them in full.
-    //
-    // The first redraw (activation) has nothing on screen above the cursor, so it erases nothing and the
-    // header lands at the fold's start position as before; every later redraw has a header (and possibly
-    // an empty body) above the cursor that must be cleared and reprinted.
-    let body_rows = thinking_fold_rendered_body_rows(fold).max(fold.window_rows);
-    let erase_rows = if fold.header_drawn {
-        // The header ends with CRLF. With no body, the cursor is on the blank
-        // row below it, so the erase span must include that row as well.
-        body_rows
-            .max(1)
-            .saturating_add(thinking_fold_header_rendered_rows(fold))
-    } else {
-        body_rows
-    };
-    erase_fold_body(out, erase_rows)?;
-    if fold.active {
-        fold.header_rendered_line = write_fold_header(out, rate, fold)?;
-        fold.header_drawn = true;
-    }
-
-    // Bound the live window to the viewport so header + body never scroll past the top; otherwise the relative-cursor
-    // erase above cannot reach the previous window and each redraw leaks a stacked marker line. Restored right after so
-    // the configured `max_visible_lines` (and the model-facing reasoning buffer) is untouched.
-    let saved_max_visible_lines = fold.max_visible_lines;
-    fold.max_visible_lines = fold.max_visible_lines.min(fold_body_viewport_row_budget());
-    let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
-    let clamped_max_visible_lines = fold.max_visible_lines;
-    THINKING_FOLD_BODY_BUF.with(|buf| -> io::Result<()> {
-        let mut buf = buf.borrow_mut();
-        let (body_rows, rendered_body_lines) = render_thinking_fold_window_lines(
-            &body_lines,
-            marker_lines,
-            fold.rewrite_right_margin_cols,
-            clamped_max_visible_lines,
-            &mut buf,
-        );
-        if !buf.is_empty() {
-            out.write_all(buf.as_bytes())?;
-        }
-        fold.window_rows = body_rows;
-        fold.rendered_body_lines = rendered_body_lines;
-        Ok(())
-    })?;
-    fold.max_visible_lines = saved_max_visible_lines;
-    out.flush()?;
-    Ok(())
-}
-
-/// Print the fold header, leaving the cursor at the start of the first body row.
-///
-/// The written plain text is returned so the caller can keep it on the fold: later erases recompute the
-/// header's physical row count from it, at the width current then (see
-/// `thinking_fold_header_rendered_rows`).
-fn write_fold_header(
-    out: &mut impl Write,
-    rate: Option<&str>,
-    fold: &super::state::ThinkingFoldState,
-) -> io::Result<String> {
-    let mut label = fold.header_label.clone();
-    // Live reasoning throughput rides on the fold header: the header is the
-    // renderer's own redraw target (unlike the one-shot model/session status
-    // line printed by request/transport.rs), so appending here needs no extra
-    // cursor movement and stays inside the fold's erase span.
-    if let Some(rate) = rate {
-        label.push_str(" · ");
-        label.push_str(rate);
-    }
-    let reserve_cols = fold.rewrite_right_margin_cols;
-    write_fold_status_line(out, &label, reserve_cols)
-}
-
-/// Both redraw and completion erase the header by moving up its row count. Bound the entire decorated
-/// line, including indentation and live metrics, to a single live-region row and return the plain text
-/// that was written; the erase steps recompute the row count from that text, because a narrowed terminal
-/// re-wraps the header row that is already on screen. This only clips the status display, never the
-/// underlying content.
-fn write_fold_status_line(
-    out: &mut impl Write,
-    label: &str,
-    reserve_cols: usize,
-) -> io::Result<String> {
-    let line = clamp_line_to_terminal_row_with_reserve(&format!("  {label}"), reserve_cols);
-    write!(out, "{}{line}\x1b[0m\r\n", theme::current().accent_muted)?;
-    Ok(line)
-}
-
-/// Write the final header directly when thinking ends; used for an empty fold that never wrote an in-progress header.
-fn write_thinking_fold_completion_header(
-    out: &mut impl Write,
-    fold: &super::state::ThinkingFoldState,
-    line_count: usize,
-) -> io::Result<()> {
-    write_fold_status_line(
-        out,
-        &format!("{} · {line_count} lines", fold.footer_label),
-        fold.rewrite_right_margin_cols,
-    )?;
-    Ok(())
-}
-
-/// Rewrite the anchored `○ thinking` in place to the completed state instead of printing a separate `✓ thinking` below the body.
-///
-/// `erase_fold_body` moved the cursor back to the first body line under the header, so the header sits
-/// directly above the cursor and is cleared row by row before being rewritten. Its row count comes from
-/// the text that was written rather than a fixed one row: after a narrowing resize the terminal re-wraps
-/// the old header, and a one-row erase would leave the header's first row behind.
-fn replace_thinking_fold_header(
-    out: &mut impl Write,
-    fold: &super::state::ThinkingFoldState,
-    line_count: usize,
-) -> io::Result<()> {
-    erase_rows_above_cursor(out, thinking_fold_header_rendered_rows(fold))?;
-    write_thinking_fold_completion_header(out, fold, line_count)
-}
-
-/// After rendering the body the cursor rests on the last physical line, not on an extra blank line; redraws therefore only need to move up
-/// `rows - 1`; returning to the line start before erasing to the screen bottom covers reflow lines produced by a narrowed window.
-fn erase_fold_body(out: &mut impl Write, rows: usize) -> io::Result<()> {
-    if rows == 0 {
-        return Ok(());
-    }
-    write!(out, "\r")?;
-    if rows > 1 {
-        write!(out, "\x1b[{}A", rows - 1)?;
-    }
-    // CSI 0J cannot be used: it clears from the first body line to the end of the physical screen, crossing the DECSTBM scroll
-    // region and wiping out the side-note composer at the bottom. Clear only the rendered body window line by line, then restore
-    // the cursor to the first body line so relative-cursor semantics of later redraws stay unchanged.
-    for row in 0..rows {
-        write!(out, "\r\x1b[2K")?;
-        if row + 1 < rows {
-            write!(out, "\x1b[1B")?;
-        }
-    }
-    if rows > 1 {
-        write!(out, "\x1b[{}A", rows - 1)?;
-    }
-    write!(out, "\r")
-}
-
-/// Final rendering when thinking ends: overwrite the body window and turn the anchored `○` into `✓` in place.
-pub(super) fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::Result<()> {
-    finalize_fold(&mut state.render.thinking_fold, true)
-}
-
-fn finalize_subagent_preview_fold(state: &mut StreamProcessingState) -> io::Result<()> {
-    // Subagent preview keeps the window body at the end: the subagent's final output should stay visible in the terminal,
-    // so the "forced 0-line pure summary" ending used by thinking (which would fold the key conclusions too) is not applied.
-    finalize_fold(&mut state.render.subagent_fold, false)
-}
-
-fn finalize_fold(
-    fold: &mut super::state::ThinkingFoldState,
-    collapse_body: bool,
-) -> io::Result<()> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    finalize_fold_to(&mut out, fold, collapse_body)
-}
-
-/// Fold-finalize writer implementation; extracted behind a writer so regression tests can verify terminal cursor sequences precisely.
-fn finalize_fold_to(
-    mut out: &mut impl Write,
-    fold: &mut super::state::ThinkingFoldState,
-    collapse_body: bool,
-) -> io::Result<()> {
-    // Same reflowed-width discipline as `thinking_fold_redraw_to`: the header rewrite
-    // below moves the cursor up by rows recomputed at the width in force now.
-    super::side_note_input::refresh_true_width();
-    if !fold.active {
-        return Ok(());
-    }
-
-    let erase_rows = thinking_fold_rendered_body_rows(fold).max(fold.window_rows);
-    erase_fold_body(&mut out, erase_rows)?;
-    // The thinking completed state replaces the in-progress header instead of printing another footer below the body.
-    // If the fold never actually landed, write the completed state directly to avoid a brief `○ thinking`.
-    let line_count = fold
-        .total_lines
-        .saturating_add(usize::from(!fold.current_line.is_empty()));
-    if collapse_body {
-        if fold.header_drawn {
-            replace_thinking_fold_header(&mut out, fold, line_count)?;
-        } else {
-            write_thinking_fold_completion_header(&mut out, fold, line_count)?;
-            fold.header_drawn = true;
-        }
-    } else if !fold.header_drawn {
-        // Subagent preview keeps the existing two-line header/footer layout.
-        fold.header_rendered_line = write_fold_header(&mut out, None, fold)?;
-        fold.header_drawn = true;
-    }
-
-    // Thinking finalize folds to a pure summary (0-line window) with no body lines: the tail of thinking often restates
-    // conclusions/questions, and keeping visible lines would duplicate the final answer that follows in the terminal. Subagent
-    // preview does not fold — it keeps the recent visible window lines so the subagent's final output stays visible.
-    let saved_max_visible_lines = fold.max_visible_lines;
-    if collapse_body {
-        fold.max_visible_lines = 0;
-    }
-    let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
-    let max_visible_rows = fold.max_visible_lines;
-    let mut final_body_rows = 0usize;
-    THINKING_FOLD_BODY_BUF.with(|buf| -> io::Result<()> {
-        let mut buf = buf.borrow_mut();
-        let (body_rows, rendered_body_lines) = render_thinking_fold_window_lines(
-            &body_lines,
-            marker_lines,
-            fold.rewrite_right_margin_cols,
-            max_visible_rows,
-            &mut buf,
-        );
-        fold.max_visible_lines = saved_max_visible_lines;
-        if !buf.is_empty() {
-            out.write_all(buf.as_bytes())?;
-        }
-        fold.window_rows = body_rows;
-        fold.rendered_body_lines = rendered_body_lines;
-        final_body_rows = body_rows;
-        Ok(())
-    })?;
-
-    if !collapse_body {
-        // Subagent preview keeps its footer; thinking's scale info was already written into the in-place-replaced header.
-        if final_body_rows > 0 {
-            out.write_all(b"\r\n")?;
-        }
-        write!(
-            out,
-            "  {}{} · {line_count} lines\x1b[0m\r\n",
-            theme::current().accent_muted,
-            fold.footer_label,
-        )?;
-    } else if final_body_rows > 0 {
-        // The collapsed window ends on the one-line summary marker (the body
-        // is rendered without a trailing newline so streaming redraws do not
-        // scroll). Finalize is terminal: release the cursor onto a fresh line,
-        // otherwise the next output — the deferred-body "generating…" hint or
-        // the final answer echoed by the driver — concatenates onto the marker
-        // row ("… N earlier lines   ⠋ generating…"). With zero body rows the
-        // completion header already ends with CRLF, so no extra blank line.
-        out.write_all(b"\r\n")?;
-    }
-    out.flush()?;
-
-    // Reset fold state
-    fold.reset();
-    Ok(())
-}
-
-fn thinking_fold_hidden_count(fold: &super::state::ThinkingFoldState) -> usize {
-    let current_line = usize::from(!fold.current_line.is_empty());
-    fold.total_lines
-        .saturating_add(current_line)
-        .saturating_sub(fold.max_visible_lines)
-}
-
-fn thinking_fold_visible_lines(fold: &super::state::ThinkingFoldState) -> Vec<&str> {
-    // 0-line window = pure summary mode: even the current incomplete line is hidden, so restated conclusions cannot leak to the terminal.
-    if fold.max_visible_lines == 0 {
-        return Vec::new();
-    }
-    let current_line = usize::from(!fold.current_line.is_empty());
-    let visible_completed = fold.max_visible_lines.saturating_sub(current_line);
-    let completed_skip = fold.recent_lines.len().saturating_sub(visible_completed);
-    let mut visible = fold
-        .recent_lines
-        .iter()
-        .skip(completed_skip)
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    if current_line > 0 {
-        visible.push(fold.current_line.as_str());
-    }
-    visible
-}
-
-/// Physical rows the written rows of a fold region occupy on a terminal `cols` columns wide.
-fn thinking_fold_rendered_body_rows(fold: &super::state::ThinkingFoldState) -> usize {
-    fold.rendered_body_lines
-        .iter()
-        .map(|line| live_preview_cursor_rows(line))
-        .sum()
-}
-
-/// Physical rows the anchored fold header currently occupies. The header is written clamped to one
-/// live-region row, but a terminal that narrowed re-wraps a row that is already on screen, so the erase
-/// recomputes the footprint from the stored text (at the live width) instead of assuming a single row.
-fn thinking_fold_header_rendered_rows(fold: &super::state::ThinkingFoldState) -> usize {
-    if fold.header_rendered_line.is_empty() {
-        1
-    } else {
-        live_preview_cursor_rows(&fold.header_rendered_line)
-    }
-}
-
-/// Erase `rows` rows whose last row sits directly **above** the cursor — the shape written by
-/// `write_fold_status_line` and `write_waiting_hint_line`, both of which end with CRLF — then park the
-/// cursor on the first of the erased rows so the next write lands where that region started.
-fn erase_rows_above_cursor(out: &mut impl Write, rows: usize) -> io::Result<()> {
-    if rows == 0 {
-        return Ok(());
-    }
-    write!(out, "\r\x1b[{rows}A")?;
-    for row in 0..rows {
-        write!(out, "\r\x1b[2K")?;
-        if row + 1 < rows {
-            write!(out, "\x1b[1B")?;
-        }
-    }
-    if rows > 1 {
-        write!(out, "\x1b[{}A", rows - 1)?;
-    }
-    Ok(())
-}
-
-/// Park a live fold frame before an out-of-band terminal line (a mid-stream warning the
-/// stream then continues past). Fold redraws erase relative to the current cursor, so any
-/// line printed while a frame is live desyncs the cursor: every later redraw then misses the
-/// old header and stacks another full `○ thinking` row below it. Erasing the frame here keeps
-/// buffers and `active`, so the next redraw draws one fresh frame below the intruder line.
-/// Mirrors the erase half of `finalize_fold_to`; the resume half is the normal redraw.
-fn suspend_fold_frame(
-    out: &mut impl Write,
-    fold: &mut super::state::ThinkingFoldState,
-) -> io::Result<()> {
-    if !fold.active {
-        return Ok(());
-    }
-    super::side_note_input::refresh_true_width();
-    let body_rows = thinking_fold_rendered_body_rows(fold).max(fold.window_rows);
-    let erase_rows = if fold.header_drawn {
-        body_rows
-            .max(1)
-            .saturating_add(thinking_fold_header_rendered_rows(fold))
-    } else {
-        body_rows
-    };
-    erase_fold_body(out, erase_rows)?;
-    out.flush()?;
-    fold.header_drawn = false;
-    fold.window_rows = 0;
-    fold.rendered_body_lines.clear();
-    Ok(())
-}
-
-/// Park every live terminal region immediately before a mid-stream diagnostic line, while the
-/// cursor is still where the live regions left it. Folds are suspended (see
-/// `suspend_fold_frame`); the waiting hint is cleared.
-fn suspend_live_terminal_regions(state: &mut StreamProcessingState) -> io::Result<()> {
-    if !runtime_ctx::terminal_output_enabled() {
-        return Ok(());
-    }
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    suspend_fold_frame(&mut out, &mut state.render.thinking_fold)?;
-    suspend_fold_frame(&mut out, &mut state.render.subagent_fold)?;
-    drop(out);
-    clear_waiting_hint(state)
-}
-
-/// Settle every live terminal region before a stream-stopping diagnostic line: same
-/// cursor-desync hazard as `suspend_live_terminal_regions`, but the stream ends here, so close
-/// the frames with their completion headers instead of parking them for a redraw that never
-/// comes. Returns whether the thinking fold was closed, so the caller can skip the plain
-/// (non-fold) end-of-thinking marker it would otherwise print below the completion header.
-fn finalize_live_folds_before_diagnostic(state: &mut StreamProcessingState) -> bool {
-    if !runtime_ctx::terminal_output_enabled() {
-        return false;
-    }
-    let mut settled = false;
-    if state.render.thinking_fold.active {
-        let _ = finalize_thinking_fold(state);
-        settled = true;
-    }
-    if state.render.subagent_fold.active {
-        let _ = finalize_subagent_preview_fold(state);
-    }
-    let _ = clear_waiting_hint(state);
-    settled
-}
-
-fn thinking_fold_window_lines(fold: &super::state::ThinkingFoldState) -> (Vec<String>, usize) {
-    let hidden_count = thinking_fold_hidden_count(fold);
-    let visible_lines = thinking_fold_visible_lines(fold);
-    if hidden_count == 0 && visible_lines.is_empty() {
-        return (Vec::new(), 0);
-    }
-
-    let mut lines = Vec::with_capacity(visible_lines.len() + usize::from(hidden_count > 0));
-    let marker_lines = usize::from(hidden_count > 0);
-    if hidden_count > 0 {
-        lines.push(format!("… {hidden_count} earlier lines"));
-    }
-    for line in visible_lines {
-        lines.push(line.to_string());
-    }
-    (lines, marker_lines)
-}
-
-/// Render the **body** of the fold window (fold summary + recent visible lines), without the header.
-/// The header is anchored and printed separately by `write_fold_header`. Returns the number of physical body lines; the body does not
-/// end with a newline and the cursor always stays on the last line, so xterm.js does not interpret a trailing LF as extra scrolling.
-fn render_thinking_fold_window(fold: &super::state::ThinkingFoldState) -> (String, usize) {
-    let (lines, marker_lines) = thinking_fold_window_lines(fold);
-    THINKING_FOLD_BODY_BUF.with(|buf| {
-        let mut buf = buf.borrow_mut();
-        let (rows, _) = render_thinking_fold_window_lines(
-            &lines,
-            marker_lines,
-            fold.rewrite_right_margin_cols,
-            fold.max_visible_lines,
-            &mut buf,
-        );
-        (buf.clone(), rows)
-    })
-}
 
 // Scratch buffer reused across thinking-fold body renders so each redraw does not
 // rebuild a zero-capacity String. Purely an allocation-reuse optimization: the
@@ -2624,105 +1344,12 @@ thread_local! {
 /// of cell widths; either invalidates the erase footprint and leaks previous frames.
 /// Use fixed four-space tab indentation and visible escapes for other controls.
 /// This is display-only: the fold buffers and canonical model content stay unchanged.
-fn fold_display_line(line: &str) -> String {
-    let mut display = String::with_capacity(line.len());
-    for ch in line.chars() {
-        match ch {
-            '\t' => display.push_str("    "),
-            ch if ch.is_control() => display.extend(ch.escape_default()),
-            ch => display.push(ch),
-        }
-    }
-    display
-}
 
 /// Render the **body** of the fold window (fold summary + recent visible lines), without the header.
 /// The header is anchored and printed separately by `write_fold_header`. Writes the body into
 /// `out` (cleared first) and returns the number of physical body lines plus the plain-text rows
 /// kept for later width recomputation; the body does not end with a newline and the cursor always
 /// stays on the last line, so xterm.js does not interpret a trailing LF as extra scrolling.
-fn render_thinking_fold_window_lines(
-    lines: &[String],
-    marker_lines: usize,
-    rewrite_right_margin_cols: usize,
-    max_visible_rows: usize,
-    out: &mut String,
-) -> (usize, Vec<String>) {
-    out.clear();
-    if lines.is_empty() {
-        return (0, Vec::new());
-    }
-
-    let reserve_cols = THINKING_FOLD_BODY_INDENT_WIDTH + rewrite_right_margin_cols;
-    let marker_lines = marker_lines.min(lines.len());
-    let mut wrapped_content_rows = Vec::new();
-    for line in lines.iter().skip(marker_lines) {
-        wrapped_content_rows.extend(wrap_line_to_terminal_rows_with_reserve(
-            &fold_display_line(line),
-            reserve_cols,
-        ));
-    }
-    let hidden_wrapped_rows = wrapped_content_rows.len().saturating_sub(max_visible_rows);
-    let marker = if hidden_wrapped_rows > 0 {
-        // When truncated at a physical line, the first hidden content may come from a still-streaming logical line, so the
-        // imprecise "earlier lines" count can no longer be reported.
-        Some("… more".to_string())
-    } else if marker_lines > 0 {
-        Some(lines[0].clone())
-    } else {
-        None
-    };
-    let mut rows_to_render = Vec::with_capacity(
-        wrapped_content_rows
-            .len()
-            .saturating_sub(hidden_wrapped_rows)
-            .saturating_add(usize::from(marker.is_some())),
-    );
-    if let Some(marker) = marker {
-        // The fold hint must always occupy exactly one physical line; only the body is allowed to wrap.
-        rows_to_render.push((
-            clamp_line_to_terminal_row_with_reserve(&marker, reserve_cols),
-            true,
-        ));
-    }
-    rows_to_render.extend(
-        wrapped_content_rows
-            .into_iter()
-            .skip(hidden_wrapped_rows)
-            .map(|line| (line, false)),
-    );
-
-    let mut rendered_lines = Vec::with_capacity(rows_to_render.len());
-    // Folded body has fixed indentation. The body keeps at most max_visible_rows wrapped physical lines; if more
-    // content must be hidden, the single-line fold hint does not count against the body budget. Each wrapped segment
-    // occupies exactly one physical line; extra right margin for the xterm.js integrated terminal.
-    let mut rows = 0usize;
-    let mut first_rendered_row = true;
-
-    for (wrapped_row, is_marker) in rows_to_render {
-        if !first_rendered_row {
-            out.push_str("\r\n");
-        }
-        first_rendered_row = false;
-        let rendered_line = format!("{THINKING_FOLD_BODY_INDENT}{wrapped_row}");
-        rows += 1;
-        if is_marker {
-            out.push_str(theme::current().accent_muted);
-            out.push_str(&rendered_line);
-            out.push_str("\x1b[0m");
-        } else {
-            // Thinking body uses the theme's muted color (same family as the marker) instead of
-            // SGR-dim on the terminal default foreground: dim support varies by terminal, and the
-            // result was nearly indistinguishable from the answer body text on some setups.
-            out.push_str(&theme::current().accent_muted);
-            out.push_str(&rendered_line);
-            out.push_str(RESET);
-        }
-        rendered_lines.push(rendered_line);
-    }
-
-    (rows, rendered_lines)
-}
 
 fn maybe_write_stream_content(
     content: &str,
@@ -3107,451 +1734,4 @@ fn process_stream_payload(
         should_stop: false,
         meaningful_progress,
     })
-}
-
-/// Compatible gateways like OpenCode sometimes return the complete DSML tool protocol as a single content snapshot.
-/// Recognize such a full wrapper before body submission and terminal rendering, so we do not only recover via a stream-end fallback.
-fn recover_protocol_only_inline_tool_call_snapshot(
-    chunk: &mut StreamChunk,
-    merge_mode: StreamEventMergeMode,
-    state: &StreamProcessingState,
-) -> Vec<InternalToolCallStreamEvent> {
-    let Some(choice) = chunk.choices.first_mut() else {
-        return Vec::new();
-    };
-    if !choice.delta.tool_calls.is_empty() || choice.delta.content.trim().is_empty() {
-        return Vec::new();
-    }
-
-    let normalized = normalize_inline_tool_call_markup(&choice.delta.content);
-    let normalized = normalized.trim();
-    if !normalized.starts_with("<tool_calls>") || !normalized.ends_with("</tool_calls>") {
-        return Vec::new();
-    }
-    let Some(mut tool_calls) = recover_inline_tool_calls(normalized) else {
-        return Vec::new();
-    };
-
-    choice.delta.content.clear();
-    if matches!(merge_mode, StreamEventMergeMode::AppendMissingSuffix) {
-        // A `.done` snapshot re-sends the full protocol already parsed from earlier deltas; filter only semantically equal calls,
-        // so genuinely new parallel calls are not swallowed just because other tool calls already exist.
-        tool_calls.retain(|tool_call| {
-            !state
-                .content
-                .tool_calls_map
-                .iter()
-                .any(|(_, builder)| collected_tool_call_matches(builder, tool_call))
-        });
-    }
-
-    let mut events = Vec::with_capacity(tool_calls.len().saturating_mul(3));
-    for tool_call in tool_calls {
-        events.push(InternalToolCallStreamEvent::Begin(tool_call.function.name));
-        events.push(InternalToolCallStreamEvent::Args(
-            tool_call.function.arguments,
-        ));
-        events.push(InternalToolCallStreamEvent::End);
-    }
-    events
-}
-
-fn collected_tool_call_matches(
-    builder: &ToolCallBuilder,
-    tool_call: &crate::ai::types::ToolCall,
-) -> bool {
-    if builder.function_name != tool_call.function.name {
-        return false;
-    }
-    match (
-        serde_json::from_str::<serde_json::Value>(&builder.arguments),
-        serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments),
-    ) {
-        (Ok(existing), Ok(incoming)) => existing == incoming,
-        _ => builder.arguments.trim() == tool_call.function.arguments.trim(),
-    }
-}
-
-/// Detect three consecutive, exactly-identical long fragments at the tail of the text (degenerate repetition loop).
-///
-/// Used for both reasoning_content and visible assistant output: under long tool-chain contexts the model may
-/// verbatim-repeat one sentence in the chain or body; continuing to read only drains the output budget and persists junk.
-/// Compares characters rather than bytes to handle Chinese correctly; the fragment must contain enough real content —
-/// letters, digits or Chinese characters — so separator lines, whitespace or Markdown punctuation are not misjudged as a degeneration loop.
-/// Number of trailing chars forming a degenerate verbatim repetition (one pattern repeated
-/// REASONING_REPEAT_COUNT times at the tail), or None when no such tail exists.
-///
-/// Same detection rules as the former boolean detector, but also returns the repeated tail length so
-/// callers can strip the looped junk before the partial text flows to retry/finalize. Runs on every
-/// stream chunk, so it only keeps a tail large enough to cover the largest candidate fragment,
-/// avoiding a long reasoning that degrades into repeatedly scanning the whole text as context grows.
-fn degenerate_repetition_strip_len(text: &str) -> Option<usize> {
-    let mut chars = text
-        .chars()
-        .rev()
-        .take(MAX_REASONING_REPEAT_CHARS * REASONING_REPEAT_COUNT)
-        .collect::<Vec<_>>();
-    chars.reverse();
-    let max_pattern_len = (chars.len() / REASONING_REPEAT_COUNT).min(MAX_REASONING_REPEAT_CHARS);
-    if max_pattern_len < MIN_REASONING_REPEAT_CHARS {
-        return None;
-    }
-
-    for pattern_len in MIN_REASONING_REPEAT_CHARS..=max_pattern_len {
-        let repeated_len = pattern_len * REASONING_REPEAT_COUNT;
-        let repeated = &chars[chars.len() - repeated_len..];
-        let pattern = &repeated[..pattern_len];
-        if pattern.iter().filter(|ch| ch.is_alphanumeric()).count() < MIN_REASONING_REPEAT_CHARS / 2
-        {
-            continue;
-        }
-        if repeated[pattern_len..pattern_len * 2] == *pattern
-            && repeated[pattern_len * 2..] == *pattern
-        {
-            if is_fold_placeholder_repeat_pattern(pattern) {
-                continue;
-            }
-            return Some(repeated_len);
-        }
-    }
-    None
-}
-
-fn is_fold_placeholder_repeat_pattern(pattern: &[char]) -> bool {
-    let pattern = pattern.iter().collect::<String>();
-    let trimmed = pattern.trim();
-    let Some(rest) = trimmed
-        .strip_prefix('…')
-        .or_else(|| trimmed.strip_prefix("..."))
-    else {
-        return false;
-    };
-    let rest = rest.trim();
-    if rest == "more" {
-        return true;
-    }
-    let mut words = rest.split_whitespace();
-    let Some(count) = words.next() else {
-        return false;
-    };
-    if !count.chars().all(|ch| ch.is_ascii_digit()) {
-        return false;
-    }
-    matches!(
-        (words.next(), words.next(), words.next()),
-        (Some("earlier"), Some("line" | "lines"), None)
-    )
-}
-
-fn has_degenerate_repetition(text: &str) -> bool {
-    degenerate_repetition_strip_len(text).is_some()
-}
-
-#[derive(Clone, Copy)]
-enum StreamEventMergeMode {
-    Append,
-    AppendMissingSuffix,
-}
-
-fn render_thinking_event(
-    markers: &StreamMarkers,
-    state: &mut StreamProcessingState,
-    event: &StreamTextEvent,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if !runtime_ctx::terminal_output_enabled() {
-        return Ok(());
-    }
-
-    match event {
-        StreamTextEvent::OpenThinking => {
-            flush_digest_filter_to_terminal(markers, state, false)?;
-            if markers.subagent_preview_enabled() {
-                return Ok(());
-            }
-            clear_waiting_hint(state)?;
-            maybe_write_stream_content(
-                &format!("\n{}\n", markers.thinking_tag),
-                state,
-                markers,
-                true,
-            )?;
-        }
-        StreamTextEvent::AppendThinking(text) => {
-            if text.is_empty() {
-                return Ok(());
-            }
-            clear_waiting_hint(state)?;
-            // digest is extra image-understanding content meant for the model; the thinking channel's terminal display strips it too
-            let terminal_text = state.render.digest_filter.push(text);
-            if terminal_text.is_empty() {
-                return Ok(());
-            }
-            if markers.subagent_preview_enabled() {
-                write_subagent_content_folded(terminal_text.as_str(), state)?;
-            } else {
-                maybe_write_stream_content(terminal_text.as_str(), state, markers, true)?;
-            }
-        }
-        StreamTextEvent::CloseThinking => {
-            flush_digest_filter_to_terminal(markers, state, true)?;
-            if markers.subagent_preview_enabled() {
-                return Ok(());
-            }
-            clear_waiting_hint(state)?;
-            if state.render.thinking_fold.active {
-                finalize_thinking_fold(state)?;
-            } else {
-                maybe_write_stream_content(
-                    &format!("{}\n", markers.end_thinking_tag),
-                    state,
-                    markers,
-                    true,
-                )?;
-            }
-        }
-        StreamTextEvent::AppendContent(_) | StreamTextEvent::AppendHiddenMeta(_) => {}
-    }
-
-    Ok(())
-}
-
-fn flush_digest_filter_to_terminal(
-    markers: &StreamMarkers,
-    state: &mut StreamProcessingState,
-    dimmed: bool,
-) -> io::Result<()> {
-    let residual = state.render.digest_filter.flush();
-    if residual.is_empty() || !runtime_ctx::terminal_output_enabled() {
-        return Ok(());
-    }
-    clear_waiting_hint(state)?;
-    if markers.subagent_preview_enabled() {
-        write_subagent_content_folded(&residual, state)
-    } else {
-        maybe_write_stream_content(&residual, state, markers, dimmed)
-    }
-}
-
-fn stream_text_event_to_content(
-    event: &StreamTextEvent,
-    markers: &StreamMarkers,
-    merge_mode: StreamEventMergeMode,
-    assistant_text: &str,
-) -> Option<String> {
-    // Thinking events may only go through render_thinking_event()'s terminal display path; they must not enter
-    // assistant_text/current_history. Deliberately only visible body is returned here.
-    if markers.subagent_preview_enabled() {
-        return match event {
-            StreamTextEvent::AppendContent(text) => match merge_mode {
-                StreamEventMergeMode::Append => (!text.is_empty()).then(|| text.clone()),
-                StreamEventMergeMode::AppendMissingSuffix => {
-                    let suffix = unseen_suffix(assistant_text, text);
-                    (!suffix.is_empty()).then_some(suffix)
-                }
-            },
-            StreamTextEvent::OpenThinking
-            | StreamTextEvent::AppendThinking(_)
-            | StreamTextEvent::CloseThinking
-            | StreamTextEvent::AppendHiddenMeta(_) => None,
-        };
-    }
-
-    match event {
-        StreamTextEvent::AppendContent(text) => match merge_mode {
-            StreamEventMergeMode::Append => (!text.is_empty()).then(|| text.clone()),
-            StreamEventMergeMode::AppendMissingSuffix => {
-                let suffix = unseen_suffix(assistant_text, text);
-                (!suffix.is_empty()).then_some(suffix)
-            }
-        },
-        StreamTextEvent::OpenThinking
-        | StreamTextEvent::AppendThinking(_)
-        | StreamTextEvent::CloseThinking
-        | StreamTextEvent::AppendHiddenMeta(_) => None,
-    }
-}
-
-fn unseen_suffix(existing: &str, incoming: &str) -> String {
-    if incoming.is_empty() || existing.ends_with(incoming) {
-        return String::new();
-    }
-
-    let leading_ws_len = incoming
-        .char_indices()
-        .find_map(|(idx, c)| (!c.is_whitespace()).then_some(idx))
-        .unwrap_or(incoming.len());
-    if leading_ws_len > 0 {
-        let trimmed = &incoming[leading_ws_len..];
-        if trimmed.is_empty() || existing.ends_with(trimmed) {
-            return String::new();
-        }
-        if let Some(suffix) = unseen_suffix_after_visible_overlap(existing, trimmed) {
-            return suffix;
-        }
-    }
-
-    if let Some(suffix) = unseen_suffix_after_visible_overlap(existing, incoming) {
-        return suffix;
-    }
-
-    if let Some(suffix) = unseen_suffix_whitespace_tolerant(existing, incoming) {
-        return suffix;
-    }
-    incoming.to_string()
-}
-
-fn unseen_suffix_after_visible_overlap(existing: &str, incoming: &str) -> Option<String> {
-    let boundaries = incoming
-        .char_indices()
-        .map(|(idx, _)| idx)
-        .chain(std::iter::once(incoming.len()))
-        .collect::<Vec<_>>();
-
-    for overlap_chars in (1..boundaries.len()).rev() {
-        let split_idx = boundaries[overlap_chars];
-        let overlap = &incoming[..split_idx];
-        // Overlaps of pure whitespace (e.g. \n) are almost always false matches — models often
-        // start a new paragraph with \n, and assistant_text often ends with \n. Only overlaps
-        // containing visible characters count as real repetition.
-        if existing.ends_with(overlap) && overlap.chars().any(|c| !c.is_whitespace()) {
-            return Some(incoming[split_idx..].to_string());
-        }
-    }
-
-    None
-}
-
-/// Whitespace-tolerant suffix dedup.
-///
-/// Tolerates whitespace differences from old history/abnormal providers: when `assistant_text` and the final
-/// `response.output_text.done` snapshot differ only in whitespace, still avoid re-appending the whole already-streamed
-/// snapshot as new content.
-///
-/// Aligns existing and incoming character by character with "whitespace skippable" to find the incoming prefix already
-/// covered by existing, and returns the remaining incoming tail (original whitespace preserved). If all of incoming's visible
-/// characters are covered, returns `Some("")`; if the visible characters cannot align, returns `None`.
-fn unseen_suffix_whitespace_tolerant(existing: &str, incoming: &str) -> Option<String> {
-    let e: Vec<(usize, char)> = existing.char_indices().collect();
-    let i: Vec<(usize, char)> = incoming.char_indices().collect();
-    let (mut ei, mut ii) = (0usize, 0usize);
-
-    // Skip leading whitespace of incoming (snapshots often start with a newline while assistant_text does not)
-    while ii < i.len() && i[ii].1.is_whitespace() {
-        ii += 1;
-    }
-
-    // last_matched_ii records the Vec index just after the last matched visible character in incoming,
-    // used to locate the byte start of the "remaining uncovered tail" in incoming at the end.
-    let mut last_matched_ii = ii;
-
-    while ei < e.len() && ii < i.len() {
-        let (ec, ic) = (e[ei].1, i[ii].1);
-        if ec.is_whitespace() && ic.is_whitespace() {
-            while ei < e.len() && e[ei].1.is_whitespace() {
-                ei += 1;
-            }
-            while ii < i.len() && i[ii].1.is_whitespace() {
-                ii += 1;
-            }
-            continue;
-        }
-        if ec.is_whitespace() {
-            ei += 1;
-            continue;
-        }
-        if ic.is_whitespace() {
-            ii += 1;
-            continue;
-        }
-        // Both sides are visible characters: they must be equal to count as aligned
-        if ec == ic {
-            last_matched_ii = ii + 1;
-            ei += 1;
-            ii += 1;
-        } else {
-            return None;
-        }
-    }
-
-    // existing is exhausted; the bytes after last_matched_ii in incoming are the remaining (uncovered) tail.
-    // If incoming is fully matched too, start_byte == incoming.len(), returning an empty string.
-    let start_byte = i
-        .get(last_matched_ii)
-        .map(|(b, _)| *b)
-        .unwrap_or(incoming.len());
-    Some(incoming[start_byte..].to_string())
-}
-
-fn flush_sse_event(
-    app: &mut App,
-    current_history: &mut String,
-    markers: &StreamMarkers,
-    state: &mut StreamProcessingState,
-    adapter: &'static dyn ProviderAdapter,
-) -> Result<StreamPayloadOutcome, Box<dyn std::error::Error>> {
-    let Some(event) = framing::flush_sse_event(&mut state.framing) else {
-        return Ok(StreamPayloadOutcome::default());
-    };
-    process_stream_payload(
-        app,
-        current_history,
-        markers,
-        state,
-        adapter,
-        event.event_type.as_deref(),
-        &event.payload,
-    )
-}
-
-fn process_stream_line(
-    app: &mut App,
-    current_history: &mut String,
-    markers: &StreamMarkers,
-    state: &mut StreamProcessingState,
-    adapter: &'static dyn ProviderAdapter,
-    line: &str,
-) -> Result<StreamPayloadOutcome, Box<dyn std::error::Error>> {
-    if let Some(event) = framing::consume_sse_line(&mut state.framing, line) {
-        return process_stream_payload(
-            app,
-            current_history,
-            markers,
-            state,
-            adapter,
-            event.event_type.as_deref(),
-            &event.payload,
-        );
-    }
-
-    Ok(StreamPayloadOutcome::default())
-}
-
-pub(super) fn write_stream_content(
-    content: &str,
-    markdown: &mut MarkdownStreamRenderer,
-    dimmed: bool,
-) -> io::Result<()> {
-    if !runtime_ctx::terminal_output_enabled() {
-        return Ok(());
-    }
-    write_stream_content_to_terminal(content, markdown, dimmed)
-}
-
-fn write_stream_content_to_terminal(
-    content: &str,
-    markdown: &mut MarkdownStreamRenderer,
-    dimmed: bool,
-) -> io::Result<()> {
-    if markdown.should_render(content) {
-        markdown.write_chunk(content, dimmed)?;
-        io::stdout().flush()?;
-    } else {
-        if dimmed {
-            print!("{}{content}{RESET}", theme::current().accent_muted);
-        } else {
-            print!("{content}");
-        }
-        io::stdout().flush()?;
-    }
-    Ok(())
 }
