@@ -34,11 +34,11 @@ use super::*;
     }
 
     /// Preview-path resolution is the security-bearing piece of
-    /// `GET /sessions/{id}/file`: both roots accept images, and everything
-    /// else (traversal, foreign paths, non-images, directories, oversized
+    /// `GET /sessions/{id}/file`: both roots accept media, and everything
+    /// else (traversal, foreign paths, non-media, directories, oversized
     /// files) is refused with a distinguishable reason.
     #[test]
-    fn resolve_preview_accepts_images_inside_the_roots_only() {
+    fn resolve_preview_accepts_media_inside_the_roots_only() {
         use super::{MAX_PREVIEW_BYTES, PreviewReject, resolve_preview};
         let base = std::env::temp_dir().join(format!(
             "a-serve-preview-{}-{}",
@@ -53,6 +53,7 @@ use super::*;
         std::fs::write(workspace.join("shot.PNG"), b"png").expect("shot");
         std::fs::write(workspace.join("notes.txt"), b"nope").expect("notes");
         std::fs::write(assets.join("paste-1.webp"), b"webp").expect("paste");
+        std::fs::write(assets.join("speech-1.mp3"), b"audio").expect("speech");
         std::fs::write(base.join("outside.png"), b"outside").expect("outside");
         let roots = vec![workspace.clone(), assets.clone()];
 
@@ -76,6 +77,13 @@ use super::*;
                 .content_type,
             "image/webp"
         );
+        assert_eq!(
+            resolve_preview("speech-1.mp3", &roots)
+                .expect("relative session audio")
+                .content_type,
+            "audio/mpeg",
+            "bare generated media names fall back to the session assets root"
+        );
 
         assert_eq!(
             resolve_preview("", &roots).unwrap_err(),
@@ -84,7 +92,7 @@ use super::*;
         assert_eq!(
             resolve_preview("notes.txt", &roots).unwrap_err(),
             PreviewReject::BadRequest,
-            "non-image extensions stay invisible even inside the root"
+            "non-media extensions stay invisible even inside the root"
         );
         assert_eq!(
             resolve_preview("missing.png", &roots).unwrap_err(),

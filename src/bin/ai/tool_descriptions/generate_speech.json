@@ -1,0 +1,37 @@
+{
+  "name": "generate_speech",
+  "description": "Generate speech with Alibaba Cloud Model Studio (DashScope), save it as a current-session audio asset, and return the file name for serve-chat playback. This is separate from OpenCode Go, whose chat endpoint does not provide TTS.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "text": {
+        "type": "string",
+        "description": "Text to synthesize (1-600 characters).",
+        "minLength": 1,
+        "maxLength": 600
+      },
+      "voice": {
+        "type": "string",
+        "description": "Optional Qwen3-TTS voice name; defaults to ai.speech.voice or Cherry.",
+        "maxLength": 100
+      },
+      "language_type": {
+        "type": "string",
+        "description": "Optional language hint such as Chinese or English.",
+        "maxLength": 40
+      },
+      "model": {
+        "type": "string",
+        "description": "Optional TTS model; defaults to ai.speech.model or qwen3-tts-flash.",
+        "enum": ["qwen3-tts-flash", "qwen3-tts-instruct-flash"]
+      },
+      "instructions": {
+        "type": "string",
+        "description": "Required style instruction when model is qwen3-tts-instruct-flash.",
+        "maxLength": 300
+      }
+    },
+    "required": ["text"]
+  },
+  "groups": ["builtin"]
+}

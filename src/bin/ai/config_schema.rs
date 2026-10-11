@@ -28,6 +28,11 @@ impl AiConfig {
     pub const MODEL_COMPATIBLE_API_KEY: &str = "compatible.api_key";
     pub const MODEL_ALIBABA_API_KEY: &str = "alibaba.api_key";
     pub const MODEL_ALIYUN_API_KEY: &str = "aliyun.api_key";
+    pub const SPEECH_API_KEY: &str = "ai.speech.api_key";
+    pub const SPEECH_ENDPOINT: &str = "ai.speech.endpoint";
+    pub const SPEECH_MODEL: &str = "ai.speech.model";
+    pub const SPEECH_VOICE: &str = "ai.speech.voice";
+    pub const SPEECH_LANGUAGE_TYPE: &str = "ai.speech.language_type";
     pub const MODEL_VOLCANO_API_KEY: &str = "volcano.api_key";
     pub const MODEL_OPENAI_API_KEY: &str = "openai.api_key";
     /// Official DeepSeek endpoint key, referenced by the model registry's

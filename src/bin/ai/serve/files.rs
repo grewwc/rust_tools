@@ -2,20 +2,22 @@
 
 use super::*;
 
-/// Query for the read-only preview route: one image path, either relative to
+/// Query for the read-only preview route: one media path, either relative to
 /// the workspace root or absolute inside an allowed root.
 #[derive(Debug, Deserialize)]
 pub(crate) struct FileQuery {
     pub(crate) path: String,
 }
 
-/// Image extensions the preview route serves. Everything else (sources,
+/// Media extensions the preview route serves. Everything else (sources,
 /// configs, dotfiles, keys) stays invisible to remote clients even inside an
-/// allowed root: the route exists so a phone can show pictures the assistant
-/// produced, not to browse the server's filesystem.
-pub(crate) const PREVIEW_IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp"];
-/// One preview is capped like an upload: a client allowed to send 10 MiB must
-/// be able to fetch what it sent.
+/// allowed root: the route exists so a phone can display media the assistant
+/// produced, not browse the server's filesystem.
+pub(crate) const PREVIEW_MEDIA_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "mp3", "wav", "m4a", "aac", "ogg",
+    "flac", "opus",
+];
+/// One preview is capped at the same 10 MiB boundary used for turn images.
 pub(crate) const MAX_PREVIEW_BYTES: u64 = MAX_TURN_IMAGE_BYTES as u64;
 /// Long absolute paths are legitimate; unbounded input is not.
 pub(crate) const MAX_PREVIEW_PATH_CHARS: usize = 4096;
@@ -46,11 +48,18 @@ pub(crate) fn preview_content_type(ext: &str) -> &'static str {
         "webp" => "image/webp",
         "svg" => "image/svg+xml",
         "avif" => "image/avif",
-        _ => "image/bmp",
+        "bmp" => "image/bmp",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
+        _ => "audio/opus",
     }
 }
 
-/// Resolve one client-supplied path to a servable image inside `roots`.
+/// Resolve one client-supplied path to servable media inside `roots`.
 ///
 /// `canonicalize` normalizes the path before the containment check, so `..`
 /// segments, relative forms and symlinks all resolve together — a symlink
@@ -62,53 +71,63 @@ pub(crate) fn resolve_preview(raw: &str, roots: &[PathBuf]) -> Result<PreviewFil
     if raw.is_empty() || raw.len() > MAX_PREVIEW_PATH_CHARS || raw.contains('\0') {
         return Err(PreviewReject::BadRequest);
     }
-    let candidate = if std::path::Path::new(raw).is_absolute() {
-        PathBuf::from(raw)
+    let candidates = if std::path::Path::new(raw).is_absolute() {
+        vec![PathBuf::from(raw)]
     } else {
-        // Relative paths are workspace-relative: that is the directory the
-        // turn child runs in, i.e. what the assistant means by `out/chart.svg`.
-        let Some(base) = roots.first() else {
+        if roots.is_empty() {
             return Err(PreviewReject::BadRequest);
+        }
+        // Prefer the workspace, then session assets. This keeps project-file
+        // semantics stable while allowing generated media to use a short bare
+        // name instead of exposing the long session-assets path to the model.
+        roots.iter().map(|base| base.join(raw)).collect()
+    };
+    let mut saw_outside = false;
+    for candidate in candidates {
+        let Ok(path) = candidate.canonicalize() else {
+            continue;
         };
-        base.join(raw)
-    };
-    let Ok(path) = candidate.canonicalize() else {
-        return Err(PreviewReject::Missing);
-    };
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return Err(PreviewReject::Missing);
-    };
-    if !meta.is_file() {
-        return Err(PreviewReject::Missing);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let inside = roots.iter().any(|root| {
+            root.canonicalize()
+                .map(|root| path.starts_with(&root))
+                .unwrap_or(false)
+        });
+        if !inside {
+            saw_outside = true;
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !PREVIEW_MEDIA_EXTS.contains(&ext.as_str()) {
+            return Err(PreviewReject::BadRequest);
+        }
+        if meta.len() > MAX_PREVIEW_BYTES {
+            return Err(PreviewReject::TooLarge);
+        }
+        return Ok(PreviewFile {
+            path,
+            content_type: preview_content_type(&ext),
+        });
     }
-    let ext = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !PREVIEW_IMAGE_EXTS.contains(&ext.as_str()) {
-        return Err(PreviewReject::BadRequest);
-    }
-    let inside = roots.iter().any(|root| {
-        root.canonicalize()
-            .map(|root| path.starts_with(&root))
-            .unwrap_or(false)
-    });
-    if !inside {
-        return Err(PreviewReject::Outside);
-    }
-    if meta.len() > MAX_PREVIEW_BYTES {
-        return Err(PreviewReject::TooLarge);
-    }
-    Ok(PreviewFile {
-        path,
-        content_type: preview_content_type(&ext),
+    Err(if saw_outside {
+        PreviewReject::Outside
+    } else {
+        PreviewReject::Missing
     })
 }
 
 /// `GET /sessions/{id}/file?path=...` (authed): one image from the workspace
 /// root or this session's assets dir, fetched by the mobile page for inline
-/// previews. Read-only and image-only by construction (see `resolve_preview`);
+/// previews. Read-only and media-only by construction (see `resolve_preview`);
 /// the client sends its bearer token in a `fetch` header, so the token never
 /// appears in a URL.
 pub(crate) async fn get_session_file(
@@ -137,9 +156,10 @@ pub(crate) async fn get_session_file(
                     "path is outside the workspace and session assets",
                 ),
                 PreviewReject::Missing => (StatusCode::NOT_FOUND, "no such image"),
-                PreviewReject::TooLarge => {
-                    (StatusCode::PAYLOAD_TOO_LARGE, "image exceeds the preview size cap")
-                }
+                PreviewReject::TooLarge => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "image exceeds the preview size cap",
+                ),
             };
             return (status, Json(serde_json::json!({"error": msg}))).into_response();
         }

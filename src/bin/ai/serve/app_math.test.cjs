@@ -218,7 +218,7 @@ test("ordinary Markdown and HTML safety survive", () => {
   assert.equal(nodesOf(render(attack))[0].textContent, attack);
 });
 
-test("remote images render inline and direct videos require manual playback", () => {
+test("remote images and media render inline without autoplay", () => {
   const { render } = harness();
   const image = render("![K2](https://example.com/K2_(mountain).jpg)");
   assert.match(image, /class="media-image"/);
@@ -230,6 +230,11 @@ test("remote images render inline and direct videos require manual playback", ()
   assert.match(video, /<video controls playsinline preload="none" src="https:\/\/example\.com\/sample\.mp4\?download=1"><\/video>/);
   assert.doesNotMatch(video, /autoplay/);
   assert.match(video, /class="media-caption"[^>]*>5 second clip<\/a>/);
+
+  const audio = render("[generated speech](https://example.com/speech.mp3)");
+  assert.match(audio, /class="media-audio"/);
+  assert.match(audio, /<audio controls playsinline preload="none" src="https:\/\/example\.com\/speech\.mp3"><\/audio>/);
+  assert.doesNotMatch(audio, /autoplay/);
 
   assert.doesNotMatch(render("![bad](javascript:alert(1))"), /<img/);
   assert.match(render("[page](https://example.com/page)"), /<a href="https:\/\/example\.com\/page"/);
@@ -345,7 +350,7 @@ test("the real streaming paint typesets completed formulas before the final even
   assert.deepEqual(h.msgs.nodes.map((node) => node.textContent), ["typeset:x", "typeset:y"]);
 });
 
-test("image decoration leaves math text and rendered math subtrees alone", () => {
+test("media decoration leaves math text and rendered math subtrees alone", () => {
   const h = harness();
   const node = { nodeValue: "plot.svg", parentElement: { closest: (selector) => selector === ".math" } };
   h.context.document.createTreeWalker = () => {
@@ -353,10 +358,10 @@ test("image decoration leaves math text and rendered math subtrees alone", () =>
     return { currentNode: node, nextNode() { const next = pending; pending = false; return next; } };
   };
   h.context.NodeFilter = { SHOW_TEXT: 4 };
-  const start = script.indexOf("function decorateImages(root)");
+  const start = script.indexOf("function decorateMedia(root)");
   const end = script.indexOf("\n}", start) + 2;
   vm.runInContext("const MAX_PREVIEWS_PER_MSG = 4;\n" + script.slice(start, end), h.context);
-  assert.doesNotThrow(() => h.context.decorateImages(h.msgs));
+  assert.doesNotThrow(() => h.context.decorateMedia(h.msgs));
 });
 
 function historyHarness({ delayed = false, existingKeys = [], existingNodes = [], follow = true } = {}) {

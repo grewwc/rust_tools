@@ -6,3 +6,4 @@ pub(crate) mod memory;
 pub(crate) mod reads;
 pub(crate) mod session_distill;
 pub(crate) mod side_note;
+pub(crate) mod speech;

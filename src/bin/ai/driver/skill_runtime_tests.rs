@@ -76,6 +76,7 @@ fn default_core_tools_exclude_lazy_skill_discovery_tools() {
         .collect::<Vec<_>>();
     assert!(names.iter().any(|name| name == "enable_tools"));
     assert!(names.iter().any(|name| name == "read_file"));
+    assert!(!names.iter().any(|name| name == "generate_speech"));
     // Skill discovery/activation, task orchestration, and knowledge memory are low-frequency capabilities: by default they do not
     // expand into the resident core set; `enable_tools` enables them on demand (the builtin group stays, discoverable dynamically).
     assert!(!names.iter().any(|name| name == "activate_skill"));
@@ -1599,7 +1600,8 @@ fn system_prompt_prefers_enable_tools_when_no_skill_active() {
         .render_system_prompt();
     assert!(prompt.contains("No skill is active for this turn"));
     assert!(prompt.contains("enable_tools(operation=list)"));
-    assert!(prompt.contains("enabling only the specific tools you need"));
+    assert!(prompt.contains("before declaring a requested capability unavailable"));
+    assert!(prompt.contains("enable only the specific tools you need"));
 }
 
 #[test]

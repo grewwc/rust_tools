@@ -1298,7 +1298,7 @@ fn build_system_prompt(
         let mut discovery_lines = Vec::new();
         if skills.is_empty() && has_tool(available_tools, "enable_tools") {
             discovery_lines.push(
-                "No skill is active for this turn. Additional capabilities are available via `enable_tools`; call `enable_tools(operation=list)` to see them, enabling only the specific tools you need.".to_string(),
+                "No skill is active for this turn. Additional capabilities are available via `enable_tools`; before declaring a requested capability unavailable, call `enable_tools(operation=list)` to discover it, then enable only the specific tools you need.".to_string(),
             );
             discovery_lines.push(
                 "If the task needs an external system or MCP-backed capability, discover and enable matching `mcp_*` tools first.".to_string(),

@@ -107,9 +107,10 @@ select, summary { touch-action:manipulation; }
 .msg.md blockquote { margin:4px 0; padding:2px 0 2px 8px; border-left:3px solid var(--line); color:var(--dim); }
 .msg.md hr { border:0; border-top:1px solid var(--line); margin:8px 0; }
 .msg.md a { color:var(--acc); }
-.msg.md .media-image, .msg.md .media-video { display:block; margin:8px 0; }
+.msg.md .media-image, .msg.md .media-video, .msg.md .media-audio { display:block; margin:8px 0; }
 .msg.md .media-image img, .msg.md .media-video video { display:block; width:auto; max-width:100%; max-height:min(70dvh,720px); border:1px solid var(--line); border-radius:8px; background:#080b10; }
 .msg.md .media-video video { width:100%; aspect-ratio:16/9; }
+.msg.md .media-audio audio { display:block; width:100%; }
 .msg.md .media-caption { display:block; margin-top:4px; overflow-wrap:anywhere; font-size:12px; color:var(--dim); }
 .msg.md code { font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:13px;
   background:#0d1117; border:1px solid var(--line); border-radius:5px; padding:0 4px; overflow-wrap:anywhere; }
@@ -197,11 +198,12 @@ select, summary { touch-action:manipulation; }
 }
 @media (prefers-reduced-motion:reduce) { #jumpbottom, #prompt { transition:none; } }
 /* Server-side images in a reply: the path text stays, the fetched picture
-   sits under it (see decorateImages in the script below). */
-.imgprev { display:block; margin:6px 0; }
-.imgprev.loaded { padding:6px; border:1px solid var(--line); border-radius:8px; }
-.imgprev img { display:block; max-width:100%; max-height:52vh; border-radius:6px; }
-.imgprev .imgcap { display:block; margin-top:4px; font-size:11px; color:var(--dim); word-break:break-all; }
+   sits under it (see decorateMedia in the script below). */
+.mediaprev { display:block; margin:6px 0; }
+.mediaprev.loaded { padding:6px; border:1px solid var(--line); border-radius:8px; }
+.mediaprev img { display:block; max-width:100%; max-height:52vh; border-radius:6px; }
+.mediaprev audio { display:block; width:100%; }
+.mediaprev .mediacap { display:block; margin-top:4px; font-size:11px; color:var(--dim); word-break:break-all; }
 #viewer { display:none; position:fixed; inset:0; z-index:60; background:rgba(0,0,0,.92); align-items:center; justify-content:center; }
 #viewer.on { display:flex; }
 #viewer img { max-width:100vw; max-height:100vh; }
@@ -358,6 +360,10 @@ const esc = (s) => s.replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt
 // and a construct that is not covered here stays visible as plain text rather
 // than being dropped.
 const mdLink = (label, url) => {
+  if (/\.(?:mp3|wav|m4a|aac|flac|opus)(?:[?#]|$)/i.test(url)) {
+    return '<span class="media-audio"><audio controls playsinline preload="none" src="' + url + '"></audio>' +
+      '<a class="media-caption" href="' + url + '" target="_blank" rel="noopener noreferrer">' + label + '</a></span>';
+  }
   if (/\.(?:mp4|webm|ogg|ogv|m4v|mov)(?:[?#]|$)/i.test(url)) {
     return '<span class="media-video"><video controls playsinline preload="none" src="' + url + '"></video>' +
       '<a class="media-caption" href="' + url + '" target="_blank" rel="noopener noreferrer">' + label + '</a></span>';
@@ -694,14 +700,14 @@ function addMsgMd(text, parent) {
   decorateAndLoad(d);
   return d;
 }
-// --- server-side images ---------------------------------------------------
-// A reply that names an image file (the assistant writes e.g. `out/chart.svg`)
+// --- server-side media ----------------------------------------------------
+// A reply that names a media file (the assistant writes e.g. `out/chart.svg`)
 // is only visible on a phone if the bytes come back over HTTP: the preview
-// route is authed and an <img src> cannot carry the bearer token, so the page
-// fetches the file itself and hands the blob to the <img>. A token that is not
-// a servable image (missing, outside the roots, wrong kind) stays plain text.
+// route is authed and media elements cannot carry the bearer token, so the page
+// fetches the file itself and hands the blob to the element. An unservable token
+// (missing, outside the roots, wrong kind) stays plain text.
 let previewUrls = [];
-const IMG_TOKEN_G = /[\w.@~+\/-]*[\w@~+\/-]\.(?:png|jpe?g|gif|webp|svg|avif|bmp)\b/gi;
+const MEDIA_TOKEN_G = /[\w.@~+\/-]*[\w@~+\/-]\.(?:png|jpe?g|gif|webp|svg|avif|bmp|mp3|wav|m4a|aac|ogg|flac|opus)\b/gi;
 const MAX_PREVIEWS_PER_MSG = 4;
 // Standalone path tokens only: a run of path characters that keeps its
 // directory prefixes (`out/chart.svg`, `rust_tools/chart.svg`, bare
@@ -710,11 +716,11 @@ const MAX_PREVIEWS_PER_MSG = 4;
 // plain text: the route serves workspace-relative paths only, and a path that
 // 404s is then retried once as its basename (loadPreviews), which needs the
 // prefixed token to survive intact without a root ambiguity.
-function imageTokensIn(text) {
+function mediaTokensIn(text) {
   const found = [];
-  IMG_TOKEN_G.lastIndex = 0;
+  MEDIA_TOKEN_G.lastIndex = 0;
   let m;
-  while ((m = IMG_TOKEN_G.exec(text))) {
+  while ((m = MEDIA_TOKEN_G.exec(text))) {
     const token = m[0];
     if (token.length > 200) continue;
     if (token.startsWith("/")) continue; // absolute paths: never workspace-relative
@@ -726,7 +732,7 @@ function imageTokensIn(text) {
   }
   return found;
 }
-function decorateImages(root) {
+function decorateMedia(root) {
   const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
   const nodes = [];
   while (tw.nextNode()) nodes.push(tw.currentNode);
@@ -735,14 +741,14 @@ function decorateImages(root) {
     if (node.parentElement.closest(".math")) continue;
     const text = node.nodeValue || "";
     if (!budget || text.indexOf(".") === -1) continue;
-    const hits = imageTokensIn(text).filter(() => budget-- > 0);
+    const hits = mediaTokensIn(text).filter(() => budget-- > 0);
     if (!hits.length) continue;
     const frag = document.createDocumentFragment();
     let last = 0;
     for (const hit of hits) {
       frag.appendChild(document.createTextNode(text.slice(last, hit.at)));
       const slot = document.createElement("span");
-      slot.className = "imgprev";
+      slot.className = "mediaprev";
       slot.dataset.path = hit.token;
       frag.appendChild(slot);
       last = hit.at + hit.token.length;
@@ -753,7 +759,7 @@ function decorateImages(root) {
 }
 async function loadPreviews(root) {
   if (!root.querySelectorAll) return;
-  for (const slot of root.querySelectorAll("span.imgprev:not([data-held])")) {
+  for (const slot of root.querySelectorAll("span.mediaprev:not([data-held])")) {
     slot.dataset.held = "1"; // one fetch per slot, however often the view repaints
     const path = slot.dataset.path;
     // Assistants print both workspace-relative paths and bare names, and the
@@ -774,15 +780,21 @@ async function loadPreviews(root) {
         url = await attempt(path.slice(cut + 1));
       }
       previewUrls.push(url);
-      const img = document.createElement("img");
-      img.src = url;
-      img.alt = path;
-      img.loading = "lazy";
-      img.onclick = () => showViewer(url);
+      const isAudio = /\.(?:mp3|wav|m4a|aac|ogg|flac|opus)$/i.test(path);
+      const media = document.createElement(isAudio ? "audio" : "img");
+      media.src = url;
+      if (isAudio) {
+        media.controls = true;
+        media.preload = "none";
+      } else {
+        media.alt = path;
+        media.loading = "lazy";
+        media.onclick = () => showViewer(url);
+      }
       const cap = document.createElement("span");
-      cap.className = "imgcap";
+      cap.className = "mediacap";
       cap.textContent = path;
-      slot.append(img, cap);
+      slot.append(media, cap);
       slot.classList.add("loaded");
     } catch (e) {
       slot.replaceWith(document.createTextNode(path));
@@ -791,7 +803,7 @@ async function loadPreviews(root) {
 }
 function decorateAndLoad(root) {
   decorateMath(root);
-  decorateImages(root);
+  decorateMedia(root);
   loadPreviews(root);
 }
 function showViewer(url) {
