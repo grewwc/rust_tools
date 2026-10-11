@@ -174,11 +174,12 @@ select, summary { touch-action:manipulation; }
   }
   #composer:focus-within { border-color:#388bfd; box-shadow:0 0 0 2px rgba(56,139,253,.18), 0 8px 24px rgba(0,0,0,.26); }
   #prompt {
-    grid-area:prompt; width:100%; min-height:84px; max-height:38dvh;
+    grid-area:prompt; width:100%; min-height:42px; max-height:38dvh;
     box-sizing:border-box; padding:6px 6px 4px; border:0; border-radius:12px;
     background:transparent; box-shadow:none; outline:none;
-    font-size:16px; line-height:1.5;
+    font-size:16px; line-height:1.5; transition:min-height .16s ease;
   }
+  #prompt:focus, #prompt:not(:placeholder-shown) { min-height:84px; }
   #img, #send {
     width:48px; min-width:48px; height:48px; min-height:48px; padding:0;
     align-self:center; border-radius:50%; font-size:19px;
@@ -190,7 +191,7 @@ select, summary { touch-action:manipulation; }
   #conn.open input { flex:1 1 100%; padding:10px 8px; }
   #conn.open #save { flex:1; min-height:44px; }
 }
-@media (prefers-reduced-motion:reduce) { #jumpbottom { transition:none; } }
+@media (prefers-reduced-motion:reduce) { #jumpbottom, #prompt { transition:none; } }
 /* Server-side images in a reply: the path text stays, the fetched picture
    sits under it (see decorateImages in the script below). */
 .imgprev { display:block; margin:6px 0; }
@@ -602,6 +603,9 @@ function growPrompt() {
   const phone = window.matchMedia && window.matchMedia("(max-width:700px)").matches;
   const viewportRatio = phone ? 0.38 : 0.3;
   p.style.height = "auto";
+  // Leave an empty composer on its compact CSS height. Focus expands it, and
+  // the first input event switches to measured multi-line growth.
+  if (!p.value) return;
   p.style.height = Math.min(p.scrollHeight, Math.round(window.innerHeight * viewportRatio)) + "px";
 }
 function textOf(content) {
