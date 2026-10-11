@@ -156,8 +156,11 @@ fn build_digest_text(digest: &str, image_paths: &[String]) -> String {
     };
     format!(
         "[The image was converted to a text digest to control token usage; the original image \
-is not sent again in later turns. If you need exact pixel/visual details, read the original \
-image with the file tools.]\nOriginal image path: {paths}\nImage digest:\n{digest}"
+is not sent again automatically in later turns, but remains available at the path below. \
+If the user asks you to inspect, re-check, zoom, read, compare, or otherwise use exact visual \
+details, you MUST call `read_file` on the original image path before answering. The tool will \
+reattach the image as visual input. Do not claim that the original image is unavailable or ask \
+the user to resend it unless that `read_file` call fails.]\nOriginal image path: {paths}\nImage digest:\n{digest}"
     )
 }
 
@@ -601,6 +604,15 @@ mod tests {
         // No images left; the second replacement should be a no-op (avoid
         // appending the digest twice).
         assert!(!swap_images_with_digest(&mut content, "摘要", &[]));
+    }
+
+    #[test]
+    fn digest_reference_requires_reopening_original_for_exact_visual_followups() {
+        let text = build_digest_text("文字不清晰", &["/tmp/shot.png".to_string()]);
+        assert!(text.contains("MUST call `read_file`"));
+        assert!(text.contains("reattach the image as visual input"));
+        assert!(text.contains("Do not claim that the original image is unavailable"));
+        assert!(text.contains("/tmp/shot.png"));
     }
 
     fn test_msg(role: &str, content: Value) -> Message {
