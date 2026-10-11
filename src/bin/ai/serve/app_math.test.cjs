@@ -45,13 +45,119 @@ function harness() {
 
 test("embedded script parses", () => { new vm.Script(script); });
 
+test("drafts persist independently for each session and restore on switch", () => {
+  const start = script.indexOf("function draftKey(");
+  const end = script.indexOf("function questionRowsOf(", start);
+  assert.ok(start >= 0 && end > start);
+  const values = new Map([["serve.draft.beta", "beta draft"]]);
+  const prompt = { value: "alpha draft" };
+  const panelClasses = new Set();
+  const elements = {
+    prompt,
+    questionpanel: { classList: { remove: (name) => panelClasses.delete(name) } },
+    questionbtn: {
+      classList: { toggle() {} },
+      setAttribute() {},
+    },
+    questioncount: { textContent: "" },
+    msgs: { querySelectorAll: () => [] },
+  };
+  const context = vm.createContext({
+    localStorage: {
+      getItem: (key) => values.get(key) || null,
+      setItem: (key, value) => values.set(key, value),
+      removeItem: (key) => values.delete(key),
+    },
+    $: (id) => elements[id],
+    growPrompt() {},
+    isPhoneLayout: () => true,
+  });
+  vm.runInContext('const DRAFT_PREFIX = "serve.draft."; let questionCache = null; let sessionId = "alpha";\n' + script.slice(start, end), context);
+  context.switchSession("beta");
+  assert.equal(values.get("serve.draft.alpha"), "alpha draft");
+  assert.equal(prompt.value, "beta draft");
+  assert.equal(values.get("serve.session"), "beta");
+  prompt.value = "";
+  context.persistDraft();
+  assert.equal(values.has("serve.draft.beta"), false);
+});
+
+test("question navigator fetches the complete history and renders an older target on demand", async () => {
+  const start = script.indexOf("function questionRowsOf(");
+  const end = script.indexOf("// `parent` mounts", start);
+  assert.ok(start >= 0 && end > start);
+  const messages = Array.from({ length: 205 }, (_, i) => ({
+    role: i % 2 ? "assistant" : "user",
+    content: "message " + i,
+  }));
+  const links = [];
+  let panelOpen = false;
+  let loaded = null;
+  let target = null;
+  let scrolled = false;
+  const panel = { classList: {
+    contains: (name) => name === "open" && panelOpen,
+    add: (name) => { if (name === "open") panelOpen = true; },
+  } };
+  const list = {
+    innerHTML: "",
+    textContent: "",
+    appendChild: (node) => links.push(node),
+  };
+  const context = vm.createContext({
+    sessionId: "session-a",
+    questionCache: null,
+    $: (id) => ({
+      questionpanel: panel,
+      questionbtn: { setAttribute() {} },
+      questionlist: list,
+      msgs: { querySelector: () => target },
+    })[id],
+    api: async (path) => {
+      assert.equal(path, "/sessions/session-a/history");
+      return { json: async () => messages, headers: { get: () => String(messages.length) } };
+    },
+    textOf: (content) => String(content || ""),
+    updateQuestionButton: (count) => { context.count = count; },
+    closeQuestionPanel: () => { panelOpen = false; },
+    loadHistory: async (prefetched) => {
+      loaded = prefetched;
+      target = {
+        offsetWidth: 1,
+        scrollIntoView: () => { scrolled = true; },
+        classList: { remove() {}, add() {} },
+      };
+    },
+    esc: (value) => value,
+    document: { createElement: () => ({ append() {} }) },
+  });
+  vm.runInContext(script.slice(start, end), context);
+  await context.openQuestionPanel();
+  assert.equal(context.count, 103);
+  assert.equal(links.length, 103);
+  await links[0].onclick();
+  assert.equal(loaded.showAll, true);
+  assert.equal(loaded.messages.length, 205);
+  assert.equal(scrolled, true);
+});
+
+test("phone question navigator is a compact session-bar control", () => {
+  assert.match(html, /<div id="sessbar"[^>]*>[\s\S]*?<button id="questionbtn"/);
+  assert.ok(html.indexOf('id="questionbtn"') < html.indexOf('<div id="msgwrap">'));
+  const buttonRule = html.match(/#questionbtn\s*\{([^}]*)\}/);
+  assert.ok(buttonRule);
+  assert.doesNotMatch(buttonRule[1], /position\s*:\s*absolute/);
+  assert.match(html, /#questionbtn\.show\s*\{\s*display:grid;\s*\}/);
+  assert.match(script, /questionbtn"\)\.onclick = \(event\) => \{ event\.stopPropagation\(\); openQuestionPanel\(\); \};/);
+});
+
 test("phone history exposes a dedicated rewind action without whole-bubble taps", () => {
   const start = script.indexOf("function addUserBubble(");
   const end = script.indexOf("async function rewindTo(", start);
   assert.ok(start >= 0 && end > start);
   const actions = [];
   const rewinds = [];
-  const bubble = { appendChild: (node) => actions.push(node) };
+  const bubble = { dataset: {}, appendChild: (node) => actions.push(node) };
   const context = vm.createContext({
     window: { matchMedia: () => ({ matches: true }) },
     document: { createElement: () => ({ setAttribute(name, value) { this[name] = value; } }) },
@@ -140,6 +246,7 @@ test("targeted session delete preserves the open session", async () => {
     api: async (path, options) => { calls.push([path, options]); },
     loadSessions: async () => { sessionsLoaded += 1; },
     loadHistory: async () => { historyLoaded += 1; },
+    clearDraft: (id) => calls.push(["clearDraft", id]),
     stopStaleFollow: () => calls.push(["stop"]),
     hideConfirm: () => calls.push(["hide"]),
     localStorage: { removeItem: (key) => calls.push(["remove", key]) },
@@ -153,7 +260,7 @@ test("targeted session delete preserves the open session", async () => {
   assert.equal(context.sessionId, "open-session");
   assert.equal(sessionsLoaded, 1);
   assert.equal(historyLoaded, 0);
-  assert.equal(calls.some(([kind]) => kind === "remove"), false);
+  assert.equal(calls.some(([kind, id]) => kind === "clearDraft" && id === "hi-session"), true);
 });
 
 test("screenshot display and inline formulas preserve their exact TeX", () => {
@@ -397,6 +504,7 @@ function historyHarness({ delayed = false, existingKeys = [], existingNodes = []
     historyRowsOf: () => ({ rows, shownCount: rows.length }),
     histKey: () => "tail", histEndsTurn: () => true,
     syncStopButton() {}, renderSessionBar() {}, attachLiveBox() {},
+    updateQuestionButton() {},
     shouldFollowOutput: () => follow,
     followOutput(wasFollowing) { if (wasFollowing) root.scrollTop = root.scrollHeight; },
     revokePreviews() { revokes += 1; },
