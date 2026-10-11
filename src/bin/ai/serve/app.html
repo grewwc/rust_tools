@@ -107,6 +107,10 @@ select, summary { touch-action:manipulation; }
 .msg.md blockquote { margin:4px 0; padding:2px 0 2px 8px; border-left:3px solid var(--line); color:var(--dim); }
 .msg.md hr { border:0; border-top:1px solid var(--line); margin:8px 0; }
 .msg.md a { color:var(--acc); }
+.msg.md .media-image, .msg.md .media-video { display:block; margin:8px 0; }
+.msg.md .media-image img, .msg.md .media-video video { display:block; width:auto; max-width:100%; max-height:min(70dvh,720px); border:1px solid var(--line); border-radius:8px; background:#080b10; }
+.msg.md .media-video video { width:100%; aspect-ratio:16/9; }
+.msg.md .media-caption { display:block; margin-top:4px; overflow-wrap:anywhere; font-size:12px; color:var(--dim); }
 .msg.md code { font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:13px;
   background:#0d1117; border:1px solid var(--line); border-radius:5px; padding:0 4px; overflow-wrap:anywhere; }
 .msg.md pre { margin:6px 0; padding:8px; background:#0d1117; border:1px solid var(--line);
@@ -353,14 +357,25 @@ const esc = (s) => s.replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt
 // below escapes before it emits markup, so reply text can never inject tags,
 // and a construct that is not covered here stays visible as plain text rather
 // than being dropped.
+const mdLink = (label, url) => {
+  if (/\.(?:mp4|webm|ogg|ogv|m4v|mov)(?:[?#]|$)/i.test(url)) {
+    return '<span class="media-video"><video controls playsinline preload="none" src="' + url + '"></video>' +
+      '<a class="media-caption" href="' + url + '" target="_blank" rel="noopener noreferrer">' + label + '</a></span>';
+  }
+  return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + label + '</a>';
+};
 const mdText = (s) => s
   .replace(/\*\*([^*\n]+?)\*\*/g, "<b>$1</b>")
   .replace(/~~([^~\n]+?)~~/g, "<s>$1</s>")
   .replace(/\*([^\s*][^*\n]*?)\*/g, "<i>$1</i>")
   // Parens inside a link destination are balanced, so a URL like wiki/Foo_(bar)
   // does not end the link at the first ")".
-  .replace(/\[([^\]\n]+?)\]\((https?:\/\/(?:[^()\s]|\([^()\s]*\))+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
-  .replace(/&lt;(https?:\/\/[^\s&]+)&gt;/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+  .replace(/!\[([^\]\n]+?)\]\((https?:\/\/(?:[^()\s]|\([^()\s]*\))+)\)/g,
+    (_all, label, url) => '<span class="media-image"><a href="' + url + '" target="_blank" rel="noopener noreferrer">' +
+      '<img src="' + url + '" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer"></a>' +
+      '<span class="media-caption">' + label + '</span></span>')
+  .replace(/\[([^\]\n]+?)\]\((https?:\/\/(?:[^()\s]|\([^()\s]*\))+)\)/g, (_all, label, url) => mdLink(label, url))
+  .replace(/&lt;(https?:\/\/[^\s&]+)&gt;/g, (_all, url) => mdLink(url, url));
 // Code spans are literal, so they are cut out before the inline rules run.
 const mdInline = (src) => {
   let html = "", last = 0, m;

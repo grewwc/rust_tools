@@ -774,6 +774,8 @@ fn system_prompt_routes_project_file_deletes_to_apply_patch() {
         .render_system_prompt();
 
     assert!(prompt.contains("<temporary_files>"));
+    assert!(prompt.contains("Save content downloaded from the network in the session temp directory"));
+    assert!(prompt.contains("Reserve the destination with `write_file(temp=true)`"));
     assert!(prompt.contains("git-tracked file"));
     assert!(prompt.contains("`apply_patch`"));
     assert!(prompt.contains("ONE `apply_patch` call with multiple `@@` hunks"));

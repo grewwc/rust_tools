@@ -218,6 +218,23 @@ test("ordinary Markdown and HTML safety survive", () => {
   assert.equal(nodesOf(render(attack))[0].textContent, attack);
 });
 
+test("remote images render inline and direct videos require manual playback", () => {
+  const { render } = harness();
+  const image = render("![K2](https://example.com/K2_(mountain).jpg)");
+  assert.match(image, /class="media-image"/);
+  assert.match(image, /<img src="https:\/\/example\.com\/K2_\(mountain\)\.jpg" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">/);
+  assert.match(image, /class="media-caption">K2<\/span>/);
+
+  const video = render("[5 second clip](https://example.com/sample.mp4?download=1)");
+  assert.match(video, /class="media-video"/);
+  assert.match(video, /<video controls playsinline preload="none" src="https:\/\/example\.com\/sample\.mp4\?download=1"><\/video>/);
+  assert.doesNotMatch(video, /autoplay/);
+  assert.match(video, /class="media-caption"[^>]*>5 second clip<\/a>/);
+
+  assert.doesNotMatch(render("![bad](javascript:alert(1))"), /<img/);
+  assert.match(render("[page](https://example.com/page)"), /<a href="https:\/\/example\.com\/page"/);
+});
+
 test("math inside tables, lists and quotes does not consume Markdown syntax", () => {
   const { render } = harness();
   const table = render("| math | value |\n| --- | --- |\n| $|x|$ | $1$ |");

@@ -1490,6 +1490,9 @@ fn build_system_prompt(
         lines.push(
             "Do NOT use `execute_command` to create temp files (e.g. `echo > /tmp/foo`, `python -c '...' > out.json`) — files created outside `write_file(temp=true)` will accumulate. `execute_command` cannot run `rm` either — that is a command-policy blacklist, not a filesystem sandbox: allowed commands run directly against the real workspace.".to_string(),
         );
+        lines.push(
+            "Save content downloaded from the network in the session temp directory, not the current working directory. Reserve the destination with `write_file(temp=true)`, then pass the returned path to the downloader; use a project or user-selected path only when the user explicitly requests that destination.".to_string(),
+        );
         if has_tool(available_tools, "apply_patch") {
             lines.push(
                 "Do NOT use `write_file(temp=true)` on existing project files; reserve `write_file` without `temp` for genuine full rewrites (localized edits go through `apply_patch`).".to_string(),
