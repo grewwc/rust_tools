@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::ai::tools::common::ToolStreamWriter;
 use crate::ai::tools::storage::file_store::{
     FileStore, current_session_assets_dir, is_read_file_overflow_artifact,
-    session_overflow_asset_for_bare_name,
+    session_live_overflow_asset_for_alias, session_overflow_asset_for_bare_name,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,13 +192,15 @@ fn resolve_file_path_arg(args: &Value) -> Result<&str, String> {
         .ok_or_else(|| "Missing file_path".to_string())
 }
 
-/// Resolves a bare archive file name from a shortened overflow stub against the
-/// current session's `tool-overflow-compressed` dir. Returns `None` when there
-/// is no driver session context or the name is not a bare file name; the caller
-/// then falls back to the original store (and its original error).
+/// Resolves a bare compressed archive file name from a shortened overflow stub.
 fn current_session_overflow_asset(file_path: &str) -> Option<PathBuf> {
     let assets = current_session_assets_dir()?;
     session_overflow_asset_for_bare_name(file_path, &assets)
+}
+
+fn current_session_asset_alias(file_path: &str) -> Option<PathBuf> {
+    let assets = current_session_assets_dir()?;
+    session_live_overflow_asset_for_alias(file_path, &assets)
 }
 
 /// Normalizes file_path when temp=true: rejects absolute paths and out-of-bounds parent references, keeping only the file name.
@@ -227,12 +229,17 @@ fn emit_stream_line(on_chunk: &mut ToolStreamWriter<'_>, line: &str) {
 
 pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
     let file_path = resolve_file_path_arg(args)?;
-    let store = FileStore::new(PathBuf::from(file_path));
-    // Shortened overflow stubs carry only the archive file name (no session
-    // directory prefix), which does not resolve under effective_cwd. Retry such
-    // bare names against the current session's `tool-overflow-compressed` dir;
+    let alias_path = current_session_asset_alias(file_path);
+    let store = FileStore::new(
+        alias_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(file_path)),
+    );
+    // Shortened overflow stubs carry only the file name (no repeated session
+    // directory prefix), which does not resolve under effective_cwd. Retry the
+    // legacy bare compressed-archive form only when no typed alias was supplied;
     // every other input keeps its original resolution and error behavior.
-    let store = if store.ensure_exists().is_err() {
+    let store = if alias_path.is_none() && store.ensure_exists().is_err() {
         match current_session_overflow_asset(file_path).map(FileStore::new) {
             Some(candidate) if candidate.ensure_exists().is_ok() => candidate,
             _ => store,

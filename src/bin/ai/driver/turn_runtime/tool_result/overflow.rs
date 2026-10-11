@@ -1,4 +1,7 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde_json::Value;
 
@@ -125,6 +128,7 @@ pub(super) fn build_model_overflow_stub(
     summary: &LargeToolSummary,
 ) -> String {
     let overflow_notice = if let Some(path) = path {
+        let display_path = model_overflow_display_path(path);
         format!(
             "Output too large; full result saved to a file. The COMPLETE output is NOT in context.\n\
              Do NOT read this overflow file by default. First use the summary / key_lines / head_preview / tail_preview below to decide whether you already have enough evidence.\n\
@@ -132,8 +136,7 @@ pub(super) fn build_model_overflow_stub(
              The previews are anchors, not the content: when the task requires following, citing, or transforming this output, recover the full text (re-run the original operation or read the original source path) instead of treating the previews as the content.\n\
              Treat `file_path` as an overflow archive, not as the original source/document path.\n\
              - file_path: {}\n- summary: {}\n",
-            path.display(),
-            summary.summary
+            display_path, summary.summary
         )
     } else {
         format!(
@@ -173,6 +176,51 @@ pub(super) fn build_model_overflow_stub(
         tail_chars(&summary.body, TOOL_OVERFLOW_PREVIEW_CHARS)
     ));
     content_for_model
+}
+
+/// Live overflow files are direct children of a per-session directory and have
+/// globally unique generated names. Showing a typed short alias removes the
+/// repeated absolute prefix from model context; `read_file` resolves it strictly
+/// within the current session. Unexpected layouts keep the full path.
+fn model_overflow_display_path(path: &Path) -> String {
+    if path
+        .parent()
+        .is_some_and(|parent| parent.ends_with("tool-overflow"))
+    {
+        if let Some(file_name) = path.file_name() {
+            return format!(
+                "session-asset:tool-overflow/{}",
+                file_name.to_string_lossy()
+            );
+        }
+    }
+    path.display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_overflow_display_path;
+    use std::path::Path;
+
+    #[test]
+    fn live_overflow_display_path_omits_repeated_session_prefix() {
+        let path = Path::new(
+            "/home/user/.history_file.sessions/session.assets/tool-overflow/20261011-read_file-id.txt",
+        );
+        assert_eq!(
+            model_overflow_display_path(path),
+            "session-asset:tool-overflow/20261011-read_file-id.txt"
+        );
+    }
+
+    #[test]
+    fn unexpected_overflow_layout_keeps_full_path() {
+        let path = Path::new("/tmp/other/result.txt");
+        assert_eq!(
+            model_overflow_display_path(path),
+            path.display().to_string()
+        );
+    }
 }
 
 fn json_type_name(value: &Value) -> &'static str {

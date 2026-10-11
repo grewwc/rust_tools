@@ -697,6 +697,22 @@ pub(crate) fn session_overflow_asset_for_bare_name(
     Some(session_assets.join("tool-overflow-compressed").join(name))
 }
 
+/// Resolves a typed model-visible alias for a live tool-output artifact.
+///
+/// The alias encodes its asset class, so it cannot collide with a project path
+/// or another session asset directory. Only one direct child is accepted;
+/// absolute paths and traversal components fail closed.
+pub(crate) fn session_live_overflow_asset_for_alias(
+    alias: &str,
+    session_assets: &Path,
+) -> Option<PathBuf> {
+    let name = alias.strip_prefix("session-asset:tool-overflow/")?;
+    if !is_bare_file_name(name) {
+        return None;
+    }
+    Some(session_assets.join("tool-overflow").join(name))
+}
+
 fn blocked_overflow_read_reason(path: &Path) -> Option<String> {
     blocked_overflow_read_reason_for_assets(path, current_session_assets_dir().as_deref())
 }
@@ -935,8 +951,8 @@ mod tests {
         FileStore, blocked_overflow_read_reason_for_assets, is_bare_file_name,
         is_read_file_overflow_artifact, is_sensitive_fs_path, is_session_overflow_asset_path,
         normalize_lexical, overflow_artifact_tool_name, path_within_allowed_roots,
-        path_within_roots, remove_partial_create_file, session_overflow_asset_for_bare_name,
-        temp_registry,
+        path_within_roots, remove_partial_create_file, session_live_overflow_asset_for_alias,
+        session_overflow_asset_for_bare_name, temp_registry,
     };
     use crate::ai::test_support::ENV_LOCK;
     use std::path::{Path, PathBuf};
@@ -1029,6 +1045,24 @@ mod tests {
         );
         assert_eq!(
             session_overflow_asset_for_bare_name("/tmp/spilled-x.txt", assets),
+            None
+        );
+        assert_eq!(
+            session_live_overflow_asset_for_alias(
+                "session-asset:tool-overflow/20261011-read_file-id.txt",
+                assets
+            ),
+            Some(
+                assets
+                    .join("tool-overflow")
+                    .join("20261011-read_file-id.txt")
+            )
+        );
+        assert_eq!(
+            session_live_overflow_asset_for_alias(
+                "session-asset:tool-overflow/../evil.txt",
+                assets
+            ),
             None
         );
     }
