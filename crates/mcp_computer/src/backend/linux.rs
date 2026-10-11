@@ -27,8 +27,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Capture helpers, most capable first. `grim` is Wayland-only, the other two are
 /// X11 (ImageMagick's `import` also works on XWayland).
 const CAPTURE_TOOLS: [&str; 3] = ["grim", "scrot", "import"];
-/// Input helpers, most capable first.
-const INPUT_TOOLS: [&str; 2] = ["xdotool", "ydotool"];
 /// Window list helpers, most capable first.
 const WINDOW_TOOLS: [&str; 2] = ["wmctrl", "xdotool"];
 /// Upper bound on rows returned by `list_windows`, so one call cannot flood the
