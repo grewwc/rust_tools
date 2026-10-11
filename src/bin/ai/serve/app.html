@@ -164,8 +164,28 @@ select, summary { touch-action:manipulation; }
     touch-action:manipulation;
   }
   .msg.md .math.display { margin:4px 0; padding:0; }
-  #composer { gap:10px; }
-  #img, #send { min-width:52px; min-height:48px; font-size:18px; }
+  #composer {
+    display:grid; grid-template-columns:48px minmax(0,1fr) 48px;
+    grid-template-areas:"prompt prompt prompt" "image . send";
+    gap:9px 10px; margin:8px 10px; padding:10px 10px calc(10px + env(safe-area-inset-bottom));
+    border:1px solid var(--line); border-radius:20px;
+    background:linear-gradient(180deg, #1b2129 0%, #151a21 100%);
+    box-shadow:0 8px 24px rgba(0,0,0,.26);
+  }
+  #composer:focus-within { border-color:#388bfd; box-shadow:0 0 0 2px rgba(56,139,253,.18), 0 8px 24px rgba(0,0,0,.26); }
+  #prompt {
+    grid-area:prompt; width:100%; min-height:84px; max-height:38dvh;
+    box-sizing:border-box; padding:6px 6px 4px; border:0; border-radius:12px;
+    background:transparent; box-shadow:none; outline:none;
+    font-size:16px; line-height:1.5;
+  }
+  #img, #send {
+    width:48px; min-width:48px; height:48px; min-height:48px; padding:0;
+    align-self:center; border-radius:50%; font-size:19px;
+  }
+  #img { grid-area:image; font-size:0; background:#262d36; border-color:#3a424d; }
+  #img::before { content:"+"; font-size:28px; font-weight:300; line-height:1; }
+  #send { grid-area:send; justify-self:end; box-shadow:0 4px 14px rgba(31,111,235,.34); }
   #conn.open { flex-wrap:wrap; }
   #conn.open input { flex:1 1 100%; padding:10px 8px; }
   #conn.open #save { flex:1; min-height:44px; }
@@ -579,8 +599,10 @@ function syncOvrSummary() {
 // trapping multi-line input in a 44px box with an inner scroll.
 function growPrompt() {
   const p = $("prompt");
+  const phone = window.matchMedia && window.matchMedia("(max-width:700px)").matches;
+  const viewportRatio = phone ? 0.38 : 0.3;
   p.style.height = "auto";
-  p.style.height = Math.min(p.scrollHeight, Math.round(window.innerHeight * 0.3)) + "px";
+  p.style.height = Math.min(p.scrollHeight, Math.round(window.innerHeight * viewportRatio)) + "px";
 }
 function textOf(content) {
   if (typeof content === "string") return content;
@@ -1738,7 +1760,7 @@ function wire() {
   $("cdeny").onclick = () => answerConfirm(false);
   $("msgs").addEventListener("scroll", updateJumpButton, { passive: true });
   $("jumpbottom").onclick = () => scrollToLatest(true);
-  window.addEventListener("resize", updateJumpButton);
+  window.addEventListener("resize", () => { updateJumpButton(); growPrompt(); });
   // Android drops a backgrounded page's connections, and a page cannot see that
   // until it is visible again, so coming back is where recovery has to start.
   // A question the turn is blocked on survives a reconnect, so coming back to
@@ -1826,6 +1848,7 @@ function wire() {
     if (pendingImages.length && !$("prompt").value.includes("[[image:")) {
       $("prompt").value += ($("prompt").value && !$("prompt").value.endsWith("\n") ? "\n" : "") +
         pendingImages.map((im) => "[[image:" + im.filename + "]]").join("\n");
+      growPrompt();
     }
   };
 }

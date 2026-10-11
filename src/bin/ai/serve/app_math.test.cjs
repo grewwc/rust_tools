@@ -527,3 +527,38 @@ test("the jump-to-latest control is a phone-only overlaid round button", () => {
   assert.match(html, /#jumpbottom \{[\s\S]*?position:absolute;[\s\S]*?border-radius:50%;/);
   assert.match(html, /@media \(max-width:700px\) \{[\s\S]*?#jumpbottom\.show \{ opacity:1;/);
 });
+
+test("the phone composer stacks a roomy prompt above round action buttons", () => {
+  const desktopCss = html.slice(html.indexOf("<style>"), html.indexOf("@media (max-width:700px)"));
+  const phoneCss = html.slice(html.indexOf("@media (max-width:700px)"), html.indexOf("</style>"));
+  assert.match(desktopCss, /#composer \{ display:flex;/);
+  assert.match(phoneCss, /#composer \{[\s\S]*?display:grid;[\s\S]*?grid-template-areas:"prompt prompt prompt" "image \. send";/);
+  assert.match(phoneCss, /#prompt \{[\s\S]*?grid-area:prompt;[\s\S]*?min-height:84px;[\s\S]*?max-height:38dvh;/);
+  assert.match(phoneCss, /#img, #send \{[\s\S]*?width:48px;[\s\S]*?border-radius:50%;/);
+  assert.match(html, /<button id="send" class="primary">➤<\/button>/);
+});
+
+function growPromptHeight({ phone, scrollHeight, innerHeight = 600 }) {
+  const start = script.indexOf("function growPrompt(");
+  const end = script.indexOf("function textOf(", start);
+  const prompt = { scrollHeight, style: { height: "" } };
+  const context = vm.createContext({
+    window: { innerHeight, matchMedia: () => ({ matches: phone }) },
+    $: (id) => { assert.equal(id, "prompt"); return prompt; },
+  });
+  vm.runInContext(script.slice(start, end), context);
+  context.growPrompt();
+  return prompt.style.height;
+}
+
+test("prompt auto-growth uses a roomier phone cap without changing desktop", () => {
+  assert.equal(growPromptHeight({ phone: true, scrollHeight: 500 }), "228px");
+  assert.equal(growPromptHeight({ phone: false, scrollHeight: 500 }), "180px");
+  assert.equal(growPromptHeight({ phone: true, scrollHeight: 96 }), "96px");
+});
+
+test("composer height is reset after send and refreshed after image attachment", () => {
+  assert.match(html, /\$\("prompt"\)\.value = "";\s*\$\("prompt"\)\.style\.height = "auto";/);
+  assert.match(html, /pendingImages\.map\([\s\S]*?\.join\("\\n"\);\s*growPrompt\(\);/);
+  assert.match(html, /e\.key === "Enter" && \(e\.ctrlKey \|\| e\.metaKey\)/);
+});
