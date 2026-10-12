@@ -313,7 +313,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 iteration,
                 max_iterations,
             ) {
-                OutstandingWorkGateAction::Allow => false,
+                OutstandingWorkGateAction::Allow => None,
                 OutstandingWorkGateAction::Reopen => {
                     final_gate_state.consume_retry();
                     // Completed drafts are transactionally deferred and were never
@@ -321,7 +321,10 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     *terminal_dedupe_candidate = None;
                     return Ok(TurnLoopStep::Continue);
                 }
-                OutstandingWorkGateAction::Warn => true,
+                OutstandingWorkGateAction::Warn => Some(OUTSTANDING_WORK_WARNING),
+                OutstandingWorkGateAction::WarnUnasserted => {
+                    Some(OUTSTANDING_WORK_UNASSERTED_WARNING)
+                }
             };
             let warn_unretried_pause = match recoverable_pause_gate_action(
                 messages,
@@ -396,14 +399,14 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 );
                 record_hidden_self_note(app, turn_messages, COMPLETION_EVIDENCE_UNVERIFIED_NOTE);
             }
-            if warn_outstanding_work {
+            if let Some(outstanding_work_warning) = warn_outstanding_work {
                 append_runtime_warning_once(
                     &mut stream_result.assistant_text,
-                    OUTSTANDING_WORK_WARNING,
+                    outstanding_work_warning,
                 );
                 append_user_visible_final_notice(
                     terminal_dedupe_candidate,
-                    OUTSTANDING_WORK_WARNING,
+                    outstanding_work_warning,
                 );
             }
             if warn_unretried_pause {

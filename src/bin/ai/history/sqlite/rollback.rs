@@ -231,8 +231,9 @@ pub(in crate::ai) fn restore_sqlite_after_rollback_with_transaction(
 
 /// Create a consistent snapshot with the SQLite Online Backup API and write it to the target via atomic replacement.
 /// Copying the WAL main file directly would miss pages not yet checkpointed; the backup API reads both the main DB and the WAL
-/// from the same SQLite snapshot. After the main DB replacement succeeds, the old sidecar files are removed so a stale WAL/SHM
-/// cannot mix with the new main DB.
+/// from the same SQLite snapshot. The source opens read-only so a rollback never drops transient sidecars into the checkpoint
+/// directory (which used to bump its mtime and steal the `[latest]` tag). After the main DB replacement succeeds, the old
+/// sidecar files are removed so a stale WAL/SHM cannot mix with the new main DB.
 pub(in crate::ai) fn backup_sqlite(source: &Path, target: &Path) -> io::Result<()> {
     if !source.exists() {
         return Err(io::Error::new(
@@ -249,7 +250,9 @@ pub(in crate::ai) fn backup_sqlite(source: &Path, target: &Path) -> io::Result<(
     let temporary = parent.join(format!(".{file_name}.backup-{}.tmp", uuid::Uuid::new_v4()));
 
     let result = (|| {
-        let source_conn = Connection::open(source).map_err(|e| io::Error::other(e.to_string()))?;
+        let source_conn =
+            Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|e| io::Error::other(e.to_string()))?;
         source_conn
             .backup(rusqlite::MAIN_DB, &temporary, None)
             .map_err(|e| io::Error::other(e.to_string()))?;

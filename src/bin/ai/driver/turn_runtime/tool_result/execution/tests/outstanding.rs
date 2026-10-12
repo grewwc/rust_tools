@@ -106,11 +106,34 @@ fn failed_step_blocks_completion() {
 }
 
 #[test]
-fn settled_plan_allows_final() {
+fn settled_plan_without_claim_reopens_once_then_warns() {
     let (app, base) = test_app_with_session();
     two_step_plan(&app);
     update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
     update_plan_step(&app, 2, StepStatus::Skipped, None).unwrap();
+    // A settled plan is not a completion assertion: landing without `complete`
+    // must reopen once (the agent-side "continue"), guiding the model to
+    // assert completion structurally instead of silently ending the turn.
+    let mut messages = Vec::new();
+    let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16);
+    assert_eq!(action, OutstandingWorkGateAction::Reopen);
+    assert!(last_note(&messages).contains("no `complete` call asserts completion"));
+    let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 1, 16);
+    assert_eq!(action, OutstandingWorkGateAction::WarnUnasserted);
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn settled_plan_with_fresh_claim_allows_final() {
+    let (app, base) = test_app_with_session();
+    two_step_plan(&app);
+    update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
+    update_plan_step(&app, 2, StepStatus::Skipped, None).unwrap();
+    let plan_updated = crate::ai::tools::plan_state::load_plan_state(&app)
+        .unwrap()
+        .unwrap()
+        .updated_at_ms;
+    record_completion_claim(&app, "Done", Some(plan_updated)).unwrap();
     let mut messages = Vec::new();
     let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16);
     assert_eq!(action, OutstandingWorkGateAction::Allow);

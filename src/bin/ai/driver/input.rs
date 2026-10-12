@@ -2829,17 +2829,23 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
     let reasoning_effort_label =
         crate::ai::request::reasoning_effort_display_label(app, &app.current_model);
     if let Some(editor) = app.prompt_editor.as_mut() {
+        let checkpoint_store = crate::ai::history::CheckpointStore::new(
+            app.config.history_file.as_path(),
+            &app.session_id,
+        );
+        super::commands::publish_checkpoint_names(&checkpoint_store);
         crate::ai::prompt::completion::CommandCompleter::set_current_model_hint(&app.current_model);
         editor.set_current_model_label(&model_label);
         editor.set_current_agent_label(&app.current_agent);
         editor.set_current_reasoning_effort_label(reasoning_effort_label);
         editor.set_session_id(app.session_id.clone());
-        // 设置 session 主题：从当前 session 的首条用户消息生成概括性标题。
-        // 若 session 尚无用户消息（新 session），显示 "new session"。
-        // SessionStore 从基础 history 文件推导 `<stem>.sessions/`；传入当前
-        // session 文件的父目录会生成嵌套路径，导致读不到已生成的标题。
+        // Derive the session topic from the first user message. A session with
+        // no user messages is displayed as "new session".
+        // SessionStore derives `<stem>.sessions/` from the base history file;
+        // passing the current session file's parent would create a nested path
+        // and hide an already-generated title.
         let store = crate::ai::history::SessionStore::new(app.config.history_file.as_path());
-        // 优先使用 LLM 生成的标题，fallback 到首条消息摘要
+        // Prefer the LLM-generated title, then fall back to the first-message summary.
         let topic = store
             .read_session_title(&app.session_id)
             .ok()
@@ -2863,7 +2869,7 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
 
-    // 无 TUI 编辑器时，在输入提示前打印一行简短的模型提示。
+    // Without the TUI editor, print a compact model hint before the prompt.
     println!(
         "  {}[{}{}{}]{RESET}",
         theme::current().accent_muted,

@@ -1914,13 +1914,11 @@ fn render_turn_stream_to_with_confirm(
     // newline, or a live thinking status). Footer/message lines must start
     // on a fresh row instead of gluing onto the answer's last line.
     let mut line_open = false;
-    // End-of-stream metrics summaries (`↳ cache` / `↳ speed`) buffered instead
-    // of printed inline: a turn can keep streaming body chunks afterwards
-    // (multi-round model calls), and the FIFO/stdout pumps can reorder the two,
-    // so printing one here would tear the answer's open line mid-sentence.
-    // They flush at end-of-turn, like the local client which prints metrics
-    // after the answer completes.
-    let mut deferred_metrics: Vec<String> = Vec::new();
+    // End-of-stream metrics summaries (`↳ cache` / `↳ speed`) are discarded
+    // here: a multi-round turn emits one pair per model stream, and printing
+    // them all buries the answer tail in stale per-round summaries. The local
+    // run keeps them; the serve-chat scrollback keeps the answer and tool
+    // rows only.
     // Local-equivalent Markdown rendering: on a TTY the body deltas go
     // through the shared streaming renderer (tables, code blocks, math),
     // exactly like the local turn output. Piped output stays raw so
@@ -1962,7 +1960,7 @@ fn render_turn_stream_to_with_confirm(
                     tty,
                     out,
                 );
-                flush_deferred_metrics(&mut deferred_metrics, &mut line_open, out);
+                close_open_line(&mut line_open, out);
                 let msg = serde_json::from_str::<serde_json::Value>(payload)
                     .ok()
                     .and_then(|v| {
@@ -1986,7 +1984,7 @@ fn render_turn_stream_to_with_confirm(
                     tty,
                     out,
                 );
-                flush_deferred_metrics(&mut deferred_metrics, &mut line_open, out);
+                close_open_line(&mut line_open, out);
                 return Ok(());
             }
             "thinking_start" => {
@@ -2187,11 +2185,10 @@ fn render_turn_stream_to_with_confirm(
                     tty,
                     out,
                 );
-                // Metrics summaries must not tear the answer's open line (see
-                // `deferred_metrics`): buffer them for the end-of-turn flush.
+                // Metrics summaries are discarded (see above): they must neither
+                // tear the answer's open line nor bury the answer tail.
                 // Every other observer row keeps the previous inline behavior.
-                if is_deferred_metrics_footer(payload) {
-                    deferred_metrics.push(payload.to_string());
+                if is_metrics_footer(payload) {
                     let _ = out.flush();
                 } else {
                     // Body deltas carry no trailing newline, so the first footer
@@ -2230,7 +2227,7 @@ fn render_turn_stream_to_with_confirm(
         tty,
         out,
     );
-    flush_deferred_metrics(&mut deferred_metrics, &mut line_open, out);
+    close_open_line(&mut line_open, out);
     Ok(())
 }
 
@@ -2244,12 +2241,12 @@ fn thinking_summary(newlines: usize, chars: usize) -> usize {
 }
 
 /// Whether a stdout-derived footer row is an end-of-stream metrics summary.
-/// These (`↳ cache …`, `↳ speed …`) describe a finished stream, but the turn
-/// may keep going; matching on the marker (not the full line) keeps this
-/// robust to the child's indent/ANSI styling. Body text never reaches this
-/// path (it arrives as `delta` events), so a quoted marker in the answer
-/// cannot be misclassified here.
-fn is_deferred_metrics_footer(payload: &str) -> bool {
+/// These (`↳ cache …`, `↳ speed …`) are discarded by the serve-chat client;
+/// matching on the marker (not the full line) keeps this robust to the
+/// child's indent/ANSI styling. Body text never reaches this path (it arrives
+/// as `delta` events), so a quoted marker in the answer cannot be
+/// misclassified here.
+fn is_metrics_footer(payload: &str) -> bool {
     payload.contains("↳ cache") || payload.contains("↳ speed")
 }
 
@@ -2324,19 +2321,12 @@ fn annotate_remote_turn_header(payload: &str, tty: bool) -> String {
     }
 }
 
-/// Print buffered metrics footers at end-of-turn, each starting on a fresh
-/// row. Drains the buffer so every path (done/error/truncated stream) emits
-/// each row exactly once, in arrival order.
-fn flush_deferred_metrics(
-    pending: &mut Vec<String>,
-    line_open: &mut bool,
-    out: &mut dyn std::io::Write,
-) {
-    for row in pending.drain(..) {
-        if *line_open {
-            let _ = writeln!(out);
-        }
-        let _ = writeln!(out, "{row}");
+/// Close the answer's open row at end-of-turn so the scrollback ends on a
+/// fresh line. Metrics summaries used to provide this trailing newline as a
+/// side effect; with them discarded the terminator is explicit.
+fn close_open_line(line_open: &mut bool, out: &mut dyn std::io::Write) {
+    if *line_open {
+        let _ = writeln!(out);
         *line_open = false;
     }
     let _ = out.flush();
@@ -3480,38 +3470,45 @@ mod tests {
     }
 
     #[test]
-    fn sse_footer_after_body_starts_on_fresh_line() {
-        // The first footer must start on a new line; subsequent footers must
-        // not add another newline after the one the renderer already wrote.
+    fn sse_metrics_footers_are_dropped() {
+        // Metrics summaries never reach the serve-chat scrollback: the body
+        // stays, its open row is still terminated, and the footers vanish.
         let url = serve_body_once(
             "event: delta\ndata: {\"delta\": \"hi there\"}\n\ndata: ↳ cache · 1k\n\ndata: ↳ speed · output 10 tok/s\n\nevent: done\ndata: \n\n",
         );
         let resp = reqwest::blocking::get(url).expect("get canned SSE");
         let mut buf = Vec::new();
         render_turn_stream_to(resp, &mut buf, false).expect("render");
-        assert_eq!(
-            String::from_utf8(buf).expect("utf8"),
-            "hi there\n↳ cache · 1k\n↳ speed · output 10 tok/s\n"
-        );
+        assert_eq!(String::from_utf8(buf).expect("utf8"), "hi there\n");
     }
 
     #[test]
-    fn sse_metrics_footer_does_not_split_body() {
+    fn sse_metrics_footer_between_chunks_is_dropped() {
         // Regression net for the serve-chat interleave report: a metrics
         // footer (`↳ speed`) arriving between two body chunks of one sentence
-        // must not tear the sentence apart (`读` / speed / `不到。`). Metrics
-        // summaries buffer until `done`, so the body stays contiguous and the
-        // footer lands after it, like the local client.
+        // is discarded, so the sentence stays contiguous (`读` + `不到。`)
+        // and no footer lands after it.
         let url = serve_body_once(
             "event: delta\ndata: {\"delta\": \"读\"}\n\ndata: ↳ speed · reasoning 601 tok @ 108 tok/s\n\nevent: delta\ndata: {\"delta\": \"不到。\"}\n\nevent: done\ndata: \n\n",
         );
         let resp = reqwest::blocking::get(url).expect("get canned SSE");
         let mut buf = Vec::new();
         render_turn_stream_to(resp, &mut buf, false).expect("render");
-        assert_eq!(
-            String::from_utf8(buf).expect("utf8"),
-            "读不到。\n↳ speed · reasoning 601 tok @ 108 tok/s\n"
+        assert_eq!(String::from_utf8(buf).expect("utf8"), "读不到。\n");
+    }
+
+    #[test]
+    fn sse_multi_round_metrics_are_dropped() {
+        // A multi-round turn emits one cache/speed pair per model stream. The
+        // client drops them all, so the answer tail keeps the viewport
+        // instead of a wall of stale per-round summaries.
+        let url = serve_body_once(
+            "event: delta\ndata: {\"delta\": \"done\"}\n\ndata: ↳ cache · 1k\n\ndata: ↳ speed · round one\n\ndata: ↳ cache · 2k\n\ndata: ↳ speed · round two\n\nevent: done\ndata: \n\n",
         );
+        let resp = reqwest::blocking::get(url).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        assert_eq!(String::from_utf8(buf).expect("utf8"), "done\n");
     }
 
     #[test]
@@ -3562,8 +3559,8 @@ mod tests {
         // client neither re-indents nor clamps these rows; soft-wrap of a row
         // wider than the terminal is the terminal's own layout, identical to
         // a local run of the same turn. Metrics summaries (`↳ cache` /
-        // `↳ speed`) stay byte-identical too, but flush at end-of-turn (after
-        // the tool rows) so they can never tear the answer's open line.
+        // `↳ speed`) are dropped instead, so they can never tear the answer's
+        // open line or bury the answer tail; the tool rows stay byte-identical.
         let cache = "  \u{1b}[2m↳ cache · 4.1k/22.0k tokens · 19% hit\u{1b}[0m";
         let speed = "  \u{1b}[2m↳ speed · reasoning 1.6k tok @ 48.4 tok/s\u{1b}[0m";
         let done = "  \u{1b}[32m✓\u{1b}[0m read_file  \u{1b}[2m·\u{1b}[0m target";
@@ -3571,8 +3568,7 @@ mod tests {
         let long_cmd = format!("  │ $ {}", "cd /data00/x; ".repeat(20));
         assert!(long_cmd.chars().count() > 200);
         let failed = "  \u{1b}[31m✕\u{1b}[0m execute_command";
-        let expected =
-            format!("ok\n{done}\n{running}\n{long_cmd}\n{failed}\n{cache}\n{speed}\n");
+        let expected = format!("ok\n{done}\n{running}\n{long_cmd}\n{failed}\n");
         let body = format!(
             "event: delta\ndata: {{\"delta\": \"ok\"}}\n\ndata: {cache}\n\ndata: {speed}\n\ndata: {done}\n\ndata: {running}\n\ndata: {long_cmd}\n\ndata: {failed}\n\nevent: done\ndata: \n\n"
         );
@@ -3594,12 +3590,18 @@ mod tests {
         let mut buf = Vec::new();
         render_turn_stream_to(resp, &mut buf, true).expect("render");
         let out = String::from_utf8(buf).expect("utf8");
-        for row in [cache, speed, done, running, long_cmd.as_str(), failed] {
+        for row in [done, running, long_cmd.as_str(), failed] {
             assert!(row.starts_with("  "), "fixture lost indent: {row:?}");
             assert!(!row.starts_with("   "), "fixture gained indent: {row:?}");
             assert!(
                 out.lines().any(|line| line == row),
                 "message row mangled or missing on TTY: {row:?}"
+            );
+        }
+        for dropped in [cache, speed] {
+            assert!(
+                !out.lines().any(|line| line == dropped),
+                "metrics footer leaked onto TTY: {dropped:?}"
             );
         }
     }
@@ -3667,7 +3669,9 @@ mod tests {
         let _ = rendered_tx.send(());
         assert!(server.join().expect("server"), "renderer waited for EOF");
         result.expect("render");
-        assert_eq!(buf, b"answer");
+        // End-of-turn still terminates the answer's open row, even when no
+        // footer follows it.
+        assert_eq!(buf, b"answer\n");
     }
 
     #[test]

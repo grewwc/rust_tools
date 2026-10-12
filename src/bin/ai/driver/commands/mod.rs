@@ -43,6 +43,10 @@ pub use theme::try_handle_theme_command;
 pub use title::try_handle_title_command;
 pub use usage::try_handle_usage_command;
 
+pub(super) fn publish_checkpoint_names(store: &crate::ai::history::CheckpointStore) {
+    checkpoint::publish_checkpoint_names(store);
+}
+
 /// True when `token` begins a local slash command (e.g. `/sessions`, `:bg`).
 ///
 /// The one-shot CLI (`cli.rs::protect_slash_command_args`) uses this to detect

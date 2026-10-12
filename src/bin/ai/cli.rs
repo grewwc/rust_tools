@@ -453,7 +453,9 @@ fn protect_slash_command_args(argv: &mut Vec<String>, kinds: &FastMap<String, Cl
         match kind {
             CliOptionKind::Flag => {}
             CliOptionKind::Value => {
-                if !tok.contains('=') && let Some(next) = argv.get(i) {
+                if !tok.contains('=')
+                    && let Some(next) = argv.get(i)
+                {
                     if !next.starts_with('-') {
                         extracted.push(next.clone());
                         i += 1;
@@ -461,7 +463,9 @@ fn protect_slash_command_args(argv: &mut Vec<String>, kinds: &FastMap<String, Cl
                 }
             }
             CliOptionKind::Files => {
-                if !tok.contains('=') && let Some(next) = argv.get(i) {
+                if !tok.contains('=')
+                    && let Some(next) = argv.get(i)
+                {
                     extracted.push(next.clone());
                     i += 1;
                 }
@@ -728,7 +732,9 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         && !cli.serve_restart
         && !cli.serve_bind.trim().is_empty()
     {
-        eprintln!("[serve] warning: --serve-bind is set without --serve/--serve-chat/--serve-sessions/--serve-start/--serve-restart; it will be ignored");
+        eprintln!(
+            "[serve] warning: --serve-bind is set without --serve/--serve-chat/--serve-sessions/--serve-start/--serve-restart; it will be ignored"
+        );
     }
 
     // Handle list-tools.
@@ -973,7 +979,7 @@ fn generate_bash(
     // argument is an internal command, the second argument completes its
     // subcommands instead of the top-level flags/command list.
     println!("  local usage_sub='today 7d 30d all daily trend days models help'");
-    println!("  local checkpoint_sub='save list rollback delete help'");
+    println!("  local checkpoint_sub='save commit list checkout fork delete help'");
     println!(
         "  local history_sub='full user assistant tool system grep rewind export copy last replay help 3 6 10 20'"
     );
@@ -1025,7 +1031,9 @@ fn generate_bash(
     println!("            _a_hist_f=\"${{_a_hist_f##*/}}\"");
     println!("            _a_hist_sess=\"$_a_hist_sess ${{_a_hist_f%.sqlite}}\"");
     println!("          done");
-    println!("          COMPREPLY=($(compgen -W \"$history_sub $_a_hist_sess\" -- \"$cur\")); return 0");
+    println!(
+        "          COMPREPLY=($(compgen -W \"$history_sub $_a_hist_sess\" -- \"$cur\")); return 0"
+    );
     println!("        fi");
     println!("        COMPREPLY=($(compgen -W \"$history_sub\" -- \"$cur\")); return 0 ;;");
     println!("      /sessions|:sessions|/ss|:ss)");
@@ -1171,7 +1179,9 @@ fn generate_zsh(
     println!();
     // Subcommand mapping.
     println!("  local -a _a_usage_subcmds=(today 7d 30d all daily trend days models help)");
-    println!("  local -a _a_checkpoint_subcmds=(save list rollback delete help)");
+    println!(
+        "  local -a _a_checkpoint_subcmds=(save commit list checkout fork delete help)"
+    );
     println!(
         "  local -a _a_history_subcmds=(full user assistant tool system grep rewind export copy last replay help 3 6 10 20)"
     );

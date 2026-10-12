@@ -34,6 +34,12 @@ static AGENT_NAME_CANDIDATES: LazyLock<RwLock<Option<Vec<CompletionCandidate>>>>
 static SERVE_SESSION_CANDIDATES: LazyLock<RwLock<Vec<(String, String)>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
 
+/// Checkpoint names of the current session, newest-first. The driver refreshes
+/// this cache before each interactive prompt and after checkpoint mutations, so
+/// Tab completion never needs to scan the disk itself.
+static CHECKPOINT_NAME_CANDIDATES: LazyLock<RwLock<Vec<String>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+
 /// Command words the running client adds on top of [`COMMANDS_TRIE`]: serve-chat
 /// registers commands of its own (`/resume`, `/bg`, ...), while the local REPL
 /// registers nothing. Kept apart from the trie so neither client is offered the
@@ -202,6 +208,15 @@ impl CommandCompleter {
     pub(in crate::ai) fn set_serve_session_candidates(entries: Vec<(String, String)>) {
         if let Ok(mut guard) = SERVE_SESSION_CANDIDATES.write() {
             *guard = entries;
+        }
+    }
+
+    /// Update the checkpoint-name completion cache (see
+    /// [`CHECKPOINT_NAME_CANDIDATES`]). Names arrive newest-first; later calls
+    /// replace the set.
+    pub(in crate::ai) fn set_checkpoint_name_candidates(names: Vec<String>) {
+        if let Ok(mut guard) = CHECKPOINT_NAME_CANDIDATES.write() {
+            *guard = names;
         }
     }
 
@@ -635,7 +650,43 @@ impl CommandCompleter {
 
     /// Subcommands of `/checkpoint` / `/cp`.
     fn checkpoint_subcommands() -> &'static [&'static str] {
-        &["save", "tree", "list", "rollback", "delete", "help"]
+        &[
+            "save", "commit", "tree", "list", "checkout", "fork", "delete", "clear", "help",
+        ]
+    }
+
+    /// Checkpoint-name candidates for checkpoint-switch and delete commands
+    /// (best-effort): names from the
+    /// driver-published cache, newest-first, capped so a large checkpoint
+    /// directory never floods the candidate list. `include_aliases` adds the
+    /// `checkout` pointer aliases (`HEAD`, `@`, `-`, `latest`); `delete`
+    /// rejects pointer aliases, so it gets names only. An unpopulated cache
+    /// yields no candidates instead of failing completion.
+    fn checkpoint_name_candidates(token: &str, include_aliases: bool) -> Vec<CompletionCandidate> {
+        let mut candidates = Vec::new();
+        if include_aliases {
+            for alias in ["HEAD", "@", "-", "latest"] {
+                if alias.to_lowercase().starts_with(&token.to_lowercase()) {
+                    candidates.push(CompletionCandidate {
+                        display: format!("{alias} · checkpoint alias"),
+                        replacement: alias.to_string(),
+                    });
+                }
+            }
+        }
+        if let Ok(guard) = CHECKPOINT_NAME_CANDIDATES.read() {
+            let mut names: Vec<&str> = guard
+                .iter()
+                .map(String::as_str)
+                .filter(|name| name.starts_with(token))
+                .collect();
+            names.truncate(50);
+            candidates.extend(names.into_iter().map(|name| CompletionCandidate {
+                display: format!("{name} · checkpoint"),
+                replacement: name.to_string(),
+            }));
+        }
+        candidates
     }
 
     /// Topics of `/help` (same set `try_handle_help_command` accepts).
@@ -965,6 +1016,32 @@ impl CommandCompleter {
                     ),
                     _ => Vec::new(),
                 }
+            } else if matches!(first, "/checkpoint" | ":checkpoint" | "/cp" | ":cp") {
+                match words.next() {
+                    // `/checkpoint <TAB>`: subcommand literals.
+                    None => Self::plain_candidates(
+                        Self::checkpoint_subcommands()
+                            .iter()
+                            .filter(|c| c.starts_with(token))
+                            .map(|c| c.to_string()),
+                    ),
+                    // `/checkpoint checkout|fork <TAB>`: checkpoint names plus
+                    // the pointer aliases (`HEAD`, `@`, `-`, `latest`).
+                    Some(sub)
+                        if matches!(sub, "checkout" | "co" | "switch" | "fork")
+                            && words.next().is_none() =>
+                    {
+                        Self::checkpoint_name_candidates(token, true)
+                    }
+                    // `/checkpoint delete <TAB>`: names only (`delete` rejects
+                    // pointer aliases).
+                    Some(sub)
+                        if matches!(sub, "delete" | "del" | "rm") && words.next().is_none() =>
+                    {
+                        Self::checkpoint_name_candidates(token, false)
+                    }
+                    _ => Vec::new(),
+                }
             } else {
                 let sources: &[&str] = match first {
                     "/skills" | ":skills" | "/skill" | ":skill" => {
@@ -1009,8 +1086,9 @@ impl CommandCompleter {
                     "/sessions" | ":sessions" | "/ss" | ":ss" => Self::session_subcommands(),
                     "/personas" | ":personas" => Self::persona_subcommands(),
                     "/usage" | ":usage" => Self::usage_subcommands(),
-                    "/checkpoint" | ":checkpoint" | "/cp" | ":cp" => Self::checkpoint_subcommands(),
                     "/help" | ":help" => Self::help_topics(),
+                    // `/checkpoint` is handled by its own branch above (third-token
+                    // checkpoint names), so it has no arm here.
                     "/model" | ":model" => Self::model_subcommands(),
                     // `/effort <TAB>` -> reasoning-effort levels (same set as `/model effort <level>`).
                     "/effort" | ":effort" => Self::model_effort_levels(),
@@ -1832,6 +1910,67 @@ mod tests {
     }
 
     #[test]
+    fn command_completion_suggests_checkpoint_names_for_switches_and_delete() {
+        // The checkpoint cache is global; serialize with any sibling writer so
+        // a parallel reset cannot empty the cache mid-assertion.
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        CommandCompleter::set_checkpoint_name_candidates(vec![
+            "before_more_change".to_string(),
+            "after_edit".to_string(),
+        ]);
+        // Third token after checkout completes names plus pointer aliases.
+        let (_, checkout) = CommandCompleter::complete_for_line("/cp checkout ", 13);
+        let replacements: Vec<&str> = checkout
+            .iter()
+            .map(|candidate| candidate.replacement.as_str())
+            .collect();
+        assert!(replacements.contains(&"before_more_change"));
+        assert!(replacements.contains(&"HEAD"));
+        assert!(replacements.contains(&"latest"));
+        let (_, fork) = CommandCompleter::complete_for_line("/cp fork bef", 12);
+        assert!(
+            fork.iter()
+                .any(|candidate| candidate.replacement == "before_more_change")
+        );
+        // A name prefix narrows to the matching checkpoint.
+        let (_, narrowed) = CommandCompleter::complete_for_line("/cp checkout la", 15);
+        assert!(
+            narrowed
+                .iter()
+                .any(|candidate| candidate.replacement == "latest")
+        );
+        // `delete` offers names but never pointer aliases.
+        let (_, delete) = CommandCompleter::complete_for_line("/checkpoint delete ", 19);
+        assert!(
+            delete
+                .iter()
+                .any(|candidate| candidate.replacement == "before_more_change")
+        );
+        assert!(
+            delete
+                .iter()
+                .all(|candidate| candidate.replacement != "HEAD")
+        );
+        // Second token still completes subcommands.
+        let (_, sub) = CommandCompleter::complete_for_line("/cp check", 9);
+        assert!(
+            sub.iter()
+                .any(|candidate| candidate.replacement == "checkout")
+        );
+        let (_, fork_subcommand) = CommandCompleter::complete_for_line("/cp fo", 6);
+        assert!(
+            fork_subcommand
+                .iter()
+                .any(|candidate| candidate.replacement == "fork")
+        );
+        let (_, removed_rollback) = CommandCompleter::complete_for_line("/cp roll", 8);
+        assert!(removed_rollback.is_empty());
+        CommandCompleter::set_checkpoint_name_candidates(Vec::new());
+    }
+
+    #[test]
     fn command_completion_resume_completes_row_numbers() {
         // Both resume tests share the global serve-session cache; serialize
         // them so a parallel reset cannot empty the cache mid-assertion.
@@ -1843,10 +1982,7 @@ mod tests {
             ("aa11bb22-2".to_string(), "write docs".to_string()),
         ]);
         let (_, candidates) = CommandCompleter::complete_for_line("/resume ", 8);
-        let replacements: Vec<&str> = candidates
-            .iter()
-            .map(|c| c.replacement.as_str())
-            .collect();
+        let replacements: Vec<&str> = candidates.iter().map(|c| c.replacement.as_str()).collect();
         assert_eq!(replacements, vec!["1", "2"]);
         assert!(candidates[0].display.contains("fix login bug"));
         // A digit prefix narrows to the matching row.
@@ -2491,7 +2627,10 @@ mod tests {
             candidates.first().map(|c| c.replacement.as_str()),
             Some("audit_own_changes"),
             "expected audit_own_changes first for `{line}`: {:?}",
-            candidates.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+            candidates
+                .iter()
+                .map(|c| &c.replacement)
+                .collect::<Vec<_>>()
         );
     }
 

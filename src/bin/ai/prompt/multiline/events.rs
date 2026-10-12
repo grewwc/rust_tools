@@ -125,11 +125,20 @@ pub(in crate::ai::prompt::multiline) fn handle_multiline_event(
                 (code, modifiers) if is_submit_key(code, modifiers) => {
                     let content = textarea_content(textarea);
                     let trimmed = content.trim_end_matches('\n').to_string();
-                    Ok(EventLoopAction::Submit(if trimmed.trim().is_empty() {
-                        None
+                    let empty = trimmed.trim().is_empty();
+                    // A bare Escape on an empty box is easy to press by accident
+                    // (e.g. to dismiss a completion); never let it end the
+                    // conversation. Deliberate submit keys (Alt+Enter / F2) and
+                    // Ctrl+C remain the explicit exit paths.
+                    if empty && code == KeyCode::Esc && modifiers == KeyModifiers::NONE {
+                        Ok(EventLoopAction::Continue)
                     } else {
-                        Some(trimmed)
-                    }))
+                        Ok(EventLoopAction::Submit(if empty {
+                            None
+                        } else {
+                            Some(trimmed)
+                        }))
+                    }
                 }
                 (KeyCode::Char('v'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                     match save_clipboard_images(session_image_dir) {
@@ -548,6 +557,62 @@ mod tests {
     fn submit_key_recognizes_esc() {
         assert!(is_submit_key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!is_submit_key(KeyCode::Esc, KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn escape_on_empty_box_does_not_exit() {
+        let mut textarea = TextArea::default();
+        let mut history = MultilineHistoryState::new(Vec::new());
+        let mut status_msg = None;
+        let mut pending_tab_completion = None;
+        let mut completion_panel = None;
+        let mut recent_text_input = None;
+
+        let action = handle_multiline_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut textarea,
+            &mut history,
+            &mut status_msg,
+            &mut pending_tab_completion,
+            &mut completion_panel,
+            &mut recent_text_input,
+            Path::new("/tmp"),
+        )
+        .unwrap();
+        assert!(matches!(action, EventLoopAction::Continue));
+
+        // Whitespace-only counts as empty too.
+        insert_text(&mut textarea, "   ");
+        let action = handle_multiline_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut textarea,
+            &mut history,
+            &mut status_msg,
+            &mut pending_tab_completion,
+            &mut completion_panel,
+            &mut recent_text_input,
+            Path::new("/tmp"),
+        )
+        .unwrap();
+        assert!(matches!(action, EventLoopAction::Continue));
+
+        // A populated box still submits on Escape.
+        insert_text(&mut textarea, "hello");
+        let action = handle_multiline_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut textarea,
+            &mut history,
+            &mut status_msg,
+            &mut pending_tab_completion,
+            &mut completion_panel,
+            &mut recent_text_input,
+            Path::new("/tmp"),
+        )
+        .unwrap();
+        assert!(matches!(
+            action,
+            EventLoopAction::Submit(Some(text)) if text == "   hello"
+        ));
     }
 
     #[test]

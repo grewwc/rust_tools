@@ -41,7 +41,7 @@ pub(in crate::ai) use blob::{
 #[allow(unused_imports)]
 pub(in crate::ai) use checkpoint::{
     CheckpointInfo, CheckpointStore, MAX_CHECKPOINTS_PER_SESSION,
-    MAX_CHECKPOINT_STORAGE_BYTES,
+    MAX_CHECKPOINT_STORAGE_BYTES, is_reserved_checkpoint_name,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use compress::value_to_string;
