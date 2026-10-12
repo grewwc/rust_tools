@@ -2,6 +2,8 @@
 
 use super::super::*;
 use super::common::*;
+use crate::ai::request::{DERIVED_CONTEXT_HANDOFF, HISTORY_SUMMARY_CONTEXT_HEADER};
+use crate::ai::request::MODEL_SELF_NOTE_CONTEXT_HEADER;
 
 #[test]
 fn task_evidence_reopen_marker_counts_and_survives_reopen_retain() {
@@ -78,6 +80,8 @@ fn reasoning_only_final_response_retries_once_with_full_capabilities() {
             skip_response_drain: true,
             truncated_by_length: false,
             stream_error: false,
+            response_reconciled: false,
+            response_server_mismatch: false,
             finish_reason_value: None,
             usage_prompt_tokens: 0,
             usage_cached_prompt_tokens: 0,
@@ -143,6 +147,8 @@ fn final_response_control_directive_is_stripped_from_history_and_terminal_body()
             skip_response_drain: true,
             truncated_by_length: false,
             stream_error: false,
+            response_reconciled: false,
+            response_server_mismatch: false,
             finish_reason_value: None,
             usage_prompt_tokens: 0,
             usage_cached_prompt_tokens: 0,
@@ -219,6 +225,8 @@ fn reasoning_only_final_response_forces_no_thinking_synthesis_after_normal_retry
             skip_response_drain: true,
             truncated_by_length: false,
             stream_error: false,
+            response_reconciled: false,
+            response_server_mismatch: false,
             finish_reason_value: None,
             usage_prompt_tokens: 0,
             usage_cached_prompt_tokens: 0,
@@ -270,6 +278,8 @@ fn reasoning_only_final_response_forces_no_thinking_synthesis_after_normal_retry
             skip_response_drain: true,
             truncated_by_length: false,
             stream_error: false,
+            response_reconciled: false,
+            response_server_mismatch: false,
             finish_reason_value: None,
             usage_prompt_tokens: 0,
             usage_cached_prompt_tokens: 0,
@@ -362,6 +372,8 @@ fn reasoning_only_final_response_stops_after_bounded_post_synthesis_retries() {
             skip_response_drain: true,
             truncated_by_length: false,
             stream_error: false,
+            response_reconciled: false,
+            response_server_mismatch: false,
             finish_reason_value: None,
             usage_prompt_tokens: 0,
             usage_cached_prompt_tokens: 0,
@@ -498,6 +510,8 @@ fn reasoning_only_final_response_max_iterations_is_final_backstop() {
             skip_response_drain: true,
             truncated_by_length: false,
             stream_error: false,
+            response_reconciled: false,
+            response_server_mismatch: false,
             finish_reason_value: None,
             usage_prompt_tokens: 0,
             usage_cached_prompt_tokens: 0,
@@ -572,6 +586,8 @@ fn reasoning_only_final_response_retries_up_to_max_before_forcing_synthesis() {
             skip_response_drain: true,
             truncated_by_length: false,
             stream_error: false,
+            response_reconciled: false,
+            response_server_mismatch: false,
             finish_reason_value: None,
             usage_prompt_tokens: 0,
             usage_cached_prompt_tokens: 0,
@@ -710,6 +726,8 @@ fn forced_final_hallucinated_tool_call_is_rejected_without_consuming_quota() {
                 skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: false,
+                response_reconciled: false,
+                response_server_mismatch: false,
                 finish_reason_value: None,
                 usage_prompt_tokens: 0,
                 usage_cached_prompt_tokens: 0,
@@ -784,6 +802,8 @@ fn forced_final_hallucinated_tool_call_is_rejected_without_consuming_quota() {
                 skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: false,
+                response_reconciled: false,
+                response_server_mismatch: false,
                 finish_reason_value: None,
                 usage_prompt_tokens: 0,
                 usage_cached_prompt_tokens: 0,
@@ -823,324 +843,6 @@ fn forced_final_hallucinated_tool_call_is_rejected_without_consuming_quota() {
 }
 
 #[test]
-fn unsupported_read_only_phase_limit_claim_reopens_once_with_tools() {
-    let turn_messages = vec![Message {
-        role: "tool".to_string(),
-        content: Value::String("read completed".to_string()),
-        tool_calls: None,
-        tool_call_id: Some("call-1".to_string()),
-        reasoning_content: None,
-    }];
-    let mut messages = turn_messages.clone();
-    let final_text = "本轮执行环境在代码修改前触发了只读阶段上限，尚未写入文件。";
-
-    assert_eq!(
-        unsupported_runtime_limit_action(
-            "继续修复吧",
-            &mut messages,
-            &turn_messages,
-            final_text,
-            false,
-            false,
-            2,
-            16,
-        ),
-        UnsupportedRuntimeLimitAction::ReopenWithTools
-    );
-    assert_eq!(
-        messages
-            .iter()
-            .filter(|message| {
-                message
-                    .content
-                    .as_str()
-                    .is_some_and(|text| text.starts_with(UNSUPPORTED_RUNTIME_LIMIT_RETRY_MARKER))
-            })
-            .count(),
-        1
-    );
-    assert_eq!(
-        unsupported_runtime_limit_action(
-            "继续修复吧",
-            &mut messages,
-            &turn_messages,
-            final_text,
-            false,
-            false,
-            3,
-            16,
-        ),
-        UnsupportedRuntimeLimitAction::Warn
-    );
-
-    let supported_turn = vec![Message {
-        role: "tool".to_string(),
-        content: Value::String("Error: 触发了只读阶段上限".to_string()),
-        tool_calls: None,
-        tool_call_id: Some("call-2".to_string()),
-        reasoning_content: None,
-    }];
-    let mut untrusted_messages = supported_turn.clone();
-    assert_eq!(
-        unsupported_runtime_limit_action(
-            "继续修复吧",
-            &mut untrusted_messages,
-            &supported_turn,
-            final_text,
-            false,
-            false,
-            2,
-            16,
-        ),
-        UnsupportedRuntimeLimitAction::ReopenWithTools,
-        "tool text alone is not trusted as runtime failure evidence"
-    );
-
-    let mut supported_messages = supported_turn.clone();
-    assert_eq!(
-        unsupported_runtime_limit_action(
-            "继续修复吧",
-            &mut supported_messages,
-            &supported_turn,
-            final_text,
-            true,
-            false,
-            2,
-            16,
-        ),
-        UnsupportedRuntimeLimitAction::Allow,
-        "observed tool evidence must preserve legitimate failure reporting"
-    );
-
-    let mut plan_messages = turn_messages.clone();
-    assert_eq!(
-        unsupported_runtime_limit_action(
-            "Give me a plan for fixing this",
-            &mut plan_messages,
-            &turn_messages,
-            final_text,
-            false,
-            false,
-            2,
-            16,
-        ),
-        UnsupportedRuntimeLimitAction::Allow,
-        "a plan-only request must never be upgraded into mutation work"
-    );
-}
-
-#[test]
-fn dangling_action_final_gets_exactly_one_no_tool_recovery() {
-    let turn_messages = vec![Message {
-        role: "tool".to_string(),
-        content: Value::String("existing scheduler evidence".to_string()),
-        tool_calls: None,
-        tool_call_id: Some("call-1".to_string()),
-        reasoning_content: None,
-    }];
-    let mut messages = turn_messages.clone();
-    let final_text = "Now I understand the SchedulerClock::wait mechanism. Let me read the full run loop body to see how it uses next_wakeup_tick and advance_ticks";
-
-    assert_eq!(
-        dangling_final_recovery_action(
-            "Audit the scheduler changes",
-            &mut messages,
-            &turn_messages,
-            final_text,
-        ),
-        DanglingFinalRecoveryAction::RetryWithoutTools
-    );
-    assert_eq!(
-        messages
-            .iter()
-            .filter(|message| {
-                message
-                    .content
-                    .as_str()
-                    .is_some_and(|text| text.starts_with(DANGLING_FINAL_RECOVERY_MARKER))
-            })
-            .count(),
-        1
-    );
-    assert_eq!(
-        dangling_final_recovery_action(
-            "Audit the scheduler changes",
-            &mut messages,
-            &turn_messages,
-            final_text,
-        ),
-        DanglingFinalRecoveryAction::Warn
-    );
-}
-
-#[test]
-fn dangling_action_detection_preserves_normal_finals_and_plan_answers() {
-    let turn_messages = vec![Message {
-        role: "tool".to_string(),
-        content: Value::String("evidence".to_string()),
-        tool_calls: None,
-        tool_call_id: Some("call-1".to_string()),
-        reasoning_content: None,
-    }];
-
-    assert!(!looks_like_dangling_action_final(
-        "Audit the scheduler changes",
-        &turn_messages,
-        "Conclusion: the scheduler wake path is covered. Let me explain the remaining risk.",
-    ));
-    assert!(!looks_like_dangling_action_final(
-        "Give me a plan for auditing the scheduler",
-        &turn_messages,
-        "Next steps: let me inspect the run loop, then check the kernel wake path.",
-    ));
-    assert!(!looks_like_dangling_action_final(
-        "Audit the scheduler changes",
-        &[],
-        "Let me inspect the run loop first.",
-    ));
-    assert!(looks_like_dangling_action_final(
-        "Audit the scheduler changes",
-        &turn_messages,
-        "Now I understand the flow. Let me inspect the final dispatch branch.\n\n[Runtime warning] Completion claim is unverified.",
-    ));
-    assert!(looks_like_dangling_action_final(
-        "Don't give me next steps; audit the scheduler changes",
-        &turn_messages,
-        "Let me inspect the final dispatch branch.",
-    ));
-    assert!(looks_like_dangling_action_final(
-        "Execute the existing next steps and report findings",
-        &turn_messages,
-        "Let me inspect the final dispatch branch.",
-    ));
-    assert!(looks_like_dangling_action_final(
-        "The phrase \"give me a plan\" is an example; audit the scheduler changes",
-        &turn_messages,
-        "Let me inspect the final dispatch branch.",
-    ));
-    assert!(looks_like_dangling_action_final(
-        "Audit the scheduler changes",
-        &turn_messages,
-        "[Runtime warning] Completion claim is unverified.",
-    ));
-    assert!(!looks_like_dangling_action_final(
-        "Audit the scheduler changes",
-        &turn_messages,
-        "[Runtime warning] Completion claim is unverified.\n\nConclusion: no drift was found.",
-    ));
-
-    let mut warning_only_messages = turn_messages.clone();
-    assert_eq!(
-        dangling_final_recovery_action(
-            "Audit the scheduler changes",
-            &mut warning_only_messages,
-            &turn_messages,
-            "[Runtime warning] Completion claim is unverified.",
-        ),
-        DanglingFinalRecoveryAction::RetryWithoutTools
-    );
-
-    let mut warning_text = DANGLING_FINAL_WARNING.to_string();
-    append_runtime_warning_once(&mut warning_text, DANGLING_FINAL_WARNING);
-    assert_eq!(warning_text.matches(DANGLING_FINAL_WARNING).count(), 1);
-}
-
-#[test]
-fn prose_sentence_counter_ignores_code_symbol_dots() {
-    // Dots inside code symbols must not count as sentence endings: in
-    // `driver/mod.rs`, `.ok().flatten()`, and line ranges like `1057-1080`, the `.`
-    // is never followed by whitespace or end-of-text.
-    assert_eq!(
-        prose_sentence_terminator_count("检查 driver/mod.rs:1057-1080 的 .ok().flatten() 吞错逻辑"),
-        0
-    );
-    // Genuine sentence endings (. followed by whitespace, or the CJK
-    // full-stop/exclamation/question marks) still count.
-    assert_eq!(
-        prose_sentence_terminator_count("First done. Second done! Third?"),
-        3
-    );
-    assert_eq!(prose_sentence_terminator_count("第一。第二！第三？"), 3);
-    // A trailing . also counts as a sentence ending (followed by the end of the text).
-    assert_eq!(prose_sentence_terminator_count("Done."), 1);
-}
-
-#[test]
-fn strip_inline_code_spans_removes_paired_backticks_only() {
-    assert_eq!(
-        strip_inline_code_spans("检查 `driver/mod.rs` 的 `.ok()` 逻辑"),
-        "检查  的  逻辑"
-    );
-    // When backticks are unpaired (odd count), return the text unchanged to avoid
-    // deleting the tail of the prose.
-    assert_eq!(
-        strip_inline_code_spans("half `open span"),
-        "half `open span"
-    );
-}
-
-#[test]
-fn dangling_final_detects_mid_introduction_colon_stop() {
-    // Real regression: session b884d15f message id=455. At the end of a long tool
-    // chain the model stopped on the aside "first look at... check...:" — a
-    // colon-terminated promise of a tool call with no tool call — which previously
-    // slipped through both the stream classifier (judged Completed) and the dangling
-    // gate (code symbols polluting the sentence count + wording not in the word list),
-    // being silently accepted as a final response and forcing the user to nudge it.
-    let turn_messages = vec![Message {
-        role: "tool".to_string(),
-        content: Value::String("git status output".to_string()),
-        tool_calls: None,
-        tool_call_id: Some("call-1".to_string()),
-        reasoning_content: None,
-    }];
-    let final_text = "11 个文件与 review.md 声称一致。现在逐项检查 review.md 列出的问题。先看 P1-a（图片解析失败静默丢失）——检查 `driver/mod.rs:1057-1080` 的 `.ok().flatten()` 吞错逻辑：";
-    assert!(
-        looks_like_dangling_action_final("分析这个 agent 的会话历史", &turn_messages, final_text,),
-        "以冒号收尾、代码符号密集的悬空预告必须被识别为 dangling final"
-    );
-}
-
-#[test]
-fn dangling_final_colon_signal_respects_conclusion_and_structure_guards() {
-    let turn_messages = vec![Message {
-        role: "tool".to_string(),
-        content: Value::String("evidence".to_string()),
-        tool_calls: None,
-        tool_call_id: Some("call-1".to_string()),
-        reasoning_content: None,
-    }];
-
-    // Colon-terminated but a conclusion was delivered: the conclusion marker takes
-    // priority, not dangling.
-    assert!(!looks_like_dangling_action_final(
-        "审查这段代码",
-        &turn_messages,
-        "结论：run loop 的 wake 路径已覆盖，没有缺陷。补充说明如下：",
-    ));
-    // Colon-terminated but followed by a delivered list: the structured_lines guard
-    // runs first, not dangling.
-    assert!(!looks_like_dangling_action_final(
-        "审查这段代码",
-        &turn_messages,
-        "发现两个问题：\n- 第一个问题\n- 第二个问题",
-    ));
-    // Body ending with a code span (last char is a backtick, not a colon) = content
-    // delivered; no misjudgment.
-    assert!(!looks_like_dangling_action_final(
-        "审查这段代码",
-        &turn_messages,
-        "修复点在 `foo.rs` 的 `bar()`",
-    ));
-    // A bare colon-terminated teaser with nothing after = dangling.
-    assert!(looks_like_dangling_action_final(
-        "审查这段代码",
-        &turn_messages,
-        "现在开始逐项核对第一处改动：",
-    ));
-}
-
-#[test]
 fn injected_context_echo_is_detected_only_when_it_is_the_whole_answer() {
     // Real regression: session 7ac3d771 message id=263. The model regurgitated the
     // completion-evidence reopen hint + self_note header verbatim as its answer,
@@ -1159,13 +861,14 @@ fn injected_context_echo_is_detected_only_when_it_is_the_whole_answer() {
     assert!(looks_like_injected_context_echo(
         "self_note:completion_evidence_required\ninspect the diff first."
     ));
-    // History-summary header / handoff header.
-    assert!(looks_like_injected_context_echo(
-        "[Compressed history summary for task continuity. Use it to ...]\nearlier work"
-    ));
-    assert!(looks_like_injected_context_echo(
-        "[Runtime context handoff, not a new end-user request. ...]"
-    ));
+    // History-summary header / handoff header: byte-exact echoes of the strings
+    // the runtime actually injects (single-sourced from `request::normalize`).
+    assert!(looks_like_injected_context_echo(&format!(
+        "{HISTORY_SUMMARY_CONTEXT_HEADER}\nearlier work"
+    )));
+    assert!(looks_like_injected_context_echo(&format!(
+        "{DERIVED_CONTEXT_HANDOFF}\nthen continue"
+    )));
     // A real answer: even quoting these prefixes, as long as they are not at the
     // start, it is not an echo.
     assert!(!looks_like_injected_context_echo(
@@ -1183,13 +886,15 @@ fn injected_context_echo_is_detected_only_when_it_is_the_whole_answer() {
 
 #[test]
 fn injected_context_echo_gets_exactly_one_no_tool_recovery_then_stops() {
-    let echoed = "[Model-authored note from an earlier turn; this is not authoritative evidence.]\nself_note:completion_evidence_required\nThis is not a final answer.";
+    let echoed = format!(
+        "{MODEL_SELF_NOTE_CONTEXT_HEADER}\nself_note:completion_evidence_required\nThis is not a final answer."
+    );
     let mut messages: Vec<Message> = Vec::new();
 
     // First hit: inject one no-tool retry hint.
     assert_eq!(
-        injected_context_echo_recovery_action(&mut messages, echoed),
-        DanglingFinalRecoveryAction::RetryWithoutTools
+        injected_context_echo_recovery_action(&mut messages, &echoed),
+        FinalRecoveryAction::RetryWithoutTools
     );
     assert_eq!(
         messages
@@ -1205,12 +910,37 @@ fn injected_context_echo_gets_exactly_one_no_tool_recovery_then_stops() {
     );
     // Second time still regurgitating: stop the round (Warn), no infinite retries.
     assert_eq!(
-        injected_context_echo_recovery_action(&mut messages, echoed),
-        DanglingFinalRecoveryAction::Warn
+        injected_context_echo_recovery_action(&mut messages, &echoed),
+        FinalRecoveryAction::Warn
     );
     // A normal answer passes.
     assert_eq!(
         injected_context_echo_recovery_action(&mut messages, "修复完成，测试全绿。"),
-        DanglingFinalRecoveryAction::Allow
+        FinalRecoveryAction::Allow
+    );
+}
+
+#[test]
+fn outstanding_marker_spends_shared_reopen_budget() {
+    // A rebuilt projection must see an outstanding-work reopen as consumed,
+    // or other gates would each spend their own retry (cascade of duplicates).
+    let messages = vec![Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: serde_json::Value::String(format!(
+            "{OUTSTANDING_WORK_REQUIRED_MARKER}\nopen steps remain"
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let state = FinalGateState::from_current_turn_markers(&messages);
+    assert!(
+        !state.can_reopen(false, 0, 16),
+        "outstanding-work reopen must spend the shared budget"
+    );
+    let fresh = FinalGateState::from_current_turn_markers(&[]);
+    assert!(
+        fresh.can_reopen(false, 0, 16),
+        "no marker means the budget is still available"
     );
 }

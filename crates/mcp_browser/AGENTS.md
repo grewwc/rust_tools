@@ -55,7 +55,7 @@ Same 13 tools/args as CDP; `wait_for_human` never `unavailable`. Dedicated invar
 |---|---|---|
 | `MCP_BROWSER_DRIVER` | auto `applescript`/else `cdp` | driver; `MCP_BROWSER_WS_URL` forces `cdp` |
 | `MCP_BROWSER_HEADLESS` | `0` | `1`/`true` = headless (CDP only) |
-| `MCP_BROWSER_CHROME` | `/Applications/Google Chrome.app/...` | Chrome exe (CDP) |
+| `MCP_BROWSER_CHROME` | auto-detected per OS | Explicit Chrome/Chromium executable (CDP) |
 | `MCP_BROWSER_WS_URL` | (unset) | attach via `Browser::connect` |
 | `MCP_BROWSER_USER_DATA_DIR` | (unset) | explicit profile (reused, never GC'd; don't share) |
 | `MCP_BROWSER_OP_TIMEOUT_MS` | `90000` | per-op cap < host timeout |

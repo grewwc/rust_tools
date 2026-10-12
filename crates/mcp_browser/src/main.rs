@@ -31,13 +31,20 @@ use serde_json::Value;
 /// browser).
 struct BrowserServer {
     mode: DriverMode,
+    capability_error: Option<String>,
     session: Option<Session>,
 }
 
 impl BrowserServer {
-    fn new() -> Self {
+    async fn new() -> Self {
+        let mode = DriverMode::from_env();
+        let capability_error = browser::capability_preflight(mode).await.err();
+        if let Some(reason) = &capability_error {
+            eprintln!("mcp_browser tools disabled: {reason}");
+        }
         Self {
-            mode: DriverMode::from_env(),
+            capability_error,
+            mode,
             session: None,
         }
     }
@@ -48,9 +55,20 @@ impl McpServer for BrowserServer {
         tools::initialize_result()
     }
     fn tools_list_result(&self) -> Value {
-        tools::tools_list_result()
+        if self.capability_error.is_some() {
+            serde_json::json!({ "tools": [] })
+        } else {
+            tools::tools_list_result()
+        }
     }
     async fn handle_tools_call(&mut self, params: Option<Value>) -> Result<Value, JsonRpcErr> {
+        if let Some(reason) = &self.capability_error {
+            return Err(JsonRpcErr::new(
+                -32000,
+                &format!("browser capability unavailable: {reason}"),
+                None,
+            ));
+        }
         if self.mode.is_applescript() {
             // Reuse the 13 tool definitions/parameter names from tools.rs; the
             // implementation runs on the applescript driver.
@@ -104,5 +122,41 @@ async fn main() {
     // (browser-specific, synchronous, idempotent) rather than a trait hook.
     browser::gc_stale_profiles();
 
-    mcp_stdio::run(BrowserServer::new()).await;
+    mcp_stdio::run(BrowserServer::new().await).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server_with_capability(capability_error: Option<&str>) -> BrowserServer {
+        BrowserServer {
+            mode: DriverMode::Cdp,
+            capability_error: capability_error.map(str::to_string),
+            session: None,
+        }
+    }
+
+    #[test]
+    fn unavailable_browser_publishes_no_tools() {
+        let server = server_with_capability(Some("Chrome is unavailable"));
+        assert_eq!(server.tools_list_result()["tools"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn available_browser_keeps_browser_tools_visible() {
+        let server = server_with_capability(None);
+        assert!(
+            server.tools_list_result()["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_browser_rejects_direct_tool_calls_without_a_session() {
+        let mut server = server_with_capability(Some("Chrome is unavailable"));
+        assert!(server.handle_tools_call(None).await.is_err());
+        assert!(server.session.is_none());
+    }
 }

@@ -1,0 +1,20 @@
+{
+  "name": "complete",
+  "description": "Assert all planned work is done. Call with a short summary once every plan step is done or skipped, then write the final response text. The runtime verifies the assertion against the session plan: if steps are still pending/running/failed, the turn reopens instead of ending. Without an active plan this is a no-op receipt.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "summary": {
+        "type": "string",
+        "description": "What was accomplished (one or two sentences)."
+      }
+    },
+    "required": [
+      "summary"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "core"
+  ]
+}

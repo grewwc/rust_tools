@@ -271,41 +271,23 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             let echo_action = if !final_gate_reopen_allowed
                 && looks_like_injected_context_echo(&stream_result.assistant_text)
             {
-                DanglingFinalRecoveryAction::Warn
+                FinalRecoveryAction::Warn
             } else {
                 injected_context_echo_recovery_action(messages, &stream_result.assistant_text)
             };
             match echo_action {
-                DanglingFinalRecoveryAction::Allow => {}
-                DanglingFinalRecoveryAction::RetryWithoutTools => {
+                FinalRecoveryAction::Allow => {}
+                FinalRecoveryAction::RetryWithoutTools => {
                     final_gate_state.consume_retry();
                     record_force_final_reason(messages, "injected_context_echo", iteration, None);
                     *force_final_response = true;
                     return Ok(TurnLoopStep::Continue);
                 }
-                DanglingFinalRecoveryAction::Warn => {
+                FinalRecoveryAction::Warn => {
                     *final_assistant_text = INJECTED_CONTEXT_ECHO_STOP.to_string();
                     return Ok(TurnLoopStep::Break);
                 }
             }
-            let warn_unsupported_runtime_limit = match unsupported_runtime_limit_action(
-                question,
-                messages,
-                turn_messages,
-                &stream_result.assistant_text,
-                *turn_had_tool_error,
-                !final_gate_reopen_allowed,
-                iteration,
-                max_iterations,
-            ) {
-                UnsupportedRuntimeLimitAction::Allow => false,
-                UnsupportedRuntimeLimitAction::ReopenWithTools => {
-                    final_gate_state.consume_retry();
-                    *force_final_response = false;
-                    return Ok(TurnLoopStep::Continue);
-                }
-                UnsupportedRuntimeLimitAction::Warn => true,
-            };
             let warn_unverified_completion = match completion_evidence_gate_action(
                 messages,
                 turn_messages,
@@ -323,6 +305,23 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     return Ok(TurnLoopStep::Continue);
                 }
                 CompletionEvidenceGateAction::Warn => true,
+            };
+            let warn_outstanding_work = match outstanding_work_gate_action(
+                app,
+                messages,
+                !final_gate_reopen_allowed,
+                iteration,
+                max_iterations,
+            ) {
+                OutstandingWorkGateAction::Allow => false,
+                OutstandingWorkGateAction::Reopen => {
+                    final_gate_state.consume_retry();
+                    // Completed drafts are transactionally deferred and were never
+                    // user-visible, so they must not become a dedupe candidate.
+                    *terminal_dedupe_candidate = None;
+                    return Ok(TurnLoopStep::Continue);
+                }
+                OutstandingWorkGateAction::Warn => true,
             };
             let warn_unretried_pause = match recoverable_pause_gate_action(
                 messages,
@@ -376,31 +375,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 }
                 FinalCitationGateAction::Warn => true,
             };
-            let dangling_action = if !final_gate_reopen_allowed
-                && looks_like_dangling_action_final(
-                    question,
-                    turn_messages,
-                    &stream_result.assistant_text,
-                ) {
-                DanglingFinalRecoveryAction::Warn
-            } else {
-                dangling_final_recovery_action(
-                    question,
-                    messages,
-                    turn_messages,
-                    &stream_result.assistant_text,
-                )
-            };
-            let warn_dangling_final = match dangling_action {
-                DanglingFinalRecoveryAction::Allow => false,
-                DanglingFinalRecoveryAction::RetryWithoutTools => {
-                    final_gate_state.consume_retry();
-                    record_force_final_reason(messages, "dangling_action_final", iteration, None);
-                    *force_final_response = true;
-                    return Ok(TurnLoopStep::Continue);
-                }
-                DanglingFinalRecoveryAction::Warn => true,
-            };
             let previously_rendered_body_matches = terminal_dedupe_candidate
                 .as_deref()
                 .is_some_and(|candidate| {
@@ -411,23 +385,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             // complete accepted answer below so finalize renders it exactly once; if an
             // identical tool-round narration was already visible, only new warnings remain.
             *terminal_dedupe_candidate = None;
-            if warn_unsupported_runtime_limit {
-                append_runtime_warning_once(
-                    &mut stream_result.assistant_text,
-                    UNSUPPORTED_RUNTIME_LIMIT_WARNING,
-                );
-                append_user_visible_final_notice(
-                    terminal_dedupe_candidate,
-                    UNSUPPORTED_RUNTIME_LIMIT_WARNING,
-                );
-            }
-            if warn_dangling_final {
-                append_runtime_warning_once(
-                    &mut stream_result.assistant_text,
-                    DANGLING_FINAL_WARNING,
-                );
-                append_user_visible_final_notice(terminal_dedupe_candidate, DANGLING_FINAL_WARNING);
-            }
             if warn_unverified_completion {
                 append_runtime_warning_once(
                     &mut stream_result.assistant_text,
@@ -438,6 +395,16 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     COMPLETION_EVIDENCE_WARNING,
                 );
                 record_hidden_self_note(app, turn_messages, COMPLETION_EVIDENCE_UNVERIFIED_NOTE);
+            }
+            if warn_outstanding_work {
+                append_runtime_warning_once(
+                    &mut stream_result.assistant_text,
+                    OUTSTANDING_WORK_WARNING,
+                );
+                append_user_visible_final_notice(
+                    terminal_dedupe_candidate,
+                    OUTSTANDING_WORK_WARNING,
+                );
             }
             if warn_unretried_pause {
                 append_runtime_warning_once(

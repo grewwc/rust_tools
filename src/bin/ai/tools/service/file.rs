@@ -255,7 +255,11 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
 
     let offset = args["offset"].as_u64().unwrap_or(1) as usize;
     let char_offset = args["char_offset"].as_u64().unwrap_or(0) as usize;
-    let limit = args["limit"].as_u64().unwrap_or(1000) as usize;
+    // Default window is intentionally small (200 lines): a large default pushes
+    // every unread-file call past the mid-turn spill threshold and forces an
+    // overflow fold. Callers page with offset/limit; the truncation notice
+    // below guarantees the continuation point, so no content is lost.
+    let limit = args["limit"].as_u64().unwrap_or(200) as usize;
     // Numbered lines by default (grounding axis); with use_line_numbers=false, return raw content,
     // so the result can feed directly into apply_patch as exact source text or into other tools.
     let use_line_numbers = should_render_read_file_line_numbers(

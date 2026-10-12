@@ -1,5 +1,6 @@
 pub(crate) mod command_tools;
 mod common;
+mod complete_tools;
 pub(crate) mod enable_tools;
 mod knowledge_tools;
 pub mod os_tools;

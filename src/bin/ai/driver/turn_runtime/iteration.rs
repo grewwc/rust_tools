@@ -1812,39 +1812,34 @@ pub(super) async fn execute_turn_iteration(
                     continue;
                 }
 
-                // Not retryable or retries exhausted — fall back to the old behavior and keep the conversation going
+                // Not retryable or retries exhausted — never fabricate a Completed
+                // placeholder: it would end the turn showing junk as the answer.
+                // Return a stream-error Truncated instead so the turn loop keeps
+                // going with its existing bounded auto-retry counter; no tool call
+                // was produced from this broken stream, so retrying is side-effect
+                // free.
                 if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
                     eprintln!("\n[Error] 流式响应处理失败：{}", err_msg);
-                    eprintln!("[Info] 尝试继续对话...");
+                    eprintln!("[Info] 本轮自动重试中...");
                 }
-                let stream_result = StreamResult {
-                    outcome: StreamOutcome::Completed,
+                return Ok(IterationExecution::Truncated(StreamResult {
+                    outcome: StreamOutcome::Truncated,
                     tool_calls: Vec::new(),
-                    assistant_text: "[Response parsing failed; please retry]".to_string(),
+                    assistant_text: String::new(),
                     hidden_meta: String::new(),
                     reasoning_text: String::new(),
                     reasoning_items: Vec::new(),
-                    skip_response_drain: false,
+                    skip_response_drain: true,
                     truncated_by_length: false,
-                    stream_error: false,
+                    stream_error: true,
+                    response_reconciled: false,
+                    response_server_mismatch: false,
                     finish_reason_value: None,
                     usage_prompt_tokens: 0,
                     usage_cached_prompt_tokens: 0,
                     usage_completion_tokens: 0,
                     usage_reasoning_tokens: 0,
-                };
-                return finalize_stream_interaction(
-                    app,
-                    &actual_model,
-                    &mut response,
-                    stream_result,
-                    turn_messages,
-                    one_shot_mode,
-                    persisted_turn_messages,
-                    should_quit,
-                    force_final_response,
-                )
-                .await;
+                }));
             }
         }
     }

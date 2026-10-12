@@ -58,6 +58,10 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
         "generate_svg.skill",
         include_str!("builtin_skills/generate_svg.skill"),
     ),
+    (
+        "mr-review-verdict.skill",
+        include_str!("builtin_skills/mr-review-verdict.skill"),
+    ),
 ];
 
 /// Body of a builtin skill (front matter stripped), resolved through the same parser the

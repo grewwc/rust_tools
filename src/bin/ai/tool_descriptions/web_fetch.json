@@ -1,6 +1,6 @@
 {
   "name": "web_fetch",
-  "description": "Fetch a public HTTP or HTTPS URL without a browser using Jina Reader. Returns bounded Markdown-like text marked as untrusted external content. An optional JINA_API_KEY environment variable enables authenticated upstream access.",
+  "description": "Fetch a public HTTP or HTTPS URL without a browser. Uses the configured reader providers (default: Jina Reader at r.jina.ai) in order; if every reader fails and ai.web.direct_fetch_fallback is enabled (default), fetches the target URL directly and strips HTML to text (public hosts only). Returns bounded text marked as untrusted external content. An optional JINA_API_KEY environment variable enables authenticated upstream access.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -16,7 +16,6 @@
     ]
   },
   "groups": [
-    "builtin",
-    "core"
+    "builtin"
   ]
 }

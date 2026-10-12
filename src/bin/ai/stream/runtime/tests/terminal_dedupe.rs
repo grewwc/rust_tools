@@ -52,6 +52,10 @@ fn completed_assistant_body_is_withheld_for_final_gates() {
     let mut app = test_app();
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
+    // This test exercises the Completed path: the provider declared the end,
+    // so the body is a finished answer, not a mid-generation cut.
+    state.content.finish_reason_seen = true;
+    state.content.finish_reason_value = Some("stop".to_string());
     state.render.defer_assistant_body = true;
     state.render.terminal_dedupe = Some(TerminalDedupeState {
         candidate: "older visible narration".to_string(),

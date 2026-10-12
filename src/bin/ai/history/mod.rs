@@ -39,7 +39,10 @@ pub(in crate::ai) use blob::{
     replace_history_messages, truncate_history_messages,
 };
 #[allow(unused_imports)]
-pub(in crate::ai) use checkpoint::{CheckpointInfo, CheckpointStore};
+pub(in crate::ai) use checkpoint::{
+    CheckpointInfo, CheckpointStore, MAX_CHECKPOINTS_PER_SESSION,
+    MAX_CHECKPOINT_STORAGE_BYTES,
+};
 #[allow(unused_imports)]
 pub(in crate::ai) use compress::value_to_string;
 #[allow(unused_imports)]

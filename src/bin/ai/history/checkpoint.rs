@@ -32,14 +32,18 @@ use super::{
         restore_sqlite_after_rollback_with_transaction,
     },
 };
-const MAX_CHECKPOINTS_PER_SESSION: usize = 20;
-const MAX_CHECKPOINT_STORAGE_BYTES: u64 = 512 * 1024 * 1024;
+pub(in crate::ai) const MAX_CHECKPOINTS_PER_SESSION: usize = 50;
+pub(in crate::ai) const MAX_CHECKPOINT_STORAGE_BYTES: u64 = 512 * 1024 * 1024;
 const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 const GENERATION_SQLITE_FILE: &str = "history.sqlite";
 const GENERATION_ASSETS_DIR: &str = "assets";
 const GENERATION_MANIFEST_FILE: &str = "checkpoint.manifest";
 const GENERATION_STAGE_MARKER: &str = ".stage-";
 const GENERATION_PREVIOUS_MARKER: &str = ".previous-";
+/// Git-style pointer to the most recently preserved checkpoint. It is a plain
+/// file (not a checkpoint directory), so it never shows up in listings; it
+/// only records a name for `rollback HEAD` (`@`, `-`) to resolve.
+const HEAD_REF_FILE: &str = "HEAD.ref";
 const LIVE_ROLLBACK_PREFIX: &str = ".live-rollback-";
 const LIVE_ROLLBACK_MANIFEST: &str = "rollback.manifest";
 
@@ -124,6 +128,15 @@ impl CheckpointStore {
     /// Returns the checkpoint file path.
     pub(in crate::ai) fn save(&self, name: &str) -> io::Result<PathBuf> {
         let normalized_name = sanitize_name(name);
+        if is_reserved_checkpoint_name(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "'{normalized_name}' is reserved for the HEAD pointer; \
+                     pick another checkpoint name"
+                ),
+            ));
+        }
         self.with_locked(|store| {
             if !store.session_file.exists() {
                 return Err(io::Error::new(
@@ -203,8 +216,60 @@ impl CheckpointStore {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
-            Ok(store.remove_legacy_checkpoint(&normalized_name)? || deleted)
+            let deleted = store.remove_legacy_checkpoint(&normalized_name)? || deleted;
+            if deleted {
+                // Dropping history is only allowed through explicit delete:
+                // when the deleted checkpoint was the HEAD target, drop the
+                // pointer as well so it never dangles.
+                store.clear_head_if_points_to_unlocked(&normalized_name)?;
+            }
+            Ok(deleted)
         })
+    }
+
+    /// Read the HEAD pointer (the most recently preserved checkpoint name).
+    /// Returns `None` when no rollback or save has set it yet.
+    pub(in crate::ai) fn head_target(&self) -> io::Result<Option<String>> {
+        self.with_locked(|store| store.head_target_unlocked())
+    }
+
+    /// Point HEAD at `name` (sanitized). Called after a successful preserve
+    /// or save so `rollback HEAD` bounces back to the latest preserved state.
+    pub(in crate::ai) fn set_head(&self, name: &str) -> io::Result<()> {
+        let normalized_name = sanitize_name(name);
+        self.with_locked(|store| {
+            fs::create_dir_all(&store.dir)?;
+            fs::write(store.dir.join(HEAD_REF_FILE), format!("{normalized_name}\n"))?;
+            Ok(())
+        })
+    }
+
+    fn head_target_unlocked(&self) -> io::Result<Option<String>> {
+        match fs::read_to_string(self.dir.join(HEAD_REF_FILE)) {
+            Ok(content) => {
+                let target = content.trim().to_string();
+                if target.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(target))
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn clear_head_if_points_to_unlocked(&self, normalized_name: &str) -> io::Result<()> {
+        match self.head_target_unlocked()? {
+            Some(target) if target == normalized_name => {
+                match fs::remove_file(self.dir.join(HEAD_REF_FILE)) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Err(err) => Err(err),
+                }
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Recover unfinished live rollbacks at startup and before every
@@ -868,6 +933,7 @@ fn restore_checkpoint_assets(source: &Path, destination: &Path) -> io::Result<()
 /// Normalize a checkpoint name into a safe file name (alphanumeric, `-`, `_`;
 /// everything else becomes `_`).
 fn sanitize_name(name: &str) -> String {
+    // Keep in sync with `is_reserved_checkpoint_name` below.
     let mut out = String::new();
     for ch in name.chars() {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
@@ -882,6 +948,15 @@ fn sanitize_name(name: &str) -> String {
     } else {
         out
     }
+}
+
+/// Whether `name` is reserved for the HEAD pointer (`HEAD` case-insensitively,
+/// plus the git-style aliases `@` and `-`). Reserved names can never become
+/// checkpoint directories: on case-insensitive filesystems `head` and `HEAD`
+/// would collide, and `@` / `-` sanitize to misleading directory names.
+pub(in crate::ai) fn is_reserved_checkpoint_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.eq_ignore_ascii_case("head") || trimmed == "@" || trimmed == "-"
 }
 
 #[cfg(test)]
@@ -1068,6 +1143,47 @@ mod tests {
         assert!(store.list().unwrap().is_empty());
 
         // Cleanup.
+        if let Some(grandparent) = history_file.parent() {
+            let _ = fs::remove_dir_all(grandparent);
+        }
+    }
+
+    #[test]
+    fn head_pointer_tracks_preserved_state_and_clears_on_delete() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-head");
+        // No HEAD before anything is preserved.
+        assert_eq!(store.head_target().unwrap(), None);
+
+        append_history_messages(
+            &store.session_file,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("v1".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        store.save("c1").unwrap();
+        store.set_head("c1").unwrap();
+        assert_eq!(store.head_target().unwrap().as_deref(), Some("c1"));
+        // The pointer file must not show up as a checkpoint.
+        assert_eq!(
+            store.list().unwrap().iter().map(|cp| cp.name.clone()).collect::<Vec<_>>(),
+            vec!["c1".to_string()]
+        );
+
+        // Reserved names can never become checkpoint directories.
+        assert!(store.save("HEAD").is_err());
+        assert!(store.save("@").is_err());
+        assert!(store.save("-").is_err());
+
+        // Deleting the HEAD target clears the pointer without touching history.
+        assert!(store.delete("c1").unwrap());
+        assert_eq!(store.head_target().unwrap(), None);
+
         if let Some(grandparent) = history_file.parent() {
             let _ = fs::remove_dir_all(grandparent);
         }

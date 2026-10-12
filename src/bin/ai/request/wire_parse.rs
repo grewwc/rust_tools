@@ -35,6 +35,12 @@ pub(in crate::ai) enum ParsedStreamPayload {
     ResponseTerminal {
         status: ResponseTerminalStatus,
         chunk: StreamChunk,
+        /// Server-assembled visible text from the terminal event (`response.output[]`
+        /// message content). Empty for wires without a server-side copy (chat
+        /// completions) and for incomplete terminals. The finalize path reconciles
+        /// it against the delta-assembled text: a strict-prefix shortfall means the
+        /// transport lost the tail even though the provider declared completion.
+        server_text: String,
     },
     /// `content_part.added` (output_text type) carries the complete text that currently
     /// exists in that part, overlapping with the incremental `output_text.delta`. This is

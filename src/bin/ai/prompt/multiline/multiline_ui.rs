@@ -31,7 +31,7 @@ use super::{
     MultilineHistoryState,
     completion_panel::{CompletionPanel, PendingTabCompletion},
     events::{EventLoopAction, RecentTextInput, handle_multiline_event},
-    render::render_multiline_popup_with_width,
+    render::{render_multiline_popup_with_width, textarea_row_range},
 };
 #[cfg(test)]
 use super::render::render_multiline_popup;
@@ -260,6 +260,18 @@ struct PromptScreen {
     /// because the terminal keeps cells written by earlier frames, and
     /// `prepare_viewport` drops the record whenever the box's rows are cleared.
     box_row_widths: Vec<u16>,
+    /// Span of the textarea rows inside `box_row_widths`, as
+    /// `(start, len, total)`: `start` is the first textarea row index, `len`
+    /// its row count, `total` the viewport height that geometry was built for.
+    /// `None` means no frame has recorded one yet.
+    ///
+    /// A width reflow must place the rebuilt box only by the rows that keep
+    /// wrapping across a repaint (the textarea). Chrome rows (title, help,
+    /// rules) repaint truncated to an ellipsis, so counting their old
+    /// soft-wraps in the anchor offset lifts the box a little higher on every
+    /// fold-to-ellipsis narrowing. The full count is still needed to blank the
+    /// old wraps above the new top; see `rebuild_after_terminal_reflow`.
+    wrap_row_span: Option<(u16, u16, u16)>,
 }
 
 impl PromptScreen {
@@ -1002,12 +1014,37 @@ fn rebuild_after_terminal_reflow(
         }
         _ => 0,
     };
+    // Placement must ignore the chrome rows' transient soft-wraps: the title,
+    // help and rule rows repaint truncated to an ellipsis, so their old wraps
+    // collapse on the next frame. Counting them in the anchor offset lifts the
+    // box a little higher on every fold-to-ellipsis narrowing, which reads as
+    // the input area drifting up with a growing blank band. Only the textarea
+    // rows keep wrapping, so only they place the box. The span is trusted only
+    // when it was recorded for this exact box height; otherwise fall back to
+    // the whole-box count.
+    let place_span = match (last_drawn_area, screen.wrap_row_span) {
+        (Some(previous_area), Some((start, len, total)))
+            if total == previous_area.height =>
+        {
+            Some((start, len))
+        }
+        _ => None,
+    };
+    let place_rows = match last_drawn_area {
+        Some(previous_area) if !screen.alternate => reflowed_place_rows(
+            previous_area,
+            &screen.box_row_widths,
+            terminal_size.width,
+            place_span,
+        ),
+        _ => 0,
+    };
     // Locate the FIRST row of the reflowed old box, not a new-height box ending
     // at the parked cursor. Clearing and rebuilding there removes all its visible
     // fragments without moving transcript rows relative to scrollback. A global
     // ScrollDown would insert blank rows at that boundary instead of repairing it.
     let cursor_offset = parked_anchor_offset(last_drawn_area, requested_height)
-        .saturating_add(extra_rows);
+        .saturating_add(place_rows);
     let rebuilt_area = rebuild_fixed_viewport(
         terminal,
         screen,
@@ -1024,6 +1061,21 @@ fn rebuild_after_terminal_reflow(
         verify_anchor,
     )?;
     park_reflow_anchor(terminal, rebuilt_area)?;
+    // The rebuild clears from the new (placed) top downwards, so the chrome
+    // wraps between the old reflowed top and the new top would stay on screen
+    // as a blank band above the box. Blank exactly those rows: the old top is
+    // flush under the transcript on a narrowing, so this range holds only the
+    // old box's own wraps, never history. It rests on the same anchor trust
+    // as the rebuild itself.
+    let released = extra_rows.saturating_sub(place_rows);
+    if released > 0 {
+        let new_top = rebuilt_area.y;
+        clear_row_range(
+            terminal.backend_mut(),
+            new_top.saturating_sub(released),
+            new_top,
+        )?;
+    }
     // A resize during the blocking cursor query belongs to the next rebuild;
     // callers must not mark a fresh backend size as already applied here.
     Ok((rebuilt_area, terminal_size))
@@ -1043,26 +1095,65 @@ fn rebuild_after_terminal_reflow(
 /// saturates at row zero; ordinary screen erasure cannot recover those hidden
 /// input rows without also mutating the transcript's scrollback.
 fn reflowed_extra_rows(previous_area: Rect, row_widths: &[u16], new_width: u16) -> u16 {
+    reflowed_rows(previous_area, row_widths, new_width, None)
+}
+
+/// Rows of the old box that keep their wraps across a repaint, counted for
+/// anchor placement: only `place_span` (`Some((start, len))` indices into the
+/// old box's rows) contributes. Chrome rows repaint truncated to an ellipsis,
+/// so their transient soft-wraps must not lift the anchor; `None` keeps the
+/// historical whole-box count.
+fn reflowed_place_rows(
+    previous_area: Rect,
+    row_widths: &[u16],
+    new_width: u16,
+    place_span: Option<(u16, u16)>,
+) -> u16 {
+    reflowed_rows(previous_area, row_widths, new_width, place_span)
+}
+
+fn reflowed_rows(
+    previous_area: Rect,
+    row_widths: &[u16],
+    new_width: u16,
+    only: Option<(u16, u16)>,
+) -> u16 {
     // A row cannot be painted wider than the box it was drawn in, so nothing can
     // re-wrap once the box fits; a zero width would also divide by zero.
     if new_width == 0 || previous_area.width <= new_width {
         return 0;
     }
+    let in_span = |index: u16| match only {
+        None => true,
+        Some((start, len)) => index >= start && index < start.saturating_add(len),
+    };
     let mut reflowed = 0u16;
+    let mut above = 0u16;
     for index in 0..previous_area.height {
+        if !in_span(index) {
+            continue;
+        }
         // An unknown row (never recorded, or blank) re-wraps into one row.
         let width = row_widths.get(index as usize).copied().unwrap_or(0);
         reflowed = reflowed.saturating_add(width.div_ceil(new_width).max(1));
+        if index + 1 < previous_area.height {
+            above = above.saturating_add(1);
+        }
     }
-    let last = row_widths
-        .get(previous_area.height.saturating_sub(1) as usize)
-        .copied()
-        .unwrap_or(0)
-        .div_ceil(new_width)
-        .max(1);
+    let bottom = previous_area.height.saturating_sub(1);
+    let last = if in_span(bottom) {
+        row_widths
+            .get(bottom as usize)
+            .copied()
+            .unwrap_or(0)
+            .div_ceil(new_width)
+            .max(1)
+    } else {
+        0
+    };
     // Saturating: a 65535-row box whose rows nearly all re-wrap must not wrap the
     // counter around into an incorrect anchor offset.
-    reflowed.saturating_sub(previous_area.height.saturating_add(last).saturating_sub(1))
+    reflowed.saturating_sub(above.saturating_add(last))
 }
 
 /// Width of each box row as the terminal sees it: the furthest column the frame
@@ -1188,6 +1279,44 @@ mod width_reflow_geometry_tests {
             rows_above_bottom_row - (previous_area.height - 1)
         );
         assert_eq!(reflowed_extra_rows(previous_area, &widths, 20), 4);
+    }
+
+    /// Fold-to-ellipsis must not place the box: a wide chrome row (title or
+    /// help) repaints truncated, so its transient soft-wrap collapses on the
+    /// next frame. The full count still covers it for clearing.
+    #[test]
+    fn chrome_wraps_count_for_clearing_but_not_for_placement() {
+        // Five-row box narrowed 40 -> 20: rows 1-2 are the (empty) textarea,
+        // rows 3-4 are full-width chrome.
+        let previous_area = Rect::new(0, 7, 40, 5);
+        let widths = [0, 0, 0, 40, 40];
+        assert_eq!(reflowed_extra_rows(previous_area, &widths, 20), 1);
+        assert_eq!(
+            reflowed_place_rows(previous_area, &widths, 20, Some((1, 2))),
+            0
+        );
+    }
+
+    /// Textarea rows keep wrapping, so they still place the box.
+    #[test]
+    fn textarea_wraps_still_place_the_box() {
+        let previous_area = Rect::new(0, 7, 40, 5);
+        let widths = [0, 40, 40, 40, 0];
+        assert_eq!(
+            reflowed_place_rows(previous_area, &widths, 20, Some((1, 2))),
+            2
+        );
+    }
+
+    /// Without a recorded span, placement keeps the historical whole-box count.
+    #[test]
+    fn unfiltered_placement_matches_the_clearing_count() {
+        let previous_area = Rect::new(0, 7, 40, 5);
+        let widths = [40, 0, 40, 0, 40];
+        assert_eq!(
+            reflowed_place_rows(previous_area, &widths, 20, None),
+            reflowed_extra_rows(previous_area, &widths, 20)
+        );
     }
 
     /// A box extending into scrollback can only have its visible suffix erased.
@@ -1858,6 +1987,22 @@ impl PromptEditor {
                     for (slot, width) in screen.box_row_widths.iter_mut().zip(&drawn_row_widths) {
                         *slot = (*slot).max(*width);
                     }
+                    // Record which width slots belong to the textarea, so a later
+                    // narrowing rebuild can tell wrapping rows (which must move the
+                    // anchor) from chrome rows (which repaint truncated and must
+                    // not). Recomputed every frame because the textarea height
+                    // follows the content.
+                    let current_lines = textarea.lines().to_vec();
+                    let (wrap_start, wrap_len) = textarea_row_range(
+                        drawn_viewport_area.height,
+                        &current_lines,
+                        completion_panel.as_ref().map(|panel| panel.items.len()),
+                        status_msg.is_some(),
+                        !self.current_model_label.is_empty()
+                            || !self.current_agent_label.is_empty(),
+                    );
+                    screen.wrap_row_span =
+                        Some((wrap_start, wrap_len, drawn_viewport_area.height));
                     park_reflow_anchor(&mut terminal, drawn_viewport_area)?;
                     drift_log(&format!(
                         "frame drawn: area={drawn_viewport_area:?} title={paint_title_now} resize_pending={pending_resize_rebuild} applied={last_applied_terminal_size:?}"

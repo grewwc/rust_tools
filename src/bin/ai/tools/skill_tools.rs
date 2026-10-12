@@ -939,8 +939,13 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
     let has_package_features = !resources.is_empty() || !subskills.is_empty();
 
     let dir = resolve_configured_skills_dir();
-    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create skills dir: {e}"))?;
     let overwrite = args["overwrite"].as_bool().unwrap_or(true);
+    // Preview mode: validate and render without touching the filesystem, so a
+    // session-distilled draft can be iterated into a generic skill before saving.
+    if args["dry_run"].as_bool().unwrap_or(false) {
+        return render_skill_dry_run_preview(args, &name, &resources, &subskills);
+    }
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create skills dir: {e}"))?;
 
     if !has_package_features {
         // Legacy behavior compatibility: single-file `*.skill`
@@ -1171,14 +1176,237 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
     Ok(msg)
 }
 
+// ===== Skill validation (shared by save_skill dry_run and validate_skill) =====
+//
+// Static checks only, no filesystem access, so drafts distilled from a long
+// session can be checked before anything is persisted.
+fn validate_skill_args(args: &Value) -> (Vec<String>, Vec<String>) {
+    let mut errors: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let name = args["name"].as_str().unwrap_or("").trim();
+    if name.is_empty() {
+        errors.push("name is empty".to_string());
+    }
+    let prompt = args["prompt"].as_str().unwrap_or("");
+    if prompt.trim().is_empty() {
+        errors.push("prompt is empty".to_string());
+    } else {
+        // Generic-skill hygiene: session-distilled drafts often leak
+        // machine-specific details that block reuse on another machine.
+        for marker in ["/Users/", "/home/", "C:\\", "/private/tmp", "/var/folders/"] {
+            if prompt.contains(marker) {
+                warnings.push(format!(
+                    "prompt contains absolute path marker '{marker}'; prefer relative paths or placeholders for a reusable skill"
+                ));
+                break;
+            }
+        }
+        if prompt.trim().len() < 50 {
+            warnings.push(
+                "prompt is very short; a reusable skill usually states goal, inputs, steps, and done criteria"
+                    .to_string(),
+            );
+        }
+    }
+    if args["description"].as_str().unwrap_or("").trim().is_empty() {
+        warnings.push("description is empty; skill routing relies on it".to_string());
+    }
+    let tools = parse_string_array(&args["tools"]);
+    if let Some(unknown) = crate::ai::tools::manifest_unknown_tool_names_warning(&tools) {
+        warnings.push(format!("unknown tool name(s): {unknown}"));
+    }
+    for group in parse_string_array(&args["tool_groups"]) {
+        if crate::ai::tools::ToolGroup::from_name(&group).is_none() {
+            errors.push(format!("unknown tool group: '{group}'"));
+        }
+    }
+    match parse_resources_arg(args) {
+        Ok(items) => {
+            for (path, content) in &items {
+                if let Err(e) = validate_resource_relative_path(path) {
+                    errors.push(format!("resource '{path}': {e}"));
+                } else if content.trim().is_empty() {
+                    warnings.push(format!("resource '{path}' is empty"));
+                }
+            }
+        }
+        Err(e) => errors.push(e),
+    }
+    match parse_subskills_arg(args) {
+        Ok(subs) => {
+            use rustc_hash::FxHashSet;
+            let mut seen: FxHashSet<String> = FxHashSet::default();
+            for sub in &subs {
+                let sub_name = sub["name"].as_str().unwrap_or("").trim();
+                if sub_name.is_empty() {
+                    errors.push("subskill name is empty".to_string());
+                    continue;
+                }
+                if sub_name == name {
+                    errors.push(format!(
+                        "Subskill name must not equal parent skill name: '{sub_name}'"
+                    ));
+                }
+                if !seen.insert(sub_name.to_string()) {
+                    errors.push(format!("Duplicate subskill name: '{sub_name}'"));
+                }
+                if sub["prompt"].as_str().unwrap_or("").trim().is_empty() {
+                    errors.push(format!("Subskill '{sub_name}' prompt is empty"));
+                }
+            }
+        }
+        Err(e) => errors.push(e),
+    }
+    (errors, warnings)
+}
+
+/// Preview-only rendering for `save_skill(dry_run=true)`: validates and renders
+/// without touching the filesystem.
+fn render_skill_dry_run_preview(
+    args: &Value,
+    name: &str,
+    resources: &[(String, String)],
+    subskills: &[Value],
+) -> Result<String, String> {
+    let content = build_skill_file_content(args)?;
+    let (errors, warnings) = validate_skill_args(args);
+    if !errors.is_empty() {
+        return Err(format!("Skill draft invalid:\n- {}", errors.join("\n- ")));
+    }
+    let mut out = String::from("Skill dry-run preview (nothing written):\n");
+    if subskills.is_empty() && resources.is_empty() {
+        out.push_str(&format!(
+            "Target: {}\n---\n{content}\n---",
+            safe_skill_file_name(name)
+        ));
+    } else {
+        out.push_str(&format!(
+            "Target package: {}/\nManifest (SKILL.md):\n---\n{content}\n---",
+            safe_skill_dir_name(name)
+        ));
+        if !resources.is_empty() {
+            out.push_str(&format!("\nResources: {} file(s)", resources.len()));
+            for (path, _) in resources {
+                out.push_str(&format!("\n  - {path}"));
+            }
+        }
+        if !subskills.is_empty() {
+            out.push_str(&format!("\nSub-skills: {} skill(s)", subskills.len()));
+            for sub in subskills {
+                out.push_str(&format!(
+                    "\n  - {}",
+                    sub["name"].as_str().unwrap_or("").trim()
+                ));
+            }
+        }
+    }
+    if !warnings.is_empty() {
+        out.push_str(&format!("\nWarnings:\n- {}", warnings.join("\n- ")));
+    }
+    out.push_str("\nRe-run save_skill without dry_run to persist.");
+    Ok(out)
+}
+
+pub(crate) fn execute_validate_skill(args: &Value) -> Result<String, String> {
+    let (errors, warnings) = validate_skill_args(args);
+    if !errors.is_empty() {
+        return Err(format!(
+            "Skill validation failed:\n- {}",
+            errors.join("\n- ")
+        ));
+    }
+    let name = args["name"].as_str().unwrap_or("").trim();
+    let mut out = format!("Skill '{name}' is valid.");
+    if !warnings.is_empty() {
+        out.push_str(&format!("\nWarnings:\n- {}", warnings.join("\n- ")));
+    }
+    Ok(out)
+}
+
+/// Remove one user skill by name from the configured skills directory.
+/// Only the sanitized single-file (`*.skill`) and package-directory entries
+/// are candidates; builtin skills are compiled in and cannot be removed here.
+fn delete_skill_entries(dir: &std::path::Path, name: &str) -> Result<Vec<String>, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("delete_skill requires a non-empty 'name'.".to_string());
+    }
+    let file_target = dir.join(safe_skill_file_name(trimmed));
+    let dir_target = dir.join(safe_skill_dir_name(trimmed));
+    let canonical_base =
+        fs::canonicalize(dir).map_err(|e| format!("Cannot resolve skills dir: {e}"))?;
+    let mut removed: Vec<String> = Vec::new();
+    for target in [&file_target, &dir_target] {
+        if !target.exists() && !target.is_symlink() {
+            continue;
+        }
+        // Fail closed on containment: never remove anything outside the skills dir.
+        let canonical_target = fs::canonicalize(target)
+            .map_err(|e| format!("Cannot resolve skill path {}: {e}", target.display()))?;
+        if canonical_target == canonical_base || !canonical_target.starts_with(&canonical_base) {
+            return Err(format!(
+                "Refusing to remove path outside the skills dir: {}",
+                target.display()
+            ));
+        }
+        if target.is_symlink() {
+            fs::remove_file(target)
+                .map_err(|e| format!("Failed to remove skill link {}: {e}", target.display()))?;
+        } else if target.is_dir() {
+            fs::remove_dir_all(target)
+                .map_err(|e| format!("Failed to remove skill package {}: {e}", target.display()))?;
+        } else {
+            fs::remove_file(target)
+                .map_err(|e| format!("Failed to remove skill file {}: {e}", target.display()))?;
+        }
+        removed.push(target.display().to_string());
+    }
+    if removed.is_empty() {
+        return Err(format!(
+            "No skill named '{trimmed}' found in {}.",
+            dir.display()
+        ));
+    }
+    Ok(removed)
+}
+
+pub(crate) fn execute_delete_skill(args: &Value) -> Result<String, String> {
+    let name = args["name"].as_str().unwrap_or("").trim().to_string();
+    let dir = resolve_configured_skills_dir();
+    match delete_skill_entries(&dir, &name) {
+        Ok(removed) => Ok(format!("Deleted skill '{name}':\n- {}", removed.join("\n- "))),
+        Err(e) => Err(e),
+    }
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "validate_skill",
+        description: "",
+
+        execute: execute_validate_skill,
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "delete_skill",
+        description: "",
+
+        execute: execute_delete_skill,
+    }
+});
+
 #[cfg(test)]
 mod tests {
     use super::PendingSkillAction;
     use super::{
-        build_skill_file_content, clear_pending_user_input_request, execute_activate_skill,
-        execute_deactivate_skill, execute_load_skill, execute_request_user_input,
+        build_skill_file_content, clear_pending_user_input_request, delete_skill_entries,
+        execute_activate_skill, execute_deactivate_skill, execute_load_skill,
+        execute_request_user_input, execute_save_skill, execute_validate_skill,
         render_loaded_skill, render_skill_catalog, skill_resource_read_limit,
         take_pending_skill_action, take_pending_user_input_request, utf8_prefix_at_most,
+        validate_skill_args,
     };
     use crate::ai::driver::runtime_ctx::TURN_IDENTITY;
     use crate::ai::skills::SkillManifest;
@@ -1385,6 +1613,109 @@ mod tests {
         let out = render_loaded_skill(&skill);
         assert!(!out.contains("Bundled resource directory"));
         assert!(!out.contains("## resources"));
+    }
+
+    #[test]
+    fn validate_skill_accepts_clean_definition() {
+        let (errors, warnings) = validate_skill_args(&serde_json::json!({
+            "name": "review-checklist",
+            "description": "Review checklist for documents",
+            "prompt": "Goal: review a document thoroughly. Inputs: the document text. Steps: read, note issues, summarize. Done when every section has a verdict.",
+            "tools": ["read_file"],
+            "tool_groups": ["skills"],
+        }));
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let out = execute_validate_skill(&serde_json::json!({
+            "name": "review-checklist",
+            "description": "Review checklist for documents",
+            "prompt": "Goal: review a document thoroughly. Inputs: the document text. Steps: read, note issues, summarize. Done when every section has a verdict.",
+        }))
+        .unwrap();
+        assert!(out.contains("is valid"));
+    }
+
+    #[test]
+    fn validate_skill_rejects_empty_prompt_and_unknown_group() {
+        let (errors, _) = validate_skill_args(&serde_json::json!({
+            "name": "broken",
+            "description": "broken skill",
+            "prompt": "  ",
+            "tool_groups": ["not-a-group"],
+        }));
+        assert!(errors.iter().any(|e| e.contains("prompt is empty")));
+        assert!(errors.iter().any(|e| e.contains("unknown tool group")));
+        let err = execute_validate_skill(&serde_json::json!({
+            "name": "broken",
+            "prompt": "  ",
+        }))
+        .unwrap_err();
+        assert!(err.contains("prompt is empty"));
+    }
+
+    #[test]
+    fn validate_skill_warns_on_session_specific_leakage() {
+        let (errors, warnings) = validate_skill_args(&serde_json::json!({
+            "name": "leaky",
+            "prompt": "Goal: handle the thing with enough detail to be reusable across machines. Always read /Users/someone/work/notes.md first.",
+            "tools": ["definitely-not-a-tool"],
+        }));
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(warnings.iter().any(|w| w.contains("absolute path")));
+        assert!(warnings.iter().any(|w| w.contains("unknown tool")));
+        assert!(warnings.iter().any(|w| w.contains("description is empty")));
+    }
+
+    #[test]
+    fn save_skill_dry_run_renders_without_writing() {
+        let out = execute_save_skill(&serde_json::json!({
+            "name": "dry-run-demo",
+            "description": "Dry run demo skill",
+            "prompt": "Goal: demonstrate dry run rendering. Inputs: none. Steps: call with dry_run, inspect output. Done when the preview looks right.",
+            "dry_run": true,
+        }))
+        .unwrap();
+        assert!(out.contains("nothing written"));
+        assert!(out.contains("dry-run-demo"));
+    }
+
+    #[test]
+    fn save_skill_dry_run_rejects_invalid_draft() {
+        let err = execute_save_skill(&serde_json::json!({
+            "name": "dry-run-broken",
+            "description": "broken draft",
+            "prompt": "",
+            "dry_run": true,
+        }))
+        .unwrap_err();
+        assert!(err.contains("prompt is empty"));
+    }
+
+    #[test]
+    fn delete_skill_entries_removes_file_and_package() {
+        let base = std::env::temp_dir().join(format!(
+            "skill-delete-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let file_skill = base.join("demo.skill");
+        std::fs::write(&file_skill, "demo").unwrap();
+        let package_skill = base.join("pack");
+        std::fs::create_dir_all(package_skill.join("sub")).unwrap();
+        std::fs::write(package_skill.join("SKILL.md"), "pack").unwrap();
+
+        let removed = delete_skill_entries(&base, "demo").unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(!file_skill.exists());
+        let removed = delete_skill_entries(&base, "pack").unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(!package_skill.exists());
+        let err = delete_skill_entries(&base, "missing").unwrap_err();
+        assert!(err.contains("No skill named"));
+        let err = delete_skill_entries(&base, "   ").unwrap_err();
+        assert!(err.contains("non-empty"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn test_skill(name: &str, description: &str) -> SkillManifest {

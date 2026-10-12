@@ -233,5 +233,54 @@ pub fn try_handle_interactive_command(
     if try_handle_skills_command(app, input, skill_manifests)? {
         return Ok(true);
     }
+    // A slash-looking invocation no handler claimed is a usage error, not a
+    // model question: report it locally instead of sending it to the model.
+    if looks_like_slash_command(input) {
+        let head = input.trim_start().split_whitespace().next().unwrap_or(input);
+        println!("Unknown command: '{head}'. Run /help to list available commands.");
+        return Ok(true);
+    }
     Ok(false)
+}
+
+/// True when `input` looks like a slash-command invocation: the first
+/// whitespace-separated token starts with `/` or `:` followed by an ASCII
+/// alphanumeric, and contains no further `/`. Absolute paths (`/tmp/foo`),
+/// `//` comments and `:)` emoticons are not commands.
+fn looks_like_slash_command(input: &str) -> bool {
+    let trimmed = input.trim_start();
+    let rest = if let Some(rest) = trimmed.strip_prefix('/') {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix(':') {
+        rest
+    } else {
+        return false;
+    };
+    let token = rest.split_whitespace().next().unwrap_or("");
+    let mut chars = token.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    !token.contains('/')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_slash_command;
+
+    #[test]
+    fn slash_command_shape_detects_commands_but_not_paths_or_text() {
+        assert!(looks_like_slash_command("/cmd"));
+        assert!(looks_like_slash_command("/foobar x"));
+        assert!(looks_like_slash_command("  :help shortcuts  "));
+        assert!(!looks_like_slash_command("/tmp/foo"));
+        assert!(!looks_like_slash_command("/api/v1/users"));
+        assert!(!looks_like_slash_command("// comment"));
+        assert!(!looks_like_slash_command("/"));
+        assert!(!looks_like_slash_command(":"));
+        assert!(!looks_like_slash_command(":)"));
+        assert!(!looks_like_slash_command("plain prompt"));
+        assert!(!looks_like_slash_command(""));
+    }
 }

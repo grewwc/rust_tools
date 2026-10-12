@@ -1,0 +1,71 @@
+---
+name: mr-review-verdict
+version: 1.0.0
+description: "MR 评审输出裁决结论时激活：当任务需要评审 Merge Request 并给出 Approve / Request Changes / 阻塞合入 / 放行类 verdict 时使用。强制 verdict 合法性：标准先行、基线归因、双边证据、级别挂钩影响、可证伪口。"
+author: rust_tools
+---
+# MR Review Verdict
+
+You review a merge request and output an Approve / Request Changes (block or pass) verdict.
+A verdict is legitimate only if it satisfies every rule below. A plan, a reminder,
+or a conclusion written earlier in the session does NOT substitute for these rules.
+
+## 1. State the judging standard first
+
+The first line of the verdict must name the standard it is judged by.
+Default standard: MR incremental risk, i.e. regressions introduced or worsened by this MR
+relative to its base. Pre-existing defects that the MR does not touch must not block merging.
+If the requester demands a stricter standard (e.g. zero pre-existing defects), restate the
+standard explicitly and judge everything by the new standard instead of mixing two standards
+in one verdict. Once a stricter standard is restated, it governs all items; the default must-not-block rule in section 3 applies only under the default incremental-risk standard.
+
+## 2. Pin the baseline before judging
+
+Identify both commits before any blocking conclusion:
+- MR source commit (`<source-sha>`, what is being reviewed);
+- base commit (`<base-sha>`, normally the merge-base with the target branch).
+A blocking item without both commits identified is automatically downgraded to "pending".
+
+## 3. Counterfactual attribution for every finding
+
+Truthfulness alone never justifies blocking. Every finding must answer:
+"How does the base behave at the same location?" Classify and dispose as follows:
+
+| Attribution | Disposal |
+|---|---|
+| Introduced by the MR | May block; cite the MR-side evidence |
+| Worsened by the MR (pre-existing but amplified) | May block; must state the amplification chain |
+| Pre-existing in base, untouched by the MR | Record as a pre-existing issue; MUST NOT block |
+| Base evidence unavailable | Downgrade to "pending confirmation"; MUST NOT block |
+
+When the requester asks "is this true / does it need fixing", do not equate "true" with
+"must fix / must block". Always add the baseline-comparison dimension yourself; if base
+evidence cannot be obtained, say so and downgrade instead of judging by force.
+
+## 4. Bilateral, re-checkable evidence pointers
+
+Every blocking item carries pointers a second reviewer can independently re-verify:
+- source pointer: `file:line`, diff hunk, or commit hash on the MR side;
+- base pointer: the corresponding behavior at the base commit;
+- test pointer: reproducing/regression test location, or an explicit statement such as
+  "tests not executed; static inference only".
+
+## 5. Severity follows impact, not truthfulness
+
+Severity = impact x trigger probability x attribution. Truthfulness is only a precondition:
+a fully confirmed behavior with narrow blast radius and low trigger probability is not
+severe and does not block. When recommending a fix for a non-blocking item, state the
+concrete chain (e.g. "it amplifies item #N via ..."), never "it is true therefore it blocks".
+
+## 6. Falsifiability clause
+
+Every blocking item states what evidence would overturn it, e.g. "if `<base-sha>` shows
+the same behavior at this path, this item is downgraded to pre-existing". This separates
+"proven" from "inferred" and gives the next round something to grip.
+
+## Verdict output format
+
+Standard: <the judging standard>
+Per item: { claim, attribution, source pointer, base pointer, severity, confidence }
+Overturn conditions: <evidence that would reverse each blocking item>
+Final: Approve / Request Changes (only items attributed to the MR may block).

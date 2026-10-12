@@ -1,6 +1,7 @@
 {
   "name": "save_skill",
   "description": "Render and save a skill into the configured skills directory. Simple skills are saved as a single .skill file; complex skills with references/examples/scripts and nested sub-skills are saved as a directory package (SKILL.md + subskills/). Use proactively to persist reusable skills, including splitting a complex skill into multiple sub-skills.",
+  "first_use_guidance": "Guidance for distilling session experience into a reusable skill:\n- Gather evidence first with search_overflow (past turns) and knowledge_search (saved facts); quote behavior, not project specifics.\n- Generalize before saving: no absolute paths, hostnames, tokens, or single-project identifiers; state goal, inputs, steps, and done criteria.\n- Iterate safely: save_skill with dry_run=true previews the rendered skill without writing; validate_skill checks the exact arguments; only then save without dry_run.\n- Prefer validate_skill over re-saving to fix drafts, and delete_skill to remove a bad skill.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -60,6 +61,10 @@
       "overwrite": {
         "type": "boolean",
         "description": "Whether to overwrite an existing file/directory at the target path (default: true; set false to fail instead of overwriting)."
+      },
+      "dry_run": {
+        "type": "boolean",
+        "description": "When true, validate and render the skill without writing anything; returns the preview plus warnings."
       },
       "resources": {
         "type": "array",

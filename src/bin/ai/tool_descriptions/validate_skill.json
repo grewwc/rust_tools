@@ -1,0 +1,80 @@
+{
+  "name": "validate_skill",
+  "description": "Statically validate a skill definition without saving anything. Pass the exact arguments you intend to give save_skill; returns valid plus warnings, or an error listing every problem.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Skill identifier to validate."
+      },
+      "description": {
+        "type": "string",
+        "description": "Short summary shown in skill lists and matching."
+      },
+      "prompt": {
+        "type": "string",
+        "description": "Full skill prompt body (Markdown) to validate."
+      },
+      "system_prompt": {
+        "type": "string",
+        "description": "Optional additional system prompt text."
+      },
+      "tools": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Explicit tool names that the skill is allowed to use."
+      },
+      "tool_groups": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Tool groups that the skill is allowed to use (e.g. builtin, executor)."
+      },
+      "mcp_servers": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Required MCP server names needed to run this skill."
+      },
+      "resources": {
+        "type": "array",
+        "description": "Optional bundled resources, each with relative `path` and `content`.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ]
+        }
+      },
+      "subskills": {
+        "type": "array",
+        "description": "Optional nested sub-skills, each with `name` and `prompt`.",
+        "items": {
+          "type": "object"
+        }
+      }
+    },
+    "required": [
+      "name",
+      "prompt"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "skills"
+  ]
+}

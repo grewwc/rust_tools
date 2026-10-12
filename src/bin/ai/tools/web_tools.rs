@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::time::Duration;
 
 use reqwest::Url;
@@ -6,15 +7,20 @@ use reqwest::blocking::{Client, Response};
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde_json::Value;
 
+use crate::ai::config_schema::AiConfig;
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
+use crate::commonw::configw;
 
 const JINA_SEARCH_BASE: &str = "https://s.jina.ai/";
 const JINA_READER_BASE: &str = "https://r.jina.ai/";
+const MAX_PROVIDERS: usize = 8;
 const MAX_QUERY_CHARS: usize = 1_000;
 const MAX_URL_CHARS: usize = 8_192;
 const MAX_DOWNLOAD_BYTES: usize = 1_000_000;
 const MAX_CONTENT_CHARS: usize = 30_000;
 const MAX_ERROR_CHARS: usize = 2_000;
+const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
@@ -34,12 +40,101 @@ inventory::submit!(ToolRegistration {
 
 fn execute_web_search(args: &Value) -> Result<String, String> {
     let query = required_text(args, "query", MAX_QUERY_CHARS)?;
-    execute_web_search_with_base(query, JINA_SEARCH_BASE, true)
+    let providers = provider_list(AiConfig::WEB_SEARCH_PROVIDERS, JINA_SEARCH_BASE);
+    execute_web_search_with_providers(query, &providers)
 }
 
 fn execute_web_fetch(args: &Value) -> Result<String, String> {
     let raw_url = required_text(args, "url", MAX_URL_CHARS)?;
-    execute_web_fetch_with_base(raw_url, JINA_READER_BASE, true)
+    let target = validate_target_url(raw_url)?;
+    let providers = provider_list(AiConfig::WEB_READER_PROVIDERS, JINA_READER_BASE);
+    let allow_direct =
+        configw::get_config(AiConfig::WEB_DIRECT_FETCH_FALLBACK, "true") != "false";
+    fetch_with_providers_and_direct(&target, &providers, allow_direct)
+}
+
+/// Parse the comma-separated provider list from config, falling back to the
+/// built-in default when the key is absent, empty, or lists no usable entry.
+fn provider_list(config_key: &str, default: &str) -> Vec<String> {
+    let raw = configw::get_config(config_key, default);
+    let mut providers: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect();
+    providers.truncate(MAX_PROVIDERS);
+    if providers.is_empty() {
+        providers.push(default.to_string());
+    }
+    providers
+}
+
+/// Try every configured search provider in order; the first success wins and
+/// failures are aggregated into one error so the model sees every attempt.
+fn execute_web_search_with_providers(query: &str, providers: &[String]) -> Result<String, String> {
+    let mut errors = Vec::new();
+    for base in providers {
+        match execute_web_search_with_base(query, base, true) {
+            Ok(output) => return Ok(output),
+            Err(error) => errors.push(format!("{base}: {error}")),
+        }
+    }
+    Err(aggregate_error("web_search", &errors))
+}
+
+/// Try every configured reader provider in order; when all fail and direct
+/// fetch is enabled, fall back to fetching the target URL directly from this
+/// machine (restricted to public hosts) and stripping HTML to text.
+fn fetch_with_providers_and_direct(
+    target: &Url,
+    providers: &[String],
+    allow_direct: bool,
+) -> Result<String, String> {
+    fetch_with_providers_and_direct_with(target, providers, allow_direct, execute_direct_fetch)
+}
+
+/// The provider loop behind `fetch_with_providers_and_direct`, with the direct
+/// fetch step injected so tests can drive it against a local mock server.
+fn fetch_with_providers_and_direct_with(
+    target: &Url,
+    providers: &[String],
+    allow_direct: bool,
+    direct_fetcher: impl Fn(&Url) -> Result<DownloadedBody, String>,
+) -> Result<String, String> {
+    let mut errors = Vec::new();
+    for base in providers {
+        match execute_web_fetch_with_base(target.as_str(), base, true) {
+            Ok(output) => return Ok(output),
+            Err(error) => errors.push(format!("{base}: {error}")),
+        }
+    }
+    if allow_direct {
+        match direct_fetcher(target) {
+            Ok(body) => {
+                return Ok(format_external_output(
+                    &format!(
+                        "URL: {} (direct fetch; HTML stripped to text)",
+                        target.as_str()
+                    ),
+                    body,
+                ));
+            }
+            Err(error) => errors.push(format!("direct fetch: {error}")),
+        }
+    }
+    Err(aggregate_error("web_fetch", &errors))
+}
+
+fn aggregate_error(subject: &str, errors: &[String]) -> String {
+    if errors.is_empty() {
+        return format!("{subject} failed: no provider configured");
+    }
+    format!(
+        "{subject} failed after {} attempt(s):\n{}",
+        errors.len(),
+        errors.join("\n")
+    )
 }
 
 fn execute_web_search_with_base(
@@ -142,7 +237,9 @@ fn request_markdown(endpoint: Url, include_api_key: bool) -> Result<DownloadedBo
     let response = request
         .send()
         .map_err(|err| format!("web request failed: {err}"))?;
-    read_response(response)
+    // The JINA_API_KEY hint applies to reader/search services even when no key
+    // is currently set (the flag only controls attaching an existing key).
+    read_response(response, true)
 }
 
 struct DownloadedBody {
@@ -150,7 +247,102 @@ struct DownloadedBody {
     download_incomplete: bool,
 }
 
-fn read_response(response: Response) -> Result<DownloadedBody, String> {
+/// Fetch the target URL directly from this machine (no reader service) and
+/// convert the HTML payload to plain text. Only public hosts are allowed:
+/// private, link-local, reserved, and metadata addresses are rejected so the
+/// agent cannot be tricked into probing internal networks.
+fn execute_direct_fetch(target: &Url) -> Result<DownloadedBody, String> {
+    validate_direct_target(target)?;
+    fetch_and_strip(target)
+}
+
+/// Fetch the target and convert HTML to text, without host validation.
+/// Validation lives in `execute_direct_fetch`; the split lets tests exercise
+/// the fetch pipeline against a local mock server.
+fn fetch_and_strip(target: &Url) -> Result<DownloadedBody, String> {
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(25))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|err| format!("failed to initialize web client: {err}"))?;
+    let response = client
+        .get(target.clone())
+        .header(USER_AGENT, BROWSER_USER_AGENT)
+        .header(ACCEPT, "text/html, application/xhtml+xml;q=0.9, */*;q=0.8")
+        .send()
+        .map_err(|err| format!("web request failed: {err}"))?;
+    let mut body = read_response(response, false)?;
+    body.text = html_to_text(&body.text);
+    Ok(body)
+}
+
+fn validate_direct_target(target: &Url) -> Result<(), String> {
+    let host = target
+        .host_str()
+        .ok_or_else(|| "url must include a host".to_string())?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_private_ip(ip) {
+            return Err(format!(
+                "direct fetch to private/reserved address {host} is not allowed"
+            ));
+        }
+        return Ok(());
+    }
+    // Domain name: allow it only if resolution yields at least one public
+    // address; unresolvable names fail closed.
+    let port = target.port_or_known_default().unwrap_or(80);
+    let mut addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|err| format!("cannot resolve {host}: {err}"))?;
+    if addrs.any(|addr| !is_private_ip(addr.ip())) {
+        Ok(())
+    } else {
+        Err(format!(
+            "direct fetch to {host} resolves only to private/reserved addresses"
+        ))
+    }
+}
+
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_private_v4(v4),
+        IpAddr::V6(v6) => {
+            // IPv4-mapped and IPv4-compatible addresses follow the v4 rules.
+            if let Some(v4) = v6.to_ipv4() {
+                return is_private_v4(v4);
+            }
+            v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_unique_local()
+                || v6.is_multicast()
+                || v6.segments()[0] & 0xffc0 == 0xfe80 // link-local fe80::/10
+                || v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8 // documentation 2001:db8::/32
+        }
+    }
+}
+
+fn is_private_v4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    match (octets[0], octets[1]) {
+        (0, _) => true,                // "this network"
+        (10, _) => true,               // RFC 1918
+        (100, 64..=127) => true,       // CGNAT
+        (127, _) => true,              // loopback
+        (169, 254) => true,            // link-local (incl. cloud metadata)
+        (172, 16..=31) => true,        // RFC 1918
+        (192, 0) => octets[2] <= 2,    // IETF assignments + TEST-NET-1
+        (192, 168) => true,            // RFC 1918
+        (198, 18..=19) => true,        // benchmarking
+        (198, 51) => octets[2] == 100, // TEST-NET-2
+        (203, 0) => octets[2] == 113,  // TEST-NET-3
+        (224..=239, _) => true,        // multicast
+        (240..=255, _) => true,        // reserved + broadcast
+        _ => false,
+    }
+}
+
+fn read_response(response: Response, auth_hint: bool) -> Result<DownloadedBody, String> {
     let status = response.status();
     let mut bytes = Vec::new();
     response
@@ -163,11 +355,11 @@ fn read_response(response: Response) -> Result<DownloadedBody, String> {
 
     if !status.is_success() {
         let detail: String = text.chars().take(MAX_ERROR_CHARS).collect();
-        let auth_hint = matches!(status.as_u16(), 401 | 403 | 429)
+        let hint = (auth_hint && matches!(status.as_u16(), 401 | 403 | 429))
             .then_some(" Set JINA_API_KEY for authenticated access or retry later.")
             .unwrap_or_default();
         return Err(format!(
-            "web service returned HTTP {status}.{auth_hint}\nUpstream response (untrusted):\n{detail}"
+            "web service returned HTTP {status}.{hint}\nUpstream response (untrusted):\n{detail}"
         ));
     }
     if text.trim().is_empty() {
@@ -199,16 +391,202 @@ fn format_external_output(subject: &str, body: DownloadedBody) -> String {
     )
 }
 
+/// Minimal HTML-to-text conversion for the direct-fetch fallback: drops
+/// script/style/noscript/template/svg/iframe bodies and comments, turns block
+/// elements into line breaks, strips remaining tags, collapses whitespace,
+/// and decodes common character entities.
+fn html_to_text(html: &str) -> String {
+    let chars: Vec<char> = html.chars().collect();
+    let mut text = String::with_capacity(html.len());
+    let mut skip_depth = 0usize;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        let opens_tag = ch == '<'
+            && i + 1 < chars.len()
+            && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '/' || chars[i + 1] == '!');
+        if opens_tag {
+            let mut end = i + 1;
+            while end < chars.len() && chars[end] != '>' {
+                end += 1;
+            }
+            if end < chars.len() {
+                let tag: String = chars[i + 1..end].iter().collect();
+                let (bare, is_close) = classify_tag(&tag);
+                if bare.starts_with('!') {
+                    // Comment or doctype: skip through the closing "-->".
+                    let mut close = end + 1;
+                    while close + 2 < chars.len()
+                        && !(chars[close] == '-'
+                            && chars[close + 1] == '-'
+                            && chars[close + 2] == '>')
+                    {
+                        close += 1;
+                    }
+                    i = if close + 2 < chars.len() {
+                        close + 3
+                    } else {
+                        chars.len()
+                    };
+                    continue;
+                }
+                if skip_depth > 0 {
+                    if is_close && is_skip_element(bare) {
+                        skip_depth -= 1;
+                    }
+                } else if is_skip_element(bare) {
+                    if !is_close {
+                        skip_depth = 1;
+                    }
+                } else if !is_close && is_block_element(bare) {
+                    text.push('\n');
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+        if skip_depth == 0 {
+            text.push(ch);
+        }
+        i += 1;
+    }
+    decode_entities(&collapse_whitespace(&text))
+}
+
+/// Returns (element name, is_closing_tag) for a raw tag body such as
+/// `p class="x"` or `/script`.
+fn classify_tag(tag: &str) -> (&str, bool) {
+    let trimmed = tag.trim().trim_end_matches('/');
+    let name = trimmed.split_whitespace().next().unwrap_or("");
+    let is_close = name.starts_with('/');
+    let bare = if is_close { &name[1..] } else { name };
+    (bare, is_close)
+}
+
+fn is_skip_element(name: &str) -> bool {
+    matches!(name, "script" | "style" | "noscript" | "template" | "svg" | "iframe")
+}
+
+fn is_block_element(name: &str) -> bool {
+    matches!(
+        name,
+        "p" | "div"
+            | "br"
+            | "li"
+            | "tr"
+            | "td"
+            | "th"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "section"
+            | "article"
+            | "header"
+            | "footer"
+            | "ul"
+            | "ol"
+            | "table"
+            | "blockquote"
+            | "pre"
+            | "hr"
+            | "form"
+            | "nav"
+            | "aside"
+            | "main"
+            | "dl"
+            | "dt"
+            | "dd"
+            | "figure"
+    )
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    let mut at_line_start = true;
+    for ch in text.chars() {
+        if ch == '\n' {
+            out.push('\n');
+            pending_space = false;
+            at_line_start = true;
+        } else if ch.is_whitespace() {
+            if !at_line_start {
+                pending_space = true;
+            }
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+            at_line_start = false;
+        }
+    }
+    out
+}
+
+fn decode_entities(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '&' {
+            let mut end = i + 1;
+            while end < chars.len() && end - i <= 12 && chars[end] != ';' {
+                end += 1;
+            }
+            if end < chars.len() && chars[end] == ';' {
+                let entity: String = chars[i + 1..end].iter().collect();
+                if let Some(decoded) = decode_entity(&entity) {
+                    out.push(decoded);
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn decode_entity(entity: &str) -> Option<char> {
+    if let Some(hex) = entity
+        .strip_prefix("#x")
+        .or_else(|| entity.strip_prefix("#X"))
+    {
+        return char::from_u32(u32::from_str_radix(hex, 16).ok()?);
+    }
+    if let Some(dec) = entity.strip_prefix('#') {
+        return char::from_u32(dec.parse::<u32>().ok()?);
+    }
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some('\u{00a0}'),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
 
+    use reqwest::Url;
     use serde_json::json;
 
     use super::{
-        execute_web_fetch, execute_web_search, execute_web_search_with_base, validate_target_url,
+        execute_web_fetch, execute_web_search, execute_web_search_with_base,
+        execute_web_search_with_providers, fetch_and_strip, fetch_with_providers_and_direct_with,
+        html_to_text, validate_direct_target, validate_target_url,
     };
 
     fn mock_server(status: &str, body: &str) -> (String, thread::JoinHandle<String>) {
@@ -274,5 +652,100 @@ mod tests {
         assert!(error.contains("HTTP 429 Too Many Requests"));
         assert!(error.contains("JINA_API_KEY"));
         assert!(error.contains("Upstream response (untrusted)"));
+    }
+
+    #[test]
+    fn search_falls_back_to_the_next_configured_provider() {
+        let (base, server) = mock_server("200 OK", "# Result\nhttps://example.com/");
+        // First provider is an unroutable loopback port (immediate refusal),
+        // second is the mock server: the loop must skip to it.
+        let providers = vec!["http://127.0.0.1:1/".to_string(), base];
+        let output = execute_web_search_with_providers("rust fallback", &providers)
+            .expect("second provider succeeds");
+        let request = server.join().expect("mock server joins");
+
+        assert!(request.starts_with("GET /rust%20fallback HTTP/1.1"));
+        assert!(output.contains("Query: rust fallback"));
+        assert!(output.contains("# Result"));
+    }
+
+    #[test]
+    fn search_reports_every_failed_provider() {
+        let providers = vec!["http://127.0.0.1:1/".to_string(), "http://127.0.0.1:2/".to_string()];
+        let error = execute_web_search_with_providers("rust", &providers).unwrap_err();
+
+        assert!(error.contains("web_search failed after 2 attempt(s)"));
+        assert!(error.contains("http://127.0.0.1:1/"));
+        assert!(error.contains("http://127.0.0.1:2/"));
+    }
+
+    #[test]
+    fn direct_fetch_strips_html_to_text() {
+        let (base, server) = mock_server(
+            "200 OK",
+            "<!DOCTYPE html><html><head><title>Weather</title><script>alert(1)</script>\
+             <style>p { color: red }</style></head><body><!-- hidden note -->\
+             <h1>Hangzhou</h1><p>Sunny <b>today</b> &amp; warm</p></body></html>",
+        );
+        let target = Url::parse(&base).expect("mock url");
+        let body = fetch_and_strip(&target).expect("direct fetch succeeds");
+        let _ = server.join();
+
+        assert!(body.text.contains("Hangzhou"));
+        assert!(body.text.contains("Sunny today & warm"));
+        assert!(!body.text.contains("<h1>"));
+        assert!(!body.text.contains("script"));
+        assert!(!body.text.contains("hidden note"));
+    }
+
+    #[test]
+    fn fetch_falls_back_to_direct_when_all_readers_fail() {
+        let (base, server) = mock_server("200 OK", "<html><body><p>hello weather</p></body></html>");
+        let target = Url::parse(&base).expect("mock url");
+        let providers = vec!["http://127.0.0.1:1/".to_string()];
+        let output = fetch_with_providers_and_direct_with(&target, &providers, true, fetch_and_strip)
+            .expect("direct fallback succeeds");
+        let _ = server.join();
+
+        assert!(output.contains("direct fetch; HTML stripped to text"));
+        assert!(output.contains("hello weather"));
+    }
+
+    #[test]
+    fn direct_fetch_rejects_private_and_reserved_hosts() {
+        let rejected = [
+            "http://127.0.0.1/",
+            "http://10.0.0.1/",
+            "http://172.16.0.1/",
+            "http://192.168.1.1/",
+            "http://169.254.169.254/",
+            "http://100.64.0.1/",
+            "http://0.0.0.0/",
+            "http://[::1]/",
+            "http://[fc00::1]/",
+            "http://[::ffff:127.0.0.1]/",
+        ];
+        for url in rejected {
+            let target = Url::parse(url).expect("parse url");
+            assert!(
+                validate_direct_target(&target).is_err(),
+                "{url} should be rejected as non-public"
+            );
+        }
+        for url in ["http://8.8.8.8/", "http://93.184.216.34/"] {
+            let target = Url::parse(url).expect("parse url");
+            assert!(
+                validate_direct_target(&target).is_ok(),
+                "{url} is a public address and should pass"
+            );
+        }
+    }
+
+    #[test]
+    fn html_to_text_handles_entities_and_blocks() {
+        let text = html_to_text("<div>a &amp; b</div><p>x</p><ul><li>1</li><li>2</li></ul>");
+        assert!(text.contains("a & b"));
+        assert!(text.contains('x'));
+        assert!(text.contains("1\n2"));
     }
 }

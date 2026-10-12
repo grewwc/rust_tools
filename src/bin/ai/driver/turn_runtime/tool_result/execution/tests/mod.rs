@@ -10,6 +10,7 @@ mod followup;
 mod iteration;
 mod observer;
 mod output_format;
+mod outstanding;
 mod patch_retry;
 mod rejection;
 mod round;

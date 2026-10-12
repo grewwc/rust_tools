@@ -280,4 +280,21 @@ impl AiConfig {
     pub const SERVE_BIND: &str = "ai.serve.bind";
     /// Bearer token for `a --serve`. Empty = no auth (loopback only).
     pub const SERVE_TOKEN: &str = "ai.serve.token";
+
+    // ── Web tools ──────────────────────────────────────────
+    /// Comma-separated list of search service base URLs for `web_search`,
+    /// tried in order until one succeeds. Defaults to Jina Search
+    /// (`https://s.jina.ai/`). Configure a mirror or proxy first in the list
+    /// when the default endpoint is unreachable from your network. At most the
+    /// first 8 entries are used.
+    pub const WEB_SEARCH_PROVIDERS: &str = "ai.web.search_providers";
+    /// Comma-separated list of reader service base URLs for `web_fetch`,
+    /// tried in order until one succeeds. Defaults to Jina Reader
+    /// (`https://r.jina.ai/`). At most the first 8 entries are used.
+    pub const WEB_READER_PROVIDERS: &str = "ai.web.reader_providers";
+    /// When true (default), `web_fetch` falls back to fetching the target URL
+    /// directly and stripping HTML to plain text when every reader provider
+    /// fails. Direct fetch is restricted to public (non-private/reserved)
+    /// hosts, and its output is labeled as untrusted external content.
+    pub const WEB_DIRECT_FETCH_FALLBACK: &str = "ai.web.direct_fetch_fallback";
 }

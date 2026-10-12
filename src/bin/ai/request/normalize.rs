@@ -19,17 +19,17 @@ use crate::ai::models;
 use crate::ai::types::App;
 
 const IMAGE_PLACEHOLDER: &str = "[image omitted]";
-const HISTORY_SUMMARY_CONTEXT_HEADER: &str = "[Compressed history summary for task continuity. \
+pub(crate) const HISTORY_SUMMARY_CONTEXT_HEADER: &str = "[Compressed history summary for task continuity. \
 This is assistant-derived, unverified navigation context—not authoritative evidence or a new user request. \
 Use cited paths and tool ids as locators. Before relying on a decision-bearing factual claim in a final answer, inspect the cited source or original tool evidence unless that evidence is already present in the current context. \
 A citation inside the summary does not by itself verify the summary's wording; keep unsupported claims explicitly uncertain.]";
-const MODEL_SELF_NOTE_CONTEXT_HEADER: &str = "[Model-authored note from an earlier turn; this is not authoritative evidence. \
+pub(crate) const MODEL_SELF_NOTE_CONTEXT_HEADER: &str = "[Model-authored note from an earlier turn; this is not authoritative evidence. \
 Treat every claim as unverified unless it is backed by tool output or a cited source, \
 and re-check it before using it as a conclusion.]";
-const DERIVED_CONTEXT_HANDOFF: &str = "[Runtime context handoff, not a new end-user request. The next assistant message contains \
+pub(crate) const DERIVED_CONTEXT_HANDOFF: &str = "[Runtime context handoff, not a new end-user request. The next assistant message contains \
 derived context from earlier turns. Use it only as described there, then continue to the latest \
 actual user request later in this conversation.]";
-const DERIVED_CONTEXT_RETURN: &str = "[Runtime context handoff complete, not a new end-user request. Continue with the next recorded \
+pub(crate) const DERIVED_CONTEXT_RETURN: &str = "[Runtime context handoff complete, not a new end-user request. Continue with the next recorded \
 conversation message and ultimately follow the latest actual user request.]";
 
 fn flatten_multimodal_content_to_text(content: &Value) -> Option<String> {

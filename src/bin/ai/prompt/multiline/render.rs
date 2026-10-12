@@ -216,16 +216,53 @@ fn popup_geometry(
     // Inset chunks[1] by the single left gutter column to get the area the
     // textarea draws into; the left bar itself is rendered separately in
     // `render_multiline_popup`. A LEFT border shifts content right by one column
-    // and adds no rows.
-    let textarea_inner = Block::default()
-        .borders(Borders::LEFT)
-        .inner(chunks[1]);
+    // and adds no rows. One further blank column separates the bar from the
+    // text so the bar never reads as a second cursor next to the block caret
+    // at column zero. The gap cell carries no ink, so it cannot re-wrap.
+    let textarea_inner = Block::default().borders(Borders::LEFT).inner(chunks[1]);
+    let textarea_inner = Rect::new(
+        textarea_inner.x.saturating_add(1),
+        textarea_inner.y,
+        textarea_inner.width.saturating_sub(1),
+        textarea_inner.height,
+    );
 
     PopupGeometry {
         popup,
         chunks: [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]],
         textarea_inner,
     }
+}
+
+/// Row span of the textarea (`chunks[1]`) inside a viewport of `area_height`
+/// rows, as `(start, len)` indices into the per-row width record.
+///
+/// The vertical split depends only on the viewport height and the editor
+/// state, never on the width, so a narrowing rebuild can recompute the span
+/// its last frame drew without the original frame. The span marks the rows
+/// that keep wrapping across a repaint: chrome rows (title, help, rules)
+/// repaint truncated to an ellipsis, so their old soft-wraps must not move
+/// the anchor (see `reflowed_place_rows` in `multiline_ui.rs`).
+pub(in crate::ai::prompt::multiline) fn textarea_row_range(
+    area_height: u16,
+    current_lines: &[String],
+    completion_items: Option<usize>,
+    has_status_msg: bool,
+    has_model_label: bool,
+) -> (u16, u16) {
+    let current_content = current_lines.join("\n");
+    let trailing_blank_lines = count_trailing_blank_lines(current_lines);
+    // Any width builds the same rows; only the height shapes the split.
+    let geometry = popup_geometry(
+        Rect::new(0, 0, 80, area_height),
+        &current_content,
+        current_lines.len(),
+        trailing_blank_lines,
+        completion_items,
+        has_status_msg,
+        has_model_label,
+    );
+    (geometry.chunks[1].y, geometry.chunks[1].height)
 }
 
 pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
@@ -301,28 +338,14 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_width(
     // textarea growth does not move it through the editing region.
     if chunks[3].height > 0 {
         let header_area = chunks[3];
+        // Compact identity line: " model (agent; reasoning)|topic". The verbose
+        // "agent:/model:/reasoning:" labels cost ~20 columns and fold the
+        // viewport on narrow terminals, so only the values are painted.
         let mut spans = Vec::new();
-        if !agent_label.is_empty() {
-            spans.push(Span::styled(
-                " agent: ",
-                Style::default().fg(Color::Rgb(148, 163, 184)),
-            ));
-            spans.push(Span::styled(
-                agent_label,
-                Style::default()
-                    .fg(Color::Rgb(134, 194, 166))
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(
-                "  |  model: ",
-                Style::default().fg(Color::Rgb(100, 116, 139)),
-            ));
-        } else {
-            spans.push(Span::styled(
-                " model: ",
-                Style::default().fg(Color::Rgb(148, 163, 184)),
-            ));
-        }
+        spans.push(Span::styled(
+            " ",
+            Style::default().fg(Color::Rgb(100, 116, 139)),
+        ));
         spans.push(Span::styled(
             model_label,
             Style::default()
@@ -339,16 +362,38 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_width(
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        if !reasoning_effort_label.is_empty() {
+        // Parenthesized agent/reasoning suffix. Parentheses and the separator
+        // stay dim so the two values keep their own colors.
+        if !agent_label.is_empty() || !reasoning_effort_label.is_empty() {
             spans.push(Span::styled(
-                "  |  reasoning: ",
+                " (",
                 Style::default().fg(Color::Rgb(100, 116, 139)),
             ));
+            if !agent_label.is_empty() {
+                spans.push(Span::styled(
+                    agent_label,
+                    Style::default()
+                        .fg(Color::Rgb(134, 194, 166))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if !agent_label.is_empty() && !reasoning_effort_label.is_empty() {
+                spans.push(Span::styled(
+                    "; ",
+                    Style::default().fg(Color::Rgb(100, 116, 139)),
+                ));
+            }
+            if !reasoning_effort_label.is_empty() {
+                spans.push(Span::styled(
+                    reasoning_effort_label,
+                    Style::default()
+                        .fg(Color::Rgb(96, 165, 250))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
             spans.push(Span::styled(
-                reasoning_effort_label,
-                Style::default()
-                    .fg(Color::Rgb(96, 165, 250))
-                    .add_modifier(Modifier::BOLD),
+                ")",
+                Style::default().fg(Color::Rgb(100, 116, 139)),
             ));
         }
         // Show the session topic on the same line as the model
@@ -357,7 +402,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_width(
             _ => "new session",
         };
         spans.push(Span::styled(
-            "  |  ",
+            "|",
             Style::default().fg(Color::Rgb(100, 116, 139)),
         ));
         spans.push(Span::styled(
@@ -402,13 +447,9 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_width(
     // parked-cursor anchor exists to avoid). A single left-column glyph can never
     // reach the right margin, so it survives width changes without leaving
     // ghost boxes.
-    let input_bar = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(
-            Style::default()
-                .fg(Color::Rgb(74, 92, 112))
-                .add_modifier(Modifier::BOLD),
-        );
+    let input_bar = Block::default().borders(Borders::LEFT).border_style(
+        Style::default().fg(Color::Rgb(74, 92, 112)),
+    );
     f.render_widget(&input_bar, textarea_area);
     f.render_widget(&*textarea, geometry.textarea_inner);
     // Reuse tui-textarea's own rendering plan for the visual caret position.
@@ -536,77 +577,19 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_width(
         ])]
     } else {
         vec![Line::from({
+            // Compact help row: only the cursor/char status plus a pointer to
+            // /help. The full shortcut list lives in /help so the chrome row
+            // stays short on narrow terminals.
             let spans: Vec<Span> = vec![
-                Span::styled("换行:", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "↵",
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(status_info, Style::default().fg(Color::DarkGray)),
                 Span::raw("  "),
-                Span::styled("发送:", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    "Alt+↵/F2",
+                    "/help",
                     Style::default()
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw("  "),
-                Span::styled("取消:", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "Ctrl+C",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(status_info, Style::default().fg(Color::DarkGray)),
-                Span::raw("  "),
-                Span::styled("历史:", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "↑↓/Ctrl+P/N",
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled("删行:", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "⌘/Ctrl+U",
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled("粘贴:", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "Ctrl+V",
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled("清空:", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "F8",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled("复制回答:", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "F9",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled("复制全部:", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "F10",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(" shortcuts", Style::default().fg(Color::DarkGray)),
             ];
             spans
         })]
@@ -865,7 +848,7 @@ mod tests {
     use super::{
         CHROME_EDGE_MARGIN, MODEL_LINE_MAX_COLUMNS, count_trailing_blank_lines,
         popup_layout_config, render_multiline_popup, render_multiline_popup_with_width,
-        truncate_line_to_width, truncate_with_ellipsis,
+        textarea_row_range, truncate_line_to_width, truncate_with_ellipsis,
     };
     use ratatui::{
         Terminal, TerminalOptions, Viewport,
@@ -1052,7 +1035,7 @@ mod tests {
         // East-Asian-ambiguous, so width_cjk charges it two columns even though
         // it costs three bytes.
         let painted = display_width(row.trim_end());
-        assert!(row.contains("reasoning: max"));
+        assert!(row.contains("(max)"));
         assert!(
             painted <= popup_x as usize + 1 + MODEL_LINE_MAX_COLUMNS as usize,
             "model line painted {painted} columns: {row:?}"
@@ -1083,10 +1066,10 @@ mod tests {
         )
         .unwrap();
         let mut textarea = TextArea::default();
-        // 31 full-width characters = 62 columns, past the 57 columns the
-        // 118-column budget leaves for the topic (59-column prefix, two
+        // 44 full-width characters = 88 columns, past the 81 columns the
+        // 118-column budget leaves for the topic (35-column prefix, two
         // columns for the marker and two held back for the edge margin).
-        let topic = "这是一个用于验证超长会话标题在模型行中被截断并标记省略号的测试";
+        let topic = "这是一个用于验证超长会话标题在模型行中被截断并标记省略号的测试再加十三个汉字把长度凑够用";
         let mut viewport_area = Rect::ZERO;
 
         terminal
@@ -1113,22 +1096,22 @@ mod tests {
         // with its whitespace removed instead of as a contiguous substring.
         let dense: String = row.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert!(row.contains('…'), "truncated topic without a marker: {row:?}");
-        // 28 full-width characters (56 columns) fit after the 59-column prefix;
-        // the two-column marker ends the row at 117 of the 118 columns. A 29th
+        // 40 full-width characters (80 columns) fit after the 35-column prefix;
+        // the two-column marker ends the row at 117 of the 118 columns. A 41st
         // character would overflow the 116-column text budget.
-        let cut_at = topic.char_indices().nth(28).unwrap().0;
+        let cut_at = topic.char_indices().nth(40).unwrap().0;
         assert!(
             dense.ends_with(&format!("|{}…", &topic[..cut_at])),
             "{row:?}"
         );
         assert!(
-            !dense.contains("的测试"),
+            !dense.contains("凑够用"),
             "model line paints past its budget: {row:?}"
         );
     }
 
     /// A typical session title (14 CJK characters, 28 columns) fits inside the
-    /// 120-column budget next to the 59-column prefix, so it renders verbatim.
+    /// 120-column budget next to the 35-column prefix, so it renders verbatim.
     #[test]
     fn model_line_shows_a_typical_topic_in_full() {
         let mut terminal = Terminal::with_options(
@@ -1256,6 +1239,25 @@ mod tests {
     }
 
     #[test]
+    fn textarea_row_range_marks_the_wrapping_rows() {
+        // Empty-input production shape: 3 textarea rows plus model/help chrome.
+        let lines = vec![String::new()];
+        let (start, len) = textarea_row_range(5, &lines, None, false, true);
+        assert!(len >= 1, "empty input still reserves textarea rows");
+        assert!(
+            start.saturating_add(len) <= 5,
+            "range escapes the viewport: start={start} len={len}"
+        );
+        // The chrome rows surround the textarea, so the span is a strict
+        // interior slice, never the whole box: otherwise placement would
+        // count the title/help wraps it must ignore.
+        assert!(
+            start >= 1 || start.saturating_add(len) < 5,
+            "span covers the chrome rows too: start={start} len={len}"
+        );
+    }
+
+    #[test]
     fn live_narrow_width_truncates_the_first_title_paint() {
         let mut terminal = Terminal::with_options(
             TestBackend::new(120, 12),
@@ -1374,7 +1376,7 @@ mod tests {
             .map(|y| buffer_row(terminal.backend(), y, viewport_area.x, viewport_area.width))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("reasoning: max"));
+        assert!(rendered.contains("(max)"));
 
         let popup_width = viewport_area
             .width
@@ -1382,9 +1384,11 @@ mod tests {
             .clamp(40, 180)
             .min(viewport_area.width);
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
-        // The caret sits one column right of the left-edge marker bar. The bar
-        // occupies a column but no row, so the caret stays on the box's top row.
-        let visual_caret = Position::new(popup_x + 2, viewport_area.y);
+        // The caret sits two columns right of the left-edge marker bar: one for
+        // the bar itself and one blank column so the bar never reads as a
+        // second cursor. The bar occupies a column but no row, so the caret
+        // stays on the box's top row.
+        let visual_caret = Position::new(popup_x + 3, viewport_area.y);
         assert_eq!(
             cursor_position,
             Some(Position::new(
@@ -1433,9 +1437,11 @@ mod tests {
             .map(|y| buffer_row(terminal.backend(), y, viewport_area.x, viewport_area.width))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("agent:"));
-        assert!(rendered.contains("build"));
-        assert!(rendered.contains("model:"));
+        // Compact identity format: "model (agent; reasoning)|topic".
+        assert!(rendered.contains("(build; max)"));
+        assert!(rendered.contains("glm-5.2-super-relay"));
+        assert!(!rendered.contains("agent:"));
+        assert!(!rendered.contains("model:"));
     }
 
     #[test]
@@ -1562,9 +1568,10 @@ mod tests {
             .clamp(40, 180)
             .min(viewport_area.width);
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
-        // Textarea content renders one column right of the left-edge marker bar;
-        // the bar adds no row, so content starts on the box's top row.
-        let input_x = popup_x + 2;
+        // Textarea content renders two columns right of the left-edge marker
+        // bar (bar plus one blank column); the bar adds no row, so content
+        // starts on the box's top row.
+        let input_x = popup_x + 3;
         let input_y = viewport_area.y;
         let cursor_cell = &terminal.backend().buffer()[(input_x, input_y)];
         assert_eq!(cursor_cell.symbol(), "h");
@@ -1653,9 +1660,10 @@ mod tests {
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
         // The caret position at the end of the CJK text uses tui-textarea's
         // calculated position, avoiding an independent CJK-width calculation.
-        // Content starts one column right of the left-edge marker bar; the bar
-        // occupies no row, so the first text line sits on the box's top row.
-        let expected_x = popup_x + 2 + 8;
+        // Content starts two columns right of the left-edge marker bar (bar
+        // plus one blank column); the bar occupies no row, so the first text
+        // line sits on the box's top row.
+        let expected_x = popup_x + 3 + 8;
         let expected = Position::new(expected_x, viewport_area.y);
         assert_eq!(
             cursor_offset,

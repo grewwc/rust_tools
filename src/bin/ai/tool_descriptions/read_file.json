@@ -1,6 +1,6 @@
 {
   "name": "read_file",
-  "description": "Read a line-numbered excerpt from a local file (regular files only). use_line_numbers=false returns raw content without line prefixes (e.g. for copy into apply_patch).",
+  "description": "Read a line-numbered excerpt from a local file (regular files only). Default window is 200 lines; page large files with offset/limit and follow the truncation notice to continue. use_line_numbers=false returns raw content without line prefixes (e.g. for copy into apply_patch).",
   "parameters": {
     "type": "object",
     "properties": {
@@ -21,7 +21,7 @@
       "limit": {
         "type": "integer",
         "minimum": 1,
-        "description": "Number of lines to read (default: 1000). Large limit for an overview, small (20-40) for a precise slice. Very large results are capped; a truncation notice gives the continuation offset."
+      "description": "Number of lines to read (default: 200). Large limit for an overview, small (20-40) for a precise slice. Very large results are capped; a truncation notice gives the exact offset/char_offset to continue with, so no content is lost by paging."
       },
       "use_line_numbers": {
         "type": "boolean",

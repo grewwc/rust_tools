@@ -28,7 +28,7 @@ use super::{
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
     state::{
         StreamChunkStep, StreamContentState, StreamMarkers, StreamProcessingState,
-        TerminalDedupeState, ToolCallBuilder,
+        TerminalDedupeState, ToolCallBuilder, response_server_text_mismatch,
     },
     wire_log::WireOutcomeNote,
 };
@@ -497,6 +497,8 @@ fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
         skip_response_drain: true,
         truncated_by_length: false,
         stream_error: false,
+        response_reconciled: false,
+        response_server_mismatch: false,
         finish_reason_value: None,
         usage_prompt_tokens: 0,
         usage_cached_prompt_tokens: 0,
@@ -802,6 +804,18 @@ fn finalize_stream_response(
             // stream stopped early without ever seeing the end marker. Distinct from a normal finish_reason=stop
             // reasoning-only response — there finish_reason_seen=true, so this branch is not entered and it stays Completed.
             StreamOutcome::Truncated
+        } else if has_text
+            && !state.content.finish_reason_seen
+            && !state.content.response_completed
+            && !state.content.done_seen
+        {
+            // Visible text but no end marker at all: no finish_reason, no
+            // `response.completed`, no SSE `[DONE]` — the stream stopped
+            // mid-generation instead of ending. Accepting the partial text as
+            // Completed would finish the turn on a half answer, so escalate to
+            // retryable Truncated: the turn loop keeps the partial text and lets
+            // the model continue. Any provider-declared end stays Completed.
+            StreamOutcome::Truncated
         } else if !has_text && !has_reasoning {
             // Detect empty responses: no text, no tool calls, no reasoning content.
             // Usually a provider-side problem (rate limit, model error); trigger a retry.
@@ -809,6 +823,24 @@ fn finalize_stream_response(
         } else {
             StreamOutcome::Completed
         }
+    };
+    // Server-text reconciliation (Responses wire only): the provider declared completion
+    // and shipped its assembled output array in the same terminal event. When the
+    // delta-assembled body is a strict prefix of the server copy with a substantive
+    // missing tail, the transport lost events — retry as Truncated instead of ending
+    // the turn on a half answer. `Completed` here always has no tool calls (the
+    // ToolCall branch above takes precedence), so no extra guard is needed.
+    let response_reconciled = !state.content.response_server_text.is_empty();
+    let response_server_mismatch = outcome == StreamOutcome::Completed
+        && state.content.response_completed
+        && response_server_text_mismatch(
+            &state.content.assistant_text,
+            &state.content.response_server_text,
+        );
+    let outcome = if response_server_mismatch {
+        StreamOutcome::Truncated
+    } else {
+        outcome
     };
     // Serve-streamed turns already delivered this text through the live FIFO;
     // re-printing a truncated tail would show it twice.
@@ -835,10 +867,15 @@ fn finalize_stream_response(
         reasoning_chars: state.content.reasoning_text.chars().count(),
         response_completed: state.content.response_completed,
         response_incomplete: state.content.response_incomplete,
+        response_reconciled,
+        response_server_mismatch,
+        server_chars: state.content.response_server_text.chars().count(),
         tool_args_cap_exceeded: state.content.tool_args_cap_exceeded,
         decode_errors: state.framing.decode_error_count,
         usage: usage_snapshot,
     });
+    // Always-on minimal outcome line (independent of the opt-in verbose wire log).
+    state.wire_log.append_outcome_record();
 
     Ok(StreamResult {
         outcome,
@@ -850,6 +887,8 @@ fn finalize_stream_response(
         skip_response_drain: true,
         truncated_by_length,
         stream_error,
+        response_reconciled,
+        response_server_mismatch,
         finish_reason_value: state.content.finish_reason_value.clone(),
         usage_prompt_tokens: usage_snapshot.map(|(p, _, _, _)| p).unwrap_or(0),
         usage_cached_prompt_tokens: usage_snapshot.map(|(_, cp, _, _)| cp).unwrap_or(0),
@@ -1037,6 +1076,8 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         truncated_by_length: false,
         // Truncation caused by a stream read failure, not by over-long model output.
         stream_error: true,
+        response_reconciled: false,
+        response_server_mismatch: false,
         finish_reason_value: state.content.finish_reason_value.clone(),
         usage_prompt_tokens: 0,
         usage_cached_prompt_tokens: 0,
@@ -1393,7 +1434,7 @@ fn process_stream_payload(
             super::state::ParsedStreamPayload::Ignore => {
                 return Ok(StreamPayloadOutcome::default());
             }
-            super::state::ParsedStreamPayload::Done => return Ok(StreamPayloadOutcome::stop()),
+            super::state::ParsedStreamPayload::Done => { state.content.done_seen = true; return Ok(StreamPayloadOutcome::stop()) },
             super::state::ParsedStreamPayload::Error(msg) => {
                 return Err(format!("provider stream error: {msg}").into());
             }
@@ -1426,13 +1467,18 @@ fn process_stream_payload(
             super::state::ParsedStreamPayload::Chunk(chunk) => {
                 (chunk, StreamEventMergeMode::Append, false)
             }
-            super::state::ParsedStreamPayload::ResponseTerminal { status, chunk } => {
+            super::state::ParsedStreamPayload::ResponseTerminal {
+                status,
+                chunk,
+                server_text,
+            } => {
                 // The provider declared how this response ended (Responses wire). Record it before
                 // the chunk is processed: a completed response ends at its own marker (`response.completed`),
                 // and an incomplete one must stay retryable even when partial visible text exists.
                 match status {
                     crate::ai::request::ResponseTerminalStatus::Completed => {
                         state.content.response_completed = true;
+                        state.content.response_server_text = server_text;
                     }
                     crate::ai::request::ResponseTerminalStatus::Incomplete => {
                         state.content.response_incomplete = true;

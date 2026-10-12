@@ -1,0 +1,20 @@
+{
+  "name": "delete_skill",
+  "description": "Delete one user skill by name from the configured skills directory (single .skill file or directory package). Builtin skills are compiled in and cannot be removed. Fails when no matching skill exists.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Exact name of the skill to delete."
+      }
+    },
+    "required": [
+      "name"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "skills"
+  ]
+}

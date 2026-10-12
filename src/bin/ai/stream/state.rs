@@ -376,6 +376,16 @@ pub(super) struct StreamContentState {
     /// whose status is not `completed`): the model was stopped, not finished, so partial visible
     /// text is not an answer and the turn must stay retryable.
     pub(super) response_incomplete: bool,
+    /// Server-assembled visible text carried by the terminal event (`response.completed`
+    /// `output[]`; see `ParsedStreamPayload::ResponseTerminal::server_text`). Empty when
+    /// the wire has no server-side copy. The finalize path reconciles it against the
+    /// delta-assembled text to catch a tail lost in transport despite declared completion.
+    pub(super) response_server_text: String,
+    /// The SSE `[DONE]` terminator (or `done` event name) was observed: the provider closed
+    /// its end of the stream deliberately. Together with `finish_reason_seen` and
+    /// `response_completed` this distinguishes a declared end from a connection that
+    /// simply stopped mid-generation with no end marker at all.
+    pub(super) done_seen: bool,
     /// Accumulated tool-call arguments exceeded the `MAX_TOOL_ARG_BYTES` cap and the stream was force-stopped. Same reasoning as
     /// `stream_idle_timed_out`: the stream was cut off by the runtime and the model may still be generating,
     /// so JSON that merely happens to be valid at the cut-off moment must not be handed to the execution layer as a complete tool call.
@@ -442,6 +452,27 @@ pub(super) struct StreamContentState {
     pub(super) content_think_demuxer: ContentThinkDemuxer,
 }
 
+/// Whether the delta-assembled body lost its tail in transport: the server copy is
+/// longer, the client body is its strict prefix, and the missing tail carries
+/// non-whitespace content. Both sides go through the same digest-strip + trim
+/// normalization used for display. Any other difference (rephrasing, reordering,
+/// extra whitespace) is not machine-decidable and must never trigger a retry.
+pub(super) fn response_server_text_mismatch(client_text: &str, server_text: &str) -> bool {
+    if server_text.is_empty() {
+        return false;
+    }
+    let client = crate::ai::request::strip_digest_blocks(client_text);
+    let server = crate::ai::request::strip_digest_blocks(server_text);
+    let (client, server) = (client.trim(), server.trim());
+    if client.is_empty() || client == server {
+        return false;
+    }
+    // `starts_with` guarantees `client.len()` is a char boundary of `server`.
+    server.len() > client.len()
+        && server.starts_with(client)
+        && !server[client.len()..].trim().is_empty()
+}
+
 impl StreamContentState {
     fn new() -> Self {
         Self {
@@ -453,6 +484,8 @@ impl StreamContentState {
             dropped_malformed_tool_call: false,
             response_completed: false,
             response_incomplete: false,
+            response_server_text: String::new(),
+            done_seen: false,
             tool_args_cap_exceeded: false,
             saw_reasoning_output: false,
             reasoning_started_at: None,
@@ -562,7 +595,7 @@ pub(super) struct InternalToolCall {
 
 #[cfg(test)]
 mod tests {
-    use super::DigestTerminalFilter;
+    use super::{DigestTerminalFilter, response_server_text_mismatch};
     use crate::ai::request::{DIGEST_BEGIN, DIGEST_END};
 
     #[test]
@@ -614,5 +647,24 @@ mod tests {
         // Stream ends inside ordinary text: a tail that may be part of a sentinel prefix is emitted at flush
         assert_eq!(f.push("结尾写着 <<<IMAGE_"), "结尾写着 ");
         assert_eq!(f.flush(), "<<<IMAGE_");
+    }
+
+    #[test]
+    fn server_text_mismatch_only_fires_on_lost_tail() {
+        // No server copy (chat wires, incomplete terminals): nothing to compare.
+        assert!(!response_server_text_mismatch("hello", ""));
+        // Identical after normalization: healthy stream.
+        assert!(!response_server_text_mismatch("hello world", "hello world"));
+        // Strict prefix with a substantive missing tail: transport lost events.
+        assert!(response_server_text_mismatch("hello", "hello world"));
+        // Whitespace-only tail: formatting noise, never a retry.
+        assert!(!response_server_text_mismatch("hello", "hello   "));
+        // Divergent text (not a prefix): rephrasing/reordering is not
+        // machine-decidable, so it must not trigger a retry.
+        assert!(!response_server_text_mismatch("hello world", "hello there"));
+        assert!(!response_server_text_mismatch("longer client text", "short"));
+        // Empty client body carries no comparison signal.
+        assert!(!response_server_text_mismatch("", "hello world"));
+        assert!(!response_server_text_mismatch("   ", "hello world"));
     }
 }

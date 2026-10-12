@@ -687,3 +687,67 @@ fn process_stream_payload_halts_and_downshifts_on_hallucinated_result_marker() {
         state.content.assistant_text
     );
 }
+
+#[test]
+fn done_sentinel_is_recorded_as_provider_declared_end() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    let outcome = process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        None,
+        "[DONE]",
+    )
+    .unwrap();
+
+    assert!(outcome.should_stop, "[DONE] 必须停流");
+    assert!(
+        state.content.done_seen,
+        "必须记录 provider-declared end，否则会被误判为中断"
+    );
+}
+
+#[test]
+fn text_without_any_end_marker_escalates_to_truncated() {
+    // The "model output suddenly stops" case: visible text arrived but the
+    // stream ended with no finish_reason, no `response.completed`, no `[DONE]`.
+    // It must stay retryable so the turn continues instead of finishing on a
+    // half answer; any declared end stays Completed (next test).
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    state.content.assistant_text = "格式对齐了。现在创建内置文件".to_string();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    let result = finalize_stream_response(&mut app, &mut current_history, &markers, state).unwrap();
+
+    assert_eq!(result.outcome, StreamOutcome::Truncated);
+    assert!(
+        !result.assistant_text.is_empty(),
+        "partial text 必须保留，下一轮才能接着继续"
+    );
+}
+
+#[test]
+fn text_with_done_sentinel_stays_completed() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    state.content.assistant_text = "格式对齐了。现在创建内置文件".to_string();
+    state.content.done_seen = true;
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    let result = finalize_stream_response(&mut app, &mut current_history, &markers, state).unwrap();
+
+    assert_eq!(
+        result.outcome,
+        StreamOutcome::Completed,
+        "provider 声明过结束就不得误判为中断"
+    );
+}

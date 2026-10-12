@@ -1,11 +1,11 @@
 use crate::ai::agents::{self, AgentManifest};
 
-/// Unified interactive command help message
-pub fn print_interactive_help() {
+/// Command sections of the interactive help (everything except shortcuts/notes).
+fn print_commands_help() {
     println!("Interactive commands:");
     println!();
     println!("  General:");
-    println!("    /help, /h                 show this help message");
+    println!("    /help [cmd|shortcuts]    show this help message (optional topic)");
     println!("    /model [name]             list or switch models");
     println!(
         "    /effort [level]           show or set reasoning effort (shortcut for /model effort)"
@@ -102,6 +102,18 @@ pub fn print_interactive_help() {
         "    /title [text]             set or show the current session title (bare /title shows it)"
     );
     println!();
+}
+
+fn print_shortcuts_help() {
+    println!("  Keyboard shortcuts:");
+    println!("    Enter                 newline | Alt+Enter/F2      send");
+    println!("    Ctrl+C                cancel  | Up/Down,Ctrl+P/N  history");
+    println!("    Cmd/Ctrl+U            delete line | Ctrl+V  paste");
+    println!("    F8  clear screen | F9  copy last answer | F10  copy all");
+    println!("    Tab                   refresh completion | Esc  close completion");
+}
+
+fn print_help_notes() {
     println!("  Notes:");
     println!("    - Commands support both / and : prefix (e.g., /help or :help)");
     println!("    - Use `/personas` for persona management");
@@ -109,6 +121,15 @@ pub fn print_interactive_help() {
     println!("    - Run bare `a` in the same terminal to resume/select suspended sessions");
     println!("    - Run `a --new-session` to start fresh without consuming suspended sessions");
     println!("    - Press Ctrl+C to interrupt streaming or exit");
+}
+
+/// Unified interactive command help message (same output as the three sections above).
+pub fn print_interactive_help() {
+    print_commands_help();
+    println!();
+    print_shortcuts_help();
+    println!();
+    print_help_notes();
     println!();
 }
 
@@ -124,10 +145,31 @@ pub fn try_handle_help_command(input: &str) -> bool {
     } else {
         return false;
     };
-    if normalized != "help" && normalized != "h" {
-        return false;
+    let mut parts = normalized.split_whitespace();
+    match parts.next() {
+        Some("help") | Some("h") => {}
+        _ => return false,
     }
-    print_interactive_help();
+    // From here the head word matched, so the input is always consumed
+    // locally: topics print their section, anything else is a usage error.
+    // Nothing falls through to the model.
+    match parts.next() {
+        None => print_interactive_help(),
+        Some(topic) if matches!(topic, "shortcuts" | "cmd" | "commands") => {
+            if parts.next().is_some() {
+                println!("Too many arguments. Usage: /help [{topic}]");
+            } else if topic == "shortcuts" {
+                print_shortcuts_help();
+                println!();
+            } else {
+                print_commands_help();
+            }
+        }
+        Some(other) => {
+            println!("Unknown help topic: '{other}'. Available topics: cmd, shortcuts");
+            println!("Usage: /help [cmd|shortcuts]");
+        }
+    }
     true
 }
 
@@ -162,4 +204,27 @@ pub fn print_agents_list(agent_manifests: &[AgentManifest]) {
     }
 
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::try_handle_help_command;
+
+    #[test]
+    fn help_consumes_bare_topics_and_rejects_unknown_words_locally() {
+        // Handled locally (never forwarded to the model).
+        assert!(try_handle_help_command("/help"));
+        assert!(try_handle_help_command(":help"));
+        assert!(try_handle_help_command("/h"));
+        assert!(try_handle_help_command("/help shortcuts"));
+        assert!(try_handle_help_command("/help cmd"));
+        assert!(try_handle_help_command("/help commands"));
+        // Usage errors are also consumed locally, not sent to the model.
+        assert!(try_handle_help_command("/help bogus"));
+        assert!(try_handle_help_command("/help shortcuts extra"));
+        // Non-help input still falls through.
+        assert!(!try_handle_help_command("/helpx"));
+        assert!(!try_handle_help_command("help"));
+        assert!(!try_handle_help_command(""));
+    }
 }

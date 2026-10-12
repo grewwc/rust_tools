@@ -54,6 +54,9 @@ const ENABLE_ENV: &str = "AIOS_STREAM_WIRE_LOG";
 /// Log file name inside the session assets directory.
 const WIRE_LOG_FILE: &str = "stream_wire.log";
 
+/// Always-on outcome file name inside the session assets directory.
+const OUTCOME_LOG_FILE: &str = "stream_outcomes.jsonl";
+
 /// Per-line cap for the raw terminal-event payload copy (the Responses wire
 /// repeats the full output array — including encrypted reasoning blobs — inside
 /// `response.completed`, so the raw copy must be bounded while the parsed
@@ -273,10 +276,45 @@ impl StreamWireLog {
             "reasoning_chars": note.reasoning_chars,
             "response_completed": note.response_completed,
             "response_incomplete": note.response_incomplete,
+            "response_reconciled": note.response_reconciled,
+            "response_server_mismatch": note.response_server_mismatch,
+            "server_chars": note.server_chars,
             "tool_args_cap_exceeded": note.tool_args_cap_exceeded,
             "decode_errors": note.decode_errors,
             "usage": usage,
         }));
+    }
+
+    /// Always-on outcome record: one minimal JSONL line per finalized response in
+    /// `<session assets>/stream_outcomes.jsonl`, independent of the opt-in verbose
+    /// wire log. Called right after `note_outcome`, so `self.client` already holds
+    /// the classification; best-effort and silent without a session dir.
+    pub(super) fn append_outcome_record(&self) {
+        let Some(dir) = current_session_assets_dir() else {
+            return;
+        };
+        let path = dir.join(OUTCOME_LOG_FILE);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let record = json!({
+            "seq": seq,
+            "ts": Utc::now().to_rfc3339(),
+            "session": &self.session,
+            "turn": self.turn,
+            "depth": self.depth,
+            "model": &self.model,
+            "wire": self.wire,
+            "client": &self.client,
+        });
+        let Ok(mut line) = serde_json::to_string(&record) else {
+            return;
+        };
+        line.push('\n');
+        let _ = std::fs::create_dir_all(&dir);
+        rotate_if_large(&path);
+        let _guard = APPEND_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = file.write_all(line.as_bytes());
+        }
     }
 
     /// Record that the stream was cut by a read error. Raw wire data alone
@@ -410,6 +448,9 @@ pub(super) struct WireOutcomeNote<'a> {
     pub(super) reasoning_chars: usize,
     pub(super) response_completed: bool,
     pub(super) response_incomplete: bool,
+    pub(super) response_reconciled: bool,
+    pub(super) response_server_mismatch: bool,
+    pub(super) server_chars: usize,
     pub(super) tool_args_cap_exceeded: bool,
     pub(super) decode_errors: usize,
     pub(super) usage: Option<(u64, u64, u64, u64)>,
@@ -795,6 +836,9 @@ mod tests {
             reasoning_chars: 0,
             response_completed: true,
             response_incomplete: false,
+            response_reconciled: false,
+            response_server_mismatch: false,
+            server_chars: 0,
             tool_args_cap_exceeded: false,
             decode_errors: 0,
             usage: Some((53403, 0, 57, 27)),

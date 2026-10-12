@@ -514,6 +514,14 @@ pub(super) struct StreamResult {
     /// pointless — the model did not output too much; the server dropped the
     /// stream. Upper layers should do a plain retry rather than shrink-and-rewrite.
     pub(super) stream_error: bool,
+    /// Server-text reconciliation ran: the Responses terminal event carried a
+    /// server-assembled output copy, so the finalize path could compare it
+    /// against the delta-assembled body. False on chat-completions wires.
+    pub(super) response_reconciled: bool,
+    /// Reconciliation found the delta-assembled body is a strict prefix of the
+    /// server copy with a substantive missing tail (transport lost events despite
+    /// declared completion). The outcome is upgraded to Truncated on mismatch.
+    pub(super) response_server_mismatch: bool,
     /// Raw finish_reason returned by the server (e.g. `stop` / `length` /
     /// `tool_calls`). Used for truncation diagnostics, distinguishing "output cap
     /// hit" from other causes.

@@ -63,6 +63,7 @@ mod followup;
 mod iteration;
 mod observer;
 mod output_format;
+mod outstanding;
 mod patch_retry;
 mod prepare;
 mod rejection;
@@ -88,8 +89,8 @@ pub(in crate::ai) use audit_evidence::is_evidence_gated_audit_agent;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(in crate::ai::driver::turn_runtime) use {
     audit_evidence::*, completion_gate::*, final_citations::*, final_recovery::*, followup::*,
-    iteration::*, observer::*, output_format::*, patch_retry::*, prepare::*, rejection::*,
-    round::*,
+    iteration::*, observer::*, outstanding::*, output_format::*, patch_retry::*, prepare::*,
+    rejection::*, round::*,
 };
 #[cfg(test)]
 mod tests;

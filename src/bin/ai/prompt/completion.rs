@@ -635,7 +635,12 @@ impl CommandCompleter {
 
     /// Subcommands of `/checkpoint` / `/cp`.
     fn checkpoint_subcommands() -> &'static [&'static str] {
-        &["save", "list", "rollback", "delete", "help"]
+        &["save", "tree", "list", "rollback", "delete", "help"]
+    }
+
+    /// Topics of `/help` (same set `try_handle_help_command` accepts).
+    fn help_topics() -> &'static [&'static str] {
+        &["cmd", "commands", "shortcuts"]
     }
 
     /// Subcommands of `/changes` / `/diff` (-- long options are primary, matching the command docs;
@@ -1005,6 +1010,7 @@ impl CommandCompleter {
                     "/personas" | ":personas" => Self::persona_subcommands(),
                     "/usage" | ":usage" => Self::usage_subcommands(),
                     "/checkpoint" | ":checkpoint" | "/cp" | ":cp" => Self::checkpoint_subcommands(),
+                    "/help" | ":help" => Self::help_topics(),
                     "/model" | ":model" => Self::model_subcommands(),
                     // `/effort <TAB>` -> reasoning-effort levels (same set as `/model effort <level>`).
                     "/effort" | ":effort" => Self::model_effort_levels(),
@@ -2601,6 +2607,24 @@ mod tests {
                 .map(|c| &c.replacement)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn help_completion_lists_topics() {
+        let (_, candidates) = CommandCompleter::complete_for_line("/help ", 6);
+        let labels: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
+        for topic in ["cmd", "commands", "shortcuts"] {
+            assert!(
+                labels.iter().any(|x| x == topic),
+                "expected help topic `{}` in candidates: {:?}",
+                topic,
+                labels
+            );
+        }
+        // Prefix filtering narrows to `shortcuts`.
+        let (_, candidates) = CommandCompleter::complete_for_line("/help sh", 8);
+        let labels: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
+        assert_eq!(labels, vec!["shortcuts"]);
     }
 
     #[test]

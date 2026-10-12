@@ -130,6 +130,25 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
     if let Some(err_msg) = value.get("error").and_then(extract_error_message) {
         return Some(ParsedStreamPayload::Error(err_msg));
     }
+/// Server-assembled visible text from a Responses terminal event: concatenate every
+/// `output[].content[].text` part. Only `message` items carry displayable text;
+/// `reasoning` items have no `content[].text`, so they contribute nothing.
+fn extract_response_server_text(response: &serde_json::Value) -> String {
+    let mut out = String::new();
+    if let Some(items) = response.get("output").and_then(|o| o.as_array()) {
+        for item in items {
+            if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                        out.push_str(text);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
     if event_type.eq_ignore_ascii_case("response.completed") {
         // Some gateways report the terminal state inside this event instead of emitting a
         // dedicated `response.incomplete` / `response.failed` (status other than `completed`, an
@@ -155,12 +174,19 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
             .get("response")
             .and_then(|response| response.get("usage"))
             .and_then(|usage| serde_json::from_value(usage.clone()).ok());
+        // The same event carries the server-assembled output array: keep its text so
+        // the finalize path can reconcile it against the delta-assembled body.
+        let server_text = value
+            .get("response")
+            .map(extract_response_server_text)
+            .unwrap_or_default();
         return Some(ParsedStreamPayload::ResponseTerminal {
             status: ResponseTerminalStatus::Completed,
             chunk: StreamChunk {
                 usage,
                 ..Default::default()
             },
+            server_text,
         });
     }
     // OpenAI Responses API 错误/不完整事件——必须显式处理，否则会 fallthrough
@@ -499,6 +525,45 @@ fn incomplete_response_payload(response: &serde_json::Value) -> ParsedStreamPayl
     ParsedStreamPayload::ResponseTerminal {
         status: ResponseTerminalStatus::Incomplete,
         chunk,
+        server_text: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod response_server_text_tests {
+    use super::parse_stream_payload;
+    use crate::ai::{
+        provider,
+        request::ResponseTerminalStatus,
+        stream::state::ParsedStreamPayload,
+    };
+
+    #[test]
+    fn completed_event_carries_server_assembled_text() {
+        // Message items contribute their output_text; reasoning items have no
+        // content text and must not pollute the server copy.
+        let payload = r#"{"type":"response.completed","response":{"id":"r1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello "},{"type":"output_text","text":"world"}]},{"type":"reasoning","encrypted_content":"enc-xyz"}]}}"#;
+        match parse_stream_payload(provider::opencode_adapter(), payload, None) {
+            ParsedStreamPayload::ResponseTerminal {
+                status: ResponseTerminalStatus::Completed,
+                server_text,
+                ..
+            } => {
+                assert_eq!(server_text, "hello world");
+            }
+            _ => panic!("expected a completed terminal"),
+        }
+    }
+
+    #[test]
+    fn server_text_is_empty_without_output_array() {
+        let payload = r#"{"type":"response.completed","response":{"id":"r1","status":"completed"}}"#;
+        match parse_stream_payload(provider::opencode_adapter(), payload, None) {
+            ParsedStreamPayload::ResponseTerminal { server_text, .. } => {
+                assert!(server_text.is_empty());
+            }
+            _ => panic!("expected a terminal payload"),
+        }
     }
 }
 
@@ -1074,6 +1139,7 @@ mod tests {
             ParsedStreamPayload::ResponseTerminal {
                 status: ResponseTerminalStatus::Incomplete,
                 chunk,
+                ..
             } => {
                 assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
                 assert!(chunk.usage.is_some());
@@ -1227,6 +1293,7 @@ mod tests {
             ParsedStreamPayload::ResponseTerminal {
                 status: ResponseTerminalStatus::Completed,
                 chunk,
+                ..
             } => {
                 assert!(chunk.choices.is_empty());
                 let usage = chunk
@@ -1276,6 +1343,7 @@ mod tests {
             ParsedStreamPayload::ResponseTerminal {
                 status: ResponseTerminalStatus::Completed,
                 chunk,
+                ..
             } => {
                 assert!(chunk.usage.is_some());
             }
@@ -1294,6 +1362,7 @@ mod tests {
             ParsedStreamPayload::ResponseTerminal {
                 status: ResponseTerminalStatus::Completed,
                 chunk,
+                ..
             } => {
                 assert!(chunk.usage.is_none());
             }
@@ -1322,6 +1391,7 @@ mod tests {
             ParsedStreamPayload::ResponseTerminal {
                 status: ResponseTerminalStatus::Incomplete,
                 chunk,
+                ..
             } => {
                 assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
                 assert!(chunk.usage.is_some());
@@ -1340,6 +1410,7 @@ mod tests {
             ParsedStreamPayload::ResponseTerminal {
                 status: ResponseTerminalStatus::Incomplete,
                 chunk,
+                ..
             } => {
                 assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
             }
@@ -1467,6 +1538,7 @@ mod tests {
                 ParsedStreamPayload::ResponseTerminal {
                     status: ResponseTerminalStatus::Incomplete,
                     chunk,
+                    ..
                 } => {
                     // The unnamed stop must not claim the output cap: no fabricated finish reason,
                     // otherwise cap-specific repair would run for a cause nobody reported.
