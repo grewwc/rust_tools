@@ -27,6 +27,11 @@ use crate::ai::{agents::AgentManifest, mcp::SharedMcpClient, skills::SkillManife
 
 pub use agent::try_handle_agent_command;
 pub use checkpoint::try_handle_checkpoint_command;
+#[cfg(feature = "serve")]
+pub(crate) use checkpoint::{
+    SERVE_CHECKPOINT_CONFIRM_ENV, SERVE_CHECKPOINT_CONFIRM_MARKER,
+    SERVE_CHECKPOINT_CONFIRM_PROBE, SERVE_CHECKPOINT_CONFIRM_YES,
+};
 pub use cwd::try_handle_cwd_command;
 pub use export::try_handle_export_command;
 pub use feishu::try_handle_feishu_auth_command;

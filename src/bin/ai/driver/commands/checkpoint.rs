@@ -1,14 +1,35 @@
-//! Interactive `/checkpoint` command (alias `/cp`): save / checkout / fork /
-//! list / delete conversation-history checkpoints for the current session.
+//! Interactive `/checkpoint` command (alias `/cp`): immutable commits,
+//! movable branches, checkout, tree, and deletion for the current session.
 
 use crate::ai::{
     history::{
-        CheckpointInfo, CheckpointStore, MAX_CHECKPOINT_STORAGE_BYTES, MAX_CHECKPOINTS_PER_SESSION,
-        SessionStore,
+        CheckpointHead, CheckpointInfo, CheckpointStore, MAX_CHECKPOINT_STORAGE_BYTES,
+        MAX_CHECKPOINTS_PER_SESSION, SessionStore,
     },
     types::App,
 };
+use chrono::Local;
 use colored::Colorize;
+
+/// Internal bridge used by `serve-chat` checkpoint requests. The serve
+/// process runs the same one-shot CLI command as local mode, but interactive
+/// confirmation must be surfaced to the client instead of reading server
+/// stdin.
+pub(crate) const SERVE_CHECKPOINT_CONFIRM_ENV: &str = "RUST_TOOLS_SERVE_CHECKPOINT_CONFIRM";
+pub(crate) const SERVE_CHECKPOINT_CONFIRM_PROBE: &str = "probe";
+pub(crate) const SERVE_CHECKPOINT_CONFIRM_YES: &str = "yes";
+pub(crate) const SERVE_CHECKPOINT_CONFIRM_MARKER: &str = "__RUST_TOOLS_CHECKPOINT_CONFIRM__:";
+
+fn prompt_checkpoint_confirmation(prompt: &str) -> Option<bool> {
+    match std::env::var(SERVE_CHECKPOINT_CONFIRM_ENV).as_deref() {
+        Ok(SERVE_CHECKPOINT_CONFIRM_PROBE) => {
+            println!("{SERVE_CHECKPOINT_CONFIRM_MARKER}{prompt}");
+            Some(false)
+        }
+        Ok(SERVE_CHECKPOINT_CONFIRM_YES) => Some(true),
+        _ => crate::commonw::prompt::prompt_yes_or_no_danger(prompt),
+    }
+}
 
 pub fn try_handle_checkpoint_command(
     app: &mut App,
@@ -41,11 +62,11 @@ pub fn try_handle_checkpoint_command(
             print_help();
         }
         "save" | "commit" | "s" => {
-            let Some(name) = parts.next() else {
-                println!("Usage: /checkpoint save <name>");
-                return Ok(true);
-            };
-            match store.save(name) {
+            let name = parts
+                .next()
+                .map(str::to_string)
+                .unwrap_or_else(|| Local::now().format("commit-%Y%m%d-%H%M%S-%3f").to_string());
+            match store.save(&name) {
                 Ok(_) => {
                     println!("Saved checkpoint '{name}'.");
                     publish_checkpoint_names(&store);
@@ -56,32 +77,133 @@ pub fn try_handle_checkpoint_command(
         "list" | "ls" | "tree" | "log" | "" => {
             print_tree(app, &store)?;
         }
-        "checkout" | "co" | "switch" | "fork" => {
-            // `checkout` and `fork` require a clean live tree by default;
-            // callers must explicitly save or discard un-checkpointed work.
-            // `fork` is an intention-revealing switch whose next `save`
-            // records the target as parent.
-            let is_fork = action == "fork";
-            let args: Vec<String> = parts.map(|s| s.to_string()).collect();
-            let (target, discard_requested, explicit_save) = parse_checkout_args(&args);
-            if is_fork && discard_requested {
-                println!("Usage: /checkpoint fork <name|HEAD|latest> [--save <name>]");
-                return Ok(true);
+        "branch" | "br" => match parts.next() {
+            None => {
+                let active = match store.head_state() {
+                    Ok(CheckpointHead::Attached { branch, .. }) => Some(branch),
+                    Ok(CheckpointHead::Detached(_)) => None,
+                    Err(err) => {
+                        println!("Failed to read HEAD: {err}");
+                        return Ok(true);
+                    }
+                };
+                match store.list_branches() {
+                    Ok(branches) if branches.is_empty() => println!("No branches yet."),
+                    Ok(branches) => {
+                        for branch in branches {
+                            let marker = if active.as_deref() == Some(branch.name.as_str()) {
+                                "*"
+                            } else {
+                                " "
+                            };
+                            let integrity = if branch.is_dangling {
+                                " (missing checkpoint)"
+                            } else {
+                                ""
+                            };
+                            println!(
+                                "{marker} {} -> {}{integrity}",
+                                branch.name,
+                                branch.target.as_deref().unwrap_or("(unborn)")
+                            );
+                        }
+                    }
+                    Err(err) => println!("Failed to list branches: {err}"),
+                }
             }
-            let Some(raw_target) = target else {
-                if is_fork {
-                    println!("Usage: /checkpoint fork <name|HEAD|latest> [--save <name>]");
+            Some("-d" | "--delete" | "delete") => {
+                let Some(name) = parts.next() else {
+                    println!("Usage: /checkpoint branch --delete <name>");
+                    return Ok(true);
+                };
+                match store.delete_branch(name) {
+                    Ok(true) => {
+                        publish_checkpoint_names(&store);
+                        println!("Deleted branch '{name}'. Checkpoints were kept.");
+                    }
+                    Ok(false) => println!("Branch '{name}' not found."),
+                    Err(err) => println!("Failed to delete branch: {err}"),
+                }
+            }
+            Some(name) => {
+                let start = parts.next();
+                match store.create_branch(name, start) {
+                    Ok(()) => {
+                        publish_checkpoint_names(&store);
+                        match store.head_state() {
+                            Ok(CheckpointHead::Attached {
+                                branch,
+                                target: None,
+                            }) => println!(
+                                "Created and switched to unborn branch '{branch}'. The next save will create its first checkpoint."
+                            ),
+                            _ => println!(
+                                "Created branch '{name}'. Switch with `/cp switch {name}`."
+                            ),
+                        }
+                    }
+                    Err(err) => println!("Failed to create branch: {err}"),
+                }
+            }
+        },
+        "checkout" | "co" | "switch" => {
+            // Navigation requires a clean live tree by default; callers must
+            // explicitly save or discard un-checkpointed work.
+            let is_switch = action == "switch";
+            let args: Vec<String> = parts.map(|s| s.to_string()).collect();
+            let parsed = match parse_navigation_args(&args, if is_switch { "-c" } else { "-b" }) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    println!("Invalid {action} arguments: {err}");
+                    return Ok(true);
+                }
+            };
+            let NavigationArgs {
+                target,
+                create_branch,
+                discard: discard_requested,
+                explicit_save,
+            } = parsed;
+            if create_branch.is_none() && target.is_none() {
+                if is_switch {
+                    println!(
+                        "Usage: /checkpoint switch <branch> | /checkpoint switch -c <new-branch> [start]"
+                    );
                 } else {
                     println!(
-                        "Usage: /checkpoint checkout <name|HEAD|latest> [--save <name> | --discard]"
+                        "Usage: /checkpoint checkout <branch|checkpoint> | /checkpoint checkout -b <new-branch> [start]"
                     );
                 }
                 return Ok(true);
-            };
+            }
             if discard_requested && explicit_save.is_some() {
                 println!("Usage: --save <name> and --discard cannot be combined.");
                 return Ok(true);
             }
+            let raw_target = match (target, create_branch.as_deref()) {
+                (Some(target), _) => target,
+                (None, Some(new_branch)) => match store.prepare_branch(new_branch, None) {
+                    Ok(Some(target)) => target,
+                    Ok(None) => match store.create_branch(new_branch, None) {
+                        Ok(()) => {
+                            publish_checkpoint_names(&store);
+                            println!(
+                                "Switched to a new unborn branch '{new_branch}'. The next save will create its first checkpoint."
+                            );
+                            return Ok(true);
+                        }
+                        Err(err) => {
+                            println!("Failed to create branch '{new_branch}': {err}");
+                            return Ok(true);
+                        }
+                    },
+                    Err(err) => {
+                        println!("Failed to create branch '{new_branch}': {err}");
+                        return Ok(true);
+                    }
+                },
+                (None, None) => unreachable!("missing navigation target handled above"),
+            };
             // Git-style HEAD: the current commit. Every save and every
             // successful switch moves it, so `HEAD` always means "where live
             // is checked out", never "where we came from".
@@ -89,7 +211,50 @@ pub fn try_handle_checkpoint_command(
             // `latest` resolves to the newest checkpoint (list order is
             // newest-first, so it matches the `[latest]` tag in the tree).
             let latest_requested = is_latest_alias(&raw_target);
-            let name = if head_requested {
+            let matching_branch = (!head_requested && !latest_requested)
+                .then(|| store.list_branches().ok())
+                .flatten()
+                .and_then(|branches| {
+                    branches
+                        .into_iter()
+                        .find(|branch| branch.name == raw_target)
+                });
+            if is_switch && create_branch.is_none() && matching_branch.is_none() {
+                println!("Failed to switch: branch '{raw_target}' not found.");
+                return Ok(true);
+            }
+            let branch_name = create_branch
+                .clone()
+                .or_else(|| matching_branch.as_ref().map(|branch| branch.name.clone()));
+            let name = if let Some(branch) = matching_branch {
+                if branch.is_dangling {
+                    println!(
+                        "Failed to checkout: branch '{}' points to missing checkpoint '{}' (nothing was changed).",
+                        branch.name,
+                        branch.target.as_deref().unwrap_or_default()
+                    );
+                    return Ok(true);
+                }
+                match branch.target {
+                    Some(target) => target,
+                    None if create_branch.is_some() => {
+                        println!(
+                            "Failed to create branch: start branch '{}' has no checkpoint yet.",
+                            branch.name
+                        );
+                        return Ok(true);
+                    }
+                    None => {
+                        return switch_to_unborn_branch(
+                            app,
+                            &store,
+                            &branch.name,
+                            explicit_save.clone(),
+                            discard_requested,
+                        );
+                    }
+                }
+            } else if head_requested {
                 let listed = match store.list() {
                     Ok(checkpoints) => checkpoints,
                     Err(err) => {
@@ -146,6 +311,12 @@ pub fn try_handle_checkpoint_command(
             } else {
                 raw_target
             };
+            if let Some(new_branch) = create_branch.as_deref()
+                && let Err(err) = store.prepare_branch(new_branch, Some(&name))
+            {
+                println!("Failed to create branch '{new_branch}': {err}");
+                return Ok(true);
+            }
             // Validate the target before preserving anything: a failed switch
             // must have zero side effects (no save and no HEAD move).
             // `latest` and `HEAD` resolve straight from a fresh listing above,
@@ -182,8 +353,16 @@ pub fn try_handle_checkpoint_command(
             let mut preserved_as: Option<String> = None;
             let mut already_on_target = false;
             let mut clean_base: Option<String> = None;
-            let mut live_is_clean = live_len == 0;
-            if live_len > 0 {
+            let live_is_clean = match store.live_matches_base(&live_messages) {
+                Ok(matches) => matches,
+                Err(err) => {
+                    println!(
+                        "Failed to switch checkpoints: cannot verify whether live history is clean: {err}"
+                    );
+                    return Ok(true);
+                }
+            };
+            if live_is_clean {
                 let base = match store.base_target() {
                     Ok(base) => base,
                     Err(err) => {
@@ -192,31 +371,19 @@ pub fn try_handle_checkpoint_command(
                     }
                 };
                 if let Some(base) = base {
-                    match store.live_matches_checkpoint(&live_messages, &base) {
-                        Ok(true) => {
-                            live_is_clean = true;
-                            if base == name {
-                                already_on_target = true;
-                            } else {
-                                clean_base = Some(base);
-                            }
-                        }
-                        Ok(false) => {}
-                        Err(err) => {
-                            println!(
-                                "Failed to switch checkpoints: cannot verify whether live history is clean: {err}"
-                            );
-                            return Ok(true);
-                        }
+                    if base == name {
+                        already_on_target = true;
+                    } else {
+                        clean_base = Some(base);
                     }
                 }
             }
             let preparation = switch_preparation(live_len, live_is_clean, discard, explicit_save);
             if preparation == SwitchPreparation::RefuseDirty {
-                let operation = if is_fork { "fork" } else { "checkout" };
+                let operation = if is_switch { "switch" } else { "checkout" };
                 println!(
                     "Cannot {operation} '{name}': live history has un-checkpointed changes. \
-                     Save them first with `/cp save <name>`, or use `/cp checkout {name} --discard` to discard them."
+                     Save them first with `/cp save <name>`, or add `--discard` to discard them."
                 );
                 return Ok(true);
             }
@@ -237,14 +404,24 @@ pub fn try_handle_checkpoint_command(
             if already_on_target && preserved_as.is_none() {
                 // Live already equals the target: restoring would be a no-op,
                 // but HEAD still moves onto the current commit when needed.
-                if let Err(err) = store.set_head(&name) {
-                    eprintln!("[checkpoint] already on '{name}' but failed to move HEAD: {err}");
+                let attach_result = match (create_branch.as_deref(), branch_name.as_deref()) {
+                    (Some(branch), _) => store
+                        .create_branch(branch, Some(&name))
+                        .and_then(|()| store.attach_branch(branch)),
+                    (None, Some(branch)) => store.attach_branch(branch),
+                    (None, None) => store.set_head(&name),
+                };
+                if let Err(err) = attach_result {
+                    if let Some(branch) = create_branch.as_deref() {
+                        let _ = store.delete_branch(branch);
+                    }
+                    println!("Failed to switch: {err}");
+                    return Ok(true);
                 }
-                match is_fork {
-                    true => println!(
-                        "Fork base is already '{name}'. The next save will create a child checkpoint."
-                    ),
-                    false => println!(
+                match (create_branch.as_deref(), branch_name.as_deref()) {
+                    (Some(branch), _) => println!("Switched to a new branch '{branch}'."),
+                    (None, Some(branch)) => println!("Already on branch '{branch}'."),
+                    (None, None) => println!(
                         "Already on '{name}': live history matches it, so nothing was preserved or restored."
                     ),
                 }
@@ -259,7 +436,7 @@ pub fn try_handle_checkpoint_command(
                     None => false,
                 };
                 if !base_matches {
-                    let confirm = crate::commonw::prompt::prompt_yes_or_no_danger(&format!(
+                    let confirm = prompt_checkpoint_confirmation(&format!(
                         "Discard {live_len} un-checkpointed live message(s) and switch to '{name}'? (y/n): ",
                     ));
                     if confirm != Some(true) {
@@ -268,33 +445,46 @@ pub fn try_handle_checkpoint_command(
                     }
                 }
             }
-            let verb = if is_fork {
-                "Forked from"
-            } else {
-                "Checked out"
+            if let Some(branch) = create_branch.as_deref()
+                && let Err(err) = store.create_branch(branch, Some(&name))
+            {
+                println!("Failed to create branch '{branch}': {err}");
+                return Ok(true);
+            }
+            let switch_result = match branch_name.as_deref() {
+                Some(branch) => store.switch_branch(branch),
+                None => store.rollback(&name),
             };
-            let fork_hint = if is_fork {
-                " The next save will create a child checkpoint."
-            } else {
-                ""
-            };
-            match store.rollback(&name) {
+            match switch_result {
                 Ok(()) => {
                     refresh_runtime_after_rollback(app);
+                    let (verb, destination) =
+                        match (create_branch.as_deref(), branch_name.as_deref()) {
+                            (Some(branch), _) => ("Switched to a new branch", branch),
+                            (None, Some(branch)) => ("Switched to branch", branch),
+                            (None, None) => ("Checked out", name.as_str()),
+                        };
                     match (preserved_as, clean_base) {
                         (Some(saved), _) => println!(
-                            "{verb} '{name}'. Previous history preserved as '{saved}'.{fork_hint}"
+                            "{verb} '{destination}'. Previous history preserved as '{saved}'."
                         ),
                         (None, Some(base)) => println!(
-                            "{verb} '{name}'. No new turns since '{base}', so nothing was preserved.{fork_hint}"
+                            "{verb} '{destination}'. No new turns since '{base}', so nothing was preserved."
                         ),
-                        (None, None) if discard && live_len > 0 => println!(
-                            "{verb} '{name}' (un-checkpointed turns discarded).{fork_hint}"
-                        ),
-                        (None, None) => println!("{verb} '{name}'.{fork_hint}"),
+                        (None, None) if discard && live_len > 0 => {
+                            println!("{verb} '{destination}' (un-checkpointed turns discarded).")
+                        }
+                        (None, None) => println!("{verb} '{destination}'."),
                     }
                 }
                 Err(err) => {
+                    if let Some(branch) = create_branch.as_deref()
+                        && let Err(cleanup_err) = store.delete_branch(branch)
+                    {
+                        eprintln!(
+                            "[checkpoint] failed to clean up branch '{branch}' after switch failure: {cleanup_err}"
+                        );
+                    }
                     let head_hint = if head_requested {
                         " (HEAD points to a checkpoint that no longer exists)"
                     } else {
@@ -303,11 +493,11 @@ pub fn try_handle_checkpoint_command(
                     match preserved_as {
                         Some(saved) => {
                             println!(
-                                "Failed to checkout: {err}{head_hint} \
+                                "Failed to switch: {err}{head_hint} \
                                  (current history preserved as '{saved}', HEAD points there)."
                             );
                         }
-                        None => println!("Failed to checkout: {err}{head_hint}"),
+                        None => println!("Failed to switch: {err}{head_hint}"),
                     }
                 }
             }
@@ -355,7 +545,7 @@ pub fn try_handle_checkpoint_command(
                 return Ok(true);
             }
             let total_bytes: u64 = checkpoints.iter().map(|cp| cp.size_bytes).sum();
-            let confirm = crate::commonw::prompt::prompt_yes_or_no_danger(&format!(
+            let confirm = prompt_checkpoint_confirmation(&format!(
                 "Permanently delete all {} checkpoint(s) ({})? Live history is untouched. (y/n): ",
                 checkpoints.len(),
                 format_human_bytes(total_bytes),
@@ -384,20 +574,27 @@ fn print_help() {
     println!("Checkpoint commands (current session):");
     println!();
     println!(
-        "  /checkpoint save <name>       save current history as a checkpoint (alias: commit)"
+        "  /checkpoint save [name]       create an immutable commit; advances the current branch"
     );
     println!(
         "  /checkpoint tree              show checkpoints as a tree, newest first (default; `list` works too)"
     );
-    println!("  /checkpoint checkout <name|HEAD|latest> [--save <name> | --discard]");
-    println!("                                switch to a checkpoint (HEAD moves onto it); dirty");
+    println!("  /checkpoint checkout <branch|checkpoint> [--save <name> | --discard]");
+    println!("                                switch to a branch or detach at a checkpoint; dirty");
     println!(
         "                                history is refused unless explicitly saved or discarded"
     );
-    println!("  /checkpoint fork <name|HEAD|latest> [--save <name>]");
+    println!("  /checkpoint checkout -b <new-branch> [start]");
     println!(
-        "                                start from a clean checkpoint; the next save becomes its child"
+        "                                create and switch to a branch (Git-style checkout -b)"
     );
+    println!("  /checkpoint branch <name> [start]");
+    println!("                                create a branch at start (or current HEAD)");
+    println!("  /checkpoint branch            list branches (* marks the current branch)");
+    println!("  /checkpoint branch -d <name>  delete only the branch pointer");
+    println!("  /checkpoint switch <branch>   restore and attach HEAD to a branch");
+    println!("  /checkpoint switch -c <new-branch> [start]");
+    println!("                                create and switch to a branch (Git-style switch -c)");
     println!("  /checkpoint delete <name>     delete a checkpoint");
     println!(
         "  /checkpoint clear             delete ALL checkpoints (asks for confirmation first)"
@@ -407,7 +604,7 @@ fn print_help() {
     println!("  `latest` means the newest checkpoint (the `[latest]` row in the tree).");
     println!("  History is never dropped except by explicit `delete`, `clear`, or `--discard`.");
     println!(
-        "  Limit: {} checkpoints / {} MiB per session; saving an existing name replaces it.",
+        "  Limit: {} commits + branches / {} MiB per session; commit names cannot be overwritten.",
         MAX_CHECKPOINTS_PER_SESSION,
         MAX_CHECKPOINT_STORAGE_BYTES / (1024 * 1024)
     );
@@ -562,7 +759,11 @@ fn effective_head<'a>(
 /// inside every checkpoint would mean opening every snapshot on each listing.
 fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::error::Error>> {
     let checkpoints = store.list()?;
-    let head = store.head_target().unwrap_or(None);
+    let branches = store.list_branches()?;
+    let (active_branch, stored_head) = match store.head_state()? {
+        CheckpointHead::Attached { branch, target } => (Some(branch), target),
+        CheckpointHead::Detached(target) => (None, target),
+    };
     let base = store.base_target().unwrap_or(None);
     let live_len = SessionStore::new(app.config.history_file.as_path())
         .read_all_messages(&app.session_id)
@@ -593,17 +794,27 @@ fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::err
     // line only exists when there is no row to mark (no checkpoints yet).
     // A best-effort write heals a missing or dangling stored pointer so the
     // next command reads it back directly.
-    let head = match effective_head(&checkpoints, head.as_deref(), base.as_deref()) {
-        Some(resolved) => {
-            let resolved = resolved.to_string();
-            if head.as_deref() != Some(resolved.as_str()) {
-                let _ = store.set_head(&resolved);
+    let head = if active_branch.is_some() && stored_head.is_none() {
+        None
+    } else {
+        match effective_head(&checkpoints, stored_head.as_deref(), base.as_deref()) {
+            Some(resolved) => {
+                let resolved = resolved.to_string();
+                if active_branch.is_none() && stored_head.as_deref() != Some(resolved.as_str()) {
+                    let _ = store.set_head(&resolved);
+                }
+                Some(resolved)
             }
-            Some(resolved)
+            None => None,
         }
-        None => None,
     };
-    if checkpoints.is_empty() {
+    if let Some(branch) = active_branch.as_deref().filter(|_| stored_head.is_none()) {
+        println!(
+            "  {}  {}",
+            "○ HEAD".dimmed(),
+            format!("branch:{branch} (unborn — next save creates its first checkpoint)").dimmed()
+        );
+    } else if checkpoints.is_empty() {
         println!(
             "  {}  {}",
             "○ HEAD".dimmed(),
@@ -682,6 +893,20 @@ fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::err
         if is_head {
             tags.push_str(&"[HEAD] ".cyan().bold().to_string());
         }
+        for branch in branches
+            .iter()
+            .filter(|branch| branch.target.as_deref() == Some(cp.name.as_str()))
+        {
+            let label = if active_branch.as_deref() == Some(branch.name.as_str()) {
+                format!("[branch:{}*] ", branch.name)
+                    .cyan()
+                    .bold()
+                    .to_string()
+            } else {
+                format!("[branch:{}] ", branch.name).green().to_string()
+            };
+            tags.push_str(&label);
+        }
         if is_orphan {
             tags.push_str(&"[orphan] ".dimmed().to_string());
         }
@@ -698,7 +923,7 @@ fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::err
     }
     println!(
         "  {}",
-        "linear saves stay flat · fork lines mark branches · → marks HEAD · [latest] marks newest · checkout <name> restores · fork <name> branches · save <name> snapshots · delete <name> drops".dimmed()
+        "linear commits stay flat · → marks HEAD · branch:<name>* marks the active branch · switch <branch> attaches · checkout <commit> detaches · save advances".dimmed()
     );
     // Tree is the most common precursor to `checkout <TAB>`: publish the
     // names just listed so third-token completion has fresh candidates.
@@ -762,7 +987,7 @@ fn is_latest_alias(name: &str) -> bool {
     name.trim().eq_ignore_ascii_case("latest")
 }
 
-/// Refresh the `/checkpoint checkout|fork|delete <TAB>` name cache (best-effort):
+/// Refresh the checkpoint and branch completion caches (best-effort):
 /// completion sits on the hot path and cannot rescan the disk on every Tab,
 /// so the driver publishes fresh names before each prompt and after mutations.
 pub(super) fn publish_checkpoint_names(store: &CheckpointStore) {
@@ -771,47 +996,63 @@ pub(super) fn publish_checkpoint_names(store: &CheckpointStore) {
         .map(|checkpoints| checkpoints.into_iter().map(|cp| cp.name).collect())
         .unwrap_or_default();
     crate::ai::prompt::completion::CommandCompleter::set_checkpoint_name_candidates(names);
+    let branches = store
+        .list_branches()
+        .map(|branches| branches.into_iter().map(|branch| branch.name).collect())
+        .unwrap_or_default();
+    crate::ai::prompt::completion::CommandCompleter::set_checkpoint_branch_candidates(branches);
 }
 
-/// Parse `checkout` arguments: the first non-flag token is the target name.
-/// `--discard` skips preservation (destructive); `--save <name>` / `--as <name>` /
-/// `--save=<name>`
-/// preserve the current history under an explicit name before switching.
-fn parse_checkout_args(args: &[String]) -> (Option<String>, bool, Option<String>) {
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NavigationArgs {
+    target: Option<String>,
+    create_branch: Option<String>,
+    discard: bool,
+    explicit_save: Option<String>,
+}
+
+/// Parse Git-style `checkout` / `switch` arguments while retaining the
+/// checkpoint-specific dirty-history preservation flags.
+fn parse_navigation_args(args: &[String], create_flag: &str) -> Result<NavigationArgs, String> {
+    let mut parsed = NavigationArgs::default();
     let mut target: Option<String> = None;
-    let mut discard = false;
-    let mut explicit_save: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
         if arg == "--discard" {
-            discard = true;
+            parsed.discard = true;
+        } else if arg == create_flag || arg == "--create" {
+            let Some(name) = args.get(i + 1).filter(|name| !name.starts_with('-')) else {
+                return Err(format!("{arg} requires a branch name"));
+            };
+            parsed.create_branch = Some(name.clone());
+            i += 1;
         } else if arg == "--save" || arg == "--as" {
             if i + 1 < args.len() {
-                explicit_save = Some(args[i + 1].clone());
+                parsed.explicit_save = Some(args[i + 1].clone());
                 i += 1;
             }
         } else if let Some(value) = arg.strip_prefix("--save=") {
             if !value.is_empty() {
-                explicit_save = Some(value.to_string());
+                parsed.explicit_save = Some(value.to_string());
             }
         } else if let Some(value) = arg.strip_prefix("--as=") {
             if !value.is_empty() {
-                explicit_save = Some(value.to_string());
+                parsed.explicit_save = Some(value.to_string());
             }
         } else if arg.len() > 1 && arg.starts_with('-') {
-            // Unknown flag: leave it unconsumed for future use, do not treat as
-            // target. A lone `-` is the git-style previous-state alias for HEAD.
+            return Err(format!("unknown option '{arg}'"));
         } else if target.is_none() {
             target = Some(args[i].clone());
-        } else if explicit_save.is_none() {
+        } else if parsed.explicit_save.is_none() {
             // A second positional token acts as the preserve name for users coming
             // from `git stash`-style habits: `checkout <target> <save-as>`.
-            explicit_save = Some(args[i].clone());
+            parsed.explicit_save = Some(args[i].clone());
         }
         i += 1;
     }
-    (target, discard, explicit_save)
+    parsed.target = target;
+    Ok(parsed)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -838,6 +1079,93 @@ fn switch_preparation(
     } else {
         SwitchPreparation::RefuseDirty
     }
+}
+
+fn switch_to_unborn_branch(
+    app: &mut App,
+    store: &CheckpointStore,
+    branch: &str,
+    explicit_save: Option<String>,
+    discard_requested: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if matches!(
+        store.head_state(),
+        Ok(CheckpointHead::Attached {
+            branch: current,
+            target: None,
+        }) if current == branch
+    ) {
+        println!("Already on unborn branch '{branch}': nothing was changed.");
+        return Ok(true);
+    }
+
+    let session_store = SessionStore::new(app.config.history_file.as_path());
+    let live_messages = match session_store.read_all_messages(&app.session_id) {
+        Ok(messages) => messages,
+        Err(err) => {
+            println!("Failed to switch branches: cannot read live history: {err}");
+            return Ok(true);
+        }
+    };
+    let live_len = live_messages.len();
+    let live_is_clean = match store.live_matches_base(&live_messages) {
+        Ok(matches) => matches,
+        Err(err) => {
+            println!(
+                "Failed to switch branches: cannot verify whether live history is clean: {err}"
+            );
+            return Ok(true);
+        }
+    };
+    let preparation = switch_preparation(
+        live_len,
+        live_is_clean,
+        discard_requested && explicit_save.is_none(),
+        explicit_save,
+    );
+    let discarding = matches!(preparation, SwitchPreparation::Discard);
+    let preserved_as = match preparation {
+        SwitchPreparation::Proceed | SwitchPreparation::Discard => None,
+        SwitchPreparation::Preserve(name) => {
+            if let Err(err) = save_preserving_current(store, &name) {
+                println!("Failed to checkout: current history was NOT overwritten. {err}");
+                return Ok(true);
+            }
+            Some(name)
+        }
+        SwitchPreparation::RefuseDirty => {
+            println!(
+                "Refusing to switch: {live_len} un-checkpointed live message(s) would be lost. Use `--save <name>` to preserve them or `--discard` to overwrite intentionally."
+            );
+            return Ok(true);
+        }
+    };
+    if discarding && live_len > 0 {
+        let confirm = prompt_checkpoint_confirmation(&format!(
+            "Discard {live_len} un-checkpointed live message(s) and switch to unborn branch '{branch}'? (y/n): "
+        ));
+        if confirm != Some(true) {
+            println!("Canceled: nothing was changed.");
+            return Ok(true);
+        }
+    }
+
+    match store.switch_branch(branch) {
+        Ok(()) => {
+            refresh_runtime_after_rollback(app);
+            publish_checkpoint_names(store);
+            match preserved_as {
+                Some(saved) => println!(
+                    "Switched to unborn branch '{branch}'. Previous history preserved as '{saved}'."
+                ),
+                None => println!(
+                    "Switched to unborn branch '{branch}'. The next save will create its first checkpoint."
+                ),
+            }
+        }
+        Err(err) => println!("Failed to switch to branch '{branch}': {err}"),
+    }
+    Ok(true)
 }
 
 /// Save the live history under `preserve_name`. Never evicts: dropping history
@@ -883,7 +1211,7 @@ fn refresh_runtime_after_rollback(app: &mut App) {
 mod tests {
     use super::{
         SwitchPreparation, effective_head, forest_order, format_human_bytes, is_head_alias,
-        is_latest_alias, parse_checkout_args, switch_preparation, truncate_middle,
+        is_latest_alias, parse_navigation_args, switch_preparation, truncate_middle,
     };
     use crate::ai::history::CheckpointInfo;
 
@@ -916,32 +1244,47 @@ mod tests {
 
     #[test]
     fn checkout_args_support_flags_and_positional_save_as() {
-        let (target, discard, explicit) = parse_checkout_args(&args(&["c1"]));
-        assert_eq!(target.as_deref(), Some("c1"));
-        assert!(!discard);
-        assert!(explicit.is_none());
+        let parsed = parse_navigation_args(&args(&["c1"]), "-b").unwrap();
+        assert_eq!(parsed.target.as_deref(), Some("c1"));
+        assert!(!parsed.discard);
+        assert!(parsed.explicit_save.is_none());
 
-        let (target, discard, explicit) = parse_checkout_args(&args(&["c1", "--discard"]));
-        assert_eq!(target.as_deref(), Some("c1"));
-        assert!(discard);
-        assert!(explicit.is_none());
+        let parsed = parse_navigation_args(&args(&["c1", "--discard"]), "-b").unwrap();
+        assert_eq!(parsed.target.as_deref(), Some("c1"));
+        assert!(parsed.discard);
+        assert!(parsed.explicit_save.is_none());
 
-        let (target, discard, explicit) =
-            parse_checkout_args(&args(&["c1", "--save", "mywork"]));
-        assert_eq!(target.as_deref(), Some("c1"));
-        assert!(!discard);
-        assert_eq!(explicit.as_deref(), Some("mywork"));
+        let parsed = parse_navigation_args(&args(&["c1", "--save", "mywork"]), "-b").unwrap();
+        assert_eq!(parsed.target.as_deref(), Some("c1"));
+        assert!(!parsed.discard);
+        assert_eq!(parsed.explicit_save.as_deref(), Some("mywork"));
 
         // Second positional token acts as the preserve name.
-        let (target, discard, explicit) = parse_checkout_args(&args(&["c1", "mywork"]));
-        assert_eq!(target.as_deref(), Some("c1"));
-        assert!(!discard);
-        assert_eq!(explicit.as_deref(), Some("mywork"));
+        let parsed = parse_navigation_args(&args(&["c1", "mywork"]), "-b").unwrap();
+        assert_eq!(parsed.target.as_deref(), Some("c1"));
+        assert!(!parsed.discard);
+        assert_eq!(parsed.explicit_save.as_deref(), Some("mywork"));
 
         for removed_alias in ["--no-save", "--hard"] {
-            let (_, discard, _) = parse_checkout_args(&args(&["c1", removed_alias]));
-            assert!(!discard, "removed flag {removed_alias} must not discard history");
+            assert!(
+                parse_navigation_args(&args(&["c1", removed_alias]), "-b").is_err(),
+                "removed flag {removed_alias} must be rejected"
+            );
         }
+    }
+
+    #[test]
+    fn navigation_args_support_git_style_branch_creation() {
+        let checkout = parse_navigation_args(&args(&["-b", "feature", "main"]), "-b").unwrap();
+        assert_eq!(checkout.create_branch.as_deref(), Some("feature"));
+        assert_eq!(checkout.target.as_deref(), Some("main"));
+
+        let switch = parse_navigation_args(&args(&["-c", "feature"]), "-c").unwrap();
+        assert_eq!(switch.create_branch.as_deref(), Some("feature"));
+        assert!(switch.target.is_none());
+
+        assert!(parse_navigation_args(&args(&["-c"]), "-c").is_err());
+        assert!(parse_navigation_args(&args(&["-b", "feature"]), "-c").is_err());
     }
 
     #[test]
@@ -967,9 +1310,9 @@ mod tests {
     #[test]
     fn checkout_args_accept_head_aliases_as_target() {
         for alias in ["HEAD", "head", "@", "-"] {
-            let (target, _, _) = parse_checkout_args(&args(&[alias]));
-            assert_eq!(target.as_deref(), Some(alias));
-            assert!(is_head_alias(&target.unwrap()));
+            let parsed = parse_navigation_args(&args(&[alias]), "-b").unwrap();
+            assert_eq!(parsed.target.as_deref(), Some(alias));
+            assert!(is_head_alias(&parsed.target.unwrap()));
         }
         assert!(is_head_alias("HEAD"));
         assert!(is_head_alias("@"));
@@ -982,8 +1325,8 @@ mod tests {
     #[test]
     fn latest_alias_matches_newest_marker_case_insensitively() {
         for alias in ["latest", "LATEST", "Latest", "  latest  "] {
-            let (target, _, _) = parse_checkout_args(&args(&[alias]));
-            assert!(is_latest_alias(&target.unwrap()));
+            let parsed = parse_navigation_args(&args(&[alias]), "-b").unwrap();
+            assert!(is_latest_alias(&parsed.target.unwrap()));
         }
         assert!(is_latest_alias("latest"));
         assert!(!is_latest_alias("c1"));

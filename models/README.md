@@ -12,6 +12,11 @@
 - 每个文件内容是一个模型对象（也支持 JSON 数组形式，便于用户侧合并文件）。
   字段含义见 `ModelDef` 的文档注释（`src/bin/ai/model_names.rs`）。
 - 删除模型 = 删除对应文件；调整偏好 = 改对应字段。
+- 同一模型多凭证集/多平台 = 追加带后缀的独立条目，用 `platform` 字段
+  区分展示名（handle = `name-platform`）：`-alibaba` 走按量计费的
+  dashscope 端点 + `api_key`；`-tokenplan` 走 Token Plan 端点
+  （`token-plan.cn-beijing.maas.aliyuncs.com`）+ `token_plan.api_key`
+  （经 `api_key_config_key` 引用，凭证不通用，见 `config_schema.rs`）。
 
 ## 用户覆盖
 

@@ -1,4 +1,4 @@
-//! Session checkpoints: save, list, checkout, delete.
+//! Session checkpoints and movable branch pointers.
 //!
 //! Each session's conversation history lives in its own SQLite WAL file.
 //! Checkpoints create a consistent snapshot via the SQLite Online Backup API
@@ -12,8 +12,10 @@
 //!
 //! Each generation also records its parent (the live base at save time) in a
 //! `checkpoint-v2` manifest, and the checkpoints directory tracks the live
-//! base in `BASE.ref` (updated on every save and rollback). `list` fills
-//! missing parents (pre-tracking `checkpoint-v1` snapshots, legacy layouts)
+//! base in `BASE.ref` (updated on every save and checkout). Branch files are
+//! movable pointers to immutable generations; `HEAD.ref` either names a
+//! detached generation or an attached branch. `list` fills missing parents
+//! (pre-tracking `checkpoint-v1` snapshots, legacy layouts)
 //! by chaining in save order so the tree still reads top-down.
 
 #[cfg(unix)]
@@ -34,7 +36,7 @@ use crate::ai::history::SessionStore;
 use super::{
     sessions::copy_dir_recursively,
     sqlite::{
-        backup_sqlite, live_rollback_transaction_is_published,
+        backup_sqlite, clear_session_history_sqlite, live_rollback_transaction_is_published,
         read_all_messages_sqlite_read_only, restore_sqlite_after_rollback,
         restore_sqlite_after_rollback_with_transaction,
     },
@@ -52,6 +54,9 @@ const GENERATION_PREVIOUS_MARKER: &str = ".previous-";
 /// file (not a checkpoint directory), so it never shows up in listings; it
 /// only records a name for `rollback HEAD` (`@`, `-`) to resolve.
 const HEAD_REF_FILE: &str = "HEAD.ref";
+const HEAD_BRANCH_PREFIX: &str = "ref: branches/";
+const BRANCHES_DIR: &str = "branches";
+const DEFAULT_BRANCH_NAME: &str = "main";
 /// Live-base pointer: which checkpoint the live history was last saved from
 /// or rolled back to. The next `save` records it as the new checkpoint's
 /// parent, so `tree` shows real lineage. Like `HEAD.ref` it is a plain file,
@@ -83,6 +88,55 @@ pub(in crate::ai) struct CheckpointInfo {
     pub(in crate::ai) parent: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::ai) struct CheckpointBranch {
+    pub(in crate::ai) name: String,
+    /// `None` means the branch exists but has not received its first
+    /// checkpoint yet.
+    pub(in crate::ai) target: Option<String>,
+    /// The branch names a checkpoint object that is no longer present.
+    pub(in crate::ai) is_dangling: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::ai) enum CheckpointHead {
+    Attached {
+        branch: String,
+        target: Option<String>,
+    },
+    Detached(Option<String>),
+}
+
+const CHECKPOINT_STATUS_PART_CHARS: usize = 10;
+
+fn compact_checkpoint_status_part(value: &str) -> String {
+    if value.chars().count() <= CHECKPOINT_STATUS_PART_CHARS {
+        return value.to_string();
+    }
+    value
+        .chars()
+        .take(CHECKPOINT_STATUS_PART_CHARS - 1)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
+pub(in crate::ai) fn checkpoint_status_label(head: &CheckpointHead) -> Option<String> {
+    match head {
+        CheckpointHead::Attached { branch, target } => Some(format!(
+            "{}@{}",
+            compact_checkpoint_status_part(branch),
+            target
+                .as_deref()
+                .map(compact_checkpoint_status_part)
+                .unwrap_or_else(|| "-".to_string())
+        )),
+        CheckpointHead::Detached(Some(target)) => {
+            Some(format!("det@{}", compact_checkpoint_status_part(target)))
+        }
+        CheckpointHead::Detached(None) => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::ai) struct CheckpointStore {
     /// The live sqlite file of the current session.
@@ -99,9 +153,20 @@ enum CheckpointSource {
     Legacy { sqlite: PathBuf },
 }
 
+#[derive(Debug, Clone)]
+struct RefSnapshot {
+    head: Option<String>,
+    base: Option<String>,
+    branch: Option<(PathBuf, Option<String>)>,
+}
+
 impl CheckpointStore {
     pub(in crate::ai) fn new(history_file: &Path, session_id: &str) -> Self {
         let store = SessionStore::new(history_file);
+        Self::from_session_store(&store, session_id)
+    }
+
+    pub(in crate::ai) fn from_session_store(store: &SessionStore, session_id: &str) -> Self {
         Self::from_session_paths(
             store.session_history_file(session_id),
             store.session_assets_dir(session_id),
@@ -141,15 +206,60 @@ impl CheckpointStore {
         self.dir.join(format!("{}.assets", sanitize_name(name)))
     }
 
+    fn branches_dir(&self) -> PathBuf {
+        self.dir.join(BRANCHES_DIR)
+    }
+
+    fn branch_path(&self, name: &str) -> PathBuf {
+        self.branches_dir().join(sanitize_name(name))
+    }
+
+    fn aliases_default_branch_unlocked(&self, branch: &str) -> io::Result<bool> {
+        if branch == DEFAULT_BRANCH_NAME {
+            return Ok(true);
+        }
+        if !self.branch_path(branch).exists() || !self.branch_path(DEFAULT_BRANCH_NAME).exists() {
+            return Ok(false);
+        }
+        let exact_entry_exists = fs::read_dir(self.branches_dir())?.any(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+                .is_some_and(|name| name == branch)
+        });
+        Ok(!exact_entry_exists)
+    }
+
+    fn initialize_default_branch_unlocked(&self) -> io::Result<()> {
+        if self.dir.exists() {
+            let head_path = self.dir.join(HEAD_REF_FILE);
+            if !head_path.exists() && self.list_unlocked()?.is_empty() {
+                self.reset_to_unborn_default_branch_unlocked()?;
+            }
+            return Ok(());
+        }
+        self.reset_to_unborn_default_branch_unlocked()
+    }
+
+    fn reset_to_unborn_default_branch_unlocked(&self) -> io::Result<()> {
+        fs::create_dir_all(self.branches_dir())?;
+        self.write_ref_unlocked(&self.branch_path(DEFAULT_BRANCH_NAME), "")?;
+        if let Err(error) = self.set_attached_head_unlocked(DEFAULT_BRANCH_NAME) {
+            let _ = fs::remove_file(self.branch_path(DEFAULT_BRANCH_NAME));
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Save the current session history as a checkpoint named `name`.
     /// Returns the checkpoint file path.
     pub(in crate::ai) fn save(&self, name: &str) -> io::Result<PathBuf> {
         let normalized_name = sanitize_name(name);
-        if is_reserved_checkpoint_name(name) {
+        if is_reserved_checkpoint_name(name) || is_reserved_checkpoint_name(&normalized_name) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "'{normalized_name}' is reserved for the HEAD pointer; \
+                    "'{normalized_name}' is reserved for a checkpoint pointer; \
                      pick another checkpoint name"
                 ),
             ));
@@ -163,37 +273,51 @@ impl CheckpointStore {
             }
 
             let checkpoints = store.list_unlocked()?;
-            let existing_size = store.checkpoint_storage_size_for_name(&normalized_name)?;
-            // The live base becomes the new checkpoint's parent. Re-saving the
-            // base itself keeps the previous parent instead of a self-loop.
-            let parent: Option<String> = match store.base_target_unlocked()? {
-                Some(base) if base == normalized_name => {
-                    match store.generation_parent_unlocked(&normalized_name)? {
-                        Some(previous) => previous,
-                        None => None,
-                    }
-                }
-                other => other,
-            };
+            let branches = store.list_branches_unlocked()?;
+            if store
+                .checkpoint_source_unlocked(&normalized_name)?
+                .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "checkpoint '{normalized_name}' already exists; checkpoint commits are immutable"
+                    ),
+                ));
+            }
+            let parent = store.base_target_unlocked()?;
+            let refs = store.capture_ref_snapshot_unlocked()?;
+            let branch_growth = store.active_branch_growth_unlocked(&normalized_name)?;
             let staged = store.stage_generation(&normalized_name, parent.as_deref())?;
             let staged_size = directory_storage_size(&staged)?;
-            let result = validate_checkpoint_budget(
+            let mut result = validate_checkpoint_budget(
                 checkpoints.len(),
-                store
-                    .checkpoint_source_unlocked(&normalized_name)?
-                    .is_some(),
-                checkpoints.iter().fold(0u64, |total, checkpoint| {
-                    total.saturating_add(checkpoint.size_bytes)
-                }),
-                existing_size,
-                staged_size,
+                false,
+                checkpoints
+                    .iter()
+                    .fold(0u64, |total, checkpoint| {
+                        total.saturating_add(checkpoint.size_bytes)
+                    })
+                    .saturating_add(store.branch_storage_size_unlocked(&branches)?),
+                0,
+                staged_size.saturating_add(branch_growth),
                 MAX_CHECKPOINTS_PER_SESSION,
                 MAX_CHECKPOINT_STORAGE_BYTES,
             )
-            .and_then(|()| store.publish_generation(&normalized_name, &staged))
-            // Saving creates the current commit: BASE and HEAD must move
-            // together while the checkpoint lock is still held.
-            .and_then(|()| store.set_current_unlocked(&normalized_name));
+            .and_then(|()| store.publish_generation(&normalized_name, &staged));
+            if result.is_ok()
+                && let Err(pointer_error) = store.advance_after_save_unlocked(&normalized_name)
+            {
+                result = match store.restore_ref_snapshot_unlocked(&refs) {
+                    Ok(()) => {
+                        let _ = fs::remove_dir_all(store.generation_dir(&normalized_name));
+                        Err(pointer_error)
+                    }
+                    Err(restore_error) => Err(io::Error::other(format!(
+                        "saved checkpoint '{normalized_name}' but failed to advance its ref ({pointer_error}) and failed to restore the previous refs ({restore_error})"
+                    ))),
+                };
+            }
             if result.is_err() {
                 let _ = fs::remove_dir_all(&staged);
             }
@@ -212,29 +336,176 @@ impl CheckpointStore {
     pub(in crate::ai) fn rollback(&self, name: &str) -> io::Result<()> {
         let normalized_name = sanitize_name(name);
         self.with_locked(|store| {
-            let Some(source) = store.checkpoint_source_unlocked(&normalized_name)? else {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("checkpoint '{normalized_name}' not found"),
-                ));
-            };
-            match source {
-                // The legacy format has no assets snapshot; keep the existing
-                // compatibility semantics: restore the SQLite file only.
-                CheckpointSource::Legacy { sqlite } => {
-                    if let Some(parent) = store.session_file.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    restore_sqlite_after_rollback(&sqlite, &store.session_file)?;
-                }
-                CheckpointSource::Generation { sqlite, assets } => {
-                    let transaction = store.stage_live_rollback(&sqlite, &assets)?;
-                    store.complete_live_rollback(&transaction)?;
-                }
+            let refs = store.capture_ref_snapshot_unlocked()?;
+            if let Err(error) = store.set_detached_current_unlocked(&normalized_name) {
+                return match store.restore_ref_snapshot_unlocked(&refs) {
+                    Ok(()) => Err(error),
+                    Err(restore_error) => Err(io::Error::other(format!(
+                        "failed to move HEAD to '{normalized_name}' ({error}) and failed to restore the previous refs ({restore_error})"
+                    ))),
+                };
             }
-            // Restoring changes the current commit: BASE and HEAD must move
-            // together while the checkpoint lock is still held.
-            store.set_current_unlocked(&normalized_name)
+            if let Err(error) = store.restore_checkpoint_unlocked(&normalized_name) {
+                return match store.restore_ref_snapshot_unlocked(&refs) {
+                    Ok(()) => Err(error),
+                    Err(restore_error) => Err(io::Error::other(format!(
+                        "failed to restore checkpoint '{normalized_name}' ({error}) and failed to restore the previous refs ({restore_error})"
+                    ))),
+                };
+            }
+            Ok(())
+        })
+    }
+
+    /// Create a movable branch pointer at `start`. When omitted, use the
+    /// current HEAD state; only a detached/unset HEAD falls back to the live
+    /// base. An attached unborn branch creates another unborn branch. If no
+    /// target exists, attach HEAD so the next save becomes its first checkpoint.
+    pub(in crate::ai) fn create_branch(&self, name: &str, start: Option<&str>) -> io::Result<()> {
+        let branch = sanitize_name(name);
+        self.with_locked(|store| {
+            let target = store.prepare_branch_unlocked(name, &branch, start)?;
+            store.write_ref_unlocked(
+                &store.branch_path(&branch),
+                target.as_deref().unwrap_or_default(),
+            )?;
+            if target.is_none()
+                && let Err(error) = store.set_attached_head_unlocked(&branch)
+            {
+                let _ = fs::remove_file(store.branch_path(&branch));
+                return Err(error);
+            }
+            Ok(())
+        })
+    }
+
+    /// Validate a branch creation and resolve its start without mutating refs.
+    pub(in crate::ai) fn prepare_branch(
+        &self,
+        name: &str,
+        start: Option<&str>,
+    ) -> io::Result<Option<String>> {
+        let branch = sanitize_name(name);
+        self.with_locked(|store| store.prepare_branch_unlocked(name, &branch, start))
+    }
+
+    pub(in crate::ai) fn list_branches(&self) -> io::Result<Vec<CheckpointBranch>> {
+        self.with_locked(|store| store.list_branches_unlocked())
+    }
+
+    /// Return a compact status label only when every displayed checkpoint ref
+    /// resolves to a stored checkpoint object.
+    pub(in crate::ai) fn current_status_label(&self) -> io::Result<Option<String>> {
+        self.with_locked(|store| {
+            let head = match store.head_state_unlocked()? {
+                CheckpointHead::Detached(None) => match store.base_target_unlocked()? {
+                    Some(base) if store.checkpoint_source_unlocked(&base)?.is_some() => {
+                        CheckpointHead::Detached(Some(base))
+                    }
+                    _ => CheckpointHead::Detached(None),
+                },
+                head => head,
+            };
+            let target = match &head {
+                CheckpointHead::Attached { target, .. } | CheckpointHead::Detached(target) => {
+                    target.as_deref()
+                }
+            };
+            if let Some(target) = target
+                && store.checkpoint_source_unlocked(target)?.is_none()
+            {
+                return Ok(None);
+            }
+            Ok(checkpoint_status_label(&head))
+        })
+    }
+
+    /// Delete a branch pointer without deleting its checkpoint history.
+    pub(in crate::ai) fn delete_branch(&self, name: &str) -> io::Result<bool> {
+        let branch = sanitize_name(name);
+        self.with_locked(|store| {
+            if store.aliases_default_branch_unlocked(&branch)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("cannot delete protected default branch '{DEFAULT_BRANCH_NAME}'"),
+                ));
+            }
+            if store.head_branch_unlocked()?.as_deref() == Some(branch.as_str()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("cannot delete the checked-out branch '{branch}'"),
+                ));
+            }
+            match fs::remove_file(store.branch_path(&branch)) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    /// Attach HEAD to `name` without restoring its target. The caller must
+    /// already have verified that the live history matches the branch target.
+    pub(in crate::ai) fn attach_branch(&self, name: &str) -> io::Result<()> {
+        let branch = sanitize_name(name);
+        self.with_locked(|store| {
+            store.branch_target_unlocked(&branch)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("branch '{branch}' not found"),
+                )
+            })?;
+            store.set_attached_head_unlocked(&branch)
+        })
+    }
+
+    /// Restore a branch target into the live session and attach HEAD to it.
+    pub(in crate::ai) fn switch_branch(&self, name: &str) -> io::Result<()> {
+        let branch = sanitize_name(name);
+        self.with_locked(|store| {
+            let target = store.branch_target_unlocked(&branch)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("branch '{branch}' not found"))
+            })?;
+            let Some(target) = target else {
+                if matches!(
+                    store.head_state_unlocked()?,
+                    CheckpointHead::Attached {
+                        branch: current,
+                        target: None,
+                    } if current == branch
+                ) {
+                    return Ok(());
+                }
+                let transaction = store.stage_empty_live_rollback()?;
+                store.complete_live_rollback(&transaction)?;
+                return store.set_attached_head_unlocked(&branch);
+            };
+            let previous = store.base_target_unlocked()?;
+            let refs = store.capture_ref_snapshot_unlocked()?;
+            store.restore_checkpoint_unlocked(&target)?;
+            if let Err(error) = store
+                .set_attached_head_unlocked(&branch)
+                .and_then(|()| store.set_base_unlocked(&target))
+            {
+                let refs_error = store.restore_ref_snapshot_unlocked(&refs).err();
+                let mut live_error = None;
+                if let Some(previous) = previous {
+                    live_error = store.restore_checkpoint_unlocked(&previous).err();
+                }
+                if refs_error.is_some() || live_error.is_some() {
+                    return Err(io::Error::other(format!(
+                        "failed to switch branch '{branch}' ({error}); ref rollback: {}; live rollback: {}",
+                        refs_error
+                            .map(|error| error.to_string())
+                            .unwrap_or_else(|| "ok".to_string()),
+                        live_error
+                            .map(|error| error.to_string())
+                            .unwrap_or_else(|| "ok".to_string())
+                    )));
+                }
+                return Err(error);
+            }
+            Ok(())
         })
     }
 
@@ -243,6 +514,17 @@ impl CheckpointStore {
     pub(in crate::ai) fn delete(&self, name: &str) -> io::Result<bool> {
         let normalized_name = sanitize_name(name);
         self.with_locked(|store| {
+            let branches = store.branches_pointing_to_unlocked(&normalized_name)?;
+            if !branches.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "checkpoint '{normalized_name}' is referenced by branch{} {}; delete the branch first",
+                        if branches.len() == 1 { "" } else { "es" },
+                        branches.join(", ")
+                    ),
+                ));
+            }
             let generation = store.generation_dir(&normalized_name);
             let mut deleted = false;
             match fs::remove_dir_all(generation) {
@@ -289,14 +571,19 @@ impl CheckpointStore {
                     Err(error) => return Err(error),
                 }
             }
+            store.reset_to_unborn_default_branch_unlocked()?;
             Ok(count)
         })
     }
 
-    /// Read the HEAD pointer (the checkpoint currently checked out).
+    /// Read the resolved HEAD checkpoint target.
     /// Returns `None` only when no checkpoint has been saved or restored yet.
     pub(in crate::ai) fn head_target(&self) -> io::Result<Option<String>> {
         self.with_locked(|store| store.head_target_unlocked())
+    }
+
+    pub(in crate::ai) fn head_state(&self) -> io::Result<CheckpointHead> {
+        self.with_locked(|store| store.head_state_unlocked())
     }
 
     /// Point HEAD at `name` (sanitized). Used to heal legacy or dangling
@@ -305,7 +592,10 @@ impl CheckpointStore {
         let normalized_name = sanitize_name(name);
         self.with_locked(|store| {
             fs::create_dir_all(&store.dir)?;
-            fs::write(store.dir.join(HEAD_REF_FILE), format!("{normalized_name}\n"))?;
+            fs::write(
+                store.dir.join(HEAD_REF_FILE),
+                format!("{normalized_name}\n"),
+            )?;
             Ok(())
         })
     }
@@ -316,12 +606,40 @@ impl CheckpointStore {
                 let target = content.trim().to_string();
                 if target.is_empty() {
                     Ok(None)
+                } else if let Some(branch) = target.strip_prefix(HEAD_BRANCH_PREFIX) {
+                    Ok(self.branch_target_unlocked(branch)?.flatten())
                 } else {
                     Ok(Some(target))
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err),
+        }
+    }
+
+    fn head_branch_unlocked(&self) -> io::Result<Option<String>> {
+        match fs::read_to_string(self.dir.join(HEAD_REF_FILE)) {
+            Ok(content) => Ok(content
+                .trim()
+                .strip_prefix(HEAD_BRANCH_PREFIX)
+                .filter(|branch| !branch.is_empty())
+                .map(str::to_string)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn head_state_unlocked(&self) -> io::Result<CheckpointHead> {
+        if let Some(branch) = self.head_branch_unlocked()? {
+            let target = self.branch_target_unlocked(&branch)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("HEAD points to missing branch '{branch}'"),
+                )
+            })?;
+            Ok(CheckpointHead::Attached { branch, target })
+        } else {
+            Ok(CheckpointHead::Detached(self.head_target_unlocked()?))
         }
     }
 
@@ -346,6 +664,9 @@ impl CheckpointStore {
     }
 
     fn base_target_unlocked(&self) -> io::Result<Option<String>> {
+        if let Some(target) = self.head_target_unlocked()? {
+            return Ok(Some(target));
+        }
         match fs::read_to_string(self.dir.join(BASE_REF_FILE)) {
             Ok(content) => {
                 let target = content.trim().to_string();
@@ -361,23 +682,266 @@ impl CheckpointStore {
     }
 
     fn set_base_unlocked(&self, normalized_name: &str) -> io::Result<()> {
-        fs::create_dir_all(&self.dir)?;
-        fs::write(
-            self.dir.join(BASE_REF_FILE),
-            format!("{normalized_name}\n"),
-        )?;
-        Ok(())
+        self.write_ref_unlocked(&self.dir.join(BASE_REF_FILE), normalized_name)
     }
 
-    /// Move the live-base and HEAD pointers as one checkpoint-store operation.
-    /// Readers and writers use the same store lock, so no command can observe
-    /// a completed save or restore with only one pointer moved.
-    fn set_current_unlocked(&self, normalized_name: &str) -> io::Result<()> {
-        self.set_base_unlocked(normalized_name)?;
-        fs::write(
-            self.dir.join(HEAD_REF_FILE),
-            format!("{normalized_name}\n"),
+    fn set_detached_current_unlocked(&self, normalized_name: &str) -> io::Result<()> {
+        self.write_ref_unlocked(&self.dir.join(HEAD_REF_FILE), normalized_name)?;
+        self.set_base_unlocked(normalized_name)
+    }
+
+    fn set_attached_head_unlocked(&self, branch: &str) -> io::Result<()> {
+        self.write_ref_unlocked(
+            &self.dir.join(HEAD_REF_FILE),
+            &format!("{HEAD_BRANCH_PREFIX}{branch}"),
         )
+    }
+
+    fn write_ref_unlocked(&self, path: &Path, value: &str) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+        fs::write(&temp, format!("{value}\n"))?;
+        match fs::rename(&temp, path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = fs::remove_file(temp);
+                Err(error)
+            }
+        }
+    }
+
+    fn read_optional_ref_unlocked(path: &Path) -> io::Result<Option<String>> {
+        match fs::read_to_string(path) {
+            Ok(content) => Ok(Some(content.trim().to_string())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn capture_ref_snapshot_unlocked(&self) -> io::Result<RefSnapshot> {
+        let head_path = self.dir.join(HEAD_REF_FILE);
+        let head = Self::read_optional_ref_unlocked(&head_path)?;
+        let base = Self::read_optional_ref_unlocked(&self.dir.join(BASE_REF_FILE))?;
+        let branch = head
+            .as_deref()
+            .and_then(|value| value.strip_prefix(HEAD_BRANCH_PREFIX))
+            .map(|name| {
+                let path = self.branch_path(name);
+                Self::read_optional_ref_unlocked(&path).map(|value| (path, value))
+            })
+            .transpose()?;
+        Ok(RefSnapshot { head, base, branch })
+    }
+
+    fn restore_optional_ref_unlocked(&self, path: &Path, value: Option<&str>) -> io::Result<()> {
+        match value {
+            Some(value) => self.write_ref_unlocked(path, value),
+            None => match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            },
+        }
+    }
+
+    fn restore_ref_snapshot_unlocked(&self, refs: &RefSnapshot) -> io::Result<()> {
+        if let Some((path, value)) = &refs.branch {
+            self.restore_optional_ref_unlocked(path, value.as_deref())?;
+        }
+        self.restore_optional_ref_unlocked(&self.dir.join(HEAD_REF_FILE), refs.head.as_deref())?;
+        self.restore_optional_ref_unlocked(&self.dir.join(BASE_REF_FILE), refs.base.as_deref())
+    }
+
+    fn active_branch_growth_unlocked(&self, target: &str) -> io::Result<u64> {
+        let Some(branch) = self.head_branch_unlocked()? else {
+            return Ok(0);
+        };
+        let old_size = fs::metadata(self.branch_path(&branch))
+            .map(|metadata| metadata.len())
+            .or_else(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    Ok(0)
+                } else {
+                    Err(error)
+                }
+            })?;
+        Ok((target.len().saturating_add(1) as u64).saturating_sub(old_size))
+    }
+
+    fn advance_after_save_unlocked(&self, normalized_name: &str) -> io::Result<()> {
+        if let Some(branch) = self.head_branch_unlocked()? {
+            self.write_ref_unlocked(&self.branch_path(&branch), normalized_name)?;
+        } else {
+            self.write_ref_unlocked(&self.dir.join(HEAD_REF_FILE), normalized_name)?;
+        }
+        self.set_base_unlocked(normalized_name)
+    }
+
+    /// The outer option reports whether the branch exists; the inner option
+    /// is its checkpoint target (`None` for an unborn branch).
+    fn branch_target_unlocked(&self, branch: &str) -> io::Result<Option<Option<String>>> {
+        match fs::read_to_string(self.branch_path(branch)) {
+            Ok(content) => {
+                let target = content.trim().to_string();
+                if target.is_empty() {
+                    Ok(Some(None))
+                } else {
+                    Ok(Some(Some(target)))
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn list_branches_unlocked(&self) -> io::Result<Vec<CheckpointBranch>> {
+        let mut branches = Vec::new();
+        let entries = match fs::read_dir(self.branches_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(branches),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let target = fs::read_to_string(entry.path())?.trim().to_string();
+            let target = (!target.is_empty()).then_some(target);
+            let is_dangling = match target.as_deref() {
+                Some(target) => self.checkpoint_source_unlocked(target)?.is_none(),
+                None => false,
+            };
+            branches.push(CheckpointBranch {
+                name,
+                target,
+                is_dangling,
+            });
+        }
+        branches.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(branches)
+    }
+
+    fn branches_pointing_to_unlocked(&self, target: &str) -> io::Result<Vec<String>> {
+        Ok(self
+            .list_branches_unlocked()?
+            .into_iter()
+            .filter(|branch| branch.target.as_deref() == Some(target))
+            .map(|branch| branch.name)
+            .collect())
+    }
+
+    fn branch_storage_size_unlocked(&self, branches: &[CheckpointBranch]) -> io::Result<u64> {
+        branches.iter().try_fold(0u64, |total, branch| {
+            Ok(total.saturating_add(fs::metadata(self.branch_path(&branch.name))?.len()))
+        })
+    }
+
+    fn prepare_branch_unlocked(
+        &self,
+        name: &str,
+        branch: &str,
+        start: Option<&str>,
+    ) -> io::Result<Option<String>> {
+        if is_reserved_checkpoint_name(name) || is_reserved_checkpoint_name(branch) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("'{branch}' is reserved and cannot be used as a branch name"),
+            ));
+        }
+        if self.branch_path(branch).exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("branch '{branch}' already exists"),
+            ));
+        }
+        let target = match start {
+            Some(start) => Some(self.resolve_revision_unlocked(start)?),
+            None => match self.head_state_unlocked()? {
+                CheckpointHead::Attached { target, .. } => target,
+                CheckpointHead::Detached(Some(target)) => Some(target),
+                CheckpointHead::Detached(None) => self.base_target_unlocked()?,
+            },
+        };
+        if let Some(target) = target.as_deref()
+            && self.checkpoint_source_unlocked(target)?.is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("cannot create branch '{branch}': checkpoint '{target}' does not exist"),
+            ));
+        }
+        let checkpoints = self.list_unlocked()?;
+        let branches = self.list_branches_unlocked()?;
+        validate_checkpoint_budget(
+            checkpoints.len().saturating_add(branches.len()),
+            false,
+            checkpoints
+                .iter()
+                .fold(0u64, |total, checkpoint| {
+                    total.saturating_add(checkpoint.size_bytes)
+                })
+                .saturating_add(self.branch_storage_size_unlocked(&branches)?),
+            0,
+            target
+                .as_ref()
+                .map_or(1, |target| target.len().saturating_add(1)) as u64,
+            MAX_CHECKPOINTS_PER_SESSION,
+            MAX_CHECKPOINT_STORAGE_BYTES,
+        )?;
+        Ok(target)
+    }
+
+    fn resolve_revision_unlocked(&self, name: &str) -> io::Result<String> {
+        let normalized = sanitize_name(name);
+        if let Some(target) = self.branch_target_unlocked(&normalized)? {
+            let target = target.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("branch '{normalized}' has no checkpoint yet"),
+                )
+            })?;
+            if self.checkpoint_source_unlocked(&target)?.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("branch '{normalized}' points to missing checkpoint '{target}'"),
+                ));
+            }
+            return Ok(target);
+        }
+        if self.checkpoint_source_unlocked(&normalized)?.is_some() {
+            return Ok(normalized);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("checkpoint or branch '{normalized}' not found"),
+        ))
+    }
+
+    fn restore_checkpoint_unlocked(&self, normalized_name: &str) -> io::Result<()> {
+        let Some(source) = self.checkpoint_source_unlocked(normalized_name)? else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("checkpoint '{normalized_name}' not found"),
+            ));
+        };
+        match source {
+            CheckpointSource::Legacy { sqlite } => {
+                if let Some(parent) = self.session_file.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                restore_sqlite_after_rollback(&sqlite, &self.session_file)
+            }
+            CheckpointSource::Generation { sqlite, assets } => {
+                let transaction = self.stage_live_rollback(&sqlite, &assets)?;
+                self.complete_live_rollback(&transaction)
+            }
+        }
     }
 
     /// Read the recorded parent of one generation directory: `None` when the
@@ -387,7 +951,9 @@ impl CheckpointStore {
         &self,
         normalized_name: &str,
     ) -> io::Result<Option<Option<String>>> {
-        Ok(read_generation_parent(&self.generation_dir(normalized_name)))
+        Ok(read_generation_parent(
+            &self.generation_dir(normalized_name),
+        ))
     }
 
     /// Recover unfinished live rollbacks at startup and before every
@@ -400,6 +966,7 @@ impl CheckpointStore {
         with_checkpoint_lock(&self.dir, || {
             self.recover_live_rollbacks_unlocked()?;
             self.recover_incomplete_generations_unlocked()?;
+            self.initialize_default_branch_unlocked()?;
             operation(self)
         })
     }
@@ -416,17 +983,37 @@ impl CheckpointStore {
         live: &[Message],
         name: &str,
     ) -> io::Result<bool> {
+        self.with_locked(|store| store.live_matches_checkpoint_unlocked(live, name))
+    }
+
+    /// Whether live canonical messages still match the last restored or saved
+    /// checkpoint. An unborn history is clean only while it remains empty.
+    pub(in crate::ai) fn live_matches_base(&self, live: &[Message]) -> io::Result<bool> {
         self.with_locked(|store| {
-            let normalized = sanitize_name(name);
-            let Some(source) = store.checkpoint_source_unlocked(&normalized)? else {
-                return Ok(false);
+            if matches!(
+                store.head_state_unlocked()?,
+                CheckpointHead::Attached { target: None, .. }
+            ) {
+                return Ok(live.is_empty());
+            }
+            let Some(base) = store.base_target_unlocked()? else {
+                return Ok(live.is_empty());
             };
-            let sqlite = match &source {
-                CheckpointSource::Generation { sqlite, .. }
-                | CheckpointSource::Legacy { sqlite } => sqlite,
-            };
-            Ok(read_all_messages_sqlite_read_only(sqlite)?.as_slice() == live)
+            store.live_matches_checkpoint_unlocked(live, &base)
         })
+    }
+
+    fn live_matches_checkpoint_unlocked(&self, live: &[Message], name: &str) -> io::Result<bool> {
+        let normalized = sanitize_name(name);
+        let Some(source) = self.checkpoint_source_unlocked(&normalized)? else {
+            return Ok(false);
+        };
+        let sqlite = match &source {
+            CheckpointSource::Generation { sqlite, .. } | CheckpointSource::Legacy { sqlite } => {
+                sqlite
+            }
+        };
+        Ok(read_all_messages_sqlite_read_only(sqlite)?.as_slice() == live)
     }
 
     fn list_unlocked(&self) -> io::Result<Vec<CheckpointInfo>> {
@@ -623,6 +1210,28 @@ impl CheckpointStore {
             Err(err) => return Err(err),
         }
         Ok(deleted)
+    }
+
+    fn stage_empty_live_rollback(&self) -> io::Result<PathBuf> {
+        fs::create_dir_all(&self.dir)?;
+        let transaction = self
+            .dir
+            .join(format!("{LIVE_ROLLBACK_PREFIX}{}", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let new_state = transaction.join("new");
+            fs::create_dir_all(new_state.join(GENERATION_ASSETS_DIR))?;
+            let sqlite = new_state.join(GENERATION_SQLITE_FILE);
+            if self.session_file.is_file() {
+                backup_sqlite(&self.session_file, &sqlite)?;
+            }
+            clear_session_history_sqlite(&sqlite)?;
+            fs::write(transaction.join(LIVE_ROLLBACK_MANIFEST), b"commit\n")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&transaction);
+        }
+        result.map(|()| transaction)
     }
 
     fn stage_live_rollback(&self, sqlite: &Path, assets: &Path) -> io::Result<PathBuf> {
@@ -1264,6 +1873,21 @@ mod tests {
     }
 
     #[test]
+    fn normalized_reserved_names_are_rejected() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-reserved");
+
+        let save_error = store.save("la💥test").unwrap_err();
+        assert_eq!(save_error.kind(), io::ErrorKind::InvalidInput);
+        let branch_error = store.create_branch("he💥ad", None).unwrap_err();
+        assert_eq!(branch_error.kind(), io::ErrorKind::InvalidInput);
+
+        if let Some(grandparent) = history_file.parent() {
+            let _ = fs::remove_dir_all(grandparent);
+        }
+    }
+
+    #[test]
     fn checkpoint_budget_rejects_over_limit_without_replacing_existing_entry() {
         let count_error = validate_checkpoint_budget(2, false, 10, 0, 1, 2, 100).unwrap_err();
         assert_eq!(count_error.kind(), io::ErrorKind::StorageFull);
@@ -1486,7 +2110,12 @@ mod tests {
         assert_eq!(store.head_target().unwrap().as_deref(), Some("c1"));
         // The pointer file must not show up as a checkpoint.
         assert_eq!(
-            store.list().unwrap().iter().map(|cp| cp.name.clone()).collect::<Vec<_>>(),
+            store
+                .list()
+                .unwrap()
+                .iter()
+                .map(|cp| cp.name.clone())
+                .collect::<Vec<_>>(),
             vec!["c1".to_string()]
         );
 
@@ -1579,17 +2208,321 @@ mod tests {
     }
 
     #[test]
-    fn resaving_base_keeps_previous_parent_instead_of_self_loop() {
+    fn checkpoint_names_are_immutable() {
         let history_file = temp_history_file();
         let store = CheckpointStore::new(&history_file, "sess-resave");
         append_history_messages(&store.session_file, &[lineage_msg("v1")]).unwrap();
         store.save("a").unwrap();
         store.save("b").unwrap();
-        // Re-saving b (already the base) replaces the snapshot but must not
-        // point at itself.
-        store.save("b").unwrap();
+        let error = store.save("b").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(lineage_parent_of(&store, "b"), Some("a".to_string()));
         assert_eq!(lineage_parent_of(&store, "a"), None);
+
+        if let Some(grandparent) = history_file.parent() {
+            let _ = fs::remove_dir_all(grandparent);
+        }
+    }
+
+    #[test]
+    fn new_store_starts_on_unborn_main_and_advances_it() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-unborn-branch");
+        append_history_messages(&store.session_file, &[lineage_msg("v1")]).unwrap();
+
+        assert_eq!(
+            store.list_branches().unwrap(),
+            vec![CheckpointBranch {
+                name: "main".to_string(),
+                target: None,
+                is_dangling: false,
+            }]
+        );
+        assert_eq!(
+            store.head_state().unwrap(),
+            CheckpointHead::Attached {
+                branch: "main".to_string(),
+                target: None,
+            }
+        );
+        assert_eq!(
+            store.delete_branch("main").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        store.save("first").unwrap();
+        assert_eq!(lineage_parent_of(&store, "first"), None);
+        assert_eq!(
+            store.head_state().unwrap(),
+            CheckpointHead::Attached {
+                branch: "main".to_string(),
+                target: Some("first".to_string()),
+            }
+        );
+        assert_eq!(
+            store.list_branches().unwrap()[0].target.as_deref(),
+            Some("first")
+        );
+        store.create_branch("topic", Some("first")).unwrap();
+        store.switch_branch("topic").unwrap();
+        let error = store.delete_branch("main").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            error
+                .to_string()
+                .contains("cannot delete protected default branch 'main'")
+        );
+        // Case-insensitive filesystems must not let a differently-cased path
+        // bypass the default-branch protection.
+        if store.branch_path("MAIN").exists() {
+            assert_eq!(
+                store.delete_branch("MAIN").unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+
+        if let Some(grandparent) = history_file.parent() {
+            let _ = fs::remove_dir_all(grandparent);
+        }
+    }
+
+    #[test]
+    fn clear_recreates_unborn_main() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-clear-main");
+        append_history_messages(&store.session_file, &[lineage_msg("v1")]).unwrap();
+        store.save("first").unwrap();
+
+        assert_eq!(store.clear().unwrap(), 1);
+        assert!(store.list().unwrap().is_empty());
+        assert_eq!(
+            store.head_state().unwrap(),
+            CheckpointHead::Attached {
+                branch: "main".to_string(),
+                target: None,
+            }
+        );
+
+        if let Some(grandparent) = history_file.parent() {
+            let _ = fs::remove_dir_all(grandparent);
+        }
+    }
+
+    #[test]
+    fn repaired_unborn_main_can_create_an_unborn_branch() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-repair-unborn-main");
+        append_history_messages(&store.session_file, &[lineage_msg("v1")]).unwrap();
+        assert_eq!(store.list_branches().unwrap().len(), 1);
+        store.set_base_unlocked("next_1").unwrap();
+        store
+            .write_ref_unlocked(&store.branch_path(DEFAULT_BRANCH_NAME), "next_1")
+            .unwrap();
+        fs::remove_file(store.dir.join(HEAD_REF_FILE)).unwrap();
+
+        assert_eq!(
+            store.current_status_label().unwrap().as_deref(),
+            Some("main@-")
+        );
+        assert_eq!(
+            store.branch_target_unlocked(DEFAULT_BRANCH_NAME).unwrap(),
+            Some(None)
+        );
+        assert_eq!(
+            store.head_state().unwrap(),
+            CheckpointHead::Attached {
+                branch: "main".to_string(),
+                target: None,
+            }
+        );
+
+        store.create_branch("check", None).unwrap();
+        assert_eq!(
+            store.current_status_label().unwrap().as_deref(),
+            Some("check@-")
+        );
+        assert_eq!(store.branch_target_unlocked("main").unwrap(), Some(None));
+        assert_eq!(store.branch_target_unlocked("check").unwrap(), Some(None));
+
+        if let Some(grandparent) = history_file.parent() {
+            let _ = fs::remove_dir_all(grandparent);
+        }
+    }
+
+    #[test]
+    fn dangling_branch_targets_are_reported_and_not_reused() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-dangling-branch");
+        append_history_messages(&store.session_file, &[lineage_msg("v1")]).unwrap();
+        store.save("first").unwrap();
+        fs::remove_dir_all(store.generation_dir("first")).unwrap();
+
+        let branches = store.list_branches().unwrap();
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].name, "main");
+        assert_eq!(branches[0].target.as_deref(), Some("first"));
+        assert!(branches[0].is_dangling);
+        assert_eq!(store.current_status_label().unwrap(), None);
+
+        let error = store.create_branch("topic", None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error
+                .to_string()
+                .contains("checkpoint 'first' does not exist")
+        );
+
+        let error = store.prepare_branch("topic", Some("main")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error
+                .to_string()
+                .contains("branch 'main' points to missing checkpoint 'first'")
+        );
+
+        if let Some(grandparent) = history_file.parent() {
+            let _ = fs::remove_dir_all(grandparent);
+        }
+    }
+
+    #[test]
+    fn switching_to_unborn_branch_clears_other_branch_live_state() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-unborn-switch");
+        store.create_branch("b2", None).unwrap();
+        store.create_branch("b1", None).unwrap();
+        append_history_messages(&store.session_file, &[lineage_msg("b1-unsaved")]).unwrap();
+        store.switch_branch("b1").unwrap();
+        assert_eq!(build_message_arr(10, &store.session_file).unwrap().len(), 1);
+
+        store.switch_branch("b2").unwrap();
+
+        assert!(
+            build_message_arr(10, &store.session_file)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.live_matches_base(&[]).unwrap());
+        assert_eq!(
+            store.head_state().unwrap(),
+            CheckpointHead::Attached {
+                branch: "b2".to_string(),
+                target: None,
+            }
+        );
+
+        if let Some(grandparent) = history_file.parent() {
+            let _ = fs::remove_dir_all(grandparent);
+        }
+    }
+
+    #[test]
+    fn attached_branch_advances_without_losing_alternate_history() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-branch");
+        append_history_messages(&store.session_file, &[lineage_msg("v1")]).unwrap();
+        store.save("c1").unwrap();
+        store.create_branch("c2", Some("c1")).unwrap();
+        store.switch_branch("c2").unwrap();
+
+        append_history_messages(&store.session_file, &[lineage_msg("branch-v2")]).unwrap();
+        store.save("c2-1").unwrap();
+        assert_eq!(
+            store.head_state().unwrap(),
+            CheckpointHead::Attached {
+                branch: "c2".to_string(),
+                target: Some("c2-1".to_string()),
+            }
+        );
+
+        store.rollback("c1").unwrap();
+        append_history_messages(&store.session_file, &[lineage_msg("alternate-v2")]).unwrap();
+        store.save("alternate").unwrap();
+        store.switch_branch("c2").unwrap();
+        let restored = build_message_arr(10, &store.session_file).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[1].content, Value::String("branch-v2".to_string()));
+        assert_eq!(lineage_parent_of(&store, "c2-1"), Some("c1".to_string()));
+        assert_eq!(
+            lineage_parent_of(&store, "alternate"),
+            Some("c1".to_string())
+        );
+        assert_eq!(
+            store.delete("c2-1").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        store.rollback("alternate").unwrap();
+        assert!(store.delete_branch("c2").unwrap());
+        assert!(store.delete("c2-1").unwrap());
+
+        if let Some(grandparent) = history_file.parent() {
+            let _ = fs::remove_dir_all(grandparent);
+        }
+    }
+
+    #[test]
+    fn attach_branch_does_not_restore_the_session_database() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-attach-only");
+        append_history_messages(&store.session_file, &[lineage_msg("v1")]).unwrap();
+        store.save("c1").unwrap();
+        store.create_branch("topic", Some("c1")).unwrap();
+
+        let connection = rusqlite::Connection::open(&store.session_file).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE attach_marker(value INTEGER); \
+                 INSERT INTO attach_marker VALUES (7);",
+            )
+            .unwrap();
+        drop(connection);
+
+        store.attach_branch("topic").unwrap();
+        assert_eq!(
+            store.head_state().unwrap(),
+            CheckpointHead::Attached {
+                branch: "topic".to_string(),
+                target: Some("c1".to_string()),
+            }
+        );
+        let connection = rusqlite::Connection::open(&store.session_file).unwrap();
+        let marker: i64 = connection
+            .query_row("SELECT value FROM attach_marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(marker, 7);
+
+        if let Some(grandparent) = history_file.parent() {
+            let _ = fs::remove_dir_all(grandparent);
+        }
+    }
+
+    #[test]
+    fn rollback_ref_write_failure_leaves_live_history_unchanged() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-ref-failure");
+        append_history_messages(&store.session_file, &[lineage_msg("v1")]).unwrap();
+        store.save("c1").unwrap();
+        append_history_messages(&store.session_file, &[lineage_msg("v2")]).unwrap();
+        store.save("c2").unwrap();
+        append_history_messages(&store.session_file, &[lineage_msg("unsaved")]).unwrap();
+        let before = build_message_arr(10, &store.session_file).unwrap();
+
+        let blocked_temp = store
+            .dir
+            .join(BASE_REF_FILE)
+            .with_extension(format!("tmp-{}", std::process::id()));
+        fs::create_dir(&blocked_temp).unwrap();
+        assert!(store.rollback("c1").is_err());
+
+        assert_eq!(build_message_arr(10, &store.session_file).unwrap(), before);
+        assert_eq!(store.head_target().unwrap().as_deref(), Some("c2"));
+        assert_eq!(
+            fs::read_to_string(store.dir.join(BASE_REF_FILE))
+                .unwrap()
+                .trim(),
+            "c2"
+        );
 
         if let Some(grandparent) = history_file.parent() {
             let _ = fs::remove_dir_all(grandparent);
@@ -1652,7 +2585,10 @@ mod tests {
             fs::write(dir.join(GENERATION_MANIFEST_FILE), body).unwrap();
             dir
         };
-        assert_eq!(read_generation_parent(&write("v1", b"checkpoint-v1\n")), None);
+        assert_eq!(
+            read_generation_parent(&write("v1", b"checkpoint-v1\n")),
+            None
+        );
         assert_eq!(
             read_generation_parent(&write("root", b"checkpoint-v2\nparent: -\n")),
             Some(None)
@@ -1678,11 +2614,8 @@ mod tests {
             Some((Some("a".to_string()), None))
         );
         assert_eq!(
-            read_generation_manifest(&write(
-                "new",
-                b"checkpoint-v2\nparent: a\nsaved_at: 7\n"
-            ))
-            .map(|manifest| (manifest.parent, manifest.saved_at)),
+            read_generation_manifest(&write("new", b"checkpoint-v2\nparent: a\nsaved_at: 7\n"))
+                .map(|manifest| (manifest.parent, manifest.saved_at)),
             Some((Some("a".to_string()), Some(7)))
         );
 
@@ -1703,13 +2636,17 @@ mod tests {
             reasoning_content: None,
         };
 
+        assert!(store.live_matches_base(&[]).unwrap());
         append_history_messages(&store.session_file, &[message("v1")]).unwrap();
+        let unsaved = build_message_arr(10, &store.session_file).unwrap();
+        assert!(!store.live_matches_base(&unsaved).unwrap());
         store.save("c1").unwrap();
         assert_eq!(store.base_target().unwrap().as_deref(), Some("c1"));
         assert_eq!(store.head_target().unwrap().as_deref(), Some("c1"));
         let live = build_message_arr(10, &store.session_file).unwrap();
         // Just saved: live matches the snapshot.
         assert!(store.live_matches_checkpoint(&live, "c1").unwrap());
+        assert!(store.live_matches_base(&live).unwrap());
         // Runtime asset churn without a new canonical turn is still clean.
         fs::create_dir_all(&store.session_assets).unwrap();
         fs::write(store.session_assets.join("runtime-cache"), b"derived").unwrap();
@@ -1721,13 +2658,21 @@ mod tests {
         append_history_messages(&store.session_file, &[message("v2")]).unwrap();
         let live = build_message_arr(10, &store.session_file).unwrap();
         assert!(!store.live_matches_checkpoint(&live, "c1").unwrap());
+        assert!(!store.live_matches_base(&live).unwrap());
 
         // Rolling back restores the match.
         store.rollback("c1").unwrap();
         let live = build_message_arr(10, &store.session_file).unwrap();
         assert!(store.live_matches_checkpoint(&live, "c1").unwrap());
+        assert!(store.live_matches_base(&live).unwrap());
         assert_eq!(store.base_target().unwrap().as_deref(), Some("c1"));
         assert_eq!(store.head_target().unwrap().as_deref(), Some("c1"));
+
+        // Rewinding all canonical messages is still dirty against a non-empty BASE.
+        clear_session_history_sqlite(&store.session_file).unwrap();
+        let live = build_message_arr(10, &store.session_file).unwrap();
+        assert!(live.is_empty());
+        assert!(!store.live_matches_base(&live).unwrap());
 
         // Saved listings carry the manifest timestamp, not the dir mtime.
         let listed = store.list().unwrap();

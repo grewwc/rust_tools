@@ -202,6 +202,14 @@ impl SubagentStatusLine {
             self.last_serve_line = Some(status_line.clone());
         }
 
+        // The side-note composer owns the footer row while open: skip the in-place
+        // redraw so its bare `\r\x1b[2K` cannot displace the output cursor or erase
+        // the DECSTBM-reserved composer. Serve frames above still publish, and the
+        // pending line is intentionally not recorded, so `finish` has nothing stale
+        // to finalize and the next refresh after the composer closes redraws it.
+        if crate::ai::stream::side_note_input::side_note_composer_active() {
+            return;
+        }
         let line = crate::ai::stream::clamp_line_to_terminal_row_with_reserve(&status_line, 0);
         if self.last_line.as_deref() == Some(line.as_str()) {
             return;
@@ -218,6 +226,14 @@ impl SubagentStatusLine {
     /// and end the dynamic line so it no longer occupies a cursor row.
     pub(super) fn finish(&mut self) {
         self.last_serve_line = None;
+        // Same ownership rule as `refresh`: never finalize a dynamic line into the
+        // transcript while the composer owns the footer row. The status itself is
+        // not lost (serve frames and tool results carry it); only the transient
+        // TTY redraw is deferred. Keep `last_line` so a later refresh/finish after
+        // the composer closes still sees and finalizes it.
+        if crate::ai::stream::side_note_input::side_note_composer_active() {
+            return;
+        }
         let Some(line) = self.last_line.take() else {
             return;
         };

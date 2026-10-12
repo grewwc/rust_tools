@@ -1498,11 +1498,11 @@ fn build_system_prompt(
                 "Do NOT use `write_file(temp=true)` on existing project files; reserve `write_file` without `temp` for genuine full rewrites (localized edits go through `apply_patch`).".to_string(),
             );
             lines.push(
-                "When one file needs several localized edits, read the relevant span once. Make ONE `apply_patch` call with multiple `@@` hunks in a single `*** Update File:` section only when every hunk has a unique anchor (distinct surrounding context)."
+                "When one file needs several localized edits, read the span once. Make ONE `apply_patch` call with multiple `@@` hunks only when every hunk has a unique anchor (distinct context) and the combined patch stays small; otherwise split into sequential calls."
                     .to_string(),
             );
             lines.push(
-                "For several files, use one Begin Patch envelope with one section per target. Do not split related edits into serial read/patch cycles unless a previous patch failed or a later edit truly depends on the earlier edit's result."
+                "For several files, prefer one small file per `apply_patch` call; batch files into one Begin Patch envelope only when every edit is tiny and the combined patch stays small."
                     .to_string(),
             );
             lines.push(
@@ -1510,7 +1510,7 @@ fn build_system_prompt(
                     .to_string(),
             );
             lines.push(
-                "Keep each patch well under the size limit. Split large edits into multiple `apply_patch` calls, or write the patch to a temp file and pass `patch_file`."
+                "Keep each patch small: one file, a few hunks, minimal context (aim <3000 chars, never approach 8000). Prefer splitting into sequential calls; use `patch_file` mainly when a small patch was truncated."
                     .to_string(),
             );
         } else {

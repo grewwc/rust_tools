@@ -28,6 +28,15 @@ impl AiConfig {
     pub const MODEL_COMPATIBLE_API_KEY: &str = "compatible.api_key";
     pub const MODEL_ALIBABA_API_KEY: &str = "alibaba.api_key";
     pub const MODEL_ALIYUN_API_KEY: &str = "aliyun.api_key";
+    /// Token Plan subscription API key (from the Bailian console's "My
+    /// subscription" page). Referenced by the model registry's
+    /// `api_key_config_key` field (models/*-tokenplan.json entries: the
+    /// adapter stays `alibaba` while the endpoint points at
+    /// `token-plan.cn-beijing.maas.aliyuncs.com`). Like
+    /// `MODEL_DEEPSEEK_API_KEY`, it is deliberately absent from any adapter's
+    /// `api_key_candidates`, since a fallback here would leak the Token Plan
+    /// key into every model behind that adapter.
+    pub const MODEL_TOKEN_PLAN_API_KEY: &str = "token_plan.api_key";
     pub const SPEECH_API_KEY: &str = "ai.speech.api_key";
     pub const SPEECH_ENDPOINT: &str = "ai.speech.endpoint";
     pub const SPEECH_MODEL: &str = "ai.speech.model";

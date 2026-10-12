@@ -31,7 +31,7 @@ use super::{
     MultilineHistoryState,
     completion_panel::{CompletionPanel, PendingTabCompletion},
     events::{EventLoopAction, RecentTextInput, handle_multiline_event},
-    render::{render_multiline_popup_with_width, textarea_row_range},
+    render::{render_multiline_popup_with_checkpoint, textarea_row_range},
 };
 #[cfg(test)]
 use super::render::render_multiline_popup;
@@ -1635,6 +1635,7 @@ fn print_submitted_input_preview(content: &str) {
 
 impl PromptEditor {
     pub(in crate::ai::prompt) fn read_multi_line_tui(&mut self) -> io::Result<Option<String>> {
+        let checkpoint_label = self.current_checkpoint_status_label();
         // The streaming side-note listener (Ctrl+G composer) owns stdin in
         // cbreak mode for the whole turn. Preempt it BEFORE touching stdin or
         // termios: the foreground flag makes it stop poll/read, restore termios
@@ -1959,7 +1960,7 @@ impl PromptEditor {
                             let area = f.area();
                             drawn_viewport_area = area;
                             last_drawn_area = Some(area);
-                            let _ = render_multiline_popup_with_width(
+                            let _ = render_multiline_popup_with_checkpoint(
                                 f,
                                 &mut textarea,
                                 status_msg.as_deref(),
@@ -1969,6 +1970,7 @@ impl PromptEditor {
                                 self.model_remote,
                                 &self.current_reasoning_effort_label,
                                 self.session_topic.as_deref(),
+                                checkpoint_label.as_deref(),
                                 live_paint_width,
                             );
                             drawn_row_widths = if force_repaint {
@@ -2274,6 +2276,7 @@ mod tests {
             current_agent_label: "fixture-agent".to_string(),
             current_reasoning_effort_label: "high".to_string(),
             session_topic: Some("fixture-topic".to_string()),
+            remote_checkpoint_status_label: None,
             session_title_update_subscription: subscription,
             session_title_updates: std::sync::Mutex::new(updates),
             first_render_notifier: None,

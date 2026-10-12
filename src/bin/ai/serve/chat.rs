@@ -172,6 +172,98 @@ fn fetch_remote_sessions(
     parse_remote_sessions(&text)
 }
 
+#[derive(Debug, Deserialize)]
+struct RemoteCheckpointList {
+    checkpoints: Vec<String>,
+    #[serde(default)]
+    branches: Vec<String>,
+    #[serde(default)]
+    checkpoint_status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteCheckpointCommand {
+    output: String,
+    confirmation: Option<String>,
+    checkpoints: Vec<String>,
+    #[serde(default)]
+    branches: Vec<String>,
+    #[serde(default)]
+    checkpoint_status: Option<String>,
+}
+
+fn fetch_remote_checkpoint_names(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+) -> Result<RemoteCheckpointList, String> {
+    let resp = auth(
+        client.get(format!("{base}/sessions/{session_id}/checkpoints")),
+        token,
+    )
+    .send()
+    .map_err(|err| format!("cannot reach serve at {base} ({err})"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(server_error_message(status, &text));
+    }
+    let response: RemoteCheckpointList = serde_json::from_str(&text)
+        .map_err(|err| format!("serve returned an unexpected checkpoint list: {err}"))?;
+    Ok(response)
+}
+
+fn post_remote_checkpoint_command(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    command: &str,
+    confirmed: bool,
+) -> Result<RemoteCheckpointCommand, String> {
+    let resp = auth(
+        client.post(format!("{base}/sessions/{session_id}/checkpoints")),
+        token,
+    )
+    .json(&serde_json::json!({"command": command, "confirmed": confirmed}))
+    .send()
+    .map_err(|err| format!("cannot reach serve at {base} ({err})"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(server_error_message(status, &text));
+    }
+    serde_json::from_str(&text)
+        .map_err(|err| format!("serve returned an unexpected checkpoint response: {err}"))
+}
+
+fn run_serve_checkpoint_command(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    command: &str,
+) -> Result<Option<String>, String> {
+    let mut response = post_remote_checkpoint_command(
+        client, base, token, session_id, command, false,
+    )?;
+    if let Some(prompt) = response.confirmation.take() {
+        let confirmed = crate::commonw::prompt::prompt_yes_or_no_danger(&prompt);
+        if confirmed != Some(true) {
+            println!("Canceled: nothing was changed.");
+            return Ok(response.checkpoint_status);
+        }
+        response = post_remote_checkpoint_command(
+            client, base, token, session_id, command, true,
+        )?;
+    }
+    print!("{}", response.output);
+    CommandCompleter::set_checkpoint_name_candidates(response.checkpoints);
+    CommandCompleter::set_checkpoint_branch_candidates(response.branches);
+    Ok(response.checkpoint_status)
+}
+
 /// Parse a `GET /sessions` body. Entries with an empty id are dropped —
 /// they can never be resumed.
 fn parse_remote_sessions(text: &str) -> Result<Vec<RemoteSession>, String> {
@@ -2957,6 +3049,13 @@ pub(in crate::ai) fn run_serve_chat(
             editor.set_session_topic(current_remote_title(&items, &session_id));
             listed = items;
         }
+        if let Ok(checkpoint_state) =
+            fetch_remote_checkpoint_names(&client, &base, &token, &session_id)
+        {
+            CommandCompleter::set_checkpoint_name_candidates(checkpoint_state.checkpoints);
+            CommandCompleter::set_checkpoint_branch_candidates(checkpoint_state.branches);
+            editor.set_remote_checkpoint_status_label(checkpoint_state.checkpoint_status);
+        }
         let input = match editor.read_multi_line() {
             Ok(Some(text)) => text,
             Ok(None) => break,
@@ -2985,13 +3084,14 @@ pub(in crate::ai) fn run_serve_chat(
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first)\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/history [N|full|user|assistant|tool|system|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first)\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/checkpoint (/cp) [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
                 );
                 continue;
             }
             "/new" => match create_session(&client, &base, &token) {
                 Ok(id) => {
                     session_id = id;
+                    CommandCompleter::clear_checkpoint_candidates();
                     editor.set_session_id(session_id.as_str());
                     println!("New session {session_id}.");
                 }
@@ -3017,6 +3117,7 @@ pub(in crate::ai) fn run_serve_chat(
                 Ok(id) => {
                     let title = listed.iter().find(|s| s.id == id).map(remote_session_title);
                     session_id = id;
+                    CommandCompleter::clear_checkpoint_candidates();
                     editor.set_session_id(session_id.as_str());
                     if restore_serve_session_picks(&client, &base, &token, &session_id, &mut selection)
                     {
@@ -3033,6 +3134,7 @@ pub(in crate::ai) fn run_serve_chat(
                 Ok(id) => {
                     println!("Forked '{session_id}' -> '{id}', switched to new branch.");
                     session_id = id;
+                    CommandCompleter::clear_checkpoint_candidates();
                     editor.set_session_id(session_id.as_str());
                 }
                 Err(err) => eprintln!("[serve-chat] {err}"),
@@ -3126,6 +3228,20 @@ pub(in crate::ai) fn run_serve_chat(
                     eprintln!("[serve-chat] {err}");
                 }
             }
+            "/checkpoint" | ":checkpoint" | "/cp" | ":cp" => {
+                match run_serve_checkpoint_command(
+                    &client,
+                    &base,
+                    &token,
+                    &session_id,
+                    &trimmed,
+                ) {
+                    Ok(checkpoint_status) => {
+                        editor.set_remote_checkpoint_status_label(checkpoint_status);
+                    }
+                    Err(err) => eprintln!("[serve-chat] {err}"),
+                }
+            }
             _ => {
                 // A local slash command is never a prompt: the local REPL
                 // would swallow it, so forwarding it as a turn only burns a
@@ -3135,7 +3251,7 @@ pub(in crate::ai) fn run_serve_chat(
                 if is_local_command_start(&trimmed) {
                     let command = trimmed.split_whitespace().next().unwrap_or(&trimmed);
                     eprintln!(
-                        "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /history, /model, /effort, /agent, /skills, /sessions, /resume, /fork, /close, /bg, /new (see /help)."
+                        "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /checkpoint, /history, /model, /effort, /agent, /skills, /sessions, /resume, /fork, /close, /bg, /new (see /help)."
                     );
                 } else if let Err(err) = post_turn_stream(
                     &client,
@@ -4044,5 +4160,49 @@ mod tests {
 
         let (base, _) = serve_capture_once("{\"session_id\":\"s1\",\"interrupted\":false}");
         assert!(!interrupt_remote_turn(&client, &base, "tk", "s1").expect("request"));
+    }
+
+    #[test]
+    fn checkpoint_requests_target_the_remote_session_route() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        rust_tools::ensure_rustls_provider();
+        let (base, captured) = serve_capture_once(
+            r#"{"output":"switched\n","confirmation":null,"checkpoints":["latest","before"],"branches":["main","feature"],"checkpoint_status":"feature@latest"}"#,
+        );
+        let client = reqwest::blocking::Client::new();
+        let response = post_remote_checkpoint_command(
+            &client,
+            &base,
+            "tk",
+            "s1",
+            "/cp switch feature",
+            false,
+        )
+        .expect("checkpoint request");
+        assert_eq!(response.output, "switched\n");
+        assert_eq!(response.checkpoints, ["latest", "before"]);
+        assert_eq!(response.branches, ["main", "feature"]);
+        assert_eq!(response.checkpoint_status.as_deref(), Some("feature@latest"));
+        let head = captured.lock().expect("capture").clone().to_lowercase();
+        assert!(
+            head.starts_with("post /sessions/s1/checkpoints http/1.1"),
+            "request head: {head}"
+        );
+        assert!(
+            head.contains("authorization: bearer tk"),
+            "request head: {head}"
+        );
+
+        let (base, _) = serve_capture_once(
+            r#"{"checkpoints":["latest","before"],"branches":["main","feature"],"checkpoint_status":"main@latest"}"#,
+        );
+        let checkpoint_state = fetch_remote_checkpoint_names(&client, &base, "tk", "s1")
+            .expect("checkpoint list");
+        assert_eq!(checkpoint_state.checkpoints, ["latest", "before"]);
+        assert_eq!(checkpoint_state.branches, ["main", "feature"]);
+        assert_eq!(checkpoint_state.checkpoint_status.as_deref(), Some("main@latest"));
+        CommandCompleter::clear_checkpoint_candidates();
     }
 }

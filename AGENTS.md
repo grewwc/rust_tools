@@ -9,7 +9,8 @@ Rust 2024 workspace: utility library + CLI binaries. Primary product is `a`, an
 LLM-based AI agent runtime (AIOS) with process scheduling, agent/skill routing,
 tool registry, and MCP integration. Workspace members: root crate,
 `crates/rust_tools_macros`, `crates/aios_kernel`, `crates/mcp_stdio`,
-`crates/mcp_browser`, `crates/mcp_excel`, `crates/mcp_pdf`, `crates/re`.
+`crates/mcp_browser`, `crates/mcp_computer`, `crates/mcp_excel`,
+`crates/mcp_pdf`, `crates/re`.
 macOS-first (`objc2` deps); core library cross-platform.
 
 ## Layout
@@ -19,12 +20,14 @@ src/lib.rs                  # utility library
 src/bin/a.rs                # AI agent entry point
 src/bin/ai/                 # AI runtime core
 src/bin/ff/                 # file-finder module embedded by `a` via include! in ai/mod.rs
-src/bin/*.rs                # one-off CLI tools (c, j, secret, pdf, ...) - not part of `a`
+src/bin/*.rs                # one-off CLI tools (c, j, secret, pdf, ff, fk, gx, his,
+                            #   ns, oo, tt, configw, installw, mcp_ocr, ...) - not part of `a`
 scripts/                    # repo shell/Python helpers (guide: scripts/AGENTS.md)
 crates/aios_kernel/         # scheduler / IPC / process state machine
 crates/rust_tools_macros/   # proc macros
 crates/mcp_stdio/           # shared MCP-over-stdio skeleton: JSON-RPC transport + run<McpServer>
 crates/mcp_browser/         # standalone MCP server: browser automation (macOS AppleScript / CDP)
+crates/mcp_computer/        # standalone MCP server: generic computer-use (screen capture, input injection)
 crates/mcp_excel/           # standalone MCP server: Excel via AppleScript
 crates/mcp_pdf/             # standalone MCP server: PDF text/metadata extraction
 crates/re/                  # memo CLI (re) — standalone bin, keeps mongodb out of `a`
@@ -32,10 +35,10 @@ tests/                      # integration tests
 models/                     # per-model JSON registry (read at runtime)
 ```
 
-> `mcp_browser` / `mcp_excel` / `mcp_pdf` are standalone binaries (not deps of `a`), so
-> `cargo check --bin a` stays fast. They reuse `mcp_stdio`; new OS-app MCP
-> servers should follow the same pattern. Standalone exceptions: `src/bin/mcp_feishu.rs`
-> and `src/bin/mcp_ocr.rs` are hand-rolled JSON-RPC servers that don't reuse `mcp_stdio`.
+> The `mcp_*` crates above are standalone binaries (not deps of `a`), so `cargo check
+> --bin a` stays fast. They reuse `mcp_stdio`; new OS-app MCP servers should follow
+> the same pattern. Standalone exceptions: `src/bin/mcp_feishu/` and
+> `src/bin/mcp_ocr.rs` are hand-rolled JSON-RPC servers that don't reuse `mcp_stdio`.
 
 ## Build / Test
 
@@ -76,7 +79,7 @@ Prefer an existing focused test before running one.
    comments (`///`, `//!`) — must be written in English. This applies to new code and
    to any code you modify; when you touch code containing Chinese comments, translate
    them as part of the change (repo-wide Chinese-comment migration).
-3. **Collections**: `rustc-hash` FxHashMap/FxHashSet via re-exports.
+3. **Collections**: `rustc-hash` FastMap/FastSet via re-exports.
 4. **Config keys**: add only in `src/bin/ai/config_schema.rs`.
 5. **Tests**: keep close to changed module; serial tests use `test_support::ENV_LOCK`.
 6. **Extensibility**: data-driven/registration-based over hardcoded `if`/`else`.
@@ -88,5 +91,6 @@ Prefer an existing focused test before running one.
 
 1. `.agent` / builtin `.skill` files are compiled in via `include_str!` (editing recompiles); user `.skill` files load at runtime.
 2. `src/bin/ff/` is embedded into `a` via `include!` in `src/bin/ai/mod.rs` (`a.rs`
-   itself is just `mod ai;`); changes affect the agent binary.
+   only re-exports the library and calls `ai::entry()` from `main`); changes affect
+   the agent binary.
 3. `objc2*` deps are macOS-only.

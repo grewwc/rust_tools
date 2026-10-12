@@ -30,10 +30,11 @@ No focused unit tests - the gate is the consuming binaries' build + smoke test.
    wording: the timeout message ("operation reached the N ms server cap") and
    `cap_text` truncation note are written to be reusable by any server.
 2. **Error wording must avoid the host's transport trigger words.** Never let
-   a returned error contain `mcp response timeout`, `broken pipe`,
-   `closed the stream`, `process exited`, `failed to read response`, or
-   `failed waiting for mcp response` - the host kills + restarts the subprocess
-   on those (see `src/bin/ai/mcp/client.rs`).
+   a returned error contain `broken pipe`, `closed the stream unexpectedly`,
+   `mcp response timeout`, `failed waiting for mcp response`, `failed to read
+   response`, `process exited with status`, `failed to get stdin`, or
+   `failed to get stdout` - the host kills + restarts the subprocess on those
+   (see `is_transport_error` in `src/bin/ai/mcp/client.rs`).
 3. **`run<S>` is only `block_on`-ed** by the consuming bin's `#[tokio::main]`,
    never `tokio::spawn` - this is why `async fn` sits directly on the trait
    (no `async-trait`, no `Send` bound). Do not add `Send` requirements.

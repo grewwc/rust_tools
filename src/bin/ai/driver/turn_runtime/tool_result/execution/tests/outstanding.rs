@@ -1,8 +1,8 @@
 //! Tests for the outstanding-work gate: plan state, not prose, decides whether
 //! a final response may land.
 
-use super::common::*;
 use super::super::*;
+use super::common::*;
 use crate::ai::tools::plan_state::{
     StepStatus, load_completion_claim, record_completion_claim, record_plan, update_plan_step,
 };
@@ -10,7 +10,7 @@ use crate::ai::tools::plan_state::{
 /// Test app whose plan/claim files land in a fresh temp dir (mirrors the
 /// plan-state store test setup; pid + sequence + timestamp keeps parallel
 /// test threads from sharing a dir).
-fn test_app_with_session() -> (App, PathBuf) {
+pub(super) fn test_app_with_session_and_tools(tools: &[&str]) -> (App, PathBuf) {
     use std::time::{SystemTime, UNIX_EPOCH};
     static TEST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let base = std::env::temp_dir().join(format!(
@@ -24,13 +24,17 @@ fn test_app_with_session() -> (App, PathBuf) {
     ));
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&base).unwrap();
-    let mut app = test_app_with_tools(&[]);
+    let mut app = test_app_with_tools(tools);
     app.session_history_file = base.join("session.sqlite");
     app.session_id = "outstanding-gate-test".to_string();
     (app, base)
 }
 
-fn two_step_plan(app: &App) {
+fn test_app_with_session() -> (App, PathBuf) {
+    test_app_with_session_and_tools(&[])
+}
+
+pub(super) fn two_step_plan(app: &App) {
     let steps = serde_json::json!([
         { "step": 1, "action": "Read", "tool": "read_file" },
         { "step": 2, "action": "Patch", "tool": "apply_patch" }
@@ -196,4 +200,20 @@ fn corrupt_plan_fails_open() {
     let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16);
     assert_eq!(action, OutstandingWorkGateAction::Allow);
     let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn final_gate_state_has_independent_outstanding_retry_budget() {
+    let mut state = FinalGateState::default();
+    assert!(state.can_reopen(false, 1, 16));
+    assert!(state.can_reopen_outstanding_work(false, 1, 16));
+
+    state.consume_retry();
+    assert!(!state.can_reopen(false, 1, 16));
+    assert!(state.can_reopen_outstanding_work(false, 1, 16));
+
+    state.consume_outstanding_work_retry();
+    assert!(!state.can_reopen_outstanding_work(false, 1, 16));
+    assert!(!FinalGateState::default().can_reopen_outstanding_work(true, 1, 16));
+    assert!(!FinalGateState::default().can_reopen_outstanding_work(false, 16, 16));
 }

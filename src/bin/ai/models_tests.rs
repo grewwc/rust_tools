@@ -279,7 +279,9 @@ fn disabled_model_tokens_accept_names_and_keys() {
 fn first_alibaba_model_name() -> String {
     super::model_names::all()
         .iter()
-        .find(|m| m.adapter == ApiProvider::Alibaba)
+        .find(|m| {
+            m.adapter == ApiProvider::Alibaba && name_resolves_unambiguously(m)
+        })
         .map(|m| m.name.clone())
         .expect("model registry must contain at least one Alibaba-adapter model")
 }
@@ -287,8 +289,21 @@ fn first_alibaba_model_name() -> String {
 fn first_alibaba_vl_model_name() -> Option<String> {
     super::model_names::all()
         .iter()
-        .find(|m| m.adapter == ApiProvider::Alibaba && m.is_vl)
+        .find(|m| {
+            m.adapter == ApiProvider::Alibaba && m.is_vl && name_resolves_unambiguously(m)
+        })
         .map(|m| m.name.clone())
+}
+
+/// `true` when the entry's `name` resolves back to the entry itself through
+/// the full identifier chain (key index first, then name index). Duplicate
+/// names (e.g. a token-plan twin reusing the dashscope model id) legitimately
+/// resolve key-first to the other entry, so tests comparing name resolution
+/// against `determine_model` must skip those entries.
+fn name_resolves_unambiguously(m: &ModelDef) -> bool {
+    super::model_names::find_by_identifier(&m.name)
+        .map(|resolved| std::ptr::eq(resolved, m))
+        .unwrap_or(false)
 }
 
 #[test]
@@ -571,6 +586,18 @@ fn registry_identifiers_resolve_to_their_owning_entry() {
                 "{}: ambiguous name resolved outside its own group ({resolved})",
                 def.name
             );
+        } else if !name_resolves_unambiguously(def) {
+            // The bare name is shadowed by another entry's key: identifier
+            // resolution is key-first, so the name legitimately resolves to
+            // that key holder (backward compat for e.g. `qwen3.8-max` ->
+            // the dashscope entry, not the token-plan twin).
+            let holder = super::model_names::find_by_identifier(&def.name)
+                .expect("shadowed name must still resolve");
+            assert_eq!(
+                holder.key, def.name,
+                "{}: shadowed name must resolve to the entry whose key it is",
+                def.name
+            );
         } else {
             assert_eq!(
                 resolved,
@@ -608,6 +635,33 @@ fn alibaba_model_entries_accept_alibaba_api_key_config() {
     let name = first_alibaba_model_name();
     let key = api_key_for_model(&name, "fallback-key");
     assert!(!key.is_empty());
+}
+
+#[test]
+fn token_plan_entries_pair_token_plan_key_with_token_plan_endpoint() {
+    // Token Plan keys are only valid on the token-plan endpoint (and vice
+    // versa), so a registry entry must never mix the two credential sets.
+    let mut token_plan_entries = 0;
+    for m in super::model_names::all() {
+        let endpoint = m.endpoint.as_deref().unwrap_or_default();
+        let is_token_plan_endpoint = endpoint.contains("token-plan.cn-beijing.maas.aliyuncs.com");
+        let uses_token_plan_key = m.api_key_config_key.as_deref() == Some(AiConfig::MODEL_TOKEN_PLAN_API_KEY);
+        if is_token_plan_endpoint || uses_token_plan_key {
+            token_plan_entries += 1;
+            assert!(
+                is_token_plan_endpoint && uses_token_plan_key,
+                "model '{}' mixes credential sets: endpoint='{}', api_key_config_key={:?}",
+                m.key,
+                endpoint,
+                m.api_key_config_key
+            );
+            assert_eq!(m.adapter, ApiProvider::Alibaba);
+        }
+    }
+    assert!(
+        token_plan_entries > 0,
+        "model registry must contain at least one token-plan entry"
+    );
 }
 
 #[test]

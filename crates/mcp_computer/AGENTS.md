@@ -41,11 +41,10 @@ src/backend/unsupported.rs # every call reports a clear "no backend on this OS" 
 3. **Screenshots return a path, not image content.** The host reads only
    `content[0].text`, so bytes in the envelope would be discarded; the path plus
    `a`'s image-aware `read_file` is what shows the frame to a vision model.
-4. **Error text must avoid the host's transport trigger words** (`mcp response
-   timeout`, `broken pipe`, `closed the stream`, `process exited`, `failed to read
-   response`, `failed waiting for mcp response` — `mcp/client.rs`). Helper stderr is
-   forwarded to the model, so each backend scans it (`sanitize`) first; forwarding
-   one of those phrases makes the host kill and restart this server.
+4. **Error text must avoid the host's transport trigger words** (the list lives
+   in `crates/mcp_stdio/AGENTS.md` invariant 2). Helper stderr is forwarded to
+   the model, so each backend scans it (`sanitize`) first; forwarding one of
+   those phrases makes the host kill and restart this server.
 5. **Backend calls run under `with_timeout` on a blocking thread.** Capture and
    injection block (subprocess + sleeps), so `tools.rs` goes through `spawn_blocking`:
    run inline they would hold the server's only executor thread and the per-op cap

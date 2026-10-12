@@ -307,6 +307,34 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_width(
     session_topic: Option<&str>,
     live_width: u16,
 ) -> Option<Position> {
+    render_multiline_popup_with_checkpoint(
+        f,
+        textarea,
+        status_msg,
+        completion_panel,
+        agent_label,
+        model_label,
+        model_remote,
+        reasoning_effort_label,
+        session_topic,
+        None,
+        live_width,
+    )
+}
+
+pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
+    f: &mut ratatui::Frame<'_>,
+    textarea: &mut TextArea<'_>,
+    status_msg: Option<&str>,
+    completion_panel: Option<&CompletionPanel>,
+    agent_label: &str,
+    model_label: &str,
+    model_remote: bool,
+    reasoning_effort_label: &str,
+    session_topic: Option<&str>,
+    checkpoint_label: Option<&str>,
+    live_width: u16,
+) -> Option<Position> {
     let frame_area = f.area();
     let area = Rect::new(
         frame_area.x,
@@ -394,6 +422,18 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_width(
             spans.push(Span::styled(
                 ")",
                 Style::default().fg(Color::Rgb(100, 116, 139)),
+            ));
+        }
+        if let Some(label) = checkpoint_label.filter(|label| !label.is_empty()) {
+            spans.push(Span::styled(
+                "|",
+                Style::default().fg(Color::Rgb(100, 116, 139)),
+            ));
+            spans.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::Rgb(125, 211, 252))
+                    .add_modifier(Modifier::BOLD),
             ));
         }
         // Show the session topic on the same line as the model
@@ -847,8 +887,9 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
 mod tests {
     use super::{
         CHROME_EDGE_MARGIN, MODEL_LINE_MAX_COLUMNS, count_trailing_blank_lines,
-        popup_layout_config, render_multiline_popup, render_multiline_popup_with_width,
-        textarea_row_range, truncate_line_to_width, truncate_with_ellipsis,
+        popup_layout_config, render_multiline_popup, render_multiline_popup_with_checkpoint,
+        render_multiline_popup_with_width, textarea_row_range, truncate_line_to_width,
+        truncate_with_ellipsis,
     };
     use ratatui::{
         Terminal, TerminalOptions, Viewport,
@@ -1150,6 +1191,46 @@ mod tests {
         assert!(
             !dense.contains('…'),
             "title fits the budget, no marker expected: {row:?}"
+        );
+    }
+
+    #[test]
+    fn model_line_shows_compact_checkpoint_status() {
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(160, 12),
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .unwrap();
+        let mut textarea = TextArea::default();
+        let mut viewport_area = Rect::ZERO;
+
+        terminal
+            .draw(|f| {
+                viewport_area = f.area();
+                render_multiline_popup_with_checkpoint(
+                    f,
+                    &mut textarea,
+                    None,
+                    None,
+                    "Sharp",
+                    "deepseek-v4-flash-volcano",
+                    false,
+                    "Low",
+                    Some("LeetCode第一题"),
+                    Some("main@next_1"),
+                    160,
+                );
+            })
+            .unwrap();
+
+        let model_row_y = viewport_area.bottom() - 2;
+        let row = buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
+        let dense: String = row.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(
+            dense.contains("(Sharp;Low)|main@next_1|LeetCode第一题"),
+            "{row:?}"
         );
     }
 

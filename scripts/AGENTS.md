@@ -50,3 +50,13 @@ the bait set lives in `prompt_eval_cases.jsonl`, recorded runs in
 - An A/B difference is attributable to the prompt only when both manifests differ
   in prompt fingerprint and share model/agent; a change that removes no violation
   but adds none is "not worse", not "better".
+
+## cleanup_test_files.sh
+
+One-off helper that removes temporary test files (e.g. `test_*.rs`) left in the
+repo root; details in the script header.
+
+## test_memory_feature.sh
+
+Quick smoke test for memory / knowledge-base retrieval (compile check plus
+`knowledge_save`/`knowledge_search` round-trips); details in the script header.

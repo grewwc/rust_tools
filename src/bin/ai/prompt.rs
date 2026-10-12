@@ -13,7 +13,7 @@ use std::{
 
 use rustyline::{CompletionType, Config, Editor, history::DefaultHistory};
 
-use super::history::SessionStore;
+use super::history::{CheckpointStore, SessionStore};
 use crate::commonw::utils::expanduser;
 
 pub(super) mod completion;
@@ -86,6 +86,9 @@ pub(super) struct PromptEditor {
     current_reasoning_effort_label: String,
     /// Current session topic, shown on the same line as the model hint above the input box.
     session_topic: Option<String>,
+    /// Server-authoritative checkpoint label for serve-chat. Local mode leaves
+    /// this unset and derives the label from the session checkpoint store.
+    remote_checkpoint_status_label: Option<String>,
     /// Background title-change subscription for the current foreground editor.
     session_title_update_subscription: u64,
     session_title_updates: Mutex<Receiver<SessionTitleUpdate>>,
@@ -164,6 +167,7 @@ impl PromptEditor {
             current_agent_label: String::new(),
             current_reasoning_effort_label: String::new(),
             session_topic: None,
+            remote_checkpoint_status_label: None,
             session_title_update_subscription,
             session_title_updates: Mutex::new(session_title_updates),
             first_render_notifier: None,
@@ -222,6 +226,7 @@ impl PromptEditor {
     /// so it must be synced to the app's current session before entering the input box.
     pub(super) fn set_session_id(&mut self, session_id: impl Into<String>) {
         self.session_id = session_id.into();
+        self.remote_checkpoint_status_label = None;
         // Pasted images are saved under the bound session's assets dir; keep the
         // save location in sync or later pastes land in the previous session and
         // the next turn cannot find them.
@@ -232,6 +237,10 @@ impl PromptEditor {
     /// same line as the model hint.
     pub(super) fn set_session_topic(&mut self, topic: Option<String>) {
         self.session_topic = topic;
+    }
+
+    pub(super) fn set_remote_checkpoint_status_label(&mut self, label: Option<String>) {
+        self.remote_checkpoint_status_label = label;
     }
 
     /// Set the notification fired once the next input box's first frame is drawn.
@@ -269,6 +278,14 @@ impl PromptEditor {
             changed = true;
         }
         changed
+    }
+
+    fn current_checkpoint_status_label(&self) -> Option<String> {
+        if self.model_remote {
+            return self.remote_checkpoint_status_label.clone();
+        }
+        let store = CheckpointStore::from_session_store(&self.session_store, &self.session_id);
+        store.current_status_label().ok().flatten()
     }
 
     pub(super) fn read_multi_line(&mut self) -> io::Result<Option<String>> {

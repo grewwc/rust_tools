@@ -28,7 +28,7 @@ the nearest child `AGENTS.md`.
 - `tools/`: registry, service implementations, storage, display/history policy
 - `mcp/`: MCP lifecycle, clients, routing snapshots, transport
 - `knowledge/`: shared types, lexical similarity, embedding provider, vector index
-- `stream/`: streaming protocol, chunk extraction, state machine, `stream/render/` terminal rendering. Golden wire→parse regression tests live in `stream/runtime/tests.rs` (`mod golden_wire`, offline `ScriptedSse` loopback) — add new provider wire shapes as fixtures there.
+- `stream/`: streaming protocol, chunk extraction, state machine, `stream/render/` terminal rendering. Golden wire→parse regression tests live in `stream/runtime/tests/` (`golden_wire.rs`, offline `ScriptedSse` loopback) — add new provider wire shapes as fixtures there.
 - `cli.rs` / `theme.rs` / `background.rs`: CLI entry, theming, background tasks
 - `terminal_session/`: PTY session plumbing (client/host/registry/replay/wire);
   `builtin_themes/` themes embedded by `theme.rs`; `tests/` module-level integration tests
@@ -50,7 +50,7 @@ Sessions are the unit of conversation persistence; IDs are not restricted to UUI
     `image_digests`, `interrupted_stream_diagnostics`.
   - `<id>.assets/` — session assets: `folded-tool-groups/`, `tool-overflow-compressed/`,
     `context-checkpoints/`, images, etc.
-  - `.<id>.sqlite.state.lock` (state lock) and `<id>.<pid>.pid` (live-process marker).
+  - `.<id>.sqlite.state.lock` (state lock) and `{session_id}.pid` (live-process marker; the pid is the file content).
 - **Model visibility**: `build_skill_turn_guard` (`driver/skill_runtime.rs`) injects a labeled
   `session_context` system-prompt section with the current session id, the sessions root, and the
   storage layout. This lets the model debug sessionid problems and read a session's content

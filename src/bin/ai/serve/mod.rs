@@ -58,6 +58,8 @@ mod sessions;
 #[cfg(feature = "serve")]
 mod history;
 #[cfg(feature = "serve")]
+mod checkpoint;
+#[cfg(feature = "serve")]
 mod files;
 #[cfg(feature = "serve")]
 mod turn;
@@ -68,6 +70,8 @@ mod tests;
 pub(crate) use files::*;
 #[cfg(feature = "serve")]
 pub(crate) use history::*;
+#[cfg(feature = "serve")]
+pub(crate) use checkpoint::*;
 #[cfg(feature = "serve")]
 pub(crate) use info::*;
 #[cfg(feature = "serve")]
@@ -1059,6 +1063,10 @@ pub(in crate::ai) async fn run_serve(
         .route("/sessions/{id}/config", get(get_session_config).post(set_session_config))
         .route("/sessions/{id}", delete(delete_session))
         .route("/sessions/{id}/history", get(read_history)).route("/sessions/{id}/rewind", post(rewind_history))
+        .route(
+            "/sessions/{id}/checkpoints",
+            get(list_checkpoints).post(post_checkpoint_command),
+        )
         .route(
             "/sessions/{id}/turns",
             post(post_turn).layer(DefaultBodyLimit::max(MAX_TURN_REQUEST_BYTES)),

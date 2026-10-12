@@ -27,13 +27,11 @@ text come back through `content[0].text`.
 
 ## Golden rules
 
-1. All results go through `content[0].text` (host reads only that); cap long
-   extracted text with `cap_text` (24K).
-2. Every parse runs under `with_timeout` (default 90s < host request_timeout_ms
-   120s); error messages must never contain the host's transport trigger words
-   (see crates/mcp_stdio/AGENTS.md).
-3. Error strings start with `open_failed` / `parse_failed` /
+1. Transport invariants (`content[0].text` only, `cap_text` 24K,
+   `with_timeout` 90s < host 120s, no transport trigger words) come from
+   `crates/mcp_stdio/AGENTS.md`.
+2. Error strings start with `open_failed` / `parse_failed` /
    `extract_text_failed` to mirror the three `PdfParseError` variants, so hosts
    can distinguish "file unreadable" from "text extraction failed".
-4. Keep the server stateless and synchronous per call: PDF parsing is
+3. Keep the server stateless and synchronous per call: PDF parsing is
    CPU-bound and fast; no background work, no long-lived handles.

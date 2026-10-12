@@ -69,6 +69,20 @@ static WIDTH_QUERY_COLS: AtomicU16 = AtomicU16::new(0);
 static WIDTH_QUERY_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 /// Set while the listener thread owns stdin and services fold width requests.
 static LISTENER_ALIVE: AtomicBool = AtomicBool::new(false);
+/// Set while the one-line side-note composer is open (Ctrl+G input mode). Transient
+/// in-place status writers (subagent status line, task heartbeat, retry waits) must
+/// not touch the TTY while this is set: their bare `\r\x1b[2K` redraws would displace
+/// the output cursor and erase/misplace the DECSTBM-reserved composer row.
+static COMPOSER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Returns true while the side-note composer is open and owns the footer row.
+pub(crate) fn side_note_composer_active() -> bool {
+    COMPOSER_ACTIVE.load(Ordering::Relaxed)
+}
+
+fn set_composer_active(active: bool) {
+    COMPOSER_ACTIVE.store(active, Ordering::Relaxed);
+}
 #[cfg(not(test))]
 static WIDTH_REFRESH_CONSECUTIVE_TIMEOUTS: AtomicU8 = AtomicU8::new(0);
 
@@ -805,6 +819,7 @@ fn submit_draft(
     if content.is_empty() {
         input.clear();
         *in_input = false;
+        set_composer_active(false);
         clear_input(footer)?;
         return Ok(false);
     }
@@ -815,6 +830,7 @@ fn submit_draft(
     {
         input.clear();
         *in_input = false;
+        set_composer_active(false);
         clear_input(footer)?;
         return Ok(true);
     }
@@ -825,6 +841,7 @@ fn submit_draft(
         Some(true) => {
             input.clear();
             *in_input = false;
+            set_composer_active(false);
             clear_input(footer)?;
             Ok(false)
         }
@@ -1177,6 +1194,7 @@ fn side_note_input_loop(
                         break;
                     }
                     in_input = true;
+                    set_composer_active(true);
                 }
             } else if b == 0x03 {
                 break; // Ctrl+C during streaming: main loop handles the interrupt, listener task exits
@@ -1236,6 +1254,7 @@ fn side_note_input_loop(
                 input.clear();
                 pending.clear();
                 in_input = false;
+                set_composer_active(false);
                 if let Some(active_footer) = footer.as_mut() {
                     if clear_input(active_footer).is_err() {
                         break;
@@ -1282,6 +1301,9 @@ fn side_note_input_loop(
     // Loop exit (stop / EOF / error / Ctrl+C): the listener thread alone performs
     // the terminal cleanup, avoiding the guard resetting the scroll region first
     // while a blocking poll has not yet returned.
+    // The composer no longer owns the footer row from here on, so deferred status
+    // writers may resume touching the TTY.
+    set_composer_active(false);
     if let Some(mut active_footer) = footer {
         if in_input {
             let _ = clear_input(&mut active_footer);
@@ -1472,5 +1494,22 @@ mod tests {
             2,
             "composer color slots misfilled: {seq:?}"
         );
+    }
+
+    #[test]
+    fn empty_submit_releases_composer_ownership() {
+        // Transient status writers consult this flag to defer their bare
+        // `\r\x1b[2K` redraws; every path that leaves input mode must clear it,
+        // even when the footer redraw itself fails (no TTY in tests).
+        set_composer_active(true);
+        let sink = SideNoteSink::Local(std::path::PathBuf::from("/nonexistent-test-queue"));
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut footer = FooterReservation { cols: 80, rows: 24 };
+        let mut input: Vec<char> = vec![' ', ' '];
+        let mut pending = Vec::new();
+        let mut in_input = true;
+        let _ = submit_draft(&sink, &stop, &mut footer, &mut input, &mut pending, &mut in_input);
+        assert!(!in_input);
+        assert!(!side_note_composer_active());
     }
 }

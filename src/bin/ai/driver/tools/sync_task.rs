@@ -799,6 +799,12 @@ fn render_heartbeat_line(elapsed: Duration, phase: &str) -> String {
 /// line; rendered dim so it does not distract.
 fn print_heartbeat_line(elapsed: Duration, phase: &str) {
     use std::io::Write;
+    // The side-note composer owns the footer row while open: skip the in-place
+    // heartbeat so its bare `\r\x1b[2K` cannot displace the output cursor or
+    // erase/misplace the DECSTBM-reserved composer.
+    if crate::ai::stream::side_note_input::side_note_composer_active() {
+        return;
+    }
     let line = render_heartbeat_line(elapsed, phase);
     print!("\r\x1b[2K\x1b[2m{line}\x1b[0m");
     let _ = std::io::stdout().flush();
@@ -809,6 +815,13 @@ fn print_heartbeat_line(elapsed: Duration, phase: &str) {
 /// to the same line as later real output.
 fn clear_heartbeat_line(show_heartbeat: bool, heartbeat_visible: &mut bool) {
     if show_heartbeat && *heartbeat_visible {
+        // Same ownership rule as `print_heartbeat_line`: never clear while the
+        // composer owns the footer row; just drop the flag so a later clear does
+        // not erase a row it never drew.
+        if crate::ai::stream::side_note_input::side_note_composer_active() {
+            *heartbeat_visible = false;
+            return;
+        }
         use std::io::Write;
         print!("\r\x1b[2K");
         let _ = std::io::stdout().flush();

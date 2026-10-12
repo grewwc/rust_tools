@@ -1,7 +1,7 @@
 {
   "name": "apply_patch",
-  "description": "Apply localized edits from inline text or a patch file. Supports line replacement, patch envelopes, and unified diffs.",
-  "first_use_guidance": "Guidance for later patches in this turn:\n- Copy source text exactly without `read_file` line prefixes; context lines must match.\n- For a single-line change prefer `*** Replace in line: <path>`: its own top-level section, never nested inside another section, with exactly three single-line fields: `anchor:` (unique substring of the target line), `old:` (exact substring to replace), `new:` (replacement).\n- When a hunk fails to match, the error echoes the current file text in a `<<<PATCH_TEXT` block; rebuild the patch from that block instead of re-reading the file.\n- `*** Begin Patch` ... `*** End Patch` envelopes support `*** Update File:` with `@@` hunks, `*** Add File:` with `+`-prefixed content, `*** Delete File:`, and `*** Replace in line:`; each `*** ...` header opens a new top-level section and is never nested.\n- Multi-file unified diffs split automatically, but unified diffs cannot delete files.",
+  "description": "Apply SMALL localized edits to existing files (one file, a few hunks per call). Supports line replacement, patch envelopes, and unified diffs.",
+  "first_use_guidance": "Guidance for later patches in this turn:\n- Keep each patch small: one file, a few hunks, minimal context. Split larger edits into sequential calls; never batch many files/hunks to 'save rounds'.\n- Copy source text exactly without `read_file` line prefixes; context lines must match.\n- For a single-line change prefer `*** Replace in line: <path>`: its own top-level section, never nested inside another section, with exactly three single-line fields: `anchor:` (unique substring of the target line), `old:` (exact substring to replace), `new:` (replacement).\n- When a hunk fails to match, the error echoes the current file text in a `<<<PATCH_TEXT` block; rebuild the patch from that block instead of re-reading the file.\n- `*** Begin Patch` ... `*** End Patch` envelopes support `*** Update File:` with `@@` hunks, `*** Add File:` with `+`-prefixed content, `*** Delete File:`, and `*** Replace in line:`; each `*** ...` header opens a new top-level section and is never nested.\n- Multi-file unified diffs split automatically, but unified diffs cannot delete files.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -11,11 +11,11 @@
       },
       "patch": {
         "type": "string",
-      "description": "Inline edit in exactly one form: `*** Replace in line:` inside a `*** Begin Patch` envelope; an envelope with `*** Update/Add/Delete File:` sections and `@@` hunks; or a unified diff. No Markdown fences or no-op edits. `*** Replace in line:` takes three single-line fields: `anchor:` (unique substring of the target line), `old:` (exact substring to replace), `new:` (replacement; empty deletes `old`); for whole-line edits use a `*** Update File:` hunk with `@@`. Limit: 8000 characters - for larger edits use `patch_file` or split."
+      "description": "Inline edit in exactly one form: `*** Replace in line:` inside a `*** Begin Patch` envelope; an envelope with `*** Update/Add/Delete File:` sections and `@@` hunks; or a unified diff. No Markdown fences or no-op edits. `*** Replace in line:` takes three single-line fields: `anchor:` (unique substring of the target line), `old:` (exact substring to replace), `new:` (replacement; empty deletes `old`); for whole-line edits use a `*** Update File:` hunk with `@@`. Keep small (one file, minimal context, aim <3000 chars). Limit 8000 - split larger edits; `patch_file` only if a small patch was truncated."
       },
       "patch_file": {
         "type": "string",
-        "description": "Patch-file path instead of `patch`; must be session-temp or under the working directory. Mutually exclusive with `patch`; limit 64000 characters."
+        "description": "Patch-file path for an already-small patch truncated in flight; must be session-temp or under the working directory. Mutually exclusive with `patch`; still keep small and split if large. Limit 64000 characters."
       }
     }
   },

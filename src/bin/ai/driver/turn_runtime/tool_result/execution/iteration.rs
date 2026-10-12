@@ -268,6 +268,11 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             // regurgitates, stop the round with a user-visible error instead of accepting it.
             let final_gate_reopen_allowed =
                 final_gate_state.can_reopen(*force_final_response, iteration, max_iterations);
+            let outstanding_work_reopen_allowed = final_gate_state.can_reopen_outstanding_work(
+                *force_final_response,
+                iteration,
+                max_iterations,
+            );
             let echo_action = if !final_gate_reopen_allowed
                 && looks_like_injected_context_echo(&stream_result.assistant_text)
             {
@@ -309,13 +314,13 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             let warn_outstanding_work = match outstanding_work_gate_action(
                 app,
                 messages,
-                !final_gate_reopen_allowed,
+                !outstanding_work_reopen_allowed,
                 iteration,
                 max_iterations,
             ) {
                 OutstandingWorkGateAction::Allow => None,
                 OutstandingWorkGateAction::Reopen => {
-                    final_gate_state.consume_retry();
+                    final_gate_state.consume_outstanding_work_retry();
                     // Completed drafts are transactionally deferred and were never
                     // user-visible, so they must not become a dedupe candidate.
                     *terminal_dedupe_candidate = None;

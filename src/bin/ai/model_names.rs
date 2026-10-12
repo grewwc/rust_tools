@@ -613,18 +613,39 @@ fn load_builtin_models() -> Vec<ModelDef> {
 
 fn build_user_key_index() -> SkipMap<String, usize> {
     let mut index = SkipMap::default();
+    // Phase 1: unique identifiers (handles, keys, declared aliases).
     for (i, m) in USER_MODELS.iter().enumerate() {
         insert_model_key_aliases(&mut index, m, i);
     }
+    insert_legacy_aliases_after_keys(&mut index, &USER_MODELS);
     index
 }
 
 fn build_builtin_key_index() -> SkipMap<String, usize> {
     let mut index = SkipMap::default();
+    // Phase 1: unique identifiers (handles, keys, declared aliases).
     for (i, m) in BUILTIN_MODELS.iter().enumerate() {
         insert_model_key_aliases(&mut index, m, i);
     }
+    insert_legacy_aliases_after_keys(&mut index, &BUILTIN_MODELS);
     index
+}
+
+/// Phase 2 of key-index building: insert backward-compat `name-adapter`
+/// aliases only when they do not collide with an already-inserted key or
+/// handle. A registry entry keyed `deepseek-v4-flash-0731-alibaba` must not
+/// be hijacked by another entry's legacy alias of the same shape (e.g. a
+/// token-plan twin whose `name` is `deepseek-v4-flash-0731` under the
+/// `alibaba` adapter); keys always win over aliases.
+fn insert_legacy_aliases_after_keys(index: &mut SkipMap<String, usize>, models: &[ModelDef]) {
+    for (i, m) in models.iter().enumerate() {
+        if let Some(legacy) = legacy_adapter_handle(m) {
+            let key = lookup_key(&legacy);
+            if !key.is_empty() && !index.contains_key(&key) {
+                index.insert(key, i);
+            }
+        }
+    }
 }
 
 fn insert_key_alias(index: &mut SkipMap<String, usize>, alias: &str, i: usize) {
@@ -636,9 +657,6 @@ fn insert_key_alias(index: &mut SkipMap<String, usize>, alias: &str, i: usize) {
 
 fn insert_model_key_aliases(index: &mut SkipMap<String, usize>, model: &ModelDef, i: usize) {
     insert_key_alias(index, &model_handle(model), i);
-    if let Some(legacy) = legacy_adapter_handle(model) {
-        insert_key_alias(index, &legacy, i);
-    }
     insert_key_alias(index, &model.key, i);
     for alias in &model.aliases {
         insert_key_alias(index, alias, i);

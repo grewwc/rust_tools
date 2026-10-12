@@ -31,7 +31,9 @@ pub(in crate::ai) fn emit_request_diagnostic(args: fmt::Arguments<'_>) -> bool {
 ///
 /// The caller keeps an `Option<TransientStatusLine>`, creates it on the first
 /// update, and calls `clear()` then drops it when done. All writes go to
-/// stderr, so they never interfere with the main output on stdout.
+/// stderr, which keeps pipes clean; on a shared TTY both streams move the same
+/// cursor, so TTY writes are additionally deferred while the side-note composer
+/// owns the footer row.
 pub(in crate::ai) struct TransientStatusLine {
     last_text: String,
     last_emitted: std::time::Instant,
@@ -65,6 +67,12 @@ impl TransientStatusLine {
     /// was more than `MIN_NON_TTY_INTERVAL` ago, preventing log flooding.
     pub(in crate::ai) fn update(&mut self, text: &str) {
         if self.is_tty {
+            // The side-note composer owns the footer row while open: stdout and
+            // stderr share one TTY cursor, so a bare `\r\x1b[2K` here would displace
+            // the output cursor just like a stdout status line. Defer while open.
+            if crate::ai::stream::side_note_input::side_note_composer_active() {
+                return;
+            }
             // Show in dim color to avoid stealing attention; use \r to return
             // to the start of the line plus \x1b[2K to clear the whole line.
             // Note: no newline is written; the cursor stays at the end of the
@@ -83,6 +91,10 @@ impl TransientStatusLine {
     /// heartbeat/wait hints do not linger into the next line of output.
     pub(in crate::ai) fn clear(&mut self) {
         if self.is_tty && self.visible {
+            if crate::ai::stream::side_note_input::side_note_composer_active() {
+                self.visible = false;
+                return;
+            }
             let _ = write!(std::io::stderr(), "\r\x1b[2K");
             let _ = std::io::stderr().flush();
             self.visible = false;

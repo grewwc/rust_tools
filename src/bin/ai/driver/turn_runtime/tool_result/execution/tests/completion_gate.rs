@@ -4,7 +4,7 @@ use super::super::*;
 use super::common::*;
 
 #[test]
-fn completion_evidence_gate_reopens_once_then_warns_on_second_final() {
+fn completion_and_outstanding_gates_each_reopen_once() {
     let mutation = test_tool_call(
         "call_patch",
         "apply_patch",
@@ -16,7 +16,18 @@ fn completion_evidence_gate_reopens_once_then_warns_on_second_final() {
         assistant_tool_call_message(mutation),
         tool_result_message("call_patch", "Successfully patched 1 file."),
     ];
-    let mut app = test_app_with_tools(&["apply_patch", "execute_command"]);
+    let (mut app, base) =
+        super::outstanding::test_app_with_session_and_tools(&["apply_patch", "execute_command"]);
+    super::outstanding::two_step_plan(&app);
+    for step in 1..=2 {
+        crate::ai::tools::plan_state::update_plan_step(
+            &app,
+            step,
+            crate::ai::tools::plan_state::StepStatus::Done,
+            None,
+        )
+        .unwrap();
+    }
     let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
     let mut messages = evidence_messages.clone();
     let mut turn_messages = evidence_messages;
@@ -97,7 +108,40 @@ fn completion_evidence_gate_reopens_once_then_warns_on_second_final() {
     )
     .unwrap();
 
-    assert!(matches!(second_step, TurnLoopStep::Break));
+    assert!(matches!(second_step, TurnLoopStep::Continue));
+    assert!(final_assistant_text.is_empty());
+    assert!(!final_assistant_recorded);
+    assert_eq!(terminal_dedupe_candidate, None);
+
+    let plan_updated = crate::ai::tools::plan_state::load_plan_state(&app)
+        .unwrap()
+        .unwrap()
+        .updated_at_ms;
+    crate::ai::tools::plan_state::record_completion_claim(&app, "Done", Some(plan_updated))
+        .unwrap();
+    let third_step = handle_iteration_execution(
+        &mut app,
+        "fix the bug",
+        &mcp_snapshot(&shared_mcp),
+        &shared_mcp,
+        final_response(),
+        &mut messages,
+        &mut turn_messages,
+        false,
+        &mut persisted_turn_messages,
+        &mut final_assistant_text,
+        &mut final_assistant_recorded,
+        &mut force_final_response,
+        &mut terminal_dedupe_candidate,
+        true,
+        4,
+        16,
+        0,
+        &mut turn_had_tool_error,
+    )
+    .unwrap();
+
+    assert!(matches!(third_step, TurnLoopStep::Break));
     assert!(final_assistant_recorded);
     assert!(final_assistant_text.starts_with("已修复。"));
     assert!(final_assistant_text.contains(COMPLETION_EVIDENCE_WARNING));
@@ -133,6 +177,7 @@ fn completion_evidence_gate_reopens_once_then_warns_on_second_final() {
                 .as_str()
                 .is_some_and(|text| text.contains(COMPLETION_EVIDENCE_UNVERIFIED_NOTE))
     }));
+    let _ = fs::remove_dir_all(&base);
 }
 
 #[test]

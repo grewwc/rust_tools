@@ -39,6 +39,8 @@ static SERVE_SESSION_CANDIDATES: LazyLock<RwLock<Vec<(String, String)>>> =
 /// Tab completion never needs to scan the disk itself.
 static CHECKPOINT_NAME_CANDIDATES: LazyLock<RwLock<Vec<String>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
+static CHECKPOINT_BRANCH_CANDIDATES: LazyLock<RwLock<Vec<String>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
 
 /// Command words the running client adds on top of [`COMMANDS_TRIE`]: serve-chat
 /// registers commands of its own (`/resume`, `/bg`, ...), while the local REPL
@@ -218,6 +220,17 @@ impl CommandCompleter {
         if let Ok(mut guard) = CHECKPOINT_NAME_CANDIDATES.write() {
             *guard = names;
         }
+    }
+
+    pub(in crate::ai) fn set_checkpoint_branch_candidates(names: Vec<String>) {
+        if let Ok(mut guard) = CHECKPOINT_BRANCH_CANDIDATES.write() {
+            *guard = names;
+        }
+    }
+
+    pub(in crate::ai) fn clear_checkpoint_candidates() {
+        Self::set_checkpoint_name_candidates(Vec::new());
+        Self::set_checkpoint_branch_candidates(Vec::new());
     }
 
     /// Replace the client-registered command words used for first-token
@@ -651,7 +664,8 @@ impl CommandCompleter {
     /// Subcommands of `/checkpoint` / `/cp`.
     fn checkpoint_subcommands() -> &'static [&'static str] {
         &[
-            "save", "commit", "tree", "list", "checkout", "fork", "delete", "clear", "help",
+            "save", "commit", "tree", "list", "checkout", "branch", "switch", "delete", "clear",
+            "help",
         ]
     }
 
@@ -686,6 +700,29 @@ impl CommandCompleter {
                 replacement: name.to_string(),
             }));
         }
+        candidates
+    }
+
+    fn checkpoint_branch_candidates(token: &str) -> Vec<CompletionCandidate> {
+        CHECKPOINT_BRANCH_CANDIDATES
+            .read()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .filter(|name| name.starts_with(token))
+                    .take(50)
+                    .map(|name| CompletionCandidate {
+                        display: format!("{name} · branch"),
+                        replacement: name.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn checkpoint_revision_candidates(token: &str) -> Vec<CompletionCandidate> {
+        let mut candidates = Self::checkpoint_branch_candidates(token);
+        candidates.extend(Self::checkpoint_name_candidates(token, true));
         candidates
     }
 
@@ -1025,14 +1062,56 @@ impl CommandCompleter {
                             .filter(|c| c.starts_with(token))
                             .map(|c| c.to_string()),
                     ),
-                    // `/checkpoint checkout|fork <TAB>`: checkpoint names plus
-                    // the pointer aliases (`HEAD`, `@`, `-`, `latest`).
-                    Some(sub)
-                        if matches!(sub, "checkout" | "co" | "switch" | "fork")
-                            && words.next().is_none() =>
-                    {
-                        Self::checkpoint_name_candidates(token, true)
+                    Some(sub) if matches!(sub, "checkout" | "co") => {
+                        let rest: Vec<&str> = words.collect();
+                        match rest.as_slice() {
+                            [] => {
+                                let mut candidates = Self::checkpoint_revision_candidates(token);
+                                if "-b".starts_with(token) {
+                                    candidates.push(CompletionCandidate {
+                                        display: "-b · create and checkout a new branch"
+                                            .to_string(),
+                                        replacement: "-b".to_string(),
+                                    });
+                                }
+                                candidates
+                            }
+                            ["-b" | "--create"] => Vec::new(),
+                            ["-b" | "--create", _] => Self::checkpoint_revision_candidates(token),
+                            _ => Vec::new(),
+                        }
                     }
+                    Some("switch") => {
+                        let rest: Vec<&str> = words.collect();
+                        match rest.as_slice() {
+                            [] => {
+                                let mut candidates = Self::checkpoint_branch_candidates(token);
+                                if "-c".starts_with(token) {
+                                    candidates.push(CompletionCandidate {
+                                        display: "-c · create and switch to a new branch"
+                                            .to_string(),
+                                        replacement: "-c".to_string(),
+                                    });
+                                }
+                                candidates
+                            }
+                            ["-c" | "--create"] => Vec::new(),
+                            ["-c" | "--create", _] => Self::checkpoint_revision_candidates(token),
+                            _ => Vec::new(),
+                        }
+                    }
+                    Some("branch") => match words.next() {
+                        None => Self::plain_candidates(
+                            ["--delete"]
+                                .into_iter()
+                                .filter(|candidate| candidate.starts_with(token))
+                                .map(str::to_string),
+                        ),
+                        Some("-d" | "--delete" | "delete") if words.next().is_none() => {
+                            Self::checkpoint_branch_candidates(token)
+                        }
+                        _ => Vec::new(),
+                    },
                     // `/checkpoint delete <TAB>`: names only (`delete` rejects
                     // pointer aliases).
                     Some(sub)
@@ -1910,7 +1989,7 @@ mod tests {
     }
 
     #[test]
-    fn command_completion_suggests_checkpoint_names_for_switches_and_delete() {
+    fn command_completion_suggests_checkpoint_and_branch_names() {
         // The checkpoint cache is global; serialize with any sibling writer so
         // a parallel reset cannot empty the cache mid-assertion.
         let _guard = crate::ai::test_support::ENV_LOCK
@@ -1920,6 +1999,10 @@ mod tests {
             "before_more_change".to_string(),
             "after_edit".to_string(),
         ]);
+        CommandCompleter::set_checkpoint_branch_candidates(vec![
+            "feature_branch".to_string(),
+            "main".to_string(),
+        ]);
         // Third token after checkout completes names plus pointer aliases.
         let (_, checkout) = CommandCompleter::complete_for_line("/cp checkout ", 13);
         let replacements: Vec<&str> = checkout
@@ -1927,12 +2010,34 @@ mod tests {
             .map(|candidate| candidate.replacement.as_str())
             .collect();
         assert!(replacements.contains(&"before_more_change"));
+        assert!(replacements.contains(&"feature_branch"));
         assert!(replacements.contains(&"HEAD"));
         assert!(replacements.contains(&"latest"));
-        let (_, fork) = CommandCompleter::complete_for_line("/cp fork bef", 12);
+        assert!(replacements.contains(&"-b"));
+        let (_, branch_start) =
+            CommandCompleter::complete_for_line("/cp checkout -b experiment bef", 30);
         assert!(
-            fork.iter()
+            branch_start
+                .iter()
                 .any(|candidate| candidate.replacement == "before_more_change")
+        );
+        let (_, switch) = CommandCompleter::complete_for_line("/cp switch fe", 13);
+        assert!(
+            switch
+                .iter()
+                .any(|candidate| candidate.replacement == "feature_branch")
+        );
+        let (_, switch_root) = CommandCompleter::complete_for_line("/cp switch ", 11);
+        assert!(
+            switch_root
+                .iter()
+                .any(|candidate| candidate.replacement == "-c")
+        );
+        let (_, branch_delete) = CommandCompleter::complete_for_line("/cp branch --delete fe", 22);
+        assert!(
+            branch_delete
+                .iter()
+                .any(|candidate| candidate.replacement == "feature_branch")
         );
         // A name prefix narrows to the matching checkpoint.
         let (_, narrowed) = CommandCompleter::complete_for_line("/cp checkout la", 15);
@@ -1959,15 +2064,15 @@ mod tests {
             sub.iter()
                 .any(|candidate| candidate.replacement == "checkout")
         );
-        let (_, fork_subcommand) = CommandCompleter::complete_for_line("/cp fo", 6);
-        assert!(
-            fork_subcommand
-                .iter()
-                .any(|candidate| candidate.replacement == "fork")
-        );
+        let (_, removed_fork) = CommandCompleter::complete_for_line("/cp fo", 6);
+        assert!(removed_fork.is_empty());
         let (_, removed_rollback) = CommandCompleter::complete_for_line("/cp roll", 8);
         assert!(removed_rollback.is_empty());
-        CommandCompleter::set_checkpoint_name_candidates(Vec::new());
+        CommandCompleter::clear_checkpoint_candidates();
+        let (_, cleared_switch) = CommandCompleter::complete_for_line("/cp switch fe", 13);
+        assert!(cleared_switch.is_empty());
+        let (_, cleared_checkout) = CommandCompleter::complete_for_line("/cp checkout bef", 16);
+        assert!(cleared_checkout.is_empty());
     }
 
     #[test]

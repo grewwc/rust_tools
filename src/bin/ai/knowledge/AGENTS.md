@@ -7,8 +7,9 @@ building blocks: `types.rs` (`Category`), `entry.rs` (path-leak guard),
 `config.rs` (hybrid-search weight), `indexing/similarity.rs` (lexical scoring +
 `cosine_similarity`), `indexing/embedder.rs` (remote OpenAI-compatible
 embedding provider, default `doubao-embedding-vision`), and
-`storage/vector_store.rs` (SQLite-backed vector index). The orchestration layer
-lives in `tools/storage/rag_store.rs` (rebuild + hybrid merge) and the
+`storage/vector_store.rs` (SQLite-backed vector index), plus `distilled.rs`
+(verified distilled entries for automatic recall, see invariant 3). The
+orchestration layer lives in `tools/storage/rag_store.rs` (rebuild + hybrid merge) and the
 `knowledge_semantic_search` / `knowledge_rebuild_index` tools in
 `tools/rag_tools.rs`.
 
