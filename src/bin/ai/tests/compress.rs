@@ -271,7 +271,7 @@ fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context()
         .iter()
         .find_map(|m| {
             let text = m.content.as_str().unwrap_or_default();
-            text.contains("归档文件:").then_some(text)
+            text.contains("archive_file_path:").then_some(text)
         })
         .expect("should include an explicit archive note");
     assert!(

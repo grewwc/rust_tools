@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-use super::{compress::ARCHIVE_NOTE_PREFIX, types::Message};
+use super::{
+    compress::{archive_file_path_from_line, is_archive_note_text},
+    types::Message,
+};
 
 const OVERFLOW_HISTORY_FILENAME: &str = "overflow-history.md";
 
@@ -58,13 +61,13 @@ fn overflow_archive_path(message: &Message) -> Option<PathBuf> {
     let Value::String(text) = &message.content else {
         return None;
     };
-    if !text.trim_start().starts_with(ARCHIVE_NOTE_PREFIX) {
+    if !is_archive_note_text(text) {
         return None;
     }
 
     let path = text
         .lines()
-        .find_map(|line| line.trim().strip_prefix("归档文件: "))?
+        .find_map(|line| archive_file_path_from_line(line.trim()))?
         .trim();
     if path.is_empty() {
         return None;
@@ -215,9 +218,27 @@ fn finish_message(messages: &mut Vec<Message>, role: Option<&str>, content_lines
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_overflow_archives, parse_overflow_history, Message};
+    use super::{Message, expand_overflow_archives, overflow_archive_path, parse_overflow_history};
     use serde_json::Value;
     use uuid::Uuid;
+
+    #[test]
+    fn archive_pointer_path_accepts_v2_and_legacy_formats() {
+        let expected = std::path::PathBuf::from("/sessions/example/overflow-history.md");
+        for content in [
+            "[archive-pointer-v2]\narchive_file_path: /sessions/example/overflow-history.md",
+            "长期记忆归档\n归档文件: /sessions/example/overflow-history.md",
+        ] {
+            let message = Message {
+                role: "internal_note".to_string(),
+                content: Value::String(content.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            };
+            assert_eq!(overflow_archive_path(&message), Some(expected.clone()));
+        }
+    }
 
     #[test]
     fn parses_overflow_batches_in_original_order() {

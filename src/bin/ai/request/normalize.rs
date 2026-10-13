@@ -7,7 +7,6 @@
 //! - `normalize_message_content_for_text_only_model`: degrades content for text-only models
 //! - `normalize_messages_for_model`: model-specific message normalization
 
-use rustc_hash::FxHashSet;
 use serde_json::Value;
 
 use crate::ai::history::compress::QUERY_MEMORY_INDEX_PREFIX;
@@ -267,29 +266,6 @@ fn is_query_memory_index_note(message: &Message) -> bool {
             .is_some_and(|text| text.trim_start().starts_with(QUERY_MEMORY_INDEX_PREFIX))
 }
 
-fn context_checkpoint_marker_key(marker: &str) -> String {
-    const PREFIX: &str = "[context_checkpoint path=";
-    let trimmed = marker.trim_start();
-    let path = trimmed
-        .strip_prefix(PREFIX)
-        .and_then(|rest| rest.split(']').next())
-        .map(str::trim)
-        .filter(|path| !path.is_empty());
-    path.unwrap_or(trimmed).to_string()
-}
-
-fn dedupe_context_checkpoint_markers_by_path(markers: Vec<String>) -> Vec<String> {
-    let mut seen = FxHashSet::default();
-    let mut deduped_newest_first = Vec::with_capacity(markers.len());
-    for marker in markers.into_iter().rev() {
-        if seen.insert(context_checkpoint_marker_key(&marker)) {
-            deduped_newest_first.push(marker);
-        }
-    }
-    deduped_newest_first.reverse();
-    deduped_newest_first
-}
-
 pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     enum InternalNoteKind {
@@ -359,6 +335,89 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
             selected.extend(tail);
         }
         truncate_chars(&selected.join("\n"), max_chars)
+    }
+
+    fn truncate_compressed_tool_evidence_text(text: &str, max_chars: usize) -> String {
+        if text.chars().count() <= max_chars {
+            return text.to_string();
+        }
+
+        let lines = text
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        let evidence_start = lines.iter().position(|line| line.trim() == "evidence:");
+        let evidence_end = evidence_start.and_then(|start| {
+            lines
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find(|(_, line)| line.starts_with("compression_decision:"))
+                .map(|(index, _)| index)
+        });
+
+        // Keep complete locator and evidence lines before repeated explanatory
+        // boilerplate. The canonical note remains untouched; this only chooses
+        // which complete lines fit in the bounded request projection.
+        let mut prioritized = lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let evidence = evidence_start.is_some_and(|start| {
+                    index > start && evidence_end.is_none_or(|end| index < end)
+                });
+                let locator = line.starts_with("compressed_tool_round:")
+                    || line.trim() == "[compressed-tool-evidence]"
+                    || line.starts_with("prune_id:")
+                    || line.starts_with("- archive_file_path:")
+                    || line.starts_with("- archive_scope:")
+                    || line.starts_with("- source_projection_archive:")
+                    || line.trim() == "evidence:";
+                let source = line.starts_with("- ") && !locator;
+                let priority = if locator {
+                    0
+                } else if evidence || source {
+                    1
+                } else if line.starts_with("assistant_checkpoint:")
+                    || line.starts_with("compression_decision:")
+                {
+                    2
+                } else {
+                    3
+                };
+                (priority, index)
+            })
+            .collect::<Vec<_>>();
+        prioritized.sort_by_key(|&(priority, index)| (priority, index));
+
+        const TRUNCATION_MARKER_RESERVE: usize = 64;
+        let content_budget = max_chars.saturating_sub(TRUNCATION_MARKER_RESERVE);
+        let mut selected = vec![false; lines.len()];
+        let mut selected_count = 0usize;
+        let mut used = 0usize;
+        for (_, index) in prioritized {
+            let line_chars = lines[index].chars().count();
+            let extra = usize::from(selected_count > 0);
+            if used + extra + line_chars <= content_budget {
+                selected[index] = true;
+                selected_count += 1;
+                used += extra + line_chars;
+            }
+        }
+
+        let mut output = lines
+            .iter()
+            .zip(selected)
+            .filter_map(|(line, keep)| keep.then_some(*line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let omitted = text.chars().count().saturating_sub(output.chars().count());
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&format!("... [truncated: {omitted} chars omitted]"));
+        truncate_chars(&output, max_chars)
     }
 
     fn detect_note_kind(text: &str) -> InternalNoteKind {
@@ -651,6 +710,9 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
     request_messages
         .iter_mut()
         .for_each(clear_runtime_message_metadata);
+    crate::ai::history::compress::dedupe_context_checkpoint_markers_for_projection(
+        &mut request_messages,
+    );
 
     // A legacy persisted role cannot make an incremental memory record the
     // authoritative system prompt, even when it is the first system message.
@@ -760,6 +822,8 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
                     // The compressor budgets complete records. A second text
                     // cap could detach entries from their runtime source locator.
                     text.to_string()
+                } else if crate::ai::history::compress::is_compressed_tool_evidence_note(message) {
+                    truncate_compressed_tool_evidence_text(text, MERGED_SINGLE_NOTE_MAX_CHARS)
                 } else {
                     truncate_note_text(text, MERGED_SINGLE_NOTE_MAX_CHARS)
                 },
@@ -811,7 +875,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         merged_first.content = Value::String(content);
     }
 
-    let checkpoint_markers = dedupe_context_checkpoint_markers_by_path(checkpoint_markers)
+    let checkpoint_markers = checkpoint_markers
         .into_iter()
         .rev()
         .take(REQUEST_CONTEXT_CHECKPOINT_LIMIT)
@@ -898,6 +962,8 @@ evidence before relying on them.\n",
             let text = message.content.as_str().unwrap_or_default();
             let kind = detect_note_kind(text);
             let incremental = crate::ai::history::compress::is_incremental_summary(&message);
+            let compressed_tool_evidence =
+                crate::ai::history::compress::is_compressed_tool_evidence_note(&message);
             // The original role decides derivation, so evaluate it before the
             // role is rewritten below.
             let model_derived = incremental
@@ -915,8 +981,12 @@ evidence before relying on them.\n",
             // cached-tool notes accumulated over many tool rounds).
             if !incremental && let Value::String(text) = &message.content {
                 if text.chars().count() > MERGED_SINGLE_NOTE_MAX_CHARS {
-                    message.content =
-                        Value::String(truncate_note_text(text, MERGED_SINGLE_NOTE_MAX_CHARS));
+                    let truncated = if compressed_tool_evidence {
+                        truncate_compressed_tool_evidence_text(text, MERGED_SINGLE_NOTE_MAX_CHARS)
+                    } else {
+                        truncate_note_text(text, MERGED_SINGLE_NOTE_MAX_CHARS)
+                    };
+                    message.content = Value::String(truncated);
                 }
             }
             if model_derived && let Some(text) = message.content.as_str() {

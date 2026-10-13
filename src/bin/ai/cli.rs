@@ -133,10 +133,8 @@ const INTERNAL_COMMANDS: &[&str] = &[
     ":feishu-auth",
     "/share",
     ":share",
-    "/checkpoint",
-    ":checkpoint",
-    "/cp",
-    ":cp",
+    "/git",
+    ":git",
     "/memo",
     ":memo",
     "/export",
@@ -1016,7 +1014,7 @@ fn generate_bash(
     println!("    case \"${{COMP_WORDS[1]}}\" in");
     println!("      /usage|:usage)");
     println!("        COMPREPLY=($(compgen -W \"$usage_sub\" -- \"$cur\")); return 0 ;;");
-    println!("      /checkpoint|:checkpoint|/cp|:cp)");
+    println!("      /git|:git)");
     println!("        COMPREPLY=($(compgen -W \"$checkpoint_sub\" -- \"$cur\")); return 0 ;;");
     println!("      /history|:history)");
     // First argument completes subcommands plus stored session ids
@@ -1298,7 +1296,7 @@ fn generate_zsh(
     println!("      /usage|:usage)");
     println!("        _describe 'usage subcommand' _a_usage_subcmds && return");
     println!("        ;;");
-    println!("      /checkpoint|:checkpoint|/cp|:cp)");
+    println!("      /git|:git)");
     println!("        _describe 'checkpoint subcommand' _a_checkpoint_subcmds && return");
     println!("        ;;");
     println!("      /history|:history)");

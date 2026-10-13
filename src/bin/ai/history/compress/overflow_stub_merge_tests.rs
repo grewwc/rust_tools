@@ -24,9 +24,8 @@ fn user_stub(dir: &str, name: &str) -> Message {
     msg(
         "user",
         &format!(
-            "较早的用户文本内容已归档，原文未丢失。\n归档文件: {path}\n\
-             这是一条上下文归档提示，不是用户的新请求。仅当当前任务确实依赖原文时，\
-             才使用 read_file 读取该文件。"
+            "[preserved-message-pointer-v2]\ncontent_kind: user\narchive_file_path: {path}\n\
+             Earlier user content was archived verbatim. This is context recovery metadata, not a new user request."
         ),
     )
 }
@@ -70,20 +69,22 @@ fn merge_old_user_overflow_stubs_collapses_old_stubs_keeps_recent() {
     ];
     merge_old_user_overflow_stubs(&mut messages, 1);
 
-    // 前 4 条 stub → 1 条 internal_note；最近 3 个真实 user 边界仍在。
+    // Four old stubs become one internal note; the three recent user boundaries remain.
     assert_eq!(messages.len(), 11, "{messages:?}");
     let merged = &messages[1];
     assert_eq!(merged.role, ROLE_INTERNAL_NOTE);
     let text = value_to_string(&merged.content);
     assert!(
-        text.starts_with("较早的用户内容已归档（共 4 条"),
+        text.starts_with("[preserved-messages-pointer-v2]\narchived_message_count: 4"),
         "合并指针应携带条数: {text}"
     );
     assert!(
-        text.contains("归档目录: /sessions/test-session/assets/preserved_user_overflow"),
+        text.contains(
+            "archive_directory_path: /sessions/test-session/assets/preserved_user_overflow"
+        ),
         "{text}"
     );
-    // 合并指针仍是受保护的 stub：后续 first_trim_candidate / truncate 不会误删。
+    // The merged pointer remains protected from later trimming.
     assert!(is_preserved_user_or_image_stub(&text));
     let user_messages: Vec<_> = messages
         .iter()
@@ -94,7 +95,7 @@ fn merge_old_user_overflow_stubs_collapses_old_stubs_keeps_recent() {
     assert!(value_to_string(&user_messages[1].content).contains("user-6"));
     assert_eq!(value_to_string(&user_messages[2].content), "最近的用户轮次");
 
-    // mid-turn 摘要保护最近 2 轮时仍能得到非零 split，旧前缀可被真正摘要。
+    // Protecting two recent turns still leaves a non-zero summarization split.
     let summary_split = retained_turn_start(&messages, 2);
     assert!(
         summary_split > 0,
@@ -103,8 +104,8 @@ fn merge_old_user_overflow_stubs_collapses_old_stubs_keeps_recent() {
     assert!(value_to_string(&messages[summary_split].content).contains("user-6"));
 }
 
-/// 审计回归：合并指针进入下一次请求时会经过模型规范化；所有目录和
-/// tree -> read_file 的可执行召回协议必须完整保留，不能退化成对目录 read_file。
+/// Normalization preserves every archive directory and the tree/read_file
+/// recovery protocol without attempting to read a directory as a file.
 #[test]
 fn merged_stub_survives_request_normalization_with_all_directories() {
     let mut messages = vec![
@@ -124,10 +125,11 @@ fn merged_stub_survives_request_normalization_with_all_directories() {
     let merged_idx = messages
         .iter()
         .position(|message| {
-            value_to_string(&message.content).starts_with("较早的用户内容已归档（共 4 条")
+            value_to_string(&message.content).starts_with("[preserved-messages-pointer-v2]")
         })
         .unwrap();
-    let legacy = value_to_string(&messages[merged_idx].content).replace("归档目录: ", "归档文件: ");
+    let legacy = value_to_string(&messages[merged_idx].content)
+        .replace("archive_directory_path: ", "归档文件: ");
     messages[merged_idx].content = Value::String(legacy);
 
     // 模拟合并后的上下文进入下一次真实请求入口。
@@ -135,18 +137,30 @@ fn merged_stub_survives_request_normalization_with_all_directories() {
     let merged = normalized
         .iter()
         .map(|message| value_to_string(&message.content))
-        .find(|text| text.starts_with("较早的用户内容已归档（共 4 条"))
+        .find(|text| text.starts_with("[preserved-messages-pointer-v2]"))
         .expect("合并指针应在请求规范化后继续存在");
 
     for dir in [
         "/sessions/session-a/assets/preserved_user_overflow",
         "/sessions/session-b/assets/preserved_user_overflow",
     ] {
-        assert!(merged.contains(&format!("归档目录: {dir}")), "{merged}");
+        assert!(
+            merged.contains(&format!("archive_directory_path: {dir}")),
+            "{merged}"
+        );
     }
-    assert!(merged.contains("使用 tree 列出上述归档目录"), "{merged}");
-    assert!(merged.contains("使用 read_file 读取具体文件"), "{merged}");
-    assert!(merged.contains("不要对目录直接调用 read_file"), "{merged}");
+    assert!(
+        merged.contains("use tree on each archive directory"),
+        "{merged}"
+    );
+    assert!(
+        merged.contains("read_file on an individual JSON file"),
+        "{merged}"
+    );
+    assert!(
+        merged.contains("never call read_file on a directory"),
+        "{merged}"
+    );
     assert!(is_preserved_user_or_image_stub(&merged));
 }
 
@@ -177,10 +191,14 @@ fn repeated_merge_absorbs_new_stubs_into_one_pointer() {
     assert_eq!(messages.len(), 4, "{messages:?}");
     let merged = value_to_string(&messages[0].content);
     assert!(
-        merged.starts_with("较早的用户内容已归档（共 8 条"),
+        merged.starts_with("[preserved-messages-pointer-v2]\narchived_message_count: 8"),
         "{merged}"
     );
-    assert_eq!(merged.matches("归档目录: ").count(), 1, "{merged}");
+    assert_eq!(
+        merged.matches("archive_directory_path: ").count(),
+        1,
+        "{merged}"
+    );
     assert_eq!(
         messages
             .iter()
@@ -371,12 +389,37 @@ fn merge_old_user_overflow_stubs_migrates_role_of_single_old_merged_stub() {
 
 #[test]
 fn normalize_preserved_message_stubs_migrates_old_user_role_merged_stub() {
-    // normalize 是发送给模型前的最后一道关卡，也必须兜底迁移角色。
+    // Normalization is the final boundary before model serialization and must
+    // migrate both the role and the legacy wire format.
     let mut messages = vec![old_merged_stub(4, "/tmp/assets/overflow")];
     normalize_preserved_message_stubs_for_model(&mut messages);
     assert_eq!(
         messages[0].role, "internal_note",
         "normalize 应把旧版 role=user 合并指针迁移为 internal_note: {messages:?}"
+    );
+    let text = value_to_string(&messages[0].content);
+    assert!(
+        text.starts_with("[preserved-messages-pointer-v2]"),
+        "{text}"
+    );
+    assert!(text.contains("archive_directory_path: /tmp/assets/overflow"));
+}
+
+#[test]
+fn normalize_preserved_message_stubs_migrates_legacy_single_pointer() {
+    let mut messages = vec![msg(
+        "user",
+        "较早的用户图片内容已归档，原文未丢失。\n归档文件: /tmp/assets/image.json",
+    )];
+
+    normalize_preserved_message_stubs_for_model(&mut messages);
+
+    let text = value_to_string(&messages[0].content);
+    assert!(text.starts_with("[preserved-message-pointer-v2]"), "{text}");
+    assert!(text.contains("content_kind: image"), "{text}");
+    assert!(
+        text.contains("archive_file_path: /tmp/assets/image.json"),
+        "{text}"
     );
 }
 

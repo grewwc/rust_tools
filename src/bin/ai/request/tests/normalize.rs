@@ -598,6 +598,83 @@ fn normalize_messages_truncates_long_internal_notes_structurally() {
 }
 
 #[test]
+fn normalize_messages_prioritizes_folded_tool_evidence_over_boilerplate() {
+    let evidence = (0..8)
+        .map(|index| format!("- call-{index}: evidence-{index:02}-{}", "e".repeat(42)))
+        .collect::<Vec<_>>();
+    let note = format!(
+        "compressed_tool_round: 8 tool calls (folded for context budget)\n\
+context_budget_note: {}\n\
+recovery_guidance: {}\n\
+[compressed-tool-evidence]\n\
+- archive_file_path: /session/folded-tool-groups/exact-evidence.md\n\
+- archive_scope: folded_tool_group_projection_messages\n\
+assistant_checkpoint: completed the bounded investigation and retained exact locators\n\
+evidence:\n{}\n\
+compression_decision: reuse the evidence above before repeating the same read/search/list/command action; re-run only if exact text is required.",
+        "template ".repeat(35),
+        "guidance ".repeat(35),
+        evidence.join("\n"),
+    );
+    assert!(note.chars().count() > 1_200);
+
+    for note_before_body in [true, false] {
+        let folded = Message {
+            role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(note.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        assert!(crate::ai::history::compress::is_compressed_tool_evidence_note(&folded));
+        let mut messages = vec![Message {
+            role: "system".to_string(),
+            content: Value::String("base system".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        if note_before_body {
+            messages.push(folded.clone());
+        }
+        messages.push(Message {
+            role: "user".to_string(),
+            content: Value::String("question".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+        if !note_before_body {
+            messages.push(folded);
+        }
+
+        let normalized = normalize_messages_for_request(&messages);
+        let projected = normalized
+            .iter()
+            .filter_map(|message| message.content.as_str())
+            .find(|text| text.contains("[compressed-tool-evidence]"))
+            .expect("folded evidence note must remain model-visible");
+        assert!(
+            projected
+                .contains("- archive_file_path: /session/folded-tool-groups/exact-evidence.md"),
+            "{projected}"
+        );
+        assert!(projected.contains("assistant_checkpoint: completed the bounded investigation"));
+        assert!(projected.contains("compression_decision: reuse the evidence above"));
+        for index in 0..8 {
+            assert!(
+                projected.contains(&format!("evidence-{index:02}-")),
+                "{projected}"
+            );
+        }
+        assert!(projected.contains("[truncated:"));
+        if !note_before_body {
+            assert!(projected.chars().count() <= 1_200);
+        }
+    }
+}
+
+#[test]
 fn normalize_messages_projects_only_recent_context_checkpoints_without_truncating_them() {
     let mut messages = vec![
         Message {
@@ -754,4 +831,68 @@ fn normalize_messages_dedupes_context_checkpoints_by_path_before_limit() {
     assert!(checkpoints[0].contains("checkpoint-0.md"));
     assert!(checkpoint_context.contains("new working plan"));
     assert!(!checkpoint_context.contains("old working plan"));
+}
+
+#[test]
+fn normalize_messages_without_system_dedupes_checkpoint_paths() {
+    let checkpoint = |text: &str| Message {
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(text.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    };
+    let messages = vec![
+        Message {
+            role: "user".to_string(),
+            content: Value::String("question".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        checkpoint("[context_checkpoint path=/tmp/working-checkpoint.md] stale plan"),
+        checkpoint("[context_checkpoint path=/tmp/other-checkpoint.md] independent memory"),
+        checkpoint("[context_checkpoint path=/tmp/working-checkpoint.md] current plan"),
+    ];
+
+    let normalized = normalize_messages_for_request(&messages);
+    let projected = normalized
+        .iter()
+        .filter_map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(projected.contains("current plan"));
+    assert!(projected.contains("independent memory"));
+    assert!(!projected.contains("stale plan"));
+    assert_eq!(
+        messages.len(),
+        4,
+        "normalization must not mutate canonical input"
+    );
+}
+
+#[test]
+fn normalize_messages_preserves_ambiguous_checkpoint_paths() {
+    let checkpoint = |text: &str| Message {
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(text.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    };
+    let messages = vec![
+        checkpoint("[context_checkpoint path=/tmp/root] shared/first.md] first memory"),
+        checkpoint("[context_checkpoint path=/tmp/root] shared/second.md] second memory"),
+    ];
+
+    let normalized = normalize_messages_for_request(&messages);
+    let projected = normalized
+        .iter()
+        .filter_map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(projected.contains("first memory"));
+    assert!(projected.contains("second memory"));
 }

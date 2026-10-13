@@ -1,4 +1,4 @@
-//! Interactive `/checkpoint` command (alias `/cp`): immutable commits,
+//! Interactive `/git` command: immutable commits,
 //! movable branches, checkout, tree, and deletion for the current session.
 
 use crate::ai::{
@@ -50,7 +50,7 @@ pub fn try_handle_checkpoint_command(
     let Some(cmd) = parts.next() else {
         return Ok(false);
     };
-    if cmd != "checkpoint" && cmd != "cp" {
+    if cmd != "git" {
         return Ok(false);
     }
 
@@ -111,9 +111,22 @@ pub fn try_handle_checkpoint_command(
                     Err(err) => println!("Failed to list branches: {err}"),
                 }
             }
+            Some("-b" | "-c" | "--create") => {
+                let rest: Vec<&str> = parts.collect();
+                if rest.is_empty() {
+                    println!("Usage: /git branch -b <new-branch> [start]");
+                    return Ok(true);
+                }
+                let mut rewritten = String::from("/git checkout -b");
+                for token in rest {
+                    rewritten.push(' ');
+                    rewritten.push_str(token);
+                }
+                return try_handle_checkpoint_command(app, &rewritten);
+            }
             Some("-d" | "--delete" | "delete") => {
                 let Some(name) = parts.next() else {
-                    println!("Usage: /checkpoint branch --delete <name>");
+                    println!("Usage: /git branch --delete <name>");
                     return Ok(true);
                 };
                 match store.delete_branch(name) {
@@ -130,17 +143,7 @@ pub fn try_handle_checkpoint_command(
                 match store.create_branch(name, start) {
                     Ok(()) => {
                         publish_checkpoint_names(&store);
-                        match store.head_state() {
-                            Ok(CheckpointHead::Attached {
-                                branch,
-                                target: None,
-                            }) => println!(
-                                "Created and switched to unborn branch '{branch}'. The next save will create its first checkpoint."
-                            ),
-                            _ => println!(
-                                "Created branch '{name}'. Switch with `/cp switch {name}`."
-                            ),
-                        }
+                        println!("Created branch '{name}'. Switch with `/git switch {name}`.")
                     }
                     Err(err) => println!("Failed to create branch: {err}"),
                 }
@@ -166,12 +169,10 @@ pub fn try_handle_checkpoint_command(
             } = parsed;
             if create_branch.is_none() && target.is_none() {
                 if is_switch {
-                    println!(
-                        "Usage: /checkpoint switch <branch> | /checkpoint switch -c <new-branch> [start]"
-                    );
+                    println!("Usage: /git switch <branch> | /git switch -c <new-branch> [start]");
                 } else {
                     println!(
-                        "Usage: /checkpoint checkout <branch|checkpoint> | /checkpoint checkout -b <new-branch> [start]"
+                        "Usage: /git checkout <branch|checkpoint> | /git checkout -b <new-branch> [start]"
                     );
                 }
                 return Ok(true);
@@ -187,10 +188,26 @@ pub fn try_handle_checkpoint_command(
                     Ok(None) => match store.create_branch(new_branch, None) {
                         Ok(()) => {
                             publish_checkpoint_names(&store);
-                            println!(
-                                "Switched to a new unborn branch '{new_branch}'. The next save will create its first checkpoint."
+                            let result = switch_to_unborn_branch(
+                                app,
+                                &store,
+                                new_branch,
+                                explicit_save,
+                                discard_requested,
                             );
-                            return Ok(true);
+                            let switched = matches!(
+                                store.head_state(),
+                                Ok(CheckpointHead::Attached { branch, .. }) if branch == new_branch
+                            );
+                            if !switched {
+                                if let Err(err) = store.delete_branch(new_branch) {
+                                    eprintln!(
+                                        "[checkpoint] failed to clean up branch '{new_branch}' after switch failure: {err}"
+                                    );
+                                }
+                                publish_checkpoint_names(&store);
+                            }
+                            return result;
                         }
                         Err(err) => {
                             println!("Failed to create branch '{new_branch}': {err}");
@@ -211,7 +228,10 @@ pub fn try_handle_checkpoint_command(
             // `latest` resolves to the newest checkpoint (list order is
             // newest-first, so it matches the `[latest]` tag in the tree).
             let latest_requested = is_latest_alias(&raw_target);
-            let matching_branch = (!head_requested && !latest_requested)
+            // `-` resolves to the previously checked-out branch or checkpoint
+            // (Git-style `switch -` / `checkout -`).
+            let previous_requested = is_previous_alias(&raw_target);
+            let matching_branch = (!head_requested && !latest_requested && !previous_requested)
                 .then(|| store.list_branches().ok())
                 .flatten()
                 .and_then(|branches| {
@@ -219,14 +239,65 @@ pub fn try_handle_checkpoint_command(
                         .into_iter()
                         .find(|branch| branch.name == raw_target)
                 });
-            if is_switch && create_branch.is_none() && matching_branch.is_none() {
+            // A `-` attached to a branch reuses the normal branch path below;
+            // a `-` attached to a detached checkpoint only `checkout` (and
+            // branch creation from it) can follow it back.
+            let mut previous_branch = None;
+            let mut previous_detached: Option<String> = None;
+            if previous_requested {
+                match store.previous_head_state() {
+                    Err(err) => {
+                        println!("Failed to checkout: cannot read previous checkout: {err}");
+                        return Ok(true);
+                    }
+                    Ok(None) => {
+                        println!("No previous branch to switch to yet.");
+                        return Ok(true);
+                    }
+                    Ok(Some(CheckpointHead::Attached { branch, .. })) => {
+                        match store
+                            .list_branches()
+                            .map(|branches| branches.into_iter().find(|item| item.name == branch))
+                        {
+                            Ok(Some(found)) => previous_branch = Some(found),
+                            _ => {
+                                println!(
+                                    "Previous branch '{branch}' no longer exists (nothing was changed)."
+                                );
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    Ok(Some(CheckpointHead::Detached(target))) => match target {
+                        Some(target) => {
+                            if is_switch && create_branch.is_none() {
+                                println!(
+                                    "Previous checkout was detached at '{target}': `switch` only moves between branches; use `/git checkout -` to go back to it."
+                                );
+                                return Ok(true);
+                            }
+                            previous_detached = Some(target);
+                        }
+                        None => {
+                            println!("No previous branch to switch to yet.");
+                            return Ok(true);
+                        }
+                    },
+                }
+            }
+            if is_switch
+                && create_branch.is_none()
+                && matching_branch.is_none()
+                && previous_branch.is_none()
+            {
                 println!("Failed to switch: branch '{raw_target}' not found.");
                 return Ok(true);
             }
             let branch_name = create_branch
                 .clone()
-                .or_else(|| matching_branch.as_ref().map(|branch| branch.name.clone()));
-            let name = if let Some(branch) = matching_branch {
+                .or_else(|| matching_branch.as_ref().map(|branch| branch.name.clone()))
+                .or_else(|| previous_branch.as_ref().map(|branch| branch.name.clone()));
+            let name = if let Some(branch) = matching_branch.or(previous_branch) {
                 if branch.is_dangling {
                     println!(
                         "Failed to checkout: branch '{}' points to missing checkpoint '{}' (nothing was changed).",
@@ -263,7 +334,7 @@ pub fn try_handle_checkpoint_command(
                     }
                 };
                 if listed.is_empty() {
-                    println!("No checkpoints yet: save one first (`/checkpoint save <name>`).");
+                    println!("No checkpoints yet: save one first (`/git save <name>`).");
                     return Ok(true);
                 }
                 let stored_head = match store.head_target() {
@@ -286,7 +357,7 @@ pub fn try_handle_checkpoint_command(
                 match effective_head(&listed, stored_head.as_deref(), stored_base.as_deref()) {
                     Some(pointed) => pointed.to_string(),
                     None => {
-                        println!("No checkpoints yet: save one first (`/checkpoint save <name>`).");
+                        println!("No checkpoints yet: save one first (`/git save <name>`).");
                         return Ok(true);
                     }
                 }
@@ -297,9 +368,7 @@ pub fn try_handle_checkpoint_command(
                         // trivially exists; the check below is skipped for it.
                         Some(newest) => newest.name,
                         None => {
-                            println!(
-                                "No checkpoints yet: save one first (`/checkpoint save <name>`)."
-                            );
+                            println!("No checkpoints yet: save one first (`/git save <name>`).");
                             return Ok(true);
                         }
                     },
@@ -308,6 +377,10 @@ pub fn try_handle_checkpoint_command(
                         return Ok(true);
                     }
                 }
+            } else if let Some(target) = previous_detached {
+                // Resolved straight from the stored previous pointer, so the
+                // target trivially exists; the check below is skipped for it.
+                target
             } else {
                 raw_target
             };
@@ -319,17 +392,17 @@ pub fn try_handle_checkpoint_command(
             }
             // Validate the target before preserving anything: a failed switch
             // must have zero side effects (no save and no HEAD move).
-            // `latest` and `HEAD` resolve straight from a fresh listing above,
-            // so their targets trivially exist and skip this check.
-            if !latest_requested && !head_requested {
-                let names = match store.list() {
-                    Ok(checkpoints) => checkpoints,
+            // `latest`, `HEAD`, and `-` resolve straight from stored state
+            // above, so their targets trivially exist and skip this check.
+            if !latest_requested && !head_requested && !previous_requested {
+                let exists = match store.checkpoint_exists(&name) {
+                    Ok(exists) => exists,
                     Err(err) => {
                         println!("Failed to checkout: cannot list checkpoints: {err}");
                         return Ok(true);
                     }
                 };
-                if !names.iter().any(|candidate| candidate.name == name) {
+                if !exists {
                     println!(
                         "Failed to checkout: checkpoint '{name}' not found (nothing was changed)."
                     );
@@ -383,7 +456,7 @@ pub fn try_handle_checkpoint_command(
                 let operation = if is_switch { "switch" } else { "checkout" };
                 println!(
                     "Cannot {operation} '{name}': live history has un-checkpointed changes. \
-                     Save them first with `/cp save <name>`, or add `--discard` to discard them."
+                     Save them first with `/git save <name>`, or add `--discard` to discard them."
                 );
                 return Ok(true);
             }
@@ -507,13 +580,13 @@ pub fn try_handle_checkpoint_command(
         }
         "delete" | "del" | "rm" => {
             let Some(name) = parts.next() else {
-                println!("Usage: /checkpoint delete <name>");
+                println!("Usage: /git delete <name>");
                 return Ok(true);
             };
             if is_head_alias(&name) || is_latest_alias(&name) {
                 println!(
                     "'{name}' is a pointer alias, not a checkpoint: delete the checkpoint it points to \
-                     instead (see `/checkpoint tree`)."
+                     instead (see `/git tree`)."
                 );
                 return Ok(true);
             }
@@ -573,34 +646,33 @@ pub fn try_handle_checkpoint_command(
 fn print_help() {
     println!("Checkpoint commands (current session):");
     println!();
+    println!("  /git save [name]       create an immutable commit; advances the current branch");
     println!(
-        "  /checkpoint save [name]       create an immutable commit; advances the current branch"
+        "  /git tree              show commit ancestry and branch pointers (default; `list` works too)"
     );
-    println!(
-        "  /checkpoint tree              show checkpoints as a tree, newest first (default; `list` works too)"
-    );
-    println!("  /checkpoint checkout <branch|checkpoint> [--save <name> | --discard]");
+    println!("  /git checkout <branch|checkpoint> [--save <name> | --discard]");
     println!("                                switch to a branch or detach at a checkpoint; dirty");
     println!(
         "                                history is refused unless explicitly saved or discarded"
     );
-    println!("  /checkpoint checkout -b <new-branch> [start]");
+    println!("  /git checkout -b <new-branch> [start]");
     println!(
         "                                create and switch to a branch (Git-style checkout -b)"
     );
-    println!("  /checkpoint branch <name> [start]");
+    println!("  /git branch <name> [start]");
     println!("                                create a branch at start (or current HEAD)");
-    println!("  /checkpoint branch            list branches (* marks the current branch)");
-    println!("  /checkpoint branch -d <name>  delete only the branch pointer");
-    println!("  /checkpoint switch <branch>   restore and attach HEAD to a branch");
-    println!("  /checkpoint switch -c <new-branch> [start]");
+    println!("  /git branch -b <new-branch> [start]");
+    println!("                                create and switch to a branch (same as checkout -b)");
+    println!("  /git branch            list branches (* marks the current branch)");
+    println!("  /git branch -d <name>  delete only the branch pointer");
+    println!("  /git switch <branch>   restore and attach HEAD to a branch");
+    println!("  /git switch -c <new-branch> [start]");
     println!("                                create and switch to a branch (Git-style switch -c)");
-    println!("  /checkpoint delete <name>     delete a checkpoint");
-    println!(
-        "  /checkpoint clear             delete ALL checkpoints (asks for confirmation first)"
-    );
+    println!("  /git delete <name>     delete a checkpoint");
+    println!("  /git clear             delete ALL checkpoints (asks for confirmation first)");
     println!();
-    println!("  HEAD / @ / - all mean the HEAD pointer (the current commit);");
+    println!("  HEAD / @ both mean the HEAD pointer (the current commit);");
+    println!("  `-` means the previous checkout (`switch -` / `checkout -`, Git-style);");
     println!("  `latest` means the newest checkpoint (the `[latest]` row in the tree).");
     println!("  History is never dropped except by explicit `delete`, `clear`, or `--discard`.");
     println!(
@@ -608,126 +680,99 @@ fn print_help() {
         MAX_CHECKPOINTS_PER_SESSION,
         MAX_CHECKPOINT_STORAGE_BYTES / (1024 * 1024)
     );
-    println!("  Alias: /cp");
 }
 
-/// One display row of the checkpoint forest: the index into the newest-first
-/// `checkpoints` slice plus the already-resolved tree-drawing prefix placed
-/// before the HEAD glyph (empty for roots, e.g. `"│   └── "` for nested rows).
-struct ForestRow {
+/// One commit and its outgoing parent edge in a newest-first topology graph.
+struct CommitGraphRow {
     index: usize,
     prefix: String,
+    suffix: String,
+    connector: String,
 }
 
-/// Order `checkpoints` (newest-first) depth-first for tree display: roots keep
-/// their relative order, each parent is immediately followed by its subtree,
-/// children stay newest-first. Lone-child links render flat with no indent and no connector,
-/// so a straight save-after-save sequence reads as peers. If live history remains based on a
-/// parent with one saved child, live is the implicit second branch and the saved child gets a
-/// connector. Dangling parents (deleted after the
-/// child was saved) and self-links count as roots, and anything still
-/// unvisited after the root pass (only possible with a corrupt parent cycle)
-/// is emitted as a root too, so the walk always terminates with every entry
-/// shown exactly once.
-fn forest_order(checkpoints: &[CheckpointInfo], live_base: Option<&str>) -> Vec<ForestRow> {
-    fn is_root(checkpoints: &[CheckpointInfo], idx: usize) -> bool {
-        match &checkpoints[idx].parent {
-            None => true,
-            Some(parent) if parent == &checkpoints[idx].name => true,
-            Some(parent) => !checkpoints.iter().any(|cp| &cp.name == parent),
-        }
-    }
+/// Children precede parents, even when legacy timestamps disagree. Lanes
+/// represent commit edges only: branch pointers, HEAD and unsaved live edits
+/// cannot change the graph. Missing parents remain visible in row annotations.
+fn commit_graph(checkpoints: &[CheckpointInfo]) -> Vec<CommitGraphRow> {
+    let parents: Vec<_> = checkpoints
+        .iter()
+        .enumerate()
+        .map(|(i, cp)| {
+            checkpoints.iter().enumerate().find_map(|(j, parent)| {
+                (i != j && Some(parent.name.as_str()) == cp.parent.as_deref()).then_some(j)
+            })
+        })
+        .collect();
     let mut rows = Vec::with_capacity(checkpoints.len());
     let mut visited = vec![false; checkpoints.len()];
-    for idx in 0..checkpoints.len() {
-        if !visited[idx] && is_root(checkpoints, idx) {
-            push_subtree(
-                checkpoints,
-                idx,
-                String::new(),
-                String::new(),
-                live_base,
-                &mut rows,
-                &mut visited,
-            );
-        }
-    }
-    // Cycle guard: anything unreachable from a root is shown as its own root.
-    for idx in 0..checkpoints.len() {
-        if !visited[idx] {
-            push_subtree(
-                checkpoints,
-                idx,
-                String::new(),
-                String::new(),
-                live_base,
-                &mut rows,
-                &mut visited,
-            );
-        }
+    let mut lanes = Vec::new();
+    while rows.len() < checkpoints.len() {
+        let ready = (0..checkpoints.len()).find(|&i| {
+            !visited[i]
+                && !parents
+                    .iter()
+                    .enumerate()
+                    .any(|(child, parent)| !visited[child] && *parent == Some(i))
+        });
+        // Corrupt cycles must not hide commits or prevent the listing.
+        let index = ready.unwrap_or_else(|| visited.iter().position(|seen| !seen).unwrap());
+        visited[index] = true;
+        let parent = parents[index].filter(|&i| !visited[i]);
+        rows.push(commit_graph_row(index, parent, &mut lanes));
     }
     rows
 }
 
-/// Push one subtree depth-first: the row itself with `prefix`, then each
-/// child. Branch connectors (`├── ` / `└── `) draw real forks: a parent with
-/// two or more saved children, or one saved child while live history remains
-/// based on the parent. Other lone children render flat. The base never accumulates:
-/// the child inherits `child_base` unchanged, so a long chain keeps every
-/// entry at the same indent, while a continuation inside a fork keeps that
-/// branch's indent. `child_base` carries the ancestors' continuations
-/// (`│   ` / `    `) for deeper levels.
-fn push_subtree(
-    checkpoints: &[CheckpointInfo],
-    idx: usize,
-    prefix: String,
-    child_base: String,
-    live_base: Option<&str>,
-    rows: &mut Vec<ForestRow>,
-    visited: &mut [bool],
-) {
-    if visited[idx] {
-        return;
-    }
-    visited[idx] = true;
-    rows.push(ForestRow { index: idx, prefix });
-    let name = checkpoints[idx].name.clone();
-    let kids: Vec<usize> = checkpoints
+/// Keep each pending parent in a stable lane; siblings converge onto its lane.
+fn commit_graph_row(
+    index: usize,
+    parent: Option<usize>,
+    lanes: &mut Vec<Option<usize>>,
+) -> CommitGraphRow {
+    let lane = lanes
         .iter()
-        .enumerate()
-        .filter(|(child, cp)| !visited[*child] && cp.parent.as_deref() == Some(name.as_str()))
-        .map(|(child, _)| child)
-        .collect();
-    // A lone saved child is normally a straight-line continuation. If live
-    // history remains on its parent, live is the other side of the fork.
-    if kids.len() == 1 && live_base != Some(name.as_str()) {
-        push_subtree(
-            checkpoints,
-            kids[0],
-            child_base.clone(),
-            child_base,
-            live_base,
-            rows,
-            visited,
-        );
-        return;
+        .position(|entry| *entry == Some(index))
+        .or_else(|| lanes.iter().position(Option::is_none))
+        .unwrap_or_else(|| {
+            lanes.push(None);
+            lanes.len() - 1
+        });
+    lanes[lane] = Some(index);
+    let strokes = |entries: &[Option<usize>]| -> String {
+        entries
+            .iter()
+            .map(|entry| if entry.is_some() { "│ " } else { "  " })
+            .collect()
+    };
+    let prefix = strokes(&lanes[..lane]);
+    let suffix = strokes(&lanes[lane + 1..]);
+    lanes[lane] = None;
+    let destination = parent.and_then(|p| lanes.iter().position(|entry| *entry == Some(p)));
+    if destination.is_none() {
+        lanes[lane] = parent;
     }
-    for (pos, child) in kids.iter().enumerate() {
-        let last = pos + 1 == kids.len();
-        let (connector, continuation) = if last {
-            ("└── ", "    ")
-        } else {
-            ("├── ", "│   ")
-        };
-        push_subtree(
-            checkpoints,
-            *child,
-            format!("{child_base}{connector}"),
-            format!("{child_base}{continuation}"),
-            live_base,
-            rows,
-            visited,
-        );
+    let mut connector: Vec<char> = strokes(lanes).chars().collect();
+    if let Some(destination) = destination {
+        let left = lane.min(destination) * 2;
+        let right = lane.max(destination) * 2;
+        for cell in &mut connector[left + 1..right] {
+            *cell = if *cell == '│' { '┼' } else { '─' };
+        }
+        connector[left] = if lane < destination { '╰' } else { '├' };
+        connector[right] = if lane < destination { '┤' } else { '╯' };
+    }
+    while lanes.last() == Some(&None) {
+        lanes.pop();
+    }
+    CommitGraphRow {
+        index,
+        prefix,
+        suffix,
+        connector: connector
+            .into_iter()
+            .collect::<String>()
+            .trim_end()
+            .to_string(),
     }
 }
 
@@ -765,10 +810,10 @@ fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::err
         CheckpointHead::Detached(target) => (None, target),
     };
     let base = store.base_target().unwrap_or(None);
-    let live_len = SessionStore::new(app.config.history_file.as_path())
+    let live_messages = SessionStore::new(app.config.history_file.as_path())
         .read_all_messages(&app.session_id)
-        .map(|messages| messages.len())
-        .unwrap_or(0);
+        .unwrap_or_default();
+    let live_len = live_messages.len();
     let total_size: u64 = checkpoints
         .iter()
         .map(|cp| cp.size_bytes)
@@ -781,8 +826,7 @@ fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::err
         format_human_bytes(total_size).bold(),
         MAX_CHECKPOINT_STORAGE_BYTES / (1024 * 1024)
     );
-    // The live history is the implicit child of its base checkpoint: naming
-    // the base here connects the working copy to the tree below.
+    // Live is working state, not a commit or an extra edge in the graph.
     let live_detail = match &base {
         Some(parent) => format!("{live_len} messages (current session, based on '{parent}')"),
         None => format!("{live_len} messages (current session)"),
@@ -821,45 +865,81 @@ fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::err
             "unset (no checkpoints yet)".dimmed()
         );
     }
+    // Every branch pointer gets one line — including unborn branches (no
+    // checkpoint yet) and branches whose target was deleted — because the
+    // per-row `[branch:…]` tags below only cover branches that still point
+    // at a listed checkpoint.
+    if !branches.is_empty() {
+        println!(
+            "  {}",
+            format!("Branch pointers ({})", branches.len()).dimmed()
+        );
+        let rows = branch_rows(&branches, active_branch.as_deref());
+        let name_width = rows
+            .iter()
+            .map(|row| truncate_middle(&row.name, 32).chars().count())
+            .max()
+            .unwrap_or(4)
+            .max(4);
+        for row in &rows {
+            let short = truncate_middle(&row.name, 32);
+            let pad = " ".repeat(name_width - short.chars().count());
+            let marker = if row.active {
+                "*".cyan().bold().to_string()
+            } else {
+                " ".to_string()
+            };
+            let name_cell = if row.active {
+                short.cyan().bold().to_string()
+            } else {
+                short.bold().to_string()
+            };
+            let target_cell = if row.target_gone {
+                format!("{} {}", row.target, "(missing checkpoint)".yellow())
+            } else {
+                row.target.dimmed().to_string()
+            };
+            println!("    {marker} {name_cell}{pad} -> {target_cell}");
+        }
+    }
     if checkpoints.is_empty() {
         println!(
             "  {}",
-            "(no checkpoints yet — save one with /checkpoint save <name>)".dimmed()
+            "(no checkpoints yet — save one with /git save <name>)".dimmed()
         );
         return Ok(());
     }
-    // Branch lines widen rows with depth, so align the columns on the full
-    // `prefix + glyph + name` label instead of the bare name. The name itself
-    // is still capped so one long entry cannot push the table off screen.
-    // Padding is manual spaces (not `format!` width) so box-drawing glyphs
-    // never disturb the column math.
-    let order = forest_order(&checkpoints, base.as_deref());
+    // Commit topology is independent of the live state and branch pointers.
+    let order = commit_graph(&checkpoints);
     let short_names: Vec<String> = checkpoints
         .iter()
         .map(|cp| truncate_middle(&cp.name, 48))
         .collect();
     let label_width = order
         .iter()
-        .map(|row| row.prefix.chars().count() + 2 + short_names[row.index].chars().count())
+        .map(|row| {
+            row.prefix.chars().count()
+                + row.suffix.chars().count()
+                + 2
+                + short_names[row.index].chars().count()
+        })
         .max()
         .unwrap_or(12)
         .max(12);
-    // Rows print as `  {prefix}{glyph} {name} ...`, so the header needs the
-    // same 2-column prefix to keep NAME/SIZE/SAVED aligned with the body.
+    println!("  {}", "Commits (children above parents)".dimmed());
     println!(
         "  {}",
         format!(
             "{}{}  {:>9}  {:<19}  {}",
-            "NAME",
-            " ".repeat(label_width - "NAME".len()),
+            "COMMIT",
+            " ".repeat(label_width - "COMMIT".len()),
             "SIZE",
             "SAVED",
             "TAGS",
         )
         .dimmed()
     );
-    // `checkpoints` arrives newest-first (see `CheckpointStore::list`), so the
-    // first row is the newest save even when rows share a displayed second.
+    // Latest follows save time, not the topological display position.
     for row in &order {
         let cp = &checkpoints[row.index];
         let when = cp
@@ -869,17 +949,18 @@ fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::err
         let short_name = &short_names[row.index];
         let is_head = head.as_deref() == Some(cp.name.as_str());
         let is_latest = row.index == 0;
-        let is_orphan = cp
-            .parent
-            .as_deref()
-            .is_some_and(|parent| !checkpoints.iter().any(|other| other.name == parent));
         let glyph = if is_head {
             "→".cyan().bold()
         } else {
             "○".dimmed()
         };
-        let name_pad =
-            " ".repeat(label_width - row.prefix.chars().count() - 2 - short_name.chars().count());
+        let name_pad = " ".repeat(
+            label_width
+                - row.prefix.chars().count()
+                - row.suffix.chars().count()
+                - 2
+                - short_name.chars().count(),
+        );
         let name_cell = if is_head {
             short_name.cyan().bold()
         } else {
@@ -907,23 +988,40 @@ fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::err
             };
             tags.push_str(&label);
         }
-        if is_orphan {
-            tags.push_str(&"[orphan] ".dimmed().to_string());
+        // Every row names the commit it builds on, so linear chains and
+        // forks read the same way. A parent whose object is gone (deleted
+        // after the child was saved) keeps its name with `(missing)` instead
+        // of rendering the child as a false root.
+        if let Some(parent) = cp.parent.as_deref() {
+            let label = if checkpoints.iter().any(|other| other.name == parent) {
+                format!("[parent:{}] ", truncate_middle(parent, 24))
+            } else {
+                format!("[parent:{} (missing)] ", truncate_middle(parent, 24))
+            };
+            tags.push_str(&label.dimmed().to_string());
         }
         if cp.name.starts_with("auto-") {
             tags.push_str(&"[auto] ".dimmed().to_string());
         }
         println!(
-            "  {}{} {}{}  {size_cell}  {when:<19}  {tags}",
+            "  {}{} {}{}{}  {size_cell}  {when:<19}  {tags}",
             row.prefix.dimmed(),
             glyph,
+            row.suffix.dimmed(),
             name_cell,
             name_pad,
         );
+        if !row.connector.is_empty() {
+            println!("  {}", row.connector.dimmed());
+        }
     }
     println!(
         "  {}",
-        "linear commits stay flat · → marks HEAD · branch:<name>* marks the active branch · switch <branch> attaches · checkout <commit> detaches · save advances".dimmed()
+        "Lines link commits, not branch ownership; branch labels are movable pointers.".dimmed()
+    );
+    println!(
+        "  {}",
+        "→ HEAD · * active branch · [latest] newest save · [parent:x] direct parent".dimmed()
     );
     // Tree is the most common precursor to `checkout <TAB>`: publish the
     // names just listed so third-token completion has fresh candidates.
@@ -972,11 +1070,55 @@ fn truncate_middle(name: &str, max_chars: usize) -> String {
     format!("{head}…{tail}")
 }
 
+/// One printable branch-pointer row for the `Branches` block in `print_tree`.
+/// `target` is the checkpoint name, or `(unborn)` when the branch has no
+/// checkpoint yet; `target_gone` means the named checkpoint object is gone.
+struct BranchRow {
+    active: bool,
+    name: String,
+    target: String,
+    target_gone: bool,
+}
+
+/// Flatten every branch pointer — active, idle, unborn, and dangling — so
+/// the display never hides a branch just because its target is not a listed
+/// checkpoint row.
+fn branch_rows(
+    branches: &[crate::ai::history::CheckpointBranch],
+    active_branch: Option<&str>,
+) -> Vec<BranchRow> {
+    branches
+        .iter()
+        .map(|branch| {
+            let (target, target_gone) = match branch.target.as_deref() {
+                None => ("(unborn)".to_string(), false),
+                Some(name) => (name.to_string(), branch.is_dangling),
+            };
+            BranchRow {
+                active: active_branch == Some(branch.name.as_str()),
+                name: branch.name.clone(),
+                target,
+                target_gone,
+            }
+        })
+        .collect()
+}
+
 /// Git-style aliases for the HEAD pointer. `HEAD` matches case-insensitively
 /// because `head` would collide with it on case-insensitive filesystems.
+/// (`-` is the previous checkout, handled separately, so it is not a HEAD
+/// alias even though it can never be a real checkpoint name either.)
 fn is_head_alias(name: &str) -> bool {
     let trimmed = name.trim();
-    trimmed.eq_ignore_ascii_case("head") || trimmed == "@" || trimmed == "-"
+    trimmed.eq_ignore_ascii_case("head") || trimmed == "@"
+}
+
+/// Git-style `-`: the previously checked-out branch or checkpoint, for
+/// `switch -` / `checkout -`. Keep in sync with
+/// `history::checkpoint::is_reserved_checkpoint_name`, which rejects it as a
+/// real checkpoint name so the alias can never collide with one.
+fn is_previous_alias(name: &str) -> bool {
+    name.trim() == "-"
 }
 
 /// Alias for the newest checkpoint (matches the `[latest]` tag in the tree).
@@ -1210,10 +1352,11 @@ fn refresh_runtime_after_rollback(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        SwitchPreparation, effective_head, forest_order, format_human_bytes, is_head_alias,
-        is_latest_alias, parse_navigation_args, switch_preparation, truncate_middle,
+        BranchRow, SwitchPreparation, branch_rows, commit_graph, effective_head,
+        format_human_bytes, is_head_alias, is_latest_alias, is_previous_alias,
+        parse_navigation_args, switch_preparation, truncate_middle,
     };
-    use crate::ai::history::CheckpointInfo;
+    use crate::ai::history::{CheckpointBranch, CheckpointInfo};
 
     fn args(words: &[&str]) -> Vec<String> {
         words.iter().map(|s| s.to_string()).collect()
@@ -1228,18 +1371,68 @@ mod tests {
         }
     }
 
-    fn forest_plan_at(
-        checkpoints: &[CheckpointInfo],
-        live_base: Option<&str>,
-    ) -> Vec<(String, String)> {
-        forest_order(checkpoints, live_base)
-            .iter()
-            .map(|row| (checkpoints[row.index].name.clone(), row.prefix.clone()))
-            .collect()
+    fn graph_text(checkpoints: &[CheckpointInfo]) -> String {
+        let mut lines = Vec::new();
+        for row in commit_graph(checkpoints) {
+            lines.push(format!(
+                "{}● {}{}",
+                row.prefix, row.suffix, checkpoints[row.index].name
+            ));
+            if !row.connector.is_empty() {
+                lines.push(row.connector);
+            }
+        }
+        lines.join("\n")
     }
 
-    fn forest_plan(checkpoints: &[CheckpointInfo]) -> Vec<(String, String)> {
-        forest_plan_at(checkpoints, None)
+    fn test_branch(name: &str, target: Option<&str>, is_dangling: bool) -> CheckpointBranch {
+        CheckpointBranch {
+            name: name.to_string(),
+            target: target.map(str::to_string),
+            is_dangling,
+        }
+    }
+
+    fn branch_plan(branches: &[CheckpointBranch], active: Option<&str>) -> Vec<BranchRow> {
+        branch_rows(branches, active)
+    }
+
+    #[test]
+    fn branch_rows_show_every_pointer_including_unborn_and_missing() {
+        let branches = vec![
+            test_branch("check", None, false),
+            test_branch("check_1", Some("c2"), false),
+            test_branch("list", Some("next_1"), true),
+            test_branch("main", Some("f2"), false),
+        ];
+        let rows = branch_plan(&branches, Some("main"));
+        assert_eq!(rows.len(), 4);
+        // Unborn branch: no checkpoint yet, never reported as gone.
+        assert_eq!(rows[0].target, "(unborn)");
+        assert!(!rows[0].target_gone);
+        assert!(!rows[0].active);
+        // Idle branch on a live checkpoint.
+        assert_eq!(rows[1].target, "c2");
+        assert!(!rows[1].target_gone);
+        assert!(!rows[1].active);
+        // Dangling branch keeps the deleted target's name for diagnosis.
+        assert_eq!(rows[2].target, "next_1");
+        assert!(rows[2].target_gone);
+        assert!(!rows[2].active);
+        // Active branch is marked, not duplicated.
+        assert_eq!(rows[3].target, "f2");
+        assert!(!rows[3].target_gone);
+        assert!(rows[3].active);
+        assert_eq!(rows.iter().filter(|row| row.active).count(), 1);
+    }
+
+    #[test]
+    fn branch_rows_without_active_branch_marks_nothing() {
+        let branches = vec![test_branch("main", Some("f2"), false)];
+        let rows = branch_plan(&branches, None);
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].active);
+        assert_eq!(rows[0].target, "f2");
     }
 
     #[test]
@@ -1309,17 +1502,28 @@ mod tests {
 
     #[test]
     fn checkout_args_accept_head_aliases_as_target() {
-        for alias in ["HEAD", "head", "@", "-"] {
+        for alias in ["HEAD", "head", "@"] {
             let parsed = parse_navigation_args(&args(&[alias]), "-b").unwrap();
             assert_eq!(parsed.target.as_deref(), Some(alias));
             assert!(is_head_alias(&parsed.target.unwrap()));
         }
         assert!(is_head_alias("HEAD"));
         assert!(is_head_alias("@"));
-        assert!(is_head_alias("-"));
+        assert!(!is_head_alias("-"));
         assert!(!is_head_alias("c1"));
         assert!(!is_head_alias("headspace"));
         assert!(!is_head_alias("latest"));
+    }
+
+    #[test]
+    fn dash_is_the_previous_checkout_alias_not_a_head_alias() {
+        let parsed = parse_navigation_args(&args(&["-"]), "-b").unwrap();
+        assert_eq!(parsed.target.as_deref(), Some("-"));
+        assert!(is_previous_alias("-"));
+        assert!(!is_previous_alias("HEAD"));
+        assert!(!is_previous_alias("c1"));
+        // Still reserved so it can never collide with a real checkpoint name.
+        assert!(crate::ai::history::is_reserved_checkpoint_name("-"));
     }
 
     #[test]
@@ -1353,66 +1557,54 @@ mod tests {
     }
 
     #[test]
-    fn forest_linear_chain_stays_flat() {
-        // Newest-first input: a child of b child of root c. A straight
-        // save-after-save sequence reads as flat peers with no indent and
-        // no connector, not nested levels.
+    fn commit_graph_linear_chain_connects_in_one_lane() {
         let checkpoints = vec![
             forest_info("a", Some("b")),
             forest_info("b", Some("c")),
             forest_info("c", None),
         ];
-        assert_eq!(
-            forest_plan(&checkpoints),
-            vec![
-                ("c".to_string(), "".to_string()),
-                ("b".to_string(), "".to_string()),
-                ("a".to_string(), "".to_string()),
-            ]
-        );
+        assert_eq!(graph_text(&checkpoints), "● a\n│\n● b\n│\n● c");
     }
 
     #[test]
-    fn forest_live_base_exposes_single_saved_child_as_a_fork() {
-        // `fork before_edit --save other_edit` preserves the edited line as
-        // one saved child, then leaves live history on the parent as the
-        // other side of the fork.
+    fn commit_graph_orders_parents_after_children_despite_timestamp_order() {
+        // Legacy save times can place a parent before its child in list().
         let checkpoints = vec![
-            forest_info("other_edit", Some("before_edit")),
             forest_info("before_edit", None),
+            forest_info("other_edit", Some("before_edit")),
         ];
-        assert_eq!(
-            forest_plan_at(&checkpoints, Some("before_edit")),
-            vec![
-                ("before_edit".to_string(), "".to_string()),
-                ("other_edit".to_string(), "└── ".to_string()),
-            ]
-        );
+        assert_eq!(graph_text(&checkpoints), "● other_edit\n│\n● before_edit");
     }
 
     #[test]
-    fn forest_branch_keeps_children_newest_first() {
+    fn commit_graph_branch_pointers_do_not_create_forks() {
+        let checkpoints = vec![forest_info("c1", Some("main1")), forest_info("main1", None)];
+        let branches = vec![
+            test_branch("check", Some("c1"), false),
+            test_branch("main", Some("main1"), false),
+        ];
+        for active in [Some("main"), Some("check"), None] {
+            let refs = branch_rows(&branches, active);
+            assert_eq!(refs[0].target, "c1");
+            assert_eq!(refs[1].target, "main1");
+            assert_eq!(graph_text(&checkpoints), "● c1\n│\n● main1");
+        }
+    }
+
+    #[test]
+    fn commit_graph_siblings_converge_on_shared_parent() {
         // Newest-first input: x and y both branch from r.
         let checkpoints = vec![
             forest_info("x", Some("r")),
             forest_info("y", Some("r")),
             forest_info("r", None),
         ];
-        assert_eq!(
-            forest_plan(&checkpoints),
-            vec![
-                ("r".to_string(), "".to_string()),
-                ("x".to_string(), "├── ".to_string()),
-                ("y".to_string(), "└── ".to_string()),
-            ]
-        );
+        assert_eq!(graph_text(&checkpoints), "● x\n│\n│ ● y\n├─╯\n● r");
     }
 
     #[test]
-    fn forest_fork_child_continues_inside_its_branch() {
+    fn commit_graph_interleaved_descendants_keep_their_lanes() {
         // Newest-first input: c and b both branch from a, d continues b.
-        // The lone b -> d link inherits b's branch indent with no extra
-        // connector of its own.
         let checkpoints = vec![
             forest_info("d", Some("b")),
             forest_info("c", Some("a")),
@@ -1420,43 +1612,32 @@ mod tests {
             forest_info("a", None),
         ];
         assert_eq!(
-            forest_plan(&checkpoints),
-            vec![
-                ("a".to_string(), "".to_string()),
-                ("c".to_string(), "├── ".to_string()),
-                ("b".to_string(), "└── ".to_string()),
-                ("d".to_string(), "    ".to_string()),
-            ]
+            graph_text(&checkpoints),
+            "● d\n│\n│ ● c\n│ │\n● │ b\n╰─┤\n  ● a"
         );
     }
 
     #[test]
-    fn forest_treats_orphan_and_self_link_as_roots() {
+    fn commit_graph_keeps_orphans_and_self_links_visible() {
         let checkpoints = vec![
             forest_info("orphan", Some("deleted")),
             forest_info("loop", Some("loop")),
             forest_info("root", None),
         ];
         // Every entry shows exactly once, all as roots.
-        assert_eq!(
-            forest_plan(&checkpoints),
-            vec![
-                ("orphan".to_string(), "".to_string()),
-                ("loop".to_string(), "".to_string()),
-                ("root".to_string(), "".to_string()),
-            ]
-        );
+        assert_eq!(graph_text(&checkpoints), "● orphan\n● loop\n● root");
     }
 
     #[test]
-    fn forest_breaks_parent_cycles_without_dropping_entries() {
+    fn commit_graph_breaks_cycles_without_dropping_entries() {
         // Corrupt cycle with no root: both must still show exactly once.
         let checkpoints = vec![forest_info("a", Some("b")), forest_info("b", Some("a"))];
-        let plan = forest_plan(&checkpoints);
+        let plan = commit_graph(&checkpoints);
         assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0].0, "a");
-        assert_eq!(plan[0].1, "");
-        assert_eq!(plan[1].0, "b");
+        assert_eq!(plan[0].index, 0);
+        assert_eq!(plan[1].index, 1);
+        assert!(plan[1].connector.is_empty());
+        assert!(commit_graph(&[]).is_empty());
     }
 
     #[test]

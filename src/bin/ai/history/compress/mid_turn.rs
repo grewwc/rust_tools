@@ -277,6 +277,22 @@ pub(in crate::ai) const MID_TURN_SPILL_MIN_CHARS: usize = 6_000;
 /// means the decrease came entirely from mechanical paths (fold/truncate/spill),
 /// letting the upper report distinguish "LLM summary executed" from "purely
 /// mechanical compaction" and avoid false reporting.
+fn cap_mid_turn_llm_evidence(messages: Vec<Message>, overflow_dir: &Path) -> (Vec<Message>, usize) {
+    let messages = trim_compressed_tool_evidence_to_inline_budget(messages, Some(overflow_dir));
+    let after = messages_total_chars(&messages);
+    (messages, after)
+}
+
+fn finalize_mid_turn_llm_summary(
+    messages: Vec<Message>,
+    before: usize,
+    llm_summary_inserted: bool,
+) -> (Vec<Message>, usize, usize, bool, bool) {
+    let after = messages_total_chars(&messages);
+    let was_effective = before.saturating_sub(after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS;
+    (messages, before, after, was_effective, llm_summary_inserted)
+}
+
 pub(in crate::ai) async fn mid_turn_llm_summarize(
     app: &App,
     messages: Vec<Message>,
@@ -290,13 +306,20 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         .session_assets_dir(&app.session_id);
     let protected_tool_call_ids = current_turn_precision_tool_call_ids(&messages);
     let lossless_tool_call_ids = current_turn_lossless_tool_call_ids(&messages);
-    // best tracks the smallest result so far; None means the original messages are
-    // still in use.
+    // Cap inherited evidence before any hard-target decision. Trimming can add an
+    // archive pointer, so Path C must see and budget that pointer rather than add it
+    // after the final hard-cap pass.
+    let (messages, initial_after) = cap_mid_turn_llm_evidence(messages, overflow_dir.as_path());
+    // best tracks the smallest result after the capped baseline; None means that
+    // baseline is still in use.
     let mut best: Option<Vec<Message>> = None;
-    let mut best_after = before;
+    let mut best_after = initial_after;
     // Whether Path A actually ran and injected a summary increment (see the return
     // doc).
     let mut llm_summary_inserted = false;
+    if best_after <= hard_target {
+        return finalize_mid_turn_llm_summary(messages, before, llm_summary_inserted);
+    }
 
     // === Path A: cross-turn LLM summary ===
     // First compute the cut point as "keep the most recent keep_recent_turns user
@@ -404,6 +427,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                     && summary_plan.commit()
                     && archive_messages_to_overflow(earlier, Some(overflow_dir.as_path())).is_some()
                 {
+                    let (out, after) = cap_mid_turn_llm_evidence(out, overflow_dir.as_path());
                     best = Some(out);
                     best_after = after;
                     llm_summary_inserted = true;
@@ -412,7 +436,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                 if before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS
                     && best_after <= hard_target
                 {
-                    return (best.unwrap(), before, best_after, true, true);
+                    return finalize_mid_turn_llm_summary(best.unwrap(), before, true);
                 }
             }
         }
@@ -447,6 +471,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         let after = messages_total_chars(plan.messages());
         if after < best_after && plan.commit() {
             let (folded, _) = plan.into_result();
+            let (folded, after) = cap_mid_turn_llm_evidence(folded, overflow_dir.as_path());
             best = Some(folded);
             best_after = after;
         }
@@ -457,12 +482,9 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     // below and letting "older groups already saved a lot, but the newest group
     // alone still overflows the window" keep sending over-limit requests.
     if best_after <= hard_target {
-        let was_effective = before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS;
-        return (
+        return finalize_mid_turn_llm_summary(
             best.unwrap_or(messages),
             before,
-            best_after,
-            was_effective,
             llm_summary_inserted,
         );
     }
@@ -495,13 +517,42 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         Some(overflow_dir.as_path()),
         &lossless_tool_call_ids,
     );
-    let after = messages_total_chars(&result);
-    let savings = before.saturating_sub(after);
-    (
-        result,
-        before,
-        after,
-        savings >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS,
-        llm_summary_inserted,
-    )
+    finalize_mid_turn_llm_summary(result, before, llm_summary_inserted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn evidence_note(label: &str) -> Message {
+        Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: serde_json::Value::String(format!(
+                "compressed_tool_round: 1 tool calls\n{COMPRESSED_TOOL_EVIDENCE_MARKER}\n{label}:{}",
+                "e".repeat(7_000)
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn llm_summary_evidence_cap_preserves_notes_when_archive_commit_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-mid-turn-llm-evidence-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let not_a_directory = root.join("not-a-directory");
+        std::fs::write(&not_a_directory, "file blocks archive directory creation").unwrap();
+        let messages = vec![evidence_note("older"), evidence_note("newer")];
+        let before = messages_total_chars(&messages);
+
+        let (capped, after) = cap_mid_turn_llm_evidence(messages.clone(), &not_a_directory);
+
+        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(capped, messages);
+        assert_eq!(after, before);
+    }
 }

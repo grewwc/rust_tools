@@ -184,7 +184,7 @@ fn rebase_metadata_after_rollback(
 }
 
 /// Prepare a rebased temporary DB inside the session state lock, then publish it to the live path
-/// via Online Backup's atomic rename. A crash before the final publish leaves the live DB unchanged; after the publish, metadata
+/// via atomic rename. A crash before the final publish leaves the live DB unchanged; after the publish, metadata
 /// is fully raised, so there is no intermediate “DB rolled back but counters still stale” state.
 pub(in crate::ai) fn restore_sqlite_after_rollback(
     checkpoint: &Path,
@@ -202,6 +202,26 @@ pub(in crate::ai) fn restore_sqlite_after_rollback_with_transaction(
     live_path: &Path,
     transaction_id: Option<&str>,
 ) -> io::Result<()> {
+    restore_rollback_database(checkpoint, live_path, transaction_id, false)
+}
+
+/// Restore a private, closed transaction snapshot. The caller holds the
+/// checkpoint lock so the source cannot change while cloning. Preserve it for
+/// crash replay; only the disposable working copy is rebased and published.
+pub(in crate::ai) fn restore_staged_sqlite_after_rollback(
+    staged: &Path,
+    live_path: &Path,
+    transaction_id: &str,
+) -> io::Result<()> {
+    restore_rollback_database(staged, live_path, Some(transaction_id), true)
+}
+
+fn restore_rollback_database(
+    checkpoint: &Path,
+    live_path: &Path,
+    transaction_id: Option<&str>,
+    private_staged_source: bool,
+) -> io::Result<()> {
     with_session_state_lock(live_path, || {
         let live = read_live_rollback_metadata(live_path)?;
         let parent = live_path.parent().unwrap_or_else(|| Path::new("."));
@@ -209,7 +229,9 @@ pub(in crate::ai) fn restore_sqlite_after_rollback_with_transaction(
         let working = parent.join(format!(".rollback-rebased-{}.sqlite", uuid::Uuid::new_v4()));
 
         let result = (|| {
-            backup_sqlite(checkpoint, &working)?;
+            if !private_staged_source || !try_clone_staged_sqlite(checkpoint, &working) {
+                backup_sqlite(checkpoint, &working)?;
+            }
             rebase_metadata_after_rollback(
                 &working,
                 live.generation,
@@ -217,16 +239,44 @@ pub(in crate::ai) fn restore_sqlite_after_rollback_with_transaction(
                 live.turn_seq,
                 transaction_id,
             )?;
-            // The second backup materializes the working WAL into the final
-            // temporary main DB. Publishing it has no fallible cleanup after
-            // the rename, so the embedded transaction marker is sufficient to
-            // distinguish an already-published rollback during recovery.
+            // Materialize the working WAL before renaming, without copying the
+            // entire DB again. The marker and rebased counters publish together.
             publish_rebased_sqlite(&working, live_path)
         })();
         let _ = fs::remove_file(&working);
         let _ = remove_sqlite_sidecars(&working);
         result
     })
+}
+
+/// Clone only private staged DBs with no sidecars. Live/WAL sources always use
+/// Online Backup, including old transaction snapshots left with a WAL. A clone
+/// has an independent inode and copy-on-write blocks, unlike an unsafe hardlink.
+#[cfg(target_os = "macos")]
+fn try_clone_staged_sqlite(source: &Path, target: &Path) -> bool {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = source.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        if !matches!(Path::new(&sidecar).try_exists(), Ok(false)) {
+            return false;
+        }
+    }
+    let (Ok(source), Ok(target)) = (
+        CString::new(source.as_os_str().as_bytes()),
+        CString::new(target.as_os_str().as_bytes()),
+    ) else {
+        return false;
+    };
+    // SAFETY: Both paths are NUL-terminated and remain alive for this call.
+    // Unsupported filesystems and cross-volume clones fall back to Online Backup.
+    unsafe { libc::clonefile(source.as_ptr(), target.as_ptr(), 0) == 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn try_clone_staged_sqlite(_source: &Path, _target: &Path) -> bool {
+    false
 }
 
 /// Create a consistent snapshot with the SQLite Online Backup API and write it to the target via atomic replacement.
@@ -269,9 +319,9 @@ pub(in crate::ai) fn backup_sqlite(source: &Path, target: &Path) -> io::Result<(
     result
 }
 
-/// Publish a rebased rollback database without any fallible work after the
-/// target rename. Existing target sidecars are checkpointed and removed before
-/// publication, so a later failure leaves the old main DB intact and retryable.
+/// Consume the private rebased working DB without another Online Backup.
+/// Both DBs are closed and their WALs checkpointed before the atomic rename;
+/// failures before publication leave the old live DB intact and retryable.
 fn publish_rebased_sqlite(source: &Path, target: &Path) -> io::Result<()> {
     if !source.exists() {
         return Err(io::Error::new(
@@ -281,30 +331,68 @@ fn publish_rebased_sqlite(source: &Path, target: &Path) -> io::Result<()> {
     }
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
-    let file_name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("history.sqlite");
-    let temporary = parent.join(format!(
-        ".{file_name}.rollback-{}.tmp",
-        uuid::Uuid::new_v4()
-    ));
+    quiesce_and_remove_sqlite_sidecars(source)?;
+    quiesce_and_remove_sqlite_sidecars(target)?;
+    fs::rename(source, target)
+}
 
-    let result = (|| {
-        let source_conn = Connection::open(source).map_err(|e| io::Error::other(e.to_string()))?;
-        source_conn
-            .backup(rusqlite::MAIN_DB, &temporary, None)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        drop(source_conn);
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
 
-        quiesce_and_remove_sqlite_sidecars(target)?;
-        fs::rename(&temporary, target)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-        let _ = remove_sqlite_sidecars(&temporary);
+    #[cfg(unix)]
+    #[test]
+    fn staged_publish_renames_working_inode_without_copying() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("rollback_publish_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("working.sqlite");
+        let target = dir.join("live.sqlite");
+        let conn = Connection::open(&source).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE proof(value); INSERT INTO proof VALUES(42);",
+        )
+        .unwrap();
+        drop(conn);
+        let inode = fs::metadata(&source).unwrap().ino();
+        publish_rebased_sqlite(&source, &target).unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::metadata(&target).unwrap().ino(), inode);
+        let conn = Connection::open(&target).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT value FROM proof", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
+        drop(conn);
+        let _ = fs::remove_dir_all(dir);
     }
-    result
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn staged_clone_is_copy_on_write_not_a_hardlink() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("rollback_clone_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.sqlite");
+        let target = dir.join("clone.sqlite");
+        fs::write(&source, b"snapshot bytes").unwrap();
+        if try_clone_staged_sqlite(&source, &target) {
+            assert_ne!(
+                fs::metadata(&source).unwrap().ino(),
+                fs::metadata(&target).unwrap().ino()
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"snapshot bytes");
+            fs::write(&target, b"modified bytes").unwrap();
+            assert_eq!(fs::read(&source).unwrap(), b"snapshot bytes");
+            eprintln!(
+                "clonefile succeeded; independent inode and in-place write isolation verified"
+            );
+        } else {
+            eprintln!("clonefile unsupported here; restore uses Online Backup fallback");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 fn quiesce_and_remove_sqlite_sidecars(path: &Path) -> io::Result<()> {

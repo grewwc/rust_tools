@@ -52,10 +52,15 @@ pub(in crate::ai) const SUMMARY_NOTE_PREFIXES: &[&str] = &[
 /// tends to re-gather evidence after compaction.
 pub(in crate::ai) const COMPRESSED_TOOL_EVIDENCE_MARKER: &str = "[compressed-tool-evidence]";
 
-/// Prefix of archive-pointer notes (back-references to overflow originals). They
-/// appear paired with summary notes; the P1 folding logic relies on this to
-/// recognize and dedupe piled-up archive pointers.
-pub(in crate::ai) const ARCHIVE_NOTE_PREFIX: &str = "长期记忆归档";
+/// Stable marker and path labels for archive-pointer notes. Readers keep
+/// accepting the legacy labels because persisted sessions can outlive the
+/// projection version that produced them.
+pub(in crate::ai) const ARCHIVE_NOTE_PREFIX: &str = "[archive-pointer-v2]";
+pub(in crate::ai) const ARCHIVE_FILE_PATH_PREFIX: &str = "archive_file_path: ";
+pub(in crate::ai) const ARCHIVE_DIRECTORY_PATH_PREFIX: &str = "archive_directory_path: ";
+const LEGACY_ARCHIVE_NOTE_PREFIX: &str = "长期记忆归档";
+const LEGACY_ARCHIVE_FILE_PATH_PREFIX: &str = "归档文件: ";
+const LEGACY_ARCHIVE_DIRECTORY_PATH_PREFIX: &str = "归档目录: ";
 
 /// Whether a piece of text is the body of an "auto-compaction summary" note
 /// (prefix match, tolerant of leading whitespace). This is the **single source of
@@ -70,7 +75,18 @@ pub(in crate::ai) fn is_summary_note_text(text: &str) -> bool {
 
 /// Whether a piece of text is an overflow archive-pointer note.
 pub(in crate::ai) fn is_archive_note_text(text: &str) -> bool {
-    text.trim_start().starts_with(ARCHIVE_NOTE_PREFIX)
+    let text = text.trim_start();
+    text.starts_with(ARCHIVE_NOTE_PREFIX) || text.starts_with(LEGACY_ARCHIVE_NOTE_PREFIX)
+}
+
+pub(in crate::ai) fn archive_file_path_from_line(line: &str) -> Option<&str> {
+    line.strip_prefix(ARCHIVE_FILE_PATH_PREFIX)
+        .or_else(|| line.strip_prefix(LEGACY_ARCHIVE_FILE_PATH_PREFIX))
+}
+
+pub(in crate::ai) fn archive_directory_path_from_line(line: &str) -> Option<&str> {
+    line.strip_prefix(ARCHIVE_DIRECTORY_PATH_PREFIX)
+        .or_else(|| line.strip_prefix(LEGACY_ARCHIVE_DIRECTORY_PATH_PREFIX))
 }
 
 pub(in crate::ai) const PERSISTED_HISTORY_KEEP_RECENT_TURNS: usize = 160;

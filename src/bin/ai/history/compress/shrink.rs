@@ -314,6 +314,11 @@ pub(in crate::ai) fn shrink_messages_to_fit(
     // and failed results are always kept, so agent effectiveness does not degrade.
     shrink_successful_write_arguments(&mut messages, overflow_dir, protected_tool_call_ids);
 
+    // The shrinker is also called directly by the mid-turn path. Enforce the
+    // evidence window here so both pre-existing notes and notes produced below
+    // obey the same archive-before-removal invariant.
+    messages = trim_compressed_tool_evidence_to_inline_budget(messages, overflow_dir);
+
     if messages_total_chars(&messages) <= max_chars {
         return messages;
     }
@@ -339,6 +344,7 @@ pub(in crate::ai) fn shrink_messages_to_fit(
             overflow_dir,
             protected_tool_call_ids,
         ) {
+            messages = trim_compressed_tool_evidence_to_inline_budget(messages, overflow_dir);
             continue;
         }
         if let Some(idx) = first_trim_candidate(&messages, max_chars) {
@@ -725,8 +731,15 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
     // (the protection window and failed results are kept).
     shrink_successful_write_arguments(&mut messages, overflow_dir, protected_tool_call_ids);
 
+    let (trimmed_messages, mut evidence_window_failure) =
+        trim_compressed_tool_evidence_with_status(messages, overflow_dir);
+    messages = trimmed_messages;
+
     if messages_total_chars(&messages) <= max_chars {
-        return finish(messages, ContextCompressionStatus::Complete);
+        return finish(
+            messages,
+            evidence_window_failure.unwrap_or(ContextCompressionStatus::Complete),
+        );
     }
     // On archive failure the full pre-removal order must be restored; inserting
     // dropped messages at the head outright would place them before the retained
@@ -753,6 +766,10 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
             overflow_dir,
             protected_tool_call_ids,
         ) {
+            let (trimmed_messages, failure) =
+                trim_compressed_tool_evidence_with_status(messages, overflow_dir);
+            messages = trimmed_messages;
+            evidence_window_failure = evidence_window_failure.or(failure);
             total = messages_total_chars(&messages);
             continue;
         }
@@ -786,7 +803,10 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
         match archive_internal_notes_deduplicated(&dropped_internal_notes, overflow_dir) {
             Ok(path) => path,
             Err(()) => {
-                return finish(messages_before_first_drop.unwrap_or(messages), archive_failure);
+                return finish(
+                    messages_before_first_drop.unwrap_or(messages),
+                    archive_failure,
+                );
             }
         };
 
@@ -829,12 +849,18 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
                 // (retry compaction next round / request-layer clamp), while data
                 // loss is irreversible — honoring the existing lesson of "never
                 // delete history when a write fails".
-                return finish(messages_before_first_drop.unwrap_or(messages), archive_failure);
+                return finish(
+                    messages_before_first_drop.unwrap_or(messages),
+                    archive_failure,
+                );
             }
         } else {
             // Without a recovery sink, dropping the raw span would make any
             // replacement summary unverifiable. Retain the pre-removal projection.
-            return finish(messages_before_first_drop.unwrap_or(messages), archive_failure);
+            return finish(
+                messages_before_first_drop.unwrap_or(messages),
+                archive_failure,
+            );
         }
     }
 
@@ -856,7 +882,7 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
     } else {
         ContextCompressionStatus::Complete
     };
-    finish(messages, status)
+    finish(messages, evidence_window_failure.unwrap_or(status))
 }
 
 #[allow(dead_code)]

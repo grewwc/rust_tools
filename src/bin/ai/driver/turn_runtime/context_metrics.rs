@@ -71,6 +71,33 @@ fn projection_fingerprint(messages: &[Message]) -> u64 {
     hasher.finish()
 }
 
+fn prompt_token_delta(before: usize, after: usize) -> i64 {
+    if after >= before {
+        i64::try_from(after - before).unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(before - after).unwrap_or(i64::MAX)
+    }
+}
+
+fn compaction_outcome(
+    replaced: bool,
+    accepted: bool,
+    before_tokens: usize,
+    after_tokens: usize,
+) -> &'static str {
+    if !accepted {
+        "rejected"
+    } else if !replaced {
+        "no_change"
+    } else if after_tokens > before_tokens {
+        "replaced_token_increased"
+    } else if after_tokens == before_tokens {
+        "replaced_token_unchanged"
+    } else {
+        "replaced"
+    }
+}
+
 pub(super) struct CompactionAttempt {
     before: CurrentRequestBudget,
     fingerprint: u64,
@@ -105,15 +132,19 @@ impl CompactionAttempt {
             window.clone()
         };
         let elapsed_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        let token_delta = prompt_token_delta(self.before.prompt_tokens, after.prompt_tokens);
         get_decision_log_store().log(DecisionLog {
             timestamp: 0, session_id: session_id.to_string(), turn_id: iteration,
             decision_type: DecisionType::ContextProjection,
             context: serde_json::json!({
-                "schema": "context-compaction-v1", "model": model, "cycle": window.cycle,
+                "schema": "context-compaction-v2", "model": model, "cycle": window.cycle,
                 "window": window,
                 "task_pid": crate::ai::driver::current_task_pid(),
                 "trigger": self.trigger, "before": self.before, "after": after,
-                "outcome": if replaced { "replaced" } else if accepted { "no_change" } else { "rejected" },
+                "outcome": compaction_outcome(
+                    replaced, accepted, self.before.prompt_tokens, after.prompt_tokens,
+                ),
+                "prompt_token_delta": token_delta,
                 "duration_ms": elapsed_ms,
             }).to_string(),
             alternatives_considered: Vec::new(), chosen_option: "compaction_attempt".to_string(),
@@ -248,6 +279,24 @@ mod tests {
     }
 
     #[test]
+    fn compaction_outcome_distinguishes_prompt_token_direction() {
+        assert_eq!(compaction_outcome(true, true, 88_078, 86_315), "replaced");
+        assert_eq!(
+            compaction_outcome(true, true, 86_315, 86_315),
+            "replaced_token_unchanged"
+        );
+        assert_eq!(
+            compaction_outcome(true, true, 86_315, 88_078),
+            "replaced_token_increased"
+        );
+        assert_eq!(compaction_outcome(false, true, 86_315, 88_078), "no_change");
+        assert_eq!(compaction_outcome(true, false, 86_315, 88_078), "rejected");
+        assert_eq!(prompt_token_delta(86_315, 88_078), 1_763);
+        assert_eq!(prompt_token_delta(117_371, 118_469), 1_098);
+        assert_eq!(prompt_token_delta(88_078, 86_315), -1_763);
+    }
+
+    #[test]
     fn context_replay_cycle_only_advances_for_committed_different_projection() {
         let session = format!("compaction-cycle-{}", uuid::Uuid::new_v4());
         let budget: CurrentRequestBudget = serde_json::from_value(json!({
@@ -285,6 +334,8 @@ mod tests {
             .filter(|log| log.session_id == session)
             .map(|log| serde_json::from_str::<serde_json::Value>(&log.context).unwrap())
             .find(|body| body["outcome"] == "replaced").unwrap();
+        assert_eq!(replaced["schema"], "context-compaction-v2");
+        assert_eq!(replaced["prompt_token_delta"], -2_000);
         assert_eq!(replaced["cycle"], 1);
         assert_eq!(replaced["before"]["prompt_tokens"], 9_000);
         assert_eq!(replaced["after"]["prompt_tokens"], 7_000);

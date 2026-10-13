@@ -67,10 +67,8 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":feishu-auth",
         "/share",
         ":share",
-        "/checkpoint",
-        ":checkpoint",
-        "/cp",
-        ":cp",
+        "/git",
+        ":git",
         "/model",
         "/memo",
         ":memo",
@@ -275,10 +273,8 @@ impl CommandCompleter {
             ":feishu-auth",
             "/share",
             ":share",
-            "/checkpoint",
-            ":checkpoint",
-            "/cp",
-            ":cp",
+            "/git",
+            ":git",
             "/model",
             "/memo",
             ":memo",
@@ -661,7 +657,7 @@ impl CommandCompleter {
         ]
     }
 
-    /// Subcommands of `/checkpoint` / `/cp`.
+    /// Subcommands of `/git`.
     fn checkpoint_subcommands() -> &'static [&'static str] {
         &[
             "save", "commit", "tree", "list", "checkout", "branch", "switch", "delete", "clear",
@@ -681,8 +677,13 @@ impl CommandCompleter {
         if include_aliases {
             for alias in ["HEAD", "@", "-", "latest"] {
                 if alias.to_lowercase().starts_with(&token.to_lowercase()) {
+                    let kind = if alias == "-" {
+                        "previous checkout"
+                    } else {
+                        "checkpoint alias"
+                    };
                     candidates.push(CompletionCandidate {
-                        display: format!("{alias} · checkpoint alias"),
+                        display: format!("{alias} · {kind}"),
                         replacement: alias.to_string(),
                     });
                 }
@@ -1053,9 +1054,9 @@ impl CommandCompleter {
                     ),
                     _ => Vec::new(),
                 }
-            } else if matches!(first, "/checkpoint" | ":checkpoint" | "/cp" | ":cp") {
+            } else if matches!(first, "/git" | ":git") {
                 match words.next() {
-                    // `/checkpoint <TAB>`: subcommand literals.
+                    // `/git <TAB>`: subcommand literals.
                     None => Self::plain_candidates(
                         Self::checkpoint_subcommands()
                             .iter()
@@ -1093,6 +1094,12 @@ impl CommandCompleter {
                                         replacement: "-c".to_string(),
                                     });
                                 }
+                                if "-".starts_with(token) {
+                                    candidates.push(CompletionCandidate {
+                                        display: "- · previous checkout".to_string(),
+                                        replacement: "-".to_string(),
+                                    });
+                                }
                                 candidates
                             }
                             ["-c" | "--create"] => Vec::new(),
@@ -1102,17 +1109,23 @@ impl CommandCompleter {
                     }
                     Some("branch") => match words.next() {
                         None => Self::plain_candidates(
-                            ["--delete"]
+                            ["--delete", "-b"]
                                 .into_iter()
                                 .filter(|candidate| candidate.starts_with(token))
                                 .map(str::to_string),
                         ),
+                        Some("-b" | "-c" | "--create") if words.next().is_none() => {
+                            Vec::new()
+                        }
+                        Some("-b" | "-c" | "--create") => {
+                            Self::checkpoint_revision_candidates(token)
+                        }
                         Some("-d" | "--delete" | "delete") if words.next().is_none() => {
                             Self::checkpoint_branch_candidates(token)
                         }
                         _ => Vec::new(),
                     },
-                    // `/checkpoint delete <TAB>`: names only (`delete` rejects
+                    // `/git delete <TAB>`: names only (`delete` rejects
                     // pointer aliases).
                     Some(sub)
                         if matches!(sub, "delete" | "del" | "rm") && words.next().is_none() =>
@@ -1166,7 +1179,7 @@ impl CommandCompleter {
                     "/personas" | ":personas" => Self::persona_subcommands(),
                     "/usage" | ":usage" => Self::usage_subcommands(),
                     "/help" | ":help" => Self::help_topics(),
-                    // `/checkpoint` is handled by its own branch above (third-token
+                    // `/git` is handled by its own branch above (third-token
                     // checkpoint names), so it has no arm here.
                     "/model" | ":model" => Self::model_subcommands(),
                     // `/effort <TAB>` -> reasoning-effort levels (same set as `/model effort <level>`).
@@ -2004,7 +2017,7 @@ mod tests {
             "main".to_string(),
         ]);
         // Third token after checkout completes names plus pointer aliases.
-        let (_, checkout) = CommandCompleter::complete_for_line("/cp checkout ", 13);
+        let (_, checkout) = CommandCompleter::complete_for_line("/git checkout ", 14);
         let replacements: Vec<&str> = checkout
             .iter()
             .map(|candidate| candidate.replacement.as_str())
@@ -2015,39 +2028,40 @@ mod tests {
         assert!(replacements.contains(&"latest"));
         assert!(replacements.contains(&"-b"));
         let (_, branch_start) =
-            CommandCompleter::complete_for_line("/cp checkout -b experiment bef", 30);
+            CommandCompleter::complete_for_line("/git checkout -b experiment bef", 31);
         assert!(
             branch_start
                 .iter()
                 .any(|candidate| candidate.replacement == "before_more_change")
         );
-        let (_, switch) = CommandCompleter::complete_for_line("/cp switch fe", 13);
+        let (_, switch) = CommandCompleter::complete_for_line("/git switch fe", 14);
         assert!(
             switch
                 .iter()
                 .any(|candidate| candidate.replacement == "feature_branch")
         );
-        let (_, switch_root) = CommandCompleter::complete_for_line("/cp switch ", 11);
+        let (_, switch_root) = CommandCompleter::complete_for_line("/git switch ", 12);
         assert!(
             switch_root
                 .iter()
                 .any(|candidate| candidate.replacement == "-c")
         );
-        let (_, branch_delete) = CommandCompleter::complete_for_line("/cp branch --delete fe", 22);
+        let (_, branch_delete) =
+            CommandCompleter::complete_for_line("/git branch --delete fe", 23);
         assert!(
             branch_delete
                 .iter()
                 .any(|candidate| candidate.replacement == "feature_branch")
         );
         // A name prefix narrows to the matching checkpoint.
-        let (_, narrowed) = CommandCompleter::complete_for_line("/cp checkout la", 15);
+        let (_, narrowed) = CommandCompleter::complete_for_line("/git checkout la", 16);
         assert!(
             narrowed
                 .iter()
                 .any(|candidate| candidate.replacement == "latest")
         );
         // `delete` offers names but never pointer aliases.
-        let (_, delete) = CommandCompleter::complete_for_line("/checkpoint delete ", 19);
+        let (_, delete) = CommandCompleter::complete_for_line("/git delete ", 12);
         assert!(
             delete
                 .iter()
@@ -2059,20 +2073,24 @@ mod tests {
                 .all(|candidate| candidate.replacement != "HEAD")
         );
         // Second token still completes subcommands.
-        let (_, sub) = CommandCompleter::complete_for_line("/cp check", 9);
+        let (_, sub) = CommandCompleter::complete_for_line("/git check", 10);
         assert!(
             sub.iter()
                 .any(|candidate| candidate.replacement == "checkout")
         );
-        let (_, removed_fork) = CommandCompleter::complete_for_line("/cp fo", 6);
+        let (_, removed_fork) = CommandCompleter::complete_for_line("/git fo", 7);
         assert!(removed_fork.is_empty());
-        let (_, removed_rollback) = CommandCompleter::complete_for_line("/cp roll", 8);
+        let (_, removed_rollback) = CommandCompleter::complete_for_line("/git roll", 9);
         assert!(removed_rollback.is_empty());
         CommandCompleter::clear_checkpoint_candidates();
-        let (_, cleared_switch) = CommandCompleter::complete_for_line("/cp switch fe", 13);
+        let (_, cleared_switch) = CommandCompleter::complete_for_line("/git switch fe", 14);
         assert!(cleared_switch.is_empty());
-        let (_, cleared_checkout) = CommandCompleter::complete_for_line("/cp checkout bef", 16);
+        let (_, cleared_checkout) = CommandCompleter::complete_for_line("/git checkout bef", 17);
         assert!(cleared_checkout.is_empty());
+        // Removed `/cp` / `/checkpoint` prefixes no longer complete.
+        CommandCompleter::set_checkpoint_name_candidates(vec!["after_edit".to_string()]);
+        let (_, removed) = CommandCompleter::complete_for_line("/cp checkout af", 15);
+        assert!(removed.is_empty());
     }
 
     #[test]

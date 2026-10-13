@@ -3084,7 +3084,7 @@ pub(in crate::ai) fn run_serve_chat(
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first)\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/checkpoint (/cp) [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first)\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
                 );
                 continue;
             }
@@ -3228,7 +3228,7 @@ pub(in crate::ai) fn run_serve_chat(
                     eprintln!("[serve-chat] {err}");
                 }
             }
-            "/checkpoint" | ":checkpoint" | "/cp" | ":cp" => {
+            "/git" | ":git" => {
                 match run_serve_checkpoint_command(
                     &client,
                     &base,
@@ -3251,7 +3251,7 @@ pub(in crate::ai) fn run_serve_chat(
                 if is_local_command_start(&trimmed) {
                     let command = trimmed.split_whitespace().next().unwrap_or(&trimmed);
                     eprintln!(
-                        "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /checkpoint, /history, /model, /effort, /agent, /skills, /sessions, /resume, /fork, /close, /bg, /new (see /help)."
+                        "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /git, /history, /model, /effort, /agent, /skills, /sessions, /resume, /fork, /close, /bg, /new (see /help)."
                     );
                 } else if let Err(err) = post_turn_stream(
                     &client,
@@ -4177,7 +4177,7 @@ mod tests {
             &base,
             "tk",
             "s1",
-            "/cp switch feature",
+            "/git switch feature",
             false,
         )
         .expect("checkpoint request");

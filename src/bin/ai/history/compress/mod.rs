@@ -48,14 +48,35 @@ use tool_overflow::{
     age_out_overflow_stub_previews, build_persisted_summary_text,
     build_persisted_summary_text_with_app,
     enforce_protected_precision_group_budget, is_non_compressible_tool,
-    is_preserved_tool_overflow_content, is_preserved_user_or_image_stub,
-    merge_old_user_overflow_stubs, minimize_overflow_stubs_for_hard_budget,
+    is_preserved_tool_overflow_content, merge_old_user_overflow_stubs,
+    minimize_overflow_stubs_for_hard_budget,
     normalize_preserved_message_stubs_for_model, prepare_tool_messages_structured,
     spill_oversized_preserved_messages, spill_protected_precision_to_fit,
     try_spill_preserved_message_to_stub,
 };
-pub(in crate::ai) use tool_overflow::cap_oversized_tool_results_for_context;
+pub(in crate::ai) use tool_overflow::{
+    cap_oversized_tool_results_for_context, is_preserved_user_or_image_stub,
+};
 pub(in crate::ai) use prune_authorization::PruneAuthorization;
+
+pub(in crate::ai) fn has_valid_folded_tool_provenance(message: &Message) -> bool {
+    folded_prune::provenance(message).is_some()
+}
+
+#[cfg(test)]
+pub(in crate::ai) fn fold_early_tool_groups_for_test(
+    messages: &[Message],
+    keep_recent_groups: usize,
+    overflow_dir: Option<&Path>,
+    protected_tool_call_ids: &rustc_hash::FxHashSet<String>,
+) -> (Vec<Message>, usize) {
+    tool_groups::fold_early_tool_groups(
+        messages,
+        keep_recent_groups,
+        overflow_dir,
+        protected_tool_call_ids,
+    )
+}
 
 mod persisted;
 pub(in crate::ai) use persisted::*;
@@ -88,17 +109,78 @@ pub(in crate::ai) fn is_context_checkpoint_marker(m: &Message) -> bool {
         || content.starts_with(QUERY_MEMORY_INDEX_PREFIX)
 }
 
+fn context_checkpoint_path(message: &Message) -> Option<&str> {
+    const PREFIX: &str = "[context_checkpoint path=";
+    if message.role != ROLE_INTERNAL_NOTE {
+        return None;
+    }
+    let rest = message
+        .content
+        .as_str()?
+        .trim_start()
+        .strip_prefix(PREFIX)?;
+    let mut possible_ends = rest.match_indices(']').filter_map(|(end, _)| {
+        rest[end + 1..]
+            .chars()
+            .next()
+            .is_none_or(char::is_whitespace)
+            .then_some(end)
+    });
+    let end = possible_ends.next()?;
+    // The marker format does not escape paths. If the path or summary contains
+    // another delimiter-like sequence, retaining both markers is safer than
+    // deduplicating distinct durable checkpoints under an ambiguous key.
+    if possible_ends.next().is_some() {
+        return None;
+    }
+    let path = rest[..end].trim();
+    (!path.is_empty()).then_some(path)
+}
+
+/// Keep only the newest marker for each mutable checkpoint path in a request projection.
+/// Callers must pass a transient projection, never canonical history.
+pub(in crate::ai) fn dedupe_context_checkpoint_markers_for_projection(
+    messages: &mut Vec<Message>,
+) -> usize {
+    let before = messages.len();
+    let mut seen = rustc_hash::FxHashSet::default();
+    messages.reverse();
+    messages.retain(|message| {
+        context_checkpoint_path(message).is_none_or(|path| seen.insert(path.to_string()))
+    });
+    messages.reverse();
+    before.saturating_sub(messages.len())
+}
+
 const OVERFLOW_HISTORY_FILENAME: &str = "overflow-history.md";
 
 pub(in crate::ai) const PERSISTED_REASONING_REPLAY_PREFIX: &str =
     "\u{1e}aios:reasoning-content-replay:v1\u{1f}";
 
-/// Inject an archive back-reference after the leading summary; idempotent when an
-/// identical back-reference already exists, so each compaction round does not
-/// append another identical `internal_note` at the top of the context.
+fn archive_note_file_path(note: &str) -> Option<&str> {
+    if !is_archive_note_text(note) {
+        return None;
+    }
+    note.lines()
+        .find_map(|line| archive_file_path_from_line(line.trim()))
+        .filter(|path| !path.is_empty())
+}
+
+fn build_minimal_archive_file_pointer(file_path: &str) -> String {
+    format!("{ARCHIVE_NOTE_PREFIX}\n{ARCHIVE_FILE_PATH_PREFIX}{file_path}\n")
+}
+
+/// Inject an archive back-reference after the leading summary; idempotent by
+/// archive path so compact and full forms cannot accumulate across rounds.
 fn insert_archive_note_if_missing(messages: &mut Vec<Message>, archive_note: String) {
+    let archive_path = archive_note_file_path(&archive_note);
     let already_present = messages.iter().any(|message| {
-        is_archive_note_message(message) && value_to_string(&message.content) == archive_note
+        if !is_archive_note_message(message) {
+            return false;
+        }
+        let existing = value_to_string(&message.content);
+        existing == archive_note
+            || archive_path.is_some_and(|path| archive_note_file_path(&existing) == Some(path))
     });
     if already_present {
         return;

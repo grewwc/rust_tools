@@ -60,15 +60,17 @@ pub(in crate::ai) use outcomes::{
 #[cfg(test)]
 pub(in crate::ai) use revision::history_revision_cache_contains;
 pub(in crate::ai) use revision::{read_history_revision, remove_history_revision_cache_entry};
+#[cfg(test)]
+pub(in crate::ai) use rollback::restore_sqlite_after_rollback_with_transaction;
 pub(in crate::ai) use rollback::{
     backup_sqlite, fork_history_for_subagent, live_rollback_transaction_is_published,
     reset_history_for_subagent, restore_sqlite_after_rollback,
-    restore_sqlite_after_rollback_with_transaction,
+    restore_staged_sqlite_after_rollback,
 };
 pub(in crate::ai) use store::{
     ContextHistory, SessionListMetadata, append_history_sqlite, append_history_sqlite_for_model,
-    coalesce_repeated_wait_wake_notes_sqlite, count_user_turns_sqlite, read_all_messages_sqlite,
-    read_all_messages_sqlite_read_only,
+    coalesce_repeated_wait_wake_notes_sqlite, count_user_turns_sqlite,
+    message_count_sqlite_read_only, read_all_messages_sqlite, read_all_messages_sqlite_read_only,
     read_all_messages_with_models_sqlite, replace_all_messages_sqlite, reserve_turn_index_sqlite,
 };
 pub(in crate::ai) use trim::{

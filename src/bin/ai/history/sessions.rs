@@ -15,6 +15,8 @@ use serde_json::json;
 
 use super::{
     blob::{delete_assets_dir, delete_history_artifacts},
+    checkpoint::CheckpointStore,
+    compress::is_preserved_user_or_image_stub,
     markdown::messages_to_markdown,
     sqlite::{
         SessionListMetadata, backup_sqlite, read_all_messages_sqlite,
@@ -1012,13 +1014,21 @@ impl SessionStore {
         read_first_user_prompt_sqlite(&path)
     }
 
-    /// Whether the session is empty (no user messages at all).
+    /// Whether the session is empty (no user messages or persisted checkpoint state).
     /// Used to clean up empty sessions when the user exits with Ctrl+C in
     /// interactive mode. A missing file or no role='user' rows in the
     /// messages table both count as empty.
     pub(in crate::ai) fn is_empty_session(&self, session_id: &str) -> io::Result<bool> {
         Self::validate_session_id(session_id)?;
         let path = self.session_history_file(session_id);
+        let checkpoints = CheckpointStore::from_session_paths(
+            path.clone(),
+            self.session_assets_dir(session_id),
+            self.checkpoints_dir(session_id),
+        );
+        if checkpoints.has_persisted_state()? {
+            return Ok(false);
+        }
         if !path.exists() {
             return Ok(true);
         }
@@ -1940,10 +1950,7 @@ pub(in crate::ai) fn is_low_quality_session_title(title: &str) -> bool {
 /// The archive protocol is internal context; it must not be shown as a session
 /// title or treated as a valid title.
 pub(super) fn is_preserved_content_message(text: &str) -> bool {
-    let text = text.trim_start();
-    text.starts_with("[[PRESERVED_CONTENT_STUB_V1]]")
-        || text.starts_with("较早的用户图片内容已归档")
-        || text.starts_with("较早的用户文本内容已归档")
+    is_preserved_user_or_image_stub(text.trim_start())
 }
 
 fn strip_request_filler_prefixes(mut text: &str) -> (&str, bool) {
@@ -2113,10 +2120,14 @@ mod tests {
 
     #[test]
     fn preserved_content_stub_is_not_a_session_title() {
-        let stub = r#"[[PRESERVED_CONTENT_STUB_V1]]{"kind":"image","file_path":"/tmp/x"}"#;
-
-        assert!(is_low_quality_session_title(stub));
-        assert!(normalize_generated_session_title(stub).is_empty());
+        for stub in [
+            r#"[[PRESERVED_CONTENT_STUB_V1]]{"kind":"image","file_path":"/tmp/x"}"#,
+            "[preserved-message-pointer-v2]\ncontent_kind: image\narchive_file_path: /tmp/x",
+            "较早的用户图片内容已归档，原文未丢失。\n归档文件: /tmp/x",
+        ] {
+            assert!(is_low_quality_session_title(stub));
+            assert!(normalize_generated_session_title(stub).is_empty());
+        }
     }
 
     #[test]

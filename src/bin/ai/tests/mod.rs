@@ -118,7 +118,10 @@ pub(in crate::ai) fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>)
 
 fn extract_stub_file_path(stub: &str) -> Option<String> {
     stub.lines()
-        .find_map(|line| line.strip_prefix("归档文件: "))
+        .find_map(|line| {
+            line.strip_prefix("archive_file_path: ")
+                .or_else(|| line.strip_prefix("归档文件: "))
+        })
         .map(str::to_string)
 }
 

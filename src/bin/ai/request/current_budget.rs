@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use super::{PromptTokenFeedback, builder};
 use crate::ai::models;
 
+/// Completion and reasoning headroom that compression tries to preserve.
+/// Provider output limits remain wire ceilings; reserving an entire 128K+
+/// ceiling here would force history compression around half of the window.
+const PREFERRED_OUTPUT_RESERVE_TOKENS: u32 = 32_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PromptCountSource {
@@ -15,6 +20,7 @@ pub(crate) enum PromptCountSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ContextLimits {
     pub(crate) physical_context_tokens: usize,
+    /// Preferred headroom for compression decisions, not the wire output cap.
     pub(crate) output_reserve_tokens: usize,
     pub(crate) safety_margin_tokens: usize,
     pub(crate) input_allowance_tokens: usize,
@@ -67,15 +73,9 @@ impl CurrentRequestBudget {
         previous: Option<&PromptTokenFeedback>,
     ) -> Self {
         let compatible = previous.is_some_and(|prior| current.compatible_usage(prior).is_some());
-        // Reserve output independently of the prompt clamp; the clamp's floor
-        // cannot establish that input fits. Unknown model output caps retain a
-        // minimum reserve without adding a max_tokens field to the wire body.
-        let output = models::max_output_tokens(model)
-            .map(|cap| cap.max(builder::MIN_OUTPUT_TOKENS_FLOOR))
-            .map(|cap| output_override.map_or(cap, |value| value.min(cap)))
-            .unwrap_or(builder::MIN_OUTPUT_TOKENS_FLOOR) as usize;
-        let inline_cap_chars =
-            crate::ai::driver::turn_runtime::max_tool_result_inline_chars(model);
+        let output =
+            preferred_output_reserve_tokens(models::max_output_tokens(model), output_override);
+        let inline_cap_chars = crate::ai::driver::turn_runtime::max_tool_result_inline_chars(model);
         Self {
             prompt_tokens: current.context_prompt_tokens(previous),
             source: if compatible {
@@ -112,9 +112,79 @@ impl CurrentRequestBudget {
     }
 }
 
+fn preferred_output_reserve_tokens(model_max: Option<u32>, output_override: Option<u32>) -> usize {
+    // Keep enough headroom for a useful completion while allowing the request
+    // builder to clamp the provider's larger wire ceiling against the actual
+    // remaining window. Unknown caps retain a minimum reserve without adding
+    // max_tokens to the wire body.
+    model_max
+        .map(|cap| cap.max(builder::MIN_OUTPUT_TOKENS_FLOOR))
+        .map(|cap| cap.min(PREFERRED_OUTPUT_RESERVE_TOKENS))
+        .map(|reserve| output_override.map_or(reserve, |value| value.min(reserve)))
+        .unwrap_or(builder::MIN_OUTPUT_TOKENS_FLOOR) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preferred_output_reserve_is_independent_from_large_wire_caps() {
+        let reserve = preferred_output_reserve_tokens(Some(128_000), None);
+        assert_eq!(reserve, 32_000);
+        let limits = ContextLimits::new(256_000, reserve, 2_048);
+        assert_eq!(limits.input_allowance_tokens, 221_952);
+        assert_eq!(limits.soft_target_tokens, 155_366);
+
+        assert_eq!(preferred_output_reserve_tokens(Some(16_000), None), 16_000);
+        assert_eq!(
+            preferred_output_reserve_tokens(Some(128_000), Some(8_000)),
+            8_000
+        );
+        assert_eq!(
+            preferred_output_reserve_tokens(Some(128_000), Some(64_000)),
+            32_000
+        );
+        assert_eq!(preferred_output_reserve_tokens(None, Some(512)), 1_024);
+    }
+
+    #[test]
+    fn measured_budget_uses_preferred_reserve_for_registry_models() {
+        let model = crate::ai::model_names::all()
+            .into_iter()
+            .find(|entry| {
+                models::max_output_tokens(&entry.key)
+                    .is_some_and(|cap| cap > PREFERRED_OUTPUT_RESERVE_TOKENS)
+            })
+            .expect("registry must contain an output cap above the preferred reserve");
+        let feedback = PromptTokenFeedback::capture_preview(
+            "session",
+            &model.key,
+            "",
+            &[],
+            &serde_json::Map::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            1_234,
+            true,
+        );
+
+        let budget = CurrentRequestBudget::measure(&model.key, None, &feedback, None);
+
+        assert_eq!(budget.prompt_tokens, 1_234);
+        assert_eq!(budget.limits.output_reserve_tokens, 32_000);
+        assert_eq!(
+            budget.limits.input_allowance_tokens,
+            models::context_window_tokens(&model.key)
+                .saturating_sub(32_000)
+                .saturating_sub(2_048)
+        );
+    }
 
     #[test]
     fn current_budget_reserve_and_tiny_window_boundaries() {

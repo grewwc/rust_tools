@@ -40,8 +40,9 @@ pub(in crate::ai) use blob::{
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use checkpoint::{
-    CheckpointHead, CheckpointInfo, CheckpointStore, MAX_CHECKPOINTS_PER_SESSION,
-    MAX_CHECKPOINT_STORAGE_BYTES, checkpoint_status_label, is_reserved_checkpoint_name,
+    CheckpointBranch, CheckpointHead, CheckpointInfo, CheckpointStore,
+    MAX_CHECKPOINTS_PER_SESSION, MAX_CHECKPOINT_STORAGE_BYTES, checkpoint_status_label,
+    is_reserved_checkpoint_name,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use compress::value_to_string;
@@ -628,7 +629,12 @@ fn context_projection_fingerprint(
     // v9: folded tool evidence carries complete, content-bound prune provenance.
     // v10: eligible old tool evidence is reclaimed automatically; model prune
     // protocols and marks no longer control the request projection.
-    const PROJECTION_VERSION: u8 = 10;
+    // v11: overflow archive pointers use an English, versioned wire format while
+    // readers remain compatible with legacy Chinese pointers.
+    // v12: hard-budget compaction gained a minimal archive-pointer projection.
+    // v13: user/image archive pointers use English v2 formats while readers
+    // remain compatible with legacy Chinese pointers.
+    const PROJECTION_VERSION: u8 = 13;
     let overflow_dir = overflow_dir
         .map(|path| path.to_string_lossy())
         .unwrap_or_default();

@@ -118,6 +118,9 @@ pub(in crate::ai) fn truncate_mutable_messages_to_fit_with_policy(
                 continue;
             }
             insert_overflow_archive_note_if_exists(messages, overflow_dir);
+            // The archive note is created after the entry de-preview pass. Keep
+            // its path but remove verbose guidance before measuring convergence.
+            minimize_truncated_previews_for_hard_budget(messages);
             // Inserting the archive note the first time may shift message indices;
             // re-evaluate candidates after a successful shrink.
             blocked_fields.clear();
@@ -235,6 +238,17 @@ pub(in crate::ai) fn emergency_cap_messages_to_fit(
 /// strictly smaller than the preview they replace.
 fn minimize_truncated_previews_for_hard_budget(messages: &mut [Message]) {
     for message in messages.iter_mut() {
+        // Archive notes are system-like and therefore exempt from generic field
+        // truncation. Keep only their stable recovery key at the hard backstop.
+        if message.role == crate::ai::history::ROLE_INTERNAL_NOTE
+            && let Value::String(text) = &message.content
+            && let Some(file_path) = archive_note_file_path(text)
+        {
+            let shortened = build_minimal_archive_file_pointer(file_path);
+            if shortened.chars().count() < text.chars().count() {
+                message.content = Value::String(shortened);
+            }
+        }
         // Fold stubs are system-like and never enter the generic truncation loop,
         // but their two guidance lines are static boilerplate (~350 chars per
         // stub), not evidence: the full group content lives behind

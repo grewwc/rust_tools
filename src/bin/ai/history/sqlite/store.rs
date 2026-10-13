@@ -444,6 +444,19 @@ pub(in crate::ai) fn read_all_messages_sqlite_read_only(path: &Path) -> io::Resu
     read_canonical_messages(&conn)
 }
 
+/// Git-style quick hash check: return the canonical message count without
+/// deserializing rows, so callers can skip full content comparison when
+/// counts already differ (the common dirty-switch case).
+pub(in crate::ai) fn message_count_sqlite_read_only(path: &Path) -> io::Result<usize> {
+    use rusqlite::OptionalExtension;
+    let conn = super::connection::open_history_db_read_only(path)?;
+    let count: Option<i64> = conn
+        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .optional()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(count.unwrap_or(0).max(0) as usize)
+}
+
 fn read_canonical_messages(conn: &Connection) -> io::Result<Vec<Message>> {
     read_messages_with_sql(
         conn,

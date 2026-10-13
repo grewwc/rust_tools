@@ -11,8 +11,10 @@ use serde_json::{Value, json};
 mod archive_files;
 
 use crate::ai::history::{
-    Message, ROLE_INTERNAL_NOTE, is_runtime_synthetic_user_message, last_real_user_index,
-    message_billable_chars, value_to_string,
+    Message, ROLE_INTERNAL_NOTE,
+    compress::{archive_directory_path_from_line, archive_file_path_from_line},
+    is_runtime_synthetic_user_message, last_real_user_index, message_billable_chars,
+    value_to_string,
 };
 
 const MIN_RECOVERABLE_MEMORY_CHARS: usize = 8_192;
@@ -76,12 +78,24 @@ pub(super) fn has_dense_recoverable_memory(messages: &[Message]) -> bool {
 /// are copied byte-for-byte and in order; the current real-user tail is never considered. Omitted
 /// entries and stale memory-index notes from earlier projections are replaced by one merged
 /// hierarchical path index (their targets are unioned, so nothing becomes unreachable). Any
-/// validation or net-savings failure returns without changing `messages`.
+/// validation or net-savings failure returns without changing `messages`, apart from removing
+/// superseded markers that point to the same mutable checkpoint path.
 pub(super) fn apply_query_aware_memory_projection(
     messages: &mut Vec<Message>,
     target_chars: usize,
 ) -> MemoryProjectionStats {
-    project_memory_metadata(messages, target_chars, "")
+    let before_chars = total_chars(messages);
+    let removed =
+        crate::ai::history::compress::dedupe_context_checkpoint_markers_for_projection(messages);
+    let mut stats = project_memory_metadata(messages, target_chars, "");
+    if removed > 0 {
+        stats.changed = true;
+        stats.removed_messages += removed;
+        stats.before_chars = before_chars;
+        stats.after_chars = total_chars(messages);
+        stats.saved_chars = stats.before_chars.saturating_sub(stats.after_chars);
+    }
+    stats
 }
 
 /// The runtime passes session authority and live task state explicitly. Archive
@@ -92,8 +106,16 @@ pub(super) fn apply_query_aware_memory_projection_with_context(
     assets_dir: &Path,
     active_context: &str,
 ) -> MemoryProjectionStats {
+    let before_chars = total_chars(messages);
+    let removed =
+        crate::ai::history::compress::dedupe_context_checkpoint_markers_for_projection(messages);
     let mut stats = project_memory_metadata(messages, target_chars, active_context);
     stats.changed |= refresh_archive_recall(messages, target_chars, assets_dir, active_context);
+    if removed > 0 {
+        stats.changed = true;
+        stats.removed_messages += removed;
+        stats.before_chars = before_chars;
+    }
     stats.after_chars = total_chars(messages);
     stats.saved_chars = stats.before_chars.saturating_sub(stats.after_chars);
     stats
@@ -226,7 +248,8 @@ fn recoverable_candidate(message: &Message) -> Option<Candidate> {
     if message.role != ROLE_INTERNAL_NOTE
         || message.tool_calls.is_some()
         || message.tool_call_id.is_some()
-        || message.reasoning_content.is_some()
+        || (message.reasoning_content.is_some()
+            && !crate::ai::history::compress::has_valid_folded_tool_provenance(message))
     {
         return None;
     }
@@ -641,18 +664,19 @@ fn extract_recovery_targets(text: &str) -> BTreeSet<RecoveryTarget> {
     for line in text.lines() {
         let line = line.trim_start();
         let line = line.strip_prefix("- ").unwrap_or(line);
+        if let Some(value) = archive_file_path_from_line(line) {
+            insert_target(&mut targets, value, false);
+        }
         for prefix in [
-            "archive_file_path: ",
             "file_path: ",
             "full original archived at: ",
             "archived at: ",
-            "归档文件: ",
         ] {
             if let Some(value) = line.strip_prefix(prefix) {
                 insert_target(&mut targets, value, false);
             }
         }
-        if let Some(value) = line.strip_prefix("归档目录: ") {
+        if let Some(value) = archive_directory_path_from_line(line) {
             insert_target(&mut targets, value, true);
         }
     }
@@ -1045,6 +1069,50 @@ fn recall_line_window(line: &str, query: &FxHashSet<String>) -> (usize, String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::types::{FunctionCall, ToolCall};
+
+    #[test]
+    fn recoverable_candidate_accepts_only_valid_folded_reasoning_sidecars() {
+        let fixture = RecallFixture::new();
+        let mut messages = vec![message("system", "system"), message("user", "inspect")];
+        for index in 0..3 {
+            let id = format!("call-{index}");
+            let mut assistant = message("assistant", "");
+            assistant.tool_calls = Some(vec![ToolCall {
+                id: id.clone(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]);
+            let mut result = message("tool", &"evidence ".repeat(300));
+            result.tool_call_id = Some(id);
+            messages.extend([assistant, result]);
+        }
+
+        let (folded, folded_groups) = crate::ai::history::compress::fold_early_tool_groups_for_test(
+            &messages,
+            0,
+            Some(&fixture.0),
+            &FxHashSet::default(),
+        );
+        assert_eq!(folded_groups, 3);
+        let valid = folded
+            .iter()
+            .find(|message| message.reasoning_content.is_some())
+            .expect("folded note with provenance");
+        assert!(recoverable_candidate(valid).is_some());
+
+        let mut tampered = valid.clone();
+        tampered.content =
+            Value::String(format!("{}\ntampered", value_to_string(&tampered.content)));
+        assert!(recoverable_candidate(&tampered).is_none());
+
+        let mut ordinary_reasoning = valid.clone();
+        ordinary_reasoning.reasoning_content = Some("model reasoning".to_string());
+        assert!(recoverable_candidate(&ordinary_reasoning).is_none());
+    }
 
     struct RecallFixture(std::path::PathBuf);
 
@@ -1335,6 +1403,48 @@ mod tests {
     }
 
     #[test]
+    fn query_projection_dedupes_mutable_checkpoint_paths_before_selection() {
+        let canonical = vec![
+            message("system", "rules"),
+            message(
+                ROLE_INTERNAL_NOTE,
+                "[context_checkpoint path=/tmp/working-checkpoint.md] stale plan",
+            ),
+            message(
+                ROLE_INTERNAL_NOTE,
+                "[context_checkpoint path=/tmp/other-checkpoint.md] independent memory",
+            ),
+            message(
+                ROLE_INTERNAL_NOTE,
+                "[context_checkpoint path=/tmp/working-checkpoint.md] current plan",
+            ),
+            message("user", "continue"),
+        ];
+        let mut projected = canonical.clone();
+
+        let stats = apply_query_aware_memory_projection(&mut projected, 120_000);
+
+        assert!(stats.changed);
+        assert_eq!(stats.removed_messages, 1);
+        assert_eq!(canonical.len(), 5, "canonical source must remain untouched");
+        assert!(
+            projected
+                .iter()
+                .any(|message| { value_to_string(&message.content).contains("current plan") })
+        );
+        assert!(
+            projected.iter().any(|message| {
+                value_to_string(&message.content).contains("independent memory")
+            })
+        );
+        assert!(
+            !projected
+                .iter()
+                .any(|message| { value_to_string(&message.content).contains("stale plan") })
+        );
+    }
+
+    #[test]
     fn query_projection_keeps_relevant_and_recent_entries_and_indexes_every_omission() {
         let system = message("system", "system stays exact");
         let current_user = message("user", "continue the payments_router migration");
@@ -1457,11 +1567,13 @@ mod tests {
         let file_path = r#"/tmp/archive/evidence,`"'.txt"#;
         let trailing_space_path = "/tmp/archive/evidence ";
         let directory_path = "/tmp/archive-root,";
+        let legacy_directory_path = "/tmp/legacy-archive-root,";
         let text = format!(
             "[context_checkpoint path={checkpoint_path}] summary\n\
              - archive_file_path: {file_path}\n\
              - file_path: {trailing_space_path}\n\
-             归档目录: {directory_path}"
+             archive_directory_path: {directory_path}\n\
+             归档目录: {legacy_directory_path}"
         );
 
         let targets = extract_recovery_targets(&text);
@@ -1470,6 +1582,9 @@ mod tests {
         assert!(targets.contains(&RecoveryTarget::File(file_path.to_string())));
         assert!(targets.contains(&RecoveryTarget::File(trailing_space_path.to_string())));
         assert!(targets.contains(&RecoveryTarget::Directory(directory_path.to_string())));
+        assert!(targets.contains(&RecoveryTarget::Directory(
+            legacy_directory_path.to_string()
+        )));
         let index = build_recovery_index(&targets).expect("index");
         assert_eq!(recovery_targets_from_index(&index), targets);
     }

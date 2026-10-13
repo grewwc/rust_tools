@@ -33,12 +33,15 @@ use rust_tools::commonw::FastMap;
 
 use crate::ai::history::SessionStore;
 
+#[cfg(test)]
+use super::sqlite::restore_sqlite_after_rollback_with_transaction;
 use super::{
     sessions::copy_dir_recursively,
     sqlite::{
         backup_sqlite, clear_session_history_sqlite, live_rollback_transaction_is_published,
-        read_all_messages_sqlite_read_only, restore_sqlite_after_rollback,
-        restore_sqlite_after_rollback_with_transaction,
+        message_count_sqlite_read_only, read_all_messages_sqlite_read_only,
+        restore_sqlite_after_rollback,
+        restore_staged_sqlite_after_rollback,
     },
     types::Message,
 };
@@ -52,7 +55,8 @@ const GENERATION_STAGE_MARKER: &str = ".stage-";
 const GENERATION_PREVIOUS_MARKER: &str = ".previous-";
 /// Git-style pointer to the most recently preserved checkpoint. It is a plain
 /// file (not a checkpoint directory), so it never shows up in listings; it
-/// only records a name for `rollback HEAD` (`@`, `-`) to resolve.
+/// only records a name for the `HEAD` (`@`) alias to resolve. `-` is the
+/// previous checkout instead (see `PREV_HEAD_REF_FILE`).
 const HEAD_REF_FILE: &str = "HEAD.ref";
 const HEAD_BRANCH_PREFIX: &str = "ref: branches/";
 const BRANCHES_DIR: &str = "branches";
@@ -62,6 +66,10 @@ const DEFAULT_BRANCH_NAME: &str = "main";
 /// parent, so `tree` shows real lineage. Like `HEAD.ref` it is a plain file,
 /// never a listing entry.
 const BASE_REF_FILE: &str = "BASE.ref";
+/// Previous-HEAD pointer for Git-style `switch -` / `checkout -`: the raw
+/// `HEAD.ref` content before the last successful branch/checkout navigation.
+/// A plain file, never a listing entry; absent until the first navigation.
+const PREV_HEAD_REF_FILE: &str = "PREV_HEAD.ref";
 const LIVE_ROLLBACK_PREFIX: &str = ".live-rollback-";
 const LIVE_ROLLBACK_MANIFEST: &str = "rollback.manifest";
 
@@ -235,6 +243,7 @@ impl CheckpointStore {
             let head_path = self.dir.join(HEAD_REF_FILE);
             if !head_path.exists() && self.list_unlocked()?.is_empty() {
                 self.reset_to_unborn_default_branch_unlocked()?;
+                self.clear_base_unlocked()?;
             }
             return Ok(());
         }
@@ -290,6 +299,37 @@ impl CheckpointStore {
             let branch_growth = store.active_branch_growth_unlocked(&normalized_name)?;
             let staged = store.stage_generation(&normalized_name, parent.as_deref())?;
             let staged_size = directory_storage_size(&staged)?;
+            // Cache the size and message count in the staged manifest so later
+            // `list` skips the recursive walk and the dirty check can skip
+            // opening the snapshot SQLite on a count mismatch. Rewriting the
+            // staged manifest (not yet published) never disturbs `SAVED`.
+            let staged_messages =
+                message_count_sqlite_read_only(&staged.join(GENERATION_SQLITE_FILE)).ok();
+            if staged_messages.is_some() {
+                let _ = fs::write(
+                    staged.join(GENERATION_MANIFEST_FILE),
+                    generation_manifest_body(
+                        parent.as_deref(),
+                        read_generation_manifest(&staged)
+                            .and_then(|manifest| manifest.saved_at)
+                            .unwrap_or_else(unix_now_secs),
+                        Some(staged_size),
+                        staged_messages,
+                    ),
+                );
+            } else {
+                let _ = fs::write(
+                    staged.join(GENERATION_MANIFEST_FILE),
+                    generation_manifest_body(
+                        parent.as_deref(),
+                        read_generation_manifest(&staged)
+                            .and_then(|manifest| manifest.saved_at)
+                            .unwrap_or_else(unix_now_secs),
+                        Some(staged_size),
+                        None,
+                    ),
+                );
+            }
             let mut result = validate_checkpoint_budget(
                 checkpoints.len(),
                 false,
@@ -337,6 +377,7 @@ impl CheckpointStore {
         let normalized_name = sanitize_name(name);
         self.with_locked(|store| {
             let refs = store.capture_ref_snapshot_unlocked()?;
+            let old_head_raw = store.head_raw_unlocked()?;
             if let Err(error) = store.set_detached_current_unlocked(&normalized_name) {
                 return match store.restore_ref_snapshot_unlocked(&refs) {
                     Ok(()) => Err(error),
@@ -353,14 +394,15 @@ impl CheckpointStore {
                     ))),
                 };
             }
+            store.record_previous_head_unlocked(old_head_raw.as_deref(), &normalized_name)?;
             Ok(())
         })
     }
 
     /// Create a movable branch pointer at `start`. When omitted, use the
     /// current HEAD state; only a detached/unset HEAD falls back to the live
-    /// base. An attached unborn branch creates another unborn branch. If no
-    /// target exists, attach HEAD so the next save becomes its first checkpoint.
+    /// base. An attached unborn branch creates another unborn branch. Creating
+    /// a branch never moves HEAD; checkout/switch owns that transition.
     pub(in crate::ai) fn create_branch(&self, name: &str, start: Option<&str>) -> io::Result<()> {
         let branch = sanitize_name(name);
         self.with_locked(|store| {
@@ -368,14 +410,7 @@ impl CheckpointStore {
             store.write_ref_unlocked(
                 &store.branch_path(&branch),
                 target.as_deref().unwrap_or_default(),
-            )?;
-            if target.is_none()
-                && let Err(error) = store.set_attached_head_unlocked(&branch)
-            {
-                let _ = fs::remove_file(store.branch_path(&branch));
-                return Err(error);
-            }
-            Ok(())
+            )
         })
     }
 
@@ -391,6 +426,36 @@ impl CheckpointStore {
 
     pub(in crate::ai) fn list_branches(&self) -> io::Result<Vec<CheckpointBranch>> {
         self.with_locked(|store| store.list_branches_unlocked())
+    }
+
+    /// Whether this session has checkpoint state that must survive empty-live
+    /// session cleanup. The default unborn `main` scaffold alone is disposable.
+    pub(in crate::ai) fn has_persisted_state(&self) -> io::Result<bool> {
+        self.with_locked(|store| {
+            if !store.list_unlocked()?.is_empty() {
+                return Ok(true);
+            }
+            if store
+                .list_branches_unlocked()?
+                .iter()
+                .any(|branch| branch.name != DEFAULT_BRANCH_NAME || branch.target.is_some())
+            {
+                return Ok(true);
+            }
+
+            let default_head = format!("{HEAD_BRANCH_PREFIX}{DEFAULT_BRANCH_NAME}");
+            let head = Self::read_optional_ref_unlocked(&store.dir.join(HEAD_REF_FILE))?;
+            if head.as_deref().is_some_and(|head| head != default_head) {
+                return Ok(true);
+            }
+            Ok(
+                Self::read_optional_ref_unlocked(&store.dir.join(BASE_REF_FILE))?.is_some()
+                    || Self::read_optional_ref_unlocked(
+                        &store.dir.join(PREV_HEAD_REF_FILE),
+                    )?
+                    .is_some(),
+            )
+        })
     }
 
     /// Return a compact status label only when every displayed checkpoint ref
@@ -455,7 +520,11 @@ impl CheckpointStore {
                     format!("branch '{branch}' not found"),
                 )
             })?;
-            store.set_attached_head_unlocked(&branch)
+            let old_head_raw = store.head_raw_unlocked()?;
+            store.set_attached_head_unlocked(&branch)?;
+            let new_raw = format!("{HEAD_BRANCH_PREFIX}{branch}");
+            store.record_previous_head_unlocked(old_head_raw.as_deref(), &new_raw)?;
+            Ok(())
         })
     }
 
@@ -474,14 +543,20 @@ impl CheckpointStore {
                         target: None,
                     } if current == branch
                 ) {
-                    return Ok(());
+                    return store.clear_base_unlocked();
                 }
+                let old_head_raw = store.head_raw_unlocked()?;
                 let transaction = store.stage_empty_live_rollback()?;
                 store.complete_live_rollback(&transaction)?;
-                return store.set_attached_head_unlocked(&branch);
+                store.set_attached_head_unlocked(&branch)?;
+                store.clear_base_unlocked()?;
+                let new_raw = format!("{HEAD_BRANCH_PREFIX}{branch}");
+                store.record_previous_head_unlocked(old_head_raw.as_deref(), &new_raw)?;
+                return Ok(());
             };
             let previous = store.base_target_unlocked()?;
             let refs = store.capture_ref_snapshot_unlocked()?;
+            let old_head_raw = store.head_raw_unlocked()?;
             store.restore_checkpoint_unlocked(&target)?;
             if let Err(error) = store
                 .set_attached_head_unlocked(&branch)
@@ -505,6 +580,8 @@ impl CheckpointStore {
                 }
                 return Err(error);
             }
+            let new_raw = format!("{HEAD_BRANCH_PREFIX}{branch}");
+            store.record_previous_head_unlocked(old_head_raw.as_deref(), &new_raw)?;
             Ok(())
         })
     }
@@ -538,6 +615,7 @@ impl CheckpointStore {
                 // when the deleted checkpoint was the HEAD target, drop the
                 // pointer as well so it never dangles.
                 store.clear_head_if_points_to_unlocked(&normalized_name)?;
+                store.clear_previous_if_points_to_unlocked(&normalized_name)?;
                 // The live base is intentionally left alone: the live history
                 // still derives from the deleted checkpoint, so the next save
                 // shows up as an orphan instead of a false root.
@@ -584,6 +662,12 @@ impl CheckpointStore {
 
     pub(in crate::ai) fn head_state(&self) -> io::Result<CheckpointHead> {
         self.with_locked(|store| store.head_state_unlocked())
+    }
+
+    /// Read the previous HEAD state for Git-style `switch -` / `checkout -`.
+    /// Returns `None` until the first successful branch/checkout navigation.
+    pub(in crate::ai) fn previous_head_state(&self) -> io::Result<Option<CheckpointHead>> {
+        self.with_locked(|store| store.previous_head_state_unlocked())
     }
 
     /// Point HEAD at `name` (sanitized). Used to heal legacy or dangling
@@ -685,6 +769,14 @@ impl CheckpointStore {
         self.write_ref_unlocked(&self.dir.join(BASE_REF_FILE), normalized_name)
     }
 
+    fn clear_base_unlocked(&self) -> io::Result<()> {
+        match fs::remove_file(self.dir.join(BASE_REF_FILE)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
     fn set_detached_current_unlocked(&self, normalized_name: &str) -> io::Result<()> {
         self.write_ref_unlocked(&self.dir.join(HEAD_REF_FILE), normalized_name)?;
         self.set_base_unlocked(normalized_name)
@@ -718,6 +810,67 @@ impl CheckpointStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    /// Raw `HEAD.ref` content (`ref: branches/<name>` when attached).
+    fn head_raw_unlocked(&self) -> io::Result<Option<String>> {
+        match Self::read_optional_ref_unlocked(&self.dir.join(HEAD_REF_FILE))? {
+            Some(raw) if !raw.is_empty() => Ok(Some(raw)),
+            _ => Ok(None),
+        }
+    }
+
+    fn previous_head_state_unlocked(&self) -> io::Result<Option<CheckpointHead>> {
+        let raw = match Self::read_optional_ref_unlocked(&self.dir.join(PREV_HEAD_REF_FILE))? {
+            Some(raw) if !raw.is_empty() => raw,
+            _ => return Ok(None),
+        };
+        if let Some(branch) = raw.strip_prefix(HEAD_BRANCH_PREFIX) {
+            // A deleted branch still reports its name so the caller can say
+            // where `-` used to point instead of pretending nothing happened.
+            let target = match self.branch_target_unlocked(branch)? {
+                Some(target) => target,
+                None => None,
+            };
+            return Ok(Some(CheckpointHead::Attached {
+                branch: branch.to_string(),
+                target,
+            }));
+        }
+        Ok(Some(CheckpointHead::Detached(Some(raw))))
+    }
+
+    /// Remember `old_raw` as the previous HEAD, but only when it differs from
+    /// the new raw HEAD value: no-op navigations must not clobber `-`.
+    /// A missing old value means there is nothing to go back to, so the
+    /// previous pointer is left untouched.
+    fn record_previous_head_unlocked(
+        &self,
+        old_raw: Option<&str>,
+        new_raw: &str,
+    ) -> io::Result<()> {
+        match old_raw {
+            Some(old) if !old.is_empty() && old != new_raw => {
+                self.write_ref_unlocked(&self.dir.join(PREV_HEAD_REF_FILE), old)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Drop the previous pointer when it resolves to the deleted checkpoint.
+    /// A previous attached branch is left alone: the caller reports the
+    /// dangling branch by name instead.
+    fn clear_previous_if_points_to_unlocked(&self, normalized_name: &str) -> io::Result<()> {
+        let previous_points_here =
+            matches!(self.previous_head_state_unlocked()?, Some(CheckpointHead::Detached(Some(target))) if target == normalized_name);
+        if previous_points_here {
+            match fs::remove_file(self.dir.join(PREV_HEAD_REF_FILE)) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
     }
 
     fn capture_ref_snapshot_unlocked(&self) -> io::Result<RefSnapshot> {
@@ -937,8 +1090,8 @@ impl CheckpointStore {
                 }
                 restore_sqlite_after_rollback(&sqlite, &self.session_file)
             }
-            CheckpointSource::Generation { sqlite, assets } => {
-                let transaction = self.stage_live_rollback(&sqlite, &assets)?;
+            CheckpointSource::Generation { sqlite, .. } => {
+                let transaction = self.stage_live_rollback(&sqlite, Some(normalized_name))?;
                 self.complete_live_rollback(&transaction)
             }
         }
@@ -1005,6 +1158,17 @@ impl CheckpointStore {
 
     fn live_matches_checkpoint_unlocked(&self, live: &[Message], name: &str) -> io::Result<bool> {
         let normalized = sanitize_name(name);
+        // Manifest count first: avoids opening the snapshot SQLite entirely
+        // when a new turn already proves dirty. Falls back below for
+        // pre-caching manifests and legacy layouts.
+        if generation_is_ready(&self.generation_dir(&normalized))
+            && let Some(cached) =
+                read_generation_manifest(&self.generation_dir(&normalized))
+                    .and_then(|manifest| manifest.message_count)
+            && cached != live.len()
+        {
+            return Ok(false);
+        }
         let Some(source) = self.checkpoint_source_unlocked(&normalized)? else {
             return Ok(false);
         };
@@ -1013,6 +1177,14 @@ impl CheckpointStore {
                 sqlite
             }
         };
+        // Fast path like `git diff --quiet`: a count mismatch already proves
+        // dirty without deserializing every row. Fail open to the full compare
+        // when the count query itself fails (missing table, corrupt DB).
+        if let Ok(count) = message_count_sqlite_read_only(sqlite)
+            && count != live.len()
+        {
+            return Ok(false);
+        }
         Ok(read_all_messages_sqlite_read_only(sqlite)?.as_slice() == live)
     }
 
@@ -1050,13 +1222,19 @@ impl CheckpointStore {
                     .ok()
                     .map(DateTime::<Local>::from);
                 let mtime = metadata.modified().ok().map(DateTime::<Local>::from);
+                // Prefer the size cached at save time; only pre-caching
+                // generations pay the recursive walk.
+                let size_bytes = match known.as_ref().and_then(|manifest| manifest.size_bytes) {
+                    Some(cached) => cached,
+                    None => directory_storage_size(&path)?,
+                };
                 out.push((
                     CheckpointInfo {
                         name: name.to_string(),
                         modified_local: manifest_saved_time(known.as_ref())
                             .or(manifest_mtime)
                             .or(mtime),
-                        size_bytes: directory_storage_size(&path)?,
+                        size_bytes,
                         parent: None,
                     },
                     known.map(|manifest| manifest.parent),
@@ -1124,6 +1302,14 @@ impl CheckpointStore {
         Ok(None)
     }
 
+    /// Lightweight existence check for checkout validation. Unlike `list()`,
+    /// this skips the recursive size walk, so switching stays O(1) instead of
+    /// O(total checkpoint bytes) like a full `git status` would.
+    pub(in crate::ai) fn checkpoint_exists(&self, name: &str) -> io::Result<bool> {
+        let normalized = sanitize_name(name);
+        self.with_locked(|store| Ok(store.checkpoint_source_unlocked(&normalized)?.is_some()))
+    }
+
     fn checkpoint_storage_size_for_name(&self, name: &str) -> io::Result<u64> {
         let generation = self.generation_dir(name);
         let mut size = if generation_is_ready(&generation) {
@@ -1150,7 +1336,7 @@ impl CheckpointStore {
             copy_directory_snapshot(&self.session_assets, &staged.join(GENERATION_ASSETS_DIR))?;
             fs::write(
                 staged.join(GENERATION_MANIFEST_FILE),
-                generation_manifest_body(parent, unix_now_secs()),
+                generation_manifest_body(parent, unix_now_secs(), None, None),
             )?;
             Ok(())
         })();
@@ -1225,7 +1411,10 @@ impl CheckpointStore {
                 backup_sqlite(&self.session_file, &sqlite)?;
             }
             clear_session_history_sqlite(&sqlite)?;
-            fs::write(transaction.join(LIVE_ROLLBACK_MANIFEST), b"commit\n")?;
+            fs::write(
+                transaction.join(LIVE_ROLLBACK_MANIFEST),
+                b"commit\nsource: -\n",
+            )?;
             Ok(())
         })();
         if result.is_err() {
@@ -1234,7 +1423,15 @@ impl CheckpointStore {
         result.map(|()| transaction)
     }
 
-    fn stage_live_rollback(&self, sqlite: &Path, assets: &Path) -> io::Result<PathBuf> {
+    fn stage_live_rollback(
+        &self,
+        sqlite: &Path,
+        source_name: Option<&str>,
+    ) -> io::Result<PathBuf> {
+        // Only the SQLite snapshot is staged: generation assets are immutable,
+        // so `complete` restores them directly from the source generation
+        // (recorded in the manifest) instead of paying a second full-tree copy
+        // checkpoint -> txn. This halves the assets I/O on every checkout.
         fs::create_dir_all(&self.dir)?;
         let transaction = self
             .dir
@@ -1243,8 +1440,11 @@ impl CheckpointStore {
             let new_state = transaction.join("new");
             fs::create_dir_all(&new_state)?;
             backup_sqlite(sqlite, &new_state.join(GENERATION_SQLITE_FILE))?;
-            copy_directory_snapshot(assets, &new_state.join(GENERATION_ASSETS_DIR))?;
-            fs::write(transaction.join(LIVE_ROLLBACK_MANIFEST), b"commit\n")?;
+            let source_line = match source_name {
+                Some(name) => format!("commit\nsource: {name}\n"),
+                None => "commit\nsource: -\n".to_string(),
+            };
+            fs::write(transaction.join(LIVE_ROLLBACK_MANIFEST), source_line)?;
             Ok(())
         })();
         if result.is_err() {
@@ -1256,7 +1456,7 @@ impl CheckpointStore {
     fn complete_live_rollback(&self, transaction: &Path) -> io::Result<()> {
         let new_state = transaction.join("new");
         let sqlite = new_state.join(GENERATION_SQLITE_FILE);
-        let assets = new_state.join(GENERATION_ASSETS_DIR);
+        let staged_assets = new_state.join(GENERATION_ASSETS_DIR);
         let transaction_id = live_rollback_transaction_id(transaction)?;
         if !live_rollback_is_ready(transaction) {
             return Err(io::Error::other(format!(
@@ -1274,11 +1474,33 @@ impl CheckpointStore {
         if let Some(parent) = self.session_file.parent() {
             fs::create_dir_all(parent)?;
         }
-        restore_checkpoint_assets(&assets, &self.session_assets)?;
-        restore_sqlite_after_rollback_with_transaction(
+        // Assets come straight from the source generation (immutable), not via
+        // the transaction copy. Old transactions without a `source:` line keep
+        // restoring from their staged copy; `source: -` means an empty target
+        // and skips the restore (same no-op as restoring an empty dir).
+        match live_rollback_source_name(transaction)? {
+            Some(name) => {
+                let source_assets = self.generation_dir(&name).join(GENERATION_ASSETS_DIR);
+                if generation_is_ready(&self.generation_dir(&name)) {
+                    restore_checkpoint_assets(&source_assets, &self.session_assets)?;
+                } else if staged_assets.is_dir() {
+                    restore_checkpoint_assets(&staged_assets, &self.session_assets)?;
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("checkpoint '{name}' not found"),
+                    ));
+                }
+            }
+            None if staged_assets.is_dir() => {
+                restore_checkpoint_assets(&staged_assets, &self.session_assets)?;
+            }
+            None => {}
+        }
+        restore_staged_sqlite_after_rollback(
             &sqlite,
             &self.session_file,
-            Some(&transaction_id),
+            &transaction_id,
         )?;
         cleanup_live_rollback_transaction(transaction);
         Ok(())
@@ -1673,9 +1895,29 @@ fn cleanup_live_rollback_transaction(transaction: &Path) {
 }
 
 fn live_rollback_is_ready(path: &Path) -> bool {
+    // New transactions stage only SQLite (assets restore straight from the
+    // source generation); old ones also staged an assets copy. Ready means the
+    // manifest plus the staged SQLite exist.
     path.join(LIVE_ROLLBACK_MANIFEST).is_file()
         && path.join("new").join(GENERATION_SQLITE_FILE).is_file()
-        && path.join("new").join(GENERATION_ASSETS_DIR).is_dir()
+}
+
+/// Source generation recorded in a live-rollback manifest (`source: <name>`).
+/// Returns `Ok(None)` for the empty target (`source: -`) and for manifests
+/// written before sources were tracked (those transactions carry their own
+/// assets copy); `Err` only when the manifest itself is unreadable.
+fn live_rollback_source_name(transaction: &Path) -> io::Result<Option<String>> {
+    let content = fs::read_to_string(transaction.join(LIVE_ROLLBACK_MANIFEST))?;
+    for line in content.lines().skip(1) {
+        if let Some(name) = line.strip_prefix("source: ") {
+            return Ok(if name == "-" || name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            });
+        }
+    }
+    Ok(None)
 }
 
 fn live_rollback_transaction_id(transaction: &Path) -> io::Result<String> {
@@ -1721,6 +1963,9 @@ fn copy_directory_snapshot(source: &Path, destination: &Path) -> io::Result<()> 
     }
     fs::create_dir_all(destination)?;
     if source.is_dir() {
+        // Byte copy, not hard links: live writers rewrite stable asset paths
+        // in place (e.g. working-checkpoint.md), so sharing an inode with the
+        // staged generation would corrupt the snapshot on the next write.
         copy_dir_recursively(source, destination)?;
     }
     Ok(())
@@ -1734,9 +1979,38 @@ fn copy_directory_snapshot(source: &Path, destination: &Path) -> io::Result<()> 
 fn restore_checkpoint_assets(source: &Path, destination: &Path) -> io::Result<()> {
     fs::create_dir_all(destination)?;
     if source.is_dir() {
-        copy_dir_recursively(source, destination)?;
+        copy_dir_skip_identical(source, destination)?;
     }
     Ok(())
+}
+
+/// Git-style checkout: only copy working files that actually differ, like git
+/// updating only changed paths between trees. Assets are UUID-named and
+/// immutable after writing, so an existing destination file with the same
+/// length already holds identical content and can be left untouched.
+fn copy_dir_skip_identical(source: &Path, destination: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            fs::create_dir_all(&to)?;
+            copy_dir_skip_identical(&from, &to)?;
+        } else if !same_file_content(&from, &to) {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+fn same_file_content(source: &Path, destination: &Path) -> bool {
+    let (Ok(src_meta), Ok(dst_meta)) = (fs::metadata(source), fs::metadata(destination)) else {
+        return false;
+    };
+    if !src_meta.is_file() || !dst_meta.is_file() {
+        return false;
+    }
+    src_meta.len() == dst_meta.len()
 }
 
 /// Normalize a checkpoint name into a safe file name (alphanumeric, `-`, `_`;
@@ -1762,9 +2036,16 @@ fn sanitize_name(name: &str) -> String {
 /// A parsed `checkpoint-v2` manifest: the recorded parent link plus the save
 /// timestamp. `saved_at` is `None` for manifests written before timestamps
 /// were tracked; callers fall back to the manifest file mtime, then the directory mtime.
+/// `size_bytes` and `message_count` are optional fast paths cached at save time
+/// (like git storing tree sizes in a commit): when present, `list` skips the
+/// recursive size walk and the dirty check skips opening the snapshot SQLite
+/// for a count mismatch. `None` means a pre-caching manifest and falls back
+/// to the existing walk/query behavior.
 struct GenerationManifest {
     parent: Option<String>,
     saved_at: Option<u64>,
+    size_bytes: Option<u64>,
+    message_count: Option<usize>,
 }
 
 /// Parse a generation manifest into its parent link and save timestamp.
@@ -1783,12 +2064,34 @@ fn read_generation_manifest(generation: &Path) -> Option<GenerationManifest> {
         Some(parent.to_string())
     };
     // Third line is optional: manifests written before timestamps existed
-    // have no `saved_at` line and fall back to mtime.
+    // have no `saved_at` line and fall back to mtime. Fourth (`size:`) and
+    // fifth (`messages:`) lines are optional size/count caches written at save
+    // time; missing lines fall back to walking the directory / querying SQLite.
     let saved_at = match lines.next() {
         None => None,
         Some(line) => Some(line.strip_prefix("saved_at: ")?.parse::<u64>().ok()?),
     };
-    Some(GenerationManifest { parent, saved_at })
+    let mut size_bytes = None;
+    let mut message_count = None;
+    for line in lines {
+        if let Some(value) = line.strip_prefix("size: ")
+            && size_bytes.is_none()
+        {
+            size_bytes = value.parse::<u64>().ok();
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("messages: ")
+            && message_count.is_none()
+        {
+            message_count = value.parse::<usize>().ok();
+        }
+    }
+    Some(GenerationManifest {
+        parent,
+        saved_at,
+        size_bytes,
+        message_count,
+    })
 }
 
 /// Parse a generation manifest into its parent link. Returns `None` when the
@@ -1819,13 +2122,27 @@ fn manifest_saved_time(manifest: Option<&GenerationManifest>) -> Option<DateTime
 
 /// Render a v2 manifest body for `parent` (`None` = root) stamped with
 /// `saved_at` (unix seconds): `SAVED` and newest-first order read this, not
-/// the directory mtime.
-fn generation_manifest_body(parent: Option<&str>, saved_at: u64) -> String {
+/// the directory mtime. `size_bytes` / `message_count` are optional caches;
+/// `None` omits the line so old readers (which only require the first three
+/// lines) keep parsing.
+fn generation_manifest_body(
+    parent: Option<&str>,
+    saved_at: u64,
+    size_bytes: Option<u64>,
+    message_count: Option<usize>,
+) -> String {
     let parent_line = match parent {
         Some(name) => format!("parent: {name}\n"),
         None => "parent: -\n".to_string(),
     };
-    format!("checkpoint-v2\n{parent_line}saved_at: {saved_at}\n")
+    let mut body = format!("checkpoint-v2\n{parent_line}saved_at: {saved_at}\n");
+    if let Some(size) = size_bytes {
+        body.push_str(&format!("size: {size}\n"));
+    }
+    if let Some(count) = message_count {
+        body.push_str(&format!("messages: {count}\n"));
+    }
+    body
 }
 
 /// Whether `name` is reserved for pointer aliases: the HEAD pointer (`HEAD`
@@ -2309,6 +2626,71 @@ mod tests {
     }
 
     #[test]
+    fn previous_checkout_toggles_between_branches_and_detached() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-previous-checkout");
+        append_history_messages(&store.session_file, &[lineage_msg("v1")]).unwrap();
+
+        // No navigation yet: nothing to go back to.
+        assert_eq!(store.previous_head_state().unwrap(), None);
+
+        store.save("c1").unwrap();
+        // Saving moves HEAD with the branch; it is not a navigation.
+        assert_eq!(store.previous_head_state().unwrap(), None);
+
+        store.create_branch("b2", None).unwrap();
+        store.switch_branch("b2").unwrap();
+        assert_eq!(
+            store.previous_head_state().unwrap(),
+            Some(CheckpointHead::Attached {
+                branch: "main".to_string(),
+                target: Some("c1".to_string()),
+            })
+        );
+
+        // A no-op re-attach must not clobber `-`.
+        store.attach_branch("b2").unwrap();
+        assert_eq!(
+            store.previous_head_state().unwrap(),
+            Some(CheckpointHead::Attached {
+                branch: "main".to_string(),
+                target: Some("c1".to_string()),
+            })
+        );
+
+        // Toggling back records the branch we just left.
+        store.switch_branch("main").unwrap();
+        assert_eq!(
+            store.previous_head_state().unwrap(),
+            Some(CheckpointHead::Attached {
+                branch: "b2".to_string(),
+                target: Some("c1".to_string()),
+            })
+        );
+
+        // Detaching records the attached branch we left ...
+        store.rollback("c1").unwrap();
+        assert_eq!(
+            store.previous_head_state().unwrap(),
+            Some(CheckpointHead::Attached {
+                branch: "main".to_string(),
+                target: Some("c1".to_string()),
+            })
+        );
+
+        // ... and re-attaching records the detached checkout we left.
+        store.attach_branch("main").unwrap();
+        assert_eq!(
+            store.previous_head_state().unwrap(),
+            Some(CheckpointHead::Detached(Some("c1".to_string())))
+        );
+
+        if let Some(grandparent) = history_file.parent() {
+            let _ = fs::remove_dir_all(grandparent);
+        }
+    }
+
+    #[test]
     fn repaired_unborn_main_can_create_an_unborn_branch() {
         let history_file = temp_history_file();
         let store = CheckpointStore::new(&history_file, "sess-repair-unborn-main");
@@ -2324,6 +2706,7 @@ mod tests {
             store.current_status_label().unwrap().as_deref(),
             Some("main@-")
         );
+        assert_eq!(store.base_target().unwrap(), None);
         assert_eq!(
             store.branch_target_unlocked(DEFAULT_BRANCH_NAME).unwrap(),
             Some(None)
@@ -2339,10 +2722,15 @@ mod tests {
         store.create_branch("check", None).unwrap();
         assert_eq!(
             store.current_status_label().unwrap().as_deref(),
-            Some("check@-")
+            Some("main@-")
         );
         assert_eq!(store.branch_target_unlocked("main").unwrap(), Some(None));
         assert_eq!(store.branch_target_unlocked("check").unwrap(), Some(None));
+        assert!(
+            !store
+                .live_matches_base(&build_message_arr(10, &store.session_file).unwrap())
+                .unwrap()
+        );
 
         if let Some(grandparent) = history_file.parent() {
             let _ = fs::remove_dir_all(grandparent);
@@ -2391,8 +2779,8 @@ mod tests {
         let store = CheckpointStore::new(&history_file, "sess-unborn-switch");
         store.create_branch("b2", None).unwrap();
         store.create_branch("b1", None).unwrap();
-        append_history_messages(&store.session_file, &[lineage_msg("b1-unsaved")]).unwrap();
         store.switch_branch("b1").unwrap();
+        append_history_messages(&store.session_file, &[lineage_msg("b1-unsaved")]).unwrap();
         assert_eq!(build_message_arr(10, &store.session_file).unwrap().len(), 1);
 
         store.switch_branch("b2").unwrap();
@@ -2410,6 +2798,25 @@ mod tests {
                 target: None,
             }
         );
+
+        if let Some(grandparent) = history_file.parent() {
+            let _ = fs::remove_dir_all(grandparent);
+        }
+    }
+
+    #[test]
+    fn empty_live_session_with_checkpoint_state_is_not_disposable() {
+        let history_file = temp_history_file();
+        let session_id = "sess-empty-live-with-checkpoint";
+        let store = CheckpointStore::new(&history_file, session_id);
+        store.create_branch("check", None).unwrap();
+        store.switch_branch("check").unwrap();
+        append_history_messages(&store.session_file, &[lineage_msg("branch-history")]).unwrap();
+        store.save("verified_tag").unwrap();
+        store.switch_branch(DEFAULT_BRANCH_NAME).unwrap();
+
+        assert!(build_message_arr(10, &store.session_file).unwrap().is_empty());
+        assert!(!SessionStore::new(&history_file).is_empty_session(session_id).unwrap());
 
         if let Some(grandparent) = history_file.parent() {
             let _ = fs::remove_dir_all(grandparent);
@@ -2600,11 +3007,11 @@ mod tests {
         assert_eq!(read_generation_parent(&write("garbage", b"nope\n")), None);
         assert_eq!(read_generation_parent(&root.join("missing")), None);
         assert_eq!(
-            generation_manifest_body(None, 0),
+            generation_manifest_body(None, 0, None, None),
             "checkpoint-v2\nparent: -\nsaved_at: 0\n"
         );
         assert_eq!(
-            generation_manifest_body(Some("a"), 7),
+            generation_manifest_body(Some("a"), 7, None, None),
             "checkpoint-v2\nparent: a\nsaved_at: 7\n"
         );
         // Pre-timestamp manifests still parse (timestamp falls back to mtime).
@@ -2820,10 +3227,7 @@ mod tests {
         fs::write(&live_asset, "after asset").unwrap();
 
         let transaction = store
-            .stage_live_rollback(
-                &store.checkpoint_path("stable"),
-                &store.checkpoint_assets_path("stable"),
-            )
+            .stage_live_rollback(&store.checkpoint_path("stable"), Some("stable"))
             .unwrap();
         assert!(transaction.exists());
 
@@ -2876,17 +3280,11 @@ mod tests {
         fs::write(&live_asset, "after working checkpoint").unwrap();
 
         let transaction = store
-            .stage_live_rollback(
-                &store.checkpoint_path("stable"),
-                &store.checkpoint_assets_path("stable"),
-            )
+            .stage_live_rollback(&store.checkpoint_path("stable"), Some("stable"))
             .unwrap();
         let transaction_id = live_rollback_transaction_id(&transaction).unwrap();
-        restore_checkpoint_assets(
-            &transaction.join("new").join(GENERATION_ASSETS_DIR),
-            &store.session_assets,
-        )
-        .unwrap();
+        restore_checkpoint_assets(&store.checkpoint_assets_path("stable"), &store.session_assets)
+            .unwrap();
         restore_sqlite_after_rollback_with_transaction(
             &transaction.join("new").join(GENERATION_SQLITE_FILE),
             &store.session_file,
@@ -2946,10 +3344,7 @@ mod tests {
         .unwrap();
         store.save("stable").unwrap();
         let transaction = store
-            .stage_live_rollback(
-                &store.checkpoint_path("stable"),
-                &store.checkpoint_assets_path("stable"),
-            )
+            .stage_live_rollback(&store.checkpoint_path("stable"), Some("stable"))
             .unwrap();
         let transaction_id = live_rollback_transaction_id(&transaction).unwrap();
 

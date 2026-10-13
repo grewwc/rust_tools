@@ -52,10 +52,13 @@ fn current_checkpoint_status(state: &ServeState, id: &str) -> Result<Option<Stri
 
 fn validate_checkpoint_command(command: &str) -> Result<(), String> {
     let first = command.split_whitespace().next().unwrap_or_default();
-    if matches!(first, "/checkpoint" | ":checkpoint" | "/cp" | ":cp") {
+    if matches!(
+        first,
+        "/git" | ":git"
+    ) {
         Ok(())
     } else {
-        Err("expected a /checkpoint or /cp command".to_string())
+        Err("expected a /git command".to_string())
     }
 }
 
@@ -209,8 +212,9 @@ mod tests {
 
     #[test]
     fn only_checkpoint_commands_are_accepted() {
-        assert!(validate_checkpoint_command("/cp tree").is_ok());
-        assert!(validate_checkpoint_command(":checkpoint list").is_ok());
+        assert!(validate_checkpoint_command("/git tree").is_ok());
+        assert!(validate_checkpoint_command(":git list").is_ok());
+        assert!(validate_checkpoint_command("/cp tree").is_err());
         assert!(validate_checkpoint_command("/history").is_err());
     }
 }

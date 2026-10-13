@@ -306,7 +306,7 @@ async fn assert_path_a_preserves_raw_archive_pointer(status: &str) {
         message
             .content
             .as_str()
-            .is_some_and(|text| text.contains("归档文件:"))
+            .is_some_and(|text| text.contains("archive_file_path:"))
     }));
 
     let archive_file = SessionStore::new(app.config.history_file.as_path())
@@ -469,4 +469,105 @@ async fn mid_turn_llm_summary_path_a_runs_when_old_user_turns_folded_away() {
     let transcript = request["messages"][1]["content"].as_str().unwrap();
     assert!(!transcript.contains("之前的对话已完成"));
     assert!(!transcript.contains("请继续修改这个文件"));
+}
+
+#[tokio::test]
+async fn mid_turn_llm_summary_caps_evidence_created_by_progressive_folding() {
+    let root = std::env::temp_dir().join(format!(
+        "ai-mid-turn-llm-evidence-cap-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut app = test_app_with_cancel_stream(Arc::new(AtomicBool::new(false)));
+    app.config.history_file = root.join("history.sqlite");
+    app.session_id = "llm-evidence-cap".to_string();
+
+    let mut messages = vec![Message {
+        role: "system".to_string(),
+        content: Value::String("system prompt".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let mut initial_evidence_chars = 0usize;
+    for index in 0..9 {
+        let prefix = format!(
+            "compressed_tool_round: 1 tool calls\n[compressed-tool-evidence]\nold-{index}:"
+        );
+        let payload_chars = if index == 8 {
+            11_950 - initial_evidence_chars - prefix.chars().count()
+        } else {
+            1_200
+        };
+        let content = format!("{prefix}{}", "e".repeat(payload_chars));
+        initial_evidence_chars += content.chars().count();
+        messages.push(Message {
+            role: "internal_note".to_string(),
+            content: Value::String(content),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+    }
+    assert_eq!(initial_evidence_chars, 11_950);
+    messages.push(Message {
+        role: "user".to_string(),
+        content: Value::String("Inspect the files.".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+    for index in 0..6 {
+        let id = format!("call-{index}");
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: id.clone(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: format!(r#"{{"file_path":"file-{index}.txt"}}"#),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+        messages.push(Message {
+            role: "tool".to_string(),
+            content: Value::String(format!("file-{index}:{}", "r".repeat(4_000))),
+            tool_calls: None,
+            tool_call_id: Some(id),
+            reasoning_content: None,
+        });
+    }
+    messages.push(Message {
+        role: "user".to_string(),
+        content: Value::String("Continue with the inspection.".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+    let before = messages_total_chars_pub(&messages);
+    let (compressed, _, after, _, inserted) =
+        mid_turn_llm_summarize(&app, messages, 4, 1_000, before - 1_000, None).await;
+
+    let evidence_chars: usize = compressed
+        .iter()
+        .filter(|message| {
+            message
+                .content
+                .as_str()
+                .is_some_and(|content| content.contains("[compressed-tool-evidence]"))
+        })
+        .map(|message| messages_total_chars_pub(std::slice::from_ref(message)))
+        .sum();
+    assert!(!inserted);
+    assert!(after <= before - 1_000, "after={after}, before={before}");
+    assert!(evidence_chars <= 12_000, "evidence_chars={evidence_chars}");
+    assert!(compressed.iter().any(|message| {
+        message.content.as_str().is_some_and(|content| {
+            content.starts_with("[archive-pointer-v2]\n") && content.contains("archive_file_path:")
+        })
+    }));
+    let _ = std::fs::remove_dir_all(root);
 }

@@ -997,8 +997,12 @@ fn truncating_reasoning_refuses_empty_preview_stub_for_long_archive_paths() {
 
 #[test]
 fn hard_budget_truncation_converges_with_archive_pointer_overhead() {
-    let overflow_dir =
+    let overflow_root =
         std::env::temp_dir().join(format!("ai-truncate-converges-{}", uuid::Uuid::new_v4()));
+    let overflow_dir = overflow_root
+        .join("a".repeat(40))
+        .join("b".repeat(40))
+        .join("c".repeat(40));
     let mut messages = vec![msg("assistant", &"x".repeat(4_000))];
 
     assert!(truncate_mutable_messages_to_fit(
@@ -1008,8 +1012,14 @@ fn hard_budget_truncation_converges_with_archive_pointer_overhead() {
         &FxHashSet::default(),
     ));
     assert!(messages_total_chars(&messages) <= 700);
+    let archive_note = messages
+        .iter()
+        .find(|message| is_archive_note_message(message))
+        .expect("archive pointer");
+    let archive_text = value_to_string(&archive_note.content);
+    assert_eq!(archive_text.lines().count(), 2, "{archive_text}");
 
-    let _ = std::fs::remove_dir_all(overflow_dir);
+    let _ = std::fs::remove_dir_all(overflow_root);
 }
 
 #[test]
@@ -2068,6 +2078,88 @@ fn compressed_tool_evidence_has_independent_inline_budget() {
         .expect("older evidence should be archived before removal");
     assert!(archived.contains("checkpoint-00"), "{archived}");
     assert!(!archived.contains("checkpoint-23"), "{archived}");
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn persisted_shrink_caps_evidence_created_during_the_same_pass() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-persisted-post-fold-evidence-cap-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut messages = vec![msg("system", "system prompt"), msg("user", "older turn")];
+    for index in 0..32 {
+        let id = format!("persisted-{index}");
+        let args = serde_json::json!({
+            "pattern": format!("{index}:{}", "x".repeat(8_000))
+        })
+        .to_string();
+        messages.push(assistant_call_args(&id, "text_grep", &args));
+        messages.push(tool_result(&id, "matching line"));
+    }
+    messages.push(msg("user", "latest turn"));
+
+    let compressed = compress_messages_for_context(
+        messages,
+        80_000,
+        256,
+        8_000,
+        Some(overflow_dir.clone()),
+        None,
+    );
+    let inline_chars = compressed
+        .iter()
+        .filter(|message| is_compressed_tool_evidence_note(message))
+        .map(message_billable_chars)
+        .sum::<usize>();
+
+    assert!(
+        compressed.iter().any(is_compressed_tool_evidence_note),
+        "the oversized history should exercise the folded-evidence producer"
+    );
+    assert!(inline_chars <= MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS);
+    let archived = std::fs::read_to_string(overflow_dir.join("overflow-history.md"))
+        .expect("evidence created above the inline cap should be archived");
+    assert!(archived.contains(COMPRESSED_TOOL_EVIDENCE_MARKER));
+
+    let _ = std::fs::remove_dir_all(overflow_dir);
+}
+
+#[test]
+fn mid_turn_shrink_caps_evidence_created_during_the_same_pass() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-mid-turn-post-fold-evidence-cap-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut messages = vec![msg("system", "system prompt"), msg("user", "current turn")];
+    for index in 0..32 {
+        let id = format!("mid-turn-{index}");
+        let args = serde_json::json!({
+            "pattern": format!("{index}:{}", "x".repeat(8_000))
+        })
+        .to_string();
+        messages.push(assistant_call_args(&id, "text_grep", &args));
+        messages.push(tool_result(&id, "matching line"));
+    }
+
+    let (compressed, before_chars, after_chars) =
+        mid_turn_compress(messages, 80_000, Some(&overflow_dir), None);
+    let inline_chars = compressed
+        .iter()
+        .filter(|message| is_compressed_tool_evidence_note(message))
+        .map(message_billable_chars)
+        .sum::<usize>();
+
+    assert!(after_chars < before_chars);
+    assert!(
+        compressed.iter().any(is_compressed_tool_evidence_note),
+        "the oversized turn should exercise the folded-evidence producer"
+    );
+    assert!(inline_chars <= MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS);
+    let archived = std::fs::read_to_string(overflow_dir.join("overflow-history.md"))
+        .expect("evidence created above the inline cap should be archived");
+    assert!(archived.contains(COMPRESSED_TOOL_EVIDENCE_MARKER));
 
     let _ = std::fs::remove_dir_all(overflow_dir);
 }

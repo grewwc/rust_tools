@@ -23,6 +23,10 @@ use crate::ai::{
 };
 
 use super::super::types::{Message, ROLE_INTERNAL_NOTE, is_system_like_role, retained_turn_start};
+use super::persisted::{
+    ARCHIVE_DIRECTORY_PATH_PREFIX, ARCHIVE_FILE_PATH_PREFIX, archive_directory_path_from_line,
+    archive_file_path_from_line,
+};
 use super::text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
 use super::tool_groups::{recent_tool_group_message_indices, recent_tool_result_groups};
 use super::{
@@ -1474,16 +1478,28 @@ pub(super) fn build_overflow_content_preview(content: &str) -> String {
     out.trim_end().to_string()
 }
 
-const MERGED_PRESERVED_USER_STUB_PREFIX: &str = "较早的用户内容已归档（共 ";
-const MERGED_PRESERVED_ARCHIVE_DIR_PREFIX: &str = "归档目录: ";
+const PRESERVED_MESSAGE_POINTER_PREFIX: &str = "[preserved-message-pointer-v2]";
+const PRESERVED_MESSAGES_POINTER_PREFIX: &str = "[preserved-messages-pointer-v2]";
+const PRESERVED_CONTENT_KIND_PREFIX: &str = "content_kind: ";
+const ARCHIVED_MESSAGE_COUNT_PREFIX: &str = "archived_message_count: ";
+const LEGACY_MERGED_PRESERVED_USER_STUB_PREFIX: &str = "较早的用户内容已归档（共 ";
+const LEGACY_PRESERVED_USER_TEXT_PREFIX: &str = "较早的用户文本内容已归档";
+const LEGACY_PRESERVED_USER_IMAGE_PREFIX: &str = "较早的用户图片内容已归档";
 
 fn parse_merged_preserved_message_stub(text: &str) -> Option<(usize, Vec<String>)> {
-    let count = text
-        .strip_prefix(MERGED_PRESERVED_USER_STUB_PREFIX)?
-        .split_once(" 条")?
-        .0
-        .parse::<usize>()
-        .ok()?;
+    let count = if text.starts_with(PRESERVED_MESSAGES_POINTER_PREFIX) {
+        text.lines()
+            .find_map(|line| line.strip_prefix(ARCHIVED_MESSAGE_COUNT_PREFIX))?
+            .trim()
+            .parse::<usize>()
+            .ok()?
+    } else {
+        text.strip_prefix(LEGACY_MERGED_PRESERVED_USER_STUB_PREFIX)?
+            .split_once(" 条")?
+            .0
+            .parse::<usize>()
+            .ok()?
+    };
     if count == 0 {
         return None;
     }
@@ -1492,9 +1508,8 @@ fn parse_merged_preserved_message_stub(text: &str) -> Option<(usize, Vec<String>
     for line in text.lines() {
         // Compatibility with the first-version merged stub's "归档文件"
         // (archive file) field; that field actually stores a directory.
-        let Some(dir) = line
-            .strip_prefix(MERGED_PRESERVED_ARCHIVE_DIR_PREFIX)
-            .or_else(|| line.strip_prefix("归档文件: "))
+        let Some(dir) = archive_directory_path_from_line(line)
+            .or_else(|| archive_file_path_from_line(line))
             .map(str::trim)
             .filter(|dir| !dir.is_empty())
         else {
@@ -1509,14 +1524,14 @@ fn parse_merged_preserved_message_stub(text: &str) -> Option<(usize, Vec<String>
 
 fn build_merged_preserved_message_stub(count: usize, dirs: &[String]) -> String {
     let mut merged =
-        format!("较早的用户内容已归档（共 {count} 条，原文零压缩保存在会话归档目录）。\n");
+        format!("{PRESERVED_MESSAGES_POINTER_PREFIX}\n{ARCHIVED_MESSAGE_COUNT_PREFIX}{count}\n");
     for dir in dirs {
-        merged.push_str(MERGED_PRESERVED_ARCHIVE_DIR_PREFIX);
+        merged.push_str(ARCHIVE_DIRECTORY_PATH_PREFIX);
         merged.push_str(dir);
         merged.push('\n');
     }
     merged.push_str(
-        "这是一条上下文归档提示，不是用户的新请求。仅当当前任务确实依赖较早用户原文且现有摘要不足时，逐个使用 tree 列出上述归档目录，再按时间戳和类型定位 JSON 文件，最后使用 read_file 读取具体文件；不要对目录直接调用 read_file。",
+        "Earlier user content was archived verbatim. This is context recovery metadata, not a new user request. If the current task needs that content, use tree on each archive directory, then read_file on an individual JSON file; never call read_file on a directory.",
     );
     merged
 }
@@ -1624,9 +1639,14 @@ pub(super) fn merge_old_user_overflow_stubs(
     messages[stub_indices[0]].content = Value::String(merged);
 }
 
-pub(super) fn is_preserved_user_or_image_stub(text: &str) -> bool {
-    parse_merged_preserved_message_stub(text).is_some()
-        || parse_preserved_message_stub(text).is_some()
+pub(in crate::ai) fn is_preserved_user_or_image_stub(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with(PRESERVED_CONTENT_STUB_PREFIX)
+        || text.starts_with(PRESERVED_MESSAGE_POINTER_PREFIX)
+        || text.starts_with(PRESERVED_MESSAGES_POINTER_PREFIX)
+        || text.starts_with(LEGACY_MERGED_PRESERVED_USER_STUB_PREFIX)
+        || text.starts_with(LEGACY_PRESERVED_USER_TEXT_PREFIX)
+        || text.starts_with(LEGACY_PRESERVED_USER_IMAGE_PREFIX)
 }
 
 fn parse_preserved_message_stub(text: &str) -> Option<(String, String)> {
@@ -1638,9 +1658,19 @@ fn parse_preserved_message_stub(text: &str) -> Option<(String, String)> {
             .then_some((kind, file_path));
     }
 
-    let kind = if text.starts_with("较早的用户图片内容已归档") {
+    if text.starts_with(PRESERVED_MESSAGE_POINTER_PREFIX) {
+        let kind = text
+            .lines()
+            .find_map(|line| line.strip_prefix(PRESERVED_CONTENT_KIND_PREFIX))?
+            .trim();
+        let file_path = text.lines().find_map(archive_file_path_from_line)?.trim();
+        return ((kind == "user" || kind == "image") && !file_path.is_empty())
+            .then(|| (kind.to_string(), file_path.to_string()));
+    }
+
+    let kind = if text.starts_with(LEGACY_PRESERVED_USER_IMAGE_PREFIX) {
         "image"
-    } else if text.starts_with("较早的用户") {
+    } else if text.starts_with(LEGACY_PRESERVED_USER_TEXT_PREFIX) {
         "user"
     } else {
         return None;
@@ -1775,9 +1805,8 @@ fn write_preserved_message_overflow_file(
 }
 
 fn build_preserved_message_overflow_stub(path: &Path, kind: &str) -> String {
-    let content_kind = if kind == "image" { "图片" } else { "文本" };
     format!(
-        "较早的用户{content_kind}内容已归档，原文未丢失。\n归档文件: {}\n这是一条上下文归档提示，不是用户的新请求。仅当当前任务确实依赖原文时，才使用 read_file 读取该文件。",
+        "{PRESERVED_MESSAGE_POINTER_PREFIX}\n{PRESERVED_CONTENT_KIND_PREFIX}{kind}\n{ARCHIVE_FILE_PATH_PREFIX}{}\nEarlier user content was archived verbatim. This is context recovery metadata, not a new user request. Use read_file only if the current task needs the original content.",
         path.display()
     )
 }

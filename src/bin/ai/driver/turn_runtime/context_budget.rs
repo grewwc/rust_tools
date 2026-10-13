@@ -9,6 +9,8 @@ use crate::ai::{
 #[cfg(test)]
 use super::mid_turn_compress_soft_threshold;
 
+const MAX_SOFT_TARGET_COMPRESSION_PASSES: usize = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SegmentKind {
     SystemPrompt,
@@ -48,6 +50,7 @@ struct ContextSegment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ContextBudgetRollbackReason {
     NoAdditionalSavings,
+    NoNormalizedTokenSavings,
     ProtectedContextChanged,
 }
 
@@ -56,6 +59,9 @@ impl ContextBudgetRollbackReason {
         match self {
             ContextBudgetRollbackReason::NoAdditionalSavings => {
                 "lossy compression rolled back because it did not improve beyond deterministic prepasses"
+            }
+            ContextBudgetRollbackReason::NoNormalizedTokenSavings => {
+                "compression rolled back because it did not reduce normalized prompt tokens"
             }
             ContextBudgetRollbackReason::ProtectedContextChanged => {
                 "compression rolled back because protected system/current-user context changed"
@@ -83,6 +89,147 @@ pub(super) struct ContextBudgetReport {
     pub(super) memory_projection_selected_messages: usize,
     pub(super) memory_projection_saved_chars: usize,
     pub(super) memory_projection_index_chars: usize,
+}
+
+impl ContextBudgetReport {
+    pub(super) fn projection_committed(&self) -> bool {
+        self.rollback_reason.is_none() || self.changed
+    }
+
+    fn absorb(&mut self, next: Self) {
+        self.after_chars = next.after_chars;
+        self.target_chars = next.target_chars;
+        self.changed |= next.changed;
+        macro_rules! add_stat {
+            ($field:ident) => {
+                self.$field = self.$field.saturating_add(next.$field);
+            };
+        }
+        add_stat!(critical_segments);
+        add_stat!(offload_only_segments);
+        add_stat!(lossy_candidate_segments);
+        add_stat!(lossy_candidate_chars);
+        add_stat!(lossless_removed_messages);
+        add_stat!(lossless_saved_chars);
+        add_stat!(tool_spill_saved_chars);
+        add_stat!(memory_projection_removed_messages);
+        add_stat!(memory_projection_selected_messages);
+        add_stat!(memory_projection_saved_chars);
+        add_stat!(memory_projection_index_chars);
+        if self.changed {
+            self.rolled_back = false;
+            self.rollback_reason = None;
+        } else if next.rolled_back {
+            self.rolled_back = true;
+            self.rollback_reason = next.rollback_reason;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SoftTargetConvergence {
+    passes: usize,
+    previous_prompt_tokens: usize,
+    previous_chars: usize,
+}
+
+impl SoftTargetConvergence {
+    fn new(budget: crate::ai::request::CurrentRequestBudget, chars: usize) -> Self {
+        Self {
+            passes: 0,
+            previous_prompt_tokens: budget.prompt_tokens,
+            previous_chars: chars,
+        }
+    }
+
+    fn next_target(
+        &mut self,
+        budget: crate::ai::request::CurrentRequestBudget,
+        chars: usize,
+        changed: bool,
+    ) -> Option<usize> {
+        self.passes += 1;
+        if !changed
+            || !budget.exceeds_soft_target()
+            || self.passes >= MAX_SOFT_TARGET_COMPRESSION_PASSES
+        {
+            return None;
+        }
+        let removed_chars = self.previous_chars.saturating_sub(chars);
+        let removed_tokens = self
+            .previous_prompt_tokens
+            .saturating_sub(budget.prompt_tokens);
+        let token_gap = budget
+            .prompt_tokens
+            .saturating_sub(budget.limits.soft_target_tokens);
+        let baseline = token_gap.saturating_mul(2);
+        let requested = if removed_tokens == 0 {
+            baseline.max(removed_chars.saturating_mul(2))
+        } else {
+            let scaled = (token_gap as u128)
+                .saturating_mul(removed_chars as u128)
+                .saturating_add(removed_tokens as u128 - 1)
+                / removed_tokens as u128;
+            baseline.max(usize::try_from(scaled).unwrap_or(usize::MAX))
+        };
+        self.previous_prompt_tokens = budget.prompt_tokens;
+        self.previous_chars = chars;
+        Some(chars.saturating_sub(requested))
+    }
+}
+
+#[derive(Debug)]
+struct BestNormalizedProjection {
+    budget: crate::ai::request::CurrentRequestBudget,
+    messages: Vec<Message>,
+    report: ContextBudgetReport,
+}
+
+fn retain_best_normalized_projection(
+    best: &mut Option<BestNormalizedProjection>,
+    baseline_prompt_tokens: usize,
+    budget: crate::ai::request::CurrentRequestBudget,
+    messages: &[Message],
+    report: &ContextBudgetReport,
+) {
+    if budget.prompt_tokens >= baseline_prompt_tokens
+        || best
+            .as_ref()
+            .is_some_and(|current| current.budget.prompt_tokens <= budget.prompt_tokens)
+    {
+        return;
+    }
+    *best = Some(BestNormalizedProjection {
+        budget,
+        messages: messages.to_vec(),
+        report: report.clone(),
+    });
+}
+
+fn finish_pressured_projection(
+    messages: &mut Vec<Message>,
+    original_messages: Vec<Message>,
+    initial_budget: crate::ai::request::CurrentRequestBudget,
+    best: Option<BestNormalizedProjection>,
+    mut report: ContextBudgetReport,
+) -> (
+    crate::ai::request::CurrentRequestBudget,
+    ContextBudgetReport,
+) {
+    if let Some(best) = best {
+        *messages = best.messages;
+        return (best.budget, best.report);
+    }
+
+    let attempted_change = report.changed;
+    *messages = original_messages;
+    report.after_chars = report.before_chars;
+    if attempted_change {
+        report.changed = false;
+        report.rolled_back = true;
+        report.rollback_reason = Some(ContextBudgetRollbackReason::NoNormalizedTokenSavings);
+    }
+    (initial_budget, report)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +280,7 @@ pub(super) fn apply_measured_context_budget(
     budget: crate::ai::request::CurrentRequestBudget,
     messages: &mut Vec<Message>,
 ) -> ContextBudgetReport {
+    crate::ai::history::compress::dedupe_context_checkpoint_markers_for_projection(messages);
     let chars = crate::ai::history::messages_total_chars_pub(messages);
     // Below token pressure, only deterministic cleanup/recall runs. A character
     // threshold (including one changed by model selection) cannot enable loss.
@@ -152,6 +300,92 @@ pub(super) fn apply_measured_context_budget(
     )
 }
 
+/// Re-measure the normalized request after each exploratory pass. Raw character
+/// savings can be projected away by request normalization, so later passes use
+/// the observed chars-per-token reduction instead of repeating the same target.
+/// When the request starts above the soft target, only the lowest-token projection
+/// with strict normalized-token savings is committed to the live request.
+pub(super) async fn apply_measured_context_budget_until_soft_target(
+    app: &App,
+    model: &str,
+    initial_budget: crate::ai::request::CurrentRequestBudget,
+    messages: &mut Vec<Message>,
+    tools_enabled: bool,
+) -> (
+    crate::ai::request::CurrentRequestBudget,
+    ContextBudgetReport,
+) {
+    let before_chars = crate::ai::history::messages_total_chars_pub(messages);
+    let pressured_original = initial_budget
+        .exceeds_soft_target()
+        .then(|| messages.clone());
+    let mut best_projection = None;
+    let mut convergence = SoftTargetConvergence::new(initial_budget, before_chars);
+    let mut budget = initial_budget;
+    let mut target = None;
+    let mut aggregate: Option<ContextBudgetReport> = None;
+
+    loop {
+        let pass_before_chars = crate::ai::history::messages_total_chars_pub(messages);
+        let pass_before_len = messages.len();
+        let mut report = match target {
+            Some(target_chars) => apply_context_budget_target(
+                app,
+                messages,
+                target_chars,
+                true,
+                budget.inline_cap_chars,
+            ),
+            None => apply_measured_context_budget(app, budget, messages),
+        };
+        let pass_changed = report.changed
+            || pass_before_chars != crate::ai::history::messages_total_chars_pub(messages)
+            || pass_before_len != messages.len();
+        report.changed = pass_changed;
+        if let Some(aggregate) = &mut aggregate {
+            aggregate.absorb(report);
+        } else {
+            aggregate = Some(report);
+        }
+        if !pass_changed {
+            break;
+        }
+
+        budget =
+            crate::ai::request::preview_request_budget(app, model, messages, true, tools_enabled)
+                .await;
+        if pressured_original.is_some() {
+            retain_best_normalized_projection(
+                &mut best_projection,
+                initial_budget.prompt_tokens,
+                budget,
+                messages,
+                aggregate
+                    .as_ref()
+                    .expect("context budget always runs at least one pass"),
+            );
+        }
+        let chars = crate::ai::history::messages_total_chars_pub(messages);
+        target = convergence.next_target(budget, chars, pass_changed);
+        if target.is_none() {
+            break;
+        }
+    }
+
+    let report = aggregate.expect("context budget always runs at least one pass");
+    if let Some(original_messages) = pressured_original {
+        finish_pressured_projection(
+            messages,
+            original_messages,
+            initial_budget,
+            best_projection,
+            report,
+        )
+    } else {
+        (budget, report)
+    }
+}
+
 fn apply_context_budget_target(
     app: &App,
     messages: &mut Vec<Message>,
@@ -159,6 +393,7 @@ fn apply_context_budget_target(
     allow_lossy: bool,
     tool_inline_cap_chars: usize,
 ) -> ContextBudgetReport {
+    crate::ai::history::compress::dedupe_context_checkpoint_markers_for_projection(messages);
     // Persisted plan state is a fixed-cost request projection, not compressible history.
     // Remove the previous pair before reserving the current one so refreshes cannot
     // accumulate charges or let recall/compression spend the plan's headroom.
@@ -759,7 +994,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
 
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::ai::{
@@ -767,6 +1002,190 @@ mod tests {
         history::Message,
         types::{App, AppConfig, FunctionCall, ToolCall},
     };
+
+    fn request_budget(
+        prompt_tokens: usize,
+        soft_target_tokens: usize,
+    ) -> crate::ai::request::CurrentRequestBudget {
+        serde_json::from_value(json!({
+            "prompt_tokens": prompt_tokens,
+            "source": "normalized_estimate",
+            "limits": {
+                "physical_context_tokens": 2_000,
+                "output_reserve_tokens": 500,
+                "safety_margin_tokens": 100,
+                "input_allowance_tokens": 1_400,
+                "soft_target_tokens": soft_target_tokens
+            },
+            "inline_cap_chars": 32_000
+        }))
+        .expect("test request budget should deserialize")
+    }
+
+    #[test]
+    fn normalized_feedback_escalates_after_projected_away_raw_savings() {
+        let initial = request_budget(1_100, 1_000);
+        let mut convergence = SoftTargetConvergence::new(initial, 10_000);
+
+        // The first pass removed raw content, but normalization had already
+        // omitted it, so the normalized prompt-token count did not move.
+        assert_eq!(
+            convergence.next_target(request_budget(1_100, 1_000), 9_800, true),
+            Some(9_400)
+        );
+        assert_eq!(
+            convergence.next_target(request_budget(1_000, 1_000), 9_400, true),
+            None
+        );
+    }
+
+    #[test]
+    fn normalized_feedback_uses_the_observed_raw_to_token_ratio() {
+        let initial = request_budget(1_200, 1_000);
+        let mut convergence = SoftTargetConvergence::new(initial, 10_000);
+
+        // Removing 400 raw chars only saved 50 normalized tokens. The remaining
+        // 150-token gap therefore requires 1,200 more raw chars, not 300.
+        assert_eq!(
+            convergence.next_target(request_budget(1_150, 1_000), 9_600, true),
+            Some(8_400)
+        );
+    }
+
+    #[test]
+    fn normalized_feedback_loop_stops_at_the_pass_limit() {
+        let unchanged_budget = request_budget(1_100, 1_000);
+        let mut convergence = SoftTargetConvergence::new(unchanged_budget, 10_000);
+
+        assert!(
+            convergence
+                .next_target(unchanged_budget, 9_900, true)
+                .is_some()
+        );
+        assert!(
+            convergence
+                .next_target(unchanged_budget, 9_700, true)
+                .is_some()
+        );
+        assert!(
+            convergence
+                .next_target(unchanged_budget, 9_300, true)
+                .is_some()
+        );
+        assert_eq!(convergence.next_target(unchanged_budget, 8_500, true), None);
+    }
+
+    fn changed_report(before_chars: usize, after_chars: usize) -> ContextBudgetReport {
+        ContextBudgetReport {
+            before_chars,
+            after_chars,
+            changed: true,
+            ..ContextBudgetReport::default()
+        }
+    }
+
+    #[test]
+    fn pressured_projection_rolls_back_when_normalized_tokens_do_not_decrease() {
+        let initial = request_budget(1_100, 1_000);
+        let original = vec![msg("assistant", "original")];
+        let mut live = vec![msg("assistant", "compressed")];
+        let mut best = None;
+        let report = changed_report(100, 60);
+
+        retain_best_normalized_projection(
+            &mut best,
+            initial.prompt_tokens,
+            request_budget(1_100, 1_000),
+            &live,
+            &report,
+        );
+        retain_best_normalized_projection(
+            &mut best,
+            initial.prompt_tokens,
+            request_budget(1_200, 1_000),
+            &live,
+            &report,
+        );
+        let (budget, report) =
+            finish_pressured_projection(&mut live, original.clone(), initial, best, report);
+
+        assert_eq!(live, original);
+        assert_eq!(budget, initial);
+        assert!(!report.changed);
+        assert!(report.rolled_back);
+        assert_eq!(
+            report.rollback_reason,
+            Some(ContextBudgetRollbackReason::NoNormalizedTokenSavings)
+        );
+        assert!(!report.projection_committed());
+    }
+
+    #[test]
+    fn pressured_projection_keeps_best_candidate_when_later_pass_regresses() {
+        let initial = request_budget(1_300, 1_000);
+        let original = vec![msg("assistant", "original")];
+        let best_messages = vec![msg("assistant", "best")];
+        let later_messages = vec![msg("assistant", "later")];
+        let best_report = changed_report(100, 70);
+        let later_report = changed_report(100, 40);
+        let mut best = None;
+
+        retain_best_normalized_projection(
+            &mut best,
+            initial.prompt_tokens,
+            request_budget(1_150, 1_000),
+            &best_messages,
+            &best_report,
+        );
+        retain_best_normalized_projection(
+            &mut best,
+            initial.prompt_tokens,
+            request_budget(1_200, 1_000),
+            &later_messages,
+            &later_report,
+        );
+        let mut live = later_messages;
+        let (budget, report) = finish_pressured_projection(
+            &mut live,
+            original,
+            initial,
+            best,
+            later_report,
+        );
+
+        assert_eq!(live, best_messages);
+        assert_eq!(budget.prompt_tokens, 1_150);
+        assert_eq!(report.after_chars, best_report.after_chars);
+        assert!(report.projection_committed());
+    }
+
+    #[test]
+    fn pressured_projection_replaces_best_candidate_only_for_lower_tokens() {
+        let initial = request_budget(1_300, 1_000);
+        let mut best = None;
+        let first_report = changed_report(100, 70);
+        let lower_report = changed_report(100, 50);
+
+        retain_best_normalized_projection(
+            &mut best,
+            initial.prompt_tokens,
+            request_budget(1_200, 1_000),
+            &[msg("assistant", "first")],
+            &first_report,
+        );
+        retain_best_normalized_projection(
+            &mut best,
+            initial.prompt_tokens,
+            request_budget(1_100, 1_000),
+            &[msg("assistant", "lower")],
+            &lower_report,
+        );
+
+        let best = best.expect("lower-token candidate should be retained");
+        assert_eq!(best.budget.prompt_tokens, 1_100);
+        assert_eq!(best.messages, vec![msg("assistant", "lower")]);
+        assert_eq!(best.report.after_chars, lower_report.after_chars);
+    }
 
     fn test_app(history_file: PathBuf) -> App {
         App {
@@ -895,6 +1314,71 @@ mod tests {
         assert_eq!(messages.first(), canonical.first());
         assert_eq!(messages.last(), canonical.last());
         assert_eq!(canonical[1].content.as_str().unwrap().len(), "old narration ".len() * 4_000);
+    }
+
+    #[test]
+    fn measured_budget_dedupes_only_transient_checkpoint_projection() {
+        let history_file = std::env::temp_dir().join(format!(
+            "context-budget-checkpoints-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let app = test_app(history_file);
+        let canonical = vec![
+            msg("system", "rules"),
+            msg(
+                crate::ai::history::ROLE_INTERNAL_NOTE,
+                "[context_checkpoint path=/tmp/working-checkpoint.md] old plan",
+            ),
+            msg(
+                crate::ai::history::ROLE_INTERNAL_NOTE,
+                "[context_checkpoint path=/tmp/other-checkpoint.md] other memory",
+            ),
+            msg(
+                crate::ai::history::ROLE_INTERNAL_NOTE,
+                "[context_checkpoint path=/tmp/working-checkpoint.md] current plan",
+            ),
+            msg(
+                "user",
+                "[context_checkpoint path=/tmp/working-checkpoint.md] untrusted text",
+            ),
+        ];
+        let budget = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 100, "source": "normalized_estimate",
+            "limits": { "physical_context_tokens": 12_000, "output_reserve_tokens": 1_000,
+                "safety_margin_tokens": 1_000, "input_allowance_tokens": 10_000,
+                "soft_target_tokens": 8_000 }
+        }))
+        .unwrap();
+        let mut projected = canonical.clone();
+
+        apply_measured_context_budget(&app, budget, &mut projected);
+
+        assert_eq!(canonical.len(), 5, "canonical source must remain untouched");
+        assert_eq!(projected.len(), 4);
+        assert!(projected.iter().any(|message| {
+            message
+                .content
+                .as_str()
+                .is_some_and(|text| text.contains("current plan"))
+        }));
+        assert!(projected.iter().any(|message| {
+            message
+                .content
+                .as_str()
+                .is_some_and(|text| text.contains("other memory"))
+        }));
+        assert!(projected.iter().any(|message| {
+            message
+                .content
+                .as_str()
+                .is_some_and(|text| text.contains("untrusted text"))
+        }));
+        assert!(!projected.iter().any(|message| {
+            message
+                .content
+                .as_str()
+                .is_some_and(|text| text.contains("old plan"))
+        }));
     }
 
     #[test]

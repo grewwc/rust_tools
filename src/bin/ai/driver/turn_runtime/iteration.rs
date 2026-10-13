@@ -1187,29 +1187,26 @@ async fn apply_request_budget(
         "projection_maintenance"
     };
     let attempt = CompactionAttempt::start(trigger, before, messages);
-    // Happy-path fast path: the measured budget pass usually leaves the
-    // projection untouched (no spill, no lossless work, no plan refresh).
-    // Rebuilding the full request projection just to remeasure identical
-    // input costs a normalize clone, a SQLite outcomes read, tool-schema
-    // serialization, per-message fingerprints and a token scan, so reuse
-    // `before` when the projection is provably unchanged.
-    let pre_len = messages.len();
-    let pre_chars = crate::ai::history::messages_total_chars_pub(messages);
-    let report = context_budget::apply_measured_context_budget(app, before, messages);
-    let post_len = messages.len();
+    // Re-measure only after a real projection change. When normalized tokens
+    // remain above the target, the shared helper uses that feedback for a
+    // bounded follow-up pass instead of retrying the same raw-char target on
+    // the next request.
+    let (mut budget, report) = context_budget::apply_measured_context_budget_until_soft_target(
+        app,
+        model,
+        before,
+        messages,
+        tools_enabled,
+    )
+    .await;
     let post_chars = crate::ai::history::messages_total_chars_pub(messages);
-    let mut budget = if !report.changed && pre_len == post_len && pre_chars == post_chars {
-        before
-    } else {
-        request::preview_request_budget(app, model, messages, true, tools_enabled).await
-    };
     attempt.finish(
         &app.session_id,
         iteration,
         model,
         budget,
         messages,
-        report.rollback_reason.is_none() || report.changed,
+        report.projection_committed(),
     );
     if let Some(reason) = report.rollback_reason {
         crate::ai::driver::print::print_tool_note_line("context-budget", reason.note());

@@ -2081,12 +2081,17 @@ async fn run_turn_body(
                 let attempt = super::context_metrics::CompactionAttempt::start(
                     "mid_turn_soft_target", budget, &messages,
                 );
-                let report = super::context_budget::apply_measured_context_budget(app, budget, &mut messages);
-                let after_budget = crate::ai::request::preview_request_budget(
-                    app, &next_model, &messages, true, !force_final_response,
-                ).await;
+                let (after_budget, report) =
+                    super::context_budget::apply_measured_context_budget_until_soft_target(
+                        app,
+                        &next_model,
+                        budget,
+                        &mut messages,
+                        !force_final_response,
+                    )
+                    .await;
                 attempt.finish(&app.session_id, supervisor.iteration, &next_model, after_budget,
-                    &messages, report.rollback_reason.is_none() || report.changed);
+                    &messages, report.projection_committed());
                 supervisor.mark_compress(report.after_chars);
                 let mut compression_report = CompressionReport::default();
                 if report.after_chars < report.before_chars {

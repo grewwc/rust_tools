@@ -220,6 +220,129 @@ fn rollback_metadata_read_error_does_not_replace_live_history() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn staged_rollback_repeated_restore_preserves_snapshots_and_counters() {
+    let dir = std::env::temp_dir().join(format!("staged_repeat_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let live = dir.join("live.sqlite");
+    let mut stages = Vec::new();
+    for name in ["b1", "b2"] {
+        let source = dir.join(format!("{name}.sqlite"));
+        let staged = dir.join(format!("{name}.stage.sqlite"));
+        append_history_sqlite(&source, vec![msg("user", name)]).unwrap();
+        backup_sqlite(&source, &staged).unwrap();
+        let bytes = std::fs::read(&staged).unwrap();
+        stages.push((staged, bytes, name));
+    }
+    let mut previous = (0, 0, 0);
+    for i in 0..8 {
+        let (staged, original, name) = &stages[i % 2];
+        let transaction = format!("switch-{i}");
+        restore_staged_sqlite_after_rollback(staged, &live, &transaction).unwrap();
+        assert!(live_rollback_transaction_is_published(&live, &transaction).unwrap());
+        assert_eq!(
+            read_all_messages_sqlite(&live).unwrap(),
+            vec![msg("user", name)]
+        );
+        let conn = Connection::open(&live).unwrap();
+        let counter = |key: &str| -> i64 {
+            conn.query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key=?1",
+                [key],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let current = (
+            counter("history_generation"),
+            counter("history_revision"),
+            counter("turn_seq"),
+        );
+        assert!(current.0 > previous.0 && current.1 > previous.1);
+        assert!(current.2 >= previous.2);
+        previous = current;
+        drop(conn);
+        append_history_sqlite(&live, vec![msg("assistant", "live-only change")]).unwrap();
+        reserve_turn_index_sqlite(&live).unwrap();
+        assert_eq!(&std::fs::read(staged).unwrap(), original);
+        assert_eq!(
+            read_all_messages_sqlite_read_only(staged).unwrap(),
+            vec![msg("user", name)]
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn staged_rollback_falls_back_for_uncheckpointed_wal() {
+    let dir = std::env::temp_dir().join(format!("staged_wal_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let staged = dir.join("stage.sqlite");
+    let live = dir.join("live.sqlite");
+    append_history_sqlite(&staged, vec![msg("user", "checkpoint")]).unwrap();
+    let writer = Connection::open(&staged).unwrap();
+    writer
+        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    writer
+        .execute(
+            "INSERT INTO meta(key,value) VALUES('wal_only','committed')",
+            [],
+        )
+        .unwrap();
+    assert!(
+        std::fs::metadata(dir.join("stage.sqlite-wal"))
+            .unwrap()
+            .len()
+            > 0
+    );
+
+    restore_staged_sqlite_after_rollback(&staged, &live, "wal-fallback").unwrap();
+    let restored = Connection::open(&live).unwrap();
+    let value: String = restored
+        .query_row("SELECT value FROM meta WHERE key='wal_only'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(value, "committed");
+    assert!(live_rollback_transaction_is_published(&live, "wal-fallback").unwrap());
+    assert_eq!(
+        read_all_messages_sqlite(&live).unwrap(),
+        vec![msg("user", "checkpoint")]
+    );
+    drop(restored);
+    drop(writer);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn staged_rollback_busy_live_wal_is_retryable_without_publication() {
+    let dir = std::env::temp_dir().join(format!("staged_busy_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let staged = dir.join("stage.sqlite");
+    let live = dir.join("live.sqlite");
+    append_history_sqlite(&staged, vec![msg("user", "checkpoint")]).unwrap();
+    append_history_sqlite(&live, vec![msg("user", "live")]).unwrap();
+    let reader = Connection::open(&live).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT * FROM messages;")
+        .unwrap();
+    append_history_sqlite(&live, vec![msg("assistant", "new live WAL")]).unwrap();
+    let before = read_all_messages_sqlite(&live).unwrap();
+    let error = restore_staged_sqlite_after_rollback(&staged, &live, "busy").unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(read_all_messages_sqlite(&live).unwrap(), before);
+    assert!(!live_rollback_transaction_is_published(&live, "busy").unwrap());
+    drop(reader);
+    restore_staged_sqlite_after_rollback(&staged, &live, "busy").unwrap();
+    assert_eq!(
+        read_all_messages_sqlite(&live).unwrap(),
+        vec![msg("user", "checkpoint")]
+    );
+    assert!(live_rollback_transaction_is_published(&live, "busy").unwrap());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// P1 regression: `read_history_revision` must observe the write increment **across connections**.
 /// Every write path opens a new connection to read the version, mimicking build_context_history's cache-invalidation check.
 /// The old implementation used the connection-local `PRAGMA data_version`, which always returns a fixed value on new connections and cannot invalidate the cache.

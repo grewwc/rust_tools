@@ -6,10 +6,11 @@ use sha2::{Digest, Sha256};
 
 use super::super::types::{Message, ROLE_INTERNAL_NOTE};
 use super::{
-    ARCHIVE_NOTE_PREFIX, INTERNAL_NOTE_OVERFLOW_DIR, MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS,
-    ContextCompressionStatus, MutableMessageField, OVERFLOW_HISTORY_FILENAME, insert_archive_note_if_missing,
-    is_compressed_tool_evidence_note, is_incremental_summary, message_billable_chars,
-    value_to_string,
+    ARCHIVE_DIRECTORY_PATH_PREFIX, ARCHIVE_FILE_PATH_PREFIX, ARCHIVE_NOTE_PREFIX,
+    ContextCompressionStatus, INTERNAL_NOTE_OVERFLOW_DIR,
+    MAX_COMPRESSED_TOOL_EVIDENCE_INLINE_CHARS, MutableMessageField, OVERFLOW_HISTORY_FILENAME,
+    insert_archive_note_if_missing, is_compressed_tool_evidence_note, is_incremental_summary,
+    message_billable_chars, value_to_string,
 };
 
 #[derive(Clone)]
@@ -378,7 +379,7 @@ pub(super) fn insert_internal_note_archive_note_if_needed(
         return;
     };
     let archive_note = format!(
-        "{ARCHIVE_NOTE_PREFIX}\n较早的内部上下文注记已逐字归档。\n归档目录: {}\n需要回顾时使用 search_overflow（scope=all）定位，再用 read_file 精读文件。",
+        "{ARCHIVE_NOTE_PREFIX}\nEarlier internal context notes were archived verbatim.\n{ARCHIVE_DIRECTORY_PATH_PREFIX}{}\nUse search_overflow with scope=all to locate relevant entries, then use read_file to inspect the source file.",
         archive_dir.to_string_lossy()
     );
     insert_archive_note_if_missing(messages, archive_note);
@@ -539,12 +540,55 @@ fn trim_archived_note_window(
 
 pub(super) fn build_overflow_placeholder(file_path: &str) -> String {
     let mut out = String::new();
+    out.push_str(ARCHIVE_NOTE_PREFIX);
     out.push_str(
-        "长期记忆归档：更早的原始对话已移出上下文窗口，原文保存在会话归档文件中（零压缩）。\n",
+        "\nEarlier raw conversation messages moved out of the context window and remain verbatim in the session archive.\n",
     );
-    out.push_str("归档文件: ");
+    out.push_str(ARCHIVE_FILE_PATH_PREFIX);
     out.push_str(file_path);
     out.push('\n');
-    out.push_str("重要：不要主动读取此归档文件。仅当当前问题确实依赖已被移出的前文细节（如最初目标、之前的决定、旧报错、或更早的工具输出）而摘要中找不到答案时，才使用 read_file 分段读取（建议 offset=1, limit=200 起步）。若当前上下文足够回答问题，忽略此归档即可。\n");
+    out.push_str("Read this archive only when needed; start with read_file offset=1 limit=200.\n");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_notes_use_the_english_v2_protocol() {
+        let placeholder = build_overflow_placeholder("/sessions/example/overflow-history.md");
+        assert!(placeholder.starts_with("[archive-pointer-v2]\n"));
+        assert!(placeholder.contains("archive_file_path: /sessions/example/overflow-history.md"));
+        assert!(placeholder.is_ascii());
+        assert!(placeholder.chars().count() <= 320, "{placeholder}");
+
+        let mut messages = Vec::new();
+        insert_internal_note_archive_note_if_needed(
+            &mut messages,
+            Some(Path::new("/sessions/example/internal-note-overflow")),
+        );
+        let note = messages[0].content.as_str().expect("archive note text");
+        assert!(note.starts_with("[archive-pointer-v2]\n"));
+        assert!(note.contains("archive_directory_path: /sessions/example/internal-note-overflow"));
+        assert!(note.is_ascii());
+    }
+
+    #[test]
+    fn archive_note_insertion_deduplicates_compact_and_full_forms_by_path() {
+        let path = "/sessions/example/overflow-history.md";
+        let compact = super::super::build_minimal_archive_file_pointer(path);
+        let mut messages = Vec::new();
+        insert_archive_note_if_missing(&mut messages, compact.clone());
+        insert_archive_note_if_missing(&mut messages, build_overflow_placeholder(path));
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(value_to_string(&messages[0].content), compact);
+
+        insert_archive_note_if_missing(
+            &mut messages,
+            build_overflow_placeholder("/sessions/example/other-overflow-history.md"),
+        );
+        assert_eq!(messages.len(), 2);
+    }
 }
