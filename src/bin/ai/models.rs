@@ -37,7 +37,7 @@ pub(super) fn is_vl_model(model: &str) -> bool {
 }
 
 pub(super) fn search_enabled(model: &str) -> bool {
-    model_def(model).map(|m| m.search_enabled).unwrap_or(true)
+    model_def(model).map(|m| m.search_enabled).unwrap_or(false)
 }
 
 pub(super) fn tools_enabled(model: &str) -> bool {

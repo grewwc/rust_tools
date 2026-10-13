@@ -7,7 +7,7 @@
   "platform": "volcano",
   "adapter": "compatible",
   "is_vl": true,
-  "search_enabled": true,
+  "search_enabled": false,
   "tools_default_enabled": true,
   "enable_thinking": true,
   "default_reasoning_effort": "max",

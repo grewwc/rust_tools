@@ -922,32 +922,46 @@ fn truncate_line(line: &str) -> String {
     }
 }
 
-/// Normalize one child-stdout row for SSE transport: neutralize
-/// cursor-addressing escapes, then eliminate every bare `\r`. SSE rows are
-/// append-only, so same-row overwrite controls are meaningless on the wire;
-/// worse, axum re-prefixes `data: ` after every `\r`/`\n` byte while the chat
-/// client only strips the first one, so any surviving `\r` renders as a
-/// literal `data: ` fragment on the client's screen. `BufRead::lines` glues
+/// Normalize one child-stdout row for SSE transport: keep the text a terminal
+/// would end up showing for that row, then neutralize cursor-addressing
+/// escapes. SSE rows are append-only, so a `\r` cannot rewind the client's
+/// cursor; worse, axum re-prefixes `data: ` after every `\r`/`\n` byte while
+/// the chat client only strips the first one, so any surviving `\r` renders as
+/// a literal `data: ` fragment on the client's screen. `BufRead::lines` glues
 /// redraw bytes into the row (completed/failed tool rows carry
 /// `\r\x1b[2K` to redraw the `running` row in place, fold teardown emits
 /// doubled `\r`s with no `\n` between), so the `\r` is routinely mid-line,
 /// not just a leading prefix. `BufRead::lines` already removed the line
-/// ending, so every `\r` left is an overwrite control, never content:
-/// leading ones are dropped and interior ones become row breaks, which the
-/// client prints as separate lines. Cursor moves (`CSI A/B`), region erases
-/// (`CSI J/K`) and friends address screen rows that only exist on the
-/// child's live terminal: replayed verbatim on the chat client's screen
-/// they erase or overwrite unrelated rows (ragged indents,
-/// duplicated-looking status lines). SGR color (`CSI ... m`) is kept: it
-/// styles only the row itself and renders identically everywhere.
+/// ending, so every `\r` left is an overwrite control, never content: only
+/// the text after the last one is what the row shows, and replaying the
+/// replaced text would print a stale running row right above its own
+/// completion (`● plan_update` and `✓ plan_update` together — a pair no local
+/// terminal ever shows). Cursor moves (`CSI A/B`), region erases (`CSI J/K`)
+/// and friends address screen rows that only exist on the child's live
+/// terminal: replayed verbatim on the chat client's screen they erase or
+/// overwrite unrelated rows (ragged indents, duplicated-looking status
+/// lines). SGR color (`CSI ... m`) is kept: it styles only the row itself and
+/// renders identically everywhere.
 #[cfg(feature = "serve")]
 fn clean_sse_line(line: &str) -> String {
-    // Neutralize cursor addressing first: stripping it can reveal a leading
-    // `\r` (e.g. `\x1b[1A\r\x1b[2K...`) that the prefix wash below must see.
-    let stripped = strip_non_sgr_csi(line);
-    // (`\x1b[2K` is already gone: `strip_non_sgr_csi` drops every non-SGR
-    // CSI sequence.) No bare `\r` may reach `Event::data`.
-    truncate_line(stripped.replace('\r', "\n").trim_matches('\n'))
+    // Collapse before escape stripping so an erase-only chunk (`\r\x1b[2K`)
+    // still counts as the row's newest content: it clears the row instead of
+    // leaving the text it replaced visible.
+    truncate_line(&strip_non_sgr_csi(collapse_row_overwrites(line)))
+}
+
+/// Collapse same-row overwrite controls (`\r` redraws) into the one row of
+/// text a terminal shows. Live rows are rewritten in place — `  ● tool`
+/// becomes `\r\x1b[2K  ✓ tool` when the call returns, and the fold / metrics
+/// rows reuse the pattern — so the newest chunk that draws on the row
+/// replaces every chunk before it. An empty chunk (a bare `\r` with nothing
+/// after it) only re-homes the cursor and leaves the row's text alone,
+/// exactly like on a terminal.
+#[cfg(feature = "serve")]
+fn collapse_row_overwrites(line: &str) -> &str {
+    line.rsplit('\r')
+        .find(|chunk| !chunk.is_empty())
+        .unwrap_or("")
 }
 
 /// Remove every ANSI CSI sequence except SGR color (`ESC [ ... m`).
