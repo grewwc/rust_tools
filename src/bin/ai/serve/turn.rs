@@ -147,10 +147,21 @@ impl Drop for ActiveTurnGuard {
 pub(crate) struct PendingConfirm {
     pub(crate) id: u64,
     pub(crate) prompt: String,
+    /// Whether the client answers with `yes`/`no` or with free text.
+    pub(crate) kind: ConfirmKind,
     /// Token handed to the client with the question; an answer must echo it.
     /// Child-side ids restart at 1 in every turn, so the id alone cannot tell
     /// one turn's question from another's.
     pub(crate) token: u64,
+}
+
+/// How the client answers a pending question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfirmKind {
+    /// `yes` / `no` line, decided by Allow / Deny buttons.
+    Confirm,
+    /// Free text line (with a Cancel path), collected through a text field.
+    Input,
 }
 
 /// Hands out the [`PendingConfirm::token`] values. Comparing the echoed token
@@ -299,7 +310,12 @@ pub(crate) async fn get_confirm(
     let body = match pending {
         Some(p) => {
             serde_json::json!({
-                "pending": {"id": p.id, "prompt": p.prompt, "token": p.token},
+                "pending": {
+                    "id": p.id,
+                    "prompt": p.prompt,
+                    "token": p.token,
+                    "input": p.kind == ConfirmKind::Input,
+                },
                 "running": running,
             })
         }
@@ -315,6 +331,9 @@ pub(crate) struct ConfirmAnswerReq {
     /// Echo of the token the question was shown with.
     pub(crate) token: u64,
     pub(crate) allow: bool,
+    /// Free-text answer for an `Input` question; ignored for `Confirm` kinds.
+    #[serde(default)]
+    pub(crate) text: Option<String>,
 }
 
 /// `POST /sessions/{id}/confirm` (authed): answer the pending question, which
@@ -353,7 +372,31 @@ pub(crate) async fn post_confirm(
         // client to re-read instead of being decided by stale text.
         return conflict("no such confirmation is pending".to_string()).into_response();
     }
-    let line = if req.allow { "yes\n" } else { "no\n" };
+    let line = match slot.pending.as_ref() {
+        // An input question is answered with the client's text; `allow:false`
+        // is the Cancel path and writes the marker the child maps to `None`.
+        Some(p) if p.kind == ConfirmKind::Input && req.allow => {
+            let text = req.text.as_deref().unwrap_or("").trim();
+            if text.is_empty() {
+                return conflict("empty answer for an input question".to_string()).into_response();
+            }
+            if text.contains('\n') || text.contains('\r') {
+                // One answer is one stdin line: a multi-line paste would write
+                // several lines, and the leftovers would be consumed as the
+                // next question's answer, desyncing the protocol.
+                return conflict("answer must be a single line".to_string()).into_response();
+            }
+            format!("{text}\n")
+        }
+        Some(p) if p.kind == ConfirmKind::Input => "\u{1e}\n".to_string(),
+        _ => {
+            if req.allow {
+                "yes\n".to_string()
+            } else {
+                "no\n".to_string()
+            }
+        }
+    };
     let write = match slot.answers.as_mut() {
         Some(stdin) => {
             use std::io::Write;

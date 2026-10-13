@@ -299,6 +299,29 @@ use super::*;
         );
     }
 
+    /// Input-request frames (the serve-client text channel) survive the
+    /// decoder like confirmation frames, payload relayed verbatim.
+    #[test]
+    fn decoder_passes_input_frames_through() {
+        use crate::ai::background::ServeLiveKind;
+        let wire = [
+            test_frame(
+                ServeLiveKind::InputRequest,
+                br#"{"id":9,"prompt":"paste the code:"}"#,
+            ),
+            test_frame(ServeLiveKind::InputDone, br#"{"id":9}"#),
+        ]
+        .concat();
+        let mut decoder = ServeFrameDecoder::default();
+        assert_eq!(
+            decoder.push(&wire),
+            vec![
+                ServeLiveEvent::InputRequest(r#"{"id":9,"prompt":"paste the code:"}"#.to_string()),
+                ServeLiveEvent::InputDone(r#"{"id":9}"#.to_string()),
+            ]
+        );
+    }
+
     /// The `/confirm` route pair: the pending question is readable, an answer
     /// reaches the turn child's stdin exactly once, and answering the same
     /// question again is refused instead of writing a second line.
@@ -334,6 +357,7 @@ use super::*;
                 pending: Some(super::PendingConfirm {
                     id: 7,
                     prompt: "proceed?".to_string(),
+                    kind: super::ConfirmKind::Confirm,
                     token: 11,
                 }),
                 answers: child.stdin.take(),
@@ -353,7 +377,7 @@ use super::*;
         assert_eq!(view["pending"]["prompt"], "proceed?");
         assert_eq!(view["pending"]["token"], 11);
 
-        let answer = |allow| super::ConfirmAnswerReq { id: 7, token: 11, allow };
+        let answer = |allow| super::ConfirmAnswerReq { id: 7, token: 11, allow, text: None };
         let ok = super::post_confirm(
             State(state.clone()),
             HeaderMap::new(),
@@ -384,6 +408,7 @@ use super::*;
                 pending: Some(super::PendingConfirm {
                     id: 7,
                     prompt: "a different question".to_string(),
+                    kind: super::ConfirmKind::Confirm,
                     token: 12,
                 }),
                 answers: None,
@@ -403,6 +428,161 @@ use super::*;
             .expect("body");
         let view: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(view["error"], "no such confirmation is pending");
+        let _ = child.wait();
+    }
+
+    /// The input question path of `/confirm`: the client's text is written to
+    /// the child's stdin verbatim (with a newline), the cancel answer writes
+    /// the cancel marker, and an empty text is refused without writing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn input_answer_reaches_the_child_stdin_once() {
+        use axum::{
+            body::Body, extract::Path, http::HeaderMap, http::Request, http::StatusCode,
+            response::IntoResponse,
+        };
+        // Stand-in turn child: consumes one stdin line and echoes it, which is
+        // what the real child's input reader does.
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read line; echo \"$line\"")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn stand-in child");
+        let echo = child.stdout.take().map(|mut out| {
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut text = String::new();
+                let _ = out.read_to_string(&mut text);
+                text
+            })
+        });
+        let state = lifecycle_test_state();
+        state.confirms.lock().expect("confirms").insert(
+            "sid".to_string(),
+            Arc::new(std::sync::Mutex::new(super::ConfirmSlot {
+                pending: Some(super::PendingConfirm {
+                    id: 9,
+                    prompt: "paste the code:".to_string(),
+                    kind: super::ConfirmKind::Input,
+                    token: 13,
+                }),
+                answers: child.stdin.take(),
+            })),
+        );
+
+        let read =
+            super::get_confirm(State(state.clone()), HeaderMap::new(), Path("sid".to_string()))
+                .await
+                .into_response();
+        assert_eq!(read.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(read.into_body(), 4096)
+            .await
+            .expect("body");
+        let view: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(view["pending"]["id"], 9);
+        assert_eq!(view["pending"]["input"], true);
+
+        // The client's text reaches the child as one line.
+        let ok = super::post_confirm(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("sid".to_string()),
+            axum::Json(super::ConfirmAnswerReq {
+                id: 9,
+                token: 13,
+                allow: true,
+                text: Some("abc123".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        // An empty text is refused and writes nothing (the question stays).
+        // Replacing the slot is a fresh question for the second answer; the
+        // child already echoed the first line and exited, so the echo thread
+        // below can join.
+        state.confirms.lock().expect("confirms").insert(
+            "sid".to_string(),
+            Arc::new(std::sync::Mutex::new(super::ConfirmSlot {
+                pending: Some(super::PendingConfirm {
+                    id: 9,
+                    prompt: "paste the code:".to_string(),
+                    kind: super::ConfirmKind::Input,
+                    token: 13,
+                }),
+                answers: None,
+            })),
+        );
+        let empty = super::post_confirm(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("sid".to_string()),
+            axum::Json(super::ConfirmAnswerReq {
+                id: 9,
+                token: 13,
+                allow: true,
+                text: Some("   ".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(empty.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(empty.into_body(), 4096)
+            .await
+            .expect("body");
+        let view: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(view["error"], "empty answer for an input question");
+        // A multi-line paste must be refused too: one answer is one stdin
+        // line, and leftover lines would be read as the next question's
+        // answer. The slot must stay pending afterwards.
+        state.confirms.lock().expect("confirms").insert(
+            "sid".to_string(),
+            Arc::new(std::sync::Mutex::new(super::ConfirmSlot {
+                pending: Some(super::PendingConfirm {
+                    id: 9,
+                    prompt: "paste the code:".to_string(),
+                    kind: super::ConfirmKind::Input,
+                    token: 14,
+                }),
+                answers: None,
+            })),
+        );
+        let multi = super::post_confirm(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("sid".to_string()),
+            axum::Json(super::ConfirmAnswerReq {
+                id: 9,
+                token: 14,
+                allow: true,
+                text: Some("line one\nline two".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(multi.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(multi.into_body(), 4096)
+            .await
+            .expect("body");
+        let view: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(view["error"], "answer must be a single line");
+        let still = super::get_confirm(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("sid".to_string()),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(still.into_body(), 4096)
+            .await
+            .expect("body");
+        let view: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(view["pending"]["id"], 9);
+        assert_eq!(view["pending"]["input"], true);
+        assert_eq!(echo.and_then(|handle| handle.join().ok()).as_deref(), Some("abc123\n"));
         let _ = child.wait();
     }
 
@@ -1405,6 +1585,7 @@ use super::*;
                 pending: Some(super::PendingConfirm {
                     id: 1,
                     prompt: "commit?".to_string(),
+                    kind: super::ConfirmKind::Confirm,
                     token: 5,
                 }),
                 answers: child.stdin.take(),
@@ -1464,6 +1645,7 @@ use super::*;
                 id: 1,
                 token: 5,
                 allow: true,
+                text: None,
             }),
         )
         .await

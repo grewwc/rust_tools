@@ -600,7 +600,8 @@ fn setup_live_fifo(_session_id: &str) -> Option<LiveFifo> {
 /// Serve-live frame kinds, mirroring `background::ServeLiveKind`
 /// discriminants (1 = delta, 2 = thinking start, 3 = thinking chunk,
 /// 4 = thinking done, 5 = output complete, 6 = confirmation request,
-/// 7 = confirmation resolved).
+/// 7 = confirmation resolved, 8 = subagent progress, 9 = input request,
+/// 10 = input resolved).
 #[derive(Debug, PartialEq, Eq)]
 #[cfg(feature = "serve")]
 enum ServeLiveEvent {
@@ -615,6 +616,11 @@ enum ServeLiveEvent {
     ConfirmDone(String),
     /// Latest compact status-line snapshot for foreground-owned subagents.
     SubagentProgress(String),
+    /// Raw JSON payload of a free-text input request (same shape as a
+    /// confirmation request: `{"id","prompt"}`).
+    InputRequest(String),
+    /// Raw JSON payload closing an input request.
+    InputDone(String),
 }
 
 /// Incremental parser for serve-live frames (`[kind: u8][len: u32 BE][payload]`):
@@ -648,7 +654,9 @@ impl ServeFrameDecoder {
                 || kind == background::ServeLiveKind::OutputComplete as u8
                 || kind == background::ServeLiveKind::ConfirmRequest as u8
                 || kind == background::ServeLiveKind::ConfirmDone as u8
-                || kind == background::ServeLiveKind::SubagentProgress as u8;
+                || kind == background::ServeLiveKind::SubagentProgress as u8
+                || kind == background::ServeLiveKind::InputRequest as u8
+                || kind == background::ServeLiveKind::InputDone as u8;
             if !known || len > background::MAX_SERVE_FRAME_LEN as usize {
                 self.buf.clear();
                 break;
@@ -674,6 +682,12 @@ impl ServeFrameDecoder {
                 }
                 k if k == background::ServeLiveKind::ConfirmDone as u8 => {
                     ServeLiveEvent::ConfirmDone(payload)
+                }
+                k if k == background::ServeLiveKind::InputRequest as u8 => {
+                    ServeLiveEvent::InputRequest(payload)
+                }
+                k if k == background::ServeLiveKind::InputDone as u8 => {
+                    ServeLiveEvent::InputDone(payload)
                 }
                 k if k == background::ServeLiveKind::SubagentProgress as u8 => {
                     ServeLiveEvent::SubagentProgress(payload)
@@ -713,9 +727,13 @@ fn live_event(event: ServeLiveEvent) -> Option<Event> {
         ServeLiveEvent::ThinkingDone => {
             Some(Event::default().event("thinking_done").data(""))
         }
-        // Confirmation frames are built by `forward_live_event`, which holds
-        // the pending state and adds the answer token; they never get here.
-        ServeLiveEvent::ConfirmRequest(_) | ServeLiveEvent::ConfirmDone(_) => None,
+        // Confirmation and input frames are built by `forward_live_event`,
+        // which holds the pending state and adds the answer token; they never
+        // get here.
+        ServeLiveEvent::ConfirmRequest(_)
+        | ServeLiveEvent::ConfirmDone(_)
+        | ServeLiveEvent::InputRequest(_)
+        | ServeLiveEvent::InputDone(_) => None,
         ServeLiveEvent::SubagentProgress(line) => {
             Some(Event::default().event("subagent_progress").data(line))
         }
@@ -762,6 +780,7 @@ fn forward_live_event(
                     slot.pending = Some(PendingConfirm {
                         id,
                         prompt: prompt.clone(),
+                        kind: ConfirmKind::Confirm,
                         token,
                     });
                 }
@@ -783,6 +802,37 @@ fn forward_live_event(
                 }
             }
             Event::default().event("confirm_done").data(payload)
+        }
+        ServeLiveEvent::InputRequest(payload) => {
+            let Some((id, prompt)) = parse_confirm_request(&payload) else {
+                return;
+            };
+            let token = NEXT_CONFIRM_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(slot) = confirm {
+                if let Ok(mut slot) = slot.lock() {
+                    slot.pending = Some(PendingConfirm {
+                        id,
+                        prompt: prompt.clone(),
+                        kind: ConfirmKind::Input,
+                        token,
+                    });
+                }
+            }
+            Event::default()
+                .event("input_request")
+                .data(serde_json::json!({"id": id, "prompt": prompt, "token": token}).to_string())
+        }
+        ServeLiveEvent::InputDone(payload) => {
+            if let Some(id) = parse_confirm_id(&payload) {
+                if let Some(slot) = confirm {
+                    if let Ok(mut slot) = slot.lock() {
+                        if slot.pending.as_ref().is_some_and(|p| p.id == id) {
+                            slot.pending = None;
+                        }
+                    }
+                }
+            }
+            Event::default().event("input_done").data(payload)
         }
         other => match live_event(other) {
             Some(e) => e,

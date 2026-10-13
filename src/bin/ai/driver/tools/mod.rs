@@ -28,7 +28,7 @@ use crate::ai::{
 use crate::commonw::prompt::prompt_yes_or_no_interruptible;
 
 mod barrier;
-mod oauth;
+pub(crate) mod oauth;
 mod sync_task;
 
 /// 供 driver 内部的显式命令复用同步 `task` 路径，保持子代理隔离、取消和证据持久化语义。

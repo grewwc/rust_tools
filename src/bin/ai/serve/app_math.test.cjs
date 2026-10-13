@@ -152,7 +152,7 @@ test("phone question navigator is a compact session-bar control", () => {
 });
 
 test("phone history exposes a dedicated rewind action without whole-bubble taps", () => {
-  const start = script.indexOf("function addUserBubble(");
+  const start = script.indexOf("function attachUserRewind(");
   const end = script.indexOf("async function rewindTo(", start);
   assert.ok(start >= 0 && end > start);
   const actions = [];
@@ -178,6 +178,38 @@ test("phone history exposes a dedicated rewind action without whole-bubble taps"
   context.window.matchMedia = () => ({ matches: false });
   bubble.onclick({ target: { closest: () => null } });
   assert.deepEqual(rewinds, [[17, "keep this preview"]]);
+});
+
+test("a live user bubble resolves the canonical index before rewinding", async () => {
+  const start = script.indexOf("function attachUserRewind(");
+  const end = script.indexOf("async function rewindTo(", start);
+  assert.ok(start >= 0 && end > start);
+  const actions = [];
+  const rewinds = [];
+  const notes = [];
+  const bubble = { dataset: {}, appendChild: (node) => actions.push(node) };
+  const messages = [
+    { role: "user", content: "repeat" },
+    { role: "assistant", content: "old" },
+    { role: "user", content: "repeat" },
+    { role: "assistant", content: "new" },
+  ];
+  const context = vm.createContext({
+    window: { matchMedia: () => ({ matches: true }) },
+    document: { createElement: () => ({ setAttribute(name, value) { this[name] = value; } }) },
+    addMsg: () => bubble,
+    textOf: (value) => String(value),
+    api: async () => ({ headers: { get: () => "12" }, json: async () => messages }),
+    note: (message) => notes.push(message),
+    rewindTo: (...args) => rewinds.push(args),
+  });
+  vm.runInContext(script.slice(start, end), context);
+  context.addLiveUserBubble("repeat", "repeat", "session-1", 10);
+  assert.equal(actions.length, 1);
+  await actions[0].onclick({ stopPropagation() {} });
+  assert.deepEqual(rewinds, [[10, "repeat", "session-1"]]);
+  assert.deepEqual(notes, []);
+  assert.match(script, /addLiveUserBubble\(text \|\| "\(images only\)", prompt, sid, rewindFloor\);/);
 });
 
 test("rewind action is visible only in the phone layout", () => {
@@ -323,6 +355,74 @@ test("ordinary Markdown and HTML safety survive", () => {
   const attack = '$\\text{"/><img src=x onerror=alert(1)>}$';
   assert.doesNotMatch(render(attack), /<img/);
   assert.equal(nodesOf(render(attack))[0].textContent, attack);
+});
+
+test("complete SVG blocks render in an isolated responsive frame", () => {
+  const { render } = harness();
+  const svg = '<svg viewBox="0 0 320 160"><defs><linearGradient id="g"><stop stop-color="navy"/></linearGradient></defs><rect width="320" height="160" fill="url( \'#g\' )"/></svg>';
+  for (const input of ["```svg\n" + svg + "\n```", svg]) {
+    const result = render(input);
+    assert.match(result, /class="svg-preview"/);
+    assert.match(result, /data-svg-view="render" aria-pressed="true">render<\/button>/);
+    assert.match(result, /data-svg-view="source" aria-pressed="false">source<\/button>/);
+    assert.match(result, /<iframe sandbox referrerpolicy="no-referrer" loading="lazy"/);
+    assert.match(result, /style="aspect-ratio:2\.0000 \/ 1"/);
+    assert.match(result, /script-src 'none'/);
+    assert.match(result, /&lt;svg viewBox=&quot;0 0 320 160&quot;&gt;/);
+    assert.match(result, /<pre class="svg-preview-source" hidden><code>&lt;svg/);
+    assert.doesNotMatch(result, /<svg\b/);
+  }
+  assert.match(render("```svg\n" + svg), /<pre data-lang="svg"><code>/);
+});
+
+test("SVG preview controls switch between isolated rendering and escaped source", () => {
+  const { context } = harness();
+  const frame = { hidden: false };
+  const source = { hidden: true };
+  const classes = new Set();
+  const buttons = ["render", "source"].map((view) => ({
+    dataset: { svgView: view },
+    pressed: view === "render" ? "true" : "false",
+    setAttribute(name, value) { if (name === "aria-pressed") this.pressed = value; },
+  }));
+  const preview = {
+    classList: { toggle(name, on) { if (on) classes.add(name); else classes.delete(name); } },
+    querySelector(selector) { return selector === "iframe" ? frame : source; },
+    querySelectorAll() { return buttons; },
+  };
+  for (const button of buttons) button.closest = () => preview;
+
+  context.handleSvgPreviewClick({ target: { closest: () => buttons[1] } });
+  assert.equal(frame.hidden, true);
+  assert.equal(source.hidden, false);
+  assert.equal(buttons[0].pressed, "false");
+  assert.equal(buttons[1].pressed, "true");
+  assert.equal(classes.has("show-source"), true);
+
+  context.handleSvgPreviewClick({ target: { closest: () => buttons[0] } });
+  assert.equal(frame.hidden, false);
+  assert.equal(source.hidden, true);
+  assert.equal(buttons[0].pressed, "true");
+  assert.equal(buttons[1].pressed, "false");
+  assert.equal(classes.has("show-source"), false);
+});
+
+test("active or externally-referencing SVG falls back to escaped source", () => {
+  const { render } = harness();
+  for (const svg of [
+    '<svg onload="alert(1)"><circle r="5"/></svg>',
+    '<svg><script>alert(1)</script></svg>',
+    '<svg><image href="https://example.com/track.png"/></svg>',
+    '<svg><rect style="fill:url(https://example.com/paint.svg)"/></svg>',
+    '<svg><style>@import "https://example.com/x.css"</style></svg>',
+  ]) {
+    const fenced = render("```svg\n" + svg + "\n```");
+    assert.doesNotMatch(fenced, /class="svg-preview"/);
+    assert.match(fenced, /<pre data-lang="svg"><code>&lt;svg/);
+    const raw = render(svg);
+    assert.doesNotMatch(raw, /class="svg-preview"/);
+    assert.match(raw, /&lt;svg/);
+  }
 });
 
 test("remote images and media render inline without autoplay", () => {
@@ -658,14 +758,14 @@ test("the jump-to-latest control is a phone-only overlaid round button", () => {
   assert.match(html, /@media \(max-width:700px\) \{[\s\S]*?#jumpbottom\.show \{ opacity:1;/);
 });
 
-test("the phone composer stacks a roomy prompt above round action buttons", () => {
+test("the phone composer keeps an idle prompt compact beside smaller action buttons", () => {
   const desktopCss = html.slice(html.indexOf("<style>"), html.indexOf("@media (max-width:700px)"));
   const phoneCss = html.slice(html.indexOf("@media (max-width:700px)"), html.indexOf("</style>"));
   assert.match(desktopCss, /#composer \{ display:flex;/);
-  assert.match(phoneCss, /#composer \{[\s\S]*?display:grid;[\s\S]*?grid-template-areas:"prompt prompt prompt" "image \. send";/);
-  assert.match(phoneCss, /#prompt \{[\s\S]*?grid-area:prompt;[\s\S]*?min-height:42px;[\s\S]*?max-height:38dvh;/);
-  assert.match(phoneCss, /#prompt:focus, #prompt:not\(:placeholder-shown\) \{ min-height:84px; \}/);
-  assert.match(phoneCss, /#img, #send \{[\s\S]*?width:48px;[\s\S]*?border-radius:50%;/);
+  assert.match(phoneCss, /#composer \{[\s\S]*?display:grid;[\s\S]*?grid-template-areas:"image prompt send";[\s\S]*?align-items:end;/);
+  assert.match(phoneCss, /#prompt \{[\s\S]*?grid-area:prompt;[\s\S]*?min-height:40px;[\s\S]*?max-height:38dvh;/);
+  assert.doesNotMatch(phoneCss, /#prompt:focus[^\{]*\{[^}]*min-height/);
+  assert.match(phoneCss, /#img, #send \{[\s\S]*?width:42px;[\s\S]*?height:42px;[\s\S]*?border-radius:50%;/);
   assert.match(html, /<button id="send" class="primary">➤<\/button>/);
 });
 

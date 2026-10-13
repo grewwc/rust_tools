@@ -489,6 +489,8 @@ pub(crate) enum ServeLiveKind {
     ConfirmRequest = 6,
     ConfirmDone = 7,
     SubagentProgress = 8,
+    InputRequest = 9,
+    InputDone = 10,
 }
 
 /// Max payload bytes per serve frame: header (5) + payload stays under the
