@@ -1,16 +1,18 @@
-//! Remote confirmation for serve turn children.
+//! Remote confirmation and text input for serve turn children.
 //!
 //! A serve turn child has no terminal: the user watches the turn from the web
 //! client (`serve/app.html`) on another device. When a tool needs explicit
-//! confirmation (today `git commit` / `git stash`), the child publishes a
-//! `ConfirmRequest` frame on the serve live FIFO, which the daemon relays to
-//! the client and answers by writing `yes` / `no` into the child's stdin. The
-//! child reads that line back here, so the gate behaves like a local prompt
-//! whose keyboard is the phone.
+//! confirmation (today `git commit` / `git stash`) or a free-text answer
+//! (today the Feishu OAuth code), the child publishes a request frame on the
+//! serve live FIFO, which the daemon relays to the client and answers by
+//! writing one line into the child's stdin. The child reads that line back
+//! here, so the gate behaves like a local prompt whose keyboard is the phone.
 //!
 //! Frame payloads are JSON: `{"id":<u64>,"prompt":"..."}` for the request and
-//! `{"id":<u64>}` for the resolution. `ai::serve` owns the daemon half of this
-//! protocol; keep the two sides in sync.
+//! `{"id":<u64>}` for the resolution. A confirm answer is `yes` / `no`; an
+//! input answer is the raw text, or the cancel marker `\u{1e}` (Record
+//! Separator, untypeable from a web input) when the client cancels. `ai::serve`
+//! owns the daemon half of this protocol; keep the two sides in sync.
 
 use std::io::BufRead;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,6 +63,26 @@ pub(crate) fn confirm(prompt: &str) -> Option<bool> {
     answer
 }
 
+/// Ask the serve client for a free-text answer to `prompt`, blocking until it
+/// answers. `Some(text)` is the client's answer (non-empty); `None` means the
+/// channel closed (daemon gone or turn torn down) or the client canceled.
+pub(crate) fn input(prompt: &str) -> Option<String> {
+    if !active() {
+        return None;
+    }
+    // Same serialization as `confirm`: one outstanding question per process.
+    let _serialized = CONFIRM_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let id = NEXT_CONFIRM_ID.fetch_add(1, Ordering::Relaxed);
+    let payload = request_payload(id, prompt);
+    background::publish_serve_frame(ServeLiveKind::InputRequest, &payload);
+    let answer = read_input();
+    background::publish_serve_frame(
+        ServeLiveKind::InputDone,
+        &serde_json::json!({ "id": id }).to_string(),
+    );
+    answer
+}
+
 /// Build the request payload, shrinking the prompt until the whole JSON fits
 /// one frame. JSON escaping can expand a byte sixfold (control characters), so
 /// a byte budget on the raw text is only a starting estimate.
@@ -93,6 +115,30 @@ fn read_answer() -> Option<bool> {
                 "no" | "n" => return Some(false),
                 _ => {}
             },
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Read the daemon's one-line answer to an input question from stdin. EOF and
+/// the cancel marker (`\u{1e}`, written by the daemon when the client cancels)
+/// are `None`; an empty line keeps waiting, matching the confirm re-ask.
+fn read_input() -> Option<String> {
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => return None,
+            Ok(_) => {
+                let text = line.trim_end_matches(['\r', '\n']).to_string();
+                if text == "\u{1e}" {
+                    return None;
+                }
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
             Err(_) => return None,
         }
     }

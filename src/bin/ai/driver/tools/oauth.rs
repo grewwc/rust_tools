@@ -52,6 +52,43 @@ fn extract_oauth_code(s: &str) -> Option<String> {
     None
 }
 
+/// Pull an OAuth code out of text a user pasted back: a full redirect URL
+/// (the code in its query string or fragment), or a bare code. Serves the
+/// serve-client flow, where the user authorizes on their own device and the
+/// callback never reaches this machine. `None` when the text looks like a URL
+/// but carries no code: fail closed instead of feeding the whole URL to the
+/// exchange endpoint.
+pub(crate) fn extract_oauth_code_from_text(s: &str) -> Option<String> {
+    let s = s.trim();
+    let code_from = |haystack: &str| {
+        for part in haystack.split('&') {
+            let mut it = part.splitn(2, '=');
+            if it.next() == Some("code") {
+                let v = it.next().unwrap_or("").trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+        None
+    };
+    if let Some(qidx) = s.find('?') {
+        let tail = &s[qidx + 1..];
+        let (query, fragment) = match tail.split_once('#') {
+            Some((q, f)) => (q, Some(f)),
+            None => (tail, None),
+        };
+        return code_from(query).or_else(|| fragment.and_then(code_from));
+    }
+    if let Some(fidx) = s.find('#') {
+        return code_from(&s[fidx + 1..]);
+    }
+    if !s.is_empty() {
+        return Some(s.to_string());
+    }
+    None
+}
+
 fn open_browser(url: &str) {
     let program = if cfg!(target_os = "macos") {
         "open"
@@ -66,8 +103,12 @@ fn run_feishu_oauth_flow(
     server_name: &str,
     scope: &str,
 ) -> Result<(), String> {
-    let confirm =
-        prompt_yes_or_no_interruptible("Feishu authorization required. Authorize now? (y/n): ");
+    let serve = crate::ai::serve_confirm::active();
+    let confirm = if serve {
+        crate::ai::serve_confirm::confirm("Feishu authorization required. Authorize now? (y/n): ")
+    } else {
+        prompt_yes_or_no_interruptible("Feishu authorization required. Authorize now? (y/n): ")
+    };
     if confirm != Some(true) {
         return Err(if confirm.is_none() {
             "feishu oauth canceled by user (Ctrl+C)".to_string()
@@ -89,27 +130,50 @@ fn run_feishu_oauth_flow(
         }),
     )?;
     let auth_url = auth_url.trim().to_string();
-    println!("\n[feishu] authorize url:\n{}\n", auth_url);
-
-    let open_now = prompt_yes_or_no_interruptible("Open browser now? (y/n): ");
-    if open_now == Some(true) {
-        open_browser(&auth_url);
-    }
-
-    println!("[feishu] waiting for oauth callback on http://127.0.0.1:{port}/callback ...");
-    let code_out = mcp_client.call_tool(
-        server_name,
-        "oauth_wait_local_code",
-        json!({
-            "port": port,
-            "timeout_sec": 180
-        }),
-    )?;
-    let Some(code) = extract_oauth_code(&code_out) else {
-        return Err(format!(
-            "failed to capture oauth code. raw output:\n{}",
-            code_out.trim()
+    let code = if serve {
+        // No terminal and no browser we can open on the user's behalf: the
+        // client opens the URL on its own device and pastes back the redirect
+        // target. The local callback server would bind this machine's
+        // 127.0.0.1, which a remote browser never reaches.
+        let ok = crate::ai::serve_confirm::confirm(&format!(
+            "Feishu authorization. Open this URL in your browser and authorize:\n\n{auth_url}\n\nAuthorized? (y/n): "
         ));
+        if ok != Some(true) {
+            return Err("feishu oauth canceled by user".to_string());
+        }
+        let pasted = crate::ai::serve_confirm::input(
+            "Paste the full redirect URL from the address bar after authorizing (or just the code):",
+        );
+        let Some(pasted) = pasted else {
+            return Err("feishu oauth canceled by user".to_string());
+        };
+        extract_oauth_code_from_text(&pasted).ok_or_else(|| {
+            "failed to extract oauth code from the pasted text".to_string()
+        })?
+    } else {
+        println!("\n[feishu] authorize url:\n{}\n", auth_url);
+
+        let open_now = prompt_yes_or_no_interruptible("Open browser now? (y/n): ");
+        if open_now == Some(true) {
+            open_browser(&auth_url);
+        }
+
+        println!("[feishu] waiting for oauth callback on http://127.0.0.1:{port}/callback ...");
+        let code_out = mcp_client.call_tool(
+            server_name,
+            "oauth_wait_local_code",
+            json!({
+                "port": port,
+                "timeout_sec": 180
+            }),
+        )?;
+        let Some(code) = extract_oauth_code(&code_out) else {
+            return Err(format!(
+                "failed to capture oauth code. raw output:\n{}",
+                code_out.trim()
+            ));
+        };
+        code
     };
 
     let exchange_out = mcp_client.call_tool(
@@ -161,5 +225,56 @@ pub(super) fn execute_mcp_tool_call(
             })
         }
         Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_oauth_code_from_text;
+
+    #[test]
+    fn extract_code_from_query_string() {
+        assert_eq!(
+            extract_oauth_code_from_text(
+                "https://open.feishu.cn/open-apis/authen/v1/index?code=abc123&state=x"
+            )
+            .as_deref(),
+            Some("abc123")
+        );
+        // `code` may appear after other parameters.
+        assert_eq!(
+            extract_oauth_code_from_text("https://host/cb?state=x&code=def456").as_deref(),
+            Some("def456")
+        );
+    }
+
+    #[test]
+    fn extract_code_from_fragment() {
+        // Fragment-only callback: no query at all.
+        assert_eq!(
+            extract_oauth_code_from_text("https://host/cb#code=abc123").as_deref(),
+            Some("abc123")
+        );
+        // Query without code, code in the fragment after it.
+        assert_eq!(
+            extract_oauth_code_from_text("https://host/cb?state=x#code=def456").as_deref(),
+            Some("def456")
+        );
+    }
+
+    #[test]
+    fn extract_code_from_bare_paste() {
+        assert_eq!(extract_oauth_code_from_text("  abc123  ").as_deref(), Some("abc123"));
+        assert_eq!(extract_oauth_code_from_text("").is_none(), true);
+    }
+
+    #[test]
+    fn url_without_code_fails_closed() {
+        // A URL-shaped paste without a code must not be passed through as the
+        // code itself; the exchange would only fail later with a confusing
+        // error. The `code` parameter must be present (and non-empty).
+        assert_eq!(extract_oauth_code_from_text("https://host/cb?state=x").is_none(), true);
+        assert_eq!(extract_oauth_code_from_text("https://host/cb?code=").is_none(), true);
+        assert_eq!(extract_oauth_code_from_text("https://host/cb?state=x#frag").is_none(), true);
     }
 }

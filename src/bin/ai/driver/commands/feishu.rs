@@ -3,6 +3,7 @@ use std::process::Command;
 use serde_json::json;
 
 use crate::ai::mcp::SharedMcpClient;
+use crate::ai::driver::tools::oauth::extract_oauth_code_from_text;
 use crate::commonw::prompt::{prompt_yes_or_no_interruptible, read_line};
 
 pub fn try_handle_feishu_auth_command(
@@ -44,14 +45,35 @@ pub fn try_handle_feishu_auth_command(
         return Ok(true);
     };
 
-    let scope = read_line("OAuth scope (default: offline_access): ");
+    let serve = crate::ai::serve_confirm::active();
+
+    let scope = if serve {
+        // `None` is an explicit cancel (client Cancel button / channel gone),
+        // not an empty answer: abort rather than silently using the default.
+        let Some(scope) =
+            crate::ai::serve_confirm::input("OAuth scope (default: offline_access): ")
+        else {
+            println!("已取消");
+            return Ok(true);
+        };
+        scope
+    } else {
+        read_line("OAuth scope (default: offline_access): ")
+    };
     let scope = if scope.trim().is_empty() {
         "offline_access".to_string()
     } else {
         scope.trim().to_string()
     };
 
-    let port_input = read_line("Local callback port (default: 8711): ");
+    // In serve mode no local callback server is ever started (the client
+    // pastes the code back instead), so the port only matters for building the
+    // redirect_uri; the default is used.
+    let port_input = if serve {
+        String::new()
+    } else {
+        read_line("Local callback port (default: 8711): ")
+    };
     let port = port_input
         .trim()
         .parse::<u16>()
@@ -76,39 +98,67 @@ pub fn try_handle_feishu_auth_command(
     let url = url.trim().to_string();
     println!("\n授权链接：\n{url}\n");
 
-    let open_now = prompt_yes_or_no_interruptible("Open browser now? (y/n): ");
-    if open_now == Some(true) {
-        let program = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
+    let code = if serve {
+        // The client opens the URL on its own device and pastes back the
+        // redirect target; the local callback server would bind this machine's
+        // 127.0.0.1, which a remote browser never reaches.
+        let ok = crate::ai::serve_confirm::confirm(&format!(
+            "飞书授权。请在浏览器中打开以下链接并完成授权：\n\n{url}\n\n已完成授权？(y/n): "
+        ));
+        if ok != Some(true) {
+            println!("已取消授权");
+            return Ok(true);
+        }
+        let pasted = crate::ai::serve_confirm::input(
+            "授权完成后，请粘贴浏览器地址栏中的完整回调 URL（或其中的 code）:",
+        );
+        let Some(pasted) = pasted else {
+            println!("已取消授权");
+            return Ok(true);
         };
-        let _ = crate::fork_guard::status(Command::new(program).arg(&url));
-    }
-
-    println!("等待授权回调（{redirect_uri}）...");
-    let code_out = {
-        let mc = mcp_client.lock().unwrap();
-        match mc.call_tool(
-            &server,
-            "oauth_wait_local_code",
-            json!({
-                "port": port,
-                "timeout_sec": 180
-            }),
-        ) {
-            Ok(v) => v,
-            Err(err) => {
-                let _ = mc.reset_server(&server);
-                return Err(err.into());
+        match extract_oauth_code_from_text(&pasted) {
+            Some(code) => code,
+            None => {
+                println!("未能从粘贴内容中提取 code：\n{pasted}");
+                return Ok(true);
             }
         }
+    } else {
+        let open_now = prompt_yes_or_no_interruptible("Open browser now? (y/n): ");
+        if open_now == Some(true) {
+            let program = if cfg!(target_os = "macos") {
+                "open"
+            } else {
+                "xdg-open"
+            };
+            let _ = crate::fork_guard::status(Command::new(program).arg(&url));
+        }
+
+        println!("等待授权回调（{redirect_uri}）...");
+        let code_out = {
+            let mc = mcp_client.lock().unwrap();
+            match mc.call_tool(
+                &server,
+                "oauth_wait_local_code",
+                json!({
+                    "port": port,
+                    "timeout_sec": 180
+                }),
+            ) {
+                Ok(v) => v,
+                Err(err) => {
+                    let _ = mc.reset_server(&server);
+                    return Err(err.into());
+                }
+            }
+        };
+        let code = extract_code_from_wait_output(&code_out).unwrap_or_default();
+        if code.is_empty() {
+            println!("未获取到 code，原始输出：\n{code_out}");
+            return Ok(true);
+        }
+        code
     };
-    let code = extract_code_from_wait_output(&code_out).unwrap_or_default();
-    if code.is_empty() {
-        println!("未获取到 code，原始输出：\n{code_out}");
-        return Ok(true);
-    }
 
     let exchange = {
         let mc = mcp_client.lock().unwrap();
@@ -143,3 +193,4 @@ fn extract_code_from_wait_output(s: &str) -> Option<String> {
     }
     None
 }
+
