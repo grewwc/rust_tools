@@ -1132,13 +1132,30 @@ use super::*;
     }
 
     #[test]
+    fn clean_sse_line_collapses_same_row_overwrites() {
+        // `print_run_status` closes the open running row with `\r\x1b[2K`
+        // and redraws the completed row on top of it. The append-only wire
+        // keeps the final state only: no local terminal shows the pair
+        // together.
+        assert_eq!(
+            clean_sse_line("  ● plan_update\r\u{1b}[2K  \u{1b}[32m✓\u{1b}[0m plan_update"),
+            "  \u{1b}[32m✓\u{1b}[0m plan_update"
+        );
+        // An erase-only chunk clears the row a live loop had drawn.
+        assert_eq!(clean_sse_line("  ↳ step 1/3\r\u{1b}[2K"), "");
+        // A bare trailing `\r` re-homes the cursor without erasing, so the
+        // row keeps its text (styling stays byte-identical).
+        assert_eq!(clean_sse_line("  ○ running\u{1b}[0m\r"), "  ○ running\u{1b}[0m");
+    }
+
+    #[test]
     fn clean_sse_line_neutralizes_cursor_addressing_escapes() {
-        // A glued running/completed pair becomes two wire rows: a surviving
-        // mid-line `\r` would make axum re-prefix `data:`, and the client
-        // only strips the first `data: `, so the second prints literally.
+        // A glued running/completed pair is one terminal row being redrawn:
+        // the wash keeps the completed state and drops the running text it
+        // replaced, so the client never prints `● tool` above its `✓ tool`.
         assert_eq!(
             clean_sse_line("  ● task_status\r\u{1b}[2K  \u{1b}[32m✓\u{1b}[0m task_status"),
-            "  ● task_status\n  \u{1b}[32m✓\u{1b}[0m task_status"
+            "  \u{1b}[32m✓\u{1b}[0m task_status"
         );
         // Cursor moves and region erases address the child's screen, never
         // the client's: strip them, keep the text and its SGR color.
@@ -1164,7 +1181,8 @@ use super::*;
             clean_sse_line("\r\r\u{1b}[2K  \u{1b}[32m✓\u{1b}[0m thinking (3 lines)"),
             "  \u{1b}[32m✓\u{1b}[0m thinking (3 lines)"
         );
-        assert_eq!(clean_sse_line("50%\r51%\r52%"), "50%\n51%\n52%");
+        // A live row rewritten in place keeps only its final text.
+        assert_eq!(clean_sse_line("50%\r51%\r52%"), "52%");
         for input in [
             "\r\r\u{1b}[2K  ✓ done",
             "  ○ running\u{1b}[0m\r",
