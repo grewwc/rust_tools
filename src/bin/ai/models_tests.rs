@@ -825,7 +825,7 @@ fn minimal_model_config_omits_capability_flags_with_matching_defaults() {
     let def: ModelDef =
         serde_json::from_str(r#"{"key":"X","name":"x"}"#).expect("minimal config parses");
     assert!(!def.is_vl);
-    assert!(def.search_enabled);
+    assert!(!def.search_enabled);
     assert!(def.tools_default_enabled);
 }
 

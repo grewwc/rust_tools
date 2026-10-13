@@ -4,7 +4,7 @@
     "adapter": "opencode",
     "quality_tier": "strong",
     "is_vl": true,
-    "search_enabled": true,
+    "search_enabled": false,
     "tools_default_enabled": true,
     "enable_thinking": true,
     "reasoning_content_replay": true,

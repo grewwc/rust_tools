@@ -5,7 +5,7 @@
   "quality_tier": "strong",
   "api_key_config_key": "deepseek.api_key",
   "is_vl": true,
-  "search_enabled": true,
+  "search_enabled": false,
   "tools_default_enabled": true,
   "enable_thinking": true,
   "subagent_priority": 85,

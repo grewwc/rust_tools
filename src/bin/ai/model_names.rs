@@ -144,8 +144,8 @@ pub struct ModelDef {
     /// Provider-native web search. Enable only when the request protocol has a clear wire mapping:
     /// DashScope Chat Completions uses `enable_search`, OpenAI Responses uses the built-in
     /// `web_search` tool; client-side tools are not part of this field.
-    /// Defaults to true, matching the `models::search_enabled` fallback for unknown models.
-    #[serde(default = "default_true")]
+    /// Defaults to false, matching the `models::search_enabled` fallback for unknown models.
+    #[serde(default)]
     pub search_enabled: bool,
     /// Defaults to true, matching the `models::tools_enabled` fallback for unknown models.
     #[serde(default = "default_true")]

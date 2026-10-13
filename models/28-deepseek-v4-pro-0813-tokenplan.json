@@ -7,7 +7,7 @@
   "quality_tier": "strong",
   "adapter": "alibaba",
   "is_vl": false,
-  "search_enabled": true,
+  "search_enabled": false,
   "reasoning_effort_wire": "top_level",
   "default_reasoning_effort": "max",
   "tools_default_enabled": true,

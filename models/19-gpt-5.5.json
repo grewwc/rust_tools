@@ -6,7 +6,7 @@
   "quality_tier": "flagship",
   "adapter": "compatible",
   "is_vl": true,
-  "search_enabled": true,
+  "search_enabled": false,
   "tools_default_enabled": true,
   "enable_thinking": true,
   "request_protocol": "responses",
