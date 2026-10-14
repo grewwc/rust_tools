@@ -654,7 +654,7 @@ pub fn try_handle_session_command(
                 }
             }
         }
-        "current" | "cur" => {
+        "current" | "cur" | "curr" => {
             println!("session: {}", app.session_id);
             println!("history: {}", app.session_history_file.display());
             // Show the session summary

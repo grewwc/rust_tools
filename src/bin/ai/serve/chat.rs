@@ -2956,6 +2956,26 @@ pub(in crate::ai) fn run_serve_sessions(
     Ok(())
 }
 
+/// What `/sessions|/ss|/ls [arg]` should do in serve-chat, mirroring the
+/// local REPL subcommands: bare/`list` lists all sessions, `current` (also
+/// `cur`/`curr`) shows the current one, `id` prints just its id, and any
+/// other argument is rejected instead of silently listing everything.
+enum ServeSessionsArg {
+    List,
+    Current,
+    Id,
+    Unknown,
+}
+
+fn classify_serve_sessions_arg(arg: &str) -> ServeSessionsArg {
+    match arg {
+        "" | "list" | "ls" | "verbose" => ServeSessionsArg::List,
+        "current" | "cur" | "curr" => ServeSessionsArg::Current,
+        "id" => ServeSessionsArg::Id,
+        _ => ServeSessionsArg::Unknown,
+    }
+}
+
 /// Run the interactive serve chat: connect to a running serve instance and
 /// loop over multiline prompts until `/quit`. Input uses the same editor as
 /// the local REPL, so Enter/movement/completion behave identically.
@@ -3009,7 +3029,7 @@ pub(in crate::ai) fn run_serve_chat(
     };
 
     println!("Connected to {base}, session {session_id}.");
-    println!("Enter inserts a newline, Esc or Alt+Enter submits; Ctrl+C interrupts the running remote turn (a second Ctrl+C exits); /quit exits, /bg backgrounds the current session and exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions, /fork branches the current session, /close deletes it and exits. /model, /effort, /agent switch the remote turn like the local REPL.");
+    println!("Enter inserts a newline, Esc or Alt+Enter submits; Ctrl+C interrupts the running remote turn (a second Ctrl+C exits); /quit exits, /bg backgrounds the current session and exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions (/sessions current|id shows the current one), /fork branches the current session, /close deletes it and exits. /model, /effort, /agent switch the remote turn like the local REPL.");
     let mut editor = PromptEditor::new(&session_id, &app_config.history_file);
     // Command words the shared completion table does not carry: serve-chat-only
     // commands plus shared ones missing from the trie. Registered per client
@@ -3089,7 +3109,7 @@ pub(in crate::ai) fn run_serve_chat(
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first)\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first); /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
                 );
                 continue;
             }
@@ -3103,20 +3123,55 @@ pub(in crate::ai) fn run_serve_chat(
                 Err(err) => eprintln!("[serve-chat] {err}"),
             },
             // `/ss` matches the local REPL shorthand (`/ss` === `/sessions`
-            // list), so the same muscle memory works on both sides.
-            "/sessions" | "/ss" | "/ls" => match fetch_remote_sessions(&client, &base, &token) {
-                Ok(items) => {
-                    print_remote_sessions(&items);
-                    // Back `/resume` Tab-completion until the next listing.
-                    CommandCompleter::set_serve_session_candidates(
-                        items
-                            .iter()
-                            .map(|s| (s.id.clone(), remote_session_title(s)))
-                            .collect(),
-                    );
-                    listed = items;
+            // list) and its subcommands (`current`/`id`) so the same muscle
+            // memory works on both sides; unknown arguments are rejected
+            // instead of silently listing every session.
+            "/sessions" | "/ss" | "/ls" => match classify_serve_sessions_arg(arg) {
+                ServeSessionsArg::List => match fetch_remote_sessions(&client, &base, &token) {
+                    Ok(items) => {
+                        print_remote_sessions(&items);
+                        // Back `/resume` Tab-completion until the next listing.
+                        CommandCompleter::set_serve_session_candidates(
+                            items
+                                .iter()
+                                .map(|s| (s.id.clone(), remote_session_title(s)))
+                                .collect(),
+                        );
+                        listed = items;
+                    }
+                    Err(err) => eprintln!("[serve-chat] {err}"),
+                },
+                ServeSessionsArg::Current => {
+                    // Local `/ss current` reads the local store; remotely the
+                    // listing carries the same per-session fields, so refresh
+                    // it and show the current session's row. If the current
+                    // session is missing (created elsewhere after the last
+                    // fetch) the id still prints.
+                    match fetch_remote_sessions(&client, &base, &token) {
+                        Ok(items) => {
+                            println!("session: {session_id}");
+                            if let Some(item) = items.iter().find(|s| s.id == session_id) {
+                                println!("title: {}", remote_session_title(item));
+                                println!(
+                                    "marked: {}",
+                                    if item.marked { "yes" } else { "no" }
+                                );
+                            }
+                            CommandCompleter::set_serve_session_candidates(
+                                items
+                                    .iter()
+                                    .map(|s| (s.id.clone(), remote_session_title(s)))
+                                    .collect(),
+                            );
+                            listed = items;
+                        }
+                        Err(err) => eprintln!("[serve-chat] {err}"),
+                    }
                 }
-                Err(err) => eprintln!("[serve-chat] {err}"),
+                ServeSessionsArg::Id => println!("{session_id}"),
+                ServeSessionsArg::Unknown => println!(
+                    "unknown /sessions subcommand: '{arg}'. try: /sessions help"
+                ),
             },
             "/resume" => match resolve_session_ref(arg, &listed) {
                 Ok(id) => {
@@ -3903,6 +3958,29 @@ mod tests {
         let legacy = parse_remote_sessions(r#"[{"id":"old"}]"#).expect("legacy");
         assert!(legacy[0].summary.is_none());
         assert!(!legacy[0].marked);
+    }
+
+    #[test]
+    fn serve_sessions_arg_dispatch_mirrors_local_repl() {
+        use ServeSessionsArg::*;
+        // Bare `/ss` and the list spellings keep the full listing.
+        for bare in ["", "list", "ls", "verbose"] {
+            assert!(matches!(classify_serve_sessions_arg(bare), List), "{bare:?}");
+        }
+        // `current`/`cur`/`curr` show only the current session; `curr` is
+        // the spelling the reported serve-chat bug silently listed all
+        // sessions for.
+        for cur in ["current", "cur", "curr"] {
+            assert!(matches!(classify_serve_sessions_arg(cur), Current), "{cur:?}");
+        }
+        assert!(matches!(classify_serve_sessions_arg("id"), Id));
+        // Anything else is rejected, never silently treated as a listing.
+        for unknown in ["foo", "use", "delete", "all"] {
+            assert!(
+                matches!(classify_serve_sessions_arg(unknown), Unknown),
+                "{unknown:?}"
+            );
+        }
     }
 
     #[test]
