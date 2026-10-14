@@ -10,6 +10,7 @@
   "search_enabled": false,
   "tools_default_enabled": true,
   "enable_thinking": true,
+  "default_reasoning_effort": "high",
   "reasoning_content_replay": true,
   "subagent_priority": 80,
   "context_window_tokens": 262144,

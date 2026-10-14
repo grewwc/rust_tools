@@ -1,8 +1,8 @@
 use super::{
     ModelStrengthTier, SubagentTaskDifficulty, agent_model_tier, api_key_for_model,
     auto_subagent_model_for_agent, classify_subagent_task_difficulty, context_window_tokens,
-    default_model, determine_model, determine_vl_model, enable_thinking, endpoint_for_model,
-    endpoint_supports_anonymous_auth, initial_model, max_output_tokens,
+    default_model, default_reasoning_effort, determine_model, determine_vl_model, enable_thinking,
+    endpoint_for_model, endpoint_supports_anonymous_auth, initial_model, max_output_tokens,
     merge_agent_tier_with_difficulty, model_adapter, model_platform_label, model_quality_tier,
     parse_disabled_model_tokens, reasoning_in_content_enabled, request_model_name,
     request_protocol_dialect,
@@ -686,6 +686,32 @@ fn token_plan_entries_pair_token_plan_key_with_token_plan_endpoint() {
         token_plan_entries > 0,
         "model registry must contain at least one token-plan entry"
     );
+}
+
+#[test]
+fn token_plan_thinking_entries_declare_default_reasoning_effort() {
+    // The token-plan gateway only accepts `enable_thinking: true` for these
+    // always-thinking models (400 "The value of the enable_thinking parameter
+    // is restricted to True"). A registry default reasoning effort makes
+    // `resolve_thinking` short-circuit to true; without it, short questions
+    // fall to the local complexity heuristic, send `enable_thinking: false`,
+    // and the gateway rejects the request.
+    for m in super::model_names::all() {
+        let is_token_plan_endpoint = m
+            .endpoint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("token-plan.cn-beijing.maas.aliyuncs.com");
+        if !is_token_plan_endpoint {
+            continue;
+        }
+        assert!(
+            m.enable_thinking && default_reasoning_effort(&m.key).is_some(),
+            "token-plan entry '{}' must declare enable_thinking and \
+             default_reasoning_effort (the gateway restricts enable_thinking to True)",
+            m.key
+        );
+    }
 }
 
 #[test]
