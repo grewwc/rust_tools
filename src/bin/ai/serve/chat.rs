@@ -2007,6 +2007,8 @@ fn render_turn_stream_to_with_confirm(
     let mut thinking_newlines = 0usize;
     let mut thinking_chars = 0usize;
     let mut thinking_body = String::new();
+    let mut answer_pending = false;
+    let mut answer_pending_drawn = false;
     // Whether the cursor sits mid-line (answer delta without a trailing
     // newline, or a live thinking status). Footer/message lines must start
     // on a fresh row instead of gluing onto the answer's last line.
@@ -2046,6 +2048,12 @@ fn render_turn_stream_to_with_confirm(
         match event_kind.as_str() {
             "error" => {
                 // Best effort: surface the partial answer before failing.
+                hide_answer_pending_status(
+                    &mut answer_pending_drawn,
+                    &mut line_open,
+                    tty,
+                    out,
+                );
                 if tty {
                     let _ = markdown.flush_pending_to(out);
                 }
@@ -2070,6 +2078,12 @@ fn render_turn_stream_to_with_confirm(
             }
             "done" => {
                 // End of turn: emit whatever the renderer still holds.
+                hide_answer_pending_status(
+                    &mut answer_pending_drawn,
+                    &mut line_open,
+                    tty,
+                    out,
+                );
                 if tty {
                     let _ = markdown.flush_pending_to(out);
                 }
@@ -2089,6 +2103,12 @@ fn render_turn_stream_to_with_confirm(
                 // summary first (multi-round model calls).
                 // Flush first: the previous round's body is complete, and the
                 // status line must not glue onto its last row.
+                hide_answer_pending_status(
+                    &mut answer_pending_drawn,
+                    &mut line_open,
+                    tty,
+                    out,
+                );
                 if tty {
                     let _ = markdown.flush_pending_to(out);
                 }
@@ -2114,6 +2134,12 @@ fn render_turn_stream_to_with_confirm(
                 // A thinking frame arriving after body output (multi-round
                 // calls) must not rewrite the rendered answer's last line.
                 // Mid-thinking this flush is a no-op.
+                hide_answer_pending_status(
+                    &mut answer_pending_drawn,
+                    &mut line_open,
+                    tty,
+                    out,
+                );
                 if tty {
                     let _ = markdown.flush_pending_to(out);
                 }
@@ -2165,6 +2191,25 @@ fn render_turn_stream_to_with_confirm(
                     tty,
                     out,
                 );
+                show_answer_pending_status(
+                    answer_pending,
+                    &mut answer_pending_drawn,
+                    thinking_active,
+                    &mut line_open,
+                    tty,
+                    out,
+                );
+            }
+            "answer_pending" => {
+                answer_pending = true;
+                show_answer_pending_status(
+                    answer_pending,
+                    &mut answer_pending_drawn,
+                    thinking_active,
+                    &mut line_open,
+                    tty,
+                    out,
+                );
             }
             "delta" => {
                 // Frames from the FIFO and lines from child stdout travel on
@@ -2175,6 +2220,13 @@ fn render_turn_stream_to_with_confirm(
                 // unconditionally.
                 // A late close can arrive after body output started; fold it
                 // on a fresh row before the renderer continues.
+                hide_answer_pending_status(
+                    &mut answer_pending_drawn,
+                    &mut line_open,
+                    tty,
+                    out,
+                );
+                answer_pending = false;
                 if tty && thinking_active {
                     let _ = markdown.flush_pending_to(out);
                 }
@@ -2209,6 +2261,12 @@ fn render_turn_stream_to_with_confirm(
             "confirm_request" => {
                 // Same ordering guarantee as the `_` arm below: the question
                 // must start on a fresh row, never glued onto answer deltas.
+                hide_answer_pending_status(
+                    &mut answer_pending_drawn,
+                    &mut line_open,
+                    tty,
+                    out,
+                );
                 if tty {
                     let _ = markdown.flush_pending_to(out);
                     if markdown.at_line_start() {
@@ -2256,6 +2314,14 @@ fn render_turn_stream_to_with_confirm(
                 }
                 line_open = false;
                 let _ = out.flush();
+                show_answer_pending_status(
+                    answer_pending,
+                    &mut answer_pending_drawn,
+                    thinking_active,
+                    &mut line_open,
+                    tty,
+                    out,
+                );
             }
             "confirm_done" => {
                 // The child's own resolution frame: an answered question already
@@ -2266,6 +2332,12 @@ fn render_turn_stream_to_with_confirm(
                 // Same ordering guarantee as the `delta` arm: observer footers
                 // arriving while a fold is still open must not slip between the
                 // answer and its thinking summary.
+                hide_answer_pending_status(
+                    &mut answer_pending_drawn,
+                    &mut line_open,
+                    tty,
+                    out,
+                );
                 if tty {
                     // Flush first so the footer starts after the rendered
                     // body; a completed row means no extra guard newline.
@@ -2309,10 +2381,24 @@ fn render_turn_stream_to_with_confirm(
                     line_open = false;
                     let _ = out.flush();
                 }
+                show_answer_pending_status(
+                    answer_pending,
+                    &mut answer_pending_drawn,
+                    thinking_active,
+                    &mut line_open,
+                    tty,
+                    out,
+                );
             }
         }
     }
     // Stream ended without a `done` event: same end-of-turn flush.
+    hide_answer_pending_status(
+        &mut answer_pending_drawn,
+        &mut line_open,
+        tty,
+        out,
+    );
     if tty {
         let _ = markdown.flush_pending_to(out);
     }
@@ -2436,6 +2522,40 @@ fn dim(text: &str, tty: bool) -> String {
     } else {
         text.to_string()
     }
+}
+
+fn show_answer_pending_status(
+    pending: bool,
+    drawn: &mut bool,
+    thinking_active: bool,
+    line_open: &mut bool,
+    tty: bool,
+    out: &mut dyn std::io::Write,
+) {
+    if !tty || !pending || *drawn || thinking_active {
+        return;
+    }
+    let _ = write!(out, "\r\x1b[K\x1b[2m◌ finalizing response…\x1b[0m");
+    let _ = out.flush();
+    *drawn = true;
+    *line_open = true;
+}
+
+fn hide_answer_pending_status(
+    drawn: &mut bool,
+    line_open: &mut bool,
+    tty: bool,
+    out: &mut dyn std::io::Write,
+) {
+    if !*drawn {
+        return;
+    }
+    if tty {
+        let _ = write!(out, "\r\x1b[K");
+        let _ = out.flush();
+    }
+    *drawn = false;
+    *line_open = false;
 }
 
 /// Close the live thinking status line (if open) and print only the folded
@@ -3633,6 +3753,24 @@ mod tests {
         );
         let resp = reqwest::blocking::get(url).expect("get canned SSE");
         assert!(render_turn_stream(resp).is_ok());
+    }
+
+    #[test]
+    fn transactional_serve_body_pending_is_temporary_and_renders_once() {
+        let body = "event: answer_pending\ndata: \n\nevent: delta\ndata: {\"delta\": \"accepted answer\"}\n\nevent: done\ndata: \n\n";
+
+        let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+        let mut piped = Vec::new();
+        render_turn_stream_to(resp, &mut piped, false).expect("render piped");
+        assert_eq!(String::from_utf8(piped).expect("utf8"), "accepted answer\n");
+
+        let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+        let mut tty = Vec::new();
+        render_turn_stream_to(resp, &mut tty, true).expect("render tty");
+        let tty = String::from_utf8(tty).expect("utf8");
+        assert!(tty.contains("finalizing response…"));
+        assert!(tty.contains("\r\x1b[K"));
+        assert!(tty.contains("accepted answer"));
     }
 
     #[test]

@@ -127,6 +127,9 @@ pub(super) struct StreamRenderState {
     /// Withhold non-thinking assistant prose until the stream outcome and the
     /// driver's final-response gates are known.
     pub(super) defer_assistant_body: bool,
+    /// Whether this model stream already told a remote client that assistant
+    /// prose is being buffered. Retries create a fresh render state.
+    pub(super) serve_body_pending_published: bool,
     pub(super) waiting_hint_active: bool,
     pub(super) waiting_hint_buffering: bool,
     pub(super) waiting_hint_tool_call: bool,
@@ -156,6 +159,7 @@ impl StreamRenderState {
         Self {
             markdown: MarkdownStreamRenderer::new(),
             defer_assistant_body: false,
+            serve_body_pending_published: false,
             waiting_hint_active: false,
             waiting_hint_buffering: false,
             waiting_hint_tool_call: false,

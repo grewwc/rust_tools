@@ -1452,7 +1452,7 @@ use super::*;
     }
 
     #[test]
-    fn frame_decoder_reassembles_split_frames() {
+    fn transactional_serve_body_frame_decoder_reassembles_pending() {
         use crate::ai::background::ServeLiveKind;
         // One delta (multibyte "é" inside) followed by a full thinking
         // lifecycle and the output-complete marker.
@@ -1461,6 +1461,7 @@ use super::*;
             test_frame(ServeLiveKind::ThinkingStart, b""),
             test_frame(ServeLiveKind::Thinking, "带来".as_bytes()),
             test_frame(ServeLiveKind::ThinkingDone, b""),
+            test_frame(ServeLiveKind::AssistantBodyPending, b""),
             test_frame(ServeLiveKind::OutputComplete, b""),
         ]
         .concat();
@@ -1470,7 +1471,7 @@ use super::*;
         // Header complete (5 + "h" + first byte of "é" = 9 bytes fed): the
         // delta frame still waits for its tail.
         assert_eq!(decoder.push(&wire[2..9]), vec![]);
-        // The rest completes the delta plus all four trailing frames.
+        // The rest completes the delta plus all five trailing frames.
         assert_eq!(
             decoder.push(&wire[9..]),
             vec![
@@ -1478,6 +1479,7 @@ use super::*;
                 ServeLiveEvent::ThinkingStart,
                 ServeLiveEvent::Thinking("带来".to_string()),
                 ServeLiveEvent::ThinkingDone,
+                ServeLiveEvent::AssistantBodyPending,
                 ServeLiveEvent::OutputComplete,
             ]
         );

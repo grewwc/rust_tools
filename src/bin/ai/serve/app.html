@@ -87,6 +87,7 @@ select, summary { touch-action:manipulation; }
 .msg.question-target { animation:question-target 1.6s ease-out; }
 @keyframes question-target { 0%,30% { box-shadow:0 0 0 4px rgba(88,166,255,.75); } 100% { box-shadow:none; } }
 .msg { max-width:92%; padding:8px 12px; border-radius:12px; white-space:pre-wrap; word-break:break-word; font-size:15px; }
+.msg.pending { color:var(--dim); font-style:italic; }
 .msg.user { align-self:flex-end; background:#1f6feb; color:#fff; }
 .msg.asst { align-self:flex-start; background:var(--panel); border:1px solid var(--line); }
 .msg details { font-size:13px; color:var(--dim); }
@@ -1889,6 +1890,7 @@ async function send() {
   const schedulePaint = () => { if (paintTimer === null) paintTimer = setTimeout(paint, 50); };
   const fail = (msg) => {
     if (paintTimer !== null) { clearTimeout(paintTimer); paintTimer = null; }
+    bubble.classList.remove("pending");
     bubble.classList.add("err");
     bubble.textContent = msg;
     prog.box.remove();
@@ -1947,12 +1949,17 @@ async function send() {
         buf = buf.slice(idx + 2);
         const follow = sid === sessionId && shouldFollowOutput();
         if (kind !== "" || payload) armStall(); // keep-alive comments (empty) must not mask a stalled turn
-        if (kind === "done") { finished = true; break; }
+        if (kind === "done") { bubble.classList.remove("pending"); if (!raw) bubble.textContent = ""; finished = true; break; }
         else if (kind === "error") { turnError = true; throw new Error(JSON.parse(payload).error || "turn failed"); }
         else if (kind === "delta") {
+          bubble.classList.remove("pending");
           try { raw += JSON.parse(payload).delta || ""; }
           catch (_) { raw += payload; }
           schedulePaint();
+        }
+        else if (kind === "answer_pending" && !raw) {
+          bubble.classList.add("pending");
+          bubble.textContent = "◌ finalizing response…";
         }
         else if (kind === "thinking_start") { think = addFold("thinking…", "", box); box.insertBefore(think.box, bubble); }
         else if (kind === "thinking") {

@@ -601,7 +601,7 @@ fn setup_live_fifo(_session_id: &str) -> Option<LiveFifo> {
 /// discriminants (1 = delta, 2 = thinking start, 3 = thinking chunk,
 /// 4 = thinking done, 5 = output complete, 6 = confirmation request,
 /// 7 = confirmation resolved, 8 = subagent progress, 9 = input request,
-/// 10 = input resolved).
+/// 10 = input resolved, 11 = assistant body pending).
 #[derive(Debug, PartialEq, Eq)]
 #[cfg(feature = "serve")]
 enum ServeLiveEvent {
@@ -621,6 +621,8 @@ enum ServeLiveEvent {
     InputRequest(String),
     /// Raw JSON payload closing an input request.
     InputDone(String),
+    /// Assistant prose is buffered until the final-response gates accept it.
+    AssistantBodyPending,
 }
 
 /// Incremental parser for serve-live frames (`[kind: u8][len: u32 BE][payload]`):
@@ -656,7 +658,8 @@ impl ServeFrameDecoder {
                 || kind == background::ServeLiveKind::ConfirmDone as u8
                 || kind == background::ServeLiveKind::SubagentProgress as u8
                 || kind == background::ServeLiveKind::InputRequest as u8
-                || kind == background::ServeLiveKind::InputDone as u8;
+                || kind == background::ServeLiveKind::InputDone as u8
+                || kind == background::ServeLiveKind::AssistantBodyPending as u8;
             if !known || len > background::MAX_SERVE_FRAME_LEN as usize {
                 self.buf.clear();
                 break;
@@ -695,6 +698,9 @@ impl ServeFrameDecoder {
                 k if k == background::ServeLiveKind::OutputComplete as u8 => {
                     ServeLiveEvent::OutputComplete
                 }
+                k if k == background::ServeLiveKind::AssistantBodyPending as u8 => {
+                    ServeLiveEvent::AssistantBodyPending
+                }
                 // Every kind accepted by the `known` gate above must have an
                 // arm here: falling through would end the turn for a frame
                 // that is not an output-complete marker.
@@ -726,6 +732,9 @@ fn live_event(event: ServeLiveEvent) -> Option<Event> {
         )),
         ServeLiveEvent::ThinkingDone => {
             Some(Event::default().event("thinking_done").data(""))
+        }
+        ServeLiveEvent::AssistantBodyPending => {
+            Some(Event::default().event("answer_pending").data(""))
         }
         // Confirmation and input frames are built by `forward_live_event`,
         // which holds the pending state and adds the answer token; they never

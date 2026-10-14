@@ -303,7 +303,7 @@ fn unarmed_demuxer_leaves_content_untouched() {
 // loopback socket; `drive(events)` runs the parser and returns the StreamResult.
 // New golden cases only add fixtures; the harness is fixed.
 #[test]
-fn serve_thinking_chunk_split_keeps_glued_close_marker_on_time() {
+fn transactional_serve_body_glued_thinking_close_becomes_pending() {
     use crate::ai::background::ServeLiveKind;
 
     let open = "╭─ thinking";
@@ -325,8 +325,8 @@ fn serve_thinking_chunk_split_keeps_glued_close_marker_on_time() {
         vec![(ServeLiveKind::Thinking, "half a thought")]
     );
     // A close marker glued to body text still closes on time: the head stays
-    // thinking and the answer tail becomes a delta instead of being swallowed
-    // by the fold.
+    // thinking and the answer tail switches the client to a pending state
+    // instead of leaking provisional prose.
     assert_eq!(
         split_serve_thinking_chunk(
             "half a thought\n╰─ done thinking\nAnd the answer",
@@ -336,7 +336,7 @@ fn serve_thinking_chunk_split_keeps_glued_close_marker_on_time() {
         vec![
             (ServeLiveKind::Thinking, "half a thought\n"),
             (ServeLiveKind::ThinkingDone, ""),
-            (ServeLiveKind::Delta, "\nAnd the answer"),
+            (ServeLiveKind::AssistantBodyPending, ""),
         ]
     );
 }
