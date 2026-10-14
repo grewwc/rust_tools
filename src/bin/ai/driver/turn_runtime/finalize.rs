@@ -80,6 +80,23 @@ fn terminal_final_text_to_render(
     Some(terminal_text.to_string())
 }
 
+fn serve_final_text_to_commit(
+    final_assistant_text: &str,
+    user_visible_suffix: Option<&str>,
+) -> Option<String> {
+    let base = terminal_final_text_to_render(final_assistant_text, false, None)?;
+    let base = base.trim();
+    let suffix = user_visible_suffix.map(str::trim).filter(|text| !text.is_empty());
+    let visible = match (base.is_empty(), suffix) {
+        (true, Some(suffix)) => suffix.to_string(),
+        (true, None) => return None,
+        (false, Some(suffix)) if suffix.starts_with(base) => suffix.to_string(),
+        (false, Some(suffix)) => format!("{base}\n\n{suffix}"),
+        (false, None) => base.to_string(),
+    };
+    Some(visible)
+}
+
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_string();
@@ -446,8 +463,8 @@ pub(super) async fn finalize_turn(
             final_assistant_recorded,
             turn_messages,
         );
-        // Serve-streamed turns already delivered this text chunk by chunk
-        // through the live FIFO; re-printing would show the answer twice.
+        // Serve children commit the accepted body through their live FIFO below;
+        // their stdout must not render a second copy.
         if crate::ai::driver::runtime_ctx::terminal_output_enabled()
             && !crate::ai::background::serve_live_streaming()
             && let Some(visible_text) = terminal_final_text_to_render(
@@ -478,6 +495,13 @@ pub(super) async fn finalize_turn(
             turn_messages,
             persisted_turn_messages,
         );
+        if crate::ai::background::serve_live_streaming()
+            && let Some(visible_text) =
+                serve_final_text_to_commit(final_assistant_text, user_visible_final_suffix)
+        {
+            let visible_text = crate::ai::request::strip_digest_blocks(&visible_text);
+            crate::ai::background::publish_committed_serve_output(&visible_text);
+        }
         // Task boundary detection: no tool calls in this turn means the agent has delivered its answer —
         // a natural "task complete" cut point. Trigger the summary with the more aggressive threshold
         // (160 turns) instead of waiting until the conversation piles up to the hard cap (200 turns).
@@ -964,6 +988,26 @@ mod tests {
                 Some("[Runtime warning] Completion is unverified."),
             ),
             Some("[Runtime warning] Completion is unverified.".to_string())
+        );
+    }
+
+    #[test]
+    fn transactional_serve_body_commits_only_user_visible_text() {
+        let warning = "[Runtime warning] Completion is unverified.";
+        assert_eq!(
+            serve_final_text_to_commit("accepted answer", None),
+            Some("accepted answer".to_string())
+        );
+        assert_eq!(
+            serve_final_text_to_commit(
+                "accepted answer\n\n[Runtime warning] Completion is unverified.",
+                Some(warning),
+            ),
+            Some(format!("accepted answer\n\n{warning}"))
+        );
+        assert_eq!(
+            serve_final_text_to_commit("self_note:completion_evidence_required", None),
+            None
         );
     }
 

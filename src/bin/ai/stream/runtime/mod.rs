@@ -842,8 +842,8 @@ fn finalize_stream_response(
     } else {
         outcome
     };
-    // Serve-streamed turns already delivered this text through the live FIFO;
-    // re-printing a truncated tail would show it twice.
+    // Serve children keep provisional prose private: a failed attempt must not
+    // escape through stdout after its live FIFO deliberately withheld it.
     if render_terminal && state.render.defer_assistant_body && outcome != StreamOutcome::Completed
         && !crate::ai::background::serve_live_streaming()
     {
@@ -1050,8 +1050,8 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         StreamOutcome::Completed
     };
     let assistant_text = std::mem::take(&mut state.content.assistant_text);
-    // Serve-streamed turns already delivered this text through the live FIFO;
-    // re-printing a truncated tail would show it twice.
+    // Serve children keep provisional prose private: a failed attempt must not
+    // escape through stdout after its live FIFO deliberately withheld it.
     if runtime_ctx::terminal_output_enabled()
         && state.render.defer_assistant_body
         && outcome != StreamOutcome::Completed
@@ -1155,7 +1155,7 @@ fn commit_visible_content(
             state.content.assistant_text.push_str(text);
             // Live output for a real-time `/bg` handoff (best-effort, no-op
             // unless the backgrounded process opened its live-output FIFO).
-            crate::ai::background::publish_live_output(text);
+            publish_live_assistant_text(text, state);
         }
         return Ok(());
     }
@@ -1196,9 +1196,25 @@ fn commit_visible_content(
     state.content.assistant_text.push_str(&text);
     // Live output for a real-time `/bg` handoff (best-effort, no-op unless the
     // backgrounded process opened its live-output FIFO).
-    crate::ai::background::publish_live_output(&text);
+    publish_live_assistant_text(&text, state);
 
     Ok(())
+}
+
+fn publish_live_assistant_text(text: &str, state: &mut StreamProcessingState) {
+    if text.is_empty() {
+        return;
+    }
+    if crate::ai::background::serve_live_streaming()
+        && !state.render.serve_body_pending_published
+    {
+        crate::ai::background::publish_serve_frame(
+            crate::ai::background::ServeLiveKind::AssistantBodyPending,
+            "",
+        );
+        state.render.serve_body_pending_published = true;
+    }
+    crate::ai::background::publish_live_output(text);
 }
 
 pub(super) fn format_end_thinking_line(
