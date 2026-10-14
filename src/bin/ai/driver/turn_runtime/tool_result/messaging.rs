@@ -1059,11 +1059,12 @@ pub(super) fn append_tool_result_messages_for_model(
 
     let prepared_results = prepare_tool_results_for_history(app, exec_result);
     let mut working_checkpoint_messages = Vec::new();
-    for ((tool_call, result), prepared) in exec_result
+    for (((tool_call, result), prepared), outcome) in exec_result
         .executed_tool_calls
         .iter()
         .zip(exec_result.tool_results.iter())
         .zip(prepared_results.into_iter())
+        .zip(exec_result.execution_outcomes.iter())
     {
         let observer_result_content = prepared.content_for_model.as_str();
         let observer_success =
@@ -1092,6 +1093,12 @@ pub(super) fn append_tool_result_messages_for_model(
                 obs.mark_poisoned();
             }
         }
+        // Surface per-call execution failure to the wire (Anthropic
+        // `tool_result.is_error`) via the turn-scoped side channel; alignment
+        // with executed_tool_calls is guaranteed by the round runner that
+        // builds both vectors.
+        let is_error = outcome.as_ref().map(|outcome| !outcome.succeeded).unwrap_or(false);
+        app.turn_tool_errors.insert(result.tool_call_id.clone(), is_error);
         let projected_tool_message = Message {
             role: "tool".to_string(),
             content: Value::String(prepared.content_for_model),
@@ -1529,6 +1536,7 @@ mod tests {
             last_turn_interrupted: false,
             prune_marks: Default::default(),
             turn_reasoning_items: Default::default(),
+        turn_tool_errors: Default::default(),
             stale_patch_targets: Default::default(),
             tool_middlewares: Vec::new(),
             llm_middlewares: Vec::new(),

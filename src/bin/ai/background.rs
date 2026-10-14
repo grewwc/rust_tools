@@ -417,7 +417,7 @@ pub(crate) fn mark_serve_child_from_env() {
 
 /// Environment handoff for remote confirmations: the serve side sets it while
 /// spawning an SSE turn child whose stdin is a pipe the daemon answers on, so
-/// gated actions (`git commit` / `git stash`) can ask the serve client instead
+/// gated actions (`git commit` / `git push` / `git stash`) can ask the serve client instead
 /// of failing closed on the missing terminal. See `ai::serve_confirm`.
 pub(crate) const SERVE_CONFIRM_ENV: &str = "A_SERVE_CONFIRM";
 

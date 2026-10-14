@@ -213,7 +213,7 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
     // (see `BLOCKED_GIT_SUBCOMMANDS`).
     // `git` itself is not in denied_programs (subcommands like status/log/diff are
     // harmless and necessary); only the listed subcommands are hard-blocked.
-    // Global option variants (`git -C /repo push`) hit too.
+    // Global option variants (`git -C /repo rm`) hit too.
     if program == "git" {
         if let Some(reason) = blocked_git_subcommand(command_tokens) {
             return Err(reason.to_string());
@@ -328,8 +328,8 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
                 "indirect execution of '{nested}' via '{program}' is blocked"
             ));
         }
-        // Indirectly executing a blocked `git` subcommand (e.g. `env git push`,
-        // `xargs git stash`) must be blocked too, otherwise wrappers bypass the
+        // Indirectly executing a blocked `git` subcommand (e.g. `env git rm`,
+        // `xargs git rm`) must be blocked too, otherwise wrappers bypass the
         // direct check.
         if nested == "git" {
             if let Some(reason) = blocked_git_subcommand(&command_tokens[idx..]) {

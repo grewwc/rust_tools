@@ -1203,6 +1203,7 @@ async fn run_turn_body(
     // start of each round so the previous round's encrypted reasoning does not leak
     // into this round's request (its call_id would no longer match either).
     app.turn_reasoning_items.clear();
+    app.turn_tool_errors.clear();
     let TurnPreparation {
         mut skill_turn,
         mut messages,

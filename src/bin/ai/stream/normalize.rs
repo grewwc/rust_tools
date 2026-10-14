@@ -2,7 +2,7 @@ use crate::ai::{
     provider::ProviderAdapter,
     request::{
         ResponseTerminalStatus, StreamChoice, StreamChunk, StreamDelta, StreamFunctionCall,
-        StreamToolCall, try_parse_stream_chunk_from_value,
+        StreamToolCall, try_parse_anthropic_event, try_parse_stream_chunk_from_value,
     },
 };
 
@@ -34,6 +34,23 @@ pub(super) fn parse_stream_payload(
             || normalized_event_type.eq_ignore_ascii_case("response.incomplete"))
             && let Some(parsed) = parse_sse_event_payload(event_type, payload)
         {
+            return parsed;
+        }
+    }
+
+    // Anthropic Messages stream events (the `/v1/messages` wire used by
+    // Anthropic-native models on gateways such as OpenCode Zen). The event name
+    // may arrive on the SSE `event:` line or only in the JSON top-level `type`
+    // field; the pre-screen keeps ordinary chat-completions chunks from paying
+    // for a JSON parse, and a non-Anthropic payload that trips the pre-screen
+    // falls through to the existing paths below.
+    if ascii_contains(payload, "message_start")
+        || ascii_contains(payload, "content_block")
+        || ascii_contains(payload, "message_delta")
+        || ascii_contains(payload, "message_stop")
+        || ascii_contains(payload, "ping")
+    {
+        if let Some(parsed) = try_parse_anthropic_event(payload, event_type) {
             return parsed;
         }
     }

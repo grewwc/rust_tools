@@ -32,6 +32,7 @@ mod wrapper;
 // path working without renaming or moving the definitions.
 pub(crate) use exec::validate_single_segment;
 pub(crate) use git::command_subcommand_index;
+pub(crate) use git::git_subcommand_index;
 pub(crate) use lexer::{
     ShellJoin, effective_command_tokens, split_unquoted_command_segments, split_unquoted_segments,
 };
@@ -521,28 +522,34 @@ mod tests {
     }
 
     #[test]
-    fn blocks_git_push_in_all_common_forms() {
-        assert!(validate("git push").is_err());
-        assert!(validate("git push origin main").is_err());
-        assert!(validate("git push --force").is_err());
-        assert!(validate("git push --force-with-lease origin").is_err());
-        assert!(validate("git push -u origin main").is_err());
-        assert!(validate("git push origin --tags").is_err());
-        assert!(validate("git -C /repo push").is_err());
-        assert!(validate("git -C /repo push origin main").is_err());
-        assert!(validate("git -c user.email=a@b.c push").is_err());
-        assert!(validate("git --git-dir=/repo push").is_err());
-        assert!(validate("git --git-dir /repo push").is_err());
-        assert!(validate("git --no-pager push").is_err());
-        assert!(validate("git PUSH origin").is_err());
-        assert!(validate("/usr/bin/git push").is_err());
-        assert!(validate("git status && git push").is_err());
-        assert!(validate("git push && echo done").is_err());
-        assert!(validate("env git push").is_err());
-        assert!(validate("env FOO=1 git push origin main").is_err());
-        assert!(validate("xargs git push").is_err());
-        assert!(validate("nohup git push").is_err());
-        assert!(validate("command git push").is_err());
+    fn allows_git_push_forms_at_audit_level() {
+        // `git push` is no longer hard-blocked here: like `git stash`, the
+        // whole push family is gated by user confirmation in
+        // `service/command.rs`, which prompts on an interactive terminal and
+        // fails closed otherwise. The audit layer must therefore let every
+        // form through so the confirmation gate downstream is the single
+        // decision point.
+        assert!(validate("git push").is_ok());
+        assert!(validate("git push origin main").is_ok());
+        assert!(validate("git push --force").is_ok());
+        assert!(validate("git push --force-with-lease origin").is_ok());
+        assert!(validate("git push -u origin main").is_ok());
+        assert!(validate("git push origin --tags").is_ok());
+        assert!(validate("git -C /repo push").is_ok());
+        assert!(validate("git -C /repo push origin main").is_ok());
+        assert!(validate("git -c user.email=a@b.c push").is_ok());
+        assert!(validate("git --git-dir=/repo push").is_ok());
+        assert!(validate("git --git-dir /repo push").is_ok());
+        assert!(validate("git --no-pager push").is_ok());
+        assert!(validate("git PUSH origin").is_ok());
+        assert!(validate("/usr/bin/git push").is_ok());
+        assert!(validate("git status && git push").is_ok());
+        assert!(validate("git push && echo done").is_ok());
+        assert!(validate("env git push").is_ok());
+        assert!(validate("env FOO=1 git push origin main").is_ok());
+        assert!(validate("xargs git push").is_ok());
+        assert!(validate("nohup git push").is_ok());
+        assert!(validate("command git push").is_ok());
     }
 
     #[test]

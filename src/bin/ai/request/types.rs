@@ -48,6 +48,10 @@ pub(crate) struct RequestBody<'a> {
     /// 不参与 chat-completions 序列化，也绝不落盘。
     #[serde(skip)]
     pub(crate) reasoning_items: Option<&'a FxHashMap<String, Vec<Value>>>,
+    /// Turn-scoped per-tool-call failure flags (`tool_call_id` -> failed) for
+    /// dialects that can surface them (Anthropic `tool_result.is_error`).
+    #[serde(skip)]
+    pub(crate) tool_errors: Option<&'a FxHashMap<String, bool>>,
     /// 模型能力位（来自模型注册表 models/ 的 `reasoning_encrypted_replay`）：开启后
     /// Responses 请求带 `include: ["reasoning.encrypted_content"]` 索取加密推理项。
     /// 在 builder 阶段用原始 model key 解析，避免 protocol 层用（可能加密的）

@@ -106,6 +106,7 @@ fn responses_request_body_converts_chat_multimodal_content_to_input_items() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        tool_errors: None,
     };
 
     let body = super::super::build_responses_request_body(&request);
@@ -198,6 +199,7 @@ fn responses_request_body_does_not_emit_input_image_for_system_multimodal_conten
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        tool_errors: None,
     };
 
     let body = super::super::build_responses_request_body(&request);

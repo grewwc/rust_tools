@@ -49,7 +49,8 @@ pub(super) use super::{
     preview::{build_terminal_preview, tail_chars},
 };
 pub(super) use crate::ai::driver::print::{
-    format_tool_output_line, format_tool_output_prefix, print_tool_command_line,
+    format_tool_output_line, format_tool_output_prefix, format_tool_status_completed,
+    format_tool_status_failed, format_tool_status_with_command, print_tool_command_line,
     print_tool_note_line, sanitize_for_terminal,
 };
 pub(super) use crate::ai::theme::RESET;

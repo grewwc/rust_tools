@@ -108,6 +108,7 @@ impl App {
             last_turn_interrupted: self.last_turn_interrupted,
             prune_marks: self.prune_marks.clone(),
             turn_reasoning_items: self.turn_reasoning_items.clone(),
+            turn_tool_errors: self.turn_tool_errors.clone(),
             stale_patch_targets: self.stale_patch_targets.clone(),
         }
     }
@@ -254,6 +255,12 @@ pub(super) struct App {
     /// (same pattern as `prune_marks`) is naturally turn-aligned, purely
     /// in-memory, and physically impossible to persist.
     pub(super) turn_reasoning_items: FxHashMap<String, Vec<Value>>,
+
+    /// Per-tool-call failure flag for the current turn, keyed by `tool_call_id`.
+    /// Same turn-scoped side-channel rationale as `turn_reasoning_items`: the
+    /// Messages dialect reads it to emit Anthropic `tool_result.is_error`, and
+    /// putting it in `Message` would pollute the hundreds of literals there.
+    pub(super) turn_tool_errors: FxHashMap<String, bool>,
 
     /// Runtime ledger of stale `apply_patch` targets: the set of target file paths
     /// whose last patch failed with `context mismatch` / `ambiguous patch` and for

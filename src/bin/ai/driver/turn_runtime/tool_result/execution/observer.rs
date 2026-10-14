@@ -4,6 +4,11 @@
 use super::*;
 use crate::ai::driver::tools::ToolExecutionObserver;
 
+/// Columns reserved on the command row for the leading status + gutter
+/// (`  ● execute_command  │ $ `) so the clamped command still fits one row and the
+/// in-place status update can replace it without wrapped-line leftovers.
+const COMMAND_LINE_STATUS_RESERVE_COLS: usize = 30;
+
 /// Foreground synchronous tool execution (especially `execute_command`'s streamed output)
 /// is also part of the “interruptible output phase of the current turn”. Without raising
 /// `app.streaming` here, Ctrl+C would be misjudged by the SIGINT handler as `Shutdown`,
@@ -41,6 +46,15 @@ pub(in crate::ai::driver::turn_runtime) struct TerminalToolObserver<'a> {
     allow_inline_fold_updates: bool,
     fold_total_lines: usize,
     tty_fold: TtyToolOutputFoldState,
+    // The command line printed for command-like tools is still the last line on
+    // screen; nothing streamed after it, so its final status can replace it in place.
+    command_line_pending: bool,
+    // Exact text of the printed command line (clamped to one physical row), reused
+    // when the merged status line is rendered.
+    pending_command_line: Option<String>,
+    // Tool call id whose final status was already merged into its command line;
+    // `print_run_status` then skips its own status line for that call.
+    rendered_inline_tool_id: Option<String>,
 }
 
 // A typical terminal QR code is about 30–50 lines; keeping 64 lines shows one-shot
@@ -64,6 +78,9 @@ impl<'a> TerminalToolObserver<'a> {
             // them through verbatim would leak raw `[2K` sequences.
             allow_inline_fold_updates: std::io::IsTerminal::is_terminal(&std::io::stdout()),
             tty_fold: TtyToolOutputFoldState::default(),
+            command_line_pending: false,
+            pending_command_line: None,
+            rendered_inline_tool_id: None,
         }
     }
 
@@ -78,13 +95,23 @@ impl<'a> TerminalToolObserver<'a> {
         self.streamed_any_output = false;
         self.fold_total_lines = 0;
         self.tty_fold.reset();
+        self.command_line_pending = false;
+        self.pending_command_line = None;
     }
 
     fn start_stream_output(&mut self, tool_call: &ToolCall) {
         if self.active_stream_tool_call_id.as_deref() == Some(tool_call.id.as_str()) {
             return;
         }
+        // Preserve the pending command line across the stream-state reset: the
+        // command line is printed in `on_tool_started`, i.e. before the first
+        // streamed chunk arrives, and the reset below only means to clear the
+        // previous tool's streaming state.
+        let pending_command_line = self.pending_command_line.take();
+        let command_line_pending = self.command_line_pending;
         self.reset_stream_state();
+        self.pending_command_line = pending_command_line;
+        self.command_line_pending = command_line_pending;
         self.active_stream_tool_call_id = Some(tool_call.id.clone());
         // `pty: true` is the caller's explicit request for interactive-terminal capability.
         // Forward this path's output in full so menus, confirmation prompts, and login
@@ -168,6 +195,9 @@ impl<'a> TerminalToolObserver<'a> {
     /// Render streamed text approved for display: explicit PTY output, or an identified
     /// visual grid.
     fn render_visible_stream_text(&mut self, text: &str) {
+        // Any streamed text rendered after the command line invalidates the in-place
+        // status update: the row above the cursor is no longer the command line.
+        self.command_line_pending = false;
         if self.allow_inline_fold_updates {
             let _ = self.tty_fold.push_text(text);
             let _ = std::io::stdout().flush();
@@ -218,6 +248,10 @@ impl<'a> TerminalToolObserver<'a> {
     }
 
     fn finish_stream_output(&mut self, newline: bool) {
+        // Do not clear `command_line_pending` here: hidden streamed output renders
+        // nothing, so the command line is still the last row and can be merged
+        // in place. Any visible row goes through `render_visible_stream_text`,
+        // which already clears the flag.
         self.flush_pending_utf8();
         self.flush_visual_output_line();
         if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
@@ -257,6 +291,34 @@ impl<'a> TerminalToolObserver<'a> {
     fn print_captured_command_output(&mut self, prepared: &PreparedToolResult) {
         // The terminal no longer prints tool output content; only the status line is kept.
         let _ = prepared;
+    }
+
+    /// Replace the still-visible command line with the merged final status
+    /// (`  ● execute_command  │ $ cmd` -> `  ✓ execute_command  │ $ cmd`) so a
+    /// completed command takes one terminal row instead of two. Only safe while
+    /// the command line is the last line on screen and stdout is a real TTY;
+    /// `print_run_status` covers every other case with its own status line.
+    fn render_command_line_status(&mut self, tool_call: &ToolCall, run_result: &tools::RunOneResult) {
+        self.command_line_pending = false;
+        let Some(command) = self.pending_command_line.take() else {
+            return;
+        };
+        if !self.allow_inline_fold_updates {
+            return;
+        }
+        let status = if run_result.ok {
+            format_tool_status_completed(&tool_call.function.name)
+        } else {
+            format_tool_status_failed(&tool_call.function.name)
+        };
+        // The cursor sits on the empty line right below the command line: move up
+        // one row, clear it, and redraw with the final status merged in.
+        print!(
+            "\x1b[1A\x1b[2K{}\n",
+            format_tool_status_with_command(&status, &command)
+        );
+        let _ = std::io::stdout().flush();
+        self.rendered_inline_tool_id = Some(tool_call.id.clone());
     }
 }
 
@@ -307,7 +369,22 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
             "execute_command" | "run_command" | "shell" | "bash"
         ) {
             if let Some(line) = format_command_input(&tool_call.function.arguments) {
+                if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+                    return;
+                }
+                let line = if self.allow_inline_fold_updates {
+                    // Keep the line to a single physical row so the in-place status
+                    // update (`CSI 1A` + `CSI 2K`) can replace it without leftovers.
+                    crate::ai::stream::clamp_line_to_terminal_row_with_reserve(
+                        &line,
+                        COMMAND_LINE_STATUS_RESERVE_COLS,
+                    )
+                } else {
+                    line
+                };
                 print_tool_command_line(&line);
+                self.pending_command_line = Some(line);
+                self.command_line_pending = true;
             }
         }
     }
@@ -352,6 +429,12 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
             let is_failure = streamed_tool_result_is_failure(tool_call, run_result);
             self.finish_stream_output(is_failure);
 
+            if self.command_line_pending {
+                // Nothing visible was rendered after the command line (the common
+                // case: piped command output stays hidden), so merge the final
+                // status into that same row instead of printing a second line.
+                self.render_command_line_status(tool_call, run_result);
+            }
             if is_failure {
                 if let Some(exit_line) = run_result.tool_result.content.lines().next() {
                     print_tool_note_line("error", exit_line);
@@ -367,7 +450,14 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
             &tool_call.function.name,
             &run_result.tool_result.content,
         );
+        if self.command_line_pending {
+            self.render_command_line_status(tool_call, run_result);
+        }
         self.print_prepared_tool_result(&prepared);
+    }
+
+    fn tool_status_rendered_inline(&self, tool_call: &ToolCall) -> bool {
+        self.rendered_inline_tool_id.as_deref() == Some(tool_call.id.as_str())
     }
 }
 

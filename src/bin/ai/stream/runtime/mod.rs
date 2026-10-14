@@ -1496,9 +1496,34 @@ fn process_stream_payload(
 
     // AIOS: capture usage block from whichever chunk carries it. OpenAI emits
     // the final `usage` on a chunk with `choices: []`, so we must pull it *before*
-    // the empty-choices early return below.
+    // the empty-choices early return below. Anthropic splits usage across
+    // `message_start` (input_tokens) and `message_delta` (output_tokens on the
+    // standard wire), so merge per-field instead of replacing: keeping the
+    // previous value when the new chunk reports 0 for a component prevents the
+    // delta-only snapshot from zeroing out the prompt count.
     if let Some(ref usage) = chunk.usage {
-        state.pending_llm_usage = Some((chunk.model.clone(), usage.clone().normalized()));
+        let usage = usage.clone().normalized();
+        match &mut state.pending_llm_usage {
+            Some((_, prev)) => {
+                if usage.prompt_tokens > 0 {
+                    prev.prompt_tokens = usage.prompt_tokens;
+                }
+                if usage.completion_tokens > 0 {
+                    prev.completion_tokens = usage.completion_tokens;
+                }
+                if let Some(details) = usage.prompt_tokens_details {
+                    prev.prompt_tokens_details = Some(details);
+                }
+                if let Some(details) = usage.completion_tokens_details {
+                    prev.completion_tokens_details = Some(details);
+                }
+                // Keep the total honest: never under-report prompt + completion.
+                prev.total_tokens = prev
+                    .total_tokens
+                    .max(prev.prompt_tokens.saturating_add(prev.completion_tokens));
+            }
+            None => state.pending_llm_usage = Some((chunk.model.clone(), usage)),
+        }
     }
 
     let saw_finish_reason = chunk.choices.iter().any(|choice| {

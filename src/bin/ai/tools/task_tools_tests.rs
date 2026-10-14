@@ -346,6 +346,7 @@ fn test_app_with_model(current_model: String) -> App {
         last_turn_interrupted: false,
         prune_marks: Default::default(),
         turn_reasoning_items: Default::default(),
+        turn_tool_errors: Default::default(),
         stale_patch_targets: Default::default(),
         tool_middlewares: Vec::new(),
         llm_middlewares: Vec::new(),

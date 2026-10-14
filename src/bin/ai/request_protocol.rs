@@ -9,12 +9,20 @@ pub(crate) enum RequestProtocolDialect {
     #[default]
     ChatCompletions,
     Responses,
+    /// Anthropic Messages API wire (`/v1/messages`): `x-api-key` auth, a
+    /// `messages` array with content blocks, and `message_*` / `content_block_*`
+    /// SSE events. Used by Anthropic-native models served through gateways that
+    /// only expose this protocol (e.g. OpenCode Zen serving claude-opus-5-5).
+    Messages,
 }
 
 impl RequestProtocolDialect {
     pub(crate) fn infer_from_endpoint(endpoint: &str) -> Self {
-        if endpoint.trim_end_matches('/').ends_with("/v1/responses") {
+        let endpoint = endpoint.trim_end_matches('/');
+        if endpoint.ends_with("/v1/responses") {
             Self::Responses
+        } else if endpoint.ends_with("/v1/messages") {
+            Self::Messages
         } else {
             Self::ChatCompletions
         }

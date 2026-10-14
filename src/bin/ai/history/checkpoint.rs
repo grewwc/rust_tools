@@ -394,7 +394,7 @@ impl CheckpointStore {
                     ))),
                 };
             }
-            store.record_previous_head_unlocked(old_head_raw.as_deref(), &normalized_name)?;
+            store.record_previous_head_unlocked(old_head_raw.as_deref(), &normalized_name);
             Ok(())
         })
     }
@@ -523,7 +523,7 @@ impl CheckpointStore {
             let old_head_raw = store.head_raw_unlocked()?;
             store.set_attached_head_unlocked(&branch)?;
             let new_raw = format!("{HEAD_BRANCH_PREFIX}{branch}");
-            store.record_previous_head_unlocked(old_head_raw.as_deref(), &new_raw)?;
+            store.record_previous_head_unlocked(old_head_raw.as_deref(), &new_raw);
             Ok(())
         })
     }
@@ -551,7 +551,7 @@ impl CheckpointStore {
                 store.set_attached_head_unlocked(&branch)?;
                 store.clear_base_unlocked()?;
                 let new_raw = format!("{HEAD_BRANCH_PREFIX}{branch}");
-                store.record_previous_head_unlocked(old_head_raw.as_deref(), &new_raw)?;
+                store.record_previous_head_unlocked(old_head_raw.as_deref(), &new_raw);
                 return Ok(());
             };
             let previous = store.base_target_unlocked()?;
@@ -581,7 +581,7 @@ impl CheckpointStore {
                 return Err(error);
             }
             let new_raw = format!("{HEAD_BRANCH_PREFIX}{branch}");
-            store.record_previous_head_unlocked(old_head_raw.as_deref(), &new_raw)?;
+            store.record_previous_head_unlocked(old_head_raw.as_deref(), &new_raw);
             Ok(())
         })
     }
@@ -844,16 +844,12 @@ impl CheckpointStore {
     /// the new raw HEAD value: no-op navigations must not clobber `-`.
     /// A missing old value means there is nothing to go back to, so the
     /// previous pointer is left untouched.
-    fn record_previous_head_unlocked(
-        &self,
-        old_raw: Option<&str>,
-        new_raw: &str,
-    ) -> io::Result<()> {
-        match old_raw {
-            Some(old) if !old.is_empty() && old != new_raw => {
-                self.write_ref_unlocked(&self.dir.join(PREV_HEAD_REF_FILE), old)
-            }
-            _ => Ok(()),
+    /// This auxiliary navigation record is best-effort: HEAD and live history
+    /// have already committed, so failure must not report a failed checkout.
+    /// Atomic ref writes preserve the old pointer on failure; `-` may stay stale.
+    fn record_previous_head_unlocked(&self, old_raw: Option<&str>, new_raw: &str) {
+        if let Some(old) = old_raw.filter(|old| !old.is_empty() && *old != new_raw) {
+            let _ = self.write_ref_unlocked(&self.dir.join(PREV_HEAD_REF_FILE), old);
         }
     }
 
@@ -2901,6 +2897,72 @@ mod tests {
 
         if let Some(grandparent) = history_file.parent() {
             let _ = fs::remove_dir_all(grandparent);
+        }
+    }
+
+    #[test]
+    fn previous_head_write_failure_does_not_fail_committed_navigation() {
+        for operation in ["rollback", "attach", "switch", "unborn"] {
+            for block_rename in [false, true] {
+                let history_file = temp_history_file();
+                let store = CheckpointStore::new(&history_file, "sess-prev-failure");
+                store.create_branch("empty", None).unwrap();
+                append_history_messages(&store.session_file, &[lineage_msg("v1")]).unwrap();
+                store.save("c1").unwrap();
+                append_history_messages(&store.session_file, &[lineage_msg("v2")]).unwrap();
+                store.save("c2").unwrap();
+                let target = if operation == "attach" { "c2" } else { "c1" };
+                store.create_branch("topic", Some(target)).unwrap();
+                let before = build_message_arr(10, &store.session_file).unwrap();
+                let previous = store.dir.join(PREV_HEAD_REF_FILE);
+                let temp = previous.with_extension(format!("tmp-{}", std::process::id()));
+                if block_rename {
+                    fs::create_dir(&previous).unwrap();
+                } else {
+                    fs::write(&previous, "c1\n").unwrap();
+                    fs::create_dir(&temp).unwrap();
+                }
+
+                let (result, head, base, count) = match operation {
+                    "rollback" => (store.rollback("c1"), "c1", Some("c1"), 1),
+                    "attach" => (
+                        store.attach_branch("topic"),
+                        "ref: branches/topic",
+                        Some("c2"),
+                        2,
+                    ),
+                    "switch" => (
+                        store.switch_branch("topic"),
+                        "ref: branches/topic",
+                        Some("c1"),
+                        1,
+                    ),
+                    _ => (store.switch_branch("empty"), "ref: branches/empty", None, 0),
+                };
+                assert!(
+                    result.is_ok(),
+                    "{operation}, block_rename={block_rename}: {result:?}"
+                );
+                assert_eq!(store.head_raw_unlocked().unwrap().as_deref(), Some(head));
+                assert_eq!(store.base_target().unwrap().as_deref(), base);
+                assert_eq!(
+                    CheckpointStore::read_optional_ref_unlocked(&store.dir.join(BASE_REF_FILE))
+                        .unwrap()
+                        .as_deref(),
+                    base
+                );
+                assert_eq!(
+                    build_message_arr(10, &store.session_file).unwrap(),
+                    before[..count]
+                );
+                if block_rename {
+                    assert!(previous.is_dir());
+                    assert!(!temp.exists());
+                } else {
+                    assert_eq!(fs::read_to_string(previous).unwrap(), "c1\n");
+                }
+                fs::remove_dir_all(history_file.parent().unwrap()).unwrap();
+            }
         }
     }
 

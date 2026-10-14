@@ -1,4 +1,4 @@
-use super::common::{first_openai_model_name, first_model_key_for_adapter};
+use super::common::{first_minimax_model_key, first_model_key_for_adapter, first_openai_model_name};
 use super::super::*;
 use crate::ai::tools::os_tools::{GLOBAL_OS, init_os_tools_globals};
 use crate::ai::{cli::ParsedCli, types::AppConfig};
@@ -18,7 +18,7 @@ fn deepseek_request_body_uses_thinking_object() {
 
     // Off: thinking={"type":"disabled"}
     let disabled = build_request_body(
-        "deepseek-v4-flash-free",
+        "deepseek-flash-opencode",
         &messages,
         false,
         false,
@@ -41,7 +41,7 @@ fn deepseek_request_body_uses_thinking_object() {
 
     // On: thinking={"type":"enabled"}
     let enabled = build_request_body(
-        "deepseek-v4-flash-free",
+        "deepseek-flash-opencode",
         &messages,
         false,
         true,
@@ -67,7 +67,7 @@ fn non_deepseek_request_body_omits_thinking_object() {
         reasoning_content: None,
     }];
     let body = build_request_body(
-        "qwen3.7-plus",
+        "qwen3.8-max",
         &messages,
         true,
         false,
@@ -100,7 +100,7 @@ fn deepseek_tool_call_messages_echo_empty_reasoning_content() {
         reasoning_content: None,
     }];
 
-    normalize_reasoning_content_replay_for_model("deepseek-v4-flash-free", &mut messages);
+    normalize_reasoning_content_replay_for_model("deepseek-flash-opencode", &mut messages);
     assert_eq!(messages[0].reasoning_content.as_deref(), Some(""));
 
     let value = serde_json::to_value(&messages[0]).unwrap();
@@ -131,11 +131,11 @@ fn opencode_deepseek_tool_call_messages_echo_even_without_thinking_gate() {
     // disabled it takes precedence over the top-level reasoning_effort); a
     // historical tool-call assistant must still get an empty reasoning_content
     // filled in, otherwise post-compression continuation requests fail with 400.
-    normalize_reasoning_content_replay_for_model("deepseek-v4-flash-free-opencode", &mut messages);
+    normalize_reasoning_content_replay_for_model("deepseek-flash-opencode", &mut messages);
     assert_eq!(messages[0].reasoning_content.as_deref(), Some(""));
 
     let body = build_request_body(
-        "deepseek-v4-flash-free-opencode",
+        "deepseek-flash-opencode",
         &messages,
         false,
         false,
@@ -311,7 +311,7 @@ fn reasoning_content_replay_is_exact_only_for_declared_models() {
     assert_eq!(untagged_glm_messages[0].reasoning_content, None);
 
     let mut deepseek_messages = vec![assistant];
-    normalize_reasoning_content_replay_for_model("deepseek-v4-flash-free", &mut deepseek_messages);
+    normalize_reasoning_content_replay_for_model("deepseek-flash-opencode", &mut deepseek_messages);
     assert_eq!(
         deepseek_messages[0].reasoning_content.as_deref(),
         Some("必须原样回放的 GLM 推理"),
@@ -320,7 +320,7 @@ fn reasoning_content_replay_is_exact_only_for_declared_models() {
 
     let mut switched_to_deepseek = vec![projected.clone()];
     normalize_reasoning_content_replay_for_model(
-        "deepseek-v4-flash-free",
+        "deepseek-flash-opencode",
         &mut switched_to_deepseek,
     );
     assert_eq!(
@@ -375,7 +375,7 @@ fn encrypted_replay_blob_cleared_when_switching_to_shape_only_model() {
 
     let mut switched_to_deepseek = vec![assistant.clone()];
     normalize_reasoning_content_replay_for_model(
-        "deepseek-v4-flash-free",
+        "deepseek-flash-opencode",
         &mut switched_to_deepseek,
     );
     assert_eq!(
@@ -446,7 +446,7 @@ fn dashscope_aux_requests_disable_thinking_regardless_of_provider() {
     // deepseek-v4-pro has moved to the OpenCode gateway (uses the thinking
     // object, see the assertion below), and kimi-k2.7-code is no longer in the
     // model registry (models/).
-    for model in ["qwen3.7-plus", "qwen3.7-max", "deepseek-v4-flash-0731"] {
+    for model in ["qwen3.8-max", "qwen3.8-flash-alibaba", "deepseek-v4-flash-0731-alibaba"] {
         let mut body = json!({ "model": model, "messages": [], "stream": false });
         apply_aux_thinking_fields(model, &mut body);
         assert_eq!(
@@ -459,8 +459,8 @@ fn dashscope_aux_requests_disable_thinking_regardless_of_provider() {
     // OpenCode's deepseek does not rely on enable_thinking; aux turns thinking
     // off via the thinking object.
     let mut deepseek =
-        json!({ "model": "deepseek-v4-flash-free", "messages": [], "stream": false });
-    apply_aux_thinking_fields("deepseek-v4-flash-free", &mut deepseek);
+        json!({ "model": "deepseek-flash-opencode", "messages": [], "stream": false });
+    apply_aux_thinking_fields("deepseek-flash-opencode", &mut deepseek);
     assert_eq!(
         deepseek.get("thinking"),
         Some(&json!({ "type": "disabled" }))
@@ -468,11 +468,20 @@ fn dashscope_aux_requests_disable_thinking_regardless_of_provider() {
     assert!(deepseek.get("enable_thinking").is_none());
 
     // MiniMax (mimo) on OpenCode has no reliable off switch; aux injects no
-    // thinking fields at all.
-    let mut mimo = json!({ "model": "mimo-v2.5-free", "messages": [], "stream": false });
-    apply_aux_thinking_fields("mimo-v2.5-free", &mut mimo);
-    assert!(mimo.get("thinking").is_none());
-    assert!(mimo.get("enable_thinking").is_none());
+    // thinking fields at all. The registry may not currently carry a MiniMax
+    // model (it is name-matched, not an adapter variant), so resolve the key
+    // dynamically and skip when absent — a stale hardcoded key would fall back
+    // to the default adapter/endpoint and never reach the MiniMax branch.
+    if let Some(mimo_key) = first_minimax_model_key() {
+        let mut mimo = json!({ "model": mimo_key, "messages": [], "stream": false });
+        apply_aux_thinking_fields(&mimo_key, &mut mimo);
+        assert!(mimo.get("thinking").is_none(), "{mimo_key}");
+        assert!(mimo.get("enable_thinking").is_none(), "{mimo_key}");
+    } else {
+        eprintln!(
+            "[test] skipping MiniMax aux sub-case: no mimo/minimax model present in model registry"
+        );
+    }
 }
 
 #[test]
@@ -531,7 +540,7 @@ fn alibaba_request_body_keeps_extension_flags() {
         reasoning_content: None,
     }];
     let body = build_request_body(
-        "qwen3.7-plus",
+        "qwen3.8-max",
         &messages,
         false,
         true,

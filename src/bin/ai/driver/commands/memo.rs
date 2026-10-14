@@ -11,30 +11,47 @@ use super::status_line::{clear_status, print_status, show_status};
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use crate::ai::types::App;
 
-/// Return `Ok(true)` when the input is a `/memo` command and run the save asynchronously.
-pub(crate) async fn try_handle_memo_command(
-    app: &mut App,
-    input: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
+/// User-facing feedback for `/memo`. Locally this is a transient stderr status
+/// line; when running as a serve-spawned turn child, the serve turn runner
+/// captures stdout as the turn result, so the confirmation must go to stdout
+/// or the remote client would see an empty turn.
+fn report_status(msg: &str) {
+    if std::env::var_os(crate::ai::background::SERVE_CHILD_ENV).is_some() {
+        println!("{msg}");
+    } else {
+        show_status(msg);
+    }
+}
+
+/// Extract the argument after an exact `/memo` or `:memo` prefix.
+/// Only accepts an exact `memo` or `memo ` prefix to avoid matching things like `/memorial`.
+pub(crate) fn memo_command_args(input: &str) -> Option<&str> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return Ok(false);
+        return None;
     }
     let rest = if let Some(r) = trimmed.strip_prefix("/memo") {
         r
     } else if let Some(r) = trimmed.strip_prefix(":memo") {
         r
     } else {
+        return None;
+    };
+    if !rest.is_empty() && !rest.starts_with(' ') && !rest.starts_with('\t') {
+        return None;
+    }
+    Some(rest.trim())
+}
+
+/// Return `Ok(true)` when the input is a `/memo` command and run the save asynchronously.
+pub(crate) async fn try_handle_memo_command(
+    app: &mut App,
+    input: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(arg) = memo_command_args(input) else {
         return Ok(false);
     };
-
-    // Only accept an exact `memo` or `memo ` prefix to avoid matching things like `/memorial`.
-    if !rest.is_empty() && !rest.starts_with(' ') && !rest.starts_with('\t') {
-        return Ok(false);
-    }
-
-    let arg = rest.trim().to_string();
-    execute_memo_save(app, arg).await?;
+    execute_memo_save(app, arg.to_string()).await?;
     Ok(true)
 }
 
@@ -49,7 +66,7 @@ async fn execute_memo_save(app: &mut App, arg: String) -> Result<(), Box<dyn std
         match last_assistant_conclusion(app)? {
             Some(text) => text,
             None => {
-                show_status(
+                report_status(
                     "[memo] 未找到上一轮的模型结论，请先进行一次对话，或使用 /memo <text> 手动指定内容。",
                 );
                 return Ok(());
@@ -58,7 +75,7 @@ async fn execute_memo_save(app: &mut App, arg: String) -> Result<(), Box<dyn std
     };
 
     if raw_text.trim().is_empty() {
-        show_status("[memo] 内容为空，已取消保存。");
+        report_status("[memo] 内容为空，已取消保存。");
         return Ok(());
     }
 
@@ -84,7 +101,7 @@ async fn execute_memo_save(app: &mut App, arg: String) -> Result<(), Box<dyn std
                 .unwrap_or(raw_text.clone()),
             Err(err) => {
                 clear_status();
-                show_status(&format!("[memo] 整理失败，保存原始输入: {}", err));
+                report_status(&format!("[memo] 整理失败，保存原始输入: {}", err));
                 raw_text.clone()
             }
         };
@@ -115,10 +132,10 @@ async fn execute_memo_save(app: &mut App, arg: String) -> Result<(), Box<dyn std
             } else {
                 ""
             };
-            show_status(&format!("[memo] 已保存: {}{}", preview, suffix));
+            report_status(&format!("[memo] 已保存: {}{}", preview, suffix));
         }
         Err(err) => {
-            show_status(&format!("[memo] 保存失败: {}", err));
+            report_status(&format!("[memo] 保存失败: {}", err));
             return Err(err.into());
         }
     }
@@ -175,4 +192,21 @@ fn searchable_content(content: &serde_json::Value) -> String {
         return out;
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::memo_command_args;
+
+    #[test]
+    fn memo_command_requires_exact_prefix_and_preserves_argument() {
+        assert_eq!(memo_command_args("  /memo  "), Some(""));
+        assert_eq!(memo_command_args("/memo 记住这个"), Some("记住这个"));
+        assert_eq!(memo_command_args(":memo note text"), Some("note text"));
+        // A longer word sharing the prefix is not a memo command.
+        assert_eq!(memo_command_args("/memorial"), None);
+        assert_eq!(memo_command_args("/memoize x"), None);
+        assert_eq!(memo_command_args("plain prompt"), None);
+        assert_eq!(memo_command_args(""), None);
+    }
 }

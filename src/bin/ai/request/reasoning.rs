@@ -117,12 +117,13 @@ pub(super) fn normalize_reasoning_content_replay_for_model(model: &str, messages
         if shape_only_replay {
             // The DeepSeek thinking-mode gateway validates that every replayed
             // assistant message carries `reasoning_content` (see the function
-            // docs), so this branch covers all assistant messages, not only
-            // tool-call rounds. Persisted replay state (exact or encrypted
-            // markers) must never be sent verbatim to the provider: an own exact
-            // marker decodes back to the original text, and any other marker
-            // (cross-model / encrypted) is cleared to an empty string to keep
-            // only the field shape.
+            // docs), and the Anthropic Messages dialect needs the thinking
+            // chain preserved for tool-round replay, so this branch covers all
+            // assistant messages, not only tool-call rounds. Persisted replay
+            // state (exact or encrypted markers) must never be sent verbatim to
+            // the provider: an own exact marker decodes back to the original
+            // text, and any other marker (cross-model / encrypted) is cleared
+            // to an empty string to keep only the field shape.
             let current = message.reasoning_content.take();
             message.reasoning_content = Some(match &current {
                 Some(reasoning)

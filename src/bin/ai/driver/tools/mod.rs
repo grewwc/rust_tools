@@ -120,6 +120,12 @@ pub(super) trait ToolExecutionObserver {
     fn on_tool_stream(&mut self, _tool_call: &ToolCall, _chunk: &[u8]) {}
 
     fn on_tool_finished(&mut self, _tool_call: &ToolCall, _run_result: &RunOneResult) {}
+
+    /// Whether the observer already rendered the final status inline, merged into
+    /// the command line; `print_run_status` then skips its own status line.
+    fn tool_status_rendered_inline(&self, _tool_call: &ToolCall) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -527,6 +533,21 @@ fn remediation_hint(
 ) -> Option<String> {
     let err_lower = err.to_lowercase();
 
+    // A user decision, not a tool failure: the user declined or canceled the
+    // action (git confirm-gate denial, SIGINT interruption, OAuth cancel, ...).
+    // Do not nudge the model to "fix" or retry it — that frames a denial as an
+    // intrinsic failure and produces an analyze-and-retry loop where each retry
+    // is denied again (and the generic execute_command hint below would suggest
+    // "break the command into smaller pieces" for a git commit).
+    if err_lower.contains("canceled by user") || err_lower.contains("cancelled by user") {
+        return Some(
+            "The user declined or canceled this action, so this is not a tool error to fix. \
+             Do not retry it or rephrase it; acknowledge the cancellation and either wait for \
+             the user's direction or propose a different approach for them to approve."
+                .to_string(),
+        );
+    }
+
     if tool_name == "apply_patch"
         && (err_lower.contains("no hunks found")
             || err_lower.contains("invalid hunk")
@@ -803,8 +824,19 @@ fn finalize_execution_result(
     run_result
 }
 
-fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
+fn print_run_status(
+    tool_call: &ToolCall,
+    run_result: &RunOneResult,
+    observer: &Option<&mut dyn ToolExecutionObserver>,
+) {
     if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
+        return;
+    }
+    if observer
+        .as_deref()
+        .is_some_and(|obs| obs.tool_status_rendered_inline(tool_call))
+    {
+        // The status was already merged into the command line; nothing to print.
         return;
     }
     let name = &tool_call.function.name;
@@ -1143,7 +1175,7 @@ fn execute_tool_calls_inner(
                     run_result.ok,
                 )));
                 notify_tool_finished(&mut observer, tool_call, &run_result);
-                print_run_status(tool_call, &run_result);
+                print_run_status(tool_call, &run_result, &observer);
                 crate::ai::driver::hooks::run_lifecycle_hook(
                     crate::ai::driver::hooks::HookEvent::AfterTool,
                     Some(&tool_call.function.name),
@@ -1188,7 +1220,7 @@ fn execute_tool_calls_inner(
             run_result.ok,
         )));
         notify_tool_finished(&mut observer, tool_call, &run_result);
-        print_run_status(tool_call, &run_result);
+        print_run_status(tool_call, &run_result, &observer);
         crate::ai::driver::hooks::run_lifecycle_hook(
             crate::ai::driver::hooks::HookEvent::AfterTool,
             Some(&tool_call.function.name),

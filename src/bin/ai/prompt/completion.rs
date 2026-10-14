@@ -961,6 +961,13 @@ impl CommandCompleter {
                     Some("use") if words.next().is_none() => Self::agent_name_candidates(token),
                     _ => Vec::new(),
                 }
+            } else if matches!(first, "/cd" | ":cd") {
+                match words.next() {
+                    // `-` (go back to the previous directory) is a literal, not a path.
+                    None if token == "-" => Vec::new(),
+                    None => complete_cd_fragment(token),
+                    Some(_) => Vec::new(),
+                }
             } else if matches!(first, "/resume") {
                 // Serve-chat only: the local REPL has no `/resume` command, and
                 // its cache stays empty, so this branch is a no-op there.
@@ -1565,6 +1572,97 @@ fn complete_path_fragment(fragment: &str, quote: Option<char>) -> Vec<String> {
         .collect()
 }
 
+/// Directory-only completion for `/cd`/`:cd`, mirroring shell `cd`: lists the
+/// directories under the fragment's base dir (files are excluded — `/cd` into a
+/// file is a no-op), appends `/` to every directory, and expands `~`. No `@`
+/// prefix and no quotes are added, because `/cd` takes its argument verbatim
+/// (`driver/commands/cwd.rs`), so a quoted name would become part of the path.
+fn complete_cd_fragment(fragment: &str) -> Vec<CompletionCandidate> {
+    let (dir_part, file_prefix) = split_fragment(fragment);
+    let base_dir = resolve_completion_base_dir(dir_part);
+    let mut candidates = Vec::new();
+
+    // `.`/`..` navigation entries, offered only while the fragment is empty or
+    // a dot-prefix — the same trigger as `relative_navigation_candidates`.
+    for nav in ["./", "../"] {
+        if fragment.is_empty() || fragment == "." || fragment == ".." || nav.starts_with(fragment)
+        {
+            candidates.push(CompletionCandidate {
+                display: nav.to_string(),
+                replacement: nav.to_string(),
+            });
+        }
+    }
+
+    let Ok(entries) = fs::read_dir(&base_dir) else {
+        return candidates;
+    };
+
+    let show_hidden = file_prefix.starts_with('.');
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(file_prefix) {
+            continue;
+        }
+        let is_hidden = name.starts_with('.');
+        if !show_hidden && is_hidden {
+            continue;
+        }
+        // Directories only: `cd` into a file is invalid.
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let mut replacement = String::new();
+        replacement.push_str(dir_part);
+        replacement.push_str(name);
+        replacement.push('/');
+        candidates.push(CompletionCandidate {
+            display: replacement.clone(),
+            replacement,
+        });
+    }
+
+    // Hidden-toggle entry (typing `.` reveals hidden dirs), same trigger as
+    // `hidden_toggle_candidate` but without the `@` prefix.
+    if !show_hidden && (file_prefix.is_empty() || ".".starts_with(file_prefix)) {
+        let toggle = if dir_part.is_empty() {
+            "./.".to_string()
+        } else {
+            format!("{dir_part}.")
+        };
+        candidates.push(CompletionCandidate {
+            display: toggle.clone(),
+            replacement: toggle,
+        });
+    }
+
+    // Navigation entries first, then case-insensitive name order (shell feel).
+    let rank = |replacement: &str| {
+        if replacement == "./" {
+            0
+        } else if replacement == "../" {
+            1
+        } else {
+            2
+        }
+    };
+    candidates.sort_by(|left, right| {
+        rank(&left.replacement)
+            .cmp(&rank(&right.replacement))
+            .then_with(|| {
+                left.replacement
+                    .to_ascii_lowercase()
+                    .cmp(&right.replacement.to_ascii_lowercase())
+            })
+            .then_with(|| left.replacement.cmp(&right.replacement))
+    });
+    candidates.dedup_by(|left, right| left.replacement == right.replacement);
+    candidates
+}
+
 fn split_fragment(fragment: &str) -> (&str, &str) {
     if fragment.is_empty() {
         return ("", "");
@@ -1790,6 +1888,60 @@ mod tests {
         assert!(values.contains(&"--"));
         assert!(!values.contains(&"--limit"));
         assert!(!values.contains(&"--dry-run"));
+    }
+
+    #[test]
+    fn cd_completion_lists_only_directories_with_trailing_slash() {
+        let tmp = std::env::temp_dir().join(format!("a-cd-complete-{}", std::process::id()));
+        let _ = fs::create_dir_all(tmp.join("alpha"));
+        let _ = fs::create_dir_all(tmp.join("beta"));
+        fs::write(tmp.join("file.txt"), "").unwrap();
+
+        // Prefix match on an absolute fragment: only the matching directory, with `/`.
+        let frag = format!("{}/al", tmp.to_str().unwrap());
+        let line = format!("/cd {frag}");
+        let (start, candidates) = CommandCompleter::complete_for_line(&line, line.len());
+        assert_eq!(&line[start..], frag);
+        assert_eq!(candidates.len(), 1, "only the matching directory");
+        assert_eq!(candidates[0].replacement, format!("{}/alpha/", tmp.to_str().unwrap()));
+
+        // A file name must never be offered as a `/cd` target.
+        let frag = format!("{}/f", tmp.to_str().unwrap());
+        let line = format!("/cd {frag}");
+        let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
+        assert!(candidates.is_empty(), "files are not valid /cd targets");
+
+        // Empty prefix inside an absolute dir: both directories listed, files never.
+        let line = format!("/cd {}/", tmp.to_str().unwrap());
+        let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
+        let values: Vec<_> = candidates.iter().map(|c| c.replacement.as_str()).collect();
+        assert!(values.iter().any(|v| v.ends_with("alpha/")), "alpha dir listed");
+        assert!(values.iter().any(|v| v.ends_with("beta/")), "beta dir listed");
+        assert!(values.iter().all(|v| !v.contains("file.txt")), "no files offered");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cd_completion_empty_fragment_offers_navigation_and_hidden_toggle() {
+        for line in ["/cd ", ":cd "] {
+            let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
+            let values: Vec<_> = candidates.iter().map(|c| c.replacement.as_str()).collect();
+            assert!(values.contains(&"./"), "{line}");
+            assert!(values.contains(&"../"), "{line}");
+            assert!(values.contains(&"./."), "{line} hidden toggle");
+        }
+    }
+
+    #[test]
+    fn cd_completion_rejects_dash_and_extra_args() {
+        for line in ["/cd -", ":cd -"] {
+            let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
+            assert!(candidates.is_empty(), "{line} (dash is a literal, not a path)");
+        }
+        let line = "/cd a b";
+        let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
+        assert!(candidates.is_empty(), "extra args produce no candidates");
     }
 
     #[test]

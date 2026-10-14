@@ -335,6 +335,43 @@ fn stream_payload_meaningful_progress_includes_new_reasoning_chunks() {
 }
 
 #[test]
+fn anthropic_usage_merge_keeps_message_start_prompt_tokens() {
+    // Standard Anthropic wire splits usage: `message_start` carries
+    // input_tokens, `message_delta` carries only output_tokens. A naive
+    // replace would zero out the prompt count; the merge must keep it.
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        None,
+        r#"{"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":1}}}"#,
+    )
+    .unwrap();
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        None,
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}"#,
+    )
+    .unwrap();
+
+    let (_, usage) = state.pending_llm_usage.as_ref().expect("usage captured");
+    assert_eq!(usage.prompt_tokens, 100);
+    assert_eq!(usage.completion_tokens, 42);
+    assert_eq!(usage.total_tokens, 142);
+}
+
+#[test]
 fn repeated_reasoning_deltas_preserve_model_output() {
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();

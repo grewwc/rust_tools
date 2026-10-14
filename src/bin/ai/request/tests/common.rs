@@ -55,6 +55,7 @@ pub(crate) fn test_app() -> App {
         last_turn_interrupted: false,
         prune_marks: Default::default(),
         turn_reasoning_items: Default::default(),
+        turn_tool_errors: Default::default(),
         stale_patch_targets: Default::default(),
         tool_middlewares: Vec::new(),
         llm_middlewares: Vec::new(),
@@ -94,6 +95,25 @@ pub(super) fn first_model_key_for_adapter(adapter: crate::ai::provider::ApiProvi
     crate::ai::model_names::all()
         .iter()
         .find(|m| m.adapter == adapter)
+        .map(|m| m.key.clone())
+}
+/// Finds a MiniMax ("MiMo" / "MiniMax") model key from the registry. MiniMax is
+/// not an `ApiProvider` variant — the thinking dialect dispatch keys off the
+/// model name (`contains("mimo") || contains("minimax")`), so a stale hardcoded
+/// key resolves to the default adapter/endpoint and never reaches the MiniMax
+/// branch. Returning the registry key keeps the sub-case honest: it exercises
+/// the MiniMax off-switch path only when such a model is actually present.
+pub(super) fn first_minimax_model_key() -> Option<String> {
+    crate::ai::model_names::all()
+        .iter()
+        .find(|m| {
+            let name = m.name.to_ascii_lowercase();
+            let key = m.key.to_ascii_lowercase();
+            name.contains("mimo")
+                || name.contains("minimax")
+                || key.contains("mimo")
+                || key.contains("minimax")
+        })
         .map(|m| m.key.clone())
 }
 /// Reuses the production clamping logic to build the expected `max_tokens`

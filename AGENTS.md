@@ -1,9 +1,7 @@
 # AGENTS.md - rust_tools Project Guide
 
-Root-level overview and repo-wide invariants only; subsystem details live in
-scoped `AGENTS.md` files. Auto-discovered instruction files are the `AGENTS.md` /
-`Agent.md` / `CLAUDE.md` families plus lowercase variants (`agent.md`, `Claude.md`,
-`claude.md`) — see `PROJECT_INSTRUCTION_FILENAMES` in `src/bin/ai/agents.rs`.
+Root-level overview and repo-wide invariants only; the nearest scoped
+`AGENTS.md` supplies subsystem rules.
 
 Rust 2024 workspace: utility library + CLI binaries. Primary product is `a`, an
 LLM-based AI agent runtime (AIOS) with process scheduling, agent/skill routing,
@@ -15,30 +13,18 @@ macOS-first (`objc2` deps); core library cross-platform.
 
 ## Layout
 
-```text
-src/lib.rs                  # utility library
-src/bin/a.rs                # AI agent entry point
-src/bin/ai/                 # AI runtime core
-src/bin/ff/                 # file-finder module embedded by `a` via include! in ai/mod.rs
-src/bin/*.rs                # one-off CLI tools (c, j, secret, pdf, ff, fk, gx, his,
-                            #   ns, oo, tt, configw, installw, mcp_ocr, ...) - not part of `a`
-scripts/                    # repo shell/Python helpers (guide: scripts/AGENTS.md)
-crates/aios_kernel/         # scheduler / IPC / process state machine
-crates/rust_tools_macros/   # proc macros
-crates/mcp_stdio/           # shared MCP-over-stdio skeleton: JSON-RPC transport + run<McpServer>
-crates/mcp_browser/         # standalone MCP server: browser automation (macOS AppleScript / CDP)
-crates/mcp_computer/        # standalone MCP server: generic computer-use (screen capture, input injection)
-crates/mcp_excel/           # standalone MCP server: Excel via AppleScript
-crates/mcp_pdf/             # standalone MCP server: PDF text/metadata extraction
-crates/re/                  # memo CLI (re) — standalone bin, keeps mongodb out of `a`
-tests/                      # integration tests
-models/                     # per-model JSON registry (read at runtime)
-```
+- `src/bin/a.rs` + `src/bin/ai/`: agent entry point and runtime; `src/bin/ff/`
+  is embedded into `a` via `include!`.
+- `src/bin/*.rs`: standalone utilities, not modules of `a`.
+- `crates/aios_kernel/`: scheduler, IPC, and process state machine.
+- `crates/mcp_stdio/` + `crates/mcp_{browser,computer,excel,pdf}/`: shared
+  stdio transport and standalone MCP servers.
+- `crates/rust_tools_macros/`, `crates/re/`, `scripts/`, `tests/`, `models/`:
+  macros, memo CLI, helpers, integration tests, and runtime model registry.
 
-> The `mcp_*` crates above are standalone binaries (not deps of `a`), so `cargo check
-> --bin a` stays fast. They reuse `mcp_stdio`; new OS-app MCP servers should follow
-> the same pattern. Standalone exceptions: `src/bin/mcp_feishu/` and
-> `src/bin/mcp_ocr.rs` are hand-rolled JSON-RPC servers that don't reuse `mcp_stdio`.
+The `mcp_*` crates are not dependencies of `a`; new OS-app servers should reuse
+`mcp_stdio` when possible. `src/bin/mcp_feishu/` and `src/bin/mcp_ocr.rs` are
+hand-rolled exceptions.
 
 ## Build / Test
 
@@ -75,22 +61,19 @@ Prefer an existing focused test before running one.
 ## Global Engineering Rules
 
 1. **Module boundaries**: `pub(super)` / `pub(crate)`.
-2. **English comments**: all code comments — line (`//`), block (`/* */`), and doc
-   comments (`///`, `//!`) — must be written in English. This applies to new code and
-   to any code you modify; when you touch code containing Chinese comments, translate
-   them as part of the change (repo-wide Chinese-comment migration).
+2. **English comments**: all line, block, and doc comments must be English; when
+   modifying code, translate any Chinese comments you touch.
 3. **Collections**: `rustc-hash` FastMap/FastSet via re-exports.
 4. **Config keys**: add only in `src/bin/ai/config_schema.rs`.
 5. **Tests**: keep close to changed module; serial tests use `test_support::ENV_LOCK`.
 6. **Extensibility**: data-driven/registration-based over hardcoded `if`/`else`.
-7. **AGENTS.md maintenance**: after code changes, update AGENTS.md only when a nearby rule is superseded; replace or delete the affected rule in place — never just append a new bullet. Instruction files are injected into every system prompt, so they must stay concise: fold sections that keep growing and drop rules that contradict the new code (a stale rule is worse than no rule). This policy is repo-local — it lives here, not in the runtime — so keep this rule intact and enforce it when editing AGENTS.md files.
+7. **AGENTS.md maintenance**: update only superseded nearby rules, in place; never
+   append history. Keep injected instructions concise and delete stale rules.
 8. **Git safety**: never `stash`/`stash drop` others' uncommitted changes. Use temp branch/worktree or stash only your own.
 9. **Architecture-first**: many fallbacks = wrong data flow — refactor the happy path instead.
 
 ## High-Value Pitfalls
 
-1. `.agent` / builtin `.skill` files are compiled in via `include_str!` (editing recompiles); user `.skill` files load at runtime.
-2. `src/bin/ff/` is embedded into `a` via `include!` in `src/bin/ai/mod.rs` (`a.rs`
-   only re-exports the library and calls `ai::entry()` from `main`); changes affect
-   the agent binary.
-3. `objc2*` deps are macOS-only.
+1. `.agent` / builtin `.skill` files are compiled via `include_str!`; user `.skill`
+   files load at runtime.
+2. `objc2*` dependencies are macOS-only.

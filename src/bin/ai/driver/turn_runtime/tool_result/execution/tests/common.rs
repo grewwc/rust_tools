@@ -93,6 +93,7 @@ pub(super) fn test_app_with_tools(tool_names: &[&str]) -> App {
         last_turn_interrupted: false,
         prune_marks: Default::default(),
         turn_reasoning_items: Default::default(),
+        turn_tool_errors: Default::default(),
         stale_patch_targets: Default::default(),
         tool_middlewares: Vec::new(),
         llm_middlewares: Vec::new(),

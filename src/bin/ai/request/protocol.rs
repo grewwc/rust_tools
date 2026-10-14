@@ -32,8 +32,233 @@ impl RequestProtocolDialect {
             }
             Self::Responses => serde_json::to_vec(&build_responses_request_body(request))
                 .expect("responses body should serialize"),
+            Self::Messages => serde_json::to_vec(&build_messages_request_body(request))
+                .expect("messages body should serialize"),
         }
     }
+}
+
+/// Anthropic Messages API body: a top-level `system` string, a `messages` array
+/// of content-block messages, `tools` as `{name, description, input_schema}` and
+/// a required `max_tokens`. History roles map onto Anthropic user/assistant
+/// blocks; OpenAI-shaped tool calls become `tool_use` blocks and tool results
+/// become `tool_result` blocks inside a user message. Extended thinking is
+/// merged in from `request.thinking` (produced by the thinking dialect) and the
+/// assistant thinking chain is replayed as `thinking` blocks, so vision and
+/// thinking stay available on this dialect instead of being silently dropped.
+fn build_messages_request_body(request: &RequestBody<'_>) -> Value {
+    let max_tokens = request.max_tokens.unwrap_or(4096);
+    let mut body = serde_json::Map::new();
+    body.insert("model".to_string(), Value::String(request.model.clone()));
+    body.insert("stream".to_string(), Value::Bool(request.stream));
+    body.insert("max_tokens".to_string(), json!(max_tokens));
+
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut messages: Vec<Value> = Vec::new();
+    for message in request.messages {
+        match message.role.as_str() {
+            "system" => {
+                let text = extract_displayable_text(&message.content);
+                if !text.is_empty() {
+                    system_parts.push(text);
+                }
+            }
+            "user" => messages.push(json!({
+                "role": "user",
+                "content": messages_user_content(message),
+            })),
+            "assistant" => messages.push(messages_assistant_message(message)),
+            "tool" => {
+                let mut tool_result = serde_json::Map::new();
+                tool_result.insert("type".to_string(), json!("tool_result"));
+                tool_result.insert(
+                    "tool_use_id".to_string(),
+                    json!(message.tool_call_id.clone().unwrap_or_default()),
+                );
+                tool_result.insert(
+                    "content".to_string(),
+                    messages_content_blocks(&message.content),
+                );
+                // Signal failed tool executions so the model treats them as
+                // errors to correct, not as ordinary text output. The flag is a
+                // turn-scoped side channel (see `RequestBody.tool_errors`),
+                // keyed by tool_call_id.
+                let tool_use_id = message.tool_call_id.clone().unwrap_or_default();
+                let failed = request
+                    .tool_errors
+                    .and_then(|errors| errors.get(&tool_use_id))
+                    .copied()
+                    .unwrap_or(false);
+                if failed {
+                    tool_result.insert("is_error".to_string(), json!(true));
+                }
+                messages.push(json!({
+                    "role": "user",
+                    "content": [Value::Object(tool_result)],
+                }));
+            }
+            // Runtime-only roles (internal_note, ...) never reach the wire.
+            _ => {}
+        }
+    }
+    if !system_parts.is_empty() {
+        body.insert("system".to_string(), Value::String(system_parts.join("\n\n")));
+    }
+    body.insert("messages".to_string(), Value::Array(messages));
+
+    if let Some(tools) = messages_tools(request.tools.as_ref()) {
+        body.insert("tools".to_string(), tools);
+    }
+
+    // Merge the resolved thinking controls (Anthropic extended thinking, set
+    // by the thinking dialect) into the body.
+    for (key, value) in &request.thinking {
+        body.insert(key.clone(), value.clone());
+    }
+
+    Value::Object(body)
+}
+
+/// User message content: plain strings pass through; structured blocks are
+/// converted to Anthropic content blocks (text → `text`, images → `image`),
+/// so vision-capable models receive the actual pixels instead of a degraded
+/// text extraction.
+fn messages_user_content(message: &Message) -> Value {
+    messages_content_blocks(&message.content)
+}
+
+/// Convert a message content value to Anthropic Messages content blocks.
+/// Strings pass through verbatim; block arrays are mapped part-by-part via
+/// [`messages_content_block`]; anything else is reduced to its displayable text.
+fn messages_content_blocks(content: &Value) -> Value {
+    match content {
+        Value::String(text) => Value::String(text.clone()),
+        Value::Array(items) => {
+            let blocks: Vec<Value> = items.iter().filter_map(messages_content_block).collect();
+            if blocks.is_empty() {
+                Value::String(String::new())
+            } else {
+                Value::Array(blocks)
+            }
+        }
+        other => Value::String(extract_displayable_text(other)),
+    }
+}
+
+/// One content part → Anthropic block, or `None` when nothing sendable remains
+/// (e.g. an image without a usable URL). Empty text parts are dropped because
+/// Anthropic rejects empty `text` blocks with a 400.
+fn messages_content_block(item: &Value) -> Option<Value> {
+    let is_image = matches!(item.get("type").and_then(Value::as_str), Some("image_url"))
+        || item.get("image_url").is_some()
+        || matches!(item.get("kind").and_then(Value::as_str), Some("image"));
+    if is_image {
+        return messages_image_block(item);
+    }
+    let text = extract_displayable_text(item);
+    if text.is_empty() {
+        return None;
+    }
+    Some(json!({ "type": "text", "text": text }))
+}
+
+/// OpenAI image part (`{"type": "image_url", "image_url": {"url": ...}}` or a
+/// bare `{"kind": "image", "url": ...}`) → Anthropic `image` block. Base64
+/// `data:` URIs become `source.type = base64`; http(s) URLs become
+/// `source.type = url`; anything else is dropped.
+fn messages_image_block(item: &Value) -> Option<Value> {
+    let url = item
+        .get("image_url")
+        .and_then(|v| v.get("url").or(Some(v)))
+        .and_then(Value::as_str)
+        .or_else(|| item.get("url").and_then(Value::as_str))?;
+    if let Some(rest) = url.strip_prefix("data:") {
+        let (media_type, payload) = rest.split_once(',')?;
+        let media_type = media_type.strip_suffix(";base64").unwrap_or(media_type);
+        return Some(json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": media_type, "data": payload },
+        }));
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Some(json!({
+            "type": "image",
+            "source": { "type": "url", "url": url },
+        }));
+    }
+    None
+}
+
+/// Assistant message → content blocks: text plus `tool_use` blocks for each tool
+/// call (the JSON-encoded arguments become the `input` object; unparseable
+/// arguments are wrapped so the wire stays valid JSON).
+fn messages_assistant_message(message: &Message) -> Value {
+    let mut blocks: Vec<Value> = Vec::new();
+    // Replay the previous thinking chain before the visible text / tool_use
+    // blocks. Anthropic requires thinking blocks to be echoed back when a tool
+    // round continues the same assistant turn, so replay only on tool-call
+    // rounds (the only case where a `tool_result` follows); stale reasoning on
+    // plain-answer turns is not resent. The zen gateway's adaptive-thinking
+    // dialect accepts plain `thinking` blocks; the `signature` field is not
+    // persisted and is not required by that gateway.
+    if let Some(thinking) = message
+        .reasoning_content
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        let has_tool_calls = message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tool_calls| !tool_calls.is_empty());
+        if has_tool_calls {
+            blocks.push(json!({ "type": "thinking", "thinking": thinking }));
+        }
+    }
+    let text = extract_displayable_text(&message.content);
+    if !text.is_empty() {
+        blocks.push(json!({"type": "text", "text": text}));
+    }
+    if let Some(tool_calls) = message.tool_calls.as_ref() {
+        for call in tool_calls {
+            let input = serde_json::from_str(&call.function.arguments)
+                .unwrap_or_else(|_| json!({"arguments": call.function.arguments}));
+            blocks.push(json!({
+                "type": "tool_use",
+                "id": call.id,
+                "name": call.function.name,
+                "input": input,
+            }));
+        }
+    }
+    if blocks.is_empty() {
+        blocks.push(json!({"type": "text", "text": ""}));
+    }
+    json!({"role": "assistant", "content": blocks})
+}
+
+/// OpenAI-compatible `tools` array (function shape) → Anthropic
+/// `{name, description, input_schema}`. Non-function tools (e.g. web_search) are
+/// dropped; the Messages dialect keeps search off for now.
+fn messages_tools(tools: Option<&Value>) -> Option<Value> {
+    let converted = tools
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let function = tool.get("function").unwrap_or(tool);
+            let name = function.get("name").and_then(Value::as_str)?;
+            let mut converted = serde_json::Map::new();
+            converted.insert("name".to_string(), Value::String(name.to_string()));
+            if let Some(description) = function.get("description").and_then(Value::as_str) {
+                converted.insert("description".to_string(), Value::String(description.to_string()));
+            }
+            if let Some(parameters) = function.get("parameters") {
+                converted.insert("input_schema".to_string(), parameters.clone());
+            }
+            Some(Value::Object(converted))
+        })
+        .collect::<Vec<_>>();
+    (!converted.is_empty()).then_some(Value::Array(converted))
 }
 
 pub(crate) fn build_http_body_for_request(
@@ -109,6 +334,7 @@ pub(crate) fn build_http_body_for_json_messages(
         reasoning_items: None,
         reasoning_encrypted_replay: models::reasoning_encrypted_replay_enabled(model),
         estimated_prompt_tokens: 0,
+        tool_errors: None,
     };
     build_http_body_for_request(model, endpoint, &mut request)
 }
@@ -444,4 +670,308 @@ pub(super) fn build_responses_request_body(request: &RequestBody<'_>) -> Value {
         object.insert("max_output_tokens".to_string(), max_tokens.into());
     }
     body
+}
+
+#[cfg(test)]
+mod messages_body_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn build_body(messages: &[Value], tools: Option<Value>, max_tokens: Option<u32>) -> Value {
+        let messages = json_messages_to_request_messages(messages);
+        let request = RequestBody {
+            model: "claude-opus-5-5".to_string(),
+            messages: &messages,
+            stream: true,
+            thinking: serde_json::Map::new(),
+            enable_search: None,
+            tools,
+            tool_choice: None,
+            reasoning_effort: None,
+            reasoning: None,
+            stream_options: None,
+            max_tokens,
+            reasoning_items: None,
+            reasoning_encrypted_replay: false,
+            estimated_prompt_tokens: 0,
+            tool_errors: None,
+        };
+        build_messages_request_body(&request)
+    }
+
+    #[test]
+    fn messages_body_merges_thinking_controls() {
+        let messages = json_messages_to_request_messages(&[]);
+        let mut thinking = serde_json::Map::new();
+        thinking.insert("thinking".to_string(), json!({"type": "adaptive"}));
+        thinking.insert("output_config".to_string(), json!({"effort": "xhigh"}));
+        let request = RequestBody {
+            model: "claude-opus-5-5".to_string(),
+            messages: &messages,
+            stream: true,
+            thinking,
+            enable_search: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            reasoning: None,
+            stream_options: None,
+            max_tokens: Some(8192),
+            reasoning_items: None,
+            reasoning_encrypted_replay: false,
+            estimated_prompt_tokens: 0,
+            tool_errors: None,
+        };
+        let body = build_messages_request_body(&request);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn messages_body_maps_history_roles_and_tools() {
+        let body = build_body(
+            &[
+                json!({"role": "system", "content": "You are a helper."}),
+                json!({"role": "user", "content": "search rust"}),
+                json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "web_search", "arguments": "{\"q\": \"rust\"}"},
+                    }],
+                }),
+                json!({"role": "tool", "tool_call_id": "call_1", "content": "results here"}),
+            ],
+            Some(json!([{
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Search the web",
+                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+                },
+            }])),
+            Some(1024),
+        );
+
+        assert_eq!(body["model"], "claude-opus-5-5");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["system"], "You are a helper.");
+        assert_eq!(body["tools"][0]["name"], "web_search");
+        assert_eq!(body["tools"][0]["description"], "Search the web");
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "search rust");
+        // Assistant: tool_use content block (empty text stays off the wire).
+        assert_eq!(messages[1]["role"], "assistant");
+        let assistant_blocks = messages[1]["content"].as_array().expect("assistant blocks");
+        assert_eq!(assistant_blocks.len(), 1);
+        assert_eq!(assistant_blocks[0]["type"], "tool_use");
+        assert_eq!(assistant_blocks[0]["id"], "call_1");
+        assert_eq!(assistant_blocks[0]["name"], "web_search");
+        assert_eq!(assistant_blocks[0]["input"]["q"], "rust");
+        // Tool result: user message with a tool_result block.
+        assert_eq!(messages[2]["role"], "user");
+        let tool_block = &messages[2]["content"][0];
+        assert_eq!(tool_block["type"], "tool_result");
+        assert_eq!(tool_block["tool_use_id"], "call_1");
+        assert_eq!(tool_block["content"], "results here");
+    }
+
+    #[test]
+    fn messages_body_converts_user_images_to_anthropic_image_blocks() {
+        let body = build_body(
+            &[json!({
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+                    {"type": "text", "text": "what is in these images?"},
+                ],
+            })],
+            None,
+            None,
+        );
+        let blocks = body["messages"][0]["content"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["type"], "base64");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[0]["source"]["data"], "AAAA");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "url");
+        assert_eq!(blocks[1]["source"]["url"], "https://example.com/a.png");
+        assert_eq!(blocks[2]["type"], "text");
+        assert_eq!(blocks[2]["text"], "what is in these images?");
+    }
+
+    #[test]
+    fn messages_body_replays_thinking_only_on_tool_call_rounds() {
+        // Tool-call round: the previous thinking chain is echoed before the
+        // tool_use block (the Anthropic-required continuation case).
+        let body = build_body(
+            &[json!({
+                "role": "assistant",
+                "content": "let me check",
+                "reasoning_content": "the file is at src/lib.rs",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{\"command\": \"ls\"}"},
+                }],
+            })],
+            None,
+            None,
+        );
+        let blocks = body["messages"][0]["content"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "the file is at src/lib.rs");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[2]["type"], "tool_use");
+
+        // Plain-answer round: no `tool_result` follows, so the stale thinking
+        // is not resent (avoids context bloat and orphan-thinking strictness).
+        let body = build_body(
+            &[json!({
+                "role": "assistant",
+                "content": "done",
+                "reasoning_content": "old chain from a previous answer",
+            })],
+            None,
+            None,
+        );
+        let blocks = body["messages"][0]["content"].as_array().expect("blocks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+    }
+
+    #[test]
+    fn messages_body_thinking_replay_survives_request_normalization_for_anthropic_dialect() {
+        // Real-chain proof: `normalize_reasoning_content_replay_for_model`
+        // strips `reasoning_content` for models that do not declare replay
+        // (reasoning.rs). The Anthropic Messages dialect opts into
+        // shape-preservation via `requires_reasoning_content_echo`, so a
+        // tool-call round's thinking text survives to the wire. This runs the
+        // actual request-layer normalization instead of constructing the body
+        // directly.
+        let mut messages = json_messages_to_request_messages(&[
+            json!({
+                "role": "assistant",
+                "content": "let me check",
+                "reasoning_content": "the file is at src/lib.rs",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{\"command\": \"ls\"}"},
+                }],
+            }),
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "ok"}),
+        ]);
+        crate::ai::request::normalize_reasoning_content_replay_for_model(
+            "claude-opus-5-5-opencode",
+            &mut messages,
+        );
+        assert_eq!(
+            messages[0].reasoning_content.as_deref(),
+            Some("the file is at src/lib.rs"),
+            "tool-call round reasoning must survive the request-layer normalization"
+        );
+        let request = RequestBody {
+            model: "claude-opus-5-5-opencode".to_string(),
+            messages: &messages,
+            stream: true,
+            thinking: serde_json::Map::new(),
+            enable_search: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            reasoning: None,
+            stream_options: None,
+            max_tokens: Some(4096),
+            reasoning_items: None,
+            reasoning_encrypted_replay: false,
+            estimated_prompt_tokens: 0,
+            tool_errors: None,
+        };
+        let body = build_messages_request_body(&request);
+        let blocks = body["messages"][0]["content"].as_array().expect("blocks");
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "the file is at src/lib.rs");
+    }
+
+    #[test]
+    fn messages_body_marks_failed_tool_results_with_is_error() {
+        let messages = json_messages_to_request_messages(&[
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "boom"}),
+            json!({"role": "tool", "tool_call_id": "call_2", "content": "fine"}),
+        ]);
+        let mut tool_errors = rustc_hash::FxHashMap::default();
+        tool_errors.insert("call_1".to_string(), true);
+        let request = RequestBody {
+            model: "claude-opus-5-5".to_string(),
+            messages: &messages,
+            stream: true,
+            thinking: serde_json::Map::new(),
+            enable_search: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            reasoning: None,
+            stream_options: None,
+            max_tokens: None,
+            reasoning_items: None,
+            reasoning_encrypted_replay: false,
+            estimated_prompt_tokens: 0,
+            tool_errors: Some(&tool_errors),
+        };
+        let body = build_messages_request_body(&request);
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages[0]["content"][0]["is_error"], true);
+        assert!(messages[1]["content"][0].get("is_error").is_none());
+    }
+
+    #[test]
+    fn messages_body_defaults_max_tokens_and_skips_non_function_tools() {
+        let body = build_body(
+            &[json!({"role": "user", "content": "hi"})],
+            Some(json!([
+                {"type": "function", "function": {"name": "a", "parameters": {}}},
+                {"type": "web_search"},
+            ])),
+            None,
+        );
+        assert_eq!(body["max_tokens"], 4096);
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "a");
+        assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn messages_body_wraps_unparseable_tool_arguments() {
+        let body = build_body(
+            &[json!({
+                "role": "assistant",
+                "content": "thinking out loud",
+                "tool_calls": [{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "f", "arguments": "not json"},
+                }],
+            })],
+            None,
+            Some(256),
+        );
+        let blocks = body["messages"][0]["content"].as_array().expect("blocks");
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "thinking out loud");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["input"]["arguments"], "not json");
+    }
 }

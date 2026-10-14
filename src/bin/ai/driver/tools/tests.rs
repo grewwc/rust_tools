@@ -544,6 +544,25 @@ fn plan_update_not_found_gets_plan_specific_hint() {
 }
 
 #[test]
+fn user_cancellation_gets_stop_hint_not_generic_execute_hint() {
+    // A denied/canceled action is a user decision, not a tool failure: the model
+    // must get an explicit "don't retry" signal instead of the generic
+    // execute_command hint ("break the command into smaller pieces") that would
+    // otherwise nudge it into an analyze-and-retry loop after a git denial.
+    let err = "Error: execute_command failed: git commit canceled by user";
+    let hint = super::remediation_hint("execute_command", err, None).unwrap();
+    assert!(hint.contains("Do not retry it"), "{hint}");
+    assert!(!hint.contains("break the command into smaller pieces"), "{hint}");
+
+    // Non-canceled execute_command errors keep the generic hint, but only when
+    // a fallback read tool is visible this turn (remediation_hint returns None
+    // for an empty visibility set, so the unwrap here needs "read_file").
+    let allowed: FastSet<String> = ["read_file".to_string()].into_iter().collect();
+    let generic = super::remediation_hint("execute_command", "exit code 1", Some(&allowed)).unwrap();
+    assert!(generic.contains("break the command into smaller pieces"), "{generic}");
+}
+
+#[test]
 fn schema_gate_rejects_wrong_typed_arguments_before_dispatch() {
     // A present-but-wrongly-typed value must fail at the central dispatch
     // point instead of reaching the service layer, where `as_u64().unwrap_or`

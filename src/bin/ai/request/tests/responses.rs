@@ -134,6 +134,7 @@ fn responses_request_body_omits_assistant_reasoning_from_message_content() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        tool_errors: None,
     };
 
     let body = super::super::build_responses_request_body(&request);
@@ -183,6 +184,7 @@ fn responses_request_body_emits_bare_function_call_for_tool_turn() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        tool_errors: None,
     };
 
     let body = super::super::build_responses_request_body(&request);
@@ -227,6 +229,7 @@ fn responses_request_body_drops_empty_text_content_items() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        tool_errors: None,
     };
 
     let body = super::super::build_responses_request_body(&request);
@@ -291,6 +294,7 @@ fn responses_request_body_omits_include_without_encrypted_replay() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        tool_errors: None,
     };
 
     let body = super::super::build_responses_request_body(&request);
@@ -344,6 +348,7 @@ fn responses_request_body_replays_reasoning_items_before_function_call() {
         reasoning_items: Some(&items),
         reasoning_encrypted_replay: true,
         estimated_prompt_tokens: 0,
+        tool_errors: None,
     };
 
     let body = super::super::build_responses_request_body(&request);
@@ -395,6 +400,7 @@ fn responses_request_body_degrades_to_bare_function_call_without_reasoning_items
         reasoning_items: Some(&empty),
         reasoning_encrypted_replay: true,
         estimated_prompt_tokens: 0,
+        tool_errors: None,
     };
 
     let body = super::super::build_responses_request_body(&request);
@@ -443,6 +449,7 @@ fn responses_request_body_replays_tool_round_narration_before_function_call() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        tool_errors: None,
     };
 
     let body = super::super::build_responses_request_body(&request);
@@ -501,6 +508,7 @@ fn responses_request_body_orders_reasoning_narration_function_call() {
         reasoning_items: Some(&items),
         reasoning_encrypted_replay: true,
         estimated_prompt_tokens: 0,
+        tool_errors: None,
     };
 
     let body = super::super::build_responses_request_body(&request);

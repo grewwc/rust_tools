@@ -11,7 +11,7 @@
 /// `--git-dir <path>`、`--work-tree <path>`、`--namespace <name>`、`--exec-path <path>`。
 /// `=`-attached forms (e.g. `--git-dir=/repo`, `-C/repo`) consume no extra token.
 /// The first token after `--` is treated as the subcommand.
-fn git_subcommand_index(command_tokens: &[String]) -> Option<usize> {
+pub(crate) fn git_subcommand_index(command_tokens: &[String]) -> Option<usize> {
     const VALUE_CONSUMING_LONG: &[&str] =
         &["--git-dir", "--work-tree", "--namespace", "--exec-path"];
     let mut i = 1usize;
@@ -99,10 +99,8 @@ pub(crate) fn command_subcommand_index(command_tokens: &[String]) -> Option<usiz
 ///
 /// `git` itself is not in `denied_programs` (subcommands like status/log/diff are
 /// harmless and necessary); only the subcommands below are hard-blocked. Global
-/// option variants (e.g. `git -C /repo push`) hit too.
+/// option variants (e.g. `git -C /repo rm`) hit too.
 const BLOCKED_GIT_SUBCOMMANDS: &[(&str, &str)] = &[
-    // Prevent pushing local commits to a remote repository.
-    ("push", "git push is blocked by sandbox policy"),
     // `git rm` physically deletes files from the working tree, unrecoverable;
     // `git rm --cached` only removes the index entry, but blocking outright is
     // safer than per-argument analysis. Use safe tools like `trash` to delete
@@ -126,7 +124,7 @@ pub(crate) fn blocked_git_subcommand(command_tokens: &[String]) -> Option<&'stat
 /// Decide which `git` subcommands would irreversibly discard or delete
 /// uncommitted work.
 ///
-/// Unlike `BLOCKED_GIT_SUBCOMMANDS` (globally banned ones like push), the
+/// Unlike `BLOCKED_GIT_SUBCOMMANDS` (globally banned ones like `rm`), the
 /// subcommands below are harmless under some argument combinations (e.g. `git
 /// switch` branch switching, `git restore --staged` unstaging), so block only
 /// when they would truly destroy uncommitted changes (working-tree/staged

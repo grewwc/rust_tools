@@ -160,7 +160,7 @@ fn materialize_safe_shell_substitutions(
             super::audit::SafeShellSubstitutionKind::Command { inner } => {
                 // The inner command must pass the full gate too: re-run
                 // validate first (guards against relaxed classification), then
-                // the git confirmation gate (commit/stash, fail-closed). The
+                // the git confirmation gate (commit/stash/checkout/switch, fail-closed). The
                 // audit classifier only proves the inner command passed
                 // validate; it does not intercept confirm-gated git commands.
                 // Without this, `echo "$(git commit -am x)"` would commit
@@ -233,12 +233,17 @@ Do not re-run near-identical variants; narrow the query instead (e.g. `grep -c` 
 const READ_ONLY_GIT_STASH_SUBACTIONS: &[&str] = &["list", "show"];
 
 /// Git subcommands that must be confirmed by the user before running
-/// (`git commit`; `git stash` and its subactions that change the working tree
-/// or stash entries, e.g. pop/drop/clear — read-only `git stash list`/`show`
-/// need no confirmation). Reuses the audit layer's lexical parsing so
+/// (`git commit`; `git push` in every form — pushing reaches the remote, so it
+/// is always confirmed; `git stash` and its subactions that change the working
+/// tree or stash entries, e.g. pop/drop/clear — read-only `git stash list`/
+/// `show` need no confirmation; `git checkout` / `git switch` in every form —
+/// the destructive forms (`-- <path>`, `-f`, `-B`, `--discard-changes`) are
+/// additionally hard-blocked by the audit layer before this gate runs). Reuses
+/// the audit layer's lexical parsing so
 /// materialized quoted arguments cannot bypass confirmation, and data like
 /// `echo 'git commit'` is not mistaken for a real command. Returns the matched
-/// subcommand name (`commit` / `stash`) for prompt and error wording.
+/// subcommand name (`commit` / `push` / `stash` / `checkout` / `switch`) for
+/// prompt and error wording.
 fn confirm_gated_git_subcommand(command: &str) -> Option<&'static str> {
     for segment in super::audit::split_unquoted_segments(command) {
         let tokens = super::audit::effective_command_tokens(&segment);
@@ -252,36 +257,36 @@ fn confirm_gated_git_subcommand(command: &str) -> Option<&'static str> {
             continue;
         }
 
-        // Skip git global options and their values (-C <path>,
-        // -c <key>=<val>, --git-dir=..., etc.), which may sit between `git`
-        // and the subcommand.
-        let mut j = 1usize;
-        loop {
-            match tokens.get(j).map(String::as_str) {
-                Some(tok)
-                    if tok == "-C"
-                        || tok == "-c"
-                        || tok == "--git-dir"
-                        || tok == "--work-tree"
-                        || tok == "--namespace" =>
-                {
-                    j += 2
-                }
-                Some(tok)
-                    if tok.starts_with("--git-dir=")
-                        || tok.starts_with("--work-tree=")
-                        || tok.starts_with("--namespace=") =>
-                {
-                    j += 1
-                }
-                _ => break,
-            }
-        }
+        // Reuse the audit layer's single subcommand parser instead of a local
+        // option list: it skips every git global option form (`-C`/`-c`
+        // with value, `--git-dir=...`, plain flags like `--no-pager`/`--bare`,
+        // `--` before the subcommand), so no option variant can escape the
+        // confirmation gate the way it could not escape the audit blocklist.
+        let Some(j) = super::audit::git_subcommand_index(&tokens) else {
+            continue;
+        };
         if let Some(sub) = tokens.get(j).map(String::as_str) {
             // `sub` borrows the local `tokens`; return the matching static
             // instead so the signature (`Option<&'static str>`) holds.
             if sub == "commit" {
                 return Some("commit");
+            }
+            // Case-insensitive like the audit layer's block list, so `git PUSH`
+            // cannot escape the gate the way it could not escape the old
+            // hard block.
+            if sub.eq_ignore_ascii_case("push") {
+                return Some("push");
+            }
+            if sub == "checkout" {
+                return Some("checkout");
+            }
+            if sub == "switch" {
+                // Every `git checkout` / `git switch` form requires
+                // confirmation. Destructive forms (`-- <path>`, `-f`/`-B`,
+                // `--discard-changes`) never reach this gate: the audit layer
+                // hard-blocks them first, so they cannot be approved; plain
+                // branch switching (and other safe forms) lands here.
+                return Some("switch");
             }
             if sub == "stash" {
                 // Read-only subactions (list/show) directly after `stash`
@@ -302,7 +307,8 @@ fn confirm_gated_git_subcommand(command: &str) -> Option<&'static str> {
 }
 
 /// Ask the user to confirm confirm-gated git subcommands (`git commit` /
-/// `git stash`) before running them.
+/// `git push` / `git stash` / `git checkout` / `git switch`) before running
+/// them.
 /// - Interactive terminal: red-highlighted prompt; y proceeds, n / Ctrl+C /
 ///   Esc cancels.
 /// - Serve turn child with a remote confirmation channel: the question travels
@@ -474,7 +480,7 @@ where
     super::audit::validate_execute_command(&command)
         .map_err(|reason| format!("Command blocked: {reason}"))?;
 
-    // Confirm-gated git subcommands (commit/stash) ask the user first
+    // Confirm-gated git subcommands (commit/stash/checkout/switch) ask the user first
     // (fail-closed in non-interactive environments).
     confirm_git_confirm_gated_if_needed(&command)?;
 
@@ -529,7 +535,7 @@ mod tests {
         ))
     }
 
-    // ---- confirm-gated git subcommands (commit / stash) ----
+    // ---- confirm-gated git subcommands (commit / push / stash / checkout / switch) ----
 
     #[test]
     fn commit_detection_matches_plain_git_commit() {
@@ -561,6 +567,42 @@ mod tests {
         assert_eq!(
             confirm_gated_git_subcommand("git -c user.name=X commit"),
             Some("commit")
+        );
+    }
+
+    #[test]
+    fn push_detection_matches_all_forms() {
+        assert_eq!(confirm_gated_git_subcommand("git push"), Some("push"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git push origin main"),
+            Some("push")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git push --force-with-lease origin"),
+            Some("push")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git -C /repo push origin main"),
+            Some("push")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git --git-dir=/repo push"),
+            Some("push")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git --no-pager push origin main"),
+            Some("push")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git 'push' origin main"),
+            Some("push")
+        );
+        // Case-insensitive: the audit layer's old hard block matched `PUSH`,
+        // so the gate must too, otherwise `git PUSH` bypasses confirmation.
+        assert_eq!(confirm_gated_git_subcommand("git PUSH origin"), Some("push"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git status && git push -u origin main"),
+            Some("push")
         );
     }
 
@@ -639,21 +681,121 @@ mod tests {
     }
 
     #[test]
+    fn checkout_detection_matches_all_checkout_forms() {
+        // Every `git checkout` form is confirm-gated, exactly like commit and
+        // stash. Destructive forms (`-- <path>`, `-f`, `-B`, path-like args)
+        // are additionally hard-blocked by the audit layer before this gate;
+        // detection here still covers them so a fail-closed error is the
+        // fallback wherever the audit layer is bypassed.
+        assert_eq!(confirm_gated_git_subcommand("git checkout"), Some("checkout"));
+        assert_eq!(confirm_gated_git_subcommand("git checkout main"), Some("checkout"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git checkout -b feature/x"),
+            Some("checkout")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git checkout -- src/main.rs"),
+            Some("checkout")
+        );
+        assert_eq!(confirm_gated_git_subcommand("git checkout -f main"), Some("checkout"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git -C /repo checkout main"),
+            Some("checkout")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git --git-dir=/repo/.git checkout main"),
+            Some("checkout")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git -c user.name=X checkout main"),
+            Some("checkout")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git add -A && git checkout main"),
+            Some("checkout")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git -C /repo add . && git -C /repo checkout main"),
+            Some("checkout")
+        );
+        assert_eq!(confirm_gated_git_subcommand("env git checkout main"), Some("checkout"));
+        assert_eq!(confirm_gated_git_subcommand("nohup git checkout main"), Some("checkout"));
+        assert_eq!(
+            confirm_gated_git_subcommand("command git checkout main"),
+            Some("checkout")
+        );
+    }
+
+    #[test]
+    fn switch_detection_matches_all_switch_forms() {
+        // `git switch` is checkout's branch-switching sibling and follows the
+        // exact same rule: every form is confirm-gated, destructive forms
+        // (`-- <path>`, `-f`, `--discard-changes`) are hard-blocked by the
+        // audit layer first.
+        assert_eq!(confirm_gated_git_subcommand("git switch"), Some("switch"));
+        assert_eq!(confirm_gated_git_subcommand("git switch main"), Some("switch"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git switch -c feature/x"),
+            Some("switch")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git switch --detach"),
+            Some("switch")
+        );
+        assert_eq!(confirm_gated_git_subcommand("git switch -f main"), Some("switch"));
+        assert_eq!(
+            confirm_gated_git_subcommand("git -C /repo switch main"),
+            Some("switch")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git --git-dir=/repo/.git switch main"),
+            Some("switch")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git -c user.name=X switch main"),
+            Some("switch")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git add -A && git switch main"),
+            Some("switch")
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("git -C /repo add . && git -C /repo switch main"),
+            Some("switch")
+        );
+        assert_eq!(confirm_gated_git_subcommand("env git switch main"), Some("switch"));
+        assert_eq!(confirm_gated_git_subcommand("nohup git switch main"), Some("switch"));
+        assert_eq!(
+            confirm_gated_git_subcommand("command git switch main"),
+            Some("switch")
+        );
+    }
+
+    #[test]
     fn confirm_gated_detection_ignores_non_gated_commands() {
         assert_eq!(confirm_gated_git_subcommand("git status"), None);
+        // Read-only branch listing is not confirm-gated.
+        assert_eq!(confirm_gated_git_subcommand("git branch"), None);
+        assert_eq!(confirm_gated_git_subcommand("git switchmessage"), None);
         assert_eq!(
             confirm_gated_git_subcommand("git log --oneline | grep commit"),
             None
         );
         assert_eq!(confirm_gated_git_subcommand("git svn commit"), None);
+        assert_eq!(confirm_gated_git_subcommand("git svn checkout"), None);
         assert_eq!(
             confirm_gated_git_subcommand("echo 'git commit' > note.txt"),
             None
         );
         assert_eq!(confirm_gated_git_subcommand("git commitmessage"), None);
         assert_eq!(confirm_gated_git_subcommand("git stashlist"), None);
+        assert_eq!(confirm_gated_git_subcommand("git checkoutmessage"), None);
         assert_eq!(
             confirm_gated_git_subcommand("echo 'git stash' > note.txt"),
+            None
+        );
+        assert_eq!(
+            confirm_gated_git_subcommand("echo 'git checkout' > note.txt"),
             None
         );
     }
@@ -667,6 +809,10 @@ mod tests {
             ("git stash", "stash"),
             ("git stash drop stash@{0}", "stash"),
             ("git -C /repo stash clear", "stash"),
+            ("git checkout main", "checkout"),
+            ("git -C /repo checkout -b feature/x", "checkout"),
+            ("git switch main", "switch"),
+            ("git -C /repo switch feature/x", "switch"),
         ] {
             let err = confirm_git_confirm_gated_if_needed(command).unwrap_err();
             assert!(err.contains("blocked"), "{command}: {err}");
@@ -697,6 +843,36 @@ mod tests {
         // confirmation gate.
         let err = execute_command(&json!({
             "command": r#"echo "$(git stash)""#,
+            "pty": false,
+            "timeout": 5,
+        }))
+        .unwrap_err();
+        assert!(err.contains("blocked"), "err: {err}");
+        assert!(err.contains("confirmation"), "err: {err}");
+    }
+
+    #[test]
+    fn execute_command_blocks_git_checkout_inside_substitution_without_terminal() {
+        // Same as commit/stash: without a TTY, `echo "$(git checkout)"` must
+        // fail closed; command substitution must not silently bypass the
+        // confirmation gate.
+        let err = execute_command(&json!({
+            "command": r#"echo "$(git checkout main)""#,
+            "pty": false,
+            "timeout": 5,
+        }))
+        .unwrap_err();
+        assert!(err.contains("blocked"), "err: {err}");
+        assert!(err.contains("confirmation"), "err: {err}");
+    }
+
+    #[test]
+    fn execute_command_blocks_git_switch_inside_substitution_without_terminal() {
+        // Same as checkout: without a TTY, `echo "$(git switch)"` must fail
+        // closed; command substitution must not silently bypass the
+        // confirmation gate.
+        let err = execute_command(&json!({
+            "command": r#"echo "$(git switch main)""#,
             "pty": false,
             "timeout": 5,
         }))

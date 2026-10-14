@@ -199,10 +199,24 @@ pub(crate) fn apply_request_auth(
     let builder = if api_key.trim().is_empty() && models::endpoint_supports_anonymous_auth(endpoint)
     {
         builder
+    } else if is_messages_endpoint(endpoint) {
+        // Anthropic Messages wire authenticates via `x-api-key` (plus the API
+        // version header); the OpenCode Zen gateway rejects Bearer auth on
+        // `/v1/messages` with 401.
+        builder
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
     } else {
         builder.bearer_auth(api_key)
     };
     apply_opencode_session_header(builder, endpoint, session_id)
+}
+
+/// `true` when `endpoint` targets an Anthropic Messages API route
+/// (`/v1/messages` suffix), matching the dialect inference in
+/// `RequestProtocolDialect::infer_from_endpoint`.
+fn is_messages_endpoint(endpoint: &str) -> bool {
+    endpoint.trim_end_matches('/').ends_with("/v1/messages")
 }
 
 /// Attaches the `x-opencode-session` request header for OpenCode gateway traffic.

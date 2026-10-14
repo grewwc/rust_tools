@@ -1,0 +1,16 @@
+{
+  "key": "claude-opus-5-5",
+  "name": "claude-opus-5-5",
+  "adapter": "opencode",
+  "request_protocol": "messages",
+  "quality_tier": "strong",
+  "is_vl": true,
+  "search_enabled": false,
+  "tools_default_enabled": true,
+  "enable_thinking": true,
+  "subagent_priority": 85,
+  "default_reasoning_effort": "xhigh",
+  "context_window_tokens": 1000000,
+  "max_output_tokens": 65536,
+  "endpoint": "https://opencode.ai/zen/v1/messages"
+}

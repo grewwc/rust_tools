@@ -496,6 +496,7 @@ pub(super) fn build_request_body<'a>(
         stream_options,
         max_tokens,
         reasoning_items,
+        tool_errors: None,
         reasoning_encrypted_replay: models::reasoning_encrypted_replay_enabled(model),
         estimated_prompt_tokens: est_prompt,
     }

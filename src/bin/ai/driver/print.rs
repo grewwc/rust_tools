@@ -358,6 +358,23 @@ pub(in crate::ai) fn format_tool_command_line(command: &str) -> String {
     )
 }
 
+/// Merge a tool status line (e.g. `  ✓ execute_command`) with its command text
+/// into one row, so the final status can replace the running status directly on
+/// the command's own line instead of printing a second status line.
+pub(in crate::ai) fn format_tool_status_with_command(status_line: &str, command: &str) -> String {
+    format!(
+        "{}  {}│{} {}${} {}{}{}",
+        status_line,
+        theme::current().accent_rule,
+        RESET,
+        theme::current().accent_muted,
+        RESET,
+        theme::current().accent_command,
+        command,
+        RESET
+    )
+}
+
 pub(in crate::ai) fn format_tool_output_block(content: &str) -> Vec<String> {
     format_tool_output_block_with_formatter(content, format_tool_output_line)
 }
@@ -633,7 +650,8 @@ mod tests {
         format_ocr_summary_block, format_section_header, format_section_item, format_section_note,
         format_skill_activation_note, format_tool_command_line, format_tool_header,
         format_tool_output_block, format_tool_output_line, format_tool_output_prefix,
-        format_tool_status_completed, format_tool_status_with_file_target, sanitize_for_terminal,
+        format_tool_status_completed, format_tool_status_with_command,
+        format_tool_status_with_file_target, sanitize_for_terminal,
     };
     use crate::ai::driver::model::{OcrExtraction, OcrImageSummary};
     use crate::ai::theme::{self, DIM};
@@ -787,6 +805,16 @@ mod tests {
         let visible = strip_ansi_for_test(&rendered);
         assert_eq!(visible, "  │ $ cargo check --bin a");
         assert!(rendered.contains(theme::current().accent_command));
+    }
+
+    #[test]
+    fn tool_status_with_command_merges_status_and_command_on_one_row() {
+        let status = format_tool_status_completed("execute_command");
+        let rendered = format_tool_status_with_command(&status, "cargo check");
+        let visible = strip_ansi_for_test(&rendered);
+        assert_eq!(visible, "  ✓ execute_command  │ $ cargo check");
+        assert!(rendered.contains(theme::current().accent_command));
+        assert!(rendered.contains(theme::current().accent_success));
     }
 
     #[test]

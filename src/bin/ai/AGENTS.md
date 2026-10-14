@@ -7,56 +7,29 @@ the nearest child `AGENTS.md`.
 
 ## Runtime layout
 
-- `config.rs` / `config_schema.rs`: config loading and schema
-- `models.rs` + `model_names.rs` + repo-root `models/` (user override `~/.config/rust_tools/models/`): model registry
-- `prompt.rs` + `prompt/` (`completion.rs`, `multiline.rs`): prompt assembly and multiline extraction
-- `skills.rs` / `agents.rs` + `builtin_skills/` / `builtin_agents/` (compiled in via `include_str!`): skill/agent manifests
-- `driver/`: turn orchestration, prompt/tool loop, skill runtime
-- `history/`: canonical persistence, context projection/compression, task evidence
-- Auxiliary LLM prompts (routing, compression, thinking, subagent wrapping, ...) live
-  as `<subsystem>/prompts/*.md` loaded via `include_str!` next to the consuming module.
-  Files consumed through `format!` are templates: literal braces are escaped as `{{`/`}}`,
-  and `format_args!` cannot implicitly capture variables from a macro-expanded format
-  string, so every placeholder needs an explicit `name = value` argument. A file rendered by
-  a bare `include_str!` (no `format!`) keeps single braces, so the brace form follows the
-  consuming call site. Give prompt files distinct names across subsystems — two files named
-  `goal_mode.md` (Behavior block vs. turn template) make every grep ambiguous.
-- `request/`: LLM request execution, retry, routing, normalization; `request/wire_parse.rs` holds stream primitives shared with `stream/` (avoids provider↔stream cycle)
-- `provider/`: provider adapters and wire-format differences
-- `pipeline/` / `ports/` / `middleware/`: turn pipeline (stage/run), port traits
-  (llm/mcp/history/prompt/stream/tool), request & tool middleware
-- `tools/`: registry, service implementations, storage, display/history policy
-- `mcp/`: MCP lifecycle, clients, routing snapshots, transport
-- `knowledge/`: shared types, lexical similarity, embedding provider, vector index
-- `stream/`: streaming protocol, chunk extraction, state machine, `stream/render/` terminal rendering. Golden wire→parse regression tests live in `stream/runtime/tests/` (`golden_wire.rs`, offline `ScriptedSse` loopback) — add new provider wire shapes as fixtures there.
-- `cli.rs` / `theme.rs` / `background.rs`: CLI entry, theming, background tasks
-- `terminal_session/`: PTY session plumbing (client/host/registry/replay/wire);
-  `builtin_themes/` themes embedded by `theme.rs`; `tests/` module-level integration tests
-- `persona.rs` / `files.rs` / `types.rs` / `errors.rs` / `request_protocol.rs`: persona, file helpers (`extract_key_lines`), shared types, `AiError`, request dialect
-- `tool_descriptions/`: per-tool JSON metadata (description, compact parameter
-  schema, optional turn-first-use guidance, group membership) auto-discovered
-  by `build.rs`
+- `config*`, `models*`, and repo/user `models/`: configuration and model registry.
+- `skills.rs`, `agents.rs`, and `builtin_*`: runtime and compiled manifests.
+- `driver/` owns turns; `history/` owns persistence and context projection.
+- Keep auxiliary prompts beside consumers as uniquely named `prompts/*.md` files.
+  `format!(include_str!(...))` templates need escaped literal braces and explicit
+  named arguments; bare `include_str!` files keep single braces.
+- `request/`, `provider/`, and `stream/`: request policy, provider wire adapters,
+  and streaming; shared wire primitives stay in `request/wire_parse.rs` to avoid
+  a provider/stream cycle. Add provider wire shapes to `stream/runtime/tests/`.
+- `pipeline/`, `ports/`, and `middleware/`: pipeline stages, traits, and middleware.
+- `tools/`, `mcp/`, and `knowledge/`: tool stack, MCP transport, and retrieval.
+- `cli.rs`, `theme.rs`, `background.rs`, and `terminal_session/`: user-facing
+  process and terminal infrastructure.
+- `tool_descriptions/`: build-discovered per-tool JSON metadata.
 
 ## Session storage & sessionid debugging
 
-Sessions are the unit of conversation persistence; IDs are not restricted to UUIDs.
-
-- **Sessions root**: `<parent>/<file-stem>.sessions` next to the history file (default
-  `~/.history_file.sessions`); derive it via `SessionStore::new(&history_file).sessions_root()`.
-- **Per session** (`SessionStore::validate_session_id` enforces 1–128 ASCII
-  letters/digits/`-`/`_`, not strict UUID shape):
-  - `<id>.sqlite` — canonical history. Tables: `messages`, `meta`, `context_messages`,
-    `context_snapshot`, `tool_execution_outcomes`, `skill_activation_events`,
-    `image_digests`, `interrupted_stream_diagnostics`.
-  - `<id>.assets/` — session assets: `folded-tool-groups/`, `tool-overflow-compressed/`,
-    `context-checkpoints/`, images, etc.
-  - `.<id>.sqlite.state.lock` (state lock) and `{session_id}.pid` (live-process marker; the pid is the file content).
-- **Model visibility**: `build_skill_turn_guard` (`driver/skill_runtime.rs`) injects a labeled
-  `session_context` system-prompt section with the current session id, the sessions root, and the
-  storage layout. This lets the model debug sessionid problems and read a session's content
-  **read-only** (`read_file` on assets/meta, read-only `sqlite3` SELECT) in *any* project — the
-  layout is independent of the working directory. Model writes to session data are forbidden;
-  session lifecycle is user-controlled via `/sessions`.
+Sessions are the persistence unit; IDs are 1–128 ASCII letters/digits/`-`/`_`,
+not necessarily UUIDs. `SessionStore` derives `<history-stem>.sessions/`, where
+`<id>.sqlite` is canonical history, `<id>.assets/` holds derived artifacts, and
+lock/PID files coordinate live state. Session layout is independent of cwd.
+The model may inspect session data only read-only; `/sessions` owns lifecycle.
+`build_skill_turn_guard` injects detailed `session_context` only when needed.
 
 ## Runtime-wide invariants
 
@@ -71,20 +44,17 @@ Sessions are the unit of conversation persistence; IDs are not restricted to UUI
 9. **Compression purity.** Speculative fold/summary candidates stay pure until selected; persist evidence only for accepted candidates with deterministic asset paths; retain raw messages if archive commit fails. Summary increments bind the removed projection bytes in `summary-sources/`; prior summaries never become fresh summarizer input. Increments are compaction products too: their inline window is capped (`MAX_INCREMENTAL_SUMMARY_INLINE_CHARS`) and older records are archived verbatim behind one back-reference before removal — never merged into a single claim set, and never dropped without an archive write. Binding is a recovery locator, not claim verification. Bump the projection fingerprint when persisted projection semantics change.
 10. **Model-visible wording is English.** Base prompt / gate notes / injected notes use one English system; keep Chinese only in keyword-match lists and terminal text.
 11. **Output post-processing is display-only.** `ai.output.postprocess_command`
-    (config_schema.rs) optionally pipes the final assistant body through a shell
-    filter (stdin -> stdout) right before `render_markdown_block` in
-    `driver/turn_runtime/finalize.rs` (via `output_postprocess.rs`). Best-effort:
-    any failure shows the original text; never mutates canonical history. Repo
-    filter + behavior details: `scripts/AGENTS.md`.
+    is a best-effort final-body filter before rendering; failures show the
+    original and canonical history never changes. See `scripts/AGENTS.md`.
 
-12. **Registry-driven tests.** `models/*.json` is runtime config that churns
-    (keys, names, aliases, context windows, output caps), so tests must discover
-    entries (`model_names::all()`) and assert invariants instead of pinning
-    literals: a registry rename must not fail a test. Existing patterns:
-    `models_tests.rs::registry_identifiers_resolve_to_their_owning_entry`,
-    `output_caps_above_the_tier_default_window_declare_an_explicit_window`. When a
-    scenario needs specific metadata (thinking channel, tier, protocol), select the
-    entry by the declaring property rather than by key.
+12. **Registry-driven tests.** Discover `models/*.json` entries via
+    `model_names::all()` and assert properties, never volatile identifiers. Select
+    fixtures by required metadata (thinking channel, tier, protocol).
+
+13. **Serve-chat parity.** Serve children have no terminal: route confirmations
+    and text input through `serve_confirm`, fail closed without a channel, and
+    never read the local TTY. Keep `serve_confirm.rs`, `serve/chat.rs`, and
+    `serve/app.html` synchronized for user-facing behavior.
 
 ## Scoped guides
 

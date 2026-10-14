@@ -23,7 +23,8 @@ use crate::commonw::{
 };
 
 use super::super::{
-    agents, cli::ParsedCli, config_schema::AiConfig, driver::{commands::is_local_command_start, input::inline_image_filenames},
+    agents, cli::ParsedCli, config_schema::AiConfig,
+    driver::{commands::is_serve_local_command_start, input::inline_image_filenames},
     history::{current_terminal_key, SessionStore},
     model_names, models,
     prompt::{completion::CommandCompleter, PromptEditor},
@@ -1934,11 +1935,15 @@ mod serve_history_tests {
     #[test]
     fn serve_chat_intercepts_local_commands() {
         // The `_` catch-all must never forward these as turn prompts.
-        assert!(is_local_command_start("/history rewind u40"));
-        assert!(is_local_command_start(":history"));
-        assert!(is_local_command_start("/compact"));
-        assert!(!is_local_command_start("/tmp/foo"));
-        assert!(!is_local_command_start("plain prompt"));
+        assert!(is_serve_local_command_start("/history rewind u40"));
+        assert!(is_serve_local_command_start(":history"));
+        assert!(is_serve_local_command_start("/compact"));
+        // `/memo` is executed by the serve turn child itself, so serve-chat
+        // must forward it (and `:memo`) like a prompt instead of blocking it.
+        assert!(!is_serve_local_command_start("/memo"));
+        assert!(!is_serve_local_command_start(":memo 记住这个"));
+        assert!(!is_serve_local_command_start("/tmp/foo"));
+        assert!(!is_serve_local_command_start("plain prompt"));
     }
 }
 
@@ -1981,7 +1986,7 @@ fn render_turn_stream_to(
 /// Same as [`render_turn_stream_to`], but `confirm` answers remote
 /// confirmation requests (`confirm_request` events) with a local y/n prompt
 /// and a `POST .../confirm` round-trip, so a serve-chat turn can approve the
-/// same gates (today `git commit` / `git stash`) as a local turn.
+/// same gates (today `git commit` / `git push` / `git stash` / `git checkout` / `git switch`) as a local turn.
 fn render_turn_stream_to_with_confirm(
     resp: reqwest::blocking::Response,
     out: &mut dyn std::io::Write,
@@ -2802,7 +2807,7 @@ fn post_turn_stream(
     // Remote confirmations are answered on this terminal: opt the child into
     // the confirm channel only when stdin can actually ask (see
     // `serve_confirm_channel`). The daemon relays the answer into the child's
-    // stdin, so the same gates as a local turn (`git commit` / `git stash`)
+    // stdin, so the same gates as a local turn (`git commit` / `git push` / `git stash` / `git checkout` / `git switch`)
     // become approvable instead of failing closed.
     let confirm_channel = serve_confirm_channel(client, base, token, session_id);
     let resp = auth(
@@ -3247,8 +3252,10 @@ pub(in crate::ai) fn run_serve_chat(
                 // would swallow it, so forwarding it as a turn only burns a
                 // model round-trip at best and hangs the session at worst
                 // (`/history rewind` used to block a turn child on stdin).
-                // Anything already handled above never reaches this arm.
-                if is_local_command_start(&trimmed) {
+                // `/memo` is the exception (it executes in the turn child) and
+                // is excluded by is_serve_local_command_start. Anything
+                // already handled above never reaches this arm.
+                if is_serve_local_command_start(&trimmed) {
                     let command = trimmed.split_whitespace().next().unwrap_or(&trimmed);
                     eprintln!(
                         "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /git, /history, /model, /effort, /agent, /skills, /sessions, /resume, /fork, /close, /bg, /new (see /help)."

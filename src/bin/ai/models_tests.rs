@@ -214,6 +214,26 @@ fn model_def_parses_request_protocol_when_present() {
 }
 
 #[test]
+fn model_def_parses_messages_request_protocol() {
+    let def: ModelDef = serde_json::from_value(json!({
+        "key": "claude-opus-5-5",
+        "name": "claude-opus-5-5",
+        "adapter": "opencode",
+        "quality_tier": "strong",
+        "is_vl": false,
+        "search_enabled": false,
+        "tools_default_enabled": true,
+        "enable_thinking": true,
+        "request_protocol": "messages"
+    }))
+    .unwrap();
+    assert_eq!(
+        def.request_protocol,
+        Some(RequestProtocolDialect::Messages)
+    );
+}
+
+#[test]
 fn model_def_defaults_request_protocol_to_none() {
     let def: ModelDef = serde_json::from_value(json!({
         "key": "demo",
@@ -243,6 +263,10 @@ fn request_protocol_dialect_falls_back_to_endpoint_inference_for_unknown_model()
     assert_eq!(
         request_protocol_dialect("unknown-model", "https://api.example.com/v1/responses"),
         RequestProtocolDialect::Responses
+    );
+    assert_eq!(
+        request_protocol_dialect("unknown-model", "https://api.example.com/v1/messages"),
+        RequestProtocolDialect::Messages
     );
     assert_eq!(
         request_protocol_dialect(

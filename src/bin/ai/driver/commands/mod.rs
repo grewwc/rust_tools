@@ -120,6 +120,14 @@ pub fn is_local_command_start(token: &str) -> bool {
     )
 }
 
+/// True when `token` starts a local command that serve-chat must not forward
+/// as a turn. `/memo` is the exception: the serve turn child's one-shot loop
+/// reaches `try_handle_memo_command`, so serve-chat forwards it like a prompt
+/// and the save lands in the shared memory store.
+pub(crate) fn is_serve_local_command_start(token: &str) -> bool {
+    is_local_command_start(token) && memo::memo_command_args(token).is_none()
+}
+
 /// Dash-flag tokens owned by the named local command's own grammar.
 ///
 /// The one-shot CLI (`cli.rs::protect_slash_command_args`) extracts registered
@@ -233,6 +241,11 @@ pub fn try_handle_interactive_command(
     // session/task identity is not lost during local-command dispatch; it also
     // takes precedence over explicit activation of a skill with the same name.
     if audit::parse_audit_command(input).is_some() {
+        return Ok(false);
+    }
+    // `/memo` needs `&mut App` plus an async model call to organize the content
+    // before saving, so it is deferred to the turn dispatcher as well.
+    if memo::memo_command_args(input).is_some() {
         return Ok(false);
     }
     if try_handle_agent_command(app, input, agent_manifests)? {

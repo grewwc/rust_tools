@@ -63,10 +63,12 @@ pub(in crate::ai) trait ThinkingDialect: Sync {
     fn fields(&self, enable: bool, top_level_reasoning_effort: Option<&str>) -> Map<String, Value>;
 
     /// Whether this dialect requires assistant tool-call messages to echo back
-    /// a `reasoning_content` field. DeepSeek thinking-mode validates this field
-    /// when continuing after a tool round; even when the gateway produced no
-    /// non-empty reasoning text, the field shape must be preserved to pass the
-    /// protocol check.
+    /// a `reasoning_content` field. DeepSeek thinking-mode validates the field
+    /// shape when continuing after a tool round (even when the gateway produced
+    /// no non-empty reasoning text). The Anthropic Messages dialect keeps the
+    /// previous thinking chain so the protocol layer can replay `thinking`
+    /// blocks on tool rounds. Without the echo the field is stripped before
+    /// the protocol layer builds the body.
     fn requires_reasoning_content_echo(&self) -> bool {
         false
     }
@@ -256,7 +258,53 @@ impl ThinkingDialect for MinimaxThinkingDialect {
     }
 }
 
+/// Anthropic Messages wire (`/v1/messages`) as served by the OpenCode Zen
+/// gateway. The gateway does not accept the stock Anthropic
+/// `thinking.type: "enabled"` + `budget_tokens` shape; it requires
+/// `thinking: {"type": "adaptive"}` and controls intensity via
+/// `output_config.effort` (the resolved reasoning tier, sent verbatim).
+/// Thinking is off via `thinking: {"type": "disabled"}`.
+pub(in crate::ai) struct AnthropicThinkingDialect;
+
+impl ThinkingDialect for AnthropicThinkingDialect {
+    fn fields(&self, enable: bool, effort: Option<&str>) -> Map<String, Value> {
+        let mut map = Map::new();
+        map.insert(
+            "thinking".to_string(),
+            json!({ "type": if enable { "adaptive" } else { "disabled" } }),
+        );
+        if enable {
+            map.insert(
+                "output_config".to_string(),
+                json!({ "effort": effort.unwrap_or("medium") }),
+            );
+        }
+        map
+    }
+
+    fn reasoning_effort_reduces_thinking(&self) -> bool {
+        // The resolved tier is sent verbatim as `output_config.effort`, so
+        // lowering effort genuinely reduces thinking intensity.
+        true
+    }
+
+    fn thinking_off_capability(&self) -> ThinkingOffCapability {
+        // `thinking: {"type": "disabled"}` is the explicit off switch.
+        ThinkingOffCapability::RealSwitch
+    }
+
+    fn requires_reasoning_content_echo(&self) -> bool {
+        // Keep the previous turn's thinking text on assistant messages so the
+        // Messages builder can replay `thinking` blocks ahead of `tool_use`
+        // rounds, preserving reasoning continuity across tool hops. The zen
+        // adaptive dialect accepts plain-text thinking blocks without the
+        // strict API's `signature` field.
+        true
+    }
+}
+
 static ENABLE_THINKING: EnableThinkingDialect = EnableThinkingDialect;
+static ANTHROPIC_THINKING: AnthropicThinkingDialect = AnthropicThinkingDialect;
 static DEEPSEEK_THINKING: DeepSeekThinkingDialect = DeepSeekThinkingDialect;
 static NO_THINKING: NoThinkingDialect = NoThinkingDialect;
 static MINIMAX_THINKING: MinimaxThinkingDialect = MinimaxThinkingDialect;
@@ -301,12 +349,20 @@ fn is_minimax_model(model: &str) -> bool {
 /// - OpenAi → DashScope endpoint uses `enable_thinking`; MiniMax models use
 ///   [`MinimaxThinkingDialect`]; plain OpenAI endpoints send nothing
 /// - OpenCode → DeepSeek models use the `thinking` object; MiniMax models use
-///   [`MinimaxThinkingDialect`]; everything else sends nothing
+///   [`MinimaxThinkingDialect`]; Anthropic Messages endpoints (`/v1/messages`)
+///   use [`AnthropicThinkingDialect`]; everything else sends nothing
 ///
 /// Historically `Compatible` always used the DashScope dialect, so pure
 /// OpenAI-compatible endpoints mounted under the compatible provider (e.g.
 /// internal modelhub) received the unknown `enable_thinking` parameter and
 /// returned 400.
+/// Whether the endpoint speaks the Anthropic Messages wire (`/v1/messages`).
+/// The `thinking` object is valid on this wire regardless of the provider
+/// label under which the gateway is mounted.
+fn is_anthropic_messages_endpoint(endpoint: &str) -> bool {
+    endpoint.trim().to_ascii_lowercase().contains("/v1/messages")
+}
+
 pub(in crate::ai) fn thinking_dialect_for(
     provider: ApiProvider,
     model: &str,
@@ -318,6 +374,9 @@ pub(in crate::ai) fn thinking_dialect_for(
         .contains("openrouter.ai")
     {
         return &NO_THINKING;
+    }
+    if is_anthropic_messages_endpoint(endpoint) {
+        return &ANTHROPIC_THINKING;
     }
     match provider {
         ApiProvider::Alibaba => &ENABLE_THINKING,
@@ -609,5 +668,52 @@ mod tests {
             UnknownDialect.thinking_off_capability(),
             ThinkingOffCapability::Unsupported
         ));
+    }
+
+    #[test]
+    fn anthropic_dialect_enabled_sends_adaptive_thinking_and_effort() {
+        let dialect = thinking_dialect_for(
+            ApiProvider::OpenCode,
+            "claude-opus-5-5",
+            "https://opencode.ai/zen/v1/messages",
+        );
+        let fields = dialect.fields(true, Some("xhigh"));
+        assert_eq!(fields["thinking"]["type"], "adaptive");
+        assert_eq!(fields["output_config"]["effort"], "xhigh");
+        // The resolved tier is sent verbatim.
+        assert_eq!(
+            dialect.fields(true, Some("low"))["output_config"]["effort"],
+            "low"
+        );
+        assert!(dialect.reasoning_effort_reduces_thinking());
+        assert!(matches!(
+            dialect.thinking_off_capability(),
+            ThinkingOffCapability::RealSwitch
+        ));
+    }
+
+    #[test]
+    fn anthropic_dialect_disabled_sends_the_disabled_type() {
+        let dialect = thinking_dialect_for(
+            ApiProvider::OpenCode,
+            "claude-opus-5-5",
+            "https://opencode.ai/zen/v1/messages",
+        );
+        let fields = dialect.fields(false, None);
+        assert_eq!(fields["thinking"]["type"], "disabled");
+        assert!(!fields.contains_key("output_config"));
+    }
+
+    #[test]
+    fn messages_endpoints_get_anthropic_dialect_other_wires_stay_unchanged() {
+        // The same model on a chat-completions endpoint keeps the old dialect:
+        // the Anthropic `thinking` object is only valid on the Messages wire.
+        assert!(thinking_dialect_for(
+            ApiProvider::OpenCode,
+            "claude-opus-5-5",
+            "https://opencode.ai/zen/go/v1/chat/completions"
+        )
+        .fields(true, Some("high"))
+        .is_empty());
     }
 }

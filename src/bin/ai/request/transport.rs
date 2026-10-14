@@ -544,6 +544,7 @@ struct RequestProjection {
     enable_thinking: bool,
     reasoning_effort: Option<&'static str>,
     reasoning_items: rustc_hash::FxHashMap<String, Vec<Value>>,
+    tool_errors: rustc_hash::FxHashMap<String, bool>,
     endpoint: String,
 }
 
@@ -556,6 +557,7 @@ struct ProjectionCore {
     enable_thinking: bool,
     reasoning_effort: Option<&'static str>,
     reasoning_items: rustc_hash::FxHashMap<String, Vec<Value>>,
+    tool_errors: rustc_hash::FxHashMap<String, bool>,
     endpoint: String,
 }
 
@@ -616,6 +618,7 @@ async fn prepare_projection_core(
         enable_thinking,
         reasoning_effort,
         reasoning_items: turn_reasoning_items,
+        tool_errors: app.turn_tool_errors.clone(),
         endpoint,
     }
 }
@@ -665,6 +668,7 @@ async fn prepare_request_projection(
         enable_thinking: core.enable_thinking,
         reasoning_effort,
         reasoning_items: core.reasoning_items,
+        tool_errors: core.tool_errors,
         endpoint: core.endpoint,
     }
 }
@@ -690,6 +694,10 @@ impl RequestProjection {
             None,
             Some(&self.reasoning_items),
         );
+        // Turn-scoped tool failure flags ride on the main request body only;
+        // auxiliary builders construct their own bodies without the side
+        // channel (nothing failed in their tool-less flows).
+        body.tool_errors = Some(&self.tool_errors);
         let feedback = PromptTokenFeedback::capture(&app.session_id, model, &self.endpoint, &body);
         let budget = CurrentRequestBudget::measure(model, app.cli.max_tokens_override, &feedback, previous);
         // Auxiliary builders lack request-scoped usage. Only this shared main
