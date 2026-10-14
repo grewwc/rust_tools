@@ -1507,16 +1507,9 @@ mod tests {
             .lines()
             .find_map(|line| line.trim().strip_prefix("- file_path: "))
             .expect("stub must carry an archived file_path");
-        // Shortened stubs carry only the archive file name; resolve it against
-        // the temp overflow dir (see `stub_archive_display_path`).
-        let raw = path_line.trim();
-        let archived_path = if std::path::Path::new(raw).is_absolute() {
-            std::path::PathBuf::from(raw)
-        } else {
-            overflow_dir
-                .join(super::super::PRESERVED_TOOL_OVERFLOW_DIR)
-                .join(raw)
-        };
+        let archived_path = super::super::tool_overflow::archived_asset_path_from_raw(
+            path_line.trim(), &overflow_dir,
+        ).expect("stub must resolve to a session archive");
         let archived = std::fs::read_to_string(&archived_path).unwrap();
         assert!(archived.contains("very long outdated result that should be pruned"));
         // call_keep's content unchanged (count < threshold)
@@ -1950,11 +1943,12 @@ mod tests {
 
         let mut messages = vec![
             make_assistant_tool_call("call_1", "execute_command"),
-            make_tool_message("call_1", &"result 1\n".repeat(100)),
+            // Keep payloads larger than their archive pointers and recall previews.
+            make_tool_message("call_1", &"result 1\n".repeat(300)),
             make_assistant_tool_call("call_2", "execute_command"),
-            make_tool_message("call_2", &"result 2\n".repeat(100)),
+            make_tool_message("call_2", &"result 2\n".repeat(300)),
             make_assistant_tool_call("call_3", "execute_command"),
-            make_tool_message("call_3", &"result 3\n".repeat(100)),
+            make_tool_message("call_3", &"result 3\n".repeat(300)),
             make_assistant_tool_call("call_4", "execute_command"),
             make_tool_message("call_4", "old unmarked result"),
             make_assistant_tool_call("call_5", "execute_command"),
@@ -2365,9 +2359,8 @@ mod tests {
             .lines()
             .find_map(|line| line.trim().strip_prefix("- file_path: "))
             .unwrap();
-        let path = overflow_dir
-            .join(super::super::PRESERVED_TOOL_OVERFLOW_DIR)
-            .join(raw);
+        let path = super::super::tool_overflow::archived_asset_path_from_raw(raw, &overflow_dir)
+            .expect("stub must resolve to a session archive");
         assert_eq!(std::fs::read_to_string(path).unwrap(), original);
         let unchanged = serde_json::to_value(&messages).unwrap();
         assert_eq!(
@@ -2444,13 +2437,8 @@ mod tests {
             .find_map(|line| line.trim().strip_prefix("- file_path: "))
             .expect("stub must carry an archived file_path")
             .trim();
-        let archived_path = if std::path::Path::new(raw).is_absolute() {
-            std::path::PathBuf::from(raw)
-        } else {
-            overflow_dir
-                .join(super::super::PRESERVED_TOOL_OVERFLOW_DIR)
-                .join(raw)
-        };
+        let archived_path = super::super::tool_overflow::archived_asset_path_from_raw(raw, &overflow_dir)
+            .expect("stub must resolve to a session archive");
         assert!(
             std::fs::read_to_string(&archived_path)
                 .unwrap()

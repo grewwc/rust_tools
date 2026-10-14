@@ -918,13 +918,8 @@ fn path_c_snapshots_mutable_session_temp_asset_instead_of_reusing_it() {
     let snapshot_path = stub
         .lines()
         .find_map(|line| line.trim_start().strip_prefix("- file_path: "))
-        .map(PathBuf::from)
+        .map(|raw| resolve_stub_archive_path(raw, &overflow_dir))
         .expect("mutable session file must be snapshotted into an overflow archive");
-    let snapshot_path = if snapshot_path.is_absolute() {
-        snapshot_path
-    } else {
-        overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR).join(snapshot_path)
-    };
     assert_ne!(snapshot_path, temp_path.canonicalize().unwrap());
     assert!(snapshot_path.starts_with(overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR)));
     assert_eq!(std::fs::read_to_string(&snapshot_path).unwrap(), content);
@@ -1007,10 +1002,13 @@ fn user_msg(text: &str) -> Message {
 /// Builds a stub in its "first spill" shape (with a multi-line Preview
 /// body), for fold testing.
 /// Resolves a stub `- file_path:` value to an on-disk archive path: absolute
-/// (legacy) stubs directly, shortened bare names against the temp overflow dir
+/// (legacy) stubs directly, typed aliases and bare names against the temp overflow dir
 /// (see `stub_archive_display_path`).
 fn resolve_stub_archive_path(raw: &str, overflow_dir: &std::path::Path) -> std::path::PathBuf {
     let raw = raw.trim();
+    if let Some(path) = crate::ai::tools::storage::file_store::session_asset_for_alias(raw, overflow_dir) {
+        return path;
+    }
     let path = std::path::Path::new(raw);
     if path.is_absolute() {
         return path.to_path_buf();
@@ -1264,7 +1262,7 @@ fn cap_no_oversized_returns_zero_and_keeps_messages_unchanged() {
 }
 
 #[test]
-fn shortened_stub_carries_bare_archive_name_for_session_archives() {
+fn shortened_stub_carries_typed_archive_alias_for_session_archives() {
     // Archive children must drop the long repeating session directory prefix;
     // any other layout keeps the full path so read-back never breaks.
     let archive_child = std::path::Path::new("/sessions/abc.assets")
@@ -1272,7 +1270,7 @@ fn shortened_stub_carries_bare_archive_name_for_session_archives() {
         .join("spilled-read_file-deadbeef12345678.txt");
     assert_eq!(
         super::tool_overflow::stub_archive_display_path(&archive_child),
-        "spilled-read_file-deadbeef12345678.txt"
+        "session-asset:tool-overflow-compressed/spilled-read_file-deadbeef12345678.txt"
     );
     let plain = std::path::PathBuf::from("/tmp/result.txt");
     assert_eq!(
@@ -1287,12 +1285,12 @@ fn shortened_stub_carries_bare_archive_name_for_session_archives() {
         "line\n".repeat(50).as_str(),
         &[],
     );
-    assert!(stub.contains("- file_path: spilled-read_file-deadbeef12345678.txt"));
+    assert!(stub.contains("- file_path: session-asset:tool-overflow-compressed/spilled-read_file-deadbeef12345678.txt"));
     assert!(!stub.contains("/sessions/abc.assets"));
 }
 
 #[test]
-fn archived_asset_reuse_accepts_shortened_bare_names_safely() {
+fn archived_asset_reuse_accepts_typed_aliases_and_legacy_paths_safely() {
     let overflow_dir = std::env::temp_dir().join(format!(
         "ai-bare-name-reuse-{}",
         uuid::Uuid::new_v4()
@@ -1311,8 +1309,39 @@ fn archived_asset_reuse_accepts_shortened_bare_names_safely() {
     // Shortened bare names resolve under this session's overflow dir.
     assert_eq!(
         super::tool_overflow::archived_asset_path_from_raw("spilled-read_file-aaaaaaaaaaaaaaaa.txt", &overflow_dir),
-        Some(canonical)
+        Some(canonical.clone())
     );
+    // The generated alias must resolve to the original asset, not a new archive.
+    let alias = super::tool_overflow::stub_archive_display_path(&archived);
+    assert_eq!(
+        super::tool_overflow::archived_asset_path_from_raw(&alias, &overflow_dir),
+        Some(canonical.clone())
+    );
+    for invalid in [
+        "session-asset:tool-overflow-compressed/../evil.txt",
+        "session-asset:tool-overflow-compressed/sub/dir.txt",
+        "session-asset:tool-overflow-compressed/spilled-missing.txt",
+        "session-asset:tool-overflow/spilled-read_file-aaaaaaaaaaaaaaaa.txt",
+        "session-asset:unknown/spilled-read_file-aaaaaaaaaaaaaaaa.txt",
+    ] {
+        assert_eq!(
+            super::tool_overflow::archived_asset_path_from_raw(invalid, &overflow_dir),
+            None,
+            "accepted {invalid}",
+        );
+    }
+    #[cfg(unix)]
+    {
+        let outside = overflow_dir.join("outside.txt");
+        std::fs::write(&outside, "not an immutable compressed archive").unwrap();
+        std::os::unix::fs::symlink(&outside, archive_dir.join("escape.txt")).unwrap();
+        assert_eq!(
+            super::tool_overflow::archived_asset_path_from_raw(
+                "session-asset:tool-overflow-compressed/escape.txt", &overflow_dir,
+            ),
+            None,
+        );
+    }
     // Traversal, absolute outsiders, and missing files stay rejected.
     assert_eq!(super::tool_overflow::archived_asset_path_from_raw("../evil.txt", &overflow_dir), None);
     assert_eq!(

@@ -25,8 +25,8 @@ use super::*;
         ));
         super::ServeState {
             history_file: root.join("history.sqlite"),
-            workspace_root: root.join("workspace"),
             token: String::new(),
+            cwds: Default::default(),
             locks: Default::default(),
             active_turns: Default::default(),
             confirms: Default::default(),
@@ -169,10 +169,22 @@ use super::*;
             std::process::id(),
             Uuid::new_v4()
         ));
-        let workspace = base.join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace");
-        std::fs::write(workspace.join("chart.svg"), b"<svg/>").expect("svg");
-        std::fs::write(workspace.join("notes.txt"), b"nope").expect("notes");
+        std::fs::create_dir_all(&base).expect("base");
+        // The workspace root is derived from the process cwd at request time
+        // (it tracks `/cd`), so relative media paths resolve against the cwd
+        // itself; `base` stays outside it so the traversal/outside assertions
+        // keep their meaning. Unique file names keep parallel tests from
+        // colliding on the shared cwd.
+        let unique = format!(
+            "a-serve-file-route-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        );
+        let cwd_root = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        let chart = cwd_root.join(format!("{unique}.svg"));
+        let notes = cwd_root.join(format!("{unique}.txt"));
+        std::fs::write(&chart, b"<svg/>").expect("svg");
+        std::fs::write(&notes, b"nope").expect("notes");
         std::fs::write(base.join("outside.png"), b"outside").expect("outside");
         let history_file = base.join("history.sqlite");
         let assets = SessionStore::new(&history_file).session_assets_dir("s1");
@@ -180,17 +192,19 @@ use super::*;
         std::fs::write(assets.join("pasted.png"), b"png-bytes").expect("pasted");
         let state = super::ServeState {
             history_file,
-            workspace_root: workspace,
             token: "t".to_string(),
+            cwds: Default::default(),
             locks: Default::default(),
             active_turns: Default::default(),
             confirms: Default::default(),
         };
 
-        let resp = call(state.clone(), false, "chart.svg").await;
+        let chart_name = format!("{unique}.svg");
+        let notes_name = format!("{unique}.txt");
+        let resp = call(state.clone(), false, &chart_name).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        let resp = call(state.clone(), true, "chart.svg").await;
+        let resp = call(state.clone(), true, &chart_name).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -233,7 +247,7 @@ use super::*;
             "only SVG carries the sandbox header"
         );
 
-        let resp = call(state.clone(), true, "notes.txt").await;
+        let resp = call(state.clone(), true, &notes_name).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let resp = call(state.clone(), true, "missing.png").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -252,12 +266,14 @@ use super::*;
             axum::http::HeaderMap::new(),
             axum::extract::Path("bad id".to_string()),
             axum::extract::Query(super::FileQuery {
-                path: "chart.svg".to_string(),
+                path: chart_name.clone(),
             }),
         )
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_file(&chart);
+        let _ = std::fs::remove_file(&notes);
         let _ = std::fs::remove_dir_all(&base);
     }
 

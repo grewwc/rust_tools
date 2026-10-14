@@ -16,7 +16,7 @@ use crate::ai::files::{extract_key_lines, split_line_number_prefix};
 use crate::ai::{
     history::HistoryMessageSummarizer,
     tools::{
-        storage::file_store::{FileStore, is_bare_file_name},
+        storage::file_store::{FileStore, is_bare_file_name, session_asset_for_alias},
         tool_history_policy,
     },
     types::App,
@@ -673,6 +673,13 @@ pub(super) fn archived_asset_path_from_raw(raw_path: &str, overflow_dir: &Path) 
         .join(PRESERVED_TOOL_OVERFLOW_DIR)
         .canonicalize()
         .ok()?;
+    if raw_path.starts_with("session-asset:") {
+        let canonical = session_asset_for_alias(raw_path, overflow_dir)?
+            .canonicalize()
+            .ok()?;
+        return (canonical.is_file() && canonical.parent() == Some(preserved_dir.as_path()))
+            .then_some(canonical);
+    }
     // Must share the same relative-path resolution rules as read_file;
     // canonicalizing directly would wrongly anchor at the process cwd and
     // ignore the subagent's effective_cwd.
@@ -694,10 +701,10 @@ pub(super) fn archived_asset_path_from_raw(raw_path: &str, overflow_dir: &Path) 
 ///
 /// Archive files are direct children of `<session>.assets/tool-overflow-compressed/`
 /// with content-addressed unique names, so the directory prefix repeats verbatim
-/// across hundreds of stubs while carrying no per-stub information. Emit only
-/// the file name in that case; `read_file` (plus the compression reuse check
-/// above) resolves bare names against the current session's overflow dir. Any
-/// other layout keeps the full path so read-back never breaks.
+/// across hundreds of stubs while carrying no per-stub information. Emit a
+/// typed session-asset reference so callers do not mistake it for a cwd-relative
+/// path. `read_file` and compression reuse resolve it against this session's
+/// assets. Other layouts keep the full path; legacy bare names remain readable.
 pub(super) fn stub_archive_display_path(path: &Path) -> String {
     let is_session_archive_child = path
         .parent()
@@ -707,7 +714,7 @@ pub(super) fn stub_archive_display_path(path: &Path) -> String {
     if is_session_archive_child
         && let Some(name) = path.file_name().and_then(|name| name.to_str())
     {
-        return name.to_string();
+        return format!("session-asset:{PRESERVED_TOOL_OVERFLOW_DIR}/{name}");
     }
     path.to_string_lossy().into_owned()
 }

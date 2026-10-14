@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     cmp::Ordering,
     fs,
     path::PathBuf,
@@ -48,6 +49,24 @@ static CHECKPOINT_BRANCH_CANDIDATES: LazyLock<RwLock<Vec<String>>> =
 /// other's commands.
 static EXTRA_COMMAND_WORDS: LazyLock<RwLock<Vec<String>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
+
+thread_local! {
+    /// Serve-chat `/cd` completion hook. When set, Tab after `/cd` asks this
+    /// provider instead of listing the client's local disk: the serve-chat
+    /// client installs a closure that fetches directory candidates from the
+    /// remote server (`GET /cd-candidates`), because the session working
+    /// directory lives there. The provider returns ready-to-insert candidate
+    /// strings in the same shape as [`cd_fragment_candidates`]. The local REPL
+    /// leaves this empty and keeps the disk path.
+    ///
+    /// Thread-local on purpose: the serve-chat client is a single-threaded
+    /// REPL (the completer runs synchronously on its input thread), so the
+    /// hook must not leak process-global completion state into other threads —
+    /// the local REPL in the same process, or parallel tests, always see the
+    /// disk path.
+    static REMOTE_CD_CANDIDATES: RefCell<Option<Box<dyn Fn(&str) -> Vec<String>>>> =
+        RefCell::new(None);
+}
 
 /// Trie holding all top-level commands starting with "/" and ":", replacing the previous linear starts_with filtering.
 static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
@@ -241,6 +260,16 @@ impl CommandCompleter {
             words.dedup();
             *guard = words;
         }
+    }
+
+    /// Install or clear the serve-chat `/cd` completion provider (see
+    /// [`REMOTE_CD_CANDIDATES`]). Called once per serve-chat connection; a
+    /// `None` clears the hook when the chat exits so a later local REPL in the
+    /// same process never completes against a dead server.
+    pub(in crate::ai) fn set_remote_cd_candidates_provider(
+        provider: Option<Box<dyn Fn(&str) -> Vec<String>>>,
+    ) {
+        REMOTE_CD_CANDIDATES.with(|slot| *slot.borrow_mut() = provider);
     }
 
     /// Client-registered command words matching `token` (empty when none).
@@ -1578,8 +1607,57 @@ fn complete_path_fragment(fragment: &str, quote: Option<char>) -> Vec<String> {
 /// prefix and no quotes are added, because `/cd` takes its argument verbatim
 /// (`driver/commands/cwd.rs`), so a quoted name would become part of the path.
 fn complete_cd_fragment(fragment: &str) -> Vec<CompletionCandidate> {
+    // Serve-chat: the session working directory lives on the remote server
+    // (turn children run there), so Tab must list remote directories, never
+    // this client's disk. The provider performs a blocking loopback fetch;
+    // without a provider this is the local REPL and the disk path below runs.
+    let remote = REMOTE_CD_CANDIDATES.with(|slot| {
+        let borrow = slot.borrow();
+        borrow.as_ref().map(|provider| provider(fragment))
+    });
+    if let Some(candidates) = remote {
+        return candidates
+            .into_iter()
+            .map(|replacement| CompletionCandidate {
+                display: replacement.clone(),
+                replacement,
+            })
+            .collect();
+    }
+    cd_fragment_candidates(fragment)
+        .into_iter()
+        .map(|replacement| CompletionCandidate {
+            display: replacement.clone(),
+            replacement,
+        })
+        .collect()
+}
+
+/// Directory-only `/cd`/`:cd` candidates as ready-to-insert strings (see
+/// [`complete_cd_fragment`] for the semantics). Runs against the calling
+/// process's own filesystem, which is exactly what the serve `/cd-candidates`
+/// route needs: the serve process's disk and cwd *are* the remote filesystem.
+pub(crate) fn cd_fragment_candidates(fragment: &str) -> Vec<String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    cd_fragment_candidates_from(fragment, &cwd)
+}
+
+/// Same completion against an explicit working directory instead of this
+/// process's cwd. Serve-chat uses it to complete `/cd` against the *session's*
+/// cwd (stored server-side), which may differ from the daemon's own cwd.
+pub(crate) fn cd_fragment_candidates_from(fragment: &str, cwd: &std::path::Path) -> Vec<String> {
     let (dir_part, file_prefix) = split_fragment(fragment);
-    let base_dir = resolve_completion_base_dir(dir_part);
+    let base_dir = if dir_part.is_empty() {
+        cwd.to_path_buf()
+    } else {
+        let expanded = expanduser(dir_part).to_string();
+        let path = PathBuf::from(&expanded);
+        if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        }
+    };
     let mut candidates = Vec::new();
 
     // `.`/`..` navigation entries, offered only while the fragment is empty or
@@ -1587,10 +1665,7 @@ fn complete_cd_fragment(fragment: &str) -> Vec<CompletionCandidate> {
     for nav in ["./", "../"] {
         if fragment.is_empty() || fragment == "." || fragment == ".." || nav.starts_with(fragment)
         {
-            candidates.push(CompletionCandidate {
-                display: nav.to_string(),
-                replacement: nav.to_string(),
-            });
+            candidates.push(nav.to_string());
         }
     }
 
@@ -1619,10 +1694,7 @@ fn complete_cd_fragment(fragment: &str) -> Vec<CompletionCandidate> {
         replacement.push_str(dir_part);
         replacement.push_str(name);
         replacement.push('/');
-        candidates.push(CompletionCandidate {
-            display: replacement.clone(),
-            replacement,
-        });
+        candidates.push(replacement);
     }
 
     // Hidden-toggle entry (typing `.` reveals hidden dirs), same trigger as
@@ -1633,10 +1705,7 @@ fn complete_cd_fragment(fragment: &str) -> Vec<CompletionCandidate> {
         } else {
             format!("{dir_part}.")
         };
-        candidates.push(CompletionCandidate {
-            display: toggle.clone(),
-            replacement: toggle,
-        });
+        candidates.push(toggle);
     }
 
     // Navigation entries first, then case-insensitive name order (shell feel).
@@ -1650,16 +1719,14 @@ fn complete_cd_fragment(fragment: &str) -> Vec<CompletionCandidate> {
         }
     };
     candidates.sort_by(|left, right| {
-        rank(&left.replacement)
-            .cmp(&rank(&right.replacement))
+        rank(left)
+            .cmp(&rank(right))
             .then_with(|| {
-                left.replacement
-                    .to_ascii_lowercase()
-                    .cmp(&right.replacement.to_ascii_lowercase())
+                left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
             })
-            .then_with(|| left.replacement.cmp(&right.replacement))
+            .then_with(|| left.cmp(right))
     });
-    candidates.dedup_by(|left, right| left.replacement == right.replacement);
+    candidates.dedup();
     candidates
 }
 
@@ -2314,6 +2381,36 @@ mod tests {
         CommandCompleter::set_extra_command_words(Vec::new());
         let (_, local) = CommandCompleter::complete_for_line("/resu", 5);
         assert!(local.is_empty());
+    }
+
+    #[test]
+    fn cd_completion_uses_remote_provider_when_installed() {
+        // Shares the process-global completion caches; serialize on the same
+        // lock as the other cache-backed tests.
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // Serve-chat mode: the provider answers with remote candidates.
+        CommandCompleter::set_remote_cd_candidates_provider(Some(Box::new(|fragment| {
+            match fragment {
+                "" => vec!["./".to_string(), "../".to_string(), "src/".to_string()],
+                "src/" => vec!["src/bin/".to_string()],
+                _ => Vec::new(),
+            }
+        })));
+        let (_, candidates) = CommandCompleter::complete_for_line("/cd ", 4);
+        let replacements: Vec<&str> = candidates.iter().map(|c| c.replacement.as_str()).collect();
+        assert_eq!(replacements, vec!["./", "../", "src/"]);
+        let (_, narrowed) = CommandCompleter::complete_for_line("/cd src/", 8);
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].replacement, "src/bin/");
+
+        // Local REPL (no provider): the disk path runs again and finds nothing
+        // for a nonexistent directory.
+        CommandCompleter::set_remote_cd_candidates_provider(None);
+        let (_, disk) =
+            CommandCompleter::complete_for_line("/cd ./definitely-not-a-dir-xyz/", 31);
+        assert!(disk.is_empty());
     }
 
     #[test]

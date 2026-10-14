@@ -62,6 +62,8 @@ mod checkpoint;
 #[cfg(feature = "serve")]
 mod files;
 #[cfg(feature = "serve")]
+mod session_cwd;
+#[cfg(feature = "serve")]
 mod turn;
 #[cfg(all(test, feature = "serve"))]
 mod tests;
@@ -76,6 +78,8 @@ pub(crate) use checkpoint::*;
 pub(crate) use info::*;
 #[cfg(feature = "serve")]
 pub(crate) use sessions::*;
+#[cfg(feature = "serve")]
+pub(crate) use session_cwd::*;
 #[cfg(feature = "serve")]
 pub(crate) use turn::*;
 pub(crate) use types::*;
@@ -95,6 +99,7 @@ fn run_one_shot_turn(
     session_id: &str,
     prompt: &str,
     overrides: &TurnOverrides,
+    cwd: &std::path::Path,
 ) -> std::io::Result<String> {
     let exe = runtime_exe()?;
     let mut cmd = std::process::Command::new(exe);
@@ -103,6 +108,9 @@ fn run_one_shot_turn(
         .arg(prompt);
     push_turn_override_args(&mut cmd, overrides);
     let out = cmd
+        // The turn runs in the session's virtual cwd, so relative paths in
+        // every tool resolve per session rather than against the daemon's.
+        .current_dir(cwd)
         // Marks the child as serve-spawned (title skip); the FIFO env stays
         // unset here, so streaming paths keep seeing a plain child.
         .env(background::SERVE_CHILD_ENV, "1")
@@ -173,8 +181,9 @@ async fn post_turn(
         Some(prompt.clone()),
     );
     let session_id = id.clone();
+    let session_cwd = session_cwd(&state, &id);
     let output = tokio::task::spawn_blocking(move || {
-        run_one_shot_turn(&session_id, &prompt, &overrides)
+        run_one_shot_turn(&session_id, &prompt, &overrides, &session_cwd)
     })
         .await
         .map_err(|err| {
@@ -328,6 +337,9 @@ async fn post_turn_sse(
         title_model.clone(),
         Some(prompt.clone()),
     );
+    // The turn child runs in the session's virtual cwd: every relative path
+    // in its tools then resolves per session, not against the daemon's cwd.
+    let session_cwd = session_cwd(&state, &id);
     tokio::task::spawn(async move {
         let guard = lock.lock().await;
         let _ = tokio::task::spawn_blocking(move || {
@@ -340,6 +352,7 @@ async fn post_turn_sse(
                 active_turns,
                 confirms,
                 confirm_enabled,
+                session_cwd,
             )
         })
         .await;
@@ -374,6 +387,7 @@ fn stream_child_turn(
     active_turns: Arc<std::sync::Mutex<HashMap<String, u32>>>,
     confirms: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<ConfirmSlot>>>>>,
     confirm_enabled: bool,
+    session_cwd: std::path::PathBuf,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -404,7 +418,10 @@ fn stream_child_turn(
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("--session")
         .arg(&session_id)
-        .arg(&prompt);
+        .arg(&prompt)
+        // Run in the session's virtual cwd (see `serve/session_cwd.rs`), so
+        // tools, MCP children and the prompt all see that session's directory.
+        .current_dir(&session_cwd);
     push_turn_override_args(&mut cmd, &overrides);
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1052,6 +1069,86 @@ async fn list_agents(State(state): State<ServeState>, headers: HeaderMap) -> imp
     (StatusCode::OK, Json(manifests)).into_response()
 }
 
+/// Cap for a `/cd` command line and a `/cd-candidates` fragment. Long paths are
+/// legitimate; unbounded input is not.
+const MAX_CD_COMMAND_CHARS: usize = 4096;
+
+/// Request body for `POST /sessions/{id}/cd`: the full `/cd` (or `:cd`)
+/// command line as typed, executed verbatim by [`post_session_cd`].
+#[derive(Debug, Deserialize)]
+#[cfg(feature = "serve")]
+struct CdCommandRequest {
+    command: String,
+}
+
+/// Query for `GET /cd-candidates`: the fragment typed after `/cd`, as-is.
+#[derive(Debug, Deserialize)]
+#[cfg(feature = "serve")]
+struct CdCandidatesQuery {
+    frag: String,
+}
+
+/// Switch a session's virtual working directory (`POST /sessions/{id}/cd`).
+///
+/// The daemon hosts many sessions in one process, so the switch is recorded
+/// per session in `ServeState.cwds` (see `serve/session_cwd.rs`) instead of
+/// moving the shared process cwd; every turn child is spawned with
+/// `.current_dir()` set to its session's entry. The captured message lines
+/// come back over HTTP instead of printing into the server's terminal.
+#[cfg(feature = "serve")]
+async fn post_session_cd(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<CdCommandRequest>,
+) -> Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if SessionStore::validate_session_id(&id).is_err() {
+        return bad_request(format!("invalid session id: {id}")).into_response();
+    }
+    if req.command.trim().is_empty() || req.command.len() > MAX_CD_COMMAND_CHARS {
+        return bad_request("empty or oversized cd command".to_string()).into_response();
+    }
+    match run_session_cd(&state, &id, &req.command) {
+        Some(outcome) => {
+            Json(serde_json::json!({ "stdout": outcome.stdout, "stderr": outcome.stderr }))
+                .into_response()
+        }
+        None => bad_request("not a /cd command".to_string()).into_response(),
+    }
+}
+
+/// Directory listing for serve-chat `/cd` completion
+/// (`GET /sessions/{id}/cd-candidates`).
+///
+/// Reuses the local REPL's `/cd` completion logic against the session's
+/// virtual cwd on this server's own filesystem — the server's disk *is* the
+/// remote filesystem — so the client completes remote paths (directories
+/// only, `dir/`-suffixed, nav entries and hidden toggle included) for the
+/// session it is chatting with, not for the daemon's own cwd.
+#[cfg(feature = "serve")]
+async fn get_session_cd_candidates(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<CdCandidatesQuery>,
+) -> Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if SessionStore::validate_session_id(&id).is_err() {
+        return bad_request(format!("invalid session id: {id}")).into_response();
+    }
+    if q.frag.len() > MAX_CD_COMMAND_CHARS {
+        return bad_request("oversized cd fragment".to_string()).into_response();
+    }
+    let base = session_cwd(&state, &id);
+    let candidates = super::prompt::completion::cd_fragment_candidates_from(&q.frag, &base);
+    Json(serde_json::json!({ "candidates": candidates })).into_response()
+}
+
 #[cfg(feature = "serve")]
 fn is_loopback_bind(bind: &str) -> bool {
     // Parse the host part instead of prefix-matching so that names like
@@ -1115,11 +1212,8 @@ pub(in crate::ai) async fn run_serve(
     }
     let state = ServeState {
         history_file,
-        // Same authority the turn child runs with (it inherits this process's
-        // cwd at spawn), so a path the assistant printed resolves here.
-        workspace_root: crate::ai::driver::runtime_ctx::effective_cwd()
-            .unwrap_or_else(|_| PathBuf::from(".")),
         token,
+        cwds: Arc::new(std::sync::Mutex::new(HashMap::new())),
         // One entry per touched session; bounded by session count in practice.
         // Idle eviction is deferred to a later multi-instance pass.
         locks: Arc::new(Mutex::new(HashMap::new())),
@@ -1157,6 +1251,8 @@ pub(in crate::ai) async fn run_serve(
         )
         .route("/skills", get(list_skills))
         .route("/agents", get(list_agents))
+        .route("/sessions/{id}/cd", post(post_session_cd))
+        .route("/sessions/{id}/cd-candidates", get(get_session_cd_candidates))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     // Record this process in the global serve state file so `--serve-status`

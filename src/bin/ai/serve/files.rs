@@ -143,7 +143,12 @@ pub(crate) async fn get_session_file(
         return bad_request(format!("invalid session id: {id}")).into_response();
     }
     let store = SessionStore::new(state.history_file.as_path());
-    let roots = vec![state.workspace_root.clone(), store.session_assets_dir(&id)];
+    // Derived per request from the session's virtual cwd, not snapshotted:
+    // the preview root must track `/cd` for this session exactly like the
+    // turn children's `.current_dir()` does. This session's assets dir is a
+    // second, per-request root.
+    let workspace_root = session_cwd(&state, &id);
+    let roots = vec![workspace_root, store.session_assets_dir(&id)];
     let file = match resolve_preview(&q.path, &roots) {
         Ok(file) => file,
         Err(reject) => {

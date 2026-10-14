@@ -34,6 +34,10 @@ pub(crate) enum ToolGroup {
     /// Multi-agent team orchestration (`manage_team` / `run_agent_graph`),
     /// resident only when a manifest declares the group (agent-team skill).
     AgentTeam,
+    /// Read-only cross-session inspection (`session_list` / `session_read` /
+    /// `session_search`): model-facing reads of other sessions' context,
+    /// loaded on demand.
+    Session,
     /// Enable-ability flag rather than a loadable group: membership marks a
     /// tool as obtainable via `enable_tools`. It never expands as a group
     /// shortcut and is not meant to be declared by manifests.
@@ -49,6 +53,7 @@ impl ToolGroup {
         Self::Knowledge,
         Self::Skills,
         Self::AgentTeam,
+        Self::Session,
         Self::Builtin,
     ];
 
@@ -62,6 +67,7 @@ impl ToolGroup {
             Self::Knowledge => "knowledge",
             Self::Skills => "skills",
             Self::AgentTeam => "agent_team",
+            Self::Session => "session",
             Self::Builtin => "builtin",
         }
     }

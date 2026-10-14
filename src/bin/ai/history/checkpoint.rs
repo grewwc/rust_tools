@@ -1152,6 +1152,43 @@ impl CheckpointStore {
         })
     }
 
+    /// Summary of what switching to `name` would replace.
+    /// Returns `(target_len, common_prefix_len)` where the prefix is the
+    /// leading run of identical canonical messages shared by live and the
+    /// target. Callers derive dropped as `live.len() - common` so prompts
+    /// report messages actually lost instead of the live total. Returns
+    /// `Ok(None)` when the target does not exist.
+    pub(in crate::ai) fn checkpoint_live_diff(
+        &self,
+        live: &[Message],
+        name: &str,
+    ) -> io::Result<Option<(usize, usize)>> {
+        self.with_locked(|store| store.checkpoint_live_diff_unlocked(live, name))
+    }
+
+    fn checkpoint_live_diff_unlocked(
+        &self,
+        live: &[Message],
+        name: &str,
+    ) -> io::Result<Option<(usize, usize)>> {
+        let normalized = sanitize_name(name);
+        let Some(source) = self.checkpoint_source_unlocked(&normalized)? else {
+            return Ok(None);
+        };
+        let sqlite = match &source {
+            CheckpointSource::Generation { sqlite, .. } | CheckpointSource::Legacy { sqlite } => {
+                sqlite
+            }
+        };
+        let target = read_all_messages_sqlite_read_only(sqlite)?;
+        let common = live
+            .iter()
+            .zip(target.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        Ok(Some((target.len(), common)))
+    }
+
     fn live_matches_checkpoint_unlocked(&self, live: &[Message], name: &str) -> io::Result<bool> {
         let normalized = sanitize_name(name);
         // Manifest count first: avoids opening the snapshot SQLite entirely

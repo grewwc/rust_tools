@@ -4,7 +4,7 @@
 use crate::ai::{
     history::{
         CheckpointHead, CheckpointInfo, CheckpointStore, MAX_CHECKPOINT_STORAGE_BYTES,
-        MAX_CHECKPOINTS_PER_SESSION, SessionStore,
+        MAX_CHECKPOINTS_PER_SESSION, Message, SessionStore,
     },
     types::App,
 };
@@ -454,10 +454,20 @@ pub fn try_handle_checkpoint_command(
             let preparation = switch_preparation(live_len, live_is_clean, discard, explicit_save);
             if preparation == SwitchPreparation::RefuseDirty {
                 let operation = if is_switch { "switch" } else { "checkout" };
-                println!(
-                    "Cannot {operation} '{name}': live history has un-checkpointed changes. \
-                     Save them first with `/git save <name>`, or add `--discard` to discard them."
-                );
+                match checkpoint_switch_diff(&store, &live_messages, &name) {
+                    Some((target_len, common)) => {
+                        let dropped = live_len.saturating_sub(common);
+                        println!(
+                            "Cannot {operation} '{name}': live history has un-checkpointed changes \
+                             (live {live_len}, target {target_len}, {common} shared; {dropped} would be dropped). \
+                             Save them first with `/git save <name>`, or add `--discard` to discard them."
+                        );
+                    }
+                    None => println!(
+                        "Cannot {operation} '{name}': live history has un-checkpointed changes. \
+                         Save them first with `/git save <name>`, or add `--discard` to discard them."
+                    ),
+                }
                 return Ok(true);
             }
             if let SwitchPreparation::Preserve(preserve_name) = preparation {
@@ -509,9 +519,23 @@ pub fn try_handle_checkpoint_command(
                     None => false,
                 };
                 if !base_matches {
-                    let confirm = prompt_checkpoint_confirmation(&format!(
-                        "Discard {live_len} un-checkpointed live message(s) and switch to '{name}'? (y/n): ",
-                    ));
+                    let prompt = match checkpoint_switch_diff(&store, &live_messages, &name) {
+                        Some((target_len, common)) => {
+                            let dropped = live_len.saturating_sub(common);
+                            let restored = target_len.saturating_sub(common);
+                            format!(
+                                "Live history has un-checkpointed changes \
+                                 (live {live_len}, target {target_len}, {common} shared). \
+                                 Switch to '{name}'? This drops {dropped} live message(s) \
+                                 not in '{name}' and restores {restored} from '{name}'? (y/n): "
+                            )
+                        }
+                        None => format!(
+                            "Live history has un-checkpointed changes. Replace all {live_len} \
+                             live message(s) with '{name}'? (y/n): "
+                        ),
+                    };
+                    let confirm = prompt_checkpoint_confirmation(&prompt);
                     if confirm != Some(true) {
                         println!("Canceled: nothing was changed.");
                         return Ok(true);
@@ -1223,6 +1247,17 @@ fn switch_preparation(
     }
 }
 
+/// Detail for checkout prompts: `(target_len, common_prefix_len)` of the
+/// target checkpoint versus live. `None` when the target is unreadable so
+/// callers fall back to the live total.
+fn checkpoint_switch_diff(
+    store: &CheckpointStore,
+    live: &[Message],
+    name: &str,
+) -> Option<(usize, usize)> {
+    store.checkpoint_live_diff(live, name).unwrap_or(None)
+}
+
 fn switch_to_unborn_branch(
     app: &mut App,
     store: &CheckpointStore,
@@ -1277,14 +1312,14 @@ fn switch_to_unborn_branch(
         }
         SwitchPreparation::RefuseDirty => {
             println!(
-                "Refusing to switch: {live_len} un-checkpointed live message(s) would be lost. Use `--save <name>` to preserve them or `--discard` to overwrite intentionally."
+                "Refusing to switch: live history has un-checkpointed changes; all {live_len} live message(s) would be replaced. Use `--save <name>` to preserve them or `--discard` to overwrite intentionally."
             );
             return Ok(true);
         }
     };
     if discarding && live_len > 0 {
         let confirm = prompt_checkpoint_confirmation(&format!(
-            "Discard {live_len} un-checkpointed live message(s) and switch to unborn branch '{branch}'? (y/n): "
+            "Live history has un-checkpointed changes. Replace all {live_len} live message(s) and switch to unborn branch '{branch}'? (y/n): "
         ));
         if confirm != Some(true) {
             println!("Canceled: nothing was changed.");

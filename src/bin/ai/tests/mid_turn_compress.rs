@@ -174,6 +174,18 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
     // Note: do not use substring splitting like `split("file_path: ").nth(1)` — in the fold note
     // `- original_file_path:` comes before `- archive_file_path:`, so substring splitting would mistake the
     // source file path for the archive path (historical bug: read src/lib.rs at only 1305 bytes).
+    let resolve_archive = |raw: &str| {
+        crate::ai::tools::storage::file_store::session_asset_for_alias(raw, &overflow_dir)
+            .unwrap_or_else(|| {
+                if std::path::Path::new(raw).is_absolute() {
+                    std::path::PathBuf::from(raw)
+                } else {
+                    overflow_dir
+                        .join(super::super::history::compress::PRESERVED_TOOL_OVERFLOW_DIR)
+                        .join(raw)
+                }
+            })
+    };
     let file_path = compressed
         .iter()
         .find_map(|m| {
@@ -192,7 +204,7 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
             let full = candidates
                 .iter()
                 .copied()
-                .find(|c| std::fs::read(c).map(|b| b.len() >= 8000).unwrap_or(false));
+                .find(|c| std::fs::read(resolve_archive(c)).map(|b| b.len() >= 8000).unwrap_or(false));
             let hit = full.or_else(|| candidates.into_iter().next())?;
             Some(hit)
         })
@@ -201,15 +213,7 @@ fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present()
                 "expected read_file recall archive path after mid-turn compression: {compressed:#?}"
             )
         });
-    // Shortened stubs carry only the archive file name; resolve it against the
-    // temp overflow dir (see `stub_archive_display_path`).
-    let archive_path = if std::path::Path::new(file_path).is_absolute() {
-        std::path::PathBuf::from(file_path)
-    } else {
-        overflow_dir
-            .join(super::super::history::compress::PRESERVED_TOOL_OVERFLOW_DIR)
-            .join(file_path)
-    };
+    let archive_path = resolve_archive(file_path);
     let archived = std::fs::read(&archive_path).unwrap_or_else(|e| {
         panic!("overflow file referenced by recall anchor should exist: {archive_path:?}: {e}")
     });

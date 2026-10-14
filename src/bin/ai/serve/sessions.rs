@@ -120,11 +120,16 @@ pub(crate) async fn delete_session(
     }
     let store = SessionStore::new(state.history_file.as_path());
     match store.delete_session(&id) {
-        Ok(deleted) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"deleted": deleted})),
-        )
-            .into_response(),
+        Ok(deleted) => {
+            // The session's virtual cwd dies with it; a later recreated
+            // session of the same id starts from the daemon cwd again.
+            drop_session_cwd(&state, &id);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"deleted": deleted})),
+            )
+                .into_response()
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": err.to_string()})),

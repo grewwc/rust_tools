@@ -53,7 +53,7 @@ futures-executor = "0.3.34"
 inventory = "0.3.24"
 notify = "8.2"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "multipart", "rustls-no-provider", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "multipart", "query", "rustls-no-provider", "stream"] }
 # rustls provider and deps: reqwest is built with rustls-no-provider so the
 # large aws-lc-rs C code stays out of the binary; ring is installed at runtime
 # in each bin's main(). hyper-rustls is declared with default-features = false

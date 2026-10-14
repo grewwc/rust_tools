@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::ai::tools::common::ToolStreamWriter;
 use crate::ai::tools::storage::file_store::{
     FileStore, current_session_assets_dir, is_read_file_overflow_artifact,
-    session_live_overflow_asset_for_alias, session_overflow_asset_for_bare_name,
+    session_asset_for_alias, session_overflow_asset_for_bare_name,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,17 +192,6 @@ fn resolve_file_path_arg(args: &Value) -> Result<&str, String> {
         .ok_or_else(|| "Missing file_path".to_string())
 }
 
-/// Resolves a bare compressed archive file name from a shortened overflow stub.
-fn current_session_overflow_asset(file_path: &str) -> Option<PathBuf> {
-    let assets = current_session_assets_dir()?;
-    session_overflow_asset_for_bare_name(file_path, &assets)
-}
-
-fn current_session_asset_alias(file_path: &str) -> Option<PathBuf> {
-    let assets = current_session_assets_dir()?;
-    session_live_overflow_asset_for_alias(file_path, &assets)
-}
-
 /// Normalizes file_path when temp=true: rejects absolute paths and out-of-bounds parent references, keeping only the file name.
 ///
 /// This avoids `PathBuf::join` replacing the whole base when given an absolute path, writing the file into the
@@ -228,8 +217,18 @@ fn emit_stream_line(on_chunk: &mut ToolStreamWriter<'_>, line: &str) {
 }
 
 pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
+    execute_read_file_with_assets(args, current_session_assets_dir().as_deref())
+}
+
+fn execute_read_file_with_assets(
+    args: &Value,
+    assets: Option<&std::path::Path>,
+) -> Result<String, String> {
     let file_path = resolve_file_path_arg(args)?;
-    let alias_path = current_session_asset_alias(file_path);
+    let alias_path = assets.and_then(|assets| session_asset_for_alias(file_path, assets));
+    if file_path.starts_with("session-asset:") && alias_path.is_none() {
+        return Err("Invalid session asset reference or no active session asset directory".to_string());
+    }
     let store = FileStore::new(
         alias_path
             .clone()
@@ -240,7 +239,10 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
     // legacy bare compressed-archive form only when no typed alias was supplied;
     // every other input keeps its original resolution and error behavior.
     let store = if alias_path.is_none() && store.ensure_exists().is_err() {
-        match current_session_overflow_asset(file_path).map(FileStore::new) {
+        match assets
+            .and_then(|assets| session_overflow_asset_for_bare_name(file_path, assets))
+            .map(FileStore::new)
+        {
             Some(candidate) if candidate.ensure_exists().is_ok() => candidate,
             _ => store,
         }
@@ -1056,6 +1058,50 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("ai_tools_test_{}_{}", name, uuid::Uuid::new_v4()));
         path
+    }
+
+    #[test]
+    fn test_read_file_session_asset_alias_and_legacy_paths() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let root = make_temp_path("session_asset_alias");
+        let assets = root.join("session.assets");
+        let cwd = root.join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let name = "pruned-execute_command-fixture.txt";
+        for directory in ["tool-overflow", "tool-overflow-compressed"] {
+            fs::create_dir_all(assets.join(directory)).unwrap();
+            fs::write(assets.join(directory).join(name), directory).unwrap();
+        }
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(cwd.clone(), || {
+            let read = |path: &str| {
+                execute_read_file_with_assets(
+                    &serde_json::json!({"file_path": path, "use_line_numbers": false}),
+                    Some(&assets),
+                )
+            };
+            assert_eq!(read(name).unwrap(), "tool-overflow-compressed");
+            fs::write(cwd.join(name), "project file").unwrap();
+            assert_eq!(read(name).unwrap(), "project file");
+            for directory in ["tool-overflow", "tool-overflow-compressed"] {
+                let alias = format!("session-asset:{directory}/{name}");
+                assert_eq!(read(&alias).unwrap(), directory);
+                let absolute = assets.join(directory).join(name);
+                assert_eq!(read(absolute.to_str().unwrap()).unwrap(), directory);
+                assert!(execute_read_file_with_assets(
+                    &serde_json::json!({"file_path": alias}), None,
+                ).is_err());
+            }
+            let wrong_absolute = cwd.join("wrong-directory").join(name);
+            assert!(read(wrong_absolute.to_str().unwrap()).is_err());
+            for invalid in [
+                "session-asset:tool-overflow-compressed/../escape.txt",
+                "session-asset:tool-overflow-compressed/sub/nested.txt",
+                "session-asset:unknown/file.txt",
+            ] {
+                assert!(read(invalid).is_err(), "accepted {invalid}");
+            }
+        });
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

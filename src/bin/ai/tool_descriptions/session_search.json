@@ -1,0 +1,29 @@
+{
+  "name": "session_search",
+  "description": "Search one session's context (read-only): canonical messages (newest first) plus text files under its assets directory (overflow archives, checkpoints). Returns snippets around matches. Use to check whether a topic, tool, or fact appears in another session before reading it in full.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "session_id": {
+        "type": "string",
+        "description": "Session id (from session_list), 1-128 ASCII letters, digits, '-' or '_'."
+      },
+      "query": {
+        "type": "string",
+        "description": "Substring to search for (case-insensitive)."
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Maximum matches to return (default 20, max 100)."
+      }
+    },
+    "required": [
+      "session_id",
+      "query"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "session"
+  ]
+}

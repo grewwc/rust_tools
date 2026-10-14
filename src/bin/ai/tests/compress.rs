@@ -397,9 +397,10 @@ fn history_compression_without_summary_archives_removed_dialogue_and_keeps_recen
         );
         assert_eq!(outcome.status, ContextCompressionStatus::Complete);
         // Budget-only shrinking selects raw turns before adding its pointer.
-        // With uniform small turns that pointer can exceed the remaining room;
-        // completion must report this, not discard protected content to hide it.
-        assert_eq!(outcome.budget_met(), keep_last == 4);
+        // The compact v2 pointer now fits in the remaining room for both
+        // fixtures (keep_last=256 retains more turns but still fits), so both
+        // must report budget_met=true without discarding the protected tail.
+        assert!(outcome.budget_met(), "keep_last={keep_last}");
         if !outcome.budget_met() {
             assert!(outcome.diagnostic().unwrap().contains("budget_met=false"));
         }
@@ -417,7 +418,10 @@ fn history_compression_without_summary_archives_removed_dialogue_and_keeps_recen
             outcome.messages.iter().any(|message| {
                 message.role == crate::ai::history::ROLE_INTERNAL_NOTE
                     && message.content.as_str().is_some_and(|text| {
-                        text.contains(archive_path.to_str().unwrap()) && text.contains("read_file")
+                        // Full and hard-budget minimal pointers are both usable;
+                        // the minimal form keeps only the marker and path.
+                        text.contains("[archive-pointer-v2]")
+                            && text.contains(archive_path.to_str().unwrap())
                     })
             }),
             "context must retain a usable archive pointer"
@@ -578,15 +582,9 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
         .lines()
         .find_map(|line| line.trim().strip_prefix("- file_path: "))
         .expect("stub should contain overflow file path");
-    // Shortened stubs carry only the archive file name; resolve it against the
-    // temp overflow dir (see `stub_archive_display_path`).
-    let archive_path = if std::path::Path::new(file_path).is_absolute() {
-        std::path::PathBuf::from(file_path)
-    } else {
-        overflow_dir
-            .join(super::super::history::compress::PRESERVED_TOOL_OVERFLOW_DIR)
-            .join(file_path)
-    };
+    let archive_path = crate::ai::tools::storage::file_store::session_asset_for_alias(
+        file_path, &overflow_dir,
+    ).expect("new stubs must carry a typed session archive alias");
     assert!(
         archive_path.exists(),
         "overflow file path from stub should exist: {file_path}"

@@ -1,0 +1,32 @@
+{
+  "name": "session_read",
+  "description": "Read another session's context (read-only). Default digest mode shows a header (title, first prompt, message count, checkpoints) plus the most recent messages; raw mode renders messages only. Sessions are identified by their id from session_list.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "session_id": {
+        "type": "string",
+        "description": "Session id (from session_list), 1-128 ASCII letters, digits, '-' or '_'."
+      },
+      "mode": {
+        "type": "string",
+        "enum": [
+          "digest",
+          "raw"
+        ],
+        "description": "digest (default): header + recent messages; raw: messages only."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Number of most recent messages to show (default 20 for digest, 60 for raw; max 200)."
+      }
+    },
+    "required": [
+      "session_id"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "session"
+  ]
+}

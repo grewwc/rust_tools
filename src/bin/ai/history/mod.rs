@@ -637,7 +637,9 @@ fn context_projection_fingerprint(
     // remain compatible with legacy Chinese pointers.
     // v14: snapshots omit stale and identical plain tool guidance; canonical
     // messages remain intact, so older snapshots can be rebuilt safely.
-    const PROJECTION_VERSION: u8 = 14;
+    // v15: compressed tool archives use typed session-asset references instead
+    // of ambiguous cwd-relative bare file names.
+    const PROJECTION_VERSION: u8 = 15;
     let overflow_dir = overflow_dir
         .map(|path| path.to_string_lossy())
         .unwrap_or_default();

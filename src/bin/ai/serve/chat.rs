@@ -1550,6 +1550,110 @@ fn post_remote_rewind(
         .map_err(|err| format!("serve returned an unexpected rewind body: {err}"))
 }
 
+/// POST a `/cd`/`:cd` line to the server and render the captured result.
+///
+/// The switch is recorded per session on the server (`POST
+/// /sessions/{id}/cd`), and every turn child of that session is spawned with
+/// that directory as its real cwd, so a child-local `/cd` would die with the
+/// child. The printed path is the remote session's working directory; this
+/// client's own directory is never touched.
+fn run_serve_cd_command(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    command: &str,
+) -> Result<(), String> {
+    let resp = auth(
+        client.post(format!("{base}/sessions/{session_id}/cd")),
+        token,
+    )
+    .header("Content-Type", "application/json")
+    .body(serde_json::json!({ "command": command }).to_string())
+    .send()
+    .map_err(|err| format!("cd request failed: {err}"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(server_error_message(status, &text));
+    }
+    let body: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|err| format!("serve returned an unexpected cd body: {err}"))?;
+    if let Some(stdout) = body.get("stdout").and_then(|v| v.as_str()) {
+        print!("{stdout}");
+    }
+    if let Some(stderr) = body.get("stderr").and_then(|v| v.as_str()) {
+        eprint!("{stderr}");
+    }
+    Ok(())
+}
+
+/// Fetch `/cd` Tab-completion candidates for `fragment` from the remote
+/// server: directories only, `dir/`-suffixed, in the exact shape the local
+/// completer would produce against the server's filesystem.
+fn fetch_remote_cd_candidates(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    fragment: &str,
+) -> Result<Vec<String>, String> {
+    let resp = auth(
+        client.get(format!("{base}/sessions/{session_id}/cd-candidates")),
+        token,
+    )
+        .query(&[("frag", fragment)])
+        .send()
+        .map_err(|err| format!("cd completion request failed: {err}"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(server_error_message(status, &text));
+    }
+    let body: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|err| format!("serve returned an unexpected cd-candidates body: {err}"))?;
+    Ok(body
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Install the serve-chat `/cd` completion provider: Tab after `/cd` lists
+/// directories on the remote server (`GET /cd-candidates`) instead of this
+/// client's local disk, always for the *currently selected* session (the
+/// shared cell follows `/resume` `/new` `/fork` switches). Cleared when the
+/// chat exits.
+fn install_serve_cd_completion(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    current_session: Arc<std::sync::Mutex<String>>,
+) {
+    let client = client.clone();
+    let base = base.to_string();
+    let token = token.to_string();
+    CommandCompleter::set_remote_cd_candidates_provider(Some(Box::new(
+        move |fragment: &str| {
+            let session_id = current_session
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            match fetch_remote_cd_candidates(&client, &base, &token, &session_id, fragment) {
+                Ok(candidates) => candidates,
+                Err(err) => {
+                    eprintln!("[serve-chat] cd completion unavailable: {err}");
+                    Vec::new()
+                }
+            }
+        },
+    )));
+}
+
 /// Remote `/history` entry: first-token verbs dispatch like the local
 /// grammar; everything else is a preview. Prints the result; `Err` carries
 /// the detail the caller prefixes with `[serve-chat]`.
@@ -3149,7 +3253,7 @@ pub(in crate::ai) fn run_serve_chat(
     };
 
     println!("Connected to {base}, session {session_id}.");
-    println!("Enter inserts a newline, Esc or Alt+Enter submits; Ctrl+C interrupts the running remote turn (a second Ctrl+C exits); /quit exits, /bg backgrounds the current session and exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions (/sessions current|id shows the current one), /fork branches the current session, /close deletes it and exits. /model, /effort, /agent switch the remote turn like the local REPL.");
+    println!("Enter inserts a newline, Esc or Alt+Enter submits; Ctrl+C interrupts the running remote turn (a second Ctrl+C exits); /quit exits, /bg backgrounds the current session and exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions (/sessions current|id shows the current one), /fork branches the current session, /close deletes it and exits. /cd switches the remote working directory (Tab completes remote paths). /model, /effort, /agent switch the remote turn like the local REPL.");
     let mut editor = PromptEditor::new(&session_id, &app_config.history_file);
     // Command words the shared completion table does not carry: serve-chat-only
     // commands plus shared ones missing from the trie. Registered per client
@@ -3160,6 +3264,13 @@ pub(in crate::ai) fn run_serve_chat(
             .map(|word| (*word).to_string())
             .collect(),
     );
+    // `/cd` Tab-completion must list the remote server's directories for the
+    // currently selected session (its cwd lives server-side), so completion
+    // fetches candidates over HTTP instead of reading this client's disk.
+    // The shared cell below follows `/resume` `/new` `/fork` switches.
+    let current_session: Arc<std::sync::Mutex<String>> =
+        Arc::new(std::sync::Mutex::new(session_id.clone()));
+    install_serve_cd_completion(&client, &base, &token, current_session.clone());
     // Last `/sessions` output: backs `/resume <number|id-prefix>`.
     let mut listed: Vec<RemoteSession> = Vec::new();
     // Client-side per-turn selection, seeded from the server (`GET /info`)
@@ -3229,13 +3340,16 @@ pub(in crate::ai) fn run_serve_chat(
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first); /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first); /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
                 );
                 continue;
             }
             "/new" => match create_session(&client, &base, &token) {
                 Ok(id) => {
                     session_id = id;
+                    if let Ok(mut cell) = current_session.lock() {
+                        *cell = session_id.clone();
+                    }
                     CommandCompleter::clear_checkpoint_candidates();
                     editor.set_session_id(session_id.as_str());
                     println!("New session {session_id}.");
@@ -3297,6 +3411,9 @@ pub(in crate::ai) fn run_serve_chat(
                 Ok(id) => {
                     let title = listed.iter().find(|s| s.id == id).map(remote_session_title);
                     session_id = id;
+                    if let Ok(mut cell) = current_session.lock() {
+                        *cell = session_id.clone();
+                    }
                     CommandCompleter::clear_checkpoint_candidates();
                     editor.set_session_id(session_id.as_str());
                     if restore_serve_session_picks(&client, &base, &token, &session_id, &mut selection)
@@ -3314,6 +3431,9 @@ pub(in crate::ai) fn run_serve_chat(
                 Ok(id) => {
                     println!("Forked '{session_id}' -> '{id}', switched to new branch.");
                     session_id = id;
+                    if let Ok(mut cell) = current_session.lock() {
+                        *cell = session_id.clone();
+                    }
                     CommandCompleter::clear_checkpoint_candidates();
                     editor.set_session_id(session_id.as_str());
                 }
@@ -3422,6 +3542,17 @@ pub(in crate::ai) fn run_serve_chat(
                     Err(err) => eprintln!("[serve-chat] {err}"),
                 }
             }
+            // Remote `/cd`: the session working directory lives on the server
+            // (every turn child is spawned with the session's cwd), so the
+            // switch runs there over HTTP and the printed result is the
+            // remote path — this client's local directory is untouched.
+            "/cd" | ":cd" => {
+                if let Err(err) =
+                    run_serve_cd_command(&client, &base, &token, &session_id, &trimmed)
+                {
+                    eprintln!("[serve-chat] {err}");
+                }
+            }
             _ => {
                 // A local slash command is never a prompt: the local REPL
                 // would swallow it, so forwarding it as a turn only burns a
@@ -3433,7 +3564,7 @@ pub(in crate::ai) fn run_serve_chat(
                 if is_serve_local_command_start(&trimmed) {
                     let command = trimmed.split_whitespace().next().unwrap_or(&trimmed);
                     eprintln!(
-                        "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /git, /history, /model, /effort, /agent, /skills, /sessions, /resume, /fork, /close, /bg, /new (see /help)."
+                        "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /cd, /git, /history, /model, /effort, /agent, /skills, /sessions, /resume, /fork, /close, /bg, /new (see /help)."
                     );
                 } else if let Err(err) = post_turn_stream(
                     &client,
@@ -3449,6 +3580,9 @@ pub(in crate::ai) fn run_serve_chat(
             }
         }
     }
+    // A later local REPL in the same process must never complete `/cd`
+    // against the (now disconnected) remote server.
+    CommandCompleter::set_remote_cd_candidates_provider(None);
     Ok(())
 }
 
@@ -4427,5 +4561,74 @@ mod tests {
         assert_eq!(checkpoint_state.branches, ["main", "feature"]);
         assert_eq!(checkpoint_state.checkpoint_status.as_deref(), Some("main@latest"));
         CommandCompleter::clear_checkpoint_candidates();
+    }
+
+    #[test]
+    fn cd_command_posts_to_the_remote_cd_route_and_renders_the_result() {
+        rust_tools::ensure_rustls_provider();
+        let (base, captured) = serve_capture_once(
+            r#"{"stdout":"Working directory: /srv/work (was /srv)\n","stderr":""}"#,
+        );
+        let client = reqwest::blocking::Client::new();
+        run_serve_cd_command(&client, &base, "tk", "s1", "/cd /srv/work").expect("cd command");
+        let head = captured.lock().expect("capture").clone().to_lowercase();
+        assert!(
+            head.starts_with("post /sessions/s1/cd http/1.1"),
+            "request head: {head}"
+        );
+        assert!(
+            head.contains("authorization: bearer tk"),
+            "request head: {head}"
+        );
+        assert!(
+            head.contains("content-type: application/json"),
+            "request head: {head}"
+        );
+
+        // A rejected switch surfaces the server's error message, not a panic.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = vec![0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            let body = r#"{"error":"not a /cd command"}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        let err = run_serve_cd_command(
+            &client,
+            &format!("http://{addr}"),
+            "tk",
+            "s1",
+            "plain prompt",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("not a /cd command"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cd_completion_fetches_remote_candidates_from_the_candidates_route() {
+        rust_tools::ensure_rustls_provider();
+        let (base, captured) = serve_capture_once(r#"{"candidates":["src/","docs/"]}"#);
+        let client = reqwest::blocking::Client::new();
+        let candidates = fetch_remote_cd_candidates(&client, &base, "tk", "s1", "s")
+            .expect("cd candidates");
+        assert_eq!(candidates, vec!["src/", "docs/"]);
+        let head = captured.lock().expect("capture").clone().to_lowercase();
+        assert!(
+            head.starts_with("get /sessions/s1/cd-candidates?frag=s http/1.1"),
+            "request head: {head}"
+        );
+        assert!(
+            head.contains("authorization: bearer tk"),
+            "request head: {head}"
+        );
     }
 }

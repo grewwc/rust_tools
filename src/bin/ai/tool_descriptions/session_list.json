@@ -1,0 +1,21 @@
+{
+  "name": "session_list",
+  "description": "List sessions in the session store, newest activity first. Read-only: never mutates session data. Use to discover which sessions exist (ids, titles, first prompts) before session_read / session_search.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of sessions to list (default 20, max 100)."
+      },
+      "query": {
+        "type": "string",
+        "description": "Optional substring filter on session id, title, or first user prompt (case-insensitive)."
+      }
+    }
+  },
+  "groups": [
+    "builtin",
+    "session"
+  ]
+}

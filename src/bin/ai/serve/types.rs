@@ -12,13 +12,13 @@ pub(crate) const DEFAULT_BIND: &str = "127.0.0.1:8080";
 #[cfg(feature = "serve")]
 pub(crate) struct ServeState {
     pub(crate) history_file: PathBuf,
-    /// Root for workspace-relative image paths on the read-only preview route
-    /// (`GET /sessions/{id}/file`). Snapshotted at startup from the same
-    /// authority a turn child runs with (`runtime_ctx::effective_cwd`), so a
-    /// path the assistant prints in a reply resolves to the file it wrote.
-    /// This session's assets dir is a second, per-request root.
-    pub(crate) workspace_root: PathBuf,
     pub(crate) token: String,
+    /// Session id -> per-session virtual working directory (serve-chat
+    /// `/cd`). The daemon keeps a single real process cwd, but every session's
+    /// turn child is spawned with `.current_dir()` set to its own entry here,
+    /// so relative paths in all tools, MCP children and the system prompt
+    /// resolve per session. An absent entry means "the daemon's own cwd".
+    pub(crate) cwds: Arc<std::sync::Mutex<HashMap<String, SessionCwd>>>,
     /// Per-session async mutex: at most one turn writer per session.
     pub(crate) locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Session id -> pid of the running turn child, for
@@ -30,6 +30,16 @@ pub(crate) struct ServeState {
     /// anything and removed when its child is reaped, so a question never
     /// outlives the process that asked it.
     pub(crate) confirms: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<ConfirmSlot>>>>>,
+}
+
+/// Per-session `/cd` state: the session's current directory and the one it
+/// switched from (for `/cd -`), mirroring the local REPL's process-global
+/// pair one level up.
+#[derive(Debug, Clone)]
+#[cfg(feature = "serve")]
+pub(crate) struct SessionCwd {
+    pub(crate) current: PathBuf,
+    pub(crate) previous: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
