@@ -413,7 +413,7 @@ pub(super) fn offload(note: &mut Message, mut meta: FoldProvenance, dir: &Path) 
     for source in &meta.sources {
         stub.push_str(&format!("- {} · {}\n", source.id, source.name));
     }
-    stub.push_str("Recovery: read the exact note archive for prior previews and original_* pointers before repeating tools. Canonical history is unchanged.");
+    stub.push_str("Recovery: read the exact note archive (previews, original_* pointers) before re-running tools; canonical history unchanged.");
     let freed = content.chars().count().checked_sub(stub.chars().count())?;
     if freed == 0 || !PlannedArchiveWrite::new(path, content.to_string()).commit() {
         return None;

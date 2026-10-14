@@ -461,7 +461,7 @@ fn apply_history_context_budget(
 
     if scan.total_chars <= target_chars
         && !scan.has_lossless_candidate
-        && !super::context_memory::has_dense_recoverable_memory(messages)
+        && !super::context_memory::has_projectable_recoverable_memory(messages)
         && !super::context_memory::has_archive_recall_sources(messages)
     {
         return report;
@@ -683,10 +683,14 @@ struct QuickScan {
 fn quick_scan(messages: &[Message]) -> QuickScan {
     let mut scan = QuickScan::default();
     let mut seen_internal_notes: FxHashSet<&Value> = FxHashSet::default();
+    let mut guidance = crate::ai::history::tool_guidance::ToolGuidanceFilter::new(messages);
     for message in messages {
+        let keep_guidance = guidance.keep(message);
         scan.total_chars = scan.total_chars.saturating_add(message_chars(message));
         if !scan.has_lossless_candidate {
             if is_empty_non_protocol_message(message) {
+                scan.has_lossless_candidate = true;
+            } else if !keep_guidance {
                 scan.has_lossless_candidate = true;
             } else if message.role == crate::ai::history::ROLE_INTERNAL_NOTE
                 && !seen_internal_notes.insert(&message.content)
@@ -707,8 +711,10 @@ struct LosslessStats {
 fn apply_lossless_prepass(messages: &mut Vec<Message>) -> LosslessStats {
     let mut seen_internal_notes: FxHashSet<String> = FxHashSet::default();
     let mut stats = LosslessStats::default();
+    let mut guidance = crate::ai::history::tool_guidance::ToolGuidanceFilter::new(messages);
     messages.retain(|message| {
-        if is_empty_non_protocol_message(message) {
+        let keep_guidance = guidance.keep(message);
+        if is_empty_non_protocol_message(message) || !keep_guidance {
             stats.removed_messages += 1;
             stats.saved_chars = stats.saved_chars.saturating_add(message_chars(message));
             return false;
@@ -1606,6 +1612,52 @@ mod tests {
     }
 
     #[test]
+    fn lossless_prepass_drops_guidance_from_prior_turns_only() {
+        let repeated_guidance =
+            "[tool_first_use_guidance name=execute_command]\ncurrent execution rules";
+        let canonical = vec![
+            msg("system", "rules"),
+            msg("user", "old request"),
+            msg(crate::ai::history::ROLE_INTERNAL_NOTE, repeated_guidance),
+            msg(
+                crate::ai::history::ROLE_INTERNAL_NOTE,
+                "[tool_first_use_guidance name=apply_patch]\nobsolete patch rules",
+            ),
+            msg(
+                crate::ai::history::ROLE_INTERNAL_NOTE,
+                "durable runtime note",
+            ),
+            msg("user", "current request"),
+            msg(crate::ai::history::ROLE_INTERNAL_NOTE, repeated_guidance),
+        ];
+        let mut projected = canonical.clone();
+
+        let stats = apply_lossless_prepass(&mut projected);
+
+        assert_eq!(stats.removed_messages, 2);
+        assert_eq!(canonical.len(), 7);
+        assert_eq!(projected.len(), 5);
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|message| message.content.as_str() == Some(repeated_guidance))
+                .count(),
+            1
+        );
+        assert!(
+            projected
+                .iter()
+                .any(|message| { message.content.as_str() == Some("durable runtime note") })
+        );
+        assert_eq!(
+            projected
+                .last()
+                .and_then(|message| message.content.as_str()),
+            Some(repeated_guidance)
+        );
+    }
+
+    #[test]
     fn context_budget_runs_lossless_prepass_without_budget_pressure() {
         let history_file = std::env::temp_dir().join(format!(
             "context-budget-lossless-{}.sqlite",
@@ -1704,7 +1756,7 @@ mod tests {
             msg("user", "continue"),
         ];
         let canonical = messages.clone();
-        assert!(!super::super::context_memory::has_dense_recoverable_memory(
+        assert!(!super::super::context_memory::has_projectable_recoverable_memory(
             &messages
         ));
         let report = apply_pre_request_context_budget(&app, &app.current_model, &mut messages);

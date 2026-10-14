@@ -7,6 +7,7 @@ mod sessions;
 mod sqlite;
 mod suspended;
 mod task_evidence;
+pub(in crate::ai) mod tool_guidance;
 mod types;
 
 /// The "model summarization" port the history compressor depends on
@@ -634,7 +635,9 @@ fn context_projection_fingerprint(
     // v12: hard-budget compaction gained a minimal archive-pointer projection.
     // v13: user/image archive pointers use English v2 formats while readers
     // remain compatible with legacy Chinese pointers.
-    const PROJECTION_VERSION: u8 = 13;
+    // v14: snapshots omit stale and identical plain tool guidance; canonical
+    // messages remain intact, so older snapshots can be rebuilt safely.
+    const PROJECTION_VERSION: u8 = 14;
     let overflow_dir = overflow_dir
         .map(|path| path.to_string_lossy())
         .unwrap_or_default();

@@ -142,6 +142,39 @@ fn folds_early_groups_in_a_single_bloated_turn() {
 }
 
 #[test]
+fn compact_fold_guidance_keeps_each_record_self_describing_and_archived() {
+    let dir = std::env::temp_dir().join(format!("ai-compact-fold-{}", uuid::Uuid::new_v4()));
+    let messages = single_turn_with_groups(6, 2_000);
+    let (folded, count) =
+        fold_early_tool_groups(&messages, 4, Some(&dir), &FxHashSet::default());
+    assert_eq!(count, 2);
+    let notes = folded
+        .iter()
+        .filter(|message| is_compressed_tool_evidence_note(message))
+        .collect::<Vec<_>>();
+    assert_eq!(notes.len(), 2);
+    for (index, note) in notes.iter().enumerate() {
+        let text = note.content.as_str().unwrap();
+        assert!(text.starts_with("compressed_tool_round:"));
+        assert!(text.contains("assistant_checkpoint:"));
+        assert_eq!(text.matches("context_budget_note:").count(), 1);
+        assert_eq!(text.matches("recovery_guidance:").count(), 1);
+        assert!(text.contains("context_budget_note: folded for budget; not a file/command limit."));
+        assert!(text.contains(
+            "recovery_guidance: use evidence/archive before re-running; split large reads/patches."
+        ));
+        assert!(super::folded_prune::provenance(note).is_some());
+        let path = archive_file_path_from_text(text);
+        let archive = std::fs::read_to_string(path).unwrap();
+        let start = 2 + 2 * index;
+        let exact_group = serde_json::to_string_pretty(&messages[start..start + 2]).unwrap();
+        assert!(archive.contains(&exact_group));
+    }
+    assert_tool_pairs_consistent(&folded);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn rejected_speculative_fold_has_no_archive_side_effects() {
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-rejected-fold-{}", uuid::Uuid::new_v4()));
@@ -1330,13 +1363,11 @@ fn folded_tool_group_keeps_assistant_checkpoint_and_evidence_targets() {
     );
     assert!(stub.contains("evidence:"), "{stub}");
     assert!(
-        stub.contains(
-            "context_budget_note: earlier tool outputs were folded out of inline context"
-        ),
+        stub.contains("context_budget_note: folded for budget; not a file/command limit."),
         "stub should explain the context-budget cause: {stub}"
     );
     assert!(
-        stub.contains("continue with smaller targeted reads and split patches"),
+        stub.contains("use evidence/archive before re-running; split large reads/patches."),
         "stub should steer recovery toward bounded work: {stub}"
     );
     assert!(

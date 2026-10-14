@@ -61,15 +61,15 @@ struct RecoveryIndex {
     directories: Vec<String>,
 }
 
-pub(super) fn has_dense_recoverable_memory(messages: &[Message]) -> bool {
-    let total_chars = total_chars(messages);
+/// Uses an absolute floor because even a small fraction of a large request can be expensive.
+/// The projection itself still requires validated recovery targets and strict net savings.
+pub(super) fn has_projectable_recoverable_memory(messages: &[Message]) -> bool {
     let recoverable_chars = messages
         .iter()
         .filter_map(recoverable_candidate)
         .map(|candidate| candidate.chars)
         .sum::<usize>();
     recoverable_chars >= MIN_RECOVERABLE_MEMORY_CHARS
-        && recoverable_chars.saturating_mul(4) >= total_chars
 }
 
 /// Shrinks only old, derived metadata whose exact source is already archived.
@@ -142,7 +142,7 @@ fn project_memory_metadata(
     // malformed note never causes another note's paths to be dropped.
     let (stale_consumed_indices, stale_targets) =
         collect_stale_index_notes(messages, current_user_index);
-    if !has_dense_recoverable_memory(messages) && stale_consumed_indices.len() < 2 {
+    if !has_projectable_recoverable_memory(messages) && stale_consumed_indices.len() < 2 {
         return stats;
     }
 
@@ -1497,6 +1497,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn query_projection_uses_absolute_savings_for_low_density_metadata() {
+        let current_user = message("user", "continue relevant migration");
+        let mut messages = vec![message("system", "stable rules ".repeat(4_000))];
+        for index in 0..12 {
+            let topic = if index == 2 {
+                "relevant migration"
+            } else {
+                "archived topic"
+            };
+            messages.push(checkpoint(index, topic, 1_000));
+        }
+        messages.push(current_user.clone());
+
+        let recoverable_chars = messages
+            .iter()
+            .filter_map(recoverable_candidate)
+            .map(|candidate| candidate.chars)
+            .sum::<usize>();
+        assert!(recoverable_chars >= MIN_RECOVERABLE_MEMORY_CHARS);
+        assert!(recoverable_chars.saturating_mul(4) < total_chars(&messages));
+
+        let stats = apply_query_aware_memory_projection(&mut messages, 120_000);
+
+        assert!(stats.changed);
+        assert!(stats.saved_chars >= MIN_NET_SAVINGS_CHARS);
+        assert_eq!(messages.last(), Some(&current_user));
+        assert!(
+            messages.iter().any(|message| {
+                value_to_string(&message.content).contains("relevant migration")
+            })
+        );
+        assert!(messages.iter().any(|message| {
+            value_to_string(&message.content)
+                .starts_with(crate::ai::history::compress::QUERY_MEMORY_INDEX_PREFIX)
+        }));
     }
 
     #[test]

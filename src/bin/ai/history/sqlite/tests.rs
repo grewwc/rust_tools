@@ -831,6 +831,134 @@ fn canonical_messages_are_unchanged_by_context_snapshots() {
 }
 
 #[test]
+fn context_snapshot_guidance_cleanup_preserves_canonical_and_protocol() {
+    const POLICY: &str = "guidance-projection";
+    let dir = std::env::temp_dir().join(format!("guidance-snapshot-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    let guidance = msg(
+        ROLE_INTERNAL_NOTE,
+        "[tool_first_use_guidance name=read_file]\nRead serially.",
+    );
+    let revised = msg(
+        ROLE_INTERNAL_NOTE,
+        "[tool_first_use_guidance name=read_file]\nKeep full evidence.",
+    );
+    let assistant = Message {
+        tool_calls: Some(vec![ToolCall {
+            id: "call-guidance".into(),
+            tool_type: "function".into(),
+            function: crate::ai::types::FunctionCall {
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+        }]),
+        ..msg("assistant", "Read the evidence")
+    };
+    let tool = Message {
+        tool_call_id: Some("call-guidance".into()),
+        ..msg("tool", "Exact evidence")
+    };
+    let original = vec![
+        msg("user", "old"),
+        guidance.clone(),
+        msg("user", "current"),
+        guidance.clone(),
+        guidance.clone(),
+        revised.clone(),
+        assistant.clone(),
+        tool.clone(),
+    ];
+    append_history_sqlite_for_model(&path, original.clone(), None).unwrap();
+    let source = read_context_history_sqlite(&path, POLICY).unwrap();
+    // Pass unclean input to prove the write boundary itself filters it.
+    assert!(
+        write_context_snapshot_sqlite(
+            &path,
+            &original,
+            source.source_message_id,
+            source.canonical_generation,
+            POLICY
+        )
+        .unwrap()
+    );
+    let conn = Connection::open(&path).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM context_messages", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 6);
+    let restored = read_context_history_sqlite(&path, POLICY).unwrap();
+    assert!(restored.snapshot_is_current);
+    assert_eq!(
+        restored.messages,
+        vec![
+            msg("user", "old"),
+            msg("user", "current"),
+            guidance,
+            revised,
+            assistant,
+            tool
+        ]
+    );
+    assert_eq!(read_all_messages_sqlite(&path).unwrap(), original);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn context_snapshot_guidance_cleanup_handles_legacy_snapshot_and_new_tail() {
+    const POLICY: &str = "guidance-legacy";
+    let dir = std::env::temp_dir().join(format!("guidance-legacy-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    let user = msg("user", "first request");
+    let guidance = msg(
+        ROLE_INTERNAL_NOTE,
+        "[tool_first_use_guidance name=read_file]\nRead serially.",
+    );
+    let original = vec![user.clone(), guidance.clone(), guidance.clone()];
+    append_history_sqlite_for_model(&path, original.clone(), None).unwrap();
+    let source = read_context_history_sqlite(&path, POLICY).unwrap();
+    write_context_snapshot_sqlite(
+        &path,
+        &source.messages,
+        source.source_message_id,
+        source.canonical_generation,
+        POLICY,
+    )
+    .unwrap();
+    // Reproduce an older snapshot containing exact duplicate guidance.
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO context_messages
+        SELECT 2, role, content, tool_calls, tool_call_id, reasoning_content
+        FROM context_messages WHERE position = 1",
+        [],
+    )
+    .unwrap();
+    let legacy = read_context_history_sqlite(&path, POLICY).unwrap();
+    assert_eq!(legacy.messages, vec![user.clone(), guidance.clone()]);
+    assert!(!legacy.snapshot_is_current);
+    let synthetic = crate::ai::history::runtime_synthetic_user_message("task completed".into());
+    append_history_sqlite_for_model(&path, vec![synthetic.clone()], None).unwrap();
+    assert_eq!(
+        read_context_history_sqlite(&path, POLICY).unwrap().messages,
+        vec![user.clone(), guidance.clone(), synthetic.clone()]
+    );
+    let next_user = msg("user", "next request");
+    append_history_sqlite_for_model(&path, vec![next_user.clone(), guidance.clone()], None)
+        .unwrap();
+    let merged = read_context_history_sqlite(&path, POLICY).unwrap();
+    assert_eq!(
+        merged.messages,
+        vec![user, synthetic.clone(), next_user.clone(), guidance.clone()]
+    );
+    let mut expected = original;
+    expected.extend([synthetic, next_user, guidance]);
+    assert_eq!(read_all_messages_sqlite(&path).unwrap(), expected);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn stale_context_snapshot_cannot_resurrect_truncated_history() {
     const PROJECTION: &str = "test-policy-a";
     let dir = std::env::temp_dir().join(format!(
@@ -1195,7 +1323,10 @@ fn read_all_messages_with_models_self_heals_fresh_and_pre_migration_dbs() {
     // Brand-new path: no schema yet -> the reader must return empty, not error
     // (the messages table only exists after init_history_schema runs).
     let fresh = dir.join("fresh.sqlite");
-    assert_eq!(read_all_messages_with_models_sqlite(&fresh).unwrap(), vec![]);
+    assert_eq!(
+        read_all_messages_with_models_sqlite(&fresh).unwrap(),
+        vec![]
+    );
 
     // Pre-migration DB: messages table without the source_model column -> the
     // reader self-heals via the column migration instead of failing.

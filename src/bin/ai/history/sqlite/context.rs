@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::super::compress;
 use super::super::compress::is_summary_note_text;
+use super::super::tool_guidance::ToolGuidanceFilter;
 use super::super::types::{Message, ROLE_INTERNAL_NOTE};
 use super::connection::{
     open_history_db, open_history_db_with_busy_timeout, sqlite_error, with_cached_read_conn,
@@ -121,11 +122,17 @@ fn read_context_history_on_conn(
     tx.commit()
         .map_err(|error| io::Error::other(error.to_string()))?;
 
+    // Apply the turn boundary only after the canonical tail is merged. A new
+    // real user in that tail expires guidance from the persisted snapshot.
+    let original_len = messages.len();
+    let mut guidance = ToolGuidanceFilter::new(&messages);
+    messages.retain(|message| guidance.keep(message));
+    let guidance_unchanged = messages.len() == original_len;
     Ok(ContextHistory {
         messages,
         source_message_id: latest_message_id,
         canonical_generation,
-        snapshot_is_current: has_snapshot && after_id == latest_message_id,
+        snapshot_is_current: has_snapshot && after_id == latest_message_id && guidance_unchanged,
     })
 }
 
@@ -204,7 +211,12 @@ fn insert_context_messages(conn: &Connection, path: &Path, messages: &[Message])
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .map_err(|error| sqlite_error(path, "prepare context_messages insert", error))?;
-    for (position, message) in messages.iter().enumerate() {
+    let mut guidance = ToolGuidanceFilter::new(messages);
+    for (position, message) in messages
+        .iter()
+        .filter(|message| guidance.keep(message))
+        .enumerate()
+    {
         let content = serde_json::to_string(&message.content)
             .map_err(|error| io::Error::other(error.to_string()))?;
         let tool_calls = message
