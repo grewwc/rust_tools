@@ -1166,7 +1166,7 @@ async fn run_loop(
         // scan — bringing read-only commands like `a /usage` from ~1s down to ~0.1s.
         // Commands like /goal that inject a forced_question and continue the
         // conversation still need the manifests loaded.
-        if try_handle_local_command(app, mcp_client, &question)? {
+        if try_handle_local_command(app, &question)? {
             if let Some(rest) = app.forced_question.take() {
                 question = rest;
             } else {
@@ -1225,7 +1225,6 @@ async fn run_loop(
 
         if try_handle_interactive_command(
             app,
-            mcp_client,
             &question,
             agent_manifests,
             skill_manifests,

@@ -305,10 +305,10 @@ fn skill_watch_roots_exclude_builtin_skills_and_include_existing_skill_container
 
 #[test]
 fn load_skills_from_dir_supports_collection_directory() {
-    // Feishu-style collection: collection/skills/<pkg>/SKILL.md, with no root manifest.
+    // Collection-style layout: collection/skills/<pkg>/SKILL.md, no root manifest.
     let dir = std::env::temp_dir().join(format!("rust-tools-skills-{}", uuid::Uuid::new_v4()));
-    let collection = dir.join("feishu");
-    for (pkg, desc) in [("lark-base", "base skill"), ("lark-im", "im skill")] {
+    let collection = dir.join("docs");
+    for (pkg, desc) in [("docs-base", "base skill"), ("docs-im", "im skill")] {
         let pkg_dir = collection.join("skills").join(pkg);
         std::fs::create_dir_all(pkg_dir.join("references")).unwrap();
         std::fs::write(
@@ -320,8 +320,8 @@ fn load_skills_from_dir_supports_collection_directory() {
     }
 
     let skills = load_skills_from_dir(&dir);
-    let base = skills.iter().find(|s| s.name == "lark-base").unwrap();
-    let im = skills.iter().find(|s| s.name == "lark-im").unwrap();
+    let base = skills.iter().find(|s| s.name == "docs-base").unwrap();
+    let im = skills.iter().find(|s| s.name == "docs-im").unwrap();
     assert_eq!(base.description, "base skill");
     assert_eq!(im.description, "im skill");
     assert_eq!(
@@ -329,7 +329,7 @@ fn load_skills_from_dir_supports_collection_directory() {
         Some(
             collection
                 .join("skills")
-                .join("lark-base")
+                .join("docs-base")
                 .display()
                 .to_string()
                 .as_str()
@@ -366,25 +366,25 @@ fn load_skills_from_dir_single_package_dir_does_not_descend() {
 fn load_skills_from_dir_supports_multi_package_collection_zip() {
     let dir = std::env::temp_dir().join(format!("rust-tools-skills-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let zip_path = dir.join("feishu.zip");
+    let zip_path = dir.join("docs.zip");
     write_zip_package(
         &zip_path,
         &[
             (
-                "feishu/skills/lark-base/SKILL.md",
-                "---\nname: lark-base\ndescription: base skill\n---\n\nbody\n",
+                "docs/skills/docs-base/SKILL.md",
+                "---\nname: docs-base\ndescription: base skill\n---\n\nbody\n",
             ),
-            ("feishu/skills/lark-base/references/guide.md", "resource"),
+            ("docs/skills/docs-base/references/guide.md", "resource"),
             (
-                "feishu/skills/lark-im/SKILL.md",
-                "---\nname: lark-im\ndescription: im skill\n---\n\nbody\n",
+                "docs/skills/docs-im/SKILL.md",
+                "---\nname: docs-im\ndescription: im skill\n---\n\nbody\n",
             ),
         ],
     );
 
     let skills = load_skills_from_dir(&dir);
-    let base = skills.iter().find(|s| s.name == "lark-base").unwrap();
-    let im = skills.iter().find(|s| s.name == "lark-im").unwrap();
+    let base = skills.iter().find(|s| s.name == "docs-base").unwrap();
+    let im = skills.iter().find(|s| s.name == "docs-im").unwrap();
     assert_eq!(base.description, "base skill");
     assert_eq!(im.description, "im skill");
     assert!(base.source_path.as_deref().unwrap().contains(".zip!"));

@@ -661,11 +661,11 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner());
         reset_state_for_tests();
         set_active_tool_names(vec!["enable_tools".to_string()]);
-        set_available_mcp_tools(vec![tool("mcp_feishu_docs_get_text_by_url")]);
+        set_available_mcp_tools(vec![tool("mcp_example_docs_get_text_by_url")]);
 
         let output = execute_enable_tools(&json!({"operation": "list"})).unwrap();
 
-        assert!(output.contains("mcp_feishu_docs_get_text_by_url"));
+        assert!(output.contains("mcp_example_docs_get_text_by_url"));
     }
 
     #[test]
@@ -931,16 +931,16 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner());
         reset_state_for_tests();
         set_active_tool_names(vec!["enable_tools".to_string()]);
-        set_available_mcp_tools(vec![tool("mcp_feishu_docs_get_text_by_url")]);
+        set_available_mcp_tools(vec![tool("mcp_example_docs_get_text_by_url")]);
 
         let output = execute_enable_tools(
-            &json!({"operation": "enable", "tools": ["mcp_feishu_docs_get_text_by_url"]}),
+            &json!({"operation": "enable", "tools": ["mcp_example_docs_get_text_by_url"]}),
         )
         .unwrap();
         let pending = drain_pending_mcp_names();
 
-        assert!(output.contains("mcp_feishu_docs_get_text_by_url"));
-        assert_eq!(pending, vec!["mcp_feishu_docs_get_text_by_url".to_string()]);
+        assert!(output.contains("mcp_example_docs_get_text_by_url"));
+        assert_eq!(pending, vec!["mcp_example_docs_get_text_by_url".to_string()]);
     }
 
     #[test]

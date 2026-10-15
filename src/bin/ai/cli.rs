@@ -129,8 +129,6 @@ const INTERNAL_COMMANDS: &[&str] = &[
     ":history",
     "/usage",
     ":usage",
-    "/feishu-auth",
-    ":feishu-auth",
     "/share",
     ":share",
     "/git",

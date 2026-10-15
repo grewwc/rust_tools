@@ -480,6 +480,19 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         }
     }
 
+    /// Whether a model-derived note projected at `idx` needs a closing user
+    /// message. The note is projected as assistant-sourced, and only a following
+    /// user turn closes it: tool messages can be dropped as unmatched and system
+    /// notes are not wire turns, so either could leave the request ending with
+    /// an assistant message, which the upstream rejects as prefill. Checkpoint
+    /// markers are skipped in the lookahead because they fold into the prefix block instead of projecting as wire turns.
+    fn derived_note_needs_return_message(messages: &[Message], idx: usize) -> bool {
+        !messages[idx + 1..]
+            .iter()
+            .find(|next| !is_context_checkpoint_marker(next))
+            .is_some_and(|next| next.role == "user")
+    }
+
     fn content_is_effectively_empty(content: &Value) -> bool {
         match content {
             Value::Null => true,
@@ -527,6 +540,109 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
                 .name
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }
+
+    /// OpenAI-compatible endpoints reject a request whose final message is an
+    /// assistant message whose content ends with whitespace (`400 ... final
+    /// assistant content cannot end with trailing whitespace`). The runtime can
+    /// legitimately project an assistant message as the last message (resumed
+    /// turns after an interrupted stream, recall/handoff assistant blocks, tool
+    /// rounds whose trailing tool messages were folded into evidence notes),
+    /// and streamed model output is persisted verbatim, so trailing whitespace
+    /// can reach the wire. Trim it in the outgoing projection only — canonical
+    /// history is never modified here.
+    ///
+    /// Both string and content-block (array) shapes are trimmed: text-only
+    /// models flatten array content *after* this runs
+    /// (`normalize_messages_for_model`), so trimming the last text block here
+    /// keeps the flattened form clean as well.
+    fn trim_final_assistant_trailing_whitespace(mut messages: Vec<Message>) -> Vec<Message> {
+        loop {
+            let pop_tail = match messages.last_mut() {
+                // Only a trailing assistant turn can trip the upstream
+                // trailing-whitespace rejection; anything else is already safe.
+                None => return messages,
+                Some(last) if last.role != "assistant" => return messages,
+                Some(last) => {
+                    let has_tool_calls =
+                        last.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
+                    match &mut last.content {
+                        Value::String(text) => {
+                            let trimmed = text.trim_end();
+                            if trimmed.is_empty() {
+                                if has_tool_calls {
+                                    // Tool-call turns legitimately carry empty
+                                    // text; dropping one would orphan the paired
+                                    // tool messages, so keep the emptied string.
+                                    *text = String::new();
+                                    false
+                                } else {
+                                    // A whitespace-only turn carries no content;
+                                    // drop it and re-check the newly exposed tail.
+                                    true
+                                }
+                            } else {
+                                if trimmed.len() != text.len() {
+                                    *text = trimmed.to_string();
+                                }
+                                false
+                            }
+                        }
+                        Value::Array(items) => {
+                            if trim_trailing_array_content(items) || has_tool_calls {
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                        _ => false,
+                    }
+                }
+            };
+            if pop_tail {
+                messages.pop();
+            } else {
+                return messages;
+            }
+        }
+    }
+
+    /// Trims trailing whitespace off the end of array content blocks in place.
+    /// The end of the content is the last text-bearing block: it gets
+    /// `trim_end`, and blocks that become empty are removed so an
+    /// all-whitespace tail cannot linger behind an image block. Returns whether
+    /// any block remains.
+    fn trim_trailing_array_content(items: &mut Vec<Value>) -> bool {
+        loop {
+            let empty_text = match items.last_mut() {
+                None => return false,
+                Some(Value::Object(map)) => match map.get_mut("text") {
+                    Some(Value::String(text)) => {
+                        let trimmed = text.trim_end();
+                        if trimmed.len() != text.len() {
+                            *text = trimmed.to_string();
+                        }
+                        text.is_empty()
+                    }
+                    // Non-text blocks (e.g. images) end the content without
+                    // trailing whitespace; earlier text is mid-content.
+                    _ => return true,
+                },
+                Some(Value::String(text)) => {
+                    let trimmed = text.trim_end();
+                    if trimmed.len() != text.len() {
+                        *text = trimmed.to_string();
+                    }
+                    text.is_empty()
+                }
+                Some(_) => return true,
+            };
+            if empty_text {
+                items.pop();
+            } else {
+                return true;
+            }
+        }
     }
 
     fn sanitize_tool_message_sequence(messages: Vec<Message>) -> Vec<Message> {
@@ -683,7 +799,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
             }
         }
 
-        out
+        trim_final_assistant_trailing_whitespace(out)
     }
 
     /// Placeholder parked into a slot after its value has been moved out for
@@ -759,10 +875,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
             }
             projected.push(note);
             if model_derived
-                && request_messages[idx + 1..]
-                    .iter()
-                    .find(|next| !is_context_checkpoint_marker(next))
-                    .is_some_and(|next| next.role == "assistant")
+                && derived_note_needs_return_message(&request_messages, idx)
             {
                 projected.push(derived_context_return_message());
             }
@@ -933,6 +1046,20 @@ evidence before relying on them.\n",
             tool_call_id: None,
             reasoning_content: None,
         });
+        // The prefix assistant block has no per-note helper call: close it
+        // unless a user turn is projected after it. Only a surviving user
+        // message counts — later tool messages may be dropped as unmatched by
+        // `sanitize_tool_message_sequence`, which would otherwise leave this
+        // assistant block as the tail (upstream prefill rejection).
+        let followed_by_user = request_messages[first_body_idx..]
+            .iter()
+            .filter(|message| {
+                !is_context_checkpoint_marker(message) && !is_query_memory_index_note(message)
+            })
+            .any(|message| message.role == "user");
+        if !followed_by_user {
+            out.push(derived_context_return_message());
+        }
     }
     for idx in 0..request_messages.len() {
         if idx == first_system_idx {
@@ -997,10 +1124,7 @@ evidence before relying on them.\n",
             }
             out.push(message);
             if model_derived
-                && request_messages[idx + 1..]
-                    .iter()
-                    .find(|next| !is_context_checkpoint_marker(next))
-                    .is_some_and(|next| next.role == "assistant")
+                && derived_note_needs_return_message(&request_messages, idx)
             {
                 out.push(derived_context_return_message());
             }
@@ -1321,5 +1445,159 @@ mod resolved_tool_failure_tests {
         fold_resolved_tool_failures(&mut projected, &outcomes);
 
         assert_eq!(projected, original);
+    }
+}
+
+#[cfg(test)]
+mod final_assistant_whitespace_tests {
+    use super::*;
+
+    fn message(role: &str, content: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: Value::String(content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn final_assistant_trailing_whitespace_is_trimmed() {
+        let normalized = normalize_messages_for_request(&[
+            message("user", "question?"),
+            message("assistant", "the answer ends here  \n\n"),
+        ]);
+        assert_eq!(normalized.last().unwrap().role, "assistant");
+        assert_eq!(
+            normalized.last().unwrap().content,
+            Value::String("the answer ends here".to_string())
+        );
+    }
+
+    #[test]
+    fn non_final_assistant_and_final_user_messages_are_untouched() {
+        let normalized = normalize_messages_for_request(&[
+            message("assistant", "middle assistant text \n"),
+            message("user", "latest question"),
+        ]);
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(
+            normalized[0].content,
+            Value::String("middle assistant text \n".to_string())
+        );
+        assert_eq!(normalized[1].content, Value::String("latest question".to_string()));
+    }
+
+    #[test]
+    fn final_assistant_without_trailing_whitespace_is_unchanged() {
+        let normalized = normalize_messages_for_request(&[
+            message("user", "question?"),
+            message("assistant", "clean ending"),
+        ]);
+        assert_eq!(
+            normalized.last().unwrap().content,
+            Value::String("clean ending".to_string())
+        );
+    }
+
+    #[test]
+    fn trailing_model_derived_note_is_closed_by_a_user_message() {
+        let normalized = normalize_messages_for_request(&[
+            message("user", "question?"),
+            message("assistant", "answer"),
+            message(
+                crate::ai::history::ROLE_INTERNAL_NOTE,
+                "self_note:\nnavigation hint",
+            ),
+        ]);
+        let last = normalized.last().unwrap();
+        assert_eq!(last.role, "user");
+        assert_eq!(last.content, Value::String(DERIVED_CONTEXT_RETURN.to_string()));
+    }
+
+    #[test]
+    fn derived_note_followed_by_user_turn_gets_no_extra_return_message() {
+        let normalized = normalize_messages_for_request(&[
+            message(crate::ai::history::ROLE_INTERNAL_NOTE, "self_note:\nhint"),
+            message("user", "latest question"),
+        ]);
+        assert_eq!(
+            normalized.last().unwrap().content,
+            Value::String("latest question".to_string())
+        );
+    }
+
+    #[test]
+    fn final_assistant_all_whitespace_message_is_dropped() {
+        let normalized = normalize_messages_for_request(&[
+            message("user", "question?"),
+            message("assistant", "   \n  "),
+        ]);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized.last().unwrap().role, "user");
+    }
+
+    #[test]
+    fn final_assistant_array_content_trailing_whitespace_is_trimmed() {
+        let array_message = Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "last has trailing space  \n"},
+            ]),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let normalized =
+            normalize_messages_for_request(&[message("user", "question?"), array_message]);
+        let last = normalized.last().unwrap();
+        assert_eq!(last.role, "assistant");
+        assert_eq!(
+            last.content,
+            serde_json::json!([
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "last has trailing space"},
+            ])
+        );
+    }
+
+    #[test]
+    fn prefix_derived_block_without_later_user_is_closed() {
+        let normalized = normalize_messages_for_request(&[
+            message("system", "base prompt"),
+            message(crate::ai::history::ROLE_INTERNAL_NOTE, "self_note:\nhint"),
+        ]);
+        let last = normalized.last().unwrap();
+        assert_eq!(last.role, "user");
+        assert_eq!(
+            last.content,
+            Value::String(DERIVED_CONTEXT_RETURN.to_string())
+        );
+    }
+
+    #[test]
+    fn prefix_derived_block_followed_only_by_orphan_tool_is_closed() {
+        let orphan_tool = Message {
+            role: "tool".to_string(),
+            content: Value::String("stale output".to_string()),
+            tool_calls: None,
+            tool_call_id: Some("call_orphan".to_string()),
+            reasoning_content: None,
+        };
+        let normalized = normalize_messages_for_request(&[
+            message("system", "base prompt"),
+            message(crate::ai::history::ROLE_INTERNAL_NOTE, "self_note:\nhint"),
+            orphan_tool,
+        ]);
+        // The orphan tool message is dropped by sanitize; the tail must still
+        // be the closing user message, not the prefix assistant block.
+        let last = normalized.last().unwrap();
+        assert_eq!(last.role, "user");
+        assert_eq!(
+            last.content,
+            Value::String(DERIVED_CONTEXT_RETURN.to_string())
+        );
     }
 }

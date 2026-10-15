@@ -248,10 +248,10 @@ mod tests {
     #[test]
     fn local_env_path_leak_detects_home_relative_and_absolute_paths() {
         assert!(note_has_local_env_path_leak(
-            "Skill 文件位置：~/.config/rust_tools/skills/feishu-upload-md.skill，约182行"
+            "Skill 文件位置：~/.config/rust_tools/skills/example-upload-md.skill，约182行"
         ));
         assert!(note_has_local_env_path_leak(
-            "read_file(file=/Users/bytedance/.config/rust_tools/skills/feishu-upload-md.skill)"
+            "read_file(file=/Users/bytedance/.config/rust_tools/skills/example-upload-md.skill)"
         ));
         assert!(note_has_local_env_path_leak(
             r"配置文件位于 C:\Users\bytedance\AppData\Roaming\rust_tools\settings.json"
@@ -264,7 +264,7 @@ mod tests {
             "实现位置在 src/bin/ai/knowledge/entry.rs，继续看这个模块。"
         ));
         assert!(!note_has_local_env_path_leak(
-            "文档地址：https://example.com/.config/rust_tools/skills/feishu-upload-md.skill"
+            "文档地址：https://example.com/.config/rust_tools/skills/example-upload-md.skill"
         ));
     }
 }

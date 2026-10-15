@@ -116,8 +116,8 @@ pub(in crate::ai) fn send_request_to_conn(
 /// In the MCP protocol, messages such as `notifications/initialized` are
 /// notifications, not requests: they carry no `id` field and the server must
 /// not reply. If sent as a request instead (with an `id` and a wait for a
-/// response), some MCP servers (such as Feishu) close the stdio stream as a
-/// protocol violation, causing an "MCP server closed the stream unexpectedly"
+/// response), some MCP servers close the stdio stream as a protocol violation,
+/// causing an "MCP server closed the stream unexpectedly"
 /// error.
 pub(in crate::ai) fn send_notification_to_conn(
     conn: &mut McpServerConnection,

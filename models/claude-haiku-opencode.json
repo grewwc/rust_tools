@@ -1,16 +1,16 @@
 {
-  "key": "claude-opus-5-5",
-  "name": "claude-opus-5-5",
+  "key": "claude-haiku-5-5",
+  "name": "claude-haiku-5-5",
   "adapter": "opencode",
   "request_protocol": "messages",
-  "quality_tier": "strong",
+  "quality_tier": "basic",
   "is_vl": true,
   "search_enabled": false,
   "tools_default_enabled": true,
   "enable_thinking": true,
   "subagent_priority": 85,
   "default_reasoning_effort": "xhigh",
-  "context_window_tokens": 1000000,
+  "context_window_tokens": 128000,
   "max_output_tokens": 65536,
-  "endpoint": "https://opencode.ai/zen/v1/messages"
+  "endpoint": "https://opencode.ai/inference/go/v1/messages"
 }

@@ -2395,7 +2395,7 @@ async fn run_turn_body(
                     "[image] backfilled {backfilled_digests} image digest(s) into history metadata"
                 );
             }
-            finalize_turn(
+            match finalize_turn(
                 app,
                 &next_model,
                 output.response_model.as_deref().unwrap_or(&next_model),
@@ -2411,6 +2411,37 @@ async fn run_turn_body(
                 output.had_tool_error,
             )
             .await
+            {
+                Ok(outcome) => {
+                    // Self-generated `/audit` enforcement: the injected note tells the lead agent
+                    // to start the audit subagent itself through the task tool. If the turn ended
+                    // without that (and was not interrupted), force a synchronous `/audit` with
+                    // this turn's final text as the instruction, so the audit always runs in a
+                    // subagent instead of silently degrading to a lead-agent self-audit.
+                    if let Some(fast) = self_generated_audit
+                        && !app.last_turn_interrupted
+                        && !crate::ai::driver::commands::audit::turn_spawned_audit_subagent(
+                            turn_messages.as_slice(),
+                        )
+                    {
+                        println!(
+                            "\n[audit] The lead agent did not start an audit subagent this turn; \
+                             forcing `/audit{}` with this turn's output as the audit instruction.",
+                            if fast { " --fast" } else { "" }
+                        );
+                        return Ok(execute_audit_command(
+                            app,
+                            crate::ai::driver::commands::audit::AuditCommand::Run {
+                                instruction: output.assistant_text.clone(),
+                                fast,
+                            },
+                            should_quit,
+                        ));
+                    }
+                    Ok(outcome)
+                }
+                Err(error) => Err(error),
+            }
         }
         Err(err_str) => Err(err_str.into()),
     }

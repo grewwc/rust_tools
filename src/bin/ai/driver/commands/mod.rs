@@ -6,7 +6,6 @@ pub(crate) mod compact;
 pub(crate) mod distill_session;
 pub mod cwd;
 pub mod export;
-pub mod feishu;
 pub mod goal;
 pub mod help;
 pub mod memo;
@@ -23,7 +22,7 @@ pub mod usage;
 
 use std::sync::Arc;
 
-use crate::ai::{agents::AgentManifest, mcp::SharedMcpClient, skills::SkillManifest, types::App};
+use crate::ai::{agents::AgentManifest, skills::SkillManifest, types::App};
 
 pub use agent::try_handle_agent_command;
 pub use checkpoint::try_handle_checkpoint_command;
@@ -34,7 +33,6 @@ pub(crate) use checkpoint::{
 };
 pub use cwd::try_handle_cwd_command;
 pub use export::try_handle_export_command;
-pub use feishu::try_handle_feishu_auth_command;
 pub use goal::try_handle_goal_command;
 pub use help::try_handle_help_command;
 pub use model::try_handle_model_command;
@@ -88,7 +86,6 @@ pub fn is_local_command_start(token: &str) -> bool {
             | "diff"
             | "effort"
             | "export"
-            | "feishu"
             | "fork"
             | "git"
             | "goal"
@@ -169,7 +166,6 @@ pub fn local_command_reserved_flags(head: &str) -> &'static [&'static str] {
 /// read-only commands in one-shot mode (e.g. `a /usage`).
 pub fn try_handle_local_command(
     app: &mut App,
-    mcp_client: &SharedMcpClient,
     input: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if try_handle_help_command(input) {
@@ -211,9 +207,6 @@ pub fn try_handle_local_command(
     if try_handle_checkpoint_command(app, input)? {
         return Ok(true);
     }
-    if try_handle_feishu_auth_command(mcp_client, input)? {
-        return Ok(true);
-    }
     if try_handle_share_command(app, input)? {
         return Ok(true);
     }
@@ -225,12 +218,11 @@ pub fn try_handle_local_command(
 
 pub fn try_handle_interactive_command(
     app: &mut App,
-    mcp_client: &SharedMcpClient,
     input: &str,
     agent_manifests: &mut Arc<Vec<AgentManifest>>,
     skill_manifests: &mut Arc<Vec<SkillManifest>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    if try_handle_local_command(app, mcp_client, input)? {
+    if try_handle_local_command(app, input)? {
         return Ok(true);
     }
     // Async compaction belongs to the turn dispatcher, not skill activation.

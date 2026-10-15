@@ -587,12 +587,15 @@ fn is_ignored_package_entry_name(name: &str) -> bool {
     name.starts_with('.') || name == "__MACOSX"
 }
 
-/// 集合下钻的最大目录深度。feishu 集合布局解压后最深为 `feishu/skills/<pkg>`（3 层），
-/// 取 4 留出余量，同时避免在异常深的目录树上无限递归。
+/// Maximum directory depth for collection drill-down. A collection layout
+/// unzips to at most `<collection>/skills/<pkg>` (3 levels); 4 leaves headroom
+/// while avoiding unbounded recursion on abnormally deep trees.
 const MAX_SKILL_PACKAGE_DEPTH: usize = 4;
 
-/// 子 skill 容器目录名。仅使用 `subskills` 白名单，避免与集合布局 `skills/<pkg>` 冲突。
-/// 历史曾包含 `skills`，会导致 `feishu/skills/<pkg>` 这类集合内容被误判为子 skill。
+/// Child-skill container directory names. Only the `subskills` allowlist is
+/// used, avoiding collisions with the collection layout `skills/<pkg>`.
+/// `skills` was once included, which misjudged `<collection>/skills/<pkg>`
+/// content as child skills.
 const SUBSKILL_CONTAINER_DIRS: &[&str] = &["subskills"];
 
 /// 尝试从文件系统布局推断子 skill 的父名。
@@ -663,8 +666,10 @@ fn collect_subskills_for_parent(parent_root: &Path) -> Vec<(PathBuf, PathBuf)> {
 /// - 若 `root` 自身就是一个包（直接含 manifest），返回它本身**外加**其子 skill：
 ///   仅扫描 `subskills` 容器下的直接子包；`references/*.skill`
 ///   等仍不会被误判为 skill（原有保证保留）。
-/// - 否则把 `root` 当作"集合"（如 feishu，其布局为 `feishu/skills/<pkg>/SKILL.md`），
-///   逐层下钻收集所有**最上层**的包；命中某个目录是包后即停止深入该目录。
+/// - Otherwise treat `root` as a "collection" (layout
+///   `<collection>/skills/<pkg>/SKILL.md`), drilling down level by level to
+///   collect all **top-level** packages; stop descending once a directory is a
+///   package.
 ///
 /// 磁盘目录集合与解压后的 zip 集合通过同一条逻辑处理，无需对 `skills/` 之类的容器
 /// 名做硬编码判断。

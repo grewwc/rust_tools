@@ -2544,10 +2544,22 @@ mod tests {
         // Rolling back a nonexistent checkpoint must error.
         assert!(store.rollback("nope").is_err());
 
-        // Delete c1.
+        // c1 is main's tip, so deleting it while a branch references it is
+        // refused (Git-style). Re-attach to main and move its tip past c1 with
+        // a new save; then c1 is unreferenced and becomes deletable.
+        let err = store.delete("c1").unwrap_err();
+        assert!(
+            err.to_string().contains("referenced by branch main"),
+            "unexpected error: {err}"
+        );
+        store.attach_branch("main").unwrap();
+        append_history_messages(&store.session_file, &[lineage_msg("v3")]).unwrap();
+        store.save("c2").unwrap();
         assert!(store.delete("c1").unwrap());
         assert!(!store.delete("c1").unwrap());
-        assert!(store.list().unwrap().is_empty());
+        let remaining = store.list().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "c2");
 
         // Cleanup.
         if let Some(grandparent) = history_file.parent() {
@@ -2591,7 +2603,18 @@ mod tests {
         assert!(store.save("@").is_err());
         assert!(store.save("-").is_err());
 
-        // Deleting the HEAD target clears the pointer without touching history.
+        // c1 is main's tip, so deleting it while a branch references it is
+        // refused. Move the branch tip away, check c1 out detached, then
+        // deleting the HEAD target clears the pointer without touching history.
+        let err = store.delete("c1").unwrap_err();
+        assert!(
+            err.to_string().contains("referenced by branch"),
+            "unexpected error: {err}"
+        );
+        append_history_messages(&store.session_file, &[lineage_msg("v2")]).unwrap();
+        store.save("c2").unwrap();
+        store.rollback("c1").unwrap();
+        assert_eq!(store.head_target().unwrap().as_deref(), Some("c1"));
         assert!(store.delete("c1").unwrap());
         assert_eq!(store.head_target().unwrap(), None);
 
@@ -3153,7 +3176,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_parent_keeps_child_as_orphan_and_base() {
+    fn deleting_parent_keeps_child_as_orphan() {
         let history_file = temp_history_file();
         let store = CheckpointStore::new(&history_file, "sess-orphan");
         append_history_messages(&store.session_file, &[lineage_msg("v1")]).unwrap();
@@ -3162,10 +3185,18 @@ mod tests {
         assert!(store.delete("a").unwrap());
         // The child keeps its (now dangling) parent so the tree can mark it.
         assert_eq!(lineage_parent_of(&store, "b"), Some("a".to_string()));
-        // The live base still records the derivation, even when deleted.
-        store.rollback("b").unwrap();
+        // b is main's tip, so deleting it while a branch references it is
+        // refused. Move the branch tip past b, then b is unreferenced and
+        // deletable; the live history still derives from the new tip.
+        let err = store.delete("b").unwrap_err();
+        assert!(
+            err.to_string().contains("referenced by branch"),
+            "unexpected error: {err}"
+        );
+        append_history_messages(&store.session_file, &[lineage_msg("v2")]).unwrap();
+        store.save("c").unwrap();
         assert!(store.delete("b").unwrap());
-        assert_eq!(store.base_target().unwrap().as_deref(), Some("b"));
+        assert_eq!(store.base_target().unwrap().as_deref(), Some("c"));
 
         if let Some(grandparent) = history_file.parent() {
             let _ = fs::remove_dir_all(grandparent);

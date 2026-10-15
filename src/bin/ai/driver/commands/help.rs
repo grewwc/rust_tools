@@ -42,7 +42,6 @@ fn print_commands_help() {
     println!(
         "    /history <session> replay     replay the last assistant conclusion of another session"
     );
-    println!("    /feishu-auth              authenticate with Feishu");
     println!("    /share [output.md]        export current session as shareable markdown");
     println!("    /close                    close and delete current session, then exit");
     println!("    /proc                     show running sessions (interactive + background)");

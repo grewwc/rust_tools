@@ -3,7 +3,6 @@ use std::fs;
 use std::io;
 use std::io::BufReader;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
 
 use crate::ai::mcp::{
     McpClient,
@@ -12,8 +11,6 @@ use crate::ai::mcp::{
 use crate::ai::types::{App, McpPrompt, McpResource, McpServerConfig, McpTool};
 use rust_tools::cw::SkipMap;
 use std::process::{Command, Stdio};
-
-const FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS: u64 = 20_000;
 
 #[derive(Debug, Clone)]
 pub struct McpConfigProbe {
@@ -72,16 +69,6 @@ pub fn probe_mcp_config(app: &App) -> McpConfigProbe {
         exists,
         server_count,
     }
-}
-
-fn is_feishu_mcp_server(name: &str, command: &str) -> bool {
-    if name == "feishu" {
-        return true;
-    }
-    let Some(file_name) = Path::new(command).file_name().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    file_name == "mcp_feishu" || file_name == "mcp_feishu.exe"
 }
 
 #[crate::ai::agent_hang_span(
@@ -170,18 +157,7 @@ async fn prepare_mcp_initialization_from_path_inner(
         }
     };
 
-    let mut loaded_servers = servers;
-    for (name, server_cfg) in loaded_servers.iter_mut() {
-        if is_feishu_mcp_server(name, &server_cfg.command)
-            && server_cfg.request_timeout_ms < FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS
-        {
-            eprintln!(
-                "[mcp] raise server '{}' request_timeout_ms from {} to {} for Feishu network calls",
-                name, server_cfg.request_timeout_ms, FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS
-            );
-            server_cfg.request_timeout_ms = FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS;
-        }
-    }
+    let loaded_servers = servers;
 
     let server_entries: Vec<_> = loaded_servers
         .iter()

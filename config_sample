@@ -37,8 +37,6 @@ special.tags = "固化"
 re.remote.host = xxxx
 
 ai.embedding.api_key = <your-volcano-key>
-feishu.app_id = <your-app-id>
-feishu.app_secret = "<your-feishu-app-secret>"
 
 
 ai.subagent.model_inherit=1

@@ -1564,7 +1564,16 @@ mod tests {
                 })
                 .collect(),
             cached_hits: vec![false; calls.len()],
-            execution_outcomes: Vec::new(),
+            execution_outcomes: calls
+                .iter()
+                .map(|call| {
+                    Some(crate::ai::history::ToolExecutionOutcome {
+                        tool_call_id: call.id.clone(),
+                        execution_signature: String::new(),
+                        succeeded: true,
+                    })
+                })
+                .collect(),
             had_error: false,
         }
     }

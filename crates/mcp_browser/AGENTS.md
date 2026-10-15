@@ -41,7 +41,7 @@ No focused unit tests (needs real Chrome). Gate = build + smoke test above; add 
 
 Same 13 tools/args as CDP; `wait_for_human` never `unavailable`. Dedicated invariants:
 
-1. **Never steal focus.** No `activate`; `open_tab` records frontmost app before creating tab and restores via `open -b <bundle id>` (fallback display name; bundle-id first because `open -a "飞书"` fails — registered as "Lark"). Skip restore if already in Chrome. Ops address `window id W` + `whose id is "T"` (int window + quoted tab; other forms -1719/-1728) → stray events fail dry instead of mutating foreign tabs. Chrome self-activates on new tab — unavoidable, hence restore.
+1. **Never steal focus.** No `activate`; `open_tab` records frontmost app before creating tab and restores via `open -b <bundle id>` (fallback display name; bundle-id first because localized display names can fail to resolve). Skip restore if already in Chrome. Ops address `window id W` + `whose id is "T"` (int window + quoted tab; other forms -1719/-1728) → stray events fail dry instead of mutating foreign tabs. Chrome self-activates on new tab — unavoidable, hence restore.
 2. **Allow JavaScript from Apple Events** (View > Developer). Server detects disabled error (message carries support URL) and returns menu-path instruction.
 3. **JS embeds as one AppleScript string literal** — escape `\`/`"`/newlines via `esc_applescript`; whole script via `osascript -` stdin (`run_osascript`), no temp files. Multi-line JS (detect/wait polling) is fine.
 4. **One session tab, reused.** `navigate` re-sets `URL of` tab unless vanished (then fresh tab in session window; first session uses front window). Tab becomes active tab *of its window* (for `screencapture -l`) but window stays background.

@@ -1,3 +1,3 @@
 - This agent run is bound to one session. Current session id: `{}`. Its canonical history file: `{}`.
 - Sessions root: `{}`; each session maps to `<id>.sqlite` (canonical history) + `<id>.assets/` (folded output, checkpoints, images).
-- To inspect a session use read-only `sqlite3` SELECT queries or `read_file` on asset/meta files from any working directory. Read-only rule: never write, modify, delete, or create session files or sessions; session lifecycle is user-controlled via `/sessions`.
+- To inspect a session, use the `session` tools (`session_list` to discover ids, `session_read` / `session_search` for content; load them via `enable_tools` when not visible) or `read_file` on asset/meta files from any working directory. Read-only rule: never write, modify, delete, or create session files or sessions; session lifecycle is user-controlled via `/sessions`.

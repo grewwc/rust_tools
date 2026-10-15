@@ -580,7 +580,6 @@ fn system_prompt_only_mentions_tools_available_this_turn() {
     assert!(!prompt.contains("Capability catalog (not yet loaded"));
     assert!(!prompt.contains("Configured MCP tools are available"));
     assert!(!prompt.contains("Process / IPC / shared-memory primitives are available"));
-    assert!(!prompt.contains("Feishu/Lark"));
     assert!(!prompt.contains("Web search:"));
     assert!(!prompt.contains("<knowledge_retrieval>"));
     assert!(!prompt.contains("cargo_test"));
@@ -729,9 +728,10 @@ fn session_context_prompt_mentions_id_layout_and_read_only_rule() {
             && rendered.contains("f6bb0f1c-ce48-4283-96ab-27ab297ed6b7")
             && rendered.contains(".history_file.sessions")
             && rendered.contains("<id>.sqlite")
-            && rendered.contains("sqlite3")
+            && rendered.contains("session_read")
+            && !rendered.contains("sqlite3")
             && rendered.contains("Read-only rule"),
-        "session_context must carry the id, storage layout, read paths and the read-only rule; got:\n{rendered}"
+        "session_context must carry the id, storage layout, the session tools and the read-only rule (no raw sqlite3 reads); got:\n{rendered}"
     );
 }
 
@@ -1435,11 +1435,11 @@ fn system_prompt_guides_tree_for_layout_when_available() {
 fn hidden_mcp_tool_catalog_lists_real_available_tools() {
     let catalog = build_hidden_mcp_tool_catalog(
         &[
-            tool("mcp_feishu_docs_get_text_by_url"),
-            tool("mcp_feishu_doc_create_from_markdown"),
+            tool("mcp_example_docs_get_text_by_url"),
+            tool("mcp_example_doc_create_from_markdown"),
             tool("mcp_pdf-extract_pdf_extract_text"),
         ],
-        &[tool("mcp_feishu_doc_create_from_markdown")],
+        &[tool("mcp_example_doc_create_from_markdown")],
     )
     .unwrap();
 
@@ -1448,7 +1448,7 @@ fn hidden_mcp_tool_catalog_lists_real_available_tools() {
         "Configured MCP tools are available but not loaded in this turn.\n\
          If the task needs an external system or MCP-backed capability, discover and enable matching \
          `mcp_*` tools via `enable_tools` first.\n\
-         Available: `mcp_feishu_docs_get_text_by_url`, `mcp_pdf-extract_pdf_extract_text`."
+         Available: `mcp_example_docs_get_text_by_url`, `mcp_pdf-extract_pdf_extract_text`."
     );
 }
 
@@ -1506,15 +1506,15 @@ fn hidden_mcp_tool_catalog_preserves_rendered_bytes_at_display_boundary() {
 #[test]
 fn hidden_mcp_tool_catalog_omits_prompt_when_everything_is_loaded() {
     let catalog = build_hidden_mcp_tool_catalog(
-        &[tool("mcp_feishu_docs_get_text_by_url")],
-        &[tool("mcp_feishu_docs_get_text_by_url")],
+        &[tool("mcp_example_docs_get_text_by_url")],
+        &[tool("mcp_example_docs_get_text_by_url")],
     );
     assert!(catalog.is_none());
 }
 
 #[test]
 fn narrow_skill_whitelist_still_lets_model_discover_explicitly_requested_mcp_tools() {
-    // Scenario: the user explicitly asks to "write a Feishu doc with MCP
+    // Scenario: the user explicitly asks to "write a doc with MCP
     // tools", but the active skill's narrow tools: whitelist replaces the
     // tool set with a single dedicated tool, and the default agent carries
     // disable_mcp_tools (no mcp_* pre-mounted). Before the fix: the narrow
@@ -1523,8 +1523,8 @@ fn narrow_skill_whitelist_still_lets_model_discover_explicitly_requested_mcp_too
     // paths were severed, making the request physically impossible to serve.
     // After the fix: enable_tools is restored as an always-on baseline, the
     // catalog gate holds again, and the model can discover and enable
-    // mcp_feishu_*.
-    let mut narrow_skill = skill("feishu-upload", "Upload markdown into Feishu docs");
+    // mcp_example_*.
+    let mut narrow_skill = skill("example-upload", "Upload markdown into example docs");
     narrow_skill.tools = vec!["write_file".to_string()];
 
     // 1) After the narrow whitelist replaces the tool set, the baseline
@@ -1550,8 +1550,8 @@ fn narrow_skill_whitelist_still_lets_model_discover_explicitly_requested_mcp_too
     // 2) The default agent's disable_mcp_tools => no mcp_* is pre-mounted
     // this turn.
     let all_mcp_tools = vec![
-        tool("mcp_feishu_doc_create_from_markdown"),
-        tool("mcp_feishu_docs_get_text_by_url"),
+        tool("mcp_example_doc_create_from_markdown"),
+        tool("mcp_example_docs_get_text_by_url"),
         tool("mcp_pdf-extract_pdf_extract_text"),
     ];
     let loaded_mcp_tools: Vec<ToolDefinition> = Vec::new();
@@ -1564,14 +1564,14 @@ fn narrow_skill_whitelist_still_lets_model_discover_explicitly_requested_mcp_too
         "the catalog injection gate depends on enable_tools being present in available_tools"
     );
 
-    // 4) The hidden MCP catalog exposes the user-requested mcp_feishu_* to
+    // 4) The hidden MCP catalog exposes the user-requested mcp_example_* to
     // the model as the discovery entry point.
     let catalog = build_hidden_mcp_tool_catalog(&all_mcp_tools, &loaded_mcp_tools)
         .expect("a discovery hint is required when unloaded mcp_* tools exist");
     assert!(catalog.contains("discover and enable matching `mcp_*` tools"));
     assert!(catalog.contains("`enable_tools`"));
-    assert!(catalog.contains("`mcp_feishu_doc_create_from_markdown`"));
-    assert!(catalog.contains("`mcp_feishu_docs_get_text_by_url`"));
+    assert!(catalog.contains("`mcp_example_doc_create_from_markdown`"));
+    assert!(catalog.contains("`mcp_example_docs_get_text_by_url`"));
 }
 
 #[test]
@@ -2213,11 +2213,11 @@ fn manifest_tool_groups_cannot_expose_request_user_input() {
 #[test]
 fn active_agent_mcp_servers_auto_load_matching_mcp_tools() {
     let all_tools = vec![
-        tool("mcp_feishu_docs_search"),
-        tool("mcp_feishu_docs_get_text_by_url"),
+        tool("mcp_example_docs_search"),
+        tool("mcp_example_docs_get_text_by_url"),
         tool("mcp_other_lookup"),
     ];
-    let build_agent = agent("build", vec!["feishu"]);
+    let build_agent = agent("build", vec!["example"]);
     let allowed_servers = build_agent.mcp_servers.clone();
 
     let tools = filter_mcp_tools_by_allowed_servers(all_tools, &allowed_servers);
@@ -2226,8 +2226,8 @@ fn active_agent_mcp_servers_auto_load_matching_mcp_tools() {
         .map(|tool| tool.function.name)
         .collect::<Vec<_>>();
 
-    assert!(names.contains(&"mcp_feishu_docs_search".to_string()));
-    assert!(names.contains(&"mcp_feishu_docs_get_text_by_url".to_string()));
+    assert!(names.contains(&"mcp_example_docs_search".to_string()));
+    assert!(names.contains(&"mcp_example_docs_get_text_by_url".to_string()));
     assert!(!names.contains(&"mcp_other_lookup".to_string()));
 }
 
@@ -2236,7 +2236,7 @@ fn agent_without_mcp_servers_field_lazy_loads_mcp_tools() {
     // With no mcp_servers whitelist, lazy-load by default: pre-mount no MCP tool schemas;
     // the model loads them on demand via the hidden MCP catalog + enable_tools.
     let all_tools = vec![
-        tool("mcp_feishu_docs_search"),
+        tool("mcp_example_docs_search"),
         tool("mcp_ocr_extract"),
         tool("mcp_other_lookup"),
     ];
@@ -2249,7 +2249,7 @@ fn agent_without_mcp_servers_field_lazy_loads_mcp_tools() {
 
 #[test]
 fn agent_disable_mcp_tools_hides_default_mcp_tools() {
-    let all_tools = vec![tool("mcp_feishu_docs_search"), tool("mcp_ocr_extract")];
+    let all_tools = vec![tool("mcp_example_docs_search"), tool("mcp_ocr_extract")];
     let mut build_agent = agent("build", vec![]);
     build_agent.disable_mcp_tools = true;
 
@@ -2260,11 +2260,11 @@ fn agent_disable_mcp_tools_hides_default_mcp_tools() {
 
 #[test]
 fn skill_mcp_servers_can_opt_in_when_agent_disables_mcp_tools() {
-    let all_tools = vec![tool("mcp_feishu_docs_search"), tool("mcp_ocr_extract")];
+    let all_tools = vec![tool("mcp_example_docs_search"), tool("mcp_ocr_extract")];
     let mut build_agent = agent("build", vec![]);
     build_agent.disable_mcp_tools = true;
-    let mut s = skill("feishu-docs", "");
-    s.mcp_servers = vec!["feishu".to_string()];
+    let mut s = skill("example-docs", "");
+    s.mcp_servers = vec!["example".to_string()];
 
     let tools = select_mcp_tools(all_tools, &[&s], Some(&build_agent));
     let names = tools
@@ -2272,14 +2272,14 @@ fn skill_mcp_servers_can_opt_in_when_agent_disables_mcp_tools() {
         .map(|tool| tool.function.name)
         .collect::<Vec<_>>();
 
-    assert_eq!(names, vec!["mcp_feishu_docs_search".to_string()]);
+    assert_eq!(names, vec!["mcp_example_docs_search".to_string()]);
 }
 
 #[test]
 fn no_active_agent_or_skill_lazy_loads_mcp_tools() {
     // With neither a skill nor an agent whitelist, lazy-load by default too: return empty and leave loading to
     // the hidden MCP catalog + enable_tools on demand.
-    let all_tools = vec![tool("mcp_feishu_docs_search"), tool("mcp_other_lookup")];
+    let all_tools = vec![tool("mcp_example_docs_search"), tool("mcp_other_lookup")];
 
     let tools = select_mcp_tools(all_tools, &[], None);
 
@@ -2288,7 +2288,7 @@ fn no_active_agent_or_skill_lazy_loads_mcp_tools() {
 
 #[test]
 fn skill_disable_mcp_tools_overrides_agent_default_fallback() {
-    let all_tools = vec![tool("mcp_feishu_docs_search"), tool("mcp_other_lookup")];
+    let all_tools = vec![tool("mcp_example_docs_search"), tool("mcp_other_lookup")];
     let build_agent = agent("build", vec![]);
     let mut s = skill("focus", "");
     s.disable_mcp_tools = true;
@@ -2299,8 +2299,8 @@ fn skill_disable_mcp_tools_overrides_agent_default_fallback() {
 
 #[test]
 fn explicit_agent_whitelist_still_narrows_when_set() {
-    let all_tools = vec![tool("mcp_feishu_docs_search"), tool("mcp_ocr_extract")];
-    let agent = agent("build", vec!["feishu"]);
+    let all_tools = vec![tool("mcp_example_docs_search"), tool("mcp_ocr_extract")];
+    let agent = agent("build", vec!["example"]);
 
     let tools = select_mcp_tools(all_tools, &[], Some(&agent));
     let names = tools
@@ -2308,7 +2308,7 @@ fn explicit_agent_whitelist_still_narrows_when_set() {
         .map(|tool| tool.function.name)
         .collect::<Vec<_>>();
 
-    assert_eq!(names, vec!["mcp_feishu_docs_search".to_string()]);
+    assert_eq!(names, vec!["mcp_example_docs_search".to_string()]);
 }
 
 #[test]

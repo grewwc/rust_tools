@@ -91,6 +91,7 @@ pub(crate) fn inject_self_generated_audit_note(
 ) {
     let mode = if fast { "/audit -f (fast)" } else { "/audit" };
     let agent = if fast { "audit-fast" } else { "audit" };
+    let fast_flag = if fast { " --fast" } else { "" };
     let procedure = match crate::ai::skills::builtin_skill_body(AUDIT_PROCEDURE_SKILL) {
         Some(body) => format!(
             "Follow the `{AUDIT_PROCEDURE_SKILL}` skill quoted below verbatim:\n\
@@ -111,6 +112,10 @@ pub(crate) fn inject_self_generated_audit_note(
          decides that an audit runs now, and it starts agent=\"{agent}\" instead of letting the \
          skill pick the tier.\n\
          \n\
+         If you end this turn without having started the `{agent}` subagent through the task \
+         tool, the runtime forces a synchronous `/audit{fast_flag}` with this turn's output as \
+         the audit instruction, so the audit always runs in a subagent.\n\
+         \n\
          {procedure}"
     );
     messages.push(crate::ai::history::Message {
@@ -120,6 +125,31 @@ pub(crate) fn inject_self_generated_audit_note(
         tool_call_id: None,
         reasoning_content: None,
     });
+}
+
+/// Detects whether the lead agent already started an audit subagent during this turn via the
+/// model-facing `task` / `task_spawn` tools with agent `audit` / `audit-fast`. The
+/// self-generated `/audit` path falls back to a forced synchronous run when this returns
+/// false, so the "audit always runs in a subagent" contract holds even if the lead agent
+/// never spawns it itself. Turn messages are this turn's in-memory canonical history; the
+/// tool calls recorded there are exactly the calls the lead agent made.
+pub(crate) fn turn_spawned_audit_subagent(turn_messages: &[crate::ai::history::Message]) -> bool {
+    turn_messages.iter().any(|message| {
+        message.tool_calls.as_ref().is_some_and(|tool_calls| {
+            tool_calls.iter().any(|tool_call| {
+                let name = &tool_call.function.name;
+                (name == "task" || name == "task_spawn")
+                    && serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+                        .ok()
+                        .and_then(|args| {
+                            args.get("agent")
+                                .and_then(|agent| agent.as_str())
+                                .map(str::to_owned)
+                        })
+                        .is_some_and(|agent| agent == "audit" || agent == "audit-fast")
+            })
+        })
+    })
 }
 
 /// 同步 `/audit` 的完整 payload 会作为主 agent 的证据持久化；终端只显示子代理的
@@ -335,8 +365,10 @@ mod tests {
         AUDIT_PROCEDURE_SKILL, AUDIT_SUBAGENT_HARD_TIMEOUT, AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME,
         AuditCommand, FAST_AUDIT_SUBAGENT_HARD_TIMEOUT, FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME,
         compose_audit_prompt, format_mutation_log, inject_self_generated_audit_note,
-        parse_audit_command, terminal_audit_result,
+        parse_audit_command, terminal_audit_result, turn_spawned_audit_subagent,
     };
+    use crate::ai::history::Message;
+    use crate::ai::types::{FunctionCall, ToolCall};
     use crate::ai::tools::storage::changes::diff_snippet;
 
     #[test]
@@ -356,6 +388,45 @@ mod tests {
     fn fast_audit_shorter_timeouts_than_full_audit() {
         assert!(FAST_AUDIT_SUBAGENT_HARD_TIMEOUT < AUDIT_SUBAGENT_HARD_TIMEOUT);
         assert!(FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME < AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME);
+    }
+
+    #[test]
+    fn turn_spawned_audit_subagent_detects_task_calls() {
+        let call = |name: &str, args: &str| ToolCall {
+            id: "1".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: args.into(),
+            },
+        };
+        let msg = |calls: Vec<ToolCall>| Message {
+            role: "assistant".into(),
+            content: serde_json::Value::Null,
+            tool_calls: Some(calls),
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        // Both spawn tools with either audit agent are detected.
+        assert!(turn_spawned_audit_subagent(&[msg(vec![call(
+            "task",
+            r#"{"agent":"audit"}"#
+        )])]));
+        assert!(turn_spawned_audit_subagent(&[msg(vec![call(
+            "task_spawn",
+            r#"{"agent":"audit-fast"}"#
+        )])]));
+        // Other agents, other tools, malformed args, and empty history are not.
+        assert!(!turn_spawned_audit_subagent(&[msg(vec![call(
+            "task",
+            r#"{"agent":"build"}"#
+        )])]));
+        assert!(!turn_spawned_audit_subagent(&[msg(vec![call(
+            "read_file",
+            r#"{"agent":"audit"}"#
+        )])]));
+        assert!(!turn_spawned_audit_subagent(&[msg(vec![call("task", "not json")])]));
+        assert!(!turn_spawned_audit_subagent(&[]));
     }
 
     #[test]

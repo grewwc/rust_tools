@@ -1660,10 +1660,10 @@ mod tests {
             current_agent: "build".to_string(),
             current_agent_manifest: None,
             pending_files: None,
-            forced_skills: vec!["feishu-upload-md".to_string()],
+            forced_skills: vec!["example-upload-md".to_string()],
             forced_skill_source: None,
             pending_skill_continuation: None,
-            forced_question: Some("把 markdown 发到飞书".to_string()),
+            forced_question: Some("把 markdown 发到示例文档服务".to_string()),
             attached_image_files: vec!["/tmp/demo.png".to_string()],
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),
@@ -1672,8 +1672,8 @@ mod tests {
             prompt_editor: None,
             agent_context: Some(AgentContext::default()),
             last_skill_bias: Some(SkillBiasMemory {
-                skill_name: "feishu-upload-md".to_string(),
-                question: "把 markdown 发到飞书".to_string(),
+                skill_name: "example-upload-md".to_string(),
+                question: "把 markdown 发到示例文档服务".to_string(),
             }),
             os: crate::ai::driver::new_local_kernel(),
             agent_reload_counter: None,
@@ -1716,7 +1716,7 @@ mod tests {
         crate::ai::driver::runtime_ctx::TURN_IDENTITY
             .scope((source_session_id.clone(), 0), async {
                 crate::ai::tools::enable_tools::set_explicit_enabled_tool_names(vec![
-                    "mcp_feishu_doc_create_from_markdown".to_string(),
+                    "mcp_example_doc_create_from_markdown".to_string(),
                 ]);
             })
             .await;
@@ -2054,7 +2054,7 @@ mod tests {
         crate::ai::driver::runtime_ctx::TURN_IDENTITY
             .scope((source_session_id.clone(), 0), async {
                 crate::ai::tools::enable_tools::set_explicit_enabled_tool_names(vec![
-                    "mcp_feishu_doc_create_from_markdown".to_string(),
+                    "mcp_example_doc_create_from_markdown".to_string(),
                 ]);
             })
             .await;

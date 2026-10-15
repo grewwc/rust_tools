@@ -2661,7 +2661,7 @@ mod tests {
             ..AgentContext::default()
         });
         crate::ai::tools::enable_tools::set_explicit_enabled_tool_names(vec![
-            "mcp_feishu_doc_create_from_markdown".to_string(),
+            "mcp_example_doc_create_from_markdown".to_string(),
         ]);
 
         append_history_messages(

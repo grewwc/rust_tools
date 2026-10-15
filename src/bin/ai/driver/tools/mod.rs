@@ -28,7 +28,6 @@ use crate::ai::{
 use crate::commonw::prompt::prompt_yes_or_no_interruptible;
 
 mod barrier;
-pub(crate) mod oauth;
 mod sync_task;
 
 /// 供 driver 内部的显式命令复用同步 `task` 路径，保持子代理隔离、取消和证据持久化语义。
@@ -581,8 +580,6 @@ fn remediation_hint(
         return Some(format!("Suggestion: {}", specific_hint) + write_file_hint);
     }
 
-    // Note: mcp_feishu_docs_search has been removed; users must provide direct Feishu URLs.
-
     if err_lower.contains("failed to parse arguments") || err_lower.contains("invalid type") {
         return Some(
             "Suggestion: fix the tool arguments to match the declared JSON schema before retrying."
@@ -677,13 +674,18 @@ fn execute_prepared_tool_call(
             server_name,
             tool_name,
         } => {
-            // `mcp_client` 是 orchestrator 传入的 routing_snapshot（servers 为空，
-            // 仅用于路由/schema）。实际执行必须走共享的真实客户端，否则 call_tool
-            // 会在空的 servers map 里找不到连接而报 "Server not found"。
+            // `mcp_client` is the routing_snapshot passed in by the orchestrator
+            // (empty servers; used only for routing/schema). Real execution must
+            // go through the shared live client, otherwise call_tool reports
+            // "Server not found" in the empty servers map.
             let guard = shared_mcp_client
                 .lock()
                 .map_err(|_| "Shared MCP client poisoned".to_string())?;
-            oauth::execute_mcp_tool_call(&guard, tool_call, server_name, tool_name, &prepared.args)
+            let content = guard.call_tool(server_name, tool_name, prepared.args.clone())?;
+            Ok(ToolResult {
+                tool_call_id: tool_call.id.clone(),
+                content,
+            })
         }
     }
 }

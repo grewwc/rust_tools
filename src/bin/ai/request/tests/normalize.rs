@@ -131,7 +131,14 @@ fn normalize_messages_prioritizes_working_memory_before_summary_and_self_note() 
             .iter()
             .map(|message| message.role.as_str())
             .collect::<Vec<_>>(),
-        vec!["system", "user", "assistant"]
+        // The prefix derived block must not be the tail: upstream models
+        // without prefill support reject a request ending with an assistant
+        // message, so a closing user message is projected after it.
+        vec!["system", "user", "assistant", "user"]
+    );
+    assert_eq!(
+        normalized.last().unwrap().content,
+        Value::String(super::super::normalize::DERIVED_CONTEXT_RETURN.to_string())
     );
     assert!(
         normalized[1]

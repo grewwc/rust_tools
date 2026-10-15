@@ -123,9 +123,8 @@ fn ls_info(asn: &str, key: &str) -> Option<String> {
 
 /// Give focus back to the previously recorded app; no Apple Events authorization is
 /// needed (so no per-app automation permission dialog appears). Prefer bundle id
-/// (`open -b`; e.g. the app whose Chinese display name is "Feishu" is actually
-/// registered as "Lark", so looking it up by name would fail), falling back to the
-/// display name via `open -a`.
+/// (`open -b`; a display name lookup can fail when the registered name differs
+/// from the localized one), falling back to the display name via `open -a`.
 /// Chrome always activates itself when creating a tab; this function restores focus
 /// after creation. Failures are silently ignored (e.g. the app just quit; the next tab
 /// creation retries). Not called when the user is already in Chrome.

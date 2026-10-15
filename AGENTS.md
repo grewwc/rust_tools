@@ -23,8 +23,7 @@ macOS-first (`objc2` deps); core library cross-platform.
   macros, memo CLI, helpers, integration tests, and runtime model registry.
 
 The `mcp_*` crates are not dependencies of `a`; new OS-app servers should reuse
-`mcp_stdio` when possible. `src/bin/mcp_feishu/` and `src/bin/mcp_ocr.rs` are
-hand-rolled exceptions.
+`mcp_stdio` when possible. `src/bin/mcp_ocr.rs` is a hand-rolled exception.
 
 ## Build / Test
 

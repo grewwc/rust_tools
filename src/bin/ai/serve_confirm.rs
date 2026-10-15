@@ -2,8 +2,8 @@
 //!
 //! A serve turn child has no terminal: the user watches the turn from the web
 //! client (`serve/app.html`) on another device. When a tool needs explicit
-//! confirmation (today `git commit` / `git push` / `git stash` / `git checkout` / `git switch`) or a free-text answer
-//! (today the Feishu OAuth code), the child publishes a request frame on the
+//! confirmation (today `git commit` / `git push` / `git stash` / `git checkout` / `git switch`) or a free-text answer,
+//! the child publishes a request frame on the
 //! serve live FIFO, which the daemon relays to the client and answers by
 //! writing one line into the child's stdin. The child reads that line back
 //! here, so the gate behaves like a local prompt whose keyboard is the phone.

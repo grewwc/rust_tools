@@ -19,7 +19,7 @@ fn full_streaming_is_limited_to_explicit_pty_execute_command() {
     let interactive = test_tool_call(
         "call_interactive",
         "execute_command",
-        serde_json::json!({ "command": "lark-cli auth login", "pty": true }),
+        serde_json::json!({ "command": "example-cli auth login", "pty": true }),
     );
     assert!(execute_command_uses_pseudo_terminal(&interactive));
 
