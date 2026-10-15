@@ -1164,7 +1164,10 @@ fn searchable_history_content(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => s.clone(),
         other => {
-            serde_json::to_string(other).unwrap_or_else(|_| "<non-string content>".to_string())
+            let mut redacted = other.clone();
+            history::redact_inline_image_data(&mut redacted);
+            serde_json::to_string(&redacted)
+                .unwrap_or_else(|_| "<non-string content>".to_string())
         }
     }
 }
@@ -2101,6 +2104,19 @@ mod tests {
         let summarized = summarize_history_content(&content, 12, None);
         assert_eq!(summarized, "hello from t...");
         assert_eq!(truncate_for_terminal("short", 10), "short");
+    }
+
+    #[test]
+    fn searchable_history_content_redacts_inline_image_payloads() {
+        let payload = "U2VjcmV0IGltYWdlIHBheWxvYWQ=".repeat(100);
+        let content = serde_json::json!([
+            {"type": "text", "text": "look at this"},
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{payload}")}},
+        ]);
+        let text = searchable_history_content(&content);
+        assert!(!text.contains(&payload));
+        assert!(text.contains("data:image/png;base64,<image data redacted>"));
+        assert!(text.contains("look at this"));
     }
 
     #[test]

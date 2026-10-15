@@ -316,7 +316,7 @@ pub(in crate::ai) use task_evidence::{
 pub(in crate::ai) use types::{
     COLON, MAX_HISTORY_TURNS, Message, NEWLINE, SkillActivationEvent, ToolExecutionOutcome,
     clear_runtime_message_metadata, is_runtime_synthetic_user_message, last_real_user_index,
-    runtime_synthetic_user_message,
+    redact_inline_image_data, runtime_synthetic_user_message,
 };
 
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;

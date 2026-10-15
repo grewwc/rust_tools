@@ -104,6 +104,43 @@ pub(in crate::ai) struct Message {
     pub(in crate::ai) reasoning_content: Option<String>,
 }
 
+/// Replace the payload of inline `data:` image URLs inside a message content
+/// array with a short placeholder. Structured image blocks
+/// (`{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}` or
+/// the bare `{"kind":"image","url":...}` form) are recognized; plain text is
+/// left untouched, so an agent merely *discussing* a `data:` URI still shows
+/// it verbatim.
+///
+/// The block shape, media type, and every array index/role are preserved, so
+/// consumers that map positions (rewind anchors, role filters, history
+/// ordinals) are unaffected. Used where the payload itself has no display
+/// value: the serve history route (before the base64 would cross the wire)
+/// and the local `/history` preview/export text.
+pub(in crate::ai) fn redact_inline_image_data(content: &mut Value) {
+    let Value::Array(blocks) = content else {
+        return;
+    };
+    for block in blocks {
+        let Value::Object(obj) = block else {
+            continue;
+        };
+        let url = match obj.get_mut("image_url") {
+            Some(Value::Object(inner)) => inner.get_mut("url"),
+            _ => obj.get_mut("url"),
+        };
+        let Some(Value::String(url)) = url else {
+            continue;
+        };
+        let Some(rest) = url.strip_prefix("data:") else {
+            continue;
+        };
+        let Some((media, _payload)) = rest.split_once(',') else {
+            continue;
+        };
+        *url = format!("data:{media},<image data redacted>");
+    }
+}
+
 pub(crate) fn is_internal_note_role(role: &str) -> bool {
     role == ROLE_INTERNAL_NOTE
 }

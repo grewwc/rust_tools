@@ -1165,6 +1165,60 @@ use super::*;
     }
 
     #[tokio::test]
+    async fn history_redacts_inline_image_payloads() {
+        use axum::{
+            extract::{Path, Query, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        use crate::ai::history::{Message, append_history_messages};
+        let state = lifecycle_test_state();
+        let store = super::SessionStore::new(state.history_file.as_path());
+        store.ensure_root_dir().expect("root dir");
+        let path = store.session_history_file("s1");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("session dir");
+        }
+        let secret_payload = "SGVhcnQgb2YgZ29sZA==".repeat(200);
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {"type": "text", "text": "look at this"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{secret_payload}")}},
+                {"kind": "image", "url": format!("data:image/jpeg;base64,{secret_payload}")},
+            ]),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        append_history_messages(&path, &messages).expect("seed messages");
+
+        let resp = super::read_history(
+            State(state),
+            HeaderMap::new(),
+            Path("s1".to_string()),
+            Query(super::HistoryQuery { limit: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8");
+        // Text survives verbatim; the base64 payload never leaves the server.
+        assert!(body.contains("look at this"));
+        assert!(!body.contains(&secret_payload));
+        assert!(body.contains("data:image/png;base64,<image data redacted>"));
+        assert!(body.contains("data:image/jpeg;base64,<image data redacted>"));
+        // The block shape and message count stay intact so rewind indices hold.
+        let v: Vec<serde_json::Value> = serde_json::from_str(&body).expect("json");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["role"], "user");
+        assert_eq!(v[0]["content"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[tokio::test]
     async fn server_info_reports_runtime_labels() {
         use axum::{
             extract::State,

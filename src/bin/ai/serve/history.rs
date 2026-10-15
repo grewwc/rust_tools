@@ -119,6 +119,14 @@ pub(crate) async fn read_history(
                 .into_response();
         }
     };
+    // History is transferred over HTTP and the client renders text fields
+    // only, so inline `data:` image payloads would ship megabytes of base64
+    // for nothing. Redact the payload in place (keeping the block shape, the
+    // media type, and every message index/role, so rewind anchors and role
+    // filters stay valid) before the response is serialized.
+    for message in &mut messages {
+        redact_inline_image_data(&mut message.content);
+    }
     // Total before the tail cut: the mobile client maps a tapped user bubble
     // back to its canonical index as `total - shown.length + bubble_index`
     // for `POST /rewind`. A header keeps the body shape (a bare message
@@ -137,3 +145,4 @@ pub(crate) async fn read_history(
     );
     resp
 }
+

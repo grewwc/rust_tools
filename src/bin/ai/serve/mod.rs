@@ -37,7 +37,7 @@ use super::{
     history::{
         SessionServeConfig, SessionStore, SessionTitleOrigin,
         invalidate_context_history_cache_for, is_runtime_synthetic_user_message,
-        truncate_history_messages, write_stale_patch_targets_sqlite,
+        redact_inline_image_data, truncate_history_messages, write_stale_patch_targets_sqlite,
     },
     model_names, models,
 };
