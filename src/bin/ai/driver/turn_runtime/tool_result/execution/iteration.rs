@@ -326,9 +326,11 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     *terminal_dedupe_candidate = None;
                     return Ok(TurnLoopStep::Continue);
                 }
-                OutstandingWorkGateAction::Warn => Some(OUTSTANDING_WORK_WARNING),
+                OutstandingWorkGateAction::Warn(steps) => Some(format!(
+                    "{OUTSTANDING_WORK_WARNING} Unsettled steps: {steps}."
+                )),
                 OutstandingWorkGateAction::WarnUnasserted => {
-                    Some(OUTSTANDING_WORK_UNASSERTED_WARNING)
+                    Some(OUTSTANDING_WORK_UNASSERTED_WARNING.to_string())
                 }
             };
             let warn_unretried_pause = match recoverable_pause_gate_action(
@@ -407,11 +409,11 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             if let Some(outstanding_work_warning) = warn_outstanding_work {
                 append_runtime_warning_once(
                     &mut stream_result.assistant_text,
-                    outstanding_work_warning,
+                    outstanding_work_warning.as_str(),
                 );
                 append_user_visible_final_notice(
                     terminal_dedupe_candidate,
-                    outstanding_work_warning,
+                    outstanding_work_warning.as_str(),
                 );
             }
             if warn_unretried_pause {

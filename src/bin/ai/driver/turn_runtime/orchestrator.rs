@@ -21,13 +21,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::ai::{history, mcp::SharedMcpClient, types::App};
 
 use super::{
-    CompressionReport, MID_TURN_COMPRESS_COOLDOWN_ITERATIONS, MID_TURN_COMPRESS_DELTA_THRESHOLD,
-    MID_TURN_COMPRESS_SOFT_FLOOR,
+    CompressionReport,
     finalize::finalize_turn,
     iteration::{
         execute_turn_iteration, finish_interrupted_turn, refresh_skill_turn_for_iteration,
     },
-    mid_turn_compress_soft_threshold,
     persistence::persist_pending_turn_messages,
     prepare::prepare_turn,
     tool_result::{
@@ -160,23 +158,6 @@ const DEGENERATE_REPETITION_MAX_ATTEMPTS: usize = 2;
 /// long visible text, so downgrading yields nothing (the model is not reasoning) and only a shrink
 /// prompt should be injected.
 const REASONING_BUDGET_DOMINANCE_RATIO: f64 = 0.5;
-
-/// === Long-loop-aware mid-turn compression ===
-/// The mid-turn compression soft threshold is derived from the model's token window (flagship
-/// 256K → ~300K chars). For a long-loop turn with "moderate history size but many tool iterations",
-/// the history peak can stay below that threshold the whole time, so compression never fires and
-/// every round re-sends the full history-so-far plus every tool schema. Total bytes sent then grow
-/// O(n²) with iteration count and blow through the TPM limit within minutes (real case: a provider
-/// refactor session with 56 iterations in one turn, history peak ~120K < 300K threshold, sent
-/// ~2.8M tokens in-turn, exceeding the 380K TPM limit ~7x).
-///
-/// Mitigation: once a single turn's tool iteration count reaches this threshold we treat the turn as
-/// a long loop and lower the effective mid-turn soft threshold to [`MID_TURN_COMPRESS_SOFT_FLOOR`]
-/// (36K), so content-level dedup (folding byte-identical re-reads) and pruning of stale results kick
-/// in early to curb the O(n²) accumulation. Short turns (below the threshold) keep the
-/// window-derived ratio threshold, leaving normal single-turn large tasks their full exploration
-/// space.
-const LONG_LOOP_COMPRESS_ITERATION_THRESHOLD: usize = 12;
 
 /// === Progress Budget (information-gain progress budget) ===
 /// This is a third layer on top of the exact/coarse loop detectors, governing divergent loops whose
@@ -483,38 +464,6 @@ impl TurnSupervisor {
 
     fn effective_max_iterations(&self, max_iterations: usize) -> usize {
         max_iterations.saturating_add(self.scoped_preflight_grace_rounds)
-    }
-
-    fn should_try_mid_turn_compress(&self, total_chars: usize, soft_threshold: usize) -> bool {
-        let cooldown_passed = self.iteration.saturating_sub(self.last_compress_iteration)
-            >= MID_TURN_COMPRESS_COOLDOWN_ITERATIONS;
-        let delta_significant = total_chars.saturating_sub(self.last_compress_after_chars)
-            >= MID_TURN_COMPRESS_DELTA_THRESHOLD;
-        total_chars > soft_threshold
-            && cooldown_passed
-            && (self.last_compress_after_chars == 0 || delta_significant)
-    }
-
-    /// The mid-turn compression soft threshold actually in effect this round.
-    ///
-    /// For long loops (tool iterations >= [`LONG_LOOP_COMPRESS_ITERATION_THRESHOLD`]) the threshold drops
-    /// to [`MID_TURN_COMPRESS_SOFT_FLOOR`] so content-level dedup and pruning of stale results engage
-    /// early, curbing the O(n²) re-send accumulation; short turns keep the window-derived baseline
-    /// threshold, leaving normal single-turn large tasks unaffected. This gating and the actual
-    /// [`mid_turn_compress`](crate::ai::history::mid_turn_compress) call must share this method's return
-    /// value — the latter has a no-op early exit for `before <= soft_threshold`, and if the two
-    /// thresholds disagree, the gate can open while compression does nothing.
-    fn effective_mid_turn_soft_threshold(&self, base_soft: usize) -> usize {
-        if self.iteration >= LONG_LOOP_COMPRESS_ITERATION_THRESHOLD {
-            base_soft.min(MID_TURN_COMPRESS_SOFT_FLOOR)
-        } else {
-            base_soft
-        }
-    }
-
-    fn mark_compress(&mut self, after_chars: usize) {
-        self.last_compress_iteration = self.iteration;
-        self.last_compress_after_chars = after_chars;
     }
 
     /// After substantive task progress, drop the samples of the earlier ineffective loop and restore the
@@ -976,6 +925,13 @@ pub(in crate::ai::driver) async fn run_turn(
     // next user message without restarting the long-lived agent process.
     crate::commonw::configw::refresh();
     crate::ai::theme::refresh();
+    // The derived history budget follows the model selected for this turn
+    // (`/model`, agent routing, or per-input routing may have changed it), and
+    // an edited `ai.history.max_chars` applies without a restart.
+    app.config.history_max_chars = crate::ai::config::history_max_chars_for_model(
+        &crate::commonw::configw::get_all_config(),
+        &next_model,
+    );
 
     // Step 3: turn-start hook (preserving the original pairing semantics; must fire before the
     // /audit shortcut). Allocate the real turn identity first (atomic increment in the session
@@ -1424,7 +1380,7 @@ async fn run_turn_body(
         // directly — so every drained note is plain guidance.
         drain_side_notes_and_inject(&app.session_history_file, &mut messages, &mut turn_messages);
         let active_skill_name = skill_turn.primary_skill_name().map(str::to_string);
-        let compression_report = std::mem::take(&mut supervisor.pending_compression_report);
+        let compression_report = CompressionReport::default();
         let mut response_model = None;
         let execution = match execute_turn_iteration(
             app,
@@ -1721,20 +1677,27 @@ async fn run_turn_body(
                     retry.consecutive_truncations = 0;
                     retry.consecutive_stream_errors += 1;
                     if retry.consecutive_stream_errors > MAX_STREAM_ERROR_RETRIES {
-                        let _ = writeln!(
-                            std::io::stderr(),
-                            "  ✗ {} consecutive response-stream read interruptions; giving up retry",
-                            retry.consecutive_stream_errors
+                        // stderr is not forwarded in serve mode (only tailed for
+                        // error detail), so print through the note line: the daemon
+                        // forwards child stdout as progress events to the frontend.
+                        crate::ai::driver::print::print_tool_note_line(
+                            "stream",
+                            &format!(
+                                "{} consecutive response-stream read interruptions; giving up retry",
+                                retry.consecutive_stream_errors
+                            ),
                         );
                         output.assistant_text =
                             "[Response stream interrupted repeatedly; the server may be unstable. Please retry later or switch models]"
                                 .to_string();
                         break 'turn Ok(None);
                     }
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "  ⚠ Response-stream read interrupted (consecutive #{}); auto-retrying, stopping after {MAX_STREAM_ERROR_RETRIES} consecutive failures…",
-                        retry.consecutive_stream_errors
+                    crate::ai::driver::print::print_tool_note_line(
+                        "stream",
+                        &format!(
+                            "response-stream read interrupted (consecutive #{}); auto-retrying, stopping after {MAX_STREAM_ERROR_RETRIES} consecutive failures…",
+                            retry.consecutive_stream_errors
+                        ),
                     );
                 } else {
                     // Real truncation: the model hit the output cap or produced half-cut tool JSON.
@@ -2062,45 +2025,11 @@ async fn run_turn_body(
             Vec::new()
         };
 
-        // Mechanical mid-turn work retains its cooldown and growth gate, but
-        // character count alone cannot authorize compaction. LLM summarization
-        // runs only at the request boundary after the final notes/tools are known.
-        let history_max_chars = app.config.history_max_chars;
-        let mid_turn_soft_base = mid_turn_compress_soft_threshold(&next_model, history_max_chars);
-        // For long loops, lower the soft threshold to SOFT_FLOOR to curb the O(n²) re-send
-        // accumulation (see [`LONG_LOOP_COMPRESS_ITERATION_THRESHOLD`]). The gate and the actual
-        // mid_turn_compress call below share the same `mid_turn_soft`, avoiding "the gate opens
-        // but compression no-ops".
-        let mid_turn_soft = supervisor.effective_mid_turn_soft_threshold(mid_turn_soft_base);
-        let total_chars = crate::ai::history::messages_total_chars_pub(&messages);
-        if supervisor.should_try_mid_turn_compress(total_chars, mid_turn_soft) {
-            super::context_budget::refresh_active_plan(app, &mut messages);
-            let budget = crate::ai::request::preview_request_budget(
-                app, &next_model, &messages, true, !force_final_response,
-            ).await;
-            if budget.exceeds_soft_target() {
-                let attempt = super::context_metrics::CompactionAttempt::start(
-                    "mid_turn_soft_target", budget, &messages,
-                );
-                let (after_budget, report) =
-                    super::context_budget::apply_measured_context_budget_until_soft_target(
-                        app,
-                        &next_model,
-                        budget,
-                        &mut messages,
-                        !force_final_response,
-                    )
-                    .await;
-                attempt.finish(&app.session_id, supervisor.iteration, &next_model, after_budget,
-                    &messages, report.projection_committed());
-                supervisor.mark_compress(report.after_chars);
-                let mut compression_report = CompressionReport::default();
-                if report.after_chars < report.before_chars {
-                    compression_report.record("mid-turn", report.before_chars, report.after_chars);
-                }
-                supervisor.pending_compression_report = compression_report;
-            }
-        }
+        // Context budgeting is owned by the request boundary
+        // (`iteration::request_model_response`): it measures the request after
+        // runtime notes, side notes and tool visibility are final, and compacts
+        // only under token pressure. A pass here would measure an incomplete
+        // request and run the same compaction twice per tool round.
 
         // === Tool-loop detection ===
         // If the execute layer has already decided to move to a final response, keep only the

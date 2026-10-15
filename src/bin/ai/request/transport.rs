@@ -20,8 +20,8 @@ use crate::ai::types::ToolDefinition;
 
 use super::aux::charge_llm_usage_to_kernel;
 use super::builder::{
-    build_request_body, clamp_with_estimated_prompt,
-    estimate_request_prompt_tokens_from_definitions, resolve_wire_enable_search,
+    build_request_body, clamp_with_estimated_prompt, estimate_request_prompt_from_definitions,
+    resolve_wire_enable_search,
 };
 use super::current_budget::CurrentRequestBudget;
 use super::error::{
@@ -38,7 +38,7 @@ use super::normalize::{
 };
 use super::prompt_feedback::PromptTokenFeedback;
 use super::reasoning::{
-    apply_prompt_cache_breakpoint, apply_thinking_force_off_effort, model_effort_graded,
+    apply_thinking_force_off_effort, model_effort_graded,
     model_thinking_off_capability, normalize_reasoning_content_replay_for_model,
     prompt_cache_enabled_for_model, reconstruct_encrypted_reasoning_items_for_model,
     resolve_reasoning_effort, resolve_reasoning_wire_controls,
@@ -510,7 +510,11 @@ pub(crate) async fn preview_request_budget(
         models::search_enabled(model).then_some(true),
     );
     let tool_choice = tools_defs.map(|_| Value::String("auto".to_string()));
-    let estimated = estimate_request_prompt_tokens_from_definitions(&core.messages, tools_defs);
+    let (estimated, message_counts) = estimate_request_prompt_from_definitions(
+        &core.messages,
+        tools_defs,
+        Some(&core.reasoning_items),
+    );
     let feedback = PromptTokenFeedback::capture_preview(
         &app.session_id,
         model,
@@ -525,7 +529,7 @@ pub(crate) async fn preview_request_budget(
         models::reasoning_encrypted_replay_enabled(model),
         stream,
         estimated,
-        core.reasoning_items.is_empty(),
+        message_counts,
     );
     CurrentRequestBudget::measure(
         model,
@@ -584,9 +588,6 @@ async fn prepare_projection_core(
         .then(|| request_tool_names_for_model(app, model))
         .unwrap_or_default();
     strip_unavailable_tool_hints_from_messages(&mut normalized_messages, &request_tool_names);
-    if prompt_cache_enabled_for_model(model) {
-        apply_prompt_cache_breakpoint(&mut normalized_messages);
-    }
     let thinking_start = Instant::now();
     let enable_thinking = resolve_thinking(app, model, &normalized_messages).await;
     crate::ai::agent_hang_debug!(
@@ -698,6 +699,13 @@ impl RequestProjection {
         // auxiliary builders construct their own bodies without the side
         // channel (nothing failed in their tool-less flows).
         body.tool_errors = Some(&self.tool_errors);
+        // Session-scoped cache routing rides on the main request boundary only,
+        // like `tool_errors`: auxiliary calls (summaries, titles) have their own
+        // prefixes and must not share or evict this session's cache shard.
+        body.prompt_cache_key = models::prompt_cache_key_enabled(model)
+            .then(|| app.session_id.clone())
+            .filter(|key| !key.is_empty());
+        body.explicit_cache_breakpoints = prompt_cache_enabled_for_model(model);
         let feedback = PromptTokenFeedback::capture(&app.session_id, model, &self.endpoint, &body);
         let budget = CurrentRequestBudget::measure(model, app.cli.max_tokens_override, &feedback, previous);
         // Auxiliary builders lack request-scoped usage. Only this shared main
@@ -740,6 +748,7 @@ async fn do_request_messages_with_tool_mode(
     );
     let (mut request_body, mut prompt_feedback, budget) =
         projection.measure(app, model, stream, previous_prompt.as_ref());
+    prompt_feedback.record_prefix_reuse(previous_prompt.as_ref());
     let context_prompt_tokens = budget.prompt_tokens;
     let retry_policy = request_retry_policy_for_current_context();
 
@@ -886,9 +895,13 @@ mod budget_tests {
         for tools_enabled in [true, false] {
             let mut projection = prepare_request_projection(&app, &model, &messages, tools_enabled)
                 .now_or_never().expect("preparation must not invoke an auxiliary LLM");
-            let message_tokens = super::super::builder::estimate_request_prompt_tokens(&projection.messages, None);
+            let message_tokens = super::super::builder::estimate_request_prompt_tokens(
+                &projection.messages,
+                None,
+                Some(&projection.reasoning_items),
+            );
             let tool_tokens = projection.tools.as_ref().map_or(0, |tools| {
-                serde_json::to_string(tools).unwrap().chars().count().div_ceil(2)
+                super::super::builder::estimate_request_prompt_tokens(&[], Some(tools), None)
             });
             assert_eq!(tool_tokens > 0, tools_enabled);
             let (body, _, measured) = projection.measure(&app, &model, true, None);

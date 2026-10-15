@@ -18,8 +18,8 @@ use serde_json::Value;
 use crate::ai::history::{SessionInfo, SessionStore, read_all_messages_sqlite_read_only};
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
 
-const MAX_OUTPUT_CHARS: usize = 24_000;
-const MAX_MESSAGE_CHARS: usize = 600;
+const MAX_OUTPUT_CHARS: usize = 32_000;
+const MAX_MESSAGE_CHARS: usize = 2_000;
 const MAX_ASSET_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ASSET_FILES: usize = 200;
 const MAX_ASSET_DEPTH: usize = 3;
@@ -85,12 +85,15 @@ fn content_to_text(content: &Value) -> String {
     }
 }
 
-/// Render one message as a single line. Assistant messages whose body is empty
-/// but carry tool calls show the calls instead of an empty line.
+/// Render one message as one or two lines: the `[role] body` line (tool calls
+/// replace an empty body) plus, when present, a `reasoning:` line with the
+/// message's persisted `reasoning_content`. Both lines are capped by
+/// `MAX_MESSAGE_CHARS`.
 fn render_message(
     role: &str,
     content: &Value,
     tool_calls: Option<&Vec<crate::ai::types::ToolCall>>,
+    reasoning: Option<&str>,
 ) -> String {
     let mut body = content_to_text(content);
     if body.trim().is_empty() {
@@ -110,7 +113,29 @@ fn render_message(
             body = "(empty)".to_string();
         }
     }
-    format!("[{role}] {}", truncate(&body, MAX_MESSAGE_CHARS))
+    let mut line = format!("[{role}] {}", truncate(&body, MAX_MESSAGE_CHARS));
+    if let Some(r) = reasoning {
+        if !r.trim().is_empty() {
+            line.push_str(&format!("\n  reasoning: {}", truncate(r, MAX_MESSAGE_CHARS)));
+        }
+    }
+    line
+}
+
+/// Resolve the `[start, end)` message window for `session_read`: with an
+/// explicit `from` (canonical message index, 0-based, oldest first) the window
+/// starts there and pages forward by `limit`; without it the most recent
+/// `limit` messages are shown, preserving the pre-paging behavior. An
+/// out-of-range `from` is an error so a stale index cannot silently render an
+/// empty page.
+fn message_window(len: usize, from: Option<usize>, limit: usize) -> Result<(usize, usize), String> {
+    match from {
+        Some(from) if from >= len => Err(format!(
+            "'from' index {from} is out of range (session has {len} messages)"
+        )),
+        Some(from) => Ok((from, from.saturating_add(limit).min(len))),
+        None => Ok((len.saturating_sub(limit), len)),
+    }
 }
 
 /// Truncate at a char boundary, keeping the removed length visible.
@@ -290,8 +315,9 @@ fn execute_session_list(args: &Value) -> Result<String, String> {
 }
 
 /// `session_read`: view one session's context. `mode=digest` (default) shows a
-/// header (title / prompt / size / checkpoints) plus the most recent messages;
-/// `mode=raw` renders messages only.
+/// header (title / prompt / size / checkpoints) plus messages; `mode=raw`
+/// renders messages only. Without `from`, the most recent `limit` messages are
+/// shown; `from` pages forward from a canonical message index.
 fn execute_session_read(args: &Value) -> Result<String, String> {
     let session_id = args["session_id"]
         .as_str()
@@ -302,10 +328,12 @@ fn execute_session_read(args: &Value) -> Result<String, String> {
     }
     let default_limit = if mode == "digest" { 20 } else { 60 };
     let limit = args["limit"].as_u64().unwrap_or(default_limit).min(200) as usize;
+    let from = args["from"].as_u64().map(|i| i as usize);
 
     let store = current_store()?;
     let file = resolve_session_file(&store, session_id)?;
     let messages = read_all_messages_sqlite_read_only(&file).map_err(|e| e.to_string())?;
+    let (start, end) = message_window(messages.len(), from, limit)?;
 
     let mut out = String::new();
     if mode == "digest" {
@@ -370,18 +398,18 @@ fn execute_session_read(args: &Value) -> Result<String, String> {
         out.push('\n');
     }
 
-    let start = messages.len().saturating_sub(limit);
-    for message in &messages[start..] {
+    for message in &messages[start..end] {
         out.push_str(&render_message(
             &message.role,
             &message.content,
             message.tool_calls.as_ref(),
+            message.reasoning_content.as_deref(),
         ));
         out.push('\n');
     }
     out.push_str(&format!(
         "-- {} of {} messages shown",
-        messages.len() - start,
+        end - start,
         messages.len()
     ));
     Ok(truncate_output(&out))
@@ -389,7 +417,7 @@ fn execute_session_read(args: &Value) -> Result<String, String> {
 
 /// `session_search`: substring search over one session's canonical messages
 /// (newest first) and its text assets; each result shows a snippet around the
-/// match.
+/// match. Matches in a message's `reasoning_content` are labeled `reasoning`.
 fn execute_session_search(args: &Value) -> Result<String, String> {
     let session_id = args["session_id"]
         .as_str()
@@ -412,11 +440,22 @@ fn execute_session_search(args: &Value) -> Result<String, String> {
             break;
         }
         let text = content_to_text(&message.content);
-        if text.to_lowercase().contains(&needle) {
-            out.push_str(&format!(
-                "canonical #{index} [{}]: {}\n",
-                message.role,
+        let reasoning = message.reasoning_content.as_deref();
+        let body_hit = text.to_lowercase().contains(&needle);
+        let reasoning_hit =
+            !body_hit && reasoning.is_some_and(|r| r.to_lowercase().contains(&needle));
+        if body_hit || reasoning_hit {
+            let snippet = if body_hit {
                 snippet_around(&text, &needle)
+            } else {
+                snippet_around(reasoning.unwrap_or(""), &needle)
+            };
+            let tag = if reasoning_hit { " reasoning" } else { "" };
+            out.push_str(&format!(
+                "canonical #{index} [{}{}]: {}\n",
+                message.role,
+                tag,
+                snippet
             ));
             count += 1;
         }
@@ -485,7 +524,7 @@ mod tests {
     #[test]
     fn render_message_shows_tool_calls_when_body_empty() {
         let content = Value::String(String::new());
-        let rendered = render_message("assistant", &content, None);
+        let rendered = render_message("assistant", &content, None, None);
         assert!(rendered.contains("(empty)"));
         let calls = vec![crate::ai::types::ToolCall {
             id: "1".to_string(),
@@ -495,8 +534,43 @@ mod tests {
                 arguments: "{\"file\":\"a.rs\"}".to_string(),
             },
         }];
-        let rendered = render_message("assistant", &content, Some(&calls));
+        let rendered = render_message("assistant", &content, Some(&calls), None);
         assert!(rendered.contains("tool_call: read_file("));
+    }
+
+    #[test]
+    fn render_message_appends_reasoning_line_when_present() {
+        let content = Value::String("visible body".to_string());
+        let rendered = render_message("assistant", &content, None, None);
+        assert!(!rendered.contains("reasoning:"), "no reasoning -> no line");
+        let rendered = render_message(
+            "assistant",
+            &content,
+            None,
+            Some("the model's hidden chain of thought"),
+        );
+        assert!(rendered.contains("visible body"));
+        assert!(rendered.contains("\n  reasoning: the model's hidden chain of thought"));
+        // Whitespace-only reasoning must not produce an empty line.
+        let rendered = render_message("assistant", &content, None, Some("  \n "));
+        assert!(!rendered.contains("reasoning:"));
+    }
+
+    #[test]
+    fn message_window_pages_from_index_and_defaults_to_recent() {
+        // No `from`: the most recent `limit` messages, never a negative start.
+        assert_eq!(message_window(10, None, 3).unwrap(), (7, 10));
+        assert_eq!(message_window(2, None, 5).unwrap(), (0, 2));
+        // Explicit `from`: pages forward by `limit`, clamped to the session end.
+        assert_eq!(message_window(10, Some(3), 4).unwrap(), (3, 7));
+        assert_eq!(message_window(10, Some(8), 4).unwrap(), (8, 10));
+        // `from` must be strictly below the message count: an empty session
+        // has no index 0 to page from.
+        let err = message_window(0, Some(0), 4).unwrap_err();
+        assert!(err.contains("out of range"), "{err}");
+        // Out-of-range `from` is an error, not a silent empty page.
+        let err = message_window(10, Some(10), 4).unwrap_err();
+        assert!(err.contains("out of range") && err.contains("10 messages"), "{err}");
     }
 
     #[test]

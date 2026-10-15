@@ -145,6 +145,7 @@ impl AgentReloadIdentity<'_> {
         }
         hasher.update(b"\0");
         hasher.update([manifest.disable_mcp_tools as u8]);
+        hasher.update([manifest.audit_checkpoints as u8]);
         hasher.update(b"\0");
         hasher.update([manifest.disabled as u8, manifest.hidden as u8]);
         hasher.update(b"\0");
@@ -269,6 +270,7 @@ mod tests {
             tool_groups: vec!["core".to_string(), "executor".to_string()],
             mcp_servers: vec!["browser".to_string(), "excel".to_string()],
             disable_mcp_tools: true,
+            audit_checkpoints: false,
             model_tier: Some(AgentModelTier::Standard),
             disabled: false,
             hidden: true,
@@ -283,8 +285,8 @@ mod tests {
         assert_eq!(
             agent_manifests_fingerprint(&[manifest_fixture()]),
             [
-                229, 91, 162, 141, 224, 214, 110, 28, 217, 146, 134, 197, 242, 124, 28, 157, 33,
-                18, 147, 95, 238, 92, 199, 40, 62, 106, 195, 178, 79, 86, 33, 146,
+                94, 85, 159, 185, 74, 221, 79, 209, 157, 105, 1, 153, 21, 19, 109, 142, 61, 25,
+                142, 223, 236, 234, 163, 31, 222, 33, 22, 1, 14, 203, 51, 29,
             ]
         );
     }
@@ -329,6 +331,7 @@ mod tests {
                 m.mcp_servers.push("calendar".to_string())
             }),
             ("disable_mcp_tools", |m| m.disable_mcp_tools = false),
+            ("audit_checkpoints", |m| m.audit_checkpoints = true),
             ("disabled", |m| m.disabled = true),
             ("hidden", |m| m.hidden = false),
             ("color", |m| m.color = Some("#abcdef".to_string())),

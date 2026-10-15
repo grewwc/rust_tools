@@ -244,6 +244,7 @@ fn primary_agent(name: &str, description: &str) -> AgentManifest {
         tool_groups: Vec::new(),
         mcp_servers: Vec::new(),
         disable_mcp_tools: false,
+        audit_checkpoints: false,
         model_tier: Some(AgentModelTier::Heavy),
         disabled: false,
         hidden: false,

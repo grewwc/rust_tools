@@ -102,10 +102,12 @@ fn overflow_preview_probes_the_omitted_middle_without_format_assumptions() {
     let preview = build_overflow_content_preview(&doc);
 
     assert!(preview.contains("- middle_samples ("), "{preview}");
-    // The first and last omitted lines are always probed (0-based labels, the
-    // same convention `extract_key_lines` uses for prefix-less content).
-    assert!(preview.contains("  L4: "), "{preview}");
-    assert!(preview.contains("  L39: "), "{preview}");
+    // The first and last omitted lines are always probed. Content without read_file
+    // line numbers is labeled by 0-based index (`#<idx>`), never as `L<idx>`, which
+    // reads like a line address the preview cannot resolve.
+    assert!(preview.contains("  #4: "), "{preview}");
+    assert!(preview.contains("  #39: "), "{preview}");
+    assert!(!preview.contains("  L"), "{preview}");
     // Deterministic: identical content yields a byte-identical preview.
     assert_eq!(preview, build_overflow_content_preview(&doc));
 
@@ -311,6 +313,89 @@ fn preserved_stub_preview_includes_line_numbered_key_lines() {
     assert!(preview.contains("L3: pub fn main()"), "preview: {preview}");
     assert!(preview.contains("L6: fn helper()"), "preview: {preview}");
     assert!(preview.contains("L8: struct Foo;"), "preview: {preview}");
+}
+
+#[test]
+fn preserved_stub_preview_tags_diff_context_as_unchanged() {
+    // A preview index that drops the marker column renders a pre-existing context
+    // line exactly like part of the change: the context marker is a single space and
+    // survives no trim, while only `+`/`-` lines were ever matched as key lines.
+    // Joined explicitly: a `\`-continued string literal strips the next line's
+    // indentation, so the fixture would hold markerless lines instead of the real
+    // leading-space context form.
+    let diff = [
+        "diff --git a/src/x.rs b/src/x.rs",
+        "index 1111111..2222222 100644",
+        "--- a/src/x.rs",
+        "+++ b/src/x.rs",
+        "@@ -63,6 +64,10 @@ pub(crate) struct Body {",
+        "     /// Pre-existing doc comment.",
+        "     #[serde(skip)]",
+        "     pub(crate) estimated: usize,",
+        "+    /// Added field doc comment.",
+        "+    pub(crate) added: usize,",
+        "-    /// Removed field doc comment.",
+        "}",
+    ]
+    .join("\n");
+    let preview = build_overflow_content_preview(&diff);
+    assert!(
+        preview.contains("#5: [ctx] /// Pre-existing doc comment."),
+        "preview: {preview}"
+    );
+    assert!(
+        preview.contains("#8: [+] /// Added field doc comment."),
+        "added lines must still be indexed: {preview}"
+    );
+    assert!(
+        preview.contains("#10: [-] /// Removed field doc comment."),
+        "preview: {preview}"
+    );
+    // File and hunk headers name files; they must not read as added/removed lines.
+    assert!(!preview.contains("[+] +++ b/src/x.rs"), "preview: {preview}");
+    assert!(!preview.contains("[+] @@"), "preview: {preview}");
+
+    // Combined diffs (`git diff --cc`, merge `git show`) open a hunk with `@@@`.
+    let combined = [
+        "diff --cc src/x.rs",
+        "@@@ -1,3 -1,3 +1,3 @@@",
+        "   /// Pre-existing doc comment.",
+        "+  /// Added doc comment.",
+    ]
+    .join("\n");
+    let combined_preview = build_overflow_content_preview(&combined);
+    assert!(
+        combined_preview.contains("[ctx] /// Pre-existing doc comment."),
+        "combined diffs still tag their context lines: {combined_preview}"
+    );
+    assert!(
+        combined_preview.contains("[+] /// Added doc comment."),
+        "combined diffs still tag their added lines: {combined_preview}"
+    );
+
+    // The first and last omitted lines are always probed, so a blank one must still be
+    // sampled; dropping it would break the advertised count and the gap guarantee.
+    let with_blank_edges = [
+        "head one",
+        "head two",
+        "head three",
+        "head four",
+        "",
+        "middle line",
+        "",
+        "tail one",
+        "tail two",
+    ]
+    .join("\n");
+    let blank_preview = build_overflow_content_preview(&with_blank_edges);
+    assert!(
+        blank_preview.contains("(3 probes across the omitted middle"),
+        "preview: {blank_preview}"
+    );
+    assert!(
+        blank_preview.contains("  #4: ") && blank_preview.contains("  #6: "),
+        "blank omitted lines are still probed: {blank_preview}"
+    );
 }
 
 #[test]

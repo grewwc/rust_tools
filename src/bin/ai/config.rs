@@ -47,16 +47,7 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "~/.history_file.sqlite".to_string());
     let vl_default_model =
         models::determine_vl_model(&cfg.get_opt(AiConfig::MODEL_VL_DEFAULT).unwrap_or_default());
-    // Live-history budget in chars (~50K tokens at ~4 chars/token). The former
-    // 90_000 default folded tool results into archive pointers after only a few
-    // read-heavy rounds, which forced the model to re-read files whose results it
-    // had just received; 200_000 keeps roughly 10x more tool output resident while
-    // still leaving headroom on 256K+-token windows after system prompt and
-    // reserved output.
-    let history_max_chars = cfg
-        .get_opt(AiConfig::HISTORY_MAX_CHARS)
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(200_000);
+    let history_max_chars = history_max_chars_for_model(&cfg, &default_model);
     let history_keep_last = cfg
         .get_opt(AiConfig::HISTORY_KEEP_LAST)
         .and_then(|v| v.parse::<usize>().ok())
@@ -78,6 +69,35 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         history_summary_max_chars,
         intent_model,
     })
+}
+
+/// Floor for the derived history budget: the former fixed default. Every
+/// cross-turn compaction rewrites the cached prompt prefix, so a budget below
+/// it would compact more often than before and lose prompt-cache hits; it also
+/// keeps a tiny or misdeclared window from collapsing the budget to 0, which
+/// would mean "compression disabled".
+const MIN_DERIVED_HISTORY_MAX_CHARS: usize = 200_000;
+
+/// Cross-turn live-history budget in chars for `model`.
+///
+/// An explicit `ai.history.max_chars` always wins (0 keeps compression
+/// disabled). Otherwise the budget is two thirds of the model's static soft
+/// target, leaving the remaining third for the system prompt, tool schemas and
+/// the current turn's growth before request-boundary compression starts, and
+/// never below [`MIN_DERIVED_HISTORY_MAX_CHARS`]. Large windows thus keep far
+/// more history resident (fewer prefix rewrites) while small windows keep the
+/// former compaction cadence. The static default chars-per-token ratio is
+/// deliberate: the value is part of the projection fingerprint, so a
+/// per-request measured ratio would invalidate persisted snapshots every turn.
+pub(super) fn history_max_chars_for_model(cfg: &configw::ConfigW, model: &str) -> usize {
+    cfg.get_opt(AiConfig::HISTORY_MAX_CHARS)
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            crate::ai::request::soft_target_chars_for_model(model)
+                .saturating_mul(2)
+                .saturating_div(3)
+                .max(MIN_DERIVED_HISTORY_MAX_CHARS)
+        })
 }
 
 #[allow(dead_code)]

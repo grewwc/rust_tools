@@ -1,6 +1,6 @@
 {
   "name": "session_read",
-  "description": "Read another session's context (read-only). Default digest mode shows a header (title, first prompt, message count, checkpoints) plus the most recent messages; raw mode renders messages only. Sessions are identified by their id from session_list.",
+  "description": "Read another session's context (read-only). Default digest mode shows a header (title, first prompt, message count, checkpoints) plus messages; raw mode renders messages only, including any reasoning_content as a 'reasoning:' line. Sessions are identified by their id from session_list. Pass `from` (canonical message index, 0-based) to page forward from an older message; without it the most recent `limit` messages are shown.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -18,7 +18,11 @@
       },
       "limit": {
         "type": "integer",
-        "description": "Number of most recent messages to show (default 20 for digest, 60 for raw; max 200)."
+        "description": "Number of messages to show: the most recent ones when `from` is omitted, or the page size forward from `from` when it is given (default 20 for digest, 60 for raw; max 200)."
+      },
+      "from": {
+        "type": "integer",
+        "description": "Canonical message index (0-based, oldest first) to start reading from, paging forward by `limit`. Omit to show the most recent messages. Errors when out of range."
       }
     },
     "required": [

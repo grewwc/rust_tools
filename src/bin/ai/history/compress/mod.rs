@@ -280,16 +280,20 @@ fn protected_tool_context_message(
 /// via [`IMAGE_BUDGET_CHARS`], keeping base64 text length from polluting the
 /// budget (see that constant's doc).
 fn value_len_chars(v: &Value) -> usize {
+    value_billable_counts(v).chars()
+}
+
+fn value_billable_counts(v: &Value) -> BillableCounts {
     if let Some(s) = v.as_str() {
         if is_inline_image_data_url(s) {
-            return IMAGE_BUDGET_CHARS;
+            return BillableCounts::IMAGE;
         }
-        return s.chars().count();
+        return BillableCounts::text(s);
     }
     if let Some(arr) = v.as_array() {
-        return arr.iter().map(content_part_budget_chars).sum();
+        return arr.iter().map(content_part_budget_counts).sum();
     }
-    v.to_string().chars().count()
+    BillableCounts::text(&v.to_string())
 }
 
 /// "Billed char count" of a single message entering a model request — the single
@@ -307,59 +311,54 @@ fn value_len_chars(v: &Value) -> usize {
 /// "in-memory budget" and "persisted budget" share one measure. Images are still
 /// billed nominally via [`IMAGE_BUDGET_CHARS`] (see `value_len_chars`).
 pub(in crate::ai) fn message_billable_chars(m: &Message) -> usize {
-    let content_chars = value_len_chars(&m.content);
-    let tool_call_chars = m
-        .tool_calls
-        .as_ref()
-        .map(|calls| tool_calls_billable_chars(calls))
-        .unwrap_or(0);
-    let reasoning_chars = m
-        .reasoning_content
-        .as_deref()
-        .map(|s| s.chars().count())
-        .unwrap_or(0);
-    content_chars + tool_call_chars + reasoning_chars
+    message_billable_counts(m).chars()
 }
 
-/// Character count of the compact JSON encoding of `tool_calls`, without
-/// materializing the encoded string. The result is identical to
+/// Script mix of exactly the fields `message_billable_chars` bills; the prompt
+/// token estimate projects the same counts via [`BillableCounts::tokens`].
+pub(in crate::ai) fn message_billable_counts(m: &Message) -> BillableCounts {
+    let content = value_billable_counts(&m.content);
+    let tool_calls = m
+        .tool_calls
+        .as_deref()
+        .map(tool_calls_billable_counts)
+        .unwrap_or_default();
+    let reasoning = m
+        .reasoning_content
+        .as_deref()
+        .map(BillableCounts::text)
+        .unwrap_or_default();
+    content + tool_calls + reasoning
+}
+
+/// Counts of the compact JSON encoding of `tool_calls`, without materializing
+/// the encoded string. `chars()` is identical to
 /// `serde_json::to_string(calls).chars().count()` by construction: struct
 /// field order follows the `ToolCall`/`FunctionCall` declarations (`id`,
 /// `type`, `function.name`, `function.arguments`), and string bodies use the
-/// same escaping as serde_json's compact formatter (see `json_string_char_len`).
-/// Avoids a potentially large transient allocation per message on every request
-/// projection rebuild (`apply_patch` arguments can be a whole patch).
-fn tool_calls_billable_chars(calls: &[crate::ai::types::ToolCall]) -> usize {
+/// same escaping as serde_json's compact formatter (see
+/// [`BillableCounts::json_string`]). Avoids a potentially large transient
+/// allocation per message on every request projection rebuild (`apply_patch`
+/// arguments can be a whole patch).
+fn tool_calls_billable_counts(calls: &[crate::ai::types::ToolCall]) -> BillableCounts {
     if calls.is_empty() {
-        return 2; // `[]`
+        return BillableCounts::ascii(2); // `[]`
     }
-    let mut len = 2 + calls.len() - 1; // brackets + inter-item commas
+    let mut punctuation = 2 + calls.len() - 1; // brackets + inter-item commas
+    let mut counts = BillableCounts::default();
     for call in calls {
         // `{"id":X,"type":Y,"function":{"name":Z,"arguments":W}}`
-        len += "{\"id\":".len();
-        len += json_string_char_len(&call.id);
-        len += ",\"type\":".len();
-        len += json_string_char_len(&call.tool_type);
-        len += ",\"function\":{\"name\":".len();
-        len += json_string_char_len(&call.function.name);
-        len += ",\"arguments\":".len();
-        len += json_string_char_len(&call.function.arguments);
-        len += "}}".len();
+        punctuation += "{\"id\":".len()
+            + ",\"type\":".len()
+            + ",\"function\":{\"name\":".len()
+            + ",\"arguments\":".len()
+            + "}}".len();
+        counts += BillableCounts::json_string(&call.id);
+        counts += BillableCounts::json_string(&call.tool_type);
+        counts += BillableCounts::json_string(&call.function.name);
+        counts += BillableCounts::json_string(&call.function.arguments);
     }
-    len
-}
-
-/// Character count of serde_json's compact string encoding of `text`
-/// (2 quotes + per-char escaping), mirroring `request::builder`'s counter.
-fn json_string_char_len(text: &str) -> usize {
-    2 + text
-        .chars()
-        .map(|ch| match ch {
-            '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
-            ch if (ch as u32) < 0x20 => 6,
-            _ => 1,
-        })
-        .sum::<usize>()
+    counts + BillableCounts::ascii(punctuation)
 }
 
 pub(in crate::ai) fn value_to_string(v: &Value) -> String {
@@ -523,7 +522,7 @@ mod tail_window_tests;
 mod tool_overflow_tests;
 #[cfg(test)]
 mod tool_calls_billable_tests {
-    use super::tool_calls_billable_chars;
+    use super::{BillableCounts, tool_calls_billable_counts};
     use crate::ai::types::{FunctionCall, ToolCall};
 
     fn call(id: &str, tool_type: &str, name: &str, arguments: &str) -> ToolCall {
@@ -538,11 +537,12 @@ mod tool_calls_billable_tests {
     }
 
     fn assert_parity(calls: &[ToolCall]) {
-        let expected = serde_json::to_string(calls)
-            .expect("tool calls must serialize")
-            .chars()
-            .count();
-        assert_eq!(tool_calls_billable_chars(calls), expected);
+        let encoded = serde_json::to_string(calls).expect("tool calls must serialize");
+        let counts = tool_calls_billable_counts(calls);
+        assert_eq!(counts.chars(), encoded.chars().count());
+        // Escape sequences are ASCII, so the script mix of the encoded text
+        // matches exactly and both projections agree with serde.
+        assert_eq!(counts, BillableCounts::text(&encoded));
     }
 
     #[test]
@@ -553,6 +553,18 @@ mod tool_calls_billable_tests {
             call("a\"b\\c", "function", "apply_patch", "{\"p\":1}"),
             call("2", "function", "run", "line\nbreak\u{1}中文🙂"),
         ]);
+    }
+
+    #[test]
+    fn token_weights_split_ascii_and_non_ascii_scalars() {
+        assert_eq!(
+            BillableCounts::text("ab中🙂").chars(),
+            "ab中🙂".chars().count()
+        );
+        assert_eq!(BillableCounts::text("abc").tokens(), 1);
+        assert_eq!(BillableCounts::text("中文🙂").tokens(), 3);
+        assert_eq!(BillableCounts::IMAGE.tokens(), 512);
+        assert_eq!(BillableCounts::IMAGE.chars(), 1_024);
     }
 }
 #[cfg(test)]

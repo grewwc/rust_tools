@@ -37,6 +37,49 @@ fn with_fake_home<T>(fake_home: &Path, f: impl FnOnce() -> T) -> T {
 }
 
 #[test]
+fn builtin_audit_agents_request_progress_checkpoints() {
+    for (name, source) in BUILTIN_AGENTS.iter().filter(|(name, _)| name.starts_with("audit")) {
+        let manifest = parse_agent_front_matter(source).expect("audit agent manifest parses");
+        assert!(
+            manifest.audit_checkpoints,
+            "{name} must request AUDIT_CHECKPOINT progress records"
+        );
+    }
+    // Anything that is not an audit agent keeps the default, so the task path does not
+    // append the audit protocol to its prompt.
+    let (name, source) = *BUILTIN_AGENTS
+        .iter()
+        .find(|(name, _)| *name == "build.agent")
+        .expect("the build agent is registered");
+    assert!(
+        !parse_agent_front_matter(source)
+            .expect("build agent manifest parses")
+            .audit_checkpoints,
+        "{name} must not request audit progress records"
+    );
+}
+
+#[test]
+fn manifest_json_without_the_progress_flag_keeps_loading() {
+    // The manifest is `Deserialize`, and every other field defaults on absence, so this flag
+    // must follow: a manifest written before it existed still has to load.
+    let (_, source) = BUILTIN_AGENTS
+        .iter()
+        .find(|(name, _)| *name == "audit.agent")
+        .expect("the audit agent is registered");
+    let parsed = parse_agent_front_matter(source).expect("audit agent manifest parses");
+    let mut json = serde_json::to_value(&parsed).expect("manifest serializes");
+    json.as_object_mut()
+        .expect("manifest JSON is an object")
+        .remove("audit_checkpoints");
+
+    let manifest: super::AgentManifest =
+        serde_json::from_value(json).expect("a manifest without the flag still deserializes");
+
+    assert!(!manifest.audit_checkpoints);
+}
+
+#[test]
 fn parses_model_tier_from_front_matter() {
     let content = r#"---
 name: test-agent

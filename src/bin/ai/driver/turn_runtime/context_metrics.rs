@@ -47,7 +47,7 @@ fn advance_cycle(cycle: &mut u64, replaced: bool) -> u64 {
     *cycle
 }
 
-fn projection_fingerprint(messages: &[Message]) -> u64 {
+pub(super) fn projection_fingerprint(messages: &[Message]) -> u64 {
     // Stream the serialized projection straight into the hasher instead of
     // materializing the full JSON (a 300K-char projection is ~1MB+): this runs
     // twice per compaction attempt (start + finish), so the Vec allocation would
@@ -221,6 +221,10 @@ pub(super) struct ContextRequestMetrics {
     pub(super) after_budget: Option<CurrentRequestBudget>,
     #[serde(default)]
     pub(super) compaction_cycle: u64,
+    /// Verbatim message prefix shared with the previous sent request; the first
+    /// divergent index attributes provider prompt-cache misses.
+    #[serde(default)]
+    pub(super) prefix_reuse: Option<crate::ai::request::PrefixReuse>,
     pub(super) provider_overflows: usize,
     pub(super) overflow_retries: usize,
     /// HTTP response received, not semantic task success or completed streaming.
@@ -403,6 +407,7 @@ mod tests {
             before_budget: None,
             after_budget: None,
             compaction_cycle: 0,
+            prefix_reuse: None,
             overflow_retries: 1,
             response_received: false,
             elapsed_ms: 50,
@@ -432,6 +437,7 @@ mod tests {
             before_budget: None,
             after_budget: None,
             compaction_cycle: 0,
+            prefix_reuse: None,
         };
         store.log(context_decision("session", 1, "model", &metrics));
         let mut decision = context_decision("session", 1, "model", &metrics);
@@ -489,6 +495,7 @@ mod tests {
             before_budget: None,
             after_budget: None,
             compaction_cycle: 0,
+            prefix_reuse: None,
         };
         for turn in 0..10 {
             let mut decision = context_decision("session", turn, "model", &metrics);

@@ -16,7 +16,7 @@ pub(crate) const FAST_AUDIT_SUBAGENT_HARD_TIMEOUT: Duration = Duration::from_sec
 pub(crate) const FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME: Duration = Duration::from_secs(3 * 60);
 
 const SUBAGENT_FINAL_ANSWER_MARKER: &str = "[Subagent final answer]\n";
-const AUDIT_PROGRESS_PROTOCOL: &str = include_str!("prompts/audit_progress_protocol.md");
+pub(crate) const AUDIT_PROGRESS_PROTOCOL: &str = include_str!("prompts/audit_progress_protocol.md");
 /// Builtin skill whose procedure the self-generated `/audit` note quotes.
 const AUDIT_PROCEDURE_SKILL: &str = "audit_own_changes";
 

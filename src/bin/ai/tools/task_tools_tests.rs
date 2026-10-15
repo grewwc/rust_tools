@@ -91,6 +91,7 @@ fn manifest(name: &str, description: &str, mode: AgentMode) -> AgentManifest {
         tool_groups: Vec::new(),
         mcp_servers: Vec::new(),
         disable_mcp_tools: false,
+        audit_checkpoints: false,
         model_tier: Some(AgentModelTier::Standard),
         disabled: false,
         hidden: false,

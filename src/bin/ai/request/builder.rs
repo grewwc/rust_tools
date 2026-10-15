@@ -17,7 +17,10 @@ use super::RequestBody;
 use super::reasoning::resolve_reasoning_wire_controls;
 use crate::ai::{
     files,
-    history::Message,
+    history::{
+        Message,
+        compress::{self, BillableCounts},
+    },
     models,
     provider::{adapter_for, compatible_wire_shapes},
     request_protocol::RequestProtocolDialect,
@@ -249,113 +252,157 @@ pub(super) fn resolve_attachment_asset(
     Ok(asset)
 }
 
-/// Conservative character-to-token conversion for mixed Chinese, English, and code: about 2 chars/token.
-/// Intentionally overestimates prompt usage, preferring to clamp the output cap early rather
-/// than let the prompt and output together exceed the context window.
-const CHARS_PER_TOKEN_CONSERVATIVE: usize = 2;
 /// Minimum output tokens retained after clamping: leaves room for visible output even when
 /// the prompt nears the window, avoiding immediate truncation from tiny or zero max_tokens.
 pub(super) const MIN_OUTPUT_TOKENS_FLOOR: u32 = 1_024;
 /// Safety margin for hidden provider overhead (template tokens, role separators, reasoning reserves, etc.).
 pub(super) const CONTEXT_WINDOW_SAFETY_MARGIN_TOKENS: usize = 2_048;
 
-/// Conservatively estimates prompt tokens in messages, tending to overestimate. Without
-/// server usage feedback, approximates from the character count at about 2 chars/token.
-fn estimate_prompt_tokens(messages: &[Message]) -> usize {
-    let chars: usize = messages
+/// Prompt-token estimate of messages over the same fields the char budget
+/// bills, weighted by script rather than a flat chars-per-token ratio (see
+/// [`BillableCounts::tokens`]). Counts are summed before rounding so many
+/// short messages do not accumulate per-message ceil error.
+pub(super) fn message_prompt_counts(messages: &[Message]) -> BillableCounts {
+    messages
         .iter()
-        .map(super::super::history::message_billable_chars)
-        .sum();
-    chars.div_ceil(CHARS_PER_TOKEN_CONSERVATIVE)
+        .map(compress::message_billable_counts)
+        .sum::<BillableCounts>()
 }
 
-/// Character count of the compact JSON text `serde_json::to_string` produces
-/// for `value`, computed without materializing that text. Every branch mirrors
+fn estimate_prompt_tokens(messages: &[Message]) -> usize {
+    message_prompt_counts(messages).tokens()
+}
+
+/// Encrypted reasoning replay spliced in front of Responses function calls.
+/// Only items keyed by a projected message's first tool call reach the wire
+/// (see `protocol::responses_input`); entries for compressed-away rounds are
+/// not billed. `encrypted_content` is base64 of an opaque payload: following
+/// codex (`context_manager/history.rs`), decoded bytes ~= 3/4 of the encoded
+/// length, minus a fixed envelope, at ~4 bytes per token. Every other field
+/// (summary text, ids, type) is charged as ordinary compact JSON.
+fn estimate_reasoning_items_tokens(
+    messages: &[Message],
+    items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
+) -> usize {
+    const ENCRYPTED_ENVELOPE_BYTES: usize = 650;
+    let Some(items) = items.filter(|items| !items.is_empty()) else {
+        return 0;
+    };
+    let mut counts = BillableCounts::default();
+    let mut encrypted_tokens = 0usize;
+    let replayed = messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref()?.first())
+        .filter_map(|call| items.get(&call.id))
+        .flatten();
+    for item in replayed {
+        let Value::Object(map) = item else {
+            counts += compact_json_counts(item);
+            continue;
+        };
+        counts += BillableCounts::ascii(2 + map.len().saturating_sub(1));
+        for (key, value) in map {
+            counts += BillableCounts::json_string(key) + BillableCounts::ascii(1);
+            match (key.as_str(), value) {
+                ("encrypted_content", Value::String(encoded)) => {
+                    let decoded = encoded.len().saturating_mul(3) / 4;
+                    encrypted_tokens = encrypted_tokens.saturating_add(
+                        decoded.saturating_sub(ENCRYPTED_ENVELOPE_BYTES).div_ceil(4),
+                    );
+                }
+                _ => counts += compact_json_counts(value),
+            }
+        }
+    }
+    encrypted_tokens.saturating_add(counts.tokens())
+}
+
+/// Script mix of the compact JSON text `serde_json::to_string` produces for
+/// `value`, computed without materializing that text. Every branch mirrors
 /// serde_json's compact formatter exactly:
-/// - strings: 2 quotes + per-char contributions (`\"`, `\\`, `\b`, `\t`, `\n`,
-///   `\f`, `\r` are two chars each, other control chars become `\u00xx`
-///   (6 chars), everything else is emitted verbatim = 1 char per scalar);
+/// - strings: see [`BillableCounts::json_string`];
 /// - containers: delimiters plus single-char commas/colons;
 /// - numbers: delegated to `serde_json::to_string` itself (tiny transient
 ///   allocation per numeric leaf only), so integer/float formatting — the one
 ///   formatter whose output is non-trivial to replicate — is identical by
 ///   construction regardless of serde_json feature flags.
-/// The token-estimation caller only consumes this count, so replacing the old
-/// full-schema `to_string` keeps the estimated number provably identical
-/// (guarded by the parity tests at the bottom of this file) while avoiding a
-/// potentially multi-megabyte string allocation per request.
-fn compact_json_char_len(value: &Value) -> usize {
+/// `chars()` of the result is pinned against serde by the parity tests at the
+/// bottom of this file, which therefore also pin what `tokens()` bills, while
+/// avoiding a potentially multi-megabyte string allocation per request.
+fn compact_json_counts(value: &Value) -> BillableCounts {
     match value {
-        Value::Null => 4,
-        Value::Bool(true) => 4,
-        Value::Bool(false) => 5,
+        Value::Null | Value::Bool(true) => BillableCounts::ascii(4),
+        Value::Bool(false) => BillableCounts::ascii(5),
         Value::Number(_) => serde_json::to_string(value)
-            .map(|encoded| encoded.chars().count())
-            .unwrap_or(0),
-        Value::String(text) => json_string_char_len(text),
+            .map(|encoded| BillableCounts::ascii(encoded.len()))
+            .unwrap_or_default(),
+        Value::String(text) => BillableCounts::json_string(text),
         Value::Array(items) => {
-            2 + items.iter().map(compact_json_char_len).sum::<usize>()
-                + items.len().saturating_sub(1)
+            items.iter().map(compact_json_counts).sum::<BillableCounts>()
+                + BillableCounts::ascii(2 + items.len().saturating_sub(1))
         }
         Value::Object(map) => {
-            2 + map
-                .iter()
-                .map(|(key, item)| json_string_char_len(key) + 1 + compact_json_char_len(item))
-                .sum::<usize>()
-                + map.len().saturating_sub(1)
+            map.iter()
+                .map(|(key, item)| {
+                    BillableCounts::json_string(key)
+                        + BillableCounts::ascii(1)
+                        + compact_json_counts(item)
+                })
+                .sum::<BillableCounts>()
+                + BillableCounts::ascii(2 + map.len().saturating_sub(1))
         }
     }
 }
 
+#[cfg(test)]
+fn compact_json_char_len(value: &Value) -> usize {
+    compact_json_counts(value).chars()
+}
+
+#[cfg(test)]
 fn json_string_char_len(text: &str) -> usize {
-    2 + text
-        .chars()
-        .map(|ch| match ch {
-            '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
-            ch if (ch as u32) < 0x20 => 6,
-            _ => 1,
-        })
-        .sum::<usize>()
+    BillableCounts::json_string(text).chars()
 }
 
 /// Estimates prompt tokens for tool schemas. Definitions (name/description/JSON Schema) are
 /// sent and counted on every request and can be large with many tools/MCP. Uses the same
-/// conservative conversion on serialized characters. `None` / empty tool sets contribute 0.
+/// weights on the serialized characters. `None` / empty tool sets contribute 0.
 fn estimate_tools_tokens(tools: Option<&Value>) -> usize {
-    let Some(tools) = tools else {
-        return 0;
-    };
-    compact_json_char_len(tools).div_ceil(CHARS_PER_TOKEN_CONSERVATIVE)
+    tools.map_or(0, |tools| compact_json_counts(tools).tokens())
 }
 
-/// Compact-JSON character length of `serde_json::to_value(defs)` computed
-/// directly from the definitions, without building the intermediate `Value`.
-/// Mirrors serde's struct layout field-for-field (`preserve_order` keeps
-/// declaration order): each tool is
-/// `{"type":..,"function":{"name":..,"description":..,"parameters":..}}`.
-/// The token-estimation caller only consumes this count; the parity test below
-/// pins it against the real serialization so the preview path can skip the
-/// per-request deep clone of the whole tool schema.
+/// Compact-JSON counts of `serde_json::to_value(defs)` computed directly from
+/// the definitions, without building the intermediate `Value`. Mirrors serde's
+/// struct layout field-for-field (`preserve_order` keeps declaration order):
+/// each tool is `{"type":..,"function":{"name":..,"description":..,"parameters":..}}`.
+/// The parity test below pins it against the real serialization so the preview
+/// path can skip the per-request deep clone of the whole tool schema.
+#[cfg(test)]
 pub(super) fn tools_definitions_compact_json_char_len(defs: &[ToolDefinition]) -> usize {
-    2 + defs
-        .iter()
+    tools_definitions_compact_json_counts(defs).chars()
+}
+
+fn tools_definitions_compact_json_counts(defs: &[ToolDefinition]) -> BillableCounts {
+    let key = |name: &str| BillableCounts::json_string(name) + BillableCounts::ascii(1);
+    defs.iter()
         .map(|def| {
-            let function = 2
-                + (json_string_char_len("name") + 1 + json_string_char_len(&def.function.name))
-                + 1
-                + (json_string_char_len("description")
-                    + 1
-                    + json_string_char_len(&def.function.description))
-                + 1
-                + (json_string_char_len("parameters")
-                    + 1
-                    + compact_json_char_len(&def.function.parameters));
-            2 + (json_string_char_len("type") + 1 + json_string_char_len(&def.tool_type))
-                + 1
-                + (json_string_char_len("function") + 1 + function)
+            // `{"name":..,"description":..,"parameters":..}`: braces + 2 commas.
+            let function = BillableCounts::ascii(4)
+                + key("name")
+                + BillableCounts::json_string(&def.function.name)
+                + key("description")
+                + BillableCounts::json_string(&def.function.description)
+                + key("parameters")
+                + compact_json_counts(&def.function.parameters);
+            // `{"type":..,"function":..}`: braces + 1 comma.
+            BillableCounts::ascii(3)
+                + key("type")
+                + BillableCounts::json_string(&def.tool_type)
+                + key("function")
+                + function
         })
-        .sum::<usize>()
-        + defs.len().saturating_sub(1)
+        .sum::<BillableCounts>()
+        + BillableCounts::ascii(2 + defs.len().saturating_sub(1))
 }
 
 /// Token estimate for tool schemas without serializing them: `Some` carries
@@ -363,27 +410,58 @@ pub(super) fn tools_definitions_compact_json_char_len(defs: &[ToolDefinition]) -
 /// `agent_tools_for_request` which yields `None` for empty tool sets), `None`
 /// contributes 0 — mirroring `estimate_tools_tokens`' `None`-vs-`Some` split.
 pub(super) fn estimate_tools_tokens_from_definitions(defs: Option<&[ToolDefinition]>) -> usize {
-    let Some(defs) = defs else {
-        return 0;
-    };
-    tools_definitions_compact_json_char_len(defs).div_ceil(CHARS_PER_TOKEN_CONSERVATIVE)
+    defs.map_or(0, |defs| tools_definitions_compact_json_counts(defs).tokens())
 }
 
-/// Preview-path prompt estimate: messages plus tool schemas, neither
-/// materialized as JSON. Matches `estimate_request_prompt_tokens` on the
+/// Preview-path prompt estimate: messages, tool schemas, and reasoning replay,
+/// none materialized as JSON. Matches `estimate_request_prompt_tokens` on the
 /// equivalent wire body (parity-tested) while skipping the schema deep clone.
+#[cfg(test)]
 pub(super) fn estimate_request_prompt_tokens_from_definitions(
     messages: &[Message],
     defs: Option<&[ToolDefinition]>,
+    reasoning_items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
 ) -> usize {
-    estimate_prompt_tokens(messages) + estimate_tools_tokens_from_definitions(defs)
+    estimate_request_prompt_from_definitions(messages, defs, reasoning_items).0
 }
 
-/// Estimates input tokens for this request: messages + tool schemas.
+/// [`estimate_request_prompt_tokens_from_definitions`] plus the message
+/// counts it walked, so the preview budget derives its chars-per-token ratio
+/// without a second history scan.
+pub(super) fn estimate_request_prompt_from_definitions(
+    messages: &[Message],
+    defs: Option<&[ToolDefinition]>,
+    reasoning_items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
+) -> (usize, BillableCounts) {
+    let counts = message_prompt_counts(messages);
+    let tokens = counts.tokens()
+        + estimate_tools_tokens_from_definitions(defs)
+        + estimate_reasoning_items_tokens(messages, reasoning_items);
+    (tokens, counts)
+}
+
+/// Estimates input tokens for this request: messages + tool schemas + any
+/// reasoning replay the wire body splices in.
 /// The request transport's TPM preflight gate and max_tokens clamp share this path so
 /// context-window and rate budgets do not diverge because of different estimates.
-pub(super) fn estimate_request_prompt_tokens(messages: &[Message], tools: Option<&Value>) -> usize {
-    estimate_prompt_tokens(messages) + estimate_tools_tokens(tools)
+pub(super) fn estimate_request_prompt_tokens(
+    messages: &[Message],
+    tools: Option<&Value>,
+    reasoning_items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
+) -> usize {
+    estimate_request_prompt(messages, tools, reasoning_items).0
+}
+
+fn estimate_request_prompt(
+    messages: &[Message],
+    tools: Option<&Value>,
+    reasoning_items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
+) -> (usize, BillableCounts) {
+    let counts = message_prompt_counts(messages);
+    let tokens = counts.tokens()
+        + estimate_tools_tokens(tools)
+        + estimate_reasoning_items_tokens(messages, reasoning_items);
+    (tokens, counts)
 }
 
 /// Clamp the output cap to the estimated remaining context window. Any supplied
@@ -400,7 +478,7 @@ pub(crate) fn clamp_max_tokens_for_prompt(
         model,
         current_prompt_tokens
             .map(|tokens| usize::try_from(tokens).unwrap_or(usize::MAX))
-            .unwrap_or_else(|| estimate_request_prompt_tokens(messages, tools)),
+            .unwrap_or_else(|| estimate_request_prompt_tokens(messages, tools, None)),
         model_max,
     )
 }
@@ -468,8 +546,11 @@ pub(super) fn build_request_body<'a>(
     // still omit this field, preserving their wire behavior.
     // Compute the raw estimate once. Transport may calibrate it against a
     // compatible request snapshot, but keeps this uncalibrated baseline for
-    // the next response's growth calculation.
-    let est_prompt = estimate_request_prompt_tokens(messages, tools.as_ref());
+    // the next response's growth calculation. Reasoning replay is included
+    // whenever the side channel carries it; a cross-dialect fallback that
+    // drops it on the wire only overestimates.
+    let (est_prompt, message_counts) =
+        estimate_request_prompt(messages, tools.as_ref(), reasoning_items);
     let max_tokens = models::max_output_tokens(model).map(|model_max| {
         let current = current_prompt_tokens
             .map(|tokens| usize::try_from(tokens).unwrap_or(usize::MAX))
@@ -499,6 +580,9 @@ pub(super) fn build_request_body<'a>(
         tool_errors: None,
         reasoning_encrypted_replay: models::reasoning_encrypted_replay_enabled(model),
         estimated_prompt_tokens: est_prompt,
+        message_counts,
+        prompt_cache_key: None,
+        explicit_cache_breakpoints: false,
     }
 }
 
@@ -695,5 +779,50 @@ mod compact_json_char_len_tests {
             ),
         ]);
         assert_eq!(estimate_tools_tokens_from_definitions(None), 0);
+    }
+
+    #[test]
+    fn token_estimate_weights_scripts_and_bills_only_projected_reasoning_replay() {
+        use super::{estimate_request_prompt_tokens, estimate_tools_tokens};
+        use crate::ai::history::Message;
+        use crate::ai::types::{FunctionCall, ToolCall};
+
+        // ASCII JSON at 3 chars/token, CJK at 1 token per scalar (+2 quotes).
+        assert_eq!(estimate_tools_tokens(Some(&json!("abcd"))), 2);
+        assert_eq!(estimate_tools_tokens(Some(&json!("中文"))), 3);
+
+        let call = |id: &str| ToolCall {
+            id: id.to_owned(),
+            tool_type: "function".to_owned(),
+            function: FunctionCall {
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        };
+        let messages = vec![Message {
+            role: "assistant".to_owned(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![call("live"), call("second")]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let base = estimate_request_prompt_tokens(&messages, None, None);
+        let encrypted = "A".repeat(4_000);
+        let item = json!({"type": "reasoning", "encrypted_content": encrypted});
+        let mut items = rustc_hash::FxHashMap::default();
+        // Keyed by a non-first call or by a compressed-away round: not on the wire.
+        items.insert("second".to_owned(), vec![item.clone()]);
+        items.insert("gone".to_owned(), vec![item.clone()]);
+        assert_eq!(
+            estimate_request_prompt_tokens(&messages, None, Some(&items)),
+            base
+        );
+        items.insert("live".to_owned(), vec![item]);
+        // 4000 base64 chars -> 3000 bytes - 650 envelope -> 588 tokens, plus
+        // `{"type":"reasoning","encrypted_content":}` as ASCII JSON (14 tokens).
+        assert_eq!(
+            estimate_request_prompt_tokens(&messages, None, Some(&items)),
+            base + 588 + 14
+        );
     }
 }

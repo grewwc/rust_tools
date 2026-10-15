@@ -4,9 +4,26 @@ use std::hash::{Hash, Hasher};
 
 use super::RequestBody;
 use crate::ai::history::Message;
+use crate::ai::history::compress::BillableCounts;
 use crate::ai::models;
 use crate::ai::types::ToolDefinition;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+/// Request-to-request prompt continuity, used to attribute provider prompt
+/// cache misses to the projection change that caused them. Carries message
+/// counts only; no bodies or fingerprints leave the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PrefixReuse {
+    pub(crate) previous_messages: usize,
+    pub(crate) current_messages: usize,
+    /// Leading messages identical to the previous request; the provider cache
+    /// can reuse at most this prefix (plus tools/system when settings match).
+    pub(crate) common_prefix_messages: usize,
+    /// Model, tools, or reasoning settings changed, which restarts the cache
+    /// regardless of how many messages match.
+    pub(crate) settings_changed: bool,
+}
 
 /// A pending request becomes usable feedback only after its own response reports
 /// nonzero prompt usage. Fingerprints avoid retaining another copy of history.
@@ -21,11 +38,20 @@ pub(crate) struct PromptTokenFeedback {
     settings: Option<u64>,
     messages: Option<Vec<u64>>,
     estimated_prompt_tokens: usize,
+    message_counts: BillableCounts,
     actual_prompt_tokens: Option<usize>,
     awaiting_usage: bool,
     cache_key: Option<u64>,
-    supports_calibration: bool,
+    prefix_reuse: Option<PrefixReuse>,
 }
+
+/// Fallback ratio when a request carries no message text to observe.
+pub(crate) const DEFAULT_CHARS_PER_TOKEN_MILLI: usize = 2_000;
+/// Bounds on the derived ratio: below 0.5 chars/token only images or exotic
+/// scripts remain, above 4 the estimate would promise more savings per char
+/// than English prose ever yields.
+const MIN_CHARS_PER_TOKEN_MILLI: usize = 500;
+const MAX_CHARS_PER_TOKEN_MILLI: usize = 4_000;
 
 /// Hash a JSON value without serializing it: no JSON escaping, no transient
 /// string allocation. Object iteration follows the map's own order, which is
@@ -213,12 +239,14 @@ impl PromptTokenFeedback {
             settings: Some(fingerprint_settings(body)),
             messages: Some(body.messages.iter().map(fingerprint_message).collect()),
             estimated_prompt_tokens: body.estimated_prompt_tokens,
+            message_counts: body.message_counts,
             actual_prompt_tokens: None,
             awaiting_usage: true,
             cache_key: None,
-            // The character estimator does not measure opaque reasoning replay.
-            // Do not extrapolate its ratio when that side channel is present.
-            supports_calibration: body.reasoning_items.is_none_or(|items| items.is_empty()),
+            // Encrypted reasoning replay is part of the estimate (see
+            // `builder::estimate_reasoning_items_tokens`), so its usage may
+            // calibrate later requests like any other prompt content.
+            prefix_reuse: None,
         }
     }
 
@@ -242,7 +270,7 @@ impl PromptTokenFeedback {
         reasoning_encrypted_replay: bool,
         stream: bool,
         estimated_prompt_tokens: usize,
-        supports_calibration: bool,
+        message_counts: BillableCounts,
     ) -> Self {
         let mut hasher = rustc_hash::FxHasher::default();
         // The body carries the request (possibly rewritten) model name, not the
@@ -273,15 +301,48 @@ impl PromptTokenFeedback {
             settings: Some(hasher.finish()),
             messages: Some(messages.iter().map(fingerprint_message).collect()),
             estimated_prompt_tokens,
+            message_counts,
             actual_prompt_tokens: None,
             awaiting_usage: true,
             cache_key: None,
-            supports_calibration,
+            prefix_reuse: None,
         }
     }
 
     pub(super) fn mark_sent_with_key(&mut self, api_key: &str) {
         self.cache_key = Some(cache_key_fingerprint(api_key));
+    }
+
+    /// Record how much of the previous request this one repeats verbatim.
+    /// Unlike `compatible_usage`, this tolerates rewrites: it reports where the
+    /// first rewrite happened instead of rejecting the comparison.
+    pub(super) fn record_prefix_reuse(&mut self, previous: Option<&Self>) {
+        self.prefix_reuse = previous.and_then(|previous| self.compare_prefix(previous));
+    }
+
+    fn compare_prefix(&self, previous: &Self) -> Option<PrefixReuse> {
+        if self.session_id != previous.session_id {
+            return None;
+        }
+        let (Some(current), Some(prior)) = (&self.messages, &previous.messages) else {
+            return None;
+        };
+        Some(PrefixReuse {
+            previous_messages: prior.len(),
+            current_messages: current.len(),
+            common_prefix_messages: current
+                .iter()
+                .zip(prior)
+                .take_while(|(current, prior)| current == prior)
+                .count(),
+            settings_changed: self.model != previous.model
+                || self.endpoint != previous.endpoint
+                || self.settings != previous.settings,
+        })
+    }
+
+    pub(crate) fn prefix_reuse(&self) -> Option<PrefixReuse> {
+        self.prefix_reuse
     }
 
     /// Consume the pending observation even when usage is missing or mismatched.
@@ -305,9 +366,7 @@ impl PromptTokenFeedback {
     }
 
     pub(super) fn compatible_usage(&self, previous: &Self) -> Option<usize> {
-        if !self.supports_calibration
-            || !previous.supports_calibration
-            || previous.awaiting_usage
+        if previous.awaiting_usage
             || self.session_id != previous.session_id
             || self.model != previous.model
             || self.endpoint != previous.endpoint
@@ -342,6 +401,26 @@ impl PromptTokenFeedback {
             .estimated_prompt_tokens
             .saturating_sub(previous.estimated_prompt_tokens);
         calibrated_context_tokens(previous.estimated_prompt_tokens, actual, growth)
+    }
+
+    /// Message chars per prompt token, in thousandths, for translating token
+    /// deficits into char targets. Derived from this request's own script mix
+    /// (ASCII-heavy history yields ~3, CJK ~1) and scaled by usage calibration
+    /// when `context_prompt_tokens` differs from the raw estimate, so a
+    /// provider that bills more than estimated also shrinks the ratio.
+    pub(super) fn chars_per_token_milli(&self, context_prompt_tokens: usize) -> usize {
+        let chars = self.message_counts.chars();
+        let tokens = self.message_counts.tokens();
+        if chars == 0 || tokens == 0 {
+            return DEFAULT_CHARS_PER_TOKEN_MILLI;
+        }
+        let numerator = (chars as u128)
+            .saturating_mul(1_000)
+            .saturating_mul(self.estimated_prompt_tokens.max(1) as u128);
+        let denominator = (tokens as u128).saturating_mul(context_prompt_tokens.max(1) as u128);
+        usize::try_from(numerator / denominator)
+            .unwrap_or(usize::MAX)
+            .clamp(MIN_CHARS_PER_TOKEN_MILLI, MAX_CHARS_PER_TOKEN_MILLI)
     }
 
     pub(super) fn reusable_cached_tokens(
@@ -519,44 +598,52 @@ mod tests {
     }
 
     #[test]
-    fn prompt_feedback_observation_is_consumed_once_and_replay_is_not_calibrated() {
+    fn prompt_feedback_observation_is_consumed_once_and_replay_growth_is_calibrated() {
         let model = model();
         let messages = vec![message("user", "unchanged")];
         let mut previous = capture(&model, &messages, None);
         assert!(previous.record_usage("session", Some(&model), Some(2)));
         assert!(!previous.record_usage("session", Some(&model), Some(900)));
         assert_eq!(previous.actual_prompt_tokens, Some(2));
+        // Reasoning replay rides on a newly appended tool round, so the verified
+        // prefix still calibrates and the replay is charged as estimated growth.
+        let mut grown = messages.clone();
+        grown.push(Message {
+            role: "assistant".to_owned(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: "call".to_owned(),
+                tool_type: "function".to_owned(),
+                function: crate::ai::types::FunctionCall {
+                    name: "read_file".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        });
         let replay = rustc_hash::FxHashMap::from_iter([(
             "call".to_owned(),
-            vec![json!({"encrypted_content": "opaque"})],
+            vec![json!({"encrypted_content": "A".repeat(8_000)})],
         )]);
-        let body = build_request_body(
-            &model,
-            &messages,
-            true,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(&replay),
-        );
+        let build = |items| {
+            build_request_body(
+                &model, &grown, true, false, None, None, None, None, None, None, items,
+            )
+        };
+        let without_replay = build(None).estimated_prompt_tokens;
+        let body = build(Some(&replay));
+        assert!(body.estimated_prompt_tokens > without_replay + 1_000);
         let current = PromptTokenFeedback::capture(
             "session",
             &model,
             "https://example.invalid/v1/chat/completions",
             &body,
         );
-        assert!(!current.supports_calibration);
+        let growth = current.estimated_prompt_tokens - previous.estimated_prompt_tokens;
         assert_eq!(
             current.context_prompt_tokens(Some(&previous)),
-            current.estimated_prompt_tokens
-        );
-        assert_eq!(
-            current.reusable_cached_tokens(Some(&previous), Some(1), "key-a"),
-            None
+            calibrated_context_tokens(previous.estimated_prompt_tokens, 2, growth)
         );
         let mut mismatched = capture(&model, &messages, None);
         assert!(!mismatched.record_usage("other-session", Some(&model), Some(2)));
@@ -675,7 +762,7 @@ mod tests {
             // estimate, which the send path derives from the serialized value.
             assert_eq!(
                 super::super::builder::estimate_request_prompt_tokens_from_definitions(
-                    &messages, tools_defs
+                    &messages, tools_defs, None
                 ),
                 body.estimated_prompt_tokens,
             );
@@ -693,7 +780,7 @@ mod tests {
                 body.reasoning_encrypted_replay,
                 body.stream,
                 body.estimated_prompt_tokens,
-                body.reasoning_items.is_none_or(|items| items.is_empty()),
+                body.message_counts,
             );
             assert_eq!(actual.settings, expected.settings);
             assert_eq!(actual.messages, expected.messages);
@@ -701,10 +788,7 @@ mod tests {
                 actual.estimated_prompt_tokens,
                 expected.estimated_prompt_tokens
             );
-            assert_eq!(
-                actual.supports_calibration,
-                expected.supports_calibration
-            );
+            assert_eq!(actual.message_counts, expected.message_counts);
         }
     }
 }

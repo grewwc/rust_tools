@@ -52,6 +52,11 @@ pub(super) fn explicit_prompt_cache_enabled(model: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether Responses requests for `model` carry a session-scoped `prompt_cache_key`.
+pub(super) fn prompt_cache_key_enabled(model: &str) -> bool {
+    model_def(model).map(|m| m.prompt_cache_key).unwrap_or(false)
+}
+
 pub(super) fn enable_thinking(model: &str) -> bool {
     model_def(model).map(|m| m.enable_thinking).unwrap_or(false)
 }

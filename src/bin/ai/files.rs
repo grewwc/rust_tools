@@ -124,6 +124,174 @@ fn render_text_attachment_block(file: &str) -> io::Result<String> {
     Ok(out)
 }
 
+/// Diff line tags rendered into recall anchors. Dropping the marker column makes a
+/// preview untrustworthy: a context line's marker is a single space, so trimming it
+/// renders pre-existing code exactly like part of the change.
+const DIFF_ADDED_TAG: &str = "[+]";
+const DIFF_REMOVED_TAG: &str = "[-]";
+const DIFF_CONTEXT_TAG: &str = "[ctx]";
+
+/// One rendered recall anchor, split so callers can dedupe on `prefix` and truncate
+/// only the body.
+pub(super) struct PreviewAnchor {
+    /// `L<line>` for lines carrying a `read_file` line-number prefix, else `#<idx>`.
+    /// `#<idx>` is a 0-based index into the archived output, not a line address:
+    /// printing it as `L<idx>` invites citations that resolve against nothing.
+    pub prefix: String,
+    /// Line body with the `read_file` prefix and the diff marker removed.
+    pub body: String,
+}
+
+/// Diff line tags for every line of `content`: `Some(tag)` only for lines inside a
+/// hunk body (`[+]`/`[-]`/`[ctx]`), `None` for hunk headers and for anything outside a
+/// hunk. Membership follows the line counts declared in the `@@` header — the diff's own
+/// geometry — instead of a guess from the text, so a removed row whose content starts
+/// with `-- `, a `\ No newline` note, or a trailing listing after the last hunk cannot
+/// pass for part of the change.
+pub(super) fn diff_line_tags(content: &str) -> Vec<Option<&'static str>> {
+    let mut tags = Vec::new();
+    // Remaining (old-side, new-side) body lines of the open hunk.
+    let mut open: Option<(usize, usize)> = None;
+    for line in content.lines() {
+        // read_file output carries a `{:>6}\t` prefix; `header` is the trimmed text used
+        // for both marker classification and header recognition.
+        let trimmed = line.trim();
+        let header = match split_line_number_prefix(trimmed) {
+            Some((_, rest)) => rest.trim_start(),
+            None => trimmed,
+        };
+
+        if let Some((old_left, new_left)) = open {
+            // Classify on the trimmed text: an indented hunk body still starts with its
+            // marker there, and the hunk's own counts decide where it ends.
+            let (tag, used_old, used_new) = match header.as_bytes().first() {
+                Some(b'+') => (Some(DIFF_ADDED_TAG), 0, 1),
+                Some(b'-') => (Some(DIFF_REMOVED_TAG), 1, 0),
+                // `\ No newline at end of file` annotates the previous line instead of
+                // being one, so it consumes no budget.
+                Some(b'\\') => (None, 0, 0),
+                _ => (Some(DIFF_CONTEXT_TAG), 1, 1),
+            };
+            let left = (
+                old_left.saturating_sub(used_old),
+                new_left.saturating_sub(used_new),
+            );
+            open = (left != (0, 0)).then_some(left);
+            tags.push(tag);
+            continue;
+        }
+
+        if header.starts_with("@@") {
+            // Unified (`@@`) and combined (`@@@`) hunk headers both open a hunk.
+            open = Some(hunk_line_budget(header));
+        }
+        tags.push(None);
+    }
+    tags
+}
+
+/// Renders one preview line as an anchor. `tag` comes from `diff_line_tags`; for an
+/// added/removed line the marker itself is dropped, so the `[+]`/`[-]` tag is the
+/// only marker a reader sees. Whitespace-only lines still render, with an empty
+/// body: probe sampling promises the first and last omitted lines.
+pub(super) fn preview_anchor(idx: usize, line: &str, tag: Option<&'static str>) -> PreviewAnchor {
+    let trimmed = line.trim();
+    // read_file output carries a `{:>6}\t` line-number prefix; stripping it keeps the
+    // real line number in the label so a long overflowed file stays locatable.
+    let (label, marked) = match split_line_number_prefix(trimmed) {
+        Some((no, rest)) => (format!("L{no}"), rest.trim()),
+        None => (format!("#{idx}"), trimmed),
+    };
+    let body = match tag {
+        // The marker sits at the start of the trimmed text, so an indented hunk body is
+        // stripped correctly too; a tag whose marker is missing keeps the text unchanged.
+        Some(DIFF_ADDED_TAG) => marked.strip_prefix('+').unwrap_or(marked),
+        Some(DIFF_REMOVED_TAG) => marked.strip_prefix('-').unwrap_or(marked),
+        _ => marked,
+    };
+    let body = body.trim();
+    let prefix = match tag {
+        Some(tag) if !body.is_empty() => format!("{label}: {tag} "),
+        Some(tag) => format!("{label}: {tag}"),
+        None => format!("{label}: "),
+    };
+    PreviewAnchor {
+        prefix,
+        body: body.to_string(),
+    }
+}
+
+/// Body-line budget of a hunk header: (old-side lines, new-side lines) summed over the
+/// header's ranges. A header without parsable ranges counts as unbounded, so such a hunk
+/// ends at the next header instead of swallowing the rest of the payload.
+fn hunk_line_budget(header: &str) -> (usize, usize) {
+    let mut old = 0usize;
+    let mut new = 0usize;
+    let mut parsed = false;
+    for token in header.split_whitespace() {
+        let (side, rest) = if let Some(rest) = token.strip_prefix('+') {
+            (&mut new, rest)
+        } else if let Some(rest) = token.strip_prefix('-') {
+            (&mut old, rest)
+        } else {
+            continue;
+        };
+        let count = match rest.split_once(',') {
+            Some((_, count)) => count.parse().unwrap_or(1),
+            None => 1,
+        };
+        *side = side.saturating_add(count);
+        parsed = true;
+    }
+    if parsed {
+        (old, new)
+    } else {
+        (usize::MAX, usize::MAX)
+    }
+}
+
+/// Structural key-line predicate, applied to the marker-stripped body. Matching the
+/// raw line never sees an added line (`+    /// x` does not start with `///`), so the
+/// index filled up with unchanged context and hid what the change actually did.
+fn is_key_line(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.starts_with("fn ")
+        || lower.starts_with("pub fn ")
+        || lower.starts_with("pub(crate) fn ")
+        || lower.starts_with("pub(super) fn ")
+        || lower.starts_with("async fn ")
+        || lower.starts_with("pub async fn ")
+        || lower.starts_with("impl ")
+        || lower.starts_with("struct ")
+        || lower.starts_with("pub struct ")
+        || lower.starts_with("trait ")
+        || lower.starts_with("enum ")
+        || lower.starts_with("pub enum ")
+        || lower.starts_with("mod ")
+        || lower.starts_with("#[")
+        || lower.starts_with("//!")
+        || lower.starts_with("///")
+        || lower.starts_with("class ")
+        || lower.starts_with("def ")
+        || lower.starts_with("func ")
+        || lower.starts_with("interface ")
+        || lower.starts_with("type ")
+        || lower.starts_with("pub type ")
+        || lower.starts_with("const ")
+        || lower.starts_with("pub const ")
+        || lower.starts_with("use ")
+        || lower.contains("error")
+        || lower.contains("failed")
+        || lower.contains("panic")
+        || lower.contains("exception")
+        || lower.contains("timeout")
+        || lower.contains("warning")
+        || lower.contains("todo")
+        || lower.contains("fixme")
+        || lower.contains(": error")
+        || lower.contains(": warning")
+}
+
 /// Extract structured key lines from text content to provide recall anchors for the
 /// overflow stub.
 ///
@@ -133,77 +301,34 @@ fn render_text_attachment_block(file: &str) -> io::Result<String> {
 /// - Errors/warnings: `error`/`failed`/`panic`/`exception`/`timeout`/`warning`
 /// - Markers: `TODO`/`FIXME`
 ///
-/// Each line is truncated to 200 chars to keep the stub compact. At most `max` lines
-/// are kept.
+/// Diff content keeps its marker as an explicit tag, so an unchanged context line is
+/// never read as part of the change. Each line is truncated to 200 chars to keep the
+/// stub compact. At most `max` lines are kept.
 pub(super) fn extract_key_lines(content: &str, max: usize) -> Vec<String> {
+    let tags = diff_line_tags(content);
     let mut result = Vec::with_capacity(max);
     for (idx, line) in content.lines().enumerate() {
         if result.len() >= max {
             break;
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let anchor = preview_anchor(idx, line, tags.get(idx).copied().flatten());
+        if !is_key_line(&anchor.body) {
             continue;
         }
-        // read_file output carries a `{:>6}\t` line-number prefix, which would block
-        // prefix matches like fn/struct; strip it and use the real line number as the
-        // L label so the structural index of a long overflowed file actually works.
-        let (label, matched) = match split_line_number_prefix(trimmed) {
-            Some((no, rest)) => (no, rest.trim()),
-            None => (idx, trimmed),
+        let body = if anchor.body.chars().count() > 200 {
+            let kept: String = anchor.body.chars().take(200).collect();
+            format!("{kept} …")
+        } else {
+            anchor.body
         };
-        let lower = matched.to_ascii_lowercase();
-        let is_key = lower.starts_with("fn ")
-            || lower.starts_with("pub fn ")
-            || lower.starts_with("pub(crate) fn ")
-            || lower.starts_with("pub(super) fn ")
-            || lower.starts_with("async fn ")
-            || lower.starts_with("pub async fn ")
-            || lower.starts_with("impl ")
-            || lower.starts_with("struct ")
-            || lower.starts_with("pub struct ")
-            || lower.starts_with("trait ")
-            || lower.starts_with("enum ")
-            || lower.starts_with("pub enum ")
-            || lower.starts_with("mod ")
-            || lower.starts_with("#[")
-            || lower.starts_with("//!")
-            || lower.starts_with("///")
-            || lower.starts_with("class ")
-            || lower.starts_with("def ")
-            || lower.starts_with("func ")
-            || lower.starts_with("interface ")
-            || lower.starts_with("type ")
-            || lower.starts_with("pub type ")
-            || lower.starts_with("const ")
-            || lower.starts_with("pub const ")
-            || lower.starts_with("use ")
-            || lower.contains("error")
-            || lower.contains("failed")
-            || lower.contains("panic")
-            || lower.contains("exception")
-            || lower.contains("timeout")
-            || lower.contains("warning")
-            || lower.contains("todo")
-            || lower.contains("fixme")
-            || lower.contains(": error")
-            || lower.contains(": warning");
-        if is_key {
-            let truncated = if matched.chars().count() > 200 {
-                let kept: String = matched.chars().take(200).collect();
-                format!("L{label}: {kept} …")
-            } else {
-                format!("L{label}: {matched}")
-            };
-            result.push(truncated);
-        }
+        result.push(format!("{}{body}", anchor.prefix));
     }
     result
 }
 
 /// Parse read_file output's `{:>6}\t{content}` line-number prefix, returning
 /// (real line number, body after the prefix). Returns None for non-matching formats
-/// (e.g. plain command output), keeping the original `L{idx}` semantics.
+/// (e.g. plain command output), whose lines are then labeled by 0-based index.
 pub(super) fn split_line_number_prefix(trimmed: &str) -> Option<(usize, &str)> {
     let bytes = trimmed.as_bytes();
     let mut i = 0;

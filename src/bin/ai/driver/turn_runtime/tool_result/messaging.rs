@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::ai::{
     driver::side_note::assets_dir_for_history,
     driver::tools::ExecuteToolCallsResult,
+    files::{diff_line_tags, preview_anchor},
     history::{
         Message, ROLE_INTERNAL_NOTE, SessionStore, compress::TOOL_RESULT_RAW_HARD_CAP_CHARS,
         is_system_like_role,
@@ -754,6 +755,7 @@ fn first_relevant_line(content: &str) -> Option<String> {
 }
 
 fn extract_tool_result_key_lines(content: &str, max: usize) -> Vec<String> {
+    let tags = diff_line_tags(content);
     let mut out = Vec::with_capacity(max);
     let mut scanned_bytes = 0usize;
     for (idx, line) in content.lines().enumerate() {
@@ -761,7 +763,10 @@ fn extract_tool_result_key_lines(content: &str, max: usize) -> Vec<String> {
             break;
         }
         scanned_bytes = scanned_bytes.saturating_add(line.len()).saturating_add(1);
-        let trimmed = line_sample(line, 512);
+        let anchor = preview_anchor(idx, line, tags.get(idx).copied().flatten());
+        // Match on the marker-stripped body: a diff's added lines (`+    /// x`) never
+        // match the raw text, which left the index full of unchanged context.
+        let trimmed = line_sample(&anchor.body, 512);
         if trimmed.is_empty() {
             if scanned_bytes >= TOOL_RESULT_PREVIEW_SCAN_MAX_BYTES {
                 break;
@@ -794,8 +799,8 @@ fn extract_tool_result_key_lines(content: &str, max: usize) -> Vec<String> {
             || lower.contains("fixme");
         if is_key {
             out.push(format!(
-                "L{}: {}",
-                idx + 1,
+                "{}{}",
+                anchor.prefix,
                 truncate_inline(&normalize_anchor_text(&trimmed), 200)
             ));
         }

@@ -518,64 +518,6 @@ fn mark_truncation_skip_resets_full_loop_detection_ladder() {
 }
 
 #[test]
-fn turn_supervisor_compress_gate_respects_cooldown_and_delta() {
-    const SOFT: usize = super::super::MID_TURN_COMPRESS_SOFT_FLOOR;
-    let mut s = TurnSupervisor::default();
-    s.iteration = 3;
-    assert!(s.should_try_mid_turn_compress(SOFT + 10, SOFT));
-
-    s.mark_compress(SOFT + 10);
-    assert!(!s.should_try_mid_turn_compress(SOFT + 20, SOFT));
-
-    s.iteration += MID_TURN_COMPRESS_COOLDOWN_ITERATIONS;
-    assert!(!s.should_try_mid_turn_compress(
-        s.last_compress_after_chars + MID_TURN_COMPRESS_DELTA_THRESHOLD - 1,
-        SOFT,
-    ));
-    assert!(s.should_try_mid_turn_compress(
-        s.last_compress_after_chars + MID_TURN_COMPRESS_DELTA_THRESHOLD,
-        SOFT,
-    ));
-}
-
-/// Long-loop awareness: short turns keep the baseline soft threshold; once the
-/// iteration count reaches the threshold, the effective soft threshold drops
-/// to SOFT_FLOOR so content-level dedup kicks in early and curbs O(n²)
-/// resending of accumulated content.
-/// This is the direct fix for incidents like aefa66f2 (medium history ~120K +
-/// 56 iterating rounds) hitting TPM: the 135K baseline never fired, while the
-/// lowered 36K threshold starts compression mid-way through long loops.
-#[test]
-fn long_loop_lowers_effective_mid_turn_soft_threshold() {
-    const FLOOR: usize = super::super::MID_TURN_COMPRESS_SOFT_FLOOR;
-    // The flagship large-window model's baseline soft threshold is far above
-    // FLOOR (simulating 135K).
-    let base = 135_000usize;
-    assert!(base > FLOOR, "precondition: base threshold above floor");
-
-    let mut s = TurnSupervisor::default();
-
-    // Short turn (below the long-loop threshold): effective threshold ==
-    // baseline; normal single-round large tasks are unaffected.
-    s.iteration = LONG_LOOP_COMPRESS_ITERATION_THRESHOLD - 1;
-    assert_eq!(s.effective_mid_turn_soft_threshold(base), base);
-    // Here ~120K of history (< 135K baseline) does not trigger compression —
-    // exactly the old behavior's blind spot.
-    assert!(!s.should_try_mid_turn_compress(120_000, s.effective_mid_turn_soft_threshold(base)));
-
-    // Long loop (threshold reached): the effective threshold drops to FLOOR
-    // and the same ~120K history triggers compression immediately.
-    s.iteration = LONG_LOOP_COMPRESS_ITERATION_THRESHOLD;
-    assert_eq!(s.effective_mid_turn_soft_threshold(base), FLOOR);
-    assert!(s.should_try_mid_turn_compress(120_000, s.effective_mid_turn_soft_threshold(base)));
-
-    // If the baseline is already below FLOOR (a tiny history_max_chars), min()
-    // guarantees the threshold is never raised.
-    let tiny_base = FLOOR / 2;
-    assert_eq!(s.effective_mid_turn_soft_threshold(tiny_base), tiny_base);
-}
-
-#[test]
 fn task_anchor_note_truncates_goal_text() {
     let mut messages = Vec::new();
     let long_q = "x".repeat(TASK_ANCHOR_MAX_QUESTION_CHARS + 30);

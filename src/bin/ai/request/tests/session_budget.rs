@@ -320,8 +320,82 @@ fn stream_usage_derives_prompt_from_total_and_reasoning_only_details() {
 }
 
 #[test]
-fn prompt_cache_breakpoint_wraps_first_system_message() {
+fn prompt_cache_breakpoints_mark_first_system_and_last_user_or_tool() {
     let mut messages = vec![
+        serde_json::json!({ "role": "system", "content": "you are helpful" }),
+        serde_json::json!({ "role": "user", "content": "first question" }),
+        serde_json::json!({ "role": "assistant", "content": "answer", "tool_calls": [] }),
+        serde_json::json!({ "role": "tool", "tool_call_id": "c1", "content": "tool output" }),
+        serde_json::json!({ "role": "assistant", "content": "" }),
+    ];
+    apply_prompt_cache_breakpoints(&mut messages);
+
+    // The first system message is rewritten into a content-block array with
+    // cache_control.
+    let blocks = messages[0]["content"].as_array().expect("array content");
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["type"], "text");
+    assert_eq!(blocks[0]["text"], "you are helpful");
+    assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+    // The rolling breakpoint lands on the last user/tool message, so the whole
+    // conversation prefix is written for the next request to read back.
+    assert_eq!(messages[3]["content"][0]["text"], "tool output");
+    assert_eq!(messages[3]["content"][0]["cache_control"]["type"], "ephemeral");
+    // Earlier and assistant messages stay untouched.
+    assert_eq!(messages[1]["content"], "first question");
+    assert_eq!(messages[2]["content"], "answer");
+    assert_eq!(messages[4]["content"], "");
+
+    // Idempotent: a second pass neither wraps again nor adds markers.
+    let once = messages.clone();
+    apply_prompt_cache_breakpoints(&mut messages);
+    assert_eq!(messages, once);
+}
+
+#[test]
+fn prompt_cache_breakpoints_mark_last_text_block_of_multimodal_user() {
+    let mut messages = vec![serde_json::json!({
+        "role": "user",
+        "content": [
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,AA==" } },
+            { "type": "text", "text": "describe" },
+        ],
+    })];
+    apply_prompt_cache_breakpoints(&mut messages);
+    let parts = messages[0]["content"].as_array().unwrap();
+    assert!(parts[0].get("cache_control").is_none());
+    assert_eq!(parts[1]["cache_control"]["type"], "ephemeral");
+}
+
+#[test]
+fn prompt_cache_breakpoints_never_mark_empty_text_blocks() {
+    let mut messages = vec![
+        serde_json::json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "describe" },
+                { "type": "text", "text": "" },
+            ],
+        }),
+        serde_json::json!({ "role": "tool", "tool_call_id": "c1", "content": "" }),
+    ];
+    // The empty last tool message is the rolling target: it stays a plain
+    // empty string instead of becoming a rejected empty text block.
+    apply_prompt_cache_breakpoints(&mut messages);
+    assert_eq!(messages[1]["content"], "");
+    assert!(messages[0]["content"][0].get("cache_control").is_none());
+
+    // A trailing empty block moves the breakpoint to the last non-empty text.
+    let mut messages = vec![messages.remove(0)];
+    apply_prompt_cache_breakpoints(&mut messages);
+    let parts = messages[0]["content"].as_array().unwrap();
+    assert_eq!(parts[0]["cache_control"]["type"], "ephemeral");
+    assert!(parts[1].get("cache_control").is_none());
+}
+
+#[test]
+fn prompt_cache_breakpoints_stay_off_request_messages_and_default_bodies() {
+    let messages = vec![
         Message {
             role: "system".to_string(),
             content: Value::String("you are helpful".to_string()),
@@ -337,30 +411,29 @@ fn prompt_cache_breakpoint_wraps_first_system_message() {
             reasoning_content: None,
         },
     ];
-    apply_prompt_cache_breakpoint(&mut messages);
+    let mut request = build_request_body(
+        "gpt-5.5", &messages, false, false, None, None, None, None, None, None, None,
+    );
+    let plain = RequestProtocolDialect::ChatCompletions.build_http_body(&request);
+    assert!(!String::from_utf8(plain).unwrap().contains("cache_control"));
 
-    // The first system message is rewritten into a content-block array with
-    // cache_control.
-    let blocks = messages[0].content.as_array().expect("array content");
-    assert_eq!(blocks.len(), 1);
-    assert_eq!(blocks[0]["type"], "text");
-    assert_eq!(blocks[0]["text"], "you are helpful");
-    assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
-    // The user message stays as is.
+    request.explicit_cache_breakpoints = true;
+    let body: Value = serde_json::from_slice(
+        &RequestProtocolDialect::ChatCompletions.build_http_body(&request),
+    )
+    .unwrap();
+    assert_eq!(body["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(body["messages"][1]["content"][0]["cache_control"]["type"], "ephemeral");
+    // Fingerprints hash these request messages; the wire patch never reaches them.
+    assert_eq!(messages[0].content, Value::String("you are helpful".to_string()));
     assert_eq!(messages[1].content, Value::String("hi".to_string()));
 }
 
 #[test]
-fn prompt_cache_breakpoint_noop_without_system_message() {
-    let mut messages = vec![Message {
-        role: "user".to_string(),
-        content: Value::String("hi".to_string()),
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    }];
-    apply_prompt_cache_breakpoint(&mut messages);
-    assert_eq!(messages[0].content, Value::String("hi".to_string()));
+fn prompt_cache_breakpoints_noop_without_system_user_or_tool_message() {
+    let mut messages = vec![serde_json::json!({ "role": "assistant", "content": "hi" })];
+    apply_prompt_cache_breakpoints(&mut messages);
+    assert_eq!(messages[0]["content"], "hi");
 }
 
 #[test]

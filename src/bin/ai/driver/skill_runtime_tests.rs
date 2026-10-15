@@ -6,7 +6,8 @@ use super::{
     declares_hidden_group, ensure_required_baseline_tools, escape_xml_attr,
     filter_mcp_tools_by_allowed_servers, has_tool, manifest_tool_definitions,
     merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
-    select_mcp_tools, session_context_prompt, session_issue_likely, tool_uses_mcp_server,
+    select_mcp_tools, session_context_prompt, session_id_referenced, session_issue_likely,
+    tool_uses_mcp_server,
 };
 use crate::ai::agents::{AgentManifest, AgentMode};
 use crate::ai::driver::runtime_ctx::{SUBAGENT_CWD, SUBAGENT_DEPTH};
@@ -47,6 +48,7 @@ fn active_agent_max_steps_override_default_iterations() {
         tool_groups: vec!["builtin".to_string(), "executor".to_string()],
         mcp_servers: Vec::new(),
         disable_mcp_tools: false,
+        audit_checkpoints: false,
         model_tier: None,
         disabled: false,
         hidden: false,
@@ -761,6 +763,92 @@ fn session_issue_likely_covers_debugging_intents_in_both_languages() {
     // history matches too. A missed debug session costs more than ~500
     // carried characters, so the gate stays broad on purpose.
     assert!(session_issue_likely("history of Rust"));
+}
+
+#[test]
+fn session_id_referenced_detects_uuid_shaped_ids_only() {
+    // Hits: a bare UUID (with or without session keywords) is an unambiguous
+    // reference to a concrete runtime session.
+    for question in [
+        "ddb7e6be-7076-43b3-898f-8370e64312da 这个会话现在有几条消息？",
+        "how many messages does ddb7e6be-7076-43b3-898f-8370e64312da have?",
+        "看看 65a9f9c2-5c6b-4c66-8462-da40a0c9a73a 的内容",
+        "DDb7e6BE-7076-43b3-898F-8370e64312da 有几条消息",
+    ] {
+        assert!(
+            session_id_referenced(question),
+            "session id reference missed: {question}"
+        );
+    }
+    // Misses: no UUID-shaped token (a hex test-store id has no dashes, and
+    // plain words/hashes must not route the turn to the session tools).
+    for question in [
+        "write a fizzbuzz",
+        "explain Rust lifetimes",
+        "test-session-0365f5d0b4e049869bd6548008c199fb 现在有几条消息",
+        "history of Rust",
+    ] {
+        assert!(
+            !session_id_referenced(question),
+            "unrelated question over-matched: {question}"
+        );
+    }
+}
+
+#[test]
+fn session_id_reference_makes_session_tools_resident_for_the_turn() {
+    let mcp_client = McpClient::new();
+    let mut app = super::super::tests::test_app("build");
+    let guard = super::prepare_skill_for_turn(
+        &mut app,
+        &mcp_client,
+        &[],
+        "ddb7e6be-7076-43b3-898f-8370e64312da 这个会话现在有几条消息？",
+    )
+    .unwrap();
+    let names: Vec<String> = app
+        .agent_context
+        .as_ref()
+        .unwrap()
+        .tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect();
+    for session_tool in ["session_list", "session_read", "session_search"] {
+        assert!(
+            names.iter().any(|name| name == session_tool),
+            "{session_tool} should be resident for a session-id turn, got {names:?}"
+        );
+    }
+    drop(guard);
+}
+
+#[test]
+fn question_without_session_id_keeps_session_tools_lazy() {
+    let mcp_client = McpClient::new();
+    let mut app = super::super::tests::test_app("build");
+    let guard = super::prepare_skill_for_turn(
+        &mut app,
+        &mcp_client,
+        &[],
+        "write a fizzbuzz",
+    )
+    .unwrap();
+    let names: Vec<String> = app
+        .agent_context
+        .as_ref()
+        .unwrap()
+        .tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect();
+    for session_tool in ["session_list", "session_read", "session_search"] {
+        assert!(
+            !names.iter().any(|name| name == session_tool),
+            "{session_tool} must stay lazy without a session id, got {names:?}"
+        );
+    }
+    drop(guard);
 }
 
 #[test]
@@ -2184,6 +2272,7 @@ fn agent(name: &str, mcp_servers: Vec<&str>) -> AgentManifest {
         tool_groups: Vec::new(),
         mcp_servers: mcp_servers.into_iter().map(|s| s.to_string()).collect(),
         disable_mcp_tools: false,
+        audit_checkpoints: false,
         model_tier: None,
         disabled: false,
         hidden: false,

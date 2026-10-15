@@ -288,7 +288,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
         prepared.inherit.history,
         true,
     )
-    .map_err(|err| format!("准备同步子代理历史失败：{err}"))?;
+    .map_err(|err| format!("failed to prepare subagent history: {err}"))?;
     let private_cwd_dir = if prepared.inherit.cwd {
         None
     } else {
@@ -305,6 +305,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     task_app.session_history_file = child_history.clone();
     let _ = crate::ai::driver::commands::session::restore_prune_marks_for_history(&mut task_app);
 
+    let mut audit_checkpoints = false;
     if let Some(agent) =
         agents::find_agent_by_name(ctx.agent_manifests.as_ref(), &prepared.agent_name)
     {
@@ -314,6 +315,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
                 prepared.agent_name
             ));
         }
+        audit_checkpoints = agent.audit_checkpoints;
         let capped_agent = task_tools::capped_subagent_manifest(agent);
         super::super::activate_primary_agent(&mut task_app, &capped_agent);
     }
@@ -347,7 +349,11 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     let task_skill_manifests_for_spawn = task_skill_manifests.clone();
     let task_mcp_for_spawn = task_mcp.clone();
     let task_agent_manifests_for_spawn = task_agent_manifests.clone();
-    let prompt = prepared.prompt.clone();
+    let prompt = if audit_checkpoints {
+        inject_audit_progress_protocol(&prepared.prompt)
+    } else {
+        prepared.prompt.clone()
+    };
     let response_schema = prepared.response_schema.clone();
     let model = prepared.model.clone();
     let auto_model_fallback = prepared.auto_model_fallback;
@@ -707,6 +713,79 @@ async fn wait_for_sync_task_completion_with_wrap_up(
 /// result slot. The parent then sees a pre-failure evidence excerpt plus the preserved file path
 /// in the failure result instead of an empty one (previously the timeout path discarded all the
 /// work, and the failed path deleted the history entirely).
+/// Records carried into the timeout recovery payload, and the per-record character cap: a
+/// checkpoint is a one-line, report-shaped summary, never quoted code.
+const TIMEOUT_RECOVERY_MAX_CHECKPOINTS: usize = 6;
+
+/// Appends the audit progress protocol to a subagent prompt that does not carry it yet, so an
+/// audit child publishes `AUDIT_CHECKPOINT` records whatever launched it. The `/audit` command
+/// already embeds the protocol in its instruction, and a second pass must not duplicate it.
+fn inject_audit_progress_protocol(prompt: &str) -> String {
+    if prompt.contains("<audit_progress_protocol>") {
+        return prompt.to_string();
+    }
+    format!(
+        "{prompt}\n\n{}",
+        crate::ai::driver::commands::audit::AUDIT_PROGRESS_PROTOCOL
+    )
+}
+
+const TIMEOUT_RECOVERY_MAX_CHECKPOINT_CHARS: usize = 600;
+
+/// Collects the `AUDIT_CHECKPOINT:` records already published by a sub-agent that was cut short.
+///
+/// The audit progress protocol has the auditor emit one report-shaped record per verified
+/// finding, so these records are the partial *findings* the parent can merge; the raw tail
+/// excerpt stays beneath them as context. Only published message content is scanned — a draft
+/// the auditor left in its reasoning is not evidence the parent may merge. Records come out
+/// oldest first, duplicates collapse, and only the newest few survive so a runaway auditor
+/// cannot flood the recovery payload.
+fn extract_audit_checkpoint_records(messages: &[history::Message]) -> Vec<String> {
+    let mut records: Vec<String> = Vec::new();
+    for message in messages {
+        // Assistant messages only: the audit prompt (a user message) and tool output can both
+        // contain the protocol's literal placeholder record, and republishing that as a partial
+        // finding would invent evidence.
+        if message.role != "assistant" {
+            continue;
+        }
+        let text = crate::ai::history::value_to_string(&message.content);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            let trimmed = ["- ", "* ", "> ", "# "]
+                .iter()
+                .find_map(|marker| trimmed.strip_prefix(marker))
+                .map(str::trim_start)
+                .unwrap_or(trimmed);
+            let Some(record) = trimmed.strip_prefix("AUDIT_CHECKPOINT:") else {
+                continue;
+            };
+            let record = record.trim();
+            if record.is_empty() {
+                continue;
+            }
+            let mut record = format!("AUDIT_CHECKPOINT: {record}");
+            if record.chars().count() > TIMEOUT_RECOVERY_MAX_CHECKPOINT_CHARS {
+                record = record
+                    .chars()
+                    .take(TIMEOUT_RECOVERY_MAX_CHECKPOINT_CHARS - 1)
+                    .collect();
+                record.push('…');
+            }
+            // Re-publishing a record moves it to the newest position, so the window below keeps
+            // the checkpoints emitted closest to the cut and never evicts the freshest emission.
+            if let Some(position) = records.iter().position(|existing| existing == &record) {
+                records.remove(position);
+            }
+            records.push(record);
+        }
+    }
+    if records.len() > TIMEOUT_RECOVERY_MAX_CHECKPOINTS {
+        records.drain(..records.len() - TIMEOUT_RECOVERY_MAX_CHECKPOINTS);
+    }
+    records
+}
+
 fn publish_recovery_evidence(
     child_history: &Path,
     result_slot: &runtime_ctx::SubagentResultSlot,
@@ -717,7 +796,7 @@ fn publish_recovery_evidence(
     // Read the recent messages (including tool output) as recoverable evidence; even a read
     // failure must still publish a structured diagnosis so the hard timeout never degrades into
     // an empty result with no context.
-    let (excerpt, extraction_error) = if preserved.exists() {
+    let (excerpt, checkpoints, extraction_error) = if preserved.exists() {
         match history::build_message_arr(TIMEOUT_RECOVERY_TAIL_MESSAGES, &preserved) {
             Ok(messages) => (
                 history::messages_to_markdown_capped(
@@ -725,13 +804,15 @@ fn publish_recovery_evidence(
                     &preserved.to_string_lossy(),
                     TIMEOUT_RECOVERY_MAX_CHARS,
                 ),
+                extract_audit_checkpoint_records(&messages),
                 None,
             ),
-            Err(error) => (String::new(), Some(error.to_string())),
+            Err(error) => (String::new(), Vec::new(), Some(error.to_string())),
         }
     } else {
         (
             String::new(),
+            Vec::new(),
             Some("preserved child history was not found".to_string()),
         )
     };
@@ -740,6 +821,7 @@ fn publish_recovery_evidence(
         phase,
         &preserved,
         excerpt.trim(),
+        &checkpoints,
         extraction_error.as_deref(),
     );
     if let Ok(mut guard) = result_slot.try_lock() {
@@ -754,6 +836,7 @@ fn format_timeout_recovery_payload(
     phase: &str,
     preserved: &Path,
     excerpt: &str,
+    checkpoints: &[String],
     extraction_error: Option<&str>,
 ) -> String {
     // Classify the recovery status from the error text so the parent (and the terminal renderer)
@@ -766,15 +849,25 @@ fn format_timeout_recovery_payload(
         "failed"
     };
     let evidence = if excerpt.is_empty() {
-        "未恢复到非空消息；请结合下方诊断和保留路径继续排查。"
+        "No non-empty message was recovered; use the diagnostic and the preserved path below to continue from here."
     } else {
         excerpt
     };
     let extraction = extraction_error
         .map(|error| format!("\nhistory_extraction_error: {error}"))
         .unwrap_or_default();
+    // The published checkpoints are partial findings, so they lead the raw excerpt: a parent
+    // that merges them gets the cut-short audit's conclusions without re-reading the tail.
+    let checkpoint_section = if checkpoints.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n## AUDIT_CHECKPOINT records (partial findings published before the cut)\n\n{}",
+            checkpoints.join("\n")
+        )
+    };
     format!(
-        "SUBAGENT_TIMEOUT_RECOVERY_V1\nstatus: {status}\nerror: {failure_error}\nlast_phase: {phase}\npreserved_child_history: {}{extraction}\n\n## 中断前已完成的工作（恢复节选）\n\n{evidence}\n\n以上是阶段性证据而非完整审计结论；后续应从这些证据继续，而不是从零重跑。",
+        "SUBAGENT_TIMEOUT_RECOVERY_V1\nstatus: {status}\nerror: {failure_error}\nlast_phase: {phase}\npreserved_child_history: {}{extraction}{checkpoint_section}\n\n## Work completed before the interruption (recovery excerpt)\n\n{evidence}\n\nThis is stage-by-stage evidence, not a complete audit conclusion; continue from it instead of starting over.",
         preserved.display(),
     )
 }
@@ -1304,15 +1397,19 @@ mod tests {
             "audit subagent exceeded hard timeout (600s)",
             "CallingTool",
             Path::new("/tmp/audit-timeout.sqlite"),
-            "AUDIT_CHECKPOINT: checked src/a.rs; finding at src/a.rs:42",
+            "### 🤖 ASSISTANT\n\nchecked src/a.rs",
+            &[String::from(
+                "AUDIT_CHECKPOINT: checked src/a.rs; finding at src/a.rs:42",
+            )],
             None,
         );
 
         assert!(payload.contains("SUBAGENT_TIMEOUT_RECOVERY_V1"));
         assert!(payload.contains("last_phase: CallingTool"));
         assert!(payload.contains("src/a.rs:42"));
+        assert!(payload.contains("## AUDIT_CHECKPOINT records"));
         assert!(payload.contains("/tmp/audit-timeout.sqlite"));
-        assert!(payload.contains("不是从零重跑"));
+        assert!(payload.contains("instead of starting over"));
     }
 
     #[test]
@@ -1322,12 +1419,13 @@ mod tests {
             "WaitingForModel",
             Path::new("/tmp/missing.sqlite"),
             "",
+            &[],
             Some("preserved child history was not found"),
         );
 
         assert!(payload.contains("history_extraction_error"));
         assert!(payload.contains("preserved child history was not found"));
-        assert!(payload.contains("未恢复到非空消息"));
+        assert!(payload.contains("No non-empty message was recovered"));
     }
 
     #[test]
@@ -1337,6 +1435,7 @@ mod tests {
             "CallingTool",
             Path::new("/tmp/audit-failed.sqlite"),
             "AUDIT_CHECKPOINT: checked src/a.rs",
+            &[],
             None,
         );
 
@@ -1351,10 +1450,140 @@ mod tests {
             "CallingTool",
             Path::new("/tmp/audit-cancel.sqlite"),
             "",
+            &[],
             None,
         );
 
         assert!(payload.contains("status: interrupted"));
+    }
+
+    fn assistant_text(text: &str) -> crate::ai::history::Message {
+        crate::ai::history::Message {
+            role: "assistant".to_string(),
+            content: Value::String(text.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn audit_child_prompt_receives_the_progress_protocol_once() {
+        let injected = inject_audit_progress_protocol("check the staged diff");
+
+        assert!(injected.starts_with("check the staged diff"));
+        assert!(injected.contains("<audit_progress_protocol>"));
+        assert!(injected.contains("AUDIT_CHECKPOINT:"));
+        // The `/audit` command already embeds the protocol in its instruction, so a second
+        // pass must not duplicate the block.
+        assert_eq!(inject_audit_progress_protocol(&injected), injected);
+    }
+
+    #[test]
+    fn timeout_recovery_extracts_latest_published_audit_checkpoints() {
+        let messages = vec![
+            assistant_text("no checkpoint in this message"),
+            assistant_text("AUDIT_CHECKPOINT: {\"findings\": []}"),
+            assistant_text(
+                "- AUDIT_CHECKPOINT: {\"findings\": [{\"severity\": \"P3\", \"title\": \"t\"}]}\n\
+                 a later line without a record",
+            ),
+            assistant_text("AUDIT_CHECKPOINT: {\"findings\": []}"),
+        ];
+
+        let records = extract_audit_checkpoint_records(&messages);
+
+        assert_eq!(records.len(), 2, "{records:?}");
+        // The record re-published last is the freshest emission, so it must end up last instead
+        // of holding the position of its first occurrence, where a window drop could evict it.
+        assert_eq!(
+            records[0],
+            "AUDIT_CHECKPOINT: {\"findings\": [{\"severity\": \"P3\", \"title\": \"t\"}]}"
+        );
+        assert_eq!(records[1], "AUDIT_CHECKPOINT: {\"findings\": []}");
+    }
+
+    #[test]
+    fn timeout_recovery_ignores_checkpoints_outside_assistant_messages() {
+        let mut injected = assistant_text("AUDIT_CHECKPOINT: {\"findings\": []}");
+        injected.role = "user".to_string();
+        let messages = vec![
+            injected,
+            assistant_text("AUDIT_CHECKPOINT: {\"coverage_gaps\": [\"src/a.rs:1-9\"]}"),
+        ];
+
+        let records = extract_audit_checkpoint_records(&messages);
+
+        // The audit prompt itself carries the protocol's placeholder line, so text that is not
+        // the auditor's own output must never fabricate a record.
+        assert_eq!(
+            records,
+            vec![String::from(
+                "AUDIT_CHECKPOINT: {\"coverage_gaps\": [\"src/a.rs:1-9\"]}"
+            )]
+        );
+    }
+
+    #[test]
+    fn timeout_recovery_checkpoint_window_keeps_the_freshest_emission() {
+        let mut messages: Vec<crate::ai::history::Message> = (0..TIMEOUT_RECOVERY_MAX_CHECKPOINTS + 2)
+            .map(|index| assistant_text(&format!("AUDIT_CHECKPOINT: {{\"i\": {index}}}")))
+            .collect();
+        // Re-publishing the earliest record makes it the freshest emission, so the window drop
+        // has to remove an older record instead of the one published closest to the cut.
+        messages.push(assistant_text("AUDIT_CHECKPOINT: {\"i\": 0}"));
+
+        let records = extract_audit_checkpoint_records(&messages);
+
+        assert_eq!(records.len(), TIMEOUT_RECOVERY_MAX_CHECKPOINTS, "{records:?}");
+        assert_eq!(
+            records.last().map(String::as_str),
+            Some("AUDIT_CHECKPOINT: {\"i\": 0}")
+        );
+        assert!(
+            !records.iter().any(|record| record.contains("\"i\": 1")),
+            "{records:?}"
+        );
+    }
+
+    #[test]
+    fn timeout_recovery_truncated_checkpoint_keeps_the_cap_and_marks_the_cut() {
+        let long = format!("AUDIT_CHECKPOINT: {{\"title\": \"{}\"}}", "x".repeat(700));
+
+        let records = extract_audit_checkpoint_records(&[assistant_text(&long)]);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].chars().count(), TIMEOUT_RECOVERY_MAX_CHECKPOINT_CHARS);
+        assert!(records[0].ends_with('…'), "{}", records[0]);
+    }
+
+    #[test]
+    fn timeout_recovery_payload_renders_checkpoint_section_only_when_present() {
+        let with_records = format_timeout_recovery_payload(
+            "audit subagent exceeded hard timeout (600s)",
+            "CallingTool",
+            Path::new("/tmp/audit-timeout.sqlite"),
+            "",
+            &[String::from(
+                "AUDIT_CHECKPOINT: {\"coverage_gaps\": [\"src/b.rs\"]}",
+            )],
+            None,
+        );
+        assert!(with_records.contains("## AUDIT_CHECKPOINT records"), "{with_records}");
+        assert!(with_records.contains("src/b.rs"), "{with_records}");
+
+        let without_records = format_timeout_recovery_payload(
+            "audit subagent exceeded hard timeout (600s)",
+            "CallingTool",
+            Path::new("/tmp/audit-timeout.sqlite"),
+            "tail excerpt",
+            &[],
+            None,
+        );
+        assert!(
+            !without_records.contains("## AUDIT_CHECKPOINT records"),
+            "{without_records}"
+        );
     }
 
     #[test]

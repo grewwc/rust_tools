@@ -1051,17 +1051,19 @@ fn reactive_shrink_context_after_overflow(
 /// Bound the total-context rescue target, not the retained size of any one
 /// message. Token-deficit estimates can saturate at zero even for large windows;
 /// they must not turn the current user instruction into a minimal archive stub.
+/// `soft_target_chars` is the soft target already converted at the request's
+/// observed chars-per-token ratio.
 fn context_overflow_target_chars(
     before: usize,
     estimated_target: usize,
-    soft_target_tokens: usize,
+    soft_target_chars: usize,
 ) -> usize {
     let floor = super::MID_TURN_COMPRESS_SOFT_FLOOR;
     // Keep recovery possible for genuinely small input budgets. A zero budget
     // has no attainable fit, so retain the safety floor rather than discarding
     // more user content in pursuit of an impossible target.
-    let floor = if soft_target_tokens > 0 {
-        floor.min(soft_target_tokens.saturating_mul(2))
+    let floor = if soft_target_chars > 0 {
+        floor.min(soft_target_chars)
     } else {
         floor
     };
@@ -1072,8 +1074,9 @@ fn context_overflow_target_chars(
         .max(floor)
 }
 
-/// Update the temporary context projection at every model request boundary without touching canonical `turn_messages`.
-fn reclaim_tool_evidence_before_request(app: &App, messages: &mut Vec<Message>) {
+/// One bounded reclaim round over the temporary request projection; never touches canonical `turn_messages`.
+/// Returns how many evidence items were replaced by archive stubs.
+fn reclaim_tool_evidence_before_request(app: &App, messages: &mut Vec<Message>) -> usize {
     let overflow_dir = {
         use crate::ai::history::SessionStore;
         let store = SessionStore::new(app.config.history_file.as_path());
@@ -1086,7 +1089,7 @@ fn reclaim_tool_evidence_before_request(app: &App, messages: &mut Vec<Message>) 
         &authorization,
     );
     if report.pruned_count == 0 || !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
-        return;
+        return report.pruned_count;
     }
 
     let tools = if report.tools.is_empty() {
@@ -1101,6 +1104,50 @@ fn reclaim_tool_evidence_before_request(app: &App, messages: &mut Vec<Message>) 
             report.pruned_count, tools, report.freed_chars
         ),
     );
+    report.pruned_count
+}
+
+/// Share of the input allowance (per mille) at which lossless evidence
+/// reclaim starts. Below it, stale results stay in the provider's prompt
+/// cache, which is cheaper than re-prefilling everything after a new stub.
+const RECLAIM_PRESSURE_PERMILLE: usize = 500;
+/// Reclaim rounds per request; each round is itself bounded by the
+/// per-call item/char caps in `llm_prune`.
+const MAX_RECLAIM_ROUNDS_PER_REQUEST: usize = 4;
+
+fn under_reclaim_pressure(budget: request::CurrentRequestBudget) -> bool {
+    budget.prompt_tokens.saturating_mul(1_000)
+        >= budget
+            .limits
+            .input_allowance_tokens
+            .saturating_mul(RECLAIM_PRESSURE_PERMILLE)
+}
+
+/// Reclaim old tool evidence only while the measured request is under token
+/// pressure, re-measuring after every round that changed the projection.
+/// Returns the budget of the final projection, so callers need no extra
+/// preview of an unchanged request. Rate (TPM) pressure is not a reason to
+/// reclaim: the request-layer TPM budget waits instead of failing, and only
+/// discounts cached tokens behind an unchanged prefix, so a stub would forfeit
+/// that discount for the whole tail behind it.
+async fn reclaim_tool_evidence_under_pressure(
+    app: &App,
+    model: &str,
+    messages: &mut Vec<Message>,
+    tools_enabled: bool,
+) -> request::CurrentRequestBudget {
+    // Legacy protocol notes are removed on every request regardless of pressure.
+    llm_prune::remove_prune_protocol_prompt(messages);
+    let mut budget =
+        request::preview_request_budget(app, model, messages, true, tools_enabled).await;
+    for _ in 0..MAX_RECLAIM_ROUNDS_PER_REQUEST {
+        if !under_reclaim_pressure(budget) || reclaim_tool_evidence_before_request(app, messages) == 0
+        {
+            break;
+        }
+        budget = request::preview_request_budget(app, model, messages, true, tools_enabled).await;
+    }
+    budget
 }
 
 #[crate::ai::agent_hang_span(
@@ -1307,14 +1354,15 @@ async fn request_model_response(
         });
     }
 
-    // Reclaim eligible old evidence before budget compression on every request,
-    // including later tool rounds. The model has no housekeeping protocol to follow.
-    reclaim_tool_evidence_before_request(app, messages);
-    context_budget::refresh_active_plan(app, messages);
-    let context_before = super::context_metrics::ContextSizeBreakdown::measure(messages);
+    // Place fixed plan overhead first so the reclaim gate measures the
+    // request about to be sent. Reclaim rewrites history mid-prefix, so it
+    // runs only under token pressure (see `RECLAIM_PRESSURE_PERMILLE`); the
+    // model has no housekeeping protocol to follow either way.
+    context_budget::ensure_active_plan(app, messages);
     let before_budget =
-        request::preview_request_budget(app, next_model, messages, true, !force_final_response)
+        reclaim_tool_evidence_under_pressure(app, next_model, messages, !force_final_response)
             .await;
+    let context_before = super::context_metrics::ContextSizeBreakdown::measure(messages);
     let mut request_budget = apply_request_budget(
         app,
         next_model,
@@ -1423,7 +1471,7 @@ async fn request_model_response(
             let target = context_overflow_target_chars(
                 before,
                 request_budget.compression_target_chars(before),
-                request_budget.limits.soft_target_tokens,
+                request_budget.tokens_to_chars(request_budget.limits.soft_target_tokens),
             );
             let attempt = super::context_metrics::CompactionAttempt::start(
                 "provider_overflow",
@@ -1503,6 +1551,13 @@ async fn request_model_response(
                 before_budget: Some(before_budget),
                 after_budget: Some(request_budget),
                 compaction_cycle: super::context_metrics::current_compaction_cycle(&app.session_id),
+                // Set by the send path only after a successful send; a failed
+                // send leaves no feedback and reports no reuse.
+                prefix_reuse: request_result
+                    .is_ok()
+                    .then(|| app.last_known_prompt_tokens.as_ref())
+                    .flatten()
+                    .and_then(request::PromptTokenFeedback::prefix_reuse),
                 provider_overflows,
                 overflow_retries: overflow_request_retries,
                 response_received: request_result.is_ok(),
@@ -1899,7 +1954,10 @@ mod tests {
             });
         }
         let canonical = messages.clone();
-        super::reclaim_tool_evidence_before_request(&app, &mut messages);
+        assert_eq!(
+            super::reclaim_tool_evidence_before_request(&app, &mut messages),
+            1
+        );
         assert_eq!(messages.len(), canonical.len());
         assert!(messages[1].content.as_str().unwrap().len() < original.len());
         assert_eq!(messages[1].tool_call_id, canonical[1].tool_call_id);
@@ -1910,9 +1968,34 @@ mod tests {
         }
         assert!(app.prune_marks.is_empty());
         let first_projection = serde_json::to_value(&messages).unwrap();
-        super::reclaim_tool_evidence_before_request(&app, &mut messages);
+        assert_eq!(
+            super::reclaim_tool_evidence_before_request(&app, &mut messages),
+            0
+        );
         assert_eq!(serde_json::to_value(&messages).unwrap(), first_projection);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reclaim_gate_opens_at_half_of_input_allowance() {
+        let budget = |prompt_tokens: usize| -> request::CurrentRequestBudget {
+            serde_json::from_value(serde_json::json!({
+                "prompt_tokens": prompt_tokens,
+                "source": "normalized_estimate",
+                "limits": {
+                    "physical_context_tokens": 128_000,
+                    "output_reserve_tokens": 24_000,
+                    "safety_margin_tokens": 4_000,
+                    "input_allowance_tokens": 100_000,
+                    "soft_target_tokens": 70_000,
+                },
+            }))
+            .unwrap()
+        };
+        assert!(!super::under_reclaim_pressure(budget(0)));
+        assert!(!super::under_reclaim_pressure(budget(49_999)));
+        assert!(super::under_reclaim_pressure(budget(50_000)));
+        assert!(super::under_reclaim_pressure(budget(usize::MAX)));
     }
 
     #[test]
@@ -1920,9 +2003,9 @@ mod tests {
         let floor = super::super::MID_TURN_COMPRESS_SOFT_FLOOR;
         for before in [0, 1, floor, 80_000, usize::MAX] {
             for estimated_target in [0, 1, 1_000] {
-                for soft_target_tokens in [40_000, usize::MAX] {
+                for soft_target_chars in [80_000, usize::MAX] {
                     assert_eq!(
-                        context_overflow_target_chars(before, estimated_target, soft_target_tokens),
+                        context_overflow_target_chars(before, estimated_target, soft_target_chars),
                         floor,
                     );
                 }
@@ -1933,19 +2016,19 @@ mod tests {
     #[test]
     fn context_overflow_target_keeps_tightening_above_floor() {
         assert_eq!(
-            context_overflow_target_chars(100_000, 100_000, 80_000),
+            context_overflow_target_chars(100_000, 100_000, 160_000),
             75_000
         );
         assert_eq!(
-            context_overflow_target_chars(100_000, 60_000, 80_000),
+            context_overflow_target_chars(100_000, 60_000, 160_000),
             60_000
         );
     }
 
     #[test]
     fn context_overflow_target_scales_only_for_nonzero_small_budgets() {
-        assert_eq!(context_overflow_target_chars(80_000, 0, 4_000), 8_000);
-        assert_eq!(context_overflow_target_chars(80_000, 0, 1), 2);
+        assert_eq!(context_overflow_target_chars(80_000, 0, 8_000), 8_000);
+        assert_eq!(context_overflow_target_chars(80_000, 0, 2), 2);
         assert_eq!(
             context_overflow_target_chars(80_000, 0, 0),
             super::super::MID_TURN_COMPRESS_SOFT_FLOOR,
@@ -1980,7 +2063,7 @@ mod tests {
         let mut prior_archive = None;
         for _ in 0..4 {
             let before = crate::ai::history::messages_total_chars_pub(&messages);
-            let target = context_overflow_target_chars(before, 0, 40_000);
+            let target = context_overflow_target_chars(before, 0, 80_000);
             let after = reactive_shrink_context_after_overflow(&app, &mut messages, target);
             assert_eq!(after, super::super::MID_TURN_COMPRESS_SOFT_FLOOR);
             let index = crate::ai::history::last_real_user_index(&messages).unwrap();

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
-use crate::ai::files::{extract_key_lines, split_line_number_prefix};
+use crate::ai::files::{diff_line_tags, extract_key_lines, preview_anchor, split_line_number_prefix};
 use crate::ai::{
     history::HistoryMessageSummarizer,
     tools::{
@@ -1416,6 +1416,13 @@ pub(super) fn build_overflow_content_preview(content: &str) -> String {
 
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
+    let tags = diff_line_tags(content);
+    // Real line numbers exist only when the archived text carries `read_file`'s
+    // `{:>6}\t` prefix. Otherwise the anchors are 0-based indexes into this output,
+    // and are labeled as such rather than as addresses they cannot resolve.
+    let has_line_numbers = content
+        .lines()
+        .any(|line| split_line_number_prefix(line.trim()).is_some());
     let mut out = String::from("Preview (for recall; not exhaustive):\n");
     // Large source/text results: attach a structural index with line-numbered
     // heads (key lines like fn/struct/impl/use/errors), aligned with the
@@ -1453,28 +1460,28 @@ pub(super) fn build_overflow_content_preview(content: &str) -> String {
         let middle_end = total - TAIL_LINES;
         let middle_len = middle_end - middle_start;
         let probes = MID_PROBES.min(middle_len);
-        out.push_str(&format!(
-            "- middle_samples ({probes} line-numbered probes across the omitted middle):\n"
-        ));
+        out.push_str(&if has_line_numbers {
+            format!("- middle_samples ({probes} line-numbered probes across the omitted middle):\n")
+        } else {
+            format!(
+                "- middle_samples ({probes} probes across the omitted middle; labels are 0-based indexes into the archived output):\n"
+            )
+        });
         for k in 0..probes {
             let idx = if probes == 1 {
                 middle_start
             } else {
                 middle_start + k * (middle_len - 1) / (probes - 1)
             };
-            let trimmed = lines[idx].trim();
-            let (label, matched) = match split_line_number_prefix(trimmed) {
-                Some((no, rest)) => (no, rest.trim()),
-                None => (idx, trimmed),
-            };
-            // key_lines prints the same `  L<no>: ` anchors; a probe that would
-            // duplicate one adds nothing.
-            let anchor = format!("  L{label}: ");
-            if out.contains(&anchor) {
+            let anchor = preview_anchor(idx, lines[idx], tags.get(idx).copied().flatten());
+            // key_lines prints the same `  L<no>: [tag] ` anchors; a probe that
+            // would duplicate one adds nothing.
+            let anchor_prefix = format!("  {}", anchor.prefix);
+            if out.contains(&anchor_prefix) {
                 continue;
             }
-            out.push_str(&anchor);
-            out.push_str(&truncate_line(matched));
+            out.push_str(&anchor_prefix);
+            out.push_str(&truncate_line(&anchor.body));
             out.push('\n');
         }
         for line in &lines[total - TAIL_LINES..] {

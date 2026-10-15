@@ -77,7 +77,7 @@ fn no_plan_still_consumes_claim() {
 }
 
 #[test]
-fn open_steps_reopen_once_then_warn() {
+fn open_steps_reopen_until_forced_then_warn_with_steps() {
     let (app, base) = test_app_with_session();
     two_step_plan(&app);
     let mut messages = Vec::new();
@@ -89,9 +89,20 @@ fn open_steps_reopen_once_then_warn() {
     );
     assert!(last_note(&messages).contains("step 1"), "{}", last_note(&messages));
     assert!(last_note(&messages).contains("step 2"), "{}", last_note(&messages));
-    // Second evaluation in the same turn sees the marker and warns instead.
+    // Persistent gate: a second evaluation in the same turn still reopens.
     let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 1, 16);
-    assert_eq!(action, OutstandingWorkGateAction::Warn);
+    assert_eq!(action, OutstandingWorkGateAction::Reopen);
+    // Forced finals land annotated with the unsettled steps named.
+    let action = super::super::outstanding_work_gate_action(&app, &mut messages, true, 1, 16);
+    match action {
+        OutstandingWorkGateAction::Warn(steps) => {
+            assert!(steps.contains("step 1"), "{steps}");
+            assert!(steps.contains("step 2"), "{steps}");
+        }
+        other => panic!("expected Warn with steps, got {other:?}"),
+    }
+    let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 16, 16);
+    assert!(matches!(action, OutstandingWorkGateAction::Warn(_)));
     let _ = fs::remove_dir_all(&base);
 }
 
@@ -110,19 +121,21 @@ fn failed_step_blocks_completion() {
 }
 
 #[test]
-fn settled_plan_without_claim_reopens_once_then_warns() {
+fn settled_plan_without_claim_reopens_until_forced_then_warns() {
     let (app, base) = test_app_with_session();
     two_step_plan(&app);
     update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
     update_plan_step(&app, 2, StepStatus::Skipped, None).unwrap();
     // A settled plan is not a completion assertion: landing without `complete`
-    // must reopen once (the agent-side "continue"), guiding the model to
+    // must keep reopening, guiding the model to
     // assert completion structurally instead of silently ending the turn.
     let mut messages = Vec::new();
     let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16);
     assert_eq!(action, OutstandingWorkGateAction::Reopen);
     assert!(last_note(&messages).contains("no `complete` call asserts completion"));
     let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 1, 16);
+    assert_eq!(action, OutstandingWorkGateAction::Reopen);
+    let action = super::super::outstanding_work_gate_action(&app, &mut messages, true, 1, 16);
     assert_eq!(action, OutstandingWorkGateAction::WarnUnasserted);
     let _ = fs::remove_dir_all(&base);
 }
@@ -190,6 +203,28 @@ fn stale_claim_after_plan_update_is_treated_as_unasserted() {
 }
 
 #[test]
+fn reopen_is_recorded_in_the_decision_log() {
+    let (app, base) = test_app_with_session();
+    two_step_plan(&app);
+    update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
+    update_plan_step(&app, 2, StepStatus::Skipped, None).unwrap();
+    let mut messages = Vec::new();
+    // Settled plan, no claim: the gate reopens and must leave an observable
+    // decision-log trail (the model-visible note is projection-only).
+    let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 3, 16);
+    assert_eq!(action, OutstandingWorkGateAction::Reopen);
+    let recent = crate::ai::driver::decision_log::get_decision_log_store()
+        .recent_by_session(&app.session_id, 5);
+    assert!(
+        recent.iter().any(|entry| {
+            entry.context.contains("reason=outstanding_work_settled_plan_no_claim")
+        }),
+        "reopen must be observable in the decision log: {recent:?}"
+    );
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
 fn corrupt_plan_fails_open() {
     let (app, base) = test_app_with_session();
     two_step_plan(&app);
@@ -203,7 +238,7 @@ fn corrupt_plan_fails_open() {
 }
 
 #[test]
-fn final_gate_state_has_independent_outstanding_retry_budget() {
+fn final_gate_state_keeps_outstanding_reopen_independent() {
     let mut state = FinalGateState::default();
     assert!(state.can_reopen(false, 1, 16));
     assert!(state.can_reopen_outstanding_work(false, 1, 16));
@@ -213,7 +248,8 @@ fn final_gate_state_has_independent_outstanding_retry_budget() {
     assert!(state.can_reopen_outstanding_work(false, 1, 16));
 
     state.consume_outstanding_work_retry();
-    assert!(!state.can_reopen_outstanding_work(false, 1, 16));
+    // Persistent gate: consuming is a no-op; only force/cap stop the reminder.
+    assert!(state.can_reopen_outstanding_work(false, 1, 16));
     assert!(!FinalGateState::default().can_reopen_outstanding_work(true, 1, 16));
     assert!(!FinalGateState::default().can_reopen_outstanding_work(false, 16, 16));
 }

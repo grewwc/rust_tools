@@ -1,6 +1,6 @@
 {
   "name": "session_search",
-  "description": "Search one session's context (read-only): canonical messages (newest first) plus text files under its assets directory (overflow archives, checkpoints). Returns snippets around matches. Use to check whether a topic, tool, or fact appears in another session before reading it in full.",
+  "description": "Search one session's context (read-only): canonical messages (newest first, including reasoning_content, labeled 'reasoning') plus text files under its assets directory (overflow archives, checkpoints). Returns snippets around matches. Use to check whether a topic, tool, or fact appears in another session before reading it in full.",
   "parameters": {
     "type": "object",
     "properties": {

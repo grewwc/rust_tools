@@ -208,8 +208,9 @@ impl AiConfig {
     pub const HOOK_TIMEOUT_SECS: &str = "ai.hooks.timeout_secs";
 
     // ── Prompt cache ───────────────────────────────────────
-    /// When true, inject an Anthropic-style `cache_control` breakpoint on the
-    /// system prompt for gateways that honor it (e.g. OpenRouter→Anthropic).
+    /// When true, inject Anthropic-style `cache_control` breakpoints (system
+    /// prompt + rolling last user/tool message, wire body only) for models whose
+    /// registry entry sets `explicit_prompt_cache` (e.g. OpenRouter→Anthropic).
     /// Default false (OpenAI/DashScope cache automatically server-side).
     pub const PROMPT_CACHE_ENABLE: &str = "ai.prompt_cache.enable";
     /// When true, print prompt-cache hit metrics (cached tokens / hit rate)

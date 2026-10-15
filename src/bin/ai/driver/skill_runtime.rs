@@ -11,8 +11,10 @@ use crate::ai::{
     types::{App, ForcedSkillSource, ToolDefinition},
 };
 use crate::commonw::configw;
+use regex::Regex;
 use rust_tools::cw::SkipSet;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use super::{DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS};
 
@@ -993,8 +995,9 @@ fn push_project_context(builder: &mut SystemPromptBuilder) {
 /// root, `<id>.sqlite`, assets dirs) is deliberately not advertised so the
 /// model cannot bypass the tools with direct sqlite or filesystem reads;
 /// `session_search` surfaces asset paths at runtime. Injected only when the
-/// request looks session-related (`session_issue_likely`); other turns keep
-/// a one-line session id for grounding (see `build_skill_turn_guard`).
+/// request looks session-related (`session_issue_likely`) or references a
+/// concrete session id (`session_id_referenced`); other turns keep a one-line
+/// session id for grounding (see `build_skill_turn_guard`).
 fn session_context_prompt(session_id: &str) -> String {
     format!(include_str!("system_prompts/session_context.md"), session_id)
 }
@@ -1016,6 +1019,22 @@ fn session_issue_likely(question: &str) -> bool {
     ]
     .iter()
     .any(|kw| lowered.contains(kw))
+}
+
+/// Deterministic session-id detection: a UUID-shaped token in the user question
+/// is an unambiguous reference to a concrete runtime session. Unlike the
+/// keyword gate above, this needs no vocabulary, so a bare id like
+/// `ddb7e6be-7076-43b3-898f-8370e64312da` (with no "session"/"会话" words)
+/// still routes the turn to the session tools. Session store ids are
+/// 1-128 ASCII letters/digits/`-`/`_`; the dominant real-world form is a UUID,
+/// which is what this matches. Non-UUID ids (e.g. `test-session-<hex>`) are
+/// still caught by `session_issue_likely` via the "session" keyword.
+fn session_id_referenced(question: &str) -> bool {
+    static SESSION_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+            .expect("session-id regex must compile")
+    });
+    SESSION_ID_RE.is_match(question)
 }
 
 const MAX_SKILL_ACTIVATION_HISTORY_ENTRIES: usize = 6;
@@ -1563,6 +1582,33 @@ fn build_skill_turn_guard(
             "request_user_input".to_string(),
         ]));
     }
+    // Deterministic session-tool routing: a user message referencing a concrete
+    // session id (UUID-shaped) auto-loads the read-only `session` group into the
+    // resident tool set for top-level turns, so the model never has to remember
+    // `enable_tools` before it can answer a session question (a real failure
+    // mode: it probes the filesystem instead). Subagent and disabled-builtin
+    // turns keep the lazy behavior; the keyword gate below still injects the
+    // guidance for vaguer session/history wording.
+    if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0
+        && !builtin_tools.is_empty()
+        && session_id_referenced(question)
+    {
+        // Only append tools that are not already resident (a skill manifest may
+        // have declared the session group); `merge_with_runtime_enabled_tools`
+        // does not dedupe when no explicit tools are enabled.
+        let known: Box<SkipSet<String>> = builtin_tools
+            .iter()
+            .map(|tool| tool.function.name.clone())
+            .collect();
+        let missing: Vec<String> = ["session_list", "session_read", "session_search"]
+            .iter()
+            .filter(|name| !known.contains_str(*name))
+            .map(|s| s.to_string())
+            .collect();
+        if !missing.is_empty() {
+            builtin_tools.extend(crate::ai::tools::get_tool_definitions_by_names(&missing));
+        }
+    }
     let mcp_tools = select_mcp_tools(all_mcp_tools.clone(), skills, active_agent.as_ref());
     let available_tools = available_tool_names(&builtin_tools, &mcp_tools);
     let ctx = PromptContext {
@@ -1597,7 +1643,7 @@ fn build_skill_turn_guard(
     // Session debugging guidance is low-frequency knowledge: every turn keeps
     // a one-line session id for grounding, while the session-tools walkthrough
     // is injected only when the request looks session-related.
-    if session_issue_likely(question) {
+    if session_issue_likely(question) || session_id_referenced(question) {
         builder.push_labeled(
             ContextKind::Behavior,
             "session_context",

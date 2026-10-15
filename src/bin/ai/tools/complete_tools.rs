@@ -21,10 +21,22 @@ fn execute_complete(args: &Value) -> Result<String, String> {
     // not suppress the ack, but must remain visible as a warning: without the
     // persisted claim the gate treats the turn as an unasserted final.
     if let Some(ctx) = crate::ai::driver::runtime_ctx::try_current() {
-        let plan_updated_at_ms = crate::ai::tools::plan_state::load_plan_state(&ctx.app_proto)
-            .ok()
-            .flatten()
-            .map(|state| state.updated_at_ms);
+        // Snapshot the plan's `updated_at_ms` so the gate can verify the
+        // assertion later. A claim recorded without the snapshot is permanently
+        // stale (the gate demands `claim.plan_updated_at_ms == plan.updated_at_ms`),
+        // yet its ack would look identical to a healthy recording and every later
+        // final would be reopened as unasserted. Surface the failure instead.
+        let plan_updated_at_ms =
+            match crate::ai::tools::plan_state::load_plan_state(&ctx.app_proto) {
+                Ok(plan) => plan.map(|state| state.updated_at_ms),
+                Err(err) => {
+                    return Ok(format!(
+                        "Completion assertion noted but could not snapshot the plan state ({err}); \
+                         the final response will be treated as an unasserted final.\n\
+                         Now write the final response text for this turn."
+                    ));
+                }
+            };
         match crate::ai::tools::plan_state::record_completion_claim(
             &ctx.app_proto,
             summary,
@@ -101,5 +113,67 @@ mod tests {
         let ok =
             execute_complete(&serde_json::json!({"summary": "fixed the bug"})).unwrap();
         assert!(ok.contains("final response text"), "{ok}");
+    }
+
+    #[test]
+    fn unreadable_plan_state_acks_as_unasserted() {
+        use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext};
+        use crate::ai::mcp::{McpClient, SharedMcpClient};
+        use std::sync::{Arc, Mutex};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct TempDirGuard(std::path::PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let base = std::env::temp_dir().join(format!(
+            "complete-unreadable-plan-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let _guard = TempDirGuard(base.clone());
+        let mut app = crate::ai::middleware::test_util::test_app();
+        app.session_history_file = base.join("session.sqlite");
+        app.session_id = "complete-unreadable-plan-test".to_string();
+
+        // A corrupt plan-state.json makes `load_plan_state` fail: the ack must say
+        // the final will be unasserted instead of silently recording a claim whose
+        // plan snapshot is permanently stale.
+        let assets = crate::ai::driver::side_note::assets_dir_for_history(
+            &app.session_history_file,
+        );
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(
+            assets.join("plan-state.json"),
+            b"{ not valid json",
+        )
+        .unwrap();
+
+        let ctx = DriverContext::new(
+            app.clone(),
+            Arc::new(Mutex::new(McpClient::new())) as SharedMcpClient,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+        );
+        DRIVER_CTX.sync_scope(ctx, || {
+            let ok =
+                execute_complete(&serde_json::json!({"summary": "fixed the bug"})).unwrap();
+            assert!(
+                ok.contains("could not snapshot the plan state"),
+                "ack must surface the snapshot failure: {ok}"
+            );
+            assert!(
+                ok.contains("unasserted final"),
+                "ack must warn about the unasserted final: {ok}"
+            );
+        });
     }
 }

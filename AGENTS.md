@@ -76,3 +76,6 @@ Prefer an existing focused test before running one.
 1. `.agent` / builtin `.skill` files are compiled via `include_str!`; user `.skill`
    files load at runtime.
 2. `objc2*` dependencies are macOS-only.
+3. Runtime sessions live in the session store, reachable only through the
+   `session` tools; `history.sessions/` at the repo root is gitignored test
+   data, not the runtime store — never search it for sessions.

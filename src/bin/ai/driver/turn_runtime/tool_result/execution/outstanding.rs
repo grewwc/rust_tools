@@ -13,10 +13,10 @@
 //! `complete` tool; the gate checks that assertion against the plan:
 //!   - no plan file              -> Allow (plain Q&A rounds pass through untouched)
 //!   - plan settled, fresh claim -> Allow (assertion verified, consumed as spent)
-//!   - plan settled, no claim    -> Reopen once, demanding a `complete` call
-//!   - work open, fresh claim    -> Reopen once, naming the contradiction
-//!   - work open, no/stale claim -> Reopen once, naming the open steps
-//!   - budget spent / forced     -> Warn (the final lands, annotated)
+//!   - plan settled, no claim    -> Reopen, demanding a `complete` call
+//!   - work open, fresh claim    -> Reopen, naming the contradiction
+//!   - work open, no/stale claim -> Reopen, naming the open steps
+//!   - forced / at cap          -> Warn (the final lands, annotated with steps)
 //! The claim is single-use — consumed on every evaluation — so an assertion
 //! never leaks into a later round, and any `plan`/`plan_update` in between
 //! silently invalidates it via the `updated_at_ms` snapshot.
@@ -32,13 +32,15 @@ pub(in crate::ai::driver::turn_runtime) const OUTSTANDING_WORK_REQUIRED_MARKER: 
 pub(in crate::ai::driver::turn_runtime) const OUTSTANDING_WORK_WARNING: &str = "[Runtime warning] The session plan still has unsettled steps, so this final response may describe incomplete work.";
 pub(in crate::ai::driver::turn_runtime) const OUTSTANDING_WORK_UNASSERTED_WARNING: &str = "[Runtime warning] No `complete` call asserted completion, so this final response may end unfinished work.";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::ai::driver::turn_runtime) enum OutstandingWorkGateAction {
     Allow,
     Reopen,
-    Warn,
+    /// Forced to land with work still open: carries the unsettled-steps summary
+    /// so the user-visible warning names what is left instead of a generic note.
+    Warn(String),
     /// The plan is settled but nothing called `complete`: the final lands
-    /// annotated, same budget semantics as [`OutstandingWorkGateAction::Warn`].
+    /// annotated, same forced/cap semantics as [`OutstandingWorkGateAction::Warn`].
     WarnUnasserted,
 }
 
@@ -76,20 +78,24 @@ pub(in crate::ai::driver::turn_runtime) fn outstanding_work_gate_action(
 
     let claim_fresh =
         claim.is_some_and(|claim| claim.plan_updated_at_ms == Some(plan.updated_at_ms));
-    let already_fired =
-        current_turn_has_internal_marker(messages, OUTSTANDING_WORK_REQUIRED_MARKER);
+    let steps = outstanding
+        .iter()
+        .map(|(number, action)| format!("step {number} ({action})"))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     if outstanding.is_empty() {
         // A settled plan is not a completion assertion on its own: without a
         // fresh `complete` claim, a turn that stops early (no tool call at all)
         // would land as a final answer and silently end. Demand the assertion
-        // once under the shared reopen budget, then let the final land.
+        // until forced or at the iteration cap, then let the final land.
         if claim_fresh {
             return OutstandingWorkGateAction::Allow;
         }
-        if already_fired || force_final_response || iteration >= max_iterations {
+        if force_final_response || iteration >= max_iterations {
             return OutstandingWorkGateAction::WarnUnasserted;
         }
+        log_outstanding_work_reopen(app, "settled_plan_no_claim", None, iteration);
         messages.push(Message {
             role: ROLE_INTERNAL_NOTE.to_string(),
             content: serde_json::Value::String(format!(
@@ -104,22 +110,19 @@ pub(in crate::ai::driver::turn_runtime) fn outstanding_work_gate_action(
         return OutstandingWorkGateAction::Reopen;
     }
 
-    if already_fired || force_final_response || iteration >= max_iterations {
-        return OutstandingWorkGateAction::Warn;
+    if force_final_response || iteration >= max_iterations {
+        return OutstandingWorkGateAction::Warn(steps);
     }
 
-    let steps = outstanding
-        .iter()
-        .map(|(number, action)| format!("step {number} ({action})"))
-        .collect::<Vec<_>>()
-        .join(", ");
     let note = if claim_fresh {
+        log_outstanding_work_reopen(app, "open_steps_with_claim", Some(&steps), iteration);
         format!(
             "{OUTSTANDING_WORK_REQUIRED_MARKER}\n\
              You called `complete` asserting all work is done, but the session plan still has unsettled steps: {steps}.\n\
              This is not a final answer. Finish or explicitly skip the open steps with `plan_update` (a step that cannot be done must be marked skipped, not left failed), then call `complete` again and write the final response."
         )
     } else {
+        log_outstanding_work_reopen(app, "open_steps_no_claim", Some(&steps), iteration);
         format!(
             "{OUTSTANDING_WORK_REQUIRED_MARKER}\n\
              The session plan still has unsettled steps: {steps}.\n\
@@ -134,4 +137,20 @@ pub(in crate::ai::driver::turn_runtime) fn outstanding_work_gate_action(
         reasoning_content: None,
     });
     OutstandingWorkGateAction::Reopen
+}
+
+/// Make the outstanding-work reopen observable after the fact. The gate's
+/// model-visible note lives only in the request projection (it must not enter
+/// canonical history, or a later round would promote it to a system rule), so
+/// without a side channel the reopen loop is invisible in the session record.
+/// The decision log is the session side channel for runtime gate decisions.
+fn log_outstanding_work_reopen(app: &App, reason: &str, target: Option<&str>, iteration: usize) {
+    crate::ai::driver::decision_log::log_runtime_stop(
+        crate::ai::driver::decision_log::get_decision_log_store(),
+        &app.session_id,
+        crate::ai::driver::runtime_ctx::current_turn_id_or_zero(),
+        &format!("outstanding_work_{reason}"),
+        target,
+        iteration,
+    );
 }

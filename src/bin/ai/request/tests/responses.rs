@@ -134,6 +134,9 @@ fn responses_request_body_omits_assistant_reasoning_from_message_content() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        message_counts: Default::default(),
+        prompt_cache_key: None,
+        explicit_cache_breakpoints: false,
         tool_errors: None,
     };
 
@@ -148,6 +151,48 @@ fn responses_request_body_omits_assistant_reasoning_from_message_content() {
         !content.iter().any(|item| item["type"] == "summary_text"),
         "message content must not contain summary_text"
     );
+}
+
+#[test]
+fn responses_request_body_emits_prompt_cache_key_only_when_set() {
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String("hi".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let mut request = RequestBody {
+        model: "gpt-5.5".to_string(),
+        messages: &messages,
+        stream: false,
+        thinking: serde_json::Map::new(),
+        enable_search: None,
+        tools: None,
+        tool_choice: None,
+        reasoning_effort: None,
+        reasoning: None,
+        stream_options: None,
+        max_tokens: None,
+        reasoning_items: None,
+        reasoning_encrypted_replay: false,
+        estimated_prompt_tokens: 0,
+        message_counts: Default::default(),
+        prompt_cache_key: None,
+        explicit_cache_breakpoints: false,
+        tool_errors: None,
+    };
+    let body = super::super::build_responses_request_body(&request);
+    assert!(body.get("prompt_cache_key").is_none());
+    // Never leaks into chat-completions bodies, which serialize RequestBody directly.
+    let chat: Value = serde_json::to_value(&request).unwrap();
+    assert!(chat.get("prompt_cache_key").is_none());
+
+    request.prompt_cache_key = Some("session-1".to_string());
+    let body = super::super::build_responses_request_body(&request);
+    assert_eq!(body["prompt_cache_key"], "session-1");
+    let chat: Value = serde_json::to_value(&request).unwrap();
+    assert!(chat.get("prompt_cache_key").is_none());
 }
 
 #[test]
@@ -184,6 +229,9 @@ fn responses_request_body_emits_bare_function_call_for_tool_turn() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        message_counts: Default::default(),
+        prompt_cache_key: None,
+        explicit_cache_breakpoints: false,
         tool_errors: None,
     };
 
@@ -229,6 +277,9 @@ fn responses_request_body_drops_empty_text_content_items() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        message_counts: Default::default(),
+        prompt_cache_key: None,
+        explicit_cache_breakpoints: false,
         tool_errors: None,
     };
 
@@ -294,6 +345,9 @@ fn responses_request_body_omits_include_without_encrypted_replay() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        message_counts: Default::default(),
+        prompt_cache_key: None,
+        explicit_cache_breakpoints: false,
         tool_errors: None,
     };
 
@@ -348,6 +402,9 @@ fn responses_request_body_replays_reasoning_items_before_function_call() {
         reasoning_items: Some(&items),
         reasoning_encrypted_replay: true,
         estimated_prompt_tokens: 0,
+        message_counts: Default::default(),
+        prompt_cache_key: None,
+        explicit_cache_breakpoints: false,
         tool_errors: None,
     };
 
@@ -400,6 +457,9 @@ fn responses_request_body_degrades_to_bare_function_call_without_reasoning_items
         reasoning_items: Some(&empty),
         reasoning_encrypted_replay: true,
         estimated_prompt_tokens: 0,
+        message_counts: Default::default(),
+        prompt_cache_key: None,
+        explicit_cache_breakpoints: false,
         tool_errors: None,
     };
 
@@ -449,6 +509,9 @@ fn responses_request_body_replays_tool_round_narration_before_function_call() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        message_counts: Default::default(),
+        prompt_cache_key: None,
+        explicit_cache_breakpoints: false,
         tool_errors: None,
     };
 
@@ -508,6 +571,9 @@ fn responses_request_body_orders_reasoning_narration_function_call() {
         reasoning_items: Some(&items),
         reasoning_encrypted_replay: true,
         estimated_prompt_tokens: 0,
+        message_counts: Default::default(),
+        prompt_cache_key: None,
+        explicit_cache_breakpoints: false,
         tool_errors: None,
     };
 

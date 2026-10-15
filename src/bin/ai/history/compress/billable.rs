@@ -25,20 +25,120 @@ pub(in crate::ai) fn is_inline_image_data_url(s: &str) -> bool {
     t.starts_with("data:image/") && t.contains(";base64,")
 }
 
-/// Budget char count of a single part in a multimodal content array: images are
-/// billed at nominal cost, text at its actual char count.
-pub(in crate::ai) fn content_part_budget_chars(item: &Value) -> usize {
+/// Script mix of billable text, gathered in one walk and projected onto either
+/// the char budget or the prompt-token estimate, so the two measures always
+/// bill exactly the same fields.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::ai) struct BillableCounts {
+    pub(in crate::ai) ascii: usize,
+    pub(in crate::ai) other: usize,
+    pub(in crate::ai) images: usize,
+}
+
+/// Thirds of a token per image: the same 512 tokens the flat
+/// 2-chars-per-token estimate charged for [`IMAGE_BUDGET_CHARS`].
+const IMAGE_TOKEN_THIRDS: usize = IMAGE_BUDGET_CHARS / 2 * 3;
+const THIRDS_PER_TOKEN: usize = 3;
+
+impl BillableCounts {
+    pub(in crate::ai) const IMAGE: Self = Self {
+        ascii: 0,
+        other: 0,
+        images: 1,
+    };
+
+    pub(in crate::ai) const fn ascii(count: usize) -> Self {
+        Self {
+            ascii: count,
+            other: 0,
+            images: 0,
+        }
+    }
+
+    /// Counts UTF-8 lead bytes instead of decoding: continuation bytes
+    /// (0x80..=0xBF) contribute nothing, so `chars()` equals `chars().count()`.
+    pub(in crate::ai) fn text(text: &str) -> Self {
+        let mut counts = Self::default();
+        for byte in text.bytes() {
+            match byte {
+                0x00..=0x7F => counts.ascii += 1,
+                0x80..=0xBF => {}
+                _ => counts.other += 1,
+            }
+        }
+        counts
+    }
+
+    /// serde_json's compact string encoding of `text`: 2 quotes, two-char
+    /// escapes for `"` `\` `\b` `\t` `\n` `\f` `\r`, `\u00xx` (6 chars) for
+    /// other controls, every other scalar verbatim.
+    pub(in crate::ai) fn json_string(text: &str) -> Self {
+        let mut counts = Self::ascii(2);
+        for byte in text.bytes() {
+            match byte {
+                b'"' | b'\\' | 0x08 | b'\t' | b'\n' | 0x0C | b'\r' => counts.ascii += 2,
+                0x00..=0x1F => counts.ascii += 6,
+                0x20..=0x7F => counts.ascii += 1,
+                0x80..=0xBF => {}
+                _ => counts.other += 1,
+            }
+        }
+        counts
+    }
+
+    /// Char budget: Unicode scalars, images at their nominal cost.
+    pub(in crate::ai) fn chars(self) -> usize {
+        self.ascii + self.other + self.images * IMAGE_BUDGET_CHARS
+    }
+
+    /// Prompt-token estimate: ASCII prose/code/JSON at ~3 chars per token, CJK
+    /// and other non-ASCII scalars at 1 token each. The previous flat
+    /// 2-chars-per-token ratio overcharged ASCII by ~1.5x (starting compression
+    /// early) while undercharging CJK by ~2x (provider overflow); usage
+    /// feedback calibrates the verified prefix of each request.
+    pub(in crate::ai) fn tokens(self) -> usize {
+        (self.ascii + self.other * 3 + self.images * IMAGE_TOKEN_THIRDS).div_ceil(THIRDS_PER_TOKEN)
+    }
+}
+
+impl std::ops::Add for BillableCounts {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            ascii: self.ascii + rhs.ascii,
+            other: self.other + rhs.other,
+            images: self.images + rhs.images,
+        }
+    }
+}
+
+impl std::ops::AddAssign for BillableCounts {
+    fn add_assign(&mut self, rhs: Self) {
+        *self = *self + rhs;
+    }
+}
+
+impl std::iter::Sum for BillableCounts {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), std::ops::Add::add)
+    }
+}
+
+/// Budget counts of a single part in a multimodal content array: images are
+/// billed at nominal cost, text by its script mix.
+pub(in crate::ai) fn content_part_budget_counts(item: &Value) -> BillableCounts {
     let is_image = item.get("type").and_then(|t| t.as_str()) == Some("image_url")
         || item.get("image_url").is_some();
     let is_image_reference = item.get("type").and_then(|t| t.as_str()) == Some("reference")
         && item.get("kind").and_then(|kind| kind.as_str()) == Some("image");
     if is_image || is_image_reference {
-        return IMAGE_BUDGET_CHARS;
+        return BillableCounts::IMAGE;
     }
     if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-        return text.chars().count();
+        return BillableCounts::text(text);
     }
-    item.to_string().chars().count()
+    BillableCounts::text(&item.to_string())
 }
 
 pub(in crate::ai) fn automatic_summary_body(text: &str) -> Option<&str> {

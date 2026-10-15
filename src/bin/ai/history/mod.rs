@@ -639,7 +639,10 @@ fn context_projection_fingerprint(
     // messages remain intact, so older snapshots can be rebuilt safely.
     // v15: compressed tool archives use typed session-asset references instead
     // of ambiguous cwd-relative bare file names.
-    const PROJECTION_VERSION: u8 = 15;
+    // v16: recall-anchor previews tag diff lines as `[+]`/`[-]`/`[ctx]` and label
+    // prefix-less lines as `#<idx>`, so a preview cannot present unchanged context
+    // as part of the change or an index as a line address.
+    const PROJECTION_VERSION: u8 = 16;
     let overflow_dir = overflow_dir
         .map(|path| path.to_string_lossy())
         .unwrap_or_default();

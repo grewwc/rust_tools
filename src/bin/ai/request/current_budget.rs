@@ -55,6 +55,16 @@ pub(crate) struct CurrentRequestBudget {
     /// *fallback* model's window, not the original one.
     #[serde(default = "default_tool_inline_cap_chars")]
     pub(crate) inline_cap_chars: usize,
+    /// Message chars per prompt token (thousandths) observed for this request,
+    /// see [`PromptTokenFeedback::chars_per_token_milli`]. Converts token
+    /// deficits into char targets instead of a flat 2 chars/token, which
+    /// over-compressed CJK histories and under-compressed ASCII ones.
+    #[serde(default = "default_chars_per_token_milli")]
+    pub(crate) chars_per_token_milli: usize,
+}
+
+fn default_chars_per_token_milli() -> usize {
+    super::prompt_feedback::DEFAULT_CHARS_PER_TOKEN_MILLI
 }
 
 /// Conservative default for externally deserialized budgets (tests, future
@@ -76,8 +86,9 @@ impl CurrentRequestBudget {
         let output =
             preferred_output_reserve_tokens(models::max_output_tokens(model), output_override);
         let inline_cap_chars = crate::ai::driver::turn_runtime::max_tool_result_inline_chars(model);
+        let prompt_tokens = current.context_prompt_tokens(previous);
         Self {
-            prompt_tokens: current.context_prompt_tokens(previous),
+            prompt_tokens,
             source: if compatible {
                 PromptCountSource::CompatibleActualPlusEstimatedGrowth
             } else {
@@ -89,6 +100,7 @@ impl CurrentRequestBudget {
                 builder::CONTEXT_WINDOW_SAFETY_MARGIN_TOKENS,
             ),
             inline_cap_chars,
+            chars_per_token_milli: current.chars_per_token_milli(prompt_tokens),
         }
     }
 
@@ -100,16 +112,43 @@ impl CurrentRequestBudget {
         self.prompt_tokens > self.limits.input_allowance_tokens
     }
 
+    /// Message chars that `tokens` prompt tokens correspond to at this
+    /// request's observed ratio, rounded up so a deficit is never understated.
+    pub(crate) fn tokens_to_chars(self, tokens: usize) -> usize {
+        let chars = (tokens as u128)
+            .saturating_mul(self.chars_per_token_milli as u128)
+            .div_ceil(1_000);
+        usize::try_from(chars).unwrap_or(usize::MAX)
+    }
+
     /// Translate a token deficit to a mechanical character target, not a claim
     /// that the replacement will fit. Fixed tool/system overhead may make this
     /// target unattainable; remeasure the normalized request after replacement.
     pub(crate) fn compression_target_chars(self, current_chars: usize) -> usize {
         current_chars.saturating_sub(
-            self.prompt_tokens
-                .saturating_sub(self.limits.soft_target_tokens)
-                .saturating_mul(2),
+            self.tokens_to_chars(
+                self.prompt_tokens
+                    .saturating_sub(self.limits.soft_target_tokens),
+            ),
         )
     }
+}
+
+/// Static soft target of `model` in message chars at the default (unmeasured)
+/// chars-per-token ratio: the same limits [`CurrentRequestBudget`] measures
+/// against, minus anything request-specific. Turn-level budgets that must stay
+/// stable for a model (e.g. the cross-turn history projection) derive from this
+/// instead of a fixed character constant.
+pub(crate) fn soft_target_chars_for_model(model: &str) -> usize {
+    let soft_target_tokens = ContextLimits::new(
+        models::context_window_tokens(model),
+        preferred_output_reserve_tokens(models::max_output_tokens(model), None),
+        builder::CONTEXT_WINDOW_SAFETY_MARGIN_TOKENS,
+    )
+    .soft_target_tokens;
+    soft_target_tokens
+        .saturating_mul(default_chars_per_token_milli())
+        .div_ceil(1_000)
 }
 
 fn preferred_output_reserve_tokens(model_max: Option<u32>, output_override: Option<u32>) -> usize {
@@ -127,6 +166,7 @@ fn preferred_output_reserve_tokens(model_max: Option<u32>, output_override: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::history::Message;
 
     #[test]
     fn preferred_output_reserve_is_independent_from_large_wire_caps() {
@@ -171,12 +211,13 @@ mod tests {
             false,
             false,
             1_234,
-            true,
+            Default::default(),
         );
 
         let budget = CurrentRequestBudget::measure(&model.key, None, &feedback, None);
 
         assert_eq!(budget.prompt_tokens, 1_234);
+        assert_eq!(budget.chars_per_token_milli, 2_000);
         assert_eq!(budget.limits.output_reserve_tokens, 32_000);
         assert_eq!(
             budget.limits.input_allowance_tokens,
@@ -201,9 +242,52 @@ mod tests {
             source: PromptCountSource::NormalizedEstimate,
             limits,
             inline_cap_chars: 32_000,
+            chars_per_token_milli: 2_000,
         };
         assert!(budget.exceeds_soft_target());
         assert!(budget.exceeds_input_allowance());
         assert_eq!(budget.compression_target_chars(usize::MAX), 0);
+    }
+
+    fn preview_budget(model: &str, messages: &[Message]) -> CurrentRequestBudget {
+        let (estimated, counts) =
+            builder::estimate_request_prompt_from_definitions(messages, None, None);
+        let feedback = PromptTokenFeedback::capture_preview(
+            "session",
+            model,
+            "",
+            messages,
+            &serde_json::Map::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            estimated,
+            counts,
+        );
+        CurrentRequestBudget::measure(model, None, &feedback, None)
+    }
+
+    #[test]
+    fn current_budget_chars_per_token_follows_script_mix() {
+        let model = crate::ai::model_names::all()[0].key.clone();
+        let text = |body: String| Message {
+            role: "user".to_owned(),
+            content: serde_json::Value::String(body),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let ascii = preview_budget(&model, &[text("plain ascii prose ".repeat(1_000))]);
+        let cjk = preview_budget(&model, &[text("中文上下文压缩".repeat(1_000))]);
+        assert_eq!(ascii.chars_per_token_milli, 3_000);
+        assert_eq!(cjk.chars_per_token_milli, 1_000);
+        // A 1K-token deficit frees 3K ASCII chars but only 1K CJK chars; the
+        // flat ratio under-compressed the former and over-compressed the latter.
+        assert_eq!(ascii.tokens_to_chars(1_000), 3_000);
+        assert_eq!(cjk.tokens_to_chars(1_000), 1_000);
     }
 }

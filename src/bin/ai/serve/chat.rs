@@ -3847,6 +3847,7 @@ mod tests {
             tool_groups: Vec::new(),
             mcp_servers: Vec::new(),
             disable_mcp_tools: false,
+            audit_checkpoints: false,
             model_tier: None,
             disabled,
             hidden,

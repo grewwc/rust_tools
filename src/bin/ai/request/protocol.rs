@@ -6,7 +6,10 @@
 
 use serde_json::{Value, json};
 
-use super::reasoning::resolve_reasoning_wire_controls;
+use super::reasoning::{
+    apply_prompt_cache_breakpoints, is_nonempty_text_block, mark_content_cache_breakpoint,
+    resolve_reasoning_wire_controls,
+};
 use super::{RequestBody, types::extract_displayable_text};
 use crate::ai::history::Message;
 use crate::ai::models;
@@ -27,6 +30,16 @@ impl RequestProtocolDialect {
     /// first, then serialize.
     pub(super) fn build_http_body(self, request: &RequestBody<'_>) -> Vec<u8> {
         match self {
+            Self::ChatCompletions if request.explicit_cache_breakpoints => {
+                // Breakpoints patch the wire copy only; the cost of the `Value`
+                // round trip is paid solely by opted-in models.
+                let mut body =
+                    serde_json::to_value(request).expect("chat-completions body should serialize");
+                if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+                    apply_prompt_cache_breakpoints(messages);
+                }
+                serde_json::to_vec(&body).expect("chat-completions body should serialize")
+            }
             Self::ChatCompletions => {
                 serde_json::to_vec(request).expect("chat-completions body should serialize")
             }
@@ -102,7 +115,18 @@ fn build_messages_request_body(request: &RequestBody<'_>) -> Value {
         }
     }
     if !system_parts.is_empty() {
-        body.insert("system".to_string(), Value::String(system_parts.join("\n\n")));
+        let system = system_parts.join("\n\n");
+        // Anthropic caches in tools → system → messages order, so this
+        // breakpoint covers the tool schemas as well.
+        let system = if request.explicit_cache_breakpoints {
+            json!([{ "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }])
+        } else {
+            Value::String(system)
+        };
+        body.insert("system".to_string(), system);
+    }
+    if request.explicit_cache_breakpoints {
+        mark_messages_cache_breakpoint(&mut messages);
     }
     body.insert("messages".to_string(), Value::Array(messages));
 
@@ -117,6 +141,24 @@ fn build_messages_request_body(request: &RequestBody<'_>) -> Value {
     }
 
     Value::Object(body)
+}
+
+/// Rolling Anthropic cache breakpoint on the last user message (tool results
+/// are user messages on this dialect), so each request writes the conversation
+/// prefix the next one reads back. Any block type except empty text accepts
+/// `cache_control` here (`tool_result` and `image` included).
+fn mark_messages_cache_breakpoint(messages: &mut [Value]) {
+    if let Some(content) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|message| message.get_mut("content"))
+    {
+        mark_content_cache_breakpoint(content, |block| {
+            block.get("type").and_then(Value::as_str) != Some("text")
+                || is_nonempty_text_block(block)
+        });
+    }
 }
 
 /// User message content: plain strings pass through; structured blocks are
@@ -334,6 +376,9 @@ pub(crate) fn build_http_body_for_json_messages(
         reasoning_items: None,
         reasoning_encrypted_replay: models::reasoning_encrypted_replay_enabled(model),
         estimated_prompt_tokens: 0,
+        message_counts: Default::default(),
+        prompt_cache_key: None,
+        explicit_cache_breakpoints: false,
         tool_errors: None,
     };
     build_http_body_for_request(model, endpoint, &mut request)
@@ -669,6 +714,9 @@ pub(super) fn build_responses_request_body(request: &RequestBody<'_>) -> Value {
     if let Some(max_tokens) = request.max_tokens {
         object.insert("max_output_tokens".to_string(), max_tokens.into());
     }
+    if let Some(key) = &request.prompt_cache_key {
+        object.insert("prompt_cache_key".to_string(), key.clone().into());
+    }
     body
 }
 
@@ -694,6 +742,9 @@ mod messages_body_tests {
             reasoning_items: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
+            message_counts: Default::default(),
+            prompt_cache_key: None,
+            explicit_cache_breakpoints: false,
             tool_errors: None,
         };
         build_messages_request_body(&request)
@@ -720,6 +771,9 @@ mod messages_body_tests {
             reasoning_items: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
+            message_counts: Default::default(),
+            prompt_cache_key: None,
+            explicit_cache_breakpoints: false,
             tool_errors: None,
         };
         let body = build_messages_request_body(&request);
@@ -781,6 +835,67 @@ mod messages_body_tests {
         assert_eq!(tool_block["type"], "tool_result");
         assert_eq!(tool_block["tool_use_id"], "call_1");
         assert_eq!(tool_block["content"], "results here");
+    }
+
+    #[test]
+    fn messages_body_places_system_and_rolling_cache_breakpoints_only_when_enabled() {
+        let messages = json_messages_to_request_messages(&[
+            json!({"role": "system", "content": "You are a helper."}),
+            json!({"role": "user", "content": "search rust"}),
+            json!({"role": "assistant", "content": "done"}),
+            json!({"role": "user", "content": "thanks"}),
+        ]);
+        let mut request = RequestBody {
+            model: "claude-opus-5-5".to_string(),
+            messages: &messages,
+            stream: true,
+            thinking: serde_json::Map::new(),
+            enable_search: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            reasoning: None,
+            stream_options: None,
+            max_tokens: None,
+            reasoning_items: None,
+            reasoning_encrypted_replay: false,
+            estimated_prompt_tokens: 0,
+            message_counts: Default::default(),
+            prompt_cache_key: None,
+            explicit_cache_breakpoints: false,
+            tool_errors: None,
+        };
+        let plain = build_messages_request_body(&request);
+        assert!(!plain.to_string().contains("cache_control"));
+
+        request.explicit_cache_breakpoints = true;
+        let body = build_messages_request_body(&request);
+        assert_eq!(body["system"][0]["text"], "You are a helper.");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        let wire = body["messages"].as_array().expect("messages array");
+        // Only the last user message carries the rolling breakpoint.
+        assert_eq!(wire[0]["content"], "search rust");
+        assert_eq!(wire[2]["content"][0]["text"], "thanks");
+        assert_eq!(wire[2]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn messages_cache_breakpoint_skips_empty_text_but_marks_tool_results() {
+        let mut messages = vec![json!({
+            "role": "user",
+            "content": [
+                { "type": "tool_result", "tool_use_id": "call_1", "content": "ok" },
+                { "type": "text", "text": "" },
+            ],
+        })];
+        mark_messages_cache_breakpoint(&mut messages);
+        let blocks = messages[0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert!(blocks[1].get("cache_control").is_none());
+
+        let mut empty = vec![json!({ "role": "user", "content": "" })];
+        mark_messages_cache_breakpoint(&mut empty);
+        assert_eq!(empty[0]["content"], "");
     }
 
     #[test]
@@ -897,6 +1012,9 @@ mod messages_body_tests {
             reasoning_items: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
+            message_counts: Default::default(),
+            prompt_cache_key: None,
+            explicit_cache_breakpoints: false,
             tool_errors: None,
         };
         let body = build_messages_request_body(&request);
@@ -928,6 +1046,9 @@ mod messages_body_tests {
             reasoning_items: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
+            message_counts: Default::default(),
+            prompt_cache_key: None,
+            explicit_cache_breakpoints: false,
             tool_errors: Some(&tool_errors),
         };
         let body = build_messages_request_body(&request);

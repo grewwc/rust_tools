@@ -22,12 +22,11 @@ pub(in crate::ai::driver::turn_runtime) const INJECTED_CONTEXT_ECHO_STOP: &str =
 /// Turn-local state for final-response recovery. Prompt markers remain useful context for
 /// the model, but runtime control flow must not infer retry budgets from persisted text:
 /// old markers can survive into later turns. General quality gates share one retry, while
-/// the structural outstanding-work assertion has its own retry so another gate cannot
-/// suppress the required `complete` prompt.
+/// the structural outstanding-work assertion reopens until forced or at the
+/// iteration cap, so another gate cannot suppress the required `complete` prompt.
 #[derive(Debug, Default)]
 pub(in crate::ai::driver::turn_runtime) struct FinalGateState {
     retry_consumed: bool,
-    outstanding_work_retry_consumed: bool,
     no_tool_retry_consumed: bool,
 }
 
@@ -43,10 +42,6 @@ impl FinalGateState {
         .any(|marker| current_turn_has_internal_marker(messages, marker));
         Self {
             retry_consumed,
-            outstanding_work_retry_consumed: current_turn_has_internal_marker(
-                messages,
-                OUTSTANDING_WORK_REQUIRED_MARKER,
-            ),
             no_tool_retry_consumed: current_turn_has_internal_marker(
                 messages,
                 NO_TOOL_SYNTHESIS_RETRY_MARKER,
@@ -73,11 +68,12 @@ impl FinalGateState {
         iteration: usize,
         max_iterations: usize,
     ) -> bool {
-        !self.outstanding_work_retry_consumed && !force_final_response && iteration < max_iterations
+        !force_final_response && iteration < max_iterations
     }
 
     pub(super) fn consume_outstanding_work_retry(&mut self) {
-        self.outstanding_work_retry_consumed = true;
+        // Persistent gate: no per-turn budget to consume. Kept so the call site
+        // stays explicit about which gate fired.
     }
 
     pub(super) fn no_tool_retry_consumed(&self) -> bool {

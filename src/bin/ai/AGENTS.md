@@ -22,19 +22,25 @@ the nearest child `AGENTS.md`.
   process and terminal infrastructure.
 - `tool_descriptions/`: build-discovered per-tool JSON metadata.
 
-## Session storage & sessionid debugging
+## Session inspection & sessionid debugging
 
-Sessions are the persistence unit; IDs are 1–128 ASCII letters/digits/`-`/`_`,
-not necessarily UUIDs. `SessionStore` derives `<history-stem>.sessions/`, where
-`<id>.sqlite` is canonical history, `<id>.assets/` holds derived artifacts, and
-lock/PID files coordinate live state. Session layout is independent of cwd.
-The model may inspect session data only read-only and only through the
-`session` tools (`session_list` / `session_read` / `session_search`, loaded via
-`enable_tools`); `/sessions` owns lifecycle. Never advertise the storage layout
-to the model: it invites raw sqlite/filesystem reads that bypass the WAL-aware
-tool access (see `driver/skill_runtime.rs` `session_context_prompt`).
+Sessions are the persistence unit; IDs are 1-128 ASCII letters/digits/`-`/`_`,
+not necessarily UUIDs, and the session layout is independent of cwd. The model
+may inspect session data only read-only and only through the `session` tools
+(`session_list` / `session_read` / `session_search`, loaded via `enable_tools`);
+`/sessions` owns lifecycle. The on-disk session storage (sqlite and asset
+files) is not a sanctioned read path: never locate, query, or open it directly
+— `session_search` surfaces asset content at runtime.
 `build_skill_turn_guard` injects that `session_context` guidance when the turn
-looks session-related; other turns carry a one-line session id only.
+looks session-related or references a concrete session id (UUID-shaped,
+`session_id_referenced`); a top-level turn with a session id also auto-loads
+the `session` group into the resident tool set so the model never needs
+`enable_tools` first. Other turns carry a one-line session id only.
+
+Capability-first: a question that names a session id must be answered with the
+`session` tools — never by probing the filesystem or sqlite. The repo-root
+`history.sessions/` directory is gitignored test session data, not the runtime
+session store; treat it like any other non-sanctioned storage.
 
 ## Runtime-wide invariants
 

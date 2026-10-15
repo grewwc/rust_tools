@@ -209,6 +209,10 @@ pub(super) struct AgentManifest {
     pub(super) mcp_servers: Vec<String>,
     #[serde(default)]
     pub(super) disable_mcp_tools: bool,
+    /// Publish `AUDIT_CHECKPOINT` progress records: a subagent with this flag gets the audit
+    /// progress protocol appended to its prompt, so a run cut short still delivers findings.
+    #[serde(default)]
+    pub(super) audit_checkpoints: bool,
     #[serde(default)]
     pub(super) model_tier: Option<AgentModelTier>,
     #[serde(default)]
@@ -806,6 +810,7 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
     let mut tool_groups: Vec<String> = Vec::new();
     let mut mcp_servers: Vec<String> = Vec::new();
     let mut disable_mcp_tools = false;
+    let mut audit_checkpoints = false;
 
     let mut body = String::new();
     let mut in_front_matter = true;
@@ -881,6 +886,9 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
                 "disable_mcp_tools" => {
                     disable_mcp_tools = unquoted.eq_ignore_ascii_case("true");
                 }
+                "audit_checkpoints" => {
+                    audit_checkpoints = unquoted.eq_ignore_ascii_case("true");
+                }
                 "tools" => tools = parse_list_value(unquoted),
                 "tool_groups" => tool_groups = parse_list_value(unquoted),
                 "mcp_servers" => mcp_servers = parse_list_value(unquoted),
@@ -943,6 +951,7 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
         tool_groups,
         mcp_servers,
         disable_mcp_tools,
+        audit_checkpoints,
         model_tier: agent_model_tier,
         disabled,
         hidden,

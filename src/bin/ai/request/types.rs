@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::ai::history::Message;
+use crate::ai::history::compress::BillableCounts;
 use rustc_hash::FxHashMap;
 
 #[derive(Debug, Serialize)]
@@ -58,11 +59,27 @@ pub(crate) struct RequestBody<'a> {
     /// request model name 反查失败。`#[serde(skip)]`：非 chat-completions 字段。
     #[serde(skip)]
     pub(crate) reasoning_encrypted_replay: bool,
-    /// 本轮请求的 prompt token 字符估算（build_request_body 内计算一次，
-    /// 供 TPM budget 等复用，避免对同一历史重复全量遍历）。`#[serde(skip)]`：
-    /// 不参与任何 wire 编码。
+    /// Character-based prompt-token estimate for this request, computed once in
+    /// `build_request_body` and reused (e.g. by the TPM budget) so the same
+    /// history is not re-walked. `#[serde(skip)]`: never part of any wire encoding.
     #[serde(skip)]
     pub(crate) estimated_prompt_tokens: usize,
+    /// Script mix of the messages behind `estimated_prompt_tokens`, so budgets
+    /// can convert token deficits back into message chars at the observed
+    /// ratio instead of a flat constant. `#[serde(skip)]`: never on the wire.
+    #[serde(skip)]
+    pub(crate) message_counts: BillableCounts,
+    /// Session-scoped cache routing key for models whose registry entry sets
+    /// `prompt_cache_key`. Only the Responses dialect emits it, and only the
+    /// main request boundary sets it. `#[serde(skip)]`: not a chat-completions field.
+    #[serde(skip)]
+    pub(crate) prompt_cache_key: Option<String>,
+    /// Explicit (Anthropic-style) cache breakpoints for models whose registry
+    /// entry sets `explicit_prompt_cache`. Applied to the wire body only, so the
+    /// request messages that feed prompt fingerprints never carry a moving
+    /// marker. `#[serde(skip)]`: never serialized as a field.
+    #[serde(skip)]
+    pub(crate) explicit_cache_breakpoints: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]

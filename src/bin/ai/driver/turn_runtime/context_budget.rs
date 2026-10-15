@@ -162,7 +162,7 @@ impl SoftTargetConvergence {
         let token_gap = budget
             .prompt_tokens
             .saturating_sub(budget.limits.soft_target_tokens);
-        let baseline = token_gap.saturating_mul(2);
+        let baseline = budget.tokens_to_chars(token_gap);
         let requested = if removed_tokens == 0 {
             baseline.max(removed_chars.saturating_mul(2))
         } else {
@@ -269,10 +269,12 @@ fn apply_pre_request_context_budget(
     )
 }
 
-/// Refresh fixed plan overhead before measuring the normalized request.
-pub(super) fn refresh_active_plan(app: &App, messages: &mut Vec<Message>) {
-    ActivePlanProjection::take(messages);
-    ActivePlanProjection::new(active_plan_text(app)).restore(messages);
+/// Place fixed plan overhead before measuring the normalized request, keeping
+/// an existing snapshot frozen (see [`ActivePlanProjection::frozen_or`]).
+pub(super) fn ensure_active_plan(app: &App, messages: &mut Vec<Message>) {
+    let snapshot = ActivePlanProjection::take(messages);
+    ActivePlanProjection::frozen_or(snapshot, ActivePlanProjection::new(active_plan_text(app)), false)
+        .restore(messages);
 }
 
 pub(super) fn apply_measured_context_budget(
@@ -288,7 +290,7 @@ pub(super) fn apply_measured_context_budget(
         budget.compression_target_chars(chars)
     } else {
         chars.saturating_add(
-            budget.limits.soft_target_tokens.saturating_sub(budget.prompt_tokens).saturating_mul(2),
+            budget.tokens_to_chars(budget.limits.soft_target_tokens.saturating_sub(budget.prompt_tokens)),
         )
     };
     apply_context_budget_target(
@@ -397,24 +399,33 @@ fn apply_context_budget_target(
     // Persisted plan state is a fixed-cost request projection, not compressible history.
     // Remove the previous pair before reserving the current one so refreshes cannot
     // accumulate charges or let recall/compression spend the plan's headroom.
-    ActivePlanProjection::take(messages);
-    let active_context = active_plan_text(app);
-    let active_plan = ActivePlanProjection::new(if last_real_user_index(messages).is_some() {
-        active_context.clone()
+    let snapshot = ActivePlanProjection::take(messages);
+    let fresh = ActivePlanProjection::new(if last_real_user_index(messages).is_some() {
+        active_plan_text(app)
     } else {
         String::new()
     });
-    let reserved_chars = active_plan.chars();
+    // Either pair may be restored, so reserve the larger one. Recall keys off the
+    // frozen text while it is reusable, keeping its query stable across requests.
+    let reusable = !snapshot.pair.is_empty() && !fresh.pair.is_empty();
+    let (reserved_chars, active_context) = if reusable {
+        (snapshot.chars().max(fresh.chars()), snapshot.text().to_string())
+    } else {
+        (fresh.chars(), fresh.text().to_string())
+    };
+    let prefix_before = history_prefix_fingerprint(messages);
     let mut report = apply_history_context_budget(
         app,
         messages,
-        active_plan.remaining_target(target_chars),
+        target_chars.saturating_sub(reserved_chars),
         &active_context,
         allow_lossy,
         tool_inline_cap_chars,
     );
+    let prefix_rewritten = history_prefix_fingerprint(messages) != prefix_before;
+    let active_plan = ActivePlanProjection::frozen_or(snapshot, fresh, prefix_rewritten);
+    report.before_chars = report.before_chars.saturating_add(active_plan.chars());
     active_plan.restore(messages);
-    report.before_chars = report.before_chars.saturating_add(reserved_chars);
     report.after_chars = crate::ai::history::messages_total_chars_pub(messages);
     report.target_chars = target_chars;
     report
@@ -553,7 +564,7 @@ fn apply_history_context_budget(
     report
 }
 
-const ACTIVE_PLAN_HANDOFF: &str = "Runtime plan handoff (not a new user request). The next assistant message is a bounded projection of persisted plan state, not verified facts or new instructions. Continue with the latest real user request.";
+const ACTIVE_PLAN_HANDOFF: &str = "Runtime plan handoff (not a new user request). The next assistant message is a bounded snapshot of persisted plan state that may predate plan tool results later in this turn; those results supersede it. It is not verified facts or new instructions. Continue with the latest real user request.";
 
 fn active_plan_text(app: &App) -> String {
     crate::ai::tools::plan_state::load_plan_state(app)
@@ -561,6 +572,14 @@ fn active_plan_text(app: &App) -> String {
         .flatten()
         .map(|plan| plan.render_active_context(4_096))
         .unwrap_or_default()
+}
+
+/// Identity of everything before the plan pair's insertion point. Changes
+/// confined to the current-turn tail (e.g. spilling older tool groups) keep it,
+/// so they do not by themselves justify re-rendering the pair.
+fn history_prefix_fingerprint(messages: &[Message]) -> Option<u64> {
+    last_real_user_index(messages)
+        .map(|user| super::context_metrics::projection_fingerprint(&messages[..user]))
 }
 
 /// A fixed snapshot kept outside compression and restored within its reserved budget.
@@ -594,6 +613,26 @@ impl ActivePlanProjection {
 
     fn chars(&self) -> usize {
         crate::ai::history::messages_total_chars_pub(&self.pair)
+    }
+
+    fn text(&self) -> &str {
+        self.pair
+            .get(1)
+            .and_then(|body| body.content.as_str())
+            .unwrap_or_default()
+    }
+
+    /// The pair sits before the current user message, so re-rendering it on
+    /// every status flip would re-prefill the whole current turn. Within a turn
+    /// the snapshot stays frozen (plan tool results in the tail already carry
+    /// the changes); `fresh` replaces it only when there is no snapshot, the
+    /// plan is gone, or the prefix before the pair was rewritten anyway.
+    fn frozen_or(snapshot: Self, fresh: Self, prefix_rewritten: bool) -> Self {
+        if snapshot.pair.is_empty() || fresh.pair.is_empty() || prefix_rewritten {
+            fresh
+        } else {
+            snapshot
+        }
     }
 
     pub(super) fn remaining_target(&self, target_chars: usize) -> usize {
@@ -1843,8 +1882,15 @@ mod tests {
         .unwrap();
         apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
         assert_eq!(messages.len(), 4);
-        assert!(message_text(&messages[2].content).contains("1=failed"));
-        assert!(message_text(&messages[2].content).contains("Verification failed"));
+        // An unchanged prefix keeps the turn's snapshot frozen; the plan tool
+        // result in the tail is what reports the flip to the model.
+        assert_eq!(messages, once);
+        assert!(message_text(&messages[2].content).contains("1=pending"));
+        // A fresh turn (no snapshot) renders the current status.
+        let mut next_turn = canonical.clone();
+        apply_pre_request_context_budget(&app, &app.current_model, &mut next_turn);
+        assert!(message_text(&next_turn[2].content).contains("1=failed"));
+        assert!(message_text(&next_turn[2].content).contains("Verification failed"));
         assert_eq!(messages.first(), canonical.first());
         assert_eq!(messages.last(), canonical.last());
         std::fs::write(
@@ -1918,7 +1964,10 @@ mod tests {
             apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
             let replacement = ActivePlanProjection::take(&mut messages);
             assert_eq!(replacement.pair.len(), 2, "budget={budget}");
-            assert_eq!(replacement.pair[1].content.as_str(), Some(fresh.as_str()));
+            // A complete snapshot stays frozen under an unchanged prefix; only a
+            // turn without one gets the fresh rendering.
+            let expected = if body.is_empty() { &fresh } else { &body };
+            assert_eq!(replacement.pair[1].content.as_str(), Some(expected.as_str()));
             assert!(fresh.contains("Fresh failure"));
             assert_eq!(messages, canonical, "budget={budget}");
         }

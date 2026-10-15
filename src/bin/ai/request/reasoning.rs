@@ -264,27 +264,62 @@ fn prompt_cache_config_enabled() -> bool {
         .eq_ignore_ascii_case("true")
 }
 
-/// Rewrites the first system / internal_note message's plain-text content into
-/// a content-block array carrying `cache_control`, as an explicit prompt-cache
-/// breakpoint. Only converts when the content is currently a string; idempotent
-/// and never touches other messages.
-pub(super) fn apply_prompt_cache_breakpoint(messages: &mut [Message]) {
-    for message in messages.iter_mut() {
-        if !is_system_like_role(&message.role) {
-            continue;
-        }
-        if let Value::String(text) = &message.content {
-            message.content = json!([
-                {
-                    "type": "text",
-                    "text": text,
-                    "cache_control": { "type": "ephemeral" }
-                }
-            ]);
-        }
-        // Setting the breakpoint on the first system-like message only is sufficient.
-        break;
+/// Places explicit prompt-cache breakpoints on chat-completions wire messages:
+/// one on the first system message (stable instructions) and one rolling
+/// breakpoint on the last user/tool message, so every request writes the whole
+/// conversation prefix and the next request reads it back (the provider looks
+/// back from each breakpoint for the longest cached prefix). Wire-only: request
+/// messages feed prompt fingerprints, and a marker that moves every request
+/// would break prefix comparison at its previous position. Uses 2 of the 4
+/// breakpoints Anthropic allows; idempotent.
+pub(super) fn apply_prompt_cache_breakpoints(messages: &mut [Value]) {
+    let role_of = |message: &Value| message.get("role").and_then(Value::as_str).map(str::to_owned);
+    if let Some(content) = messages
+        .iter_mut()
+        .find(|message| role_of(message).is_some_and(|role| is_system_like_role(&role)))
+        .and_then(|message| message.get_mut("content"))
+    {
+        mark_content_cache_breakpoint(content, is_nonempty_text_block);
     }
+    if let Some(content) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| matches!(role_of(message).as_deref(), Some("user" | "tool")))
+        .and_then(|message| message.get_mut("content"))
+    {
+        mark_content_cache_breakpoint(content, is_nonempty_text_block);
+    }
+}
+
+/// Marks `content` as a cache breakpoint: a non-empty plain string becomes a
+/// single text block; a block array marks its last block accepted by
+/// `cacheable`. Empty text is never marked because Anthropic rejects empty
+/// text blocks. Shared by the chat-completions and Anthropic Messages dialects
+/// so the breakpoint rule cannot drift between them; idempotent.
+pub(super) fn mark_content_cache_breakpoint(content: &mut Value, cacheable: fn(&Value) -> bool) {
+    if let Value::String(text) = content {
+        if text.is_empty() {
+            return;
+        }
+        let text = std::mem::take(text);
+        *content = json!([{ "type": "text", "text": text }]);
+    }
+    if let Some(Value::Object(block)) = content
+        .as_array_mut()
+        .and_then(|blocks| blocks.iter_mut().rev().find(|block| cacheable(block)))
+    {
+        block.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+    }
+}
+
+/// Non-empty `text` block: the only part chat-completions gateways accept
+/// `cache_control` on.
+pub(super) fn is_nonempty_text_block(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("text")
+        && block
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
 }
 
 /// Per-vendor thinking-off capability for the current model (see

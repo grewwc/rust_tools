@@ -26,6 +26,8 @@ Create an `audit_prompt` from the changes you made for this request. It must inc
 - **Change summary:** For each changed file, state what changed and why. This lets the auditor distinguish your intent from unrelated diffs.
 - **Verification focus:** List the invariants, edge cases, and regression risks to check, such as compilation, behavior changes, error handling, concurrency or side effects, and configuration impact.
 
+- **Evidence read list (required):** For each changed file, name the ranges the auditor must read (`path:start-end`, taken from your own `read_file` calls) and the invariant each range checks. The auditor may only cite evidence from its own `read_file` calls in its turn, so this list is what lets it verify quickly instead of re-discovering the change set with repo-wide searches. Keep one list per audit scope — see the scoped parallel path in §2.
+
 A task subagent cannot see your conversation history. The `/audit` path adds this session's change context, but the `task` path receives only `audit_prompt`; therefore, `audit_prompt` must stand alone.
 
 ### 2. Start the audit
@@ -33,6 +35,8 @@ A task subagent cannot see your conversation history. The `/audit` path adds thi
 `/audit [-f] <audit_prompt>` is an interactive command typed by the user before the model loop. The model cannot invoke it, and it is not a shell command; never run it through `execute_command`.
 
 - **Autonomous path:** Call `task` with `audit_prompt` and `agent: "audit"` (full audit) or `agent: "audit-fast"` (small, low-risk review only; never downgrade a user-requested audit). Leave `inherit` at its default so the auditor reasons independently and never reads your conversation; do not widen it to `"all"`, and do not pass `response_schema`: these agents publish the machine-checked `<audit_report>` envelope as their final response, so a JSON Schema contract makes the whole task fail. If `task` is missing from the available tools, enable it first via `enable_tools` (`{"operation":"enable","tools":["task"]}`). If the task family is hidden entirely — inside a subagent turn, for example — do not claim an audit happened: report the change as un-audited or hand the user the `/audit` prompt. This path injects no change context, so tell the subagent that a finding is only published when every cited line range comes from its own `read_file` call in that turn; diff output is a lead, not evidence.
+- **Scoped parallel path (large change sets):** When the change set spans more than two files, roughly 150+ changed lines, or independent subsystems, start 2-4 audits at once with `task_spawn_batch` (`agent: "audit"`, one scope per child — a module or an invariant family — each with its own read list and the same scope/evidence rules). Tell each child to stay inside its list, not to re-run the commands you already ran (build, tests, `git`/`grep`), and to report `coverage_gaps` instead of widening its scope. Collect every child (`task_status`/`task_wait`), merge and deduplicate the findings, and integrate each delivered task before finishing.
+
 - **User-assisted path:** If the user is present, offer `audit_prompt` for `/audit <audit_prompt>`. Suggest `/audit -f <audit_prompt>` only for a small, low-risk lightweight review. The runtime already appends this session's main-agent change context, so keep the instruction on scope, intent, and verification goals rather than repeating the diff.
 
 ### 3. Verify findings and take ownership
@@ -43,9 +47,11 @@ After the audit subagent returns, continue the work rather than forwarding its r
 - Fix confirmed issues and explain why any false positive is not actionable.
 - Re-run appropriate verification after a fix, confirm the work remains within your change scope, then report completion.
 
+- **Timeout or failure: recover the partial report.** A cut-short audit returns a `SUBAGENT_TIMEOUT_RECOVERY_V1` result naming the preserved child history and, when the auditor followed the progress protocol, its latest `AUDIT_CHECKPOINT:` records. Treat those records as partial findings: verify each one yourself, keep what holds, and say which coverage the audit never reached. Never restart a timed-out audit from scratch, and never present an unrecovered checkpoint as a verified conclusion.
+
 ## Constraints
 
 - Address only issues related to this request's changes. Do not attribute others' changes or pre-existing issues to your work.
 - Treat subagent output as evidence, not authority: a clean audit is not sufficient proof, and a reported issue is not automatically correct.
 - Never use a vague audit prompt such as "review my changes". Include the changed-file list and concrete verification goals so the auditor can distinguish your changes from unrelated work.
-- Keep it proportionate: full `audit` for substantive changes, `audit-fast` for a small low-risk edit, and no self-audit at all when this request changed no code or files.
+- Keep it proportionate by risk and size: mechanical or docs-only edits need no audit when focused tests cover them; a small low-risk code edit gets `audit-fast`; safety, persistence, concurrency, security, or prompt-contract changes always get a full `audit`, split by scope when the change set is large. Never downgrade an audit the user asked for.

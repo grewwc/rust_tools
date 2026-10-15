@@ -1,2 +1,3 @@
 - This agent run is bound to one session. Current session id: `{}`.
-- To inspect a session, use the `session` tools (`session_list` to discover ids, `session_read` / `session_search` for content; load them via `enable_tools` when not visible). Read-only rule: never write, modify, delete, or create session files or sessions; session lifecycle is user-controlled via `/sessions`.
+- Any question about a session (its id, title, or messages) is answered with the `session` tools only: `session_list` to discover ids, `session_read` / `session_search` for content. Top-level turns referencing a session id already have these tools loaded — call them before any filesystem search. Otherwise load them via `enable_tools` first, never probe the filesystem or a database for session data.
+- Read-only rule: never write, modify, delete, or create session files or sessions; session lifecycle is user-controlled via `/sessions`.

@@ -170,20 +170,21 @@ pub(crate) fn max_tool_result_inline_chars(model: &str) -> usize {
         .clamp(MAX_TOOL_RESULT_INLINE_CHARS, 64_000)
 }
 
-/// Mid-turn progressive compression: when total message characters exceed this threshold, the cross-turn
-/// compression pipeline runs inside the iteration loop, preventing a single turn of long tool chains from blowing up the context.
+/// Character floors for the window-derived compaction thresholds below.
 ///
-/// The threshold defaults to a dynamic value from `app.config.history_max_chars` (see
+/// The thresholds default to a dynamic value from `app.config.history_max_chars` (see
 /// [`mid_turn_compress_soft_threshold`] / [`mid_turn_compress_hard_threshold`]).
 /// These two constants only act as floor guards (so a user-set too-small history_max_chars cannot cause
-/// mid-turn compression to trigger on a single tool result and no-op repeatedly).
+/// compaction to trigger on a single tool result and no-op repeatedly). In-turn compaction itself
+/// runs only at the request boundary, gated by measured token pressure.
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_SOFT_FLOOR: usize = 36_000;
 /// Mid-turn LLM summary hard-threshold floor: if content still exceeds this after lossless/weak-loss compression, an LLM summary
 /// fallback runs (one model call, followed by a single merged compression status line).
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_HARD_FLOOR: usize = 80_000;
 
 /// Soft threshold: min 36K, otherwise history_max_chars * 1.5.
-/// history_max_chars defaults to 200K, giving a 300K soft threshold.
+/// history_max_chars is derived from the model window when unset (see
+/// `config::history_max_chars_for_model`; ~200K chars on 256K-token windows).
 ///
 /// But character thresholds and the model token window are different units: a heavily loaded prompt may be far below
 /// the 400K character threshold yet already close to the model token window. [`token_window_char_ceiling`] gives
@@ -219,8 +220,11 @@ pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_hard_threshold(
 /// Number of user-started turns kept in the tail window for the LLM summary fallback. Earlier conversation beyond this window is compressed
 /// into a single internal_note summary inserted before the tail window.
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS: usize = 2;
-/// Maximum character count of the LLM summary text.
-pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_MAX_CHARS: usize = 4_000;
+/// Maximum character count of the LLM summary text. Matches the resident
+/// increment window (`MAX_INCREMENTAL_SUMMARY_INLINE_CHARS`, 8_000) so the newest
+/// record can use the whole window: the summary replaces everything before the
+/// last two user turns, and 4_000 chars dropped most of that span's decisions.
+pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_MAX_CHARS: usize = 8_000;
 /// Pre-request LLM summary threshold: before each LLM request is sent, if lossless + weak-loss compression still leaves
 /// content above this threshold, the LLM summary fallback runs (compressing earlier conversation into a single internal_note).
 /// Gated by the LLM summary character threshold — LLM summary only runs when the context approaches the model's actual context window,
@@ -323,13 +327,6 @@ pub(in crate::ai::driver::turn_runtime) fn should_try_llm_summary(
     let delta = total_chars.abs_diff(last_attempt_chars);
     last_attempt_chars == 0 || delta >= PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH
 }
-
-/// Mid-turn compression cooldown: after one trigger, wait at least N turns before re-evaluating, avoiding repeated runs
-/// while hovering near the threshold (with no actual change).
-pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_COOLDOWN_ITERATIONS: usize = 2;
-/// Mid-turn compression growth gate: skip when messages have grown by less than this since the last compression (avoids
-/// repeated no-op compressions while a large tool result sits at the end of messages).
-pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_DELTA_THRESHOLD: usize = 4_000;
 
 pub(in crate::ai) use debug::report_agent_hang_debug;
 

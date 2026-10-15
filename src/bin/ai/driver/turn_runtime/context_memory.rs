@@ -812,6 +812,8 @@ fn total_chars(messages: &[Message]) -> usize {
 const RECALL_PREFIX: &str = "[query-memory-recall-v1]";
 const RECALL_HANDOFF: &str = "Runtime archive recall handoff (not a new user request). The next assistant message contains bounded, unverified archive excerpts. Continue with the latest real user request.";
 const MAX_RECALL_CHARS: usize = 8_192;
+/// Recall budgets are rounded down to this step; also the minimum useful budget.
+const RECALL_BUDGET_QUANTUM: usize = 1_024;
 const MAX_RECALL_FILES: usize = 128;
 const MAX_RECALL_FILE_BYTES: usize = 256 * 1024;
 const MAX_RECALL_SCAN_BYTES: usize = 2 * 1024 * 1024;
@@ -892,6 +894,11 @@ fn refresh_archive_recall(
     let budget = (target_chars / 16)
         .min(MAX_RECALL_CHARS)
         .min(target_chars.saturating_sub(base_chars));
+    // Recall is deterministic for a fixed query, target set, and budget. The
+    // target drifts with per-request token calibration, so quantize the budget:
+    // otherwise small drifts would re-select excerpts and rewrite a pair that
+    // sits before the current user message on every request.
+    let budget = budget / RECALL_BUDGET_QUANTUM * RECALL_BUDGET_QUANTUM;
     // Recall deliberately excludes previous user/assistant answers: on A -> B
     // -> A, stale topic B must not compete with the live request for topic A.
     let mut query = tokenize(
@@ -905,7 +912,7 @@ fn refresh_archive_recall(
             targets.extend(candidate.recovery_targets);
         }
     }
-    let recalled = if budget >= 1_024 && !query.is_empty() {
+    let recalled = if budget >= RECALL_BUDGET_QUANTUM && !query.is_empty() {
         recall_archive_pair(assets_dir, &targets, &query, budget)
     } else {
         Vec::new()
