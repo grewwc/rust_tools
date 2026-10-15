@@ -94,7 +94,9 @@ select, summary { touch-action:manipulation; }
 /* Desktop keeps the compact whole-bubble shortcut; phones use the explicit
    action below so a normal transcript tap cannot destroy history. */
 .msg.rewindable { cursor:pointer; }
+.user-msg-row { display:contents; }
 .rewind-action { display:none; }
+#sidenote { display:none; }
 .msg .prog { font-size:13px; color:var(--dim); }
 .msg.err { border-color:var(--err); color:var(--err); }
 #ovr { display:flex; gap:6px; padding:8px 12px 0; }
@@ -202,11 +204,16 @@ select, summary { touch-action:manipulation; }
   #jumpbottom.show { opacity:1; transform:translateY(0) scale(1); pointer-events:auto; }
   #questionbtn.show { display:grid; }
   .msg { max-width:94%; }
-  .msg.rewindable { cursor:default; }
-  .msg.rewindable .rewind-action {
-    display:block; min-height:36px; margin:6px 0 -2px auto; padding:5px 10px;
-    border:1px solid rgba(255,255,255,.42); border-radius:999px;
-    background:rgba(13,17,23,.28); color:#fff; font-size:12px; line-height:1;
+  .user-msg-row {
+    display:flex; align-items:center; align-self:flex-end; justify-content:flex-end;
+    max-width:94%; gap:7px;
+  }
+  .user-msg-row > .msg.rewindable { min-width:0; max-width:none; align-self:auto; cursor:default; }
+  .user-msg-row > .rewind-action {
+    display:inline-flex; flex:0 0 auto; align-items:center; justify-content:center;
+    width:34px; min-width:34px; height:34px; padding:0; border:1px solid rgba(88,166,255,.48);
+    border-radius:999px; background:rgba(22,27,34,.92); color:#b6d8ff;
+    box-shadow:0 3px 10px rgba(0,0,0,.22); font-size:19px; line-height:1;
     touch-action:manipulation;
   }
   .msg.md .math.display { margin:4px 0; padding:0; }
@@ -218,6 +225,10 @@ select, summary { touch-action:manipulation; }
     border:1px solid var(--line); border-radius:18px;
     background:linear-gradient(180deg, #1b2129 0%, #151a21 100%);
     box-shadow:0 8px 24px rgba(0,0,0,.26);
+  }
+  #composer.side-note-ready {
+    grid-template-columns:42px minmax(0,1fr) 58px 42px;
+    grid-template-areas:"image prompt sidenote send";
   }
   #composer:focus-within { border-color:#388bfd; box-shadow:0 0 0 2px rgba(56,139,253,.18), 0 8px 24px rgba(0,0,0,.26); }
   #prompt {
@@ -232,6 +243,13 @@ select, summary { touch-action:manipulation; }
   }
   #img { grid-area:image; font-size:0; background:#262d36; border-color:#3a424d; }
   #img::before { content:"+"; font-size:24px; font-weight:300; line-height:1; }
+  #sidenote.show {
+    grid-area:sidenote; display:inline-flex; align-items:center; justify-content:center;
+    align-self:end; height:42px; padding:0 8px; gap:4px; border-radius:999px;
+    border-color:rgba(88,166,255,.5); background:rgba(31,111,235,.13);
+    color:#b6d8ff; font-size:11px; line-height:1;
+  }
+  #sidenote svg { width:15px; height:15px; fill:none; stroke:currentColor; stroke-width:1.9; stroke-linecap:round; stroke-linejoin:round; }
   #send { grid-area:send; justify-self:end; box-shadow:0 4px 14px rgba(31,111,235,.34); }
   #conn.open { flex-wrap:wrap; }
   #conn.open input { flex:1 1 100%; padding:10px 8px; }
@@ -293,6 +311,7 @@ select, summary { touch-action:manipulation; }
 <button id="img" aria-label="attach image">🖼</button>
 <input id="file" type="file" accept="image/*" multiple hidden>
 <textarea id="prompt" placeholder="ask…" rows="1"></textarea>
+<button id="sidenote" type="button" aria-label="send as side note" aria-hidden="true" tabindex="-1" title="send as side note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v11H9l-4 3V5Z"/><path d="M9 9h6"/></svg><span>note</span></button>
 <button id="send" class="primary">➤</button>
 </div>
 </main>
@@ -357,6 +376,7 @@ let turnRunning = false;
 let turnRunningAt = 0; // Date.now() of the last poll that reported running
 const RUNNING_SAMPLE_TTL_MS = 60000; // a running sample older than this is stale
 let stopBusy = false; // one interrupt POST at a time: a double tap must not send two
+let sideNoteBusy = false; // one queued note at a time; the running turn itself continues
 let noteTimer = null; // pending auto-clear of the transient #connstat note
 let pendingImages = []; // {filename, data_base64}
 // A turn stream that dies on the wire (page backgrounded, network switched) is
@@ -853,6 +873,14 @@ function updateJumpButton() {
   button.classList.toggle("show", show);
   button.setAttribute("aria-hidden", show ? "false" : "true");
   button.tabIndex = show ? 0 : -1;
+}
+let jumpButtonFrame = null;
+function scheduleJumpButtonUpdate() {
+  if (jumpButtonFrame !== null) return;
+  jumpButtonFrame = requestAnimationFrame(() => {
+    jumpButtonFrame = null;
+    updateJumpButton();
+  });
 }
 function followOutput(wasFollowing, root = $("msgs")) {
   if (wasFollowing) root.scrollTop = root.scrollHeight;
@@ -1604,17 +1632,28 @@ async function loadHistory(prefetched) {
 // session lock, so an action during an active turn waits for it to finish.
 function attachUserRewind(d, text, activate) {
   d.title = "tap to rewind to just before this message";
+  const host = d.parentNode;
+  const row = document.createElement("div");
+  row.className = "user-msg-row";
   const action = document.createElement("button");
   action.type = "button";
   action.className = "rewind-action";
-  action.textContent = "↶ rewind";
+  action.textContent = "↶";
   action.title = "rewind to before this message";
   action.setAttribute("aria-label", "rewind to before this message");
   action.onclick = (ev) => {
     ev.stopPropagation();
     return activate();
   };
-  d.appendChild(action);
+  // Keep one transcript child per history row while placing the phone action
+  // beside the bubble; append-only history reconciliation relies on that count.
+  if (host) {
+    host.replaceChild(row, d);
+    row.appendChild(action);
+    row.appendChild(d);
+  } else {
+    d.appendChild(action);
+  }
   d.onclick = (ev) => {
     if (ev.target && ev.target.closest && ev.target.closest(".rewind-action")) return;
     if (!window.matchMedia || !window.matchMedia("(max-width: 700px)").matches) activate();
@@ -1821,6 +1860,12 @@ function syncStopButton() {
   const label = running ? "stop this turn" : "send";
   b.setAttribute("aria-label", label);
   b.title = label;
+  const sideNote = $("sidenote");
+  $("composer").classList.toggle("side-note-ready", running);
+  sideNote.classList.toggle("show", running);
+  sideNote.disabled = sideNoteBusy;
+  sideNote.setAttribute("aria-hidden", String(!running));
+  sideNote.tabIndex = running ? 0 : -1;
 }
 // Transient note through the existing #connstat line; no new toast element.
 function note(msg) {
@@ -1829,6 +1874,35 @@ function note(msg) {
   el.classList.add("show", "note");
   if (noteTimer !== null) clearTimeout(noteTimer);
   noteTimer = setTimeout(() => { el.classList.remove("show", "note"); noteTimer = null; }, 3000);
+}
+async function sendSideNote() {
+  if (sideNoteBusy || !sessionId || !isTurnRunning()) return;
+  const input = $("prompt");
+  const draft = input.value;
+  const text = draft.trim();
+  if (!text) { note("type a side note first"); input.focus(); return; }
+  if (pendingImages.length) { note("side notes are text only — send the pending images after this turn"); return; }
+  const targetSession = sessionId;
+  sideNoteBusy = true;
+  $("sidenote").disabled = true;
+  try {
+    await api("/sessions/" + targetSession + "/side-notes", {
+      method: "POST", body: JSON.stringify({ text }),
+    });
+    // Do not erase a different session's draft, or text added while the POST
+    // was in flight. In either case the submitted note was still queued.
+    if (sessionId === targetSession && input.value === draft) {
+      input.value = "";
+      input.style.height = "auto";
+      clearDraft(targetSession);
+    }
+    note("side note queued");
+  } catch (e) {
+    note("side note failed: " + e.message);
+  } finally {
+    sideNoteBusy = false;
+    $("sidenote").disabled = false;
+  }
 }
 async function stopTurn() {
   if (stopBusy || !sessionId) return;
@@ -1927,6 +2001,7 @@ async function send() {
   // (or inserted ahead of) the reply bubble, so the trace reads top-down
   // and the final answer always lands last.
   const prog = addFold("progress", "", box);
+  const progDetails = prog.box.querySelector("details");
   const bubble = addMsgMd("", box);
   let progLines = [];
   let subagentProgress = "";
@@ -1937,19 +2012,54 @@ async function send() {
     prog.set("progress (" + count + ")", visible.join("\n"));
   };
   let think = null;
-  // Reply text arrives token by token, and markdown has to be parsed over the
-  // whole reply (an unterminated fence changes how every later line reads), so
-  // deltas are coalesced into one repaint per interval instead of one per token.
+  let thinkRaw = "";
+  let answerDirty = false;
+  let progressDirty = false;
+  let expandProgress = false;
+  let thinkingDirty = false;
+  let thinkingDoneDirty = false;
+  // Stream events can outpace a phone's display. Coalesce answer, thinking and
+  // progress writes so each interval performs at most one layout/follow pass.
+  // Markdown still renders from the complete reply because an unfinished fence
+  // can change how all following lines are interpreted.
   let raw = "";
   let paintTimer = null;
   const paint = () => {
     paintTimer = null;
+    if (!answerDirty && !progressDirty && !thinkingDirty && !thinkingDoneDirty) return;
     const follow = sid === sessionId && shouldFollowOutput();
-    bubble.innerHTML = renderMarkdown(raw);
-    decorateMath(bubble);
+    if (progressDirty) {
+      if (expandProgress) progDetails.open = true;
+      renderProgress();
+      progressDirty = false;
+      expandProgress = false;
+    }
+    if (thinkingDirty && think) {
+      think.body.textContent = thinkRaw;
+      thinkingDirty = false;
+    }
+    if (thinkingDoneDirty && think) {
+      think.box.querySelector("summary").textContent = "thinking";
+      thinkingDoneDirty = false;
+    }
+    if (answerDirty) {
+      bubble.classList.remove("pending");
+      bubble.innerHTML = renderMarkdown(raw);
+      decorateMath(bubble);
+      answerDirty = false;
+    }
     if (sid === sessionId) followOutput(follow);
   };
   const schedulePaint = () => { if (paintTimer === null) paintTimer = setTimeout(paint, 50); };
+  const flushPaint = () => {
+    if (paintTimer !== null) { clearTimeout(paintTimer); paintTimer = null; }
+    paint();
+  };
+  const mutateTranscript = (mutation) => {
+    const follow = sid === sessionId && shouldFollowOutput();
+    mutation();
+    if (sid === sessionId) followOutput(follow);
+  };
   const fail = (msg) => {
     if (paintTimer !== null) { clearTimeout(paintTimer); paintTimer = null; }
     bubble.classList.remove("pending");
@@ -2009,29 +2119,54 @@ async function send() {
       while ((idx = buf.indexOf("\n\n")) >= 0) {
         const { kind, payload } = parseBlock(buf.slice(0, idx));
         buf = buf.slice(idx + 2);
-        const follow = sid === sessionId && shouldFollowOutput();
         if (kind !== "" || payload) armStall(); // keep-alive comments (empty) must not mask a stalled turn
-        if (kind === "done") { bubble.classList.remove("pending"); if (!raw) bubble.textContent = ""; finished = true; break; }
+        if (kind === "done") {
+          if (!answerDirty) mutateTranscript(() => {
+            bubble.classList.remove("pending");
+            if (!raw) bubble.textContent = "";
+          });
+          finished = true;
+          break;
+        }
         else if (kind === "error") { turnError = true; throw new Error(JSON.parse(payload).error || "turn failed"); }
         else if (kind === "delta") {
-          bubble.classList.remove("pending");
           try { raw += JSON.parse(payload).delta || ""; }
           catch (_) { raw += payload; }
+          answerDirty = true;
           schedulePaint();
         }
         else if (kind === "answer_pending" && !raw) {
-          bubble.classList.add("pending");
-          bubble.textContent = "◌ finalizing response…";
+          mutateTranscript(() => {
+            bubble.classList.add("pending");
+            bubble.textContent = "◌ finalizing response…";
+          });
         }
-        else if (kind === "thinking_start") { think = addFold("thinking…", "", box); box.insertBefore(think.box, bubble); }
+        else if (kind === "thinking_start") {
+          mutateTranscript(() => {
+            think = addFold("thinking…", "", box);
+            box.insertBefore(think.box, bubble);
+          });
+        }
         else if (kind === "thinking") {
-          try { if (think) think.body.textContent += JSON.parse(payload).text || ""; } catch (_) {}
+          try {
+            if (think) {
+              thinkRaw += JSON.parse(payload).text || "";
+              thinkingDirty = true;
+              schedulePaint();
+            }
+          } catch (_) {}
         }
-        else if (kind === "thinking_done") { if (think) think.box.querySelector("summary").textContent = "thinking"; }
+        else if (kind === "thinking_done") {
+          if (think) {
+            thinkingDoneDirty = true;
+            flushPaint();
+          }
+        }
         else if (kind === "subagent_progress") {
           subagentProgress = payload;
-          renderProgress();
-          prog.box.querySelector("details").open = true;
+          progressDirty = true;
+          expandProgress = true;
+          schedulePaint();
         }
         else if (kind === "confirm_request") {
           // Server text: showConfirm renders the prompt through textContent.
@@ -2056,14 +2191,17 @@ async function send() {
           try { cid = JSON.parse(payload).id; } catch (_) {}
           if (sid === sessionId && (cid === null || (confirmShown && confirmShown.id === cid))) hideConfirm();
         }
-        else if (payload) { progLines.push(payload); renderProgress(); }
-        if (sid === sessionId) followOutput(follow);
+        else if (payload) {
+          progLines.push(payload);
+          progressDirty = true;
+          schedulePaint();
+        }
       }
       if (finished) break;
       if (done) break;
     }
     clearTimeout(stallTimer);
-    if (paintTimer !== null) { clearTimeout(paintTimer); paint(); } // flush the tail
+    flushPaint(); // flush the tail before final decoration or stale recovery
     finishFollow = sid === sessionId && shouldFollowOutput();
     decorateAndLoad(bubble); // reply paths become previews only once it is final
     if (stalled && !finished && !turnError) {
@@ -2076,6 +2214,7 @@ async function send() {
     else if (!raw) bubble.innerHTML = "<span style='color:var(--dim)'>(empty reply)</span>";
   } catch (e) {
     clearTimeout(stallTimer);
+    flushPaint();
     finishFollow = sid === sessionId && shouldFollowOutput();
     if (turnStarted && !turnError) {
       // The POST was accepted and no server `error` event arrived, so this is
@@ -2133,13 +2272,14 @@ function wire() {
   $("token").value = localStorage.getItem("serve.token") || "";
   showStored();
   $("send").onclick = () => { if (isTurnRunning()) stopTurn(); else send(); };
+  $("sidenote").onclick = sendSideNote;
   syncStopButton();
   // The dialog is the only way to unblock a turn that stopped to ask; both
   // answers post to /sessions/{id}/confirm through answerConfirm.
   $("callow").onclick = () => answerConfirm(true);
   $("cdeny").onclick = () => answerConfirm(false);
   $("msgs").addEventListener("click", handleSvgPreviewClick);
-  $("msgs").addEventListener("scroll", updateJumpButton, { passive: true });
+  $("msgs").addEventListener("scroll", scheduleJumpButtonUpdate, { passive: true });
   $("jumpbottom").onclick = () => scrollToLatest(true);
   $("questionbtn").onclick = (event) => { event.stopPropagation(); openQuestionPanel(); };
   $("questionclose").onclick = closeQuestionPanel;

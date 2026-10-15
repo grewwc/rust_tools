@@ -151,23 +151,47 @@ test("phone question navigator is a compact session-bar control", () => {
   assert.match(script, /questionbtn"\)\.onclick = \(event\) => \{ event\.stopPropagation\(\); openQuestionPanel\(\); \};/);
 });
 
+function rewindDomFixture() {
+  const actions = [];
+  const host = {
+    child: null,
+    replaceChild(next, current) {
+      assert.equal(current, bubble);
+      this.child = next;
+      next.parentNode = this;
+    },
+  };
+  const bubble = { dataset: {}, parentNode: host };
+  const createElement = (tag) => {
+    const node = {
+      children: [],
+      appendChild(child) { this.children.push(child); child.parentNode = this; },
+      setAttribute(name, value) { this[name] = value; },
+    };
+    if (tag === "button") actions.push(node);
+    return node;
+  };
+  return { actions, bubble, createElement, host };
+}
+
 test("phone history exposes a dedicated rewind action without whole-bubble taps", () => {
   const start = script.indexOf("function attachUserRewind(");
   const end = script.indexOf("async function rewindTo(", start);
   assert.ok(start >= 0 && end > start);
-  const actions = [];
+  const { actions, bubble, createElement, host } = rewindDomFixture();
   const rewinds = [];
-  const bubble = { dataset: {}, appendChild: (node) => actions.push(node) };
   const context = vm.createContext({
     window: { matchMedia: () => ({ matches: true }) },
-    document: { createElement: () => ({ setAttribute(name, value) { this[name] = value; } }) },
+    document: { createElement },
     addMsg: () => bubble,
     rewindTo: (...args) => rewinds.push(args),
   });
   vm.runInContext(script.slice(start, end), context);
   context.addUserBubble("keep this preview", 17);
   assert.equal(actions.length, 1);
-  assert.equal(actions[0].textContent, "↶ rewind");
+  assert.equal(host.child.className, "user-msg-row");
+  assert.deepEqual(host.child.children, [actions[0], bubble]);
+  assert.equal(actions[0].textContent, "↶");
   let stopped = false;
   actions[0].onclick({ stopPropagation: () => { stopped = true; } });
   assert.equal(stopped, true);
@@ -184,10 +208,9 @@ test("a live user bubble resolves the canonical index before rewinding", async (
   const start = script.indexOf("function attachUserRewind(");
   const end = script.indexOf("async function rewindTo(", start);
   assert.ok(start >= 0 && end > start);
-  const actions = [];
+  const { actions, bubble, createElement, host } = rewindDomFixture();
   const rewinds = [];
   const notes = [];
-  const bubble = { dataset: {}, appendChild: (node) => actions.push(node) };
   const messages = [
     { role: "user", content: "repeat" },
     { role: "assistant", content: "old" },
@@ -196,7 +219,7 @@ test("a live user bubble resolves the canonical index before rewinding", async (
   ];
   const context = vm.createContext({
     window: { matchMedia: () => ({ matches: true }) },
-    document: { createElement: () => ({ setAttribute(name, value) { this[name] = value; } }) },
+    document: { createElement },
     addMsg: () => bubble,
     textOf: (value) => String(value),
     api: async () => ({ headers: { get: () => "12" }, json: async () => messages }),
@@ -206,6 +229,7 @@ test("a live user bubble resolves the canonical index before rewinding", async (
   vm.runInContext(script.slice(start, end), context);
   context.addLiveUserBubble("repeat", "repeat", "session-1", 10);
   assert.equal(actions.length, 1);
+  assert.deepEqual(host.child.children, [actions[0], bubble]);
   await actions[0].onclick({ stopPropagation() {} });
   assert.deepEqual(rewinds, [[10, "repeat", "session-1"]]);
   assert.deepEqual(notes, []);
@@ -214,7 +238,66 @@ test("a live user bubble resolves the canonical index before rewinding", async (
 
 test("rewind action is visible only in the phone layout", () => {
   assert.ok(html.includes(".rewind-action { display:none; }"));
-  assert.match(html, /@media \(max-width:700px\) \{[\s\S]*?\.msg\.rewindable \.rewind-action \{[\s\S]*?display:block;/);
+  assert.match(html, /@media \(max-width:700px\) \{[\s\S]*?\.user-msg-row > \.rewind-action \{[\s\S]*?display:inline-flex;/);
+  assert.match(html, /\.user-msg-row > \.rewind-action \{[\s\S]*?width:34px;[\s\S]*?height:34px;[\s\S]*?border-radius:999px;/);
+});
+
+test("a mobile side note queues text without stopping the running turn", async () => {
+  const start = script.indexOf("async function sendSideNote(");
+  const end = script.indexOf("async function stopTurn(", start);
+  assert.ok(start >= 0 && end > start);
+  const calls = [], notices = [];
+  const prompt = { value: "  steer left  ", style: { height: "96px" }, focus() {} };
+  const button = { disabled: false };
+  const context = vm.createContext({
+    sideNoteBusy: false,
+    sessionId: "session-a",
+    pendingImages: [],
+    isTurnRunning: () => true,
+    $: (id) => id === "prompt" ? prompt : button,
+    api: async (path, options) => { calls.push([path, options]); },
+    clearDraft: (id) => calls.push(["clearDraft", id]),
+    note: (message) => notices.push(message),
+    JSON,
+  });
+  vm.runInContext(script.slice(start, end), context);
+  await context.sendSideNote();
+  assert.equal(calls[0][0], "/sessions/session-a/side-notes");
+  assert.equal(calls[0][1].method, "POST");
+  assert.deepEqual(JSON.parse(calls[0][1].body), { text: "steer left" });
+  assert.deepEqual(calls[1], ["clearDraft", "session-a"]);
+  assert.equal(prompt.value, "");
+  assert.equal(prompt.style.height, "auto");
+  assert.equal(notices.at(-1), "side note queued");
+  assert.equal(button.disabled, false);
+});
+
+test("a failed side note preserves the draft and pending images never enter a note", async () => {
+  const start = script.indexOf("async function sendSideNote(");
+  const end = script.indexOf("async function stopTurn(", start);
+  let apiCalls = 0;
+  const notices = [];
+  const prompt = { value: "keep this", style: { height: "80px" }, focus() {} };
+  const button = { disabled: false };
+  const context = vm.createContext({
+    sideNoteBusy: false,
+    sessionId: "session-a",
+    pendingImages: [],
+    isTurnRunning: () => true,
+    $: (id) => id === "prompt" ? prompt : button,
+    api: async () => { apiCalls++; throw new Error("offline"); },
+    clearDraft: () => assert.fail("failed notes must not clear drafts"),
+    note: (message) => notices.push(message),
+    JSON,
+  });
+  vm.runInContext(script.slice(start, end), context);
+  await context.sendSideNote();
+  assert.equal(prompt.value, "keep this");
+  assert.equal(notices.at(-1), "side note failed: offline");
+  context.pendingImages.push({ filename: "photo.png" });
+  await context.sendSideNote();
+  assert.equal(apiCalls, 1);
+  assert.match(notices.at(-1), /side notes are text only/);
 });
 
 test("phone session hold targets its own row and scrolling cancels it", () => {
@@ -537,24 +620,81 @@ test("the real streaming paint typesets completed formulas before the final even
   const h = harness();
   const bubble = {
     set innerHTML(markup) { h.msgs.nodes = nodesOf(markup); },
+    classList: { remove() {} },
     querySelector: () => h.msgs.querySelector(),
     querySelectorAll: () => h.msgs.querySelectorAll(),
   };
   Object.assign(h.context, {
     bubble, raw: "$x", paintTimer: null, sid: "s", sessionId: "s",
+    answerDirty: true, progressDirty: false, thinkingDirty: false, thinkingDoneDirty: false,
     shouldFollowOutput: () => true, followOutput() {},
   });
   const paint = script.match(/const paint = \(\) => \{([\s\S]*?)\n  \};/)[1];
-  vm.runInContext("{" + paint + "}", h.context);
+  const runPaint = () => vm.runInContext("(() => {" + paint + "})()", h.context);
+  runPaint();
   assert.equal(h.assets.length, 0);
   h.context.raw = "$x$";
-  vm.runInContext("{" + paint + "}", h.context);
+  h.context.answerDirty = true;
+  runPaint();
   assert.equal(h.assets.length, 2);
   await h.finishLoading();
   assert.equal(h.msgs.nodes[0].textContent, "typeset:x");
   h.context.raw += " and $y$";
-  vm.runInContext(paint, h.context);
+  h.context.answerDirty = true;
+  runPaint();
   assert.deepEqual(h.msgs.nodes.map((node) => node.textContent), ["typeset:x", "typeset:y"]);
+});
+
+test("stream paint batches answer, thinking and progress into one follow pass", () => {
+  const h = harness();
+  let followChecks = 0;
+  let follows = 0;
+  let progressWrites = 0;
+  let thinkingWrites = 0;
+  let answerWrites = 0;
+  const summary = { set textContent(value) { assert.equal(value, "thinking"); } };
+  const think = {
+    body: { set textContent(value) { thinkingWrites++; assert.equal(value, "reasoning"); } },
+    box: { querySelector: () => summary },
+  };
+  const bubble = {
+    classList: { remove() {} },
+    set innerHTML(markup) { answerWrites++; h.msgs.nodes = nodesOf(markup); },
+    querySelector: () => null,
+    querySelectorAll: () => [],
+  };
+  Object.assign(h.context, {
+    answerDirty: true, progressDirty: true, thinkingDirty: true, thinkingDoneDirty: true,
+    expandProgress: true, progDetails: { open: false }, renderProgress: () => { progressWrites++; },
+    think, thinkRaw: "reasoning", bubble, raw: "answer", paintTimer: 1,
+    sid: "s", sessionId: "s",
+    shouldFollowOutput: () => { followChecks++; return true; },
+    followOutput: (follow) => { follows++; assert.equal(follow, true); },
+  });
+  const paint = script.match(/const paint = \(\) => \{([\s\S]*?)\n  \};/)[1];
+  const runPaint = () => vm.runInContext("(() => {" + paint + "})()", h.context);
+  runPaint();
+  assert.deepEqual(
+    { followChecks, follows, progressWrites, thinkingWrites, answerWrites },
+    { followChecks: 1, follows: 1, progressWrites: 1, thinkingWrites: 1, answerWrites: 1 },
+  );
+  assert.equal(h.context.progDetails.open, true);
+  runPaint();
+  assert.deepEqual(
+    { followChecks, follows, progressWrites, thinkingWrites, answerWrites },
+    { followChecks: 1, follows: 1, progressWrites: 1, thinkingWrites: 1, answerWrites: 1 },
+  );
+});
+
+test("delta blocks defer layout work to the coalesced paint", () => {
+  const start = script.indexOf('const { kind, payload } = parseBlock');
+  const end = script.indexOf("if (finished) break;", start);
+  const blockDispatch = script.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.doesNotMatch(blockDispatch, /shouldFollowOutput|followOutput/);
+  assert.match(blockDispatch, /kind === "delta"[\s\S]*?answerDirty = true;[\s\S]*?schedulePaint\(\)/);
+  assert.match(blockDispatch, /kind === "thinking"[\s\S]*?thinkingDirty = true;[\s\S]*?schedulePaint\(\)/);
+  assert.match(blockDispatch, /kind === "subagent_progress"[\s\S]*?progressDirty = true;[\s\S]*?schedulePaint\(\)/);
 });
 
 test("media decoration leaves math text and rendered math subtrees alone", () => {
@@ -763,10 +903,13 @@ test("the phone composer keeps an idle prompt compact beside smaller action butt
   const phoneCss = html.slice(html.indexOf("@media (max-width:700px)"), html.indexOf("</style>"));
   assert.match(desktopCss, /#composer \{ display:flex;/);
   assert.match(phoneCss, /#composer \{[\s\S]*?display:grid;[\s\S]*?grid-template-areas:"image prompt send";[\s\S]*?align-items:end;/);
+  assert.match(phoneCss, /#composer\.side-note-ready \{[\s\S]*?grid-template-areas:"image prompt sidenote send";/);
+  assert.match(phoneCss, /#sidenote\.show \{[\s\S]*?grid-area:sidenote;[\s\S]*?display:inline-flex;/);
   assert.match(phoneCss, /#prompt \{[\s\S]*?grid-area:prompt;[\s\S]*?min-height:40px;[\s\S]*?max-height:38dvh;/);
   assert.match(desktopCss, /#prompt \{[\s\S]*?-webkit-user-select:text; user-select:text; -webkit-touch-callout:default;/);
   assert.doesNotMatch(phoneCss, /#prompt:focus[^\{]*\{[^}]*min-height/);
   assert.match(phoneCss, /#img, #send \{[\s\S]*?width:42px;[\s\S]*?height:42px;[\s\S]*?border-radius:50%;/);
+  assert.match(script, /\$\("sidenote"\)\.onclick = sendSideNote;/);
   assert.match(html, /<button id="send" class="primary">➤<\/button>/);
 });
 
