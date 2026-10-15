@@ -708,30 +708,28 @@ fn system_prompt_includes_runtime_environment_and_effective_cwd() {
 }
 
 #[test]
-fn session_context_prompt_mentions_id_layout_and_read_only_rule() {
+fn session_context_prompt_mentions_id_tools_and_read_only_rule() {
     let mut builder = SystemPromptBuilder::new();
     builder.push_labeled(
         ContextKind::Behavior,
         "session_context",
-        session_context_prompt(
-            "f6bb0f1c-ce48-4283-96ab-27ab297ed6b7",
-            Path::new(
-                "/Users/u/.history_file.sessions/f6bb0f1c-ce48-4283-96ab-27ab297ed6b7.sqlite",
-            ),
-            Path::new("/Users/u/.history_file.sqlite"),
-        ),
+        session_context_prompt("f6bb0f1c-ce48-4283-96ab-27ab297ed6b7"),
     );
     let rendered = builder.render_system_prompt();
     assert!(
         rendered.contains("<session_context>")
             && !rendered.contains("<session_context>\n<session_context>")
             && rendered.contains("f6bb0f1c-ce48-4283-96ab-27ab297ed6b7")
-            && rendered.contains(".history_file.sessions")
-            && rendered.contains("<id>.sqlite")
+            && rendered.contains("session_list")
             && rendered.contains("session_read")
-            && !rendered.contains("sqlite3")
-            && rendered.contains("Read-only rule"),
-        "session_context must carry the id, storage layout, the session tools and the read-only rule (no raw sqlite3 reads); got:\n{rendered}"
+            && rendered.contains("session_search")
+            && rendered.contains("enable_tools")
+            && rendered.contains("Read-only rule")
+            && !rendered.contains(".history_file.sessions")
+            && !rendered.contains("<id>.sqlite")
+            && !rendered.contains("sessions root")
+            && !rendered.contains("sqlite3"),
+        "session_context must carry the id, the standard session tools and the read-only rule, and must not advertise the raw storage layout (which invites direct sqlite reads); got:\n{rendered}"
     );
 }
 

@@ -72,8 +72,7 @@ fn resolve_session_file(store: &SessionStore, session_id: &str) -> Result<PathBu
     let file = store.session_history_file(session_id);
     if !file.is_file() {
         return Err(format!(
-            "session '{session_id}' does not exist (no <id>.sqlite under {})",
-            store.sessions_root().display()
+            "session '{session_id}' does not exist (no history found for this id)"
         ));
     }
     Ok(file)

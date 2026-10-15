@@ -985,37 +985,28 @@ fn push_project_context(builder: &mut SystemPromptBuilder) {
     push_project_type_context(builder);
 }
 
-/// Session context: tells the model the current session and its data layout, so that in any project
-/// (even directories unrelated to rust_tools) it can locate and debug sessionid problems and
-/// interact read-only with a given session's content. The model is read-only: no writing, modifying, or deleting session data.
-/// The full layout is injected only when the request looks session-related
-/// (`session_issue_likely`); other turns keep a one-line session id for
-/// grounding (see `build_skill_turn_guard`).
-fn session_context_prompt(
-    session_id: &str,
-    session_history_file: &Path,
-    history_file: &Path,
-) -> String {
-    let sessions_root = crate::ai::history::SessionStore::new(history_file)
-        .sessions_root()
-        .display()
-        .to_string();
-    format!(
-        include_str!("system_prompts/session_context.md"),
-        session_id,
-        session_history_file.display(),
-        sessions_root,
-    )
+/// Session context: grounds the model in its current session id and steers
+/// session inspection through the standard `session` tools (`session_list`
+/// to discover ids, `session_read` / `session_search` for content; loaded
+/// via `enable_tools` when not visible). The model is read-only: no writing,
+/// modifying, or deleting session data. The raw storage layout (sessions
+/// root, `<id>.sqlite`, assets dirs) is deliberately not advertised so the
+/// model cannot bypass the tools with direct sqlite or filesystem reads;
+/// `session_search` surfaces asset paths at runtime. Injected only when the
+/// request looks session-related (`session_issue_likely`); other turns keep
+/// a one-line session id for grounding (see `build_skill_turn_guard`).
+fn session_context_prompt(session_id: &str) -> String {
+    format!(include_str!("system_prompts/session_context.md"), session_id)
 }
 
 /// Relevance gate for the session-debugging walkthrough: decides whether the
-/// turn injects the full session storage layout or just the one-line session
-/// id. Matching is deliberately broad substring — a missed debug session
-/// costs more than the ~500 carried characters of an occasional
-/// over-injection (a general "history of X" knowledge question also matches
-/// `history`; accepted). Chinese is matched literally here alongside English;
-/// this keyword list is the one place where non-English prompt text is
-/// intentional.
+/// turn injects the session-context guidance (session id + standard session
+/// tools) or just the one-line session id. Matching is deliberately broad
+/// substring — a missed debug session costs more than the ~500 carried
+/// characters of an occasional over-injection (a general "history of X"
+/// knowledge question also matches `history`; accepted). Chinese is matched
+/// literally here alongside English; this keyword list is the one place where
+/// non-English prompt text is intentional.
 fn session_issue_likely(question: &str) -> bool {
     let lowered = question.to_lowercase();
     [
@@ -1603,18 +1594,14 @@ fn build_skill_turn_guard(
         builder.push(ContextKind::Capability, catalog);
     }
     push_project_context(&mut builder);
-    // Session debugging layout is low-frequency knowledge: every turn keeps a
-    // one-line session id for grounding, while the sessions-root/SQLite/assets
-    // walkthrough is injected only when the request looks session-related.
+    // Session debugging guidance is low-frequency knowledge: every turn keeps
+    // a one-line session id for grounding, while the session-tools walkthrough
+    // is injected only when the request looks session-related.
     if session_issue_likely(question) {
         builder.push_labeled(
             ContextKind::Behavior,
             "session_context",
-            session_context_prompt(
-                &app.session_id,
-                &app.session_history_file,
-                &app.config.history_file,
-            ),
+            session_context_prompt(&app.session_id),
         );
     } else {
         builder.push_labeled(

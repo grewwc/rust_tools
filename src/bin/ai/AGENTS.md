@@ -28,8 +28,13 @@ Sessions are the persistence unit; IDs are 1–128 ASCII letters/digits/`-`/`_`,
 not necessarily UUIDs. `SessionStore` derives `<history-stem>.sessions/`, where
 `<id>.sqlite` is canonical history, `<id>.assets/` holds derived artifacts, and
 lock/PID files coordinate live state. Session layout is independent of cwd.
-The model may inspect session data only read-only; `/sessions` owns lifecycle.
-`build_skill_turn_guard` injects detailed `session_context` only when needed.
+The model may inspect session data only read-only and only through the
+`session` tools (`session_list` / `session_read` / `session_search`, loaded via
+`enable_tools`); `/sessions` owns lifecycle. Never advertise the storage layout
+to the model: it invites raw sqlite/filesystem reads that bypass the WAL-aware
+tool access (see `driver/skill_runtime.rs` `session_context_prompt`).
+`build_skill_turn_guard` injects that `session_context` guidance when the turn
+looks session-related; other turns carry a one-line session id only.
 
 ## Runtime-wide invariants
 
