@@ -100,7 +100,10 @@ select, summary { touch-action:manipulation; }
 #ovr { display:flex; gap:6px; padding:8px 12px 0; }
 #ovr select { flex:1; min-width:0; font-size:13px; padding:6px 8px; }
 #composer { display:flex; gap:8px; padding:10px 12px calc(10px + env(safe-area-inset-bottom)); background:var(--panel); border-top:1px solid var(--line); }
-#prompt { flex:1; min-height:44px; max-height:30dvh; padding:9px 10px; resize:none; }
+#prompt {
+  flex:1; min-height:44px; max-height:30dvh; padding:9px 10px; resize:none;
+  -webkit-user-select:text; user-select:text; -webkit-touch-callout:default;
+}
 #conn { display:none; gap:6px; padding:8px 12px; background:var(--panel); border-top:1px solid var(--line); }
 #conn.open { display:flex; }
 #conn input { flex:1; min-width:0; font-size:13px; padding:6px 8px; }
@@ -757,6 +760,65 @@ function growPrompt() {
   // measured multi-line growth without making focus alone enlarge the box.
   if (!p.value) return;
   p.style.height = Math.min(p.scrollHeight, Math.round(window.innerHeight * viewportRatio)) + "px";
+}
+function insertPromptText(text) {
+  const prompt = $("prompt");
+  const start = Number.isInteger(prompt.selectionStart) ? prompt.selectionStart : prompt.value.length;
+  const end = Number.isInteger(prompt.selectionEnd) ? prompt.selectionEnd : start;
+  if (typeof prompt.setRangeText === "function") prompt.setRangeText(text, start, end, "end");
+  else {
+    prompt.value = prompt.value.slice(0, start) + text + prompt.value.slice(end);
+    prompt.selectionStart = prompt.selectionEnd = start + text.length;
+  }
+  growPrompt();
+  persistDraft();
+}
+async function queueImageFiles(files) {
+  const added = [];
+  for (const file of files) {
+    if (pendingImages.length >= 10) break;
+    if (!file || !String(file.type || "").startsWith("image/")) continue;
+    try {
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+      const data = String(dataUrl).split(",", 2)[1] || "";
+      if (!data) continue;
+      const filename = (file.name || "pasted-image").replace(/[^\w.\-]+/g, "_");
+      const image = { filename, data_base64: data };
+      pendingImages.push(image);
+      added.push(image);
+    } catch (error) {
+      note("could not attach image: " + (error && error.message ? error.message : error));
+    }
+  }
+  if (!added.length) return;
+  const prompt = $("prompt");
+  prompt.value += (prompt.value && !prompt.value.endsWith("\n") ? "\n" : "") +
+    added.map((image) => "[[image:" + image.filename + "]]").join("\n");
+  growPrompt();
+  persistDraft();
+}
+function handlePromptPaste(event) {
+  const clipboard = event.clipboardData;
+  if (!clipboard) return;
+  const itemImages = Array.from(clipboard.items || [])
+    .filter((item) => item.kind === "file" && String(item.type || "").startsWith("image/"))
+    .map((item) => item.getAsFile())
+    .filter(Boolean);
+  const images = itemImages.length ? itemImages : Array.from(clipboard.files || [])
+    .filter((file) => String(file.type || "").startsWith("image/"));
+  if (images.length) {
+    event.preventDefault();
+    return queueImageFiles(images);
+  }
+  const text = clipboard.getData("text/plain");
+  if (!text) return;
+  event.preventDefault();
+  insertPromptText(text);
 }
 function textOf(content) {
   if (typeof content === "string") return content;
@@ -2094,6 +2156,7 @@ function wire() {
   $("oagent").onchange = () => savePick();
   $("oeffort").onchange = () => savePick();
   $("prompt").addEventListener("input", () => { growPrompt(); persistDraft(); });
+  $("prompt").addEventListener("paste", handlePromptPaste);
   restoreDraft();
   $("prompt").addEventListener("keydown", (e) => {
     // Plain Enter inserts a newline (mobile keyboards included); only the
@@ -2158,21 +2221,8 @@ function wire() {
   $("img").onclick = () => $("file").click();
   $("viewer").onclick = () => { $("viewer").classList.remove("on"); $("viewerimg").src = ""; };
   $("file").onchange = async () => {
-    for (const f of $("file").files) {
-      if (pendingImages.length >= 10) break;
-      const dataUrl = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(f); });
-      const b64 = String(dataUrl).split(",", 2)[1] || "";
-      if (!b64) continue;
-      const filename = (f.name || "image").replace(/[^\w.\-]+/g, "_");
-      pendingImages.push({ filename, data_base64: b64 });
-    }
+    await queueImageFiles($("file").files);
     $("file").value = "";
-    if (pendingImages.length && !$("prompt").value.includes("[[image:")) {
-      $("prompt").value += ($("prompt").value && !$("prompt").value.endsWith("\n") ? "\n" : "") +
-        pendingImages.map((im) => "[[image:" + im.filename + "]]").join("\n");
-      growPrompt();
-      persistDraft();
-    }
   };
 }
 async function boot() {

@@ -764,6 +764,7 @@ test("the phone composer keeps an idle prompt compact beside smaller action butt
   assert.match(desktopCss, /#composer \{ display:flex;/);
   assert.match(phoneCss, /#composer \{[\s\S]*?display:grid;[\s\S]*?grid-template-areas:"image prompt send";[\s\S]*?align-items:end;/);
   assert.match(phoneCss, /#prompt \{[\s\S]*?grid-area:prompt;[\s\S]*?min-height:40px;[\s\S]*?max-height:38dvh;/);
+  assert.match(desktopCss, /#prompt \{[\s\S]*?-webkit-user-select:text; user-select:text; -webkit-touch-callout:default;/);
   assert.doesNotMatch(phoneCss, /#prompt:focus[^\{]*\{[^}]*min-height/);
   assert.match(phoneCss, /#img, #send \{[\s\S]*?width:42px;[\s\S]*?height:42px;[\s\S]*?border-radius:50%;/);
   assert.match(html, /<button id="send" class="primary">➤<\/button>/);
@@ -791,6 +792,81 @@ test("prompt auto-growth uses a roomier phone cap without changing desktop", () 
 
 test("composer height is reset after send and refreshed after image attachment", () => {
   assert.match(html, /\$\("prompt"\)\.value = "";\s*\$\("prompt"\)\.style\.height = "auto";/);
-  assert.match(html, /pendingImages\.map\([\s\S]*?\.join\("\\n"\);\s*growPrompt\(\);/);
+  assert.match(html, /added\.map\([\s\S]*?\.join\("\\n"\);\s*growPrompt\(\);/);
   assert.match(html, /e\.key === "Enter" && \(e\.ctrlKey \|\| e\.metaKey\)/);
+  assert.match(html, /\$\("prompt"\)\.addEventListener\("paste", handlePromptPaste\);/);
+});
+
+function pasteHarness(value = "") {
+  const calls = [];
+  const prompt = {
+    value,
+    selectionStart: value.length,
+    selectionEnd: value.length,
+    setRangeText(text, start, end) {
+      this.value = this.value.slice(0, start) + text + this.value.slice(end);
+      this.selectionStart = this.selectionEnd = start + text.length;
+    },
+  };
+  class Reader {
+    readAsDataURL(file) {
+      this.result = "data:" + file.type + ";base64,aW1hZ2U=";
+      this.onload();
+    }
+  }
+  const context = vm.createContext({
+    $: (id) => { assert.equal(id, "prompt"); return prompt; },
+    growPrompt: () => calls.push("grow"),
+    persistDraft: () => calls.push("draft"),
+    note: (message) => calls.push(message),
+    pendingImages: [],
+    FileReader: Reader,
+  });
+  const start = script.indexOf("function insertPromptText(");
+  const end = script.indexOf("function textOf(", start);
+  vm.runInContext(script.slice(start, end), context);
+  return { context, prompt, calls };
+}
+
+test("prompt paste inserts plain text at the selection and persists the draft", () => {
+  const h = pasteHarness("before after");
+  h.prompt.selectionStart = 7;
+  h.prompt.selectionEnd = 12;
+  let prevented = false;
+  h.context.handlePromptPaste({
+    clipboardData: { items: [], getData: (type) => type === "text/plain" ? "pasted" : "" },
+    preventDefault: () => { prevented = true; },
+  });
+  assert.equal(prevented, true);
+  assert.equal(h.prompt.value, "before pasted");
+  assert.deepEqual(h.calls, ["grow", "draft"]);
+});
+
+test("prompt paste attaches clipboard images without inserting their fallback URL", async () => {
+  const h = pasteHarness("caption");
+  const file = { name: "photo one.png", type: "image/png" };
+  let prevented = false;
+  await h.context.handlePromptPaste({
+    clipboardData: {
+      items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+      getData: () => "https://example.test/photo.png",
+    },
+    preventDefault: () => { prevented = true; },
+  });
+  assert.equal(prevented, true);
+  assert.equal(h.prompt.value, "caption\n[[image:photo_one.png]]");
+  assert.equal(JSON.stringify(h.context.pendingImages),
+    '[{"filename":"photo_one.png","data_base64":"aW1hZ2U="}]');
+  assert.deepEqual(h.calls, ["grow", "draft"]);
+});
+
+test("prompt paste accepts mobile clipboard image files without DataTransfer items", async () => {
+  const h = pasteHarness();
+  const file = { name: "mobile.png", type: "image/png" };
+  await h.context.handlePromptPaste({
+    clipboardData: { files: [file], getData: () => "" },
+    preventDefault() {},
+  });
+  assert.equal(h.prompt.value, "[[image:mobile.png]]");
+  assert.equal(h.context.pendingImages.length, 1);
 });
