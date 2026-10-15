@@ -641,7 +641,7 @@ pub fn try_handle_checkpoint_command(
                 println!("No checkpoints to clear.");
                 return Ok(true);
             }
-            let total_bytes: u64 = checkpoints.iter().map(|cp| cp.size_bytes).sum();
+            let total_bytes: u64 = checkpoints.iter().map(|cp| cp.storage_bytes).sum();
             let confirm = prompt_checkpoint_confirmation(&format!(
                 "Permanently delete all {} checkpoint(s) ({})? Live history is untouched. (y/n): ",
                 checkpoints.len(),
@@ -840,10 +840,10 @@ fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::err
     let live_len = live_messages.len();
     let total_size: u64 = checkpoints
         .iter()
-        .map(|cp| cp.size_bytes)
+        .map(|cp| cp.storage_bytes)
         .fold(0u64, |acc, size| acc.saturating_add(size));
     println!(
-        "{} ({} / {} checkpoints, {} / {} MiB)",
+        "{} ({} / {} checkpoints, {} stored / {} MiB)",
         "Checkpoints".bold(),
         checkpoints.len(),
         MAX_CHECKPOINTS_PER_SESSION,
@@ -1402,6 +1402,7 @@ mod tests {
             name: name.to_string(),
             modified_local: None,
             size_bytes: 0,
+            storage_bytes: 0,
             parent: parent.map(str::to_string),
         }
     }

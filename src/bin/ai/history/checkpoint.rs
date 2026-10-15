@@ -20,6 +20,8 @@
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "macos")]
+use std::{ffi::CString, os::unix::ffi::OsStrExt};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -36,7 +38,6 @@ use crate::ai::history::SessionStore;
 #[cfg(test)]
 use super::sqlite::restore_sqlite_after_rollback_with_transaction;
 use super::{
-    sessions::copy_dir_recursively,
     sqlite::{
         backup_sqlite, clear_session_history_sqlite, live_rollback_transaction_is_published,
         message_count_sqlite_read_only, read_all_messages_sqlite_read_only,
@@ -90,6 +91,10 @@ pub(in crate::ai) struct CheckpointInfo {
     pub(in crate::ai) name: String,
     pub(in crate::ai) modified_local: Option<DateTime<Local>>,
     pub(in crate::ai) size_bytes: u64,
+    /// Bytes charged to the per-session checkpoint quota. COW-cloned file data
+    /// is shared with the live assets and therefore does not consume quota
+    /// until a later snapshot has to materialize its own copy.
+    pub(in crate::ai) storage_bytes: u64,
     /// Parent checkpoint name (`None` for roots). A parent that no longer
     /// exists (deleted after the child was saved) is kept as-is so the tree
     /// can mark the child as an orphan instead of a false root.
@@ -297,54 +302,47 @@ impl CheckpointStore {
             let parent = store.base_target_unlocked()?;
             let refs = store.capture_ref_snapshot_unlocked()?;
             let branch_growth = store.active_branch_growth_unlocked(&normalized_name)?;
+            let current_size = checkpoints
+                .iter()
+                .fold(0u64, |total, checkpoint| {
+                    total.saturating_add(checkpoint.storage_bytes)
+                })
+                .saturating_add(store.branch_storage_size_unlocked(&branches)?);
             let staged = store.stage_generation(&normalized_name, parent.as_deref())?;
-            let staged_size = directory_storage_size(&staged)?;
+            let sqlite = staged.path.join(GENERATION_SQLITE_FILE);
+            let logical_base = checkpoint_storage_size(
+                &sqlite,
+                &staged.path.join(GENERATION_ASSETS_DIR),
+            )?;
+            let storage_base = sqlite_storage_size(&sqlite)?
+                .saturating_add(staged.copied_asset_bytes);
             // Cache the size and message count in the staged manifest so later
             // `list` skips the recursive walk and the dirty check can skip
-            // opening the snapshot SQLite on a count mismatch. Rewriting the
-            // staged manifest (not yet published) never disturbs `SAVED`.
-            let staged_messages =
-                message_count_sqlite_read_only(&staged.join(GENERATION_SQLITE_FILE)).ok();
-            if staged_messages.is_some() {
-                let _ = fs::write(
-                    staged.join(GENERATION_MANIFEST_FILE),
-                    generation_manifest_body(
-                        parent.as_deref(),
-                        read_generation_manifest(&staged)
-                            .and_then(|manifest| manifest.saved_at)
-                            .unwrap_or_else(unix_now_secs),
-                        Some(staged_size),
-                        staged_messages,
-                    ),
-                );
-            } else {
-                let _ = fs::write(
-                    staged.join(GENERATION_MANIFEST_FILE),
-                    generation_manifest_body(
-                        parent.as_deref(),
-                        read_generation_manifest(&staged)
-                            .and_then(|manifest| manifest.saved_at)
-                            .unwrap_or_else(unix_now_secs),
-                        Some(staged_size),
-                        None,
-                    ),
-                );
-            }
+            // opening the snapshot SQLite on a count mismatch. Logical size is
+            // displayed; storage size charges only bytes materialized instead
+            // of COW-cloned from the live assets.
+            let staged_messages = message_count_sqlite_read_only(&sqlite).ok();
+            let saved_at = read_generation_manifest(&staged.path)
+                .and_then(|manifest| manifest.saved_at)
+                .unwrap_or_else(unix_now_secs);
+            let (manifest, _staged_size, staged_storage) = generation_manifest_with_sizes(
+                parent.as_deref(),
+                saved_at,
+                logical_base,
+                storage_base,
+                staged_messages,
+            );
+            fs::write(staged.path.join(GENERATION_MANIFEST_FILE), manifest)?;
             let mut result = validate_checkpoint_budget(
                 checkpoints.len(),
                 false,
-                checkpoints
-                    .iter()
-                    .fold(0u64, |total, checkpoint| {
-                        total.saturating_add(checkpoint.size_bytes)
-                    })
-                    .saturating_add(store.branch_storage_size_unlocked(&branches)?),
+                current_size,
                 0,
-                staged_size.saturating_add(branch_growth),
+                staged_storage.saturating_add(branch_growth),
                 MAX_CHECKPOINTS_PER_SESSION,
                 MAX_CHECKPOINT_STORAGE_BYTES,
             )
-            .and_then(|()| store.publish_generation(&normalized_name, &staged));
+            .and_then(|()| store.publish_generation(&normalized_name, &staged.path));
             if result.is_ok()
                 && let Err(pointer_error) = store.advance_after_save_unlocked(&normalized_name)
             {
@@ -359,7 +357,7 @@ impl CheckpointStore {
                 };
             }
             if result.is_err() {
-                let _ = fs::remove_dir_all(&staged);
+                let _ = fs::remove_dir_all(&staged.path);
             }
             result.map(|()| store.checkpoint_path(&normalized_name))
         })
@@ -1033,7 +1031,7 @@ impl CheckpointStore {
             checkpoints
                 .iter()
                 .fold(0u64, |total, checkpoint| {
-                    total.saturating_add(checkpoint.size_bytes)
+                    total.saturating_add(checkpoint.storage_bytes)
                 })
                 .saturating_add(self.branch_storage_size_unlocked(&branches)?),
             0,
@@ -1261,6 +1259,10 @@ impl CheckpointStore {
                     Some(cached) => cached,
                     None => directory_storage_size(&path)?,
                 };
+                let storage_bytes = known
+                    .as_ref()
+                    .and_then(|manifest| manifest.storage_bytes)
+                    .unwrap_or(size_bytes);
                 out.push((
                     CheckpointInfo {
                         name: name.to_string(),
@@ -1268,6 +1270,7 @@ impl CheckpointStore {
                             .or(manifest_mtime)
                             .or(mtime),
                         size_bytes,
+                        storage_bytes,
                         parent: None,
                     },
                     known.map(|manifest| manifest.parent),
@@ -1283,14 +1286,14 @@ impl CheckpointStore {
             if out.iter().any(|checkpoint| checkpoint.0.name == stem) {
                 continue;
             }
+            let size_bytes =
+                checkpoint_storage_size(&path, &self.legacy_checkpoint_assets_path(stem))?;
             out.push((
                 CheckpointInfo {
                     name: stem.to_string(),
                     modified_local: metadata.modified().ok().map(DateTime::<Local>::from),
-                    size_bytes: checkpoint_storage_size(
-                        &path,
-                        &self.legacy_checkpoint_assets_path(stem),
-                    )?,
+                    size_bytes,
+                    storage_bytes: size_bytes,
                     parent: None,
                 },
                 None,
@@ -1357,7 +1360,7 @@ impl CheckpointStore {
         Ok(size)
     }
 
-    fn stage_generation(&self, name: &str, parent: Option<&str>) -> io::Result<PathBuf> {
+    fn stage_generation(&self, name: &str, parent: Option<&str>) -> io::Result<StagedGeneration> {
         fs::create_dir_all(&self.dir)?;
         let staged = self.dir.join(format!(
             ".{name}{GENERATION_STAGE_MARKER}{}",
@@ -1366,17 +1369,21 @@ impl CheckpointStore {
         let result = (|| {
             fs::create_dir_all(&staged)?;
             backup_sqlite(&self.session_file, &staged.join(GENERATION_SQLITE_FILE))?;
-            copy_directory_snapshot(&self.session_assets, &staged.join(GENERATION_ASSETS_DIR))?;
+            let copied_asset_bytes =
+                copy_directory_snapshot(&self.session_assets, &staged.join(GENERATION_ASSETS_DIR))?;
             fs::write(
                 staged.join(GENERATION_MANIFEST_FILE),
-                generation_manifest_body(parent, unix_now_secs(), None, None),
+                generation_manifest_body(parent, unix_now_secs(), None, None, None),
             )?;
-            Ok(())
+            Ok(copied_asset_bytes)
         })();
         if result.is_err() {
             let _ = fs::remove_dir_all(&staged);
         }
-        result.map(|()| staged)
+        result.map(|copied_asset_bytes| StagedGeneration {
+            path: staged,
+            copied_asset_bytes,
+        })
     }
 
     fn publish_generation(&self, name: &str, staged: &Path) -> io::Result<()> {
@@ -1863,7 +1870,7 @@ fn validate_checkpoint_budget(
         return Err(io::Error::new(
             io::ErrorKind::StorageFull,
             format!(
-                "checkpoint storage limit reached ({} MiB per session; projected {} bytes); delete old checkpoints before saving",
+                "checkpoint storage limit reached ({} MiB per session; projected {} bytes); delete old checkpoints or reduce session assets before saving",
                 max_size / (1024 * 1024),
                 projected_size,
             ),
@@ -1990,18 +1997,72 @@ fn staged_generation_base<'a>(name: &'a str, marker: &str) -> Option<&'a str> {
         .filter(|base| !base.is_empty())
 }
 
-fn copy_directory_snapshot(source: &Path, destination: &Path) -> io::Result<()> {
+#[derive(Debug)]
+struct StagedGeneration {
+    path: PathBuf,
+    copied_asset_bytes: u64,
+}
+
+fn copy_directory_snapshot(source: &Path, destination: &Path) -> io::Result<u64> {
     if destination.exists() {
         fs::remove_dir_all(destination)?;
     }
-    fs::create_dir_all(destination)?;
-    if source.is_dir() {
-        // Byte copy, not hard links: live writers rewrite stable asset paths
-        // in place (e.g. working-checkpoint.md), so sharing an inode with the
-        // staged generation would corrupt the snapshot on the next write.
-        copy_dir_recursively(source, destination)?;
+    if !source.is_dir() {
+        fs::create_dir_all(destination)?;
+        return Ok(0);
     }
-    Ok(())
+    copy_directory_snapshot_impl(source, destination)
+}
+
+#[cfg(target_os = "macos")]
+fn copy_directory_snapshot_impl(source: &Path, destination: &Path) -> io::Result<u64> {
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "asset path contains NUL"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "asset path contains NUL"))?;
+    // COPYFILE_CLONE recursively creates independent COW files on APFS. If a
+    // file cannot be cloned, copyfile safely falls back to a byte copy and
+    // reports those materialized bytes through COPYFILE_STATE_COPIED.
+    let state = unsafe { libc::copyfile_state_alloc() };
+    if state.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let result = unsafe {
+        libc::copyfile(
+            source.as_ptr(),
+            destination.as_ptr(),
+            state,
+            libc::COPYFILE_METADATA
+                | libc::COPYFILE_DATA
+                | libc::COPYFILE_RECURSIVE
+                | libc::COPYFILE_CLONE,
+        )
+    };
+    let copy_error = (result != 0).then(io::Error::last_os_error);
+    let mut copied: libc::off_t = 0;
+    let state_result = unsafe {
+        libc::copyfile_state_get(
+            state,
+            libc::COPYFILE_STATE_COPIED as u32,
+            (&mut copied as *mut libc::off_t).cast(),
+        )
+    };
+    unsafe {
+        libc::copyfile_state_free(state);
+    }
+    if let Some(error) = copy_error {
+        return Err(error);
+    }
+    if state_result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::try_from(copied).unwrap_or(0))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_directory_snapshot_impl(source: &Path, destination: &Path) -> io::Result<u64> {
+    super::sessions::copy_dir_recursively(source, destination)?;
+    directory_storage_size(destination)
 }
 
 /// Overflow assets are UUID-named and immutable after writing. Rollback only
@@ -2017,10 +2078,9 @@ fn restore_checkpoint_assets(source: &Path, destination: &Path) -> io::Result<()
     Ok(())
 }
 
-/// Git-style checkout: only copy working files that actually differ, like git
-/// updating only changed paths between trees. Assets are UUID-named and
-/// immutable after writing, so an existing destination file with the same
-/// length already holds identical content and can be left untouched.
+/// Restore every snapshotted path. Session scratch files are mutable, so equal
+/// length does not imply equal content. On APFS each replacement is another
+/// COW clone rather than a full byte copy.
 fn copy_dir_skip_identical(source: &Path, destination: &Path) -> io::Result<()> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
@@ -2029,21 +2089,35 @@ fn copy_dir_skip_identical(source: &Path, destination: &Path) -> io::Result<()> 
         if entry.file_type()?.is_dir() {
             fs::create_dir_all(&to)?;
             copy_dir_skip_identical(&from, &to)?;
-        } else if !same_file_content(&from, &to) {
-            fs::copy(&from, &to)?;
+        } else {
+            replace_snapshot_file(&from, &to)?;
         }
     }
     Ok(())
 }
 
-fn same_file_content(source: &Path, destination: &Path) -> bool {
-    let (Ok(src_meta), Ok(dst_meta)) = (fs::metadata(source), fs::metadata(destination)) else {
-        return false;
-    };
-    if !src_meta.is_file() || !dst_meta.is_file() {
-        return false;
+#[cfg(target_os = "macos")]
+fn replace_snapshot_file(source: &Path, destination: &Path) -> io::Result<()> {
+    let temporary = destination.with_extension(format!("restore-{}", uuid::Uuid::new_v4()));
+    let source_c = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "asset path contains NUL"))?;
+    let temporary_c = CString::new(temporary.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "asset path contains NUL"))?;
+    let cloned = unsafe { libc::clonefile(source_c.as_ptr(), temporary_c.as_ptr(), 0) } == 0;
+    if cloned {
+        if let Err(error) = fs::rename(&temporary, destination) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        return Ok(());
     }
-    src_meta.len() == dst_meta.len()
+    let _ = fs::remove_file(&temporary);
+    fs::copy(source, destination).map(|_| ())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn replace_snapshot_file(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::copy(source, destination).map(|_| ())
 }
 
 /// Normalize a checkpoint name into a safe file name (alphanumeric, `-`, `_`;
@@ -2069,15 +2143,18 @@ fn sanitize_name(name: &str) -> String {
 /// A parsed `checkpoint-v2` manifest: the recorded parent link plus the save
 /// timestamp. `saved_at` is `None` for manifests written before timestamps
 /// were tracked; callers fall back to the manifest file mtime, then the directory mtime.
-/// `size_bytes` and `message_count` are optional fast paths cached at save time
-/// (like git storing tree sizes in a commit): when present, `list` skips the
-/// recursive size walk and the dirty check skips opening the snapshot SQLite
-/// for a count mismatch. `None` means a pre-caching manifest and falls back
-/// to the existing walk/query behavior.
+/// `size_bytes`, `storage_bytes`, and `message_count` are optional fast paths
+/// cached at save time. `size_bytes` is the logical snapshot size while
+/// `storage_bytes` is the newly allocated data charged to the quota. Like git
+/// storing tree sizes in a commit, these caches let `list` skip the recursive
+/// size walk and the dirty check skip opening the snapshot SQLite on a count
+/// mismatch. `None` means a pre-caching manifest and falls back to the existing
+/// walk/query behavior.
 struct GenerationManifest {
     parent: Option<String>,
     saved_at: Option<u64>,
     size_bytes: Option<u64>,
+    storage_bytes: Option<u64>,
     message_count: Option<usize>,
 }
 
@@ -2098,19 +2175,26 @@ fn read_generation_manifest(generation: &Path) -> Option<GenerationManifest> {
     };
     // Third line is optional: manifests written before timestamps existed
     // have no `saved_at` line and fall back to mtime. Fourth (`size:`) and
-    // fifth (`messages:`) lines are optional size/count caches written at save
-    // time; missing lines fall back to walking the directory / querying SQLite.
+    // Remaining lines are optional caches written at save time; missing
+    // storage falls back to logical size for pre-COW snapshots.
     let saved_at = match lines.next() {
         None => None,
         Some(line) => Some(line.strip_prefix("saved_at: ")?.parse::<u64>().ok()?),
     };
     let mut size_bytes = None;
+    let mut storage_bytes = None;
     let mut message_count = None;
     for line in lines {
         if let Some(value) = line.strip_prefix("size: ")
             && size_bytes.is_none()
         {
             size_bytes = value.parse::<u64>().ok();
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("storage: ")
+            && storage_bytes.is_none()
+        {
+            storage_bytes = value.parse::<u64>().ok();
             continue;
         }
         if let Some(value) = line.strip_prefix("messages: ")
@@ -2123,6 +2207,7 @@ fn read_generation_manifest(generation: &Path) -> Option<GenerationManifest> {
         parent,
         saved_at,
         size_bytes,
+        storage_bytes,
         message_count,
     })
 }
@@ -2155,13 +2240,14 @@ fn manifest_saved_time(manifest: Option<&GenerationManifest>) -> Option<DateTime
 
 /// Render a v2 manifest body for `parent` (`None` = root) stamped with
 /// `saved_at` (unix seconds): `SAVED` and newest-first order read this, not
-/// the directory mtime. `size_bytes` / `message_count` are optional caches;
+/// the directory mtime. Size, storage, and message count are optional caches;
 /// `None` omits the line so old readers (which only require the first three
 /// lines) keep parsing.
 fn generation_manifest_body(
     parent: Option<&str>,
     saved_at: u64,
     size_bytes: Option<u64>,
+    storage_bytes: Option<u64>,
     message_count: Option<usize>,
 ) -> String {
     let parent_line = match parent {
@@ -2172,10 +2258,41 @@ fn generation_manifest_body(
     if let Some(size) = size_bytes {
         body.push_str(&format!("size: {size}\n"));
     }
+    if let Some(storage) = storage_bytes {
+        body.push_str(&format!("storage: {storage}\n"));
+    }
     if let Some(count) = message_count {
         body.push_str(&format!("messages: {count}\n"));
     }
     body
+}
+
+fn generation_manifest_with_sizes(
+    parent: Option<&str>,
+    saved_at: u64,
+    logical_base: u64,
+    storage_base: u64,
+    message_count: Option<usize>,
+) -> (String, u64, u64) {
+    let mut logical_size = logical_base;
+    let mut storage_size = storage_base;
+    loop {
+        let body = generation_manifest_body(
+            parent,
+            saved_at,
+            Some(logical_size),
+            Some(storage_size),
+            message_count,
+        );
+        let body_size = body.len() as u64;
+        let next_logical = logical_base.saturating_add(body_size);
+        let next_storage = storage_base.saturating_add(body_size);
+        if next_logical == logical_size && next_storage == storage_size {
+            return (body, logical_size, storage_size);
+        }
+        logical_size = next_logical;
+        storage_size = next_storage;
+    }
 }
 
 /// Whether `name` is reserved for pointer aliases: the HEAD pointer (`HEAD`
@@ -3106,11 +3223,11 @@ mod tests {
         assert_eq!(read_generation_parent(&write("garbage", b"nope\n")), None);
         assert_eq!(read_generation_parent(&root.join("missing")), None);
         assert_eq!(
-            generation_manifest_body(None, 0, None, None),
+            generation_manifest_body(None, 0, None, None, None),
             "checkpoint-v2\nparent: -\nsaved_at: 0\n"
         );
         assert_eq!(
-            generation_manifest_body(Some("a"), 7, None, None),
+            generation_manifest_body(Some("a"), 7, None, None, None),
             "checkpoint-v2\nparent: a\nsaved_at: 7\n"
         );
         // Pre-timestamp manifests still parse (timestamp falls back to mtime).
@@ -3211,9 +3328,18 @@ mod tests {
             .join("durable.md");
         fs::create_dir_all(checkpoint_asset.parent().unwrap()).unwrap();
         fs::write(&checkpoint_asset, "before asset").unwrap();
+        let scratch_asset = store.session_assets.join("tmp").join("workspace.bin");
+        fs::create_dir_all(scratch_asset.parent().unwrap()).unwrap();
+        fs::write(&scratch_asset, "before scratch").unwrap();
 
         store.save("stable").unwrap();
         assert!(store.checkpoint_assets_path("stable").exists());
+        assert!(
+            store
+                .checkpoint_assets_path("stable")
+                .join("tmp/workspace.bin")
+                .exists()
+        );
         let listed = store.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert!(
@@ -3221,6 +3347,8 @@ mod tests {
                 >= fs::metadata(store.checkpoint_path("stable")).unwrap().len()
                     + "before asset".len() as u64
         );
+        #[cfg(target_os = "macos")]
+        assert!(listed[0].storage_bytes < listed[0].size_bytes);
 
         append_history_messages(
             &store.session_file,
@@ -3234,6 +3362,7 @@ mod tests {
         )
         .unwrap();
         fs::write(&checkpoint_asset, "after asset").unwrap();
+        fs::write(&scratch_asset, "after_ scratch").unwrap();
 
         store.rollback("stable").unwrap();
         let restored = build_message_arr(10, &store.session_file).unwrap();
@@ -3246,9 +3375,44 @@ mod tests {
             fs::read_to_string(checkpoint_asset).unwrap(),
             "before asset"
         );
+        assert_eq!(fs::read_to_string(scratch_asset).unwrap(), "before scratch");
 
-        assert!(store.delete("stable").unwrap());
+        assert_eq!(store.clear().unwrap(), 1);
         assert!(!store.checkpoint_assets_path("stable").exists());
+        if let Some(root) = history_file.parent() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cow_snapshot_charges_allocated_copy_not_logical_asset_size() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-large-cow");
+        append_history_messages(
+            &store.session_file,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("large workspace".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        let sparse = store.session_assets.join("tmp/large-workspace.bin");
+        fs::create_dir_all(sparse.parent().unwrap()).unwrap();
+        fs::File::create(&sparse)
+            .unwrap()
+            .set_len(MAX_CHECKPOINT_STORAGE_BYTES + 1)
+            .unwrap();
+
+        store.save("large-cow").unwrap();
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].size_bytes > MAX_CHECKPOINT_STORAGE_BYTES);
+        assert!(listed[0].storage_bytes < MAX_CHECKPOINT_STORAGE_BYTES);
+
         if let Some(root) = history_file.parent() {
             let _ = fs::remove_dir_all(root);
         }
