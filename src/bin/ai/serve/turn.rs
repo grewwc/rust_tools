@@ -167,7 +167,8 @@ pub(crate) enum ConfirmKind {
 /// Hands out the [`PendingConfirm::token`] values. Comparing the echoed token
 /// is what keeps a dialog left over from an earlier turn from deciding the
 /// question that took its id.
-pub(crate) static NEXT_CONFIRM_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+pub(crate) static NEXT_CONFIRM_TOKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 /// Per-turn confirmation channel: the question the child is blocked on (if
 /// any) and the pipe that answers it. The slot lives in [`ServeState`], not in
@@ -247,7 +248,10 @@ pub(crate) fn parse_confirm_id(payload: &str) -> Option<u64> {
 
 /// The session's live confirmation channel, if a turn with the channel
 /// enabled is running.
-pub(crate) fn confirm_slot(state: &ServeState, id: &str) -> Option<Arc<std::sync::Mutex<ConfirmSlot>>> {
+pub(crate) fn confirm_slot(
+    state: &ServeState,
+    id: &str,
+) -> Option<Arc<std::sync::Mutex<ConfirmSlot>>> {
     state.confirms.lock().ok()?.get(id).map(Arc::clone)
 }
 
@@ -264,7 +268,11 @@ pub(crate) fn dismiss_pending_confirm(
     confirms: &std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<ConfirmSlot>>>>,
     session_id: &str,
 ) {
-    let Some(slot) = confirms.lock().ok().and_then(|m| m.get(session_id).cloned()) else {
+    let Some(slot) = confirms
+        .lock()
+        .ok()
+        .and_then(|m| m.get(session_id).cloned())
+    else {
         return;
     };
     let Some(mut slot) = slot.lock().ok() else {
@@ -400,7 +408,9 @@ pub(crate) async fn post_confirm(
     let write = match slot.answers.as_mut() {
         Some(stdin) => {
             use std::io::Write;
-            stdin.write_all(line.as_bytes()).and_then(|()| stdin.flush())
+            stdin
+                .write_all(line.as_bytes())
+                .and_then(|()| stdin.flush())
         }
         None => Err(std::io::Error::new(
             std::io::ErrorKind::NotConnected,

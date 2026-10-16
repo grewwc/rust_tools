@@ -5,8 +5,16 @@ use std::path::PathBuf;
 fn parse_cli_args_distill_session_accepts_zip_and_session_id() {
     for input in ["./archive.zip", "6e969353-01f4-40c2-bddb-59fae9970ad3"] {
         let cli = super::parse_cli_args(
-            ["a", "--distill-session", input, "--distill-dry-run", "--distill-limit", "10"]
-                .into_iter().map(str::to_owned),
+            [
+                "a",
+                "--distill-session",
+                input,
+                "--distill-dry-run",
+                "--distill-limit",
+                "10",
+            ]
+            .into_iter()
+            .map(str::to_owned),
         );
         assert_eq!(cli.distill_session.as_deref(), Some(input));
         assert!(cli.distill_dry_run);
@@ -129,13 +137,23 @@ fn parse_cli_args_reads_resume_flag() {
 
 #[test]
 fn parse_cli_args_reads_serve_sessions_flag() {
-    let cli =
-        super::parse_cli_args(["a".to_string(), "--serve-sessions".to_string()].into_iter());
+    let cli = super::parse_cli_args(["a".to_string(), "--serve-sessions".to_string()].into_iter());
     assert!(cli.serve_sessions);
 
     // Defaults to false when --serve-sessions is not given.
     let cli = super::parse_cli_args(["a".to_string()].into_iter());
     assert!(!cli.serve_sessions);
+}
+
+#[test]
+fn parse_cli_args_reads_serve_tls_init_with_bind() {
+    let cli = super::parse_cli_args(
+        ["a", "--serve-tls-init", "--serve-bind", "192.0.2.10:8080"]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    assert!(cli.serve_tls_init);
+    assert_eq!(cli.serve_bind, "192.0.2.10:8080");
 }
 
 #[test]
@@ -197,9 +215,7 @@ fn parse_cli_args_sharp_shortcut_selects_sharp_agent() {
     assert_eq!(cli.args, vec!["quick question".to_string()]);
 
     // Long form behaves the same.
-    let cli = super::parse_cli_args(
-        ["a".to_string(), "--sharp".to_string()].into_iter(),
-    );
+    let cli = super::parse_cli_args(["a".to_string(), "--sharp".to_string()].into_iter());
     assert_eq!(cli.agent.as_deref(), Some("sharp"));
 
     // `-s` selects sharp; the implied low reasoning effort is derived at
@@ -242,12 +258,7 @@ fn parse_cli_args_sharp_shortcut_selects_sharp_agent() {
     // `--agent sharp` without `-s` selects sharp the same way — still no
     // stored override; the low default is derived at resolve time.
     let cli = super::parse_cli_args(
-        [
-            "a".to_string(),
-            "--agent".to_string(),
-            "sharp".to_string(),
-        ]
-        .into_iter(),
+        ["a".to_string(), "--agent".to_string(), "sharp".to_string()].into_iter(),
     );
     assert_eq!(cli.agent.as_deref(), Some("sharp"));
     assert!(cli.reasoning_effort_override.is_none());
@@ -261,12 +272,7 @@ fn parse_cli_args_sharp_shortcut_selects_sharp_agent() {
 
     // `-s` must not steal `-ss` (session).
     let cli = super::parse_cli_args(
-        [
-            "a".to_string(),
-            "-ss".to_string(),
-            "my-session".to_string(),
-        ]
-        .into_iter(),
+        ["a".to_string(), "-ss".to_string(), "my-session".to_string()].into_iter(),
     );
     assert_eq!(cli.session.as_deref(), Some("my-session"));
     assert!(cli.agent.is_none());
@@ -318,9 +324,8 @@ fn parse_cli_args_keeps_changes_short_flags_verbatim() {
         assert!(cli.reasoning_effort_override.is_none());
     }
     // `/diff` shares the changes grammar.
-    let cli = super::parse_cli_args(
-        ["a".to_string(), "/diff".to_string(), "-s".to_string()].into_iter(),
-    );
+    let cli =
+        super::parse_cli_args(["a".to_string(), "/diff".to_string(), "-s".to_string()].into_iter());
     assert_eq!(cli.args, vec!["/diff -s".to_string()]);
     assert!(cli.agent.is_none());
     // A global flag before the command still applies.
@@ -395,19 +400,20 @@ fn parse_cli_args_does_not_join_non_command_slash_tokens() {
     // A prompt that merely starts with a `/`-token (a path, not a command)
     // keeps its tokens separate.
     let cli = super::parse_cli_args(
-        ["a".to_string(), "/etc/hosts".to_string(), "解释".to_string()].into_iter(),
+        [
+            "a".to_string(),
+            "/etc/hosts".to_string(),
+            "解释".to_string(),
+        ]
+        .into_iter(),
     );
-    assert_eq!(
-        cli.args,
-        vec!["/etc/hosts".to_string(), "解释".to_string()]
-    );
+    assert_eq!(cli.args, vec!["/etc/hosts".to_string(), "解释".to_string()]);
 }
 
 #[test]
 fn parse_cli_args_passes_colon_aliases_through() {
-    let cli = super::parse_cli_args(
-        ["a".to_string(), ":bg".to_string(), "now".to_string()].into_iter(),
-    );
+    let cli =
+        super::parse_cli_args(["a".to_string(), ":bg".to_string(), "now".to_string()].into_iter());
     assert_eq!(cli.args, vec![":bg now".to_string()]);
 }
 

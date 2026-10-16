@@ -115,6 +115,8 @@ pub(super) struct ParsedCli {
     pub(super) serve_tls_key: String,
     /// Private CA certificate trusted by serve clients.
     pub(super) serve_ca_cert: String,
+    /// Whether to initialize or refresh the managed serve TLS certificate.
+    pub(super) serve_tls_init: bool,
     /// Whether to start the serve daemon in the background (`--serve-start`).
     pub(super) serve_start: bool,
     /// Whether to stop the serve daemon (`--serve-stop`).
@@ -277,6 +279,11 @@ fn register_cli_flags(parser: &mut TermParser) {
         "serve-ca-cert",
         "",
         "PEM CA certificate trusted by --serve-chat/--serve-sessions",
+    );
+    parser.add_bool(
+        "serve-tls-init",
+        false,
+        "generate or refresh managed HTTPS certificates without replacing the existing CA",
     );
     parser.add_bool(
         "serve-start",
@@ -638,6 +645,7 @@ impl Default for ParsedCli {
             serve_tls_cert: String::new(),
             serve_tls_key: String::new(),
             serve_ca_cert: String::new(),
+            serve_tls_init: false,
             serve_start: false,
             serve_stop: false,
             serve_restart: false,
@@ -738,6 +746,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     cli.serve = parser.contains_flag_strict("serve");
     cli.serve_chat = parser.contains_flag_strict("serve-chat");
     cli.serve_sessions = parser.contains_flag_strict("serve-sessions");
+    cli.serve_tls_init = parser.contains_flag_strict("serve-tls-init");
     cli.serve_start = parser.contains_flag_strict("serve-start");
     cli.serve_stop = parser.contains_flag_strict("serve-stop");
     cli.serve_restart = parser.contains_flag_strict("serve-restart");
@@ -761,6 +770,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     if !cli.serve
         && !cli.serve_chat
         && !cli.serve_sessions
+        && !cli.serve_tls_init
         && !cli.serve_start
         && !cli.serve_restart
         && has_serve_transport_override
@@ -1212,9 +1222,7 @@ fn generate_zsh(
     println!();
     // Subcommand mapping.
     println!("  local -a _a_usage_subcmds=(today 7d 30d all daily trend days models help)");
-    println!(
-        "  local -a _a_checkpoint_subcmds=(save commit list checkout fork delete help)"
-    );
+    println!("  local -a _a_checkpoint_subcmds=(save commit list checkout fork delete help)");
     println!(
         "  local -a _a_history_subcmds=(full user assistant tool system grep rewind export copy last replay help 3 6 10 20)"
     );

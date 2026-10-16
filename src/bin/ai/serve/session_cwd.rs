@@ -128,8 +128,10 @@ mod tests {
     /// the daemon cwd.
     fn test_state() -> ServeState {
         ServeState {
-            history_file: std::env::temp_dir()
-                .join(format!("a-serve-session-cwd-test-{}.sqlite", std::process::id())),
+            history_file: std::env::temp_dir().join(format!(
+                "a-serve-session-cwd-test-{}.sqlite",
+                std::process::id()
+            )),
             token: String::new(),
             cwds: Arc::new(std::sync::Mutex::new(HashMap::new())),
             locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -162,16 +164,23 @@ mod tests {
     fn switch_sets_session_cwd_and_prints_local_message() {
         let state = test_state();
         let target = temp_dir("switch");
-        let outcome = run_session_cd(&state, "s1", &format!("/cd {}", target.display()))
-            .expect("cd command");
+        let outcome =
+            run_session_cd(&state, "s1", &format!("/cd {}", target.display())).expect("cd command");
         assert!(outcome.stderr.is_empty());
-        assert!(outcome.stdout.contains(&format!("(was {})\n", cwd().display())));
+        assert!(
+            outcome
+                .stdout
+                .contains(&format!("(was {})\n", cwd().display()))
+        );
         assert_eq!(session_cwd(&state, "s1"), target.canonicalize().unwrap());
         // Bare `/cd` prints the session cwd.
         let shown = run_session_cd(&state, "s1", "/cd").expect("cd command");
         assert_eq!(
             shown.stdout,
-            format!("Working directory: {}\n", target.canonicalize().unwrap().display())
+            format!(
+                "Working directory: {}\n",
+                target.canonicalize().unwrap().display()
+            )
         );
     }
 
@@ -184,21 +193,26 @@ mod tests {
         run_session_cd(&state, "s1", &format!("/cd {}", second.display())).expect("cd");
         let back = run_session_cd(&state, "s1", "/cd -").expect("cd");
         assert_eq!(session_cwd(&state, "s1"), first.canonicalize().unwrap());
-        assert!(back.stdout.contains(&format!("(was {})\n", second.canonicalize().unwrap().display())));
+        assert!(back.stdout.contains(&format!(
+            "(was {})\n",
+            second.canonicalize().unwrap().display()
+        )));
     }
 
     #[test]
     fn go_back_without_history_prints_local_message() {
         let state = test_state();
         let outcome = run_session_cd(&state, "s1", "/cd -").expect("cd");
-        assert_eq!(outcome.stdout, "No previous working directory recorded yet.\n");
+        assert_eq!(
+            outcome.stdout,
+            "No previous working directory recorded yet.\n"
+        );
     }
 
     #[test]
     fn not_a_directory_reports_error_with_usage() {
         let state = test_state();
-        let outcome =
-            run_session_cd(&state, "s1", "/cd /definitely/not/a/real/dir").expect("cd");
+        let outcome = run_session_cd(&state, "s1", "/cd /definitely/not/a/real/dir").expect("cd");
         assert!(outcome.stdout.is_empty());
         assert!(outcome.stderr.contains("[cd] not a directory:"));
         assert!(outcome.stderr.contains("Usage: /cd [dir]"));

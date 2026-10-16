@@ -3,7 +3,7 @@
 //! real terminal, real `a` process, or the real registry is touched.
 
 use super::client::{
-    attach, eligible, maybe_run_impl, reattach_hint, AttachEnd, DisplayBacklog, MAX_DISPLAY_BACKLOG,
+    AttachEnd, DisplayBacklog, MAX_DISPLAY_BACKLOG, attach, eligible, maybe_run_impl, reattach_hint,
 };
 use super::{host, registry, wire};
 use crate::ai::cli::ParsedCli;
@@ -28,10 +28,8 @@ fn pty_pair() -> (std::fs::File, std::fs::File) {
 fn start_host(worker: Command) -> (PathBuf, PathBuf) {
     // macOS caps Unix socket paths at SUN_LEN (104 bytes); temp_dir() on macOS
     // is already ~70 bytes, so keep the test root short and under /tmp.
-    let root = std::path::PathBuf::from("/tmp").join(format!(
-        "a-pty-test-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let root = std::path::PathBuf::from("/tmp")
+        .join(format!("a-pty-test-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&root).unwrap();
     let name = registry::bootstrap_name(&uuid::Uuid::new_v4().to_string()).unwrap();
     let token = "test-token".to_string();
@@ -76,7 +74,11 @@ fn read_until(fd: RawFd, needle: &[u8], timeout: Duration) -> Vec<u8> {
                 String::from_utf8_lossy(&buffer)
             );
         }
-        let mut pollfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         if unsafe { libc::poll(&mut pollfd, 1, remaining.as_millis() as i32) } <= 0 {
             continue;
         }
@@ -91,8 +93,13 @@ fn read_until(fd: RawFd, needle: &[u8], timeout: Duration) -> Vec<u8> {
 fn write_all(fd: RawFd, bytes: &[u8]) {
     let mut offset = 0;
     while offset < bytes.len() {
-        let count =
-            unsafe { libc::write(fd, bytes[offset..].as_ptr() as *const _, bytes.len() - offset) };
+        let count = unsafe {
+            libc::write(
+                fd,
+                bytes[offset..].as_ptr() as *const _,
+                bytes.len() - offset,
+            )
+        };
         assert!(count > 0, "PTY master write failed");
         offset += count as usize;
     }
@@ -124,9 +131,9 @@ fn same_termios(a: &libc::termios, b: &libc::termios) -> bool {
         // ever set or restore, so ignore it when comparing.
         && (a.c_lflag & !libc::PENDIN) == (b.c_lflag & !libc::PENDIN)
         && a.c_cc == b.c_cc
-        // c_ispeed/c_ospeed are excluded: openpty reports speed 0 initially,
-        // and the kernel normalizes it after any tcsetattr, so they differ
-        // even when the modes were restored exactly.
+    // c_ispeed/c_ospeed are excluded: openpty reports speed 0 initially,
+    // and the kernel normalizes it after any tcsetattr, so they differ
+    // even when the modes were restored exactly.
 }
 
 /// Capture the remaining output after attach returns, including its cleanup.
@@ -136,11 +143,20 @@ fn assert_client_reset(master: RawFd, slave: RawFd, mut output: Vec<u8>) {
     const DONE: &[u8] = b"__CLIENT_RETURNED__";
     write_all(slave, DONE);
     output.extend(read_until(master, DONE, Duration::from_secs(5)));
-    assert!(output.starts_with(RESET), "attach must preserve the output cursor");
+    assert!(
+        output.starts_with(RESET),
+        "attach must preserve the output cursor"
+    );
     let mut suffix = RESET.to_vec();
     suffix.extend_from_slice(DONE);
-    assert!(output.ends_with(&suffix), "exit must reset modes on the supplied output fd");
-    assert_eq!(output.windows(RESET.len()).filter(|w| *w == RESET).count(), 2);
+    assert!(
+        output.ends_with(&suffix),
+        "exit must reset modes on the supplied output fd"
+    );
+    assert_eq!(
+        output.windows(RESET.len()).filter(|w| *w == RESET).count(),
+        2
+    );
 }
 
 /// A `ParsedCli` with every field at its default value (bare `a`).
@@ -183,6 +199,7 @@ fn default_cli() -> ParsedCli {
         serve_tls_cert: String::new(),
         serve_tls_key: String::new(),
         serve_ca_cert: String::new(),
+        serve_tls_init: false,
         serve_chat: false,
         serve_sessions: false,
         serve_start: false,
@@ -195,7 +212,10 @@ fn default_cli() -> ParsedCli {
 #[test]
 fn attach_relays_io_and_restores_termios() {
     let mut worker = Command::new("/bin/sh");
-    worker.args(["-c", "printf 'hi\\n'; read line; printf 'got:%s\\n' \"$line\""]);
+    worker.args([
+        "-c",
+        "printf 'hi\\n'; read line; printf 'got:%s\\n' \"$line\"",
+    ]);
     let (root, socket) = start_host(worker);
     let (master, slave) = pty_pair();
     let before = termios_of(slave.as_raw_fd());
@@ -211,7 +231,11 @@ fn attach_relays_io_and_restores_termios() {
     let mut output = read_until(master.as_raw_fd(), b"hi\r\n", Duration::from_secs(5));
     // Keystrokes on the client's terminal reach the worker and come back.
     write_all(master.as_raw_fd(), b"world\n");
-    output.extend(read_until(master.as_raw_fd(), b"got:world\r\n", Duration::from_secs(5)));
+    output.extend(read_until(
+        master.as_raw_fd(),
+        b"got:world\r\n",
+        Duration::from_secs(5),
+    ));
     let end = rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
     assert_eq!(end.code, 0);
     assert!(!end.detached);
@@ -220,9 +244,16 @@ fn attach_relays_io_and_restores_termios() {
     if !same_termios(&after, &before) {
         eprintln!(
             "[debug] iflag {:x}->{:x} oflag {:x}->{:x} cflag {:x}->{:x} lflag {:x}->{:x} cc {:?}->{:?}",
-            before.c_iflag, after.c_iflag, before.c_oflag, after.c_oflag,
-            before.c_cflag, after.c_cflag, before.c_lflag, after.c_lflag,
-            before.c_cc, after.c_cc
+            before.c_iflag,
+            after.c_iflag,
+            before.c_oflag,
+            after.c_oflag,
+            before.c_cflag,
+            after.c_cflag,
+            before.c_lflag,
+            after.c_lflag,
+            before.c_cc,
+            after.c_cc
         );
     }
     assert!(same_termios(&after, &before));
@@ -247,7 +278,13 @@ fn detach_keeps_worker_and_reattach_replays_output() {
         tx1.send(end).unwrap();
     });
     let output1 = read_until(master1.as_raw_fd(), b"first\r\n", Duration::from_secs(5));
-    wire::rpc(&socket, wire::Request::Detach { token: "test-token".into() }).unwrap();
+    wire::rpc(
+        &socket,
+        wire::Request::Detach {
+            token: "test-token".into(),
+        },
+    )
+    .unwrap();
     let end1 = rx1.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
     assert!(end1.detached);
     assert_eq!(end1.code, 0);
@@ -302,7 +339,10 @@ fn second_attach_is_rejected_while_attached() {
     .join()
     .unwrap();
     let message = error.expect("second attach should have failed");
-    assert!(message.contains("already attached"), "unexpected error: {message}");
+    assert!(
+        message.contains("already attached"),
+        "unexpected error: {message}"
+    );
     assert!(same_termios(&termios_of(slave2_fd), &before2));
     assert_client_reset(master2.as_raw_fd(), slave2_fd, Vec::new());
     // End the worker so the host and first client exit cleanly.
@@ -355,7 +395,10 @@ fn maybe_run_attaches_to_live_terminal_binding() {
     registry::bind_terminal(
         &root,
         "tmux:test-pane",
-        &registry::Binding { socket: name, session: None },
+        &registry::Binding {
+            socket: name,
+            session: None,
+        },
     )
     .unwrap();
     let previous = std::env::var("TMUX_PANE").ok();
@@ -430,11 +473,18 @@ fn display_backlog_drops_overflow_and_notices_once() {
         drain_fd(read_fd, &mut output);
     }
     drain_fd(read_fd, &mut output);
-    assert!(output.starts_with(&kept[..]), "kept frame must arrive first");
+    assert!(
+        output.starts_with(&kept[..]),
+        "kept frame must arrive first"
+    );
     let notice = String::from_utf8_lossy(&output[kept.len()..]);
     assert!(notice.contains("[output truncated: terminal was unresponsive"));
     assert!(notice.contains(&format!("{} bytes dropped", dropped.len())));
-    assert_eq!(notice.matches("output truncated").count(), 1, "notice must appear exactly once");
+    assert_eq!(
+        notice.matches("output truncated").count(),
+        1,
+        "notice must appear exactly once"
+    );
 }
 
 #[test]
@@ -444,7 +494,10 @@ fn stalled_terminal_does_not_freeze_client() {
     // blocking stdout write. The bounded backlog must let attach finish once
     // the worker exits.
     let mut worker = Command::new("/bin/sh");
-    worker.args(["-c", "i=0; while [ $i -lt 20000 ]; do echo 'payload line'; i=$((i+1)); done"]);
+    worker.args([
+        "-c",
+        "i=0; while [ $i -lt 20000 ]; do echo 'payload line'; i=$((i+1)); done",
+    ]);
     let (root, socket) = start_host(worker);
     let (master, slave) = pty_pair();
     let slave_fd = slave.as_raw_fd();
@@ -512,7 +565,10 @@ fn second_stall_notice_reports_only_second_round_drops() {
     let second_text = String::from_utf8_lossy(&second);
     assert!(second_text.contains(&format!("{} bytes dropped", second_dropped.len())));
     assert!(
-        !second_text.contains(&format!("{} bytes dropped", first_dropped.len() + second_dropped.len())),
+        !second_text.contains(&format!(
+            "{} bytes dropped",
+            first_dropped.len() + second_dropped.len()
+        )),
         "second notice must not sum both stalls"
     );
 }
@@ -536,7 +592,10 @@ fn exit_code_one_is_not_reported_as_lost_connection() {
     let end = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
     assert_eq!(end.code, 1, "worker exit status must be forwarded");
     assert!(!end.detached);
-    assert!(!end.connection_lost, "normal exit 1 must not look like a lost connection");
+    assert!(
+        !end.connection_lost,
+        "normal exit 1 must not look like a lost connection"
+    );
     let _ = (master, root);
 }
 
@@ -559,25 +618,52 @@ fn socket_eof_is_reported_as_lost_connection() {
     let end = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
     assert_eq!(end.code, 1);
     assert!(!end.detached);
-    assert!(end.connection_lost, "socket EOF without EXIT must be a lost connection");
+    assert!(
+        end.connection_lost,
+        "socket EOF without EXIT must be a lost connection"
+    );
     let _ = master;
 }
 
 #[test]
 fn reattach_hint_only_for_lost_connections_with_session() {
     let with_session = || Some("sess-1".into());
-    let lost = AttachEnd { code: 1, detached: false, session: with_session(), connection_lost: true };
-    assert!(reattach_hint(&lost).is_some(), "lost connection with a session id must hint");
+    let lost = AttachEnd {
+        code: 1,
+        detached: false,
+        session: with_session(),
+        connection_lost: true,
+    };
+    assert!(
+        reattach_hint(&lost).is_some(),
+        "lost connection with a session id must hint"
+    );
     assert!(
         reattach_hint(&lost).unwrap().contains("a -ss sess-1"),
         "hint must include the re-attach command"
     );
     // Normal worker exit with code 1: no hint, the session is already gone.
-    let normal = AttachEnd { code: 1, detached: false, session: with_session(), connection_lost: false };
-    assert!(reattach_hint(&normal).is_none(), "normal exit 1 must not hint");
+    let normal = AttachEnd {
+        code: 1,
+        detached: false,
+        session: with_session(),
+        connection_lost: false,
+    };
+    assert!(
+        reattach_hint(&normal).is_none(),
+        "normal exit 1 must not hint"
+    );
     // Lost connection without a session id: nothing useful to hint.
-    let anonymous = AttachEnd { code: 1, detached: false, session: None, connection_lost: true };
-    assert!(reattach_hint(&anonymous).is_none(), "no session id means no hint");
+    let anonymous = AttachEnd {
+        code: 1,
+        detached: false,
+        session: None,
+        connection_lost: true,
+    };
+    assert!(
+        reattach_hint(&anonymous).is_none(),
+        "no session id means no hint"
+    );
 }
 
 #[test]
@@ -597,7 +683,8 @@ fn host_death_flushes_backlog_before_returning() {
     let reply = wire::frame(wire::REPLY, br#"{"session":"s1"}"#).unwrap();
     held.write_all(&reply).unwrap();
     let tail = b"tail output before host death";
-    held.write_all(&wire::frame(wire::OUTPUT, tail).unwrap()).unwrap();
+    held.write_all(&wire::frame(wire::OUTPUT, tail).unwrap())
+        .unwrap();
     thread::sleep(Duration::from_millis(300));
     drop(held); // host dies
     let end = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();

@@ -52,10 +52,7 @@ fn current_checkpoint_status(state: &ServeState, id: &str) -> Result<Option<Stri
 
 fn validate_checkpoint_command(command: &str) -> Result<(), String> {
     let first = command.split_whitespace().next().unwrap_or_default();
-    if matches!(
-        first,
-        "/git" | ":git"
-    ) {
+    if matches!(first, "/git" | ":git") {
         Ok(())
     } else {
         Err("expected a /git command".to_string())
@@ -91,7 +88,10 @@ fn split_checkpoint_confirmation(stdout: &str) -> (String, Option<String>) {
         if let Some(prompt) = line.strip_prefix(SERVE_CHECKPOINT_CONFIRM_MARKER) {
             confirmation = Some(prompt.to_string());
         } else if confirmation.is_none()
-            || !matches!(line, "Canceled: nothing was changed." | "Checkpoint clear canceled by user.")
+            || !matches!(
+                line,
+                "Canceled: nothing was changed." | "Checkpoint clear canceled by user."
+            )
         {
             output.push(line);
         }
@@ -119,7 +119,10 @@ pub(crate) async fn list_checkpoints(
         .session_history_file(&id)
         .exists()
     {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "session not found"})))
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "session not found"})),
+        )
             .into_response();
     }
     match checkpoint_names(&state, &id) {
@@ -155,7 +158,10 @@ pub(crate) async fn post_checkpoint_command(
 
     let store = SessionStore::new(state.history_file.as_path());
     if !store.session_history_file(&id).exists() {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "session not found"})))
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "session not found"})),
+        )
             .into_response();
     }
 

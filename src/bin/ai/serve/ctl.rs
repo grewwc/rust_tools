@@ -31,7 +31,7 @@ use std::os::fd::AsRawFd as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use super::tls::{ServeTlsConfig, resolve_serve_tls};
+use super::tls::{ServeTlsConfig, default_serve_tls_config, resolve_serve_tls};
 use crate::ai::cli::ParsedCli;
 use crate::commonw::configw;
 
@@ -481,10 +481,13 @@ fn start_daemon(
         let _ = std::fs::remove_file(&pid_path);
     }
     let bind = resolve_ctl_bind(cli, previous.map(|state| state.bind.as_str()));
+    let managed_tls = default_serve_tls_config()?;
     let tls = resolve_serve_tls(
         &cli.serve_tls_cert,
         &cli.serve_tls_key,
-        previous.and_then(|state| state.tls.as_ref()),
+        previous
+            .and_then(|state| state.tls.as_ref())
+            .or(managed_tls.as_ref()),
     )?;
     // Freeze first: the daemon re-execs its own file for every turn, so it
     // must not run from a path that a rebuild can replace.

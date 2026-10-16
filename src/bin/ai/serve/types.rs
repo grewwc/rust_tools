@@ -135,7 +135,10 @@ pub(crate) struct TurnOverrides {
 /// Validate one free-form model/agent override: non-empty after trim, short,
 /// and never flag-shaped (a `--x` value would confuse the child CLI parser,
 /// which only claims non-`-` tokens for `--model`/`--agent` values).
-pub(crate) fn sanitize_turn_name_override(value: Option<String>, field: &str) -> Result<Option<String>, String> {
+pub(crate) fn sanitize_turn_name_override(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<String>, String> {
     let Some(raw) = value else {
         return Ok(None);
     };
@@ -163,11 +166,14 @@ pub(crate) fn validate_turn_name_value(trimmed: String, field: &str) -> Result<S
 /// for the `sanitize_turn_effort_override` whitelist below and the `efforts`
 /// list published via `GET /info` (`off` included; clearing is expressed by
 /// omitting the field, matching the local `/effort auto` semantics).
-pub(crate) const SERVE_EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max", "off"];
+pub(crate) const SERVE_EFFORT_LEVELS: &[&str] =
+    &["minimal", "low", "medium", "high", "xhigh", "max", "off"];
 
 /// Validate the `--reasoning-effort` override against the child CLI's
 /// accepted values (see `SERVE_EFFORT_LEVELS`).
-pub(crate) fn sanitize_turn_effort_override(value: Option<String>) -> Result<Option<String>, String> {
+pub(crate) fn sanitize_turn_effort_override(
+    value: Option<String>,
+) -> Result<Option<String>, String> {
     let Some(raw) = value else {
         return Ok(None);
     };
@@ -348,7 +354,10 @@ pub(crate) fn merge_session_config(overrides: &mut TurnOverrides, stored: &Sessi
 /// Best-effort read of a session's stored serve config; a read failure must
 /// never fail a turn, so it degrades to defaults.
 #[cfg(feature = "serve")]
-pub(crate) fn read_session_config_or_default(store: &SessionStore, session_id: &str) -> SessionServeConfig {
+pub(crate) fn read_session_config_or_default(
+    store: &SessionStore,
+    session_id: &str,
+) -> SessionServeConfig {
     match store.read_session_serve_config(session_id) {
         Ok(config) => config,
         Err(err) => {
@@ -468,7 +477,10 @@ pub(crate) fn bad_request(msg: String) -> (StatusCode, Json<serde_json::Value>) 
 }
 
 #[cfg(feature = "serve")]
-pub(crate) fn check_auth(state: &ServeState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+pub(crate) fn check_auth(
+    state: &ServeState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     if state.token.is_empty() {
         return Ok(());
     }
@@ -479,7 +491,11 @@ pub(crate) fn check_auth(state: &ServeState, headers: &HeaderMap) -> Result<(), 
     let want = format!("Bearer {}", state.token);
     // Constant-time compare to avoid leaking prefix length via timing.
     let ok = got.len() == want.len()
-        && got.bytes().zip(want.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+        && got
+            .bytes()
+            .zip(want.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
     if ok {
         Ok(())
     } else {
@@ -497,11 +513,9 @@ pub(crate) fn check_auth(state: &ServeState, headers: &HeaderMap) -> Result<(), 
 #[cfg(feature = "serve")]
 pub(crate) async fn session_lock(state: &ServeState, session_id: &str) -> Arc<Mutex<()>> {
     let mut map = state.locks.lock().await;
-    map.get(session_id)
-        .cloned()
-        .unwrap_or_else(|| {
-            let lock = Arc::new(Mutex::new(()));
-            map.insert(session_id.to_string(), lock.clone());
-            lock
-        })
+    map.get(session_id).cloned().unwrap_or_else(|| {
+        let lock = Arc::new(Mutex::new(()));
+        map.insert(session_id.to_string(), lock.clone());
+        lock
+    })
 }
