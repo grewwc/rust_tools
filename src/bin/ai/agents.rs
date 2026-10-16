@@ -80,7 +80,7 @@ impl ProjectKind {
         match self {
             ProjectKind::Rust => {
                 "Rust project (Cargo.toml). Prefer: `cargo check` for fast type-check, \
-                 `cargo test` for tests, `cargo clippy` for lint. \
+                 `cargo test <name>` scoped to the narrowest target for tests, `cargo clippy` for lint. \
                  Use Rust idioms (Result, ?, Box<dyn Error>)."
             }
             ProjectKind::NodeJs => {

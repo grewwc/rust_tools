@@ -232,9 +232,7 @@ impl SkillTurnGuard {
                     }
                     pointer.push_str(
                         "Treat their instructions in the system prompt's <skill_instructions> \
-                         section as the primary behavior contract for this turn; all active \
-                         skills are equal peers that compose additively, and guardrails \
-                         always take precedence.",
+                         section as the primary behavior contract for this turn.",
                     );
                 }
                 parts.push(format!(
@@ -316,15 +314,16 @@ impl SkillTurnGuard {
     }
 }
 
+/// Install the turn's resolved tool set (already merged with runtime-enabled
+/// tools by the caller) into the agent context, returning the previous tools
+/// and iteration cap for restoration.
 fn activate_skill_context(
     app: &mut App,
-    builtin_tools: Vec<ToolDef>,
-    mcp_tools: Vec<ToolDef>,
+    all_tools: Vec<ToolDef>,
     max_iterations: usize,
 ) -> Option<(Vec<ToolDef>, usize)> {
     let mut restore = None;
     if let Some(ctx) = app.agent_context.as_mut() {
-        let all_tools = merge_with_runtime_enabled_tools(builtin_tools, mcp_tools, &ctx.tools);
         let names: Vec<String> = all_tools.iter().map(|t| t.function.name.clone()).collect();
         super::super::tools::enable_tools::set_active_tool_names(names);
         let prev_tools = std::mem::replace(&mut ctx.tools, all_tools);
@@ -905,7 +904,7 @@ fn build_project_instruction_prompt() -> Option<String> {
 
     let mut out = String::from(
         "- The current working directory provides project-specific instruction documents.\n\
-         - Follow these repo-local constraints and preferences unless they conflict with higher-priority system, developer, or user instructions.\n",
+         - Follow these repo-local constraints and preferences; only safety redlines, correctness guardrails, and explicit user instructions take precedence over them, and they override agent, skill, and generic guidance.\n",
     );
     for doc in docs {
         out.push_str(&format!(
@@ -1125,20 +1124,24 @@ fn build_system_prompt(
                 use std::fmt::Write;
                 let _ = writeln!(header, "  {}. {}", i + 1, skill.name);
             }
-            header
-                .push_str("No active skill overrides another; guardrails always take precedence.");
+            header.push_str("No active skill overrides another.");
             header
         };
         s.push_str("\n\n<skill_instructions>\n");
         s.push_str(skill_text.trim());
         s.push_str("\n</skill_instructions>");
+        // Precedence names only the sections that must never yield. The
+        // `<policy>` group also carries tool heuristics (knowledge retrieval,
+        // discovery) that a skill contract may legitimately override, so it is
+        // not named wholesale; project-local instructions are named instead,
+        // and their own preamble states the same ordering.
         if let Some(agent_text) = &agent_extra {
             s.push_str("\n\n<agent_instructions>\n");
             s.push_str(agent_text.trim());
             s.push_str("\n</agent_instructions>");
-            s.push_str("\n\nEnforcement: skill instructions override agent instructions when they differ. Use agent instructions only for capabilities, workflow, and defaults not covered by the active skill. Neither skill nor agent instructions override the correctness guardrails (including git-safety rules), safety redlines, or policy sections, which always take precedence.");
+            s.push_str("\n\nEnforcement: skill instructions override agent instructions when they differ. Use agent instructions only for capabilities, workflow, and defaults not covered by the active skill. Neither skill nor agent instructions override the correctness guardrails (including git-safety rules), safety redlines, or project-local instructions, which always take precedence.");
         } else {
-            s.push_str("\n\nEnforcement: skill instructions override generic assistant guidelines when they differ, except the correctness guardrails (including git-safety rules), safety redlines, and policy sections, which always take precedence.");
+            s.push_str("\n\nEnforcement: skill instructions override generic assistant guidelines when they differ, except the correctness guardrails (including git-safety rules), safety redlines, and project-local instructions, which always take precedence.");
         }
         s
     } else {
@@ -1229,18 +1232,12 @@ fn build_system_prompt(
     // anti-hallucination conclusion gate (merged here from the former separate
     // no_hallucination section): unverified content is never presented as a
     // conclusion, so fact tracing / evidence calibration stay single-sourced
-    // in correctness_guardrails.
+    // in correctness_guardrails. The no-regression rule for other modules
+    // lives in correctness_guardrails' scope section, beside the caller /
+    // dependent rule it extends.
     b.push(
         ContextKind::Behavior,
         include_str!("system_prompts/intellectual_honesty.md"),
-    );
-
-    // ── System constraints: implementing a requirement must not break other modules ──
-    // Unconditionally rendered regression red line: no change may sacrifice
-    // existing module behavior just to satisfy a new requirement.
-    b.push(
-        ContextKind::Behavior,
-        include_str!("system_prompts/system_constraints.md"),
     );
 
     // ── Task convergence: success criteria land in the plan carrier, closing the loop ──
@@ -1307,11 +1304,10 @@ fn build_system_prompt(
         // already-loaded tools get concrete rules injected below.
         let mut discovery_lines = Vec::new();
         if skills.is_empty() && has_tool(available_tools, "enable_tools") {
+            // The MCP-specific hint lives in the hidden MCP catalog, which is
+            // rendered only when unloaded `mcp_*` tools actually exist.
             discovery_lines.push(
                 "No skill is active for this turn. Additional capabilities are available via `enable_tools`; before declaring a requested capability unavailable, call `enable_tools(operation=list)` to discover it, then enable only the specific tools you need.".to_string(),
-            );
-            discovery_lines.push(
-                "If the task needs an external system or MCP-backed capability, discover and enable matching `mcp_*` tools first.".to_string(),
             );
         } else if has_tool(available_tools, "enable_tools") {
             discovery_lines.push(
@@ -1322,24 +1318,12 @@ fn build_system_prompt(
             && has_tool(available_tools, "list_skills")
             && has_tool(available_tools, "activate_skill")
         {
+            // When-to-browse and when-to-activate criteria are owned by the
+            // `list_skills` / `activate_skill` descriptions, which are visible
+            // whenever this line renders.
             discovery_lines.push(
-                "Skills are optional. Call `list_skills` when the user asks about them; otherwise assess the task first."
+                "Skills are optional: follow the `list_skills` / `activate_skill` criteria, and never browse skills as a routine opening step."
                     .to_string(),
-            );
-            discovery_lines.push(
-                "After assessing the task, proactively call `list_skills` only for a concrete, genuinely specialized need for domain context, an established workflow, bundled resources, or dedicated tools. Call it only when you do not know which skill is available."
-                    .to_string(),
-            );
-            discovery_lines.push("Do not browse skills as a routine opening step.".to_string());
-            discovery_lines.push(
-                "A routine source-code, repository, file, or terminal investigation—or technical keywords alone—is not evidence that a skill is needed."
-                    .to_string(),
-            );
-            discovery_lines.push(
-                "Call `activate_skill(name=...)` only when one listed skill clearly and materially improves the task. Do not activate for generic work, loose keyword overlap, or just in case.".to_string(),
-            );
-            discovery_lines.push(
-                "Skill activation is limited to the current user turn and unloads automatically after it ends; rediscover and reactivate only when a later turn clearly needs it.".to_string(),
             );
         }
         push_tool_guidance_section(
@@ -1351,20 +1335,14 @@ fn build_system_prompt(
     }
 
     if has_tool(available_tools, "knowledge_save") {
-        let mut lines = vec![
+        // Retrieval guidance is owned by the knowledge_retrieval section, which
+        // renders whenever a retrieval tool is available.
+        let lines = vec![
             "If the user asks to remember or states a durable preference/constraint, call `knowledge_save`.".to_string(),
             "When saving a durable principle, preference, safety rule, or coding rule, choose a guideline category such as `common_sense`, `coding_guideline`, `preference`, `user_preference`, or `safety_rules`.".to_string(),
             "Use `user_memory` / `project_info` / `architecture` / `decision_log` for factual knowledge.".to_string(),
             "Save each distinct durable fact at most once per turn. Do not save temporary work notes, raw tool output, or speculative conclusions as global knowledge.".to_string(),
         ];
-        let retrieval_tools =
-            available_tool_names_in_order(available_tools, &["knowledge_search", "knowledge_list"]);
-        if !retrieval_tools.is_empty() {
-            lines.push(format!(
-                "When asked about remembered info, use {}.",
-                format_tool_names(&retrieval_tools)
-            ));
-        }
         push_tool_guidance_section(&mut b, ContextKind::Policy, "knowledge_save", lines);
     }
 
@@ -1381,13 +1359,8 @@ fn build_system_prompt(
         let mut lines = Vec::new();
         if has_tool(available_tools, "plan") {
             lines.push("Simple tasks: act directly. Complex ones: call `plan` first — before the first tool call, so the plan is the roadmap for the whole task.".to_string());
-            if has_tool(available_tools, "plan_update") {
-                // plan_update's own tool description carries the per-step status
-                // semantics; only the track-as-you-go cadence is restated here.
-                lines.push("Track step progress with `plan_update` as you work (per-step status semantics live in its tool description).".to_string());
-            } else {
-                lines.push("Track step progress with `plan_update`: mark a step `running` before starting it and `done` when finished; use `failed`/`skipped` when a step cannot be completed as planned. Each `plan_update` returns the changed step, the aggregate progress, and the remaining steps.".to_string());
-            }
+            // Step-status cadence and semantics are owned by the `plan_update`
+            // description and the plan tool's first-use guidance.
             lines.push("Treat the plan as a living roadmap: when findings, changed requirements, or a dead end reshape the task, call `plan` again instead of drifting; the latest plan is preserved in full as the task anchor while older versions may be summarized.".to_string());
             if has_tool(available_tools, "task_spawn") {
                 // The delegation decision is owned by the async_subagent_orchestration
@@ -1474,7 +1447,7 @@ fn build_system_prompt(
                 format_tool_names(&search_tools)
             ));
             lines.push(
-                "Exception: when the current task concerns past project decisions, preferences, or architecture, one proactive search using task keywords is allowed (entries distilled from session archives carry a session-distill source tag); reuse its result for the rest of the turn."
+                "Exception: when the current task concerns past project decisions, preferences, or architecture, one proactive search using task keywords is allowed (entries distilled from session archives carry a session-distill source tag)."
                     .to_string(),
             );
             lines.push(
@@ -1493,12 +1466,16 @@ fn build_system_prompt(
     }
 
     if has_tool(available_tools, "write_file") {
+        // Patch-size limits, envelope syntax, and multi-hunk mechanics are owned
+        // by the `apply_patch` schema and first-use guidance; this section keeps
+        // only the cross-tool routing between write_file, execute_command, and
+        // apply_patch.
         let mut lines = Vec::new();
         lines.push(
             "To run a script, dump intermediate data, or write a test fixture, create it with `write_file(temp=true)` first, then run it with `execute_command`. Prefer this over inline `python -c '...'` whenever the code is more than a few lines or you need to inspect/edit the file.".to_string(),
         );
         lines.push(
-            "Do NOT use `execute_command` to create temp files (e.g. `echo > /tmp/foo`, `python -c '...' > out.json`) — files created outside `write_file(temp=true)` will accumulate. `execute_command` cannot run `rm` either — that is a command-policy blacklist, not a filesystem sandbox: allowed commands run directly against the real workspace.".to_string(),
+            "Do NOT use `execute_command` to create temp files (e.g. `echo > /tmp/foo`, `python -c '...' > out.json`) — files created outside `write_file(temp=true)` will accumulate. `execute_command` may `rm` only inside the session temp directory; that is a command-policy blacklist, not a filesystem sandbox: allowed commands run directly against the real workspace.".to_string(),
         );
         lines.push(
             "Save content downloaded from the network in the session temp directory, not the current working directory. Reserve the destination with `write_file(temp=true)`, then pass the returned path to the downloader; use a project or user-selected path only when the user explicitly requests that destination.".to_string(),
@@ -1508,42 +1485,18 @@ fn build_system_prompt(
                 "Do NOT use `write_file(temp=true)` on existing project files; reserve `write_file` without `temp` for genuine full rewrites (localized edits go through `apply_patch`).".to_string(),
             );
             lines.push(
-                "When one file needs several localized edits, read the span once. Make ONE `apply_patch` call with multiple `@@` hunks only when every hunk has a unique anchor (distinct context) and the combined patch stays small; otherwise split into sequential calls."
+                "When one file needs several localized edits, read the span once. Make ONE `apply_patch` call with multiple `@@` hunks only when every hunk has a unique anchor (distinct context); for structurally similar blocks, patch one at a time with a distinctive anchor line such as a function name or comment."
                     .to_string(),
             );
             lines.push(
-                "For several files, prefer one small file per `apply_patch` call; batch files into one Begin Patch envelope only when every edit is tiny and the combined patch stays small."
-                    .to_string(),
-            );
-            lines.push(
-                "For structurally similar blocks (for example, repeated closures with identical bodies), apply one at a time with a distinctive anchor line such as a function name or comment."
-                    .to_string(),
-            );
-            lines.push(
-                "Keep each patch small: one file, a few hunks, minimal context (aim <3000 chars, never approach 8000). Prefer splitting into sequential calls; use `patch_file` mainly when a small patch was truncated."
-                    .to_string(),
+                "To remove an existing project/source/config file, including a git-tracked file, use `apply_patch` with a `*** Delete File: <path>` section.".to_string(),
             );
         } else {
             lines.push(
                 "When modifying an existing project file, do NOT use `write_file` with `temp=true`; use `write_file` without `temp` only when a full rewrite is genuinely necessary.".to_string(),
             );
         }
-        if has_tool(available_tools, "apply_patch") {
-            let line = "To remove an existing project/source/config file, including a git-tracked file, use `apply_patch` with a Begin Patch envelope and a `*** Delete File: <path>` section.".to_string();
-            lines.push(line);
-        }
         push_tool_guidance_section(&mut b, ContextKind::Behavior, "temporary_files", lines);
-    }
-
-    if has_tool(available_tools, "tree") {
-        push_tool_guidance_section(
-            &mut b,
-            ContextKind::Behavior,
-            "codebase_navigation",
-            vec![
-                "Use `tree` to grasp directory layout before reading files, instead of repeatedly listing directories via shell or guessing paths. Then open specific files with `read_file`.".to_string(),
-            ],
-        );
     }
 
     b
@@ -1610,14 +1563,22 @@ fn build_skill_turn_guard(
         }
     }
     let mcp_tools = select_mcp_tools(all_mcp_tools.clone(), skills, active_agent.as_ref());
-    let available_tools = available_tool_names(&builtin_tools, &mcp_tools);
+    // Prompt gating must see exactly the tool set this request will carry,
+    // including tools enabled via `enable_tools` in earlier turns; otherwise
+    // the hidden-tool catalogs keep advertising loaded tools as "not loaded"
+    // and tool-gated guidance sections never render for them.
+    let loaded_tools: Vec<ToolDef> = match app.agent_context.as_ref() {
+        Some(ctx) => merge_with_runtime_enabled_tools(builtin_tools, mcp_tools, &ctx.tools),
+        None => builtin_tools.into_iter().chain(mcp_tools).collect(),
+    };
+    let available_tools = available_tool_names(&loaded_tools, &[]);
     let ctx = PromptContext {
         goal_mode: app.goal_mode.clone(),
         is_background: app.cli.background,
     };
     let mut builder = build_system_prompt(active_agent.as_ref(), skills, &available_tools, &ctx);
     if has_tool(&available_tools, "enable_tools")
-        && let Some(catalog) = build_hidden_mcp_tool_catalog(&all_mcp_tools, &mcp_tools)
+        && let Some(catalog) = build_hidden_mcp_tool_catalog(&all_mcp_tools, &loaded_tools)
     {
         builder.push(ContextKind::Capability, catalog);
     }
@@ -1680,8 +1641,7 @@ fn build_skill_turn_guard(
         builder.push_labeled(ContextKind::Identity, "persistent_persona", persona_prompt);
     }
     let max_iterations = resolve_max_iterations(active_agent.as_ref(), executor_active);
-    let restore_agent_context =
-        activate_skill_context(app, builtin_tools, mcp_tools, max_iterations);
+    let restore_agent_context = activate_skill_context(app, loaded_tools, max_iterations);
 
     SkillTurnGuard {
         restore_agent_context,

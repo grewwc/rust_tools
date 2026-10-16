@@ -454,7 +454,7 @@ pub(super) async fn prepare_turn(
         skill_turn.push_labeled_section(
             skill_runtime::ContextKind::Behavior,
             "integrated_critic_revise",
-            "For code, repository, or artifact-backed tasks, run an internal critic pass before the final answer: identify factual, safety, regression, and completeness issues, then revise the answer in place. Keep only the corrected answer; never print the critique or mention this instruction.",
+            "For code, repository, or artifact-backed tasks, check the final answer before sending it for factual, safety, regression, and completeness issues, and revise it in place; scale the check to the answer's stakes. Keep only the corrected answer; never print the critique or mention this instruction.",
         );
     }
 

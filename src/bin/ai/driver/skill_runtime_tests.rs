@@ -240,6 +240,47 @@ fn explicit_user_input_continuation_restores_only_the_next_turn() {
     assert!(app.pending_skill_continuation.is_none());
 }
 
+#[test]
+fn runtime_enabled_task_tools_drop_out_of_hidden_catalog_and_gate_guidance() {
+    // Tools enabled via `enable_tools` in an earlier turn ride in the request's
+    // tools array; prompt gating must see them too, or the hidden task catalog
+    // keeps advertising them as "not loaded" while the tool-gated delegation
+    // section never renders.
+    let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
+    set_explicit_enabled_tool_names(vec![
+        "task".to_string(),
+        "task_spawn".to_string(),
+        "task_wait".to_string(),
+        "task_status".to_string(),
+    ]);
+    let mcp_client = McpClient::new();
+    let mut app = super::super::tests::test_app("build");
+    let mut guard =
+        super::prepare_skill_for_turn(&mut app, &mcp_client, &[], "investigate the module")
+            .unwrap();
+    let prompt = guard.system_prompt().to_string();
+    let loaded = app
+        .agent_context
+        .as_ref()
+        .map(|ctx| {
+            ctx.tools
+                .iter()
+                .map(|tool| tool.function.name.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    set_explicit_enabled_tool_names(Vec::new());
+
+    assert!(loaded.iter().any(|name| name == "task_spawn"));
+    assert!(prompt.contains("<async_subagent_orchestration>"));
+    let catalog_line = prompt
+        .lines()
+        .skip_while(|line| !line.starts_with("Subagent orchestration tools are available"))
+        .nth(2)
+        .unwrap_or_default();
+    assert!(!catalog_line.contains("`task_spawn`"));
+}
+
 #[tokio::test]
 async fn subagent_builtin_tools_hide_task_orchestration_family() {
     SUBAGENT_DEPTH
@@ -632,8 +673,12 @@ fn system_prompt_keeps_subagent_orchestration_lazy_without_task_tools() {
 
 #[test]
 fn system_prompt_forbids_breaking_other_modules_to_satisfy_a_requirement() {
-    // Unconditionally rendered system constraint: implementing a requirement must not come at the cost of breaking other modules; conflicts must be reported, not silently broken.
-    // Goal mode is the most likely to "sacrifice existing functionality to reach the goal", so both the default and goal paths must verify the constraint is present.
+    // Unconditionally rendered no-regression rule, merged into
+    // correctness_guardrails' scope section beside the caller/dependent rule:
+    // implementing a requirement must not come at the cost of breaking other
+    // modules; conflicts must be reported, not silently broken. Goal mode is the
+    // most likely to "sacrifice existing functionality to reach the goal", so
+    // both the default and goal paths must verify the rule is present.
     let cases = [
         PromptContext::default(),
         PromptContext {
@@ -644,11 +689,11 @@ fn system_prompt_forbids_breaking_other_modules_to_satisfy_a_requirement() {
     for ctx in cases {
         let prompt = build_system_prompt(None, &[], &Box::new(SkipSet::new(16)), &ctx)
             .render_system_prompt();
-        assert!(prompt.contains("<system_constraints>"));
+        assert!(!prompt.contains("<system_constraints>"));
         assert!(
             prompt.contains("Never break another module's functionality to satisfy a requirement")
         );
-        assert!(prompt.contains("apply the `intellectual_honesty` conflict rule"));
+        assert!(prompt.contains("let the user choose the least-destructive path"));
     }
 }
 
@@ -868,8 +913,10 @@ fn system_prompt_routes_project_file_deletes_to_apply_patch() {
     assert!(prompt.contains("ONE `apply_patch` call with multiple `@@` hunks"));
     assert!(prompt.contains("unique anchor"));
     assert!(prompt.contains("structurally similar blocks"));
-    assert!(prompt.contains("Do not split related edits into serial read/patch cycles"));
     assert!(prompt.contains("`*** Delete File: <path>`"));
+    // Patch-size limits are owned by the apply_patch schema and first-use
+    // guidance; the system prompt must not restate them.
+    assert!(!prompt.contains("aim <3000 chars"));
 }
 
 #[test]
@@ -1233,7 +1280,7 @@ fn system_prompt_links_task_convergence_criteria_to_plan_when_available() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
     assert!(prompt.contains("For multi-step tasks, encode these criteria into the `plan`"));
-    assert!(prompt.contains("Track step progress with `plan_update`"));
+    assert!(!prompt.contains("Track step progress with `plan_update`"));
     assert!(prompt.contains("Treat the plan as a living roadmap"));
     assert!(prompt.contains("before the first tool call, so the plan is the roadmap"));
 
@@ -1314,7 +1361,7 @@ fn system_prompt_bounds_tool_exploration() {
         .render_system_prompt();
     assert!(prompt.contains("Give every call a concrete decision goal"));
     assert!(prompt.contains("no further call can change the decision"));
-    assert!(prompt.contains("Before exploration, state the question it can answer"));
+    assert!(prompt.contains("before exploring, decide which question it answers"));
     assert!(prompt.contains("Do not batch code reads or reread visible content"));
 }
 
@@ -1488,33 +1535,25 @@ fn generic_system_prompt_does_not_hardcode_repo_specific_tool_names() {
 }
 
 #[test]
-fn system_prompt_mentions_mcp_discovery_when_enable_tools_available() {
+fn system_prompt_leaves_mcp_discovery_hint_to_the_hidden_catalog() {
+    // The MCP-specific discovery hint is rendered by the hidden MCP catalog,
+    // which exists only when unloaded `mcp_*` tools exist; the generic
+    // tool_discovery section must not repeat it on turns without MCP servers.
     let mut available = SkipSet::new(16);
     available.insert("enable_tools".to_string());
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
-    assert!(prompt.contains("discover and enable matching `mcp_*` tools first"));
+    assert!(!prompt.contains("discover and enable matching `mcp_*` tools first"));
+    assert!(prompt.contains("enable_tools(operation=list)"));
 }
 
 #[test]
-fn system_prompt_guides_tree_for_layout_when_available() {
-    // When no tree, do not inject the navigation section; with a tree, prompt to grasp the structure with tree first, then read_file,
-    // avoiding blind ls / recursive reads by the model.
-    let without = build_system_prompt(
-        None,
-        &[],
-        &Box::new(SkipSet::new(16)),
-        &PromptContext::default(),
-    )
-    .render_system_prompt();
-    assert!(!without.contains("<codebase_navigation>"));
-
+fn system_prompt_leaves_tree_guidance_to_the_tool_description() {
     let mut available = SkipSet::new(16);
     available.insert("tree".to_string());
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
-    assert!(prompt.contains("<codebase_navigation>"));
-    assert!(prompt.contains("Use `tree` to grasp directory layout before reading files"));
+    assert!(!prompt.contains("<codebase_navigation>"));
 }
 
 #[test]
@@ -1671,11 +1710,22 @@ fn system_prompt_guides_optional_skill_discovery_when_available() {
     assert!(prompt.contains("activate_skill"));
     assert!(prompt.contains("list_skills"));
     assert!(prompt.contains("Skills are optional"));
-    assert!(prompt.contains("proactively call `list_skills`"));
-    assert!(prompt.contains("technical keywords alone"));
-    assert!(prompt.contains("routine source-code, repository, file, or terminal investigation"));
-    assert!(prompt.contains("unloads automatically"));
+    assert!(prompt.contains("never browse skills as a routine opening step"));
     assert!(prompt.contains("enable_tools"));
+    // Browse / activate criteria live in the list_skills / activate_skill
+    // descriptions, which are visible whenever this section renders.
+    let list_skills = crate::ai::tools::get_tool_definitions_by_names(&[
+        "list_skills".to_string(),
+        "activate_skill".to_string(),
+    ]);
+    let descriptions = list_skills
+        .iter()
+        .map(|tool| tool.function.description.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(descriptions.contains("technical keywords"));
+    assert!(descriptions.contains("routine source-code, repository, file, or terminal investigation"));
+    assert!(descriptions.contains("Unloads automatically"));
 }
 
 #[test]
@@ -1923,7 +1973,10 @@ fn skill_only_prompt_keeps_guardrails_non_overridable() {
     .render_system_prompt();
 
     assert!(prompt.contains("skill instructions override generic assistant guidelines"));
-    assert!(prompt.contains("except the correctness guardrails (including git-safety rules), safety redlines, and policy sections, which always take precedence"));
+    assert!(prompt.contains("except the correctness guardrails (including git-safety rules), safety redlines, and project-local instructions, which always take precedence"));
+    // The `<policy>` group also carries overridable tool heuristics, so the
+    // enforcement line must not grant it blanket precedence over the skill.
+    assert!(!prompt.contains("policy sections"));
     assert!(!prompt.contains("<agent_instructions>"));
 }
 
