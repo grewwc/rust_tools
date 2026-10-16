@@ -91,9 +91,27 @@ pub(crate) fn record_plan(
         .lock()
         .map_err(|_| "plan-state lock poisoned".to_string())?;
     let previous = load_plan_state(app)?;
-    let state = PlanState::build(summary, raw_steps, previous.as_ref())?;
+    let mut state = PlanState::build(summary, raw_steps, previous.as_ref())?;
+    stamp_current_turn(&mut state);
     save_plan_state(app, &state)?;
     Ok(state)
+}
+
+/// Record the writing turn. Turn ids come from the session's persistent turn
+/// sequence (monotonic across restarts and rollbacks); outside a turn this is 0.
+fn stamp_current_turn(state: &mut PlanState) {
+    state.turn_id = crate::ai::driver::runtime_ctx::current_turn_id_or_zero() as u64;
+}
+
+/// Whether `plan` constrains the running turn: it was written in this turn, or the
+/// turn continues the same work by construction (process wake-up resume, goal
+/// mode). Decided from runtime state only, never from user wording. An older plan
+/// stays visible as carried context and becomes binding again once this turn
+/// writes it with `plan` / `plan_update`.
+pub(crate) fn plan_binds_current_turn(app: &App, plan: &PlanState) -> bool {
+    plan.turn_id == crate::ai::driver::runtime_ctx::current_turn_id_or_zero() as u64
+        || crate::ai::driver::runtime_ctx::is_resume_turn()
+        || app.goal_mode.as_deref().is_some_and(|goal| !goal.is_empty())
 }
 
 pub(crate) fn update_plan_step(
@@ -132,6 +150,7 @@ pub(crate) fn update_plan_step(
             ));
         }
     };
+    stamp_current_turn(&mut state);
     save_plan_state(app, &state)?;
     Ok((state, transition))
 }
@@ -222,5 +241,35 @@ mod tests {
         let err = update_plan_step(&app, 1, StepStatus::Done, None).unwrap_err();
         assert!(err.contains("No active plan"), "{err}");
         assert!(err.contains("Call `plan`"), "{err}");
+    }
+
+    #[test]
+    fn writes_stamp_the_turn_and_legacy_files_bind_no_numbered_turn() {
+        let (app, _guard) = test_app();
+        let steps = serde_json::json!([{ "step": 1, "action": "Read", "tool": "read_file" }]);
+        let in_turn = |turn: usize, f: &dyn Fn()| {
+            crate::ai::driver::runtime_ctx::TURN_IDENTITY
+                .sync_scope((app.session_id.clone(), turn), f)
+        };
+        in_turn(3, &|| {
+            record_plan(&app, "Demo", steps.as_array().unwrap()).unwrap();
+        });
+        assert_eq!(load_plan_state(&app).unwrap().unwrap().turn_id, 3);
+        in_turn(9, &|| {
+            update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
+        });
+        let state = load_plan_state(&app).unwrap().unwrap();
+        assert_eq!(state.turn_id, 9);
+        in_turn(9, &|| assert!(plan_binds_current_turn(&app, &state)));
+        in_turn(10, &|| assert!(!plan_binds_current_turn(&app, &state)));
+
+        // Files written before turn stamping deserialize as turn 0.
+        let mut legacy: Value =
+            serde_json::from_slice(&std::fs::read(plan_state_path(&app)).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("turn_id");
+        std::fs::write(plan_state_path(&app), legacy.to_string()).unwrap();
+        let legacy = load_plan_state(&app).unwrap().unwrap();
+        assert_eq!(legacy.turn_id, 0);
+        in_turn(1, &|| assert!(!plan_binds_current_turn(&app, &legacy)));
     }
 }

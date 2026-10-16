@@ -253,3 +253,77 @@ fn final_gate_state_keeps_outstanding_reopen_independent() {
     assert!(!FinalGateState::default().can_reopen_outstanding_work(true, 1, 16));
     assert!(!FinalGateState::default().can_reopen_outstanding_work(false, 16, 16));
 }
+
+/// Run `f` as if inside session turn `turn_id` (the scope `run_turn` installs).
+fn in_turn<R>(app: &App, turn_id: usize, f: impl FnOnce() -> R) -> R {
+    crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope((app.session_id.clone(), turn_id), f)
+}
+
+#[test]
+fn plan_from_earlier_turn_does_not_bind_a_new_turn() {
+    let (app, base) = test_app_with_session();
+    in_turn(&app, 5, || two_step_plan(&app));
+    let mut messages = Vec::new();
+    // Turn 6 carries an unrelated request: the turn-5 plan must not reopen it.
+    let action = in_turn(&app, 6, || {
+        super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16)
+    });
+    assert_eq!(action, OutstandingWorkGateAction::Allow);
+    assert!(messages.is_empty(), "a carried plan must not inject a reopen note");
+    // The same turn that wrote the plan stays bound.
+    let action = in_turn(&app, 5, || {
+        super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16)
+    });
+    assert_eq!(action, OutstandingWorkGateAction::Reopen);
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn settled_plan_from_earlier_turn_does_not_demand_complete() {
+    let (app, base) = test_app_with_session();
+    in_turn(&app, 5, || {
+        two_step_plan(&app);
+        update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
+        update_plan_step(&app, 2, StepStatus::Done, None).unwrap();
+    });
+    let mut messages = Vec::new();
+    let action = in_turn(&app, 6, || {
+        super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16)
+    });
+    assert_eq!(action, OutstandingWorkGateAction::Allow);
+    assert!(messages.is_empty());
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn updating_carried_plan_rebinds_it_to_the_current_turn() {
+    let (app, base) = test_app_with_session();
+    in_turn(&app, 5, || two_step_plan(&app));
+    let mut messages = Vec::new();
+    let action = in_turn(&app, 6, || {
+        update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
+        super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16)
+    });
+    assert_eq!(action, OutstandingWorkGateAction::Reopen);
+    assert!(last_note(&messages).contains("step 2"), "{}", last_note(&messages));
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn carried_plan_still_binds_resume_and_goal_mode_turns() {
+    let (mut app, base) = test_app_with_session();
+    in_turn(&app, 5, || two_step_plan(&app));
+    let mut messages = Vec::new();
+    let resumed = crate::ai::driver::runtime_ctx::IS_RESUME_TURN.sync_scope(true, || {
+        in_turn(&app, 6, || {
+            super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16)
+        })
+    });
+    assert_eq!(resumed, OutstandingWorkGateAction::Reopen);
+    app.goal_mode = Some("ship the feature".to_string());
+    let goal = in_turn(&app, 7, || {
+        super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16)
+    });
+    assert_eq!(goal, OutstandingWorkGateAction::Reopen);
+    let _ = fs::remove_dir_all(&base);
+}

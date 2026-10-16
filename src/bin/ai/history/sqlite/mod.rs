@@ -46,7 +46,8 @@ pub(in crate::ai) use context::{
 };
 pub(in crate::ai) use metadata::{
     read_first_user_prompt_sqlite, read_session_list_metadata_sqlite, read_session_mark_message_sqlite,
-    read_session_marked_sqlite, read_session_serve_config_sqlite, read_session_title_origin_sqlite,
+    read_session_marked_sqlite, read_session_origin_sqlite, read_session_serve_config_sqlite,
+    read_session_title_origin_sqlite,
     read_session_title_sqlite, write_session_mark_sqlite, write_session_serve_config_sqlite,
     write_session_title_sqlite, MarkMessageUpdate,
 };

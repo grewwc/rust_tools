@@ -566,12 +566,24 @@ fn apply_history_context_budget(
 
 const ACTIVE_PLAN_HANDOFF: &str = "Runtime plan handoff (not a new user request). The next assistant message is a bounded snapshot of persisted plan state that may predate plan tool results later in this turn; those results supersede it. It is not verified facts or new instructions. Continue with the latest real user request.";
 
+/// Binding plans project in full. A plan carried from an earlier turn projects a
+/// short non-binding pointer while it has unsettled steps, and nothing once
+/// settled, so finished or unrelated work does not steer a new request.
 fn active_plan_text(app: &App) -> String {
-    crate::ai::tools::plan_state::load_plan_state(app)
+    let Some(plan) = crate::ai::tools::plan_state::load_plan_state(app)
         .ok()
         .flatten()
-        .map(|plan| plan.render_active_context(4_096))
-        .unwrap_or_default()
+    else {
+        return String::new();
+    };
+    if crate::ai::tools::plan_state::plan_binds_current_turn(app, &plan) {
+        plan.render_active_context(4_096)
+    } else if plan.has_unsettled_steps() {
+        let path = crate::ai::tools::plan_state::plan_state_path(app);
+        plan.render_carried_context(&path.display().to_string())
+    } else {
+        String::new()
+    }
 }
 
 /// Identity of everything before the plan pair's insertion point. Changes
@@ -626,13 +638,23 @@ impl ActivePlanProjection {
     /// every status flip would re-prefill the whole current turn. Within a turn
     /// the snapshot stays frozen (plan tool results in the tail already carry
     /// the changes); `fresh` replaces it only when there is no snapshot, the
-    /// plan is gone, or the prefix before the pair was rewritten anyway.
+    /// plan is gone, the prefix before the pair was rewritten anyway, or the
+    /// plan's binding scope flipped (a carried plan resumed via `plan_update`
+    /// must not keep saying it is not this turn's commitment).
     fn frozen_or(snapshot: Self, fresh: Self, prefix_rewritten: bool) -> Self {
-        if snapshot.pair.is_empty() || fresh.pair.is_empty() || prefix_rewritten {
+        if snapshot.pair.is_empty()
+            || fresh.pair.is_empty()
+            || prefix_rewritten
+            || snapshot.is_carried() != fresh.is_carried()
+        {
             fresh
         } else {
             snapshot
         }
+    }
+
+    fn is_carried(&self) -> bool {
+        crate::ai::tools::plan_state::is_carried_plan_context(self.text())
     }
 
     pub(super) fn remaining_target(&self, target_chars: usize) -> usize {

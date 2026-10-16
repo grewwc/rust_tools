@@ -8,7 +8,7 @@ use super::connection::{open_history_db, open_history_db_read_only};
 use super::lock::with_session_state_lock;
 use super::migrations::init_history_schema;
 use super::revision::{read_i64_meta_from_conn, touch_session_activity};
-use super::store::{SessionListMetadata, decode_message_content};
+use super::store::{SessionListMetadata, decode_message_content, decode_tool_calls};
 use super::{
     LAST_ACTIVITY_META_KEY, SESSION_MARKED_META_KEY, SESSION_MARK_MESSAGE_META_KEY,
     SESSION_SERVE_AGENT_META_KEY, SESSION_SERVE_EFFORT_META_KEY, SESSION_SERVE_MODEL_META_KEY,
@@ -56,6 +56,67 @@ fn read_first_user_prompt_from_conn(conn: &Connection) -> io::Result<Option<Stri
         }
     }
     Ok((!prompts.is_empty()).then(|| prompts.join("\n---\n")))
+}
+
+/// The session's opening exchange from canonical history: the first real user
+/// message and the first assistant text reply after it, both verbatim, plus the
+/// canonical message index of that user message. Runtime-synthetic users,
+/// archive stubs, and tool-call-only assistant messages are skipped structurally.
+/// Compression never rewrites the canonical table, so this stays exact however
+/// long the session grows.
+pub(in crate::ai) fn read_session_origin_sqlite(
+    path: &Path,
+) -> io::Result<Option<(usize, String, Option<String>)>> {
+    use super::super::types::is_runtime_synthetic_user_message;
+    let conn = open_history_db_read_only(path)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT role, content, tool_calls, reasoning_content FROM messages ORDER BY id ASC",
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let mut rows = stmt.query([]).map_err(|e| io::Error::other(e.to_string()))?;
+    let mut origin: Option<(usize, String)> = None;
+    let mut index = 0usize;
+    while let Some(row) = rows.next().map_err(|e| io::Error::other(e.to_string()))? {
+        let role: String = row.get(0).map_err(|e| io::Error::other(e.to_string()))?;
+        let raw: String = row.get(1).map_err(|e| io::Error::other(e.to_string()))?;
+        let tool_calls: Option<String> = row.get(2).map_err(|e| io::Error::other(e.to_string()))?;
+        let reasoning: Option<String> = row.get(3).map_err(|e| io::Error::other(e.to_string()))?;
+        let position = index;
+        index += 1;
+        let text = value_to_string(&decode_message_content(&raw));
+        match (&origin, role.as_str()) {
+            (None, "user") => {
+                let message = super::super::types::Message {
+                    role,
+                    content: serde_json::Value::Null,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: reasoning,
+                };
+                if !is_runtime_synthetic_user_message(&message)
+                    && !is_preserved_content_message(&text)
+                    && !text.trim().is_empty()
+                {
+                    origin = Some((position, text));
+                }
+            }
+            (Some(_), "user") => {
+                // The opening turn ended without a text reply.
+                let (position, prompt) = origin.take().expect("origin is set");
+                return Ok(Some((position, prompt, None)));
+            }
+            (Some(_), "assistant")
+                if decode_tool_calls(tool_calls.as_deref()).is_none_or(|calls| calls.is_empty())
+                    && !text.trim().is_empty() =>
+            {
+                let (position, prompt) = origin.take().expect("origin is set");
+                return Ok(Some((position, prompt, Some(text))));
+            }
+            _ => {}
+        }
+    }
+    Ok(origin.map(|(position, prompt)| (position, prompt, None)))
 }
 
 /// Read the session title (stored in the meta table under key='session_title').

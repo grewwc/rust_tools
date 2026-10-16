@@ -12,6 +12,8 @@
 //! inferred from prose. The model asserts completion structurally with the
 //! `complete` tool; the gate checks that assertion against the plan:
 //!   - no plan file              -> Allow (plain Q&A rounds pass through untouched)
+//!   - plan from an earlier turn -> Allow (carried context; binds again once this
+//!                                  turn writes it, or on resume / goal-mode turns)
 //!   - plan settled, fresh claim -> Allow (assertion verified, consumed as spent)
 //!   - plan settled, no claim    -> Reopen, demanding a `complete` call
 //!   - work open, fresh claim    -> Reopen, naming the contradiction
@@ -24,6 +26,7 @@
 use super::*;
 use crate::ai::tools::plan_state::{
     StepStatus, consume_completion_claim, load_completion_claim, load_plan_state,
+    plan_binds_current_turn,
 };
 use crate::ai::types::App;
 
@@ -64,6 +67,11 @@ pub(in crate::ai::driver::turn_runtime) fn outstanding_work_gate_action(
     let Some(plan) = plan else {
         return OutstandingWorkGateAction::Allow;
     };
+    // A plan written by an earlier turn is carried context, not this turn's
+    // commitment: a new, unrelated request must not be forced back into it.
+    if !plan_binds_current_turn(app, &plan) {
+        return OutstandingWorkGateAction::Allow;
+    }
     let outstanding: Vec<(u64, String)> = plan
         .steps
         .iter()
