@@ -23,12 +23,14 @@ use crate::commonw::{
 };
 
 use super::super::{
-    agents, cli::ParsedCli, config_schema::AiConfig,
+    agents,
+    cli::ParsedCli,
+    config_schema::AiConfig,
     driver::{commands::is_serve_local_command_start, input::inline_image_filenames},
-    history::{current_terminal_key, SessionStore},
+    history::{SessionStore, current_terminal_key},
     model_names, models,
-    prompt::{completion::CommandCompleter, PromptEditor},
-    stream::{side_note_input::SideNoteInputGuard, MarkdownStreamRenderer},
+    prompt::{PromptEditor, completion::CommandCompleter},
+    stream::{MarkdownStreamRenderer, side_note_input::SideNoteInputGuard},
 };
 
 #[derive(Debug, Deserialize)]
@@ -130,8 +132,7 @@ fn load_serve_chat_binding() -> Option<ServeChatSuspendedBinding> {
 /// Best-effort cleanup (used after `/close` deletes the bound session).
 fn clear_serve_chat_binding() {
     if let Some(key) = current_terminal_key() {
-        let _ =
-            std::fs::remove_file(serve_chat_binding_path(&serve_chat_suspended_root(), &key));
+        let _ = std::fs::remove_file(serve_chat_binding_path(&serve_chat_suspended_root(), &key));
     }
 }
 
@@ -159,12 +160,9 @@ fn fetch_remote_sessions(
     base: &str,
     token: &str,
 ) -> Result<Vec<RemoteSession>, String> {
-    let resp = auth(
-        client.get(format!("{base}/sessions")),
-        token,
-    )
-    .send()
-    .map_err(|err| format!("cannot reach serve at {base} ({err})"))?;
+    let resp = auth(client.get(format!("{base}/sessions")), token)
+        .send()
+        .map_err(|err| format!("cannot reach serve at {base} ({err})"))?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
@@ -246,18 +244,15 @@ fn run_serve_checkpoint_command(
     session_id: &str,
     command: &str,
 ) -> Result<Option<String>, String> {
-    let mut response = post_remote_checkpoint_command(
-        client, base, token, session_id, command, false,
-    )?;
+    let mut response =
+        post_remote_checkpoint_command(client, base, token, session_id, command, false)?;
     if let Some(prompt) = response.confirmation.take() {
         let confirmed = crate::commonw::prompt::prompt_yes_or_no_danger(&prompt);
         if confirmed != Some(true) {
             println!("Canceled: nothing was changed.");
             return Ok(response.checkpoint_status);
         }
-        response = post_remote_checkpoint_command(
-            client, base, token, session_id, command, true,
-        )?;
+        response = post_remote_checkpoint_command(client, base, token, session_id, command, true)?;
     }
     print!("{}", response.output);
     CommandCompleter::set_checkpoint_name_candidates(response.checkpoints);
@@ -477,7 +472,10 @@ fn persist_serve_config_patch(
 /// non-empty picks override the `/info` defaults so a reconnect resumes the
 /// last `/model`/`/effort`/`/agent` state. Returns true when something
 /// changed (callers refresh the input-box header in that case).
-fn merge_restored_session_config(cfg: &ServeSessionConfig, selection: &mut ServeTurnSelection) -> bool {
+fn merge_restored_session_config(
+    cfg: &ServeSessionConfig,
+    selection: &mut ServeTurnSelection,
+) -> bool {
     let mut changed = false;
     if !cfg.model.is_empty() && cfg.model != selection.model {
         selection.model = cfg.model.clone();
@@ -505,12 +503,15 @@ fn restore_serve_session_picks(
     session_id: &str,
     selection: &mut ServeTurnSelection,
 ) -> bool {
-    let cfg = auth(client.get(format!("{base}/sessions/{session_id}/config")), token)
-        .send()
-        .ok()
-        .filter(|resp| resp.status().is_success())
-        .and_then(|resp| resp.text().ok())
-        .and_then(|text| serde_json::from_str::<ServeSessionConfig>(&text).ok());
+    let cfg = auth(
+        client.get(format!("{base}/sessions/{session_id}/config")),
+        token,
+    )
+    .send()
+    .ok()
+    .filter(|resp| resp.status().is_success())
+    .and_then(|resp| resp.text().ok())
+    .and_then(|text| serde_json::from_str::<ServeSessionConfig>(&text).ok());
     cfg.as_ref()
         .map(|cfg| merge_restored_session_config(cfg, selection))
         .unwrap_or(false)
@@ -528,10 +529,7 @@ fn normalize_serve_effort_arg(arg: &str) -> Result<Option<String>, String> {
         "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => {
             Ok(Some(arg.trim().to_ascii_lowercase()))
         }
-        _ => Err(
-            "unknown effort; expected minimal|low|medium|high|xhigh|max|off|auto"
-                .to_string(),
-        ),
+        _ => Err("unknown effort; expected minimal|low|medium|high|xhigh|max|off|auto".to_string()),
     }
 }
 
@@ -568,7 +566,10 @@ fn run_serve_model_command(
             println!("(remote) model: unknown");
         } else if let Some(def) = model_names::find_by_identifier(&selection.model) {
             let handle = model_names::model_handle(def);
-            println!("(remote) current model: {}", models::model_display_label(&handle));
+            println!(
+                "(remote) current model: {}",
+                models::model_display_label(&handle)
+            );
         } else {
             println!("(remote) current model: {}", selection.model);
         }
@@ -615,7 +616,10 @@ fn run_serve_model_command(
             let handle = model_names::model_handle(def);
             selection.model = handle.clone();
             selection.apply_header(editor);
-            println!("(remote) switched model to {}", models::model_display_label(&handle));
+            println!(
+                "(remote) switched model to {}",
+                models::model_display_label(&handle)
+            );
             (
                 question,
                 ServeConfigPatch {
@@ -677,7 +681,11 @@ fn run_serve_agent_command(
     if arg.is_empty() || arg.eq_ignore_ascii_case("list") || arg.eq_ignore_ascii_case("ls") {
         let primary = agents::get_primary_agents(agent_manifests);
         for agent in &primary {
-            let marker = if agent.name == selection.agent { "*" } else { " " };
+            let marker = if agent.name == selection.agent {
+                "*"
+            } else {
+                " "
+            };
             println!("{marker} {} - {}", agent.name, agent.description);
         }
         return ServeConfigPatch::default();
@@ -839,7 +847,9 @@ fn run_serve_skills_command(
         return None;
     }
     if arg.eq_ignore_ascii_case("help") || arg.eq_ignore_ascii_case("h") {
-        println!("(remote) /skills [list|current|use <name>...|clear|<names...> [question]] - force server skills for the next turn");
+        println!(
+            "(remote) /skills [list|current|use <name>...|clear|<names...> [question]] - force server skills for the next turn"
+        );
         return None;
     }
     if arg.eq_ignore_ascii_case("clear") {
@@ -897,7 +907,10 @@ fn run_serve_skills_command(
         return None;
     }
     selection.skills = names.clone();
-    println!("(remote) skills selected for next turn: {}", names.join(", "));
+    println!(
+        "(remote) skills selected for next turn: {}",
+        names.join(", ")
+    );
     question
 }
 
@@ -953,13 +966,16 @@ fn resolve_session_ref(arg: &str, listed: &[RemoteSession]) -> Result<String, St
         return Err("usage: /resume <number|id-prefix|id> (see /sessions)".to_string());
     }
     if let Ok(n) = arg.parse::<usize>() {
-        return listed.get(n.wrapping_sub(1)).map(|s| s.id.clone()).ok_or_else(|| {
-            if listed.is_empty() {
-                "no session listing yet; run /sessions first".to_string()
-            } else {
-                format!("session number out of range (1-{})", listed.len())
-            }
-        });
+        return listed
+            .get(n.wrapping_sub(1))
+            .map(|s| s.id.clone())
+            .ok_or_else(|| {
+                if listed.is_empty() {
+                    "no session listing yet; run /sessions first".to_string()
+                } else {
+                    format!("session number out of range (1-{})", listed.len())
+                }
+            });
     }
     let mut prefix_hits = listed.iter().filter(|s| s.id.starts_with(arg));
     match (prefix_hits.next(), prefix_hits.next()) {
@@ -1003,12 +1019,8 @@ fn build_serve_client(
         let path = PathBuf::from(expanduser(ca_cert).as_ref());
         let pem = std::fs::read(&path)
             .map_err(|err| format!("cannot read serve CA certificate {}: {err}", path.display()))?;
-        let certificate = reqwest::Certificate::from_pem(&pem).map_err(|err| {
-            format!(
-                "invalid PEM serve CA certificate {}: {err}",
-                path.display()
-            )
-        })?;
+        let certificate = reqwest::Certificate::from_pem(&pem)
+            .map_err(|err| format!("invalid PEM serve CA certificate {}: {err}", path.display()))?;
         builder = builder.add_root_certificate(certificate);
     }
     builder
@@ -1024,10 +1036,7 @@ fn resolve_serve_ca_cert(explicit: &str, configured: &str) -> String {
     }
 }
 
-fn auth(
-    req: reqwest::blocking::RequestBuilder,
-    token: &str,
-) -> reqwest::blocking::RequestBuilder {
+fn auth(req: reqwest::blocking::RequestBuilder, token: &str) -> reqwest::blocking::RequestBuilder {
     if token.trim().is_empty() {
         req
     } else {
@@ -1313,10 +1322,7 @@ fn serve_truncate_for_terminal(value: &str, max_chars: usize) -> String {
 /// `role == "user"` row exactly like the local rewind resolver so ordinals
 /// match on both sides. A runtime-injected row still resolves here; the
 /// server rejects it with 400, same rule as local.
-fn serve_user_message_index(
-    messages: &[RemoteHistoryMessage],
-    ordinal: usize,
-) -> Option<usize> {
+fn serve_user_message_index(messages: &[RemoteHistoryMessage], ordinal: usize) -> Option<usize> {
     if ordinal == 0 {
         return None;
     }
@@ -1513,9 +1519,7 @@ fn render_serve_history(messages: &[RemoteHistoryMessage], view: &ServeHistoryVi
             ServeHistoryRole::Assistant => message.role == "assistant",
             ServeHistoryRole::Tool => message.role == "tool",
             // Same rule as the local system filter (system + internal notes).
-            ServeHistoryRole::System => {
-                message.role == "system" || message.role == "internal_note"
-            }
+            ServeHistoryRole::System => message.role == "system" || message.role == "internal_note",
         };
         if !role_matches {
             continue;
@@ -1699,8 +1703,7 @@ fn resolve_serve_rewind_target(
             return Err(out);
         }
         let (ord, _) = matches[0];
-        let index =
-            serve_user_message_index(messages, ord).expect("matched user message resolves");
+        let index = serve_user_message_index(messages, ord).expect("matched user message resolves");
         return Ok((ord, index));
     }
     let raw = first
@@ -1844,9 +1847,9 @@ fn fetch_remote_cd_candidates(
         client.get(format!("{base}/sessions/{session_id}/cd-candidates")),
         token,
     )
-        .query(&[("frag", fragment)])
-        .send()
-        .map_err(|err| format!("cd completion request failed: {err}"))?;
+    .query(&[("frag", fragment)])
+    .send()
+    .map_err(|err| format!("cd completion request failed: {err}"))?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
@@ -1879,21 +1882,19 @@ fn install_serve_cd_completion(
     let client = client.clone();
     let base = base.to_string();
     let token = token.to_string();
-    CommandCompleter::set_remote_cd_candidates_provider(Some(Box::new(
-        move |fragment: &str| {
-            let session_id = current_session
-                .lock()
-                .map(|guard| guard.clone())
-                .unwrap_or_default();
-            match fetch_remote_cd_candidates(&client, &base, &token, &session_id, fragment) {
-                Ok(candidates) => candidates,
-                Err(err) => {
-                    eprintln!("[serve-chat] cd completion unavailable: {err}");
-                    Vec::new()
-                }
+    CommandCompleter::set_remote_cd_candidates_provider(Some(Box::new(move |fragment: &str| {
+        let session_id = current_session
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        match fetch_remote_cd_candidates(&client, &base, &token, &session_id, fragment) {
+            Ok(candidates) => candidates,
+            Err(err) => {
+                eprintln!("[serve-chat] cd completion unavailable: {err}");
+                Vec::new()
             }
-        },
-    )));
+        }
+    })));
 }
 
 /// Remote `/history` entry: first-token verbs dispatch like the local
@@ -2351,8 +2352,7 @@ mod serve_history_tests {
             (2, 3)
         );
         assert!(resolve_serve_rewind_target(&messages, &["grep", "missing"]).is_err());
-        let err =
-            resolve_serve_rewind_target(&messages, &["grep", "question"]).expect_err("multi");
+        let err = resolve_serve_rewind_target(&messages, &["grep", "question"]).expect_err("multi");
         assert!(err.contains("2 user inputs match"), "{err}");
         assert!(err.contains("u1") && err.contains("u2"), "{err}");
         assert!(resolve_serve_rewind_target(&messages, &["grep"]).is_err());
@@ -2417,9 +2417,7 @@ mod serve_history_tests {
 /// block is open and print only the `✓ thinking (N lines)` summary on close
 /// (local-fold parity: the body is discarded), error events abort with
 /// the server detail, the done event (or the end of the body) ends the turn.
-fn render_turn_stream(
-    resp: reqwest::blocking::Response,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn render_turn_stream(resp: reqwest::blocking::Response) -> Result<(), Box<dyn std::error::Error>> {
     render_turn_stream_with_confirm(resp, None)
 }
 
@@ -2512,12 +2510,7 @@ fn render_turn_stream_to_with_confirm(
         match event_kind.as_str() {
             "error" => {
                 // Best effort: surface the partial answer before failing.
-                hide_answer_pending_status(
-                    &mut answer_pending_drawn,
-                    &mut line_open,
-                    tty,
-                    out,
-                );
+                hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
                 if tty {
                     let _ = markdown.flush_pending_to(out);
                 }
@@ -2532,22 +2525,13 @@ fn render_turn_stream_to_with_confirm(
                 close_open_line(&mut line_open, out);
                 let msg = serde_json::from_str::<serde_json::Value>(payload)
                     .ok()
-                    .and_then(|v| {
-                        v.get("error")
-                            .and_then(|e| e.as_str())
-                            .map(str::to_string)
-                    })
+                    .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
                     .unwrap_or_else(|| payload.to_string());
                 return Err(format!("turn failed: {msg}").into());
             }
             "done" => {
                 // End of turn: emit whatever the renderer still holds.
-                hide_answer_pending_status(
-                    &mut answer_pending_drawn,
-                    &mut line_open,
-                    tty,
-                    out,
-                );
+                hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
                 if tty {
                     let _ = markdown.flush_pending_to(out);
                 }
@@ -2567,12 +2551,7 @@ fn render_turn_stream_to_with_confirm(
                 // summary first (multi-round model calls).
                 // Flush first: the previous round's body is complete, and the
                 // status line must not glue onto its last row.
-                hide_answer_pending_status(
-                    &mut answer_pending_drawn,
-                    &mut line_open,
-                    tty,
-                    out,
-                );
+                hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
                 if tty {
                     let _ = markdown.flush_pending_to(out);
                 }
@@ -2598,22 +2577,13 @@ fn render_turn_stream_to_with_confirm(
                 // A thinking frame arriving after body output (multi-round
                 // calls) must not rewrite the rendered answer's last line.
                 // Mid-thinking this flush is a no-op.
-                hide_answer_pending_status(
-                    &mut answer_pending_drawn,
-                    &mut line_open,
-                    tty,
-                    out,
-                );
+                hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
                 if tty {
                     let _ = markdown.flush_pending_to(out);
                 }
                 let text = serde_json::from_str::<serde_json::Value>(payload)
                     .ok()
-                    .and_then(|v| {
-                        v.get("text")
-                            .and_then(|t| t.as_str())
-                            .map(str::to_string)
-                    })
+                    .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
                     .unwrap_or_else(|| payload.to_string());
                 if !thinking_active {
                     // Tolerate start-less frames (older servers never send
@@ -2684,12 +2654,7 @@ fn render_turn_stream_to_with_confirm(
                 // unconditionally.
                 // A late close can arrive after body output started; fold it
                 // on a fresh row before the renderer continues.
-                hide_answer_pending_status(
-                    &mut answer_pending_drawn,
-                    &mut line_open,
-                    tty,
-                    out,
-                );
+                hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
                 answer_pending = false;
                 if tty && thinking_active {
                     let _ = markdown.flush_pending_to(out);
@@ -2704,11 +2669,7 @@ fn render_turn_stream_to_with_confirm(
                 );
                 let text = serde_json::from_str::<serde_json::Value>(payload)
                     .ok()
-                    .and_then(|v| {
-                        v.get("delta")
-                            .and_then(|d| d.as_str())
-                            .map(str::to_string)
-                    })
+                    .and_then(|v| v.get("delta").and_then(|d| d.as_str()).map(str::to_string))
                     .unwrap_or_else(|| payload.to_string());
                 if tty {
                     // Same renderer as the local turn output: tables, code
@@ -2725,12 +2686,7 @@ fn render_turn_stream_to_with_confirm(
             "confirm_request" => {
                 // Same ordering guarantee as the `_` arm below: the question
                 // must start on a fresh row, never glued onto answer deltas.
-                hide_answer_pending_status(
-                    &mut answer_pending_drawn,
-                    &mut line_open,
-                    tty,
-                    out,
-                );
+                hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
                 if tty {
                     let _ = markdown.flush_pending_to(out);
                     if markdown.at_line_start() {
@@ -2796,12 +2752,7 @@ fn render_turn_stream_to_with_confirm(
                 // Same ordering guarantee as the `delta` arm: observer footers
                 // arriving while a fold is still open must not slip between the
                 // answer and its thinking summary.
-                hide_answer_pending_status(
-                    &mut answer_pending_drawn,
-                    &mut line_open,
-                    tty,
-                    out,
-                );
+                hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
                 if tty {
                     // Flush first so the footer starts after the rendered
                     // body; a completed row means no extra guard newline.
@@ -2857,12 +2808,7 @@ fn render_turn_stream_to_with_confirm(
         }
     }
     // Stream ended without a `done` event: same end-of-turn flush.
-    hide_answer_pending_status(
-        &mut answer_pending_drawn,
-        &mut line_open,
-        tty,
-        out,
-    );
+    hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
     if tty {
         let _ = markdown.flush_pending_to(out);
     }
@@ -2880,11 +2826,7 @@ fn render_turn_stream_to_with_confirm(
 
 /// Approximate folded-thinking line count for the summary row.
 fn thinking_summary(newlines: usize, chars: usize) -> usize {
-    if chars == 0 {
-        0
-    } else {
-        newlines + 1
-    }
+    if chars == 0 { 0 } else { newlines + 1 }
 }
 
 /// Whether a stdout-derived footer row is an end-of-stream metrics summary.
@@ -3250,13 +3192,7 @@ impl ServeConfirmChannel {
     /// child cannot proceed without the answer, so pausing the stream here is
     /// correct (pending SSE bytes stay buffered in TCP). The renderer is
     /// already flushed by the caller, so the question starts on a fresh row.
-    fn answer(
-        &self,
-        id: u64,
-        token: u64,
-        prompt: &str,
-        out: &mut dyn std::io::Write,
-    ) {
+    fn answer(&self, id: u64, token: u64, prompt: &str, out: &mut dyn std::io::Write) {
         let allow = crate::commonw::prompt::prompt_yes_or_no_interruptible(&format!(
             "[serve-chat] remote confirmation: {prompt} [y/n] "
         ));
@@ -3278,13 +3214,7 @@ impl ServeConfirmChannel {
     /// is terminal per the route contract (answered elsewhere, superseded, or
     /// the turn ended), not a retry. Other failures leave the child blocked
     /// until the turn ends, which the warning says plainly.
-    fn post_answer(
-        &self,
-        id: u64,
-        token: u64,
-        allow: bool,
-        out: &mut dyn std::io::Write,
-    ) {
+    fn post_answer(&self, id: u64, token: u64, allow: bool, out: &mut dyn std::io::Write) {
         let url = format!("{}/sessions/{}/confirm", self.base, self.session_id);
         // Reuse the shared client so private-CA trust is preserved, while the
         // per-request timeout prevents a wedged answer from pinning rendering.
@@ -3376,8 +3306,7 @@ fn post_turn_stream(
             missing.push(name);
         }
         if !missing.is_empty() {
-            let assets_dir =
-                SessionStore::new(history_file).session_assets_dir(session_id);
+            let assets_dir = SessionStore::new(history_file).session_assets_dir(session_id);
             eprintln!(
                 "[serve-chat] warning: image file(s) {} missing, empty, or unreadable in local session assets ({}); re-paste the image in this session before sending.",
                 missing.join(", "),
@@ -3429,14 +3358,13 @@ fn post_turn_stream(
     // the stream renders, so the listener owns it until the turn ends. Drafts
     // are POSTed to the serve session; the server-side turn child drains them
     // like local notes. Degrades to a no-op on non-tty stdin.
-    let _side_note_guard =
-        if super::super::stream::side_note_input::side_note_input_enabled() {
-            Some(SideNoteInputGuard::spawn_remote(remote_side_note_sink(
-                client, base, token, session_id,
-            )))
-        } else {
-            None
-        };
+    let _side_note_guard = if super::super::stream::side_note_input::side_note_input_enabled() {
+        Some(SideNoteInputGuard::spawn_remote(remote_side_note_sink(
+            client, base, token, session_id,
+        )))
+    } else {
+        None
+    };
     let outcome = render_turn_stream_with_confirm(resp, confirm_channel.as_ref());
     if REMOTE_TURN_INTERRUPT_SENT.swap(false, Ordering::SeqCst) {
         // Leading newline: `delta` events print without a trailing newline, so
@@ -3525,9 +3453,7 @@ fn print_remote_sessions(items: &[RemoteSession]) {
 
 /// Non-interactive `--serve-sessions`: print the remote session list and
 /// exit, so the session can be picked before opening the interactive client.
-pub(in crate::ai) fn run_serve_sessions(
-    cli: &ParsedCli,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub(in crate::ai) fn run_serve_sessions(cli: &ParsedCli) -> Result<(), Box<dyn std::error::Error>> {
     let (client, base, token) = serve_connection(cli, "serve-sessions")?;
     let items = fetch_remote_sessions(&client, &base, &token)
         .map_err(|err| format!("[serve-sessions] {err}"))?;
@@ -3558,9 +3484,7 @@ fn classify_serve_sessions_arg(arg: &str) -> ServeSessionsArg {
 /// Run the interactive serve chat: connect to a running serve instance and
 /// loop over multiline prompts until `/quit`. Input uses the same editor as
 /// the local REPL, so Enter/movement/completion behave identically.
-pub(in crate::ai) fn run_serve_chat(
-    cli: ParsedCli,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::error::Error>> {
     let (client, base, token) = serve_connection(&cli, "serve-chat")?;
     // Ctrl+C must stop the remote turn rather than this client: without a
     // handler, SIGINT's default action would exit mid-stream and leave the
@@ -3608,7 +3532,9 @@ pub(in crate::ai) fn run_serve_chat(
     };
 
     println!("Connected to {base}, session {session_id}.");
-    println!("Enter inserts a newline, Esc or Alt+Enter submits; Ctrl+C interrupts the running remote turn (a second Ctrl+C exits); /quit exits, /bg backgrounds the current session and exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions (/sessions current|id shows the current one), /fork branches the current session, /close deletes it and exits. /cd switches the remote working directory (Tab completes remote paths). /model, /effort, /agent switch the remote turn like the local REPL.");
+    println!(
+        "Enter inserts a newline, Esc or Alt+Enter submits; Ctrl+C interrupts the running remote turn (a second Ctrl+C exits); /quit exits, /bg backgrounds the current session and exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions (/sessions current|id shows the current one), /fork branches the current session, /close deletes it and exits. /cd switches the remote working directory (Tab completes remote paths). /model, /effort, /agent switch the remote turn like the local REPL."
+    );
     let mut editor = PromptEditor::new(&session_id, &app_config.history_file);
     // Command words the shared completion table does not carry: serve-chat-only
     // commands plus shared ones missing from the trie. Registered per client
@@ -3741,10 +3667,7 @@ pub(in crate::ai) fn run_serve_chat(
                             println!("session: {session_id}");
                             if let Some(item) = items.iter().find(|s| s.id == session_id) {
                                 println!("title: {}", remote_session_title(item));
-                                println!(
-                                    "marked: {}",
-                                    if item.marked { "yes" } else { "no" }
-                                );
+                                println!("marked: {}", if item.marked { "yes" } else { "no" });
                             }
                             CommandCompleter::set_serve_session_candidates(
                                 items
@@ -3758,9 +3681,9 @@ pub(in crate::ai) fn run_serve_chat(
                     }
                 }
                 ServeSessionsArg::Id => println!("{session_id}"),
-                ServeSessionsArg::Unknown => println!(
-                    "unknown /sessions subcommand: '{arg}'. try: /sessions help"
-                ),
+                ServeSessionsArg::Unknown => {
+                    println!("unknown /sessions subcommand: '{arg}'. try: /sessions help")
+                }
             },
             "/resume" => match resolve_session_ref(arg, &listed) {
                 Ok(id) => {
@@ -3771,8 +3694,13 @@ pub(in crate::ai) fn run_serve_chat(
                     }
                     CommandCompleter::clear_checkpoint_candidates();
                     editor.set_session_id(session_id.as_str());
-                    if restore_serve_session_picks(&client, &base, &token, &session_id, &mut selection)
-                    {
+                    if restore_serve_session_picks(
+                        &client,
+                        &base,
+                        &token,
+                        &session_id,
+                        &mut selection,
+                    ) {
                         selection.apply_header(&mut editor);
                     }
                     match title {
@@ -3849,7 +3777,8 @@ pub(in crate::ai) fn run_serve_chat(
                 persist_serve_config_patch(&client, &base, &token, &session_id, &patch);
             }
             "/agent" | ":agent" => {
-                let patch = run_serve_agent_command(arg, &mut selection, &agent_manifests, &mut editor);
+                let patch =
+                    run_serve_agent_command(arg, &mut selection, &agent_manifests, &mut editor);
                 persist_serve_config_patch(&client, &base, &token, &session_id, &patch);
             }
             // Remote `/skills`: list/use run against the server skill list
@@ -3884,13 +3813,7 @@ pub(in crate::ai) fn run_serve_chat(
                 }
             }
             "/git" | ":git" => {
-                match run_serve_checkpoint_command(
-                    &client,
-                    &base,
-                    &token,
-                    &session_id,
-                    &trimmed,
-                ) {
+                match run_serve_checkpoint_command(&client, &base, &token, &session_id, &trimmed) {
                     Ok(checkpoint_status) => {
                         editor.set_remote_checkpoint_status_label(checkpoint_status);
                     }
@@ -4008,8 +3931,7 @@ mod tests {
             let (mut stream, _) = listener.accept().expect("accept");
             let mut head = String::new();
             {
-                let mut reader =
-                    std::io::BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone stream"));
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
@@ -4065,15 +3987,13 @@ mod tests {
         render_turn_stream_to(resp, &mut buf, false).expect("render");
         let out = String::from_utf8(buf).expect("utf8");
         assert!(out.contains("cannot answer"), "unexpected: {out}");
-        assert!(
-            !out.contains("confirm_request"),
-            "raw event leaked: {out}"
-        );
+        assert!(!out.contains("confirm_request"), "raw event leaked: {out}");
     }
 
     #[test]
     fn sse_malformed_confirm_request_is_ignored() {
-        let url = serve_body_once("event: confirm_request\ndata: not-json\n\nevent: done\ndata: \n\n");
+        let url =
+            serve_body_once("event: confirm_request\ndata: not-json\n\nevent: done\ndata: \n\n");
         let resp = reqwest::blocking::get(url).expect("get canned SSE");
         let mut buf = Vec::new();
         render_turn_stream_to(resp, &mut buf, false).expect("render");
@@ -4126,8 +4046,7 @@ mod tests {
     #[test]
     fn collect_image_uploads_packages_multiple_local_files() {
         // Client assets layout: <tmp>/<stem>.sessions/<session>.assets/.
-        let root =
-            std::env::temp_dir().join(format!("a-serve-chat-img-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("a-serve-chat-img-{}", uuid::Uuid::new_v4()));
         let history = root.join("history.jsonl");
         let assets = SessionStore::new(&history).session_assets_dir("sess-1");
         std::fs::create_dir_all(&assets).unwrap();
@@ -4159,10 +4078,22 @@ mod tests {
 
     #[test]
     fn serve_effort_arg_normalizes_like_local() {
-        assert_eq!(normalize_serve_effort_arg("low"), Ok(Some("low".to_string())));
-        assert_eq!(normalize_serve_effort_arg(" HIGH "), Ok(Some("high".to_string())));
-        assert_eq!(normalize_serve_effort_arg("off"), Ok(Some("off".to_string())));
-        assert_eq!(normalize_serve_effort_arg("disabled"), Ok(Some("off".to_string())));
+        assert_eq!(
+            normalize_serve_effort_arg("low"),
+            Ok(Some("low".to_string()))
+        );
+        assert_eq!(
+            normalize_serve_effort_arg(" HIGH "),
+            Ok(Some("high".to_string()))
+        );
+        assert_eq!(
+            normalize_serve_effort_arg("off"),
+            Ok(Some("off".to_string()))
+        );
+        assert_eq!(
+            normalize_serve_effort_arg("disabled"),
+            Ok(Some("off".to_string()))
+        );
         assert_eq!(normalize_serve_effort_arg("auto"), Ok(None));
         assert_eq!(normalize_serve_effort_arg("clear"), Ok(None));
         assert!(normalize_serve_effort_arg("ultra").is_err());
@@ -4174,8 +4105,7 @@ mod tests {
         let (selector, question) = split_serve_model_inline("deepseek");
         assert_eq!(selector, "deepseek");
         assert_eq!(question, None);
-        let (selector, question) =
-            split_serve_model_inline("deepseek   explain this code");
+        let (selector, question) = split_serve_model_inline("deepseek   explain this code");
         assert_eq!(selector, "deepseek");
         assert_eq!(question.as_deref(), Some("explain this code"));
     }
@@ -4197,12 +4127,14 @@ mod tests {
         // the trailing question stays verbatim.
         let (names, question) =
             split_serve_skills_inline(&known, "ByteDcli CODE-review   explain this");
-        assert_eq!(names, vec!["bytedcli".to_string(), "code-review".to_string()]);
+        assert_eq!(
+            names,
+            vec!["bytedcli".to_string(), "code-review".to_string()]
+        );
         assert_eq!(question.as_deref(), Some("explain this"));
         // Dedupes keeping input order; a non-skill token stops the split and
         // starts the question.
-        let (names, question) =
-            split_serve_skills_inline(&known, "bytedcli bytedcli ??? nope");
+        let (names, question) = split_serve_skills_inline(&known, "bytedcli bytedcli ??? nope");
         assert_eq!(names, vec!["bytedcli".to_string()]);
         assert_eq!(question.as_deref(), Some("??? nope"));
         // No leading skill token: pure question, no selection.
@@ -4254,8 +4186,10 @@ mod tests {
             reasoning_effort: None,
             skills: Vec::new(),
         };
-        let mut editor =
-            PromptEditor::new("test", std::path::Path::new("/tmp/a-serve-agent-test-history"));
+        let mut editor = PromptEditor::new(
+            "test",
+            std::path::Path::new("/tmp/a-serve-agent-test-history"),
+        );
         run_serve_agent_command("off", &mut selection, &manifests, &mut editor);
         assert_eq!(selection.agent, "build");
         run_serve_agent_command("helper", &mut selection, &manifests, &mut editor);
@@ -4371,7 +4305,9 @@ mod tests {
         // through untouched.
         let colored = "\x1b[2m\x1b[32m[model (effort: max) · topic]\x1b[0m";
         assert!(is_turn_header_row(colored));
-        assert!(!is_turn_header_row("[model (effort: max) · topic] (remote)"));
+        assert!(!is_turn_header_row(
+            "[model (effort: max) · topic] (remote)"
+        ));
         assert!(!is_turn_header_row("  ✕ execute_command"));
         assert!(!is_turn_header_row("[note] something else"));
         assert_eq!(
@@ -4462,10 +4398,7 @@ mod tests {
         let mut buf = Vec::new();
         render_turn_stream_to(resp, &mut buf, true).expect("render");
         let out = String::from_utf8(buf).expect("utf8");
-        assert!(
-            out.contains('─'),
-            "table must render as a box, got: {out}"
-        );
+        assert!(out.contains('─'), "table must render as a box, got: {out}");
         assert!(
             !out.contains("| ---"),
             "raw separator must not leak, got: {out}"
@@ -4621,13 +4554,19 @@ mod tests {
         use ServeSessionsArg::*;
         // Bare `/ss` and the list spellings keep the full listing.
         for bare in ["", "list", "ls", "verbose"] {
-            assert!(matches!(classify_serve_sessions_arg(bare), List), "{bare:?}");
+            assert!(
+                matches!(classify_serve_sessions_arg(bare), List),
+                "{bare:?}"
+            );
         }
         // `current`/`cur`/`curr` show only the current session; `curr` is
         // the spelling the reported serve-chat bug silently listed all
         // sessions for.
         for cur in ["current", "cur", "curr"] {
-            assert!(matches!(classify_serve_sessions_arg(cur), Current), "{cur:?}");
+            assert!(
+                matches!(classify_serve_sessions_arg(cur), Current),
+                "{cur:?}"
+            );
         }
         assert!(matches!(classify_serve_sessions_arg("id"), Id));
         // Anything else is rejected, never silently treated as a listing.
@@ -4692,9 +4631,8 @@ mod tests {
     fn fetch_remote_sessions_parses_canned_list() {
         // serve_body_once ignores the request path, so the canned session
         // list stands in for GET /sessions over loopback.
-        let url = serve_body_once(
-            r#"[{"id":"s1","summary":"Hello","size_bytes":7,"marked":true}]"#,
-        );
+        let url =
+            serve_body_once(r#"[{"id":"s1","summary":"Hello","size_bytes":7,"marked":true}]"#);
         let base = url.rsplit_once('/').map(|(b, _)| b).unwrap_or(&url);
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(5))
@@ -4804,10 +4742,14 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        save_serve_chat_binding_for_key(&root, "terminal:term-1", "http://127.0.0.1:8080", "sess-1")
-            .expect("save");
-        let loaded =
-            load_serve_chat_binding_for_key(&root, "terminal:term-1").expect("load");
+        save_serve_chat_binding_for_key(
+            &root,
+            "terminal:term-1",
+            "http://127.0.0.1:8080",
+            "sess-1",
+        )
+        .expect("save");
+        let loaded = load_serve_chat_binding_for_key(&root, "terminal:term-1").expect("load");
         assert_eq!(loaded.base, "http://127.0.0.1:8080");
         assert_eq!(loaded.session_id, "sess-1");
         // A different terminal key sees nothing: bindings are per-terminal,
@@ -4871,12 +4813,18 @@ mod tests {
             serve_sigint_action(true, false),
             ServeSigintAction::InterruptRemoteTurn
         );
-        assert_eq!(serve_sigint_action(true, true), ServeSigintAction::ExitLocal);
+        assert_eq!(
+            serve_sigint_action(true, true),
+            ServeSigintAction::ExitLocal
+        );
         assert_eq!(
             serve_sigint_action(false, false),
             ServeSigintAction::ExitLocal
         );
-        assert_eq!(serve_sigint_action(false, true), ServeSigintAction::ExitLocal);
+        assert_eq!(
+            serve_sigint_action(false, true),
+            ServeSigintAction::ExitLocal
+        );
     }
 
     /// The interrupt must address the session-scoped route with the bearer
@@ -4925,7 +4873,10 @@ mod tests {
         assert_eq!(response.output, "switched\n");
         assert_eq!(response.checkpoints, ["latest", "before"]);
         assert_eq!(response.branches, ["main", "feature"]);
-        assert_eq!(response.checkpoint_status.as_deref(), Some("feature@latest"));
+        assert_eq!(
+            response.checkpoint_status.as_deref(),
+            Some("feature@latest")
+        );
         let head = captured.lock().expect("capture").clone().to_lowercase();
         assert!(
             head.starts_with("post /sessions/s1/checkpoints http/1.1"),
@@ -4939,11 +4890,14 @@ mod tests {
         let (base, _) = serve_capture_once(
             r#"{"checkpoints":["latest","before"],"branches":["main","feature"],"checkpoint_status":"main@latest"}"#,
         );
-        let checkpoint_state = fetch_remote_checkpoint_names(&client, &base, "tk", "s1")
-            .expect("checkpoint list");
+        let checkpoint_state =
+            fetch_remote_checkpoint_names(&client, &base, "tk", "s1").expect("checkpoint list");
         assert_eq!(checkpoint_state.checkpoints, ["latest", "before"]);
         assert_eq!(checkpoint_state.branches, ["main", "feature"]);
-        assert_eq!(checkpoint_state.checkpoint_status.as_deref(), Some("main@latest"));
+        assert_eq!(
+            checkpoint_state.checkpoint_status.as_deref(),
+            Some("main@latest")
+        );
         CommandCompleter::clear_checkpoint_candidates();
     }
 
@@ -4991,10 +4945,7 @@ mod tests {
             "plain prompt",
         )
         .unwrap_err();
-        assert!(
-            err.contains("not a /cd command"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("not a /cd command"), "unexpected error: {err}");
     }
 
     #[test]
@@ -5002,8 +4953,8 @@ mod tests {
         rust_tools::ensure_rustls_provider();
         let (base, captured) = serve_capture_once(r#"{"candidates":["src/","docs/"]}"#);
         let client = reqwest::blocking::Client::new();
-        let candidates = fetch_remote_cd_candidates(&client, &base, "tk", "s1", "s")
-            .expect("cd candidates");
+        let candidates =
+            fetch_remote_cd_candidates(&client, &base, "tk", "s1", "s").expect("cd candidates");
         assert_eq!(candidates, vec!["src/", "docs/"]);
         let head = captured.lock().expect("capture").clone().to_lowercase();
         assert!(

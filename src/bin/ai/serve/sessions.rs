@@ -95,9 +95,7 @@ pub(crate) async fn fork_session(
                 .into_response();
         }
     }
-    if let Err(err) =
-        crate::ai::driver::commands::session::apply_fork_title(&store, &id, &dst)
-    {
+    if let Err(err) = crate::ai::driver::commands::session::apply_fork_title(&store, &id, &dst) {
         eprintln!("[serve] fork title for session {dst}: {err}");
     }
     (StatusCode::OK, Json(CreateSessionResp { id: dst })).into_response()
@@ -175,11 +173,7 @@ pub(crate) async fn set_session_title(
     }
     let store = SessionStore::new(state.history_file.as_path());
     match store.write_session_title_with_origin(&id, &title, SessionTitleOrigin::User) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"title": title})),
-        )
-            .into_response(),
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"title": title}))).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": err.to_string()})),

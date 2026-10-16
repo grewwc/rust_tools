@@ -31,57 +31,56 @@ use crate::ai::exe_path::runtime_exe;
 use crate::commonw::configw;
 
 #[cfg(feature = "serve")]
+use super::driver::side_note::push_side_note;
+#[cfg(feature = "serve")]
+use super::driver::turn_runtime::stale_patch_targets_from_messages;
+#[cfg(feature = "serve")]
 use super::{
     agents,
     config_schema::AiConfig,
     history::{
-        SessionServeConfig, SessionStore, SessionTitleOrigin,
-        invalidate_context_history_cache_for, is_runtime_synthetic_user_message,
-        redact_inline_image_data, truncate_history_messages, write_stale_patch_targets_sqlite,
+        SessionServeConfig, SessionStore, SessionTitleOrigin, invalidate_context_history_cache_for,
+        is_runtime_synthetic_user_message, redact_inline_image_data, truncate_history_messages,
+        write_stale_patch_targets_sqlite,
     },
     model_names, models,
 };
-#[cfg(feature = "serve")]
-use super::driver::turn_runtime::stale_patch_targets_from_messages;
-#[cfg(feature = "serve")]
-use super::driver::side_note::push_side_note;
 pub(in crate::ai) mod chat;
 #[cfg(feature = "serve")]
 pub(in crate::ai) mod ctl;
 
-
-mod types;
-#[cfg(feature = "serve")]
-mod info;
-#[cfg(feature = "serve")]
-mod sessions;
-#[cfg(feature = "serve")]
-mod history;
 #[cfg(feature = "serve")]
 mod checkpoint;
 #[cfg(feature = "serve")]
 mod files;
 #[cfg(feature = "serve")]
+mod history;
+#[cfg(feature = "serve")]
+mod info;
+#[cfg(feature = "serve")]
 mod session_cwd;
 #[cfg(feature = "serve")]
-mod turn;
-#[cfg(feature = "serve")]
-mod tls;
+mod sessions;
 #[cfg(all(test, feature = "serve"))]
 mod tests;
+#[cfg(feature = "serve")]
+mod tls;
+#[cfg(feature = "serve")]
+mod turn;
+mod types;
 
+#[cfg(feature = "serve")]
+pub(crate) use checkpoint::*;
 #[cfg(feature = "serve")]
 pub(crate) use files::*;
 #[cfg(feature = "serve")]
 pub(crate) use history::*;
 #[cfg(feature = "serve")]
-pub(crate) use checkpoint::*;
-#[cfg(feature = "serve")]
 pub(crate) use info::*;
 #[cfg(feature = "serve")]
-pub(crate) use sessions::*;
-#[cfg(feature = "serve")]
 pub(crate) use session_cwd::*;
+#[cfg(feature = "serve")]
+pub(crate) use sessions::*;
 #[cfg(feature = "serve")]
 pub(crate) use turn::*;
 pub(crate) use types::*;
@@ -106,9 +105,7 @@ fn run_one_shot_turn(
 ) -> std::io::Result<String> {
     let exe = runtime_exe()?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--session")
-        .arg(session_id)
-        .arg(prompt);
+    cmd.arg("--session").arg(session_id).arg(prompt);
     push_turn_override_args(&mut cmd, overrides);
     let out = cmd
         // The turn runs in the session's virtual cwd, so relative paths in
@@ -128,10 +125,7 @@ fn run_one_shot_turn(
             let skip = combined.len() - MAX_TURN_ERROR_CHARS;
             combined = format!("...[truncated]...{}", &combined[skip..]);
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            combined,
-        ))
+        Err(std::io::Error::new(std::io::ErrorKind::Other, combined))
     }
 }
 
@@ -188,13 +182,13 @@ async fn post_turn(
     let output = tokio::task::spawn_blocking(move || {
         run_one_shot_turn(&session_id, &prompt, &overrides, &session_cwd)
     })
-        .await
-        .map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": err.to_string()})),
-            )
-        });
+    .await
+    .map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+    });
     let output = match output {
         Ok(Ok(text)) => text,
         Ok(Err(err)) => {
@@ -523,7 +517,9 @@ fn stream_child_turn(
     if let Some(handle) = fifo_handle {
         let _ = handle.join();
     }
-    let stderr_tail = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr_tail = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
     // The pump may have ended the turn early via OutputComplete; only the
     // first `done` wins. A late failure still surfaces its detail as an
     // error event (harmless if the client already left on `done`).
@@ -747,12 +743,12 @@ fn live_event(event: ServeLiveEvent) -> Option<Event> {
     match event {
         ServeLiveEvent::Delta(text) => Some(delta_event(text)),
         ServeLiveEvent::ThinkingStart => Some(Event::default().event("thinking_start").data("")),
-        ServeLiveEvent::Thinking(text) => Some(Event::default().event("thinking").data(
-            serde_json::json!({"text": text}).to_string(),
-        )),
-        ServeLiveEvent::ThinkingDone => {
-            Some(Event::default().event("thinking_done").data(""))
-        }
+        ServeLiveEvent::Thinking(text) => Some(
+            Event::default()
+                .event("thinking")
+                .data(serde_json::json!({"text": text}).to_string()),
+        ),
+        ServeLiveEvent::ThinkingDone => Some(Event::default().event("thinking_done").data("")),
         ServeLiveEvent::AssistantBodyPending => {
             Some(Event::default().event("answer_pending").data(""))
         }
@@ -936,9 +932,9 @@ fn pump_live_fifo(
 
 #[cfg(feature = "serve")]
 fn delta_event(delta: String) -> Event {
-    Event::default().event("delta").data(
-        serde_json::json!({"delta": delta}).to_string(),
-    )
+    Event::default()
+        .event("delta")
+        .data(serde_json::json!({"delta": delta}).to_string())
 }
 
 #[cfg(feature = "serve")]
@@ -1044,9 +1040,9 @@ fn last_chars(text: &str, limit: usize) -> String {
 
 #[cfg(feature = "serve")]
 fn error_event(detail: String) -> Event {
-    Event::default().event("error").data(
-        serde_json::json!({"error": detail}).to_string(),
-    )
+    Event::default()
+        .event("error")
+        .data(serde_json::json!({"error": detail}).to_string())
 }
 
 #[cfg(feature = "serve")]
@@ -1156,12 +1152,10 @@ async fn get_session_cd_candidates(
 fn is_loopback_bind(bind: &str) -> bool {
     // Parse the host part instead of prefix-matching so that names like
     // "127.x.evil.com" cannot pass the loopback gate.
-    let host = bind
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(bind)
-        .trim();
-    let host = host.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or(bind).trim();
+    let host = host
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
     if host == "localhost" {
         return true;
     }
@@ -1185,6 +1179,38 @@ pub(in crate::ai) fn resolve_serve_bind(cli_bind: &str, cfg_bind: &str) -> Strin
 }
 
 #[cfg(feature = "serve")]
+pub(in crate::ai) fn run_serve_tls_init(
+    cli: &super::cli::ParsedCli,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.serve
+        || cli.serve_chat
+        || cli.serve_sessions
+        || cli.serve_start
+        || cli.serve_stop
+        || cli.serve_restart
+        || cli.serve_status
+    {
+        return Err("--serve-tls-init must be run by itself (optionally with --serve-bind)".into());
+    }
+    let cfg = configw::get_all_config();
+    let configured = cfg.get_opt(AiConfig::SERVE_BIND).unwrap_or_default();
+    let bind = resolve_serve_bind(&cli.serve_bind, &configured);
+    let result = tls::init_serve_tls(&bind)?;
+    println!("[serve] TLS {:?}: {}", result.status, result.tls.cert);
+    println!("[serve] private key: {}", result.tls.key);
+    println!("[serve] CA certificate: {}", result.ca_cert.display());
+    println!("[serve] CA SHA-256: {}", result.fingerprint);
+    println!(
+        "[serve] certificate names: {}",
+        result.subject_alt_names.join(", ")
+    );
+    println!(
+        "[serve] future `a --serve`/`a --serve-start` runs will use this managed certificate automatically"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "serve")]
 pub(in crate::ai) async fn run_serve(
     cli: super::cli::ParsedCli,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1195,7 +1221,12 @@ pub(in crate::ai) async fn run_serve(
     let cfg = configw::get_all_config();
     let from_cfg = cfg.get_opt(AiConfig::SERVE_BIND).unwrap_or_default();
     let bind = resolve_serve_bind(&cli.serve_bind, &from_cfg);
-    let tls = tls::resolve_serve_tls(&cli.serve_tls_cert, &cli.serve_tls_key, None)?;
+    let managed_tls = tls::default_serve_tls_config()?;
+    let tls = tls::resolve_serve_tls(
+        &cli.serve_tls_cert,
+        &cli.serve_tls_key,
+        managed_tls.as_ref(),
+    )?;
     let token = cfg.get_opt(AiConfig::SERVE_TOKEN).unwrap_or_default();
     if token.is_empty() && !is_loopback_bind(&bind) {
         return Err(
@@ -1236,9 +1267,13 @@ pub(in crate::ai) async fn run_serve(
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/fork", post(fork_session))
         .route("/sessions/{id}/title", post(set_session_title))
-        .route("/sessions/{id}/config", get(get_session_config).post(set_session_config))
+        .route(
+            "/sessions/{id}/config",
+            get(get_session_config).post(set_session_config),
+        )
         .route("/sessions/{id}", delete(delete_session))
-        .route("/sessions/{id}/history", get(read_history)).route("/sessions/{id}/rewind", post(rewind_history))
+        .route("/sessions/{id}/history", get(read_history))
+        .route("/sessions/{id}/rewind", post(rewind_history))
         .route(
             "/sessions/{id}/checkpoints",
             get(list_checkpoints).post(post_checkpoint_command),
@@ -1261,7 +1296,10 @@ pub(in crate::ai) async fn run_serve(
         .route("/skills", get(list_skills))
         .route("/agents", get(list_agents))
         .route("/sessions/{id}/cd", post(post_session_cd))
-        .route("/sessions/{id}/cd-candidates", get(get_session_cd_candidates))
+        .route(
+            "/sessions/{id}/cd-candidates",
+            get(get_session_cd_candidates),
+        )
         .with_state(state);
     if let Some(tls) = tls.as_ref() {
         let server = tls::TlsServer::bind(&bind, tls).await?;

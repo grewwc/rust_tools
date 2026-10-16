@@ -138,6 +138,17 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if cli.serve_tls_init {
+        #[cfg(feature = "serve")]
+        {
+            return serve::run_serve_tls_init(&cli);
+        }
+        #[cfg(not(feature = "serve"))]
+        {
+            return Err("this binary was built without the `serve` feature; rebuild with --features serve".into());
+        }
+    }
+
     if cli.serve_start || cli.serve_stop || cli.serve_restart || cli.serve_status {
         #[cfg(feature = "serve")]
         {

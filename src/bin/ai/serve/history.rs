@@ -283,4 +283,3 @@ pub(crate) async fn read_history(
     );
     resp
 }
-
