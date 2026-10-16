@@ -23,7 +23,7 @@ agent-hang-debug = []
 # Client-only serve support (`a --serve-chat`, `a --serve-sessions`): needs no
 # extra dependencies. The `serve` feature adds the axum HTTP server on top.
 serve-client = []
-serve = ["dep:axum", "serve-client"]
+serve = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:tokio-rustls", "serve-client"]
 
 [dependencies]
 arboard = "3.6.1"
@@ -61,6 +61,9 @@ rust_decimal = "1.42.1"
 rustyline = "18.0.1"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
 axum = { version = "0.8", optional = true, default-features = false, features = ["json", "query", "http1", "tokio"] }
+hyper = { version = "1.8", optional = true, features = ["http1", "server"] }
+hyper-util = { version = "0.1", optional = true, features = ["service", "tokio"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
 tui-textarea = { package = "tui-textarea-2", version = "0.13.2", default-features = false, features = ["crossterm"] }
 unicode-width = "0.2.2"
 lopdf = "0.44.0"

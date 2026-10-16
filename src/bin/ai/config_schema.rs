@@ -290,6 +290,8 @@ impl AiConfig {
     pub const SERVE_BIND: &str = "ai.serve.bind";
     /// Bearer token for `a --serve`. Empty = no auth (loopback only).
     pub const SERVE_TOKEN: &str = "ai.serve.token";
+    /// PEM CA certificate trusted by `--serve-chat` and `--serve-sessions`.
+    pub const SERVE_CA_CERT: &str = "ai.serve.ca_cert";
 
     // ── Web tools ──────────────────────────────────────────
     /// Comma-separated list of search service base URLs for `web_search`,

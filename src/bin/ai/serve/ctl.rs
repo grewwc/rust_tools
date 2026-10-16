@@ -31,6 +31,7 @@ use std::os::fd::AsRawFd as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use super::tls::{ServeTlsConfig, resolve_serve_tls};
 use crate::ai::cli::ParsedCli;
 use crate::commonw::configw;
 
@@ -80,11 +81,12 @@ const DEFERRED_RESTART_WAIT: Duration = Duration::from_secs(30 * 60);
 #[cfg(unix)]
 const RESPONSE_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
-/// On-disk serve state: one value per line (`pid`, `bind`, unix start time).
+/// On-disk serve state: the legacy three lines followed by optional JSON TLS paths.
 struct ServeState {
     pid: u32,
     bind: String,
     started_unix: u64,
+    tls: Option<ServeTlsConfig>,
 }
 
 /// Entry point for the four `--serve-*` management flags. Synchronous: no
@@ -274,15 +276,42 @@ fn parse_state(text: &str) -> Result<ServeState, String> {
         .trim()
         .parse()
         .map_err(|_| "bad started line".to_string())?;
+    let tls_cert: Option<String> = lines
+        .next()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| "bad TLS certificate line".to_string())?
+        .flatten();
+    let tls_key: Option<String> = lines
+        .next()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| "bad TLS key line".to_string())?
+        .flatten();
+    let tls = match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => Some(ServeTlsConfig { cert, key }),
+        (None, None) => None,
+        _ => return Err("incomplete TLS state".to_string()),
+    };
     Ok(ServeState {
         pid,
         bind,
         started_unix,
+        tls,
     })
 }
 
 fn format_state(state: &ServeState) -> String {
-    format!("{}\n{}\n{}\n", state.pid, state.bind, state.started_unix)
+    let cert = state.tls.as_ref().map(|tls| tls.cert.as_str());
+    let key = state.tls.as_ref().map(|tls| tls.key.as_str());
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n",
+        state.pid,
+        state.bind,
+        state.started_unix,
+        serde_json::to_string(&cert).expect("TLS certificate path serializes"),
+        serde_json::to_string(&key).expect("TLS key path serializes")
+    )
 }
 
 /// Read the state file. `Ok(None)` means no daemon was ever recorded here;
@@ -354,19 +383,26 @@ fn format_uptime(secs: u64) -> String {
     }
 }
 
-fn healthz_url(bind: &str) -> String {
-    format!("http://{bind}/healthz")
+fn serve_url(bind: &str, tls: Option<&ServeTlsConfig>) -> String {
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    format!("{scheme}://{bind}")
 }
 
 /// GET the public liveness endpoint. Returns the reported server version.
 fn query_healthz(
     bind: &str,
+    tls: Option<&ServeTlsConfig>,
     timeout: Duration,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
+        // This probe authenticates the daemon by pid/state ownership. Its TLS
+        // certificate may be signed by a phone-only private CA.
+        .danger_accept_invalid_certs(tls.is_some())
         .build()?;
-    let resp = client.get(healthz_url(bind)).send()?;
+    let resp = client
+        .get(format!("{}/healthz", serve_url(bind, tls)))
+        .send()?;
     if !resp.status().is_success() {
         return Err(format!("/healthz returned {}", resp.status()).into());
     }
@@ -380,11 +416,12 @@ fn query_healthz(
 /// Poll `/healthz` until it answers or the budget runs out.
 fn wait_for_healthz(
     bind: &str,
+    tls: Option<&ServeTlsConfig>,
     budget: Duration,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let start = Instant::now();
     loop {
-        match query_healthz(bind, Duration::from_secs(2)) {
+        match query_healthz(bind, tls, Duration::from_secs(2)) {
             Ok(version) => return Ok(version),
             Err(err) if start.elapsed() < budget => {
                 let _ = err;
@@ -416,7 +453,7 @@ fn resolve_ctl_bind(cli: &ParsedCli, forced_bind: Option<&str>) -> String {
 #[cfg(not(unix))]
 fn start_daemon(
     _cli: &ParsedCli,
-    _forced_bind: Option<&str>,
+    _previous: Option<&ServeState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err("--serve-start is unix-only (posix daemonize)".into())
 }
@@ -426,23 +463,29 @@ fn start_daemon(
 #[cfg(unix)]
 fn start_daemon(
     cli: &ParsedCli,
-    forced_bind: Option<&str>,
+    previous: Option<&ServeState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dir = state_dir()?;
     std::fs::create_dir_all(&dir)?;
     let pid_path = dir.join(PID_FILE);
     if let Some(state) = read_state_file(&pid_path)? {
         if process_alive(state.pid) {
+            let base = serve_url(&state.bind, state.tls.as_ref());
             println!(
-                "[serve] already running (pid={} bind=http://{}); use --serve-restart to restart it",
-                state.pid, state.bind
+                "[serve] already running (pid={} bind={base}); use --serve-restart to restart it",
+                state.pid
             );
             return Ok(());
         }
         // A killed daemon leaves its state file behind; reclaim it.
         let _ = std::fs::remove_file(&pid_path);
     }
-    let bind = resolve_ctl_bind(cli, forced_bind);
+    let bind = resolve_ctl_bind(cli, previous.map(|state| state.bind.as_str()));
+    let tls = resolve_serve_tls(
+        &cli.serve_tls_cert,
+        &cli.serve_tls_key,
+        previous.and_then(|state| state.tls.as_ref()),
+    )?;
     // Freeze first: the daemon re-execs its own file for every turn, so it
     // must not run from a path that a rebuild can replace.
     let exe = freeze_daemon_exe(&dir)?;
@@ -460,6 +503,12 @@ fn start_daemon(
         .stdin(dev_null)
         .stdout(log.try_clone()?)
         .stderr(log);
+    if let Some(tls) = tls.as_ref() {
+        cmd.arg("--serve-tls-cert")
+            .arg(&tls.cert)
+            .arg("--serve-tls-key")
+            .arg(&tls.key);
+    }
     let child = crate::fork_guard::spawn(&mut cmd)?;
     write_state_file(
         &pid_path,
@@ -467,20 +516,22 @@ fn start_daemon(
             pid: child.id(),
             bind: bind.clone(),
             started_unix: now_unix(),
+            tls: tls.clone(),
         },
     )?;
-    match wait_for_healthz(&bind, STARTUP_WAIT) {
+    let base = serve_url(&bind, tls.as_ref());
+    match wait_for_healthz(&bind, tls.as_ref(), STARTUP_WAIT) {
         Ok(version) => {
             let version = version.map(|v| format!(" version={v}")).unwrap_or_default();
             println!(
-                "[serve] started pid={} bind=http://{bind}{version} log={} exe={}",
+                "[serve] started pid={} bind={base}{version} log={} exe={}",
                 child.id(),
                 log_path.display(),
                 exe.display()
             );
         }
         Err(_) => println!(
-            "[serve] started pid={} bind=http://{bind} (not answering /healthz yet; tail {})",
+            "[serve] started pid={} bind={base} (not answering /healthz yet; tail {})",
             child.id(),
             log_path.display()
         ),
@@ -720,15 +771,14 @@ fn restart_daemon(cli: &ParsedCli) -> Result<(), Box<dyn std::error::Error>> {
 /// overrides it. A failed stop still falls through to start (a dead daemon's
 /// only residue is its state file, which start reclaims).
 fn restart_daemon_now(cli: &ParsedCli) -> Result<(), Box<dyn std::error::Error>> {
-    let previous_bind = state_dir()
+    let previous = state_dir()
         .ok()
-        .and_then(|dir| read_state_file(&dir.join(PID_FILE)).ok().flatten())
-        .map(|state| state.bind);
+        .and_then(|dir| read_state_file(&dir.join(PID_FILE)).ok().flatten());
     match stop_daemon() {
         Ok(()) => {}
         Err(err) => eprintln!("[serve] stop phase: {err} (continuing to start)"),
     }
-    start_daemon(cli, previous_bind.as_deref())
+    start_daemon(cli, previous.as_ref())
 }
 
 #[cfg(unix)]
@@ -763,6 +813,12 @@ fn schedule_restart_after_turn(
     cmd.arg("--serve-detached").arg("--serve-restart");
     if !cli.serve_bind.trim().is_empty() {
         cmd.arg("--serve-bind").arg(&cli.serve_bind);
+    }
+    if !cli.serve_tls_cert.trim().is_empty() {
+        cmd.arg("--serve-tls-cert").arg(&cli.serve_tls_cert);
+    }
+    if !cli.serve_tls_key.trim().is_empty() {
+        cmd.arg("--serve-tls-key").arg(&cli.serve_tls_key);
     }
     cmd.env(RESTART_AFTER_PID_ENV, turn_pid.to_string())
         .env(RESTART_REQUEST_ENV, &request)
@@ -811,13 +867,14 @@ fn report_status() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    match query_healthz(&state.bind, Duration::from_secs(3)) {
+    let base = serve_url(&state.bind, state.tls.as_ref());
+    match query_healthz(&state.bind, state.tls.as_ref(), Duration::from_secs(3)) {
         Ok(version) => {
             let version = version.map(|v| format!(" version={v}")).unwrap_or_default();
             println!(
-                "[serve] running pid={} bind=http://{} uptime={}{} log={}",
+                "[serve] running pid={} bind={} uptime={}{} log={}",
                 state.pid,
-                state.bind,
+                base,
                 format_uptime(now_unix().saturating_sub(state.started_unix)),
                 version,
                 dir.join(LOG_FILE).display()
@@ -825,8 +882,8 @@ fn report_status() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Err(err) => Err(format!(
-            "serve pid {} {} but not answering http://{}/healthz ({err}); still starting, or listening elsewhere?",
-            state.pid, PID_LIVENESS_WORD, state.bind
+            "serve pid {} {} but not answering {base}/healthz ({err}); still starting, or listening elsewhere?",
+            state.pid, PID_LIVENESS_WORD
         )
         .into()),
     }
@@ -835,7 +892,7 @@ fn report_status() -> Result<(), Box<dyn std::error::Error>> {
 /// Best-effort state-file write for a foreground `a --serve`, so
 /// `--serve-status` and `--serve-stop` see it too. Never fails the server:
 /// a missing state file only costs manageability, never availability.
-pub(in crate::ai) fn note_foreground_serve(bind: &str) {
+pub(super) fn note_foreground_serve(bind: &str, tls: Option<&ServeTlsConfig>) {
     let dir = match state_dir() {
         Ok(dir) => dir,
         Err(err) => {
@@ -854,8 +911,9 @@ pub(in crate::ai) fn note_foreground_serve(bind: &str) {
     if let Ok(Some(existing)) = read_state_file(&pid_path) {
         if existing.pid != me && process_alive(existing.pid) {
             eprintln!(
-                "[serve] warning: serve daemon already running (pid={} bind=http://{}); this foreground server will not claim --serve-status/--serve-stop",
-                existing.pid, existing.bind
+                "[serve] warning: serve daemon already running (pid={} bind={}); this foreground server will not claim --serve-status/--serve-stop",
+                existing.pid,
+                serve_url(&existing.bind, existing.tls.as_ref())
             );
             return;
         }
@@ -864,6 +922,7 @@ pub(in crate::ai) fn note_foreground_serve(bind: &str) {
         pid: me,
         bind: bind.to_string(),
         started_unix: now_unix(),
+        tls: tls.cloned(),
     };
     if let Err(err) =
         std::fs::create_dir_all(&dir).and_then(|_| write_state_file(&pid_path, &state))
@@ -1091,11 +1150,22 @@ mod tests {
             pid: 4242,
             bind: "127.0.0.1:8080".to_string(),
             started_unix: 1700000000,
+            tls: Some(ServeTlsConfig {
+                cert: "/tmp/local cert.pem".into(),
+                key: "/tmp/local key.pem".into(),
+            }),
         };
         let back = parse_state(&format_state(&state)).expect("round trip");
         assert_eq!(back.pid, 4242);
         assert_eq!(back.bind, "127.0.0.1:8080");
         assert_eq!(back.started_unix, 1700000000);
+        assert_eq!(back.tls, state.tls);
+        assert!(
+            parse_state("42\n127.0.0.1:8080\n1\n")
+                .unwrap()
+                .tls
+                .is_none()
+        );
     }
 
     #[test]

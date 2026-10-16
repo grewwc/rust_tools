@@ -971,12 +971,56 @@ fn resolve_session_ref(arg: &str, listed: &[RemoteSession]) -> Result<String, St
     }
 }
 
-fn normalize_base(bind: &str) -> String {
+fn normalize_base(bind: &str) -> Result<String, String> {
     let trimmed = bind.trim().trim_end_matches('/');
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         trimmed.to_string()
     } else {
         format!("http://{trimmed}")
+    };
+    let url = reqwest::Url::parse(&candidate)
+        .map_err(|err| format!("invalid serve URL {candidate:?}: {err}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(format!(
+            "serve URL must use http:// or https:// and include a host: {candidate:?}"
+        ));
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err(format!(
+            "serve URL must not include a path, query, or fragment: {candidate:?}"
+        ));
+    }
+    Ok(candidate)
+}
+
+fn build_serve_client(
+    ca_cert: &str,
+    timeout: Duration,
+) -> Result<reqwest::blocking::Client, String> {
+    let mut builder = reqwest::blocking::Client::builder().timeout(timeout);
+    let ca_cert = ca_cert.trim();
+    if !ca_cert.is_empty() {
+        let path = PathBuf::from(expanduser(ca_cert).as_ref());
+        let pem = std::fs::read(&path)
+            .map_err(|err| format!("cannot read serve CA certificate {}: {err}", path.display()))?;
+        let certificate = reqwest::Certificate::from_pem(&pem).map_err(|err| {
+            format!(
+                "invalid PEM serve CA certificate {}: {err}",
+                path.display()
+            )
+        })?;
+        builder = builder.add_root_certificate(certificate);
+    }
+    builder
+        .build()
+        .map_err(|err| format!("cannot build serve HTTP client: {err}"))
+}
+
+fn resolve_serve_ca_cert(explicit: &str, configured: &str) -> String {
+    if explicit.trim().is_empty() {
+        configured.trim().to_string()
+    } else {
+        explicit.trim().to_string()
     }
 }
 
@@ -2870,14 +2914,8 @@ fn serve_confirm_channel(
     if !std::io::stdin().is_terminal() {
         return None;
     }
-    // Short timeout: the shared turn client waits up to 10 minutes, which
-    // would pin the render loop on a wedged connection while the child waits.
-    let poster = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .unwrap_or_else(|_| client.clone());
     Some(ServeConfirmChannel {
-        poster,
+        poster: client.clone(),
         base: base.to_string(),
         token: token.to_string(),
         session_id: session_id.to_string(),
@@ -2932,7 +2970,10 @@ impl ServeConfirmChannel {
         out: &mut dyn std::io::Write,
     ) {
         let url = format!("{}/sessions/{}/confirm", self.base, self.session_id);
+        // Reuse the shared client so private-CA trust is preserved, while the
+        // per-request timeout prevents a wedged answer from pinning rendering.
         match auth(self.poster.post(url), &self.token)
+            .timeout(Duration::from_secs(15))
             .json(&confirm_answer_body(id, token, allow))
             .send()
         {
@@ -3100,14 +3141,12 @@ fn remote_side_note_sink(
 ) -> Arc<dyn Fn(String) -> bool + Send + Sync> {
     let url = format!("{base}/sessions/{session_id}/side-notes");
     let token = token.to_string();
-    // Short timeout: the shared turn client waits up to 10 minutes, which
-    // would pin the composer's persist worker on a wedged connection.
-    let poster = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .unwrap_or_else(|_| client.clone());
+    // Reuse the shared client so private-CA trust is preserved. The request
+    // keeps its own short timeout so a wedged server cannot pin the composer.
+    let poster = client.clone();
     Arc::new(move |text: String| {
         auth(poster.post(url.clone()), &token)
+            .timeout(Duration::from_secs(15))
             .json(&serde_json::json!({"text": text}))
             .send()
             .map(|resp| resp.status().is_success())
@@ -3128,11 +3167,11 @@ fn serve_connection(
     // `--serve-bind` wins, then `ai.serve.bind`, then the default.
     let from_cfg = cfg.get_opt(AiConfig::SERVE_BIND).unwrap_or_default();
     let bind = super::resolve_serve_bind(&cli.serve_bind, &from_cfg);
-    let base = normalize_base(&bind);
+    let base = normalize_base(&bind)?;
     let token = cfg.get_opt(AiConfig::SERVE_TOKEN).unwrap_or_default();
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()?;
+    let ca_from_cfg = cfg.get_opt(AiConfig::SERVE_CA_CERT).unwrap_or_default();
+    let ca_cert = resolve_serve_ca_cert(&cli.serve_ca_cert, &ca_from_cfg);
+    let client = build_serve_client(&ca_cert, Duration::from_secs(600))?;
 
     // Fail fast with a copy-pasteable hint when the server is not up.
     let health = client.get(format!("{base}/healthz")).send();
@@ -3147,7 +3186,7 @@ fn serve_connection(
         }
         Err(err) => {
             return Err(format!(
-                "{tool}: cannot reach serve at {base} ({err}); start it first with `a --serve --serve-bind <addr>`"
+                "{tool}: cannot reach serve at {base} ({err}); for HTTPS use `--serve-bind https://<host>:<port>` and, for a private CA, `--serve-ca-cert <ca.pem>`"
             )
             .into());
         }
@@ -3591,6 +3630,34 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::net::TcpListener;
+
+    #[test]
+    fn normalize_base_preserves_explicit_https_and_defaults_to_http() {
+        assert_eq!(
+            normalize_base(" https://10.37.110.250:8080/ ").unwrap(),
+            "https://10.37.110.250:8080"
+        );
+        assert_eq!(
+            normalize_base("10.37.110.250:8080").unwrap(),
+            "http://10.37.110.250:8080"
+        );
+    }
+
+    #[test]
+    fn normalize_base_rejects_non_base_urls() {
+        assert!(normalize_base("https://host:8080/app").is_err());
+        assert!(normalize_base("https://host:8080?mode=chat").is_err());
+        assert!(normalize_base("ftp://host:8080").is_err());
+    }
+
+    #[test]
+    fn explicit_serve_ca_certificate_wins_over_config() {
+        assert_eq!(
+            resolve_serve_ca_cert(" /cli/ca.pem ", "/cfg/ca.pem"),
+            "/cli/ca.pem"
+        );
+        assert_eq!(resolve_serve_ca_cert("", " /cfg/ca.pem "), "/cfg/ca.pem");
+    }
 
     /// Serve one canned HTTP response body, then return its URL. Keeps the
     /// SSE framing tests offline (loopback only, one connection).

@@ -26,6 +26,60 @@ pub(crate) async fn serve_app() -> (
         Html(include_str!("app.html")),
     )
 }
+
+const APP_MANIFEST: &str = r##"{
+  "id": "/app",
+  "name": "a serve",
+  "short_name": "a",
+  "description": "Mobile client for a serve",
+  "start_url": "/app",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0d1117",
+  "theme_color": "#0d1117",
+  "launch_handler": { "client_mode": "navigate-existing" },
+  "icons": [
+    { "src": "/app-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}"##;
+
+const APP_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="112" fill="#0d1117"/><circle cx="256" cy="256" r="160" fill="#2f81f7"/><text x="256" y="270" fill="white" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="300" font-weight="700" text-anchor="middle" dominant-baseline="central">a</text></svg>"##;
+
+/// Public manifest: browsers cannot attach the API bearer token while
+/// installing a web app, and this static identity contains no session data.
+pub(crate) async fn serve_app_manifest() -> Response {
+    public_app_asset(
+        APP_MANIFEST,
+        "application/manifest+json; charset=utf-8",
+        "no-cache",
+    )
+}
+
+/// Public maskable icon referenced by both the manifest and the document head.
+pub(crate) async fn serve_app_icon() -> Response {
+    public_app_asset(APP_ICON_SVG, "image/svg+xml", "public, max-age=86400")
+}
+
+fn public_app_asset(
+    body: &'static str,
+    content_type: &'static str,
+    cache: &'static str,
+) -> Response {
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static(cache),
+    );
+    response.headers_mut().insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
 // Note: /healthz is intentionally public (liveness only, no session data).
 // All session/skill/agent routes enforce check_auth.
 
@@ -59,7 +113,10 @@ pub(crate) struct ServerInfo {
     efforts: Vec<&'static str>,
 }
 
-pub(crate) async fn server_info(State(state): State<ServeState>, headers: HeaderMap) -> impl IntoResponse {
+pub(crate) async fn server_info(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     if let Err(e) = check_auth(&state, &headers) {
         return e.into_response();
     }

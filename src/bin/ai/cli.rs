@@ -109,6 +109,12 @@ pub(super) struct ParsedCli {
     pub(super) serve_sessions: bool,
     /// Bind address override for `--serve-bind` (empty = config/default).
     pub(super) serve_bind: String,
+    /// PEM certificate chain for optional HTTPS serve mode.
+    pub(super) serve_tls_cert: String,
+    /// PEM private key for optional HTTPS serve mode.
+    pub(super) serve_tls_key: String,
+    /// Private CA certificate trusted by serve clients.
+    pub(super) serve_ca_cert: String,
     /// Whether to start the serve daemon in the background (`--serve-start`).
     pub(super) serve_start: bool,
     /// Whether to stop the serve daemon (`--serve-stop`).
@@ -255,7 +261,22 @@ fn register_cli_flags(parser: &mut TermParser) {
     parser.add_string(
         "serve-bind",
         "",
-        "address of the --serve instance (e.g. 127.0.0.1:8080; default from ai.serve.bind)",
+        "server listen address, or HTTP(S) base URL for serve clients (default from ai.serve.bind)",
+    );
+    parser.add_string(
+        "serve-tls-cert",
+        "",
+        "PEM certificate chain for HTTPS serve mode (requires --serve-tls-key)",
+    );
+    parser.add_string(
+        "serve-tls-key",
+        "",
+        "PEM private key for HTTPS serve mode (requires --serve-tls-cert)",
+    );
+    parser.add_string(
+        "serve-ca-cert",
+        "",
+        "PEM CA certificate trusted by --serve-chat/--serve-sessions",
     );
     parser.add_bool(
         "serve-start",
@@ -614,6 +635,9 @@ impl Default for ParsedCli {
             serve_chat: false,
             serve_sessions: false,
             serve_bind: String::new(),
+            serve_tls_cert: String::new(),
+            serve_tls_key: String::new(),
+            serve_ca_cert: String::new(),
             serve_start: false,
             serve_stop: false,
             serve_restart: false,
@@ -721,15 +745,28 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     if parser.contains_flag_strict("serve-bind") {
         cli.serve_bind = parser.flag_value_or_default("serve-bind");
     }
+    if parser.contains_flag_strict("serve-tls-cert") {
+        cli.serve_tls_cert = parser.flag_value_or_default("serve-tls-cert");
+    }
+    if parser.contains_flag_strict("serve-tls-key") {
+        cli.serve_tls_key = parser.flag_value_or_default("serve-tls-key");
+    }
+    if parser.contains_flag_strict("serve-ca-cert") {
+        cli.serve_ca_cert = parser.flag_value_or_default("serve-ca-cert");
+    }
+    let has_serve_transport_override = !cli.serve_bind.trim().is_empty()
+        || !cli.serve_tls_cert.trim().is_empty()
+        || !cli.serve_tls_key.trim().is_empty()
+        || !cli.serve_ca_cert.trim().is_empty();
     if !cli.serve
         && !cli.serve_chat
         && !cli.serve_sessions
         && !cli.serve_start
         && !cli.serve_restart
-        && !cli.serve_bind.trim().is_empty()
+        && has_serve_transport_override
     {
         eprintln!(
-            "[serve] warning: --serve-bind is set without --serve/--serve-chat/--serve-sessions/--serve-start/--serve-restart; it will be ignored"
+            "[serve] warning: serve transport options are set without --serve/--serve-chat/--serve-sessions/--serve-start/--serve-restart; they will be ignored"
         );
     }
 

@@ -1124,10 +1124,39 @@ use super::*;
         assert!(body.contains("/sessions/"));
         assert!(body.contains("turns/stream"));
         assert!(body.contains("/rewind"));
+        assert!(body.contains("rel=\"manifest\" href=\"/app.webmanifest\""));
+        assert!(body.contains("rel=\"icon\" href=\"/app-icon.svg\""));
         assert!(
             body.contains("/file?path="),
             "the page must fetch server-side images through the authed preview route"
         );
+    }
+
+    #[test]
+    fn app_entry_paths_cover_browser_normalizations() {
+        assert_eq!(super::APP_ENTRY_PATHS, ["/", "/app", "/app/"]);
+    }
+
+    #[tokio::test]
+    async fn serve_app_pwa_assets_define_stable_single_window_identity() {
+        use axum::response::IntoResponse as _;
+        let manifest = super::serve_app_manifest().await.into_response();
+        assert_eq!(manifest.status(), StatusCode::OK);
+        assert_eq!(manifest.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()), Some("application/manifest+json; charset=utf-8"));
+        let body = axum::body::to_bytes(manifest.into_body(), 64 * 1024).await.expect("manifest body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("valid manifest");
+        assert_eq!(value["id"], "/app");
+        assert_eq!(value["start_url"], "/app");
+        assert_eq!(value["scope"], "/");
+        assert_eq!(value["display"], "standalone");
+        assert_eq!(value["launch_handler"]["client_mode"], "navigate-existing");
+        assert_eq!(value["icons"][0]["src"], "/app-icon.svg");
+        assert_eq!(value["icons"][0]["purpose"], "any maskable");
+        let icon = super::serve_app_icon().await.into_response();
+        assert_eq!(icon.status(), StatusCode::OK);
+        assert_eq!(icon.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()), Some("image/svg+xml"));
+        let body = axum::body::to_bytes(icon.into_body(), 64 * 1024).await.expect("icon body");
+        assert!(body.starts_with(b"<svg"));
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-//! Serve mode: local HTTP API with parity to the CLI personal assistant.
+//! Serve mode: local HTTP(S) API with parity to the CLI personal assistant.
 //!
 //! v1 scope: HTTP on loopback, Bearer auth (optional), session list/history,
 //! one-shot turns via subprocess (same binary, `--session <id>`), session
@@ -65,6 +65,8 @@ mod files;
 mod session_cwd;
 #[cfg(feature = "serve")]
 mod turn;
+#[cfg(feature = "serve")]
+mod tls;
 #[cfg(all(test, feature = "serve"))]
 mod tests;
 
@@ -90,6 +92,7 @@ pub(crate) use types::*;
 /// Error detail is capped so a large dump (possibly containing local paths)
 /// never floods the API response.
 const MAX_TURN_ERROR_CHARS: usize = 4096;
+const APP_ENTRY_PATHS: [&str; 3] = ["/", "/app", "/app/"];
 /// Cap for one forwarded child-output line so a single tool dump cannot blow
 /// up the SSE frame budget.
 const MAX_SSE_LINE_CHARS: usize = 8192;
@@ -1192,6 +1195,7 @@ pub(in crate::ai) async fn run_serve(
     let cfg = configw::get_all_config();
     let from_cfg = cfg.get_opt(AiConfig::SERVE_BIND).unwrap_or_default();
     let bind = resolve_serve_bind(&cli.serve_bind, &from_cfg);
+    let tls = tls::resolve_serve_tls(&cli.serve_tls_cert, &cli.serve_tls_key, None)?;
     let token = cfg.get_opt(AiConfig::SERVE_TOKEN).unwrap_or_default();
     if token.is_empty() && !is_loopback_bind(&bind) {
         return Err(
@@ -1220,9 +1224,14 @@ pub(in crate::ai) async fn run_serve(
         active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
         confirms: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
-    let app = Router::new()
+    let app = APP_ENTRY_PATHS
+        .into_iter()
+        .fold(Router::new(), |router, path| {
+            router.route(path, get(serve_app))
+        })
         .route("/healthz", get(healthz))
-        .route("/app", get(serve_app))
+        .route("/app.webmanifest", get(serve_app_manifest))
+        .route("/app-icon.svg", get(serve_app_icon))
         .route("/info", get(server_info))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/fork", post(fork_session))
@@ -1254,13 +1263,19 @@ pub(in crate::ai) async fn run_serve(
         .route("/sessions/{id}/cd", post(post_session_cd))
         .route("/sessions/{id}/cd-candidates", get(get_session_cd_candidates))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
-    // Record this process in the global serve state file so `--serve-status`
-    // and `--serve-stop` see a foreground server too. Best-effort: a missing
-    // state file only costs manageability, never availability.
-    ctl::note_foreground_serve(&bind);
-    eprintln!("[serve] listening on http://{bind}");
-    axum::serve(listener, app).await?;
+    if let Some(tls) = tls.as_ref() {
+        let server = tls::TlsServer::bind(&bind, tls).await?;
+        // Record this process in the global serve state file so
+        // `--serve-status` and `--serve-stop` see a foreground server too.
+        ctl::note_foreground_serve(&bind, Some(tls));
+        eprintln!("[serve] listening on https://{bind}");
+        server.serve(app).await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(&bind).await?;
+        ctl::note_foreground_serve(&bind, None);
+        eprintln!("[serve] listening on http://{bind}");
+        axum::serve(listener, app).await?;
+    }
     // The listener shut down cleanly; drop our claim so a later status does
     // not report a stale pid. (A signal-killed server leaves a stale file
     // behind; status/start self-heal by reaping it.)
