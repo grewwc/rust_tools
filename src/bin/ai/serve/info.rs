@@ -72,6 +72,8 @@ self.addEventListener("fetch", (event) => {
 });
 "##;
 
+const APP_ANDROID_APK: &[u8] = include_bytes!("../../../../android/a-serve/dist/a-serve.apk");
+
 /// Public manifest: browsers cannot attach the API bearer token while
 /// installing a web app, and this static identity contains no session data.
 pub(crate) async fn serve_app_manifest() -> Response {
@@ -145,6 +147,29 @@ pub(crate) async fn serve_app_service_worker() -> Response {
     response.headers_mut().insert(
         axum::http::header::HeaderName::from_static("service-worker-allowed"),
         HeaderValue::from_static("/"),
+    );
+    response
+}
+
+/// Public Android shell download. The small APK is compiled into the server so
+/// an installed `a` binary does not depend on the source tree at runtime.
+pub(crate) async fn serve_android_apk() -> Response {
+    let mut response = Response::new(axum::body::Body::from(APP_ANDROID_APK));
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.android.package-archive"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"a-serve-v1.1.0.apk\""),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
     );
     response
 }

@@ -1146,11 +1146,49 @@ async fn serve_app_returns_mobile_client() {
     assert!(body.contains("/rewind"));
     assert!(body.contains("rel=\"manifest\" href=\"/app.webmanifest\""));
     assert!(body.contains("rel=\"icon\" href=\"/app-icon.svg\""));
+    assert!(body.contains(
+        "href=\"/a-serve-v1.1.0.apk\" download=\"a-serve-v1.1.0.apk\""
+    ));
     assert!(body.contains("serviceWorker.register(\"/app-sw.js\", { scope: \"/\" })"));
     assert!(
         body.contains("/file?path="),
         "the page must fetch server-side images through the authed preview route"
     );
+}
+
+#[tokio::test]
+async fn serve_android_apk_returns_installable_attachment() {
+    let response = super::serve_android_apk().await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/vnd.android.package-archive")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok()),
+        Some("attachment; filename=\"a-serve-v1.1.0.apk\"")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("APK body");
+    assert!(
+        body.len() > 10_000,
+        "APK should not be an empty placeholder"
+    );
+    assert!(body.starts_with(b"PK\x03\x04"), "APK must be a ZIP archive");
 }
 
 #[test]

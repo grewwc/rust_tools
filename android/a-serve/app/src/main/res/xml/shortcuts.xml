@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:enabled="true"
+        android:shortcutId="server_settings"
+        android:shortcutShortLabel="@string/change_server">
+        <intent
+            android:action="com.grewwc.aserve.CONFIGURE"
+            android:targetClass="com.grewwc.aserve.MainActivity"
+            android:targetPackage="com.grewwc.aserve" />
+    </shortcut>
+</shortcuts>

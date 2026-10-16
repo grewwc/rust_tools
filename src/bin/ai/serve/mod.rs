@@ -1271,6 +1271,8 @@ pub(in crate::ai) async fn run_serve(
         .route("/app-icon-192.png", get(serve_app_icon_192))
         .route("/app-icon-512.png", get(serve_app_icon_512))
         .route("/app-sw.js", get(serve_app_service_worker))
+        .route("/a-serve.apk", get(serve_android_apk))
+        .route("/a-serve-v1.1.0.apk", get(serve_android_apk))
         .route("/info", get(server_info))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/fork", post(fork_session))

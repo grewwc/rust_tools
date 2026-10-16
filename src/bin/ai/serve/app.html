@@ -19,6 +19,8 @@ body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-sys
 header { display:flex; align-items:center; gap:8px; padding:10px 12px; background:var(--panel); border-bottom:1px solid var(--line); }
 header b { font-size:15px; }
 #info { font-size:12px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1; }
+#apkdownload { display:none; }
+#apkdownload svg { width:21px; height:21px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
 button, select, input, textarea { font:inherit; color:var(--fg); background:#0d1117; border:1px solid var(--line); border-radius:8px; }
 button { padding:7px 12px; background:#21262d; cursor:pointer; touch-action:manipulation; }
 button:disabled { opacity:.5; cursor:default; }
@@ -190,6 +192,12 @@ select, summary { touch-action:manipulation; }
 /* ---- phone layout (narrow viewports only; desktop is untouched) ---------- */
 @media (max-width:700px) {
   header button { min-width:44px; min-height:44px; }
+  #apkdownload {
+    display:grid; flex:0 0 44px; width:44px; height:44px; place-items:center;
+    border:1px solid #3a424d; border-radius:10px; background:#21262d;
+    color:#79c0ff; text-decoration:none; touch-action:manipulation;
+  }
+  #apkdownload:active { background:#30363d; transform:translateY(1px); }
   /* The drawer floats over the chat instead of squeezing it; tapping the
      dimmed remainder (the scrim) closes it. */
   #sessions { position:absolute; top:0; bottom:0; left:0; z-index:10; width:min(86vw,320px); box-shadow:8px 0 24px rgba(0,0,0,.55); }
@@ -276,6 +284,7 @@ select, summary { touch-action:manipulation; }
 <header>
 <button id="menu" aria-label="sessions">☰</button>
 <b>a</b><span id="info">connecting…</span>
+<a id="apkdownload" href="/a-serve-v1.1.0.apk" download="a-serve-v1.1.0.apk" aria-label="download Android app" title="download Android app"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></a>
 <button id="connbtn" aria-label="connection">⚙</button>
 <button id="newbtn" class="primary">＋</button>
 </header>

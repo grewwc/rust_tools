@@ -22,3 +22,9 @@ history.sqlite-*
 /scripts/__pycache__/
 # prompt_eval.py 运行产物（每 case 的转录、manifest、scores.json）：本地评测数据，不提交。
 /scripts/prompt_eval_runs/
+# Android build state and local SDK paths.
+/android/**/.gradle/
+/android/**/build/
+/android/**/local.properties
+/android/**/dist/*
+!/android/a-serve/dist/a-serve.apk

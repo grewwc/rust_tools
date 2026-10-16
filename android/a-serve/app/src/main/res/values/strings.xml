@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">a serve</string>
+    <string name="change_server">服务器地址</string>
+    <string name="server_dialog_title">连接 a serve · v%1$s</string>
+    <string name="server_dialog_hint">https://服务器地址:端口</string>
+    <string name="server_dialog_save">连接</string>
+    <string name="server_dialog_cancel">取消</string>
+    <string name="server_url_invalid">请输入有效的 HTTPS 地址</string>
+    <string name="server_connection_failed">无法连接服务器，可检查地址、服务状态和 CA 证书。</string>
+    <string name="server_tls_failed">TLS 验证失败（APK v%1$s：%2$s）。此版本已内置 a serve CA，且不会绕过证书校验。</string>
+    <string name="tls_not_yet_valid">证书尚未生效</string>
+    <string name="tls_expired">证书已过期</string>
+    <string name="tls_id_mismatch">服务器地址与证书不匹配</string>
+    <string name="tls_untrusted">证书不受信任</string>
+    <string name="tls_date_invalid">证书日期无效</string>
+    <string name="tls_invalid">证书无效</string>
+</resources>

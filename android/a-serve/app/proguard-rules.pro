@@ -1,0 +1,1 @@
+# No custom rules are needed while code shrinking is disabled.
