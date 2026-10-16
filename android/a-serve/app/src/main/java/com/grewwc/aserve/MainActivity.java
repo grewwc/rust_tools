@@ -57,10 +57,7 @@ public final class MainActivity extends Activity {
         createWebView();
 
         boolean configure = CONFIGURE_ACTION.equals(getIntent().getAction());
-        if (serverOrigin != null
-                && (savedInstanceState == null || webView.restoreState(savedInstanceState) == null)) {
-            loadApp();
-        }
+        if (serverOrigin != null) loadApp();
         if (configure || serverOrigin == null) showServerDialog(null, serverOrigin == null);
     }
 
@@ -82,6 +79,9 @@ public final class MainActivity extends Activity {
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
+        // The server owns the UI. Always fetch its current shell instead of
+        // restoring an obsolete document after the server has been upgraded.
+        settings.setCacheMode(WebSettings.LOAD_NO_CACHE);
         settings.setAllowFileAccess(false);
         // The system picker grants access only to files explicitly selected by the user.
         settings.setAllowContentAccess(true);
@@ -105,7 +105,7 @@ public final class MainActivity extends Activity {
     }
 
     private void loadApp() {
-        webView.loadUrl(ServerUrl.appUrl(serverOrigin));
+        webView.loadUrl(ServerUrl.freshAppUrl(serverOrigin, System.currentTimeMillis()));
     }
 
     private int dp(int value) {
@@ -236,13 +236,12 @@ public final class MainActivity extends Activity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        if (CONFIGURE_ACTION.equals(intent.getAction())) showServerDialog(null, false);
-    }
-
-    @Override
-    protected void onSaveInstanceState(Bundle outState) {
-        webView.saveState(outState);
-        super.onSaveInstanceState(outState);
+        if (CONFIGURE_ACTION.equals(intent.getAction())) {
+            showServerDialog(null, false);
+        }
+        // A singleTask activity receives another launcher intent when its icon is
+        // tapped again. Keep the live document so WebView focus and IME composition
+        // survive; cold starts and explicit server changes still call loadApp().
     }
 
     @Override

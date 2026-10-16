@@ -283,6 +283,29 @@ test("a mobile side note queues text without stopping the running turn", async (
   assert.equal(button.disabled, false);
 });
 
+test("a visible side-note control refreshes an expired running-state sample", async () => {
+  const start = script.indexOf("async function sendSideNote(");
+  const end = script.indexOf("async function stopTurn(", start);
+  let running = false;
+  let polls = 0;
+  let posts = 0;
+  const prompt = { value: "continue", style: {}, focus() {} };
+  const button = { disabled: false };
+  const context = vm.createContext({
+    sideNoteBusy: false, sessionId: "session-a", pendingImages: [],
+    isTurnRunning: () => running,
+    pollConfirm: async () => { polls++; running = true; return true; },
+    $: (id) => id === "prompt" ? prompt : button,
+    api: async () => { posts++; }, clearDraft() {}, note() {}, syncStopButton() {}, JSON,
+  });
+  vm.runInContext(script.slice(start, end), context);
+  await context.sendSideNote();
+  assert.equal(polls, 1);
+  assert.equal(posts, 1);
+  assert.equal(prompt.value, "");
+  assert.equal(button.disabled, false);
+});
+
 test("a failed side note preserves the draft and pending images never enter a note", async () => {
   const start = script.indexOf("async function sendSideNote(");
   const end = script.indexOf("async function stopTurn(", start);
@@ -297,7 +320,7 @@ test("a failed side note preserves the draft and pending images never enter a no
     isTurnRunning: () => true,
     $: (id) => id === "prompt" ? prompt : button,
     api: async () => { apiCalls++; throw new Error("offline"); },
-    clearDraft: () => assert.fail("failed notes must not clear drafts"),
+    clearDraft: () => assert.fail("failed notes must not clear drafts"), syncStopButton() {},
     note: (message) => notices.push(message),
     JSON,
   });
@@ -637,6 +660,7 @@ test("the real streaming paint typesets completed formulas before the final even
   };
   Object.assign(h.context, {
     bubble, raw: "$x", paintTimer: null, sid: "s", sessionId: "s",
+    activityDirty: false,
     answerDirty: true, progressDirty: false, thinkingDirty: false, thinkingDoneDirty: false,
     shouldFollowOutput: () => true, followOutput() {},
   });
@@ -676,7 +700,8 @@ test("stream paint batches answer, thinking and progress into one follow pass", 
   };
   Object.assign(h.context, {
     answerDirty: true, progressDirty: true, thinkingDirty: true, thinkingDoneDirty: true,
-    expandProgress: true, progDetails: { open: false }, renderProgress: () => { progressWrites++; },
+    activityDirty: false,
+    expandProgress: true, prog: {}, progDetails: { open: false }, renderProgress: () => { progressWrites++; },
     think, thinkRaw: "reasoning", bubble, raw: "answer", paintTimer: 1,
     sid: "s", sessionId: "s",
     shouldFollowOutput: () => { followChecks++; return true; },
@@ -697,33 +722,34 @@ test("stream paint batches answer, thinking and progress into one follow pass", 
   );
 });
 
-test("repeated thinking phases reuse one turn-level fold", () => {
-  const start = script.indexOf("function activateThinkingFold(");
+test("separate thinking phases create separate folds", () => {
+  const start = script.indexOf("function createThinkingFold(");
   const end = script.indexOf("// The three override picks", start);
   assert.ok(start >= 0 && end > start);
   const summary = { textContent: "thinking" };
-  const body = { textContent: "first phase" };
-  const fold = { box: { querySelector: () => summary }, body };
+  const body = { textContent: "" };
+  const fold = () => ({ box: { querySelector: () => summary }, body });
   let creations = 0;
   let insertions = 0;
-  const parent = { insertBefore(node, before) { insertions++; assert.equal(node, fold.box); assert.equal(before, "reply"); } };
+  const parent = { insertBefore(node, before) { insertions++; assert.ok(node); assert.equal(before, "reply"); } };
   const context = vm.createContext({
     addFold(title, text, host) {
       creations++;
       assert.equal(title, "thinking…");
       assert.equal(text, "");
       assert.equal(host, parent);
-      return fold;
+      summary.textContent = title;
+      return fold();
     },
   });
   vm.runInContext(script.slice(start, end), context);
-  const first = context.activateThinkingFold(null, parent, "reply");
-  const second = context.activateThinkingFold(first, parent, "reply");
-  assert.equal(second, first);
-  assert.equal(creations, 1);
-  assert.equal(insertions, 1);
+  const first = context.createThinkingFold(parent, "reply");
+  const second = context.createThinkingFold(parent, "reply");
+  assert.notEqual(second, first);
+  assert.equal(creations, 2);
+  assert.equal(insertions, 2);
   assert.equal(summary.textContent, "thinking…");
-  assert.equal(body.textContent, "first phase");
+  assert.equal(body.textContent, "");
 });
 
 test("delta blocks defer layout work to the coalesced paint", () => {
@@ -733,9 +759,40 @@ test("delta blocks defer layout work to the coalesced paint", () => {
   assert.ok(start >= 0 && end > start);
   assert.doesNotMatch(blockDispatch, /shouldFollowOutput|followOutput/);
   assert.match(blockDispatch, /kind === "delta"[\s\S]*?answerDirty = true;[\s\S]*?schedulePaint\(\)/);
-  assert.match(blockDispatch, /kind === "thinking_start"[\s\S]*?activateThinkingFold\(think, box, bubble\)/);
-  assert.match(blockDispatch, /kind === "thinking"[\s\S]*?thinkingDirty = true;[\s\S]*?schedulePaint\(\)/);
-  assert.match(blockDispatch, /kind === "subagent_progress"[\s\S]*?progressDirty = true;[\s\S]*?schedulePaint\(\)/);
+  assert.match(blockDispatch, /kind === "thinking_start"[\s\S]*?closeThinkingPhase\(\)/);
+  assert.match(blockDispatch, /kind === "thinking"[\s\S]*?if \(text\)[\s\S]*?createThinkingFold\(box, bubble\)[\s\S]*?thinkingDirty = true;[\s\S]*?schedulePaint\(\)/);
+  assert.doesNotMatch(blockDispatch, /kind !== "thinking_start" && kind !== "thinking" && kind !== "thinking_done"/);
+  assert.match(blockDispatch, /kind === "done"[\s\S]*?closeThinkingPhase\(\)/);
+  assert.match(blockDispatch, /kind === "subagent_progress"[\s\S]*?activity.subagents\(payload\)/);
+});
+
+test("progress cannot split an active thinking phase", () => {
+  const start = script.indexOf('const { kind, payload } = parseBlock');
+  const end = script.indexOf("if (finished) break;", start);
+  const blockDispatch = script.slice(start, end);
+  const progressBranch = blockDispatch.match(/else if \(payload\) \{([\s\S]*?)\n        \}/);
+  const subagentBranch = blockDispatch.match(/else if \(kind === "subagent_progress"\) \{([\s\S]*?)\n        \}/);
+  assert.ok(progressBranch);
+  assert.ok(subagentBranch);
+  assert.doesNotMatch(progressBranch[1], /closeThinkingPhase/);
+  assert.doesNotMatch(subagentBranch[1], /closeThinkingPhase/);
+  assert.match(progressBranch[1], /ensureProgressPhase\(\)/);
+  assert.match(subagentBranch[1], /activity.subagents\(payload\)/);
+  assert.doesNotMatch(blockDispatch, /closeProgressPhase/);
+  assert.match(script, /const ensureProgressPhase = \(\) => \{[\s\S]*?box\.insertBefore\(prog\.box, bubble\)/);
+  assert.doesNotMatch(script, /finalizing response/);
+});
+
+test("prompt composition defers reflow, draft writes and keyboard shortcuts", () => {
+  const start = script.indexOf('$("prompt").addEventListener("compositionstart"');
+  const end = script.indexOf("const toggleSessions", start);
+  const promptHandlers = script.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.match(promptHandlers, /compositionstart[\s\S]*?promptComposing = true/);
+  assert.match(promptHandlers, /compositionend[\s\S]*?promptComposing = false[\s\S]*?growPrompt\(\)[\s\S]*?persistDraft\(\)/);
+  assert.match(promptHandlers, /addEventListener\("input", \(e\)[\s\S]*?if \(promptComposing \|\| e\.isComposing\) return/);
+  assert.match(promptHandlers, /addEventListener\("keydown", \(e\)[\s\S]*?if \(e\.isComposing \|\| e\.keyCode === 229\) return/);
+  assert.match(script, /document\.activeElement === prompt\)\) growPrompt\(\)/);
 });
 
 test("media decoration leaves math text and rendered math subtrees alone", () => {

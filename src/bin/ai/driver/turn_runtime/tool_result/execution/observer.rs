@@ -363,6 +363,20 @@ pub(in crate::ai::driver::turn_runtime) fn format_command_input(arguments: &str)
 }
 
 impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
+    fn on_tool_dispatched(&mut self, tool_call: &ToolCall) {
+        // Background agents share the process FIFO but not the foreground turn.
+        if crate::ai::background::serve_live_streaming()
+            && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+        {
+            if let Some(payload) = crate::ai::background::serve_tool_started_payload(tool_call) {
+                crate::ai::background::publish_serve_frame(
+                    crate::ai::background::ServeLiveKind::Tool,
+                    &payload,
+                );
+            }
+        }
+    }
+
     fn on_tool_started(&mut self, tool_call: &ToolCall) {
         if matches!(
             tool_call.function.name.as_str(),
@@ -422,6 +436,22 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
     }
 
     fn on_tool_finished(&mut self, tool_call: &ToolCall, run_result: &tools::RunOneResult) {
+        if crate::ai::background::serve_live_streaming()
+            && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+        {
+            if let Some(payload) = crate::ai::background::serve_tool_finished_payload(
+                tool_call,
+                &run_result.tool_result.content,
+                run_result.ok,
+                run_result.cached,
+                run_result.executed,
+            ) {
+                crate::ai::background::publish_serve_frame(
+                    crate::ai::background::ServeLiveKind::Tool,
+                    &payload,
+                );
+            }
+        }
         let streamed_output = self.active_stream_tool_call_id.as_deref()
             == Some(tool_call.id.as_str())
             && self.streamed_any_output;
@@ -519,6 +549,7 @@ impl ToolExecutor for RoundToolExecutorAdapter {
                     if call.function.name == "session_distill"
                         && !self.suppressed_read_only_results.contains_key(&call.id)
                     {
+                        observer.on_tool_dispatched(&call);
                         observer.on_tool_started(&call);
                         let run = crate::ai::driver::tools::run_session_distill(
                             app, &snapshot, &self.session_id, &call, &self.allowed_tool_names,

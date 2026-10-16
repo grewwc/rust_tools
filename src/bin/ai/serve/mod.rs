@@ -617,7 +617,7 @@ fn setup_live_fifo(_session_id: &str) -> Option<LiveFifo> {
 /// discriminants (1 = delta, 2 = thinking start, 3 = thinking chunk,
 /// 4 = thinking done, 5 = output complete, 6 = confirmation request,
 /// 7 = confirmation resolved, 8 = subagent progress, 9 = input request,
-/// 10 = input resolved, 11 = assistant body pending).
+/// 10 = input resolved, 11 = assistant body pending, 12 = tool lifecycle).
 #[derive(Debug, PartialEq, Eq)]
 #[cfg(feature = "serve")]
 enum ServeLiveEvent {
@@ -639,6 +639,8 @@ enum ServeLiveEvent {
     InputDone(String),
     /// Assistant prose is buffered until the final-response gates accept it.
     AssistantBodyPending,
+    /// Bounded JSON describing an actual tool dispatch or its completed result.
+    Tool(String),
 }
 
 /// Incremental parser for serve-live frames (`[kind: u8][len: u32 BE][payload]`):
@@ -675,7 +677,8 @@ impl ServeFrameDecoder {
                 || kind == background::ServeLiveKind::SubagentProgress as u8
                 || kind == background::ServeLiveKind::InputRequest as u8
                 || kind == background::ServeLiveKind::InputDone as u8
-                || kind == background::ServeLiveKind::AssistantBodyPending as u8;
+                || kind == background::ServeLiveKind::AssistantBodyPending as u8
+                || kind == background::ServeLiveKind::Tool as u8;
             if !known || len > background::MAX_SERVE_FRAME_LEN as usize {
                 self.buf.clear();
                 break;
@@ -717,6 +720,7 @@ impl ServeFrameDecoder {
                 k if k == background::ServeLiveKind::AssistantBodyPending as u8 => {
                     ServeLiveEvent::AssistantBodyPending
                 }
+                k if k == background::ServeLiveKind::Tool as u8 => ServeLiveEvent::Tool(payload),
                 // Every kind accepted by the `known` gate above must have an
                 // arm here: falling through would end the turn for a frame
                 // that is not an output-complete marker.
@@ -762,6 +766,7 @@ fn live_event(event: ServeLiveEvent) -> Option<Event> {
         ServeLiveEvent::SubagentProgress(line) => {
             Some(Event::default().event("subagent_progress").data(line))
         }
+        ServeLiveEvent::Tool(payload) => Some(Event::default().event("tool").data(payload)),
         ServeLiveEvent::OutputComplete => None,
     }
 }
@@ -1273,6 +1278,9 @@ pub(in crate::ai) async fn run_serve(
         .route("/app-sw.js", get(serve_app_service_worker))
         .route("/a-serve.apk", get(serve_android_apk))
         .route("/a-serve-v1.1.0.apk", get(serve_android_apk))
+        .route("/a-serve-v1.2.0.apk", get(serve_android_apk))
+        .route("/a-serve-v1.3.0.apk", get(serve_android_apk))
+        .route("/a-serve-v1.4.0.apk", get(serve_android_apk))
         .route("/info", get(server_info))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/fork", post(fork_session))

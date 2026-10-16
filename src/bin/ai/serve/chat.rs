@@ -2634,6 +2634,8 @@ fn render_turn_stream_to_with_confirm(
                     out,
                 );
             }
+            // Text progress already serves the terminal; do not print web UI JSON.
+            "tool" => {}
             "answer_pending" => {
                 answer_pending = true;
                 show_answer_pending_status(
@@ -4403,6 +4405,20 @@ mod tests {
             !out.contains("| ---"),
             "raw separator must not leak, got: {out}"
         );
+    }
+
+    #[test]
+    fn serve_tool_lifecycle_chat_preserves_answer_without_json() {
+        let body = "event: tool\ndata: {\"id\":\"a\",\"name\":\"read_file\",\"phase\":\"started\",\"arguments\":\"{}\"}\n\nevent: delta\ndata: {\"delta\":\"answer\"}\n\nevent: tool\ndata: {\"id\":\"a\",\"name\":\"read_file\",\"phase\":\"finished\",\"output\":\"private preview\"}\n\nevent: done\ndata: \n\n";
+        for tty in [false, true] {
+            let response = reqwest::blocking::get(serve_body_once(body)).unwrap();
+            let mut output = Vec::new();
+            render_turn_stream_to(response, &mut output, tty).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("answer"), "{output}");
+            assert!(!output.contains("private preview"), "{output}");
+            assert!(!output.contains("read_file"), "{output}");
+        }
     }
 
     #[test]

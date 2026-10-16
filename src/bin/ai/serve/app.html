@@ -57,6 +57,9 @@ select, summary { touch-action:manipulation; }
 #chat { flex:1; display:flex; flex-direction:column; min-width:0; }
 #msgwrap { flex:1; min-height:0; position:relative; }
 #msgs { height:100%; box-sizing:border-box; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:10px; overscroll-behavior-y:contain; }
+.turn { display:flex; flex-direction:column; gap:8px; min-width:0; }
+.turn .tool-activity summary { color:var(--fg); }
+.turn .tool-activity[data-running="true"] { border-color:#426b94; }
 #jumpbottom {
   display:none; position:absolute; right:16px; bottom:14px; z-index:3;
   width:46px; height:46px; padding:0; place-items:center; border-radius:50%;
@@ -114,6 +117,7 @@ select, summary { touch-action:manipulation; }
 }
 #conn { display:none; gap:6px; padding:8px 12px; background:var(--panel); border-top:1px solid var(--line); }
 #conn.open { display:flex; }
+#conn:not(.open) ~ #inputtrace { display:none; }
 #conn input { flex:1; min-width:0; font-size:13px; padding:6px 8px; }
 #connstat { display:none; padding:2px 12px 6px; font-size:12px; color:var(--dim); background:var(--panel); }
 #connstat.show { display:block; }
@@ -284,7 +288,7 @@ select, summary { touch-action:manipulation; }
 <header>
 <button id="menu" aria-label="sessions">☰</button>
 <b>a</b><span id="info">connecting…</span>
-<a id="apkdownload" href="/a-serve-v1.1.0.apk" download="a-serve-v1.1.0.apk" aria-label="download Android app" title="download Android app"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></a>
+<a id="apkdownload" href="/a-serve-v1.4.0.apk" download="a-serve-v1.4.0.apk" aria-label="download Android app" title="download Android app"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></a>
 <button id="connbtn" aria-label="connection">⚙</button>
 <button id="newbtn" class="primary">＋</button>
 </header>
@@ -293,8 +297,10 @@ select, summary { touch-action:manipulation; }
 <input id="base" placeholder="server, e.g. http://192.168.1.5:8080 (empty = this page)">
 <input id="token" type="password" placeholder="bearer token (ai.serve.token)" style="flex:1">
 <button id="save">save</button>
+<button id="inputdiagnostics" type="button" title="Show local input event timings, without typed text">input diagnostics</button>
 </div>
 <div id="connstat"></div>
+<textarea id="inputtrace" hidden readonly rows="5" aria-label="input diagnostics (no typed text)" style="flex-shrink:0;margin:6px 12px;font-size:12px"></textarea>
 <div id="views">
 <div id="scrim"></div>
 <nav id="sessions"><input id="sessfilter" placeholder="filter sessions…" autocomplete="off">
@@ -795,6 +801,7 @@ function syncOvrSummary() {
 }
 // The composer grows with its content (up to the CSS cap) instead of
 // trapping multi-line input in a 44px box with an inner scroll.
+let promptComposing = false;
 function growPrompt() {
   const p = $("prompt");
   const phone = window.matchMedia && window.matchMedia("(max-width:700px)").matches;
@@ -1213,16 +1220,74 @@ function addFold(title, bodyText, parent) {
   return { box: d, body: pre, set(title2, text2) { sum.textContent = title2; pre.textContent = text2; } };
 }
 
-// A tool-using turn can enter model thinking more than once. Keep those phases
-// in one turn-level fold instead of adding an indistinguishable card per phase.
-function activateThinkingFold(current, parent, before) {
-  if (current) {
-    current.box.querySelector("summary").textContent = "thinking…";
-    return current;
-  }
+// Create a fold only after real thinking text arrives. Explicit lifecycle
+// events close each phase; concurrent progress cannot split the reasoning text.
+function createThinkingFold(parent, before) {
   const next = addFold("thinking…", "", parent);
   parent.insertBefore(next.box, before);
   return next;
+}
+
+// Live tools use the same call labels as history, keyed by call id rather than
+// inferred from stderr. Completion updates its own card, even for parallel tools.
+function createLiveActivity(parent, before) {
+  const tools = new Map();
+  let phase = "Connecting…";
+  let waiting = false;
+  let subagents = null;
+  const insert = (title) => {
+    const fold = addFold(title, "", parent);
+    parent.insertBefore(fold.box, before);
+    return fold;
+  };
+  const renderTool = (tool) => {
+    const call = { function: { name: tool.name, arguments: tool.arguments || "{}" } };
+    const icon = tool.running ? "◌ " : tool.ok === false ? "! " : tool.ok === true ? "✓ " : "• ";
+    const title = icon + callLabel(call) + (tool.cached ? " · cached" : "");
+    tool.fold.box.dataset.running = String(tool.running);
+    const args = tool.arguments ? "Arguments\n" + tool.arguments + (tool.arguments_truncated ? "\n[preview truncated]" : "") + "\n\n" : "";
+    tool.fold.set(title, args + (tool.output || "") + (tool.output_truncated ? "\n[preview truncated; full output in history]" : ""));
+  };
+  return {
+    setPhase(text, needsInput = false) { phase = text; waiting = needsInput; },
+    label() {
+      const active = [...tools.values()].filter((tool) => tool.running);
+      if (waiting || !active.length) return phase;
+      return "Running " + active.map((tool) => tool.name).join(", ") + "…";
+    },
+    tool(event) {
+      if (!event || !event.id || !event.name || !["started", "finished"].includes(event.phase)) return;
+      let tool = tools.get(event.id);
+      if (!tool) {
+        tool = { fold: insert(event.name), name: event.name };
+        tool.fold.box.classList.add("tool-activity");
+        tools.set(event.id, tool);
+      }
+      if (typeof event.arguments === "string") tool.arguments = event.arguments;
+      if (typeof event.output === "string") tool.output = event.output;
+      for (const key of ["ok", "cached", "arguments_truncated", "output_truncated"]) {
+        if (typeof event[key] === "boolean") tool[key] = event[key];
+      }
+      tool.running = event.phase === "started";
+      phase = "Processing…";
+      renderTool(tool);
+    },
+    subagents(text) {
+      if (!subagents && !text) return;
+      if (!subagents) subagents = insert("subagents");
+      subagents.set("subagents · " + shortLine(text || "idle", 100), text);
+    },
+    finish(reason) {
+      for (const tool of tools.values()) if (tool.running) {
+        tool.running = false;
+        tool.fold.box.dataset.running = "false";
+        tool.fold.set(callLabel({ function: { name: tool.name, arguments: tool.arguments || "{}" } }) + " · " + reason,
+          (tool.arguments || "") + "\n" + (tool.output || ""));
+      }
+      phase = reason;
+      waiting = false;
+    },
+  };
 }
 
 // The three override picks are per-session, not per-browser: they live in the
@@ -1912,15 +1977,35 @@ function note(msg) {
   noteTimer = setTimeout(() => { el.classList.remove("show", "note"); noteTimer = null; }, 3000);
 }
 async function sendSideNote() {
-  if (sideNoteBusy || !sessionId || !isTurnRunning()) return;
+  if (sideNoteBusy || !sessionId) return;
+  sideNoteBusy = true;
+  $("sidenote").disabled = true;
+  if (!isTurnRunning()) {
+    const running = await pollConfirm();
+    if (running !== true && !isTurnRunning()) {
+      note("no turn running");
+      sideNoteBusy = false;
+      syncStopButton();
+      return;
+    }
+  }
   const input = $("prompt");
   const draft = input.value;
   const text = draft.trim();
-  if (!text) { note("type a side note first"); input.focus(); return; }
-  if (pendingImages.length) { note("side notes are text only — send the pending images after this turn"); return; }
+  if (!text) {
+    note("type a side note first");
+    input.focus();
+    sideNoteBusy = false;
+    syncStopButton();
+    return;
+  }
+  if (pendingImages.length) {
+    note("side notes are text only — send the pending images after this turn");
+    sideNoteBusy = false;
+    syncStopButton();
+    return;
+  }
   const targetSession = sessionId;
-  sideNoteBusy = true;
-  $("sidenote").disabled = true;
   try {
     await api("/sessions/" + targetSession + "/side-notes", {
       method: "POST", body: JSON.stringify({ text }),
@@ -2033,22 +2118,35 @@ async function send() {
   $("msgs").appendChild(box);
   turns.set(sid, { box });
   syncStopButton(); // only now does isTurnRunning() see this session's own turn
-  // Chronological DOM order: progress and thinking folds are created before
-  // (or inserted ahead of) the reply bubble, so the trace reads top-down
-  // and the final answer always lands last.
-  const prog = addFold("progress", "", box);
-  const progDetails = prog.box.querySelector("details");
+  // Progress and thinking folds are inserted lazily in stream order ahead of
+  // the final reply, so tool phases remain visible between reasoning phases.
   const bubble = addMsgMd("", box);
+  const activity = createLiveActivity(box, bubble);
+  let activityDirty = true;
+  const setPhase = (label, waiting = false) => {
+    activity.setPhase(label, waiting);
+    activityDirty = true;
+    schedulePaint();
+  };
+  let prog = null;
+  let progDetails = null;
   let progLines = [];
   let subagentProgress = "";
+  const progressFolds = [];
+  const ensureProgressPhase = () => {
+    if (prog) return;
+    prog = addFold("activity log", "", box);
+    box.insertBefore(prog.box, bubble);
+    progDetails = prog.box.querySelector("details");
+    progressFolds.push(prog);
+  };
   const renderProgress = () => {
     const visible = progLines.slice(-50);
-    if (subagentProgress) visible.push(subagentProgress);
-    const count = progLines.length + (subagentProgress ? 1 : 0);
-    prog.set("progress (" + count + ")", visible.join("\n"));
+    prog.set("activity log (" + progLines.length + ") · " + shortLine(visible[visible.length - 1] || "", 80), visible.join("\n"));
   };
   let think = null;
   let thinkRaw = "";
+  const thinkingFolds = [];
   let answerDirty = false;
   let progressDirty = false;
   let expandProgress = false;
@@ -2062,9 +2160,16 @@ async function send() {
   let paintTimer = null;
   const paint = () => {
     paintTimer = null;
-    if (!answerDirty && !progressDirty && !thinkingDirty && !thinkingDoneDirty) return;
+    if (!answerDirty && !progressDirty && !thinkingDirty && !thinkingDoneDirty && !activityDirty) return;
     const follow = sid === sessionId && shouldFollowOutput();
-    if (progressDirty) {
+    if (activityDirty) {
+      if (!raw) {
+        bubble.classList.add("pending");
+        bubble.textContent = "◌ " + activity.label();
+      }
+      activityDirty = false;
+    }
+    if (progressDirty && prog) {
       if (expandProgress) progDetails.open = true;
       renderProgress();
       progressDirty = false;
@@ -2091,6 +2196,13 @@ async function send() {
     if (paintTimer !== null) { clearTimeout(paintTimer); paintTimer = null; }
     paint();
   };
+  const closeThinkingPhase = () => {
+    if (!think) return;
+    thinkingDoneDirty = true;
+    flushPaint();
+    think = null;
+    thinkRaw = "";
+  };
   const mutateTranscript = (mutation) => {
     const follow = sid === sessionId && shouldFollowOutput();
     mutation();
@@ -2098,11 +2210,11 @@ async function send() {
   };
   const fail = (msg) => {
     if (paintTimer !== null) { clearTimeout(paintTimer); paintTimer = null; }
+    activity.finish("interrupted");
+    activityDirty = false;
     bubble.classList.remove("pending");
     bubble.classList.add("err");
     bubble.textContent = msg;
-    prog.box.remove();
-    if (think) think.box.remove();
   };
   // The POST is accepted before its first byte arrives, and the server keeps the
   // turn running even if this page goes away: only a server-sent `error` event is
@@ -2147,6 +2259,7 @@ async function send() {
     let buf = "";
     armStall(); // the first meaningful block must arrive within STREAM_STALL_MS
     let finished = false;
+    setPhase("Waiting for model…");
     for (;;) {
       const { done, value } = await reader.read();
       if (value) buf += dec.decode(value, { stream: true });
@@ -2157,6 +2270,9 @@ async function send() {
         buf = buf.slice(idx + 2);
         if (kind !== "" || payload) armStall(); // keep-alive comments (empty) must not mask a stalled turn
         if (kind === "done") {
+          closeThinkingPhase();
+          activity.finish("ended");
+          activityDirty = false;
           if (!answerDirty) mutateTranscript(() => {
             bubble.classList.remove("pending");
             if (!raw) bubble.textContent = "";
@@ -2166,44 +2282,53 @@ async function send() {
         }
         else if (kind === "error") { turnError = true; throw new Error(JSON.parse(payload).error || "turn failed"); }
         else if (kind === "delta") {
+          closeThinkingPhase();
           try { raw += JSON.parse(payload).delta || ""; }
           catch (_) { raw += payload; }
           answerDirty = true;
           schedulePaint();
         }
         else if (kind === "answer_pending" && !raw) {
-          mutateTranscript(() => {
-            bubble.classList.add("pending");
-            bubble.textContent = "◌ finalizing response…";
-          });
+          // Buffered prose may precede more tool calls; it is not a final reply.
+          setPhase("Processing response…");
         }
         else if (kind === "thinking_start") {
-          mutateTranscript(() => {
-            think = activateThinkingFold(think, box, bubble);
-          });
+          closeThinkingPhase();
+          setPhase("Waiting for model…");
         }
         else if (kind === "thinking") {
           try {
-            if (think) {
-              thinkRaw += JSON.parse(payload).text || "";
+            const text = JSON.parse(payload).text || "";
+            if (text) {
+              setPhase("Thinking…");
+              if (!think) mutateTranscript(() => {
+                think = createThinkingFold(box, bubble);
+                thinkingFolds.push(think);
+              });
+              thinkRaw += text;
               thinkingDirty = true;
               schedulePaint();
             }
           } catch (_) {}
         }
         else if (kind === "thinking_done") {
-          if (think) {
-            thinkingDoneDirty = true;
-            flushPaint();
-          }
+          closeThinkingPhase();
+          setPhase("Processing…");
+        }
+        else if (kind === "tool") {
+          try {
+            const event = JSON.parse(payload);
+            closeThinkingPhase();
+            mutateTranscript(() => activity.tool(event));
+            activityDirty = true;
+            schedulePaint();
+          } catch (_) {}
         }
         else if (kind === "subagent_progress") {
-          subagentProgress = payload;
-          progressDirty = true;
-          expandProgress = true;
-          schedulePaint();
+          mutateTranscript(() => activity.subagents(payload));
         }
         else if (kind === "confirm_request") {
+          setPhase("Waiting for confirmation…", true);
           // Server text: showConfirm renders the prompt through textContent.
           // Only the session on screen can answer: the dialog answers into
           // `sessionId`, so a question from a turn in another session is left
@@ -2212,6 +2337,7 @@ async function send() {
           try { const c = JSON.parse(payload); if (sid === sessionId) showConfirm(c.id, c.prompt, c.token, c.input); } catch (_) {}
         }
         else if (kind === "confirm_done") {
+          setPhase("Processing…");
           // Only the question this event closes goes away; a newer request can
           // only follow it, and an id-less event hides whatever is on screen.
           let cid = null;
@@ -2219,14 +2345,17 @@ async function send() {
           if (sid === sessionId && (cid === null || (confirmShown && confirmShown.id === cid))) hideConfirm();
         }
         else if (kind === "input_request") {
+          setPhase("Waiting for your input…", true);
           try { const c = JSON.parse(payload); if (sid === sessionId) showConfirm(c.id, c.prompt, c.token, true); } catch (_) {}
         }
         else if (kind === "input_done") {
+          setPhase("Processing…");
           let cid = null;
           try { cid = JSON.parse(payload).id; } catch (_) {}
           if (sid === sessionId && (cid === null || (confirmShown && confirmShown.id === cid))) hideConfirm();
         }
         else if (payload) {
+          ensureProgressPhase();
           progLines.push(payload);
           progressDirty = true;
           schedulePaint();
@@ -2239,12 +2368,13 @@ async function send() {
     flushPaint(); // flush the tail before final decoration or stale recovery
     finishFollow = sid === sessionId && shouldFollowOutput();
     decorateAndLoad(bubble); // reply paths become previews only once it is final
-    if (stalled && !finished && !turnError) {
+    if (!finished && !turnError) {
       // Only the session on screen can be followed from history here; a stalled
       // turn in a session the user has left is retired, and its reply is what
       // that session renders when it is opened again.
-      if (sid === sessionId) goStale("stream stalled (no updates for 60s) — the turn keeps running on the server (following history)");
-      else dropBackgroundTurn(box, "stream stalled");
+      const reason = stalled ? "stream stalled (no updates for 60s)" : "stream ended before completion";
+      if (sid === sessionId) goStale(reason + " — checking server history");
+      else dropBackgroundTurn(box, reason);
     }
     else if (!raw) bubble.innerHTML = "<span style='color:var(--dim)'>(empty reply)</span>";
   } catch (e) {
@@ -2300,15 +2430,46 @@ function showStored() {
   el.textContent = msg;
   el.classList.add("show");
 }
+// Keep only event metadata in memory; never record text, keys, tokens or URLs.
+function createInputTrace(prompt) {
+  const events = [];
+  const started = Date.now();
+  return {
+    record(event) {
+      events.push({ ms: Date.now() - started, event: event.type,
+        composing: !!event.isComposing, inputType: event.inputType || "",
+        focused: document.activeElement === prompt, length: prompt.value.length,
+        viewportHeight: window.innerHeight, cssHeight: prompt.style.height });
+      if (events.length > 80) events.shift();
+    },
+    export() { return JSON.stringify({ version: 1, userAgent: navigator.userAgent, events }, null, 2); },
+  };
+}
+let uiWired = false;
 function wire() {
   // Show what is actually stored: typing alone never reaches localStorage
   // until Save, so prefill both inputs or an empty box misleads into a 401.
   $("base").value = localStorage.getItem("serve.base") || "";
   $("token").value = localStorage.getItem("serve.token") || "";
   showStored();
+  syncStopButton();
+  if (uiWired) return;
+  uiWired = true;
+  const inputTrace = createInputTrace($("prompt"));
+  for (const type of ["focus", "blur", "compositionstart", "compositionupdate", "compositionend", "beforeinput", "input"]) {
+    $("prompt").addEventListener(type, (event) => inputTrace.record(event));
+  }
+  window.addEventListener("resize", (event) => inputTrace.record(event));
+  document.addEventListener("visibilitychange", (event) => inputTrace.record(event));
+  $("inputdiagnostics").onclick = () => {
+    const output = $("inputtrace");
+    output.value = inputTrace.export();
+    output.hidden = false;
+    output.focus();
+    output.select();
+  };
   $("send").onclick = () => { if (isTurnRunning()) stopTurn(); else send(); };
   $("sidenote").onclick = sendSideNote;
-  syncStopButton();
   // The dialog is the only way to unblock a turn that stopped to ask; both
   // answers post to /sessions/{id}/confirm through answerConfirm.
   $("callow").onclick = () => answerConfirm(true);
@@ -2318,7 +2479,12 @@ function wire() {
   $("jumpbottom").onclick = () => scrollToLatest(true);
   $("questionbtn").onclick = (event) => { event.stopPropagation(); openQuestionPanel(); };
   $("questionclose").onclick = closeQuestionPanel;
-  window.addEventListener("resize", () => { updateJumpButton(); updateQuestionButton(); growPrompt(); });
+  window.addEventListener("resize", () => {
+    updateJumpButton();
+    updateQuestionButton();
+    const prompt = $("prompt");
+    if (!(promptComposing && document.activeElement === prompt)) growPrompt();
+  });
   // Android drops a backgrounded page's connections, and a page cannot see that
   // until it is visible again, so coming back is where recovery has to start.
   // A question the turn is blocked on survives a reconnect, so coming back to
@@ -2330,12 +2496,23 @@ function wire() {
   $("omodel").onchange = () => savePick();
   $("oagent").onchange = () => savePick();
   $("oeffort").onchange = () => savePick();
-  $("prompt").addEventListener("input", () => { growPrompt(); persistDraft(); });
+  $("prompt").addEventListener("compositionstart", () => { promptComposing = true; });
+  $("prompt").addEventListener("compositionend", () => {
+    promptComposing = false;
+    growPrompt();
+    persistDraft();
+  });
+  $("prompt").addEventListener("input", (e) => {
+    if (promptComposing || e.isComposing) return;
+    growPrompt();
+    persistDraft();
+  });
   $("prompt").addEventListener("paste", handlePromptPaste);
   restoreDraft();
   $("prompt").addEventListener("keydown", (e) => {
     // Plain Enter inserts a newline (mobile keyboards included); only the
     // send button — or Ctrl/Cmd+Enter for hardware keyboards — submits.
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
   });
   const toggleSessions = () => setDrawer(!$("sessions").classList.contains("open"));;

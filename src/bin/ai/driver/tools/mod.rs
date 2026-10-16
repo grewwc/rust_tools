@@ -114,6 +114,10 @@ pub(super) struct RunOneResult {
 }
 
 pub(super) trait ToolExecutionObserver {
+    /// A call entered dispatch, including cache hits and preparation failures.
+    /// Separate from terminal start timing so every finished result has a boundary.
+    fn on_tool_dispatched(&mut self, _tool_call: &ToolCall) {}
+
     fn on_tool_started(&mut self, _tool_call: &ToolCall) {}
 
     fn on_tool_stream(&mut self, _tool_call: &ToolCall, _chunk: &[u8]) {}
@@ -996,6 +1000,9 @@ fn run_one(
     allowed_tool_names: Option<&FastSet<String>>,
     observer: &mut Option<&mut dyn ToolExecutionObserver>,
 ) -> (ToolRoute, RunOneResult) {
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.on_tool_dispatched(tool_call);
+    }
     let prepared = match prepare_tool_call(mcp_client, tool_call, allowed_tool_names) {
         Ok(prepared) => prepared,
         Err(tool_result) => {
@@ -1375,9 +1382,10 @@ fn run_parallel_readonly_batch(
     allowed_tool_names: Option<&FastSet<String>>,
     observer: &mut Option<&mut dyn ToolExecutionObserver>,
 ) -> Vec<(ToolRoute, RunOneResult)> {
-    // 在并发执行前，按顺序触发 on_tool_started，保持观察者看到的启动顺序稳定。
+    // Publish boundaries in input order before workers run without an observer.
     if let Some(observer) = observer.as_deref_mut() {
         for tool_call in batch {
+            observer.on_tool_dispatched(tool_call);
             observer.on_tool_started(tool_call);
         }
     }

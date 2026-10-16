@@ -41,6 +41,10 @@ final class ServerUrl {
         return origin + "/app";
     }
 
+    static String freshAppUrl(String origin, long launchNonce) {
+        return appUrl(origin) + "?shell_reload=" + Long.toUnsignedString(launchNonce);
+    }
+
     static boolean isSameOrigin(String origin, String candidate) {
         String candidateOrigin = normalizeOriginOnly(candidate);
         return origin != null && origin.equals(candidateOrigin);

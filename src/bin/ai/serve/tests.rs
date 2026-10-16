@@ -317,6 +317,38 @@ fn decoder_passes_subagent_progress_through() {
     );
 }
 
+#[tokio::test]
+async fn serve_tool_lifecycle_decoder_and_sse_preserve_order() {
+    use crate::ai::background::{ServeLiveKind, serve_tool_finished_payload, serve_tool_started_payload};
+    use axum::response::IntoResponse;
+    let call = crate::ai::types::ToolCall {
+        id: "tool-id".into(),
+        tool_type: "function".into(),
+        function: crate::ai::types::FunctionCall {
+            name: "read_file".into(),
+            arguments: r#"{"file_path":"源.txt"}"#.into(),
+        },
+    };
+    let started = serve_tool_started_payload(&call).unwrap();
+    let finished = serve_tool_finished_payload(&call, "read failed", false, false, true).unwrap();
+    let wire = [
+        test_frame(ServeLiveKind::Tool, started.as_bytes()),
+        test_frame(ServeLiveKind::Tool, finished.as_bytes()),
+    ].concat();
+    let mut decoder = ServeFrameDecoder::default();
+    let events: Vec<_> = wire.iter().flat_map(|byte| decoder.push(&[*byte])).collect();
+    assert_eq!(events, vec![ServeLiveEvent::Tool(started.clone()), ServeLiveEvent::Tool(finished.clone())]);
+    assert!(decoder.finish().is_empty());
+    let response = Sse::new(stream::iter(events.into_iter().map(|event| {
+        Ok::<_, std::convert::Infallible>(live_event(event).unwrap())
+    }))).into_response();
+    let bytes = axum::body::to_bytes(response.into_body(), 16384).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert_eq!(text.matches("event: tool").count(), 2, "{text}");
+    assert!(text.contains(&started), "{text}");
+    assert!(text.contains(&finished), "{text}");
+}
+
 /// Input-request frames (the serve-client text channel) survive the
 /// decoder like confirmation frames, payload relayed verbatim.
 #[test]
@@ -1147,7 +1179,7 @@ async fn serve_app_returns_mobile_client() {
     assert!(body.contains("rel=\"manifest\" href=\"/app.webmanifest\""));
     assert!(body.contains("rel=\"icon\" href=\"/app-icon.svg\""));
     assert!(body.contains(
-        "href=\"/a-serve-v1.1.0.apk\" download=\"a-serve-v1.1.0.apk\""
+        "href=\"/a-serve-v1.4.0.apk\" download=\"a-serve-v1.4.0.apk\""
     ));
     assert!(body.contains("serviceWorker.register(\"/app-sw.js\", { scope: \"/\" })"));
     assert!(
@@ -1172,7 +1204,7 @@ async fn serve_android_apk_returns_installable_attachment() {
             .headers()
             .get(axum::http::header::CONTENT_DISPOSITION)
             .and_then(|v| v.to_str().ok()),
-        Some("attachment; filename=\"a-serve-v1.1.0.apk\"")
+        Some("attachment; filename=\"a-serve-v1.4.0.apk\"")
     );
     assert_eq!(
         response

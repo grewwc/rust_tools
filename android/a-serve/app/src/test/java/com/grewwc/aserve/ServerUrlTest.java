@@ -16,6 +16,13 @@ public final class ServerUrlTest {
     }
 
     @Test
+    public void freshAppUrlBypassesAStoredShellDocument() {
+        assertEquals(
+                "https://example.test:8080/app?shell_reload=42",
+                ServerUrl.freshAppUrl("https://example.test:8080", 42));
+    }
+
+    @Test
     public void rejectsUnsafeOrAmbiguousUrls() {
         assertNull(ServerUrl.normalize("http://10.37.110.250:8080"));
         assertNull(ServerUrl.normalize("https://user@example.test"));

@@ -499,6 +499,7 @@ pub(crate) enum ServeLiveKind {
     InputRequest = 9,
     InputDone = 10,
     AssistantBodyPending = 11,
+    Tool = 12,
 }
 
 /// Max payload bytes per serve frame: header (5) + payload stays under the
@@ -507,6 +508,58 @@ pub(crate) enum ServeLiveKind {
 pub(crate) const MAX_SERVE_FRAME_BYTES: usize = 4000;
 /// Defensive cap accepted by the serve decoder; larger lengths are dropped.
 pub(crate) const MAX_SERVE_FRAME_LEN: u32 = 16 * 1024 * 1024;
+
+/// Tool previews are display-only; the original call/result remains untouched.
+/// Fit the serialized JSON, not just its text, into one atomic FIFO frame.
+fn bounded_serve_tool_payload(
+    mut payload: serde_json::Value,
+    field: &str,
+    text: &str,
+) -> Option<String> {
+    let truncated_field = format!("{field}_truncated");
+    let mut end = text.len().min(3000);
+    loop {
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        payload[field] = serde_json::Value::String(text[..end].to_string());
+        payload[&truncated_field] = serde_json::Value::Bool(end < text.len());
+        let encoded = payload.to_string();
+        if encoded.len() <= MAX_SERVE_FRAME_BYTES {
+            return Some(encoded);
+        }
+        if end == 0 {
+            // Never truncate identity fields or split JSON into invalid fragments.
+            return None;
+        }
+        end /= 2;
+    }
+}
+
+pub(crate) fn serve_tool_started_payload(call: &crate::ai::types::ToolCall) -> Option<String> {
+    bounded_serve_tool_payload(
+        serde_json::json!({"id": call.id, "name": call.function.name, "phase": "started"}),
+        "arguments",
+        &call.function.arguments,
+    )
+}
+
+pub(crate) fn serve_tool_finished_payload(
+    call: &crate::ai::types::ToolCall,
+    output: &str,
+    ok: bool,
+    cached: bool,
+    executed: bool,
+) -> Option<String> {
+    bounded_serve_tool_payload(
+        serde_json::json!({
+            "id": call.id, "name": call.function.name, "phase": "finished",
+            "ok": ok, "cached": cached, "executed": executed,
+        }),
+        "output",
+        output,
+    )
+}
 
 /// Publish one framed event to the serve-owned live FIFO. No-op unless
 /// [`open_serve_live_fifo_from_env`] installed a serve FIFO (normal CLI and
@@ -1152,6 +1205,65 @@ fn spawn_daemon_child(
 mod tests {
     use super::*;
     use crate::ai::cli::parse_cli_args;
+
+    fn lifecycle_call(arguments: &str) -> crate::ai::types::ToolCall {
+        crate::ai::types::ToolCall {
+            id: "provider-call-7".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn serve_tool_lifecycle_payload_preserves_identity_and_result_flags() {
+        let call = lifecycle_call(r#"{"file_path":"src/main.rs"}"#);
+        let started: serde_json::Value =
+            serde_json::from_str(&serve_tool_started_payload(&call).unwrap()).unwrap();
+        assert_eq!(started["id"], call.id);
+        assert_eq!(started["name"], "read_file");
+        assert_eq!(started["phase"], "started");
+        assert_eq!(started["arguments"], call.function.arguments);
+        assert_eq!(started["arguments_truncated"], false);
+        for (ok, cached, executed) in [(false, false, true), (true, true, false)] {
+            let finished: serde_json::Value = serde_json::from_str(
+                &serve_tool_finished_payload(&call, "result\n带来", ok, cached, executed).unwrap(),
+            ).unwrap();
+            assert_eq!(finished["id"], call.id);
+            assert_eq!(finished["phase"], "finished");
+            assert_eq!(finished["output"], "result\n带来");
+            assert_eq!(finished["output_truncated"], false);
+            assert_eq!(finished["ok"], ok);
+            assert_eq!(finished["cached"], cached);
+            assert_eq!(finished["executed"], executed);
+        }
+    }
+
+    #[test]
+    fn serve_tool_lifecycle_preview_fits_atomic_frame_after_json_escaping() {
+        for text in ["界🙂".repeat(3000), "\u{0000}\"\\\n".repeat(3000)] {
+            let call = lifecycle_call(&text);
+            for (payload, field) in [
+                (serve_tool_started_payload(&call).unwrap(), "arguments"),
+                (serve_tool_finished_payload(&call, &text, true, false, true).unwrap(), "output"),
+            ] {
+                assert!(payload.len() <= MAX_SERVE_FRAME_BYTES);
+                let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                let preview = parsed[field].as_str().unwrap();
+                assert!(!preview.is_empty());
+                assert!(text.starts_with(preview));
+                assert_eq!(parsed[format!("{field}_truncated")], true);
+                assert_eq!(parsed["id"], call.id);
+            }
+            assert_eq!(call.function.arguments, text, "canonical arguments remain intact");
+        }
+        let mut call = lifecycle_call("");
+        call.id = "x".repeat(MAX_SERVE_FRAME_BYTES);
+        assert!(serve_tool_started_payload(&call).is_none());
+        assert!(serve_tool_finished_payload(&call, "", true, false, true).is_none());
+    }
 
     #[test]
     fn daemon_args_contains_interactively_entered_task() {
