@@ -1172,7 +1172,13 @@ use super::*;
             State(state),
             HeaderMap::new(),
             Path("s1".to_string()),
-            Query(super::HistoryQuery { limit: Some(1) }),
+            Query(super::HistoryQuery {
+                limit: Some(1),
+                meta: None,
+                role: None,
+                count: None,
+                conclusion: None,
+            }),
         )
         .await
         .into_response();
@@ -1226,7 +1232,13 @@ use super::*;
             State(state),
             HeaderMap::new(),
             Path("s1".to_string()),
-            Query(super::HistoryQuery { limit: None }),
+            Query(super::HistoryQuery {
+                limit: None,
+                meta: None,
+                role: None,
+                count: None,
+                conclusion: None,
+            }),
         )
         .await
         .into_response();
@@ -1245,6 +1257,315 @@ use super::*;
         assert_eq!(v.len(), 1);
         assert_eq!(v[0]["role"], "user");
         assert_eq!(v[0]["content"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[tokio::test]
+    async fn history_roles_shape_omits_content() {
+        use axum::{
+            extract::{Path, Query, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        use crate::ai::history::{Message, append_history_messages};
+        let state = lifecycle_test_state();
+        let store = super::SessionStore::new(state.history_file.as_path());
+        store.ensure_root_dir().expect("root dir");
+        let path = store.session_history_file("s1");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("session dir");
+        }
+        let secret_payload = "U2VjcmV0IGltYWdlIGJ5dGVz".repeat(100);
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "look at this"},
+                    {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{secret_payload}")}},
+                ]),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("a long answer ".repeat(50)),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+        append_history_messages(&path, &messages).expect("seed messages");
+
+        let resp = super::read_history(
+            State(state),
+            HeaderMap::new(),
+            Path("s1".to_string()),
+            Query(super::HistoryQuery {
+                limit: None,
+                meta: Some("roles".to_string()),
+                role: None,
+                count: None,
+                conclusion: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-history-total")
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8");
+        // Roles only: neither the message text nor the base64 payload leaves
+        // the server.
+        let roles: Vec<String> = serde_json::from_str(&body).expect("role array");
+        assert_eq!(roles, vec!["user".to_string(), "assistant".to_string()]);
+        assert!(!body.contains("look at this"));
+        assert!(!body.contains(&secret_payload));
+    }
+
+    #[tokio::test]
+    async fn history_role_count_filters_and_attaches_ordinals() {
+        use axum::{
+            extract::{Path, Query, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        use crate::ai::history::{Message, append_history_messages};
+        let state = lifecycle_test_state();
+        let store = super::SessionStore::new(state.history_file.as_path());
+        store.ensure_root_dir().expect("root dir");
+        let path = store.session_history_file("s1");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("session dir");
+        }
+        let mk = |role: &str, content: serde_json::Value| Message {
+            role: role.to_string(),
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let messages = vec![
+            mk("system", serde_json::json!("boot")),
+            mk("user", serde_json::json!("q1")),
+            mk("assistant", serde_json::json!("a1")),
+            mk(
+                "user",
+                serde_json::json!([
+                    {"type": "text", "text": "q2"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,U0VDUkVU"}},
+                ]),
+            ),
+            mk("tool", serde_json::json!("tool result")),
+            mk("assistant", serde_json::json!("a2")),
+            mk("internal_note", serde_json::json!("note")),
+            mk("user", serde_json::json!("q3")),
+        ];
+        append_history_messages(&path, &messages).expect("seed messages");
+
+        let call = |q: super::HistoryQuery| {
+            let state = state.clone();
+            async move {
+                let resp = super::read_history(
+                    State(state),
+                    HeaderMap::new(),
+                    Path("s1".to_string()),
+                    Query(q),
+                )
+                .await
+                .into_response();
+                let status = resp.status();
+                let total = resp
+                    .headers()
+                    .get("x-history-total")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                    .await
+                    .expect("body");
+                let body = String::from_utf8(body.to_vec()).expect("utf8");
+                (status, total, body)
+            }
+        };
+
+        // role=user&count=2: only the last two user rows, with their global
+        // ordinals, and the image payload redacted in the returned row.
+        let (status, total, body) = call(super::HistoryQuery {
+            limit: None,
+            meta: None,
+            role: Some("user".to_string()),
+            count: Some(2),
+            conclusion: None,
+        })
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(total.as_deref(), Some("8"));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["role"], "user");
+        assert_eq!(rows[0]["user_ordinal"], 2);
+        assert_eq!(rows[1]["role"], "user");
+        assert_eq!(rows[1]["user_ordinal"], 3);
+        let serialized = serde_json::to_string(&rows).expect("serialize rows");
+        assert!(!serialized.contains("U0VDUkVU"));
+        assert!(serialized.contains("<image data redacted>"));
+
+        // role=all&count=3: bounded tail across roles keeps global ordinals.
+        let (_, _, body) = call(super::HistoryQuery {
+            limit: None,
+            meta: None,
+            role: None,
+            count: Some(3),
+            conclusion: None,
+        })
+        .await;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).expect("rows");
+        let roles: Vec<String> = rows
+            .iter()
+            .map(|r| r["role"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(roles, vec!["assistant", "internal_note", "user"]);
+        assert_eq!(rows[2]["user_ordinal"], 3);
+
+        // role=system also covers internal_note rows.
+        let (_, _, body) = call(super::HistoryQuery {
+            limit: None,
+            meta: None,
+            role: Some("system".to_string()),
+            count: Some(10),
+            conclusion: None,
+        })
+        .await;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).expect("rows");
+        let roles: Vec<String> = rows
+            .iter()
+            .map(|r| r["role"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(roles, vec!["system", "internal_note"]);
+
+        // Unknown role value is a client error, not a silent full dump.
+        let (status, _, body) = call(super::HistoryQuery {
+            limit: None,
+            meta: None,
+            role: Some("bogus".to_string()),
+            count: None,
+            conclusion: None,
+        })
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("invalid history role filter: bogus"));
+    }
+
+    #[tokio::test]
+    async fn history_conclusion_back_selects_and_errors() {
+        use axum::{
+            extract::{Path, Query, State},
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        use crate::ai::history::{Message, append_history_messages};
+        use crate::ai::types::{FunctionCall, ToolCall};
+        let state = lifecycle_test_state();
+        let store = super::SessionStore::new(state.history_file.as_path());
+        store.ensure_root_dir().expect("root dir");
+        let path = store.session_history_file("s1");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("session dir");
+        }
+        let assistant = |text: &str| Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!(text),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let user = |text: &str| Message {
+            role: "user".to_string(),
+            content: serde_json::json!(text),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let tool_only = Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("thinking about a patch"),
+            tool_calls: Some(vec![ToolCall {
+                id: "c1".to_string(),
+                tool_type: "apply_patch".to_string(),
+                function: FunctionCall {
+                    name: "apply_patch".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let messages = vec![
+            user("q0"),
+            tool_only,
+            user("q1"),
+            assistant(""),
+            user("q2"),
+            assistant("conclusion 1"),
+            user("q3"),
+            assistant("conclusion 2"),
+        ];
+        append_history_messages(&path, &messages).expect("seed messages");
+
+        let call = |conclusion: Option<usize>| {
+            let state = state.clone();
+            async move {
+                let resp = super::read_history(
+                    State(state),
+                    HeaderMap::new(),
+                    Path("s1".to_string()),
+                    Query(super::HistoryQuery {
+                        limit: None,
+                        meta: None,
+                        role: None,
+                        count: None,
+                        conclusion,
+                    }),
+                )
+                .await
+                .into_response();
+                let status = resp.status();
+                let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                    .await
+                    .expect("body");
+                let body = String::from_utf8(body.to_vec()).expect("utf8");
+                (status, body)
+            }
+        };
+
+        let (status, body) = call(Some(1)).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["content"], "conclusion 2");
+
+        let (status, body) = call(Some(2)).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&body).expect("rows");
+        assert_eq!(rows[0]["content"], "conclusion 1");
+
+        // The tool-call-only and empty assistant rows are not conclusions.
+        let (status, body) = call(Some(3)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.contains("Only 2 assistant message(s) in history."),
+            "{body}"
+        );
+
+        let (status, body) = call(Some(0)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("invalid /history last argument: 0"), "{body}");
     }
 
     #[tokio::test]

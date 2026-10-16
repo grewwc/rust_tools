@@ -70,6 +70,28 @@ pub(crate) struct CreateSessionResp {
 #[derive(Debug, Deserialize)]
 pub(crate) struct HistoryQuery {
     pub(crate) limit: Option<usize>,
+    /// `?meta=roles` returns only the per-message roles (a bare array of
+    /// role strings, one per canonical message) instead of full message
+    /// bodies. serve-chat rewinds fetch this lightweight shape to resolve
+    /// `u<N>` ordinals without shipping the session payload; unknown values
+    /// are ignored so an older client never breaks a newer server.
+    #[serde(default)]
+    pub(crate) meta: Option<String>,
+    /// serve-chat preview views: filter by role before the tail cut.
+    /// `"system"` also covers `internal_note` rows, matching the client rule.
+    #[serde(default)]
+    pub(crate) role: Option<String>,
+    /// serve-chat preview views: return at most this many rows, cut from the
+    /// end of the role-filtered list (capped server-side). Absent keeps the
+    /// mobile tail-cut semantics of `limit`.
+    #[serde(default)]
+    pub(crate) count: Option<usize>,
+    /// serve-chat `/history last [N]`: 1-based N-th-most-recent assistant
+    /// conclusion (no tool calls, non-empty searchable text). Mutually
+    /// exclusive with the other view params; not found returns 400 with the
+    /// local error wording.
+    #[serde(default)]
+    pub(crate) conclusion: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]

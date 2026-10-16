@@ -1146,6 +1146,12 @@ struct RemoteHistoryMessage {
     content: serde_json::Value,
     #[serde(default)]
     tool_calls: Option<Vec<serde_json::Value>>,
+    /// Global user ordinal attached by the server on filtered view fetches
+    /// (`?role`/`?count`), so `u<N>` markers stay exact on a partial
+    /// response. Absent on full fetches and older servers; the renderer
+    /// falls back to counting locally then.
+    #[serde(default)]
+    user_ordinal: Option<usize>,
 }
 
 const SERVE_HISTORY_DEFAULT_COUNT: usize = 6;
@@ -1172,6 +1178,104 @@ fn fetch_remote_history(
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
+        return Err(server_error_message(status, &text));
+    }
+    serde_json::from_str(&text)
+        .map_err(|err| format!("serve returned an unexpected history body: {err}"))
+}
+
+/// Fetch only the per-message roles (`GET /sessions/{id}/history?meta=roles`):
+/// a bare array of role strings indexed by canonical position. Rewind
+/// ordinal resolution and user-turn counting need nothing else, so the
+/// session payload (tool outputs, attachment text, reasoning content) never
+/// crosses the wire for `u<N>` rewinds. A server that does not know
+/// `meta=roles` returns the full message body, which fails to parse as a
+/// role array and surfaces loudly here instead of misresolving ordinals.
+fn fetch_remote_history_roles(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+) -> Result<Vec<String>, String> {
+    let resp = auth(
+        client
+            .get(format!("{base}/sessions/{session_id}/history"))
+            .query(&[("meta", "roles")]),
+        token,
+    )
+    .send()
+    .map_err(|err| format!("history roles request failed: {err}"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(server_error_message(status, &text));
+    }
+    serde_json::from_str(&text)
+        .map_err(|err| format!("serve returned an unexpected history roles body: {err}"))
+}
+
+/// Fetch the bounded preview subset for a view (`?role` + `?count`): the
+/// server filters by role and tail-cuts, so only the rows the client will
+/// show travel, and it attaches each user row's global `user_ordinal` for
+/// exact `u<N>` markers. `grep` views need content scanning, so they keep
+/// the full fetch.
+fn fetch_remote_history_view(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    view: &ServeHistoryView,
+) -> Result<Vec<RemoteHistoryMessage>, String> {
+    let mut query: Vec<(&str, String)> = Vec::new();
+    if let Some(role) = serve_view_role_param(view.role) {
+        query.push(("role", role.to_string()));
+    }
+    query.push(("count", view.count.to_string()));
+    let resp = auth(
+        client
+            .get(format!("{base}/sessions/{session_id}/history"))
+            .query(&query),
+        token,
+    )
+    .send()
+    .map_err(|err| format!("history request failed: {err}"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(server_error_message(status, &text));
+    }
+    serde_json::from_str(&text)
+        .map_err(|err| format!("serve returned an unexpected history body: {err}"))
+}
+
+/// Fetch the N-th-most-recent assistant conclusion (`?conclusion=N`): a
+/// one-row body the server selected with the same scan rule as the local
+/// `/history last`. Not-found surfaces the server's exact error wording
+/// verbatim (matching what the local command prints) instead of a transport
+/// wrapper.
+fn fetch_serve_history_conclusion(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    nth_back: usize,
+) -> Result<Vec<RemoteHistoryMessage>, String> {
+    let resp = auth(
+        client
+            .get(format!("{base}/sessions/{session_id}/history"))
+            .query(&[("conclusion", nth_back.to_string())]),
+        token,
+    )
+    .send()
+    .map_err(|err| format!("history request failed: {err}"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        if let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(detail) = body.get("error").and_then(|e| e.as_str()) {
+                return Err(detail.to_string());
+            }
+        }
         return Err(server_error_message(status, &text));
     }
     serde_json::from_str(&text)
@@ -1231,6 +1335,44 @@ fn serve_user_message_index(
 
 fn serve_user_message_count(messages: &[RemoteHistoryMessage]) -> usize {
     messages.iter().filter(|m| m.role == "user").count()
+}
+
+/// Role-array counterparts of the message-based helpers above: the
+/// `?meta=roles` response carries no message bodies, only one role string
+/// per canonical row. Ordinals must count every stored `user` row exactly
+/// like the full-message resolver so `u<N>` means the same thing on both
+/// shapes.
+fn serve_role_user_message_index(roles: &[String], ordinal: usize) -> Option<usize> {
+    if ordinal == 0 {
+        return None;
+    }
+    let mut seen = 0usize;
+    for (idx, role) in roles.iter().enumerate() {
+        if role != "user" {
+            continue;
+        }
+        seen += 1;
+        if seen == ordinal {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn serve_role_user_message_count(roles: &[String]) -> usize {
+    roles.iter().filter(|role| role.as_str() == "user").count()
+}
+
+/// Wire value for a view's role filter, mirroring `parse_serve_history_view`
+/// role set; `All` sends no filter so the server keeps the unfiltered shape.
+fn serve_view_role_param(role: ServeHistoryRole) -> Option<&'static str> {
+    match role {
+        ServeHistoryRole::All => None,
+        ServeHistoryRole::User => Some("user"),
+        ServeHistoryRole::Assistant => Some("assistant"),
+        ServeHistoryRole::Tool => Some("tool"),
+        ServeHistoryRole::System => Some("system"),
+    }
 }
 
 /// Read-only view selector for the remote `/history` preview. Mirrors the
@@ -1351,11 +1493,19 @@ fn render_serve_history(messages: &[RemoteHistoryMessage], view: &ServeHistoryVi
     let mut user_ordinal = 0usize;
     let mut filtered = Vec::new();
     for message in messages {
-        let ordinal = if message.role == "user" {
-            user_ordinal += 1;
-            Some(user_ordinal)
-        } else {
-            None
+        // The server attaches each user row's global ordinal on filtered
+        // fetches; fall back to local counting on full fetches (grep, older
+        // servers), where every user row is present anyway.
+        let ordinal = match message.user_ordinal {
+            Some(n) => Some(n),
+            None => {
+                if message.role == "user" {
+                    user_ordinal += 1;
+                    Some(user_ordinal)
+                } else {
+                    None
+                }
+            }
         };
         let role_matches = match view.role {
             ServeHistoryRole::All => true,
@@ -1456,24 +1606,30 @@ fn render_serve_history_last(
             "[history] Only {seen} assistant message(s) in history."
         ));
     };
-    let header = if nth_back == 1 {
+    Ok(format!("{}\n{}", serve_history_last_header(nth_back), text))
+}
+
+/// Header for the Nth-back assistant conclusion (1 = latest).
+fn serve_history_last_header(nth_back: usize) -> String {
+    if nth_back == 1 {
         "[history] Latest assistant message:".to_string()
     } else {
         format!("[history] Assistant message {nth_back} back from latest:")
-    };
-    Ok(format!("{header}\n{text}"))
+    }
 }
 
 /// Print the Nth recent assistant conclusion like local `/history last`:
 /// the header stays plain text while the body goes through the same
 /// display-only post-processing and terminal markdown renderer as a live
-/// turn. Keeps `render_serve_history_last` pure (it still returns the raw
-/// `"header\nbody"` string for tests and `/history replay`).
+/// turn. `messages` is the one-row server result (`?conclusion=N`), so the
+/// header uses the requested `nth_back` rather than the subset position;
+/// `render_serve_history_last` stays pure for tests and `/history replay`.
 fn print_serve_history_last_rendered(
     messages: &[RemoteHistoryMessage],
     nth_back: usize,
 ) -> Result<(), String> {
-    let rendered = render_serve_history_last(messages, nth_back)?;
+    let body = serve_history_searchable_text(&messages[0].content);
+    let rendered = format!("{}\n{}", serve_history_last_header(nth_back), body);
     let (header, body) = rendered.split_once('\n').unwrap_or((rendered.as_str(), ""));
     println!("{header}");
     let body = super::super::driver::turn_runtime::postprocess_terminal_text(body.to_string());
@@ -1558,6 +1714,48 @@ fn resolve_serve_rewind_target(
         return Err("user ordinal must be >= 1".into());
     }
     serve_user_message_index(messages, ordinal)
+        .map(|index| (ordinal, index))
+        .ok_or_else(|| format!("user input u{ordinal} not found"))
+}
+
+/// Same resolution grammar as `resolve_serve_rewind_target`, but over the
+/// roles-only history shape (`u<N>`, bare `N`, `last`/`latest`). `grep`
+/// needs message content, so it stays on the full-message resolver; callers
+/// branch on the first verb before fetching anything, and this defensive
+/// arm keeps the two resolvers' contracts separate.
+fn resolve_serve_rewind_target_from_roles(
+    roles: &[String],
+    args: &[&str],
+) -> Result<(usize, usize), String> {
+    let Some(first) = args.first().copied() else {
+        return Err("missing rewind target. try: /history rewind u3".into());
+    };
+    if first == "last" || first == "latest" {
+        let count = serve_role_user_message_count(roles);
+        if count == 0 {
+            return Err("no user input found in history".into());
+        }
+        let index =
+            serve_role_user_message_index(roles, count).expect("counted user message resolves");
+        return Ok((count, index));
+    }
+    if first == "grep" {
+        return Err(
+            "`/history rewind grep` needs message content; the full-history path resolves it"
+                .into(),
+        );
+    }
+    let raw = first
+        .strip_prefix('u')
+        .or_else(|| first.strip_prefix('U'))
+        .unwrap_or(first);
+    let ordinal = raw
+        .parse::<usize>()
+        .map_err(|_| format!("invalid rewind target: {first}. try: /history rewind u3"))?;
+    if ordinal == 0 {
+        return Err("user ordinal must be >= 1".into());
+    }
+    serve_role_user_message_index(roles, ordinal)
         .map(|index| (ordinal, index))
         .ok_or_else(|| format!("user input u{ordinal} not found"))
 }
@@ -1724,7 +1922,7 @@ fn run_serve_history_command(
             if args.len() > 1 {
                 return Err("too many arguments. try: /history replay".into());
             }
-            let messages = fetch_remote_history(client, base, token, session_id)?;
+            let messages = fetch_serve_history_conclusion(client, base, token, session_id, 1)?;
             println!("{}", render_serve_history_last(&messages, 1)?);
             Ok(())
         }
@@ -1744,7 +1942,7 @@ fn run_serve_history_command(
             if nth_back == 0 {
                 return Err("invalid /history last argument: 0. try: /history last [N]".into());
             }
-            let messages = fetch_remote_history(client, base, token, session_id)?;
+            let messages = fetch_serve_history_conclusion(client, base, token, session_id, nth_back)?;
             print_serve_history_last_rendered(&messages, nth_back)?;
             Ok(())
         }
@@ -1764,7 +1962,14 @@ fn show_serve_history(
         print_serve_history_help();
         return Ok(());
     }
-    let messages = fetch_remote_history(client, base, token, session_id)?;
+    // `grep` searches content, so it needs the full message list and shapes
+    // locally like the local preview; every other view is a bounded tail the
+    // server filters and cuts before transfer.
+    let messages = if view.grep.is_some() {
+        fetch_remote_history(client, base, token, session_id)?
+    } else {
+        fetch_remote_history_view(client, base, token, session_id, &view)?
+    };
     println!("{}", render_serve_history(&messages, &view));
     Ok(())
 }
@@ -1780,9 +1985,21 @@ fn rewind_serve_history(
     // round trip, so a missing or malformed target is never masked by a
     // transport failure. Range checks still need the fetched messages below.
     check_serve_rewind_syntax(args)?;
-    let messages = fetch_remote_history(client, base, token, session_id)?;
-    let (ordinal, index) = resolve_serve_rewind_target(&messages, args)?;
-    let removed = messages.len() - index;
+    // `u<N>`/`last` resolve from the roles-only shape (no message bodies
+    // cross the wire); only `grep` needs full content to search, so it keeps
+    // the full-history fetch. Both shapes resolve the same canonical index,
+    // so the `POST /rewind` contract is unchanged.
+    let first = args.first().copied().unwrap_or("");
+    let (ordinal, index, total) = if first == "grep" {
+        let messages = fetch_remote_history(client, base, token, session_id)?;
+        let (ordinal, index) = resolve_serve_rewind_target(&messages, args)?;
+        (ordinal, index, messages.len())
+    } else {
+        let roles = fetch_remote_history_roles(client, base, token, session_id)?;
+        let (ordinal, index) = resolve_serve_rewind_target_from_roles(&roles, args)?;
+        (ordinal, index, roles.len())
+    };
+    let removed = total - index;
     if removed == 0 {
         println!("[history] Nothing to rewind.");
         return Ok(());
@@ -1849,6 +2066,7 @@ mod serve_history_tests {
             role: role.to_string(),
             content: json!(text),
             tool_calls: None,
+            user_ordinal: None,
         }
     }
 
@@ -1930,6 +2148,103 @@ mod serve_history_tests {
     }
 
     #[test]
+    fn serve_role_ordinals_match_message_resolver() {
+        let messages = sample_history();
+        let roles: Vec<String> = messages.iter().map(|m| m.role.clone()).collect();
+        assert_eq!(
+            serve_role_user_message_count(&roles),
+            serve_user_message_count(&messages)
+        );
+        for ordinal in 0..=4 {
+            assert_eq!(
+                serve_role_user_message_index(&roles, ordinal),
+                serve_user_message_index(&messages, ordinal)
+            );
+        }
+    }
+
+    #[test]
+    fn serve_view_role_param_maps_roles() {
+        assert_eq!(serve_view_role_param(ServeHistoryRole::All), None);
+        assert_eq!(
+            serve_view_role_param(ServeHistoryRole::User),
+            Some("user")
+        );
+        assert_eq!(
+            serve_view_role_param(ServeHistoryRole::Assistant),
+            Some("assistant")
+        );
+        assert_eq!(serve_view_role_param(ServeHistoryRole::Tool), Some("tool"));
+        assert_eq!(
+            serve_view_role_param(ServeHistoryRole::System),
+            Some("system")
+        );
+    }
+
+    #[test]
+    fn render_serve_history_prefers_attached_ordinals() {
+        // A filtered fetch arrives as a tail subset with global ordinals
+        // attached; the markers must use them, not renumber the subset.
+        let mut first = test_message("user", "q1");
+        first.user_ordinal = Some(38);
+        let mut second = test_message("user", "q2");
+        second.user_ordinal = Some(40);
+        let messages = vec![first, second];
+        let view = ServeHistoryView {
+            count: 2,
+            role: ServeHistoryRole::User,
+            full: false,
+            grep: None,
+        };
+        let rendered = render_serve_history(&messages, &view);
+        assert!(rendered.contains(" (u38)"), "{rendered}");
+        assert!(rendered.contains(" (u40)"), "{rendered}");
+        assert!(!rendered.contains(" (u1)"), "{rendered}");
+        assert!(!rendered.contains(" (u2)"), "{rendered}");
+    }
+
+    #[test]
+    fn serve_history_last_header_wording() {
+        assert_eq!(
+            serve_history_last_header(1),
+            "[history] Latest assistant message:"
+        );
+        assert_eq!(
+            serve_history_last_header(3),
+            "[history] Assistant message 3 back from latest:"
+        );
+    }
+
+    #[test]
+    fn serve_rewind_target_from_roles_resolves_uN_and_last() {
+        let roles: Vec<String> = sample_history().iter().map(|m| m.role.clone()).collect();
+        assert_eq!(
+            resolve_serve_rewind_target_from_roles(&roles, &["u2"]).expect("u2"),
+            (2, 3)
+        );
+        assert_eq!(
+            resolve_serve_rewind_target_from_roles(&roles, &["2"]).expect("2"),
+            (2, 3)
+        );
+        assert_eq!(
+            resolve_serve_rewind_target_from_roles(&roles, &["last"]).expect("last"),
+            (2, 3)
+        );
+        assert_eq!(
+            resolve_serve_rewind_target_from_roles(&roles, &["latest"]).expect("latest"),
+            (2, 3)
+        );
+        let err = resolve_serve_rewind_target_from_roles(&roles, &["u9"]).expect_err("u9");
+        assert!(err.contains("u9 not found"), "{err}");
+        let err = resolve_serve_rewind_target_from_roles(&roles, &["u0"]).expect_err("u0");
+        assert!(err.contains("must be >= 1"), "{err}");
+        let err = resolve_serve_rewind_target_from_roles(&roles, &[]).expect_err("empty");
+        assert!(err.contains("missing rewind target"), "{err}");
+        let err = resolve_serve_rewind_target_from_roles(&roles, &["grep", "foo"]).expect_err("grep");
+        assert!(err.contains("needs message content"), "{err}");
+    }
+
+    #[test]
     fn serve_history_renders_local_shaped_rows() {
         let rendered = render_serve_history(&sample_history(), &default_view());
         assert!(rendered.starts_with("[history] Showing 5 recent message(s):\n"));
@@ -1987,6 +2302,7 @@ mod serve_history_tests {
             role: "assistant".to_string(),
             content: json!("tool answer"),
             tool_calls: Some(vec![json!({"id": "1"})]),
+            user_ordinal: None,
         });
         messages.push(test_message("assistant", "   "));
         let first = render_serve_history_last(&messages, 1).expect("last");
