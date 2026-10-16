@@ -14,7 +14,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response, Sse, sse::Event},
-    routing::{delete, get, post},
+    routing::{any, delete, get, post},
 };
 #[cfg(feature = "serve")]
 use futures_util::stream;
@@ -1260,9 +1260,13 @@ pub(in crate::ai) async fn run_serve(
         .fold(Router::new(), |router, path| {
             router.route(path, get(serve_app))
         })
+        .route("/app/{*path}", any(redirect_legacy_app_api))
         .route("/healthz", get(healthz))
         .route("/app.webmanifest", get(serve_app_manifest))
         .route("/app-icon.svg", get(serve_app_icon))
+        .route("/app-icon-192.png", get(serve_app_icon_192))
+        .route("/app-icon-512.png", get(serve_app_icon_512))
+        .route("/app-sw.js", get(serve_app_service_worker))
         .route("/info", get(server_info))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/fork", post(fork_session))

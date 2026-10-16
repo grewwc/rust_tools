@@ -45,6 +45,17 @@ function harness() {
 
 test("embedded script parses", () => { new vm.Script(script); });
 
+test("server base drops the app entry path before API calls", () => {
+  const start = script.indexOf("function normalizeServeBase(");
+  const end = script.indexOf("const store =", start);
+  assert.ok(start >= 0 && end > start);
+  const context = vm.createContext({ URL, location: { origin: "https://10.37.110.250:8080" } });
+  vm.runInContext(script.slice(start, end), context);
+  assert.equal(context.normalizeServeBase("https://10.37.110.250:8080/app"), "https://10.37.110.250:8080");
+  assert.equal(context.normalizeServeBase("https://10.37.110.250:8080/app/?from=home"), "https://10.37.110.250:8080");
+  assert.equal(context.normalizeServeBase("https://example.test/proxy"), "https://example.test/proxy");
+});
+
 test("drafts persist independently for each session and restore on switch", () => {
   const start = script.indexOf("function draftKey(");
   const end = script.indexOf("function questionRowsOf(", start);

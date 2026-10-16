@@ -1146,6 +1146,7 @@ async fn serve_app_returns_mobile_client() {
     assert!(body.contains("/rewind"));
     assert!(body.contains("rel=\"manifest\" href=\"/app.webmanifest\""));
     assert!(body.contains("rel=\"icon\" href=\"/app-icon.svg\""));
+    assert!(body.contains("serviceWorker.register(\"/app-sw.js\", { scope: \"/\" })"));
     assert!(
         body.contains("/file?path="),
         "the page must fetch server-side images through the authed preview route"
@@ -1155,6 +1156,37 @@ async fn serve_app_returns_mobile_client() {
 #[test]
 fn app_entry_paths_cover_browser_normalizations() {
     assert_eq!(super::APP_ENTRY_PATHS, ["/", "/app", "/app/"]);
+}
+
+#[tokio::test]
+async fn legacy_app_base_redirects_api_requests_to_root() {
+    use axum::{
+        http::{StatusCode, Uri, header::LOCATION},
+        response::IntoResponse as _,
+    };
+
+    let uri: Uri = "/app/sessions/demo/turns/stream?follow=1"
+        .parse()
+        .expect("legacy URI");
+    let response = super::redirect_legacy_app_api(uri).await.into_response();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get(LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/sessions/demo/turns/stream?follow=1")
+    );
+
+    let uri: Uri = "/app//external.example/path".parse().expect("safe URI");
+    let response = super::redirect_legacy_app_api(uri).await.into_response();
+    assert_eq!(
+        response
+            .headers()
+            .get(LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/external.example/path")
+    );
 }
 
 #[tokio::test]
@@ -1178,8 +1210,11 @@ async fn serve_app_pwa_assets_define_stable_single_window_identity() {
     assert_eq!(value["scope"], "/");
     assert_eq!(value["display"], "standalone");
     assert_eq!(value["launch_handler"]["client_mode"], "navigate-existing");
-    assert_eq!(value["icons"][0]["src"], "/app-icon.svg");
-    assert_eq!(value["icons"][0]["purpose"], "any maskable");
+    assert_eq!(value["icons"][0]["src"], "/app-icon-192.png");
+    assert_eq!(value["icons"][0]["sizes"], "192x192");
+    assert_eq!(value["icons"][1]["src"], "/app-icon-512.png");
+    assert_eq!(value["icons"][1]["sizes"], "512x512");
+    assert_eq!(value["icons"][2]["purpose"], "maskable");
     let icon = super::serve_app_icon().await.into_response();
     assert_eq!(icon.status(), StatusCode::OK);
     assert_eq!(
@@ -1192,6 +1227,58 @@ async fn serve_app_pwa_assets_define_stable_single_window_identity() {
         .await
         .expect("icon body");
     assert!(body.starts_with(b"<svg"));
+
+    for (response, expected_size) in [
+        (super::serve_app_icon_192().await, 192),
+        (super::serve_app_icon_512().await, 512),
+    ] {
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/png")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("PNG icon body");
+        let icon = image::load_from_memory(&body).expect("valid PNG icon");
+        assert_eq!(
+            (icon.width(), icon.height()),
+            (expected_size, expected_size)
+        );
+    }
+
+    let worker = super::serve_app_service_worker().await.into_response();
+    assert_eq!(worker.status(), StatusCode::OK);
+    assert_eq!(
+        worker
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/javascript; charset=utf-8")
+    );
+    assert_eq!(
+        worker
+            .headers()
+            .get("service-worker-allowed")
+            .and_then(|v| v.to_str().ok()),
+        Some("/")
+    );
+    assert_eq!(
+        worker
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-cache")
+    );
+    let body = axum::body::to_bytes(worker.into_body(), 64 * 1024)
+        .await
+        .expect("service worker body");
+    let body = std::str::from_utf8(&body).expect("service worker text");
+    assert!(body.contains("respondWith(fetch(event.request))"));
+    assert!(!body.contains("caches."));
 }
 
 #[tokio::test]

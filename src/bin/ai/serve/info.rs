@@ -2,6 +2,7 @@
 //! (`GET /info`).
 
 use super::*;
+use axum::response::Redirect;
 
 pub(crate) async fn healthz() -> Json<Healthz> {
     Json(Healthz {
@@ -10,8 +11,8 @@ pub(crate) async fn healthz() -> Json<Healthz> {
     })
 }
 /// Mobile web client (`GET /app`, public like `/healthz`): a single-file
-/// chat UI compiled in via `include_str!`, so Android phones just open
-/// `http://<host>:<port>/app` in Chrome with no app install. The page
+/// chat UI compiled in via `include_str!`, available both in a browser and as
+/// an installed PWA. The page
 /// itself carries no session data; the bearer token lives in the phone's
 /// `localStorage` and every API call reuses the existing authed routes.
 // `no-store` keeps phones from running a stale cached copy of this page
@@ -27,6 +28,19 @@ pub(crate) async fn serve_app() -> (
     )
 }
 
+/// Redirect API requests made by an already-open client that retained `/app`
+/// as its server base. A temporary redirect preserves the method and body, so
+/// stale POST/SSE callers recover as well as the initial health check.
+pub(crate) async fn redirect_legacy_app_api(uri: axum::http::Uri) -> Redirect {
+    let suffix = uri.path().strip_prefix("/app/").unwrap_or_default();
+    let mut target = format!("/{}", suffix.trim_start_matches('/'));
+    if let Some(query) = uri.query() {
+        target.push('?');
+        target.push_str(query);
+    }
+    Redirect::temporary(&target)
+}
+
 const APP_MANIFEST: &str = r##"{
   "id": "/app",
   "name": "a serve",
@@ -39,11 +53,24 @@ const APP_MANIFEST: &str = r##"{
   "theme_color": "#0d1117",
   "launch_handler": { "client_mode": "navigate-existing" },
   "icons": [
-    { "src": "/app-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+    { "src": "/app-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/app-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/app-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
   ]
 }"##;
 
 const APP_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="112" fill="#0d1117"/><circle cx="256" cy="256" r="160" fill="#2f81f7"/><text x="256" y="270" fill="white" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="300" font-weight="700" text-anchor="middle" dominant-baseline="central">a</text></svg>"##;
+
+const APP_SERVICE_WORKER: &str = r##"self.addEventListener("install", (event) => {
+  event.waitUntil(self.skipWaiting());
+});
+self.addEventListener("activate", (event) => {
+  event.waitUntil(self.clients.claim());
+});
+self.addEventListener("fetch", (event) => {
+  if (event.request.method === "GET") event.respondWith(fetch(event.request));
+});
+"##;
 
 /// Public manifest: browsers cannot attach the API bearer token while
 /// installing a web app, and this static identity contains no session data.
@@ -58,6 +85,68 @@ pub(crate) async fn serve_app_manifest() -> Response {
 /// Public maskable icon referenced by both the manifest and the document head.
 pub(crate) async fn serve_app_icon() -> Response {
     public_app_asset(APP_ICON_SVG, "image/svg+xml", "public, max-age=86400")
+}
+
+pub(crate) async fn serve_app_icon_192() -> Response {
+    public_app_png_icon(192)
+}
+
+pub(crate) async fn serve_app_icon_512() -> Response {
+    public_app_png_icon(512)
+}
+
+fn public_app_png_icon(size: u32) -> Response {
+    let mut image = image::RgbaImage::from_pixel(size, size, image::Rgba([13, 17, 23, 255]));
+    let scale = size as f32;
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        let px = x as f32 + 0.5;
+        let py = y as f32 + 0.5;
+        let circle =
+            (px - scale * 0.5).powi(2) + (py - scale * 0.5).powi(2) <= (scale * 0.36).powi(2);
+        if circle {
+            *pixel = image::Rgba([47, 129, 247, 255]);
+        }
+        let outer = ((px - scale * 0.46) / (scale * 0.14)).powi(2)
+            + ((py - scale * 0.55) / (scale * 0.13)).powi(2)
+            <= 1.0;
+        let inner = ((px - scale * 0.46) / (scale * 0.075)).powi(2)
+            + ((py - scale * 0.55) / (scale * 0.065)).powi(2)
+            <= 1.0;
+        let stem =
+            px >= scale * 0.55 && px <= scale * 0.62 && py >= scale * 0.40 && py <= scale * 0.68;
+        if (outer && !inner) || stem {
+            *pixel = image::Rgba([255, 255, 255, 255]);
+        }
+    }
+    let mut body = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut body, image::ImageFormat::Png)
+        .expect("encoding the built-in PWA icon cannot fail");
+    let mut response = body.into_inner().into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("image/png"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    response
+}
+
+/// Network-only worker: it establishes installability without persisting
+/// authenticated API responses, conversation data, or a stale application shell.
+pub(crate) async fn serve_app_service_worker() -> Response {
+    let mut response = public_app_asset(
+        APP_SERVICE_WORKER,
+        "application/javascript; charset=utf-8",
+        "no-cache",
+    );
+    response.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("service-worker-allowed"),
+        HeaderValue::from_static("/"),
+    );
+    response
 }
 
 fn public_app_asset(

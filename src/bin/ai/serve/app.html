@@ -10,7 +10,7 @@
 <meta name="apple-mobile-web-app-title" content="a serve">
 <link rel="manifest" href="/app.webmanifest">
 <link rel="icon" href="/app-icon.svg" type="image/svg+xml">
-<link rel="apple-touch-icon" href="/app-icon.svg">
+<link rel="apple-touch-icon" href="/app-icon-192.png" sizes="192x192">
 <title>a serve</title>
 <style>
 :root { color-scheme: dark; --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --dim:#8b949e; --acc:#2f81f7; --ok:#3fb950; --err:#f85149; }
@@ -336,8 +336,19 @@ select, summary { touch-action:manipulation; }
 // Same-origin by default: when opened via http://<host>:<port>/app the base is
 // this page's origin. Token is kept in localStorage, never in the URL.
 const $ = (id) => document.getElementById(id);
+function normalizeServeBase(value) {
+  const base = String(value || "").trim().replace(/\/+$/, "");
+  if (!base) return "";
+  try {
+    const url = new URL(base, location.origin);
+    // The connection field needs the API origin, not this page's entry path.
+    // Keeping `/app` here would turn `/sessions` into `/app/sessions`.
+    if (url.pathname === "/app" || url.pathname === "/app/") return url.origin;
+  } catch (_) {}
+  return base;
+}
 const store = {
-  get base() { return (localStorage.getItem("serve.base") || "").trim() || location.origin; },
+  get base() { return normalizeServeBase(localStorage.getItem("serve.base")) || location.origin; },
   get token() { return localStorage.getItem("serve.token") || ""; },
 };
 let sessionId = localStorage.getItem("serve.session") || "";
@@ -2313,7 +2324,8 @@ function wire() {
   $("sessfilter").oninput = (e) => { sessFilter = e.target.value; renderSessionList(lastItems); };
   $("connbtn").onclick = () => $("conn").classList.toggle("open");
   $("save").onclick = async () => {
-    const b = $("base").value.trim().replace(/\/+$/, "");
+    const b = normalizeServeBase($("base").value);
+    $("base").value = b;
     // Phones love appending a trailing space via autocomplete; that single
     // char is enough for a 401, so trim and write it back visibly.
     const t = $("token").value.trim();
@@ -2369,7 +2381,14 @@ function wire() {
     $("file").value = "";
   };
 }
+function registerAppServiceWorker() {
+  if (!("serviceWorker" in navigator) || !window.isSecureContext) return;
+  navigator.serviceWorker.register("/app-sw.js", { scope: "/" }).catch((error) => {
+    console.warn("service worker registration failed", error);
+  });
+}
 async function boot() {
+  registerAppServiceWorker();
   wire();
   try { await api("/healthz"); } catch (e) { $("info").textContent = "cannot reach server: " + e.message + " — tap ⚙"; return; }
   await loadInfo();
