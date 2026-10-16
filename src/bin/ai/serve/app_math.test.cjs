@@ -697,6 +697,35 @@ test("stream paint batches answer, thinking and progress into one follow pass", 
   );
 });
 
+test("repeated thinking phases reuse one turn-level fold", () => {
+  const start = script.indexOf("function activateThinkingFold(");
+  const end = script.indexOf("// The three override picks", start);
+  assert.ok(start >= 0 && end > start);
+  const summary = { textContent: "thinking" };
+  const body = { textContent: "first phase" };
+  const fold = { box: { querySelector: () => summary }, body };
+  let creations = 0;
+  let insertions = 0;
+  const parent = { insertBefore(node, before) { insertions++; assert.equal(node, fold.box); assert.equal(before, "reply"); } };
+  const context = vm.createContext({
+    addFold(title, text, host) {
+      creations++;
+      assert.equal(title, "thinking…");
+      assert.equal(text, "");
+      assert.equal(host, parent);
+      return fold;
+    },
+  });
+  vm.runInContext(script.slice(start, end), context);
+  const first = context.activateThinkingFold(null, parent, "reply");
+  const second = context.activateThinkingFold(first, parent, "reply");
+  assert.equal(second, first);
+  assert.equal(creations, 1);
+  assert.equal(insertions, 1);
+  assert.equal(summary.textContent, "thinking…");
+  assert.equal(body.textContent, "first phase");
+});
+
 test("delta blocks defer layout work to the coalesced paint", () => {
   const start = script.indexOf('const { kind, payload } = parseBlock');
   const end = script.indexOf("if (finished) break;", start);
@@ -704,6 +733,7 @@ test("delta blocks defer layout work to the coalesced paint", () => {
   assert.ok(start >= 0 && end > start);
   assert.doesNotMatch(blockDispatch, /shouldFollowOutput|followOutput/);
   assert.match(blockDispatch, /kind === "delta"[\s\S]*?answerDirty = true;[\s\S]*?schedulePaint\(\)/);
+  assert.match(blockDispatch, /kind === "thinking_start"[\s\S]*?activateThinkingFold\(think, box, bubble\)/);
   assert.match(blockDispatch, /kind === "thinking"[\s\S]*?thinkingDirty = true;[\s\S]*?schedulePaint\(\)/);
   assert.match(blockDispatch, /kind === "subagent_progress"[\s\S]*?progressDirty = true;[\s\S]*?schedulePaint\(\)/);
 });

@@ -1213,6 +1213,18 @@ function addFold(title, bodyText, parent) {
   return { box: d, body: pre, set(title2, text2) { sum.textContent = title2; pre.textContent = text2; } };
 }
 
+// A tool-using turn can enter model thinking more than once. Keep those phases
+// in one turn-level fold instead of adding an indistinguishable card per phase.
+function activateThinkingFold(current, parent, before) {
+  if (current) {
+    current.box.querySelector("summary").textContent = "thinking…";
+    return current;
+  }
+  const next = addFold("thinking…", "", parent);
+  parent.insertBefore(next.box, before);
+  return next;
+}
+
 // The three override picks are per-session, not per-browser: they live in the
 // session's own config on the server (`GET`/`POST /sessions/{id}/config`), so
 // changing the model in one session never leaks into another, and reopening a
@@ -2167,8 +2179,7 @@ async function send() {
         }
         else if (kind === "thinking_start") {
           mutateTranscript(() => {
-            think = addFold("thinking…", "", box);
-            box.insertBefore(think.box, bubble);
+            think = activateThinkingFold(think, box, bubble);
           });
         }
         else if (kind === "thinking") {
