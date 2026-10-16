@@ -294,6 +294,17 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     } else {
         runtime_ctx::make_subagent_cwd(&scratch_base, &task_id)
     };
+    // Explicit inheritance: snapshot the parent's effective cwd now and carry
+    // it into the child via `SUBAGENT_CWD`, instead of relying on the ambient
+    // process cwd being right at every tool call inside the subagent. The
+    // inherited directory is resolution-only here: unlike `private_cwd_dir`
+    // it is never registered with the history guard, so the guard cannot
+    // delete the parent's working directory when the subagent ends.
+    let inherited_cwd_dir = if prepared.inherit.cwd {
+        runtime_ctx::effective_cwd().ok()
+    } else {
+        None
+    };
     // Set by the parent before a hard timeout; on guard Drop the sub-agent history is preserved
     // (renamed, not deleted).
     let preserve_history_on_timeout = Arc::new(AtomicBool::new(false));
@@ -437,6 +448,9 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
 
     if let Some(scratch) = private_cwd_dir {
         wrapped = Box::pin(runtime_ctx::SUBAGENT_CWD.scope(scratch, wrapped));
+    }
+    if let Some(dir) = inherited_cwd_dir {
+        wrapped = Box::pin(runtime_ctx::SUBAGENT_CWD.scope(dir, wrapped));
     }
 
     wrapped = suppress_subagent_terminal_output(wrapped);

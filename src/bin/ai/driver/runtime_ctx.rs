@@ -256,8 +256,11 @@ tokio::task_local! {
     pub(crate) static SUBAGENT_MEMORY_PATH: PathBuf;
     /// When set, every `runtime_ctx::effective_cwd()` consumer inside this
     /// task scope sees this directory as the active working directory
-    /// instead of `std::env::current_dir()`. Used by `inherit.cwd ==
-    /// false` to scope the sub-agent to a per-task scratch workspace.
+    /// instead of `std::env::current_dir()`. Used by `inherit.cwd == false`
+    /// to scope the sub-agent to a per-task scratch workspace, and by
+    /// `inherit.cwd == true` to carry the parent's effective cwd explicitly
+    /// (resolution-only; the inherited directory is never registered for
+    /// deletion with the history guard).
     pub(crate) static SUBAGENT_CWD: PathBuf;
     /// When set, the sub-agent's `finalize_turn` publishes its final
     /// assistant text into this slot so the spawning tool can return it

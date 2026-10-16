@@ -744,6 +744,16 @@ pub(super) fn dispatch_background_batch(
         } else {
             runtime_ctx::make_subagent_cwd(&scratch_base_for_cwd, &scope_task_id)
         };
+        // Explicit inheritance: snapshot the parent's effective cwd now and
+        // carry it into the child via `SUBAGENT_CWD`, instead of relying on
+        // the ambient process cwd being right at every tool call inside the
+        // subagent. Resolution-only: never registered with the history guard,
+        // so the guard cannot delete the parent's working directory.
+        let inherited_cwd_dir = if inherit.cwd {
+            runtime_ctx::effective_cwd().ok()
+        } else {
+            None
+        };
         let history_guard =
             BackgroundSubagentHistoryGuard::new(task_app.session_history_file.clone())
                 .with_scoped_artifacts(scoped_memory_path.clone(), scoped_cwd_dir.clone());
@@ -902,6 +912,9 @@ pub(super) fn dispatch_background_batch(
         }
         if let Some(scratch) = scoped_cwd_dir {
             wrapped = Box::pin(runtime_ctx::SUBAGENT_CWD.scope(scratch, wrapped));
+        }
+        if let Some(dir) = inherited_cwd_dir {
+            wrapped = Box::pin(runtime_ctx::SUBAGENT_CWD.scope(dir, wrapped));
         }
         // Set the subagent nesting depth, used by `task_spawn` / `task` to
         // detect recursive fan-out inside subagents.

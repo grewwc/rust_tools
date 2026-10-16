@@ -98,6 +98,9 @@ pub(crate) async fn fork_session(
     if let Err(err) = crate::ai::driver::commands::session::apply_fork_title(&store, &id, &dst) {
         eprintln!("[serve] fork title for session {dst}: {err}");
     }
+    // The branch keeps working where its parent was; otherwise the fork would
+    // silently revert to the daemon cwd on its first turn.
+    copy_session_cwd(&state, &id, &dst);
     (StatusCode::OK, Json(CreateSessionResp { id: dst })).into_response()
 }
 

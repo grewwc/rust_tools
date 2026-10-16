@@ -35,7 +35,7 @@ pub(crate) struct ServeState {
 /// Per-session `/cd` state: the session's current directory and the one it
 /// switched from (for `/cd -`), mirroring the local REPL's process-global
 /// pair one level up.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg(feature = "serve")]
 pub(crate) struct SessionCwd {
     pub(crate) current: PathBuf,

@@ -1245,10 +1245,14 @@ pub(in crate::ai) async fn run_serve(
             token.len()
         );
     }
+    // Restore per-session `/cd` directories recorded by a previous daemon
+    // process: without this a `--serve-restart` silently reverts every session
+    // (and the subagents inheriting from its turns) to the daemon cwd.
+    let restored_cwds = load_cwds(&history_file);
     let state = ServeState {
         history_file,
         token,
-        cwds: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        cwds: Arc::new(std::sync::Mutex::new(restored_cwds)),
         // One entry per touched session; bounded by session count in practice.
         // Idle eviction is deferred to a later multi-instance pass.
         locks: Arc::new(Mutex::new(HashMap::new())),
