@@ -12,7 +12,10 @@ mod store;
 mod claim;
 
 pub(crate) use model::{PlanState, StepStatus};
-pub(crate) use store::{load_plan_state, plan_state_path, record_plan, update_plan_step};
+pub(crate) use render::is_carried_plan_context;
+pub(crate) use store::{
+    load_plan_state, plan_binds_current_turn, plan_state_path, record_plan, update_plan_step,
+};
 pub(crate) use claim::{
     consume_completion_claim, load_completion_claim, record_completion_claim,
 };

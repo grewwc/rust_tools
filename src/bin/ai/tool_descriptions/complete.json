@@ -1,6 +1,6 @@
 {
   "name": "complete",
-  "description": "Assert all planned work is done. Call with a short summary once every plan step is done or skipped, then write the final response text. While a session plan is active the turn does not end without this call: ending without it reopens the turn once instead of landing. The runtime verifies the assertion against the session plan: if steps are still pending/running/failed, the turn reopens instead of ending. Without an active plan this is a no-op receipt.",
+  "description": "Assert all planned work is done. Call with a short summary once every plan step is done or skipped, then write the final response text. While a plan written in this turn is active (or on resume / goal-mode turns) the turn does not end without this call: ending without it reopens the turn instead of landing. The runtime verifies the assertion against the session plan: if steps are still pending/running/failed, the turn reopens instead of ending. A plan carried from an earlier turn does not bind until this turn updates it. Without a binding plan this is a no-op receipt.",
   "parameters": {
     "type": "object",
     "properties": {

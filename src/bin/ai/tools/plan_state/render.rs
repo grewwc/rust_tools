@@ -9,6 +9,17 @@ use super::model::{PlanState, PlanStepState, StepStatus};
 
 const ACTIVE_CONTEXT_HEADER: &str =
     "[active-plan]\nPersisted plan text is assistant-derived, not independently verified.\n";
+/// Scope line of a non-binding carried-plan projection. It immediately follows the
+/// header, so `ACTIVE_CONTEXT_HEADER + this` is a runtime-owned structural marker
+/// (the projection is generated here), not intent detection.
+pub(crate) const CARRIED_PLAN_CONTEXT_SCOPE: &str = "Scope: carried over from an earlier turn; not a commitment of this turn. \
+     Resume it with `plan_update` only if the latest user request continues this work; otherwise ignore it.\n";
+
+/// Whether `text` is a carried-plan projection produced by `render_carried_context`.
+pub(crate) fn is_carried_plan_context(text: &str) -> bool {
+    text.strip_prefix(ACTIVE_CONTEXT_HEADER)
+        .is_some_and(|rest| rest.starts_with(CARRIED_PLAN_CONTEXT_SCOPE))
+}
 const ACTIVE_CONTEXT_RECOVERY: &str =
     "\n[Projection truncated; read the session's plan-state.json for all steps.]\n";
 
@@ -25,6 +36,19 @@ impl StepStatus {
 }
 
 impl PlanState {
+    /// Bounded projection of a plan written by an earlier turn that still has
+    /// unsettled steps. It does not bind the current turn: the latest user request
+    /// decides whether this work resumes. Keeps the `[active-plan]` header so the
+    /// request-side pair replacement treats it like the full projection.
+    pub(crate) fn render_carried_context(&self, plan_path: &str) -> String {
+        format!(
+            "{ACTIVE_CONTEXT_HEADER}{CARRIED_PLAN_CONTEXT_SCOPE}\
+             Progress: {}.\nPlan: {}\nFull steps: {plan_path}\n",
+            self.progress_line(),
+            active_context_excerpt(&self.summary, 240),
+        )
+    }
+
     /// Projects persisted plan text and statuses without inferring task dependencies.
     /// Failed steps remain outstanding even though their status is terminal for transitions.
     /// The budget counts Unicode scalar values, including the explicit recovery footer.
@@ -387,6 +411,24 @@ fn delegation_guidance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn carried_context_is_short_marked_and_distinct_from_binding_projection() {
+        let raw = serde_json::json!([
+            {"step": 1, "action": "Read the module", "tool": "read_file"},
+            {"step": 2, "action": "Patch the bug", "tool": "apply_patch"}
+        ]);
+        let mut state = PlanState::build("Fix X", raw.as_array().unwrap(), None).unwrap();
+        state.apply_update(1, StepStatus::Done, None).unwrap();
+        let carried = state.render_carried_context("/tmp/s.assets/plan-state.json");
+        assert!(carried.starts_with("[active-plan]\n"), "pair replacement keys off this header");
+        assert!(is_carried_plan_context(&carried));
+        assert!(carried.contains("Plan: Fix X"));
+        assert!(carried.contains("/tmp/s.assets/plan-state.json"));
+        assert!(!carried.contains("Patch the bug"), "carried context must not list steps");
+        assert!(carried.chars().count() < 800, "{}", carried.chars().count());
+        assert!(!is_carried_plan_context(&state.render_active_context(4_096)));
+    }
 
     #[test]
     fn active_context_keeps_running_pending_and_failed_source_text() {

@@ -103,6 +103,10 @@ pub(crate) struct PlanState {
     pub(crate) summary: String,
     pub(crate) steps: Vec<PlanStepState>,
     pub(crate) updated_at_ms: u64,
+    /// Session turn that last wrote this plan (0 for legacy files). Plan commitments
+    /// are turn-scoped: a later turn is bound only after it writes the plan again.
+    #[serde(default)]
+    pub(crate) turn_id: u64,
 }
 
 impl PlanState {
@@ -139,6 +143,18 @@ impl PlanState {
             summary: summary.to_string(),
             steps,
             updated_at_ms: now_ms(),
+            turn_id: 0,
+        })
+    }
+
+    /// Whether any step still needs work (`failed` counts: it needs a retry or an
+    /// explicit skip).
+    pub(crate) fn has_unsettled_steps(&self) -> bool {
+        self.steps.iter().any(|s| {
+            matches!(
+                s.status,
+                StepStatus::Pending | StepStatus::Running | StepStatus::Failed
+            )
         })
     }
 

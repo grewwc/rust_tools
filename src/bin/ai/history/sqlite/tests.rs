@@ -1355,3 +1355,44 @@ fn read_all_messages_with_models_self_heals_fresh_and_pre_migration_dbs() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn session_origin_reads_first_real_exchange_verbatim_past_synthetic_and_tool_rows() {
+    let dir = std::env::temp_dir().join(format!(
+        "session_origin_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    let mut tool_call_assistant = msg("assistant", "");
+    tool_call_assistant.tool_calls = Some(vec![crate::ai::types::ToolCall {
+        id: "call-1".to_string(),
+        tool_type: "function".to_string(),
+        function: crate::ai::types::FunctionCall {
+            name: "read_file".to_string(),
+            arguments: "{}".to_string(),
+        },
+    }]);
+    let mut messages = vec![
+        crate::ai::history::runtime_synthetic_user_message(Value::String("handoff".into())),
+        msg("user", "第一轮：帮我看下 src/main.rs"),
+        tool_call_assistant,
+        tool_msg("call-1", "fn main() {}"),
+        msg("assistant", "main 只有一个空函数。"),
+    ];
+    for i in 0..1_000 {
+        messages.push(msg("user", &format!("turn {i}")));
+        messages.push(msg("assistant", &format!("reply {i}")));
+    }
+    append_history_sqlite(&path, messages).unwrap();
+
+    let (index, prompt, reply) = read_session_origin_sqlite(&path).unwrap().unwrap();
+    assert_eq!(index, 1);
+    assert_eq!(prompt, "第一轮：帮我看下 src/main.rs");
+    assert_eq!(reply.as_deref(), Some("main 只有一个空函数。"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
