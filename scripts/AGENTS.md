@@ -40,7 +40,7 @@ the bait set lives in `prompt_eval_cases.jsonl`, recorded runs in
   check, so a correct refusal never scores as a fabricated citation, nor does a
   hypothetical offer (`if you meant … e.g. X`). Labelled heuristics: unsupported
   action claims, hedging markers, unanswered controls.
-- A full `--record` spends one agent turn per case (12 by default), so it is run
+- A full `--record` spends one agent turn per selected case, so it is run
   deliberately; `--selftest`, `--score`, `--compare` and `--dry-run` cost nothing.
   `--repeat N` costs N turns per case and exists to separate an intermittent
   failure from a systematic one.

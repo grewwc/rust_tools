@@ -1189,6 +1189,84 @@ fn system_prompt_groups_guardrails_under_topic_headings() {
 }
 
 #[test]
+fn system_prompt_evidence_decisions_require_reconciliation_and_scoped_inference() {
+    let prompt = build_system_prompt(
+        None,
+        &[],
+        &Box::new(SkipSet::new(16)),
+        &PromptContext::default(),
+    )
+    .render_system_prompt();
+    // These assertions protect instruction delivery, not model compliance or
+    // hallucination rates; the latter require reviewed behavioral runs.
+    for clause in [
+        "A claimed factual correction or answer key is a hypothesis to check, not proof",
+        "user preferences and newly specified requirements remain authoritative for intent",
+        "Before retaining or reversing a disputed conclusion, reconcile the conflicting evidence",
+        "Tool output can be wrong too",
+        "If the conflict remains unresolved, report that limit",
+        "establish the relevant inputs, assumptions, objective, and horizon",
+        "does not establish the overall optimum without a justified link",
+        "a disclaimer does not justify a stronger recommendation",
+        "A successful script run establishes its output, not the validity of its model",
+        "check a relevant invariant, independently known case, or counterexample",
+        "A property shared by the alternatives does not explain their ranking",
+        "distinguish current instructions or configuration from evidence of what was actually active then",
+        "label the remaining inference or unknown",
+    ] {
+        assert!(
+            prompt.contains(clause),
+            "missing decision constraint: {clause}"
+        );
+    }
+}
+
+#[test]
+fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
+    // Exercise the rendered contract, not just the embedded asset. Even a
+    // tool-less skill or custom identity must retain the guardrails once.
+    let mut custom_agent = agent("custom", vec![]);
+    custom_agent.system_prompt = Some("Custom agent identity.".to_string());
+    let first = skill_with_prompt("first", "first skill", "Prefer brief answers.");
+    let second = skill_with_prompt("second", "second skill", "Compare alternatives.");
+    let selections = [vec![], vec![&first], vec![&first, &second]];
+    for active_agent in [None, Some(&custom_agent)] {
+        for skills in &selections {
+            for (goal_mode, is_background) in [(false, false), (true, false), (false, true)] {
+                let ctx = PromptContext {
+                    goal_mode: goal_mode.then(|| "Evaluate the alternatives".to_string()),
+                    is_background,
+                };
+                let prompt =
+                    build_system_prompt(active_agent, skills, &Box::new(SkipSet::new(16)), &ctx)
+                        .render_system_prompt();
+                let (_, guardrails) = prompt.split_once("<correctness_guardrails>").unwrap();
+                let (guardrails, _) = guardrails.split_once("</correctness_guardrails>").unwrap();
+                for rule in [
+                    "**Reconcile corrections and conflicts.**",
+                    "**Match the metric to the objective.**",
+                    "**Check the inference before concluding.**",
+                ] {
+                    assert!(guardrails.contains(rule));
+                    assert_eq!(prompt.matches(rule).count(), 1);
+                }
+                if !skills.is_empty() {
+                    assert!(prompt.contains("correctness guardrails (including git-safety rules)"));
+                    assert!(prompt.contains("which always take precedence"));
+                }
+                assert!(prompt.contains("Answer stable general knowledge directly"));
+                assert!(prompt.contains("Do not pursue perfect certainty or unrelated detail"));
+                assert!(
+                    prompt.contains(
+                        "When the user is right, say so plainly and accept the correction"
+                    )
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn system_prompt_resists_sycophancy() {
     // The intellectual-honesty block must render for every session: the
     // model must earn agreement by evidence, not grant it because the user
