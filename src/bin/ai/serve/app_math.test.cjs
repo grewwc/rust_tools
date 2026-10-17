@@ -8,6 +8,7 @@ const { test } = require("node:test");
 
 const html = fs.readFileSync(path.join(__dirname, "app.html"), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+const userOriginHelpers = script.slice(script.indexOf("function isRuntimeSyntheticUser("), script.indexOf("const PHONE_LAYOUT_QUERY"));
 const renderer = script.slice(script.indexOf("const esc ="), script.indexOf("function sessionTitle("));
 const decode = (s) => s.replace(/&(amp|lt|gt|quot);/g, (_, key) => ({ amp: "&", lt: "<", gt: ">", quot: '"' })[key]);
 function nodesOf(markup) {
@@ -144,6 +145,7 @@ test("question navigator fetches the complete history and renders an older targe
     document: { createElement: () => ({ append() {} }) },
   });
   vm.runInContext(script.slice(start, end), context);
+  vm.runInContext(userOriginHelpers, context);
   await context.openQuestionPanel();
   assert.equal(context.count, 103);
   assert.equal(links.length, 103);
@@ -239,6 +241,7 @@ test("a live user bubble resolves the canonical index before rewinding", async (
     rewindTo: (...args) => rewinds.push(args),
   });
   vm.runInContext(script.slice(start, end), context);
+  vm.runInContext(userOriginHelpers, context);
   context.addLiveUserBubble("repeat", "repeat", "session-1", 10);
   assert.equal(actions.length, 1);
   assert.deepEqual(host.child.children, [actions[0], bubble]);
@@ -1123,6 +1126,65 @@ test("user image references stay visible as placeholders; assistant media stays 
   assert.match(rendered[2].assistant, /<img src="https:\/\/example.com\/result.png"/);
   assert.equal(h.context.textOf(messages[0].content), "", "non-display consumers keep their text-only contract");
   assert.notEqual(history.rows[0].key, h.context.historyRowsOf(messages, 13, false).rows[0].key);
+});
+
+test("image reread followups stay internal without losing real prompts or canonical indices", () => {
+  const h = harness(), rendered = [];
+  const chunks = [
+    ["function textOf(", "const PHONE_LAYOUT_QUERY"],
+    ["function historyRowsOf(", "function attachLiveBox("],
+    ["function questionRowsOf(", "async function openQuestionPanel("],
+    ["function findUserHistoryIndex(", "function addLiveUserBubble("],
+  ];
+  for (const [start, end] of chunks) vm.runInContext(script.slice(script.indexOf(start), script.indexOf(end)), h.context);
+  Object.assign(h.context, {
+    addUserBubble: (text, index) => rendered.push({ role: "user", text, index }),
+    addMsgMd: (text) => rendered.push({ role: "assistant", text }),
+    addFold: (label, text) => rendered.push({ role: "tool", label, text }),
+    FOLD_ROLE_LABELS: {},
+  });
+  const content = [{ type: "reference", kind: "image", name: "hand.jpg", asset: "attachments/hand.jpg" }, { type: "text", text: "which tile?" }];
+  const origin = "runtime-origin:synthetic-user:v1";
+  const messages = [
+    { role: "user", content },
+    { role: "tool", content: "Image file detected" },
+    { role: "user", content, reasoning_content: origin },
+    { role: "assistant", content: "![result](https://example.test/result.png)" },
+    { role: "user", content },
+  ];
+  const before = JSON.stringify(messages);
+  const history = h.context.historyRowsOf(messages, 20, false);
+  assert.equal(history.shownCount, 5, "hidden messages still occupy canonical slots");
+  assert.deepEqual(Array.from(history.rows, (r) => r.historyIndex), [15, 16, 18, 19]);
+  history.rows.forEach((row) => h.context.renderHistoryRow(row));
+  assert.deepEqual(rendered.map((r) => r.role), ["user", "tool", "assistant", "user"]);
+  assert.equal(rendered[0].text, "[image: hand.jpg]\nwhich tile?");
+  assert.equal(rendered[2].text, messages[3].content, "assistant images remain Markdown");
+  assert.deepEqual(Array.from(h.context.questionRowsOf(messages, 20), (r) => r.historyIndex), [15, 19]);
+  assert.equal(h.context.findUserHistoryIndex(messages.slice(0, 3), 18, "which tile?", 0), 15);
+  assert.equal(h.context.findUserHistoryIndex(messages.slice(0, 3), 18, "which tile?", 16), null);
+  assert.equal(h.context.findUserHistoryIndex(messages, 20, "which tile?", 0), 19, "genuine repeated prompts remain selectable");
+  assert.equal(JSON.stringify(messages), before, "projection must not mutate canonical messages");
+  const windowed = Array.from({ length: 202 }, () => ({ role: "assistant", content: "reply" }));
+  windowed[2] = messages[2];
+  windowed[3] = messages[0];
+  const tail = h.context.historyRowsOf(windowed, 302, false);
+  assert.equal(tail.shownCount, 200);
+  assert.equal(tail.rows[0].historyIndex, 103, "filtering does not shift a truncated window");
+});
+
+test("synthetic origin is exact metadata, never a content or image heuristic", () => {
+  const context = vm.createContext({});
+  vm.runInContext(userOriginHelpers, context);
+  const rust = fs.readFileSync(path.join(__dirname, "../history/types.rs"), "utf8");
+  const origin = rust.match(/const RUNTIME_SYNTHETIC_USER_ORIGIN: &str = "([^"]+)";/)[1];
+  assert.equal(context.isRuntimeSyntheticUser({ role: "user", content: [], reasoning_content: origin }), true);
+  for (const message of [
+    { role: "user", content: origin },
+    { role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,AA==" } }] },
+    { role: "user", content: "repeat", reasoning_content: "other metadata" },
+    { role: "assistant", content: "reply", reasoning_content: origin },
+  ]) assert.equal(context.isRuntimeSyntheticUser(message), false);
 });
 
 test("a stale live box is not reattached beside canonical history", () => {
