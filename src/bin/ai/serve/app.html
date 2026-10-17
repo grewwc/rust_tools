@@ -319,11 +319,12 @@ select, summary { touch-action:manipulation; }
 </section>
 </div>
 <details id="ovrwrap" open>
-<summary id="ovrsummary">model · agent · effort</summary>
+<summary id="ovrsummary">model · agent · effort · skill</summary>
 <div id="ovr">
 <select id="omodel" aria-label="model override"></select>
 <select id="oagent" aria-label="agent override"></select>
 <select id="oeffort" aria-label="reasoning effort override"></select>
+<select id="oskill" aria-label="skill for next message" title="Skill for the next message only" disabled><option value="">skill: loading…</option></select>
 </div>
 </details>
 <div id="composer">
@@ -798,6 +799,8 @@ function setDrawer(open) {
 function syncOvrSummary() {
   const t = (s) => { const o = s.options[s.selectedIndex]; return (o && s.value) ? o.textContent : "default"; };
   $("ovrsummary").textContent = "model " + t($("omodel")) + " · agent " + t($("oagent")) + " · effort " + t($("oeffort"));
+  const skill = $("oskill").value;
+  $("ovrsummary").textContent = (skill ? "skill " + skill + " (next) · " : "") + $("ovrsummary").textContent;
 }
 // The composer grows with its content (up to the CSS cap) instead of
 // trapping multi-line input in a 44px box with an inner scroll.
@@ -871,11 +874,14 @@ function handlePromptPaste(event) {
   event.preventDefault();
   insertPromptText(text);
 }
-function textOf(content) {
+function textOf(content, imagePlaceholders = false) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content.map((b) => {
       if (typeof b === "string") return b;
+      if (imagePlaceholders && b && (b.kind === "image" || b.type === "image_url" || b.type === "image" || b.type === "input_image")) {
+        return "\n[image" + (b.name ? ": " + b.name : "") + "]\n";
+      }
       if (b && typeof b === "object") return b.text || b.content || "";
       return "";
     }).join("");
@@ -968,6 +974,7 @@ function switchSession(nextId, saveCurrent = true) {
   else localStorage.removeItem("serve.session");
   restoreDraft();
   resetQuestionNavigator();
+  restoreSkillPick();
 }
 function questionRowsOf(messages, histTotal) {
   const base = Math.max(0, (histTotal || messages.length) - messages.length);
@@ -1060,7 +1067,7 @@ function addMsgMd(text, parent) {
 // route is authed and media elements cannot carry the bearer token, so the page
 // fetches the file itself and hands the blob to the element. An unservable token
 // (missing, outside the roots, wrong kind) stays plain text.
-let previewUrls = [];
+const previewUrls = new Map(); // slot -> Object URL; ownership follows the DOM
 const MEDIA_TOKEN_G = /[\w.@~+\/-]*[\w@~+\/-]\.(?:png|jpe?g|gif|webp|svg|avif|bmp|mp3|wav|m4a|aac|ogg|flac|opus)\b/gi;
 const MAX_PREVIEWS_PER_MSG = 4;
 // Standalone path tokens only: a run of path characters that keeps its
@@ -1113,14 +1120,17 @@ function decorateMedia(root) {
 }
 async function loadPreviews(root) {
   if (!root.querySelectorAll) return;
+  const forSession = sessionId;
   for (const slot of root.querySelectorAll("span.mediaprev:not([data-held])")) {
+    if (slot.dataset.retired) continue;
     slot.dataset.held = "1"; // one fetch per slot, however often the view repaints
     const path = slot.dataset.path;
     // Assistants print both workspace-relative paths and bare names, and the
     // printed prefix need not match the served root; a path that fails is
     // retried once as a basename before the token falls back to plain text.
     const attempt = async (p) => {
-      const res = await api("/sessions/" + sessionId + "/file?path=" + encodeURIComponent(p));
+      if (slot.dataset.retired) throw new Error("preview retired");
+      const res = await api("/sessions/" + forSession + "/file?path=" + encodeURIComponent(p));
       if (!res.ok) throw new Error("HTTP " + res.status);
       return URL.createObjectURL(await res.blob());
     };
@@ -1133,7 +1143,12 @@ async function loadPreviews(root) {
         if (cut <= 0) throw e;
         url = await attempt(path.slice(cut + 1));
       }
-      previewUrls.push(url);
+      // A history refresh or session switch may retire this slot during fetch.
+      if (slot.dataset.retired) {
+        URL.revokeObjectURL(url);
+        continue;
+      }
+      previewUrls.set(slot, url);
       const isAudio = /\.(?:mp3|wav|m4a|aac|ogg|flac|opus)$/i.test(path);
       const media = document.createElement(isAudio ? "audio" : "img");
       media.src = url;
@@ -1151,7 +1166,7 @@ async function loadPreviews(root) {
       slot.append(media, cap);
       slot.classList.add("loaded");
     } catch (e) {
-      slot.replaceWith(document.createTextNode(path));
+      if (!slot.dataset.retired) slot.replaceWith(document.createTextNode(path));
     }
   }
 }
@@ -1164,9 +1179,14 @@ function showViewer(url) {
   $("viewerimg").src = url;
   $("viewer").classList.add("on");
 }
-function revokePreviews() {
-  for (const url of previewUrls) URL.revokeObjectURL(url);
-  previewUrls = [];
+function revokePreviews(root = $("msgs")) {
+  // Retire pending fetches as well as URLs already attached to this subtree.
+  for (const slot of root.querySelectorAll("span.mediaprev")) slot.dataset.retired = "1";
+  for (const [slot, url] of previewUrls) {
+    if (!root.contains(slot)) continue;
+    URL.revokeObjectURL(url);
+    previewUrls.delete(slot);
+  }
 }
 // A history fold is titled by what produced it. Tool results are stored as
 // their own `tool`-role messages, so titling them with the raw role printed a
@@ -1359,6 +1379,61 @@ function fillSelect(sel, entries, currentLabel, kind) {
     sel.appendChild(o);
   }
   sel.value = (prev && [...sel.options].some((o) => o.value === prev)) ? prev : "";
+}
+// Skills are pending next-turn choices, not persistent session configuration.
+// Keep drafts per server/session while the page is open; object identity keeps
+// an older HTTP acknowledgement from clearing a newer selection.
+const skillPicks = new Map();
+let skillLoadEpoch = 0;
+function skillPickKey(sid = sessionId) { return JSON.stringify([store.base, sid || ""]); }
+function saveSkillPick() {
+  const key = skillPickKey();
+  if ($("oskill").value) skillPicks.set(key, { name: $("oskill").value });
+  else skillPicks.delete(key);
+  syncOvrSummary();
+}
+function restoreSkillPick() {
+  const sel = $("oskill"), key = skillPickKey(), pick = skillPicks.get(key);
+  const available = pick && [...sel.options].some((o) => o.value === pick.name);
+  if (pick && !sel.disabled && !available) skillPicks.delete(key);
+  sel.value = available ? pick.name : "";
+  syncOvrSummary();
+}
+function carrySkillPick(from, to) {
+  const key = skillPickKey(from), pick = skillPicks.get(key);
+  if (pick) { skillPicks.set(skillPickKey(to), pick); skillPicks.delete(key); }
+  restoreSkillPick();
+}
+function captureSkillPick() {
+  restoreSkillPick();
+  const key = skillPickKey(), pick = skillPicks.get(key);
+  return { key, pick, skills: !$("oskill").disabled && pick ? [pick.name] : [] };
+}
+function consumeSkillPick(sent) {
+  if (sent.skills.length && skillPicks.get(sent.key) === sent.pick) skillPicks.delete(sent.key);
+  restoreSkillPick();
+}
+async function loadSkills() {
+  const epoch = ++skillLoadEpoch, base = store.base, sel = $("oskill");
+  sel.disabled = true;
+  fillSelect(sel, [], "", "skill");
+  sel.options[0].textContent = "skill: loading…";
+  try {
+    const skills = await (await api("/skills")).json();
+    if (epoch !== skillLoadEpoch || base !== store.base) return;
+    const entries = skills.map((s) => [s.name, s.name]);
+    fillSelect(sel, entries, "", "skill");
+    sel.options[0].textContent = entries.length ? "skill: default (next message)" : "skill: none available";
+    for (let i = 0; i < skills.length; i++) sel.options[i + 1].title = skills[i].description || skills[i].name;
+    sel.title = "Skill for the next message only; default does not force a skill";
+    sel.disabled = !entries.length;
+    if (!entries.length) skillPicks.delete(skillPickKey());
+  } catch (_) {
+    if (epoch !== skillLoadEpoch || base !== store.base) return;
+    sel.options[0].textContent = "skill: unavailable";
+    sel.title = "Could not load skills; reconnect to retry. Normal messages still work.";
+  }
+  restoreSkillPick();
 }
 async function loadInfo() {
   try {
@@ -1593,7 +1668,7 @@ function historyRowsOf(msgs, histTotal, showAll) {
   const rows = [];
   for (let i = 0; i < shown.length; i++) {
     const message = shown[i];
-    const text = textOf(message.content).trim();
+    const text = textOf(message.content, message.role === "user").trim();
     if (!text) continue;
     rows.push({
       message,
@@ -1601,8 +1676,9 @@ function historyRowsOf(msgs, histTotal, showAll) {
       historyIndex: histBase + i,
       call: message.tool_call_id ? calls.get(message.tool_call_id) : null,
       key: JSON.stringify([
-        message.role || "", text, !!message.reasoning_content,
+        histBase + i, message.role || "", text, !!message.reasoning_content,
         message.tool_call_id || "",
+        message.tool_call_id ? calls.get(message.tool_call_id) : null,
       ]),
     });
   }
@@ -1700,23 +1776,28 @@ async function loadHistory(prefetched) {
   const follow = !sameSession || shouldFollowOutput(root);
   const oldScrollTop = root.scrollTop;
   const nextKeys = history.rows.map((row) => row.key);
-  const appendOnly = !!prefetched && prefetched.appendOnly
-    && historySession === forSession
-    && historyKeys.length <= nextKeys.length
-    && historyKeys.every((key, i) => key === nextKeys[i])
-    && root.children.length >= historyKeys.length
-    // Object URLs are tracked transcript-wide. Keep their existing cleanup
-    // semantics rather than retaining removed live-tail previews indefinitely.
-    && previewUrls.length === 0;
+  // Keep the overlapping canonical window, including loaded media. The
+  // 200-message window can slide forward without re-decoding every image.
+  const start = sameSession && nextKeys.length ? historyKeys.indexOf(nextKeys[0]) : -1;
+  const retained = start < 0 ? 0 : Math.min(historyKeys.length - start, nextKeys.length);
+  const appendOnly = retained > 0
+    && nextKeys.slice(0, retained).every((key, i) => key === historyKeys[start + i])
+    && root.children.length >= historyKeys.length;
+  const liveBox = turns.get(forSession)?.box;
+  const removeRow = (node) => {
+    if (node !== liveBox) revokePreviews(node);
+    node.remove();
+  };
   if (appendOnly) {
-    // The canonical prefix stays mounted. Remove only the temporary user/live
-    // turn tail, then append rows that became durable since the feed was lost.
-    while (root.children.length > historyKeys.length) root.lastElementChild.remove();
-    for (let i = historyKeys.length; i < history.rows.length; i++) renderHistoryRow(history.rows[i], root);
+    for (let i = 0; i < start; i++) removeRow(root.children[0]);
+    while (root.children.length > retained) removeRow(root.lastElementChild);
+    for (let i = retained; i < history.rows.length; i++) renderHistoryRow(history.rows[i], root);
   } else {
     // Fetching has completed, so this synchronous clear-and-render is painted
     // as one frame instead of exposing an empty transcript during network I/O.
-    revokePreviews();
+    // A still-running box is reattached below; its previews remain owned by it.
+    if (liveBox) liveBox.remove();
+    revokePreviews(root);
     root.textContent = "";
     for (const row of history.rows) renderHistoryRow(row, root);
   }
@@ -1978,34 +2059,24 @@ function note(msg) {
 }
 async function sendSideNote() {
   if (sideNoteBusy || !sessionId) return;
-  sideNoteBusy = true;
-  $("sidenote").disabled = true;
-  if (!isTurnRunning()) {
-    const running = await pollConfirm();
-    if (running !== true && !isTurnRunning()) {
-      note("no turn running");
-      sideNoteBusy = false;
-      syncStopButton();
-      return;
-    }
-  }
   const input = $("prompt");
   const draft = input.value;
   const text = draft.trim();
   if (!text) {
     note("type a side note first");
     input.focus();
-    sideNoteBusy = false;
-    syncStopButton();
     return;
   }
   if (pendingImages.length) {
     note("side notes are text only — send the pending images after this turn");
-    sideNoteBusy = false;
-    syncStopButton();
     return;
   }
+  // The queue accepts notes even between turns. Do not gate delivery on a
+  // running-state poll, or let that wait change the target session or text.
   const targetSession = sessionId;
+  sideNoteBusy = true;
+  $("sidenote").disabled = true;
+  note("sending side note…");
   try {
     await api("/sessions/" + targetSession + "/side-notes", {
       method: "POST", body: JSON.stringify({ text }),
@@ -2017,7 +2088,7 @@ async function sendSideNote() {
       input.style.height = "auto";
       clearDraft(targetSession);
     }
-    note("side note queued");
+    note("side note queued — applies at the next model request");
   } catch (e) {
     note("side note failed: " + e.message);
   } finally {
@@ -2075,6 +2146,7 @@ async function send() {
       try { sessionId = (await (await api("/sessions", { method: "POST" })).json()).id; }
       catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); return; }
       localStorage.setItem("serve.session", sessionId);
+      carrySkillPick(draftSession, sessionId);
       persistPicks(); // picks made before any session existed belong to this one now
     }
     sid = sessionId;
@@ -2095,6 +2167,8 @@ async function send() {
   // `confirm: true` tells the server this page renders and answers confirmation
   // requests; clients that cannot answer must not open a question nobody sees.
   const body = { prompt, confirm: true };
+  const skillSelection = captureSkillPick();
+  if (skillSelection.skills.length) body.skills = skillSelection.skills;
   if ($("omodel").value.trim()) body.model = $("omodel").value.trim();
   if ($("oagent").value.trim()) body.agent = $("oagent").value.trim();
   if ($("oeffort").value.trim()) body.reasoning_effort = $("oeffort").value.trim();
@@ -2253,6 +2327,7 @@ async function send() {
       try { detail = (await res.json()).error || detail; } catch (_) {}
       throw new Error(res.status + " " + detail);
     }
+    consumeSkillPick(skillSelection); // Accepted by the server, not model completion.
     turnStarted = true;
     reader = res.body.getReader();
     const dec = new TextDecoder();
@@ -2496,6 +2571,7 @@ function wire() {
   $("omodel").onchange = () => savePick();
   $("oagent").onchange = () => savePick();
   $("oeffort").onchange = () => savePick();
+  $("oskill").onchange = () => saveSkillPick();
   $("prompt").addEventListener("compositionstart", () => { promptComposing = true; });
   $("prompt").addEventListener("compositionend", () => {
     promptComposing = false;
@@ -2589,6 +2665,7 @@ async function boot() {
   wire();
   try { await api("/healthz"); } catch (e) { $("info").textContent = "cannot reach server: " + e.message + " — tap ⚙"; return; }
   await loadInfo();
+  loadSkills(); // Optional catalog must not delay history or the composer.
   await loadSessions();
   await loadHistory();
   await loadSessionConfig(); // restore this session's picks from the server

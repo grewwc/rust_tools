@@ -81,6 +81,7 @@ test("drafts persist independently for each session and restore on switch", () =
     },
     $: (id) => elements[id],
     growPrompt() {},
+    restoreSkillPick() {},
     isPhoneLayout: () => true,
   });
   vm.runInContext('const DRAFT_PREFIX = "serve.draft."; let questionCache = null; let sessionId = "alpha";\n' + script.slice(start, end), context);
@@ -279,30 +280,40 @@ test("a mobile side note queues text without stopping the running turn", async (
   assert.deepEqual(calls[1], ["clearDraft", "session-a"]);
   assert.equal(prompt.value, "");
   assert.equal(prompt.style.height, "auto");
-  assert.equal(notices.at(-1), "side note queued");
+  assert.equal(notices.at(-1), "side note queued — applies at the next model request");
   assert.equal(button.disabled, false);
 });
 
-test("a visible side-note control refreshes an expired running-state sample", async () => {
+test("a side note posts immediately despite an expired running-state sample", async () => {
   const start = script.indexOf("async function sendSideNote(");
   const end = script.indexOf("async function stopTurn(", start);
-  let running = false;
   let polls = 0;
-  let posts = 0;
+  const posts = [], notices = [];
+  let finishPost;
+  const response = new Promise((resolve) => { finishPost = resolve; });
   const prompt = { value: "continue", style: {}, focus() {} };
   const button = { disabled: false };
   const context = vm.createContext({
     sideNoteBusy: false, sessionId: "session-a", pendingImages: [],
-    isTurnRunning: () => running,
-    pollConfirm: async () => { polls++; running = true; return true; },
+    isTurnRunning: () => false,
+    pollConfirm: () => { polls++; return new Promise(() => {}); },
     $: (id) => id === "prompt" ? prompt : button,
-    api: async () => { posts++; }, clearDraft() {}, note() {}, syncStopButton() {}, JSON,
+    api: (path, options) => { posts.push([path, JSON.parse(options.body)]); return response; },
+    clearDraft() {}, note: (message) => notices.push(message), syncStopButton() {}, JSON,
   });
   vm.runInContext(script.slice(start, end), context);
+  const sending = context.sendSideNote();
+  assert.equal(polls, 0, "confirmation polling must not gate a side-note POST");
+  assert.deepEqual(posts, [["/sessions/session-a/side-notes", { text: "continue" }]]);
+  assert.equal(button.disabled, true);
+  assert.equal(prompt.value, "continue", "keep the draft until the server acknowledges it");
+  assert.equal(notices.at(-1), "sending side note…");
   await context.sendSideNote();
-  assert.equal(polls, 1);
-  assert.equal(posts, 1);
+  assert.equal(posts.length, 1, "repeated taps must not duplicate the note");
+  finishPost();
+  await sending;
   assert.equal(prompt.value, "");
+  assert.equal(notices.at(-1), "side note queued — applies at the next model request");
   assert.equal(button.disabled, false);
 });
 
@@ -332,6 +343,58 @@ test("a failed side note preserves the draft and pending images never enter a no
   await context.sendSideNote();
   assert.equal(apiCalls, 1);
   assert.match(notices.at(-1), /side notes are text only/);
+});
+
+test("a slow side-note acknowledgement preserves edits and another session's draft", async () => {
+  const start = script.indexOf("async function sendSideNote(");
+  const end = script.indexOf("async function stopTurn(", start);
+  for (const switchSession of [false, true]) {
+    let finishPost;
+    const response = new Promise((resolve) => { finishPost = resolve; });
+    const posts = [];
+    const prompt = { value: "original", style: { height: "90px" } };
+    const button = { disabled: false };
+    const context = vm.createContext({
+      sideNoteBusy: false, sessionId: "session-a", pendingImages: [],
+      $: (id) => id === "prompt" ? prompt : button,
+      api: (path, options) => { posts.push([path, JSON.parse(options.body)]); return response; },
+      clearDraft: () => assert.fail("must not clear a changed or different session's draft"),
+      note() {}, JSON,
+    });
+    vm.runInContext(script.slice(start, end), context);
+    const sending = context.sendSideNote();
+    if (switchSession) context.sessionId = "session-b";
+    else prompt.value = "edited while sending";
+    const expected = prompt.value;
+    finishPost();
+    await sending;
+    assert.deepEqual(posts, [["/sessions/session-a/side-notes", { text: "original" }]]);
+    assert.equal(prompt.value, expected);
+    assert.equal(prompt.style.height, "90px");
+    assert.equal(button.disabled, false);
+    assert.equal(context.sideNoteBusy, false);
+  }
+});
+
+test("empty side notes are rejected locally without polling or disabling the control", async () => {
+  const start = script.indexOf("async function sendSideNote(");
+  const end = script.indexOf("async function stopTurn(", start);
+  let focused = false;
+  const notices = [];
+  const prompt = { value: "   ", focus() { focused = true; } };
+  const button = { disabled: false };
+  const context = vm.createContext({
+    sideNoteBusy: false, sessionId: "session-a", pendingImages: [],
+    $: (id) => id === "prompt" ? prompt : button,
+    api: () => assert.fail("empty notes must not issue requests"),
+    note: (message) => notices.push(message),
+  });
+  vm.runInContext(script.slice(start, end), context);
+  await context.sendSideNote();
+  assert.equal(notices.at(-1), "type a side note first");
+  assert.equal(focused, true);
+  assert.equal(button.disabled, false);
+  assert.equal(context.sideNoteBusy, false);
 });
 
 test("phone session hold targets its own row and scrolling cancels it", () => {
@@ -809,11 +872,78 @@ test("media decoration leaves math text and rendered math subtrees alone", () =>
   assert.doesNotThrow(() => h.context.decorateMedia(h.msgs));
 });
 
+function previewHarness(paths, api) {
+  const slots = paths.map((path) => ({
+    dataset: { path }, children: [], classList: { add() {} },
+    append(...nodes) { this.children.push(...nodes); },
+    replaceWith(node) { this.replacement = node; },
+  }));
+  const subtree = (nodes) => ({
+    querySelectorAll(selector) { return nodes.filter((n) => !selector.includes(":not") || !n.dataset.held); },
+    contains: (node) => nodes.includes(node),
+  });
+  const root = subtree(slots);
+  const requested = [], revoked = [];
+  let serial = 0;
+  const context = vm.createContext({
+    sessionId: "s", previewUrls: new Map(), $: () => root,
+    api: async (url) => { requested.push(url); return api ? api(url) : { ok: true, blob: async () => ({}) }; },
+    URL: { createObjectURL: () => "blob:" + (++serial), revokeObjectURL: (url) => revoked.push(url) },
+    document: { createElement: (tag) => ({ tag }), createTextNode: (text) => ({ text }) },
+  });
+  vm.runInContext(script.slice(script.indexOf("async function loadPreviews("), script.indexOf("// A history fold is titled")), context);
+  return { context, root, slots, subtree, requested, revoked };
+}
+
+test("assistant previews load automatically once and cleanup is scoped to removed rows", async () => {
+  const h = previewHarness(["result.png", "other.png"]);
+  await h.context.loadPreviews(h.root);
+  await h.context.loadPreviews(h.root);
+  assert.equal(h.requested.length, 2);
+  assert.equal(h.slots[0].children[0].tag, "img");
+  assert.equal(h.slots[0].children[0].src, "blob:1");
+  h.context.revokePreviews(h.subtree([h.slots[0]]));
+  assert.deepEqual(h.revoked, ["blob:1"]);
+  assert.equal(h.context.previewUrls.get(h.slots[1]), "blob:2");
+  h.context.revokePreviews();
+  assert.deepEqual(h.revoked, ["blob:1", "blob:2"]);
+  assert.equal(h.context.previewUrls.size, 0);
+});
+
+test("a retired preview revokes a late blob without mounting it or fetching later slots", async () => {
+  let finishBlob, startBlob;
+  const started = new Promise((resolve) => { startBlob = resolve; });
+  const h = previewHarness(["result.png", "other.png"], () => ({
+    ok: true, blob: () => new Promise((resolve) => { finishBlob = resolve; startBlob(); }),
+  }));
+  const loading = h.context.loadPreviews(h.root);
+  await started;
+  h.context.revokePreviews();
+  finishBlob({});
+  await loading;
+  assert.deepEqual(h.revoked, ["blob:1"]);
+  assert.equal(h.requested.length, 1);
+  assert.equal(h.slots[0].children.length, 0);
+  assert.equal(h.context.previewUrls.size, 0);
+});
+
+test("a failed retired preview cannot retry its basename in a different session", async () => {
+  let fail;
+  const h = previewHarness(["dir/result.png"], () => new Promise((_, reject) => { fail = reject; }));
+  const loading = h.context.loadPreviews(h.root);
+  h.context.revokePreviews();
+  h.context.sessionId = "other";
+  fail(new Error("not found"));
+  await loading;
+  assert.deepEqual(h.requested, ["/sessions/s/file?path=dir%2Fresult.png"]);
+  assert.equal(h.slots[0].replacement, undefined);
+});
+
 function historyHarness({ delayed = false, existingKeys = [], existingNodes = [], follow = true } = {}) {
   let resolveResponse;
   let apiCalls = 0;
   let clears = 0;
-  let revokes = 0;
+  const retired = [];
   const response = {
     headers: { get: () => "2" },
     json: async () => [{ role: "user", content: "prompt" }, { role: "assistant", content: "reply" }],
@@ -836,7 +966,7 @@ function historyHarness({ delayed = false, existingKeys = [], existingNodes = []
   ];
   const context = vm.createContext({
     sessionId: "s", historySession: existingKeys.length ? "s" : "", historyKeys: existingKeys.slice(),
-    lastMsgCount: null, staleKey: "", staleDone: false, previewUrls: [],
+    lastMsgCount: null, staleKey: "", staleDone: false, previewUrls: new Map(), turns: new Map(),
     $: () => root,
     api: async () => { apiCalls += 1; return pending; },
     historyRowsOf: () => ({ rows, shownCount: rows.length }),
@@ -845,7 +975,7 @@ function historyHarness({ delayed = false, existingKeys = [], existingNodes = []
     updateQuestionButton() {},
     shouldFollowOutput: () => follow,
     followOutput(wasFollowing) { if (wasFollowing) root.scrollTop = root.scrollHeight; },
-    revokePreviews() { revokes += 1; },
+    revokePreviews(node) { retired.push(node); },
     renderHistoryRow(row, parent) {
       const node = { key: row.key, parent };
       node.remove = function remove() {
@@ -861,7 +991,7 @@ function historyHarness({ delayed = false, existingKeys = [], existingNodes = []
   vm.runInContext(script.slice(start, end), context);
   return {
     context, root, rows, resolveResponse,
-    apiCalls: () => apiCalls, clears: () => clears, revokes: () => revokes,
+    apiCalls: () => apiCalls, clears: () => clears, revokes: () => retired.length, retired,
   };
 }
 
@@ -888,7 +1018,7 @@ test("stale history appends canonical progress without replacing its prefix", as
   const firstProgress = h.root.children[1];
   assert.equal(h.apiCalls(), 0);
   assert.equal(h.clears(), 0);
-  assert.equal(h.revokes(), 0);
+  assert.deepEqual(h.retired, [staleBox, liveUser]);
   assert.equal(h.root.children[0], old);
   assert.deepEqual(h.root.children.map((node) => node.key), ["mounted-old", "new"]);
   h.rows.push({ key: "newer", text: "later progress" });
@@ -899,15 +1029,71 @@ test("stale history appends canonical progress without replacing its prefix", as
   assert.deepEqual(h.root.children.map((node) => node.key), ["mounted-old", "new", "newer"]);
 });
 
-test("stale history falls back to safe preview cleanup when object URLs exist", async () => {
+test("history retains image nodes and URLs across repeated progress and normal refresh", async () => {
   const old = { key: "mounted-old" };
   const h = historyHarness({ existingKeys: ["old"], existingNodes: [old] });
-  h.context.previewUrls.push("blob:old-preview");
+  h.context.previewUrls.set(old, "blob:old-preview");
   await h.context.loadHistory({ messages: [], histTotal: 2, appendOnly: true });
+  const reply = h.root.children[1];
+  h.rows.push({ key: "newer", text: "more progress" });
+  await h.context.loadHistory({ messages: [], histTotal: 3 });
+  assert.equal(h.clears(), 0);
+  assert.equal(h.revokes(), 0);
+  assert.equal(h.root.children[0], old);
+  assert.equal(h.root.children[1], reply);
+  assert.equal(h.context.previewUrls.get(old), "blob:old-preview");
+});
+
+test("a sliding history window retires only rows that left the window", async () => {
+  const first = { key: "first" }, image = { key: "image" };
+  const h = historyHarness({ existingKeys: ["first", "image"], existingNodes: [first, image] });
+  h.rows.splice(0, h.rows.length, { key: "image" }, { key: "new" });
+  await h.context.loadHistory({ messages: [], histTotal: 201, appendOnly: true });
+  assert.equal(h.clears(), 0);
+  assert.equal(h.root.children[0], image);
+  assert.deepEqual(h.retired, [first]);
+});
+
+test("a changed canonical row rebuilds safely without retiring a running box", async () => {
+  const old = { key: "old" }, live = { key: "running" };
+  const h = historyHarness({ existingKeys: ["different"], existingNodes: [old, live] });
+  h.context.turns.set("s", { box: live });
+  let liveWasDetached = false;
+  h.context.revokePreviews = (root) => { liveWasDetached = !root.children.includes(live); };
+  h.context.attachLiveBox = () => h.root.appendChild(live);
+  await h.context.loadHistory({ messages: [], histTotal: 2 });
   assert.equal(h.clears(), 1);
-  assert.equal(h.revokes(), 1);
-  assert.notEqual(h.root.children[0], old);
-  assert.deepEqual(h.root.children.map((node) => node.key), ["old", "new"]);
+  assert.equal(liveWasDetached, true);
+  assert.equal(h.root.lastElementChild, live);
+});
+
+test("user image references stay visible as placeholders; assistant media stays Markdown", () => {
+  const h = harness();
+  vm.runInContext(script.slice(script.indexOf("function textOf("), script.indexOf("const PHONE_LAYOUT_QUERY")), h.context);
+  const rendered = [];
+  Object.assign(h.context, {
+    callLabel: () => "tool",
+    addUserBubble: (text, index) => rendered.push({ user: text, index }),
+    addMsgMd: (text) => rendered.push({ assistant: h.render(text) }),
+  });
+  const start = script.indexOf("function historyRowsOf(");
+  const end = script.indexOf("function attachLiveBox(", start);
+  vm.runInContext(script.slice(start, end), h.context);
+  const messages = [
+    { role: "user", content: [{ type: "reference", kind: "image", name: "photo.png", asset: "opaque-key" }] },
+    { role: "user", content: [{ type: "text", text: "caption" }, { type: "image_url", image_url: { url: "data:image/png;base64,PRIVATE" } }] },
+    { role: "assistant", content: "![result](https://example.com/result.png)" },
+  ];
+  const history = h.context.historyRowsOf(messages, 12, false);
+  assert.equal(history.rows.length, 3);
+  history.rows.forEach((row) => h.context.renderHistoryRow(row));
+  assert.equal(rendered[0].user, "[image: photo.png]");
+  assert.equal(rendered[0].index, 9);
+  assert.equal(rendered[1].user, "caption\n[image]");
+  assert.doesNotMatch(JSON.stringify(rendered), /PRIVATE|opaque-key/);
+  assert.match(rendered[2].assistant, /<img src="https:\/\/example.com\/result.png"/);
+  assert.equal(h.context.textOf(messages[0].content), "", "non-display consumers keep their text-only contract");
+  assert.notEqual(history.rows[0].key, h.context.historyRowsOf(messages, 13, false).rows[0].key);
 });
 
 test("a stale live box is not reattached beside canonical history", () => {
@@ -987,7 +1173,8 @@ test("same-session history refresh preserves a phone reader's position", async (
   h.root.scrollTop = 37;
   await h.context.loadHistory({ messages: [], histTotal: 2, appendOnly: false });
   assert.equal(h.root.scrollTop, 37);
-  assert.deepEqual(h.root.children.map((node) => node.key), ["old", "new"]);
+  assert.equal(h.root.children[0], old);
+  assert.deepEqual(h.root.children.map((node) => node.key), ["mounted-old", "new"]);
 });
 
 test("the jump-to-latest control is a phone-only overlaid round button", () => {
