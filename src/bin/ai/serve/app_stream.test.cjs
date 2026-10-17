@@ -48,6 +48,12 @@ function streamHarness() {
   const dispatch = script.slice(dispatchStart, dispatchEnd).replace(/\s*}\s*$/, "");
   return {
     box,
+    connect() {
+      const begin = script.indexOf("  let turnStarted = false;", start);
+      const end = script.indexOf("  try {\n    const res = await fetch", begin);
+      assert.ok(end > begin);
+      vm.runInContext(script.slice(begin, end), context);
+    },
     emit(kind, value) {
       context.kind = kind;
       context.payload = typeof value === "string" ? value : JSON.stringify(value ?? {});
@@ -60,6 +66,45 @@ function streamHarness() {
     reply: () => vm.runInContext("bubble.innerHTML", context),
   };
 }
+
+test("pending HTTP request paints a connection indicator before any SSE event", () => {
+  const h = streamHarness();
+  h.connect();
+  assert.equal(h.pending(), "◌ Connecting…");
+  assert.deepEqual(h.titles(), []);
+  h.emit("thinking", { text: "reasoning" });
+  assert.match(h.pending(), /Thinking/);
+});
+
+test("restored running sessions distinguish missing live updates from active streams", () => {
+  const elements = Object.fromEntries(["send", "sidenote", "composer", "turnstatus"].map((id) => [id, {
+    textContent: "", hidden: true, classList: { toggle() {} }, setAttribute() {},
+  }]));
+  const context = vm.createContext({
+    $: (id) => elements[id], sessionId: "a", turns: new Map(),
+    staleSession: "", staleDone: false, sideNoteBusy: false,
+    turnRunning: true, turnRunningAt: 100000, RUNNING_SAMPLE_TTL_MS: 60000,
+    Date: { now: () => 100001 },
+  });
+  vm.runInContext(script.slice(script.indexOf("function isTurnRunning()"), script.indexOf("function note(")), context);
+  context.syncStopButton();
+  assert.equal(elements.turnstatus.hidden, false);
+  assert.match(elements.turnstatus.textContent, /Turn running on server.*live updates unavailable/);
+  assert.equal(elements.send.title, "stop this turn");
+  context.turns.set("a", {});
+  context.syncStopButton();
+  assert.equal(elements.turnstatus.hidden, true);
+  context.turns.clear(); context.turnRunningAt = 0; context.staleSession = "a";
+  context.syncStopButton();
+  assert.match(elements.turnstatus.textContent, /Live connection lost/);
+  context.turnRunning = false; context.staleSession = "";
+  context.syncStopButton();
+  assert.equal(elements.turnstatus.hidden, true);
+  assert.equal(elements.send.title, "send");
+  context.sessionId = "b"; context.staleSession = "a";
+  context.syncStopButton();
+  assert.equal(elements.turnstatus.hidden, true);
+});
 
 test("live tools separate real thinking phases, while logs cannot split tokens", () => {
   const h = streamHarness();

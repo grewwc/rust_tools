@@ -59,6 +59,7 @@ test("native skill selector loads server names and describes next-message scope"
   assert.deepEqual(h.elements.oskill.options.map((o) => o.value), ["", "review", "build"]);
   assert.match(h.elements.oskill.options[0].textContent, /next message/);
   assert.equal(h.elements.oskill.options[1].title, "Review changes");
+  assert.match(h.elements.ovrsummary.textContent, /^skill default · model/);
   h.choose("review");
   assert.match(h.elements.ovrsummary.textContent, /^skill review \(next\)/);
 });
@@ -72,6 +73,7 @@ test("actual turn request sends skills only when selected, clearing on HTTP succ
   assert.equal(h.requests[0].url, "https://a.test/sessions/alpha/turns/stream");
   assert.equal(h.elements.oskill.value, "");
   await h.context.submit();
+  assert.match(h.elements.ovrsummary.textContent, /^skill default · model/);
   assert.equal("skills" in h.requests[1].body, false);
 });
 

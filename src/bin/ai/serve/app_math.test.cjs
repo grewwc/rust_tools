@@ -537,6 +537,35 @@ test("ordinary Markdown and HTML safety survive", () => {
   assert.equal(nodesOf(render(attack))[0].textContent, attack);
 });
 
+test("emphasis encloses inline code without interpreting its contents", () => {
+  const { render } = harness();
+  const input = '以后可以直接说：**“用 `play_mahjong_discard` 分析这手牌。”**';
+  assert.equal(render(input), '<div class="p">以后可以直接说：<b>“用 <code>play_mahjong_discard</code> 分析这手牌。”</b></div>');
+  assert.match(render('**Use `a` and `b`.**'), /<b>Use <code>a<\/code> and <code>b<\/code>\.<\/b>/);
+  assert.match(render('**`**$x$** <img>`**'), /<b><code>\*\*\$x\$\*\* &lt;img&gt;<\/code><\/b>/);
+  assert.match(render('*`x`* and ~~`y`~~'), /<i><code>x<\/code><\/i> and <s><code>y<\/code><\/s>/);
+  const math = render('**Use `a` and $x*y*z$.**');
+  assert.equal(nodesOf(math)[0].dataset.tex, 'x*y*z');
+  assert.match(math, /<b>Use <code>a<\/code> and <span class="math/);
+  assert.match(render('```\n**`literal`**\n```'), /<code>\*\*`literal`\*\*/);
+  for (let end = 0; end <= input.length; end++) {
+    const partial = render(input.slice(0, end));
+    assert.doesNotMatch(partial, /[\uE000\uE001]/);
+  }
+});
+
+test("code slots cannot collide with text or enter link attributes", () => {
+  const { render } = harness();
+  const collision = '\uE000code 0\uE001';
+  assert.ok(render(collision + ' **`x`**').includes(collision));
+  for (const input of ['[link](https://example.com/`x y`)', '![alt](https://example.com/`x`)']) {
+    assert.doesNotMatch(render(input), /<(?:a|img) /);
+  }
+  assert.match(render('[`label`](https://example.com)'), /href="https:\/\/example.com"[^>]*><code>label<\/code><\/a>/);
+  assert.doesNotMatch(render('**`<img src=x onerror=alert(1)>`**'), /<img/);
+  assert.doesNotMatch(render('[`bad`](javascript:alert(1))'), /<a /);
+});
+
 test("complete SVG blocks render in an isolated responsive frame", () => {
   const { render } = harness();
   const svg = '<svg viewBox="0 0 320 160"><defs><linearGradient id="g"><stop stop-color="navy"/></linearGradient></defs><rect width="320" height="160" fill="url( \'#g\' )"/></svg>';
