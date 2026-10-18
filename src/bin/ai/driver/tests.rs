@@ -2,12 +2,13 @@ use super::note_search::read_recent_history;
 use super::{
     DispatchOutcomeTag, ProcessDispatchMeta, SCHED_COOLDOWN_EPOCHS_DEFAULT,
     SCHEDULER_DISPATCH_META, SCHEDULER_TICK_DURATION, SchedulerClock, background_execute_limit,
-    background_pop_limit, build_background_process_question, decode_background_process_task_goal,
-    has_pending_foreground_process, one_shot_cli_mode, reset_scheduler_test_state,
-    resolve_background_subagent_override, resolve_startup_session_choice,
-    resolve_startup_session_choice_with_selector, should_preload_mcp,
-    should_publish_subagent_task_result, should_resume_suspended_terminal_session,
-    should_suspend_session_on_sigint, update_dispatch_meta,
+    background_pop_limit, build_background_process_question, can_flush_foreground_side_notes,
+    decode_background_process_task_goal, has_pending_foreground_process, one_shot_cli_mode,
+    reset_scheduler_test_state, resolve_background_subagent_override,
+    resolve_startup_session_choice, resolve_startup_session_choice_with_selector,
+    should_preload_mcp, should_publish_subagent_task_result,
+    should_resume_suspended_terminal_session, should_suspend_session_on_sigint,
+    update_dispatch_meta,
 };
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
 use crate::ai::cli::ParsedCli;
@@ -347,6 +348,14 @@ fn interactive_flag_disables_one_shot_cli_mode() {
 
     cli.interactive = true;
     assert!(!one_shot_cli_mode(&cli));
+}
+
+#[test]
+fn serve_one_shot_can_flush_late_foreground_side_notes() {
+    assert!(can_flush_foreground_side_notes(true, true, false));
+    assert!(!can_flush_foreground_side_notes(true, false, false));
+    assert!(!can_flush_foreground_side_notes(true, true, true));
+    assert!(can_flush_foreground_side_notes(false, false, false));
 }
 
 #[test]

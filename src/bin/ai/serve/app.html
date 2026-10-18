@@ -1470,7 +1470,17 @@ function renderSkillMenu() {
   closeSkillMenu();
   if (input.disabled || skillComposing || document.activeElement !== input) return;
   const query = input.value.trim().toLowerCase();
-  const matches = skillCatalog.filter((s) => (s.name + " " + (s.description || "")).toLowerCase().includes(query));
+  const tokens = query.split(/\s+/).filter(Boolean);
+  // Fuzzy matching: every token must match the name or description, as a
+  // substring or as an ordered subsequence (gaps allowed). Scores rank
+  // name/substring hits above description/subsequence hits; the best
+  // candidates come first so a short typo-tolerant query still lands on
+  // the intended skill.
+  const scored = skillCatalog.map((skill) => ({ skill, score: skillMatchScore(skill, tokens) }))
+    .filter((entry) => entry.score >= 0);
+  // With a query, rank by relevance; with no query, keep catalog order.
+  if (tokens.length) scored.sort((a, b) => b.score - a.score || a.skill.name.localeCompare(b.skill.name));
+  const matches = scored.map((entry) => entry.skill);
   // Use DOM text nodes: catalog descriptions are untrusted plain text.
   skillMatches = [...matches, { name: "", description: "No forced skill for the next message" }];
   menu.textContent = "";
@@ -1495,6 +1505,34 @@ function renderSkillMenu() {
   }
   menu.hidden = false;
   input.setAttribute("aria-expanded", "true");
+}
+function skillMatchScore(skill, tokens) {
+  const name = (skill.name || "").toLowerCase();
+  const desc = (skill.description || "").toLowerCase();
+  let score = 0;
+  for (const token of tokens) {
+    const nIdx = name.indexOf(token);
+    if (nIdx >= 0) { score += 100; continue; }
+    const dIdx = desc.indexOf(token);
+    if (dIdx >= 0) { score += 50; continue; }
+    const nGap = subseqGaps(token, name);
+    if (nGap >= 0) { score += 30 - nGap; continue; }
+    const dGap = subseqGaps(token, desc);
+    if (dGap >= 0) { score += 15 - dGap; continue; }
+    return -1; // A token matched nothing: not a candidate.
+  }
+  return score;
+}
+function subseqGaps(needle, hay) {
+  let ni = 0, gaps = 0, prev = -1;
+  for (let hi = 0; ni < needle.length && hi < hay.length; hi++) {
+    if (hay[hi] === needle[ni]) {
+      if (prev >= 0) gaps += hi - prev - 1;
+      prev = hi;
+      ni++;
+    }
+  }
+  return ni === needle.length ? gaps : -1;
 }
 function skillKeydown(e) {
   if (skillComposing || e.isComposing || e.keyCode === 229) return;

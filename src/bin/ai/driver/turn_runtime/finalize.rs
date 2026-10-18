@@ -555,27 +555,10 @@ pub(super) async fn finalize_turn(
             }
         }
         let _ = poisoned;
-        // Serve streaming: everything user-visible (answer, observer footers)
-        // is printed above. Emit the marker so the server can end the SSE
-        // turn now instead of waiting for process exit (a first turn would
-        // otherwise idle behind the silent bookkeeping below). The publish is a
-        // no-op unless a serve FIFO is installed; the one-shot + terminal
-        // gates scope it to the top-level serve child turn (background
-        // subagent scopes suppress terminal output, interactive turns are
-        // not one-shot).
-        if one_shot_mode && crate::ai::driver::runtime_ctx::terminal_output_enabled() {
-            crate::ai::background::publish_serve_frame(
-                crate::ai::background::ServeLiveKind::OutputComplete,
-                "",
-            );
-        }
-        // Persisted compression runs after the early-done marker above: the
-        // snapshot is only a write-back cache (the next round recomputes from
-        // canonical), so the user-visible turn must not wait on CPU
-        // compression plus a SQLite write transaction. Foreground interactive
-        // turns still dispatch to the background; one-shot runs, soon-to-exit
-        // processes, and subagent turns still take the current future so the
-        // owning history does not end its lifetime first.
+        // Persisted compression is a write-back cache (the next round recomputes
+        // from canonical). A serve child may still consume a side-note queued
+        // during this final model request, so the SSE remains open until the
+        // child either starts that follow-up or exits.
         // `at_boundary` = no tool calls this round (answer delivered), using
         // the more aggressive threshold.
         dispatch_finalize_compaction(

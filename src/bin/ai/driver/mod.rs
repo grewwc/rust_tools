@@ -278,6 +278,14 @@ fn one_shot_cli_mode(cli: &cli::ParsedCli) -> bool {
     !cli.args.is_empty() && !cli.interactive
 }
 
+fn can_flush_foreground_side_notes(
+    one_shot_mode: bool,
+    serve_child: bool,
+    has_subagent_target: bool,
+) -> bool {
+    !has_subagent_target && (!one_shot_mode || serve_child)
+}
+
 /// Ctrl+C only sets a flag in the signal handler; the driver event loop then safely
 /// persists the current session.
 fn should_suspend_session_on_sigint(app: &App) -> bool {
@@ -1048,10 +1056,14 @@ async fn run_loop(
             // The model output has ended by the time we get here, so flush the queue
             // now and run the pending note(s) as the next user input instead of
             // waiting at the input box. Only the foreground target (task id None)
-            // flushes its own queue, and one-shot sessions never loop back to input.
-            let pending_side_notes = if one_shot_mode
-                || crate::ai::driver::side_note::current_target_id().is_some()
-            {
+            // flushes its own queue. A serve child is allowed to continue its
+            // one-shot process so a note queued during the final model request is
+            // still delivered before that request's SSE stream ends.
+            let pending_side_notes = if !can_flush_foreground_side_notes(
+                one_shot_mode,
+                crate::ai::background::is_serve_child(),
+                crate::ai::driver::side_note::current_target_id().is_some(),
+            ) {
                 Vec::new()
             } else {
                 crate::ai::driver::side_note::drain_side_notes(&app.session_history_file, None)
@@ -1468,6 +1480,19 @@ async fn run_loop(
         let parked_awaiting_subagents =
             matches!(turn_outcome, Ok(turn_runtime::TurnOutcome::Continue))
                 && has_pending_foreground_process(app);
+        let serve_side_note_follow_up = one_shot_mode
+            && can_flush_foreground_side_notes(
+                one_shot_mode,
+                crate::ai::background::is_serve_child(),
+                crate::ai::driver::side_note::current_target_id().is_some(),
+            )
+            && crate::ai::driver::side_note::has_pending_side_notes(
+                &app.session_history_file,
+                None,
+            );
+        if serve_side_note_follow_up && !parked_awaiting_subagents {
+            continue;
+        }
         if (matches!(turn_outcome, Ok(turn_runtime::TurnOutcome::Quit)) || should_quit)
             && !parked_awaiting_subagents
         {

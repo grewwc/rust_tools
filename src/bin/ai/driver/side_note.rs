@@ -62,6 +62,17 @@ pub fn side_note_file(history_file: &Path, target: Option<&str>) -> PathBuf {
     dir.join(name)
 }
 
+/// Whether the target queue currently contains at least one side-note.
+///
+/// This is a boundary snapshot: callers use it to decide whether a serve child
+/// must stay alive for another model iteration. The subsequent drain remains
+/// the authority for the actual notes.
+pub fn has_pending_side_notes(history_file: &Path, target: Option<&str>) -> bool {
+    fs::metadata(side_note_file(history_file, target))
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false)
+}
+
 fn sanitize_task_id(id: &str) -> String {
     id.chars()
         .map(|c| {
@@ -230,11 +241,13 @@ mod tests {
         let hist = dir.join("sess.sqlite");
         push_side_note(&hist, "hello", "user", None).unwrap();
         push_side_note(&hist, "world", "lead", None).unwrap();
+        assert!(has_pending_side_notes(&hist, None));
         let notes = drain_side_notes(&hist, None);
         assert_eq!(notes.len(), 2);
         assert_eq!(notes[0].content, "hello");
         // should be empty after drain
         assert!(drain_side_notes(&hist, None).is_empty());
+        assert!(!has_pending_side_notes(&hist, None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

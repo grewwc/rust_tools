@@ -357,3 +357,34 @@ test("overlapping catalog fetches cannot restore options from an old server", as
   h.elements.oskill.focus();
   assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["new-skill", "Default"]);
 });
+
+test("fuzzy search matches multi-token, reordered, and subsequence queries", async () => {
+  const h = harness();
+  h.context.api = async () => ({ json: async () => [
+    { name: "play_mahjong_discard", description: "Analyze mahjong discards" },
+    { name: "review", description: "Review changes" },
+    { name: "build", description: "Build software" },
+  ] });
+  await h.context.loadSkills();
+  // Multi-token query spans name and description, order-independent.
+  h.type("mahjong discard");
+  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["play_mahjong_discard", "Default"]);
+  h.type("discard mahjong");
+  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["play_mahjong_discard", "Default"]);
+  // Subsequence tolerance: "mhd" appears in order inside "mahjong_discard".
+  h.type("mhd");
+  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["play_mahjong_discard", "Default"]);
+  // Name substring outranks description substring for the same query.
+  h.type("build");
+  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["build", "Default"]);
+  h.type("softwar");
+  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["build", "Default"]);
+  // Every token must match somewhere: one bad token kills the candidate.
+  h.type("review mahjong");
+  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["Default"]);
+  h.type("zzz");
+  assert.match(h.elements.skillmenu.textContent, /No matching skills/);
+  // A query that only fuzzy-matches still shows the intended skill.
+  h.type("pl_mj_dscrd");
+  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["play_mahjong_discard", "Default"]);
+});
