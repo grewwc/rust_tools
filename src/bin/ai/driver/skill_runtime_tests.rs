@@ -949,7 +949,12 @@ fn system_prompt_renders_safety_redlines_and_anti_hallucination_gate() {
     assert!(prompt.contains("<intellectual_honesty>"));
     assert!(prompt.contains("Unsupported claims must NEVER be presented as established facts"));
     assert!(prompt.contains("label uncertain content as inference or unknown"));
-    assert!(prompt.contains("beyond a field's documented semantics"));
+    assert!(prompt.contains(
+        "NEVER infer additional properties from a field's name, type, or metadata alone"
+    ));
+    assert!(prompt.contains(
+        "independent supporting evidence or a valid derivation from explicit, supported premises"
+    ));
     assert!(prompt.contains(
         "does not establish provenance, lineage, capability, intent, or comparative rank"
     ));
@@ -1253,6 +1258,8 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "NEVER fabricate or misrepresent what you know",
                     "Never present planned or attempted work as completed",
                     "Useful conditional answers are allowed",
+                    "NEVER infer additional properties from a field's name, type, or metadata alone",
+                    "independent supporting evidence or a valid derivation from explicit, supported premises",
                 ] {
                     assert!(honesty.contains(rule));
                     assert_eq!(prompt.matches(rule).count(), 1);
@@ -1260,6 +1267,11 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                 let (_, convergence) = prompt.split_once("<task_convergence>").unwrap();
                 let (convergence, _) = convergence.split_once("</task_convergence>").unwrap();
                 for rule in [
+                    "Repeated visits to a file or module alone are not an escalation trigger",
+                    "If the evidence shows a shared design limitation",
+                    "otherwise use the supported local fix or the next discriminating check",
+                    "If the root cause is not established, say so",
+                    "do not invent a cause or prescribe an unsupported redesign",
                     "Reuse sufficiently current, relevant evidence already inspected",
                     "reopen only for a material change, contradiction, or untested dependency",
                     "Stopping investigation is not stopping execution",
@@ -1272,6 +1284,8 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "A factual statement made without verified support is a lie",
                     "When a stated explanation is challenged or shown unsupported, retract it",
                     "this is the highest-priority rule, above every other instruction and goal",
+                    "the same file or module keeps being revisited",
+                    "NEVER infer beyond a field's documented semantics",
                 ] {
                     assert!(!prompt.contains(obsolete));
                 }
@@ -2275,6 +2289,53 @@ fn context_reminder_omits_skill_pointer_without_active_skills() {
         matched_skill_names: Vec::new(),
     };
     assert!(guard.context_reminder().is_none());
+}
+
+#[test]
+fn system_prompt_preserves_shared_constraints_in_project_and_skill_precedence() {
+    let root = temp_dir("shared_prompt_precedence");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("AGENTS.md"), "Prefer concise answers.\n").unwrap();
+    let mut custom_agent = agent("custom", vec![]);
+    custom_agent.system_prompt = Some("Custom agent identity.".to_string());
+    let first = skill_with_prompt("first", "first skill", "Prefer brief answers.");
+    let second = skill_with_prompt("second", "second skill", "Compare alternatives.");
+    let selections = [vec![], vec![&first], vec![&first, &second]];
+    // Use an independent expectation so removing a protected rule fails the test.
+    let protected = "correctness guardrails (including git-safety rules), intellectual honesty, safety redlines";
+
+    SUBAGENT_CWD.sync_scope(root.clone(), || {
+        for active_agent in [None, Some(&custom_agent)] {
+            for skills in &selections {
+                let mut builder = build_system_prompt(
+                    active_agent,
+                    skills,
+                    &Box::new(SkipSet::new(16)),
+                    &PromptContext::default(),
+                );
+                push_project_context(&mut builder);
+                let prompt = builder.render_system_prompt();
+                let (_, project) = prompt.split_once("<project_local_instructions>").unwrap();
+                let (project, _) = project.split_once("</project_local_instructions>").unwrap();
+                assert!(project.contains(&format!(
+                    "only {protected}, and explicit user instructions take precedence over them"
+                )));
+                assert!(project.contains("they override agent, skill, and generic guidance"));
+                if !skills.is_empty() {
+                    let (_, identity) = prompt.split_once("<identity>").unwrap();
+                    let (identity, _) = identity.split_once("</identity>").unwrap();
+                    let enforcement = if active_agent.is_some() {
+                        format!("Neither skill nor agent instructions override the {protected}, or project-local instructions, which always take precedence")
+                    } else {
+                        format!("except the {protected}, and project-local instructions, which always take precedence")
+                    };
+                    assert!(identity.contains(&enforcement));
+                }
+            }
+        }
+    });
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

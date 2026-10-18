@@ -896,15 +896,19 @@ fn escape_xml_attr(s: &str) -> String {
     out
 }
 
+// Keep project and skill precedence declarations aligned on the protected rules.
+const NON_OVERRIDABLE_PROMPT_CONSTRAINTS: &str =
+    "correctness guardrails (including git-safety rules), intellectual honesty, safety redlines";
+
 fn build_project_instruction_prompt() -> Option<String> {
     let docs = load_project_instruction_docs();
     if docs.is_empty() {
         return None;
     }
 
-    let mut out = String::from(
+    let mut out = format!(
         "- The current working directory provides project-specific instruction documents.\n\
-         - Follow these repo-local constraints and preferences; only safety redlines, correctness guardrails, and explicit user instructions take precedence over them, and they override agent, skill, and generic guidance.\n",
+         - Follow these repo-local constraints and preferences; only {NON_OVERRIDABLE_PROMPT_CONSTRAINTS}, and explicit user instructions take precedence over them, and they override agent, skill, and generic guidance.\n",
     );
     for doc in docs {
         out.push_str(&format!(
@@ -1139,9 +1143,9 @@ fn build_system_prompt(
             s.push_str("\n\n<agent_instructions>\n");
             s.push_str(agent_text.trim());
             s.push_str("\n</agent_instructions>");
-            s.push_str("\n\nEnforcement: skill instructions override agent instructions when they differ. Use agent instructions only for capabilities, workflow, and defaults not covered by the active skill. Neither skill nor agent instructions override the correctness guardrails (including git-safety rules), intellectual honesty, safety redlines, or project-local instructions, which always take precedence.");
+            s.push_str(&format!("\n\nEnforcement: skill instructions override agent instructions when they differ. Use agent instructions only for capabilities, workflow, and defaults not covered by the active skill. Neither skill nor agent instructions override the {NON_OVERRIDABLE_PROMPT_CONSTRAINTS}, or project-local instructions, which always take precedence."));
         } else {
-            s.push_str("\n\nEnforcement: skill instructions override generic assistant guidelines when they differ, except the correctness guardrails (including git-safety rules), intellectual honesty, safety redlines, and project-local instructions, which always take precedence.");
+            s.push_str(&format!("\n\nEnforcement: skill instructions override generic assistant guidelines when they differ, except the {NON_OVERRIDABLE_PROMPT_CONSTRAINTS}, and project-local instructions, which always take precedence."));
         }
         s
     } else {
