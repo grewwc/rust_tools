@@ -1139,9 +1139,9 @@ fn build_system_prompt(
             s.push_str("\n\n<agent_instructions>\n");
             s.push_str(agent_text.trim());
             s.push_str("\n</agent_instructions>");
-            s.push_str("\n\nEnforcement: skill instructions override agent instructions when they differ. Use agent instructions only for capabilities, workflow, and defaults not covered by the active skill. Neither skill nor agent instructions override the correctness guardrails (including git-safety rules), safety redlines, or project-local instructions, which always take precedence.");
+            s.push_str("\n\nEnforcement: skill instructions override agent instructions when they differ. Use agent instructions only for capabilities, workflow, and defaults not covered by the active skill. Neither skill nor agent instructions override the correctness guardrails (including git-safety rules), intellectual honesty, safety redlines, or project-local instructions, which always take precedence.");
         } else {
-            s.push_str("\n\nEnforcement: skill instructions override generic assistant guidelines when they differ, except the correctness guardrails (including git-safety rules), safety redlines, and project-local instructions, which always take precedence.");
+            s.push_str("\n\nEnforcement: skill instructions override generic assistant guidelines when they differ, except the correctness guardrails (including git-safety rules), intellectual honesty, safety redlines, and project-local instructions, which always take precedence.");
         }
         s
     } else {
@@ -1187,9 +1187,8 @@ fn build_system_prompt(
 
     // ── Safety red lines: non-negotiable prohibitions, rendered ahead of the ──
     // working-style rules so the red lines are read before any guidance about
-    // how to work. The anti-hallucination conclusion gate ("unverified content
-    // is never presented as a conclusion") lives in intellectual_honesty below,
-    // and fact tracing / evidence calibration stay single-sourced in
+    // how to work. The non-fabrication rule lives in intellectual_honesty below,
+    // while fact tracing / evidence calibration stay single-sourced in
     // correctness_guardrails, so this block holds only the dangerous-operation
     // prohibitions and the confirmation requirement.
     // Never relaxed by task, skill, or goal mode; when a skill activates, the
@@ -1228,11 +1227,10 @@ fn build_system_prompt(
     );
     // Intellectual honesty: evidence-earned agreement and respectful pushback
     // against wrong or inappropriate user premises. Unconditional — it applies
-    // in every mode and is never relaxed by a skill or goal. It also hosts the
-    // anti-hallucination conclusion gate (merged here from the former separate
-    // no_hallucination section): unverified content is never presented as a
-    // conclusion, so fact tracing / evidence calibration stay single-sourced
-    // in correctness_guardrails. The no-regression rule for other modules
+    // in every mode and is never relaxed by a skill or goal. It forbids treating
+    // unsupported claims as established facts while allowing explicit hypotheses
+    // and conditional answers. Fact tracing / evidence calibration stay
+    // single-sourced in correctness_guardrails. The no-regression rule for other modules
     // lives in correctness_guardrails' scope section, beside the caller /
     // dependent rule it extends.
     b.push(

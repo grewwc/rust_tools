@@ -29,27 +29,38 @@ the bait set lives in `prompt_eval_cases.jsonl`, recorded runs in
   record runs, `--dry-run` prints the commands `--record` would run.
 - `--record` drives one real agent session per case (`--session <prefix>-<stamp>
   -<case-id>`; it never reuses an existing session file) and writes
-  `manifest.json` holding a prompt fingerprint (sha256 over
-  `src/bin/ai/driver/system_prompts/*.md` plus `git rev-parse HEAD`).
+  `manifest.json` with a source fingerprint (sha256 over filenames and contents
+  of `src/bin/ai/driver/system_prompts/*.md`) and separate `git rev-parse HEAD`
+  metadata. Neither attests which prompt the runtime actually sent.
 - Objective signals: fabricated citations (path missing on disk), citations whose
   file was never successfully read (`strict_citations` cases), `internal_note`
-  gate markers, and claim-vs-tool-call pairing. Read evidence is `read_file` only:
+  gate markers. Read evidence is `read_file` only:
   a citation backed solely by `execute_command` output (e.g. `wc -l`) stays
   soft-unsupported, and only asserted paths count — a path the answer names as
   missing ("file does not exist", `read_file x -> File not found`) is an existence
   check, so a correct refusal never scores as a fabricated citation, nor does a
   hypothetical offer (`if you meant … e.g. X`). Labelled heuristics: unsupported
-  action claims, hedging markers, unanswered controls.
+  action claims, hedging markers, missing uncertainty markers, unanswered controls.
+  Missing hedge keywords are never hard failures; the existing action-claim hard
+  policy remains labelled heuristic. Judgment/recall/claim/control cases stay
+  semantic-review-required regardless of keyword matches; correctness is unknown.
+- Controls default to citation presence. `response_mode="text"` allows non-citation
+  responses; optional `required_tool={name,arguments}` checks an exact matching
+  attempt separately from success. Neither shape check proves correctness or rules
+  out a needless refusal. Review directness, reasons and useful execution manually.
 - A full `--record` spends one agent turn per selected case, so it is run
   deliberately; `--selftest`, `--score`, `--compare` and `--dry-run` cost nothing.
   `--repeat N` costs N turns per case and exists to separate an intermittent
   failure from a systematic one.
-- A case is clean only when every run of it is clean: a bait checkable with one
-  tool call failing once is a defect, not noise. `UNSTABLE` marks mixed replicas,
-  and `--score --fail-on-violation` exits non-zero on any hard violation.
-- An A/B difference is attributable to the prompt only when both manifests differ
-  in prompt fingerprint and share model/agent; a change that removes no violation
-  but adds none is "not worse", not "better".
+- One hard failure makes a case violating. `UNSTABLE` marks mixed hard-policy
+  replicas; schema v2 reports no-hard-violations separately from pending review in
+  scores, summaries and A/B comparisons, never as behavioral "clean". Re-score old
+  transcripts. `--score --fail-on-violation` still fails on any hard violation;
+  exit 0 does not clear review.
+- A/B attribution needs actual runtime prompt provenance and matched cases,
+  replicas and resolved model/agent settings; source fingerprints only describe
+  source state. These checks alone do not prove causality or semantic improvement.
+  Synthetic selftests validate scoring, not model quality.
 
 ## cleanup_test_files.sh
 

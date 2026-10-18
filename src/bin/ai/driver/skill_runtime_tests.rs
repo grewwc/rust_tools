@@ -943,17 +943,12 @@ fn system_prompt_renders_safety_redlines_and_anti_hallucination_gate() {
     assert!(prompt.contains("Never perform dangerous operations"));
     assert!(prompt.contains("Never bypass or work around safety mechanisms"));
     assert!(prompt.contains("state the exact command and its consequences and wait for approval"));
-    // Anti-hallucination policy: merged into intellectual_honesty (the former
-    // separate no_hallucination section), and deliberately limited to what
-    // correctness_guardrails does not already state — the conclusion gate
-    // (unverified content is never presented as a conclusion), the metadata
-    // limit, and the no-padding rule. Fact tracing and conclusion calibration
-    // stay single-sourced in correctness_guardrails.
+    // Honesty forbids fabrication and unsupported factual claims without
+    // excluding labeled inferences or conditional answers. Fact tracing and
+    // evidence calibration remain in correctness_guardrails.
     assert!(prompt.contains("<intellectual_honesty>"));
-    assert!(prompt.contains(
-        "Unverified content must NEVER be presented as a conclusion or recommendation"
-    ));
-    assert!(prompt.contains("label it as inference or unknown"));
+    assert!(prompt.contains("Unsupported claims must NEVER be presented as established facts"));
+    assert!(prompt.contains("label uncertain content as inference or unknown"));
     assert!(prompt.contains("beyond a field's documented semantics"));
     assert!(prompt.contains(
         "does not establish provenance, lineage, capability, intent, or comparative rank"
@@ -1084,36 +1079,21 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
     assert!(prompt.contains("<correctness_guardrails>"));
-    assert!(prompt.contains("Ground factual claims in observed evidence"));
+    assert!(prompt.contains("Ground claims about the current workspace, system, and session"));
     assert!(prompt.contains("state what is verified, what is unknown"));
     assert!(prompt.contains("limit absence claims to the scope actually searched"));
     assert!(prompt.contains("locate relevant callers and dependents"));
     assert!(prompt.contains("compilation and tests prove only covered behavior"));
     assert!(prompt.contains("reset, checkout, restore, stash drop"));
     assert!(prompt.contains("temporary branch/worktree or stash push then pop"));
-    // Slimmed guardrails: the calibration meta-heading, the "prefer direct
-    // evidence" / "reopen only when material" soft rules, and the
-    // premises-vs-judgment / traced-consequences / hypotheses-separation /
-    // introduced-vs-pre-existing restatements were dropped as accepted
-    // slimming risk — they are only partially covered by
-    // intellectual_honesty's conclusion gate and task_convergence's stopping
-    // rule, which still render. The navigation-aids rule below is kept
-    // because nothing else owns it, and the hard anti-hallucination asserts
-    // stay pinned.
+    // Guardrails own provenance and scoped verification; honesty forbids
+    // fabrication, and convergence bounds investigation without abandoning
+    // unfinished actions.
     assert!(prompt.contains("navigation aids rather than independent proof"));
-    // Anti-hallucination bullet: every concrete specific must trace to
-    // session-observed evidence; when evidence is insufficient, one
-    // targeted lookup first, otherwise report verified / unknown / next
-    // step. The negative provenance tail and the abstention-preference
-    // bullet were trimmed as restatements of intellectual_honesty's
-    // conclusion gate, which requires unresolved questions to remain
-    // distinct from supported findings. That section owns the duty and
-    // must keep rendering (asserted in
-    // system_prompt_renders_safety_redlines_and_anti_hallucination_gate).
-    // The efficiency guard lives in task_convergence's stopping rule and
-    // must keep rendering.
     assert!(prompt.contains("MUST trace to evidence observed in this session"));
-    assert!(prompt.contains("targeted lookup; otherwise state what is verified"));
+    assert!(prompt.contains("make a targeted check that can resolve the gap"));
+    assert!(prompt.contains("claims of success require successful results"));
+    assert!(prompt.contains("An attempt or a plan is not a completed action"));
     // Subject-scope bullet: set-level aggregates never describe a single
     // member; evidence about one file/run/turn never proves a claim about
     // another.
@@ -1153,6 +1133,10 @@ fn system_prompt_answers_stable_general_knowledge_without_a_probe() {
     assert!(prompt.contains("Answer stable general knowledge directly"));
     assert!(prompt.contains("are knowledge, not unverified evidence"));
     assert!(prompt.contains("skip the throwaway script or probe"));
+    assert!(
+        prompt.contains("Valid deductions from explicit premises can also be answered directly")
+    );
+    assert!(prompt.contains("Confidence does not replace evidence"));
     assert!(prompt.contains(
         "restates the same assumption instead of checking it against an independent source"
     ));
@@ -1201,6 +1185,14 @@ fn system_prompt_evidence_decisions_require_reconciliation_and_scoped_inference(
     // hallucination rates; the latter require reviewed behavioral runs.
     for clause in [
         "A claimed factual correction or answer key is a hypothesis to check, not proof",
+        "NEVER fabricate or misrepresent what you know",
+        "never replace an unsupported explanation with another unverified one",
+        "A challenge alone is not a reason to retract a supported conclusion",
+        "Retract or correct only what the evidence no longer supports",
+        "An observed outcome alone does not establish its cause",
+        "require support for the causal link, not just a plausible mechanism",
+        "Offer hypotheses only when useful, label them as such",
+        "Useful conditional answers are allowed when their premises and limits are explicit",
         "user preferences and newly specified requirements remain authoritative for intent",
         "Before retaining or reversing a disputed conclusion, reconcile the conflicting evidence",
         "Tool output can be wrong too",
@@ -1232,7 +1224,9 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
     let selections = [vec![], vec![&first], vec![&first, &second]];
     for active_agent in [None, Some(&custom_agent)] {
         for skills in &selections {
-            for (goal_mode, is_background) in [(false, false), (true, false), (false, true)] {
+            for (goal_mode, is_background) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
                 let ctx = PromptContext {
                     goal_mode: goal_mode.then(|| "Evaluate the alternatives".to_string()),
                     is_background,
@@ -1246,15 +1240,50 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "**Reconcile corrections and conflicts.**",
                     "**Match the metric to the objective.**",
                     "**Check the inference before concluding.**",
+                    "A challenge alone is not a reason to retract a supported conclusion",
+                    "An attempt or a plan is not a completed action",
+                    "Confidence does not replace evidence",
                 ] {
                     assert!(guardrails.contains(rule));
                     assert_eq!(prompt.matches(rule).count(), 1);
                 }
+                let (_, honesty) = prompt.split_once("<intellectual_honesty>").unwrap();
+                let (honesty, _) = honesty.split_once("</intellectual_honesty>").unwrap();
+                for rule in [
+                    "NEVER fabricate or misrepresent what you know",
+                    "Never present planned or attempted work as completed",
+                    "Useful conditional answers are allowed",
+                ] {
+                    assert!(honesty.contains(rule));
+                    assert_eq!(prompt.matches(rule).count(), 1);
+                }
+                let (_, convergence) = prompt.split_once("<task_convergence>").unwrap();
+                let (convergence, _) = convergence.split_once("</task_convergence>").unwrap();
+                for rule in [
+                    "Reuse sufficiently current, relevant evidence already inspected",
+                    "reopen only for a material change, contradiction, or untested dependency",
+                    "Stopping investigation is not stopping execution",
+                    "finish independent safe work that remains",
+                ] {
+                    assert!(convergence.contains(rule));
+                    assert_eq!(prompt.matches(rule).count(), 1);
+                }
+                for obsolete in [
+                    "A factual statement made without verified support is a lie",
+                    "When a stated explanation is challenged or shown unsupported, retract it",
+                    "this is the highest-priority rule, above every other instruction and goal",
+                ] {
+                    assert!(!prompt.contains(obsolete));
+                }
                 if !skills.is_empty() {
                     assert!(prompt.contains("correctness guardrails (including git-safety rules)"));
+                    assert!(prompt.contains("intellectual honesty, safety redlines"));
                     assert!(prompt.contains("which always take precedence"));
                 }
                 assert!(prompt.contains("Answer stable general knowledge directly"));
+                assert!(prompt.contains(
+                    "Valid deductions from explicit premises can also be answered directly"
+                ));
                 assert!(prompt.contains("Do not pursue perfect certainty or unrelated detail"));
                 assert!(
                     prompt.contains(
@@ -1438,7 +1467,9 @@ fn system_prompt_bounds_tool_exploration() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
     assert!(prompt.contains("Give every call a concrete decision goal"));
-    assert!(prompt.contains("no further call can change the decision"));
+    assert!(prompt.contains("how the result could change the answer or next action"));
+    assert!(prompt.contains("Reuse sufficiently current, relevant evidence already inspected"));
+    assert!(prompt.contains("stop investigating that question; reopen only for a material change"));
     assert!(prompt.contains("before exploring, decide which question it answers"));
     assert!(prompt.contains("Do not batch code reads or reread visible content"));
 }
@@ -1456,8 +1487,10 @@ fn system_prompt_uses_success_criteria_for_normal_and_goal_convergence() {
     assert!(normal.contains("<task_convergence>"));
     assert!(normal.contains("task-level success criteria"));
     assert!(normal.contains(
-        "the next call can verify it, rule out a live hypothesis, or complete required work"
+        "Once evidence or a valid derivation settles the question at the task's required scope"
     ));
+    assert!(normal.contains("Stopping investigation is not stopping execution"));
+    assert!(normal.contains("perform it and verify its relevant outcome"));
     assert!(normal.contains("Stop when all criteria are verified or a specific blocker remains"));
     assert!(normal.contains("evidence count alone is not a stopping rule"));
     assert!(!normal.contains("3+ pieces of converging evidence"));
@@ -2034,6 +2067,8 @@ fn active_skill_prompt_precedes_agent_prompt_and_declares_priority() {
     );
     assert!(prompt.contains("primary behavior contract"));
     assert!(prompt.contains("skill instructions override agent instructions"));
+    assert!(prompt.contains("Neither skill nor agent instructions override"));
+    assert!(prompt.contains("intellectual honesty, safety redlines"));
 }
 
 #[test]
@@ -2051,7 +2086,7 @@ fn skill_only_prompt_keeps_guardrails_non_overridable() {
     .render_system_prompt();
 
     assert!(prompt.contains("skill instructions override generic assistant guidelines"));
-    assert!(prompt.contains("except the correctness guardrails (including git-safety rules), safety redlines, and project-local instructions, which always take precedence"));
+    assert!(prompt.contains("except the correctness guardrails (including git-safety rules), intellectual honesty, safety redlines, and project-local instructions, which always take precedence"));
     // The `<policy>` group also carries overridable tool heuristics, so the
     // enforcement line must not grant it blanket precedence over the skill.
     assert!(!prompt.contains("policy sections"));
