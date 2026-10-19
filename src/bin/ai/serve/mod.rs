@@ -1254,6 +1254,10 @@ pub(in crate::ai) async fn run_serve(
     // process: without this a `--serve-restart` silently reverts every session
     // (and the subagents inheriting from its turns) to the daemon cwd.
     let restored_cwds = load_cwds(&history_file);
+    eprintln!(
+        "[serve] restored {} persisted session working directories",
+        restored_cwds.len()
+    );
     let state = ServeState {
         history_file,
         token,

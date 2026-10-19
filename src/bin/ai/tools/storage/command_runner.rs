@@ -9,7 +9,10 @@ pub(crate) fn run_command(
 ) -> Result<Output, String> {
     crate::cmd::run::run_cmd_output_with_timeout_non_interactive(
         command,
-        crate::cmd::run::RunCmdOptions { cwd },
+        crate::cmd::run::RunCmdOptions {
+            cwd,
+            input: None,
+        },
         Duration::from_secs(timeout_secs),
     )
     .map_err(map_command_error)
@@ -20,6 +23,7 @@ pub(crate) fn run_command_streaming<F>(
     cwd: Option<&str>,
     timeout_secs: u64,
     pseudo_terminal: bool,
+    input: Option<&str>,
     on_chunk: F,
 ) -> Result<crate::cmd::run::CommandRunResult, String>
 where
@@ -30,7 +34,7 @@ where
     let session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
     let on_background_group =
         |pgid| crate::ai::tools::storage::process_registry::register(&session_id, pgid);
-    let opts = crate::cmd::run::RunCmdOptions { cwd };
+    let opts = crate::cmd::run::RunCmdOptions { cwd, input };
     let result = if pseudo_terminal {
         crate::cmd::run::run_cmd_output_streaming_with_timeout_tracked_pseudo_terminal(
             command,

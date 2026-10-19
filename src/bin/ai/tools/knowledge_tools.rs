@@ -64,8 +64,10 @@
 use serde_json::Value;
 
 use crate::ai::knowledge::types::Category;
-use crate::ai::tools::common::ToolRegistration;
-use crate::ai::tools::common::ToolSpec;
+use crate::ai::tools::common::{
+    ToolParallelPolicy, ToolParallelPolicyRegistration, ToolRegistration, ToolRetryPolicy,
+    ToolRetryPolicyRegistration, ToolSpec,
+};
 use crate::ai::tools::service::memory::{
     MemoryOwnerScope, next_memory_id, prepare_memory_save_entry,
 };
@@ -191,6 +193,12 @@ inventory::submit!(ToolRegistration {
     }
 });
 
+// Deletes a knowledge entry; the `get` inside `forget` is not a read marker.
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "knowledge_forget",
+    policy: ToolParallelPolicy::Serial,
+});
+
 // ─── knowledge_search ────────────────────────────────────────────────────────
 
 fn execute_knowledge_search(args: &Value) -> Result<String, String> {
@@ -276,6 +284,16 @@ inventory::submit!(ToolRegistration {
 
         execute: execute_knowledge_search,
     }
+});
+
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "knowledge_search",
+    policy: ToolParallelPolicy::ReadOnly,
+});
+
+inventory::submit!(ToolRetryPolicyRegistration {
+    name: "knowledge_search",
+    policy: ToolRetryPolicy::RetrySafe,
 });
 
 // ─── knowledge_list ──────────────────────────────────────────────────────────
@@ -371,6 +389,16 @@ inventory::submit!(ToolRegistration {
 
         execute: execute_knowledge_list,
     }
+});
+
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "knowledge_list",
+    policy: ToolParallelPolicy::ReadOnly,
+});
+
+inventory::submit!(ToolRetryPolicyRegistration {
+    name: "knowledge_list",
+    policy: ToolRetryPolicy::RetrySafe,
 });
 
 // ─── knowledge_consolidate ─────────────────────────────────────────────────

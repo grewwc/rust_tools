@@ -8,7 +8,10 @@ use reqwest::header::{ACCEPT, USER_AGENT};
 use serde_json::Value;
 
 use crate::ai::config_schema::AiConfig;
-use crate::ai::tools::common::{ToolRegistration, ToolSpec};
+use crate::ai::tools::common::{
+    ToolParallelPolicy, ToolParallelPolicyRegistration, ToolRegistration, ToolRetryPolicy,
+    ToolRetryPolicyRegistration, ToolSpec,
+};
 use crate::commonw::configw;
 
 const JINA_SEARCH_BASE: &str = "https://s.jina.ai/";
@@ -30,12 +33,32 @@ inventory::submit!(ToolRegistration {
     }
 });
 
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "web_search",
+    policy: ToolParallelPolicy::ReadOnly,
+});
+
+inventory::submit!(ToolRetryPolicyRegistration {
+    name: "web_search",
+    policy: ToolRetryPolicy::RetrySafe,
+});
+
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "web_fetch",
         description: "",
         execute: execute_web_fetch,
     }
+});
+
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "web_fetch",
+    policy: ToolParallelPolicy::ReadOnly,
+});
+
+inventory::submit!(ToolRetryPolicyRegistration {
+    name: "web_fetch",
+    policy: ToolRetryPolicy::RetrySafe,
 });
 
 fn execute_web_search(args: &Value) -> Result<String, String> {

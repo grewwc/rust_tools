@@ -101,6 +101,14 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
                     effect.behavior_check && (!tool_succeeded || output_reports_behavior_failure);
             }
             let had_mutation_before_command = state.successful_mutation;
+            // A session poll has no `command` argument, so its effects cannot be
+            // recovered from the current call. The shared status classifier
+            // already marks a leading `Exit code:` as failure; if the captured
+            // output also reports a known failed check, record that fact even
+            // when the originating command is not in this tool call.
+            if had_mutation_before_command && output_reports_behavior_failure {
+                state.successful_post_mutation_failed_check = true;
+            }
             for effect in &effects {
                 let had_mutation = state.successful_mutation;
                 // Command-level changes are only recorded into successful_mutation (for
@@ -191,8 +199,17 @@ pub(in crate::ai::driver::turn_runtime) fn behavior_check_output_reports_failure
 pub(in crate::ai::driver::turn_runtime) fn completion_tool_result_succeeded(
     content: &serde_json::Value,
 ) -> bool {
-    let text = content.as_str().unwrap_or_default().trim_start();
-    !text.starts_with("Error") && !text.starts_with("Exit code:")
+    use crate::ai::driver::turn_runtime::progress::{
+        ToolResultProgressStatus, classify_tool_result_progress,
+    };
+    // One status classifier is shared by the completion gate, the checkpoint
+    // phase, the loop detector, and the progress ledger. Adding a new command
+    // wrapper must not require teaching each consumer a new failure prefix.
+    !matches!(
+        classify_tool_result_progress(content.as_str().unwrap_or_default()),
+        ToolResultProgressStatus::Failure
+            | ToolResultProgressStatus::BlockedOutsideWorkspace(_)
+    )
 }
 
 pub(in crate::ai::driver::turn_runtime) fn tool_call_is_successful_mutation_candidate(

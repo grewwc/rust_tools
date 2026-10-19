@@ -14,7 +14,9 @@
       },
       "max_results": {
         "type": "integer",
-        "description": "Maximum matches to return (default 20, max 100)."
+        "description": "Maximum matches to return (default 20, max 100; 0 stops immediately).",
+        "minimum": 0,
+        "maximum": 100
       }
     },
     "required": [

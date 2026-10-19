@@ -31,6 +31,17 @@ mod theme;
 pub(crate) mod tools;
 mod types;
 
+/// Kill child processes owned by `execute_command` sessions. The caller owns
+/// the process-exit path; sessions have no other way to outlive a normal exit
+/// cleanly because they are stored in a process-global registry.
+pub(crate) fn shutdown_command_sessions() {
+    tools::storage::command_session::shutdown_all();
+}
+
+pub(crate) fn shutdown_command_sessions_best_effort() {
+    tools::storage::command_session::shutdown_all_best_effort();
+}
+
 pub(in crate::ai) use rust_tools_macros::{agent_hang_debug, agent_hang_span};
 
 #[cfg(test)]

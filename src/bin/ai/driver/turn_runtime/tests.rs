@@ -1165,6 +1165,20 @@ fn agent_team_temp_write_does_not_disable_read_only_progress_guard() {
 }
 
 #[test]
+fn session_poll_is_not_a_workspace_mutation() {
+    let poll_round = checkpoint_tool_round(
+        "poll-1",
+        "execute_command",
+        serde_json::json!({"session_id": "cmd-1", "pty": false}),
+        "Exit code: 101\n[session cmd-1]\ntest result: FAILED",
+    );
+    assert!(
+        !round_has_mutation(&poll_round),
+        "polling an existing session must not refresh the mutation/progress budget"
+    );
+}
+
+#[test]
 fn agent_team_delegation_does_not_disable_read_only_progress_guard() {
     let mut messages = checkpoint_tool_round(
         "spawn-1",

@@ -6,7 +6,9 @@
     "properties": {
       "limit": {
         "type": "integer",
-        "description": "Maximum number of sessions to list (default 20, max 100)."
+        "description": "Maximum number of sessions to list (default 20, max 100; 0 returns only the summary).",
+        "minimum": 0,
+        "maximum": 100
       },
       "query": {
         "type": "string",

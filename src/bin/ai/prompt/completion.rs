@@ -124,6 +124,8 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":title",
         "/cd",
         ":cd",
+        "/pwd",
+        ":pwd",
         "/theme",
         ":theme",
     ] {
@@ -2407,6 +2409,17 @@ mod tests {
         let (_, disk) =
             CommandCompleter::complete_for_line("/cd ./definitely-not-a-dir-xyz/", 31);
         assert!(disk.is_empty());
+    }
+
+    #[test]
+    fn pwd_completes_as_a_first_word_without_path_completion() {
+        // `/pwd` lives in the shared trie, so both REPLs offer it; it takes
+        // no arguments, so nothing completes after the word.
+        let (token_start, candidates) = CommandCompleter::complete_for_line("/pw", 3);
+        assert_eq!(token_start, 0);
+        assert!(candidates.iter().any(|c| c.replacement == "/pwd"));
+        let (_, after) = CommandCompleter::complete_for_line("/pwd ", 5);
+        assert!(after.is_empty());
     }
 
     #[test]

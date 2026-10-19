@@ -245,6 +245,92 @@ pub(crate) fn tool_history_policy(name: &str) -> ToolHistoryPolicy {
         .unwrap_or_default()
 }
 
+/// Whether a builtin tool may run in a parallel batch with other read-only
+/// calls. Registered explicitly: tool names do not encode side effects, and a
+/// substring such as `get` in `forget` must not make a deleting tool parallel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ToolParallelPolicy {
+    /// Run through the sequential path. This is the fail-closed default.
+    #[default]
+    Serial,
+    /// Pure read-only work that is independent of other parallel calls.
+    ReadOnly,
+}
+
+/// Optional parallel-execution-policy registration. Co-located with each
+/// tool's registration so side effects and concurrency are reviewed together;
+/// unregistered tools stay serial.
+pub(crate) struct ToolParallelPolicyRegistration {
+    pub(crate) name: &'static str,
+    pub(crate) policy: ToolParallelPolicy,
+}
+
+inventory::collect!(ToolParallelPolicyRegistration);
+
+static TOOL_PARALLEL_POLICY_INDEX: LazyLock<SkipMap<String, ToolParallelPolicy>> =
+    LazyLock::new(|| {
+        let mut index: SkipMap<String, ToolParallelPolicy> = SkipMap::default();
+        for reg in inventory::iter::<ToolParallelPolicyRegistration> {
+            let name = reg.name.to_string();
+            if !index.contains_key(&name) {
+                index.insert(name, reg.policy);
+            }
+        }
+        index
+    });
+
+/// Query a tool's parallel-execution policy; unregistered tools are serial.
+pub(crate) fn tool_parallel_policy(name: &str) -> ToolParallelPolicy {
+    TOOL_PARALLEL_POLICY_INDEX
+        .get_ref(&name.to_string())
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Whether a builtin tool may be retried once after a transient error.
+///
+/// Retry safety is not the same dimension as parallel safety: `read_file` is
+/// serial for evidence precision but idempotent, while `read_mailbox` is serial
+/// because it drains state and must never be replayed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ToolRetryPolicy {
+    /// Do not retry. This is the fail-closed default for mutating or
+    /// non-idempotent tools.
+    #[default]
+    NoRetry,
+    /// Idempotent read-only work that is safe to execute twice.
+    RetrySafe,
+}
+
+/// Optional retry-policy registration. Co-located with each tool's
+/// registration so side effects and retry semantics are reviewed together;
+/// unregistered tools are never retried.
+pub(crate) struct ToolRetryPolicyRegistration {
+    pub(crate) name: &'static str,
+    pub(crate) policy: ToolRetryPolicy,
+}
+
+inventory::collect!(ToolRetryPolicyRegistration);
+
+static TOOL_RETRY_POLICY_INDEX: LazyLock<SkipMap<String, ToolRetryPolicy>> = LazyLock::new(|| {
+    let mut index: SkipMap<String, ToolRetryPolicy> = SkipMap::default();
+    for reg in inventory::iter::<ToolRetryPolicyRegistration> {
+        let name = reg.name.to_string();
+        if !index.contains_key(&name) {
+            index.insert(name, reg.policy);
+        }
+    }
+    index
+});
+
+/// Query a tool's retry policy; unregistered tools are never retried.
+pub(crate) fn tool_retry_policy(name: &str) -> ToolRetryPolicy {
+    TOOL_RETRY_POLICY_INDEX
+        .get_ref(&name.to_string())
+        .copied()
+        .unwrap_or_default()
+}
+
 const TOOL_CANCEL_FUTEX_ENV: &str = "__ai_tool_cancel_futex_addr";
 
 pub(crate) fn ensure_process_tool_cancel_futex(
@@ -851,6 +937,67 @@ mod history_policy_tests {
                 policy.prune_policy(),
                 ToolPrunePolicy::AfterIntegration,
                 "{name} must gate pruning on integration"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_policy_defaults_to_serial_for_unregistered_tools() {
+        assert_eq!(
+            tool_parallel_policy("tree"),
+            ToolParallelPolicy::Serial
+        );
+        assert_eq!(
+            tool_parallel_policy("not_a_registered_tool"),
+            ToolParallelPolicy::Serial
+        );
+    }
+
+    #[test]
+    fn every_parallel_policy_names_a_registered_tool() {
+        // A typo in a policy registration must fail here instead of silently
+        // leaving the intended tool serial forever.
+        for reg in inventory::iter::<ToolParallelPolicyRegistration> {
+            assert!(
+                REGISTERED_TOOL_NAMES.contains(reg.name),
+                "parallel policy registered for unknown tool: {}",
+                reg.name
+            );
+        }
+    }
+
+    #[test]
+    fn retry_policy_defaults_to_no_retry() {
+        // Side effects are not encoded in names. In particular, "forget" and
+        // "mailbox" must not inherit retry safety from "get"/"read" substrings.
+        assert_eq!(tool_retry_policy("knowledge_forget"), ToolRetryPolicy::NoRetry);
+        assert_eq!(tool_retry_policy("read_mailbox"), ToolRetryPolicy::NoRetry);
+        assert_eq!(
+            tool_retry_policy("task_evidence_read"),
+            ToolRetryPolicy::NoRetry
+        );
+        assert_eq!(
+            tool_retry_policy("execute_command"),
+            ToolRetryPolicy::NoRetry
+        );
+        assert_eq!(
+            tool_retry_policy("not_a_registered_tool"),
+            ToolRetryPolicy::NoRetry
+        );
+    }
+
+    #[test]
+    fn retry_safe_policy_is_explicit_and_names_registered_tools() {
+        assert_eq!(tool_retry_policy("read_file"), ToolRetryPolicy::RetrySafe);
+        assert_eq!(
+            tool_retry_policy("knowledge_search"),
+            ToolRetryPolicy::RetrySafe
+        );
+        for reg in inventory::iter::<ToolRetryPolicyRegistration> {
+            assert!(
+                REGISTERED_TOOL_NAMES.contains(reg.name),
+                "retry policy registered for unknown tool: {}",
+                reg.name
             );
         }
     }

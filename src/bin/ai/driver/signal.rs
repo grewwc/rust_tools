@@ -186,6 +186,10 @@ fn force_exit_after_sigint(shutdown: &AtomicBool) {
     unsafe {
         let _ = libc::close(libc::STDIN_FILENO);
     }
+    // Forced exit otherwise bypasses `main`'s drop guard and leaves command
+    // sessions reparented. Best effort: never block on a lock held by an
+    // in-flight tool call.
+    crate::ai::shutdown_command_sessions_best_effort();
     #[cfg(not(test))]
     std::process::exit(130);
     #[cfg(test)]

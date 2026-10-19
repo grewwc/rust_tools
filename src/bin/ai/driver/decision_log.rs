@@ -43,6 +43,8 @@ pub enum DecisionType {
     RuntimeStop,
     /// Content-free request projection sizes and provider outcome for offline replay
     ContextProjection,
+    /// Turn-health detector intervention (advisory note, forced wrap-up, or suppression)
+    TurnSignal,
 }
 
 /// Decision record

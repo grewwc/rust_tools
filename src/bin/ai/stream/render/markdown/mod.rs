@@ -6,7 +6,9 @@ use crate::ai::stream::render::code::{
 use crate::ai::stream::render::html::{
     contains_close_table_tag, contains_open_table_tag, parse_html_table, render_html_table,
 };
-use crate::ai::stream::render::inline::{render_inline_md, terminal_cell_width};
+use crate::ai::stream::render::inline::{
+    render_inline_md, terminal_cell_width, visible_width, wrap_md_cell,
+};
 use crate::ai::stream::render::table::{
     TableAlign, TableState, compute_table_widths, is_table_row, is_table_row_candidate,
     is_table_separator, line_looks_like_table_preview, parse_table_align, parse_table_row,
@@ -1188,6 +1190,43 @@ impl MarkdownStreamRenderer {
         "\x1b[1A\r\x1b[0J".to_string()
     }
 
+    /// Render one logical prose line into physical rows that fit the terminal.
+    ///
+    /// The answer body previously relied on the terminal's soft wrap. That is
+    /// harmless in native terminals, but xterm.js (VS Code / Trae) reflows an
+    /// already-drawn long logical row when the panel is resized, which moves the
+    /// rows this renderer later addresses with relative cursor moves. Emitting
+    /// explicit newlines keeps every physical row stable. `first_prefix` is the
+    /// rendered marker for the first row (list bullet, quote bar); continuation
+    /// rows use `continuation`, whose display width is `marker_width`.
+    fn render_wrapped_prose(
+        &self,
+        indent: &str,
+        first_prefix: &str,
+        continuation: &str,
+        marker_width: usize,
+        body: &str,
+        base: &str,
+    ) -> String {
+        let width = preview_terminal_width()
+            .saturating_sub(visible_width(indent))
+            .saturating_sub(marker_width)
+            .max(1);
+        let segments = wrap_md_cell(body, width);
+        let mut out = String::new();
+        for (idx, segment) in segments.iter().enumerate() {
+            out.push_str(indent);
+            if idx == 0 {
+                out.push_str(first_prefix);
+            } else {
+                out.push_str(continuation);
+            }
+            out.push_str(&render_inline_md(segment, base));
+            out.push('\n');
+        }
+        out
+    }
+
     fn render_line_no_table(&mut self, line: &str) -> String {
         let (indent, rest) = split_indent(line);
         let trimmed = rest.trim_start_matches([' ', '\t']);
@@ -1366,13 +1405,21 @@ impl MarkdownStreamRenderer {
                 out.push('\n');
                 self.bol = true;
             }
-            out.push_str(indent);
             let combined_base = format!("{base}\x1b[1m{}", theme::current().markdown_heading);
-            out.push_str(&render_inline_md(title, &combined_base));
-            out.push_str("\x1b[0m\n");
+            out.push_str(&self.render_wrapped_prose(
+                indent,
+                "",
+                "",
+                0,
+                title,
+                &combined_base,
+            ));
 
             if let Some(ch) = underline_char {
-                let len = title.chars().count().clamp(3, 80);
+                let available = preview_terminal_width()
+                    .saturating_sub(visible_width(indent))
+                    .max(1);
+                let len = title.chars().count().clamp(3, 80).min(available);
                 out.push_str(indent);
                 out.push_str(base);
                 out.push_str("\x1b[2m");
@@ -1384,59 +1431,60 @@ impl MarkdownStreamRenderer {
         }
 
         if is_thematic_break(trimmed) {
+            let len = 28
+                .min(
+                    preview_terminal_width()
+                        .saturating_sub(visible_width(indent))
+                        .max(1),
+                );
             return format!(
                 "{indent}{base}{}{}\x1b[0m\n",
                 theme::current().accent_rule,
-                "─".repeat(28)
+                "─".repeat(len)
             );
         }
 
         if let Some(body) = parse_blockquote(trimmed) {
             let quote_base = format!("{base}{}", theme::current().accent_muted);
-            // Prepend the prefix in place so the rendered body is not copied a
-            // second time into a fresh `format!` buffer.
-            let mut out = render_inline_md(body, &quote_base);
-            out.insert_str(
-                0,
-                &format!("{indent}{base}{}▍\x1b[0m ", theme::current().accent_muted),
-            );
-            out.push('\n');
-            return out;
+            let marker = format!("{base}{}▍\x1b[0m ", theme::current().accent_muted);
+            return self.render_wrapped_prose(indent, &marker, "  ", 2, body, &quote_base);
         }
 
         if let Some((p_indent, prefix, checkbox, body)) = split_list_prefix(line) {
-            let mut out = String::new();
-            out.push_str(p_indent);
-            if let Some(checked) = checkbox {
-                out.push_str(base);
-                if checked {
-                    out.push_str(theme::current().accent_success);
-                    out.push('✓');
+            let (marker, marker_width) = if let Some(checked) = checkbox {
+                let (color, symbol) = if checked {
+                    (theme::current().accent_success, '✓')
                 } else {
-                    out.push_str(theme::current().accent_muted);
-                    out.push('○');
-                }
-                out.push_str("\x1b[0m ");
+                    (theme::current().accent_muted, '○')
+                };
+                (format!("{base}{color}{symbol}\x1b[0m "), 2)
             } else if prefix.ends_with(". ") {
-                out.push_str(base);
-                out.push_str(theme::current().accent_muted);
-                out.push_str(prefix.trim_end());
-                out.push_str("\x1b[0m ");
+                let number = prefix.trim_end();
+                (
+                    format!("{base}{}{number}\x1b[0m ", theme::current().accent_muted),
+                    visible_width(number) + 1,
+                )
             } else {
-                out.push_str(base);
-                out.push_str(theme::current().accent_primary);
-                out.push('•');
-                out.push_str("\x1b[0m ");
-            }
-            out.push_str(&render_inline_md(body, base));
-            out.push('\n');
-            return out;
+                (
+                    format!("{base}{}•\x1b[0m ", theme::current().accent_primary),
+                    2,
+                )
+            };
+            let continuation = " ".repeat(marker_width);
+            return self.render_wrapped_prose(
+                p_indent,
+                &marker,
+                &continuation,
+                marker_width,
+                body,
+                base,
+            );
         }
 
         if line.is_empty() {
             return "\n".to_string();
         }
-        format!("{}{}\n", indent, render_inline_md(rest, base))
+        self.render_wrapped_prose(indent, "", "", 0, rest, base)
     }
 }
 
@@ -1456,6 +1504,6 @@ pub(in crate::ai) use width::{
 // public `markdown` surface.
 use width::{
     code_block_content_width, code_block_preview_continuation_prefix, code_block_preview_prefix,
-    wrap_code_block_text,
+    preview_terminal_width, wrap_code_block_text,
 };
 use parser::{is_thematic_break, parse_blockquote, parse_heading, split_list_prefix};

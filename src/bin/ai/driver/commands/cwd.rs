@@ -37,10 +37,15 @@ pub(crate) enum CwdCommand {
     /// `/cd <dir>`: switch to `<dir>`, kept verbatim so directory names
     /// containing spaces survive.
     Switch(String),
+    /// `/pwd` with trailing arguments: printing the directory takes none, so
+    /// the arguments are a usage error (reported, never silently ignored).
+    UnexpectedPwdArgs(String),
 }
 
-/// Parse a `/cd [dir]` / `:cd [dir]` line without touching any state.
-/// Returns `None` when the line is not a `cd` command (e.g. `/model foo`).
+/// Parse a `/cd [dir]` / `:cd [dir]` or `/pwd` / `:pwd` line without touching
+/// any state. Returns `None` when the line is neither a `cd` nor a `pwd`
+/// command (e.g. `/model foo`). Bare `/pwd` parses to `Show`, exactly like
+/// bare `/cd`, so both report the same `Working directory:` line.
 pub(crate) fn parse_cwd_command(input: &str) -> Option<CwdCommand> {
     let trimmed = input.trim();
     let Some(rest) = trimmed
@@ -49,26 +54,38 @@ pub(crate) fn parse_cwd_command(input: &str) -> Option<CwdCommand> {
     else {
         return None;
     };
-    if rest.split_whitespace().next() != Some("cd") {
-        return None;
-    }
-    // Take the path verbatim (not word-by-word) so directory names containing
-    // spaces work; the prefix check above guarantees `rest` starts with "cd".
-    let arg = rest.trim_start()[2..].trim();
-    if arg.is_empty() {
-        Some(CwdCommand::Show)
-    } else if arg == "-" {
-        Some(CwdCommand::GoBack)
-    } else {
-        Some(CwdCommand::Switch(arg.to_string()))
+    match rest.split_whitespace().next() {
+        Some("cd") => {
+            // Take the path verbatim (not word-by-word) so directory names
+            // containing spaces work; the match above guarantees `rest`
+            // starts with "cd".
+            let arg = rest.trim_start()[2..].trim();
+            if arg.is_empty() {
+                Some(CwdCommand::Show)
+            } else if arg == "-" {
+                Some(CwdCommand::GoBack)
+            } else {
+                Some(CwdCommand::Switch(arg.to_string()))
+            }
+        }
+        Some("pwd") => {
+            let arg = rest.trim_start()[3..].trim();
+            if arg.is_empty() {
+                Some(CwdCommand::Show)
+            } else {
+                Some(CwdCommand::UnexpectedPwdArgs(arg.to_string()))
+            }
+        }
+        _ => None,
     }
 }
 
-/// Handle `/cd [dir]` / `:cd [dir]`.
+/// Handle `/cd [dir]` / `:cd [dir]` and `/pwd` / `:pwd`.
 ///
 /// Bare `/cd` prints the directory tools currently resolve against; `-` goes
-/// back to the previous one. Returns `true` when the input was a `/cd` command
-/// (including a switch that failed), `false` otherwise.
+/// back to the previous one; bare `/pwd` prints the same directory without
+/// accepting arguments. Returns `true` when the input was a `/cd` or `/pwd`
+/// command (including a switch that failed), `false` otherwise.
 pub fn try_handle_cwd_command(input: &str) -> bool {
     let Some(outcome) = run_cwd_command(input) else {
         return false;
@@ -90,19 +107,21 @@ pub(crate) struct CwdOutcome {
     pub(crate) stderr: String,
 }
 
-/// Execute a `/cd [dir]` / `:cd [dir]` command against this process and return
-/// the message lines it would print, without printing anything.
+/// Execute a `/cd [dir]` / `:cd [dir]` or `/pwd` / `:pwd` command against
+/// this process and return the message lines it would print, without printing
+/// anything.
 ///
 /// Serve mode uses this: the session working directory is the serve process's
 /// working directory (turn children inherit it at spawn), so the switch must
 /// happen in the serve process, but its output must come back over HTTP
 /// instead of leaking into the server's terminal. Returns `None` when `input`
-/// is not a `/cd` command.
+/// is neither a `/cd` nor a `/pwd` command.
 pub(crate) fn run_cwd_command(input: &str) -> Option<CwdOutcome> {
     let outcome = match parse_cwd_command(input)? {
         CwdCommand::Show => current_dir_outcome(),
         CwdCommand::GoBack => return_to_previous_dir_outcome(),
         CwdCommand::Switch(arg) => change_dir_outcome(&arg),
+        CwdCommand::UnexpectedPwdArgs(arg) => unexpected_pwd_args_outcome(&arg),
     };
     Some(outcome)
 }
@@ -123,6 +142,20 @@ fn current_dir_outcome() -> CwdOutcome {
 /// Usage line shared by the local and per-session switch error messages.
 pub(crate) fn cd_usage_line() -> String {
     "Usage: /cd [dir]   (no argument shows the current directory, \"-\" goes back)\n".to_string()
+}
+
+/// Usage line for `/pwd`, shared by the local and per-session error messages.
+pub(crate) fn pwd_usage_line() -> String {
+    "Usage: /pwd   (shows the current directory and takes no arguments)\n".to_string()
+}
+
+/// Message lines for `/pwd` with trailing arguments, shared by the local and
+/// per-session paths so both report the same error.
+pub(crate) fn unexpected_pwd_args_outcome(arg: &str) -> CwdOutcome {
+    CwdOutcome {
+        stdout: String::new(),
+        stderr: format!("[pwd] unexpected argument: {arg}\n{}", pwd_usage_line()),
+    }
 }
 
 /// Expand `~`, then move the process to the resolved directory.
@@ -220,6 +253,39 @@ mod tests {
         assert!(!try_handle_cwd_command("/model foo"));
         assert!(!try_handle_cwd_command("cd /tmp"));
         assert!(!try_handle_cwd_command("/cdx /tmp"));
+    }
+
+    #[test]
+    fn pwd_parses_like_bare_cd_and_rejects_arguments() {
+        assert!(matches!(parse_cwd_command("/pwd"), Some(CwdCommand::Show)));
+        assert!(matches!(parse_cwd_command(":pwd"), Some(CwdCommand::Show)));
+        assert!(matches!(parse_cwd_command("  /pwd  "), Some(CwdCommand::Show)));
+        assert!(matches!(
+            parse_cwd_command("/pwd /tmp"),
+            Some(CwdCommand::UnexpectedPwdArgs(_))
+        ));
+        assert!(matches!(
+            parse_cwd_command(":pwd -"),
+            Some(CwdCommand::UnexpectedPwdArgs(_))
+        ));
+        // Near-misses are not commands: they must keep falling through to the
+        // model instead of printing a directory.
+        assert!(parse_cwd_command("/pwdx").is_none());
+        assert!(parse_cwd_command("pwd").is_none());
+    }
+
+    #[test]
+    fn pwd_outcome_reports_without_moving() {
+        let before = cwd();
+        let outcome = run_cwd_command("/pwd").expect("pwd outcome");
+        assert!(outcome.stderr.is_empty());
+        assert!(outcome.stdout.contains(&before.display().to_string()));
+        assert_eq!(cwd(), before);
+        let outcome = run_cwd_command("/pwd extra").expect("pwd outcome");
+        assert!(outcome.stdout.is_empty());
+        assert!(outcome.stderr.contains("[pwd] unexpected argument"));
+        assert!(outcome.stderr.contains("Usage: /pwd"));
+        assert_eq!(cwd(), before);
     }
 
     #[test]

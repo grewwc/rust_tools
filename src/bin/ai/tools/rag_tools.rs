@@ -7,7 +7,10 @@
 
 use serde_json::Value;
 
-use crate::ai::tools::common::{ToolRegistration, ToolSpec};
+use crate::ai::tools::common::{
+    ToolParallelPolicy, ToolParallelPolicyRegistration, ToolRegistration, ToolRetryPolicy,
+    ToolRetryPolicyRegistration, ToolSpec,
+};
 use crate::ai::tools::storage::rag_store::{hybrid_search, rebuild_index, semantic_search};
 
 fn execute_knowledge_semantic_search(args: &Value) -> Result<String, String> {
@@ -61,6 +64,16 @@ inventory::submit!(ToolRegistration {
         description: "",
         execute: execute_knowledge_semantic_search,
     }
+});
+
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "knowledge_semantic_search",
+    policy: ToolParallelPolicy::ReadOnly,
+});
+
+inventory::submit!(ToolRetryPolicyRegistration {
+    name: "knowledge_semantic_search",
+    policy: ToolRetryPolicy::RetrySafe,
 });
 
 fn execute_knowledge_rebuild_index(args: &Value) -> Result<String, String> {

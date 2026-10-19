@@ -28,6 +28,7 @@ use super::{
     },
     persistence::persist_pending_turn_messages,
     prepare::prepare_turn,
+    turn_signals::{SignalKind, TurnSignalBudget},
     tool_result::{
         DEGENERATE_REPETITION_FINISH_REASON, FinalGateState, append_empty_response_retry_note,
         audit_evidence_gate_action, completion_evidence_state, completion_tool_result_succeeded,
@@ -144,6 +145,9 @@ const MAX_STREAM_ERROR_RETRIES: usize = 16;
 /// Retry cap for consecutive "model output too long / truncated tool-call JSON" truncations.
 /// stream_error uses its own separate cap and does not count toward this one.
 const MAX_MODEL_TRUNCATION_RETRIES: usize = 3;
+/// A malformed provider envelope gets one clean replay. Repeating the same protocol leak means
+/// the adapter/model pair is not converging, so more retries would only repeat an untrusted response.
+const PROVIDER_CONTROL_LEAK_MAX_ATTEMPTS: usize = 2;
 /// Retry cap for consecutive degenerate-repetition stops (the model loops on one phrase in
 /// reasoning or visible content). This is deliberately separate from MAX_MODEL_TRUNCATION_RETRIES:
 /// effort/max_tokens downgrades cannot fix a content-triggered loop — the model re-generates the
@@ -248,6 +252,10 @@ use progress::*;
 mod tests;
 
 #[cfg(test)]
+#[path = "session_e2e_tests.rs"]
+mod session_e2e_tests;
+
+#[cfg(test)]
 #[path = "digest_backfill_tests.rs"]
 mod digest_backfill_tests;
 
@@ -266,6 +274,7 @@ struct TurnRetryState {
     consecutive_empty_responses: usize,
     consecutive_truncations: usize,
     consecutive_stream_errors: usize,
+    consecutive_provider_control_leaks: usize,
     /// Consecutive degenerate-repetition stops (reasoning/content loop) in this turn. Separate
     /// budget from consecutive_truncations: the effort ladder cannot fix content-triggered loops,
     /// so this caps retries independently (see DEGENERATE_REPETITION_MAX_ATTEMPTS).
@@ -282,6 +291,7 @@ impl TurnRetryState {
             consecutive_empty_responses: 0,
             consecutive_truncations: 0,
             consecutive_stream_errors: 0,
+            consecutive_provider_control_leaks: 0,
             consecutive_degenerate_repetitions: 0,
             saved_effort_override: app.cli.reasoning_effort_override,
             saved_thinking_disabled: app.cli.thinking_disabled_override,
@@ -321,6 +331,8 @@ struct TurnSupervisor {
     tool_target_history: Vec<Vec<String>>,
     target_repeat_note_injected: bool,
     progress: ProgressLedger,
+    /// One shared advisory budget across every turn-health detector.
+    signal_budget: TurnSignalBudget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,6 +373,35 @@ enum ToolLoopSignal {
     /// read-only targets than the breadth threshold have been touched without converging. Decoupled
     /// from content novelty; switch to no-tool handoff and force an answer.
     ReadOnlyBreadthHard,
+}
+
+impl ToolLoopSignal {
+    /// Name and severity used by the shared signal budget / decision log.
+    /// `None` means no intervention (the detector matched nothing). Only
+    /// convergence-enforcing hard stops are [`SignalKind::HardStop`]; every
+    /// soft nudge shares the advisory budget so detectors cannot pile
+    /// independent prompts onto the same turn. Suppressing a soft nudge only
+    /// drops that nudge — hard stops are detected independently of whether
+    /// their soft precursor was injected, so convergence is preserved.
+    fn intervention(&self) -> Option<(&'static str, SignalKind)> {
+        match self {
+            Self::None => None,
+            Self::Coarse => Some(("coarse", SignalKind::Advisory)),
+            Self::TargetRepeat => Some(("target_repeat", SignalKind::Advisory)),
+            Self::TargetRescan(..) => Some(("target_rescan", SignalKind::Advisory)),
+            Self::TargetRescanHard(..) => Some(("target_rescan_hard", SignalKind::HardStop)),
+            Self::CoarseHard => Some(("coarse_hard", SignalKind::HardStop)),
+            Self::Soft => Some(("exact_soft", SignalKind::Advisory)),
+            Self::Hard => Some(("exact_hard", SignalKind::HardStop)),
+            Self::LowProgressSoft => Some(("low_progress_soft", SignalKind::Advisory)),
+            Self::LowProgressLedger => Some(("low_progress_ledger", SignalKind::Advisory)),
+            Self::LowProgressHard => Some(("low_progress_hard", SignalKind::HardStop)),
+            Self::ReadOnlyBreadth => Some(("read_only_breadth", SignalKind::Advisory)),
+            Self::ReadOnlyBreadthHard => {
+                Some(("read_only_breadth_hard", SignalKind::HardStop))
+            }
+        }
+    }
 }
 
 /// Runtime state for the Progress Budget, held on `TurnSupervisor`. Charged by "information gain"
@@ -1552,8 +1593,31 @@ async fn run_turn_body(
                     .finish_reason_value
                     .as_deref()
                     .is_some_and(|reason| reason == DEGENERATE_REPETITION_FINISH_REASON);
+                let is_provider_control_leak = stream_result
+                    .finish_reason_value
+                    .as_deref()
+                    .is_some_and(|reason| {
+                        reason == crate::ai::stream::PROVIDER_CONTROL_LEAK_FINISH_REASON
+                    });
 
-                if is_degenerate_repetition {
+                if is_provider_control_leak {
+                    retry.consecutive_provider_control_leaks += 1;
+                    retry.consecutive_truncations = 0;
+                    retry.consecutive_degenerate_repetitions = 0;
+                    retry.consecutive_stream_errors = 0;
+                    if retry.consecutive_provider_control_leaks
+                        >= PROVIDER_CONTROL_LEAK_MAX_ATTEMPTS
+                    {
+                        output.assistant_text =
+                            "[Model response was malformed: provider control markers leaked into the reasoning channel twice. No tool calls from those responses were executed; please retry or switch models.]"
+                                .to_string();
+                        break 'turn Ok(None);
+                    }
+                    crate::ai::driver::print::print_tool_note_line(
+                        "stream",
+                        "provider control markers leaked into reasoning; discarding the response and retrying once",
+                    );
+                } else if is_degenerate_repetition {
                     // Separate failure mode from output-length truncation: the model looped on one
                     // phrase (reasoning or visible content), detected locally or reported by the
                     // server. The generic effort/max_tokens ladder cannot fix a content-triggered
@@ -1911,6 +1975,7 @@ async fn run_turn_body(
                 }
             } else {
                 retry.consecutive_truncations = 0;
+                retry.consecutive_provider_control_leaks = 0;
                 // Not a truncation: restore the max_tokens downgraded due to zero output.
                 if retry.max_tokens_downgraded {
                     app.cli.max_tokens_override = retry.saved_max_tokens_override;
@@ -2048,6 +2113,26 @@ async fn run_turn_body(
                 },
                 PROGRESS_FREE_EXPLORE_ROUNDS,
             )
+        };
+        // Every detector feeds one advisory budget and one decision record.
+        // Hard stops bypass the budget; advisory notes are suppressed once the
+        // per-turn allowance is exhausted so separate detectors cannot keep
+        // stacking prompts on the same projection.
+        let tool_loop_signal = match tool_loop_signal.intervention() {
+            Some((name, kind)) => {
+                if supervisor.signal_budget.admit(
+                    &app.session_id,
+                    turn_index,
+                    supervisor.iteration,
+                    name,
+                    kind,
+                ) {
+                    tool_loop_signal
+                } else {
+                    ToolLoopSignal::None
+                }
+            }
+            None => ToolLoopSignal::None,
         };
         let health_signal_injected = tool_loop_signal != ToolLoopSignal::None;
         match tool_loop_signal {

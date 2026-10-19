@@ -577,7 +577,7 @@ mod tests {
             thinking_off_capability_for(
                 ApiProvider::OpenCode,
                 "mimo-v2.5-pro",
-                "https://opencode.ai/zen/go/v1/chat/completions"
+                "https://opencode.ai/inference/go/v1/chat/completions"
             ),
             ThinkingOffCapability::Unsupported
         ));
@@ -602,7 +602,7 @@ mod tests {
         let dialect = thinking_dialect_for(
             ApiProvider::OpenCode,
             "mimo-v2.5-pro",
-            "https://opencode.ai/zen/go/v1/chat/completions",
+            "https://opencode.ai/inference/go/v1/chat/completions",
         );
         assert!(dialect.fields(true, Some("high")).is_empty());
         assert_eq!(dialect.adapt_effort(Some("high")), Some("high"));
@@ -675,7 +675,7 @@ mod tests {
         let dialect = thinking_dialect_for(
             ApiProvider::OpenCode,
             "claude-opus-5-5",
-            "https://opencode.ai/zen/v1/messages",
+            "https://opencode.ai/inference/go/v1/messages",
         );
         let fields = dialect.fields(true, Some("xhigh"));
         assert_eq!(fields["thinking"]["type"], "adaptive");
@@ -697,7 +697,7 @@ mod tests {
         let dialect = thinking_dialect_for(
             ApiProvider::OpenCode,
             "claude-opus-5-5",
-            "https://opencode.ai/zen/v1/messages",
+            "https://opencode.ai/inference/go/v1/messages",
         );
         let fields = dialect.fields(false, None);
         assert_eq!(fields["thinking"]["type"], "disabled");
@@ -711,7 +711,7 @@ mod tests {
         assert!(thinking_dialect_for(
             ApiProvider::OpenCode,
             "claude-opus-5-5",
-            "https://opencode.ai/zen/go/v1/chat/completions"
+            "https://opencode.ai/inference/go/v1/chat/completions"
         )
         .fields(true, Some("high"))
         .is_empty());

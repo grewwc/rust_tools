@@ -101,6 +101,8 @@ pub(in crate::ai::driver::turn_runtime) const TRUNCATION_RETRY_NOTE_PREFIX: &str
     "tool_followup:output_truncated\n";
 pub(in crate::ai::driver::turn_runtime) const DEGENERATE_REPETITION_RETRY_NOTE_PREFIX: &str =
     "tool_followup:degenerate_repetition\n";
+pub(in crate::ai::driver::turn_runtime) const PROVIDER_CONTROL_LEAK_RETRY_NOTE_PREFIX: &str =
+    "tool_followup:provider_control_leak\n";
 pub(in crate::ai::driver::turn_runtime) const DEGENERATE_REPETITION_FINISH_REASON: &str =
     "degenerate_repetition";
 
@@ -122,6 +124,10 @@ pub(in crate::ai::driver::turn_runtime) fn append_truncation_retry_note(
         .finish_reason_value
         .as_deref()
         .is_some_and(|reason| reason == DEGENERATE_REPETITION_FINISH_REASON);
+    let provider_control_leak = stream_result
+        .finish_reason_value
+        .as_deref()
+        .is_some_and(|reason| reason == crate::ai::stream::PROVIDER_CONTROL_LEAK_FINISH_REASON);
 
     // Keep the visible text the model already produced as "partial progress" so a retry
     // does not lose all context. Under truncation this text is usually a half-finished
@@ -156,8 +162,24 @@ pub(in crate::ai::driver::turn_runtime) fn append_truncation_retry_note(
             && message.content.as_str().is_some_and(|content| {
                 content.starts_with(TRUNCATION_RETRY_NOTE_PREFIX)
                     || content.starts_with(DEGENERATE_REPETITION_RETRY_NOTE_PREFIX)
+                    || content.starts_with(PROVIDER_CONTROL_LEAK_RETRY_NOTE_PREFIX)
             }))
     });
+
+    if provider_control_leak {
+        let note = format!(
+            "{}The previous response leaked provider control markers into the reasoning channel and was discarded as malformed. No tool calls from that response were executed. Continue from the latest valid state; emit any tool call only through the structured tool-call interface, and do not quote or reconstruct the leaked control payload.",
+            PROVIDER_CONTROL_LEAK_RETRY_NOTE_PREFIX
+        );
+        messages.push(Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(note),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+        return;
+    }
 
     if degenerate_repetition {
         let note = format!(

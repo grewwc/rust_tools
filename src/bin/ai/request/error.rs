@@ -585,7 +585,7 @@ mod tests {
 
         // OpenCode gateway: exact apex, subdomains, explicit port, mixed case.
         assert_eq!(
-            header("https://opencode.ai/zen/v1/chat/completions", "s1"),
+            header("https://opencode.ai/inference/go/v1/chat/completions", "s1"),
             Some("s1".to_string())
         );
         assert_eq!(
@@ -593,11 +593,11 @@ mod tests {
             Some("s2".to_string())
         );
         assert_eq!(
-            header("https://opencode.ai:443/zen/v1/chat/completions", "s3"),
+            header("https://opencode.ai:443/inference/go/v1/chat/completions", "s3"),
             Some("s3".to_string())
         );
         assert_eq!(
-            header("https://OPEncode.AI/zen/v1/chat/completions", "s4"),
+            header("https://OPEncode.AI/inference/go/v1/chat/completions", "s4"),
             Some("s4".to_string())
         );
 
@@ -614,7 +614,7 @@ mod tests {
         assert_eq!(header("https://notopencode.ai/v1", "s7"), None);
 
         // Empty session id never attaches the header, even on the real gateway.
-        assert_eq!(header("https://opencode.ai/zen/v1", "  "), None);
+        assert_eq!(header("https://opencode.ai/inference/go/v1", "  "), None);
     }
 
     #[test]

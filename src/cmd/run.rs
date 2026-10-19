@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::{
     ffi::OsString,
     fs::File,
-    io::{self, Read},
+    io::{self, Read, Write},
     process::{Child, Command, ExitStatus, Output, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
     thread,
@@ -26,6 +26,7 @@ use std::os::unix::{io::FromRawFd, process::CommandExt};
 /// # Fields
 ///
 /// * `cwd` - Optional working-directory path
+/// * `input` - Optional bytes written to the child's stdin immediately after spawn
 ///
 /// # Examples
 ///
@@ -38,6 +39,7 @@ use std::os::unix::{io::FromRawFd, process::CommandExt};
 /// // Run in a specific directory
 /// let opts = RunCmdOptions {
 ///     cwd: Some("/tmp"),
+///     input: None,
 /// };
 /// ```
 #[derive(Debug, Clone, Copy, Default)]
@@ -46,6 +48,12 @@ pub struct RunCmdOptions<'a> {
     ///
     /// If `None`, the command runs in the current process's working directory.
     pub cwd: Option<&'a str>,
+    /// Optional input forwarded to the child's stdin.
+    ///
+    /// The bytes are written verbatim (no newline is appended). For a PTY they
+    /// go through the terminal master, so line-oriented programs receive them
+    /// as if typed; include `\n` when the program expects a submitted line.
+    pub input: Option<&'a str>,
 }
 
 /// Normalize a command string.
@@ -187,6 +195,20 @@ fn build_command(command: &str, opts: RunCmdOptions<'_>) -> io::Result<Command> 
     } else {
         build_no_shell_command(command, opts)
     }
+}
+
+/// Builds a command exactly like the one-shot runner does, for a persistent
+/// command session. Session shell selection, `cwd`, and path expansion must not
+/// diverge from one-shot execution; otherwise the same command behaves
+/// differently depending on whether it was started with `yield_time_ms`.
+pub fn build_session_command(command: &str, cwd: Option<&str>) -> io::Result<Command> {
+    build_command(
+        command,
+        RunCmdOptions {
+            cwd,
+            input: None,
+        },
+    )
 }
 
 /// Builds a `Command` without a shell.
@@ -603,6 +625,18 @@ fn apply_command_env_policy(cmd: &mut Command, policy: CommandEnvPolicy) {
     }
 }
 
+/// Apply the same environment contract as the one-shot streaming runner to a
+/// manually built session child: non-interactive sessions suppress pagers,
+/// editors, and prompts; PTY sessions keep terminal capabilities while still
+/// disabling pagers that could block captured output.
+pub fn apply_session_env_policy(cmd: &mut Command, pseudo_terminal: bool) {
+    if pseudo_terminal {
+        apply_command_env_policy(cmd, PSEUDO_TERMINAL_ENV_POLICY);
+    } else {
+        apply_command_env_policy(cmd, NON_INTERACTIVE_ENV_POLICY);
+    }
+}
+
 /// Converts a result carrying timeout/cancel markers back to the legacy
 /// `io::Result<Output>` semantics:
 /// timeout -> `Err(TimedOut)`, cancel -> `Err(Interrupted)`, normal ->
@@ -766,6 +800,7 @@ where
     C: Fn() -> bool,
     G: FnMut(u32),
 {
+    let input = opts.input;
     let mut cmd = build_command(command, opts)?;
     apply_command_env_policy(&mut cmd, env_policy);
 
@@ -773,12 +808,22 @@ where
         #[cfg(unix)]
         {
             let (master, slave) = open_pseudo_terminal()?;
+            let mut input_writer = match input {
+                Some(_) => Some(master.try_clone()?),
+                None => None,
+            };
             cmd.stdin(Stdio::from(slave.try_clone()?));
             cmd.stdout(Stdio::from(slave.try_clone()?));
             cmd.stderr(Stdio::from(slave));
             configure_child_process_group_with_controlling_terminal(&mut cmd);
 
             let child = crate::fork_guard::spawn(&mut cmd)?;
+            if let (Some(input), Some(mut writer)) = (input, input_writer.take()) {
+                let input = input.to_string();
+                thread::spawn(move || {
+                    let _ = writer.write_all(input.as_bytes());
+                });
+            }
             let (tx, rx) = mpsc::channel::<(StreamKind, Vec<u8>)>();
             // The PTY merges stdout/stderr into the same master; store it in
             // the stdout slot to keep the existing "merged output" result
@@ -794,12 +839,24 @@ where
             ));
         }
     } else {
-        cmd.stdin(Stdio::null());
+        if input.is_some() {
+            cmd.stdin(Stdio::piped());
+        } else {
+            cmd.stdin(Stdio::null());
+        }
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         configure_child_process_group(&mut cmd);
 
         let mut child = crate::fork_guard::spawn(&mut cmd)?;
+        if let Some(input) = input {
+            if let Some(mut stdin) = child.stdin.take() {
+                let input = input.to_string();
+                thread::spawn(move || {
+                    let _ = stdin.write_all(input.as_bytes());
+                });
+            }
+        }
         let stdout = child
             .stdout
             .take()
@@ -1170,6 +1227,47 @@ mod tests {
             .unwrap();
             assert!(output.status.success());
             assert_eq!(String::from_utf8_lossy(&streamed), "hello\nworld");
+        }
+    }
+
+    #[test]
+    fn test_streaming_runner_forwards_stdin_pipe_and_pty() {
+        #[cfg(unix)]
+        {
+            let piped = run_cmd_output_streaming_with_timeout(
+                "cat",
+                RunCmdOptions {
+                    input: Some("pipe-stdin\n"),
+                    ..RunCmdOptions::default()
+                },
+                Duration::from_secs(2),
+                |_| {},
+                || false,
+            )
+            .expect("piped stdin command should run");
+            assert!(
+                String::from_utf8_lossy(&piped.stdout).contains("pipe-stdin"),
+                "pipe stdin was not forwarded: {:?}",
+                String::from_utf8_lossy(&piped.stdout)
+            );
+
+            let pty = super::run_cmd_output_streaming_with_timeout_tracked_pseudo_terminal(
+                "head -n 1",
+                RunCmdOptions {
+                    input: Some("pty-stdin\n"),
+                    ..RunCmdOptions::default()
+                },
+                Duration::from_secs(2),
+                |_| {},
+                || false,
+                |_| {},
+            )
+            .expect("pty stdin command should run");
+            assert!(
+                String::from_utf8_lossy(&pty.stdout).contains("pty-stdin"),
+                "pty stdin was not forwarded: {:?}",
+                String::from_utf8_lossy(&pty.stdout)
+            );
         }
     }
 

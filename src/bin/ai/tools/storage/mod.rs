@@ -8,6 +8,7 @@ use std::sync::{LazyLock, Mutex};
 
 pub(crate) mod changes;
 pub(crate) mod command_runner;
+pub(crate) mod command_session;
 pub(crate) mod file_store;
 pub(crate) mod memory_index;
 pub(crate) mod memory_store;

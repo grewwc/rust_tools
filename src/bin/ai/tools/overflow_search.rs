@@ -61,7 +61,8 @@ use serde_json::Value;
 use crate::ai::history::compress::SOURCE_DIR;
 use crate::ai::tools::common::{
     ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
-    ToolRegistration, ToolSpec,
+    ToolParallelPolicy, ToolParallelPolicyRegistration, ToolRegistration, ToolRetryPolicy,
+    ToolRetryPolicyRegistration, ToolSpec,
 };
 use crate::ai::tools::storage::file_store::current_session_assets_dir;
 
@@ -1071,6 +1072,16 @@ inventory::submit!(ToolRegistration {
         description: "",
         execute: execute_search_overflow,
     }
+});
+
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "search_overflow",
+    policy: ToolParallelPolicy::ReadOnly,
+});
+
+inventory::submit!(ToolRetryPolicyRegistration {
+    name: "search_overflow",
+    policy: ToolRetryPolicy::RetrySafe,
 });
 
 // search_overflow results are localization pointers for recalled compressed

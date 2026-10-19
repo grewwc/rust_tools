@@ -17,7 +17,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::ai::driver::commands::cwd::{CwdCommand, CwdOutcome, cd_usage_line, parse_cwd_command};
+use crate::ai::driver::commands::cwd::{
+    CwdCommand, CwdOutcome, cd_usage_line, parse_cwd_command, unexpected_pwd_args_outcome,
+};
 use crate::commonw::utils::expanduser;
 
 use super::*;
@@ -25,47 +27,68 @@ use super::*;
 /// File holding the persisted per-session working directories. It lives next
 /// to the session store so a daemon restart (which re-execs into a fresh
 /// process with an empty in-memory map) restores every session's `/cd`.
-fn cwds_file(history_file: &Path) -> Option<PathBuf> {
-    let parent = history_file.parent()?;
-    if parent.as_os_str().is_empty() {
-        return None;
+fn cwds_file(history_file: &Path) -> PathBuf {
+    match history_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        Some(parent) => parent.join("serve-cwds.json"),
+        // A bare `history_file` filename has no directory component to anchor
+        // the sidecar to; keep it next to the daemon's cwd, mirroring where
+        // the session store itself would land. Without this fallback
+        // persistence would be silently disabled and every restart would wipe
+        // all sessions' `/cd` directories.
+        None => std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("serve-cwds.json"),
     }
-    Some(parent.join("serve-cwds.json"))
 }
 
 /// Load persisted per-session working directories. Best-effort: any IO or
-/// parse failure yields an empty map, and entries whose directory no longer
-/// exists are dropped, so a stale file can never break daemon startup.
+/// parse failure yields an empty map. Entries are kept verbatim, even when
+/// their directory is currently missing: `session_cwd` already falls back to
+/// the daemon cwd at read time, so dropping them here would permanently erase
+/// a session's directory on the next save when the mount simply reappears
+/// (a restart while an external drive is unplugged must not be amnesia).
 pub(crate) fn load_cwds(history_file: &Path) -> HashMap<String, SessionCwd> {
-    let Some(path) = cwds_file(history_file) else {
-        return HashMap::new();
-    };
+    let path = cwds_file(history_file);
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     if text.trim().is_empty() {
         return HashMap::new();
     }
-    let map: HashMap<String, SessionCwd> = serde_json::from_str(&text).unwrap_or_default();
-    map.into_iter()
-        .filter(|(_, entry)| entry.current.is_dir())
-        .collect()
+    serde_json::from_str(&text).unwrap_or_default()
 }
 
 /// Persist the in-memory map. Best-effort: failures are logged and never fail
-/// the `/cd` command or the turn they belong to.
+/// the `/cd` command or the turn they belong to. The snapshot is serialized
+/// under the map lock and published atomically (temporary file plus rename):
+/// a torn sidecar parses as garbage, and the loader's lenient default would
+/// then wipe every session's directory on the next boot.
 fn save_cwds(state: &ServeState) {
-    let Some(path) = cwds_file(&state.history_file) else {
-        return;
+    let path = cwds_file(&state.history_file);
+    let guard = match state.cwds.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
     };
-    let text = match state.cwds.lock().ok().map(|guard| {
-        serde_json::to_string(&*guard).unwrap_or_else(|_| "{}".to_string())
-    }) {
-        Some(text) => text,
-        None => return,
-    };
-    if let Some(parent) = path.parent() {
+    let text = serde_json::to_string(&*guard).unwrap_or_else(|_| "{}".to_string());
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(err) = std::fs::write(&path, text) {
+    // Unique per thread: concurrent `/cd` switches in different sessions
+    // serialize on the map lock above, but each still needs its own
+    // temporary file so their renames cannot cross.
+    let tmp = path.with_extension(format!(
+        "json.tmp-{:?}",
+        std::thread::current().id()
+    ));
+    // The guard stays alive across the write: a second switch serializes its
+    // own (newer) snapshot afterwards instead of racing this one to disk.
+    let result = std::fs::write(&tmp, &text)
+        .and_then(|_| std::fs::rename(&tmp, &path));
+    std::mem::drop(guard);
+    if let Err(err) = result {
         eprintln!("[serve] warning: failed to persist session cwds: {err}");
     }
 }
@@ -95,6 +118,7 @@ pub(crate) fn run_session_cd(state: &ServeState, id: &str, command: &str) -> Opt
         CwdCommand::Show => show_outcome(state, id),
         CwdCommand::GoBack => go_back_outcome(state, id),
         CwdCommand::Switch(target) => switch_outcome(state, id, &target),
+        CwdCommand::UnexpectedPwdArgs(arg) => unexpected_pwd_args_outcome(&arg),
     };
     Some(outcome)
 }
@@ -321,6 +345,23 @@ mod tests {
     }
 
     #[test]
+    fn pwd_reports_the_session_cwd_and_rejects_arguments() {
+        let state = test_state();
+        let target = temp_dir("pwd-show");
+        run_session_cd(&state, "s1", &format!("/cd {}", target.display())).expect("cd");
+        let shown = run_session_cd(&state, "s1", "/pwd").expect("pwd");
+        assert!(shown.stderr.is_empty());
+        assert_eq!(
+            shown.stdout,
+            format!("Working directory: {}\n", target.canonicalize().unwrap().display())
+        );
+        let rejected = run_session_cd(&state, "s1", "/pwd extra").expect("pwd");
+        assert!(rejected.stdout.is_empty());
+        assert!(rejected.stderr.contains("Usage: /pwd"));
+        assert!(run_session_cd(&state, "s1", "/pwdx").is_none());
+    }
+
+    #[test]
     fn sessions_are_isolated() {
         let state = test_state();
         let first = temp_dir("iso-a");
@@ -401,5 +442,36 @@ mod tests {
             session_cwd(&state, "s2"),
             target.canonicalize().unwrap()
         );
+    }
+
+    /// A restart while a session directory is temporarily unavailable keeps
+    /// the entry: reads fall back to the daemon cwd, and the session resumes
+    /// its directory once it reappears instead of losing it on the next save.
+    #[test]
+    fn missing_dir_entry_survives_reload_and_resumes() {
+        let state = persist_state("persist-resume");
+        let base = temp_dir("persist-resume-base");
+        let target = format!("/cd {}", base.display());
+        run_session_cd(&state, "s1", &target).expect("cd");
+        let missing = temp_dir("persist-resume-missing").join("gone");
+        assert!(!missing.exists());
+        state.cwds.lock().unwrap().insert(
+            "s1".to_string(),
+            SessionCwd {
+                current: missing.clone(),
+                previous: None,
+            },
+        );
+        save_cwds(&state);
+        let restarted = persist_state("persist-resume");
+        let loaded = load_cwds(&restarted.history_file);
+        assert_eq!(
+            loaded.get("s1").map(|entry| entry.current.as_path()),
+            Some(missing.as_path())
+        );
+        *restarted.cwds.lock().unwrap() = loaded;
+        assert_eq!(session_cwd(&restarted, "s1"), cwd());
+        std::fs::create_dir_all(&missing).unwrap();
+        assert_eq!(session_cwd(&restarted, "s1"), missing);
     }
 }

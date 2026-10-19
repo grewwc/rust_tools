@@ -1,10 +1,6 @@
 use super::super::protocol::build_http_body_for_json_messages;
 use super::super::*;
-use crate::ai::tools::os_tools::{GLOBAL_OS, init_os_tools_globals};
-use crate::ai::{cli::ParsedCli, types::AppConfig};
 use serde_json::Value;
-use std::path::PathBuf;
-use std::sync::{Arc, atomic::AtomicBool};
 
 #[test]
 fn responses_protocol_dialect_infers_from_endpoint_when_unspecified() {
@@ -20,17 +16,18 @@ fn responses_protocol_dialect_infers_from_endpoint_when_unspecified() {
 
 #[test]
 fn json_messages_aux_body_uses_responses_protocol_for_modelhub_models() {
-    let endpoint = models::endpoint_for_model("gpt-5.5", "");
+    // Registry rename: gpt-5.5 is now gpt-5.6-luna (responses protocol).
+    let endpoint = models::endpoint_for_model("gpt-5.6-luna", "");
     let messages = vec![
         json!({"role": "system", "content": "Return JSON only."}),
         json!({"role": "user", "content": "classify this"}),
     ];
 
     let body_bytes =
-        build_http_body_for_json_messages("gpt-5.5", &endpoint, &messages, false, None, false);
+        build_http_body_for_json_messages("gpt-5.6-luna", &endpoint, &messages, false, None, false);
     let body: Value = serde_json::from_slice(&body_bytes).expect("body should be valid JSON");
 
-    assert_eq!(body["model"], models::request_model_name("gpt-5.5"));
+    assert_eq!(body["model"], models::request_model_name("gpt-5.6-luna"));
     assert!(body.get("messages").is_none());
     assert_eq!(body["input"][0]["role"], "system");
     assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
@@ -306,11 +303,11 @@ fn responses_request_body_includes_encrypted_reasoning_flag_for_capable_model() 
         reasoning_content: None,
     }];
     let request = build_request_body(
-        "gpt-5.5", &messages, false, false, None, None, None, None, None, None, None,
+        "gpt-5.6-luna", &messages, false, false, None, None, None, None, None, None, None,
     );
     assert!(
         request.reasoning_encrypted_replay,
-        "gpt-5.5 declares reasoning_encrypted_replay=true in model registry"
+        "gpt-5.6-luna declares reasoning_encrypted_replay=true in model registry"
     );
 
     let body = super::super::build_responses_request_body(&request);

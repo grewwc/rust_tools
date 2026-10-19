@@ -741,15 +741,24 @@ pub(super) fn round_has_mutation(messages: &[crate::ai::history::Message]) -> bo
         }
         match name {
             "execute_command" => {
-                // 只读取证命令不算变更进展；解析失败或非只读命令保守计为 Mutation
-                // （安全方向：避免把真实改动误判为无进展而过早收口）。
-                serde_json::from_str::<serde_json::Value>(tc.function.arguments.as_str())
-                    .ok()
-                    .and_then(|args| {
-                        args.get("command")
-                            .and_then(|v| v.as_str())
-                            .map(|cmd| !execute_command_is_read_only(cmd))
-                    })
+                // 只读取证命令不算变更进展；session poll/write/close 只是
+                // 控制已有进程，更不是新的 workspace mutation。分类统一由
+                // `command_request_kind` 提供，避免在多个 detector 里各自
+                // 根据 `command` 是否存在来猜。
+                let Ok(args) = serde_json::from_str::<serde_json::Value>(tc.function.arguments.as_str())
+                else {
+                    // Malformed arguments are conservatively treated as a
+                    // mutation candidate, matching the previous fail-safe.
+                    return true;
+                };
+                if crate::ai::tools::service::command::command_request_kind(&args)
+                    != crate::ai::tools::service::command::CommandRequestKind::Start
+                {
+                    return false;
+                }
+                args.get("command")
+                    .and_then(|v| v.as_str())
+                    .map(|cmd| !execute_command_is_read_only(cmd))
                     .unwrap_or(true)
             }
             "task_wait" | "task_status" => tool_results_by_call_id

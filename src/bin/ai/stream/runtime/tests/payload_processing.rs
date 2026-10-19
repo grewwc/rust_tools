@@ -788,3 +788,17 @@ fn text_with_done_sentinel_stays_completed() {
         "provider 声明过结束就不得误判为中断"
     );
 }
+
+#[test]
+fn provider_control_leak_requires_a_complete_ordered_envelope() {
+    let leaked = "No reasoning available.<|end|>assistant to=read_file<|channel|>analysis \
+        <|constrain|>xml<|message|><rfl:parameter name=\"file_path\">/tmp/x</rfl:parameter>";
+    assert!(reasoning_contains_provider_control_leak(leaked));
+
+    assert!(!reasoning_contains_provider_control_leak(
+        "The literal token <|end|> is part of the protocol documentation."
+    ));
+    assert!(!reasoning_contains_provider_control_leak(
+        "<|end|>assistant to=read_file<|message|>example<|channel|>analysis<|constrain|>xml"
+    ));
+}

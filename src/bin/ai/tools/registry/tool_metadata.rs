@@ -9,6 +9,7 @@
 //!   "description": "...",
 //!   "parameters": { "type": "object", "properties": { ... } },
 //!   "first_use_guidance": "...",
+//!   "raw_body_parameter": "command",
 //!   "groups": ["builtin", "core"]
 //! }
 //! ```
@@ -24,6 +25,10 @@
 //! `execute` is a Rust function and must stay in code; description,
 //! parameters schema, and group membership are declarative metadata and live
 //! here.
+//! Optional `raw_body_parameter` names the string parameter that receives a
+//! bare XML body such as `<execute_command>pwd</execute_command>`. Recovery
+//! must not infer it from `required`: session-capable tools intentionally allow
+//! calls without their primary string argument.
 //!
 //! At compile time, build.rs scans this directory, embeds every file with
 //! `include_str!`, and generates `BUILTIN_TOOL_DESCRIPTION_FILES`; the files are
@@ -74,6 +79,9 @@ struct ToolMetadataFile {
     // An absent field inherits from a user override's base entry. An explicit
     // empty string disables inherited guidance for that tool.
     first_use_guidance: Option<String>,
+    // Optional explicit raw-body parameter. Absent inherits from the entry
+    // being replaced; an explicit empty string disables inheritance.
+    raw_body_parameter: Option<String>,
     // Distinguish "field absent" (None) from a declared schema: a user override
     // that omits the field inherits the entry being replaced instead of
     // resetting the tool's input schema to the empty default. Built-in files
@@ -100,6 +108,8 @@ pub(crate) struct ToolMetadata {
     pub(crate) description: String,
     pub(crate) parameters: Value,
     pub(crate) first_use_guidance: Option<String>,
+    /// Parameter that receives a bare XML body, when the tool supports one.
+    pub(crate) raw_body_parameter: Option<String>,
     // Interned once at parse time so group lookups can return `&'static`
     // slices without re-parsing; the metadata cache itself is a `OnceLock`,
     // so each file's groups are leaked exactly once.
@@ -157,10 +167,15 @@ fn finalize_metadata(
         Some(guidance) => (!guidance.trim().is_empty()).then_some(guidance),
         None => base.and_then(|b| b.first_use_guidance.clone()),
     };
+    let raw_body_parameter = match file.raw_body_parameter {
+        Some(parameter) => (!parameter.trim().is_empty()).then_some(parameter),
+        None => base.and_then(|b| b.raw_body_parameter.clone()),
+    };
     Some(ToolMetadata {
         description: file.description,
         parameters,
         first_use_guidance,
+        raw_body_parameter,
         groups,
         hidden: file
             .hidden
@@ -321,6 +336,18 @@ pub(crate) fn tool_first_use_guidance(name: &str) -> Option<&'static str> {
         .and_then(|metadata| metadata.first_use_guidance.as_deref())
 }
 
+/// Returns the parameter that receives a bare XML body for a built-in tool.
+///
+/// This is explicit metadata rather than a `required`-schema inference: a tool
+/// may allow calls without its primary argument (for example, polling an
+/// existing command session), while a bare `<tool>text</tool>` body still has
+/// an unambiguous destination.
+pub(crate) fn tool_raw_body_parameter(name: &str) -> Option<String> {
+    load_metadata()
+        .get(name)
+        .and_then(|metadata| metadata.raw_body_parameter.clone())
+}
+
 /// Group membership of a registered tool, sourced from the `groups` field of
 /// its metadata JSON (`tool_descriptions/<tool>.json`). This is the single
 /// source of truth for group membership — the Rust `ToolSpec` carries no
@@ -353,6 +380,12 @@ mod tests {
         assert!(metadata.contains_key("read_file"));
         assert!(metadata["read_file"].description.contains("line-numbered"));
         assert!(metadata["read_file"].parameters.get("properties").is_some());
+        assert_eq!(
+            metadata["execute_command"].raw_body_parameter.as_deref(),
+            Some("command"),
+            "bare XML recovery needs an explicit raw-body parameter"
+        );
+        assert!(metadata["read_file"].raw_body_parameter.is_none());
         assert!(
             metadata["plan"]
                 .first_use_guidance

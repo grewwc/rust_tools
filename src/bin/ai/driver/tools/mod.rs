@@ -22,6 +22,9 @@ use crate::ai::{
     ports::ToolExecOutput,
     tools as builtin_tools,
     tools::os_tools::GLOBAL_OS,
+    tools::registry::common::{
+        ToolParallelPolicy, ToolRetryPolicy, tool_parallel_policy, tool_retry_policy,
+    },
     tools::storage::memory_store::{AgentMemoryEntry, MemoryStore},
     types::{ToolCall, ToolResult},
 };
@@ -757,10 +760,11 @@ fn should_retry_once(route: &ToolRoute, tool_name: &str, err: &str) -> bool {
     if classify_tool_error(err) != ToolFailureKind::Transient {
         return false;
     }
-    // 仅对本地只读工具做一次重试，避免副作用工具重复执行。
+    // Retry only explicitly registered idempotent builtins. Tool names do not
+    // encode side effects: `knowledge_forget` contains "get" and
+    // `read_mailbox` drains state, so neither may be replayed.
     matches!(route, ToolRoute::Builtin)
-        && is_cacheable_tool_name(tool_name)
-        && tool_name != "execute_command"
+        && matches!(tool_retry_policy(tool_name), ToolRetryPolicy::RetrySafe)
 }
 
 fn execute_with_safe_retry<F>(
@@ -1328,24 +1332,21 @@ fn tool_execution_outcome(
 /// 上限：单批并行只读工具的并发度，避免模型一次发起几十个调用时打满线程。
 const PARALLEL_READONLY_MAX_CONCURRENCY: usize = 8;
 
-/// 判断一个工具调用是否可安全并行执行：必须是 builtin 路由、只读（命中
-/// `is_cacheable_tool_name` 的复用白名单且不在 mutating 列表）、且永不触发
-/// barrier。
+/// A tool may run in a parallel batch only when its registered policy is
+/// [`ToolParallelPolicy::ReadOnly`], it routes to a builtin implementation,
+/// and it can never trigger a barrier. Side effects are therefore declared
+/// next to the tool registration instead of inferred from its name.
 ///
-/// `read_file` 属于高精度 grounding 入口：虽然技术上无副作
-/// 用，但它返回的大块证据进入上下文的成本远高于执行成本，必须串行以压缩证据面，
-/// 帮助模型沿“定位 -> 阅读 -> 判断 -> 修改”的收敛路径推进。
+/// `read_file` stays serial by explicit registration: the execution itself
+/// is cheap, but returning several precise evidence blocks at once floods the
+/// context and disrupts the locate -> read -> judge -> edit convergence path.
 ///
-/// MCP 工具（始终 barrier）、写类工具、命令执行、子 agent / 异步任务工具都会
-/// 被排除，因此并行批次与顺序执行在语义上完全等价，只是更快。
+/// MCP tools (always barriers), mutating tools, commands, and subagent /
+/// async task tools are excluded, so a parallel batch is semantically
+/// equivalent to sequential execution; only latency changes.
 fn is_parallel_safe_tool_call(mcp_client: &McpClient, tool_call: &ToolCall) -> bool {
     let name = &tool_call.function.name;
-    // 源码阅读工具必须强制串行：执行本身便宜，但并行批量返回会迅速把
-    // 大量精确证据塞进上下文，放大 evidence flooding 风险并干扰后续收敛。
-    if matches!(name.as_str(), "read_file" | "read_file_lines") {
-        return false;
-    }
-    if !is_cacheable_tool_name(name) {
+    if !matches!(tool_parallel_policy(name), ToolParallelPolicy::ReadOnly) {
         return false;
     }
     let route = route_tool_call(mcp_client, name);
@@ -1543,6 +1544,10 @@ fn store_tool_cache_result(
     store.maintain_after_append();
 }
 
+/// Name-based eligibility for the `read_file` result cache only.
+///
+/// Do not reuse this for retry or parallel policy: side effects are not
+/// encoded in tool names. Those decisions live in explicit registry metadata.
 fn is_cacheable_tool_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let mutating = [

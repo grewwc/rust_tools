@@ -473,7 +473,11 @@ pub(super) fn parse_bare_xml_tool_body(tool_name: &str, body: &str) -> Option<St
         return Some(args);
     }
 
-    let key = single_required_string_argument_key(tool_name)?;
+    // Explicit metadata wins: session-capable tools may omit their primary
+    // string argument from `required`, but a bare body still needs an
+    // unambiguous destination.
+    let key = crate::ai::tools::registry::tool_metadata::tool_raw_body_parameter(tool_name)
+        .or_else(|| single_required_string_argument_key(tool_name))?;
     Some(serde_json::json!({ key: trimmed }).to_string())
 }
 

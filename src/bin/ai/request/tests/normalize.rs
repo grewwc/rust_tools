@@ -1,9 +1,5 @@
 use super::super::*;
-use crate::ai::tools::os_tools::{GLOBAL_OS, init_os_tools_globals};
-use crate::ai::{cli::ParsedCli, types::AppConfig};
 use serde_json::Value;
-use std::path::PathBuf;
-use std::sync::{Arc, atomic::AtomicBool};
 
 #[test]
 fn normalize_messages_keeps_model_derived_notes_out_of_system_role() {

@@ -18,7 +18,6 @@ use crate::ai::tools::enable_tools::set_explicit_enabled_tool_names;
 use crate::ai::types::{FunctionDefinition, PendingSkillContinuation, ToolDefinition};
 use rust_tools::cw::SkipSet;
 use std::fs;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};

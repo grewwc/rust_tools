@@ -23,16 +23,51 @@ use rust_tools::commonw::{FastMap, FastSet};
 static REGISTRY: LazyLock<Mutex<FastMap<String, FastSet<u32>>>> =
     LazyLock::new(|| Mutex::new(FastMap::default()));
 
-/// 登记一个后台进程组。`session_id` 为空时忽略（无归属，交由进程退出兜底）。
+/// Owner key used when no DRIVER_CTX session is available (CLI helpers and
+/// tests). It keeps such groups visible to `is_registered_pgid("", ..)` and
+/// `kill_session("")` instead of dropping the registration on the floor.
+const UNSCOPED_OWNER: &str = "__unscoped__";
+
+fn owner_key(session_id: &str) -> &str {
+    if session_id.is_empty() {
+        UNSCOPED_OWNER
+    } else {
+        session_id
+    }
+}
+
+/// 登记一个后台进程组。空的 `session_id` 归入进程级 unscoped 桶，
+/// 仍然可被 `is_registered_pgid("", ..)` / `kill_session("")` 找到。
 pub(crate) fn register(session_id: &str, pgid: u32) {
-    if session_id.is_empty() || pgid == 0 {
+    if pgid == 0 {
         return;
     }
+    let session_id = owner_key(session_id);
     let mut guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     guard
         .entry(session_id.to_string())
         .or_default()
         .insert(pgid);
+}
+
+/// Remove one process group after its session has exited normally. Without
+/// this, a later `kill_session` could signal a recycled pgid.
+pub(crate) fn unregister(session_id: &str, pgid: u32) {
+    if pgid == 0 {
+        return;
+    }
+    let session_id = owner_key(session_id);
+    let mut guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let empty = match guard.get_mut(session_id) {
+        Some(pgids) => {
+            pgids.remove(&pgid);
+            pgids.is_empty()
+        }
+        None => false,
+    };
+    if empty {
+        guard.remove(session_id);
+    }
 }
 
 /// True when `pgid` is a registered background process group of `session_id`.
@@ -41,9 +76,10 @@ pub(crate) fn register(session_id: &str, pgid: u32) {
 /// session started via `execute_command` are killable, everything else stays
 /// blocked.
 pub(crate) fn is_registered_pgid(session_id: &str, pgid: u32) -> bool {
-    if session_id.is_empty() || pgid == 0 {
+    if pgid == 0 {
         return false;
     }
+    let session_id = owner_key(session_id);
     REGISTRY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -54,9 +90,7 @@ pub(crate) fn is_registered_pgid(session_id: &str, pgid: u32) -> bool {
 /// 清理指定会话登记的所有后台进程组：先 `SIGTERM` 给存活组一次优雅退出的机会，
 /// 短暂等待后对仍存活的组补 `SIGKILL`。返回实际发出终止信号的进程组数量。
 pub(crate) fn kill_session(session_id: &str) -> usize {
-    if session_id.is_empty() {
-        return 0;
-    }
+    let session_id = owner_key(session_id);
     let pgids: Vec<u32> = {
         let mut guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         match guard.remove(session_id) {
@@ -107,10 +141,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn register_ignores_empty_session_and_zero_pgid() {
-        // 不应 panic，且不产生条目。
+    fn register_keeps_unscoped_groups_and_ignores_zero_pgid() {
         register("", 123);
+        assert!(is_registered_pgid("", 123));
         register("sess", 0);
+        assert!(!is_registered_pgid("sess", 0));
+        unregister("", 123);
+        assert!(!is_registered_pgid("", 123));
         assert_eq!(kill_session("sess"), 0);
     }
 
@@ -127,5 +164,16 @@ mod tests {
         register(&sid, 0x7FFF_FFF0);
         let _ = kill_session(&sid);
         assert_eq!(kill_session(&sid), 0);
+    }
+
+    #[test]
+    fn unregister_removes_only_the_exited_group() {
+        let sid = format!("proc_reg_test_{}", uuid::Uuid::new_v4());
+        register(&sid, 0x7FFF_FFF0);
+        register(&sid, 0x7FFF_FFF1);
+        unregister(&sid, 0x7FFF_FFF0);
+        assert!(!is_registered_pgid(&sid, 0x7FFF_FFF0));
+        assert!(is_registered_pgid(&sid, 0x7FFF_FFF1));
+        let _ = kill_session(&sid);
     }
 }

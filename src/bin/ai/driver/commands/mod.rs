@@ -99,6 +99,7 @@ pub fn is_local_command_start(token: &str) -> bool {
             | "persona"
             | "personas"
             | "proc"
+            | "pwd"
             | "s"
             | "session"
             | "sessions"

@@ -996,7 +996,7 @@ mod tests {
     fn opencode_provider_uses_opencode_adapter() {
         let adapter = provider::adapter_for(
             crate::ai::provider::ApiProvider::OpenCode,
-            "https://opencode.ai/zen/v1/chat/completions",
+            "https://opencode.ai/inference/go/v1/chat/completions",
         );
         assert_eq!(adapter.label(), "opencode");
     }

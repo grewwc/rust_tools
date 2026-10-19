@@ -10,6 +10,12 @@ use crate::ai::tools::storage::command_runner;
 use crate::cmd::run::CommandRunResult;
 
 const MAX_COMMAND_OUTPUT_CHARS: usize = 16_000;
+/// Maximum one-shot stdin payload accepted by `execute_command`.
+const MAX_COMMAND_INPUT_BYTES: usize = 16 * 1024;
+/// Default time a session call waits for new output before yielding.
+const DEFAULT_SESSION_YIELD_MS: u64 = 10_000;
+/// Upper bound for one session yield; keeps one tool call from blocking too long.
+const MAX_SESSION_YIELD_MS: u64 = 30_000;
 /// Read cap when materializing `$(cat /absolute/literal/path)` into a plain
 /// shell argument. The limit stops the tool from accidentally reading an
 /// unbounded stream or an oversized file before validation; regular JSON/DSL
@@ -462,17 +468,108 @@ dead time — it is expensive. Use it only when truly necessary (e.g. waiting fo
 accept connections); prefer backgrounding the work (`&` + log file) and polling a readiness \
 condition, or `task_wait` for subagent tasks.";
 
+/// The single classification of an `execute_command` request. Session control
+/// calls (poll / write / close) are not new workspace mutations; only `Start`
+/// launches a command whose text can be classified as read-only or mutating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommandRequestKind {
+    Start,
+    SessionPoll,
+    SessionWrite,
+    SessionClose,
+}
+
+/// Classifies an `execute_command` argument object once. Callers that reason
+/// about progress or mutation must use this instead of re-checking individual
+/// fields, so a missing `command` cannot be mistaken for a mutating command.
+pub(crate) fn command_request_kind(args: &Value) -> CommandRequestKind {
+    let has_session = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty());
+    if !has_session {
+        return CommandRequestKind::Start;
+    }
+    if args
+        .get("close_session")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        CommandRequestKind::SessionClose
+    } else if args.get("write_stdin").and_then(Value::as_str).is_some() {
+        CommandRequestKind::SessionWrite
+    } else {
+        CommandRequestKind::SessionPoll
+    }
+}
+
 fn execute_command_inner<F>(args: &Value, on_chunk: F) -> Result<String, String>
 where
     F: FnMut(&[u8]),
 {
-    let raw_command = args["command"].as_str().ok_or("Missing command")?;
+    let session_id = args["session_id"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty());
+    let write_stdin = args["write_stdin"].as_str();
+    let close_session = args["close_session"].as_bool().unwrap_or(false);
+    let yield_ms = args["yield_time_ms"].as_u64().map(resolve_session_yield);
+    if let Some(session_id) = session_id {
+        if args["command"]
+            .as_str()
+            .is_some_and(|command| !command.trim().is_empty())
+        {
+            return Err(
+                "Command blocked: pass either `command` (new session) or `session_id` (existing session), not both"
+                    .to_string(),
+            );
+        }
+        if args.get("input").is_some() {
+            return Err(
+                "Command blocked: `input` starts a new session; use `write_stdin` for an existing session"
+                    .to_string(),
+            );
+        }
+        if close_session {
+            if write_stdin.is_some() {
+                return Err(
+                    "Command blocked: `close_session` terminates the session; do not combine it with `write_stdin`"
+                        .to_string(),
+                );
+            }
+            return super::super::storage::command_session::close(session_id);
+        }
+        let wait = yield_ms.unwrap_or(DEFAULT_SESSION_YIELD_MS);
+        return match write_stdin {
+            Some(bytes) => {
+                super::super::storage::command_session::write_stdin(session_id, bytes, wait)
+            }
+            None => super::super::storage::command_session::poll(session_id, wait),
+        };
+    }
+    if write_stdin.is_some() {
+        return Err("Command blocked: `write_stdin` requires `session_id`".to_string());
+    }
+    if close_session {
+        return Err("Command blocked: `close_session` requires `session_id`".to_string());
+    }
+    let raw_command = args["command"]
+        .as_str()
+        .filter(|command| !command.trim().is_empty())
+        .ok_or("Missing command")?;
     let cwd = args["cwd"].as_str().filter(|dir| !dir.trim().is_empty());
     // Materialize harmless "$(...)" first (cat literals and generic harmless
     // commands); the result is still fully audited afterwards.
     let command = materialize_safe_shell_substitutions(raw_command, cwd)
         .map_err(|reason| format!("Command blocked: {reason}"))?;
     let pseudo_terminal = args["pty"].as_bool().unwrap_or(false);
+    let input = args.get("input").and_then(Value::as_str);
+    if let Some(input) = input
+        && input.len() > MAX_COMMAND_INPUT_BYTES
+    {
+        return Err(format!(
+            "Command blocked: input exceeds the {MAX_COMMAND_INPUT_BYTES}-byte limit"
+        ));
+    }
     let (default_timeout, max_timeout) = config_command_timeout_bounds();
     let timeout = resolve_command_timeout(args["timeout"].as_u64(), default_timeout, max_timeout);
 
@@ -484,8 +581,23 @@ where
     // (fail-closed in non-interactive environments).
     confirm_git_confirm_gated_if_needed(&command)?;
 
-    let output =
-        command_runner::run_command_streaming(&command, cwd, timeout, pseudo_terminal, on_chunk)?;
+    if let Some(wait) = yield_ms {
+        let mut output = super::super::storage::command_session::start(
+            &command,
+            cwd,
+            pseudo_terminal,
+            input,
+            wait,
+        )?;
+        if contains_sleep(&command) {
+            output = format!("{SLEEP_WARNING}\n{output}");
+        }
+        return Ok(output);
+    }
+
+    let output = command_runner::run_command_streaming(
+        &command, cwd, timeout, pseudo_terminal, input, on_chunk,
+    )?;
     let interrupted = output.timed_out || output.cancelled || output.stalled;
     let mut formatted = format_command_result(output, timeout);
     if contains_sleep(&command) {
@@ -496,6 +608,10 @@ where
     } else {
         Ok(formatted)
     }
+}
+
+fn resolve_session_yield(value: u64) -> u64 {
+    value.clamp(1, MAX_SESSION_YIELD_MS)
 }
 
 pub(crate) fn execute_command(args: &Value) -> Result<String, String> {
@@ -512,9 +628,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_COMMAND_OUTPUT_CHARS, SLEEP_WARNING, confirm_gated_git_subcommand,
-        confirm_git_confirm_gated_if_needed, contains_sleep, execute_command,
-        format_command_result, resolve_command_timeout, truncate_chars,
+        CommandRequestKind, MAX_COMMAND_INPUT_BYTES, MAX_COMMAND_OUTPUT_CHARS, SLEEP_WARNING,
+        command_request_kind, confirm_gated_git_subcommand, confirm_git_confirm_gated_if_needed,
+        contains_sleep, execute_command, format_command_result, resolve_command_timeout, truncate_chars,
     };
     use crate::cmd::run::CommandRunResult;
     use serde_json::json;
@@ -1069,5 +1185,121 @@ mod tests {
         assert_eq!(resolve_command_timeout(Some(10_000), 60, 300), 300);
         assert_eq!(resolve_command_timeout(Some(0), 60, 300), 1);
         assert_eq!(resolve_command_timeout(Some(120), 60, 300), 120);
+    }
+
+    #[test]
+    fn execute_command_forwards_one_shot_stdin() {
+        let output = execute_command(&json!({
+            "command": "cat",
+            "pty": false,
+            "input": "service-stdin\n",
+        }))
+        .expect("cat with stdin should run");
+        assert!(output.contains("service-stdin"), "out: {output}");
+    }
+
+    #[test]
+    fn execute_command_rejects_oversized_stdin() {
+        let input = "x".repeat(MAX_COMMAND_INPUT_BYTES + 1);
+        let err = execute_command(&json!({
+            "command": "cat",
+            "pty": false,
+            "input": input,
+        }))
+        .expect_err("oversized input must be rejected");
+        assert!(err.contains("input exceeds"), "err: {err}");
+    }
+
+    #[test]
+    fn execute_command_session_round_trip() {
+        // Shares the process-wide session registry with the storage tests.
+        let _guard = super::super::super::storage::command_session::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let started = execute_command(&json!({
+            "command": "read line; echo GOT:$line",
+            "pty": false,
+            "yield_time_ms": 500,
+        }))
+        .expect("session should start");
+        let session_id = started
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("[session "))
+            .and_then(|line| line.strip_suffix(']'))
+            .expect("session id");
+        let out = execute_command(&json!({
+            "session_id": session_id,
+            "write_stdin": "hello\n",
+            "pty": false,
+            "yield_time_ms": 5000,
+        }))
+        .expect("session stdin should be accepted");
+        let mut combined = out;
+        if !combined.contains("GOT:hello") {
+            // Slow shell startup (>5s is pathological, not racy): one bounded
+            // re-poll before failing so CI hiccups don't flake the suite.
+            combined.push_str(
+                &execute_command(&json!({
+                    "session_id": session_id,
+                    "pty": false,
+                    "yield_time_ms": 5000,
+                }))
+                .expect("session poll should be accepted"),
+            );
+        }
+        assert!(combined.contains("GOT:hello"), "out: {combined}");
+        if !combined.contains("session closed") {
+            combined.push_str(
+                &execute_command(&json!({
+                    "session_id": session_id,
+                    "pty": false,
+                    "yield_time_ms": 5000,
+                }))
+                .expect("session poll should be accepted"),
+            );
+        }
+        assert!(combined.contains("session closed"), "out: {combined}");
+        // Exited *and* drained sessions are removed from the registry, so an
+        // explicit close afterwards must fail closed as unknown — this proves
+        // removal instead of leaking the entry.
+        let close_err = execute_command(&json!({
+            "session_id": session_id,
+            "pty": false,
+            "close_session": true,
+        }))
+        .expect_err("close of a drained session must fail closed");
+        assert!(
+            close_err.contains("Unknown command session"),
+            "out: {close_err}"
+        );
+    }
+
+    #[test]
+    fn command_request_kind_separates_session_control_from_start() {
+        assert_eq!(
+            command_request_kind(&json!({"command": "cargo test", "pty": false})),
+            CommandRequestKind::Start
+        );
+        assert_eq!(
+            command_request_kind(&json!({"session_id": "cmd-1", "pty": false})),
+            CommandRequestKind::SessionPoll
+        );
+        assert_eq!(
+            command_request_kind(&json!({
+                "session_id": "cmd-1",
+                "write_stdin": "y\n",
+                "pty": false,
+            })),
+            CommandRequestKind::SessionWrite
+        );
+        assert_eq!(
+            command_request_kind(&json!({
+                "session_id": "cmd-1",
+                "close_session": true,
+                "pty": false,
+            })),
+            CommandRequestKind::SessionClose
+        );
     }
 }

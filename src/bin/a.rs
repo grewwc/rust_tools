@@ -1,7 +1,16 @@
 mod ai;
 pub use rust_tools::*;
 
+struct CommandSessionCleanup;
+
+impl Drop for CommandSessionCleanup {
+    fn drop(&mut self) {
+        ai::shutdown_command_sessions();
+    }
+}
+
 fn main() {
+    let _command_session_cleanup = CommandSessionCleanup;
     // rustls has no default crypto provider (reqwest uses rustls-no-provider
     // to keep aws-lc-rs out of the binary); install ring before any TLS use.
     rust_tools::ensure_rustls_provider();

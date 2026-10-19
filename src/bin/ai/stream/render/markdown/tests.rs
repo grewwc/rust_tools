@@ -784,10 +784,46 @@
             assert_eq!(streamed_rows, blocked_rows, "terminal width: {cols}");
             let text = blocked_rows.join("");
             assert!(text.contains("read_file"));
-            assert!(text.contains("src/bin/ai/tools/service/file.rs:42"));
+            // Continuation rows repeat the source indentation, so compare the
+            // path with row-leading whitespace ignored.
+            let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+            assert!(
+                compact.contains("src/bin/ai/tools/service/file.rs:42"),
+                "wrapped text lost the path: {text:?}"
+            );
             assert!(!text.contains("**"));
             assert!(!text.contains("38;2;"));
         }
+    }
+
+    #[test]
+    fn long_prose_is_hard_wrapped_to_terminal_width() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "40") };
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let inputs = [
+            "Q1: reaper 会不会误删“刚被复用”的会话——不成立，符合设计。poll (command_session.rs:455) 入口第一行就是 reap_idle() (:456)，之后才 lookup。",
+            "## 这是一个很长的标题，用来确认标题也会按终端宽度拆分，而不是交给终端软换行。",
+            "> 这是一段很长的引用，用来确认引用正文的续行会保持对齐，同时不会超过终端宽度。",
+            "- 这是一个很长的列表项，用来确认列表正文的续行会保持悬挂缩进，同时不会超过终端宽度。",
+        ];
+        for input in inputs {
+            let out = renderer.consume_line(input, false);
+            let visible = strip_ansi_for_test(&out);
+            let lines: Vec<_> = visible.lines().collect();
+            assert!(!lines.is_empty(), "no output for {input:?}");
+            for line in &lines {
+                let width = terminal_display_width(line);
+                assert!(
+                    width <= 40,
+                    "line exceeds terminal width ({width} > 40): {line:?}\nfull output:\n{visible}"
+                );
+            }
+        }
+        let prose = strip_ansi_for_test(&renderer.consume_line(inputs[0], false));
+        assert!(prose.lines().count() > 1, "long prose stayed on one row: {prose:?}");
+        assert!(prose.contains("reap_idle()"));
+        assert!(prose.contains("command_session.rs:455"));
     }
 
     #[test]

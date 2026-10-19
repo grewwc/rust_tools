@@ -32,6 +32,7 @@ mod persistence;
 mod prepare;
 pub(in crate::ai) mod tool_result;
 mod types;
+mod turn_signals;
 
 pub(super) use orchestrator::run_turn;
 // `/history last` replay (driver/input.rs, serve/chat.rs) paints the stored

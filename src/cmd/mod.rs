@@ -27,6 +27,7 @@
 //!
 //! let opts = RunCmdOptions {
 //!     cwd: Some("/tmp"),
+//!     input: None,
 //! };
 //! let output = run_cmd_output("pwd", opts).expect("命令执行失败");
 //! println!("当前目录：{}", String::from_utf8_lossy(&output.stdout));

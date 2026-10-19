@@ -14,5 +14,5 @@
   "context_window_tokens": 1048576,
   "max_output_tokens": 131072,
   "stream_silence_timeout_secs": 360,
-  "endpoint": "https://opencode.ai/zen/go/v1/responses"
+  "endpoint": "https://opencode.ai/inference/go/v1/responses"
 }

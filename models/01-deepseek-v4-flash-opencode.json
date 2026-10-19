@@ -16,5 +16,5 @@
   "reasoning_content_replay": true,
   "context_window_tokens": 128000,
   "max_output_tokens": 65536,
-  "endpoint": "https://opencode.ai/zen/go/v1/chat/completions"
+  "endpoint": "https://opencode.ai/inference/go/v1/chat/completions"
 }

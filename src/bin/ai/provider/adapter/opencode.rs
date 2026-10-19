@@ -1,8 +1,9 @@
-//! OpenCode Zen 网关适配器。
+//! OpenCode Go gateway adapter.
 //!
-//! 端点：`https://opencode.ai/zen/v1/chat/completions`。首 token 较慢，需打印
-//! 等待提示；流式 payload 解析更宽松。思考开关（DeepSeek 的 `thinking` 对象 /
-//! MiniMax always-on）由 `thinking` 方言模块统一处理，不在此实现。
+//! Endpoint: `https://opencode.ai/inference/go/v1/chat/completions`. The first
+//! token is slow, so a waiting hint is printed; streamed payload parsing is
+//! more lenient. The thinking switch (DeepSeek's `thinking` object / MiniMax
+//! always-on) is handled by the `thinking` dialect module, not here.
 
 use crate::ai::config_schema::AiConfig;
 use crate::ai::request::{ParsedStreamPayload, try_parse_stream_chunk_loose};

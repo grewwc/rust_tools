@@ -16,7 +16,10 @@ use std::path::PathBuf;
 use chrono::{Local, TimeZone};
 use serde_json::{Value, json};
 
-use crate::ai::tools::registry::common::{ToolRegistration, ToolSpec};
+use crate::ai::tools::registry::common::{
+    ToolParallelPolicy, ToolParallelPolicyRegistration, ToolRegistration, ToolRetryPolicy,
+    ToolRetryPolicyRegistration, ToolSpec,
+};
 use crate::ai::tools::storage::read_registry;
 
 fn execute_list_read_files(args: &Value) -> Result<String, String> {
@@ -30,6 +33,16 @@ inventory::submit!(ToolRegistration {
         description: "",
         execute: execute_list_read_files,
     }
+});
+
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "list_read_files",
+    policy: ToolParallelPolicy::ReadOnly,
+});
+
+inventory::submit!(ToolRetryPolicyRegistration {
+    name: "list_read_files",
+    policy: ToolRetryPolicy::RetrySafe,
 });
 
 /// Cap on listed entries; the most recently read files win.

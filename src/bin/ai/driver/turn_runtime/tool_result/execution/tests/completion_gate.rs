@@ -856,3 +856,32 @@ fn completion_evidence_records_direct_nonzero_check_after_mutation() {
     assert!(evidence.successful_post_mutation_failed_check);
     assert!(!evidence.successful_post_mutation_verification);
 }
+
+#[test]
+fn completion_evidence_sees_session_poll_failure_after_mutation() {
+    let turn_messages = vec![
+        assistant_tool_call_message(test_tool_call(
+            "call_patch",
+            "apply_patch",
+            serde_json::json!({"patch": "*** Begin Patch\n*** End Patch"}),
+        )),
+        tool_result_message("call_patch", "Successfully patched src/lib.rs"),
+        assistant_tool_call_message(test_tool_call(
+            "call_poll",
+            "execute_command",
+            serde_json::json!({"session_id": "cmd-1", "pty": false}),
+        )),
+        tool_result_message(
+            "call_poll",
+            "Exit code: 101\n[session cmd-1]\ntest result: FAILED. 1 passed; 2 failed",
+        ),
+    ];
+
+    let evidence = completion_evidence_state(&turn_messages);
+    assert!(evidence.successful_mutation);
+    assert!(
+        evidence.successful_post_mutation_failed_check,
+        "a failed session poll must be visible to the completion gate"
+    );
+    assert!(!evidence.successful_post_mutation_verification);
+}

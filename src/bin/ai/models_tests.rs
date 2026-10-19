@@ -252,9 +252,9 @@ fn model_def_defaults_request_protocol_to_none() {
 
 #[test]
 fn request_protocol_dialect_prefers_model_declared_protocol() {
-    let endpoint = endpoint_for_model("gpt-5.5", "");
+    let endpoint = endpoint_for_model("gpt-5.6-sol", "");
     assert_eq!(
-        request_protocol_dialect("gpt-5.5", &endpoint),
+        request_protocol_dialect("gpt-5.6-sol", &endpoint),
         RequestProtocolDialect::Responses
     );
 }
@@ -454,13 +454,13 @@ fn output_caps_above_the_tier_default_window_declare_an_explicit_window() {
 
 #[test]
 fn gpt_5_x_routes_declare_window_consistent_with_output_cap() {
-    // gpt-5.5 / gpt-5.6 share a 256K context window (confirmed by the provider). A 256K
-    // output cap cannot coexist with a 256K window: prompt + 2048 safety margin would
-    // always exceed it, so the builder would clamp max_tokens below the declared cap on
-    // every request. The gpt-5.6 output cap is therefore 128K (matching gpt-5.5 and the
-    // glm-5.3 half-window pattern), and the window is declared explicitly so a future
-    // tier-default change cannot silently re-clamp max_tokens.
-    for key in ["gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra"] {
+    // The gpt-5.6 family (luna/sol/terra) shares a 256K context window (confirmed by the
+    // provider). A 256K output cap cannot coexist with a 256K window: prompt + 2048 safety
+    // margin would always exceed it, so the builder would clamp max_tokens below the
+    // declared cap on every request. The output cap is therefore 128K (the glm-5.3
+    // half-window pattern), and the window is declared explicitly so a future tier-default
+    // change cannot silently re-clamp max_tokens.
+    for key in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
         assert_eq!(context_window_tokens(key), 256_000, "{key}");
         assert_eq!(max_output_tokens(key), Some(128_000), "{key}");
     }
@@ -735,13 +735,54 @@ fn openrouter_models_use_openrouter_endpoint_in_config() {
 
 #[test]
 fn known_model_without_endpoint_uses_provider_default_before_global_fallback() {
-    let model = super::model_names::all()
-        .iter()
-        .find(|m| m.adapter == ApiProvider::OpenCode && m.endpoint.is_none())
-        .map(|m| super::model_names::model_handle(m).to_string())
-        .expect("model registry must contain at least one OpenCode entry without endpoint");
-    let endpoint = endpoint_for_model(&model, "https://example.com/v1/chat/completions");
-    assert_eq!(endpoint, OPENCODE_DEFAULT_ENDPOINT);
+    // A known registry model must never fall back to the caller-supplied
+    // global endpoint: it resolves to its own endpoint, or to its adapter's
+    // default endpoint when the entry declares none. Every builtin entry
+    // currently declares an endpoint, so the no-endpoint branch is only
+    // reachable through user-model overrides; discover it from the registry
+    // instead of pinning a concrete entry.
+    let fallback = "https://example.com/v1/chat/completions";
+    let all = super::model_names::all();
+    assert!(!all.is_empty(), "model registry must not be empty");
+
+    for m in &all {
+        let handle = super::model_names::model_handle(m).to_string();
+        let resolved = endpoint_for_model(&handle, fallback);
+        match m.endpoint.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+            // Plaintext endpoints must round-trip exactly.
+            Some(endpoint) if !endpoint.starts_with("enc:") => {
+                assert_eq!(
+                    resolved,
+                    endpoint,
+                    "model '{}' must use its own endpoint",
+                    m.key
+                );
+            }
+            // Encrypted endpoints only decrypt when the runtime key is
+            // present; either way they must not be swapped for the fallback.
+            Some(_) => {
+                assert_ne!(
+                    resolved,
+                    fallback,
+                    "model '{}' must not use the global fallback",
+                    m.key
+                );
+            }
+            // No declared endpoint: the adapter default wins over the global
+            // fallback.
+            None => {
+                assert_ne!(
+                    resolved,
+                    fallback,
+                    "model '{}' must use its adapter default",
+                    m.key
+                );
+                if m.adapter == ApiProvider::OpenCode {
+                    assert_eq!(resolved, OPENCODE_DEFAULT_ENDPOINT);
+                }
+            }
+        }
+    }
 }
 
 #[test]

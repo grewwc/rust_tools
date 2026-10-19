@@ -314,7 +314,7 @@ mod tests {
     fn opencode_go_endpoint_is_not_accepted_as_speech_endpoint() {
         assert!(validate_endpoint(DEFAULT_ENDPOINT).is_ok());
         assert!(validate_endpoint("https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation").is_ok());
-        assert!(validate_endpoint("https://opencode.ai/zen/go/v1/chat/completions").is_err());
+        assert!(validate_endpoint("https://opencode.ai/inference/go/v1/chat/completions").is_err());
     }
 
     #[test]

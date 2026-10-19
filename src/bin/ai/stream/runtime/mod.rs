@@ -18,7 +18,7 @@ use crate::ai::{
 use crate::commonw::configw;
 
 use super::{
-    MarkdownStreamRenderer,
+    MarkdownStreamRenderer, PROVIDER_CONTROL_LEAK_FINISH_REASON,
     extract::{StreamTextEvent, extract_chunk_events_streaming, normalize_stream_text},
     framing, normalize,
     render::markdown::{
@@ -756,8 +756,17 @@ fn finalize_stream_response(
         .finish_reason_value
         .as_deref()
         .is_some_and(|reason| reason == DEGENERATE_REPETITION_FINISH_REASON);
+    let provider_control_leak = state
+        .content
+        .finish_reason_value
+        .as_deref()
+        .is_some_and(|reason| reason == PROVIDER_CONTROL_LEAK_FINISH_REASON);
 
     let outcome = if stream_error {
+        StreamOutcome::Truncated
+    } else if provider_control_leak {
+        // A leaked provider envelope makes the whole response structurally ambiguous.
+        // Never execute even otherwise-valid calls accumulated before the leak.
         StreamOutcome::Truncated
     } else if !tool_calls.is_empty() {
         StreamOutcome::ToolCall
@@ -1430,6 +1439,29 @@ fn maybe_write_stream_content(
     Ok(())
 }
 
+const PROVIDER_CONTROL_LEAK_MAX_SPAN: usize = 2_048;
+
+fn reasoning_contains_provider_control_leak(reasoning: &str) -> bool {
+    const START: &str = "<|end|>assistant to=";
+    const FOLLOWING_MARKERS: [&str; 3] = ["<|channel|>", "<|constrain|>", "<|message|>"];
+
+    let Some(start) = reasoning.rfind(START) else {
+        return false;
+    };
+    let suffix = &reasoning[start..];
+    let mut cursor = START.len();
+    for marker in FOLLOWING_MARKERS {
+        let Some(relative) = suffix[cursor..].find(marker) else {
+            return false;
+        };
+        cursor += relative + marker.len();
+        if cursor > PROVIDER_CONTROL_LEAK_MAX_SPAN {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -1652,6 +1684,14 @@ fn process_stream_payload(
             .content
             .live_reasoning_tokens
             .saturating_add(estimate_stream_tokens(&emitted_reasoning));
+
+        if reasoning_contains_provider_control_leak(&state.content.reasoning_text) {
+            state.content.finish_reason_seen = true;
+            state.content.finish_reason_value =
+                Some(PROVIDER_CONTROL_LEAK_FINISH_REASON.to_string());
+            state.content.tool_calls_map.clear();
+            return Ok(StreamPayloadOutcome::stop_with_progress());
+        }
 
         // Some long tool-chain contexts make the model verbatim-repeat one sentence in thinking. Continuing to read only
         // burns the output budget and makes the terminal look stuck; escalate to retryable truncation and let the upper layer lower the reasoning tier.

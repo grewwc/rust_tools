@@ -1,4 +1,7 @@
-use crate::ai::tools::registry::common::{ToolRegistration, ToolSpec};
+use crate::ai::tools::registry::common::{
+    ToolParallelPolicy, ToolParallelPolicyRegistration, ToolRegistration, ToolRetryPolicy,
+    ToolRetryPolicyRegistration, ToolSpec,
+};
 use aios_kernel::kernel::{ProcessCapabilities, SharedKernel};
 use aios_kernel::primitives::{ChannelMetaSnapshot, ChannelOwnerTag};
 use serde_json::Value;
@@ -284,6 +287,12 @@ inventory::submit!(ToolRegistration {
 
         execute: execute_read_mailbox,
     }
+});
+
+// Drains the mailbox, so two calls must never overlap.
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "read_mailbox",
+    policy: ToolParallelPolicy::Serial,
 });
 
 // 5. env tools
@@ -633,6 +642,16 @@ inventory::submit!(ToolRegistration {
 
         execute: execute_shm_read,
     }
+});
+
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "shm_read",
+    policy: ToolParallelPolicy::ReadOnly,
+});
+
+inventory::submit!(ToolRetryPolicyRegistration {
+    name: "shm_read",
+    policy: ToolRetryPolicy::RetrySafe,
 });
 
 fn execute_shm_write(args: &Value) -> Result<String, String> {

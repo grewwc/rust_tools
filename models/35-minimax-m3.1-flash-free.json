@@ -1,0 +1,20 @@
+{
+  "key": "minimax-m3.1-flash-free",
+  "aliases": [
+    "minimax-m3.1-flash"
+  ],
+  "name": "minimax-m3.1-flash-free",
+  "adapter": "opencode",
+  "quality_tier": "strong",
+  "is_vl": true,
+  "search_enabled": false,
+  "tools_default_enabled": true,
+  "enable_thinking": true,
+  "default_reasoning_effort": "max",
+  "reasoning_content_replay": true,
+  "subagent_priority": 80,
+  "context_window_tokens": 1000000,
+  "max_output_tokens": 131072,
+  "endpoint": "https://opencode.ai/inference/go/v1/chat/completions",
+  "_comment": "OpenCode Go model (https://opencode.ai/v2/docs/console/go): free for a limited time. Specs from official MiniMax docs (platform.minimaxi.com/docs/guides/text-generation, /docs/api-reference/text-chat-openai): natively multimodal (text/image/video input), 1M context, max_tokens recommended 131072 (cap 524288), effort low..max (default max when omitted), adaptive thinking always on, and tool-call rounds must replay reasoning_content (interleaved thinking)."
+}

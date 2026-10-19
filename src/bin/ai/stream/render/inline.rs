@@ -582,18 +582,41 @@ pub(super) fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {
     while i < s.len() {
         let rest = &s[i..];
 
+        // Toggle emphasis only for markers that actually pair up, and treat a
+        // marker seen while its span is open as the closer. `render_inline_md`
+        // requires paired delimiters too; an unpaired `*` / `**` (for example
+        // the multiplication sign in `2 * 3`) stays literal text, so it must
+        // keep its display width and must not gain a synthetic closing marker
+        // when a wrapped line is closed.
         if rest.starts_with("**") {
-            bold = !bold;
-            cur.push_str("**");
-            i += 2;
-            continue;
+            if bold {
+                bold = false;
+                cur.push_str("**");
+                i += 2;
+                continue;
+            } else if find_unescaped_delim(s, i + 2, "**").is_some() {
+                bold = true;
+                cur.push_str("**");
+                i += 2;
+                continue;
+            }
+            // Unpaired: consume one literal `*` through the generic path below
+            // so the normal width check can move it to the next row.
         }
 
         if rest.starts_with('*') && !rest.starts_with("**") {
-            italic = !italic;
-            cur.push('*');
-            i += 1;
-            continue;
+            if italic {
+                italic = false;
+                cur.push('*');
+                i += 1;
+                continue;
+            } else if find_unescaped_delim(s, i + 1, "*").is_some() {
+                italic = true;
+                cur.push('*');
+                i += 1;
+                continue;
+            }
+            // Unpaired: literal `*`, width-checked by the generic path.
         }
 
         if let Some((piece, next)) = take_atomic_markdown_span(s, i) {
@@ -865,6 +888,31 @@ mod tests {
                 "code styling should be preserved per wrapped line: {line:?}"
             );
             assert!(visible_width(&line) <= 18, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn wrap_md_cell_keeps_unpaired_emphasis_literal() {
+        assert_eq!(wrap_md_cell("2 * 3 = 6", 80), vec!["2 * 3 = 6"]);
+        assert_eq!(wrap_md_cell("**Note: 2", 80), vec!["**Note: 2"]);
+        assert_eq!(
+            wrap_md_cell("before **bold span** after", 80),
+            vec!["before **bold span** after"]
+        );
+    }
+
+    #[test]
+    fn wrap_md_cell_width_checks_literal_emphasis_markers() {
+        let star = wrap_md_cell("abcd *", 5);
+        assert_eq!(star, vec!["abcd", "*"]);
+
+        let stars = wrap_md_cell("abc **", 5);
+        assert_eq!(stars, vec!["abc *", "*"]);
+        for line in star.into_iter().chain(stars) {
+            assert!(
+                visible_width(&line) <= 5,
+                "literal marker overflowed the requested width: {line:?}"
+            );
         }
     }
 

@@ -1,6 +1,7 @@
 use crate::ai::tools::common::{
     ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
-    ToolRegistration, ToolReplayRegistration, ToolSpec, ToolStreamingRegistration,
+    ToolParallelPolicy, ToolParallelPolicyRegistration, ToolRegistration, ToolReplayRegistration,
+    ToolRetryPolicy, ToolRetryPolicyRegistration, ToolSpec, ToolStreamingRegistration,
 };
 use crate::ai::tools::service::file::{
     execute_read_file, execute_write_file, execute_write_file_streaming,
@@ -13,6 +14,18 @@ inventory::submit!(ToolRegistration {
 
         execute: execute_read_file,
     }
+});
+
+// High-precision grounding results must stay serial even though reading is
+// side-effect free: batching several blocks at once floods the context.
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "read_file",
+    policy: ToolParallelPolicy::Serial,
+});
+
+inventory::submit!(ToolRetryPolicyRegistration {
+    name: "read_file",
+    policy: ToolRetryPolicy::RetrySafe,
 });
 
 // read_file is a high-precision grounding result: reproducing its content is

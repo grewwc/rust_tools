@@ -18,11 +18,14 @@
       },
       "limit": {
         "type": "integer",
-        "description": "Number of messages to show: the most recent ones when `from` is omitted, or the page size forward from `from` when it is given (default 20 for digest, 60 for raw; max 200)."
+        "description": "Number of messages to show: the most recent ones when `from` is omitted, or the page size forward from `from` when it is given (default 20 for digest, 60 for raw; max 200; 0 shows none).",
+        "minimum": 0,
+        "maximum": 200
       },
       "from": {
         "type": "integer",
-        "description": "Canonical message index (0-based, oldest first) to start reading from, paging forward by `limit`. Omit to show the most recent messages. Errors when out of range."
+        "description": "Canonical message index (0-based, oldest first) to start reading from, paging forward by `limit`. Omit to show the most recent messages. Errors when out of range.",
+        "minimum": 0
       }
     },
     "required": [

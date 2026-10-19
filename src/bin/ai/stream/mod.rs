@@ -13,6 +13,8 @@ mod wire_log;
 pub(super) use render::markdown::MarkdownStreamRenderer;
 pub(in crate::ai) use render::markdown::clamp_line_to_terminal_row_with_reserve;
 
+pub(in crate::ai) const PROVIDER_CONTROL_LEAK_FINISH_REASON: &str = "provider_control_leak";
+
 use crate::ai::{
     request::StreamChunk,
     types::{App, StreamResult},

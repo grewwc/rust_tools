@@ -1,11 +1,7 @@
 use super::common::{expected_max_tokens_field};
 use super::super::builder::MIN_OUTPUT_TOKENS_FLOOR;
 use super::super::*;
-use crate::ai::tools::os_tools::{GLOBAL_OS, init_os_tools_globals};
-use crate::ai::{cli::ParsedCli, types::AppConfig};
 use serde_json::Value;
-use std::path::PathBuf;
-use std::sync::{Arc, atomic::AtomicBool};
 
 #[test]
 fn dashscope_and_other_adapter_request_body_wire_format_is_byte_stable() {
@@ -446,14 +442,13 @@ fn dashscope_deepseek_sends_effort_and_exact_reasoning_replay() {
 
 #[test]
 fn dashscope_qwen_metadata_matches_documented_thinking_controls() {
+    // Registry rename: qwen3.7-plus/max-alibaba are now qwen3.8-max
+    // (models/qwen.json, effort "max"); flash is qwen3.8-flash-alibaba.
     assert_eq!(
-        models::default_reasoning_effort("qwen3.7-plus-alibaba"),
-        Some(crate::ai::provider::ReasoningEffort::High)
+        models::default_reasoning_effort("qwen3.8-max"),
+        Some(crate::ai::provider::ReasoningEffort::Max)
     );
-    assert_eq!(
-        models::default_reasoning_effort("qwen3.7-max-alibaba"),
-        Some(crate::ai::provider::ReasoningEffort::High)
-    );
+    assert!(models::enable_thinking("qwen3.8-max"));
     assert_eq!(
         // Registry entry renamed: models/07-qwen3.6-flash-alibaba.json is now
         // models/qwen-flash-alibaba.json (name "qwen3.8-flash", effort "max").
@@ -513,7 +508,7 @@ fn effort_value_adaptation_is_per_vendor_on_wire() {
     let dashscope_endpoint =
         "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
     let (thinking, top_level, nested) = resolve_reasoning_wire_controls(
-        "qwen3.7-max-alibaba",
+        "qwen3.8-max",
         dashscope_endpoint,
         true,
         Some("max"),
@@ -522,7 +517,7 @@ fn effort_value_adaptation_is_per_vendor_on_wire() {
     assert_eq!(
         top_level,
         Some("max"),
-        "qwen3.7-max-alibaba declares top_level wire placement, so the tier passes through"
+        "qwen3.8-max declares top_level wire placement, so the tier passes through"
     );
     assert!(nested.is_none());
 
@@ -561,9 +556,9 @@ fn effort_value_adaptation_is_per_vendor_on_wire() {
 fn model_effort_graded_reflects_registry_declared_gradation() {
     // Registry-declared wire placement means the model is vendor-verified
     // graded (qwen / DeepSeek v4 on DashScope, official DeepSeek, OpenCode
-    // Zen), so "graded" is true. Undeclared models follow the dialect default,
+    // Go), so "graded" is true. Undeclared models follow the dialect default,
     // where binary-switch dialects omit the tier.
-    assert!(model_effort_graded("qwen3.7-max-alibaba"));
+    assert!(model_effort_graded("qwen3.8-max"));
     assert!(model_effort_graded("deepseek-v4-flash-0731-alibaba"));
     assert!(model_effort_graded("deepseek-flash-official"));
     // Effort-only dialects keep the gradation.
@@ -632,8 +627,10 @@ fn responses_request_body_uses_function_tools_and_nested_reasoning() {
             "parameters": {"type": "object"}
         }
     }]);
+    // Registry rename: gpt-5.5 is now gpt-5.6-luna
+    // (models/gpt-5.6-luna.json, responses protocol + encrypted replay).
     let request = build_request_body(
-        "gpt-5.5",
+        "gpt-5.6-luna",
         &messages,
         false,
         false,
@@ -674,13 +671,13 @@ fn responses_force_off_override_emits_none_effort_on_wire() {
     let effort = super::super::reasoning::apply_thinking_force_off_effort(
         true,
         crate::ai::provider::ApiProvider::Compatible,
-        "gpt-5.5",
+        "gpt-5.6-luna",
         "https://dataagent-dev-llm.bytedance.net/v1",
         Some("low"),
     );
     assert_eq!(effort, Some("none"));
     let request = build_request_body(
-        "gpt-5.5", &messages, false, false, None, None, None, effort, None, None, None,
+        "gpt-5.6-luna", &messages, false, false, None, None, None, effort, None, None, None,
     );
     let body = super::super::build_responses_request_body(&request);
     assert_eq!(body["reasoning"]["effort"], "none");

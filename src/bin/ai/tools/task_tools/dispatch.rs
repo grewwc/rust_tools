@@ -1,4 +1,5 @@
 use super::*;
+use crate::ai::tools::common::{ToolParallelPolicy, ToolParallelPolicyRegistration};
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
@@ -273,6 +274,14 @@ inventory::submit!(ToolRegistration {
         description: "",
         execute: execute_task_evidence_read,
     }
+});
+
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "task_evidence_read",
+    // The default `progress` source persists a refreshed snapshot before it
+    // reads, so this is not a pure read even though the caller only observes
+    // evidence.
+    policy: ToolParallelPolicy::Serial,
 });
 
 inventory::submit!(ToolHistoryPolicyRegistration {

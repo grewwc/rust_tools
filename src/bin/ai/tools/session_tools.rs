@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::ai::history::{SessionInfo, SessionStore, read_all_messages_sqlite_read_only};
-use crate::ai::tools::common::{ToolRegistration, ToolSpec};
+use crate::ai::tools::common::{
+    ToolParallelPolicy, ToolParallelPolicyRegistration, ToolRegistration, ToolRetryPolicy,
+    ToolRetryPolicyRegistration, ToolSpec,
+};
 
 const MAX_OUTPUT_CHARS: usize = 32_000;
 const MAX_MESSAGE_CHARS: usize = 2_000;
@@ -35,6 +38,16 @@ inventory::submit!(ToolRegistration {
     }
 });
 
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "session_list",
+    policy: ToolParallelPolicy::ReadOnly,
+});
+
+inventory::submit!(ToolRetryPolicyRegistration {
+    name: "session_list",
+    policy: ToolRetryPolicy::RetrySafe,
+});
+
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "session_read",
@@ -44,6 +57,16 @@ inventory::submit!(ToolRegistration {
     }
 });
 
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "session_read",
+    policy: ToolParallelPolicy::ReadOnly,
+});
+
+inventory::submit!(ToolRetryPolicyRegistration {
+    name: "session_read",
+    policy: ToolRetryPolicy::RetrySafe,
+});
+
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "session_search",
@@ -51,6 +74,16 @@ inventory::submit!(ToolRegistration {
 
         execute: execute_session_search,
     }
+});
+
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "session_search",
+    policy: ToolParallelPolicy::ReadOnly,
+});
+
+inventory::submit!(ToolRetryPolicyRegistration {
+    name: "session_search",
+    policy: ToolRetryPolicy::RetrySafe,
 });
 
 /// The session store of the running driver. Fails closed when no driver

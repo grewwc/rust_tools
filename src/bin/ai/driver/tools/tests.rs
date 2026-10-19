@@ -6,6 +6,7 @@ use super::{
     should_retry_once, should_store_or_load_tool_cache, tool_cache_validation_matches,
 };
 use crate::ai::mcp::McpClient;
+use crate::ai::tools::registry::common::{ToolParallelPolicy, tool_parallel_policy};
 use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
 use crate::ai::types::{FunctionCall, ToolCall};
 use aios_kernel::primitives::ResourceLimit;
@@ -136,10 +137,38 @@ fn parallel_batch_stops_at_mutating_tool() {
 }
 
 #[test]
-fn parallel_batch_excludes_non_cacheable_tools() {
+fn parallel_batch_excludes_tools_without_readonly_policy() {
     let mcp = McpClient::new();
-    // tree is not in the read-only reusable whitelist, so it must run sequentially.
+    // tree has no explicit read-only policy, so it must run sequentially.
     assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("tree")));
+}
+
+#[test]
+fn name_substrings_cannot_make_mutating_tools_parallel() {
+    let mcp = McpClient::new();
+    // `forget` contains `get`, and `read_mailbox` drains the mailbox: both
+    // must stay serial despite their read-looking names.
+    for name in ["knowledge_forget", "read_mailbox", "read_file"] {
+        assert_eq!(
+            tool_parallel_policy(name),
+            ToolParallelPolicy::Serial,
+            "{name} must be explicitly serial"
+        );
+        assert!(!is_parallel_safe_tool_call(&mcp, &tool_call(name)));
+    }
+}
+
+#[test]
+fn read_only_tool_policy_is_registry_driven() {
+    let mcp = McpClient::new();
+    for name in ["knowledge_search", "session_read", "web_fetch"] {
+        assert_eq!(
+            tool_parallel_policy(name),
+            ToolParallelPolicy::ReadOnly,
+            "{name} must be registered read-only"
+        );
+        assert!(is_parallel_safe_tool_call(&mcp, &tool_call(name)));
+    }
 }
 
 #[test]
@@ -273,7 +302,7 @@ fn classify_tool_error_distinguishes_argument_and_transient_cases() {
 }
 
 #[test]
-fn should_retry_once_only_for_safe_builtin_read_only_tools() {
+fn should_retry_once_only_for_explicitly_retry_safe_builtin_tools() {
     let builtin = ToolRoute::Builtin;
     let mcp = ToolRoute::Mcp {
         server_name: "demo".to_string(),
@@ -282,6 +311,33 @@ fn should_retry_once_only_for_safe_builtin_read_only_tools() {
     assert!(should_retry_once(
         &builtin,
         "read_file",
+        "timeout while reading"
+    ));
+    assert!(should_retry_once(
+        &builtin,
+        "knowledge_search",
+        "timeout while reading"
+    ));
+    assert!(should_retry_once(
+        &builtin,
+        "web_fetch",
+        "timeout while fetching"
+    ));
+    // Name substrings must not grant retry safety to mutating or
+    // non-idempotent tools.
+    assert!(!should_retry_once(
+        &builtin,
+        "knowledge_forget",
+        "timeout while deleting"
+    ));
+    assert!(!should_retry_once(
+        &builtin,
+        "read_mailbox",
+        "timeout while reading"
+    ));
+    assert!(!should_retry_once(
+        &builtin,
+        "task_evidence_read",
         "timeout while reading"
     ));
     assert!(!should_retry_once(
@@ -770,6 +826,7 @@ fn schema_gate_rejects_out_of_range_integers_before_dispatch() {
 /// integer parameter fails until its author registers it here.
 const INT_BOUND_REGISTRY: &[(&str, &str, Option<i64>, Option<i64>, &str)] = &[
     ("execute_command", "timeout", Some(1), Some(300), "service clamps 1-300"),
+    ("execute_command", "yield_time_ms", Some(1), Some(30000), "service clamps 1-30000"),
     ("task_wait", "timeout_secs", Some(1), Some(60), "service clamps 1-60"),
     ("search_overflow", "context_lines", Some(0), Some(5), "unwrap_or(2).min(5); 0 is valid"),
     ("search_overflow", "max_results", Some(1), Some(200), "service clamps 1-200"),
@@ -796,6 +853,10 @@ const INT_BOUND_REGISTRY: &[(&str, &str, Option<i64>, Option<i64>, &str)] = &[
     ("spawn_daemon", "quota_turns", Some(0), None, "0 means unlimited, as above"),
     ("spawn_daemon", "max_restarts", Some(0), None, "0 disables restarts; no upper clamp"),
     ("session_distill", "limit", Some(1), Some(100), "service clamps 1-100"),
+    ("session_list", "limit", Some(0), Some(100), "unwrap_or(20).min(100); 0 returns no rows"),
+    ("session_read", "limit", Some(0), Some(200), "unwrap_or(default).min(200); 0 returns no messages"),
+    ("session_read", "from", Some(0), None, "0 is the oldest canonical index; no upper clamp"),
+    ("session_search", "max_results", Some(0), Some(100), "unwrap_or(20).min(100); 0 stops immediately"),
     ("tree", "max_depth", Some(0), Some(6), "pre-existing bound, pinned"),
     ("manage_team", "budget.max_parallel", Some(1), Some(8), "validate_budget enforces 1-8"),
     ("manage_team", "budget.max_tasks", Some(1), Some(512), "validate_budget enforces 1-512"),

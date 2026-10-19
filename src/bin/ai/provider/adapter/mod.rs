@@ -51,7 +51,7 @@ pub(in crate::ai) const ALIBABA_DEFAULT_ENDPOINT: &str =
 pub(in crate::ai) const OPENAI_DEFAULT_ENDPOINT: &str =
     "https://api.openai.com/v1/chat/completions";
 pub(in crate::ai) const OPENCODE_DEFAULT_ENDPOINT: &str =
-    "https://opencode.ai/zen/v1/chat/completions";
+    "https://opencode.ai/inference/go/v1/chat/completions";
 pub(in crate::ai) const OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 /// Unified abstraction over per-LLM-provider behavioral differences. All

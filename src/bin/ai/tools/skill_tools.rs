@@ -7,7 +7,10 @@ use serde_json::Value;
 
 use crate::ai::config_schema::AiConfig;
 use crate::ai::skills::SkillManifest;
-use crate::ai::tools::common::{ToolRegistration, ToolSpec};
+use crate::ai::tools::common::{
+    ToolParallelPolicy, ToolParallelPolicyRegistration, ToolRegistration, ToolRetryPolicy,
+    ToolRetryPolicyRegistration, ToolSpec,
+};
 
 /// Skill change actions requested by the model via the `activate_skill` / `deactivate_skill` tools (to be
 /// read and applied by the driver on the next iteration).
@@ -261,6 +264,16 @@ inventory::submit!(ToolRegistration {
 
         execute: execute_list_skills,
     }
+});
+
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "list_skills",
+    policy: ToolParallelPolicy::ReadOnly,
+});
+
+inventory::submit!(ToolRetryPolicyRegistration {
+    name: "list_skills",
+    policy: ToolRetryPolicy::RetrySafe,
 });
 
 /// Collect the file listing (relative paths) under `resource_path` for `load_skill` / resource tool display.
@@ -624,12 +637,32 @@ inventory::submit!(ToolRegistration {
     }
 });
 
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "list_skill_resources",
+    policy: ToolParallelPolicy::ReadOnly,
+});
+
+inventory::submit!(ToolRetryPolicyRegistration {
+    name: "list_skill_resources",
+    policy: ToolRetryPolicy::RetrySafe,
+});
+
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "read_skill_resource",
         description: "",
         execute: execute_read_skill_resource,
     }
+});
+
+inventory::submit!(ToolParallelPolicyRegistration {
+    name: "read_skill_resource",
+    policy: ToolParallelPolicy::ReadOnly,
+});
+
+inventory::submit!(ToolRetryPolicyRegistration {
+    name: "read_skill_resource",
+    policy: ToolRetryPolicy::RetrySafe,
 });
 
 inventory::submit!(ToolRegistration {

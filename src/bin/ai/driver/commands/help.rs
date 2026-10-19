@@ -14,6 +14,7 @@ fn print_commands_help() {
     println!(
         "    /cd [dir]                 show or change the session working directory (\"-\" goes back)"
     );
+    println!("    /pwd                      show the session working directory (same as bare /cd)");
     println!("    /audit <instruction>      run the audit subagent synchronously (up to 15 min)");
     println!(
         "    /changes [/diff] [--stat|--json|--patch|--open]  show session file changes & open diff externally"

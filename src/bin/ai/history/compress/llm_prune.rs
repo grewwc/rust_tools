@@ -1004,21 +1004,6 @@ pub(crate) fn reclaim_under_pressure_authorized(
     report
 }
 
-/// Legacy query: runtime-owned reclamation never needs a model protocol.
-pub(crate) fn should_inject_prune_prompt_authorized(
-    _messages: &[Message],
-    _authorization: &PruneAuthorization,
-) -> bool {
-    false
-}
-
-/// Fail-closed entry point kept for tests: it authorizes no conditional result,
-/// so production callers must use [`should_inject_prune_prompt_authorized`].
-#[cfg(test)]
-pub(crate) fn should_inject_prune_prompt(messages: &[Message]) -> bool {
-    should_inject_prune_prompt_authorized(messages, &PruneAuthorization::default())
-}
-
 /// Recognizes legacy protocol notes, including previously rendered candidate lists.
 pub(crate) fn is_prune_protocol_message(message: &Message) -> bool {
     message.role == "system"
@@ -1770,29 +1755,6 @@ mod tests {
     }
 
     #[test]
-    fn test_should_inject_prune_prompt() {
-        let mut messages = vec![make_user_message("long dialog without tools")];
-        assert!(!should_inject_prune_prompt(&messages));
-
-        for index in 0..4 {
-            let id = format!("call_{index}");
-            messages.push(make_assistant_tool_call(&id, "execute_command"));
-            messages.push(make_tool_message(&id, &"recent result ".repeat(500)));
-        }
-        assert!(
-            !should_inject_prune_prompt(&messages),
-            "the four protected recent groups are not prune candidates"
-        );
-
-        messages.push(make_assistant_tool_call("call_4", "execute_command"));
-        messages.push(make_tool_message("call_4", &"newest result ".repeat(500)));
-        assert!(
-            !should_inject_prune_prompt(&messages),
-            "eligible evidence does not require a model protocol"
-        );
-    }
-
-    #[test]
     fn test_prune_protocol_never_activates_at_request_boundaries() {
         let mut messages = vec![make_user_message("same-turn request")];
         for index in 0..4 {
@@ -2216,17 +2178,9 @@ mod tests {
             !active_prunable_tool_ids_authorized(&messages, &PruneAuthorization::default())
                 .contains("call_sub")
         );
-        assert!(!should_inject_prune_prompt_authorized(
-            &messages,
-            &PruneAuthorization::default()
-        ));
 
         let integrated = integration_authorization(&["task_a"]);
         assert!(active_prunable_tool_ids_authorized(&messages, &integrated).contains("call_sub"));
-        assert!(!should_inject_prune_prompt_authorized(
-            &messages,
-            &integrated
-        ));
     }
 
     #[test]

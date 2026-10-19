@@ -8,14 +8,14 @@
 use super::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum ToolResultProgressStatus {
+pub(crate) enum ToolResultProgressStatus {
     Success,
     Failure,
     DedupOnly,
     BlockedOutsideWorkspace(String),
 }
 
-pub(super) fn classify_tool_result_progress(text: &str) -> ToolResultProgressStatus {
+pub(crate) fn classify_tool_result_progress(text: &str) -> ToolResultProgressStatus {
     let text = text.trim_start();
     if let Some(path) = blocked_outside_workspace_path(text) {
         return ToolResultProgressStatus::BlockedOutsideWorkspace(path);
@@ -242,6 +242,11 @@ pub(super) fn extract_round_evidence_fingerprints(
             let Ok(args) = serde_json::from_str::<Value>(arguments) else {
                 continue;
             };
+            if crate::ai::tools::service::command::command_request_kind(&args)
+                != crate::ai::tools::service::command::CommandRequestKind::Start
+            {
+                continue;
+            }
             let Some(command) = args.get("command").and_then(|value| value.as_str()) else {
                 continue;
             };

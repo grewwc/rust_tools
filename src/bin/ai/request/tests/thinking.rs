@@ -1,10 +1,6 @@
 use super::common::{test_app};
 use super::super::*;
-use crate::ai::tools::os_tools::{GLOBAL_OS, init_os_tools_globals};
-use crate::ai::{cli::ParsedCli, types::AppConfig};
 use serde_json::Value;
-use std::path::PathBuf;
-use std::sync::{Arc, atomic::AtomicBool};
 
 
 #[test]
