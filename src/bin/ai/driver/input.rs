@@ -16,7 +16,6 @@ use crate::pdfw::{PdfParseError, PdfParseOptions, parse_pdf};
 
 const HISTORY_PREVIEW_DEFAULT_COUNT: usize = 6;
 const HISTORY_PREVIEW_FULL_COUNT: usize = 20;
-const HISTORY_PREVIEW_MAX_COUNT: usize = 20;
 const HISTORY_PREVIEW_MAX_CHARS: usize = 160;
 const HISTORY_GREP_HIGHLIGHT_START: &str = "\x1b[1;93m";
 const HISTORY_GREP_HIGHLIGHT_END: &str = "\x1b[0m";
@@ -617,7 +616,7 @@ fn parse_history_preview_options(
                 options.count = raw
                     .parse::<usize>()
                     .map_err(|_| format!("invalid /history argument: {raw}"))?
-                    .clamp(1, HISTORY_PREVIEW_MAX_COUNT);
+                    .max(1);
                 idx += 1;
                 continue;
             }
@@ -1931,7 +1930,7 @@ mod tests {
         assert_eq!(
             parse_local_command("/history 999").unwrap(),
             Some(LocalCommand::ShowHistory(HistoryPreviewOptions {
-                count: 20,
+                count: 999,
                 role_filter: HistoryRoleFilter::All,
                 full: false,
                 grep: None,

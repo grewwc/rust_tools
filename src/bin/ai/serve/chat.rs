@@ -1165,7 +1165,6 @@ struct RemoteHistoryMessage {
 
 const SERVE_HISTORY_DEFAULT_COUNT: usize = 6;
 const SERVE_HISTORY_FULL_COUNT: usize = 20;
-const SERVE_HISTORY_MAX_COUNT: usize = 20;
 const SERVE_HISTORY_MAX_CHARS: usize = 160;
 
 /// Fetch the session's full canonical history. No `limit`: user ordinals
@@ -1462,7 +1461,7 @@ fn parse_serve_history_view(
             }
             raw => match raw.parse::<usize>() {
                 Ok(count) => {
-                    view.count = count.clamp(1, SERVE_HISTORY_MAX_COUNT);
+                    view.count = count.max(1);
                     idx += 1;
                 }
                 Err(_) if idx == 0 => {
@@ -2106,7 +2105,7 @@ mod serve_history_tests {
         assert_eq!(view.role, ServeHistoryRole::Assistant);
         assert_eq!(view.count, 8);
         let (view, _) = parse_serve_history_view(&["999"]).expect("parse");
-        assert_eq!(view.count, SERVE_HISTORY_MAX_COUNT);
+        assert_eq!(view.count, 999);
         let (view, _) = parse_serve_history_view(&["0"]).expect("parse");
         assert_eq!(view.count, 1);
     }
