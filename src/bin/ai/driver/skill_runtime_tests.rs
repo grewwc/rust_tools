@@ -942,12 +942,15 @@ fn system_prompt_renders_safety_redlines_and_anti_hallucination_gate() {
     assert!(prompt.contains("Never perform dangerous operations"));
     assert!(prompt.contains("Never bypass or work around safety mechanisms"));
     assert!(prompt.contains("state the exact command and its consequences and wait for approval"));
-    // Honesty forbids fabrication and unsupported factual claims without
-    // excluding labeled inferences or conditional answers. Fact tracing and
-    // evidence calibration remain in correctness_guardrails.
+    // Honesty forbids fabrication; unsupported-claim grounding and evidence
+    // calibration remain in correctness_guardrails.
     assert!(prompt.contains("<intellectual_honesty>"));
-    assert!(prompt.contains("Unsupported claims must NEVER be presented as established facts"));
-    assert!(prompt.contains("label uncertain content as inference or unknown"));
+    let (_, guardrails) = prompt.split_once("<correctness_guardrails>").unwrap();
+    assert!(
+        guardrails
+            .contains("NEVER state a conclusion with more scope, certainty, or causal strength")
+    );
+    assert!(guardrails.contains("label the remaining inference or unknown"));
     assert!(prompt.contains(
         "NEVER infer additional properties from a field's name, type, or metadata alone"
     ));
@@ -1261,6 +1264,7 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "A challenge alone NEVER justifies retracting a supported conclusion",
                     "you MUST re-check it before replying",
                     "An attempt or a plan is not a completed action",
+                    "Useful conditional answers are allowed when their premises and limits are explicit",
                     "Confidence does not replace evidence",
                 ] {
                     assert!(guardrails.contains(rule));
@@ -1271,7 +1275,6 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                 for rule in [
                     "NEVER fabricate or misrepresent what you know",
                     "Never present planned or attempted work as completed",
-                    "Useful conditional answers are allowed",
                     "NEVER infer additional properties from a field's name, type, or metadata alone",
                     "independent supporting evidence or a valid derivation from explicit, supported premises",
                 ] {
@@ -1350,7 +1353,7 @@ fn system_prompt_resists_sycophancy() {
     assert!(default_prompt.contains(
         "change a factual position because the user holds, repeats, or insists on another one"
     ));
-    assert!(default_prompt.contains("A conclusion the user disputes is not established"));
+    assert!(default_prompt.contains("When the user disputes a factual conclusion you stated"));
     assert!(default_prompt.contains("a user dispute of an earlier conclusion"));
 
     let goal_ctx = PromptContext {

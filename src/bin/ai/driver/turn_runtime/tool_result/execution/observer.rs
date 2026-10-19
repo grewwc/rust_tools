@@ -386,16 +386,14 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
                 if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
                     return;
                 }
-                let line = if self.allow_inline_fold_updates {
-                    // Keep the line to a single physical row so the in-place status
-                    // update (`CSI 1A` + `CSI 2K`) can replace it without leftovers.
-                    crate::ai::stream::clamp_line_to_terminal_row_with_reserve(
-                        &line,
-                        COMMAND_LINE_STATUS_RESERVE_COLS,
-                    )
-                } else {
-                    line
-                };
+                // Keep the line to a single physical row in all environments. The TTY
+                // path needs it so the in-place status update (`CSI 1A` + `CSI 2K`)
+                // can replace it without leftovers; the non-TTY path needs the same
+                // bound so a long command never overflows the visible panel.
+                let line = crate::ai::stream::clamp_line_to_terminal_row_with_reserve(
+                    &line,
+                    COMMAND_LINE_STATUS_RESERVE_COLS,
+                );
                 print_tool_command_line(&line);
                 self.pending_command_line = Some(line);
                 self.command_line_pending = true;
