@@ -213,6 +213,7 @@ mod tests {
             locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
             confirms: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            events: Arc::new(SessionEventBus::default()),
         }
     }
 
@@ -352,6 +353,7 @@ mod tests {
             locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
             confirms: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            events: Arc::new(SessionEventBus::default()),
         }
     }
 

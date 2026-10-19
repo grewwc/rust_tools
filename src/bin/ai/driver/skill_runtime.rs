@@ -147,6 +147,16 @@ impl SystemPromptBuilder {
 
 const DEFAULT_TURN_TOOL_GROUPS: &[ToolGroup] = &[ToolGroup::Core];
 
+/// Core tools, plus phone actions only for a serve turn whose client declared
+/// the native bridge. Other clients never see `phone_action`.
+fn default_turn_tool_groups() -> Vec<ToolGroup> {
+    let mut groups = DEFAULT_TURN_TOOL_GROUPS.to_vec();
+    if crate::ai::background::native_client() {
+        groups.push(ToolGroup::Phone);
+    }
+    groups
+}
+
 fn runtime_environment_prompt() -> String {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
@@ -436,6 +446,21 @@ fn filter_subagent_hidden_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
     tools
 }
 
+/// Native phone actions are injected only for a top-level turn whose serve
+/// client declared the Android bridge; manifests cannot grant them to desktop
+/// or subagent turns.
+fn append_native_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
+    if !crate::ai::background::native_client() || should_hide_task_tools_for_subagent() {
+        return tools;
+    }
+    for def in super::super::tools::tool_definitions_for_groups(&[ToolGroup::Phone]) {
+        if !tools.iter().any(|tool| tool.function.name == def.function.name) {
+            tools.push(def);
+        }
+    }
+    tools
+}
+
 fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option<Vec<ToolDef>> {
     let mut defs: Vec<ToolDef> = Vec::new();
     // Case-insensitive dedup so a tool named both via a group and by an
@@ -539,7 +564,7 @@ fn builtin_tools_for_skill(
 ) -> Vec<ToolDef> {
     // If any active skill disables builtin, disable builtin entirely (most-restrictive)
     if skills.iter().any(|s| s.disable_builtin_tools) {
-        return filter_subagent_hidden_tools(Vec::new());
+        return append_native_tools(filter_subagent_hidden_tools(Vec::new()));
     }
     // Merge tool_groups and tools across all active skills (dedup, order-preserving)
     let mut merged_groups: Vec<String> = Vec::new();
@@ -558,16 +583,16 @@ fn builtin_tools_for_skill(
     }
     if !merged_groups.is_empty() || !merged_tools.is_empty() {
         if let Some(tool_defs) = manifest_tool_definitions(&merged_groups, &merged_tools) {
-            return filter_subagent_hidden_tools(tool_defs);
+            return append_native_tools(filter_subagent_hidden_tools(tool_defs));
         }
     }
     if let Some(agent) = active_agent
         && let Some(tool_defs) = manifest_tool_definitions(&agent.tool_groups, &agent.tools)
     {
-        return filter_subagent_hidden_tools(tool_defs);
+        return append_native_tools(filter_subagent_hidden_tools(tool_defs));
     }
     filter_subagent_hidden_tools(super::super::tools::tool_definitions_for_groups(
-        DEFAULT_TURN_TOOL_GROUPS,
+        &default_turn_tool_groups(),
     ))
 }
 

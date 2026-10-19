@@ -1,15 +1,18 @@
 package com.grewwc.aserve;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -30,6 +33,9 @@ import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import java.util.ArrayList;
 
 public final class MainActivity extends Activity {
@@ -37,6 +43,7 @@ public final class MainActivity extends Activity {
     private static final String PREFS = "a_serve";
     private static final String SERVER_ORIGIN = "server_origin";
     private static final int FILE_CHOOSER_REQUEST = 10;
+    private static final int LOCATION_PERMISSION_REQUEST = 11;
 
     private WebView webView;
     private ProgressBar progressBar;
@@ -44,6 +51,9 @@ public final class MainActivity extends Activity {
     private String serverOrigin;
     private ValueCallback<Uri[]> fileChooserCallback;
     private boolean connectionDialogVisible;
+    private NativeBridge nativeBridge;
+    private String pendingLocationRequest;
+    private long pausedAt;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -102,6 +112,10 @@ public final class MainActivity extends Activity {
         webView.setWebChromeClient(new AppWebChromeClient());
         webView.setDownloadListener((url, userAgent, contentDisposition, mimeType, length) ->
                 openExternalUrl(url));
+        // The bridge exposes only allowlisted native actions; every call checks
+        // the loaded origin again before it can reach the phone.
+        nativeBridge = new NativeBridge(this);
+        webView.addJavascriptInterface(nativeBridge, NativeBridge.NAME);
     }
 
     private void loadApp() {
@@ -110,6 +124,78 @@ public final class MainActivity extends Activity {
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    /** Whether the document currently loaded still belongs to the configured server. */
+    boolean isTrustedPage() {
+        String current = webView == null ? null : webView.getUrl();
+        return current != null && serverOrigin != null && ServerUrl.isSameOrigin(serverOrigin, current);
+    }
+
+    boolean hasLocationPermission() {
+        return checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /**
+     * Ask for coarse location at the moment the user requested it. Android
+     * requires a visible, foreground request; there is no background grant.
+     */
+    void requestLocationPermission(String requestId) {
+        // Bridge calls arrive on a WebView thread; runtime permission requests
+        // must be issued from the activity's UI thread.
+        runOnUiThread(() -> {
+            if (isFinishing() || isDestroyed()) {
+                deliverNativeResult(requestId, false, "app not active", null);
+                return;
+            }
+            if (hasLocationPermission()) {
+                if (nativeBridge != null) nativeBridge.fetchLocation(requestId);
+                return;
+            }
+            if (pendingLocationRequest != null) {
+                deliverNativeResult(requestId, false, "location request already pending", null);
+                return;
+            }
+            pendingLocationRequest = requestId;
+            requestPermissions(
+                    new String[]{Manifest.permission.ACCESS_COARSE_LOCATION},
+                    LOCATION_PERMISSION_REQUEST);
+        });
+    }
+
+    @Override
+    public void onRequestPermissionsResult(
+            int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != LOCATION_PERMISSION_REQUEST) return;
+        String requestId = pendingLocationRequest;
+        pendingLocationRequest = null;
+        if (requestId == null) return;
+        if (grantResults.length > 0
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED
+                && nativeBridge != null) {
+            nativeBridge.fetchLocation(requestId);
+        } else {
+            deliverNativeResult(requestId, false, "location permission denied", null);
+        }
+    }
+
+    /** Report one native action result back to the server-owned page. */
+    void deliverNativeResult(String requestId, boolean ok, String error, JSONObject data) {
+        if (webView == null) return;
+        JSONObject result = new JSONObject();
+        try {
+            result.put("id", requestId);
+            result.put("ok", ok);
+            if (error != null) result.put("error", error);
+            if (data != null) result.put("data", data);
+        } catch (JSONException ignored) {
+            return;
+        }
+        String js = "window.AServeNativeResult&&window.AServeNativeResult("
+                + JSONObject.quote(result.toString()) + ");";
+        webView.post(() -> webView.evaluateJavascript(js, null));
     }
 
     private boolean handleNavigation(Uri uri) {
@@ -248,10 +334,23 @@ public final class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         webView.onResume();
+        // The WebView keeps its document across app switches. A document loaded
+        // before the current UI generation cannot run the newer reconnect logic,
+        // so replace it once the app returns from a real background stay.
+        if (pausedAt > 0 && SystemClock.elapsedRealtime() - pausedAt > 2000) {
+            webView.evaluateJavascript(
+                "String(window.__aserveUi||'')",
+                value -> {
+                    String marker = value == null ? "" : value.replace("\"", "").trim();
+                    if (marker.isEmpty() || "null".equals(marker)) loadApp();
+                });
+        }
+        pausedAt = 0;
     }
 
     @Override
     protected void onPause() {
+        pausedAt = SystemClock.elapsedRealtime();
         webView.onPause();
         super.onPause();
     }
@@ -266,6 +365,7 @@ public final class MainActivity extends Activity {
     protected void onDestroy() {
         if (fileChooserCallback != null) fileChooserCallback.onReceiveValue(null);
         fileChooserCallback = null;
+        webView.removeJavascriptInterface(NativeBridge.NAME);
         webView.stopLoading();
         webView.setWebChromeClient(null);
         webView.setWebViewClient(null);

@@ -18,6 +18,10 @@
 pub(crate) enum ToolGroup {
     /// Resident in every turn unless a manifest overrides the tool set.
     Core,
+    /// Android-shell native actions (`phone_action`). Resident only for a serve
+    /// turn whose client declared the native bridge, so web/CLI clients never
+    /// see phone-only tools.
+    Phone,
     /// Subagent orchestration family (`task` / `task_spawn` / ...). Lazy for
     /// every top-level turn; loaded eagerly when a manifest declares the group.
     Task,
@@ -48,6 +52,7 @@ impl ToolGroup {
     /// All groups, for exhaustive iteration (catalogs, docs, tests).
     pub(crate) const ALL: &'static [ToolGroup] = &[
         Self::Core,
+        Self::Phone,
         Self::Task,
         Self::Executor,
         Self::Knowledge,
@@ -62,6 +67,7 @@ impl ToolGroup {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Core => "core",
+            Self::Phone => "phone",
             Self::Task => "task",
             Self::Executor => "executor",
             Self::Knowledge => "knowledge",

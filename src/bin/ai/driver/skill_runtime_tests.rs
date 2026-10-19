@@ -698,6 +698,53 @@ fn system_prompt_forbids_breaking_other_modules_to_satisfy_a_requirement() {
 }
 
 #[test]
+fn system_prompt_pins_impact_surface_workflow() {
+    // The scope section's impact-surface workflow must stay rendered: pre-mutation
+    // enumeration ("Before the first mutation"), per-item verification with named
+    // unverified assumptions, and the pre-completion closure re-check ("impact
+    // surface is closed"). task_convergence's own "impact surface (callers and
+    // dependents)" phrasing does not cover these, and tests are dependents too:
+    // a failing test is a regression unless the change deliberately replaces the
+    // pinned behavior, a failing test alone never proves outdatedness, and
+    // deleting/weakening an assertion needs user confirmation — pin all of that here.
+    let cases = [
+        PromptContext::default(),
+        PromptContext {
+            goal_mode: Some("finish the goal".to_string()),
+            is_background: false,
+        },
+    ];
+    for ctx in cases {
+        let prompt = build_system_prompt(None, &[], &Box::new(SkipSet::new(16)), &ctx)
+            .render_system_prompt();
+        assert!(
+            prompt.contains("Before the first mutation, enumerate the change's impact surface"),
+            "pre-mutation impact enumeration missing from the rendered prompt"
+        );
+        assert!(
+            prompt.contains("impact surface is closed"),
+            "pre-completion impact closure re-check missing from the rendered prompt"
+        );
+        assert!(
+            prompt.contains("name any assumption left unverified"),
+            "unverified-assumption reporting missing from the rendered prompt"
+        );
+        assert!(
+            prompt.contains("never delete, weaken, skip, or edit a test merely to make it pass"),
+            "outdated-test update protocol missing from the rendered prompt"
+        );
+        assert!(
+            prompt.contains("a failing test alone never proves it is outdated"),
+            "test-outdatedness evidence gate missing from the rendered prompt"
+        );
+        assert!(
+            prompt.contains("Deleting or weakening an assertion requires user confirmation"),
+            "assertion-relaxation confirmation gate missing from the rendered prompt"
+        );
+    }
+}
+
+#[test]
 fn system_prompt_bridges_compressed_context_recovery_via_search_overflow() {
     // search_overflow is a core resident tool but must be explicitly bridged to the compression pipeline:
     // after context compression, absence claims must first search the session archive instead of directly asserting "not found".
@@ -1087,7 +1134,7 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     assert!(prompt.contains("Ground claims about the current workspace, system, and session"));
     assert!(prompt.contains("state what is verified, what is unknown"));
     assert!(prompt.contains("limit absence claims to the scope actually searched"));
-    assert!(prompt.contains("locate relevant callers and dependents"));
+    assert!(prompt.contains("plus its callers and dependents anywhere in the workspace"));
     assert!(prompt.contains("compilation and tests prove only covered behavior"));
     assert!(prompt.contains("reset, checkout, restore, stash drop"));
     assert!(prompt.contains("temporary branch/worktree or stash push then pop"));

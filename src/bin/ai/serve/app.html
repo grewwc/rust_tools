@@ -301,7 +301,7 @@ select, summary { touch-action:manipulation; }
 <header>
 <button id="menu" aria-label="sessions">☰</button>
 <b>a</b><span id="info">connecting…</span>
-<a id="apkdownload" href="/a-serve-v1.4.0.apk" download="a-serve-v1.4.0.apk" aria-label="download Android app" title="download Android app"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></a>
+<a id="apkdownload" href="/a-serve-v1.5.2.apk" download="a-serve-v1.5.2.apk" aria-label="download Android app" title="download Android app"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></a>
 <button id="connbtn" aria-label="connection">⚙</button>
 <button id="newbtn" class="primary">＋</button>
 </header>
@@ -369,6 +369,9 @@ select, summary { touch-action:manipulation; }
 <div id="viewer"><img id="viewerimg" alt=""></div>
 <script>
 "use strict";
+// Document generation marker: the Android shell reloads a document that
+// predates it, because an old page cannot run the newer reconnect logic.
+window.__aserveUi = "2026-10-20";
 // Minimal mobile client for the serve HTTP API (same routes as serve-chat).
 // Same-origin by default: when opened via http://<host>:<port>/app the base is
 // this page's origin. Token is kept in localStorage, never in the URL.
@@ -442,6 +445,7 @@ let staleBox = null; // live turn box to update if the server confirms it ended
 let staleTimer = null; // follow-up reload timer while the reply is pending
 let staleTries = 0; // bounded follow-ups: an idle page must not ask forever
 let staleBusy = false; // one history fetch at a time; ticks may overlap a slow one
+let lastHistoryEndsUnanswered = false; // loaded history has no reply after its user turn
 const STALE_FOLLOW_MS = 4000; // follow-up reload interval
 const STALE_FOLLOW_TRIES = 300; // ~20 min of visible following, then ↻ takes over
 
@@ -450,11 +454,19 @@ const STALE_FOLLOW_TRIES = 300; // ~20 min of visible following, then ↻ takes 
 // same dialog is driven by the SSE `confirm_request` event and by pollConfirm.
 let confirmShown = null; // {id, prompt} currently on screen; null when hidden
 let confirmBusy = false; // one answer POST at a time: a double tap must not send two
+let confirmPollTimer = null; // keeps answering native requests even when history follow stops
+let eventAbort = null; // AbortController for the reattached event stream
+let eventActive = false; // one reattach stream at a time
+let eventSession = ""; // session the reattach stream belongs to
+let recoveredView = null; // progress card rendered from replayed events
 
 function headers(json) {
   const h = {};
   if (json) h["Content-Type"] = "application/json";
   if (store.token) h["Authorization"] = "Bearer " + store.token;
+  // The Android shell is the only client that can run native actions; the
+  // server uses this to expose the phone tool group for just these turns.
+  if (typeof nativeBridgeReady === "function" && nativeBridgeReady()) h["X-AServe-Native"] = "1";
   return h;
 }
 async function api(path, opts) {
@@ -568,6 +580,34 @@ function handleSvgPreviewClick(event) {
   const button = event.target && event.target.closest ? event.target.closest("[data-svg-view]") : null;
   const preview = button && button.closest(".svg-preview");
   if (preview) setSvgPreviewView(preview, button.dataset.svgView);
+}
+// The agent sends a phone action as JSON over the serve input channel. The
+// page validates it again before the bridge sees it and drops unknown fields.
+function parsePhoneAction(raw) {
+  let spec;
+  try { spec = JSON.parse(String(raw)); } catch (_) { return null; }
+  if (!spec || typeof spec !== "object" || Array.isArray(spec)) return null;
+  const action = typeof spec.action === "string" ? spec.action : "";
+  if (action === "alarm") {
+    if (typeof spec.hour !== "number" || typeof spec.minute !== "number") return null;
+    const hour = Number(spec.hour), minute = Number(spec.minute);
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23) return null;
+    if (!Number.isInteger(minute) || minute < 0 || minute > 59) return null;
+    const label = typeof spec.label === "string" ? spec.label.slice(0, 120) : "";
+    return { action, hour, minute, label };
+  }
+  if (action === "note") {
+    const text = typeof spec.text === "string" ? spec.text : "";
+    if (!text.trim() || text.length > 3000) return null;
+    const title = typeof spec.title === "string" ? spec.title.slice(0, 200) : "";
+    return { action, title, text };
+  }
+  if (action === "location") return { action };
+  return null;
+}
+function nativeBridgeReady() {
+  return typeof window !== "undefined" && !!window.AServeNative &&
+    typeof window.AServeNative.perform === "function";
 }
 // Protect TeX before Markdown can interpret its stars, pipes, or newlines.
 // Slots are collision-free and restored only in text, never in code or URLs.
@@ -739,7 +779,8 @@ function renderMarkdown(src) {
       }
       if (closed) i++; // skip the closing fence; a stream cut mid-block stays code
       flushText();
-      const preview = closed && fence[2].toLowerCase() === "svg" ? svgPreview(body.join("\n")) : null;
+      const lang = fence[2].toLowerCase();
+      const preview = closed && lang === "svg" ? svgPreview(body.join("\n")) : null;
       out.push(preview || ("<pre" + (fence[2] ? ' data-lang="' + esc(fence[2]) + '"' : "") +
         "><code>" + esc(body.join("\n")) + "</code></pre>"));
       continue;
@@ -852,6 +893,121 @@ function insertPromptText(text) {
   growPrompt();
   persistDraft();
 }
+// --- native phone actions (Android shell bridge) ---------------------------
+// The agent's phone_action tool arrives as an input_request whose prompt starts
+// with NATIVE_PREFIX. The page runs it through the APK and answers /confirm with
+// one JSON line; no extra button or dialog is involved.
+const nativePending = new Map();
+const nativeRequests = new Map();
+const NATIVE_PREFIX = "@@aserve-native ";
+let nativeSeq = 0;
+function nativeCall(action, payload) {
+  return new Promise((resolve, reject) => {
+    if (!nativeBridgeReady()) { reject(new Error("需要 Android 客户端")); return; }
+    const id = "n" + (++nativeSeq) + "-" + Date.now();
+    const timer = setTimeout(() => {
+      nativePending.delete(id);
+      reject(new Error("手机没有响应"));
+    }, 45000);
+    nativePending.set(id, { resolve, reject, timer });
+    try {
+      window.AServeNative.perform(id, action, JSON.stringify(payload || {}));
+    } catch (error) {
+      clearTimeout(timer);
+      nativePending.delete(id);
+      reject(error);
+    }
+  });
+}
+function handleNativeResult(raw) {
+  let message;
+  try { message = typeof raw === "string" ? JSON.parse(raw) : raw; } catch (_) { return; }
+  if (!message || typeof message.id !== "string") return;
+  const pending = nativePending.get(message.id);
+  if (!pending) return;
+  nativePending.delete(message.id);
+  clearTimeout(pending.timer);
+  if (message.ok) pending.resolve(message);
+  else pending.reject(new Error(message.error === "cancelled" ? "已取消" : (message.error || "执行失败")));
+}
+if (typeof window !== "undefined") window.AServeNativeResult = handleNativeResult;
+async function handleNativeRequest(id, token, prompt, sid = sessionId) {
+  // Bind both execution and its reply to the original server/session. Replay
+  // and confirmation recovery can deliver the same request concurrently.
+  const base = store.base;
+  const key = JSON.stringify([base, sid, token, id]);
+  let entry = nativeRequests.get(key);
+  if (!entry) {
+    entry = { busy: false, answered: false, result: null, failures: 0, retry: null };
+    try {
+      const saved = JSON.parse(sessionStorage.getItem("aserve-native:" + key));
+      if (saved) entry.result = saved.result || { ok: false, error: "页面在手机操作期间重新加载，执行结果未知；未重复执行。请检查手机。" };
+    } catch (_) {}
+    nativeRequests.set(key, entry);
+  }
+  if (entry.busy || entry.answered) return;
+  if (entry.retry !== null) { clearTimeout(entry.retry); entry.retry = null; }
+  entry.busy = true;
+  const save = (value) => {
+    try { sessionStorage.setItem("aserve-native:" + key, JSON.stringify(value)); } catch (_) {}
+  };
+  const requestHeaders = headers(true);
+  const request = async (opts = {}) => {
+    const res = await fetch(base + "/sessions/" + sid + "/confirm", { ...opts, headers: requestHeaders });
+    if (!res.ok) {
+      const error = new Error("confirmation HTTP " + res.status);
+      error.retryable = res.status >= 500;
+      throw error;
+    }
+    return res;
+  };
+  try {
+    // An event log is not authority to repeat a side effect. Only execute the
+    // exact request still pending on the server, never an old replayed event.
+    const state = await (await request()).json();
+    const pending = state.pending;
+    if (!pending || pending.id !== id || pending.token !== token || pending.prompt !== prompt || !pending.input) {
+      entry.answered = true;
+      return;
+    }
+    if (!entry.result) {
+      save({ inFlight: true });
+      entry.result = await executeNativeRequest(prompt);
+      save({ result: entry.result });
+    }
+    await request({ method: "POST", body: JSON.stringify({ id, token, allow: true, text: JSON.stringify(entry.result) }) });
+    entry.answered = true;
+  } catch (error) {
+    // A healthy event stream will not resend input_request after a failed
+    // answer POST. Retry delivery explicitly, reusing the saved result.
+    if (error.retryable !== false && ++entry.failures <= 3) {
+      entry.retry = setTimeout(() => {
+        entry.retry = null;
+        if (sid === sessionId && base === store.base) void handleNativeRequest(id, token, prompt, sid);
+      }, 1000 * entry.failures);
+    }
+    if (sid === sessionId && base === store.base) addMsg("err", "phone action answer failed: " + error.message, "asst err");
+  } finally {
+    entry.busy = false;
+  }
+}
+async function executeNativeRequest(prompt) {
+  const spec = parsePhoneAction(String(prompt).slice(NATIVE_PREFIX.length));
+  let result;
+  if (!spec) {
+    result = { ok: false, error: "无效的手机动作" };
+  } else if (!nativeBridgeReady()) {
+    result = { ok: false, error: "需要 Android 客户端" };
+  } else {
+    try {
+      const answer = await nativeCall(spec.action, Object.assign({ auto: true }, spec));
+      result = { ok: true, data: answer.data || {} };
+    } catch (error) {
+      result = { ok: false, error: String(error && error.message ? error.message : error) };
+    }
+  }
+  return result;
+}
 async function queueImageFiles(files) {
   const added = [];
   for (const file of files) {
@@ -918,6 +1074,19 @@ function textOf(content, imagePlaceholders = false) {
 // repeat a real prompt (image rereads), so never infer origin from its text.
 function isRuntimeSyntheticUser(message) {
   return message.role === "user" && message.reasoning_content === "runtime-origin:synthetic-user:v1";
+}
+// History is the only durable trace of a turn that died with the server. Tool
+// rows may trail the user message, so look back past them; a synthetic image
+// follow-up is not a question the user is still waiting on.
+function historyEndsUnanswered(messages) {
+  if (!Array.isArray(messages) || !messages.length) return false;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i] || {};
+    const role = String(message.role || "");
+    if (role === "assistant") return false;
+    if (role === "user" && !isRuntimeSyntheticUser(message)) return true;
+  }
+  return false;
 }
 const PHONE_LAYOUT_QUERY = "(max-width:700px)";
 const FOLLOW_BOTTOM_GAP = 80;
@@ -1904,6 +2073,7 @@ async function loadHistory(prefetched) {
     return;
   }
   const forSession = sessionId; // the session this fetch describes, checked again before rendering
+  if (historySession && historySession !== forSession) abortEvents();
   let msgs = [];
   // One message beyond the rendered window: a tool result sitting at the edge
   // would otherwise be titled with a bare role name, because the call that
@@ -1935,9 +2105,11 @@ async function loadHistory(prefetched) {
   lastMsgCount = history.shownCount;
   staleKey = histKey(msgs);
   staleDone = histEndsTurn(msgs);
+  lastHistoryEndsUnanswered = historyEndsUnanswered(msgs);
   syncStopButton();
   renderSessionBar();
   const root = $("msgs");
+  if (!lastHistoryEndsUnanswered) root.querySelectorAll(".turn-interrupted").forEach((node) => node.remove());
   const sameSession = historySession === forSession;
   const follow = !sameSession || shouldFollowOutput(root);
   const oldScrollTop = root.scrollTop;
@@ -2094,8 +2266,19 @@ async function reloadStale() {
         if (bubble) bubble.textContent = "connection lost; server no longer reports this turn running (it may have restarted before finishing)";
       }
       note("turn ended before a final reply; you can send again");
+      checkInterruptedTurn();
     }
   } finally { staleBusy = false; }
+}
+// A restart can end a turn between two page loads: the transcript then ends
+// with the user's message and the server reports nothing running. Say so
+// explicitly instead of leaving a blank-looking conversation.
+function checkInterruptedTurn() {
+  if (!sessionId || turnRunning || turns.has(sessionId)) return;
+  if (!lastHistoryEndsUnanswered) return;
+  const root = $("msgs");
+  if (root.querySelector(".turn-interrupted")) return;
+  addMsg("err", "这条消息没有收到回复：上一轮可能被服务重启中断。可以重新发送。", "asst err turn-interrupted");
 }
 function stopStaleFollow() {
   if (staleTimer !== null) { clearInterval(staleTimer); staleTimer = null; }
@@ -2164,6 +2347,160 @@ async function answerConfirm(allow) {
 // feed (or was reloaded) mid-prompt has no live event to show the question, so
 // it is rebuilt from /confirm through the same path the SSE event uses. Returns
 // the authoritative running state, or null when no current sample was obtained.
+// A running turn can outlive this page's live stream and its bounded history
+// follow. Native phone actions arrive as pending input requests, so keep
+// polling /confirm while the server reports the turn running; otherwise a
+// request created after the follow stops would block the turn forever.
+function ensureConfirmPoll() {
+  if (confirmPollTimer !== null) return;
+  confirmPollTimer = setInterval(async () => {
+    if (document.visibilityState !== "visible") return;
+    const running = await pollConfirm();
+    if (running === false && !turns.has(sessionId) && staleSession !== sessionId) stopConfirmPoll();
+  }, 10000); // fallback only; the reattached event stream is the primary path
+}
+function stopConfirmPoll() {
+  if (confirmPollTimer === null) return;
+  clearInterval(confirmPollTimer);
+  confirmPollTimer = null;
+}
+// Rebuild a compact progress card from replayed turn events. It is not the
+// original live DOM, but it restores thinking, tool cards, the partial answer
+// and any pending question after a page reload.
+function recoveredProgressView() {
+  const box = document.createElement("div");
+  box.className = "turn recovered";
+  const bubble = document.createElement("div");
+  bubble.className = "msg asst pending";
+  box.appendChild(bubble);
+  $("msgs").appendChild(box);
+  const activity = createLiveActivity(box, bubble);
+  let think = null;
+  let thinking = "";
+  let answer = "";
+  const paintPhase = () => { if (!answer) bubble.textContent = activity.label(); };
+  const endThinking = () => { think = null; thinking = ""; };
+  paintPhase();
+  return {
+    box,
+    endThinking,
+    thinkingText(text) {
+      thinking += text;
+      if (!think) think = createThinkingFold(box, bubble);
+      think.set("thinking", thinking.length > 6000 ? "…" + thinking.slice(-6000) : thinking);
+      activity.setPhase("Thinking…");
+      paintPhase();
+    },
+    delta(text) { endThinking(); answer += text; bubble.classList.remove("pending"); bubble.textContent = answer; },
+    tool(event) { endThinking(); activity.setPhase("Processing…"); activity.tool(event); paintPhase(); },
+    subagents(text) { activity.subagents(text); },
+    phase(text, waiting) { activity.setPhase(text, waiting); paintPhase(); },
+    remove() { box.remove(); },
+  };
+}
+
+function handleReplayEvent(sid, kind, payload, view) {
+  if (sid !== sessionId) return;
+  if (kind === "thinking") {
+    try { const text = JSON.parse(payload).text || ""; if (text) view.thinkingText(text); } catch (_) {}
+  } else if (kind === "thinking_done") {
+    view.endThinking();
+    view.phase("Processing…");
+  } else if (kind === "tool") {
+    try { view.tool(JSON.parse(payload)); } catch (_) {}
+  } else if (kind === "subagent_progress") {
+    view.subagents(payload);
+  } else if (kind === "delta") {
+    try { view.delta(JSON.parse(payload).delta || ""); } catch (_) {}
+  } else if (kind === "answer_pending") {
+    view.phase("Processing response…");
+  } else if (kind === "confirm_request") {
+    view.phase("Waiting for confirmation…", true);
+    try {
+      const c = JSON.parse(payload);
+      showConfirm(c.id, c.prompt, c.token, c.input);
+    } catch (_) {}
+  } else if (kind === "input_request") {
+    let c = null;
+    try { c = JSON.parse(payload); } catch (_) {}
+    if (c && typeof c.prompt === "string" && c.prompt.startsWith(NATIVE_PREFIX)) {
+      view.phase("正在手机上执行…", true);
+      void handleNativeRequest(c.id, c.token, c.prompt);
+    } else if (c) {
+      view.phase("Waiting for your input…", true);
+      showConfirm(c.id, c.prompt, c.token, true);
+    }
+  } else if (kind === "confirm_done" || kind === "input_done") {
+    let cid = null;
+    try { cid = JSON.parse(payload).id; } catch (_) {}
+    if (cid === null || (confirmShown && confirmShown.id === cid)) hideConfirm();
+    view.phase("Processing…");
+  }
+}
+
+// Reattach to the running turn's retained event stream. This is the primary
+// path after a reload: it replays progress and delivers a pending native or
+// confirmation request without waiting for a poll interval.
+async function attachEvents() {
+  if (!sessionId || eventActive || turns.has(sessionId)) return;
+  const sid = sessionId;
+  const controller = new AbortController();
+  eventAbort = controller;
+  eventActive = true;
+  eventSession = sid;
+  syncStopButton();
+  stopConfirmPoll();
+  const view = recoveredProgressView();
+  recoveredView = view;
+  let buf = "";
+  let finished = false;
+  try {
+    // This connection builds a fresh view; a cursor from a discarded view
+    // would skip the very events needed to reconstruct its state.
+    const eventsUrl = store.base + "/sessions/" + sid + "/events?after=0";
+    const res = await fetch(eventsUrl, {
+      headers: headers(false), signal: controller.signal,
+    });
+    if (!res.ok || !res.body) throw new Error("event stream " + res.status);
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (value) buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const block = parseBlock(buf.slice(0, idx));
+        buf = buf.slice(idx + 2);
+        if (block.kind === "done") { finished = true; break; }
+        if (block.kind) handleReplayEvent(sid, block.kind, block.payload, view);
+      }
+      if (finished || done) break;
+    }
+  } catch (error) {
+    if (!controller.signal.aborted && sid === sessionId && !String(error.message).includes("404")) {
+      addMsg("err", "live progress unavailable: " + error.message, "asst err");
+    }
+  } finally {
+    view.remove();
+    if (recoveredView === view) recoveredView = null;
+    if (eventAbort === controller) { eventAbort = null; eventActive = false; eventSession = ""; syncStopButton(); }
+    const fresh = turnRunning && Date.now() - turnRunningAt < RUNNING_SAMPLE_TTL_MS;
+    if (sid === sessionId && !finished && fresh && !controller.signal.aborted) {
+      ensureConfirmPoll(); // fallback while the event stream is down
+      setTimeout(attachEvents, 2000);
+    } else if (sid === sessionId && !controller.signal.aborted) {
+      await loadHistory();
+    }
+  }
+}
+
+function abortEvents() {
+  if (eventAbort) { eventAbort.abort(); eventAbort = null; }
+  eventActive = false;
+  eventSession = "";
+  if (recoveredView) { recoveredView.remove(); recoveredView = null; }
+}
+
 async function pollConfirm() {
   if (!sessionId || confirmBusy) return null;
   const sid = sessionId;
@@ -2179,10 +2516,16 @@ async function pollConfirm() {
   // source that survives this page losing the stream. A missing field means an
   // older server, treated as "not running".
   turnRunning = body.running === true;
-  if (turnRunning) { turnRunningAt = Date.now(); armHistoryFollow(); }
+  if (turnRunning) { turnRunningAt = Date.now(); armHistoryFollow(); ensureConfirmPoll(); void attachEvents(); }
+  else if (!turns.has(sessionId) && staleSession !== sessionId) stopConfirmPoll();
   syncStopButton();
   const pending = body.pending;
   if (!pending) { if (confirmShown) hideConfirm(); return turnRunning; }
+  if (pending.input && typeof pending.prompt === "string" && pending.prompt.startsWith(NATIVE_PREFIX)) {
+    if (confirmShown) hideConfirm();
+    void handleNativeRequest(pending.id, pending.token, pending.prompt);
+    return turnRunning;
+  }
   // The token, not the id, is the question's identity: child-side ids restart
   // at 1 every turn, so an equal id can still be different text.
   if (!confirmShown || confirmShown.token !== pending.token) showConfirm(pending.id, pending.prompt, pending.token, pending.input);
@@ -2217,7 +2560,8 @@ function syncStopButton() {
   // A restored session has no live stream. Report that distinction without
   // inventing a model phase or inserting status rows into canonical history.
   const status = $("turnstatus");
-  const detached = sessionId && running && !turns.has(sessionId);
+  const attachedEvents = eventActive && eventSession === sessionId;
+  const detached = sessionId && running && !turns.has(sessionId) && !attachedEvents;
   const fresh = turnRunning && Date.now() - turnRunningAt < RUNNING_SAMPLE_TTL_MS;
   const text = !detached ? "" : fresh
     ? "Turn running on server · live updates unavailable"
@@ -2299,19 +2643,22 @@ async function stopTurn() {
 // Parse one SSE block the way serve-chat does: `event: <kind>` plus one or
 // more `data: <payload>` lines. Blocks without a kind are progress lines.
 function parseBlock(raw) {
+  let id = "";
   let kind = "";
   const data = [];
   for (const line of raw.split("\n")) {
-    if (line.startsWith("event:")) kind = line.slice(6).trim();
+    if (line.startsWith("id:")) id = line.slice(3).trim();
+    else if (line.startsWith("event:")) kind = line.slice(6).trim();
     else if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
     else if (line.trim() === "" || line.startsWith(":")) continue; // blank or SSE keep-alive comment, never progress
     else data.push(line);
   }
-  return { kind, payload: data.join("\n") };
+  return { id, kind, payload: data.join("\n") };
 }
 
 async function send() {
   if (sendBusy) return; // one send's own setup at a time
+  if (typeof abortEvents === "function") abortEvents();
   const text = $("prompt").value.trim();
   if (!text && !pendingImages.length) return;
   if (!validateSkillInput()) return;
@@ -2356,6 +2703,8 @@ async function send() {
   clearDraft(draftSession);
   clearDraft(sid);
   questionCache = null;
+  document.querySelectorAll("#msgs .turn-interrupted").forEach((node) => node.remove());
+  lastHistoryEndsUnanswered = false;
   addLiveUserBubble(text || "(images only)", prompt, sid, rewindFloor);
   scrollToLatest(false);
 
@@ -2600,8 +2949,18 @@ async function send() {
           if (sid === sessionId && (cid === null || (confirmShown && confirmShown.id === cid))) hideConfirm();
         }
         else if (kind === "input_request") {
-          setPhase("Waiting for your input…", true);
-          try { const c = JSON.parse(payload); if (sid === sessionId) showConfirm(c.id, c.prompt, c.token, true); } catch (_) {}
+          let c = null;
+          try { c = JSON.parse(payload); } catch (_) {}
+          if (c && typeof c.prompt === "string" && c.prompt.startsWith(NATIVE_PREFIX)) {
+            // A phone action is executed by the app, not typed into a dialog.
+            if (sid === sessionId) {
+              setPhase("正在手机上执行…", true);
+              void handleNativeRequest(c.id, c.token, c.prompt);
+            }
+          } else {
+            setPhase("Waiting for your input…", true);
+            if (c && sid === sessionId) showConfirm(c.id, c.prompt, c.token, true);
+          }
         }
         else if (kind === "input_done") {
           setPhase("Processing…");
@@ -2744,8 +3103,8 @@ function wire() {
   // until it is visible again, so coming back is where recovery has to start.
   // A question the turn is blocked on survives a reconnect, so coming back to
   // the page is also where the confirm dialog has to be rebuilt.
-  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { pollConfirm(); startStaleFollow(); } });
-  window.addEventListener("pageshow", () => { pollConfirm(); startStaleFollow(); }); // bfcache restore fires no visibility change
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { void pollConfirm().then(checkInterruptedTurn); startStaleFollow(); } });
+  window.addEventListener("pageshow", () => { void pollConfirm().then(checkInterruptedTurn); startStaleFollow(); }); // bfcache restore fires no visibility change
   if (window.matchMedia && matchMedia("(max-width: 700px)").matches) $("ovrwrap").open = false;
   $("scrim").onclick = () => setDrawer(false);
   $("omodel").onchange = () => savePick();
@@ -2860,7 +3219,8 @@ async function boot() {
   await loadSessions();
   await loadHistory();
   await loadSessionConfig(); // restore this session's picks from the server
-  pollConfirm(); // cold boot mid-turn (or a remote turn) has no live event; derive once
+  await pollConfirm(); // cold boot mid-turn (or a remote turn) has no live event; derive once
+  checkInterruptedTurn();
 }
 boot();
 </script>

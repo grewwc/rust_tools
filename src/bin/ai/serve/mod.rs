@@ -279,6 +279,12 @@ async fn post_turn_sse(
     if SessionStore::validate_session_id(&id).is_err() {
         return bad_request(format!("invalid session id: {id}")).into_response();
     }
+    // The Android shell marks its requests; only those turns get the native
+    // phone tool group, so web/CLI clients never see phone-only tools.
+    let native_client = headers
+        .get("x-aserve-native")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "1");
     let prompt = req.prompt.trim().to_string();
     if prompt.is_empty() {
         return bad_request("prompt is empty".to_string()).into_response();
@@ -310,7 +316,15 @@ async fn post_turn_sse(
     // reaped. Falls back to the line pump when the FIFO cannot be set up —
     // never fails the turn for streaming plumbing.
     let live_fifo = setup_live_fifo(&id);
+    let (raw_tx, mut raw_rx) = mpsc::channel::<Result<ServeSse, std::convert::Infallible>>(128);
     let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(128);
+    // Publish every event to the session log before forwarding it to the
+    // originating client, and keep draining after that client goes away so a
+    // reconnecting page can replay what it missed. The log is bound only once
+    // the per-session lock is held: a queued second turn must not replace the
+    // running turn's log while that turn still owns the session.
+    let bus = Arc::clone(&state.events);
+    let bus_session = id.clone();
     let session_id = id.clone();
     let active_turns = Arc::clone(&state.active_turns);
     let confirms = Arc::clone(&state.confirms);
@@ -339,16 +353,30 @@ async fn post_turn_sse(
     let session_cwd = session_cwd(&state, &id);
     tokio::task::spawn(async move {
         let guard = lock.lock().await;
+        let event_log = bus.begin(&bus_session);
+        tokio::spawn(async move {
+            let mut client_alive = true;
+            while let Some(item) = raw_rx.recv().await {
+                if let Ok(event) = &item {
+                    event_log.publish(&event.kind, &event.data);
+                }
+                if client_alive && tx.send(item.map(ServeSse::into_event)).await.is_err() {
+                    client_alive = false;
+                }
+            }
+            event_log.finish();
+        });
         let _ = tokio::task::spawn_blocking(move || {
             stream_child_turn(
                 session_id,
                 prompt,
                 overrides,
-                tx,
+                raw_tx,
                 live_fifo,
                 active_turns,
                 confirms,
                 confirm_enabled,
+                native_client,
                 session_cwd,
             )
         })
@@ -379,18 +407,19 @@ fn stream_child_turn(
     session_id: String,
     prompt: String,
     overrides: TurnOverrides,
-    tx: mpsc::Sender<Result<Event, std::convert::Infallible>>,
+    tx: mpsc::Sender<Result<ServeSse, std::convert::Infallible>>,
     mut live_fifo: Option<LiveFifo>,
     active_turns: Arc<std::sync::Mutex<HashMap<String, u32>>>,
     confirms: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<ConfirmSlot>>>>>,
     confirm_enabled: bool,
+    native_client: bool,
     session_cwd: std::path::PathBuf,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let t0 = std::time::Instant::now();
     let timing = TurnSendTiming::default();
-    let send = |event: Event| {
+    let send = |event: ServeSse| {
         timing.stamp_first(t0);
         let _ = tx.blocking_send(Ok(event));
     };
@@ -425,6 +454,9 @@ fn stream_child_turn(
         // Marks the child as serve-spawned even when no FIFO is set up
         // (fallback line pump): the title skip must not depend on streaming.
         .env(background::SERVE_CHILD_ENV, "1");
+    if native_client {
+        cmd.env(background::SERVE_NATIVE_ENV, "1");
+    }
     if confirm_enabled {
         // The child publishes its question on the live FIFO and reads the
         // answer as one stdin line: the daemon has no terminal for it to
@@ -509,7 +541,7 @@ fn stream_child_turn(
             .lines()
             .map_while(Result::ok)
         {
-            send(Event::default().data(clean_sse_line(&line)));
+            send(ServeSse::new("", clean_sse_line(&line)));
         }
     }
     let status = child.wait();
@@ -740,21 +772,48 @@ impl ServeFrameDecoder {
     }
 }
 
+/// One SSE event before it is turned into an axum `Event`. Keeping the parts
+/// explicit lets the session log retain them for reconnects; axum's `Event`
+/// exposes builders only, not getters.
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone)]
+struct ServeSse {
+    kind: String,
+    data: String,
+}
+
+#[cfg(feature = "serve")]
+impl ServeSse {
+    fn new(kind: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            data: data.into(),
+        }
+    }
+
+    fn into_event(self) -> Event {
+        let mut event = Event::default();
+        if !self.kind.is_empty() {
+            event = event.event(&self.kind);
+        }
+        event.data(self.data)
+    }
+}
+
 /// Map one parsed frame to its SSE event. `OutputComplete` has no event here:
 /// the caller ends the turn with `done` instead (see `forward_live_event`).
 #[cfg(feature = "serve")]
-fn live_event(event: ServeLiveEvent) -> Option<Event> {
+fn live_event(event: ServeLiveEvent) -> Option<ServeSse> {
     match event {
         ServeLiveEvent::Delta(text) => Some(delta_event(text)),
-        ServeLiveEvent::ThinkingStart => Some(Event::default().event("thinking_start").data("")),
-        ServeLiveEvent::Thinking(text) => Some(
-            Event::default()
-                .event("thinking")
-                .data(serde_json::json!({"text": text}).to_string()),
-        ),
-        ServeLiveEvent::ThinkingDone => Some(Event::default().event("thinking_done").data("")),
+        ServeLiveEvent::ThinkingStart => Some(ServeSse::new("thinking_start", "")),
+        ServeLiveEvent::Thinking(text) => Some(ServeSse::new(
+            "thinking",
+            serde_json::json!({"text": text}).to_string(),
+        )),
+        ServeLiveEvent::ThinkingDone => Some(ServeSse::new("thinking_done", "")),
         ServeLiveEvent::AssistantBodyPending => {
-            Some(Event::default().event("answer_pending").data(""))
+            Some(ServeSse::new("answer_pending", ""))
         }
         // Confirmation and input frames are built by `forward_live_event`,
         // which holds the pending state and adds the answer token; they never
@@ -764,9 +823,9 @@ fn live_event(event: ServeLiveEvent) -> Option<Event> {
         | ServeLiveEvent::InputRequest(_)
         | ServeLiveEvent::InputDone(_) => None,
         ServeLiveEvent::SubagentProgress(line) => {
-            Some(Event::default().event("subagent_progress").data(line))
+            Some(ServeSse::new("subagent_progress", line))
         }
-        ServeLiveEvent::Tool(payload) => Some(Event::default().event("tool").data(payload)),
+        ServeLiveEvent::Tool(payload) => Some(ServeSse::new("tool", payload)),
         ServeLiveEvent::OutputComplete => None,
     }
 }
@@ -779,7 +838,7 @@ fn live_event(event: ServeLiveEvent) -> Option<Event> {
 fn forward_live_event(
     event: ServeLiveEvent,
     turn_done: &std::sync::atomic::AtomicBool,
-    tx: &mpsc::Sender<Result<Event, std::convert::Infallible>>,
+    tx: &mpsc::Sender<Result<ServeSse, std::convert::Infallible>>,
     timing: &TurnSendTiming,
     t0: std::time::Instant,
     confirm: Option<&std::sync::Mutex<ConfirmSlot>>,
@@ -815,9 +874,10 @@ fn forward_live_event(
                     });
                 }
             }
-            Event::default()
-                .event("confirm_request")
-                .data(serde_json::json!({"id": id, "prompt": prompt, "token": token}).to_string())
+            ServeSse::new(
+                "confirm_request",
+                serde_json::json!({"id": id, "prompt": prompt, "token": token}).to_string(),
+            )
         }
         ServeLiveEvent::ConfirmDone(payload) => {
             // A close that cannot name its question must not hide one: only a
@@ -831,7 +891,7 @@ fn forward_live_event(
                     }
                 }
             }
-            Event::default().event("confirm_done").data(payload)
+            ServeSse::new("confirm_done", payload)
         }
         ServeLiveEvent::InputRequest(payload) => {
             let Some((id, prompt)) = parse_confirm_request(&payload) else {
@@ -848,9 +908,10 @@ fn forward_live_event(
                     });
                 }
             }
-            Event::default()
-                .event("input_request")
-                .data(serde_json::json!({"id": id, "prompt": prompt, "token": token}).to_string())
+            ServeSse::new(
+                "input_request",
+                serde_json::json!({"id": id, "prompt": prompt, "token": token}).to_string(),
+            )
         }
         ServeLiveEvent::InputDone(payload) => {
             if let Some(id) = parse_confirm_id(&payload) {
@@ -862,7 +923,7 @@ fn forward_live_event(
                     }
                 }
             }
-            Event::default().event("input_done").data(payload)
+            ServeSse::new("input_done", payload)
         }
         other => match live_event(other) {
             Some(e) => e,
@@ -883,7 +944,7 @@ fn pump_live_fifo(
     reader: std::fs::File,
     child_done: &std::sync::atomic::AtomicBool,
     turn_done: &std::sync::atomic::AtomicBool,
-    tx: &mpsc::Sender<Result<Event, std::convert::Infallible>>,
+    tx: &mpsc::Sender<Result<ServeSse, std::convert::Infallible>>,
     timing: TurnSendTiming,
     t0: std::time::Instant,
     confirm: Option<Arc<std::sync::Mutex<ConfirmSlot>>>,
@@ -936,10 +997,8 @@ fn pump_live_fifo(
 }
 
 #[cfg(feature = "serve")]
-fn delta_event(delta: String) -> Event {
-    Event::default()
-        .event("delta")
-        .data(serde_json::json!({"delta": delta}).to_string())
+fn delta_event(delta: String) -> ServeSse {
+    ServeSse::new("delta", serde_json::json!({"delta": delta}).to_string())
 }
 
 #[cfg(feature = "serve")]
@@ -1044,15 +1103,13 @@ fn last_chars(text: &str, limit: usize) -> String {
 }
 
 #[cfg(feature = "serve")]
-fn error_event(detail: String) -> Event {
-    Event::default()
-        .event("error")
-        .data(serde_json::json!({"error": detail}).to_string())
+fn error_event(detail: String) -> ServeSse {
+    ServeSse::new("error", serde_json::json!({"error": detail}).to_string())
 }
 
 #[cfg(feature = "serve")]
-fn done_event() -> Event {
-    Event::default().event("done").data("")
+fn done_event() -> ServeSse {
+    ServeSse::new("done", "")
 }
 
 #[cfg(feature = "serve")]
@@ -1263,6 +1320,7 @@ pub(in crate::ai) async fn run_serve(
         locks: Arc::new(Mutex::new(HashMap::new())),
         active_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
         confirms: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        events: Arc::new(SessionEventBus::default()),
     };
     let app = APP_ENTRY_PATHS
         .into_iter()
@@ -1281,6 +1339,7 @@ pub(in crate::ai) async fn run_serve(
         .route("/a-serve-v1.2.0.apk", get(serve_android_apk))
         .route("/a-serve-v1.3.0.apk", get(serve_android_apk))
         .route("/a-serve-v1.4.0.apk", get(serve_android_apk))
+        .route("/a-serve-v1.5.2.apk", get(serve_android_apk))
         .route("/info", get(server_info))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/fork", post(fork_session))
@@ -1291,6 +1350,7 @@ pub(in crate::ai) async fn run_serve(
         )
         .route("/sessions/{id}", delete(delete_session))
         .route("/sessions/{id}/history", get(read_history))
+        .route("/sessions/{id}/events", get(stream_session_events))
         .route("/sessions/{id}/rewind", post(rewind_history))
         .route(
             "/sessions/{id}/checkpoints",

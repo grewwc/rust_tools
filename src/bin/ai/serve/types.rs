@@ -3,6 +3,12 @@
 
 #[cfg(feature = "serve")]
 use super::*;
+#[cfg(feature = "serve")]
+use std::collections::VecDeque;
+#[cfg(feature = "serve")]
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "serve")]
+use tokio::sync::Notify;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +36,179 @@ pub(crate) struct ServeState {
     /// anything and removed when its child is reaped, so a question never
     /// outlives the process that asked it.
     pub(crate) confirms: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<ConfirmSlot>>>>>,
+    /// Per-session live event log for reconnects: retained with sequence
+    /// numbers so a page that lost its stream can replay progress, including a
+    /// pending native or confirmation request.
+    pub(crate) events: Arc<SessionEventBus>,
+}
+
+/// One retained SSE event from a running turn.
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone)]
+pub(crate) struct EventRecord {
+    pub(crate) seq: u64,
+    pub(crate) event: String,
+    pub(crate) data: String,
+}
+
+/// Bounded per-session event log shared by the turn pump and reconnecting pages.
+#[cfg(feature = "serve")]
+#[derive(Default)]
+pub(crate) struct SessionEventBus {
+    logs: std::sync::Mutex<HashMap<String, Arc<SessionEventLog>>>,
+}
+
+#[cfg(feature = "serve")]
+impl std::fmt::Debug for SessionEventBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionEventBus").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "serve")]
+pub(crate) struct SessionEventLog {
+    next_seq: AtomicU64,
+    events: std::sync::Mutex<VecDeque<EventRecord>>,
+    bytes: AtomicUsize,
+    running: AtomicBool,
+    notify: Notify,
+}
+
+#[cfg(feature = "serve")]
+impl Default for SessionEventLog {
+    fn default() -> Self {
+        Self {
+            next_seq: AtomicU64::new(0),
+            events: std::sync::Mutex::new(VecDeque::new()),
+            bytes: AtomicUsize::new(0),
+            running: AtomicBool::new(true),
+            notify: Notify::new(),
+        }
+    }
+}
+
+/// Enough to rebuild the current turn's visible progress, never the whole reply.
+#[cfg(feature = "serve")]
+const MAX_EVENT_RECORDS: usize = 2000;
+#[cfg(feature = "serve")]
+const MAX_EVENT_BYTES: usize = 1 << 20;
+
+#[cfg(feature = "serve")]
+impl SessionEventBus {
+    /// Start a fresh log for a turn, replacing any previous finished log.
+    pub(crate) fn begin(&self, session: &str) -> Arc<SessionEventLog> {
+        let log = Arc::new(SessionEventLog::default());
+        if let Ok(mut logs) = self.logs.lock() {
+            if let Some(previous) = logs.insert(session.to_string(), Arc::clone(&log)) {
+                previous.finish();
+            }
+        }
+        log
+    }
+
+    /// Test-only convenience: production forwarders hold their turn's log.
+    #[cfg(test)]
+    pub(crate) fn publish(&self, session: &str, event: &str, data: &str) {
+        if let Some(log) = self.log(session) {
+            log.publish(event, data);
+        }
+    }
+
+    /// Test-only convenience: production forwarders finish their turn's log.
+    #[cfg(test)]
+    pub(crate) fn finish(&self, session: &str) {
+        if let Some(log) = self.log(session) {
+            log.finish();
+        }
+    }
+
+    /// Retained events after `after`, the running flag, and the log to follow.
+    /// `None` means this session has no live turn to attach to.
+    pub(crate) fn snapshot(
+        &self,
+        session: &str,
+        after: u64,
+    ) -> Option<(Vec<EventRecord>, bool, Arc<SessionEventLog>)> {
+        let log = self.log(session)?;
+        let (events, running) = log.since(after);
+        Some((events, running, log))
+    }
+
+    fn log(&self, session: &str) -> Option<Arc<SessionEventLog>> {
+        self.logs.lock().ok()?.get(session).cloned()
+    }
+}
+
+#[cfg(feature = "serve")]
+impl SessionEventLog {
+    /// Append one event to this log. A turn's forwarder holds the log returned
+    /// by [`SessionEventBus::begin`], so a later turn replacing the session
+    /// entry cannot redirect or finish this turn's records.
+    pub(crate) fn publish(&self, event: &str, data: &str) {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let record = EventRecord {
+            seq,
+            event: event.to_string(),
+            data: data.to_string(),
+        };
+        let size = record.data.len();
+        if let Ok(mut events) = self.events.lock() {
+            events.push_back(record);
+            self.bytes.fetch_add(size, Ordering::Relaxed);
+            while events.len() > MAX_EVENT_RECORDS
+                || (self.bytes.load(Ordering::Relaxed) > MAX_EVENT_BYTES && events.len() > 1)
+            {
+                let Some(old) = events.pop_front() else { break };
+                self.bytes.fetch_sub(old.data.len(), Ordering::Relaxed);
+            }
+        }
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn finish(&self) {
+        self.running.store(false, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn since(&self, after: u64) -> (Vec<EventRecord>, bool) {
+        // A cursor from a previous turn can exceed this turn's sequence (each
+        // log restarts at 1). Treat it as stale instead of silently skipping
+        // every event of the new turn.
+        let latest = self.next_seq.load(Ordering::Relaxed);
+        let after = if after > latest { 0 } else { after };
+        let events = self
+            .events
+            .lock()
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|record| record.seq > after)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        (events, self.running.load(Ordering::Relaxed))
+    }
+
+    /// Wake on a change, with a bounded wait so a missed notification cannot
+    /// leave a reconnecting page parked forever.
+    pub(crate) async fn changed(&self) {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.notify.notified(),
+        )
+        .await;
+    }
+}
+
+#[cfg(feature = "serve")]
+impl EventRecord {
+    pub(crate) fn into_event(self) -> Event {
+        Event::default()
+            .id(self.seq.to_string())
+            .event(self.event)
+            .data(self.data)
+    }
 }
 
 /// Per-session `/cd` state: the session's current directory and the one it
@@ -540,4 +719,54 @@ pub(crate) async fn session_lock(state: &ServeState, session_id: &str) -> Arc<Mu
         map.insert(session_id.to_string(), lock.clone());
         lock
     })
+}
+
+#[cfg(all(test, feature = "serve"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_log_replays_after_sequence_and_finishes() {
+        let bus = SessionEventBus::default();
+        bus.begin("s");
+        bus.publish("s", "delta", "a");
+        bus.publish("s", "tool", "b");
+        bus.publish("s", "delta", "c");
+        let (events, running, _) = bus.snapshot("s", 1).expect("live log");
+        assert!(running);
+        assert_eq!(
+            events.iter().map(|record| record.seq).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(events[1].data, "c");
+        bus.finish("s");
+        let (_, running, _) = bus.snapshot("s", 3).expect("finished log");
+        assert!(!running);
+        assert!(bus.snapshot("missing", 0).is_none());
+    }
+
+    #[test]
+    fn event_log_is_owned_by_the_turn_that_started_it() {
+        let bus = SessionEventBus::default();
+        let first = bus.begin("s");
+        first.publish("delta", "one");
+        // A later turn replaces the session entry; the first turn's forwarder
+        // still holds its own log handle.
+        let second = bus.begin("s");
+        first.publish("delta", "two");
+        first.finish();
+        let (events, running, _) = bus.snapshot("s", 0).expect("second log");
+        assert!(
+            events.is_empty(),
+            "a stale turn must not write into the new log"
+        );
+        assert!(running, "a stale turn must not finish the new log");
+        second.publish("delta", "three");
+        second.finish();
+        // Each log restarts its sequence: a cursor beyond the new log is stale.
+        let (events, running, _) = bus.snapshot("s", 99).expect("finished log");
+        assert!(!running);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "three");
+    }
 }

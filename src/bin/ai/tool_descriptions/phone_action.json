@@ -1,0 +1,40 @@
+{
+  "name": "phone_action",
+  "description": "Perform one action on the user's phone when this turn runs inside the a serve Android app: set an alarm, start a note in the phone's notes app (through the system share sheet), or read the phone's current coarse location. Use this for direct requests such as 'set an alarm for 6 tomorrow' or 'what is the weather here' when the phone's location is needed. Only available in the Android client; other clients return an error. Setting an alarm is silent; a note opens the share sheet and still needs the user to pick an app; location asks for the Android permission on first use.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": ["alarm", "note", "location"],
+        "description": "alarm sets a clock alarm; note opens the phone's share sheet with text; location returns one coarse position."
+      },
+      "hour": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 23,
+        "description": "Alarm hour in 24-hour local time (required for alarm)."
+      },
+      "minute": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 59,
+        "description": "Alarm minute (required for alarm)."
+      },
+      "label": {
+        "type": "string",
+        "description": "Optional alarm label shown by the clock app."
+      },
+      "title": {
+        "type": "string",
+        "description": "Optional note title (note action)."
+      },
+      "text": {
+        "type": "string",
+        "description": "Note body (required for note)."
+      }
+    },
+    "required": ["action"]
+  },
+  "groups": ["phone"]
+}

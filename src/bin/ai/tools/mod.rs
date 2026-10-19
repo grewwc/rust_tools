@@ -6,6 +6,7 @@ mod knowledge_tools;
 pub mod os_tools;
 mod overflow_search;
 mod patch_tools;
+mod phone_tools;
 pub(crate) mod permissions;
 // `App` is `pub(in crate::ai)`, so the plan-state API stays at the same visibility; the
 // driver reaches it through this path instead of duplicating plan persistence.
