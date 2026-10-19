@@ -197,6 +197,11 @@ fn builtin_build_agent_prompt_preserves_end_to_end_behavior_tracing() {
             .prompt
             .contains("Prove behavior, not just compilation")
     );
+    // Analysis-only answers carry the same grounding duty as code changes,
+    // without demoting stable knowledge to inference.
+    assert!(agent.prompt.contains("Ground analysis answers too"));
+    assert!(agent.prompt.contains("or mark it as inference"));
+    assert!(agent.prompt.contains("stable general knowledge and stated derivations need no such tie"));
 }
 
 #[test]

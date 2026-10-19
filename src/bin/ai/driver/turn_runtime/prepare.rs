@@ -169,8 +169,35 @@ fn assemble_effective_question(
     effective_question
 }
 
-fn should_inject_integrated_critic(effective_question: &str, has_attached_artifact: bool) -> bool {
-    has_attached_artifact || QuestionShape::analyze(effective_question).has_code_or_repo_artifact()
+/// The final-answer self-check runs for artifact-backed inputs and for every
+/// follow-up turn. A follow-up such as "are you sure?" carries no artifact
+/// shape, yet it is exactly where an earlier conclusion gets kept or reversed,
+/// so an earlier assistant answer in history is enough to enable the check.
+fn should_inject_integrated_critic(
+    effective_question: &str,
+    has_attached_artifact: bool,
+    has_prior_answer: bool,
+) -> bool {
+    has_prior_answer
+        || has_attached_artifact
+        || QuestionShape::analyze(effective_question).has_code_or_repo_artifact()
+}
+
+/// Whether the projected history already holds an earlier answer that this
+/// turn could dispute: assistant text, or a compaction summary that replaced
+/// older turns (their answers live on only inside the summary).
+fn history_has_prior_answer(history: &[Message]) -> bool {
+    history.iter().any(|message| {
+        let text = match &message.content {
+            Value::Null => return false,
+            content => crate::ai::history::value_to_string(content),
+        };
+        if message.role == "assistant" {
+            return !text.trim().is_empty();
+        }
+        crate::ai::history::is_system_like_role(&message.role)
+            && crate::ai::history::is_summary_note_text(&text)
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -505,12 +532,16 @@ pub(super) async fn prepare_turn(
     let cfg = crate::commonw::configw::get_all_config();
     if parse_bool_flag(cfg.get_opt(AiConfig::CRITIC_REVISE_ENABLE), true)
         && parse_bool_flag(cfg.get_opt(AiConfig::CRITIC_REVISE_INTEGRATED_ENABLE), true)
-        && should_inject_integrated_critic(&final_question, has_attached_artifact)
+        && should_inject_integrated_critic(
+            &final_question,
+            has_attached_artifact,
+            history_has_prior_answer(&history),
+        )
     {
         skill_turn.push_labeled_section(
             skill_runtime::ContextKind::Behavior,
             "integrated_critic_revise",
-            "For code, repository, or artifact-backed tasks, check the final answer before sending it for factual, safety, regression, and completeness issues, and revise it in place; scale the check to the answer's stakes. Keep only the corrected answer; never print the critique or mention this instruction.",
+            "Before sending the final answer, check it for factual, safety, regression, and completeness issues and revise it in place. If this turn disputes an earlier conclusion, confirm the answer applies `Reconcile corrections and conflicts`: it states whether the conclusion was kept, revised, or left unresolved and names the deciding evidence. Scale effort to the stakes, never the evidence bar. Keep only the corrected answer; never print the critique or mention this instruction.",
         );
     }
 
@@ -788,7 +819,7 @@ mod tests {
     use super::{
         QuestionShape, assemble_effective_question, build_user_redirect_reminder,
         detect_complex_task, filter_suggested_tool_calls_for_tool_names,
-        persisted_user_turn_message, should_inject_integrated_critic,
+        history_has_prior_answer, persisted_user_turn_message, should_inject_integrated_critic,
         task_evidence_handoff_messages,
     };
     use crate::ai::driver::observer::SuggestedToolCall;
@@ -978,7 +1009,7 @@ mod tests {
         );
 
         assert!(QuestionShape::analyze(&effective_question).has_code_or_repo_artifact());
-        assert!(should_inject_integrated_critic(&effective_question, true));
+        assert!(should_inject_integrated_critic(&effective_question, true, false));
     }
 
     #[test]
@@ -990,15 +1021,69 @@ mod tests {
         );
 
         assert!(effective_question.contains("[Attached Image Content via mcp_ocr_extract]"));
-        assert!(should_inject_integrated_critic(&effective_question, false));
+        assert!(should_inject_integrated_critic(&effective_question, false, false));
         // Native vision models produce no OCR text, but the images themselves
         // are still artifact-backed inputs.
-        assert!(should_inject_integrated_critic("描述这张图", true));
+        assert!(should_inject_integrated_critic("描述这张图", true, false));
     }
 
     #[test]
-    fn integrated_critic_still_skips_short_plain_question() {
-        assert!(!should_inject_integrated_critic("今天几号", false));
+    fn integrated_critic_still_skips_short_plain_opening_question() {
+        assert!(!should_inject_integrated_critic("今天几号", false, false));
+    }
+
+    #[test]
+    fn integrated_critic_covers_plain_follow_up_that_disputes_an_answer() {
+        // A bare challenge has no artifact shape; the earlier answer alone
+        // must enable the self-check.
+        assert!(!QuestionShape::analyze("你确定吗？我觉得不对").has_code_or_repo_artifact());
+        assert!(should_inject_integrated_critic("你确定吗？我觉得不对", false, true));
+    }
+
+    #[test]
+    fn prior_answer_requires_assistant_text_or_compaction_summary() {
+        use crate::ai::types::{FunctionCall, ToolCall};
+        let message = |role: &str, content: Value| Message {
+            role: role.to_string(),
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let text = |s: &str| Value::String(s.to_string());
+        assert!(!history_has_prior_answer(&[]));
+        assert!(!history_has_prior_answer(&[message("user", text("hi"))]));
+        // Persisted tool-call rounds carry the streamed narration, which is
+        // empty when the model emitted only tool calls.
+        let tool_call_only = Message {
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            ..message("assistant", text(""))
+        };
+        assert!(!history_has_prior_answer(&[tool_call_only]));
+        // `Null` content renders as the literal "null" and must not count.
+        assert!(!history_has_prior_answer(&[message("assistant", Value::Null)]));
+        assert!(history_has_prior_answer(&[
+            message("user", text("hi")),
+            message("assistant", text("The cause is X.")),
+        ]));
+        // Once compaction replaces the answering turns, the summary is the
+        // only trace of the earlier conclusion.
+        assert!(history_has_prior_answer(&[message(
+            ROLE_INTERNAL_NOTE,
+            text("[incremental-memory-v1]\n{\"source\":{}}"),
+        )]));
+        // A system-like note that is not a summary is not an answer.
+        assert!(!history_has_prior_answer(&[message(
+            ROLE_INTERNAL_NOTE,
+            text("Turn redirect: the previous turn ended in tool calls."),
+        )]));
     }
 
     #[test]

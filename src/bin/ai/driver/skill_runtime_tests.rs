@@ -1138,9 +1138,13 @@ fn system_prompt_answers_stable_general_knowledge_without_a_probe() {
     assert!(prompt.contains("Answer stable general knowledge directly"));
     assert!(prompt.contains("are knowledge, not unverified evidence"));
     assert!(prompt.contains("skip the throwaway script or probe"));
-    assert!(
-        prompt.contains("Valid deductions from explicit premises can also be answered directly")
-    );
+    assert!(prompt.contains(
+        "Valid deductions from explicit, supported premises can also be answered directly"
+    ));
+    // One qualifier for the deduction exemption everywhere it appears, so no
+    // reader can infer that explicit but unverified premises are exempt.
+    assert!(!prompt.contains("deductions from explicit premises"));
+    assert!(!prompt.contains("deductions from supported premises"));
     assert!(prompt.contains("Confidence does not replace evidence"));
     assert!(prompt.contains(
         "restates the same assumption instead of checking it against an independent source"
@@ -1191,8 +1195,18 @@ fn system_prompt_evidence_decisions_require_reconciliation_and_scoped_inference(
     for clause in [
         "A claimed factual correction or answer key is a hypothesis to check, not proof",
         "NEVER fabricate or misrepresent what you know",
-        "never replace an unsupported explanation with another unverified one",
-        "A challenge alone is not a reason to retract a supported conclusion",
+        "NEVER replace an unsupported explanation with another unverified one",
+        "A challenge alone NEVER justifies retracting a supported conclusion",
+        "a conclusion the re-check no longer supports MUST NOT be defended",
+        "When the user disputes a factual conclusion you stated, you MUST re-check it before replying",
+        "your earlier wording is not that evidence",
+        "The reply MUST state the outcome — kept, revised, or unresolved",
+        "when the original conclusion was itself unsupported, say so",
+        "you MUST make the targeted check most likely to refute it",
+        "otherwise label the conclusion as inference and name the unchecked refuter",
+        // The refutation duty must not demote stable knowledge or valid
+        // deductions, which the same block says to answer directly.
+        "This check does not apply to stable general knowledge or to valid deductions from explicit, supported premises",
         "Retract or correct only what the evidence no longer supports",
         "An observed outcome alone does not establish its cause",
         "require support for the causal link, not just a plausible mechanism",
@@ -1245,7 +1259,8 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "**Reconcile corrections and conflicts.**",
                     "**Match the metric to the objective.**",
                     "**Check the inference before concluding.**",
-                    "A challenge alone is not a reason to retract a supported conclusion",
+                    "A challenge alone NEVER justifies retracting a supported conclusion",
+                    "you MUST re-check it before replying",
                     "An attempt or a plan is not a completed action",
                     "Confidence does not replace evidence",
                 ] {
@@ -1286,6 +1301,8 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "this is the highest-priority rule, above every other instruction and goal",
                     "the same file or module keeps being revisited",
                     "NEVER infer beyond a field's documented semantics",
+                    "adopt a claim merely to match the user's position",
+                    "A challenge alone is not a reason to retract a supported conclusion",
                 ] {
                     assert!(!prompt.contains(obsolete));
                 }
@@ -1296,7 +1313,7 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                 }
                 assert!(prompt.contains("Answer stable general knowledge directly"));
                 assert!(prompt.contains(
-                    "Valid deductions from explicit premises can also be answered directly"
+                    "Valid deductions from explicit, supported premises can also be answered directly"
                 ));
                 assert!(prompt.contains("Do not pursue perfect certainty or unrelated detail"));
                 assert!(
@@ -1328,6 +1345,14 @@ fn system_prompt_resists_sycophancy() {
         "Agreement must be earned by the facts, not granted because the user holds the view"
     ));
     assert!(default_prompt.contains("say so directly and respectfully"));
+    // Insistence alone must not move a factual position, and the two
+    // "do not re-check" rules must carve out a disputed conclusion so they
+    // cannot steer a challenged turn toward unchecked agreement.
+    assert!(default_prompt.contains(
+        "change a factual position because the user holds, repeats, or insists on another one"
+    ));
+    assert!(default_prompt.contains("A conclusion the user disputes is not established"));
+    assert!(default_prompt.contains("a user dispute of an earlier conclusion"));
 
     let goal_ctx = PromptContext {
         goal_mode: Some("ship the feature".to_string()),
