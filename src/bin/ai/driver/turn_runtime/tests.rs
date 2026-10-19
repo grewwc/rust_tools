@@ -657,6 +657,62 @@ fn coarse_execute_command_signature_keeps_git_global_option_before_subcommand() 
 }
 
 #[test]
+fn coarse_execute_command_signature_keeps_git_inspection_pathspecs() {
+    let first = coarse_execute_command_signature(
+        "git diff --stat -- src/conciliator/services/aeolus.py",
+    );
+    let same_target = coarse_execute_command_signature(
+        "git status --short -- src/conciliator/services/aeolus.py",
+    );
+    let second = coarse_execute_command_signature(
+        "git diff --stat -- src/conciliator/services/meego_bot.py",
+    );
+    let bare_path = coarse_execute_command_signature("git diff -- README.md");
+
+    assert_eq!(first, "git:inspect:src/conciliator/services/aeolus.py");
+    assert_eq!(first, same_target);
+    assert_ne!(first, second);
+    assert_eq!(bare_path, "git:inspect:README.md");
+}
+
+#[test]
+fn distinct_git_diff_pathspecs_do_not_trigger_coarse_loop() {
+    let mut supervisor = TurnSupervisor::default();
+    let mut messages = Vec::new();
+
+    for i in 0..TOOL_LOOP_COARSE_HARD_WINDOW {
+        let command = format!("git diff -- src/conciliator/services/service_{i}.py");
+        pb_execute_command_round(&mut messages, &command, &format!("git-distinct-{i}"));
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert!(
+            matches!(signal, ToolLoopSignal::None),
+            "distinct Git pathspec at round {} must not look like a loop: {signal:?}",
+            i + 1
+        );
+    }
+}
+
+#[test]
+fn repeated_git_inspection_of_same_path_still_triggers_coarse_hard_stop() {
+    let mut supervisor = TurnSupervisor::default();
+    let mut messages = Vec::new();
+    let path = "src/conciliator/services/aeolus.py";
+
+    for i in 0..TOOL_LOOP_COARSE_HARD_WINDOW {
+        let command = format!("git diff --unified={i} -- {path}");
+        pb_execute_command_round(&mut messages, &command, &format!("git-repeat-{i}"));
+        let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        if i + 1 == TOOL_LOOP_COARSE_WINDOW {
+            assert!(matches!(signal, ToolLoopSignal::Coarse));
+        } else if i + 1 == TOOL_LOOP_COARSE_HARD_WINDOW {
+            assert!(matches!(signal, ToolLoopSignal::CoarseHard));
+        } else {
+            assert!(matches!(signal, ToolLoopSignal::None));
+        }
+    }
+}
+
+#[test]
 fn turn_supervisor_emits_coarse_signal_for_same_file_paging() {
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();

@@ -29,11 +29,10 @@ pub(super) fn extract_round_tool_signatures(
     extract_round_tool_signatures_inner(messages, false)
 }
 
-/// 提取「粗粒度」签名：剥离 offset/limit/page 等易变翻页参数后再归一化。
-/// 用于抓字节精确检测漏掉的同文件翻页 / 仅微调分页参数的重复检索。
-/// 对 `execute_command` 额外折叠 shell 中的低收益变体（如 `| head -20/-30`、
-/// `2>/dev/null`、`ls -la/-lt` 的细微差异，以及 git log/show/diff 取证视角的
-/// 轻微切换），让同目标资源的反复试探能命中。
+/// Extract a coarse signature after stripping volatile paging arguments such as
+/// offset, limit, and page. This catches repeated probing of the same resource
+/// despite small shell-window or Git inspection-view changes, while preserving
+/// target identity such as file paths and Git pathspecs.
 pub(super) fn extract_round_tool_signatures_coarse(
     messages: &[crate::ai::history::Message],
 ) -> Option<Vec<String>> {
@@ -365,15 +364,13 @@ pub(super) fn normalize_git_segment(tokens: &[String]) -> String {
     };
 
     let subcommand = tokens[subcommand_idx].to_ascii_lowercase();
-    // 对「为什么有两个 commit / 这两个 commit 差什么 / 当前分支状态如何」这类
-    // git 取证问题，模型常在 log/show/diff/status/reflog 之间来回切视角，命令
-    // 字面不同但语义上仍在围绕同一份证据打转。coarse 模式将其折叠成同一簇。
-    if matches!(
+    // Keep Git evidence views in one coarse family so switching among log/show/diff
+    // cannot evade loop detection. Pathspecs remain part of the target: inspecting
+    // different files is real breadth, not repeated probing of one resource.
+    let is_inspection = matches!(
         subcommand.as_str(),
         "log" | "show" | "diff" | "diff-tree" | "reflog" | "status"
-    ) {
-        return "git:inspect".to_string();
-    }
+    );
 
     let mut paths = Vec::new();
     let mut revs = Vec::new();
@@ -397,7 +394,7 @@ pub(super) fn normalize_git_segment(tokens: &[String]) -> String {
             }
             continue;
         }
-        if looks_like_path_token(token) {
+        if after_double_dash || looks_like_path_token(token) {
             paths.push(normalize_path_like_token(token));
             continue;
         }
@@ -409,6 +406,13 @@ pub(super) fn normalize_git_segment(tokens: &[String]) -> String {
     paths.dedup();
     revs.sort();
     revs.dedup();
+    if is_inspection {
+        return if paths.is_empty() {
+            "git:inspect".to_string()
+        } else {
+            format!("git:inspect:{}", paths.join(","))
+        };
+    }
     if !paths.is_empty() && !revs.is_empty() {
         format!("git:{subcommand}:{}#{}", revs.join(","), paths.join(","))
     } else if !paths.is_empty() {
