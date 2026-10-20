@@ -447,6 +447,49 @@ fn llm_prune_marks_round_trip_and_clear_on_history_truncate() {
 }
 
 #[test]
+fn prompt_residency_clears_when_truncation_removes_turns() {
+    let dir = std::env::temp_dir().join(format!(
+        "prompt_residency_truncate_{}_{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.sqlite");
+    append_history_sqlite(
+        &path,
+        vec![
+            msg("user", "first"),
+            msg("assistant", "one"),
+            msg("user", "second"),
+            msg("assistant", "two"),
+        ],
+    )
+    .unwrap();
+    let residency = outcomes::PromptResidency {
+        scoped_instruction_dirs: vec![PathBuf::from("/tmp/project/src")],
+        session_context_guidance: true,
+    };
+    let write = || write_prompt_residency_sqlite(&path, &residency).unwrap();
+
+    // Keeping every message removes nothing, so the residency still applies.
+    write();
+    truncate_messages_sqlite(&path, 4).unwrap();
+    assert_eq!(read_prompt_residency_sqlite(&path).unwrap(), Some(residency.clone()));
+
+    truncate_messages_to_user_turns_sqlite(&path, 1).unwrap();
+    assert_eq!(read_prompt_residency_sqlite(&path).unwrap(), None);
+
+    write();
+    truncate_messages_sqlite(&path, 1).unwrap();
+    assert_eq!(read_prompt_residency_sqlite(&path).unwrap(), None);
+
+    write();
+    truncate_messages_sqlite(&path, 0).unwrap();
+    assert_eq!(read_prompt_residency_sqlite(&path).unwrap(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn stale_patch_targets_survive_history_replacement_and_clear_with_session() {
     let dir = std::env::temp_dir().join(format!(
         "stale_patch_meta_test_{}_{}",

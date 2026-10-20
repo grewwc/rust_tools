@@ -108,7 +108,7 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-// `task` / `task_spawn` / `task_spawn_batch` / `task_wait` / `task_status`
+// `task` / `task_spawn` / `task_wait` / `task_status`
 // may all carry the only visible result of a subagent: the spawn-family arguments (subagent
 // prompt / response schema) and return values (the task_id list) are required inputs for the
 // later wait/status/integrate calls; once a result is lossy-compressed or LLM-pruned, the main
@@ -137,26 +137,8 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-inventory::submit!(ToolRegistration {
-    spec: ToolSpec {
-        name: "task_spawn_batch",
-        description: "",
-
-        execute: execute_task_spawn_batch,
-    }
-});
-
 inventory::submit!(ToolHistoryPolicyRegistration {
     name: "task_spawn",
-    policy: ToolHistoryPolicy {
-        lossy_compress: ToolLossyCompressPolicy::Never,
-        prune: ToolPrunePolicy::AfterIntegration,
-        counts_toward_precision_inline_budget: false,
-    },
-});
-
-inventory::submit!(ToolHistoryPolicyRegistration {
-    name: "task_spawn_batch",
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
         prune: ToolPrunePolicy::AfterIntegration,
@@ -465,33 +447,16 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
 }
 pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
     ensure_top_level_task_orchestration("task_spawn")?;
-    let prepared = prepare_subagent_task(args)?;
-    let spawned = spawn_subagent_kernel_task(&prepared)?;
-    record_last_spawn_batch(vec![spawned.task_id.clone()]);
-    record_subagent_spawn_audit(&spawned.task_id, &prepared);
-
-    Ok(format!(
-        "Task spawned: task_id={}, pid={}, agent={}, model={}, inherit={}\nContinue independent parent-side work now. Do not call task_wait immediately unless the parent is blocked on this result; use task_status for a non-blocking snapshot.",
-        spawned.task_id,
-        spawned.pid,
-        prepared.agent_name,
-        prepared.model,
-        prepared.inherit.describe()
-    ))
-}
-
-pub(crate) fn execute_task_spawn_batch(args: &Value) -> Result<String, String> {
-    ensure_top_level_task_orchestration("task_spawn_batch")?;
     let tasks = args
         .get("tasks")
         .and_then(Value::as_array)
-        .ok_or_else(|| "task_spawn_batch requires a 'tasks' array".to_string())?;
+        .ok_or_else(|| "task_spawn requires a 'tasks' array".to_string())?;
     if tasks.is_empty() {
-        return Err("task_spawn_batch requires at least one task".to_string());
+        return Err("task_spawn requires at least one task".to_string());
     }
     if tasks.len() > MAX_SUBAGENT_SPAWN_BATCH_SIZE {
         return Err(format!(
-            "task_spawn_batch accepts at most {MAX_SUBAGENT_SPAWN_BATCH_SIZE} tasks per call"
+            "task_spawn accepts at most {MAX_SUBAGENT_SPAWN_BATCH_SIZE} tasks per call"
         ));
     }
 
@@ -502,7 +467,7 @@ pub(crate) fn execute_task_spawn_batch(args: &Value) -> Result<String, String> {
         .enumerate()
         .map(|(index, task)| {
             prepare_subagent_task(task)
-                .map_err(|error| format!("task_spawn_batch tasks[{index}]: {error}"))
+                .map_err(|error| format!("task_spawn tasks[{index}]: {error}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -538,6 +503,17 @@ pub(crate) fn execute_task_spawn_batch(args: &Value) -> Result<String, String> {
     if !spawned_ids.is_empty() {
         record_last_spawn_batch(spawned_ids);
     }
+    if spawned_count == 0 {
+        let details = entries
+            .iter()
+            .filter_map(|entry| entry.get("error").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "task_spawn failed to spawn all {} task(s): {details}",
+            entries.len()
+        ));
+    }
 
     Ok(serde_json::to_string_pretty(&serde_json::json!({
         "spawned": spawned_count,
@@ -545,5 +521,5 @@ pub(crate) fn execute_task_spawn_batch(args: &Value) -> Result<String, String> {
         "tasks": entries,
         "next": "Continue independent parent-side work; use task_status for snapshots and task_wait only when blocked on results."
     }))
-    .expect("serializing task_spawn_batch result cannot fail"))
+    .expect("serializing task_spawn result cannot fail"))
 }

@@ -6,7 +6,7 @@
     "properties": {
       "task_id": {
         "type": "string",
-        "description": "Exact task_id returned by task/task_spawn/task_spawn_batch or listed by task_audit. Delivered lookup preserves the ID verbatim."
+        "description": "Exact task_id returned by task/task_spawn or listed by task_audit. Delivered lookup preserves the ID verbatim."
       },
       "source": {
         "type": "string",

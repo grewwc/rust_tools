@@ -90,6 +90,7 @@ struct PopupLayoutConfig {
     top_rule_lines: u16,
     help_lines: u16,
     model_header_lines: u16,
+    topic_lines: u16,
     min_textarea_lines: u16,
 }
 
@@ -116,6 +117,15 @@ fn popup_layout_config(
     } else {
         1
     };
+    // The session title gets its own row below the identity line. A long
+    // title used to share the identity row and stretch it to the terminal
+    // edge, folding the whole chrome on narrowing; on its own row it is
+    // truncated against the same edge margin instead.
+    let topic_lines = if has_completion_panel || !has_model_label {
+        0
+    } else {
+        1
+    };
     let min_textarea_lines = if has_completion_panel {
         1
     } else {
@@ -127,6 +137,7 @@ fn popup_layout_config(
         top_rule_lines,
         help_lines,
         model_header_lines,
+        topic_lines,
         min_textarea_lines,
     }
 }
@@ -134,7 +145,7 @@ fn popup_layout_config(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PopupGeometry {
     popup: Rect,
-    chunks: [Rect; 5],
+    chunks: [Rect; 6],
     /// Content area inside the input box border (chunks[1] inset by one cell on
     /// every side); the textarea widget renders here.
     textarea_inner: Rect,
@@ -178,6 +189,7 @@ fn popup_geometry(
                 .saturating_sub(layout.top_rule_lines)
                 .saturating_sub(layout.help_lines)
                 .saturating_sub(layout.model_header_lines)
+                .saturating_sub(layout.topic_lines)
                 .saturating_sub(layout.min_textarea_lines);
             let panel = desired_panel.min(panel_cap).max(1.min(panel_cap));
             let textarea = inner
@@ -185,6 +197,7 @@ fn popup_geometry(
                 .saturating_sub(layout.top_rule_lines)
                 .saturating_sub(panel)
                 .saturating_sub(layout.model_header_lines)
+                .saturating_sub(layout.topic_lines)
                 .saturating_sub(layout.help_lines)
                 .max(layout.min_textarea_lines);
             (textarea, panel)
@@ -194,6 +207,7 @@ fn popup_geometry(
                 .height
                 .saturating_sub(layout.top_rule_lines)
                 .saturating_sub(layout.model_header_lines)
+                .saturating_sub(layout.topic_lines)
                 .saturating_sub(layout.help_lines)
                 .max(layout.min_textarea_lines);
             (textarea, 0)
@@ -209,6 +223,7 @@ fn popup_geometry(
             Constraint::Length(textarea_lines),
             Constraint::Length(panel_lines),
             Constraint::Length(layout.model_header_lines),
+            Constraint::Length(layout.topic_lines),
             Constraint::Length(layout.help_lines),
         ])
         .split(inner);
@@ -229,7 +244,9 @@ fn popup_geometry(
 
     PopupGeometry {
         popup,
-        chunks: [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]],
+        chunks: [
+            chunks[0], chunks[1], chunks[2], chunks[3], chunks[4], chunks[5],
+        ],
         textarea_inner,
     }
 }
@@ -361,12 +378,14 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
     // Clear the popup area so old borders/text do not linger after a resize
     f.render_widget(Clear, popup);
 
-    // Bottom agent/model/topic info line: lets the user see the current agent, model and session topic while typing.
-    // Draw it in the dedicated bottom chunk (chunks[3], above the help line) so
+    // Bottom agent/model identity line: lets the user see the current agent,
+    // model and checkpoint while typing. The session topic lives on its own
+    // row below so a long title cannot stretch this row to the terminal edge.
+    // Draw it in the dedicated chunk (chunks[3], above the title row) so
     // textarea growth does not move it through the editing region.
     if chunks[3].height > 0 {
         let header_area = chunks[3];
-        // Compact identity line: " model (agent; reasoning)|topic". The verbose
+        // Compact identity line: " model (agent; reasoning)|checkpoint". The verbose
         // "agent:/model:/reasoning:" labels cost ~20 columns and fold the
         // viewport on narrow terminals, so only the values are painted.
         let mut spans = Vec::new();
@@ -436,21 +455,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        // Show the session topic on the same line as the model
-        let topic_text = match session_topic {
-            Some(t) if !t.is_empty() => t,
-            _ => "new session",
-        };
-        spans.push(Span::styled(
-            "|",
-            Style::default().fg(Color::Rgb(100, 116, 139)),
-        ));
-        spans.push(Span::styled(
-            topic_text,
-            Style::default()
-                .fg(Color::Rgb(251, 191, 36))
-                .add_modifier(Modifier::ITALIC),
-        ));
         let header = Line::from(spans);
         // Hold back the edge margin so a stale-width paint through a
         // one-column narrowing can never reach the last terminal column and
@@ -460,6 +464,33 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
             .saturating_sub(CHROME_EDGE_MARGIN as usize);
         let truncated_header = truncate_line_to_width(&header, max_width);
         f.render_widget(Paragraph::new(truncated_header), header_area);
+    }
+
+    // Session title on its own row (chunks[4], between the identity line and
+    // the help line). Truncated against the same edge margin as the other
+    // chrome rows so it can never reach the last terminal column and fold.
+    if chunks[4].height > 0 {
+        let topic_text = match session_topic {
+            Some(t) if !t.is_empty() => t,
+            _ => "new session",
+        };
+        // Same one-cell left indent as the identity/help rows above and below.
+        let title = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                topic_text,
+                Style::default()
+                    .fg(Color::Rgb(251, 191, 36))
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]);
+        let max_width = (chunks[4].width as usize)
+            .min(MODEL_LINE_MAX_COLUMNS as usize)
+            .saturating_sub(CHROME_EDGE_MARGIN as usize);
+        f.render_widget(
+            Paragraph::new(truncate_line_to_width(&title, max_width)),
+            chunks[4],
+        );
     }
 
     let char_count = current_content.chars().count();
@@ -634,7 +665,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
             spans
         })]
     };
-    let help_area = chunks[4];
+    let help_area = chunks[5];
     let truncated_help_lines = help_lines
         .into_iter()
         // Same edge margin as the model line: the help row is equally able to
@@ -649,7 +680,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
     f.render_widget(Paragraph::new(truncated_help_lines), help_area);
 
     if let Some(msg) = status_msg {
-        let c2 = chunks[4];
+        let c2 = chunks[5];
         if c2.height >= 1 && c2.width > 0 {
             let clear_area = Rect::new(c2.x, c2.y, c2.width, 1);
             f.render_widget(Clear, clear_area);
@@ -1009,6 +1040,7 @@ mod tests {
         assert_eq!(layout.top_rule_lines, 0);
         assert_eq!(layout.help_lines, 1);
         assert_eq!(layout.model_header_lines, 1);
+        assert_eq!(layout.topic_lines, 1);
         assert_eq!(layout.min_textarea_lines, 1);
     }
 
@@ -1020,6 +1052,7 @@ mod tests {
         assert_eq!(layout.top_rule_lines, 0);
         assert_eq!(layout.help_lines, 1);
         assert_eq!(layout.model_header_lines, 1);
+        assert_eq!(layout.topic_lines, 1);
         assert_eq!(layout.min_textarea_lines, 1);
     }
 
@@ -1030,6 +1063,7 @@ mod tests {
         assert_eq!(layout.top_rule_lines, 0);
         assert_eq!(layout.help_lines, 1);
         assert_eq!(layout.model_header_lines, 0);
+        assert_eq!(layout.topic_lines, 0);
         assert_eq!(layout.min_textarea_lines, 1);
     }
 
@@ -1069,8 +1103,9 @@ mod tests {
             .clamp(40, 180)
             .min(viewport_area.width);
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
-        // The model line is the row above the help row, which is the viewport tail.
-        let model_row_y = viewport_area.bottom() - 2;
+        // The identity row sits above the title row, two rows above the help
+        // row, which is the viewport tail.
+        let model_row_y = viewport_area.bottom() - 3;
         let row = buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
         // The reflow budget counts terminal columns, not bytes: U+2026 is
         // East-Asian-ambiguous, so width_cjk charges it two columns even though
@@ -1094,11 +1129,11 @@ mod tests {
         );
     }
 
-    /// The session title is the trailing field of the model line and the only
-    /// one that can exceed the reflow budget. A hard cut leaves a partial CJK
-    /// phrase that reads as a typo, so the row has to end with the marker.
+    /// The session title has its own row and the only chrome field that can
+    /// exceed the reflow budget. A hard cut leaves a partial CJK phrase that
+    /// reads as a typo, so the row has to end with the marker.
     #[test]
-    fn model_line_marks_a_truncated_topic_with_an_ellipsis() {
+    fn title_row_marks_a_truncated_topic_with_an_ellipsis() {
         let mut terminal = Terminal::with_options(
             TestBackend::new(200, 12),
             TerminalOptions {
@@ -1107,10 +1142,11 @@ mod tests {
         )
         .unwrap();
         let mut textarea = TextArea::default();
-        // 44 full-width characters = 88 columns, past the 81 columns the
-        // 118-column budget leaves for the topic (35-column prefix, two
-        // columns for the marker and two held back for the edge margin).
-        let topic = "这是一个用于验证超长会话标题在模型行中被截断并标记省略号的测试再加十三个汉字把长度凑够用";
+        // 88 full-width characters = 176 columns, past the 118-column title
+        // budget (120-column cap minus the two-column edge margin). The title
+        // row holds the topic alone now, with no identity prefix.
+        let short = "这是一个用于验证超长会话标题在模型行中被截断并标记省略号的测试再加十三个汉字把长度凑够用";
+        let topic = format!("{short}{short}");
         let mut viewport_area = Rect::ZERO;
 
         terminal
@@ -1125,29 +1161,53 @@ mod tests {
                     "deepseek-v4.1-flash-volcano",
                     false,
                     "max",
-                    Some(topic),
+                    Some(&topic),
                 );
             })
             .unwrap();
 
-        // The model line is the row above the help row, which is the viewport tail.
-        let model_row_y = viewport_area.bottom() - 2;
-        let row = buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
+        // The title row sits above the help row, which is the viewport tail.
+        let title_row_y = viewport_area.bottom() - 2;
+        let title_row =
+            buffer_row(terminal.backend(), title_row_y, 0, viewport_area.width);
         // Cells holding a wide character exist per column, so compare the row
         // with its whitespace removed instead of as a contiguous substring.
-        let dense: String = row.chars().filter(|ch| !ch.is_whitespace()).collect();
-        assert!(row.contains('…'), "truncated topic without a marker: {row:?}");
-        // 40 full-width characters (80 columns) fit after the 35-column prefix;
-        // the two-column marker ends the row at 117 of the 118 columns. A 41st
-        // character would overflow the 116-column text budget.
-        let cut_at = topic.char_indices().nth(40).unwrap().0;
+        let dense: String =
+            title_row.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert!(
-            dense.ends_with(&format!("|{}…", &topic[..cut_at])),
-            "{row:?}"
+            title_row.contains('…'),
+            "truncated title without a marker: {title_row:?}"
+        );
+        let painted = display_width(title_row.trim_end());
+        assert!(
+            painted as u16 + CHROME_EDGE_MARGIN <= viewport_area.width,
+            "title row reaches the terminal edge: painted={painted} {title_row:?}"
+        );
+        let head: String = short.chars().take(20).collect();
+        assert!(
+            dense.contains(&head),
+            "title row drops the topic head: {title_row:?}"
+        );
+        // 116-column text budget holds 58 wide chars plus the marker; the
+        // whitespace-filtered row must end there, not at the topic end. (The
+        // tail of the first copy repeats mid-row, so absence is unassertable.)
+        assert_eq!(
+            dense.chars().count(),
+            58 + 1,
+            "title row paints past its budget: {title_row:?}"
+        );
+        // The identity row keeps only model/agent info: no topic, no marker.
+        let model_row_y = viewport_area.bottom() - 3;
+        let model_row =
+            buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
+        assert!(model_row.contains("(max)"), "{model_row:?}");
+        assert!(
+            !model_row.contains(&head),
+            "topic leaks into the identity row: {model_row:?}"
         );
         assert!(
-            !dense.contains("凑够用"),
-            "model line paints past its budget: {row:?}"
+            !model_row.contains('…'),
+            "short identity row needs no marker: {model_row:?}"
         );
     }
 
@@ -1183,14 +1243,25 @@ mod tests {
             })
             .unwrap();
 
-        // The model line is the row above the help row, which is the viewport tail.
-        let model_row_y = viewport_area.bottom() - 2;
-        let row = buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
-        let dense: String = row.chars().filter(|ch| !ch.is_whitespace()).collect();
-        assert!(dense.ends_with(&format!("|{topic}")), "{row:?}");
+        // The title row sits above the help row, which is the viewport tail.
+        let title_row_y = viewport_area.bottom() - 2;
+        let title_row =
+            buffer_row(terminal.backend(), title_row_y, 0, viewport_area.width);
+        let dense: String =
+            title_row.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert_eq!(dense, topic, "{title_row:?}");
         assert!(
-            !dense.contains('…'),
-            "title fits the budget, no marker expected: {row:?}"
+            !title_row.contains('…'),
+            "title fits the budget, no marker expected: {title_row:?}"
+        );
+        // The identity row above it carries the model info, not the topic.
+        let model_row_y = viewport_area.bottom() - 3;
+        let model_row =
+            buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
+        assert!(model_row.contains("deepseek-v4.1-flash-volcano"), "{model_row:?}");
+        assert!(
+            !model_row.contains(topic),
+            "topic leaks into the identity row: {model_row:?}"
         );
     }
 
@@ -1225,18 +1296,30 @@ mod tests {
             })
             .unwrap();
 
-        let model_row_y = viewport_area.bottom() - 2;
+        // The identity row keeps agent/reasoning/checkpoint; the topic moved
+        // to its own row below.
+        let model_row_y = viewport_area.bottom() - 3;
         let row = buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
         let dense: String = row.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert!(
-            dense.contains("(Sharp;Low)|main@next_1|LeetCode第一题"),
+            dense.contains("(Sharp;Low)|main@next_1"),
             "{row:?}"
         );
+        assert!(
+            !dense.contains("LeetCode第一题"),
+            "topic leaks into the identity row: {row:?}"
+        );
+        let title_row_y = viewport_area.bottom() - 2;
+        let title_row =
+            buffer_row(terminal.backend(), title_row_y, 0, viewport_area.width);
+        let title_dense: String =
+            title_row.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert_eq!(title_dense, "LeetCode第一题", "{title_row:?}");
     }
 
     /// Chrome rows hold an edge margin on narrow terminals: below ~42 columns
     /// the popup spans the full terminal width, so without the margin the
-    /// model line would paint into the last column and a single ignored
+    /// title row would paint into the last column and a single ignored
     /// one-column narrowing would soft-wrap it into a folded second visual
     /// row, re-anchoring the viewport one row lower per cycle.
     #[test]
@@ -1269,8 +1352,15 @@ mod tests {
             })
             .unwrap();
 
-        // The model line is the row above the help row, which is the viewport tail.
+        // The identity row sits two rows above the help row (title row in
+        // between); the title row is the one carrying the long topic here.
         let model_row = buffer_row(
+            terminal.backend(),
+            viewport_area.bottom() - 3,
+            0,
+            viewport_area.width,
+        );
+        let title_row = buffer_row(
             terminal.backend(),
             viewport_area.bottom() - 2,
             0,
@@ -1294,9 +1384,38 @@ mod tests {
         let model_painted = UnicodeWidthStr::width(model_row.trim_end());
         assert!(
             model_painted as u16 + CHROME_EDGE_MARGIN <= viewport_area.width,
-            "model line touches the edge and would fold on narrowing: painted={model_painted} width={} {model_row:?}",
+            "identity row touches the edge and would fold on narrowing: painted={model_painted} width={} {model_row:?}",
             viewport_area.width,
         );
+        // The title row carries CJK, whose continuation cells read back as
+        // spaces, so display-column math cannot measure it. Assert on content
+        // chars instead: 17 wide chars fit the 34-column text budget, plus
+        // the marker. The edge margin is checked cell by cell below.
+        let title_dense: String =
+            title_row.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let title_head: String = topic.chars().take(10).collect();
+        assert!(
+            title_dense.contains(&title_head),
+            "title row drops the topic head: {title_row:?}"
+        );
+        assert!(
+            title_dense.chars().count() <= 19,
+            "title row paints past its budget: {title_row:?}"
+        );
+        assert!(
+            title_row.contains('…'),
+            "long title is still truncated, not dropped: {title_row:?}"
+        );
+        // Edge margin, checked directly: the last two terminal columns stay
+        // blank so a one-column narrowing cannot soft-wrap this row.
+        let title_y = viewport_area.bottom() - 2;
+        for x in (viewport_area.width - 2)..viewport_area.width {
+            assert_eq!(
+                terminal.backend().buffer().cell((x, title_y)).map(|c| c.symbol()),
+                Some(" "),
+                "title row touches the last column: x={x} {title_row:?}"
+            );
+        }
         // The help row carries CJK, and joining backend cells overcounts every
         // CJK by one column against the renderer's own accounting, so a tight
         // bound is unmeasurable here. Keep the repo's loose overflow guard
@@ -1313,15 +1432,11 @@ mod tests {
             "help line overflows the terminal width: painted={help_painted} width={} {help_row:?}",
             viewport_area.width,
         );
-        assert!(
-            model_row.contains('…'),
-            "long topic is still truncated, not dropped: {model_row:?}"
-        );
     }
 
     #[test]
     fn textarea_row_range_marks_the_wrapping_rows() {
-        // Empty-input production shape: 3 textarea rows plus model/help chrome.
+        // Empty-input production shape: 2 textarea rows plus model/title/help chrome.
         let lines = vec![String::new()];
         let (start, len) = textarea_row_range(5, &lines, None, false, true);
         assert!(len >= 1, "empty input still reserves textarea rows");
@@ -1369,15 +1484,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(stale_frame_area.width, 120);
-        let model_y = stale_frame_area.bottom() - 2;
-        let live_row = buffer_row(terminal.backend(), model_y, 0, 40);
-        let stale_tail = buffer_row(terminal.backend(), model_y, 40, 80);
-        let painted = UnicodeWidthStr::width(live_row.trim_end());
+        // The title has its own row now: it sits above the help row, which is
+        // the stale frame tail.
+        let title_y = stale_frame_area.bottom() - 2;
+        let live_row = buffer_row(terminal.backend(), title_y, 0, 40);
+        let stale_tail = buffer_row(terminal.backend(), title_y, 40, 80);
         assert!(live_row.contains('…'), "title was not truncated: {live_row:?}");
+        // Continuation cells read back as spaces, so count content chars:
+        // 17 wide chars fit the 34-column live budget, plus the marker.
+        let live_dense: String =
+            live_row.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert!(
-            painted as u16 + CHROME_EDGE_MARGIN <= 40,
-            "title reaches the live terminal edge: painted={painted} {live_row:?}",
+            live_dense.chars().count() <= 19,
+            "title paints past its live budget: {live_row:?}"
         );
+        // The live edge itself stays blank: the last two columns of the
+        // 40-column frame carry no ink.
+        for x in 38..40u16 {
+            assert_eq!(
+                terminal.backend().buffer().cell((x, title_y)).map(|c| c.symbol()),
+                Some(" "),
+                "title reaches the live terminal edge: x={x} {live_row:?}"
+            );
+        }
         assert!(
             stale_tail.trim().is_empty(),
             "the stale viewport width was painted: {stale_tail:?}",
@@ -1792,8 +1921,9 @@ mod tests {
             })
             .unwrap();
 
-        // The model line is the row above the help row, which is the viewport tail.
-        let model_row_y = viewport_area.bottom() - 2;
+        // The identity row sits above the title row, two rows above the help
+        // row, which is the viewport tail.
+        let model_row_y = viewport_area.bottom() - 3;
         let row = buffer_row(
             terminal.backend(),
             model_row_y,

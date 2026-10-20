@@ -397,7 +397,6 @@ fn folded_prune_protects_plan_task_unknown_and_mixed_groups_past_preview_cutoff(
         "plan",
         "plan_update",
         "task_spawn",
-        "task_spawn_batch",
         "task_retry",
         "unregistered_future_tool",
         "multi_tool_use.parallel",

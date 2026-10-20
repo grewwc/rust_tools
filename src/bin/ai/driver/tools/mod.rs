@@ -182,6 +182,12 @@ fn prepare_tool_call(
     tool_call: &ToolCall,
     allowed_tool_names: Option<&FastSet<String>>,
 ) -> Result<PreparedToolCall, ToolResult> {
+    if tool_call.function.name == crate::ai::types::INVALID_TOOL_CALL_NAME {
+        return Err(ToolResult {
+            tool_call_id: tool_call.id.clone(),
+            content: "Error: the model emitted a malformed tool name; the call was not executed. Retry with exactly one name from the current tool schema.".to_string(),
+        });
+    }
     if let Some(allowed_tool_names) = allowed_tool_names
         && !allowed_tool_names.contains(&tool_call.function.name)
     {
@@ -604,6 +610,13 @@ fn remediation_hint(
         // compression folded the plan-creation turns.
         return Some(
             "Suggestion: reuse an existing step number from the plan listed in the error, or call `plan` again to create a new step list. Plan state persists at plan-state.json in the session assets and survives context compression."
+                .to_string(),
+        );
+    }
+
+    if tool_name == "command_session" && err_lower.contains("unknown command session") {
+        return Some(
+            "Suggestion: reuse a session id printed by `execute_command` as `[session ...]` in this agent session. Ids disappear after the process exits or is closed; start the command again if the session is gone."
                 .to_string(),
         );
     }

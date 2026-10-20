@@ -399,6 +399,29 @@ pub(crate) struct FunctionCall {
     pub(crate) arguments: String,
 }
 
+/// Reserved name used when a provider emits a function name that cannot be
+/// displayed or persisted safely. Collapsing every malformed name to one value
+/// also lets the existing repeated-tool-call guard converge.
+pub(crate) const INVALID_TOOL_CALL_NAME: &str = "__invalid_tool_call_name__";
+
+/// Function names are model-visible protocol identifiers, not arbitrary text.
+/// Keep the accepted alphabet broad enough for namespaced MCP tools while
+/// excluding whitespace, markup, quotes, and unbounded transcript fragments.
+pub(crate) fn normalize_tool_call_name(name: &str) -> &str {
+    const MAX_TOOL_CALL_NAME_BYTES: usize = 128;
+
+    if !name.is_empty()
+        && name.len() <= MAX_TOOL_CALL_NAME_BYTES
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/')
+        })
+    {
+        name
+    } else {
+        INVALID_TOOL_CALL_NAME
+    }
+}
+
 /// The output produced after executing a tool call,
 /// linking back to the original call ID with the result content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -570,7 +593,7 @@ pub(super) struct FileParseResult {
 mod tests {
     use std::{path::Path, sync::Arc};
 
-    use super::PendingSkillContinuation;
+    use super::{INVALID_TOOL_CALL_NAME, PendingSkillContinuation, normalize_tool_call_name};
     use crate::ai::{
         driver::observer::TurnObserver,
         middleware::{RequestMiddleware, ToolMiddleware, test_util::test_app},
@@ -595,6 +618,27 @@ mod tests {
     }
 
     struct PassthroughRequestMiddleware;
+
+    #[test]
+    fn tool_call_names_reject_transcript_fragments_but_keep_namespaces() {
+        for valid in ["read_file", "mcp-browser.click", "server:tool/name"] {
+            assert_eq!(normalize_tool_call_name(valid), valid);
+        }
+        for invalid in [
+            "",
+            "`",
+            "read file",
+            "read_file\n[assistant]",
+            "<invoke>",
+            "工具",
+        ] {
+            assert_eq!(normalize_tool_call_name(invalid), INVALID_TOOL_CALL_NAME);
+        }
+        assert_eq!(
+            normalize_tool_call_name(&"a".repeat(129)),
+            INVALID_TOOL_CALL_NAME
+        );
+    }
 
     impl RequestMiddleware for PassthroughRequestMiddleware {
         fn name(&self) -> &'static str {

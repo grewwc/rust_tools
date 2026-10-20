@@ -37,7 +37,7 @@ A worker branch must be sized to its own bounded turn budget: the default subage
 ## Orchestration strategy
 
 1. Start with the smallest useful decomposition. Preserve shared discovery, product decisions, conflicting edits, and final synthesis in the parent.
-2. Use ordinary task delegation for bounded workers. Use `task_spawn_batch` only when independent branches can make progress concurrently. Follow the runtime task-tool guidance for spawning, waiting, cancellation, inheritance, and result integration.
+2. Use ordinary task delegation for bounded workers. Use one `task_spawn` call with a `tasks` array only when independent branches can make progress concurrently. Follow the runtime task-tool guidance for spawning, waiting, cancellation, inheritance, and result integration.
 3. Use `manage_team` only for durable, dependency-aware multi-phase work where named roles, task ownership, messaging, or resumable orchestration add real value.
 4. Use `run_agent_graph` only when an explicit DAG, reducer, conditional path, or structured multi-perspective pooling is materially better than ordinary task delegation.
 5. Do not delegate from a subagent. Subagents are leaf workers; the parent owns orchestration.

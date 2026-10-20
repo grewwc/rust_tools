@@ -46,6 +46,30 @@ fn collect_valid_tool_calls_no_drop_on_valid_arguments() {
 }
 
 #[test]
+fn collect_valid_tool_calls_collapses_malformed_names_and_arguments() {
+    let mut builders: rust_tools::cw::SkipMap<usize, ToolCallBuilder> =
+        rust_tools::cw::SkipMap::default();
+    builders.insert(
+        0,
+        ToolCallBuilder {
+            function_name: "`\n[assistant] copied transcript".to_string(),
+            arguments: r#"{"copied":"<|tool_call_begin|>"}"#.to_string(),
+            ..Default::default()
+        },
+    );
+
+    let (calls, dropped) = collect_valid_tool_calls(&mut builders);
+
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].function.name,
+        crate::ai::types::INVALID_TOOL_CALL_NAME
+    );
+    assert_eq!(calls[0].function.arguments, "{}");
+    assert!(!dropped);
+}
+
+#[test]
 fn recover_inline_tool_calls_handles_bare_object() {
     // Simulate qwen3.7-max emitting a tool call as content.
     let raw = r#"{"name":"read_file","arguments":{"path":"/tmp/x"}}"#;

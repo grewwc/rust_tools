@@ -11,8 +11,8 @@ use super::connection::open_history_db;
 use super::lock::with_session_state_lock;
 use super::migrations::init_history_schema;
 use super::outcomes::{
-    clear_llm_prune_marks_meta, drop_ambiguous_tool_execution_outcomes,
-    prune_orphan_tool_execution_outcomes,
+    clear_llm_prune_marks_meta, clear_prompt_residency_meta,
+    drop_ambiguous_tool_execution_outcomes, prune_orphan_tool_execution_outcomes,
 };
 use super::revision::{bump_history_revision, invalidate_context_snapshot};
 use super::store::decode_message_content;
@@ -205,6 +205,7 @@ fn truncate_messages_sqlite_unlocked(path: &Path, keep: usize) -> io::Result<()>
         tx.execute("DELETE FROM skill_activation_events", [])
             .map_err(|e| io::Error::other(e.to_string()))?;
         clear_llm_prune_marks_meta(&tx)?;
+        clear_prompt_residency_meta(&tx)?;
         bump_history_revision(&tx)?;
         return tx.commit().map_err(|e| io::Error::other(e.to_string()));
     }
@@ -218,10 +219,14 @@ fn truncate_messages_sqlite_unlocked(path: &Path, keep: usize) -> io::Result<()>
         .optional()
         .map_err(|e| io::Error::other(e.to_string()))?;
     if let Some(cutoff_id) = cutoff {
-        tx.execute("DELETE FROM messages WHERE id > ?1", params![cutoff_id])
+        let removed = tx
+            .execute("DELETE FROM messages WHERE id > ?1", params![cutoff_id])
             .map_err(|e| io::Error::other(e.to_string()))?;
         invalidate_context_snapshot(&tx)?;
         clear_llm_prune_marks_meta(&tx)?;
+        if removed > 0 {
+            clear_prompt_residency_meta(&tx)?;
+        }
     }
     prune_orphan_tool_execution_outcomes(&tx)?;
     bump_history_revision(&tx)?;
@@ -275,6 +280,7 @@ fn truncate_messages_to_user_turns_sqlite_unlocked(
         .map_err(|error| io::Error::other(error.to_string()))?;
         invalidate_context_snapshot(&tx)?;
         clear_llm_prune_marks_meta(&tx)?;
+        clear_prompt_residency_meta(&tx)?;
     }
     prune_orphan_tool_execution_outcomes(&tx)?;
     bump_history_revision(&tx)?;

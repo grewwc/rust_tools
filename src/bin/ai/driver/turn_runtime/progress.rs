@@ -232,8 +232,9 @@ pub(super) fn extract_round_evidence_fingerprints(
             continue;
         }
 
-        // 变更/调度工具由 round_has_mutation 单独判定。execute_command 只有明确只读时
-        // 才把返回内容当作证据，避免一次成功写操作被重复记账。
+        // 变更/调度工具由 round_has_mutation 单独判定。`execute_command` only
+        // starts commands now; only a provably read-only start counts as evidence,
+        // so a successful write operation is not recorded as new read output.
         let mut read_only_command: Option<String> = None;
         if MUTATION_TOOL_NAMES.contains(&tool_name) {
             if tool_name != "execute_command" {
@@ -242,11 +243,6 @@ pub(super) fn extract_round_evidence_fingerprints(
             let Ok(args) = serde_json::from_str::<Value>(arguments) else {
                 continue;
             };
-            if crate::ai::tools::service::command::command_request_kind(&args)
-                != crate::ai::tools::service::command::CommandRequestKind::Start
-            {
-                continue;
-            }
             let Some(command) = args.get("command").and_then(|value| value.as_str()) else {
                 continue;
             };

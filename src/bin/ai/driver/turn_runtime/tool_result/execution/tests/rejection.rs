@@ -75,6 +75,23 @@ fn scoped_instruction_preflight_blocks_first_mutation_until_rules_are_loaded() {
         assert!(matches!(step, TurnLoopStep::ScopedPreflightContinue(_)));
         assert!(!force_final_response);
         assert_eq!(fs::read_to_string(&target).unwrap(), "// source\n");
+        // The model must receive the pause as the call's tool result, both in
+        // the request and in canonical history; an unanswered call makes it
+        // reissue the mutation blindly until the preflight budget runs out.
+        for (track, history) in [("request", &messages), ("canonical", &turn_messages)] {
+            let result = history
+                .iter()
+                .find(|message| {
+                    message.role == "tool" && message.tool_call_id.as_deref() == Some(&mutation.id)
+                })
+                .unwrap_or_else(|| panic!("{track} history must answer the paused call"));
+            assert!(
+                crate::ai::history::value_to_string(&result.content)
+                    .contains(SCOPED_INSTRUCTIONS_PAUSE_PREFIX),
+                "{track} result must carry the pause: {:?}",
+                result.content
+            );
+        }
 
         let targets =
             super::super::super::super::iteration::project_instruction_target_paths_from_tool_calls(

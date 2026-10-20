@@ -845,6 +845,130 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn spaced_ascii_dsml_marker_is_recovered_not_leaked() {
+        // The same model can emit ASCII bars with a space after `<`:
+        // `< | | DSML | | tool_calls>`. The old guard recognized only `<|` /
+        // `<｜`, so this form reached the visible body unparsed.
+        let full = "< | | DSML | | calls>\n\
+                    < | | DSML | | invoke name=\"mcp_browser_get_text\">\n\n\
+                    </ | | DSML | | invoke>\n\
+                    </ | | DSML | | calls>";
+        let pieces = [
+            "< | | DSML | | calls>\n< | | DSML | | invoke name=",
+            "\"mcp_browser_get_text\">\n\n</ | | DSML | | invoke>\n</ | | DSML | | calls>",
+        ];
+
+        let mut thinking_open = false;
+        let mut hidden_meta_parse = HiddenMetaParseState::default();
+        let mut streamer = InternalToolCallStreamer::new();
+        let mut hermes_streamer = HermesXmlToolCallStreamer::new();
+        let mut anthropic_streamer = AnthropicXmlToolCallStreamer::new();
+        let mut bare_xml_streamer = BareXmlToolCallStreamer::new();
+        let mut inline_markup_normalizer =
+            super::super::inline_recovery::InlineMarkupNormalizer::new();
+
+        let mut visible = String::new();
+        let mut tool_events_total = Vec::new();
+        for piece in pieces {
+            let chunk = StreamChunk {
+                choices: vec![StreamChoice {
+                    delta: StreamDelta {
+                        content: piece.to_string(),
+                        reasoning_content: String::new(),
+                        reasoning_details: String::new(),
+                        tool_calls: Vec::new(),
+                    },
+                    finish_reason: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let (events, tool_events) = extract_chunk_events_streaming(
+                &chunk,
+                "<meta:self_note>",
+                "</meta:self_note>",
+                &mut thinking_open,
+                &mut hidden_meta_parse,
+                &mut streamer,
+                &mut hermes_streamer,
+                &mut anthropic_streamer,
+                &mut bare_xml_streamer,
+                &mut inline_markup_normalizer,
+            );
+            for ev in &events {
+                if let StreamTextEvent::AppendContent(t) = ev {
+                    visible.push_str(t);
+                }
+            }
+            tool_events_total.extend(tool_events);
+        }
+        assert!(
+            !visible.contains("DSML")
+                && !visible.contains("invoke")
+                && !visible.contains("calls"),
+            "spaced ASCII DSML markup leaked to visible content: {visible:?}; source={full:?}"
+        );
+        assert_eq!(
+            tool_events_total,
+            vec![
+                InternalToolCallStreamEvent::Begin("mcp_browser_get_text".to_string()),
+                InternalToolCallStreamEvent::Args("{}".to_string()),
+                InternalToolCallStreamEvent::End,
+            ]
+        );
+    }
+
+    #[test]
+    fn truncated_spaced_dsml_marker_is_dropped_at_flush() {
+        // The reported second line is truncated at `invoke name=`. A protocol
+        // prefix that never closes must not be flushed as answer text.
+        let mut normalizer =
+            super::super::inline_recovery::InlineMarkupNormalizer::new();
+        let emitted = normalizer.push("< | | DSML | | calls>\n< | | DSML | | invoke name=");
+        assert_eq!(emitted, "<calls>\n");
+
+        let mut anthropic = AnthropicXmlToolCallStreamer::new();
+        let (cleaned, events) = anthropic.push(&emitted);
+        assert!(
+            cleaned.trim().is_empty(),
+            "wrapper tag must be suppressed: {cleaned:?}"
+        );
+        assert!(events.is_empty());
+
+        assert!(
+            normalizer.flush().is_empty(),
+            "truncated protocol marker must be dropped at stream end"
+        );
+    }
+
+    #[test]
+    fn ordinary_bar_led_text_is_not_flushed_away() {
+        // A bar after `<` is not proof of a protocol marker; ordinary prose
+        // such as a comparison must survive the stream-end flush.
+        let mut normalizer = super::super::inline_recovery::InlineMarkupNormalizer::new();
+        assert_eq!(normalizer.push("compare < |x|"), "compare ");
+        assert_eq!(normalizer.flush(), "< |x|");
+    }
+
+    #[test]
+    fn incomplete_marker_before_another_tag_is_still_held() {
+        // Holding from the last `<` would emit the earlier incomplete marker.
+        let mut normalizer = super::super::inline_recovery::InlineMarkupNormalizer::new();
+        assert_eq!(normalizer.push("< | | DSML | | invoke name= <"), "");
+        assert_eq!(normalizer.flush(), "");
+    }
+
+    #[test]
+    fn unicode_whitespace_in_dsml_marker_is_normalized() {
+        assert_eq!(
+            super::super::inline_recovery::normalize_inline_tool_call_markup(
+                "<　|　|　DSML　|　|　calls>"
+            ),
+            "<calls>"
+        );
+    }
 }
 
 fn push_text_with_hidden_meta(

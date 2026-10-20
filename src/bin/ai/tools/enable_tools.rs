@@ -778,7 +778,7 @@ mod tests {
             "{enabled}"
         );
         assert!(
-            enabled.contains("Expanded group shortcut(s): task (11 tools)"),
+            enabled.contains("Expanded group shortcut(s): task (10 tools)"),
             "{enabled}"
         );
         assert!(
@@ -787,8 +787,8 @@ mod tests {
             ),
             "{enabled}"
         );
-        // 11 group members minus the already-loaded `task` itself, each once.
-        assert!(enabled.contains("Enabled 10 tool(s)"), "{enabled}");
+        // 10 group members minus the already-loaded `task` itself, each once.
+        assert!(enabled.contains("Enabled 9 tool(s)"), "{enabled}");
         for name in [
             "task_audit",
             "task_evidence_read",
@@ -817,7 +817,6 @@ mod tests {
         for name in [
             "task",
             "task_spawn",
-            "task_spawn_batch",
             "task_retry",
             "task_wait",
             "task_status",

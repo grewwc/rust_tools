@@ -31,7 +31,7 @@ mod theme;
 pub(crate) mod tools;
 mod types;
 
-/// Kill child processes owned by `execute_command` sessions. The caller owns
+/// Kill child processes owned by persistent command sessions. The caller owns
 /// the process-exit path; sessions have no other way to outlive a normal exit
 /// cleanly because they are stored in a process-global registry.
 pub(crate) fn shutdown_command_sessions() {

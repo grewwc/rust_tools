@@ -614,3 +614,114 @@ async fn provider_control_leak_discards_tools_and_retries_only_once() {
         "no tool from either malformed response may execute or persist: {history:#?}"
     );
 }
+/// Number of leading messages two request bodies share byte for byte: the part
+/// of the second request a provider prefix cache can serve from the first.
+fn shared_message_prefix(previous: &[Value], next: &[Value]) -> usize {
+    previous
+        .iter()
+        .zip(next)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_turn_requests_extend_the_previous_request_prefix() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    // A project with a scoped instruction file next to the file the model reads.
+    // The turn's effective cwd is pinned to the project root below.
+    let project_dir = TempDirGuard::new("ai-scripted-scoped-project");
+    let project = project_dir.path().to_path_buf();
+    let nested = project.join("src/driver");
+    std::fs::create_dir_all(project.join(".git")).expect("create project marker");
+    std::fs::create_dir_all(&nested).expect("create nested dir");
+    std::fs::write(project.join("AGENTS.md"), "Root project rules.\n").expect("root rules");
+    std::fs::write(nested.join("AGENTS.md"), "SCOPED_DRIVER_RULES\n").expect("scoped rules");
+    let target = nested.join("turn.rs");
+    std::fs::write(&target, "// DRIVER_SOURCE\n").expect("target file");
+    let read_args = json!({"file_path": target.to_string_lossy()});
+    let mut fixture = TurnFixture::new(vec![
+        ScriptedTurn::tool_call("call_turn1_read", "read_file", read_args.clone()),
+        ScriptedTurn::final_text("Turn one done."),
+        ScriptedTurn::tool_call("call_turn2_read", "read_file", read_args),
+        ScriptedTurn::final_text("Turn two done."),
+    ]);
+
+    // Both questions name a code artifact, so the integrated critic gate is on
+    // for both turns and does not mask the behavior under test.
+    for question in ["Inspect `src/driver/turn.rs`.", "Inspect `src/driver/turn.rs` once more."] {
+        let outcome = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
+            .scope(
+                project.clone(),
+                tokio::time::timeout(Duration::from_secs(20), fixture.run(question)),
+            )
+            .await
+            .expect("scripted turn timed out")
+            .expect("scripted turn failed");
+        assert_eq!(outcome, TurnOutcome::Continue);
+    }
+
+    let requests = fixture.server.requests();
+    assert_eq!(requests.len(), 4, "two turns of one tool round plus a final answer each");
+    let messages: Vec<&[Value]> = requests.iter().map(|r| request_messages(r)).collect();
+
+    // Every request after the first must carry the scoped rules the model already
+    // followed: losing them at a turn boundary would change agent behavior.
+    for (index, request) in messages.iter().enumerate().skip(1) {
+        assert!(
+            text_content(&request[0]).contains("SCOPED_DRIVER_RULES"),
+            "request {index} dropped the scoped rules loaded earlier in the session"
+        );
+    }
+
+    // Within a turn the first touch of a scoped directory necessarily rewrites
+    // the system prompt once (the model must see the new rules). After that,
+    // the next turn's first request must reuse everything through the previous
+    // tool round byte for byte. The only exception is the last pre-request
+    // working-memory note, which is request-only and never persisted.
+    let shared: Vec<usize> = (1..messages.len())
+        .map(|index| shared_message_prefix(messages[index - 1], messages[index]))
+        .collect();
+    let first_difference = |previous: &[Value], next: &[Value]| {
+        let index = shared_message_prefix(previous, next);
+        let render = |message: Option<&Value>| {
+            message
+                .map(|message| match message["content"].as_str() {
+                    Some(text) => text.to_string(),
+                    None => message.to_string(),
+                })
+                .unwrap_or_default()
+        };
+        let (left, right) = (render(previous.get(index)), render(next.get(index)));
+        let split = left
+            .char_indices()
+            .zip(right.chars())
+            .find(|((_, a), b)| a != b)
+            .map(|((offset, _), _)| offset)
+            .unwrap_or_else(|| left.len().min(right.len()));
+        let window = |text: &str| {
+            let start = text.floor_char_boundary(split.saturating_sub(200));
+            let end = text.ceil_char_boundary((split + 400).min(text.len()));
+            text[start..end].to_string()
+        };
+        format!(
+            "first differing message #{index} at byte {split}\nprevious: …{}…\nnext: …{}…",
+            window(&left),
+            window(&right)
+        )
+    };
+    assert_eq!(
+        shared[1],
+        messages[1].len() - 1,
+        "the next turn must reuse everything through the previous tool round; shared {shared:?} of lengths {:?}\n{}",
+        messages.iter().map(|m| m.len()).collect::<Vec<_>>(),
+        first_difference(messages[1], messages[2])
+    );
+    assert_eq!(
+        shared[2],
+        messages[2].len(),
+        "the tool-round request must extend the turn's first request: shared {shared:?}"
+    );
+}

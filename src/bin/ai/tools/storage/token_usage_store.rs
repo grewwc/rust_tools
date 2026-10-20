@@ -86,7 +86,8 @@ fn open_store() -> Result<Connection, String> {
             output_tokens  INTEGER NOT NULL,
             reasoning_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens   INTEGER NOT NULL,
-            cost_micros    INTEGER NOT NULL DEFAULT 0
+            cost_micros    INTEGER NOT NULL DEFAULT 0,
+            cached_input_tokens INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_token_usage_created_at ON token_usage(created_at);
         "#,
@@ -97,6 +98,7 @@ fn open_store() -> Result<Connection, String> {
     let migrations = [
         "ALTER TABLE token_usage ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE token_usage ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE token_usage ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0",
     ];
     for sql in &migrations {
         if let Err(e) = conn.execute_batch(sql) {
@@ -177,8 +179,8 @@ pub(crate) fn persist_drained(records: &[LlmUsageRecord], new_head: u64) {
     {
         let mut stmt = match tx.prepare_cached(
             "INSERT INTO token_usage (created_at, model, input_tokens, output_tokens, \
-             reasoning_tokens, total_tokens, cost_micros) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             reasoning_tokens, total_tokens, cost_micros, cached_input_tokens) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -195,6 +197,7 @@ pub(crate) fn persist_drained(records: &[LlmUsageRecord], new_head: u64) {
                 r.reasoning_tokens as i64,
                 r.total_tokens as i64,
                 r.cost_micros as i64,
+                r.cached_prompt_tokens as i64,
             ]) {
                 eprintln!("[TokenUsage] insert failed: {e}");
                 // Roll back the whole batch and keep the drain cursor, so failed records never cause a permanent accounting gap.
@@ -252,6 +255,10 @@ pub(crate) struct UsageByModel {
     pub model: String,
     pub calls: u64,
     pub input: u64,
+    /// The subset of `input` the provider reported as served from its prompt
+    /// cache. Rows persisted before this column existed contribute 0, so the
+    /// ratio is a lower bound for windows that span the migration.
+    pub cached_input: u64,
     pub output: u64,
     /// The subset of `output` spent on reasoning/thinking.
     pub reasoning: u64,
@@ -314,7 +321,8 @@ pub(crate) fn query_by_model(window_secs: Option<u64>) -> Option<Vec<UsageByMode
                COALESCE(SUM(output_tokens),0), \
                COALESCE(SUM(reasoning_tokens),0), \
                COALESCE(SUM(total_tokens),0), \
-               COALESCE(SUM(cost_micros),0) \
+               COALESCE(SUM(cost_micros),0), \
+               COALESCE(SUM(cached_input_tokens),0) \
                FROM token_usage WHERE (?1 IS NULL OR created_at >= ?1) \
                GROUP BY model ORDER BY 6 DESC";
     let mut stmt = conn.prepare(sql).ok()?;
@@ -324,6 +332,7 @@ pub(crate) fn query_by_model(window_secs: Option<u64>) -> Option<Vec<UsageByMode
                 model: row.get::<_, String>(0)?,
                 calls: row.get::<_, i64>(1)? as u64,
                 input: row.get::<_, i64>(2)? as u64,
+                cached_input: row.get::<_, i64>(7)? as u64,
                 output: row.get::<_, i64>(3)? as u64,
                 reasoning: row.get::<_, i64>(4)? as u64,
                 total: row.get::<_, i64>(5)? as u64,

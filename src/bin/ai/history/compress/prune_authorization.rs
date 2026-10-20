@@ -17,7 +17,7 @@ const TASK_ID_PREFIX: &str = "task_";
 /// Markers the runtime itself writes into subagent results: `[task_id=X]` for
 /// deliveries, `Task spawned: task_id=X` for spawns, `retry_of=X` /
 /// `new_task_id=X` for retries, the `"task_id": "X"` JSON form used by
-/// `task_spawn_batch` and by the `task_evidence_read` envelope, and the
+/// `task_spawn` and by the `task_evidence_read` envelope, and the
 /// `"runtime_task_id": "X"` / `"pool_task_id": "X"` fields that `manage_team`
 /// and `run_agent_graph` render in their JSON output.
 ///

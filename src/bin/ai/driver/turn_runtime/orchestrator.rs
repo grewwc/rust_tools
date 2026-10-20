@@ -227,6 +227,38 @@ impl ScopedPreflightTargets {
     }
 }
 
+/// Records what this turn made resident in the system prompt (scoped
+/// instruction directories, session-tools guidance), so the next turn starts
+/// from the same prompt instead of dropping instructions the model already
+/// followed. Writes only when the turn added something; ephemeral one-shot
+/// sessions are deleted on exit and are skipped.
+fn persist_prompt_residency(
+    app: &App,
+    one_shot_mode: bool,
+    skill_turn: &crate::ai::driver::skill_runtime::SkillTurnGuard,
+) {
+    if one_shot_mode && app.cli.session.is_none() {
+        return;
+    }
+    let changed_dirs = skill_turn.changed_scoped_instruction_dirs();
+    let guidance_added = skill_turn.session_context_guidance_newly_rendered();
+    if changed_dirs.is_none() && !guidance_added {
+        return;
+    }
+    let path = &app.session_history_file;
+    let mut residency = crate::ai::history::read_prompt_residency_sqlite(path)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if let Some(dirs) = changed_dirs {
+        residency.scoped_instruction_dirs = dirs.to_vec();
+    }
+    residency.session_context_guidance |= guidance_added;
+    if let Err(error) = crate::ai::history::write_prompt_residency_sqlite(path, &residency) {
+        eprintln!("[Warning] failed to persist prompt residency: {error}");
+    }
+}
+
 // These submodules are stored as siblings of orchestrator.rs. Note the crate also has a module with
 // the same name, driver::thinking::orchestrator; on a name collision rustc resolves this module's
 // submodules by "directory-style" paths (looking under an orchestrator/ directory), so #[path] must
@@ -2338,6 +2370,7 @@ async fn run_turn_body(
     // `scoped_project_instructions_missing` and skips documents already present, so the
     // carried list is self-correcting).
     app.scoped_preflight_required = scoped_preflight_targets.required().to_vec();
+    persist_prompt_residency(app, one_shot_mode, &skill_turn);
 
     // A one-shot continuation is set up only when an active skill explicitly requested user
     // input through a tool AND this round ended normally. This avoids guessing from

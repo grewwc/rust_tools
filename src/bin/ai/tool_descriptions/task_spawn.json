@@ -1,37 +1,51 @@
 {
   "name": "task_spawn",
-  "description": "Start one subagent asynchronously and return its `task_id`. Use for independent work while the parent continues; collect with `task_wait` and acknowledge with `task_integrate`. For one result needed immediately, use `task`. Top-level agents only.",
+  "description": "Spawn one or more independent subagent tasks (1-8) asynchronously in one deterministic batch. Every item is preflight-validated before any child starts; spawn attempts run in input order and returned task entries preserve that order. Collect with `task_wait` or `task_status`, then acknowledge with `task_integrate`. For one result needed immediately, use the synchronous `task` tool. Top-level agents only.",
   "parameters": {
     "type": "object",
     "properties": {
-      "description": {
-        "type": "string",
-        "description": "Short description of what this task will do (3-10 words)."
-      },
-      "prompt": {
-        "type": "string",
-        "description": "Self-contained instructions: goal, scope, relevant context, constraints, and expected output."
-      },
-      "agent": {
-        "type": "string",
-        "description": "Optional subagent name (default: auto-select). Omit unless you know the exact name."
-      },
-      "model": {
-        "type": "string",
-        "description": "Optional model override. Default: reuse parent model; override only when the subtask is clearly lighter or heavier."
-      },
-      "inherit": {
-        "type": "string",
-        "description": "Default 'cwd,skills' (history/memory private; right for workspace-touching steps). Otherwise 'all', 'none', or a comma-separated subset of 'history','memory','cwd','skills' (e.g. \"cwd,skills\"). 'none' for pure analysis; 'all' only when the subtask needs the full conversation."
-      },
-      "response_schema": {
-        "type": "object",
-        "description": "Optional JSON Schema object the subagent's single returned value must match, e.g. {\"type\": \"string\"} — not a bare type name."
+      "tasks": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 8,
+        "description": "Independent subagent tasks (1-8).",
+        "items": {
+          "type": "object",
+          "properties": {
+            "description": {
+              "type": "string",
+              "description": "Short description of what this task will do (3-10 words)."
+            },
+            "prompt": {
+              "type": "string",
+              "description": "Self-contained instructions: goal, scope, relevant context, constraints, and expected output."
+            },
+            "agent": {
+              "type": "string",
+              "description": "Optional subagent name (default: auto-select). Omit unless you know the exact name."
+            },
+            "model": {
+              "type": "string",
+              "description": "Optional model override. Default: reuse parent model; override only when the subtask is clearly lighter or heavier."
+            },
+            "inherit": {
+              "type": "string",
+              "description": "Default 'cwd,skills' (history/memory private; right for workspace-touching steps). Otherwise 'all', 'none', or a comma-separated subset of 'history','memory','cwd','skills' (e.g. \"cwd,skills\"). 'none' for pure analysis; 'all' only when the subtask needs the full conversation."
+            },
+            "response_schema": {
+              "type": "object",
+              "description": "Optional JSON Schema object the subagent's single returned value must match, e.g. {\"type\": \"string\"} — not a bare type name."
+            }
+          },
+          "required": [
+            "description",
+            "prompt"
+          ]
+        }
       }
     },
     "required": [
-      "description",
-      "prompt"
+      "tasks"
     ]
   },
   "groups": [

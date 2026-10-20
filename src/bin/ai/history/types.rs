@@ -47,6 +47,60 @@ const RUNTIME_SYNTHETIC_USER_ORIGIN: &str = "runtime-origin:synthetic-user:v1";
 /// Runtime-authored fold provenance; persisted but never sent to a provider.
 pub(super) const FOLDED_TOOL_ORIGIN: &str = "runtime-origin:folded-tool-evidence:v1:";
 
+/// Per-turn context reminder the request prepended to a real user message.
+/// The canonical content keeps only the user's own input; request
+/// normalization replays the reminder byte-identically, so the next turn's
+/// request extends the previous request instead of diverging at that message.
+const REQUEST_REMINDER_ORIGIN: &str = "runtime-origin:request-reminder:v1:";
+
+/// Prepends a context reminder to user content. The single formatting entry
+/// for both the live request and the replay of persisted reminders.
+pub(in crate::ai) fn prepend_request_reminder(content: Value, reminder: &str) -> Value {
+    match content {
+        Value::String(text) => Value::String(format!("{}\n\n{}", reminder, text)),
+        Value::Array(mut parts) => {
+            parts.insert(0, serde_json::json!({ "type": "text", "text": reminder }));
+            Value::Array(parts)
+        }
+        other => other,
+    }
+}
+
+/// Records the reminder the request showed with this real user message.
+pub(in crate::ai) fn attach_request_reminder(message: &mut Message, reminder: &str) {
+    if message.role == "user" && message.reasoning_content.is_none() {
+        message.reasoning_content = Some(format!("{REQUEST_REMINDER_ORIGIN}{reminder}"));
+    }
+}
+
+/// The context reminder recorded on a real user message, if any.
+pub(in crate::ai) fn request_reminder(message: &Message) -> Option<&str> {
+    if message.role != "user" {
+        return None;
+    }
+    message
+        .reasoning_content
+        .as_deref()?
+        .strip_prefix(REQUEST_REMINDER_ORIGIN)
+}
+
+/// Whether `reasoning_content` carries runtime metadata rather than model
+/// reasoning; such payloads are never truncated, summarized, or shown as
+/// reasoning. A reminder marker counts on any role, so a message whose role
+/// was rewritten still never leaks it to a provider.
+pub(in crate::ai) fn has_runtime_message_metadata(message: &Message) -> bool {
+    is_runtime_synthetic_user_message(message)
+        || message
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|text| text.starts_with(REQUEST_REMINDER_ORIGIN))
+        || (message.role == ROLE_INTERNAL_NOTE
+            && message
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|text| text.starts_with(FOLDED_TOOL_ORIGIN)))
+}
+
 /// Builds a runtime-synthesized user message. All user messages injected mid-turn
 /// must go through this entry point.
 pub(in crate::ai) fn runtime_synthetic_user_message(content: Value) -> Message {
@@ -67,15 +121,14 @@ pub(in crate::ai) fn is_runtime_synthetic_user_message(message: &Message) -> boo
 }
 
 /// Clears the runtime-only message origin side channel, preventing internal markers
-/// from leaking to the provider.
+/// from leaking to the provider. A recorded request reminder is replayed into
+/// the content first, exactly as the original request showed it.
 pub(in crate::ai) fn clear_runtime_message_metadata(message: &mut Message) {
-    if is_runtime_synthetic_user_message(message)
-        || (message.role == ROLE_INTERNAL_NOTE
-            && message
-                .reasoning_content
-                .as_deref()
-                .is_some_and(|text| text.starts_with(FOLDED_TOOL_ORIGIN)))
-    {
+    if let Some(reminder) = request_reminder(message).map(str::to_string) {
+        let content = std::mem::take(&mut message.content);
+        message.content = prepend_request_reminder(content, &reminder);
+    }
+    if has_runtime_message_metadata(message) {
         message.reasoning_content = None;
     }
 }
@@ -288,6 +341,45 @@ mod tests {
         let restored: Message = serde_json::from_str(&encoded).unwrap();
         assert!(is_runtime_synthetic_user_message(&restored));
         assert_eq!(restored.content, multimodal.content);
+    }
+
+    #[test]
+    fn request_reminder_replays_byte_identically_and_stays_a_real_user_turn() {
+        let reminder = "<system-reminder>\n## Current Date\nToday.\n</system-reminder>";
+        for content in [
+            Value::String("修复这个 bug".to_string()),
+            Value::Array(vec![
+                serde_json::json!({"type": "text", "text": "分析这张图"}),
+                serde_json::json!({"type": "image_url", "image_url": {"url": "x.png"}}),
+            ]),
+        ] {
+            let mut persisted = Message {
+                content: content.clone(),
+                ..user("")
+            };
+            attach_request_reminder(&mut persisted, reminder);
+            // Canonical content keeps only the user's input, and the message
+            // still forms a real user turn boundary.
+            assert_eq!(persisted.content, content);
+            assert_eq!(request_reminder(&persisted), Some(reminder));
+            assert!(has_runtime_message_metadata(&persisted));
+            assert_eq!(last_real_user_index(std::slice::from_ref(&persisted)), Some(0));
+
+            let restored: Message =
+                serde_json::from_str(&serde_json::to_string(&persisted).unwrap()).unwrap();
+            let mut projected = restored;
+            clear_runtime_message_metadata(&mut projected);
+            assert_eq!(projected.content, prepend_request_reminder(content, reminder));
+            assert_eq!(projected.reasoning_content, None);
+        }
+
+        // Only real user messages carry a reminder.
+        let mut synthetic = runtime_synthetic_user_message(Value::String("handoff".to_string()));
+        attach_request_reminder(&mut synthetic, reminder);
+        assert_eq!(request_reminder(&synthetic), None);
+        let mut assistant = assistant();
+        attach_request_reminder(&mut assistant, reminder);
+        assert_eq!(assistant.reasoning_content, None);
     }
 
     #[test]

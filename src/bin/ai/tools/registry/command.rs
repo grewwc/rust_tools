@@ -6,6 +6,7 @@ use crate::ai::tools::common::{
     ToolRegistration, ToolReplayRegistration, ToolSpec, ToolStreamingRegistration,
 };
 use crate::ai::tools::service::command::execute_command;
+use crate::ai::tools::service::command_session::execute_command_session;
 
 fn execute_command_streaming_registered(
     args: &Value,
@@ -23,6 +24,15 @@ inventory::submit!(ToolRegistration {
     }
 });
 
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "command_session",
+        description: "",
+
+        execute: execute_command_session,
+    }
+});
+
 // The command exit status and compile/test diagnostics are direct evidence the agent
 // uses when fixing issues later. When compressing, the full output must first be written
 // to a session asset with a read-back path; failure logs must not be degraded to just the
@@ -30,6 +40,17 @@ inventory::submit!(ToolRegistration {
 // marks them stale, so this does not make the session context grow monotonically.
 inventory::submit!(ToolHistoryPolicyRegistration {
     name: "execute_command",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Allow,
+        counts_toward_precision_inline_budget: true,
+    },
+});
+
+// Session output is build/test evidence as well: polling must return complete
+// diagnostics, and a failed build must not be reduced to a bare exit code.
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "command_session",
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
         prune: ToolPrunePolicy::Allow,

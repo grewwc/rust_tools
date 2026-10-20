@@ -428,6 +428,27 @@ mod tests {
     }
 
     #[test]
+    fn task_and_task_spawn_item_schemas_stay_in_sync() {
+        // `task` and each `task_spawn` item describe the same subagent payload.
+        // Keep them byte-for-byte aligned so adding a field cannot silently
+        // leave one launch path without it.
+        let metadata = load_builtin_metadata();
+        let task = &metadata["task"].parameters;
+        let tasks = &metadata["task_spawn"].parameters["properties"]["tasks"];
+
+        assert_eq!(tasks["minItems"], serde_json::json!(1));
+        assert_eq!(tasks["maxItems"], serde_json::json!(8));
+        assert_eq!(
+            metadata["task_spawn"].parameters["required"],
+            serde_json::json!(["tasks"])
+        );
+
+        let item = &tasks["items"];
+        assert_eq!(task["properties"], item["properties"]);
+        assert_eq!(task["required"], item["required"]);
+    }
+
+    #[test]
     fn resolve_description_falls_back_when_absent() {
         let resolved = tool_description("__definitely_missing_tool__", "fallback text");
         assert_eq!(resolved, "fallback text");

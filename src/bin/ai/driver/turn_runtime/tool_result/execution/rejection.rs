@@ -57,7 +57,10 @@ pub(in crate::ai::driver::turn_runtime) fn reject_tool_calls(
             })
             .collect(),
         cached_hits: vec![false; tool_calls.len()],
-        execution_outcomes: Vec::new(),
+        // One slot per call: result recording zips these per-call vectors, so
+        // a shorter one would silently drop every rejection message and leave
+        // the model with unanswered tool calls.
+        execution_outcomes: vec![None; tool_calls.len()],
         had_error: true,
     }
 }

@@ -1,6 +1,7 @@
 use super::{
     AgentModelTier, BUILTIN_AGENTS, load_project_instruction_docs_from,
     load_scoped_project_instruction_docs_for_target_priority_from,
+    load_scoped_project_instruction_docs_for_target_tiers_from,
     load_scoped_project_instruction_docs_for_targets_from, parse_agent_front_matter,
 };
 use crate::ai::test_support::ENV_LOCK;
@@ -562,6 +563,76 @@ fn target_scoped_instruction_budget_prioritizes_pending_mutation() {
         .find(|doc| doc.path.ends_with("required/AGENTS.md"))
         .expect("pending mutation rules must not be starved by observed targets");
     assert_eq!(required.content, "required mutation rule");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn resident_scoped_instructions_outrank_new_observed_targets_but_not_pending_mutations() {
+    let root = temp_dir("target_scoped_resident_tier");
+    let resident_dirs = [root.join("resident_a"), root.join("resident_b")];
+    let observed_target = root.join("observed/file.rs");
+    let required_target = root.join("required/file.rs");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    for dir in resident_dirs
+        .iter()
+        .chain([&root.join("observed"), &root.join("required")])
+    {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::write(root.join("AGENTS.md"), "root rules\n").unwrap();
+    // Two resident documents near the per-document cap fill the budget.
+    let resident_rules = format!("resident-start\n{}\nresident-tail", "r".repeat(7_900));
+    for dir in &resident_dirs {
+        fs::write(dir.join("AGENTS.md"), &resident_rules).unwrap();
+    }
+    fs::write(
+        root.join("observed/AGENTS.md"),
+        format!("observed-start\n{}\nobserved-tail", "o".repeat(7_900)),
+    )
+    .unwrap();
+    fs::write(
+        root.join("required/AGENTS.md"),
+        format!("required-start\n{}\nrequired-tail", "q".repeat(7_900)),
+    )
+    .unwrap();
+    fs::write(&observed_target, "// observed\n").unwrap();
+    fs::write(&required_target, "// required\n").unwrap();
+
+    // A newly observed target competes for the remaining budget only: the
+    // resident documents keep every byte they were rendered with.
+    let docs = load_scoped_project_instruction_docs_for_target_tiers_from(
+        &root,
+        &[],
+        std::slice::from_ref(&observed_target),
+        &resident_dirs,
+    );
+    let resident = docs
+        .iter()
+        .filter(|doc| doc.path.contains("/resident_"))
+        .collect::<Vec<_>>();
+    assert_eq!(resident.len(), 2, "resident rules must not be evicted by observed targets");
+    assert!(resident.iter().all(|doc| doc.content == resident_rules));
+    assert!(
+        docs.iter()
+            .filter(|doc| doc.path.ends_with("observed/AGENTS.md"))
+            .all(|doc| !doc.content.contains("observed-tail")),
+        "observed rules only fill the remaining budget"
+    );
+
+    // A pending mutation still outranks resident rules, so preflight can
+    // always unblock it.
+    let docs = load_scoped_project_instruction_docs_for_target_tiers_from(
+        &root,
+        std::slice::from_ref(&required_target),
+        std::slice::from_ref(&observed_target),
+        &resident_dirs,
+    );
+    let required = docs
+        .iter()
+        .find(|doc| doc.path.ends_with("required/AGENTS.md"))
+        .expect("pending mutation rules must load first");
+    assert!(required.content.contains("required-tail"));
 
     let _ = fs::remove_dir_all(root);
 }

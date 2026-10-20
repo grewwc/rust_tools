@@ -138,15 +138,22 @@ pub(crate) fn turn_spawned_audit_subagent(turn_messages: &[crate::ai::history::M
         message.tool_calls.as_ref().is_some_and(|tool_calls| {
             tool_calls.iter().any(|tool_call| {
                 let name = &tool_call.function.name;
-                (name == "task" || name == "task_spawn")
-                    && serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
-                        .ok()
-                        .and_then(|args| {
-                            args.get("agent")
-                                .and_then(|agent| agent.as_str())
-                                .map(str::to_owned)
-                        })
+                let is_audit = |value: &serde_json::Value| {
+                    value
+                        .get("agent")
+                        .and_then(|agent| agent.as_str())
                         .is_some_and(|agent| agent == "audit" || agent == "audit-fast")
+                };
+                serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+                    .ok()
+                    .is_some_and(|args| match name.as_str() {
+                        "task" => is_audit(&args),
+                        "task_spawn" => args
+                            .get("tasks")
+                            .and_then(|tasks| tasks.as_array())
+                            .is_some_and(|tasks| tasks.iter().any(|task| is_audit(task))),
+                        _ => false,
+                    })
             })
         })
     })
@@ -414,9 +421,13 @@ mod tests {
         )])]));
         assert!(turn_spawned_audit_subagent(&[msg(vec![call(
             "task_spawn",
-            r#"{"agent":"audit-fast"}"#
+            r#"{"tasks":[{"agent":"audit-fast"},{"agent":"build"}]}"#
         )])]));
         // Other agents, other tools, malformed args, and empty history are not.
+        assert!(!turn_spawned_audit_subagent(&[msg(vec![call(
+            "task_spawn",
+            r#"{"tasks":[{"agent":"build"}]}"#
+        )])]));
         assert!(!turn_spawned_audit_subagent(&[msg(vec![call(
             "task",
             r#"{"agent":"build"}"#

@@ -365,9 +365,9 @@ fn executor_group_defers_process_primitives_but_keeps_core_editing() {
 #[test]
 fn manifest_groups_union_explicit_tools_keeps_delegation_subset_resident() {
     // build.agent declares [core] plus a whitelist of the task family
-    // (task/task_spawn/task_spawn_batch/task_wait/task_status/task_integrate/
+    // (task/task_spawn/task_wait/task_status/task_integrate/
     // task_cancel) to keep delegation tools visible without paying for the
-    // whole 12-tool group in every turn. The loader must merge group
+    // whole 11-tool group in every turn. The loader must merge group
     // expansion with explicitly named tools (previously mutually exclusive
     // branches), and the unlisted heavy/admin tools stay lazy.
     let mut agent = agent("build", Vec::new());
@@ -375,7 +375,6 @@ fn manifest_groups_union_explicit_tools_keeps_delegation_subset_resident() {
     agent.tools = vec![
         "task".to_string(),
         "task_spawn".to_string(),
-        "task_spawn_batch".to_string(),
         "task_wait".to_string(),
         "task_status".to_string(),
         "task_integrate".to_string(),
@@ -394,7 +393,6 @@ fn manifest_groups_union_explicit_tools_keeps_delegation_subset_resident() {
         "enable_tools",
         "task",
         "task_spawn",
-        "task_spawn_batch",
         "task_wait",
         "task_status",
         "task_integrate",
@@ -488,8 +486,8 @@ fn hidden_task_tool_catalog_advertises_lazy_subagent_family() {
          When the task splits into multiple independent branches that would benefit from \
          subagent parallelism (broad discovery, cross-module mapping, independent verification, \
          or concurrent research), enable the needed tools via `enable_tools`.\n\
-         Available: `task`, `task_spawn`, `task_spawn_batch`, `task_wait`, `task_status`, \
-         `task_retry`, `task_cancel`, `task_evidence_read`, and 4 more."
+         Available: `task`, `task_spawn`, `task_wait`, `task_status`, \
+         `task_retry`, `task_cancel`, `task_evidence_read`, `task_audit`, and 3 more."
     );
 }
 
@@ -501,7 +499,6 @@ fn hidden_task_tool_catalog_suppressed_when_family_loaded() {
     for name in [
         "task",
         "task_spawn",
-        "task_spawn_batch",
         "task_wait",
         "task_status",
         "task_retry",
@@ -1066,7 +1063,6 @@ fn system_prompt_task_only_tools_skip_empty_planning_section() {
     available.insert("task_status".to_string());
     available.insert("task_integrate".to_string());
     available.insert("task_cancel".to_string());
-    available.insert("task_spawn_batch".to_string());
 
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
@@ -2230,7 +2226,7 @@ fn scoped_project_instruction_prompt_follows_observed_target_path() {
         })
         .expect("target-scoped instruction prompt");
 
-    assert!(prompt.contains("- These documents apply to files already touched in this turn."));
+    assert!(prompt.contains("- These documents apply to files already touched in this session."));
     assert!(prompt.contains("<instructions path="));
     assert!(prompt.contains("AI runtime rules."));
     assert!(prompt.contains("Driver-specific rules."));
@@ -2257,9 +2253,8 @@ fn scoped_project_instruction_push_confirms_required_target_is_loaded() {
         let mut guard = super::SkillTurnGuard {
             restore_agent_context: None,
             builder: SystemPromptBuilder::new(),
-            cached_system_prompt: None,
-            cached_context_reminder: None,
             matched_skill_names: Vec::new(),
+            ..Default::default()
         };
 
         assert!(guard.push_scoped_project_instructions(std::slice::from_ref(&target), &[]));
@@ -2270,13 +2265,121 @@ fn scoped_project_instruction_push_confirms_required_target_is_loaded() {
 }
 
 #[test]
+fn scoped_instructions_stay_resident_and_keep_their_position_across_guards() {
+    let root = temp_dir("resident_scoped_instructions");
+    let driver_file = root.join("src/driver/turn.rs");
+    let tools_file = root.join("src/tools/read.rs");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(driver_file.parent().unwrap()).unwrap();
+    fs::create_dir_all(tools_file.parent().unwrap()).unwrap();
+    fs::write(root.join("AGENTS.md"), "Root rules.\n").unwrap();
+    fs::write(root.join("src/driver/AGENTS.md"), "Driver rules.\n").unwrap();
+    fs::write(root.join("src/tools/AGENTS.md"), "Tool rules.\n").unwrap();
+    fs::write(&driver_file, "// driver\n").unwrap();
+    fs::write(&tools_file, "// tools\n").unwrap();
+
+    SUBAGENT_CWD.sync_scope(root.clone(), || {
+        // Turn 1 touches the driver file: its rules load and the directory is
+        // reported for persistence.
+        let mut turn_one = super::SkillTurnGuard::default();
+        turn_one.push_labeled_section(ContextKind::Behavior, "turn_fact", "Prepared fact.");
+        assert!(turn_one.push_scoped_project_instructions(&[], std::slice::from_ref(&driver_file)));
+        let resident = turn_one
+            .changed_scoped_instruction_dirs()
+            .expect("a newly loaded directory must be reported")
+            .to_vec();
+        let turn_one_prompt = turn_one.system_prompt().to_string();
+        assert!(turn_one_prompt.contains("Driver rules."));
+
+        // A mid-turn rebuild must keep both the prepare-time section and the
+        // loaded rules, byte for byte.
+        let mut rebuilt = super::SkillTurnGuard::default();
+        rebuilt.inherit_turn_state(&turn_one);
+        assert!(rebuilt.push_scoped_project_instructions(&[], std::slice::from_ref(&driver_file)));
+        assert_eq!(rebuilt.system_prompt(), turn_one_prompt);
+
+        // Turn 2 starts from storage before touching anything: the rules the
+        // model followed in turn 1 are still there.
+        let mut turn_two = super::SkillTurnGuard::default();
+        turn_two.push_labeled_section(ContextKind::Behavior, "turn_fact", "Prepared fact.");
+        turn_two.seed_scoped_instruction_dirs(resident.clone());
+        assert!(turn_two.changed_scoped_instruction_dirs().is_none());
+        assert_eq!(turn_two.system_prompt(), turn_one_prompt);
+
+        // Touching another directory adds its rules without dropping or
+        // moving the resident ones.
+        assert!(turn_two.push_scoped_project_instructions(&[], std::slice::from_ref(&tools_file)));
+        let grown = turn_two.system_prompt().to_string();
+        assert!(grown.contains("Driver rules.") && grown.contains("Tool rules."));
+        assert_eq!(
+            grown.matches("<target_scoped_project_instructions>").count(),
+            1,
+            "scoped instructions must stay one section, replaced in place: {grown}"
+        );
+        assert_eq!(
+            turn_two.changed_scoped_instruction_dirs().map(<[_]>::len),
+            Some(resident.len() + 1)
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn seed_reports_directories_whose_documents_cannot_be_rendered() {
+    let root = temp_dir("seed_prunes_unrenderable_directories");
+    let driver_dir = root.join("src/driver");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(&driver_dir).unwrap();
+    fs::write(root.join("AGENTS.md"), "Root rules.\n").unwrap();
+    fs::write(driver_dir.join("AGENTS.md"), "Driver rules.\n").unwrap();
+
+    SUBAGENT_CWD.sync_scope(root.clone(), || {
+        let canonical_driver = fs::canonicalize(&driver_dir).unwrap();
+        let missing = root.join("src/missing");
+        let mut guard = super::SkillTurnGuard::default();
+        guard.seed_scoped_instruction_dirs(vec![canonical_driver.clone(), missing]);
+        assert_eq!(
+            guard.changed_scoped_instruction_dirs(),
+            Some(std::slice::from_ref(&canonical_driver)),
+            "storage must be told that the missing directory is no longer resident"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn seed_drops_residency_when_no_stored_document_renders() {
+    let root = temp_dir("seed_drops_unrenderable_residency");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("AGENTS.md"), "Root rules.\n").unwrap();
+
+    SUBAGENT_CWD.sync_scope(root.clone(), || {
+        let missing = root.join("src/missing");
+        let mut guard = super::SkillTurnGuard::default();
+        guard.seed_scoped_instruction_dirs(vec![missing]);
+        assert_eq!(
+            guard.changed_scoped_instruction_dirs().map(<[_]>::len),
+            Some(0),
+            "storage must be told that no stored directory is resident anymore"
+        );
+        assert!(
+            !guard.has_scoped_project_instructions(),
+            "no scoped section may survive when no stored document renders"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn context_reminder_injects_active_skill_pointer_into_user_message_reminder() {
     let mut guard = super::SkillTurnGuard {
         restore_agent_context: None,
         builder: SystemPromptBuilder::new(),
-        cached_system_prompt: None,
-        cached_context_reminder: None,
         matched_skill_names: vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
+        ..Default::default()
     };
     let reminder = guard
         .context_reminder()
@@ -2295,9 +2398,8 @@ fn context_reminder_single_active_skill_uses_singular_pointer() {
     let mut guard = super::SkillTurnGuard {
         restore_agent_context: None,
         builder: SystemPromptBuilder::new(),
-        cached_system_prompt: None,
-        cached_context_reminder: None,
         matched_skill_names: vec!["solo".to_string()],
+        ..Default::default()
     };
     let reminder = guard
         .context_reminder()
@@ -2311,9 +2413,8 @@ fn context_reminder_omits_skill_pointer_without_active_skills() {
     let mut guard = super::SkillTurnGuard {
         restore_agent_context: None,
         builder: SystemPromptBuilder::new(),
-        cached_system_prompt: None,
-        cached_context_reminder: None,
         matched_skill_names: Vec::new(),
+        ..Default::default()
     };
     assert!(guard.context_reminder().is_none());
 }

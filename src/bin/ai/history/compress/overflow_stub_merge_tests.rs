@@ -455,3 +455,27 @@ fn second_pass_zero_summary_budget_keeps_early_summary_and_archive_notes() {
         "最近的用户轮次必须保留: {texts:?}"
     );
 }
+
+/// A spilled old user message turns into archive metadata; the reminder it was
+/// sent with must not be replayed onto the stub.
+#[test]
+fn spilled_user_message_does_not_replay_its_request_reminder() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-spill-reminder-{}", uuid::Uuid::new_v4()));
+    let mut old_user = msg("user", &"long user input ".repeat(USER_OVERFLOW_SPILL_MIN_CHARS));
+    crate::ai::history::attach_request_reminder(&mut old_user, "<system-reminder>x</system-reminder>");
+    let mut messages = vec![
+        msg("system", "sys"),
+        old_user,
+        msg("assistant", "a1"),
+        msg("user", "u2"),
+        msg("assistant", "a2"),
+        msg("user", "u3"),
+        msg("assistant", "a3"),
+        msg("user", "最近的用户轮次"),
+    ];
+    assert!(try_spill_preserved_message_to_stub(&mut messages, &overflow_dir, 1_000));
+    assert!(is_preserved_user_or_image_stub(&value_to_string(&messages[1].content)));
+    assert_eq!(messages[1].reasoning_content, None);
+    let _ = std::fs::remove_dir_all(&overflow_dir);
+}

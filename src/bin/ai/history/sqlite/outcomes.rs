@@ -13,7 +13,7 @@ use super::connection::{open_history_db, open_history_db_read_only};
 use super::lock::with_session_state_lock;
 use super::migrations::init_history_schema;
 use super::revision::bump_history_revision;
-use super::{LLM_PRUNE_MARKS_META_KEY, STALE_PATCH_TARGETS_META_KEY};
+use super::{LLM_PRUNE_MARKS_META_KEY, PROMPT_RESIDENCY_META_KEY, STALE_PATCH_TARGETS_META_KEY};
 
 /// Persist a structured success/failure and execution signature for every real tool call. The tool result body still lives only in
 /// `messages`, so the request projection can fold resolved errors while the human history keeps the original diagnostics.
@@ -348,6 +348,86 @@ pub(in crate::ai) fn write_stale_patch_targets_sqlite(
     })
 }
 
+/// System-prompt content that, once rendered in a session, stays resident in
+/// later turns instead of being recomputed per turn, so the model keeps
+/// instructions it already followed and consecutive requests share the
+/// system-prompt prefix the provider caches. Only a paused mutation's
+/// documents can displace resident ones (budget), and history truncation
+/// drops the whole record. Recorded only for SQLite-backed histories.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(in crate::ai) struct PromptResidency {
+    /// Directories whose target-scoped instruction documents are loaded.
+    #[serde(default)]
+    pub(in crate::ai) scoped_instruction_dirs: Vec<PathBuf>,
+    /// Whether the full session-tools guidance replaces the one-line session id.
+    #[serde(default)]
+    pub(in crate::ai) session_context_guidance: bool,
+}
+
+/// Read the session's resident prompt state. `None` means none was recorded.
+pub(in crate::ai) fn read_prompt_residency_sqlite(
+    path: &Path,
+) -> io::Result<Option<PromptResidency>> {
+    if !blob::is_sqlite_path(path) || !path.exists() {
+        return Ok(None);
+    }
+    let conn = open_history_db_read_only(path)?;
+    let table_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(None);
+    }
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1 LIMIT 1",
+            params![PROMPT_RESIDENCY_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    raw.map(|raw| {
+        serde_json::from_str::<PromptResidency>(&raw).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid prompt residency metadata: {error}"),
+            )
+        })
+    })
+    .transpose()
+}
+
+/// Atomically replace the session's resident prompt state. Lives in the meta
+/// table; clearing or truncating the session history also clears it. Non-SQLite
+/// histories have no meta table and return `Ok(())` without recording anything.
+pub(in crate::ai) fn write_prompt_residency_sqlite(
+    path: &Path,
+    residency: &PromptResidency,
+) -> io::Result<()> {
+    if !blob::is_sqlite_path(path) {
+        return Ok(());
+    }
+    let encoded =
+        serde_json::to_string(residency).map_err(|error| io::Error::other(error.to_string()))?;
+    with_session_state_lock(path, || {
+        let conn = open_history_db(path)?;
+        init_history_schema(&conn)?;
+        conn.execute(
+            "INSERT INTO meta (key, value, created_at) VALUES (?1, ?2, unixepoch())
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, created_at=excluded.created_at",
+            params![PROMPT_RESIDENCY_META_KEY, encoded],
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(())
+    })
+}
+
 /// Read the current session's model-guided prune counts. Missing or non-SQLite history safely degrades to empty.
 pub(in crate::ai) fn read_llm_prune_marks_sqlite(path: &Path) -> io::Result<FxHashMap<String, u8>> {
     if !blob::is_sqlite_path(path) || !path.exists() {
@@ -432,6 +512,17 @@ pub(super) fn clear_llm_prune_marks_meta(conn: &Connection) -> io::Result<()> {
     conn.execute(
         "DELETE FROM meta WHERE key=?1",
         params![LLM_PRUNE_MARKS_META_KEY],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(())
+}
+
+/// Truncation rolls the session back to an earlier point, so the resident
+/// prompt state recorded by the removed turns no longer applies.
+pub(super) fn clear_prompt_residency_meta(conn: &Connection) -> io::Result<()> {
+    conn.execute(
+        "DELETE FROM meta WHERE key=?1",
+        params![PROMPT_RESIDENCY_META_KEY],
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(())

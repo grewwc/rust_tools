@@ -1,14 +1,14 @@
 {
   "name": "execute_command",
-  "description": "Run a shell command. Destructive, privilege-escalation, remote-shell, and network-listener commands are blocked; ordinary HTTP clients and package managers are allowed. Truncated output reports shown/total counts; narrow or page instead of rerunning variants. Failures report the exit code.",
-  "first_use_guidance": "Guidance for later execute_command calls in this turn:\n- Long-running or interactive commands: start with `yield_time_ms`, then poll with `session_id`, send input with `write_stdin`, or end with `close_session`. Prefer this over `&` plus log-file polling.\n- `sleep` is expensive: it blocks the whole turn on dead time — do not use it unless truly necessary (e.g. waiting for a server to accept connections). Prefer `session_id` polling for commands already running, or `task_wait` for subagent tasks.",
+  "description": "Start a shell command. Destructive, privilege-escalation, remote-shell, and network-listener commands are blocked; ordinary HTTP clients and package managers are allowed. Truncated output reports shown/total counts; narrow or page instead of rerunning variants. Failures report the exit code. For long-running commands, start with `yield_time_ms` and control the returned session with `command_session`.",
+  "first_use_guidance": "Guidance for later execute_command calls in this turn:\n- Long-running or interactive commands: start with `yield_time_ms`, then use `command_session` with action=poll/write/close and the returned session id. Prefer this over `&` plus log-file polling.\n- `sleep` is expensive: it blocks the whole turn on dead time — do not use it unless truly necessary (e.g. waiting for a server to accept connections). Prefer `command_session` polling for commands already running, or `task_wait` for subagent tasks.",
   "raw_body_parameter": "command",
   "parameters": {
     "type": "object",
     "properties": {
       "command": {
         "type": "string",
-        "description": "Shell command for a new call. Required for a new call; omit it when polling, writing to, or closing an existing `session_id` (passing both is rejected). Long-running or interactive work should start a session with `yield_time_ms` instead of relying on the 60-300s one-shot timeout. Do not pipe interactive commands through `head`, `tail`, `grep`, or `tee`; they can wait for process exit and stall."
+        "description": "Shell command to start. Long-running or interactive work should use `yield_time_ms` instead of relying on the 60-300s one-shot timeout. Do not pipe interactive commands through `head`, `tail`, `grep`, or `tee`; they can wait for process exit and stall."
       },
       "cwd": {
         "type": "string",
@@ -16,7 +16,7 @@
       },
       "input": {
         "type": "string",
-        "description": "Optional text written verbatim to the command's stdin immediately after spawn, up to 16 KiB. Include a trailing newline for line-oriented prompts. For pty=true this is typed into the terminal: closing the writer does not send EOF, so a program that reads until EOF will wait for timeout; send `\\u0004` (Ctrl-D) explicitly for that case. Do not send secrets; the text becomes part of the tool call history.",
+        "description": "Optional text written verbatim to the command's stdin immediately after spawn, up to 16 KiB. Include a trailing newline for line-oriented prompts. Omit when not needed; an empty string means no input. For pty=true this is typed into the terminal: closing the writer does not send EOF, so a program that reads until EOF will wait for timeout; send `\\u0004` (Ctrl-D) explicitly for that case. Do not send secrets; the text becomes part of the tool call history.",
         "maxLength": 16384
       },
       "timeout": {
@@ -27,28 +27,17 @@
       },
       "pty": {
         "type": "boolean",
-        "description": "Required: always supply this field (the call is rejected if omitted). Use true only for interactive CLIs (prompts, QR codes, full-screen UI); use false for everything else, including background commands. With `yield_time_ms`, `pty=true` starts a persistent PTY session and `write_stdin` types into it."
-      },
-      "session_id": {
-        "type": "string",
-        "description": "Existing command session returned by a prior `yield_time_ms` call. Omit `command` when using this; only the session that created it may poll, write, or close it."
+        "description": "Required: always supply this field (the call is rejected if omitted). Use true only for interactive CLIs (prompts, QR codes, full-screen UI); use false for everything else, including background commands. With `yield_time_ms`, `pty=true` starts a persistent PTY session controlled through `command_session`."
       },
       "yield_time_ms": {
         "type": "integer",
-        "description": "Start a persistent command session and wait up to this many milliseconds for output (1-30000, default 10000). Returns a session id when the process is still running. Use this for long builds, REPLs, and multi-step interactive commands.",
+        "description": "Start a persistent command session and wait up to this many milliseconds for output (1-30000, default 10000). Returns a session id when the process is still running; control it with `command_session`. Use this for long builds, REPLs, and multi-step interactive commands.",
         "minimum": 1,
         "maximum": 30000
-      },
-      "write_stdin": {
-        "type": "string",
-        "description": "Bytes written verbatim to an existing session's stdin, followed by a yield. Requires `session_id`; include a trailing newline for line-oriented prompts. With `pty=true`, EOF is not implied by ending the write: send `\\u0004` (Ctrl-D) if the program waits for EOF. Do not send secrets; the text becomes part of the tool call history. Do not combine with `close_session`."
-      },
-      "close_session": {
-        "type": "boolean",
-        "description": "Terminate the existing `session_id` and remove it. Requires `session_id`; do not combine with `write_stdin` or `command`. Use this for stuck processes instead of waiting for the 10-minute idle reaper."
       }
     },
     "required": [
+      "command",
       "pty"
     ]
   },

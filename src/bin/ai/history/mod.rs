@@ -300,6 +300,7 @@ pub(in crate::ai) use sqlite::{
     write_llm_prune_marks_sqlite, write_stale_patch_targets_sqlite,
 };
 pub(in crate::ai) use sqlite::{read_image_digest_sqlite, upsert_image_digest_sqlite};
+pub(in crate::ai) use sqlite::{read_prompt_residency_sqlite, write_prompt_residency_sqlite};
 #[allow(unused_imports)]
 pub(in crate::ai) use suspended::{
     SuspendedSessionEntry, SuspendedSessionStore, current_terminal_key,
@@ -315,8 +316,9 @@ pub(in crate::ai) use task_evidence::{
 #[allow(unused_imports)]
 pub(in crate::ai) use types::{
     COLON, MAX_HISTORY_TURNS, Message, NEWLINE, SkillActivationEvent, ToolExecutionOutcome,
-    clear_runtime_message_metadata, is_runtime_synthetic_user_message, last_real_user_index,
-    redact_inline_image_data, runtime_synthetic_user_message,
+    attach_request_reminder, clear_runtime_message_metadata, has_runtime_message_metadata,
+    is_runtime_synthetic_user_message, last_real_user_index, prepend_request_reminder,
+    redact_inline_image_data, request_reminder, runtime_synthetic_user_message,
 };
 
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;

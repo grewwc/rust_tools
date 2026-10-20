@@ -57,6 +57,8 @@ fn persisted_user_turn_message(
     Message {
         role: ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(persisted_question_text.to_string()),
+        // The request reminder side channel belongs to real user messages only.
+        reasoning_content: None,
         ..user_message
     }
 }
@@ -143,7 +145,14 @@ fn session_origin_fact(history_file: &Path, session_id: &str, history: &[Message
     fact.push_str(&format!(
         "Any older turn is readable verbatim with `session_read` (session_id=\"{session_id}\", mode=\"raw\", from=<canonical index>)."
     ));
-    Some(fact)
+    // Earlier user messages replay the reminder they were sent with, so once a
+    // resident one already shows this exact fact the model sees it verbatim;
+    // repeating it in every later turn would only grow the context.
+    let replayed = history.iter().any(|message| {
+        crate::ai::history::request_reminder(message)
+            .is_some_and(|reminder| reminder.contains(&fact))
+    });
+    (!replayed).then_some(fact)
 }
 
 fn assemble_effective_question(
@@ -690,8 +699,10 @@ pub(super) async fn prepare_turn(
     // everything from the reminder onward. Fold it into the **current**
     // user message instead: the current message is always a cache miss
     // anyway, so reminder churn no longer truncates the cached prefix.
-    // The `turn_messages` list (what gets persisted to long-term history)
-    // intentionally keeps the original user question without the reminder.
+    // The persisted user message records the reminder in its runtime side
+    // channel (content keeps only the user's input), and request
+    // normalization replays it byte-identically, so later turns resend this
+    // message exactly as the model saw it and the cached prefix extends.
     let context_reminder = skill_turn.context_reminder();
     // Two content forms of the same user turn:
     // - `user_content`: the MATERIALIZED request form (inline base64 image_url
@@ -713,7 +724,7 @@ pub(super) async fn prepare_turn(
         attachment_assets_dir.as_path(),
     )?;
     // Persisted track: canonical turn_messages keep the reference boundary.
-    let user_message = Message {
+    let mut user_message = Message {
         role: "user".to_string(),
         content: persisted_user_content,
         tool_calls: None,
@@ -729,20 +740,9 @@ pub(super) async fn prepare_turn(
         reasoning_content: None,
     };
     if let Some(reminder) = context_reminder.as_deref() {
-        request_user_message.content = match request_user_message.content {
-            Value::String(text) => Value::String(format!("{}\n\n{}", reminder, text)),
-            Value::Array(mut parts) => {
-                parts.insert(
-                    0,
-                    serde_json::json!({
-                        "type": "text",
-                        "text": reminder,
-                    }),
-                );
-                Value::Array(parts)
-            }
-            other => other,
-        };
+        crate::ai::history::attach_request_reminder(&mut user_message, reminder);
+        request_user_message.content =
+            crate::ai::history::prepend_request_reminder(request_user_message.content, reminder);
     }
     // Recalled knowledge is historical reference data for this request only.
     // It never enters turn_messages, which is the canonical persistence track.
@@ -1126,9 +1126,17 @@ mod tests {
         assert!(fact.contains("session_read"), "{fact}");
         // Stable across turns: the same canonical origin renders the same bytes.
         assert_eq!(
-            Some(fact),
+            Some(fact.clone()),
             super::session_origin_fact(&path, "sid", &compacted[1..])
         );
+        // A resident user message whose replayed reminder already shows the
+        // fact makes a second copy redundant.
+        let mut replayed = compacted.clone();
+        crate::ai::history::attach_request_reminder(
+            &mut replayed[1],
+            &format!("<system-reminder>\n## Session Origin\n{fact}\n</system-reminder>"),
+        );
+        assert!(super::session_origin_fact(&path, "sid", &replayed).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

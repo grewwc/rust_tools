@@ -310,7 +310,9 @@ fn render_summary_message(message: &Message, max_chars: usize) -> String {
             max_chars,
         );
     }
-    if let Some(reasoning) = &message.reasoning_content {
+    if let Some(reasoning) = &message.reasoning_content
+        && !crate::ai::history::has_runtime_message_metadata(message)
+    {
         let remaining = max_chars.saturating_sub(out.chars().count());
         push_summary_text(
             &mut out,

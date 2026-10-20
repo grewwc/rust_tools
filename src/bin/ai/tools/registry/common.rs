@@ -914,7 +914,7 @@ mod history_policy_tests {
 
     #[test]
     fn subagent_spawn_tools_block_lossy_and_gate_prune_on_integration() {
-        // task_spawn / task_spawn_batch arguments (subagent prompt / response
+        // task_spawn arguments (subagent prompt / response
         // schema) and return values (task_id list) are required inputs for
         // later wait/status/integrate. Missing registration would fall back to
         // the default policy (Allow/Allow); after folding, evidence degrades
@@ -923,7 +923,7 @@ mod history_policy_tests {
         // already-spawned subtasks. Pruning stays possible, but only after
         // integration: see `ToolPrunePolicy::AfterIntegration`. This assertion
         // pins the contract.
-        for name in ["task_spawn", "task_spawn_batch"] {
+        for name in ["task_spawn"] {
             let policy = tool_history_policy(name);
             assert!(
                 !policy.allows_lossy_compress(),

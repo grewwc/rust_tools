@@ -389,39 +389,66 @@ pub(super) fn load_scoped_project_instruction_docs_for_targets(
     let Ok(cwd) = crate::ai::driver::runtime_ctx::effective_cwd() else {
         return Vec::new();
     };
-    load_scoped_project_instruction_docs_for_target_priority_from(&cwd, targets, &[])
+    load_scoped_project_instruction_docs_for_target_tiers_from(&cwd, targets, &[], &[])
 }
 
-/// 加载 scoped 指令时，先为当前必须解锁的 mutation 目标分配预算，再用本轮其它已
-/// 观察目标填充剩余预算。安全 preflight 不能与普通历史读取竞争同一个无优先级池，
-/// 否则长 turn 中旧目标会让新 mutation 永远拿不到规则、反复暂停。
+/// Loads scoped instructions with budgeted priority: a pending mutation's
+/// targets first, then directories already resident in the prompt, then other
+/// targets touched in the current turn. Safety preflight must not compete with
+/// ordinary historical reads for one unprioritized pool, or a new mutation in a
+/// long turn would never get its rules and would pause repeatedly.
 pub(super) fn load_scoped_project_instruction_docs_for_target_priority(
     required_targets: &[PathBuf],
     observed_targets: &[PathBuf],
+    carried_targets: &[PathBuf],
 ) -> Vec<ProjectInstructionDoc> {
     let Ok(cwd) = crate::ai::driver::runtime_ctx::effective_cwd() else {
         return Vec::new();
     };
-    load_scoped_project_instruction_docs_for_target_priority_from(
+    load_scoped_project_instruction_docs_for_target_tiers_from(
         &cwd,
         required_targets,
         observed_targets,
+        carried_targets,
     )
 }
 
+#[cfg(test)]
 fn load_scoped_project_instruction_docs_for_targets_from(
     cwd: &Path,
     targets: &[PathBuf],
 ) -> Vec<ProjectInstructionDoc> {
-    load_scoped_project_instruction_docs_for_target_priority_from(cwd, targets, &[])
+    load_scoped_project_instruction_docs_for_target_tiers_from(cwd, targets, &[], &[])
 }
 
+#[cfg(test)]
 fn load_scoped_project_instruction_docs_for_target_priority_from(
     cwd: &Path,
     required_targets: &[PathBuf],
     observed_targets: &[PathBuf],
 ) -> Vec<ProjectInstructionDoc> {
-    if required_targets.is_empty() && observed_targets.is_empty() {
+    load_scoped_project_instruction_docs_for_target_tiers_from(
+        cwd,
+        required_targets,
+        observed_targets,
+        &[],
+    )
+}
+
+/// Budgeted scoped-instruction selection over three priority tiers:
+/// `required` (paused mutations that must be unblocked), `carried` (the
+/// directories already resident in the system prompt), then `observed`
+/// (targets touched in the current turn). Each tier is fully considered
+/// before the next: a pending mutation is never starved, and resident
+/// documents keep their bytes when new targets compete for the budget — only
+/// a pending mutation can displace them.
+fn load_scoped_project_instruction_docs_for_target_tiers_from(
+    cwd: &Path,
+    required_targets: &[PathBuf],
+    observed_targets: &[PathBuf],
+    carried_targets: &[PathBuf],
+) -> Vec<ProjectInstructionDoc> {
+    if required_targets.is_empty() && observed_targets.is_empty() && carried_targets.is_empty() {
         return Vec::new();
     }
     let base_docs = load_project_instruction_docs_from(cwd);
@@ -436,9 +463,15 @@ fn load_scoped_project_instruction_docs_for_target_priority_from(
     let mut seen_paths = std::collections::BTreeSet::new();
     let mut required_candidates = Vec::new();
     let mut observed_candidates = Vec::new();
-    for (targets, candidates) in [
-        (required_targets, &mut required_candidates),
-        (observed_targets, &mut observed_candidates),
+    let mut carried_candidates = Vec::new();
+    // Required and observed entries are touched files (their documents come
+    // from the parent directory); carried entries are the directories that a
+    // previous turn already resolved. Collected in priority order so a
+    // document both resident and observed is deduplicated into the resident tier.
+    for (targets, entries_are_dirs, candidates) in [
+        (required_targets, false, &mut required_candidates),
+        (carried_targets, true, &mut carried_candidates),
+        (observed_targets, false, &mut observed_candidates),
     ] {
         for target in targets {
             let absolute = if target.is_absolute() {
@@ -446,10 +479,15 @@ fn load_scoped_project_instruction_docs_for_target_priority_from(
             } else {
                 cwd.join(target)
             };
-            let Some(parent) = absolute.parent() else {
-                continue;
+            let dir = if entries_are_dirs {
+                absolute.as_path()
+            } else {
+                let Some(parent) = absolute.parent() else {
+                    continue;
+                };
+                parent
             };
-            let Ok(target_dir) = fs::canonicalize(parent) else {
+            let Ok(target_dir) = fs::canonicalize(dir) else {
                 continue;
             };
             if !target_dir.starts_with(&canonical_root) {
@@ -463,8 +501,13 @@ fn load_scoped_project_instruction_docs_for_target_priority_from(
             }
         }
     }
-    // 每个优先级内部先选最具体规则；required 整组始终排在 observed 之前。
-    for candidates in [&mut required_candidates, &mut observed_candidates] {
+    // Within each tier the most specific rules come first; whole tiers are
+    // ordered required, then carried, then observed.
+    for candidates in [
+        &mut required_candidates,
+        &mut observed_candidates,
+        &mut carried_candidates,
+    ] {
         candidates.sort_by(|a, b| {
             instruction_doc_depth(b)
                 .cmp(&instruction_doc_depth(a))
@@ -475,7 +518,8 @@ fn load_scoped_project_instruction_docs_for_target_priority_from(
     let mut used = 0usize;
     for doc in required_candidates
         .into_iter()
-        .chain(observed_candidates.into_iter())
+        .chain(carried_candidates)
+        .chain(observed_candidates)
     {
         if used >= TARGET_SCOPED_INSTRUCTION_MAX_TOTAL_CHARS {
             break;

@@ -64,6 +64,15 @@ fn format_number(n: u64) -> String {
     }
 }
 
+/// Share of input tokens the provider served from its prompt cache, as a
+/// percentage. `-` when there is no input to divide by.
+fn format_cache_ratio(cached: u64, input: u64) -> String {
+    if input == 0 {
+        return "-".to_string();
+    }
+    format!("{:.0}%", (cached.min(input) as f64 / input as f64) * 100.0)
+}
+
 /// 把秒数解析成时间窗口；返回 `Some(None)`=全部历史，`Some(Some(secs))`=最近 secs 秒，`None`=无法解析。
 fn parse_window(arg: &str) -> Option<Option<u64>> {
     let a = arg.trim().to_ascii_lowercase();
@@ -136,15 +145,16 @@ fn print_models_breakdown(window: Option<u64>) {
             rows.sort_by(|a, b| b.calls.cmp(&a.calls));
             println!("  [{} models]  sorted by calls ↓", label);
             println!(
-                "      {:<24} {:>6}  {:>7}  {:>7}  {:>7}  {:>7}",
-                "model", "calls", "in", "out", "think", "total"
+                "      {:<24} {:>6}  {:>7}  {:>6}  {:>7}  {:>7}  {:>7}",
+                "model", "calls", "in", "cache", "out", "think", "total"
             );
             for r in rows.iter().filter(|r| r.calls > 0) {
                 println!(
-                    "      {:<24} {:>6}  {:>7}  {:>7}  {:>7}  {:>7}",
+                    "      {:<24} {:>6}  {:>7}  {:>6}  {:>7}  {:>7}  {:>7}",
                     r.model,
                     format_number(r.calls),
                     format_number(r.input),
+                    format_cache_ratio(r.cached_input, r.input),
                     format_number(r.output),
                     format_number(r.reasoning),
                     format_number(r.total)
@@ -319,4 +329,18 @@ pub fn try_handle_usage_command(input: &str) -> Result<bool, Box<dyn std::error:
         print_usage_help();
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_cache_ratio;
+
+    #[test]
+    fn cache_ratio_is_clamped_to_the_input_share() {
+        assert_eq!(format_cache_ratio(0, 0), "-");
+        assert_eq!(format_cache_ratio(0, 200), "0%");
+        assert_eq!(format_cache_ratio(50, 200), "25%");
+        assert_eq!(format_cache_ratio(200, 100), "100%");
+        assert_eq!(format_cache_ratio(2, 3), "67%");
+    }
 }

@@ -73,7 +73,7 @@ pub(crate) fn unregister(session_id: &str, pgid: u32) {
 /// True when `pgid` is a registered background process group of `session_id`.
 /// Read-only probe used by the command sandbox to decide whether a
 /// `kill`/`pkill`/`killall` target may be signaled: only process groups this
-/// session started via `execute_command` are killable, everything else stays
+/// session started via `execute_command` / `command_session` are killable, everything else stays
 /// blocked.
 pub(crate) fn is_registered_pgid(session_id: &str, pgid: u32) -> bool {
     if pgid == 0 {

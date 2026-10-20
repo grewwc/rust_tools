@@ -6,7 +6,7 @@ use super::{
     build_selection_explanation, bump_task_wait_noop_count, capped_subagent_manifest,
     discard_tasks_for_session, encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels,
     execute_task_cancel, execute_task_integrate, execute_task_retry, execute_task_spawn,
-    execute_task_spawn_batch, execute_task_status, execute_task_wait,
+    execute_task_status, execute_task_wait,
     expire_task_wait_states_for_test, format_task_result_with_id, insert_task_entry_for_test,
     is_encoded_task_goal, is_retryable_task_status, parse_task_wait_options, prepare_subagent_task,
     reap_timed_out_subagents, record_subagent_progress_update, register_retry_spec,
@@ -225,16 +225,38 @@ fn subagent_response_schema_is_prompted_and_validated() {
 }
 
 #[test]
-fn task_spawn_batch_rejects_unbounded_fan_out() {
+fn task_spawn_rejects_unbounded_fan_out() {
     let tasks = vec![serde_json::json!({}); super::MAX_SUBAGENT_SPAWN_BATCH_SIZE + 1];
-    let error = execute_task_spawn_batch(&serde_json::json!({ "tasks": tasks })).unwrap_err();
+    let error = execute_task_spawn(&serde_json::json!({ "tasks": tasks })).unwrap_err();
 
     assert_eq!(
         error,
         format!(
-            "task_spawn_batch accepts at most {} tasks per call",
+            "task_spawn accepts at most {} tasks per call",
             super::MAX_SUBAGENT_SPAWN_BATCH_SIZE
         )
+    );
+}
+
+#[test]
+fn task_spawn_requires_a_non_empty_tasks_array_and_preflights_every_item() {
+    let legacy = execute_task_spawn(&serde_json::json!({
+        "description": "legacy single form",
+        "prompt": "must not run",
+    }))
+    .unwrap_err();
+    assert_eq!(legacy, "task_spawn requires a 'tasks' array");
+
+    let empty = execute_task_spawn(&serde_json::json!({ "tasks": [] })).unwrap_err();
+    assert_eq!(empty, "task_spawn requires at least one task");
+
+    let incomplete = execute_task_spawn(&serde_json::json!({
+        "tasks": [{ "description": "first" }],
+    }))
+    .unwrap_err();
+    assert!(
+        incomplete.contains("task_spawn tasks[0]: Missing 'prompt' parameter"),
+        "err: {incomplete}"
     );
 }
 
@@ -999,8 +1021,10 @@ fn subagent_depth_rejects_task_orchestration_execution() {
             (
                 "task_spawn",
                 execute_task_spawn(&serde_json::json!({
-                    "description": "nested",
-                    "prompt": "should not run"
+                    "tasks": [{
+                        "description": "nested",
+                        "prompt": "should not run"
+                    }]
                 })),
             ),
             (
@@ -2363,7 +2387,6 @@ fn subagent_result_tools_are_never_lossy_and_gate_evidence_pruning_on_integratio
         "task_status",
         "task_retry",
         "task_spawn",
-        "task_spawn_batch",
         "task_evidence_read",
     ];
     for name in gated {

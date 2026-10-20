@@ -1063,6 +1063,11 @@ pub(super) fn append_tool_result_messages_for_model(
     }
 
     let prepared_results = prepare_tool_results_for_history(app, exec_result);
+    debug_assert_eq!(
+        exec_result.execution_outcomes.len(),
+        exec_result.executed_tool_calls.len(),
+        "every executed call needs an outcome slot, or its result is dropped below"
+    );
     let mut working_checkpoint_messages = Vec::new();
     for (((tool_call, result), prepared), outcome) in exec_result
         .executed_tool_calls

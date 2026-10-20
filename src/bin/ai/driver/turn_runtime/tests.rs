@@ -1184,8 +1184,10 @@ fn agent_team_delegation_does_not_disable_read_only_progress_guard() {
         "spawn-1",
         "task_spawn",
         serde_json::json!({
-            "description": "inspect independent branch",
-            "prompt": "Inspect one independent branch and report evidence.",
+            "tasks": [{
+                "description": "inspect independent branch",
+                "prompt": "Inspect one independent branch and report evidence.",
+            }],
         }),
         r#"{"task_id":"child-1"}"#,
     );

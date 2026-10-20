@@ -46,7 +46,6 @@ const BASELINE_TOOL_NAMES: &[&str] = &[
     "read_file",
     "task",
     "task_spawn",
-    "task_spawn_batch",
     "task_retry",
     "task_wait",
     "task_status",
@@ -69,7 +68,6 @@ pub(crate) fn eager_baseline_tool_names() -> &'static [&'static str] {
 const SUBAGENT_ORCHESTRATION_TOOL_NAMES: &[&str] = &[
     "task",
     "task_spawn",
-    "task_spawn_batch",
     "task_retry",
     "task_wait",
     "task_status",

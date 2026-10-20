@@ -39,7 +39,7 @@ pub(super) enum ContextKind {
     Fact,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) struct SystemPromptBuilder {
     sections: Vec<(ContextKind, Option<String>, String)>,
 }
@@ -68,6 +68,28 @@ impl SystemPromptBuilder {
                 content,
             ));
         }
+    }
+
+    /// Replaces the content of the first section carrying `label` in place,
+    /// keeping its position so the rendered prompt only changes inside that
+    /// section; appends when no such section exists yet.
+    fn replace_labeled(&mut self, kind: ContextKind, label: &str, content: impl Into<String>) {
+        let content = content.into();
+        if content.trim().is_empty() {
+            return;
+        }
+        let label = label.trim();
+        if let Some(section) = self
+            .sections
+            .iter_mut()
+            .find(|(existing_kind, existing_label, _)| {
+                *existing_kind == kind && existing_label.as_deref() == Some(label)
+            })
+        {
+            section.2 = content;
+            return;
+        }
+        self.push_labeled(kind, label, content);
     }
 
     fn render_system_prompt(&self) -> String {
@@ -182,6 +204,7 @@ fn runtime_environment_prompt() -> String {
     )
 }
 
+#[derive(Default)]
 pub(super) struct SkillTurnGuard {
     restore_agent_context: Option<(Vec<ToolDef>, usize)>,
     builder: SystemPromptBuilder,
@@ -189,7 +212,24 @@ pub(super) struct SkillTurnGuard {
     cached_context_reminder: Option<Option<String>>,
     /// Currently active skill list (ordered; multiple skills are peers with no ranking).
     matched_skill_names: Vec<String>,
+    /// Sections pushed after the guard was built (turn-preparation facts,
+    /// critic and observer guidance), in push order. A mid-turn rebuild
+    /// replays them onto the fresh guard so the turn keeps the same
+    /// instructions and the same system-prompt bytes.
+    turn_sections: Vec<(ContextKind, Option<String>, String)>,
+    /// Directories whose target-scoped instruction documents the section
+    /// currently renders (seeded from storage, updated on every load).
+    scoped_instruction_dirs: Vec<PathBuf>,
+    /// Whether `scoped_instruction_dirs` differs from what storage holds.
+    scoped_instruction_dirs_changed: bool,
+    /// Whether this guard rendered the full session-tools guidance.
+    session_context_guidance: bool,
+    /// Whether the session had already made that guidance resident.
+    session_context_guidance_was_sticky: bool,
 }
+
+/// Label of the system-prompt section holding target-scoped instructions.
+const SCOPED_PROJECT_INSTRUCTIONS_LABEL: &str = "target_scoped_project_instructions";
 
 impl SkillTurnGuard {
     pub(super) fn system_prompt(&mut self) -> &str {
@@ -256,12 +296,34 @@ impl SkillTurnGuard {
         self.cached_system_prompt = None;
         self.cached_context_reminder = None;
         self.builder.push(kind, content);
+        if !content.trim().is_empty() {
+            self.turn_sections.push((kind, None, content.to_string()));
+        }
     }
 
     pub(super) fn push_labeled_section(&mut self, kind: ContextKind, label: &str, content: &str) {
         self.cached_system_prompt = None;
         self.cached_context_reminder = None;
         self.builder.push_labeled(kind, label, content);
+        if !content.trim().is_empty() {
+            let label = label.trim();
+            self.turn_sections.push((
+                kind,
+                (!label.is_empty()).then(|| label.to_string()),
+                content.to_string(),
+            ));
+        }
+    }
+
+    /// Replays the sections `previous` received after it was built onto this
+    /// freshly built guard, in their original order.
+    fn inherit_turn_sections(&mut self, previous: &SkillTurnGuard) {
+        for (kind, label, content) in &previous.turn_sections {
+            match label {
+                Some(label) => self.push_labeled_section(*kind, label, content),
+                None => self.push_section(*kind, content),
+            }
+        }
     }
 
     pub(super) fn append_system_prompt(&mut self, extra: &str) {
@@ -273,17 +335,88 @@ impl SkillTurnGuard {
         required_targets: &[PathBuf],
         observed_targets: &[PathBuf],
     ) -> bool {
-        if let Some(prompt) = build_scoped_project_instruction_prompt_with_priority(
+        if let Some((prompt, doc_dirs)) = build_scoped_project_instruction_prompt_with_priority(
             required_targets,
             observed_targets,
+            &self.scoped_instruction_dirs,
         ) {
-            self.push_labeled_section(
+            // Record exactly what the section renders: a paused mutation's
+            // documents outrank resident ones and may evict them when the
+            // budget is full, and storage must not claim documents the
+            // prompt no longer holds.
+            if self.scoped_instruction_dirs != doc_dirs {
+                self.scoped_instruction_dirs = doc_dirs;
+                self.scoped_instruction_dirs_changed = true;
+            }
+            // Replaced in place rather than appended: the section keeps its
+            // position, and it is rebuilt from the guard's own state instead
+            // of being replayed through `turn_sections`.
+            self.cached_system_prompt = None;
+            self.cached_context_reminder = None;
+            self.builder.replace_labeled(
                 ContextKind::Policy,
-                "target_scoped_project_instructions",
-                &prompt,
+                SCOPED_PROJECT_INSTRUCTIONS_LABEL,
+                prompt,
             );
         }
         !scoped_project_instructions_missing(self.system_prompt(), required_targets)
+    }
+
+    /// Seeds the directories whose scoped instruction documents earlier turns
+    /// of this session already loaded, and renders them. Documents stay
+    /// resident instead of being dropped at every turn boundary and re-added
+    /// on the next touch, so the model keeps seeing the rules it already
+    /// followed and the system-prompt prefix stays stable. Only a paused
+    /// mutation's documents can displace them when the budget is full.
+    pub(super) fn seed_scoped_instruction_dirs(&mut self, dirs: Vec<PathBuf>) {
+        if dirs.is_empty() {
+            return;
+        }
+        let seeded = dirs;
+        self.scoped_instruction_dirs = seeded.clone();
+        self.push_scoped_project_instructions(&[], &[]);
+        if !self.has_scoped_project_instructions() {
+            // None of the stored documents can be rendered anymore (deleted,
+            // outside the project, or over budget). Drop the stale directories
+            // so storage stops claiming a section the prompt does not hold.
+            self.scoped_instruction_dirs.clear();
+            self.scoped_instruction_dirs_changed = true;
+            return;
+        }
+        // Seeded directories came from storage, but rendering may drop entries
+        // whose documents disappeared or no longer fit the budget. Report that
+        // shrinkage so storage never claims documents the prompt does not hold.
+        self.scoped_instruction_dirs_changed = self.scoped_instruction_dirs != seeded;
+    }
+
+    fn has_scoped_project_instructions(&self) -> bool {
+        self.builder.sections.iter().any(|(kind, label, _)| {
+            *kind == ContextKind::Policy
+                && label.as_deref() == Some(SCOPED_PROJECT_INSTRUCTIONS_LABEL)
+        })
+    }
+
+    /// Directories whose scoped instruction documents are resident, when this
+    /// turn changed them from what storage holds.
+    pub(super) fn changed_scoped_instruction_dirs(&self) -> Option<&[PathBuf]> {
+        self.scoped_instruction_dirs_changed
+            .then_some(self.scoped_instruction_dirs.as_slice())
+    }
+
+    /// Whether this turn rendered the full session-tools guidance for the
+    /// first time in the session, so later turns should keep it resident.
+    pub(super) fn session_context_guidance_newly_rendered(&self) -> bool {
+        self.session_context_guidance && !self.session_context_guidance_was_sticky
+    }
+
+    /// Carries turn-scoped state from the guard this one replaces: sections
+    /// pushed after the old guard was built, and the resident scoped
+    /// instruction directories. Must run before scoped instructions are
+    /// pushed onto this guard.
+    pub(super) fn inherit_turn_state(&mut self, previous: &SkillTurnGuard) {
+        self.inherit_turn_sections(previous);
+        self.scoped_instruction_dirs = previous.scoped_instruction_dirs.clone();
+        self.scoped_instruction_dirs_changed = previous.scoped_instruction_dirs_changed;
     }
 
     /// Returns the names of all currently active skills (ordered; peers with no ranking).
@@ -826,7 +959,6 @@ fn build_hidden_task_tool_catalog(available_tools: &Box<SkipSet<String>>) -> Opt
     const TASK_FAMILY: &[&str] = &[
         "task",
         "task_spawn",
-        "task_spawn_batch",
         "task_wait",
         "task_status",
         "task_retry",
@@ -920,33 +1052,45 @@ fn build_project_instruction_prompt() -> Option<String> {
     Some(out)
 }
 
+#[cfg(test)]
 fn build_scoped_project_instruction_prompt(targets: &[PathBuf]) -> Option<String> {
-    build_scoped_project_instruction_prompt_with_priority(targets, &[])
+    build_scoped_project_instruction_prompt_with_priority(targets, &[], &[]).map(|(prompt, _)| prompt)
 }
 
+/// Renders the target-scoped instruction section. Also returns the directories
+/// holding the rendered documents, so the caller can keep them resident for
+/// the rest of the session.
 fn build_scoped_project_instruction_prompt_with_priority(
     required_targets: &[PathBuf],
     observed_targets: &[PathBuf],
-) -> Option<String> {
+    carried_dirs: &[PathBuf],
+) -> Option<(String, Vec<PathBuf>)> {
     let docs = load_scoped_project_instruction_docs_for_target_priority(
         required_targets,
         observed_targets,
+        carried_dirs,
     );
     if docs.is_empty() {
         return None;
     }
     let mut out = String::from(
-        "- These documents apply to files already touched in this turn.\n\
+        "- These documents apply to files already touched in this session.\n\
          - A rule from a deeper directory is more specific and overrides a conflicting general project rule.\n",
     );
+    let mut dirs: Vec<PathBuf> = Vec::new();
     for doc in docs {
         out.push_str(&format!(
             "\n<instructions path=\"{}\">\n{}\n</instructions>\n",
             escape_xml_attr(&doc.path),
             doc.content.trim()
         ));
+        if let Some(dir) = Path::new(&doc.path).parent().map(Path::to_path_buf)
+            && !dirs.contains(&dir)
+        {
+            dirs.push(dir);
+        }
     }
-    Some(out)
+    Some((out, dirs))
 }
 
 pub(super) fn scoped_project_instructions_missing(
@@ -1422,11 +1566,7 @@ fn build_system_prompt(
             lines.push("Keep pre-division shared discovery sequential; never run dependent steps concurrently, do not delegate merely to create parallelism, and keep work in the parent when net benefit is marginal or uncertain.".to_string());
             lines.push("Prefer delegating broad read-only discovery, cross-module caller or consumer mapping, noisy log or dependency research, and independent adversarial verification. Keep final decisions, tightly coupled overlapping edits, unresolved coupled work, and end-to-end synthesis in the parent; iteration limits, tool failures, and recovery steps are not delegation benefits.".to_string());
             lines.push("Give each subagent an explicit result contract: return a concise conclusion, the key evidence paths/lines or commands, remaining uncertainty, and suggested verification; do not return raw logs, exhaustive search output, or large source excerpts unless requested.".to_string());
-            if has_tool(available_tools, "task_spawn_batch") {
-                lines.push("Once you identify multiple qualifying subtasks with no data dependency, prefer one `task_spawn_batch` call so dispatch and returned task ids preserve input order, and continue every independent parent-side step while they run — never spawn-wait-spawn-wait serially.".to_string());
-            } else {
-                lines.push("Once you identify multiple qualifying subtasks with no data dependency, spawn ALL of them in the same response (multiple `task_spawn` calls in one turn), and continue every independent parent-side step while they run — never spawn-wait-spawn-wait serially.".to_string());
-            }
+            lines.push("Once you identify multiple qualifying subtasks with no data dependency, spawn ALL of them in one `task_spawn` call (1-8 tasks) so preflight, dispatch, and returned task ids preserve input order; continue every independent parent-side step while they run — never spawn-wait-spawn-wait serially.".to_string());
         }
         if has_tool(available_tools, "task_status") {
             lines.push("Before finishing your answer, call `task_status` to confirm no spawned subagent is still running. Never silently drop a spawned task.".to_string());
@@ -1603,10 +1743,19 @@ fn build_skill_turn_guard(
         builder.push(ContextKind::Capability, catalog);
     }
     push_project_context(&mut builder);
+    let residency = history::read_prompt_residency_sqlite(&app.session_history_file)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     // Session debugging guidance is low-frequency knowledge: every turn keeps
     // a one-line session id for grounding, while the session-tools walkthrough
-    // is injected only when the request looks session-related.
-    if session_issue_likely(question) || session_id_referenced(question) {
+    // is injected once the request looks session-related. After that it stays
+    // resident for the rest of the session, so later turns keep the guidance
+    // and the system-prompt prefix does not flip between the two forms.
+    let session_context_guidance = residency.session_context_guidance
+        || session_issue_likely(question)
+        || session_id_referenced(question);
+    if session_context_guidance {
         builder.push_labeled(
             ContextKind::Behavior,
             "session_context",
@@ -1645,13 +1794,18 @@ fn build_skill_turn_guard(
     let max_iterations = resolve_max_iterations(active_agent.as_ref(), executor_active);
     let restore_agent_context = activate_skill_context(app, loaded_tools, max_iterations);
 
-    SkillTurnGuard {
+    let mut guard = SkillTurnGuard {
         restore_agent_context,
         builder,
-        cached_system_prompt: None,
-        cached_context_reminder: None,
         matched_skill_names,
-    }
+        session_context_guidance,
+        session_context_guidance_was_sticky: residency.session_context_guidance,
+        ..SkillTurnGuard::default()
+    };
+    // Rendered last so the section is the final policy entry, the same position
+    // a mid-turn load appends it at.
+    guard.seed_scoped_instruction_dirs(residency.scoped_instruction_dirs);
+    guard
 }
 
 pub(super) fn rebuild_skill_turn_with_existing_selection(

@@ -10,7 +10,7 @@ routing, commands, observation, and terminal output.
 
 These are driver-only additions to `src/bin/ai/AGENTS.md` invariant 2.
 
-1. **Prompt assembly is explicit.** Don't duplicate instructions across system prompts/catalogs/skill prompts/reminders. Trust-boundary block is injected once by `build_system_prompt` in `skill_runtime.rs`.
+1. **Prompt assembly is explicit.** Don't duplicate instructions across system prompts/catalogs/skill prompts/reminders. Trust-boundary block is injected once by `build_system_prompt` in `skill_runtime.rs`. Keep earlier request bytes stable: scoped instructions and session guidance stay resident (`prompt_residency_v1`, dropped by history truncation) and are replaced in place — only a paused mutation's documents may evict resident ones from the budget; the per-turn reminder is recorded on the persisted user message and replayed byte-identically. Known exceptions: image digest substitution, text-attachment materialization, and edited instruction files.
 2. **Progress sampling.** Sample progress from the pre-compression current tool-round snapshot, not compressed `messages`.
 3. **Retry & streaming are contracts.** Retry only on classified transport/provider/context-window failures. Event ordering and final-response semantics are stable; terminal previews are not persisted truth.
 4. **Skill runtime isolation.** Manifests determine visible tools, MCP allowlists, prompt overlays, and inheritance. Keep default `core` visibility and explicit pinning aligned with `tools/registry/`. Multi-skill: ordered active set, union tools/MCP, most-restrictive `disable_*` wins.

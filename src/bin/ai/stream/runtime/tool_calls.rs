@@ -141,9 +141,9 @@ pub(super) fn process_external_tool_calls_delta(
                 builder.tool_type.clone_from(&stream_tool_call.tool_type);
             }
             if !stream_tool_call.function.name.is_empty() {
-                builder
-                    .function_name
-                    .clone_from(&stream_tool_call.function.name);
+                builder.function_name =
+                    crate::ai::types::normalize_tool_call_name(&stream_tool_call.function.name)
+                        .to_string();
             }
             append_tool_call_arguments(
                 &mut builder.arguments,
@@ -234,6 +234,8 @@ pub(super) fn process_internal_tool_calls(
                 if function_name.trim().is_empty() {
                     continue;
                 }
+                let function_name =
+                    crate::ai::types::normalize_tool_call_name(&function_name).to_string();
                 meaningful_progress = true;
                 ensure_tool_calls_section_open(app, markers, state);
 
@@ -241,7 +243,7 @@ pub(super) fn process_internal_tool_calls(
                 let builder = state.content.tool_calls_map.entry(index).or_default();
                 builder.id = format!("internal_{index}");
                 builder.tool_type = "function".to_string();
-                builder.function_name = function_name.clone();
+                builder.function_name.clone_from(&function_name);
 
                 let _ = open_tool_call_line(state, index, &function_name);
             }

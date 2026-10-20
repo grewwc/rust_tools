@@ -30,27 +30,25 @@ const INLINE_PARSERS: &[InlineToolCallParser] = &[
 ];
 
 /// Normalizes namespace-prefixed XML tags in model output into standard XML tags, e.g.
-/// `<|DSML|invoke name="x">` / `<｜｜DSML｜｜invoke name="x">` → `<invoke name="x">`，
+/// `<|DSML|invoke name="x">` / `<｜｜DSML｜｜invoke name="x">` → `<invoke name="x">`,
 /// `</|DSML|invoke>` / `</｜｜DSML｜｜invoke>` → `</invoke>`。
-/// Also handles the space-separated form some models emit: `<｜｜DSML ｜ invoke ...>`.
+/// Also handles the space-separated forms some models emit, including a space
+/// immediately after `<` and ASCII `|` separators: `<｜｜DSML ｜ invoke ...>` and
+/// `< | | DSML | | invoke ...>`.
 /// This way the Hermes / Anthropic parsers need no per-`<|PREFIX|>` protocol adaptation.
 pub(super) fn normalize_inline_tool_call_markup(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.contains("<|")
-        && !text.contains("</|")
-        && !text.contains("<｜")
-        && !text.contains("</｜")
-    {
+    if !contains_namespace_marker(text) {
         return std::borrow::Cow::Borrowed(text);
     }
     static OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r#"<(?:\|\s*([^>|]+?)\s*\|\s*([^\s>|｜]+)([^＞>]*)|｜\s*｜?\s*([^｜＞>]+?)\s*｜\s*｜?\s*([^\s｜＞>]+)([^＞>]*))[＞>]"#,
+            r#"<\s*(?:\|\s*\|?\s*([^>|]+?)\s*\|\s*\|?\s*([^\s>|｜]+)([^＞>]*)|｜\s*｜?\s*([^｜＞>]+?)\s*｜\s*｜?\s*([^\s｜＞>]+)([^＞>]*))[＞>]"#,
         )
             .expect("valid open-tag regex")
     });
     static CLOSE_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r#"</(?:\|\s*([^>|]+?)\s*\|\s*([^\s>|｜]+)|｜\s*｜?\s*([^｜＞>]+?)\s*｜\s*｜?\s*([^\s｜＞>]+))\s*[＞>]"#,
+            r#"</\s*(?:\|\s*\|?\s*([^>|]+?)\s*\|\s*\|?\s*([^\s>|｜]+)|｜\s*｜?\s*([^｜＞>]+?)\s*｜\s*｜?\s*([^\s｜＞>]+))\s*[＞>]"#,
         )
             .expect("valid close-tag regex")
     });
@@ -81,6 +79,24 @@ pub(super) fn normalize_inline_tool_call_markup(text: &str) -> std::borrow::Cow<
     )
 }
 
+/// Cheap pre-check for [`normalize_inline_tool_call_markup`].
+///
+/// The normalizer used to look only for the compact `<|` / `<｜` spellings.
+/// Some models instead render the namespace separator with spaces, including a
+/// space directly after `<` (`< | | DSML | | tool_calls>`), so that shortcut
+/// skipped normalization and leaked the raw marker to the terminal.
+fn contains_namespace_marker(text: &str) -> bool {
+    for (lt, _) in text.match_indices('<') {
+        let after = &text[lt + 1..];
+        let after = after.strip_prefix('/').unwrap_or(after);
+        let after = after.trim_start_matches(char::is_whitespace);
+        if after.starts_with('|') || after.starts_with('｜') {
+            return true;
+        }
+    }
+    false
+}
+
 /// Stateful namespace-tag normalizer for streaming scenarios.
 ///
 /// `normalize_inline_tool_call_markup` is a stateless whole-text normalizer; it cannot
@@ -108,12 +124,15 @@ impl InlineMarkupNormalizer {
             return String::new();
         }
         self.pending.push_str(chunk);
-        // Find the last `<`: everything after it may be an unclosed (namespace) tag.
-        // If that segment could be a split marker, keep all of it for the next chunk.
+        // Find the first `<` that may start an unclosed (namespace) tag. Using
+        // the first, not the last, matters when an incomplete marker is
+        // followed by another `<` in the same chunk: holding only from the
+        // later `<` would emit the incomplete marker as visible text.
         let hold_from = self
             .pending
-            .rfind('<')
-            .filter(|&pos| Self::maybe_partial_marker(&self.pending[pos..]));
+            .match_indices('<')
+            .find(|&(pos, _)| Self::maybe_partial_marker(&self.pending[pos..]))
+            .map(|(pos, _)| pos);
         let emit = match hold_from {
             Some(pos) => {
                 let tail = self.pending.split_off(pos);
@@ -132,6 +151,12 @@ impl InlineMarkupNormalizer {
             return String::new();
         }
         let rest = std::mem::take(&mut self.pending);
+        if Self::is_truncated_protocol_marker(&rest) {
+            // A marker that never received its closing `>` is control markup,
+            // not answer text. Emitting it would leak a line such as
+            // `< | | DSML | | invoke name=` into the terminal.
+            return String::new();
+        }
         normalize_inline_tool_call_markup(&rest).into_owned()
     }
 
@@ -154,6 +179,8 @@ impl InlineMarkupNormalizer {
         if let Some(after) = rest.strip_prefix('/') {
             rest = after;
         }
+        // Models may insert whitespace between `<` and the namespace bars.
+        let rest = rest.trim_start_matches([' ', '\t', '\r', '\n']);
         // Empty (stopped right at `<` or `</`) also counts as a possible marker prefix.
         if rest.is_empty() {
             return true;
@@ -161,6 +188,38 @@ impl InlineMarkupNormalizer {
         // Allow ASCII/full-width vertical bars inside the marker prefix; as long as no
         // closing `>` has appeared, treat it as a possibly partial marker.
         rest.starts_with(HALF) || rest.starts_with(FULL)
+    }
+
+    /// True when `frag` is a DSML namespace marker prefix that ended before its
+    /// closing `>`. Unlike [`Self::maybe_partial_marker`], this requires the
+    /// `DSML` namespace after the bars; a bare bar-led fragment can be ordinary
+    /// prose such as `a < |b|` and must still be emitted as text.
+    fn is_truncated_protocol_marker(frag: &str) -> bool {
+        if frag.contains('>') {
+            return false;
+        }
+        let mut chars = frag.chars();
+        if chars.next() != Some('<') {
+            return false;
+        }
+        let mut rest = chars.as_str();
+        if let Some(after) = rest.strip_prefix('/') {
+            rest = after;
+        }
+        let rest = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+        let Some(rest) = rest
+            .strip_prefix('|')
+            .or_else(|| rest.strip_prefix('｜'))
+        else {
+            return false;
+        };
+        let rest = rest.trim_start_matches(char::is_whitespace);
+        let rest = rest
+            .strip_prefix('|')
+            .or_else(|| rest.strip_prefix('｜'))
+            .unwrap_or(rest);
+        rest.trim_start_matches(char::is_whitespace)
+            .starts_with("DSML")
     }
 }
 
@@ -666,6 +725,16 @@ pub(super) fn collect_valid_tool_calls(
     let tool_calls = builders
         .drain()
         .filter_map(|(_, mut builder)| {
+            let function_name =
+                crate::ai::types::normalize_tool_call_name(&builder.function_name);
+            if function_name == crate::ai::types::INVALID_TOOL_CALL_NAME {
+                builder.function_name = function_name.to_string();
+                // Do not feed transcript fragments disguised as arguments back
+                // into the next model request. A canonical empty payload also
+                // makes repeated malformed calls share one loop signature.
+                builder.arguments = "{}".to_string();
+                builder.printed_arguments_len = 0;
+            }
             let Some(arguments) = normalize_tool_call_arguments(&builder.arguments) else {
                 dropped = true;
                 // Print the truncated arguments fragment to ease debugging "why was it

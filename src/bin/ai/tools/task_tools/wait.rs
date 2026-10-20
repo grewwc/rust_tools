@@ -29,7 +29,7 @@ pub(super) fn reset_task_wait_noop_count(key: &TaskWaitKey) {
 
 pub(super) const OUTSTANDING_SUBAGENT_TASKS_NOTE_PREFIX: &str = "[pending-subagent-tasks]";
 
-/// Task id list produced by the most recent successful `task_spawn` / `task_spawn_batch`, used to
+/// Task id list produced by the most recent successful `task_spawn`, used to
 /// detect the "lone spawn" anti-pattern: spawning a single task and immediately `task_wait`-ing to
 /// collect it. That scenario gains no concurrency and should use the synchronous `task` tool
 /// (spawn + wait is only slower). The hint is light normative guidance: it fires once, never

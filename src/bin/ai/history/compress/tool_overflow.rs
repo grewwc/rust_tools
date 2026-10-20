@@ -1649,6 +1649,7 @@ pub(super) fn merge_old_user_overflow_stubs(
     for &idx in stub_indices.iter().skip(1).rev() {
         messages.remove(idx);
     }
+    drop_request_reminder(&mut messages[stub_indices[0]]);
     messages[stub_indices[0]].role = ROLE_INTERNAL_NOTE.to_string();
     messages[stub_indices[0]].content = Value::String(merged);
 }
@@ -1719,6 +1720,7 @@ pub(in crate::ai) fn normalize_preserved_message_stubs_for_model(messages: &mut 
             Path::new(&file_path),
             &kind,
         ));
+        drop_request_reminder(message);
     }
 }
 
@@ -1843,7 +1845,16 @@ pub(super) fn try_spill_preserved_message_to_stub(
         return false;
     };
     messages[idx].content = Value::String(build_preserved_message_overflow_stub(&path, kind));
+    // The stub replaces the message the reminder framed; replaying it onto
+    // archive metadata would only re-add the bytes the spill removed.
+    drop_request_reminder(&mut messages[idx]);
     true
+}
+
+fn drop_request_reminder(message: &mut Message) {
+    if crate::ai::history::request_reminder(message).is_some() {
+        message.reasoning_content = None;
+    }
 }
 
 /// Proactively moves oversized old user / image messages (before the protected

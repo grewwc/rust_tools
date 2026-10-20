@@ -43,10 +43,11 @@ use crate::commonw::prompt::acquire_foreground_stdin;
 const MAX_VIEWPORT_HEIGHT: u16 = 11;
 /// Upper bound on textarea lines (a comfortable value on large terminals).
 const MAX_TEXTAREA_LINES: u16 = 7;
-/// Fixed chrome line count for the normal editing state: model(1) + help(1).
+/// Fixed chrome line count for the normal editing state: model(1) + title(1)
+/// + help(1).
 /// No decorative divider is drawn anymore, so stray horizontal lines do not
 /// pile up after terminal resizes.
-const VIEWPORT_CHROME_LINES: u16 = 2;
+const VIEWPORT_CHROME_LINES: u16 = 3;
 /// Minimum textarea line count, used for clamping.
 const MIN_TEXTAREA_LINES: u16 = 2;
 /// With empty input, reserve 3 lines for the textarea plus the fixed chrome.
@@ -3554,18 +3555,18 @@ mod tests {
 
     #[test]
     fn multiline_viewport_height_scales_with_terminal() {
-        // Empty input: viewport = 3 input lines + chrome(2) = 5. The left-edge
+        // Empty input: viewport = 3 input lines + chrome(3) = 6. The left-edge
         // marker bar occupies a column, not a row, so it adds no height.
-        assert_eq!(multiline_viewport_height(30, None), 5);
-        assert_eq!(multiline_viewport_height(30, Some("")), 5);
+        assert_eq!(multiline_viewport_height(30, None), 6);
+        assert_eq!(multiline_viewport_height(30, Some("")), 6);
         // Prefilled but shorter than base: keep the base size. base textarea is
-        // 7 content lines; 7 + chrome(2) = 9.
-        assert_eq!(multiline_viewport_height(30, Some("one line")), 9);
+        // 7 content lines; 7 + chrome(3) = 10.
+        assert_eq!(multiline_viewport_height(30, Some("one line")), 10);
         // Small terminal: terminal=12, available=10; empty input still keeps its
-        // 5-line box (3 content + chrome).
-        assert_eq!(multiline_viewport_height(12, None), 5);
+        // 6-line box (3 content + chrome).
+        assert_eq!(multiline_viewport_height(12, None), 6);
         // On large terminals empty input still keeps the same compact box.
-        assert_eq!(multiline_viewport_height(40, None), 5);
+        assert_eq!(multiline_viewport_height(40, None), 6);
     }
 
     #[test]
@@ -3576,8 +3577,8 @@ mod tests {
             .join("\n");
 
         // terminal=40: available=38, base_textarea=7, content=20→clamp(7,7)=7,
-        // viewport = 7 + chrome(2) = 9.
-        assert_eq!(multiline_viewport_height(40, Some(&prefill)), 9);
+        // viewport = 7 + chrome(3) = 10.
+        assert_eq!(multiline_viewport_height(40, Some(&prefill)), 10);
         assert_eq!(multiline_viewport_height(10, Some(&prefill)), 8);
         assert_eq!(multiline_viewport_height(4, Some(&prefill)), 2);
         assert_eq!(multiline_viewport_height(4, None), 2); // available=2; still bounded by available lines

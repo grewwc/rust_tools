@@ -311,8 +311,8 @@ pub(crate) fn execute_task_audit(_args: &Value) -> Result<String, String> {
     .map_err(|error| format!("failed to read subagent spawn audit: {error}"))?;
     if records.is_empty() {
         return Ok(
-            "No subagent calls recorded in this session yet. Use `task` / `task_spawn` / \
-             `task_spawn_batch` to delegate work; every spawn is persisted here."
+            "No subagent calls recorded in this session yet. Use `task` / `task_spawn` \
+             to delegate work; every spawn is persisted here."
                 .to_string(),
         );
     }

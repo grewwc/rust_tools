@@ -1,0 +1,42 @@
+{
+  "name": "command_session",
+  "description": "Control a persistent command session started by `execute_command` with `yield_time_ms`. action=poll waits for new output, action=write sends stdin then waits, and action=close terminates the process. Session ids are scoped to the agent session that created them.",
+  "first_use_guidance": "Guidance for later command_session calls in this turn:\n- Reuse the exact `session_id` printed as `[session ...]` by `execute_command`; never invent or reuse an id from another session.\n- A session that exited and drained its output is removed automatically; a later poll then reports an unknown session. Start the command again if it is gone.\n- Polling is bounded. Do not add `sleep` to wait for output; use `yield_time_ms` and poll again.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": [
+          "poll",
+          "write",
+          "close"
+        ],
+        "description": "Required operation: `poll` waits for new output, `write` sends `write_stdin` then waits, `close` terminates the session."
+      },
+      "session_id": {
+        "type": "string",
+        "description": "Required id returned by `execute_command` when the process stayed alive after `yield_time_ms`."
+      },
+      "write_stdin": {
+        "type": "string",
+        "description": "Bytes written verbatim to the session's stdin. Required for action=write; a non-empty value is rejected for action=poll/close, while an empty string is treated as omitted. Include a trailing newline for line-oriented prompts. For sessions started with `execute_command` `pty=true`, EOF is not implied by ending the write: send `\\u0004` (Ctrl-D) if the program waits for EOF. Do not send secrets; the text becomes part of the tool call history.",
+        "maxLength": 16384
+      },
+      "yield_time_ms": {
+        "type": "integer",
+        "description": "Milliseconds to wait for new output after polling or writing (1-30000, default 10000). Ignored by action=close.",
+        "minimum": 1,
+        "maximum": 30000
+      }
+    },
+    "required": [
+      "action",
+      "session_id"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "core"
+  ]
+}

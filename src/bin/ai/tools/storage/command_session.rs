@@ -1,4 +1,4 @@
-//! Long-lived command sessions for `execute_command`.
+//! Long-lived command sessions for `execute_command` / `command_session`.
 //!
 //! A one-shot tool call cannot keep a build, REPL, or interactive prompt alive
 //! between model rounds. This module owns a small, bounded registry of child
@@ -290,8 +290,8 @@ fn check_owner(session: &Session, session_id: &str) -> Result<(), String> {
 }
 
 /// Start the process-wide session reaper once. A detached thread is required:
-/// `reap_idle` on the tool-call path only runs when the model calls
-/// `execute_command` again, which is exactly what a forgotten session does not do.
+/// `reap_idle` on the tool-call path only runs when the model calls a command
+/// tool again, which is exactly what a forgotten session does not do.
 fn ensure_reaper() {
     REAPER.call_once(|| {
         let _ = std::thread::Builder::new()
@@ -425,11 +425,10 @@ pub(crate) fn start(
             .and_then(|_| stdin.flush())
             .map_err(|err| format!("Command session stdin write failed: {err}"))?;
     }
-    let pty_for_hint = session.pty;
     let body = session.snapshot(Duration::from_millis(yield_time_ms));
     let exited = session.stdout.lock().unwrap().exited.is_some();
     let drained = !session.has_pending_output();
-    let rendered = render_with_id(&id, &body, exited, drained, pty_for_hint);
+    let rendered = render_with_id(&id, &body, exited, drained);
     if exited && drained {
         let _ = session.child.wait();
     } else {
@@ -481,15 +480,15 @@ fn remove_if_drained(session_id: &str, handle: &Arc<Mutex<Session>>) {
 pub(crate) fn poll(session_id: &str, yield_time_ms: u64) -> Result<String, String> {
     reap_idle();
     let handle = lookup_owned(session_id)?;
-    let (body, exited, drained, pty) = {
+    let (body, exited, drained) = {
         let mut session = lock_or_recover(&handle);
         let body = session.snapshot(Duration::from_millis(yield_time_ms));
         let exited = session.stdout.lock().unwrap().exited.is_some();
         let drained = !session.has_pending_output();
-        (body, exited, drained, session.pty)
+        (body, exited, drained)
     };
     remove_if_drained(session_id, &handle);
-    Ok(render_with_id(session_id, &body, exited, drained, pty))
+    Ok(render_with_id(session_id, &body, exited, drained))
 }
 
 /// Write bytes to an existing session, then poll it.
@@ -503,7 +502,7 @@ pub(crate) fn write_stdin(
     }
     reap_idle();
     let handle = lookup_owned(session_id)?;
-    let (body, exited, drained, pty) = {
+    let (body, exited, drained) = {
         let mut session = lock_or_recover(&handle);
         let stdin = session
             .stdin
@@ -516,10 +515,10 @@ pub(crate) fn write_stdin(
         let body = session.snapshot(Duration::from_millis(yield_time_ms));
         let exited = session.stdout.lock().unwrap().exited.is_some();
         let drained = !session.has_pending_output();
-        (body, exited, drained, session.pty)
+        (body, exited, drained)
     };
     remove_if_drained(session_id, &handle);
-    Ok(render_with_id(session_id, &body, exited, drained, pty))
+    Ok(render_with_id(session_id, &body, exited, drained))
 }
 
 /// Explicitly terminate and remove a session. Gives a stuck non-PTY process a
@@ -628,7 +627,7 @@ fn reap_idle() {
     }
 }
 
-fn render_with_id(id: &str, body: &str, exited: bool, drained: bool, pty: bool) -> String {
+fn render_with_id(id: &str, body: &str, exited: bool, drained: bool) -> String {
     // A failed command's `Exit code:` must be the first line, matching the
     // one-shot runner and every status classifier that consumes it. Session
     // metadata follows instead of pushing the failure marker below a header.
@@ -644,7 +643,7 @@ fn render_with_id(id: &str, body: &str, exited: bool, drained: bool, pty: bool) 
         out.push_str("\n[session exited; more buffered output pending; poll again]\n");
     } else {
         out.push_str(&format!(
-            "\n[continue with execute_command {{\"session_id\": \"{id}\", \"pty\": {pty}, \"write_stdin\": \"...\"}} to send input, omit write_stdin to poll, or pass \"close_session\": true to terminate it]\n"
+            "\n[continue with command_session: {{\"action\": \"write\", \"session_id\": \"{id}\", \"write_stdin\": \"...\"}} to send input, {{\"action\": \"poll\", \"session_id\": \"{id}\"}} to poll, or {{\"action\": \"close\", \"session_id\": \"{id}\"}} to terminate]\n"
         ));
     }
     out
@@ -655,7 +654,7 @@ pub(crate) mod tests {
     use super::*;
 
     /// Serializes every test that touches the process-wide session registry,
-    /// including the service-level round-trip test in `service::command`.
+    /// including the service-level round-trip tests in `service::command_session`.
     /// Without this, a concurrent `shutdown_all` wipes another test's live
     /// session and turns registry interference into flakes.
     pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());

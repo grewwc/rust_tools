@@ -794,7 +794,10 @@ fn classify_anthropic_tag(tag: &str) -> AnthropicTagClass {
         };
     }
     match local {
-        "function_calls" | "tool_calls" => AnthropicTagClass::Wrapper,
+        // `calls` is the truncated wrapper name some models emit when their
+        // `tool_calls` marker loses its prefix (`< | | DSML | | calls>`); treat
+        // it as a wrapper so the leftover tag is not rendered as answer text.
+        "function_calls" | "tool_calls" | "calls" => AnthropicTagClass::Wrapper,
         "invoke" => {
             if is_close {
                 AnthropicTagClass::InvokeClose

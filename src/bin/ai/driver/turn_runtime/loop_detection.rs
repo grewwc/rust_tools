@@ -14,7 +14,6 @@ pub(super) const MUTATION_TOOL_NAMES: &[&str] = &[
     "plan",
     "plan_update",
     "task_spawn",
-    "task_spawn_batch",
     "task_wait",
     "task_cancel",
     "task_status",
@@ -741,21 +740,15 @@ pub(super) fn round_has_mutation(messages: &[crate::ai::history::Message]) -> bo
         }
         match name {
             "execute_command" => {
-                // 只读取证命令不算变更进展；session poll/write/close 只是
-                // 控制已有进程，更不是新的 workspace mutation。分类统一由
-                // `command_request_kind` 提供，避免在多个 detector 里各自
-                // 根据 `command` 是否存在来猜。
+                // Only starting a command can change the workspace. Session
+                // control is a separate `command_session` tool and is not a
+                // mutation tool, so it never reaches this branch.
                 let Ok(args) = serde_json::from_str::<serde_json::Value>(tc.function.arguments.as_str())
                 else {
                     // Malformed arguments are conservatively treated as a
                     // mutation candidate, matching the previous fail-safe.
                     return true;
                 };
-                if crate::ai::tools::service::command::command_request_kind(&args)
-                    != crate::ai::tools::service::command::CommandRequestKind::Start
-                {
-                    return false;
-                }
                 args.get("command")
                     .and_then(|v| v.as_str())
                     .map(|cmd| !execute_command_is_read_only(cmd))

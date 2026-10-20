@@ -3,7 +3,7 @@ use super::{
     build_tool_cache_key, classify_tool_error, collect_tool_cache_file_fingerprints,
     execute_tool_calls, execute_with_safe_retry, is_cacheable_tool_name,
     is_parallel_safe_tool_call, is_tool_cache_entry_fresh, parallel_safe_batch_len,
-    should_retry_once, should_store_or_load_tool_cache, tool_cache_validation_matches,
+    prepare_tool_call, should_retry_once, should_store_or_load_tool_cache, tool_cache_validation_matches,
 };
 use crate::ai::mcp::McpClient;
 use crate::ai::tools::registry::common::{ToolParallelPolicy, tool_parallel_policy};
@@ -77,6 +77,28 @@ fn first_tool_call() -> ToolCall {
             arguments: r#"{"b":2,"a":{"y":1,"x":0}}"#.to_string(),
         },
     }
+}
+
+#[test]
+fn malformed_tool_name_returns_a_bounded_error_without_echoing_source_text() {
+    let call = ToolCall {
+        id: "malformed".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: crate::ai::types::INVALID_TOOL_CALL_NAME.to_string(),
+            arguments: "{}".to_string(),
+        },
+    };
+
+    let error = prepare_tool_call(&McpClient::new(), &call, None).unwrap_err();
+
+    assert_eq!(error.tool_call_id, "malformed");
+    assert!(error.content.contains("malformed tool name"));
+    assert!(
+        !error
+            .content
+            .contains(crate::ai::types::INVALID_TOOL_CALL_NAME)
+    );
 }
 
 static TOOL_KERNEL_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -748,6 +770,46 @@ fn schema_gate_rejects_silent_divergence_beyond_read_file() {
 }
 
 #[test]
+fn execute_command_session_control_is_split_into_command_session() {
+    let mcp = McpClient::new();
+    // The old combined tool must no longer accept session-control fields; a
+    // model that carries them over gets a precise schema error instead of a
+    // misleading "write_stdin requires session_id" runtime failure.
+    let legacy = tool_call_with_args(
+        "execute_command",
+        r#"{"command": "ls", "pty": false, "session_id": ""}"#,
+    );
+    let err = super::prepare_tool_call(&mcp, &legacy, None)
+        .expect_err("execute_command must reject session fields");
+    assert!(err.content.contains("unknown argument(s)"), "{err:?}");
+    assert!(err.content.contains("session_id"), "{err:?}");
+
+    let missing_action = tool_call_with_args(
+        "command_session",
+        r#"{"session_id": "cmd-1"}"#,
+    );
+    assert!(
+        super::prepare_tool_call(&mcp, &missing_action, None).is_err(),
+        "command_session must require action"
+    );
+
+    let poll = tool_call_with_args(
+        "command_session",
+        r#"{"action": "poll", "session_id": "cmd-1"}"#,
+    );
+    assert!(super::prepare_tool_call(&mcp, &poll, None).is_ok());
+
+    let bad_action = tool_call_with_args(
+        "command_session",
+        r#"{"action": "resume", "session_id": "cmd-1"}"#,
+    );
+    assert!(
+        super::prepare_tool_call(&mcp, &bad_action, None).is_err(),
+        "command_session must reject unknown actions at the schema gate"
+    );
+}
+
+#[test]
 fn schema_gate_rejects_negative_read_window_before_dispatch() {
     let mcp = McpClient::new();
     // Negative integers pass `type: integer`, but the service reads them via
@@ -827,6 +889,7 @@ fn schema_gate_rejects_out_of_range_integers_before_dispatch() {
 const INT_BOUND_REGISTRY: &[(&str, &str, Option<i64>, Option<i64>, &str)] = &[
     ("execute_command", "timeout", Some(1), Some(300), "service clamps 1-300"),
     ("execute_command", "yield_time_ms", Some(1), Some(30000), "service clamps 1-30000"),
+    ("command_session", "yield_time_ms", Some(1), Some(30000), "service clamps 1-30000"),
     ("task_wait", "timeout_secs", Some(1), Some(60), "service clamps 1-60"),
     ("search_overflow", "context_lines", Some(0), Some(5), "unwrap_or(2).min(5); 0 is valid"),
     ("search_overflow", "max_results", Some(1), Some(200), "service clamps 1-200"),
