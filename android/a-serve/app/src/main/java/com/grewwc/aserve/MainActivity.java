@@ -1,15 +1,21 @@
 package com.grewwc.aserve;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.database.Cursor;
 import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Bundle;
+import android.os.SystemClock;
+import android.provider.OpenableColumns;
+import android.util.Base64;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -30,13 +36,21 @@ import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import java.util.ArrayList;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 
 public final class MainActivity extends Activity {
     private static final String CONFIGURE_ACTION = "com.grewwc.aserve.CONFIGURE";
     private static final String PREFS = "a_serve";
     private static final String SERVER_ORIGIN = "server_origin";
     private static final int FILE_CHOOSER_REQUEST = 10;
+    private static final int NATIVE_PERMISSION_REQUEST = 11;
+    private static final int MAX_SHARED_IMAGE_BYTES = 8 * 1024 * 1024;
 
     private WebView webView;
     private ProgressBar progressBar;
@@ -44,6 +58,13 @@ public final class MainActivity extends Activity {
     private String serverOrigin;
     private ValueCallback<Uri[]> fileChooserCallback;
     private boolean connectionDialogVisible;
+    private NativeBridge nativeBridge;
+    private String pendingPermissionRequestId;
+    private String pendingPermissionAction;
+    private String pendingPermissionPayload;
+    private String pendingShareJson;
+    private boolean pageReady;
+    private long pausedAt;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -58,6 +79,7 @@ public final class MainActivity extends Activity {
 
         boolean configure = CONFIGURE_ACTION.equals(getIntent().getAction());
         if (serverOrigin != null) loadApp();
+        handleShareIntent(getIntent());
         if (configure || serverOrigin == null) showServerDialog(null, serverOrigin == null);
     }
 
@@ -102,14 +124,163 @@ public final class MainActivity extends Activity {
         webView.setWebChromeClient(new AppWebChromeClient());
         webView.setDownloadListener((url, userAgent, contentDisposition, mimeType, length) ->
                 openExternalUrl(url));
+        // The bridge exposes only allowlisted native actions; every call checks
+        // the loaded origin again before it can reach the phone.
+        nativeBridge = new NativeBridge(this);
+        webView.addJavascriptInterface(nativeBridge, NativeBridge.NAME);
     }
 
     private void loadApp() {
+        pageReady = false;
         webView.loadUrl(ServerUrl.freshAppUrl(serverOrigin, System.currentTimeMillis()));
+    }
+
+    /**
+     * Turn an incoming {@code ACTION_SEND} into a page call. Shared content only
+     * pre-fills the composer; sharing never sends a message or starts a turn.
+     */
+    private void handleShareIntent(Intent intent) {
+        if (intent == null || !Intent.ACTION_SEND.equals(intent.getAction())) return;
+        String type = intent.getType() == null ? "" : intent.getType();
+        String text = intent.getStringExtra(Intent.EXTRA_TEXT);
+        JSONObject payload = new JSONObject();
+        try {
+            if (type.startsWith("image/")) {
+                Uri stream = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+                String encoded = readSharedImage(stream);
+                if (encoded == null) {
+                    Toast.makeText(this, "无法读取分享的图片", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                payload.put("kind", "image");
+                payload.put("filename", sharedFileName(stream));
+                payload.put("data_base64", encoded);
+                if (text != null && !text.trim().isEmpty()) payload.put("text", text);
+            } else {
+                if (text == null || text.trim().isEmpty()) return;
+                payload.put("kind", "text");
+                payload.put("text", text);
+            }
+        } catch (JSONException error) {
+            return;
+        }
+        pendingShareJson = payload.toString();
+        flushShare();
+    }
+
+    private void flushShare() {
+        if (pendingShareJson == null || !pageReady || webView == null) return;
+        String json = pendingShareJson;
+        pendingShareJson = null;
+        webView.post(() -> webView.evaluateJavascript(
+                "window.AServeShare&&window.AServeShare(" + JSONObject.quote(json) + ");", null));
+    }
+
+    private String readSharedImage(Uri uri) {
+        if (uri == null) return null;
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        byte[] chunk = new byte[8192];
+        try (InputStream input = getContentResolver().openInputStream(uri)) {
+            if (input == null) return null;
+            int read;
+            while ((read = input.read(chunk)) != -1) {
+                if (buffer.size() + read > MAX_SHARED_IMAGE_BYTES) return null;
+                buffer.write(chunk, 0, read);
+            }
+        } catch (IOException | SecurityException error) {
+            return null;
+        }
+        if (buffer.size() == 0) return null;
+        return Base64.encodeToString(buffer.toByteArray(), Base64.NO_WRAP);
+    }
+
+    private String sharedFileName(Uri uri) {
+        String name = null;
+        Cursor cursor = null;
+        try {
+            cursor = getContentResolver().query(
+                    uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null);
+            if (cursor != null && cursor.moveToFirst()) name = cursor.getString(0);
+        } catch (SecurityException ignored) {
+            // Fall back to the default name below.
+        } finally {
+            if (cursor != null) cursor.close();
+        }
+        if (name == null || name.isEmpty()) return "shared-image";
+        return name.replaceAll("[^\\w.\\-]+", "_");
     }
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    /** Whether the document currently loaded still belongs to the configured server. */
+    boolean isTrustedPage() {
+        String current = webView == null ? null : webView.getUrl();
+        return current != null && serverOrigin != null && ServerUrl.isSameOrigin(serverOrigin, current);
+    }
+
+    /**
+     * Ask for the runtime permissions one native action needs, at the moment the
+     * action runs. Android requires a visible, foreground request; there is no
+     * background grant for location, calendar or contacts.
+     */
+    void requestNativePermissions(
+            String requestId, String action, String payloadJson, String[] permissions) {
+        // Bridge calls arrive on a WebView thread; runtime permission requests
+        // must be issued from the activity's UI thread.
+        runOnUiThread(() -> {
+            if (isFinishing() || isDestroyed()) {
+                deliverNativeResult(requestId, false, "app not active", null);
+                return;
+            }
+            if (pendingPermissionRequestId != null) {
+                deliverNativeResult(requestId, false, "another permission request is pending", null);
+                return;
+            }
+            pendingPermissionRequestId = requestId;
+            pendingPermissionAction = action;
+            pendingPermissionPayload = payloadJson;
+            requestPermissions(permissions, NATIVE_PERMISSION_REQUEST);
+        });
+    }
+
+    @Override
+    public void onRequestPermissionsResult(
+            int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != NATIVE_PERMISSION_REQUEST) return;
+        String requestId = pendingPermissionRequestId;
+        String action = pendingPermissionAction;
+        String payloadJson = pendingPermissionPayload;
+        pendingPermissionRequestId = null;
+        pendingPermissionAction = null;
+        pendingPermissionPayload = null;
+        if (requestId == null || action == null) return;
+        for (int result : grantResults) {
+            if (result != PackageManager.PERMISSION_GRANTED) {
+                deliverNativeResult(requestId, false, "permission denied", null);
+                return;
+            }
+        }
+        if (nativeBridge != null) nativeBridge.resumeAfterPermission(requestId, action, payloadJson);
+    }
+
+    /** Report one native action result back to the server-owned page. */
+    void deliverNativeResult(String requestId, boolean ok, String error, JSONObject data) {
+        if (webView == null) return;
+        JSONObject result = new JSONObject();
+        try {
+            result.put("id", requestId);
+            result.put("ok", ok);
+            if (error != null) result.put("error", error);
+            if (data != null) result.put("data", data);
+        } catch (JSONException ignored) {
+            return;
+        }
+        String js = "window.AServeNativeResult&&window.AServeNativeResult("
+                + JSONObject.quote(result.toString()) + ");";
+        webView.post(() -> webView.evaluateJavascript(js, null));
     }
 
     private boolean handleNavigation(Uri uri) {
@@ -239,6 +410,7 @@ public final class MainActivity extends Activity {
         if (CONFIGURE_ACTION.equals(intent.getAction())) {
             showServerDialog(null, false);
         }
+        handleShareIntent(intent);
         // A singleTask activity receives another launcher intent when its icon is
         // tapped again. Keep the live document so WebView focus and IME composition
         // survive; cold starts and explicit server changes still call loadApp().
@@ -248,10 +420,23 @@ public final class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         webView.onResume();
+        // The WebView keeps its document across app switches. A document loaded
+        // before the current UI generation cannot run the newer reconnect logic,
+        // so replace it once the app returns from a real background stay.
+        if (pausedAt > 0 && SystemClock.elapsedRealtime() - pausedAt > 2000) {
+            webView.evaluateJavascript(
+                "String(window.__aserveUi||'')",
+                value -> {
+                    String marker = value == null ? "" : value.replace("\"", "").trim();
+                    if (marker.isEmpty() || "null".equals(marker)) loadApp();
+                });
+        }
+        pausedAt = 0;
     }
 
     @Override
     protected void onPause() {
+        pausedAt = SystemClock.elapsedRealtime();
         webView.onPause();
         super.onPause();
     }
@@ -266,6 +451,7 @@ public final class MainActivity extends Activity {
     protected void onDestroy() {
         if (fileChooserCallback != null) fileChooserCallback.onReceiveValue(null);
         fileChooserCallback = null;
+        webView.removeJavascriptInterface(NativeBridge.NAME);
         webView.stopLoading();
         webView.setWebChromeClient(null);
         webView.setWebViewClient(null);
@@ -287,6 +473,8 @@ public final class MainActivity extends Activity {
         @Override
         public void onPageFinished(WebView view, String url) {
             progressBar.setVisibility(View.GONE);
+            pageReady = true;
+            flushShare();
         }
 
         @Override

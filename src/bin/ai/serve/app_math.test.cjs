@@ -46,6 +46,19 @@ function harness() {
 
 test("embedded script parses", () => { new vm.Script(script); });
 
+test("history ending in an unanswered user message is treated as interrupted", () => {
+  const start = script.indexOf("function isRuntimeSyntheticUser(");
+  const end = script.indexOf("const PHONE_LAYOUT_QUERY", start);
+  assert.ok(start >= 0 && end > start);
+  const context = vm.createContext({});
+  vm.runInContext(script.slice(start, end), context);
+  assert.equal(context.historyEndsUnanswered([{ role: "assistant" }, { role: "user" }]), true);
+  assert.equal(context.historyEndsUnanswered([{ role: "user" }, { role: "assistant" }]), false);
+  assert.equal(context.historyEndsUnanswered([{ role: "user" }, { role: "assistant" }, { role: "tool" }]), false);
+  assert.equal(context.historyEndsUnanswered([{ role: "user", reasoning_content: "runtime-origin:synthetic-user:v1" }]), false);
+  assert.equal(context.historyEndsUnanswered([]), false);
+});
+
 test("server base drops the app entry path before API calls", () => {
   const start = script.indexOf("function normalizeServeBase(");
   const end = script.indexOf("const store =", start);
@@ -1002,7 +1015,7 @@ function historyHarness({ delayed = false, existingKeys = [], existingNodes = []
     $: () => root,
     api: async () => { apiCalls += 1; return pending; },
     historyRowsOf: () => ({ rows, shownCount: rows.length }),
-    histKey: () => "tail", histEndsTurn: () => true,
+    histKey: () => "tail", histEndsTurn: () => true, historyEndsUnanswered: () => true,
     syncStopButton() {}, renderSessionBar() {}, attachLiveBox() {},
     updateQuestionButton() {},
     shouldFollowOutput: () => follow,

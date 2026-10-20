@@ -428,6 +428,16 @@ pub(crate) fn mark_serve_child_from_env() {
 /// of failing closed on the missing terminal. See `ai::serve_confirm`.
 pub(crate) const SERVE_CONFIRM_ENV: &str = "A_SERVE_CONFIRM";
 
+/// Set for a serve turn child whose client declared native phone actions.
+/// Only those turns expose the `phone` tool group; other clients never see it.
+pub(crate) const SERVE_NATIVE_ENV: &str = "A_SERVE_NATIVE";
+
+/// Whether this process was started for a client that can execute phone
+/// actions (the Android shell). Plain web/CLI clients stay false.
+pub(crate) fn native_client() -> bool {
+    std::env::var_os(SERVE_NATIVE_ENV).is_some()
+}
+
 /// Set while [`SERVE_CONFIRM_ENV`] marked this process as remotely
 /// confirmable. Requires the live FIFO as well: without it the question could
 /// never reach the client, so waiting on an answer would be pointless.

@@ -332,6 +332,66 @@ pub(crate) async fn get_confirm(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+/// `GET /sessions/{id}/events?after=N`: reattach to a running turn's stream.
+#[derive(Debug, Deserialize)]
+pub(crate) struct EventsQuery {
+    #[serde(default)]
+    pub(crate) after: u64,
+}
+
+struct AttachState {
+    log: Arc<SessionEventLog>,
+    pending: std::collections::VecDeque<EventRecord>,
+    next_seq: u64,
+    done: bool,
+}
+
+pub(crate) async fn stream_session_events(
+    State(state): State<ServeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<EventsQuery>,
+) -> Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e.into_response();
+    }
+    if SessionStore::validate_session_id(&id).is_err() {
+        return bad_request(format!("invalid session id: {id}")).into_response();
+    }
+    let Some((backlog, running, log)) = state.events.snapshot(&id, query.after) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let stream = stream::unfold(
+        AttachState {
+            log,
+            pending: backlog.into(),
+            next_seq: query.after,
+            done: !running,
+        },
+        |mut state| async move {
+            loop {
+                if let Some(record) = state.pending.pop_front() {
+                    state.next_seq = record.seq;
+                    return Some((
+                        Ok::<_, std::convert::Infallible>(record.into_event()),
+                        state,
+                    ));
+                }
+                if state.done {
+                    return None;
+                }
+                state.log.changed().await;
+                let (events, running) = state.log.since(state.next_seq);
+                state.pending.extend(events);
+                state.done = !running && state.pending.is_empty();
+            }
+        },
+    );
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
 /// Answer body for [`post_confirm`].
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConfirmAnswerReq {

@@ -30,6 +30,7 @@ fn lifecycle_test_state() -> super::ServeState {
         locks: Default::default(),
         active_turns: Default::default(),
         confirms: Default::default(),
+        events: Default::default(),
     }
 }
 
@@ -199,6 +200,7 @@ async fn file_route_serves_images_and_guards_access() {
         locks: Default::default(),
         active_turns: Default::default(),
         confirms: Default::default(),
+        events: Default::default(),
     };
 
     let chart_name = format!("{unique}.svg");
@@ -340,7 +342,7 @@ async fn serve_tool_lifecycle_decoder_and_sse_preserve_order() {
     assert_eq!(events, vec![ServeLiveEvent::Tool(started.clone()), ServeLiveEvent::Tool(finished.clone())]);
     assert!(decoder.finish().is_empty());
     let response = Sse::new(stream::iter(events.into_iter().map(|event| {
-        Ok::<_, std::convert::Infallible>(live_event(event).unwrap())
+        Ok::<_, std::convert::Infallible>(live_event(event).unwrap().into_event())
     }))).into_response();
     let bytes = axum::body::to_bytes(response.into_body(), 16384).await.unwrap();
     let text = String::from_utf8(bytes.to_vec()).unwrap();
@@ -1179,9 +1181,11 @@ async fn serve_app_returns_mobile_client() {
     assert!(body.contains("rel=\"manifest\" href=\"/app.webmanifest\""));
     assert!(body.contains("rel=\"icon\" href=\"/app-icon.svg\""));
     assert!(body.contains(
-        "href=\"/a-serve-v1.4.0.apk\" download=\"a-serve-v1.4.0.apk\""
+        "href=\"/a-serve-v1.6.0.apk\" download=\"a-serve-v1.6.0.apk\""
     ));
     assert!(body.contains("serviceWorker.register(\"/app-sw.js\", { scope: \"/\" })"));
+    assert!(body.contains("parsePhoneAction"));
+    assert!(body.contains("@@aserve-native "));
     assert!(
         body.contains("/file?path="),
         "the page must fetch server-side images through the authed preview route"
@@ -1204,7 +1208,7 @@ async fn serve_android_apk_returns_installable_attachment() {
             .headers()
             .get(axum::http::header::CONTENT_DISPOSITION)
             .and_then(|v| v.to_str().ok()),
-        Some("attachment; filename=\"a-serve-v1.4.0.apk\"")
+        Some("attachment; filename=\"a-serve-v1.6.0.apk\"")
     );
     assert_eq!(
         response

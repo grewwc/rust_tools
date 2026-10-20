@@ -47,6 +47,7 @@ function streamHarness() {
   // Remove the SSE block loop's closing brace and supply a loop for done's break.
   const dispatch = script.slice(dispatchStart, dispatchEnd).replace(/\s*}\s*$/, "");
   return {
+    context,
     box,
     connect() {
       const begin = script.indexOf("  let turnStarted = false;", start);
@@ -67,6 +68,96 @@ function streamHarness() {
   };
 }
 
+function replayHarness() {
+  const { context } = streamHarness();
+  function node() {
+    return {
+      children: [], textContent: "", dataset: {}, classList: { add() {}, remove() {} },
+      appendChild(child) { this.children.push(child); child.parent = this; },
+      insertBefore(child, before) {
+        if (child.parent) child.remove();
+        this.children.splice(this.children.indexOf(before), 0, child); child.parent = this;
+      },
+      remove() { if (this.parent) this.parent.children = this.parent.children.filter((c) => c !== this); },
+      querySelector(selector) { return selector === "summary" ? this.summary : this.details; },
+    };
+  }
+  const msgs = node();
+  context.$ = () => msgs;
+  context.document = { createElement: node };
+  context.addFold = (title, text, parent) => {
+    const box = node(); box.summary = { textContent: title }; box.details = { open: false };
+    box.body = { textContent: text }; parent.appendChild(box);
+    return { box, set(label, value) { box.summary.textContent = label; box.body.textContent = value; } };
+  };
+  context.NATIVE_PREFIX = "@@aserve-native ";
+  const requests = [];
+  context.handleNativeRequest = (...args) => requests.push(args);
+  vm.runInContext(script.slice(script.indexOf("function recoveredProgressView("), script.indexOf("async function pollConfirm(")), context);
+  const view = context.recoveredProgressView();
+  return {
+    context, msgs, view, requests,
+    emit(kind, payload) { context.handleReplayEvent("s", kind, JSON.stringify(payload ?? {}), view); },
+    status: () => view.box.children.at(-1).textContent,
+    titles: () => view.box.children.filter((item) => item.summary).map((item) => item.summary.textContent),
+  };
+}
+
+test("replayed phases paint visible status and separate thinking across tools", () => {
+  const h = replayHarness();
+  assert.equal(h.status(), "Connecting…");
+  h.emit("thinking", { text: "first phase" });
+  assert.equal(h.status(), "Thinking…");
+  h.emit("thinking_done");
+  h.emit("tool", { id: "alarm", name: "phone_action", phase: "started", arguments: "{}" });
+  assert.equal(h.status(), "Running phone_action…");
+  h.emit("input_request", { id: 7, token: "t", prompt: '@@aserve-native {"action":"alarm","hour":9,"minute":30}' });
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.status(), "正在手机上执行…");
+  h.emit("input_done", { id: 7 });
+  assert.equal(h.status(), "Running phone_action…");
+  h.emit("tool", { id: "alarm", name: "phone_action", phase: "finished", ok: true });
+  assert.equal(h.status(), "Processing…");
+  h.emit("thinking", { text: "second phase" });
+  assert.equal(h.titles().filter((title) => title === "thinking").length, 2);
+  h.emit("delta", { delta: "answer" });
+  assert.equal(h.status(), "answer");
+});
+
+test("a reattach rebuilds fresh DOM from the retained log on every connection", async () => {
+  const h = replayHarness();
+  h.view.remove();
+  const urls = [], statuses = [];
+  const c = h.context;
+  Object.assign(c, {
+    eventActive: false, eventAbort: null, eventSession: "", recoveredView: null,
+    turns: new Map(), store: { base: "https://server" },
+    turnRunning: true, turnRunningAt: Date.now(), RUNNING_SAMPLE_TTL_MS: 60000,
+    AbortController, TextDecoder, headers: () => ({}),
+    syncStopButton() {}, stopConfirmPoll() {}, ensureConfirmPoll() {},
+    setTimeout() {}, addMsg() {}, loadHistory() { assert.fail("must keep following the active turn"); },
+    async fetch(url) {
+      urls.push(url);
+      let read = false;
+      return { ok: true, body: { getReader: () => ({ async read() {
+        if (!read) {
+          read = true;
+          const events = url.endsWith("after=0") ? 'id: 41\nevent: thinking\ndata: {"text":"restored"}\n\n' : "";
+          return { value: new TextEncoder().encode(events), done: false };
+        }
+        statuses.push(h.msgs.children.at(-1).children.at(-1).textContent);
+        return { done: true };
+      } }) } };
+    },
+  });
+  vm.runInContext(script.slice(script.indexOf("function parseBlock("), script.indexOf("async function send()")), c);
+  await c.attachEvents();
+  await c.attachEvents();
+  assert.deepEqual(statuses, ["Thinking…", "Thinking…"]);
+  assert.equal(urls.length, 2);
+  assert.ok(urls.every((url) => url.endsWith("after=0")));
+});
+
 test("pending HTTP request paints a connection indicator before any SSE event", () => {
   const h = streamHarness();
   h.connect();
@@ -82,6 +173,7 @@ test("restored running sessions distinguish missing live updates from active str
   }]));
   const context = vm.createContext({
     $: (id) => elements[id], sessionId: "a", turns: new Map(),
+    eventActive: false, eventSession: "",
     staleSession: "", staleDone: false, sideNoteBusy: false,
     turnRunning: true, turnRunningAt: 100000, RUNNING_SAMPLE_TTL_MS: 60000,
     Date: { now: () => 100001 },
@@ -90,6 +182,11 @@ test("restored running sessions distinguish missing live updates from active str
   context.syncStopButton();
   assert.equal(elements.turnstatus.hidden, false);
   assert.match(elements.turnstatus.textContent, /Turn running on server.*live updates unavailable/);
+  // A reattached event stream is a live source even though it is not in `turns`.
+  context.eventActive = true; context.eventSession = "a";
+  context.syncStopButton();
+  assert.equal(elements.turnstatus.hidden, true);
+  context.eventActive = false; context.eventSession = "";
   assert.equal(elements.send.title, "stop this turn");
   context.turns.set("a", {});
   context.syncStopButton();

@@ -35,6 +35,11 @@ const MAX_PROMPT_BYTES: usize = 1500;
 /// `{"id","prompt"}` object, so the question must fit in a single frame.
 const MAX_PAYLOAD_BYTES: usize = background::MAX_SERVE_FRAME_BYTES - 64;
 
+/// Marker that turns an ordinary input question into a phone-action request.
+/// The client strips it, runs the action through the Android bridge, and
+/// answers with one JSON line; the child reads that line as the tool result.
+pub(crate) const NATIVE_PREFIX: &str = "@@aserve-native ";
+
 /// Whether this turn child should route confirmation prompts to the serve
 /// client instead of the local terminal. False in every non-serve process.
 pub(crate) fn active() -> bool {
@@ -74,6 +79,34 @@ pub(crate) fn input(prompt: &str) -> Option<String> {
     let _serialized = CONFIRM_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let id = NEXT_CONFIRM_ID.fetch_add(1, Ordering::Relaxed);
     let payload = request_payload(id, prompt);
+    background::publish_serve_frame(ServeLiveKind::InputRequest, &payload);
+    let answer = read_input();
+    background::publish_serve_frame(
+        ServeLiveKind::InputDone,
+        &serde_json::json!({ "id": id }).to_string(),
+    );
+    answer
+}
+
+/// Ask the Android client to perform one phone action, blocking until it
+/// answers. The response is a single-line JSON object (`{"ok":bool,...}`), so
+/// it can travel through the same stdin channel as a free-text answer.
+pub(crate) fn native(request: &serde_json::Value) -> Option<String> {
+    if !active() {
+        return None;
+    }
+    let prompt = format!("{NATIVE_PREFIX}{request}");
+    if prompt.len() > MAX_PAYLOAD_BYTES {
+        return None;
+    }
+    let _serialized = CONFIRM_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let id = NEXT_CONFIRM_ID.fetch_add(1, Ordering::Relaxed);
+    let payload = serde_json::json!({ "id": id, "prompt": prompt }).to_string();
+    if payload.len() > MAX_PAYLOAD_BYTES {
+        return None;
+    }
     background::publish_serve_frame(ServeLiveKind::InputRequest, &payload);
     let answer = read_input();
     background::publish_serve_frame(
