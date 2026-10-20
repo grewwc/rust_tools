@@ -76,9 +76,60 @@ test("does not turn a fenced aserve block into a tappable button", () => {
   assert.doesNotMatch(rendered, /aserve-card/);
 });
 
-function nativeHarness(storage = new Map()) {
+const phoneFixtures = {
+  now: { action: "now" },
+  calendar_read: { action: "calendar_read", days: 7, max: 10 },
+  calendar_add: { action: "calendar_add", title: "Meeting", begin_local: "2026-10-21T15:00", duration_min: 60, location: "Room 1", description: "Agenda" },
+  sms: { action: "sms", contact: "", number: "10086", text: "你好" },
+  alarm: { action: "alarm", hour: 9, minute: 30, label: "Wake up" },
+  note: { action: "note", title: "Note", text: "Content" },
+  location: { action: "location" },
+};
+
+test("every advertised phone action has a valid browser payload", () => {
+  const tool = JSON.parse(fs.readFileSync(path.join(__dirname, "../tool_descriptions/phone_action.json"), "utf8"));
+  assert.deepEqual(Object.keys(phoneFixtures).sort(), [...tool.parameters.properties.action.enum].sort());
+  const app = load();
+  for (const spec of Object.values(phoneFixtures)) {
+    const parsed = app.parsePhoneAction(JSON.stringify({ ...spec, auto: false, package: "untrusted" }));
+    assert.deepEqual(JSON.parse(JSON.stringify(parsed)), spec, spec.action);
+  }
+});
+
+test("SMS accepts contact lookup but rejects missing content and unsafe numbers", () => {
+  const app = load(), parse = (spec) => app.parsePhoneAction(JSON.stringify(spec));
+  assert.deepEqual(JSON.parse(JSON.stringify(parse({ action: "sms", contact: " 妈妈 ", text: "你好" }))),
+    { action: "sms", contact: "妈妈", number: "", text: "你好" });
+  for (const number of ["10086?body=bad", "10086;10010", "100\n86", "smsto:10086", "+()- .", 10086]) {
+    assert.equal(parse({ action: "sms", number, text: "你好" }), null, String(number));
+  }
+  for (const spec of [
+    { text: "hello" }, { number: "10086" }, { number: "10086", text: " " },
+    { number: "10086", text: "x".repeat(1001) }, { contact: "x".repeat(121), text: "hi" },
+    { number: "1".repeat(41), text: "hi" }, { contact: {}, text: "hi" },
+  ]) assert.equal(parse({ action: "sms", ...spec }), null);
+});
+
+test("calendar payloads retain local dates, defaults, and strict bounds", () => {
+  const app = load(), parse = (spec) => app.parsePhoneAction(JSON.stringify(spec));
+  assert.deepEqual(JSON.parse(JSON.stringify(parse({ action: "calendar_read" }))),
+    { action: "calendar_read", days: 7, max: 10 });
+  for (const spec of [{ days: 0 }, { days: 31 }, { max: 21 }, { max: "10" }, { days: 1.5 }]) {
+    assert.equal(parse({ action: "calendar_read", ...spec }), null);
+  }
+  const event = { action: "calendar_add", title: "Meeting", begin_local: "2028-02-29T15:00" };
+  assert.deepEqual(JSON.parse(JSON.stringify(parse(event))), { ...event, duration_min: 60, location: "", description: "" });
+  for (const begin_local of ["2026-02-29T15:00", "2026-04-31T15:00", "2026-13-01T15:00", "2026-10-21T24:00", "2026-10-21T15:60", "2026-10-21T15:00Z", "2026-10-21T15:00:00", 1792566000]) {
+    assert.equal(parse({ ...event, begin_local }), null, String(begin_local));
+  }
+  for (const spec of [{ duration_min: 4 }, { duration_min: 601 }, { title: " " }, { title: "x".repeat(201) }, { description: "x".repeat(1001) }, { location: {} }]) {
+    assert.equal(parse({ ...event, ...spec }), null);
+  }
+});
+
+function nativeHarness(storage = new Map(), spec = { action: "alarm", hour: 9, minute: 30 }) {
   const calls = [], posts = [], errors = [], timers = new Map();
-  const prompt = '@@aserve-native {"action":"alarm","hour":9,"minute":30}';
+  const prompt = '@@aserve-native ' + JSON.stringify(spec);
   const pending = { id: 7, token: "turn-token", prompt, input: true };
   let rejectPost = false;
   const context = vm.createContext({
@@ -112,6 +163,24 @@ function nativeHarness(storage = new Map()) {
     failPost(value) { rejectPost = value; },
   };
 }
+
+test("every phone action reaches the bridge and returns its acknowledgement unchanged", async () => {
+  for (const spec of Object.values(phoneFixtures)) {
+    const h = nativeHarness(new Map(), spec);
+    const request = h.request();
+    await h.settle();
+    assert.equal(h.calls.length, 1, spec.action);
+    assert.equal(h.calls[0][1], spec.action);
+    assert.deepEqual(JSON.parse(h.calls[0][2]), { auto: true, ...spec });
+    const result = { ok: true, data: { action: spec.action, ...(spec.action === "sms" ? { sent: false } : {}) } };
+    h.result(result);
+    await request;
+    assert.equal(h.posts.length, 1);
+    assert.deepEqual(JSON.parse(h.posts[0].body.text), result);
+    await h.request();
+    assert.equal(h.calls.length, 1, "replay must not repeat " + spec.action);
+  }
+});
 
 test("native request reaches the APK and returns its result to the server", async () => {
   const h = nativeHarness();
