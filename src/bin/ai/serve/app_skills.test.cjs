@@ -61,7 +61,7 @@ function harness() {
   vm.runInContext(between("function fillSelect(", "async function loadInfo()"), context);
   vm.runInContext(between('  $("oskill").onfocus', '  $("prompt").addEventListener("compositionstart"'), context);
   vm.runInContext(between("async function send()", "  const rewindFloor =") + "\n}", context);
-  const body = between("  const body = { prompt, confirm: true };", '  $("prompt").value = "";');
+  const body = between("  const body = { prompt, confirm: true };", '  setPromptValue("", true);');
   const accept = between('    const res = await fetch(store.base + "/sessions/"', "    turnStarted = true;");
   vm.runInContext(`async function submit() { if (!validateSkillInput()) return; const prompt = "hello", images = []; ${body}\n${accept}\nreturn body; }`, context);
   return {

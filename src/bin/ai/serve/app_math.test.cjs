@@ -95,6 +95,7 @@ test("drafts persist independently for each session and restore on switch", () =
     },
     $: (id) => elements[id],
     growPrompt() {},
+    setPromptValue(value) { prompt.value = value; return true; },
     restoreSkillPick() {},
     isPhoneLayout: () => true,
   });
@@ -975,7 +976,10 @@ test("prompt composition defers reflow, draft writes and keyboard shortcuts", ()
   assert.match(promptHandlers, /compositionend[\s\S]*?promptComposing = false[\s\S]*?growPrompt\(\)[\s\S]*?persistDraft\(\)/);
   assert.match(promptHandlers, /addEventListener\("input", \(e\)[\s\S]*?if \(promptComposing \|\| e\.isComposing\) return/);
   assert.match(promptHandlers, /addEventListener\("keydown", \(e\)[\s\S]*?if \(e\.isComposing \|\| e\.keyCode === 229\) return/);
-  assert.match(script, /document\.activeElement === prompt\)\) growPrompt\(\)/);
+  // A layout change during a composition cancels the word on Android WebView,
+  // so the composer holds its height until the composition ends.
+  assert.match(script, /function growPrompt\(\)[\s\S]*?if \(promptComposing\) return;/);
+  assert.match(script, /addEventListener\("resize", \(\) => \{[\s\S]*?growPrompt\(\)/);
 });
 
 test("media decoration leaves math text and rendered math subtrees alone", () => {
@@ -1384,6 +1388,8 @@ function growPromptHeight({ phone, scrollHeight, innerHeight = 600, value = "mes
   const context = vm.createContext({
     window: { innerHeight, matchMedia: () => ({ matches: phone }) },
     $: (id) => { assert.equal(id, "prompt"); return prompt; },
+    promptComposing: false,
+    traceMark: () => {},
   });
   vm.runInContext(script.slice(start, end), context);
   context.growPrompt();
@@ -1398,7 +1404,7 @@ test("prompt auto-growth uses a roomier phone cap without changing desktop", () 
 });
 
 test("composer height is reset after send and refreshed after image attachment", () => {
-  assert.match(html, /\$\("prompt"\)\.value = "";\s*\$\("prompt"\)\.style\.height = "auto";/);
+  assert.match(html, /setPromptValue\("", true\);[^\n]*\n\s*\$\("prompt"\)\.style\.height = "auto";/);
   assert.match(html, /added\.map\([\s\S]*?\.join\("\\n"\);\s*growPrompt\(\);/);
   assert.match(html, /e\.key === "Enter" && \(e\.ctrlKey \|\| e\.metaKey\)/);
   assert.match(html, /\$\("prompt"\)\.addEventListener\("paste", handlePromptPaste\);/);
@@ -1425,6 +1431,8 @@ function pasteHarness(value = "") {
     $: (id) => { assert.equal(id, "prompt"); return prompt; },
     growPrompt: () => calls.push("grow"),
     persistDraft: () => calls.push("draft"),
+    promptComposing: false,
+    setPromptValue: (value) => { prompt.value = value; return true; },
     note: (message) => calls.push(message),
     pendingImages: [],
     FileReader: Reader,

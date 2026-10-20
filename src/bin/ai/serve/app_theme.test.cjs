@@ -88,7 +88,7 @@ test("the theme helpers flip the palette, the label and the status bar", () => {
   context.applyTheme("light", true);
   assert.equal(attrs.get("data-theme"), "light");
   assert.equal(store.get("serve.theme"), "light");
-  assert.equal(meta.attrs.content, "#ffffff");
+  assert.equal(meta.attrs.content, "#f2f4f7");
   assert.equal(btn.attrs["aria-label"], "switch to dark theme");
   assert.equal(context.activeTheme(), "light");
 

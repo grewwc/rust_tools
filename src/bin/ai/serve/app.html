@@ -41,20 +41,27 @@
   --composer-a:#1b2129; --composer-b:#151a21;
   --focus-ring:rgba(56,139,253,.18); --acc-shadow:rgba(31,111,235,.34); --glow:rgba(88,166,255,.75);
   --edge:rgba(255,255,255,.28);
+  /* Reading weight. 450 resolves to the Medium face of Roboto / SF Pro and of
+     Noto Sans CJK, and stays Regular where no Medium face exists, so body
+     text gains body without turning bold. */
+  --fw-text:450; --fw-meta:400;
 }
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg:#f6f8fa; --panel:#ffffff; --line:#d8dee4; --fg:#1f2328; --dim:#59636e;
-  --acc:#0969da; --ok:#1a7f37; --err:#cf222e;
-  --surface:#eef1f4; --surface-hover:#dde2e8; --surface-2:#e4e8ed; --line-2:#d0d7de;
-  --field:#ffffff; --code-bg:#f6f8fa; --media-bg:#eef1f4; --code-toolbar:#f1f4f8;
-  --acc-soft:#0969da; --acc-soft-2:#0a3069; --acc-line:#54aeff; --acc-line-soft:rgba(9,105,218,.4);
-  --acc-solid:#0969da; --acc-focus:#0969da; --on-acc:#ffffff;
-  --glass:rgba(255,255,255,.94); --glass-strong:rgba(255,255,255,.98);
-  --tint:rgba(9,105,218,.12); --tint-2:rgba(9,105,218,.10); --tint-3:rgba(9,105,218,.16); --tint-4:rgba(9,105,218,.24);
-  --composer-a:#ffffff; --composer-b:#f1f4f8;
-  --focus-ring:rgba(9,105,218,.16); --acc-shadow:rgba(9,105,218,.30); --glow:rgba(9,105,218,.35);
-  --edge:rgba(31,35,40,.22);
+  /* Soft paper instead of pure white: a large #ffffff surface is what makes
+     a light theme glare on a phone, so every area is a light grey and the
+     contrast against the text is carried by the text, not by the background. */
+  --bg:#f2f4f7; --panel:#fbfcfd; --line:#dde2e8; --fg:#23282e; --dim:#5f6873;
+  --acc:#0b62c9; --ok:#1a7f37; --err:#c0392b;
+  --surface:#eceff3; --surface-hover:#e2e7ec; --surface-2:#f0f3f6; --line-2:#d2d9e0;
+  --field:#fafbfc; --code-bg:#f4f6f9; --media-bg:#e9edf1; --code-toolbar:#f0f3f6;
+  --acc-soft:#0b62c9; --acc-soft-2:#0a3f80; --acc-line:#6cb2f0; --acc-line-soft:rgba(11,98,201,.38);
+  --acc-solid:#0b62c9; --acc-focus:#0b62c9; --on-acc:#ffffff;
+  --glass:rgba(251,252,253,.95); --glass-strong:rgba(251,252,253,.98);
+  --tint:rgba(11,98,201,.10); --tint-2:rgba(11,98,201,.08); --tint-3:rgba(11,98,201,.14); --tint-4:rgba(11,98,201,.22);
+  --composer-a:#fafbfc; --composer-b:#f3f5f8;
+  --focus-ring:rgba(11,98,201,.16); --acc-shadow:rgba(11,98,201,.26); --glow:rgba(11,98,201,.30);
+  --edge:rgba(35,40,46,.20);
 }
 /* Theme switch repaints smoothly instead of snapping. The list is explicit:
    elements that animate on their own (the jump button, the question
@@ -66,6 +73,18 @@ body, header, #sessbar, #composer, #msgs, .msg, button, select, input, textarea,
 }
 * { box-sizing: border-box; }
 body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; display:flex; flex-direction:column; height:100dvh; }
+/* The font shorthand resets font-weight, so the reading weight has to be
+   declared after it. */
+body { font-weight:var(--fw-text); }
+/* Secondary chrome keeps the Regular weight: the hierarchy is carried by
+   colour and size, and 11-12px labels turn muddy at Medium. */
+#info, #sesscount, #sessmeta, #turnstatus, #connstat, #confirmtitle, #confirmerr,
+#skillhint, #skillmenu small, #sessions li small, #sessions li .rn,
+#questionlist .empty, #ovrwrap > summary, .msg.pending, .msg details, .msg .prog,
+.msg.md .li > .bullet, .msg.md blockquote, .msg.md .media-caption,
+.msg.md .code-preview-toolbar button, .msg.md .code-preview-note,
+.msg.md .code-block-toolbar .code-lang, .msg.md .code-block-toolbar button,
+.mediaprev .mediacap { font-weight:var(--fw-meta); }
 header { display:flex; align-items:center; gap:8px; padding:10px 12px; background:var(--panel); border-bottom:1px solid var(--line); }
 header b { font-size:15px; }
 #info { font-size:12px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1; }
@@ -159,7 +178,11 @@ select, summary { touch-action:manipulation; }
 .question-link .text { min-width:0; overflow:hidden; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; white-space:normal; }
 .msg.question-target { animation:question-target 1.6s ease-out; }
 @keyframes question-target { 0%,30% { box-shadow:0 0 0 4px var(--glow); } 100% { box-shadow:none; } }
-.msg { max-width:92%; padding:8px 12px; border-radius:12px; white-space:pre-wrap; word-break:break-word; font-size:15px; }
+.msg { max-width:92%; padding:8px 12px; border-radius:12px; white-space:pre-wrap; word-break:break-word; font-size:15px;
+  /* A hair of tracking keeps Chinese glyphs from crowding each other; monospace
+     keeps its own metrics so code columns stay aligned. */
+  letter-spacing:.01em; }
+.msg.md pre, .msg.md code { letter-spacing:normal; }
 .msg.pending { color:var(--dim); font-style:italic; }
 .msg.user { align-self:flex-end; background:var(--acc-solid); color:var(--on-acc); }
 .msg.asst { align-self:flex-start; background:var(--panel); border:1px solid var(--line); }
@@ -383,6 +406,7 @@ select, summary { touch-action:manipulation; }
 <input id="token" type="password" placeholder="bearer token (ai.serve.token)" style="flex:1">
 <button id="save">save</button>
 <button id="inputdiagnostics" type="button" title="Show local input event timings, without typed text">input diagnostics</button>
+<button id="inputtraceclear" type="button" title="Clear the buffered input diagnostics, so a fresh reproduction can be captured">clear</button>
 </div>
 <div id="connstat"></div>
 <textarea id="inputtrace" hidden readonly rows="5" aria-label="input diagnostics (no typed text)" style="flex-shrink:0;margin:6px 12px;font-size:12px"></textarea>
@@ -452,7 +476,7 @@ const $ = (id) => document.getElementById(id);
 // before the first paint; this part owns the toggle and keeps the stored
 // choice, the button label and the status-bar color in sync with it.
 const THEME_KEY = "serve.theme";
-const THEME_STATUS_BAR = { dark: "#0d1117", light: "#ffffff" };
+const THEME_STATUS_BAR = { dark: "#0d1117", light: "#f2f4f7" };
 function activeTheme() {
   return document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
 }
@@ -1169,23 +1193,84 @@ function syncOvrSummary() {
 // The composer grows with its content (up to the CSS cap) instead of
 // trapping multi-line input in a 44px box with an inner scroll.
 let promptComposing = false;
+// Android WebView drops an in-flight IME composition when the field's value
+// is written or its box is resized: the pinyin the user is still assembling
+// never reaches the composer and the keyboard stops committing words. Both
+// writes therefore refuse to run while a composition is active.
+let traceMark = () => {};
+let pendingShare = "";
+function setPromptValue(value, force) {
+  const p = $("prompt");
+  if (promptComposing && !force) return false;
+  p.value = value;
+  traceMark("valueWrite");
+  return true;
+}
+// True while the composer holds the user's attention: an active IME
+// composition, or the field simply has focus.
+function composerInUse() {
+  return promptComposing || document.activeElement === $("prompt");
+}
 function growPrompt() {
   const p = $("prompt");
   const phone = window.matchMedia && window.matchMedia("(max-width:700px)").matches;
   const viewportRatio = phone ? 0.38 : 0.3;
-  p.style.height = "auto";
-  // Leave an empty composer on its compact CSS height; input events switch to
-  // measured multi-line growth without making focus alone enlarge the box.
-  if (!p.value) return;
-  p.style.height = Math.min(p.scrollHeight, Math.round(window.innerHeight * viewportRatio)) + "px";
+  if (promptComposing) return; // a resize mid-composition cancels the word
+  const max = Math.round(window.innerHeight * viewportRatio);
+  // The box state lives on the element: the height it was last given and the
+  // text length it was measured at. Both are needed to tell a real height
+  // change from a no-op resize, and every layout change on the focused field
+  // is a chance for an Android keyboard to drop the word being composed.
+  const box = p._aserveBox || (p._aserveBox = { height: 0, textLength: 0 });
+  const length = p.value.length;
+  if (!length) {
+    // Leave an empty composer on its compact CSS height; input events switch
+    // to measured multi-line growth without making focus alone enlarge it.
+    box.textLength = 0;
+    if (p.style.height !== "auto") {
+      p.style.height = "auto";
+      traceMark("resize");
+    }
+    box.height = 0;
+    return;
+  }
+  let next = Math.min(p.scrollHeight, max);
+  if (length < box.textLength) {
+    // The text shrank: release the fixed height first, otherwise scrollHeight
+    // still reports the old box height instead of the content height.
+    p.style.height = "auto";
+    next = Math.min(p.scrollHeight, max);
+    box.textLength = length;
+    if (next === box.height) {
+      p.style.height = next + "px"; // restore, the box keeps its height
+      return;
+    }
+    p.style.height = next + "px";
+    box.height = next;
+    traceMark("resize");
+    return;
+  }
+  box.textLength = length;
+  if (next === box.height) return; // no layout change, so no lost word
+  p.style.height = next + "px";
+  box.height = next;
+  traceMark("resize");
+}
+// The composer is resized after the IME has committed, not inside the commit
+// itself: a layout change in the same task as the commit is what some
+// Android keyboards turn into a lost word.
+function scheduleGrow() {
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => growPrompt());
+  else growPrompt();
 }
 function insertPromptText(text) {
   const prompt = $("prompt");
+  if (promptComposing) return;
   const start = Number.isInteger(prompt.selectionStart) ? prompt.selectionStart : prompt.value.length;
   const end = Number.isInteger(prompt.selectionEnd) ? prompt.selectionEnd : start;
   if (typeof prompt.setRangeText === "function") prompt.setRangeText(text, start, end, "end");
   else {
-    prompt.value = prompt.value.slice(0, start) + text + prompt.value.slice(end);
+    setPromptValue(prompt.value.slice(0, start) + text + prompt.value.slice(end));
     prompt.selectionStart = prompt.selectionEnd = start + text.length;
   }
   growPrompt();
@@ -1370,7 +1455,15 @@ if (typeof window !== "undefined") {
       text = (text ? text + "\n" : "") + "[[image:" + filename + "]]";
     }
     if (!text) return false;
-    prompt.value += (prompt.value && !prompt.value.endsWith("\n") ? "\n" : "") + text;
+    const extra = (prompt.value && !prompt.value.endsWith("\n") ? "\n" : "") + text;
+    // A share can land while the user is still assembling a word; the text is
+    // held back instead of overwriting the composition, and applied when the
+    // composition ends.
+    if (!setPromptValue(prompt.value + extra)) {
+      pendingShare = extra;
+      note("分享内容稍后填入，请先完成当前输入");
+      return false;
+    }
     growPrompt();
     persistDraft();
     prompt.focus();
@@ -1481,7 +1574,9 @@ function persistDraft(id = sessionId) {
   else localStorage.removeItem(draftKey(id));
 }
 function restoreDraft(id = sessionId) {
-  $("prompt").value = localStorage.getItem(draftKey(id)) || "";
+  // A draft is only restored when the composer is free; replacing the value
+  // under an active composition would discard the word being typed.
+  if (!setPromptValue(localStorage.getItem(draftKey(id)) || "")) return;
   growPrompt();
 }
 function clearDraft(id) {
@@ -2312,13 +2407,20 @@ async function loadSessions() {
   else if (!items.length) { switchSession(""); pendingNew = null; turnRunning = false; resetPicks(); }
   else {
     pendingNew = null;
-    switchSession(items[0].id);
-    // A running sample from the previous session must not leak onto the new
-    // one; re-derive below (the id exists, so a poll is safe here).
-    turnRunning = false;
-    pollConfirm();
-    await loadHistory();
-    await loadSessionConfig();
+    // An automatic switch restores another session's draft into the composer,
+    // which would discard the word the user is typing. The current session
+    // is only missing when it was deleted elsewhere, so the composer wins.
+    if (composerInUse()) {
+      note("当前会话已不在列表中，你的输入已保留");
+    } else {
+      switchSession(items[0].id);
+      // A running sample from the previous session must not leak onto the new
+      // one; re-derive below (the id exists, so a poll is safe here).
+      turnRunning = false;
+      pollConfirm();
+      await loadHistory();
+      await loadSessionConfig();
+    }
   }
   lastItems = items;
   renderSessionList(items);
@@ -3054,7 +3156,7 @@ async function send() {
   if ($("oagent").value.trim()) body.agent = $("oagent").value.trim();
   if ($("oeffort").value.trim()) body.reasoning_effort = $("oeffort").value.trim();
   if (images.length) body.images = images;
-  $("prompt").value = "";
+  setPromptValue("", true); // the user asked for this write, so it goes through
   $("prompt").style.height = "auto";
   clearDraft(draftSession);
   clearDraft(sid);
@@ -3406,15 +3508,40 @@ function showStored() {
 function createInputTrace(prompt) {
   const events = [];
   const started = Date.now();
+  const counters = { composition: 0, compositionInput: 0, directInput: 0 };
   return {
     record(event) {
-      events.push({ ms: Date.now() - started, event: event.type,
+      const type = event.type || "";
+      if (type === "compositionstart" || type === "compositionupdate" || type === "compositionend") counters.composition++;
+      if (type === "input" && event.inputType === "insertCompositionText") counters.compositionInput++;
+      if (type === "input" && event.inputType === "insertText") counters.directInput++;
+      events.push({ ms: Date.now() - started, event: type,
         composing: !!event.isComposing, inputType: event.inputType || "",
         focused: document.activeElement === prompt, length: prompt.value.length,
         viewportHeight: window.innerHeight, cssHeight: prompt.style.height });
-      if (events.length > 80) events.shift();
+      if (events.length > 300) events.shift();
     },
-    export() { return JSON.stringify({ version: 1, userAgent: navigator.userAgent, events }, null, 2); },
+    clear() { events.length = 0; },
+    export() {
+      // A Chinese keyboard announces itself with composition events. A log
+      // without a single one was taken while the IME was in direct input
+      // mode, which is the "only latin letters come out" symptom: the pinyin
+      // was never composed, so no page side effect could have cancelled it.
+      const hint = counters.composition === 0 && counters.directInput > 0
+        ? "no IME composition was observed: the keyboard was in direct (latin) input mode, so pinyin was never composed into Chinese"
+        : "";
+      return JSON.stringify({
+        version: 2,
+        userAgent: navigator.userAgent,
+        ime: {
+          compositionEvents: counters.composition,
+          compositionInputs: counters.compositionInput,
+          directInputs: counters.directInput,
+          hint,
+        },
+        events,
+      }, null, 2);
+    },
   };
 }
 let uiWired = false;
@@ -3428,6 +3555,10 @@ function wire() {
   if (uiWired) return;
   uiWired = true;
   const inputTrace = createInputTrace($("prompt"));
+  // Programmatic writes and resizes leave no DOM event behind, so they are
+  // marked explicitly: a marker recorded while `composing` is true identifies
+  // what broke an IME composition.
+  traceMark = (what) => inputTrace.record({ type: what, isComposing: promptComposing, inputType: "" });
   for (const type of ["focus", "blur", "compositionstart", "compositionupdate", "compositionend", "beforeinput", "input"]) {
     $("prompt").addEventListener(type, (event) => inputTrace.record(event));
   }
@@ -3439,6 +3570,14 @@ function wire() {
     output.hidden = false;
     output.focus();
     output.select();
+  };
+  // Clearing first and reproducing second is what makes a report conclusive:
+  // the exported log then covers the failing attempt only.
+  $("inputtraceclear").onclick = () => {
+    inputTrace.clear();
+    const output = $("inputtrace");
+    output.value = "";
+    output.hidden = true;
   };
   $("send").onclick = () => { if (isTurnRunning()) stopTurn(); else send(); };
   $("sidenote").onclick = sendSideNote;
@@ -3454,8 +3593,7 @@ function wire() {
   window.addEventListener("resize", () => {
     updateJumpButton();
     updateQuestionButton();
-    const prompt = $("prompt");
-    if (!(promptComposing && document.activeElement === prompt)) growPrompt();
+    growPrompt(); // growPrompt itself holds off while a composition is active
   });
   // Android drops a backgrounded page's connections, and a page cannot see that
   // until it is visible again, so coming back is where recovery has to start.
@@ -3483,7 +3621,18 @@ function wire() {
   $("prompt").addEventListener("compositionstart", () => { promptComposing = true; });
   $("prompt").addEventListener("compositionend", () => {
     promptComposing = false;
-    growPrompt();
+    // A share that landed mid-composition is applied now that the field is
+    // free again.
+    if (pendingShare) {
+      const extra = pendingShare;
+      pendingShare = "";
+      if (setPromptValue($("prompt").value + extra)) {
+        growPrompt();
+        persistDraft();
+        note("已填入分享内容，确认后发送");
+      }
+    }
+    scheduleGrow();
     persistDraft();
   });
   $("prompt").addEventListener("input", (e) => {

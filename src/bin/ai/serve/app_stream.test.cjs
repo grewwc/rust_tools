@@ -298,6 +298,7 @@ test("reconnect does not bind input listeners twice and diagnostics never contai
   const listeners = [];
   const prompt = { value: "中文 secret", style: { height: "44px" }, addEventListener: (type, fn) => listeners.push({ type, fn }) };
   const elements = { prompt, base: {}, token: {}, inputdiagnostics: {}, inputtrace: { focus() {}, select() {} } };
+  elements.inputtraceclear = {};
   const context = vm.createContext({
     $: (id) => elements[id], localStorage: { getItem: () => "" }, showStored() {}, syncStopButton() {},
     document: { activeElement: prompt, addEventListener() {} },
@@ -311,7 +312,9 @@ test("reconnect does not bind input listeners twice and diagnostics never contai
   for (let i = 0; i < 100; i++) input({ type: "input", data: "secret", key: "中", isComposing: true, inputType: "insertCompositionText" });
   elements.inputdiagnostics.onclick();
   const report = JSON.parse(elements.inputtrace.value);
-  assert.equal(report.events.length, 80);
+  assert.equal(report.events.length, 100);
+  assert.equal(report.ime.compositionInputs, 100);
+  assert.equal(report.ime.hint, "");
   assert.equal(report.events[0].composing, true);
   assert.equal(report.events[0].focused, true);
   assert.equal(report.events[0].length, prompt.value.length);
