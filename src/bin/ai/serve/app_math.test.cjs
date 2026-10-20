@@ -587,26 +587,26 @@ test("complete SVG blocks render in an isolated responsive frame", () => {
   const svg = '<svg viewBox="0 0 320 160"><defs><linearGradient id="g"><stop stop-color="navy"/></linearGradient></defs><rect width="320" height="160" fill="url( \'#g\' )"/></svg>';
   for (const input of ["```svg\n" + svg + "\n```", svg]) {
     const result = render(input);
-    assert.match(result, /class="svg-preview"/);
-    assert.match(result, /data-svg-view="render" aria-pressed="true">render<\/button>/);
-    assert.match(result, /data-svg-view="source" aria-pressed="false">source<\/button>/);
+    assert.match(result, /class="code-preview code-preview-svg"/);
+    assert.match(result, /data-preview-view="render" aria-pressed="true">render<\/button>/);
+    assert.match(result, /data-preview-view="source" aria-pressed="false">source<\/button>/);
     assert.match(result, /<iframe sandbox referrerpolicy="no-referrer" loading="lazy"/);
     assert.match(result, /style="aspect-ratio:2\.0000 \/ 1"/);
     assert.match(result, /script-src 'none'/);
     assert.match(result, /&lt;svg viewBox=&quot;0 0 320 160&quot;&gt;/);
-    assert.match(result, /<pre class="svg-preview-source" hidden><code>&lt;svg/);
+    assert.match(result, /<pre class="code-preview-source" hidden><code>&lt;svg/);
     assert.doesNotMatch(result, /<svg\b/);
   }
   assert.match(render("```svg\n" + svg), /<pre data-lang="svg"><code>/);
 });
 
-test("SVG preview controls switch between isolated rendering and escaped source", () => {
+test("preview controls switch between isolated rendering and escaped source", () => {
   const { context } = harness();
   const frame = { hidden: false };
   const source = { hidden: true };
   const classes = new Set();
   const buttons = ["render", "source"].map((view) => ({
-    dataset: { svgView: view },
+    dataset: { previewView: view },
     pressed: view === "render" ? "true" : "false",
     setAttribute(name, value) { if (name === "aria-pressed") this.pressed = value; },
   }));
@@ -615,16 +615,21 @@ test("SVG preview controls switch between isolated rendering and escaped source"
     querySelector(selector) { return selector === "iframe" ? frame : source; },
     querySelectorAll() { return buttons; },
   };
-  for (const button of buttons) button.closest = () => preview;
+  for (const button of buttons) {
+    button.closest = (selector) => (selector === ".code-preview" ? preview : null);
+  }
+  const click = (button) => context.handlePreviewClick({
+    target: { closest: (selector) => (selector === "[data-copy-code]" ? null : button) },
+  });
 
-  context.handleSvgPreviewClick({ target: { closest: () => buttons[1] } });
+  click(buttons[1]);
   assert.equal(frame.hidden, true);
   assert.equal(source.hidden, false);
   assert.equal(buttons[0].pressed, "false");
   assert.equal(buttons[1].pressed, "true");
   assert.equal(classes.has("show-source"), true);
 
-  context.handleSvgPreviewClick({ target: { closest: () => buttons[0] } });
+  click(buttons[0]);
   assert.equal(frame.hidden, false);
   assert.equal(source.hidden, true);
   assert.equal(buttons[0].pressed, "true");
@@ -642,12 +647,82 @@ test("active or externally-referencing SVG falls back to escaped source", () => 
     '<svg><style>@import "https://example.com/x.css"</style></svg>',
   ]) {
     const fenced = render("```svg\n" + svg + "\n```");
-    assert.doesNotMatch(fenced, /class="svg-preview"/);
+    assert.doesNotMatch(fenced, /code-preview/);
     assert.match(fenced, /<pre data-lang="svg"><code>&lt;svg/);
     const raw = render(svg);
-    assert.doesNotMatch(raw, /class="svg-preview"/);
+    assert.doesNotMatch(raw, /code-preview/);
     assert.match(raw, /&lt;svg/);
   }
+});
+
+// The document the frame renders, read back out of the srcdoc attribute.
+function frameDoc(markup) {
+  const m = /srcdoc="([^"]*)"/.exec(markup);
+  if (!m) return "";
+  return m[1].replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+
+test("HTML code fences render in an isolated frame and keep the source", () => {
+  const { render } = harness();
+  const html = '<!DOCTYPE html><html><head><title>Pelican</title></head>' +
+    '<body><svg viewBox="0 0 10 10"><circle r="4"/></svg></body></html>';
+  const result = render("```html\n" + html + "\n```");
+  assert.match(result, /class="code-preview code-preview-html"/);
+  assert.match(result, /<iframe sandbox referrerpolicy="no-referrer" loading="lazy"/);
+  assert.match(result, /script-src 'none'/);
+  assert.match(result, /name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot;/);
+  assert.match(result, /<pre class="code-preview-source" hidden><code>&lt;!DOCTYPE html&gt;/);
+  // The document itself never enters the chat DOM.
+  assert.doesNotMatch(result, /<circle/);
+  assert.match(frameDoc(result), /<circle r="4"\/>/);
+});
+
+test("HTML previews drop scripts, auto-refresh and network references", () => {
+  const { render } = harness();
+  const html = [
+    "<!doctype html><html><head>",
+    '<meta http-equiv="refresh" content="0;url=https://example.com/">',
+    "<script>fetch('https://example.com/steal')</script>",
+    '</head><body><a href="https://example.com/x">go</a>',
+    '<img src="https://example.com/pic.png"></body></html>',
+  ].join("");
+  const result = render("```html\n" + html + "\n```");
+  assert.match(result, /class="code-preview code-preview-html"/);
+  assert.match(result, /scripts disabled/);
+  const doc = frameDoc(result);
+  assert.doesNotMatch(doc, /steal/);
+  assert.doesNotMatch(doc, /example\.com/);
+  assert.doesNotMatch(doc, /refresh/);
+  assert.match(doc, /href="#"/);
+  // The source next to the frame stays what the model wrote.
+  assert.match(result, /&lt;script&gt;fetch/);
+});
+
+test("every code block carries a copy control", () => {
+  const { render } = harness();
+  const result = render("```rust\nfn main() {}\n```");
+  assert.match(result, /class="code-block"/);
+  assert.match(result, /data-copy-code/);
+  assert.match(result, /<pre data-lang="rust"><code>fn main\(\) \{\}/);
+});
+
+test("the copy control copies the source next to it", async () => {
+  const { context } = harness();
+  const copied = [];
+  context.navigator = { clipboard: { writeText: async (text) => { copied.push(text); } } };
+  const code = { textContent: "line one\nline two" };
+  const host = { querySelector: () => code };
+  const button = {
+    textContent: "copy", isConnected: true,
+    closest: (selector) => selector === "[data-copy-code]" ? button
+      : (selector === ".code-preview, .code-block" ? host : null),
+  };
+  context.handlePreviewClick({
+    target: { closest: (selector) => (selector === "[data-copy-code]" ? button : null) },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(copied, ["line one\nline two"]);
+  assert.equal(button.textContent, "copied");
 });
 
 test("remote images and media render inline without autoplay", () => {
