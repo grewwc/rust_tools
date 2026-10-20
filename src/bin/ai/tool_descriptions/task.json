@@ -1,6 +1,6 @@
 {
   "name": "task",
-  "description": "Run one subagent synchronously: the call blocks the turn, so no parent-side work runs until it returns. Use when one delegated result is needed before continuing; use `task_spawn` when parent work should continue in parallel. Top-level agents only.",
+  "description": "Run one subagent synchronously: the call blocks the turn, so no parent-side work runs until it returns. Use when one delegated result is needed before continuing; use `task_spawn` when parent work should continue in parallel. The subagent is hard-terminated after 10 minutes by default; the `audit` agent gets 15 minutes. A long subtask returns a timeout result instead of a late answer. Top-level agents only.",
   "first_use_guidance": "Guidance for later `task` calls in this turn:\n- `task` is synchronous: the turn waited for it and did no other work meanwhile. Describe such a call as sequential; never describe parent-side work as running in parallel with it.\n- Tool calls in the same assistant message do not overlap with it either — they run one after another.",
   "parameters": {
     "type": "object",
@@ -27,7 +27,7 @@
       },
       "response_schema": {
         "type": "object",
-        "description": "Optional JSON Schema object the subagent's single returned value must match, e.g. {\"type\": \"string\"} — not a bare type name."
+        "description": "Optional JSON Schema object the subagent's single returned value must match, e.g. {\"type\": \"string\"} — not a bare type name. Evidence-gated audit agents reject `response_schema`; call them without one and read the `<audit_report>` envelope from the result."
       }
     },
     "required": [

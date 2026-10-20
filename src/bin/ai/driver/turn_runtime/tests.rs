@@ -5,6 +5,42 @@
 use super::*;
 
 #[test]
+fn record_turn_tool_uses_only_reads_the_current_turn() {
+    let user = crate::ai::history::Message {
+        role: "user".to_string(),
+        content: serde_json::Value::String("new question".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    };
+    let mut turn_messages = vec![user];
+    let mut used = rust_tools::cw::SkipSet::default();
+
+    record_turn_tool_uses(&turn_messages, &mut used);
+    assert!(
+        used.is_empty(),
+        "a failed first request has no current-turn tool calls"
+    );
+
+    turn_messages.push(crate::ai::history::Message {
+        role: "assistant".to_string(),
+        content: serde_json::Value::String(String::new()),
+        tool_calls: Some(vec![crate::ai::types::ToolCall {
+            id: "call-1".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall {
+                name: "task_wait".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+    record_turn_tool_uses(&turn_messages, &mut used);
+    assert!(used.iter().any(|name| name == "task_wait"));
+}
+
+#[test]
 fn subagent_pre_timeout_wrap_up_note_requires_immediate_final_answer() {
     let mut messages = Vec::new();
     inject_subagent_pre_timeout_wrap_up_note(&mut messages);

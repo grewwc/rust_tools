@@ -1,6 +1,6 @@
 {
   "name": "task_wait",
-  "description": "Wait for one or more task_spawn subagent tasks to complete and collect their results. timeout_secs bounds this call: on expiry it returns the collected results plus a note that the rest are still running — call again with the same task_ids. Responses include pending tasks' latest live progress/checkpoint snapshots.",
+  "description": "Wait for one or more task_spawn subagent tasks to complete and collect their results. timeout_secs bounds this call: on expiry it returns the collected results plus a note that the rest are still running — call again with the same task_ids. Responses include pending tasks' latest live progress/checkpoint snapshots. It can also return early with a PARKED status while tasks are still running; re-call with the same task_ids.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -15,7 +15,7 @@
         "type": "integer",
         "minimum": 1,
         "maximum": 60,
-        "description": "Wait budget for THIS call (clamped 1–60, default 30). Suspends the parent — call only after independent work is exhausted. Hitting the budget does NOT cancel or stall subagents; they keep running — use task_status while other work remains."
+        "description": "Wait budget in seconds for THIS call (clamped 1–60, default 30). Suspends the parent — call only after independent work is exhausted. Hitting the budget does NOT cancel or stall subagents; they keep running — use task_status while other work remains."
       },
       "wait_policy": {
         "type": "string",
@@ -23,7 +23,7 @@
           "all",
           "any"
         ],
-        "description": "'any' (default) returns on the first finisher; 'all' waits until every pending task finishes. Remaining tasks stay alive and can be retrieved later."
+        "description": "'any' (default) returns on the first finisher; 'all' collects every finished result but returns early (PARKED) while any task is still running; call `task_wait` again with the same task_ids. Remaining tasks stay alive and can be retrieved later."
       }
     },
     "required": [

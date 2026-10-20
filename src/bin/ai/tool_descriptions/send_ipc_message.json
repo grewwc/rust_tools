@@ -1,6 +1,6 @@
 {
   "name": "send_ipc_message",
-  "description": "Send an Inter-Process Communication (IPC) message to another running process's mailbox.",
+  "description": "Send an Inter-Process Communication (IPC) message to another running process's mailbox. The target must be in the sender's own process group or be its ancestor, or be a child/sibling that is not in a restricted process group. A target in a restricted process group accepts messages only from group members or ancestors. The mailbox holds at most 64 unread messages; otherwise the send fails.",
   "parameters": {
     "type": "object",
     "properties": {

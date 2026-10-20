@@ -1,6 +1,6 @@
 {
   "name": "task_status",
-  "description": "Show status of all asynchronously spawned tasks: task_id, agent, model, current state (running/completed/failed), and each task's latest live progress/checkpoint snapshot, without blocking. Finished tasks' output is included inline and collected immediately, so you can use results without calling task_wait.",
+  "description": "Show status of all asynchronously spawned tasks: task_id (truncated to 19 characters in the table — take the full id from the `[task_id=...]` header or from `task_audit`), agent, model, current state (running/completed/failed), and each task's latest live progress/checkpoint snapshot, without blocking. Finished tasks' output is included inline and collected immediately, so you can use results without calling task_wait.",
   "parameters": {
     "type": "object",
     "properties": {}

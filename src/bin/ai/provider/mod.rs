@@ -53,11 +53,12 @@ pub(super) enum ReasoningEffort {
     /// Explicit lowest tier: sends `reasoning_effort: "none"` (`reasoning: {"effort":"none"}` on
     /// the Responses wire). Differs from "omit the field" (`override = Some(None)`, where the
     /// server default takes over and keeps thinking on): `None` is the true reasoning floor,
-    /// used by gpt-5.x in place of the removed `minimal`. It is emitted only by the truncation
+    /// used by gpt-5.x in place of the removed `minimal`. It is emitted by the truncation
     /// ladder's last-resort force-off fallback (`thinking_disabled_override`, see
-    /// `request::reasoning::apply_thinking_force_off_effort`); the graduated ladder itself
-    /// deliberately never sends it (orchestrator.rs) because an explicit none during convergence
-    /// retries would castrate reasoning instead of shrinking it.
+    /// `request::reasoning::apply_thinking_force_off_effort`) and by the internal attached-image
+    /// parse dispatch; the graduated ladder itself deliberately never sends it (orchestrator.rs)
+    /// because an explicit none during convergence retries would castrate reasoning instead of
+    /// shrinking it.
     None,
     Minimal,
     Low,

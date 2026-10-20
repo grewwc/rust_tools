@@ -1,6 +1,7 @@
 {
   "name": "task_spawn",
-  "description": "Spawn one or more independent subagent tasks (1-8) asynchronously in one deterministic batch. Every item is preflight-validated before any child starts; spawn attempts run in input order and returned task entries preserve that order. Collect with `task_wait` or `task_status`, then acknowledge with `task_integrate`. For one result needed immediately, use the synchronous `task` tool. Top-level agents only.",
+  "description": "Spawn one or more independent subagent tasks (1-8) asynchronously in one deterministic batch. Every item is preflight-validated before any child starts; spawn attempts run in input order and returned task entries preserve that order. Each spawned subagent is hard-terminated after 60 minutes of wall-clock lifetime (32 iterations by default), so a long-running subtask ends with a timeout result instead of a late answer. Collect with `task_wait` or `task_status`, then acknowledge with `task_integrate`. For one result needed immediately, use the synchronous `task` tool. Top-level agents only.",
+  "first_use_guidance": "Guidance for later task_spawn calls in this turn:\n- A per-item runtime spawn failure is reported as status 'failed' with no task_id and does not fail the whole call, so only wait on the task_ids that were returned.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -34,7 +35,7 @@
             },
             "response_schema": {
               "type": "object",
-              "description": "Optional JSON Schema object the subagent's single returned value must match, e.g. {\"type\": \"string\"} — not a bare type name."
+              "description": "Optional JSON Schema object the subagent's single returned value must match, e.g. {\"type\": \"string\"} — not a bare type name. Evidence-gated audit agents reject `response_schema`; call them without one and read the `<audit_report>` envelope from the result."
             }
           },
           "required": [

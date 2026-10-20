@@ -186,6 +186,34 @@ fn sync_task_timeouts_for_agent(args: &Value) -> (Duration, Option<Duration>) {
     }
 }
 
+/// Reasoning-effort tier requested by a subagent dispatch.
+///
+/// The user-facing tier table ([`crate::ai::provider::ReasoningEffort::parse`]) deliberately
+/// stops at the graded tiers: "none" / "off" carry control semantics that the CLI resolves
+/// itself, so the table never claims them. The internal dispatch needs both controls: "none"
+/// for the effort-only floor and "off" for a vendor's dedicated thinking switch. Everything
+/// else is delegated to the shared table.
+fn parse_subagent_reasoning_effort(value: &str) -> Option<crate::ai::provider::ReasoningEffort> {
+    if value.trim().eq_ignore_ascii_case("none") {
+        Some(crate::ai::provider::ReasoningEffort::None)
+    } else {
+        crate::ai::provider::ReasoningEffort::parse(value)
+    }
+}
+
+/// Parses the internal dispatch override. `"off"` is not a graded tier: it asks the request
+/// layer to disable thinking through the vendor switch, or to emit the `"none"` floor for
+/// effort-only dialects.
+fn parse_subagent_reasoning_override(
+    value: &str,
+) -> Option<Option<crate::ai::provider::ReasoningEffort>> {
+    if value.trim().eq_ignore_ascii_case("off") {
+        Some(None)
+    } else {
+        parse_subagent_reasoning_effort(value).map(Some)
+    }
+}
+
 /// Internal synchronous-task entry point with caller-selected timeout and wrap-up policy. These
 /// controls are not exposed to model tool arguments, so the foreground wait remains bounded.
 pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
@@ -218,8 +246,8 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
     // - `image_files`: attaches images directly to the sub-agent's first user message so a VL
     //   model sees them in the first round, avoiding the redundant read_file-then-re-attach
     //   base64 round trip;
-    // - `reasoning_effort`: lowers the reasoning level for simple sub-tasks such as pure
-    //   transcription (e.g. minimal for image parsing).
+    // - `reasoning_effort`: controls the child's reasoning level. The image-parse dispatch
+    //   sends "off" for pure transcription; graded tiers remain available for other callers.
     if let Some(images) = args.get("image_files").and_then(|v| v.as_array()) {
         let resolved = images
             .iter()
@@ -252,12 +280,12 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
             crate::ai::driver::input::snapshot_image_attachments(resolved, assets_dir.as_path())
                 .map_err(|error| format!("failed to snapshot task images: {error}"))?;
     }
-    if let Some(level) = args
+    if let Some(override_value) = args
         .get("reasoning_effort")
         .and_then(|v| v.as_str())
-        .and_then(crate::ai::provider::ReasoningEffort::parse)
+        .and_then(parse_subagent_reasoning_override)
     {
-        task_app.cli.reasoning_effort_override = Some(Some(level));
+        task_app.cli.reasoning_effort_override = Some(override_value);
     }
     // Key: the sub-agent no longer shares shutdown/streaming/cancel_stream flags with the parent.
     // Sharing would let a single Ctrl+C aimed at the sub-agent flip the global shutdown and take
@@ -993,6 +1021,41 @@ fn subagent_history_path(base: &std::path::Path, task_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_effort_accepts_the_reasoning_floor_and_keeps_the_shared_tiers() {
+        // The dispatch contract is internal: it may ask for the "none" floor that the
+        // user-facing tier table deliberately leaves to the CLI.
+        assert_eq!(
+            parse_subagent_reasoning_effort("none"),
+            Some(crate::ai::provider::ReasoningEffort::None)
+        );
+        assert_eq!(
+            parse_subagent_reasoning_effort(" None "),
+            Some(crate::ai::provider::ReasoningEffort::None)
+        );
+        assert_eq!(
+            parse_subagent_reasoning_effort("minimal"),
+            Some(crate::ai::provider::ReasoningEffort::Minimal)
+        );
+        assert_eq!(parse_subagent_reasoning_effort("off"), None);
+        assert_eq!(parse_subagent_reasoning_effort("bogus"), None);
+    }
+
+    #[test]
+    fn subagent_override_distinguishes_off_from_a_graded_tier() {
+        assert_eq!(parse_subagent_reasoning_override("off"), Some(None));
+        assert_eq!(parse_subagent_reasoning_override(" OFF "), Some(None));
+        assert_eq!(
+            parse_subagent_reasoning_override("none"),
+            Some(Some(crate::ai::provider::ReasoningEffort::None))
+        );
+        assert_eq!(
+            parse_subagent_reasoning_override("minimal"),
+            Some(Some(crate::ai::provider::ReasoningEffort::Minimal))
+        );
+        assert_eq!(parse_subagent_reasoning_override("bogus"), None);
+    }
 
     #[tokio::test]
     async fn sync_task_wait_signals_wrap_up_before_hard_timeout() {

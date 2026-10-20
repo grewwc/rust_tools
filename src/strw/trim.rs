@@ -1,6 +1,7 @@
-//! 字符串修剪工具
+//! # String Trimming Tools
 //!
-//! 提供去除字符串中指定字符集合的功能。
+//! Provides removal of an arbitrary character set ([`trim_cutset`]) and of
+//! whitespace ([`trim_all_whitespace`], [`collapse_whitespace`]).
 
 use std::borrow::Cow;
 
@@ -72,11 +73,105 @@ pub fn trim_cutset<'a>(text: &'a str, cutset: &'a str) -> Cow<'a, str> {
     Cow::Owned(x.into_iter().collect())
 }
 
+/// Remove every whitespace character from the text.
+///
+/// Unlike [`str::trim`], which only strips whitespace at both ends, this
+/// removes whitespace anywhere in the text, including the middle.
+///
+/// Whitespace follows the Unicode `White_Space` property (spaces, tabs, line
+/// breaks and the Unicode space separators). Zero-width characters such as
+/// `U+200B` are not whitespace and are kept.
+///
+/// # Arguments
+///
+/// * `text` - The text to process
+///
+/// # Returns
+///
+/// Returns `Cow::Borrowed(text)` when the text holds no whitespace (zero-copy),
+/// otherwise `Cow::Owned` with the whitespace removed.
+///
+/// # Examples
+///
+/// ```rust
+/// use rust_tools::strw::trim_all_whitespace;
+///
+/// // Whitespace is removed everywhere, not just at the ends
+/// let result = trim_all_whitespace("  a b\tc\n");
+/// assert_eq!(result, "abc");
+///
+/// // Text without whitespace is returned unchanged
+/// let result = trim_all_whitespace("abc");
+/// assert_eq!(result, "abc");
+/// ```
+///
+/// # Performance
+///
+/// - Time complexity: O(n), n being the text length
+/// - Space complexity: O(n) when whitespace is present
+pub fn trim_all_whitespace(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(char::is_whitespace) {
+        return Cow::Borrowed(text);
+    }
+
+    Cow::Owned(text.chars().filter(|ch| !ch.is_whitespace()).collect())
+}
+
+/// Collapse every run of whitespace into a single space and drop the ends.
+///
+/// Whitespace at the very beginning and at the very end is removed entirely,
+/// whitespace runs in the middle become one space each.
+///
+/// # Arguments
+///
+/// * `text` - The text to process
+///
+/// # Returns
+///
+/// Returns `Cow::Borrowed(text)` when the text holds no whitespace (zero-copy),
+/// otherwise `Cow::Owned` with the collapsed text.
+///
+/// # Examples
+///
+/// ```rust
+/// use rust_tools::strw::collapse_whitespace;
+///
+/// let result = collapse_whitespace("  hello \t\n  world  ");
+/// assert_eq!(result, "hello world");
+/// ```
+///
+/// # Performance
+///
+/// - Time complexity: O(n), n being the text length
+/// - Space complexity: O(n) when whitespace is present
+pub fn collapse_whitespace(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(char::is_whitespace) {
+        return Cow::Borrowed(text);
+    }
+
+    let mut collapsed = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            // A separator is only needed between two non-whitespace characters.
+            pending_space = !collapsed.is_empty();
+            continue;
+        }
+        if pending_space {
+            collapsed.push(' ');
+            pending_space = false;
+        }
+        collapsed.push(ch);
+    }
+
+    Cow::Owned(collapsed)
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
 
-    use super::trim_cutset;
+    use super::{collapse_whitespace, trim_all_whitespace, trim_cutset};
 
     #[test]
     fn trim_set_returns_borrowed_when_set_is_empty() {
@@ -119,5 +214,56 @@ mod tests {
     #[test]
     fn trim_set_with_special_chars() {
         assert_eq!(trim_cutset("a-b_c.d", "-_."), "abcd");
+    }
+
+    #[test]
+    fn trim_all_whitespace_removes_whitespace_everywhere() {
+        assert_eq!(trim_all_whitespace("  a b\tc\n"), "abc");
+    }
+
+    #[test]
+    fn trim_all_whitespace_returns_borrowed_when_no_whitespace() {
+        let result = trim_all_whitespace("hello");
+
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn trim_all_whitespace_handles_unicode_spaces() {
+        assert_eq!(trim_all_whitespace("a\u{3000}b\u{00a0}c"), "abc");
+    }
+
+    #[test]
+    fn trim_all_whitespace_keeps_zero_width_characters() {
+        assert_eq!(trim_all_whitespace("a\u{200b}b"), "a\u{200b}b");
+    }
+
+    #[test]
+    fn trim_all_whitespace_returns_empty_for_blank_text() {
+        assert_eq!(trim_all_whitespace(" \t\n "), "");
+    }
+
+    #[test]
+    fn collapse_whitespace_collapses_runs_and_trims_ends() {
+        assert_eq!(collapse_whitespace("  hello \t\n  world  "), "hello world");
+    }
+
+    #[test]
+    fn collapse_whitespace_returns_borrowed_when_no_whitespace() {
+        let result = collapse_whitespace("hello");
+
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn collapse_whitespace_keeps_single_spaces() {
+        assert_eq!(collapse_whitespace("a b c"), "a b c");
+    }
+
+    #[test]
+    fn collapse_whitespace_returns_empty_for_blank_text() {
+        assert_eq!(collapse_whitespace(" \t\n "), "");
     }
 }

@@ -1,6 +1,7 @@
 {
   "name": "list_skill_resources",
   "description": "List bundled resource files for an installed skill package (references/examples/scripts). Use proactively after `load_skill` to discover what reference material is available.",
+  "first_use_guidance": "Guidance for later list_skill_resources calls in this turn:\n- At most 120 files are collected per call, so the reported total can undercount a larger bundle; a listing showing 120 files may be truncated.",
   "parameters": {
     "type": "object",
     "properties": {

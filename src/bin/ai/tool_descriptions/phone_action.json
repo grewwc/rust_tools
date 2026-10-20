@@ -1,6 +1,6 @@
 {
   "name": "phone_action",
-  "description": "Perform one action on the user's phone when this turn runs inside the a serve Android app. Actions: 'now' returns the phone's local date, time and timezone; 'calendar_read' lists upcoming events; 'calendar_add' creates one timed event; 'sms' opens the messaging composer for a contact with the text pre-filled (it never sends); 'alarm' sets a clock alarm; 'note' opens the share sheet with note text; 'location' returns one coarse position. Use this for direct requests such as 'what is on my calendar tomorrow', 'book 3pm tomorrow with the client', 'text Zhang San that I am late', 'set an alarm for 6 tomorrow', or 'what is the weather here'. Call 'now' before any action that needs a date, because the phone may be in a different timezone than this machine. Only available in the Android client; other clients return an error. Alarms and calendar events are created without a further dialog after the agent decides, the SMS composer still needs the user to press send, a note still needs the user to pick an app, and location asks for the Android permission on first use.",
+  "description": "Perform one action on the user's phone when this turn runs inside the a serve Android app. Actions: 'now' returns the phone's local date, time and timezone; 'calendar_read' lists upcoming events; 'calendar_add' creates one timed event; 'sms' opens the messaging composer for a contact with the text pre-filled (it never sends); 'alarm' sets a clock alarm; 'note' opens the share sheet with note text; 'location' returns one coarse position. Use this for direct requests such as 'what is on my calendar tomorrow', 'book 3pm tomorrow with the client', 'text Zhang San that I am late', 'set an alarm for 6 tomorrow', or 'what is the weather here'. Call 'now' before any action that needs a date, because the phone may be in a different timezone than this machine. Only available in the Android client; other clients return an error. Alarms and calendar events are created directly; the SMS composer still needs the user to press send, a note still needs the user to pick an app, and location asks for the Android permission on first use.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -59,7 +59,7 @@
         "type": "integer",
         "minimum": 0,
         "maximum": 23,
-        "description": "alarm: hour in 24-hour local time."
+        "description": "alarm: hour in 24-hour PHONE local time (call action 'now' first if the phone may be in another timezone). The request carries only hour, minute and label — no repeat days and no date are set, so it fires once at the next occurrence of that time."
       },
       "minute": {
         "type": "integer",

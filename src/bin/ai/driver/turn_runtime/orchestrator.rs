@@ -1207,6 +1207,22 @@ fn drain_side_notes_and_inject(
     }
 }
 
+/// Records the tools invoked by the current turn's last assistant message. `turn_messages`
+/// contains only the canonical messages for this turn; `messages` is the full context
+/// projection, so a failed first request must not inherit a previous turn's tool calls.
+fn record_turn_tool_uses(
+    turn_messages: &[crate::ai::history::Message],
+    tools_used_this_turn: &mut rust_tools::cw::SkipSet<String>,
+) {
+    if let Some(last_assistant) = turn_messages.iter().rev().find(|m| m.role == "assistant")
+        && let Some(tool_calls) = &last_assistant.tool_calls
+    {
+        for tc in tool_calls {
+            tools_used_this_turn.insert(tc.function.name.clone());
+        }
+    }
+}
+
 async fn run_turn_body(
     app: &mut App,
     mcp_client: &SharedMcpClient,
@@ -1239,7 +1255,7 @@ async fn run_turn_body(
         mut turn_messages,
         mut persisted_turn_messages,
         max_iterations,
-       pending_image_digests,
+        pending_image_digests,
     } = match prepare_turn(
         app,
         mcp_client,
@@ -2046,6 +2062,11 @@ async fn run_turn_body(
             if matches!(step, TurnLoopStep::Continue) {
                 drop(output.validation_status.take());
             }
+            // Record the tool names this round's assistant actually invoked
+            // before branching on the loop step. Cooperative yields exit
+            // through `Return`, and those calls still count as use for
+            // explicit-tool aging.
+            record_turn_tool_uses(&turn_messages, &mut tools_used_this_turn);
             match step {
                 TurnLoopStep::ScopedPreflightContinue(targets) => {
                     if supervisor.grant_scoped_preflight_grace() {
@@ -2086,16 +2107,6 @@ async fn run_turn_body(
                                     ctx.tools.push(tool);
                                 }
                             }
-                        }
-                    }
-                    // Record the tool names this round's assistant actually invoked (deduplicated), kept
-                    // for aging out unused explicit tools at turn end.
-                    if let Some(last_assistant) =
-                        messages.iter().rev().find(|m| m.role == "assistant")
-                        && let Some(tool_calls) = &last_assistant.tool_calls
-                    {
-                        for tc in tool_calls {
-                            tools_used_this_turn.insert(tc.function.name.clone());
                         }
                     }
                 }

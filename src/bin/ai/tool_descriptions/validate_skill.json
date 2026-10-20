@@ -1,6 +1,6 @@
 {
   "name": "validate_skill",
-  "description": "Statically validate a skill definition without saving anything. Pass the exact arguments you intend to give save_skill; returns valid plus warnings, or an error listing every problem.",
+  "description": "Statically validate a skill definition without saving anything. Pass the exact arguments you intend to give save_skill; returns valid plus warnings, or an error listing every problem. Static check only — filesystem conflicts (an existing file or package at the target, `overwrite=false`) are reported by `save_skill` itself.",
   "parameters": {
     "type": "object",
     "properties": {

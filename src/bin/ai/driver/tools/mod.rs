@@ -191,11 +191,15 @@ fn prepare_tool_call(
     if let Some(allowed_tool_names) = allowed_tool_names
         && !allowed_tool_names.contains(&tool_call.function.name)
     {
+        let enable_hint = allowed_tool_names
+            .contains("enable_tools")
+            .then_some(" If this is a lazily loaded builtin, call enable_tools with the exact tool name (or run enable_tools list) and retry.");
         return Err(ToolResult {
             tool_call_id: tool_call.id.clone(),
             content: format!(
-                "Error: tool '{}' is not available in this turn's tool schema.",
-                tool_call.function.name
+                "Error: tool '{}' is not available in this turn's tool schema.{}",
+                tool_call.function.name,
+                enable_hint.unwrap_or("")
             ),
         });
     }

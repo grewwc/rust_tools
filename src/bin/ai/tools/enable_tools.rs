@@ -229,6 +229,11 @@ fn mark_explicitly_enabled_tools(s: &mut EnableState, owner: EnableOwner, names:
         if !explicit.tool_names.contains(name) {
             explicit.tool_names.push(name.clone());
         }
+        // A fresh enable request is an explicit request to keep the tool
+        // resident, so it must reset the idle counter. Otherwise a tool that
+        // was enabled earlier, aged while idle, and re-enabled can be demoted
+        // at the end of this very turn.
+        explicit.tool_age.insert(name.clone(), 0);
     }
 }
 
@@ -1089,5 +1094,47 @@ mod tests {
         let s = STATE.read().unwrap_or_else(|poison| poison.into_inner());
         assert!(!s.turns.contains_key(&turn));
         assert!(!s.explicit.contains_key(&owner));
+    }
+
+    #[test]
+    fn explicit_re_enable_resets_idle_demotion_age() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_state_for_tests();
+
+        let enable_task_wait = || {
+            set_active_tool_names(vec!["enable_tools".to_string()]);
+            execute_enable_tools(&json!({
+                "operation": "enable",
+                "tools": ["task_wait"]
+            }))
+            .unwrap();
+        };
+
+        enable_task_wait();
+        // A cooperative yield records task_wait as used, so repeated PARKED
+        // cycles must keep its idle age at zero.
+        for _ in 0..(EXPLICIT_TOOL_DEMOTE_AGE + 1) {
+            age_unused_explicit_tools(["task_wait"]);
+        }
+        assert!(explicit_enabled_tool_names().contains(&"task_wait".to_string()));
+
+        for _ in 0..(EXPLICIT_TOOL_DEMOTE_AGE - 1) {
+            age_unused_explicit_tools(Vec::<String>::new());
+        }
+        assert!(explicit_enabled_tool_names().contains(&"task_wait".to_string()));
+
+        // Re-enabling after aging must reset the idle counter; otherwise the
+        // next four idle turns would demote it despite the explicit request.
+        enable_task_wait();
+        for _ in 0..(EXPLICIT_TOOL_DEMOTE_AGE - 1) {
+            age_unused_explicit_tools(Vec::<String>::new());
+        }
+        assert!(explicit_enabled_tool_names().contains(&"task_wait".to_string()));
+
+        // Without another enable, the fourth idle turn demotes it.
+        age_unused_explicit_tools(Vec::<String>::new());
+        assert!(!explicit_enabled_tool_names().contains(&"task_wait".to_string()));
     }
 }

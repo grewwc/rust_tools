@@ -254,6 +254,33 @@ fn execute_tool_calls_rejects_tools_hidden_from_current_turn_schema() {
 }
 
 #[test]
+fn unavailable_tool_error_points_to_enable_tools_when_available() {
+    let allowed_tool_names: FastSet<String> = ["enable_tools".to_string()].into_iter().collect();
+    let call = tool_call("task_wait");
+
+    let error = prepare_tool_call(&McpClient::new(), &call, Some(&allowed_tool_names)).unwrap_err();
+
+    assert!(
+        error
+            .content
+            .contains("not available in this turn's tool schema")
+    );
+    assert!(error.content.contains("enable_tools"));
+    assert!(error.content.contains("lazily loaded"));
+}
+
+#[test]
+fn unavailable_tool_error_omits_enable_hint_when_enable_tools_is_hidden() {
+    let allowed_tool_names: FastSet<String> = FastSet::default();
+    let call = tool_call("task_wait");
+
+    let error = prepare_tool_call(&McpClient::new(), &call, Some(&allowed_tool_names)).unwrap_err();
+
+    assert!(!error.content.contains("lazily loaded"));
+    assert!(!error.content.contains("enable_tools"));
+}
+
+#[test]
 fn execute_tool_calls_preflights_kernel_tool_quota_before_running_tool() {
     let (_guard, kernel, root) = setup_tool_kernel();
     {

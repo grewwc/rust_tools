@@ -16,7 +16,7 @@
         "type": "integer",
         "minimum": 0,
         "maximum": 4000,
-        "description": "Maximum lines of unified diff snippet to include (default 120, 0 = header only)."
+        "description": "Maximum characters of the change summary to include (default 120 means 9600 characters; 0 disables this truncation, but the summary itself is still capped at 14,000 characters and the git fallback at 32,768 diff bytes). "
       }
     },
     "required": []

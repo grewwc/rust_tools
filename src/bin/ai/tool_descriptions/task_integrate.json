@@ -25,7 +25,7 @@
             },
             "summary": {
               "type": "string",
-              "description": "What the parent concluded and how it affects the remaining work."
+              "description": "What the parent concluded and how it affects the remaining work. Must be non-empty and at most 6000 characters."
             }
           },
           "required": [

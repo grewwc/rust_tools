@@ -25,7 +25,7 @@
       },
       "capabilities": {
         "type": "object",
-        "description": "Optional exact capability set for the child process. Omitted means inherit the parent capabilities.",
+        "description": "Optional exact capability set for the child process. Omitted means inherit the parent capabilities; when present, every capability you leave out is set to false, so list every capability the child needs (spawn, wait, ipc_send, ipc_receive, env_write, manage_children, sleep, reap, signal).",
         "properties": {
           "spawn": {
             "type": "boolean",

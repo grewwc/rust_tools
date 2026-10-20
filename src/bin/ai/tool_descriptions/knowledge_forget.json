@@ -1,6 +1,6 @@
 {
   "name": "knowledge_forget",
-  "description": "Delete a knowledge entry by id. Use knowledge_list or knowledge_search first to find the id.",
+  "description": "Delete a knowledge entry by id. Use knowledge_list or knowledge_search first to find the id. The entry is removed with no undo — re-read it with knowledge_list/knowledge_search first and re-save the content yourself if it may still be needed.",
   "parameters": {
     "type": "object",
     "properties": {

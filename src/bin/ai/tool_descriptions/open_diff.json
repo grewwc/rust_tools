@@ -6,7 +6,7 @@
     "properties": {
       "editor": {
         "type": "string",
-        "description": "Preferred editor. 'auto' (default) auto-detects: code → cursor → idea → open. Examples: 'code', 'cursor', 'idea', 'git', 'open', 'auto'."
+        "description": "Preferred editor. 'auto' (default) auto-detects: code → cursor → git difftool (in a git repo) → open. Examples: 'code', 'cursor', 'idea', 'git', 'open', 'auto'."
       },
       "patch_file": {
         "type": "string",

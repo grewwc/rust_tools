@@ -1,12 +1,13 @@
 {
   "name": "session_list",
   "description": "List sessions in the session store, newest activity first. Read-only: never mutates session data. Use to discover which sessions exist (ids, titles, first prompts) before session_read / session_search.",
+  "first_use_guidance": "Guidance for later session_list calls in this turn:\n- The footer reports only how many sessions were shown, never the store total or the number of matches, so a truncated list can look complete. Widen `limit` (max 100) or narrow it with `query` when the list looks short.",
   "parameters": {
     "type": "object",
     "properties": {
       "limit": {
         "type": "integer",
-        "description": "Maximum number of sessions to list (default 20, max 100; 0 returns only the summary).",
+        "description": "Maximum number of sessions to list (default 20, max 100; 0 lists nothing and returns `No sessions found.`).",
         "minimum": 0,
         "maximum": 100
       },

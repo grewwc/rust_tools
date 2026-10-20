@@ -181,32 +181,14 @@ fn attached_image_parse_route(vl_model: &str) -> AttachedImageParseRoute {
 /// parsed result to the main agent.
 const IMAGE_PARSE_SUBAGENT_HARD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-pub(in crate::ai) async fn parse_attached_images_via_subagent(
-    mcp_client: &SharedMcpClient,
-    image_files: &[String],
-) -> Result<Option<OcrExtraction>, String> {
-    if image_files.is_empty() {
-        return Ok(None);
-    }
-
-    // Always use the system-configured default VL model; images are attached directly to the
-    // subagent's first user message via the image_files argument, so the model can "see" the
-    // images on the first round, avoiding a redundant read_file round-trip.
-    let vl_model = crate::ai::models::default_vl_model();
-    if attached_image_parse_route(&vl_model) == AttachedImageParseRoute::Ocr {
-        return match ocr_images_for_attached_input(mcp_client, image_files) {
-            Ok(Some(ocr)) => Ok(Some(ocr)),
-            Ok(None) => Ok(Some(failed_image_parse_extraction(
-                image_files,
-                "未配置可用的 VL 模型，且未发现 OCR 工具",
-            ))),
-            Err(e) => Ok(Some(failed_image_parse_extraction(
-                image_files,
-                &format!("OCR fallback failed: {e}"),
-            ))),
-        };
-    }
-
+/// Dispatch arguments for the attached-image parse subagent.
+///
+/// A pure transcription task does not need a reasoning chain, so the parse sends the internal
+/// `"off"` control. The request layer turns that into `"none"` for `EffortNone` dialects (the
+/// gpt-5.x gateways) and into the vendor switch for `RealSwitch` dialects (Qwen / DeepSeek),
+/// instead of leaving them at their default tier. A dialect that cannot express off (MiniMax
+/// always-on reasoning) gets no override and keeps its own default.
+fn image_parse_dispatch_args(vl_model: &str, image_files: &[String]) -> serde_json::Value {
     let file_list = image_files
         .iter()
         .enumerate()
@@ -227,7 +209,13 @@ pub(in crate::ai) async fn parse_attached_images_via_subagent(
          3. 只输出图片解析结果，不要讨论其他话题。"
     );
 
-    let args = json!({
+    let reasoning_effort = match crate::ai::request::model_thinking_off_capability(vl_model) {
+        crate::ai::provider::ThinkingOffCapability::EffortNone
+        | crate::ai::provider::ThinkingOffCapability::RealSwitch => Some("off"),
+        crate::ai::provider::ThinkingOffCapability::Unsupported => None,
+    };
+
+    let mut args = json!({
         "description": "解析附带图片",
         "prompt": prompt,
         "agent": "build",
@@ -236,9 +224,43 @@ pub(in crate::ai) async fn parse_attached_images_via_subagent(
         // first round, avoiding the redundant read_file-then-reattach-base64 round-trip (saving one
         // model request plus one duplicate image transfer).
         "image_files": image_files,
-        // A pure transcription task does not need a high reasoning chain; drop to minimal to speed up parsing.
-        "reasoning_effort": "minimal",
     });
+    if let Some(effort) = reasoning_effort {
+        args["reasoning_effort"] = json!(effort);
+    }
+    args
+}
+
+pub(in crate::ai) async fn parse_attached_images_via_subagent(
+    mcp_client: &SharedMcpClient,
+    vl_model: &str,
+    image_files: &[String],
+) -> Result<Option<OcrExtraction>, String> {
+    if image_files.is_empty() {
+        return Ok(None);
+    }
+
+    // Parse with the configured VL model (`ai.model.vl_default`, resolved into
+    // `AppConfig::vl_default_model` at startup; unset means the auto-selected default). Images are
+    // attached directly to the subagent's first user message via the image_files argument, so
+    // the model can "see" the images on the first round, avoiding a redundant read_file
+    // round-trip.
+    let vl_model = vl_model.to_string();
+    if attached_image_parse_route(&vl_model) == AttachedImageParseRoute::Ocr {
+        return match ocr_images_for_attached_input(mcp_client, image_files) {
+            Ok(Some(ocr)) => Ok(Some(ocr)),
+            Ok(None) => Ok(Some(failed_image_parse_extraction(
+                image_files,
+                "未配置可用的 VL 模型，且未发现 OCR 工具",
+            ))),
+            Err(e) => Ok(Some(failed_image_parse_extraction(
+                image_files,
+                &format!("OCR fallback failed: {e}"),
+            ))),
+        };
+    }
+
+    let args = image_parse_dispatch_args(&vl_model, image_files);
 
     // Same as /audit: dispatch a synchronous subagent to parse the images, wait for it to
     // finish, then return to the main agent. On failure do not silently return None (otherwise
@@ -347,9 +369,10 @@ fn extract_subagent_output_text(content: &str) -> String {
 mod tests {
     use super::{
         AttachedImageParseRoute, attached_image_parse_route, extract_subagent_output_text,
-        failed_image_parse_extraction, preferred_ocr_image_tool_name,
+        failed_image_parse_extraction, image_parse_dispatch_args, preferred_ocr_image_tool_name,
     };
     use crate::ai::tools::task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER;
+    use serde_json::json;
 
     #[test]
     fn prefers_configured_ocr_extract_image_tool_when_available() {
@@ -427,6 +450,78 @@ mod tests {
             SUBAGENT_PARENT_SUMMARY_REMINDER
         );
         assert!(extract_subagent_output_text(&rendered).is_empty());
+    }
+
+    /// Registry-driven fixture: a VL model whose dialect expresses "thinking off" as the
+    /// effort floor (the plain OpenAI-compatible family the gpt-5.x gateways belong to).
+    fn effort_none_vl_model_handle() -> String {
+        crate::ai::model_names::all()
+            .into_iter()
+            .filter(|model| model.is_vl)
+            .map(crate::ai::model_names::model_handle)
+            .find(|handle| {
+                matches!(
+                    crate::ai::request::model_thinking_off_capability(handle),
+                    crate::ai::provider::ThinkingOffCapability::EffortNone
+                )
+            })
+            .expect("registry should hold a VL model with an effort-only off switch")
+    }
+
+    /// Registry-driven fixture: a VL model with always-on reasoning, where the gateway
+    /// accepts `low..max` only and may reject the "none" floor.
+    fn always_on_reasoning_vl_model_handle() -> String {
+        crate::ai::model_names::all()
+            .into_iter()
+            .filter(|model| model.is_vl)
+            .map(crate::ai::model_names::model_handle)
+            .find(|handle| {
+                matches!(
+                    crate::ai::request::model_thinking_off_capability(handle),
+                    crate::ai::provider::ThinkingOffCapability::Unsupported
+                )
+            })
+            .expect("registry should hold a VL model without a thinking-off switch")
+    }
+
+    /// Registry-driven fixture: a VL model with a dedicated thinking off-switch.
+    fn real_switch_vl_model_handle() -> String {
+        crate::ai::model_names::all()
+            .into_iter()
+            .filter(|model| model.is_vl)
+            .map(crate::ai::model_names::model_handle)
+            .find(|handle| {
+                matches!(
+                    crate::ai::request::model_thinking_off_capability(handle),
+                    crate::ai::provider::ThinkingOffCapability::RealSwitch
+                )
+            })
+            .expect("registry should hold a VL model with a real thinking off-switch")
+    }
+
+    #[test]
+    fn image_parse_dispatch_runs_at_the_reasoning_floor() {
+        // The dispatch contract spells "thinking off" as "off"; the request layer maps it to
+        // "none" for effort-only dialects and to the vendor switch for RealSwitch dialects.
+        let model = effort_none_vl_model_handle();
+        let args = image_parse_dispatch_args(&model, &["/tmp/shot.png".to_string()]);
+        assert_eq!(args["reasoning_effort"], json!("off"));
+        assert_eq!(args["model"], json!(model));
+    }
+
+    #[test]
+    fn image_parse_dispatch_disables_thinking_for_real_switch_dialects() {
+        let model = real_switch_vl_model_handle();
+        let args = image_parse_dispatch_args(&model, &["/tmp/shot.png".to_string()]);
+        assert_eq!(args["reasoning_effort"], json!("off"));
+        assert_eq!(args["model"], json!(model));
+    }
+
+    #[test]
+    fn image_parse_dispatch_omits_the_floor_when_the_dialect_cannot_express_it() {
+        let model = always_on_reasoning_vl_model_handle();
+        let args = image_parse_dispatch_args(&model, &["/tmp/shot.png".to_string()]);
+        assert!(args.get("reasoning_effort").is_none());
     }
 
     #[test]

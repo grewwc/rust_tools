@@ -1,6 +1,7 @@
 {
   "name": "session_read",
-  "description": "Read another session's context (read-only). Default digest mode shows a header (title, first prompt, message count, checkpoints) plus messages; raw mode renders messages only, including any reasoning_content as a 'reasoning:' line. Sessions are identified by their id from session_list. Pass `from` (canonical message index, 0-based) to page forward from an older message; without it the most recent `limit` messages are shown.",
+  "description": "Read another session's context (read-only). Default digest mode shows a header (title, first prompt, message count, checkpoints) plus messages; raw mode renders messages only, adding a 'reasoning:' line when the message carries model reasoning (runtime bookkeeping notes are not shown as reasoning). Sessions are identified by their id from session_list. Pass `from` (canonical message index, 0-based) to page forward from an older message; without it the most recent `limit` messages are shown.",
+  "first_use_guidance": "Guidance for later session_read calls in this turn:\n- The result does not report the page's index range, so to reach older messages pass `from` with a lower canonical index (0 for the oldest page).",
   "parameters": {
     "type": "object",
     "properties": {

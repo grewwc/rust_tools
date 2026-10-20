@@ -1,6 +1,6 @@
 {
   "name": "deactivate_skill",
-  "description": "Remove a specific skill by name from the active skill set. The skill's prompt and tools will be unloaded on the next step. If the skill was the only active skill, no skill will be active afterwards. Use this when a skill's specialization is no longer needed for the current task.",
+  "description": "Remove a specific skill by name from the active skill set. The skill's prompt and tools will be unloaded on the next step. If the skill was the only active skill, no skill will be active afterwards. Use this when a skill's specialization is no longer needed for the current task. An inactive or unknown name is a silent no-op.",
   "parameters": {
     "type": "object",
     "properties": {

@@ -1,6 +1,6 @@
 {
   "name": "write_file",
-  "description": "Write content to a file, replacing its entire contents (no append/merge); returns the absolute path. temp=true writes under the per-session temp dir; otherwise use an absolute or working-directory-relative path.",
+  "description": "Write content to a file, replacing its entire contents (no append/merge); returns the absolute path. temp=true writes under the per-session temp dir; otherwise use an absolute or working-directory-relative path. A path outside the session's writable roots is rejected with `Write blocked` — write under the working directory, or use temp=true for scratch files.",
   "parameters": {
     "type": "object",
     "properties": {

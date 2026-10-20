@@ -1,6 +1,6 @@
 {
   "name": "spawn_daemon",
-  "description": "Spawn a daemon process that automatically restarts when it terminates (up to max_restarts times). For long-running background services like file watchers or knowledge indexers.",
+  "description": "Spawn a daemon process that automatically restarts when it terminates (up to max_restarts times). For long-running background services like file watchers or knowledge indexers. Each restart runs under a new PID, so re-read ps_processes to find it. Killing one incarnation triggers a restart until max_restarts is exhausted; set max_restarts to 0 when a single kill should be final.",
   "parameters": {
     "type": "object",
     "properties": {

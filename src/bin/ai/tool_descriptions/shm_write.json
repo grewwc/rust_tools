@@ -1,6 +1,6 @@
 {
   "name": "shm_write",
-  "description": "Update an existing shared memory region's value. Fails if the key does not exist (use shm_create first).",
+  "description": "Update an existing shared memory region's value. Fails if the key does not exist (use shm_create first). The writer must be the owner, in the owner's process group, or an ancestor of the owner; otherwise the write is rejected with 'Permission denied' (use set_process_group to share a group).",
   "parameters": {
     "type": "object",
     "properties": {

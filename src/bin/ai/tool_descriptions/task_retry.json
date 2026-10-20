@@ -1,12 +1,12 @@
 {
   "name": "task_retry",
-  "description": "Retry a terminal failed, timed-out, or cancelled subagent as a new linked attempt using the original task configuration. Returns a new task_id; collect and integrate the old and new attempts separately.",
+  "description": "Retry a terminal failed, timed-out, or cancelled `task_spawn` subagent as a new linked attempt using the original task configuration. Synchronous `task` results cannot be retried. Returns a new task_id; collect and integrate the old and new attempts separately.",
   "parameters": {
     "type": "object",
     "properties": {
       "task_id": {
         "type": "string",
-        "description": "Terminal failed, timed-out, or cancelled task_id to retry with the original configuration."
+        "description": "Terminal failed, timed-out, or cancelled task_id to retry with the original configuration. Its failed result must already have been collected with `task_wait` or `task_status`; retrying before collection is rejected."
       }
     },
     "required": [

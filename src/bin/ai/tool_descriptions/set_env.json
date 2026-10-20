@@ -1,6 +1,6 @@
 {
   "name": "set_env",
-  "description": "Set an environment variable in the current process's Context Manager. Child processes will inherit this context.",
+  "description": "Set an environment variable in the current process's Context Manager (the AIOS process record). Only AIOS children spawned after the call (`spawn_process`, `spawn_daemon`) inherit it; an `execute_command` shell runs with the host environment and never sees it.",
   "parameters": {
     "type": "object",
     "properties": {
