@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use regex::RegexBuilder;
 
 use crate::ai::history;
-use crate::ai::theme::{self, RESET};
+use crate::ai::theme::{self, BOLD, RESET};
 use crate::ai::types::{App, QuestionContext};
 use crate::clipboardw::string_content;
 
@@ -15,15 +15,24 @@ use crate::ai::{files, prompt::trim_trailing_newline};
 use crate::pdfw::{PdfParseError, PdfParseOptions, parse_pdf};
 
 const HISTORY_PREVIEW_DEFAULT_COUNT: usize = 6;
+/// Count used by `/history full`: a deliberately small cap, because that mode
+/// prints whole message bodies instead of summaries.
 const HISTORY_PREVIEW_FULL_COUNT: usize = 20;
+/// Upper bound for one history preview.
+///
+/// A bare `/history` is a quick peek (`HISTORY_PREVIEW_DEFAULT_COUNT`), but a
+/// role-filtered query wants every match, so it defaults to this cap. An
+/// explicit `/history N` is clamped to it, which keeps the count a request can
+/// never outgrow.
+const HISTORY_PREVIEW_MAX_COUNT: usize = 2000;
 const HISTORY_PREVIEW_MAX_CHARS: usize = 160;
-const HISTORY_GREP_HIGHLIGHT_START: &str = "\x1b[1;93m";
-const HISTORY_GREP_HIGHLIGHT_END: &str = "\x1b[0m";
 
 fn print_history_help() {
     println!(
-        "/history usage:\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history grep <keyword>  Search messages\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history export [path] Export to file\n  /history copy          Copy to clipboard\n  /history last          Replay the last assistant message with markdown rendering\n  /history replay        Replay the last turn's assistant conclusion (text only)\n  /history <session> [N] Show last N messages of another session (no switch)\n  /history <session> last [N]\n                         Replay the Nth recent assistant message of another session with markdown rendering\n  /history <session> replay\n                         Replay the last assistant conclusion of another session\n  /history help            Show this help",
-        HISTORY_PREVIEW_DEFAULT_COUNT
+        "/history usage:\n  /history [N]           Show last N messages (default: {default}, max: {max})\n  /history full          Show full messages (up to {full})\n  /history user/assistant/tool/system\n                         Filter by role (up to {max} matching messages)\n  /history grep <keyword>  Search messages by keyword\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history export [path] Export to file\n  /history copy          Copy to clipboard\n  /history last          Replay the last assistant message with markdown rendering\n  /history replay        Replay the last turn's assistant conclusion (text only)\n  /history <session> [N] Show last N messages of another session (no switch)\n  /history <session> last [N]\n                         Replay the Nth recent assistant message of another session with markdown rendering\n  /history <session> replay\n                         Replay the last assistant conclusion of another session\n  /history help            Show this help",
+        default = HISTORY_PREVIEW_DEFAULT_COUNT,
+        max = HISTORY_PREVIEW_MAX_COUNT,
+        full = HISTORY_PREVIEW_FULL_COUNT,
     );
 }
 
@@ -568,6 +577,11 @@ fn parse_history_preview_options(
     };
     let mut action = HistoryAction::Show;
     let mut idx = 0usize;
+    // A bare `/history` is a quick peek; a role-filtered query wants every
+    // match, so it defaults to the cap. `full` keeps its own small count, and
+    // an explicit count always wins.
+    let mut role_filtered = false;
+    let mut explicit_count = false;
 
     while idx < args.len() {
         match args[idx] {
@@ -578,18 +592,22 @@ fn parse_history_preview_options(
             }
             "user" => {
                 options.role_filter = HistoryRoleFilter::User;
+                role_filtered = true;
                 idx += 1;
             }
             "assistant" => {
                 options.role_filter = HistoryRoleFilter::Assistant;
+                role_filtered = true;
                 idx += 1;
             }
             "tool" => {
                 options.role_filter = HistoryRoleFilter::Tool;
+                role_filtered = true;
                 idx += 1;
             }
             "system" => {
                 options.role_filter = HistoryRoleFilter::System;
+                role_filtered = true;
                 idx += 1;
             }
             "grep" => {
@@ -616,13 +634,17 @@ fn parse_history_preview_options(
                 options.count = raw
                     .parse::<usize>()
                     .map_err(|_| format!("invalid /history argument: {raw}"))?
-                    .max(1);
+                    .clamp(1, HISTORY_PREVIEW_MAX_COUNT);
+                explicit_count = true;
                 idx += 1;
                 continue;
             }
         }
     }
 
+    if !explicit_count && role_filtered && !options.full {
+        options.count = HISTORY_PREVIEW_MAX_COUNT;
+    }
     Ok((options, action))
 }
 
@@ -1199,9 +1221,13 @@ fn highlight_history_keyword(value: &str, grep: Option<&str>) -> String {
 
     pattern
         .replace_all(value, |caps: &regex::Captures| {
+            // Highlight follows the active theme (`accent.marked`) instead of a
+            // fixed 16-color escape, so a search hit looks the same in every
+            // palette.
             format!(
-                "{}{}{}",
-                HISTORY_GREP_HIGHLIGHT_START, &caps[0], HISTORY_GREP_HIGHLIGHT_END
+                "{BOLD}{}{}{RESET}",
+                theme::current().accent_marked,
+                &caps[0]
             )
         })
         .into_owned()
@@ -1622,7 +1648,9 @@ fn finalize_question(
 #[cfg(test)]
 mod tests {
     use super::{
-        HistoryAction, HistoryPreviewOptions, HistoryRewindTarget, HistoryRoleFilter, LocalCommand,
+        HISTORY_PREVIEW_DEFAULT_COUNT, HISTORY_PREVIEW_FULL_COUNT, HISTORY_PREVIEW_MAX_COUNT,
+        HistoryAction,
+        HistoryPreviewOptions, HistoryRewindTarget, HistoryRoleFilter, LocalCommand,
         apply_history_rewind, assistant_conclusion_text_at, extract_at_file_references,
         extract_forced_skill_references, finalize_question, highlight_history_keyword,
         last_assistant_conclusion_text, parse_history_preview_options, parse_local_command,
@@ -1633,6 +1661,7 @@ mod tests {
     };
     use crate::ai::{
         history::{self, Message, append_history_messages, append_history_messages_for_model},
+        theme::{self, BOLD, RESET},
         types::{
             AgentContext, App, AppConfig, FunctionDefinition, SkillBiasMemory, ToolDefinition,
         },
@@ -1948,7 +1977,9 @@ mod tests {
         assert_eq!(
             parse_local_command("/history grep panic").unwrap(),
             Some(LocalCommand::ShowHistory(HistoryPreviewOptions {
-                count: 6,
+                // A keyword search narrows the set, so it returns every match
+                // up to the cap instead of the short default peek.
+                count: HISTORY_PREVIEW_DEFAULT_COUNT,
                 role_filter: HistoryRoleFilter::All,
                 full: false,
                 grep: Some("panic".to_string()),
@@ -2075,7 +2106,7 @@ mod tests {
             parse_history_preview_options(&["full"]).unwrap(),
             (
                 HistoryPreviewOptions {
-                    count: 20,
+                    count: HISTORY_PREVIEW_FULL_COUNT,
                     role_filter: HistoryRoleFilter::All,
                     full: true,
                     grep: None,
@@ -2094,6 +2125,47 @@ mod tests {
                 },
                 HistoryAction::Show,
             )
+        );
+    }
+
+    #[test]
+    fn parse_history_preview_options_caps_counts_at_the_maximum() {
+        // A role-filtered query returns every match up to the cap.
+        assert_eq!(
+            parse_history_preview_options(&["user"]).unwrap().0.count,
+            HISTORY_PREVIEW_MAX_COUNT
+        );
+        assert_eq!(
+            parse_history_preview_options(&["assistant"]).unwrap().0.count,
+            HISTORY_PREVIEW_MAX_COUNT
+        );
+        // `full` keeps its own small count, even combined with a role filter.
+        assert_eq!(
+            parse_history_preview_options(&["full"]).unwrap().0.count,
+            HISTORY_PREVIEW_FULL_COUNT
+        );
+        assert_eq!(
+            parse_history_preview_options(&["user", "full"]).unwrap().0.count,
+            HISTORY_PREVIEW_FULL_COUNT
+        );
+        // A keyword search is not a role filter: it keeps the quick peek.
+        assert_eq!(
+            parse_history_preview_options(&["grep", "boom"]).unwrap().0.count,
+            HISTORY_PREVIEW_DEFAULT_COUNT
+        );
+        // An explicit count wins over the cap default and is clamped to it.
+        assert_eq!(
+            parse_history_preview_options(&["user", "50"]).unwrap().0.count,
+            50
+        );
+        assert_eq!(
+            parse_history_preview_options(&["999999"]).unwrap().0.count,
+            HISTORY_PREVIEW_MAX_COUNT
+        );
+        // A bare preview stays a quick peek.
+        assert_eq!(
+            parse_history_preview_options(&[]).unwrap().0.count,
+            HISTORY_PREVIEW_DEFAULT_COUNT
         );
     }
 
@@ -2121,13 +2193,19 @@ mod tests {
     #[test]
     fn highlight_history_keyword_marks_matches_with_ansi() {
         let highlighted = highlight_history_keyword("panic in fetch_chat_messages", Some("panic"));
-        assert!(highlighted.contains("\x1b[1;93mpanic\x1b[0m"));
+        assert!(highlighted.contains(&format!(
+            "{BOLD}{}panic{RESET}",
+            theme::current().accent_marked
+        )));
     }
 
     #[test]
     fn highlight_history_keyword_marks_all_matches() {
         let highlighted = highlight_history_keyword("panic then Panic again", Some("panic"));
-        assert_eq!(highlighted.matches("\x1b[1;93m").count(), 2);
+        assert_eq!(
+            highlighted.matches(theme::current().accent_marked).count(),
+            2
+        );
     }
 
     #[test]
@@ -2176,6 +2254,39 @@ mod tests {
         assert!(rendered.contains("[assistant] first answer"));
         assert!(rendered.contains("[user] second question"));
         assert!(!rendered.contains("first question"));
+
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn history_role_filter_returns_every_match_not_only_the_default_peek() {
+        let history_path = std::env::temp_dir()
+            .join(format!("ai-history-role-filter-{}.sqlite", Uuid::new_v4()));
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+
+        let messages = (0..12)
+            .map(|idx| Message {
+                role: "user".to_string(),
+                content: Value::String(format!("question {idx}")),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            })
+            .collect::<Vec<_>>();
+        append_history_messages(&history_path, &messages).unwrap();
+
+        // A filtered query returns every match, not just the short peek.
+        let filtered = parse_history_preview_options(&["user"]).unwrap().0;
+        let rendered = render_history_preview(&app, filtered).unwrap();
+        assert!(rendered.contains("[history] Showing 12 recent user message(s):"));
+        assert!(rendered.contains("[user] question 0"));
+        assert!(rendered.contains("[user] question 11"));
+
+        // A bare preview stays the short peek.
+        let bare = parse_history_preview_options(&[]).unwrap().0;
+        let bare_rendered = render_history_preview(&app, bare).unwrap();
+        assert!(bare_rendered.contains("[history] Showing 6 recent message(s):"));
 
         let _ = std::fs::remove_file(history_path);
     }
@@ -2800,7 +2911,10 @@ mod tests {
         )
         .unwrap();
         assert!(rendered.contains("recent tool message(s) matching \"panic\""));
-        assert!(rendered.contains("[tool] \x1b[1;93mpanic\x1b[0m in fetch_messages"));
+        assert!(rendered.contains(&format!(
+            "[tool] {BOLD}{}panic{RESET} in fetch_messages",
+            theme::current().accent_marked
+        )));
         assert!(!rendered.contains("stable note"));
 
         let _ = std::fs::remove_file(history_path);

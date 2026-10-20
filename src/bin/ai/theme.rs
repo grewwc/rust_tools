@@ -13,9 +13,9 @@
 //!   "name": "my-theme",
 //!   "type": "dark",
 //!   "colors": {
-//!     "accent.primary": "#6E82A0",
-//!     "accent.submittedBar": "#E06C75",
-//!     "code.background": "#282828",
+//!     "accent.primary": "#7C9CF5",
+//!     "accent.submittedBar": "#7C9CF5",
+//!     "code.background": "#242832",
 //!     "markdown.math": "\u001b[95m"
 //!   }
 //! }
@@ -27,6 +27,18 @@
 //! 256-color code). Unknown keys and unparsable values are ignored; every key
 //! falls back to the built-in default, so a custom theme only needs to list
 //! what it changes.
+//!
+//! `name` and `type` (`"dark"` / `"light"`) describe the terminal a theme was
+//! designed for; the renderer reads the `colors` map alone, so they are
+//! documentation for the person writing the file.
+//!
+//! # Color slots
+//!
+//! - `accent.*` — terminal chrome: status glyphs, tool names, file paths,
+//!   commands, rules, the `❯` prompt marker (`accent.prompt`, which follows
+//!   `accent.primary` when a theme omits it) and the echo of submitted input.
+//! - `markdown.*` — assistant prose: body, strong, heading, links, inline code
+//!   and math.
 //!
 //! # Theme resolution
 //!
@@ -92,14 +104,20 @@ pub(crate) struct Theme {
     /// Echoed user input after submit: the theme's bright signature warm hue
     /// (amber/yellow on dark themes, deep purple on light) — deliberately NOT
     /// the white/gray markdown body colors, so the user's own text stays
-    /// visible and distinguishable from assistant output. The bold green `❯`
-    /// marker in `prompt/multiline/multiline_ui.rs` keeps the submit boundary.
+    /// visible and distinguishable from assistant output. The `❯` marker in
+    /// `prompt/multiline/multiline_ui.rs` keeps the submit boundary.
     pub(crate) accent_submitted: &'static str,
     /// Left emphasis bar for echoed user input after submit. A theme that sets
     /// `accent.submittedBar` uses that color; a theme that changes other colors
     /// but not the bar mirrors its resolved `accent.success`; a theme that
     /// overrides no known color keeps the compiled-in default.
     pub(crate) accent_submitted_bar: &'static str,
+    /// Input affordance: the `❯` prompt marker in front of the text the user
+    /// is typing. It is a separate slot from `accent.success` so green can
+    /// keep meaning "done" while the prompt marker carries the theme's brand
+    /// hue. A theme that does not set `accent.prompt` inherits its resolved
+    /// `accent.primary`.
+    pub(crate) accent_prompt: &'static str,
     // ── Markdown prose (previously `MARKDOWN_*` consts in render/mod.rs) ───
     pub(crate) markdown_body: &'static str,
     pub(crate) markdown_strong: &'static str,
@@ -124,35 +142,36 @@ impl Theme {
     /// that file is the copy-paste template for custom themes.
     pub(crate) fn default_theme() -> Theme {
         Theme {
-            accent_primary: "\x1b[38;2;110;130;160m",
-            accent_tool_name: "\x1b[38;2;235;140;130m",
-            accent_secondary: "\x1b[38;2;196;181;253m",
-            accent_command: "\x1b[38;2;165;185;225m",
-            accent_muted: "\x1b[38;2;148;163;184m",
-            accent_input: "\x1b[38;2;215;212;206m",
-            accent_input_rgb: (215, 212, 206),
-            accent_success: "\x1b[38;2;134;194;166m",
-            accent_emphasized_output: "\x1b[38;2;152;195;121m",
-            accent_warn: "\x1b[38;2;245;158;11m",
-            accent_danger: "\x1b[38;2;251;113;133m",
-            accent_marked: "\x1b[38;2;255;150;150m",
-            accent_rule: "\x1b[38;2;71;85;105m",
-            accent_submitted: "\x1b[38;2;230;219;116m",
-            accent_submitted_bar: "\x1b[38;2;224;108;117m",
-            markdown_body: "\x1b[38;2;212;209;203m",
-            markdown_strong: "\x1b[38;2;229;223;213m",
-            markdown_heading: "\x1b[38;2;242;236;223m",
-            markdown_accent: "\x1b[38;2;190;203;219m",
-            markdown_code_fg: "\x1b[38;2;195;188;220m",
-            markdown_math: "\x1b[38;2;229;115;158m",
-            code_background: "\x1b[48;2;40;40;40m",
-            code_foreground: "\x1b[38;2;248;248;242m",
-            code_comment: "\x1b[38;2;117;113;94m",
-            code_keyword: "\x1b[38;2;249;38;114m",
-            code_string: "\x1b[38;2;230;219;116m",
-            code_number: "\x1b[38;2;174;129;255m",
-            code_type: "\x1b[38;2;102;217;239m",
-            code_dim: "\x1b[38;2;107;107;107m",
+            accent_primary: "\x1b[38;2;124;156;245m",
+            accent_tool_name: "\x1b[38;2;220;227;240m",
+            accent_secondary: "\x1b[38;2;169;155;240m",
+            accent_command: "\x1b[38;2;116;199;217m",
+            accent_muted: "\x1b[38;2;138;147;166m",
+            accent_input: "\x1b[38;2;221;227;238m",
+            accent_input_rgb: (221, 227, 238),
+            accent_success: "\x1b[38;2;143;217;168m",
+            accent_emphasized_output: "\x1b[38;2;165;214;255m",
+            accent_warn: "\x1b[38;2;232;185;107m",
+            accent_danger: "\x1b[38;2;232;131;139m",
+            accent_marked: "\x1b[38;2;245;199;126m",
+            accent_rule: "\x1b[38;2;107;120;144m",
+            accent_submitted: "\x1b[38;2;224;192;136m",
+            accent_submitted_bar: "\x1b[38;2;124;156;245m",
+            accent_prompt: "\x1b[38;2;124;156;245m",
+            markdown_body: "\x1b[38;2;211;217;228m",
+            markdown_strong: "\x1b[38;2;233;237;245m",
+            markdown_heading: "\x1b[38;2;245;248;252m",
+            markdown_accent: "\x1b[38;2;127;179;240m",
+            markdown_code_fg: "\x1b[38;2;196;181;253m",
+            markdown_math: "\x1b[38;2;239;168;200m",
+            code_background: "\x1b[48;2;36;40;50m",
+            code_foreground: "\x1b[38;2;226;231;240m",
+            code_comment: "\x1b[38;2;138;149;168m",
+            code_keyword: "\x1b[38;2;224;139;180m",
+            code_string: "\x1b[38;2;155;214;160m",
+            code_number: "\x1b[38;2;229;192;123m",
+            code_type: "\x1b[38;2;116;199;217m",
+            code_dim: "\x1b[38;2;107;116;136m",
         }
     }
 
@@ -167,6 +186,7 @@ impl Theme {
         };
         let mut t = Theme::default_theme();
         let mut submitted_bar_overridden = false;
+        let mut prompt_overridden = false;
         for (key, value) in colors {
             let Some(raw) = value.as_str() else { continue };
             match key.as_str() {
@@ -193,6 +213,10 @@ impl Theme {
                         t.accent_submitted_bar = leak(ansi);
                         submitted_bar_overridden = true;
                     }
+                }
+                "accent.prompt" => {
+                    set_fg(&mut t.accent_prompt, raw);
+                    prompt_overridden = true;
                 }
                 "markdown.body" => set_fg(&mut t.markdown_body, raw),
                 "markdown.strong" => set_fg(&mut t.markdown_strong, raw),
@@ -221,6 +245,13 @@ impl Theme {
             // bar the same color regardless of JSON object iteration order.
             t.accent_submitted_bar = t.accent_success;
         }
+        // The prompt marker follows the theme's primary hue when the theme
+        // does not name one: an input affordance in the brand color reads as
+        // "type here" instead of "success", and every built-in theme sets
+        // `accent.prompt` to that same hue.
+        if !prompt_overridden {
+            t.accent_prompt = t.accent_primary;
+        }
         Some(t)
     }
 
@@ -246,6 +277,107 @@ impl Theme {
             }
         }
         Theme::default_theme()
+    }
+
+    /// A short sample of the agent's terminal UI painted with this palette:
+    /// tool status lines, prose, a code block and the prompt marker. It exists
+    /// so a palette can be judged before it is switched on.
+    pub(crate) fn preview_lines(&self) -> Vec<String> {
+        vec![
+            format!(
+                "  {}{}{} {}{}{}",
+                self.accent_primary, "●", RESET, self.accent_tool_name, "read_file", RESET
+            ),
+            format!(
+                "  {}{}{} {}{}{}",
+                self.accent_success, "✓", RESET, self.accent_tool_name, "apply_patch", RESET
+            ),
+            format!(
+                "  {}{}{} {}{}{}",
+                self.accent_danger, "×", RESET, self.accent_tool_name, "execute_command", RESET
+            ),
+            format!(
+                "  {}{}{} {}{}{} {}{}{}",
+                self.accent_rule,
+                "│",
+                RESET,
+                self.accent_muted,
+                "·",
+                RESET,
+                self.accent_secondary,
+                "src/main.rs",
+                RESET
+            ),
+            format!(
+                "  {}{}{} {}{}{}",
+                self.accent_rule,
+                "│",
+                RESET,
+                self.accent_command,
+                "cargo test --lib",
+                RESET
+            ),
+            format!(
+                "  {}{}{} {}{}{}",
+                self.accent_rule,
+                "│",
+                RESET,
+                self.accent_emphasized_output,
+                "important: 3 warnings",
+                RESET
+            ),
+            String::new(),
+            format!("{}{}## Heading{}", self.markdown_heading, RESET, RESET),
+            [
+                (self.markdown_body, "Body with "),
+                (self.markdown_strong, "strong"),
+                (self.markdown_body, ", "),
+                (self.markdown_accent, "a link"),
+                (self.markdown_body, ", and "),
+                (self.markdown_code_fg, "inline_code()"),
+                (self.markdown_body, "."),
+            ]
+            .iter()
+            .map(|(color, text)| format!("{color}{text}{RESET}"))
+            .collect::<String>(),
+            String::new(),
+            format!("{}{}╭─ rust{}", self.code_background, self.code_dim, RESET),
+            [
+                (self.code_dim, "  1 │"),
+                (self.code_comment, "// a comment"),
+                (self.code_keyword, "fn"),
+                (self.code_foreground, " main() { let n = "),
+                (self.code_number, "42"),
+                (self.code_foreground, "; }"),
+            ]
+            .iter()
+            .map(|(color, text)| format!("{}{}{}", self.code_background, color, text))
+            .collect::<String>()
+                + RESET,
+            format!(
+                "{}{}╰{}{}",
+                self.code_background,
+                self.code_dim,
+                "─".repeat(20),
+                RESET
+            ),
+            String::new(),
+            format!(
+                "{}{}{}❯{} your input{}",
+                BOLD, self.accent_prompt, RESET, self.accent_input, RESET
+            ),
+            format!(
+                "{}{}▎{} {}{}{}❯{} your submitted input{}",
+                BOLD,
+                self.accent_submitted_bar,
+                RESET,
+                BOLD,
+                self.accent_prompt,
+                RESET,
+                self.accent_submitted,
+                RESET
+            ),
+        ]
     }
 }
 
@@ -484,6 +616,20 @@ mod tests {
     }
 
     #[test]
+    fn from_json_prompt_defaults_to_resolved_primary() {
+        // A theme that does not name a prompt color gets the theme's primary
+        // hue, so the input marker keeps the palette's brand color.
+        let json = r##"{"colors": {"accent.primary": "#112233"}}"##;
+        let t = Theme::from_json(json).unwrap();
+        assert_eq!(t.accent_prompt, t.accent_primary);
+        assert_eq!(t.accent_prompt, "\x1b[38;2;17;34;51m");
+
+        let json = r##"{"colors": {"accent.primary": "#112233", "accent.prompt": "#445566"}}"##;
+        let t = Theme::from_json(json).unwrap();
+        assert_eq!(t.accent_prompt, "\x1b[38;2;68;85;102m");
+    }
+
+    #[test]
     fn from_json_unknown_keys_ignored() {
         let json = r##"{"colors": {"editor.background": "#000000", "accent.bogus": "#000000"}}"##;
         let t = Theme::from_json(json).unwrap();
@@ -517,7 +663,7 @@ mod tests {
                 t.accent_primary, t.accent_tool_name, t.accent_secondary, t.accent_command,
                 t.accent_muted, t.accent_input, t.accent_success, t.accent_emphasized_output,
                 t.accent_warn, t.accent_danger, t.accent_marked, t.accent_rule, t.accent_submitted,
-                t.accent_submitted_bar,
+                t.accent_submitted_bar, t.accent_prompt,
                 t.markdown_body, t.markdown_strong, t.markdown_heading, t.markdown_accent,
                 t.markdown_code_fg, t.markdown_math, t.code_background, t.code_foreground,
                 t.code_comment, t.code_keyword, t.code_string, t.code_number, t.code_type,

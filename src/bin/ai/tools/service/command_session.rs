@@ -9,10 +9,15 @@ use serde_json::Value;
 
 use super::super::storage::command_session;
 
-/// Default time a session call waits for new output before yielding.
-pub(crate) const DEFAULT_SESSION_YIELD_MS: u64 = 10_000;
+/// Default time a session call waits for new output before yielding. Each poll
+/// is one full model request, so a longer default trades latency for fewer
+/// rounds.
+pub(crate) const DEFAULT_SESSION_YIELD_MS: u64 = 30_000;
+/// Floor for one session yield: polling faster than this spends a model round
+/// per call without giving the process time to produce new output.
+pub(crate) const MIN_SESSION_YIELD_MS: u64 = 5_000;
 /// Upper bound for one session yield; keeps one tool call from blocking too long.
-pub(crate) const MAX_SESSION_YIELD_MS: u64 = 30_000;
+pub(crate) const MAX_SESSION_YIELD_MS: u64 = 60_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommandSessionAction {
@@ -43,7 +48,7 @@ pub(crate) fn non_empty_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a st
 }
 
 pub(crate) fn resolve_session_yield(value: u64) -> u64 {
-    value.clamp(1, MAX_SESSION_YIELD_MS)
+    value.clamp(MIN_SESSION_YIELD_MS, MAX_SESSION_YIELD_MS)
 }
 
 pub(crate) fn execute_command_session(args: &Value) -> Result<String, String> {
@@ -150,6 +155,17 @@ mod tests {
             poll_with_write.contains("action=write"),
             "err: {poll_with_write}"
         );
+    }
+
+    #[test]
+    fn session_yield_defaults_and_bounds_avoid_tight_polling() {
+        assert_eq!(DEFAULT_SESSION_YIELD_MS, 30_000);
+        assert_eq!(MIN_SESSION_YIELD_MS, 5_000);
+        assert_eq!(MAX_SESSION_YIELD_MS, 60_000);
+        assert_eq!(resolve_session_yield(1), MIN_SESSION_YIELD_MS);
+        assert_eq!(resolve_session_yield(5_000), 5_000);
+        assert_eq!(resolve_session_yield(30_000), DEFAULT_SESSION_YIELD_MS);
+        assert_eq!(resolve_session_yield(u64::MAX), MAX_SESSION_YIELD_MS);
     }
 
     #[test]

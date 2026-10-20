@@ -11,7 +11,8 @@ use crate::commonw::{configw, utils::expanduser};
 
 /// Subcommand literals offered by tab completion (`/theme <TAB>`); theme names
 /// complete alongside these (see `completion.rs`).
-pub(crate) const THEME_SUBCOMMANDS: &[&str] = &["list", "current", "clear", "file", "help"];
+pub(crate) const THEME_SUBCOMMANDS: &[&str] =
+    &["list", "current", "clear", "file", "preview", "help"];
 
 /// Handle `/theme` / `:theme`. Returns `Ok(false)` when the input is a
 /// different command; every `/theme` form prints its own result and returns
@@ -63,6 +64,11 @@ pub fn try_handle_theme_command(input: &str) -> Result<bool, Box<dyn Error>> {
         }
         return apply_file(path);
     }
+    // `/theme preview [name]`: show how a palette looks without switching.
+    let mut words = arg.split_whitespace();
+    if words.next() == Some("preview") {
+        return print_theme_preview(words.next());
+    }
     apply_name(arg.split_whitespace().next().unwrap_or(arg))
 }
 
@@ -76,6 +82,28 @@ fn apply_name(name: &str) -> Result<bool, Box<dyn Error>> {
             println!("Unknown theme: {name}");
             print_theme_list();
         }
+    }
+    Ok(true)
+}
+
+/// Print a sample of the terminal UI painted with a palette. Without a name
+/// the active theme is previewed; with a name the palette is resolved but the
+/// session keeps its current theme.
+fn print_theme_preview(name: Option<&str>) -> Result<bool, Box<dyn Error>> {
+    let (label, resolved) = match name {
+        Some(name) => match theme::theme_from_name(name) {
+            Some(resolved) => (name.to_string(), resolved),
+            None => {
+                println!("Unknown theme: {name}");
+                print_theme_list();
+                return Ok(true);
+            }
+        },
+        None => (active_label(), theme::current().clone()),
+    };
+    println!("Preview: {label}");
+    for line in resolved.preview_lines() {
+        println!("{line}");
     }
     Ok(true)
 }
@@ -136,6 +164,7 @@ fn print_theme_help() {
     println!("  /theme                    list available themes");
     println!("  /theme <name>             switch theme live (session-only)");
     println!("  /theme file <path.json>   load a custom theme file (session-only)");
+    println!("  /theme preview [name]     show how a theme looks without switching");
     println!("  /theme current            show current theme");
     println!("  /theme clear              drop the session override, back to config");
     println!();
@@ -198,6 +227,21 @@ mod tests {
         assert_eq!(theme::current().code_background, active);
 
         theme::clear_override();
+    }
+
+    #[test]
+    fn theme_command_previews_without_switching() {
+        let _guard = env_guard();
+        theme::clear_override();
+        let before = theme::current().clone();
+
+        assert!(try_handle_theme_command("/theme preview monokai").unwrap());
+        assert!(try_handle_theme_command("/theme preview").unwrap());
+        assert!(try_handle_theme_command("/theme preview no-such-theme").unwrap());
+
+        // Previewing a palette never switches to it.
+        assert_eq!(*theme::current(), before);
+        assert_eq!(theme::override_label(), None);
     }
 
     #[test]

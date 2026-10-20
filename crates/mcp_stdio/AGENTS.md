@@ -2,11 +2,12 @@
 
 ## Scope
 
-Shared **MCP-over-stdio protocol skeleton** (lib crate) reused by the standalone
-MCP server binaries (`mcp_browser`, `mcp_excel`). Carries everything unrelated
-to "which app is driven": JSON-RPC transport, result/error writing, text
-capping, per-operation timeout, and the `run<S: McpServer>` dispatch loop.
-Not a binary; light deps only (`tokio` io-std/io-util/time + `serde_json`).
+Shared **MCP-over-stdio protocol skeleton** (lib crate) reused by every standalone
+MCP server binary (`mcp_browser`, `mcp_computer`, `mcp_excel`, `mcp_pdf`).
+Carries everything unrelated to "which app is driven": JSON-RPC transport,
+result/error writing, text capping, per-operation timeout, and the
+`run<S: McpServer>` dispatch loop. Not a binary; light deps only (`tokio`
+io-std/io-util/time + `serde_json`).
 
 ## Layout
 

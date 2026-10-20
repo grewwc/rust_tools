@@ -42,7 +42,7 @@ fn load_config_accepts_default_model_specific_api_key_config_key() {
 }
 
 #[test]
-fn history_max_chars_derives_from_model_window_unless_configured() {
+fn history_max_chars_is_fixed_and_window_independent_unless_configured() {
     let model_with_window = |predicate: fn(usize) -> bool| {
         crate::ai::model_names::all()
             .into_iter()
@@ -55,16 +55,16 @@ fn history_max_chars_derives_from_model_window_unless_configured() {
         .expect("registry must contain a >=1M-token model");
 
     let unset = configw::ConfigW::parse("");
-    let small_budget = super::history_max_chars_for_model(&unset, &small);
-    let large_budget = super::history_max_chars_for_model(&unset, &large);
-    let small_soft_chars = crate::ai::request::soft_target_chars_for_model(&small);
-    // Small windows keep the former fixed default: a lower budget would
-    // compact the cached prefix more often than before.
-    assert!(small_soft_chars * 2 / 3 < super::MIN_DERIVED_HISTORY_MAX_CHARS);
-    assert_eq!(small_budget, super::MIN_DERIVED_HISTORY_MAX_CHARS);
-    assert!(
-        large_budget > 4 * small_budget,
-        "1M-token windows must keep far more resident history: {large_budget} vs {small_budget}"
+    // The budget no longer scales with the model window: a 1M-token model gets
+    // exactly the same fixed default as a 128K one, so a large declared window
+    // cannot inflate resident history and per-request tokens stay stable.
+    assert_eq!(
+        super::history_max_chars_for_model(&unset, &small),
+        super::DEFAULT_HISTORY_MAX_CHARS
+    );
+    assert_eq!(
+        super::history_max_chars_for_model(&unset, &large),
+        super::DEFAULT_HISTORY_MAX_CHARS
     );
 
     let explicit = configw::ConfigW::parse("ai.history.max_chars = 90000\n");

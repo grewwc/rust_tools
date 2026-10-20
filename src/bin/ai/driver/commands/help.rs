@@ -23,7 +23,7 @@ fn print_commands_help() {
     println!("    /compact                  compact session context; preserve full history");
     println!("    /distill-session [id|zip] [--dry-run] [--limit N]  distill into the knowledge base (default: current session)");
     println!("    /usage [models|today|7d|30d|all|daily]   show LLM token usage statistics");
-    println!("    /history [full|user|assistant|tool|system] [N]     show recent session messages");
+    println!("    /history [full|user|assistant|tool|system] [N]     show session messages (role filters: up to 2000)");
     println!("    /history grep <keyword>      search recent messages by keyword");
     println!("    /history rewind u<N>|last    remove a user input and all following messages");
     println!("    /history export [file.txt]   export current preview to a file");

@@ -184,8 +184,8 @@ pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_SOFT_FLOOR: usiz
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_HARD_FLOOR: usize = 80_000;
 
 /// Soft threshold: min 36K, otherwise history_max_chars * 1.5.
-/// history_max_chars is derived from the model window when unset (see
-/// `config::history_max_chars_for_model`; ~200K chars on 256K-token windows).
+/// history_max_chars is a fixed default when unset (see
+/// `config::history_max_chars_for_model`; 200K chars for every model).
 ///
 /// But character thresholds and the model token window are different units: a heavily loaded prompt may be far below
 /// the 400K character threshold yet already close to the model token window. [`token_window_char_ceiling`] gives

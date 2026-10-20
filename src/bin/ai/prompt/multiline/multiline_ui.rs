@@ -1606,14 +1606,16 @@ fn take_standalone_resize_rebuild(
 fn submitted_input_preview_lines(content: &str) -> Vec<String> {
     let mut rendered = Vec::new();
     let mut lines = content.lines();
-    let marker = crate::ai::theme::current().accent_success;
+    let marker = crate::ai::theme::current().accent_prompt;
     let bar = crate::ai::theme::current().accent_submitted_bar;
     // The post-submit preview body uses the theme's `accent.submitted`, a bright
     // signature warm hue (amber/yellow on dark themes, deep purple on light).
     // It is deliberately NOT a white/gray: assistant output is full of near-white
     // body/strong text, so the echoed user input must carry its own hue to stay
     // visible and recognizable as the user's own text. The theme-aware left
-    // bar and bold green marker keep the submit boundary distinct.
+    // bar and the `accent.prompt` marker keep the submit boundary distinct;
+    // the marker uses the prompt slot rather than `accent.success` so green
+    // keeps meaning "done" everywhere in the transcript.
     let body = crate::ai::theme::current().accent_submitted;
     if let Some(first) = lines.next() {
         // The left bar makes a user turn scannable in long output; continuation
@@ -3610,7 +3612,7 @@ mod tests {
 
     #[test]
     fn submitted_input_preview_formats_single_and_multi_line_content() {
-        let marker = crate::ai::theme::current().accent_success;
+        let marker = crate::ai::theme::current().accent_prompt;
         let bar = crate::ai::theme::current().accent_submitted_bar;
         let body = crate::ai::theme::current().accent_submitted;
         let reset = "\x1b[0m";

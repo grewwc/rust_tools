@@ -1,7 +1,7 @@
 {
   "name": "command_session",
-  "description": "Control a persistent command session started by `execute_command` with `yield_time_ms`. action=poll waits for new output, action=write sends stdin then waits, and action=close terminates the process. Session ids are scoped to the agent session that created them.",
-  "first_use_guidance": "Guidance for later command_session calls in this turn:\n- Reuse the exact `session_id` printed as `[session ...]` by `execute_command`; never invent or reuse an id from another session.\n- A session that exited and drained its output is removed automatically; a later poll then reports an unknown session. Start the command again if it is gone.\n- Polling is bounded. Do not add `sleep` to wait for output; use `yield_time_ms` and poll again.",
+  "description": "Control a persistent command session started by `execute_command` with `yield_time_ms`. action=poll waits for new output, action=write sends stdin then waits, and action=close terminates the process. Each poll is one full model round, so poll only when the process needs to be supervised. Session ids are scoped to the agent session that created them.",
+  "first_use_guidance": "Guidance for later command_session calls in this turn:\n- Reuse the exact `session_id` printed as `[session ...]` by `execute_command`; never invent or reuse an id from another session.\n- An id can refer to a process that already exited but still has buffered output to read; one poll drains it. A session that exited and drained its output is removed automatically, and a later poll reports an unknown session.\n- Polling is deliberately slow: each poll waits 5000-60000ms (default 30000) and costs a full model round. Do not poll in a tight loop, and do not add `sleep` to wait for output. If the command is finite, let `execute_command` block instead of starting a session.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -16,7 +16,7 @@
       },
       "session_id": {
         "type": "string",
-        "description": "Required id returned by `execute_command` when the process stayed alive after `yield_time_ms`."
+        "description": "Required id returned by `execute_command` when the process is still running or has buffered output left to read."
       },
       "write_stdin": {
         "type": "string",
@@ -25,9 +25,9 @@
       },
       "yield_time_ms": {
         "type": "integer",
-        "description": "Milliseconds to wait for new output after polling or writing (1-30000, default 10000). Ignored by action=close.",
-        "minimum": 1,
-        "maximum": 30000
+        "description": "Milliseconds to wait for new output after polling or writing (5000-60000, default 30000). Ignored by action=close.",
+        "minimum": 5000,
+        "maximum": 60000
       }
     },
     "required": [

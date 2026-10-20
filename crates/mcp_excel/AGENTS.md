@@ -22,14 +22,15 @@ cargo build -p mcp_excel   # ~10s; third-party deps tokio+serde_json (+ local mc
 
 `cargo check --bin a` unaffected (not a dep). No unit tests — needs real Excel. Gate: build + smoke-test cold-Excel round-trip `open_workbook -> read_range -> write_cell -> read_cell -> export_csv -> close_workbook`.
 
-## AppleScript golden rules (mirrored in `osa.rs`; found via real `-50`/`-10003` — do not simplify)
+## AppleScript rules (binding — do not simplify)
 
-1. One `tell worksheet` block = one op kind — mixing `set value` then `value of` → `-10003`; keep read/write templates strictly separate.
-2. `range "A1"` not `cell "A1"` — cross-call `cell` refs → `-10003`; `range` (even single cell) is stable.
-3. `open` is async — cold `open POSIX file` returns before workbook registered → immediate `-50`; `open_workbook` polls `exists workbook` until ready; use `open POSIX file` (never `open workbook workbook file name` — uncatchable `-50`).
-4. Bulk property over iteration — `name of every worksheet` stable; `repeat with ws in (every worksheet)` → `-50` after cold open.
-5. Block read via `value of used range`, rebuild TSV in Rust — osascript flattens 2D list and loses row structure.
-6. `tab` is literal `"tab"` in `format!` — use `(ASCII character 9)` for real tab.
+The rule set lives with the templates: `src/osa.rs` module docstring,
+"已验证的 AppleScript 铁律" (7 rules, each traced to a real `-50`/`-10003`
+diagnostic). The three that cost the most when broken:
+
+- One `tell worksheet` block = one op kind — mixing a write then a read → `-10003`.
+- `range "A1"`, never `cell "A1"` — cross-call `cell` refs → `-10003`.
+- `open` is async — `open_workbook` polls until the workbook is registered, or the next call → `-50`.
 
 ## Invariants (do not break)
 

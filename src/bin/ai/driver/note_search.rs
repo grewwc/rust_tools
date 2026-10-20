@@ -12,6 +12,7 @@ use std::time::Duration;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ai::cli::ParsedCli;
+use crate::ai::theme::{BOLD, DIM, RESET};
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use crate::ai::types::{App, clear_stream_cancel};
 
@@ -1151,12 +1152,16 @@ pub(super) async fn handle_note_edit(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
-    // Status-line coloring: keeps the note body (white on black) visually distinct.
-    const NE: &str = "\x1b[1;36m[note-edit]\x1b[0m"; // bold cyan label
-    const FIELD: &str = "\x1b[2m"; // field names (id/time/content) in dim gray
-    const HINT: &str = "\x1b[1;32m"; // action hints in bold green
-    const IDX: &str = "\x1b[1;33m"; // candidate indices in bold yellow
-    const RST: &str = "\x1b[0m";
+    // Status-line coloring follows the active theme so this screen matches the
+    // rest of the terminal: the label uses the primary accent, the action
+    // hints the success accent, the candidate indices the warning accent, and
+    // the field names a plain dim style.
+    let theme = crate::ai::theme::current();
+    let ne = format!("{BOLD}{}[note-edit]{RESET}", theme.accent_primary);
+    let field = DIM;
+    let hint = format!("{BOLD}{}", theme.accent_success);
+    let idx = format!("{BOLD}{}", theme.accent_warn);
+    let rst = RESET;
 
     // Join the query: flag value + remaining positional args; if both are empty,
     // open the multi-line input box.
@@ -1170,7 +1175,7 @@ pub(super) async fn handle_note_edit(
     }
     let query = query.trim().to_string();
     let query = if query.is_empty() {
-        println!("{NE} 请描述你想修改的内容（多行；提交后开始匹配，留空取消）：");
+        println!("{ne} 请描述你想修改的内容（多行；提交后开始匹配，留空取消）：");
         let input = match app.prompt_editor.as_mut() {
             Some(editor) => editor.read_multi_line().ok().flatten(),
             None => None,
@@ -1178,7 +1183,7 @@ pub(super) async fn handle_note_edit(
         match input {
             Some(s) if !s.trim().is_empty() => s.trim().to_string(),
             _ => {
-                eprintln!("{NE} 未输入任何内容，已取消");
+                eprintln!("{ne} 未输入任何内容，已取消");
                 return Ok(());
             }
         }
@@ -1196,13 +1201,13 @@ pub(super) async fn handle_note_edit(
             Ok(c) => c,
             Err(err) => {
                 spinner.stop();
-                eprintln!("{NE} 检索失败: {}", err);
+                eprintln!("{ne} 检索失败: {}", err);
                 return Err(err.into());
             }
         };
     if candidates.is_empty() {
         spinner.stop();
-        println!("{NE} 没有找到与「{}」相关的可修改 memo 条目。", query);
+        println!("{ne} 没有找到与「{}」相关的可修改 memo 条目。", query);
         return Ok(());
     }
 
@@ -1242,7 +1247,7 @@ pub(super) async fn handle_note_edit(
         };
     spinner.stop();
     if let Some(err) = matched_err {
-        eprintln!("{NE} 模型匹配失败: {}", err);
+        eprintln!("{ne} 模型匹配失败: {}", err);
     }
 
     // Parse the set of indices returned by the model.
@@ -1274,7 +1279,7 @@ pub(super) async fn handle_note_edit(
 
     let mut matched = parse_indices(&chosen, candidates.len());
     if matched.is_empty() {
-        println!("{NE} 模型未能从候选中确定要修改的条目，已取消。可换个更具体的描述重试。");
+        println!("{ne} 模型未能从候选中确定要修改的条目，已取消。可换个更具体的描述重试。");
         return Ok(());
     }
 
@@ -1283,33 +1288,33 @@ pub(super) async fn handle_note_edit(
     let target_idx = if matched.len() == 1 {
         matched[0]
     } else {
-        println!("\n{NE} 匹配到以下 {IDX}{}{RST} 条条目：", matched.len());
+        println!("\n{ne} 匹配到以下 {idx}{}{rst} 条条目：", matched.len());
         for (n, &ci) in matched.iter().enumerate() {
             let e = &candidates[ci];
-            println!("  {IDX}[{}]{RST}", n + 1);
+            println!("  {idx}[{}]{rst}", n + 1);
             if let Some(id) = e.id.as_deref().filter(|s| !s.is_empty()) {
-                println!("    {FIELD}id:{RST} {}", id);
+                println!("    {field}id:{rst} {}", id);
             }
-            println!("    {FIELD}时间:{RST} {}", e.timestamp);
+            println!("    {field}时间:{rst} {}", e.timestamp);
             println!(
-                "    {FIELD}内容:{RST} {}",
+                "    {field}内容:{rst} {}",
                 e.note.chars().take(500).collect::<String>()
             );
         }
-        print!("\n{HINT}请输入要修改的编号（只能选一条；n=取消）:{RST} ");
+        print!("\n{hint}请输入要修改的编号（只能选一条；n=取消）:{rst} ");
         std::io::stdout().flush().ok();
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer).ok();
         let answer = answer.trim().to_lowercase();
         if answer == "n" || answer == "no" || answer == "q" || answer == "cancel" {
-            println!("{NE} 已取消，未修改任何内容。");
+            println!("{ne} 已取消，未修改任何内容。");
             return Ok(());
         }
         let picks = parse_indices(&answer, matched.len());
         match picks.first() {
             Some(&p) => matched.remove(p),
             None => {
-                println!("{NE} 未识别到有效编号，已取消，未修改任何内容。");
+                println!("{ne} 未识别到有效编号，已取消，未修改任何内容。");
                 return Ok(());
             }
         }
@@ -1318,11 +1323,11 @@ pub(super) async fn handle_note_edit(
     let target = candidates[target_idx].clone();
 
     // Prefill the original text in the editor for the user to rewrite.
-    println!("\n{NE} 将打开编辑器修改以下条目（原文已预填；留空或不改动即取消）：");
+    println!("\n{ne} 将打开编辑器修改以下条目（原文已预填；留空或不改动即取消）：");
     if let Some(id) = target.id.as_deref().filter(|s| !s.is_empty()) {
-        println!("    {FIELD}id:{RST} {}", id);
+        println!("    {field}id:{rst} {}", id);
     }
-    println!("    {FIELD}时间:{RST} {}", target.timestamp);
+    println!("    {field}时间:{rst} {}", target.timestamp);
 
     let new_note = match app.prompt_editor.as_mut() {
         Some(editor) => {
@@ -1334,12 +1339,12 @@ pub(super) async fn handle_note_edit(
     let new_note = match new_note {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => {
-            println!("{NE} 未输入新内容，已取消。");
+            println!("{ne} 未输入新内容，已取消。");
             return Ok(());
         }
     };
     if new_note == target.note.trim() {
-        println!("{NE} 内容未变化，已取消。");
+        println!("{ne} 内容未变化，已取消。");
         return Ok(());
     }
 
@@ -1379,13 +1384,13 @@ pub(super) async fn handle_note_edit(
             };
         spinner.stop();
         if let Some(err) = tidy_err {
-            eprintln!("{NE} 模型整理失败（将保存原文）: {}", err);
+            eprintln!("{ne} 模型整理失败（将保存原文）: {}", err);
         }
         match result {
             Some(tidied) if tidied != new_note => {
-                println!("{NE} 已整理修改内容（语义未变）：");
+                println!("{ne} 已整理修改内容（语义未变）：");
                 println!(
-                    "  {FIELD}整理后:{RST} {}",
+                    "  {field}整理后:{rst} {}",
                     tidied.chars().take(500).collect::<String>()
                 );
                 tidied
@@ -1396,11 +1401,11 @@ pub(super) async fn handle_note_edit(
 
     match crate::ai::tools::service::memory::update_memo_entry(&target, &final_note) {
         Ok(_) => {
-            println!("{NE} 已更新该条目。");
+            println!("{ne} 已更新该条目。");
             Ok(())
         }
         Err(err) => {
-            eprintln!("{NE} 更新失败: {}", err);
+            eprintln!("{ne} 更新失败: {}", err);
             Err(err.into())
         }
     }

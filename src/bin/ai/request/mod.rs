@@ -54,7 +54,7 @@ pub(in crate::ai) use logging::emit_request_diagnostic;
 #[cfg(test)]
 pub(in crate::ai) use logging::request_diagnostics_enabled;
 pub(crate) use prompt_feedback::{PrefixReuse, PromptTokenFeedback};
-pub(crate) use current_budget::{CurrentRequestBudget, soft_target_chars_for_model};
+pub(crate) use current_budget::CurrentRequestBudget;
 pub(crate) use protocol::extract_response_text;
 #[cfg(test)]
 use protocol::responses_reasoning_replay_stats;

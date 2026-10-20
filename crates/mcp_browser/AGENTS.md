@@ -10,7 +10,7 @@ Standalone stdio JSON-RPC **MCP server** for browser automation (navigate/click/
 
 ```text
 src/main.rs      # #[tokio::main(multi_thread)]; BrowserServer { mode, session } + impl McpServer; gc_stale_profiles() + mcp_stdio::run()
-src/browser.rs   # BrowserSession { browser, page, handler_task, temp_profile_dir, pending_human }; launch()/ensure_session()/shutdown() + Session enum + DriverMode::from_env()
+src/browser.rs   # BrowserSession + launch()/ensure_session()/shutdown() + Session enum + DriverMode::from_env()
 src/applescript.rs # AppleScript driver: ApplescriptSession + osascript runner + 13 tool impls
 src/tools.rs     # initialize/tools_list schemas + handle_tools_call dispatch + 13 tool impls
 ```
@@ -32,22 +32,39 @@ No focused unit tests (needs real Chrome). Gate = build + smoke test above; add 
 1. **Server cap < host timeout** (`crates/mcp_stdio/AGENTS.md` invariant 5). No per-tool override — the host kills+restarts the subprocess on `request_timeout_ms`, so every CDP/osascript op stays under the **90s** cap (host **120s**).
 2. **Error wording avoids host transport triggers** — the trigger list and the shared timeout wording live in `crates/mcp_stdio/AGENTS.md` invariant 2.
 3. **Only `content[0].text` reaches model.** Screenshots save to disk and return the path; extracted text/HTML is capped by `cap_text` (`mcp_stdio`; host offloads >32K).
-4. **Sequential + Handler polling.** `main` owns `Option<BrowserSession>` by `&mut`; host serializes requests so one reused `Page` keeps cookies. CDP `Handler` must be continuously polled (`tokio::spawn while handler.next().await` in `launch()`), else all CDP hangs.
+4. **Sequential + Handler polling.** `main` owns `Option<BrowserSession>` by `&mut`; host serializes requests so one reused `Page` keeps cookies. CDP `Handler` must be continuously polled, else all CDP hangs.
 5. **launch vs connect.** `Browser::launch` = new controlled Chrome (throwaway profile). `Browser::connect` (when `MCP_BROWSER_WS_URL` set) = attach existing `--remote-debugging` instance. Default is launch.
-6. **Per-pid profile dir + startup GC.** Chromiumoxide default `<temp>/chromiumoxide-runner` is single fixed path → `SingletonLock` collision. `launch()` uses `<temp>/mcp_browser-profile-<pid>` + `purge_singleton_locks()`. Host usually SIGKILLs subprocess → `shutdown()` never runs, so `gc_stale_profiles()` at startup removes dirs whose pid is dead (`kill(pid,0)`). Do not revert to shared dir.
-7. **Human-required detection + `wait_for_human`.** `navigate`/`get_text`/`get_html` (and post-action re-check in `click`/`type_text`/`press_key`) detect captcha/slider/sms_otp/twofa/login_required/payment_verify/identity_verify via one `evaluate_expression` (conservative DOM signals; keyword+input required for text-only; JS errors → `None`). Signals are **visibility-gated** — hidden inputs/iframes (display:none / visibility:hidden / zero-size: unopened modals, templates, invisible captchas) never count, and **no raw `innerHTML` substring matching** (SPA script/config text false-positives, e.g. the word "otp" in a bundle); text clues use visibility-safe `body.innerText` + a visible input (AppleScript `jo()` checks only `location.hash`; both drivers share the same keyword rules). Appends `[USER_ACTION_REQUIRED: <category>]` **after** `cap_text` (never truncated). Single tag source: `user_action_tag()`. Captcha = present **and unsolved** (iframe stays in DOM after solve — check `g-recaptcha-response`/`h-captcha-response` + visibility, not bare presence). `wait_for_human`: blocking wait resumable in bounded segments — polls every 2s (each 5s timeout, hung poll = still-blocked), needs 2 consecutive clean polls to resolve; fixed 60s budget clamped to `op_timeout_ms-15s`; on expiry returns `status=still_waiting` (normal result, not error — model ends turn, asks user, calls again). Stays under host timeout so user can take minutes without kill. Headless → `status=unavailable` fast. Session tracks `pending_human: Option<String>` (set on detection, cleared on resolve/empty/navigate); while set, mutating tools prepend `[HUMAN_ACTION_PENDING: <category>]`.
+6. **Per-pid profile dir + startup GC.** A shared profile path collides (`SingletonLock`), and the host usually SIGKILLs the subprocess so `shutdown()` never runs — `launch()` uses a per-pid dir and `gc_stale_profiles()` at startup removes dirs whose pid is dead. Do not revert to a shared dir.
+7. **Human-required detection + `wait_for_human`.**
+   - **Detect** captcha/slider/sms_otp/twofa/login_required/payment_verify/
+     identity_verify in `navigate`/`get_text`/`get_html` and after
+     `click`/`type_text`/`press_key`; one `evaluate_expression` pass per call, and
+     a JS error means "no signal".
+   - **Signals must be visibility-gated** — hidden inputs/iframes never count, and
+     **no raw `innerHTML` substring matching** (SPA script text false-positives);
+     text clues come from visibility-safe `body.innerText` plus a visible input.
+     Both drivers share the same keyword rules.
+   - **Tag** `[USER_ACTION_REQUIRED: <category>]` **after** `cap_text` (never
+     truncated), from the single source `user_action_tag()`; captcha counts only
+     while present *and* unsolved. While a human action is pending, mutating
+     tools prepend `[HUMAN_ACTION_PENDING: <category>]`.
+   - **`wait_for_human`** waits in bounded segments under the host timeout (60s
+     budget) and returns `status=still_waiting` — a normal result, not an error:
+     the model ends the turn and asks the user. Headless reports
+     `status=unavailable`. Detector internals live in `src/tools.rs` (CDP) and
+     `src/applescript.rs` (AppleScript).
 
 ## AppleScript driver specifics
 
 Same 13 tools/args as CDP; `wait_for_human` never `unavailable`. Dedicated invariants:
 
-1. **Never steal focus.** No `activate`; `open_tab` records frontmost app before creating tab and restores via `open -b <bundle id>` (fallback display name; bundle-id first because localized display names can fail to resolve). Skip restore if already in Chrome. Ops address `window id W` + `whose id is "T"` (int window + quoted tab; other forms -1719/-1728) → stray events fail dry instead of mutating foreign tabs. Chrome self-activates on new tab — unavoidable, hence restore.
+1. **Never steal focus.** No `activate`; `open_tab` records the frontmost app before creating the tab and restores it afterwards (skip when already in Chrome). Ops address `window id W` + `whose id is "T"` (int window + quoted tab; other forms -1719/-1728) → stray events fail dry instead of mutating foreign tabs. Chrome self-activates on a new tab — hence the restore.
 2. **Allow JavaScript from Apple Events** (View > Developer). Server detects disabled error (message carries support URL) and returns menu-path instruction.
-3. **JS embeds as one AppleScript string literal** — escape `\`/`"`/newlines via `esc_applescript`; whole script via `osascript -` stdin (`run_osascript`), no temp files. Multi-line JS (detect/wait polling) is fine.
+3. **JS embeds as one AppleScript string literal** — escape `\`/`"`/newlines via `esc_applescript`; the whole script goes over `osascript -` stdin, no temp files. Multi-line JS (detect/wait polling) is fine.
 4. **One session tab, reused.** `navigate` re-sets `URL of` tab unless vanished (then fresh tab in session window; first session uses front window). Tab becomes active tab *of its window* (for `screencapture -l`) but window stays background.
 5. **Synthetic events only.** JS `click()`, native-setter `value`+`input`/`change`, `KeyboardEvent` dispatch (Enter also `form.requestSubmit()`). No OS key chords / drag&drop. `full_page` degrades to a window screenshot.
-6. **Screenshot TCC preflight.** `screenshot` first runs a silent TCC preflight (`CGPreflightScreenCaptureAccess` via `screen_capture_allowed()`): without *Screen Recording* permission `screencapture -l` always fails while the region/full-screen fallbacks still exit 0 and produce a wallpaper-only image that looks like success (measured: with preflight false, 4 real Chrome windows all returned "could not create image from window") -- so the server errors out immediately with authorization instructions (macOS 15+ re-verifies that grant monthly). With permission, a three-stage fallback: `screencapture -l <wid>` → `bounds → -R x,y,w,h` → full screen; a first call with no window auto-creates a session via `about:blank`. The grant only takes effect after fully quitting and restarting the host app.
-7. **Every osascript call wrapped in `with_timeout` (90s).** CDP-only env vars (`MCP_BROWSER_USER_DATA_DIR`/`MCP_BROWSER_HEADLESS`/`MCP_BROWSER_CHROME`/`MCP_BROWSER_WS_URL` win) don't apply.
+6. **Screenshot TCC preflight.** `screenshot` probes Screen Recording permission first: without it the window capture fails while the region/full-screen fallbacks still exit 0 with a wallpaper-only image that looks like success — so the server must error out with authorization instructions instead of returning a useless frame. The probe and fallback chain live in `src/applescript.rs`; the grant applies only after fully quitting and restarting the host app.
+7. **Every osascript call wrapped in `with_timeout` (90s).** CDP-only env vars don't apply.
 
 ## Environment variables
 
@@ -63,7 +80,7 @@ Same 13 tools/args as CDP; `wait_for_human` never `unavailable`. Dedicated invar
 
 ## chromiumoxide 0.9 notes
 
-Keyboard/typing on **`Element`** (`type_str`/`press_key`/`focus`/`scroll_into_view`/`click`/`inner_text`/`outer_html`); `Page` lacks `press_key` → focus `body` first. Screenshot: `ScreenshotParams::builder().format(CaptureScreenshotFormat::Png).full_page(bool).build()` (`chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat`).
+Keyboard/typing must go through **`Element`**; `Page` has no `press_key`, so focus `body` first. The element/screenshot API details live in `src/tools.rs`.
 
 ## Host registration
 

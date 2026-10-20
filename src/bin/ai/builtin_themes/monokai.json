@@ -3,18 +3,20 @@
   "type": "dark",
   "colors": {
     "accent.primary": "#66D9EF",
-    "accent.toolName": "#FD971F",
+    "accent.toolName": "#F8F8F2",
     "accent.secondary": "#AE81FF",
-    "accent.command": "#90C528",
-    "accent.muted": "#9A9A85",
+    "accent.command": "#46DA6B",
+    "accent.muted": "#A6A692",
     "accent.input": "#F8F8F2",
     "accent.success": "#A6E22E",
     "accent.emphasizedOutput": "#66D9EF",
     "accent.warn": "#FD971F",
     "accent.danger": "#F92672",
     "accent.marked": "#FF6188",
-    "accent.rule": "#5A5A48",
+    "accent.rule": "#7A7A62",
     "accent.submitted": "#E6DB74",
+    "accent.submittedBar": "#66D9EF",
+    "accent.prompt": "#66D9EF",
     "markdown.body": "#D7D7C9",
     "markdown.strong": "#F8F8F2",
     "markdown.heading": "#F8F8F2",
@@ -23,11 +25,11 @@
     "markdown.math": "#F92672",
     "code.background": "#272822",
     "code.foreground": "#F8F8F2",
-    "code.comment": "#75715E",
+    "code.comment": "#9A9580",
     "code.keyword": "#F92672",
     "code.string": "#E6DB74",
     "code.number": "#AE81FF",
     "code.type": "#66D9EF",
-    "code.dim": "#6B6B6B"
+    "code.dim": "#7E7E72"
   }
 }

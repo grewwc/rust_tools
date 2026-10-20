@@ -1112,20 +1112,23 @@ fn reclaim_tool_evidence_before_request(app: &App, messages: &mut Vec<Message>) 
     report.pruned_count
 }
 
-/// Share of the input allowance (per mille) at which lossless evidence
-/// reclaim starts. Below it, stale results stay in the provider's prompt
-/// cache, which is cheaper than re-prefilling everything after a new stub.
-const RECLAIM_PRESSURE_PERMILLE: usize = 500;
+/// Absolute cap on the prompt-token size at which lossless evidence reclaim
+/// starts. A pure share of the input allowance scaled with the window: a
+/// 1M-token model only reclaimed past ~500K prompt tokens, so stale tool output
+/// was replayed every round. The cap fixes those large windows, while small
+/// windows still reclaim at half their allowance: the gate is
+/// `min(RECLAIM_PRESSURE_TOKENS, input_allowance / 2)`. Without the relative
+/// term a 128K model would never reach the cap, because its input allowance is
+/// below it. Below the gate, stale results stay in the provider's prompt cache,
+/// which is cheaper than re-prefilling everything after a new stub.
+const RECLAIM_PRESSURE_TOKENS: usize = 110_000;
 /// Reclaim rounds per request; each round is itself bounded by the
 /// per-call item/char caps in `llm_prune`.
 const MAX_RECLAIM_ROUNDS_PER_REQUEST: usize = 4;
 
 fn under_reclaim_pressure(budget: request::CurrentRequestBudget) -> bool {
-    budget.prompt_tokens.saturating_mul(1_000)
-        >= budget
-            .limits
-            .input_allowance_tokens
-            .saturating_mul(RECLAIM_PRESSURE_PERMILLE)
+    let threshold = RECLAIM_PRESSURE_TOKENS.min(budget.limits.input_allowance_tokens / 2);
+    budget.prompt_tokens >= threshold
 }
 
 /// Reclaim old tool evidence only while the measured request is under token
@@ -1361,7 +1364,7 @@ async fn request_model_response(
 
     // Place fixed plan overhead first so the reclaim gate measures the
     // request about to be sent. Reclaim rewrites history mid-prefix, so it
-    // runs only under token pressure (see `RECLAIM_PRESSURE_PERMILLE`); the
+    // runs only under token pressure (see `RECLAIM_PRESSURE_TOKENS`); the
     // model has no housekeeping protocol to follow either way.
     context_budget::ensure_active_plan(app, messages);
     let before_budget =
@@ -1982,8 +1985,11 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_gate_opens_at_half_of_input_allowance() {
-        let budget = |prompt_tokens: usize| -> request::CurrentRequestBudget {
+    fn reclaim_gate_caps_large_windows_and_scales_with_small_allowances() {
+        // The gate is min(absolute cap, half the input allowance): small windows
+        // must still reclaim before their allowance is exhausted, while large
+        // windows stop waiting for a window-sized share.
+        let budget = |prompt_tokens: usize, allowance: usize| -> request::CurrentRequestBudget {
             serde_json::from_value(serde_json::json!({
                 "prompt_tokens": prompt_tokens,
                 "source": "normalized_estimate",
@@ -1991,16 +1997,23 @@ mod tests {
                     "physical_context_tokens": 128_000,
                     "output_reserve_tokens": 24_000,
                     "safety_margin_tokens": 4_000,
-                    "input_allowance_tokens": 100_000,
+                    "input_allowance_tokens": allowance,
                     "soft_target_tokens": 70_000,
                 },
             }))
             .unwrap()
         };
-        assert!(!super::under_reclaim_pressure(budget(0)));
-        assert!(!super::under_reclaim_pressure(budget(49_999)));
-        assert!(super::under_reclaim_pressure(budget(50_000)));
-        assert!(super::under_reclaim_pressure(budget(usize::MAX)));
+        let cap = super::RECLAIM_PRESSURE_TOKENS;
+        // 100K allowance -> half (50K) wins over the 110K cap.
+        assert!(!super::under_reclaim_pressure(budget(49_999, 100_000)));
+        assert!(super::under_reclaim_pressure(budget(50_000, 100_000)));
+        // 200K allowance -> half (100K) still sits below the cap.
+        assert!(!super::under_reclaim_pressure(budget(99_999, 200_000)));
+        assert!(super::under_reclaim_pressure(budget(100_000, 200_000)));
+        // 1M allowance -> the cap wins, far below the old ~500K share.
+        assert!(!super::under_reclaim_pressure(budget(cap - 1, 1_000_000)));
+        assert!(super::under_reclaim_pressure(budget(cap, 1_000_000)));
+        assert!(super::under_reclaim_pressure(budget(usize::MAX, 1_000_000)));
     }
 
     #[test]

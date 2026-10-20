@@ -80,16 +80,16 @@ rustc --edition 2024 --crate-type lib --emit=metadata -o /dev/null \
   crates/mcp_computer/src/backend/linux.rs
 ```
 
-That check proves it compiles, not that the Linux helpers behave — a real Linux
-session (X11 and Wayland) still has to be exercised before claiming Linux support.
+That check proves it compiles, not that the Linux helpers behave.
 
 ## Status / known gaps
 
-- Linux backend is compile-checked only (never run on a Linux host).
+- Linux backend is compile-checked only (never run on a Linux host); a real
+  Linux session (X11 and Wayland) still has to be exercised before claiming Linux
+  support.
 - Pixels-per-point must be taken from the display *mode* (`CGDisplayCopyDisplayMode` +
-  `CGDisplayMode::pixel_width`); `CGDisplayPixelsWide` returns the *point* size on a HiDPI
-  mode, which described this Retina screen as 1.00 px/point while its captures came back
-  3024x1964 px. `capture.rs` also re-measures the ratio from the PNG it wrote, so the
+  `CGDisplayMode::pixel_width`); `CGDisplayPixelsWide` returns the *point* size on a
+  HiDPI mode. `capture.rs` also re-measures the ratio from the PNG it wrote, so the
   pixel→point mapping the model is given stays right for window captures too.
 - `screen_info` reports `cursor: unknown` when CoreGraphics refuses the null mouse
   event used to read the pointer position (`screen.rs::cursor_position`).

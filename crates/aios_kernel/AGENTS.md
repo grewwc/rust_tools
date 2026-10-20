@@ -12,11 +12,10 @@ facilities (futex, trace, epoll, rlimit, llm-usage, vfs, daemon, ipc). Pure
 ## Layout
 
 ```text
-src/kernel.rs       # Kernel / Syscall / KernelInternal traits, Process, ProcessState,
-                    # Signal, EventId, WaitPolicy/WaitReason, ShmReadError,
-                    # ProcessCapabilities, SharedKernel, CurrentPidProvider
-src/primitives.rs   # FutexOps, TraceOps, EpollOps, RlimitOps, LlmOps, VfsOps,
-                    # DaemonOps, IpcOps + their types (ResourceLimit/Usage, ...)
+src/kernel.rs       # Kernel / Syscall / KernelInternal traits + the shared process,
+                    # signal, event, wait, capability, shm and pid-provider types
+src/primitives.rs   # one ops trait per primitive facility (futex, trace, epoll, rlimit,
+                    # llm-usage, vfs, daemon, ipc) + their types
 src/local/          # LocalOS: single-machine implementation of every trait, split
                     # by facility (syscall, futex, ipc, vfs, daemon, ...)
 src/types.rs        # FastMap / FastSet (rustc-hash re-exports)
@@ -46,10 +45,9 @@ cargo test -p aios_kernel test_name
 6. **`LocalOS` state is guarded by the caller** via
    `SharedKernel = Arc<Mutex<Box<dyn Kernel + Send>>>` - kernel methods must
    not block or await.
-7. **Process-table lifecycle.** `remove_process_entry_raw` reattaches surviving
-   children to the oldest live foreground process (deterministic root via
-   `min_by_key(pid)`, pids increase monotonically) instead of orphaning them, so
-   child-scoped ops (`kill_process` / `signal_process` / `reap_process` /
-   `wait_on`) always have a manageable owner. A target pid absent from the
-   process table reports `"Process {pid} does not exist."` rather than a
-   misleading "outside its scope" error.
+7. **Process-table lifecycle.** Removing a process reattaches its surviving
+   children to a live foreground owner instead of orphaning them, so child-scoped
+   ops (`kill_process` / `signal_process` / `reap_process` / `wait_on`) always have
+   a manageable owner. A target pid absent from the process table reports
+   `"Process {pid} does not exist."` rather than a misleading "outside its scope"
+   error.

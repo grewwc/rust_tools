@@ -305,7 +305,11 @@ fn ensure_reaper() {
     });
 }
 
-/// Start a session and return its id plus the first output snapshot.
+/// Start a command session and return its first output snapshot.
+///
+/// A command that exits and drains its output inside `yield_time_ms` is not
+/// kept in the registry; it returns plain output with no session id so callers
+/// do not poll a handle that never existed.
 pub(crate) fn start(
     command: &str,
     cwd: Option<&str>,
@@ -428,12 +432,12 @@ pub(crate) fn start(
     let body = session.snapshot(Duration::from_millis(yield_time_ms));
     let exited = session.stdout.lock().unwrap().exited.is_some();
     let drained = !session.has_pending_output();
-    let rendered = render_with_id(&id, &body, exited, drained);
     if exited && drained {
         let _ = session.child.wait();
-    } else {
-        lock_registry().insert(id, Arc::new(Mutex::new(session)));
+        return Ok(body);
     }
+    let rendered = render_with_id(&id, &body, exited, drained);
+    lock_registry().insert(id, Arc::new(Mutex::new(session)));
     Ok(rendered)
 }
 
@@ -758,6 +762,14 @@ pub(crate) mod tests {
             out.starts_with("Exit code: 1"),
             "session failure must use the shared marker: {out}"
         );
+        assert!(
+            !out.contains("[session "),
+            "a command that already exited and drained must not advertise a session: {out}"
+        );
+        assert!(
+            !out.contains("session closed"),
+            "a never-registered session must not report a close: {out}"
+        );
     }
 
     #[test]
@@ -972,9 +984,12 @@ pub(crate) mod tests {
             5_000,
         )
         .expect("session with initial input");
-        let id = session_id_of(&out);
-        let mut combined = out;
+        // A command that exits and drains inside the yield window returns plain
+        // output with no session id, so only look for a handle when the child
+        // has not produced the marker yet.
+        let mut combined = out.clone();
         if !combined.contains("GOT:initial-hello") {
+            let id = session_id_of(&out);
             combined.push_str(&poll_until(&id, "GOT:initial-hello", 10_000));
         }
         assert!(combined.contains("GOT:initial-hello"), "out: {combined}");

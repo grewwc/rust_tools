@@ -5,13 +5,12 @@
 Applies to `src/bin/ai/knowledge/**`. Shared types and the semantic-index
 building blocks: `types.rs` (`Category`), `entry.rs` (path-leak guard),
 `config.rs` (hybrid-search weight), `indexing/similarity.rs` (lexical scoring +
-`cosine_similarity`), `indexing/embedder.rs` (remote OpenAI-compatible
-embedding provider, default `doubao-embedding-vision`), and
-`storage/vector_store.rs` (SQLite-backed vector index), plus `distilled.rs`
-(verified distilled entries for automatic recall, see invariant 3). The
-orchestration layer lives in `tools/storage/rag_store.rs` (rebuild + hybrid merge) and the
-`knowledge_semantic_search` / `knowledge_rebuild_index` tools in
-`tools/rag_tools.rs`.
+vector similarity), `indexing/embedder.rs` (remote OpenAI-compatible embedding
+provider, default `doubao-embedding-vision`), `storage/vector_store.rs`
+(SQLite-backed vector index), and `distilled.rs` (verified distilled entries for
+automatic recall, see invariant 3). The orchestration layer lives in
+`tools/storage/rag_store.rs` (rebuild + hybrid merge) and the
+`knowledge_semantic_search` / `knowledge_rebuild_index` tools in `tools/rag_tools.rs`.
 
 ## Key invariants
 
@@ -23,11 +22,11 @@ orchestration layer lives in `tools/storage/rag_store.rs` (rebuild + hybrid merg
 2. **Consolidation contract.** `knowledge_consolidate` is a two-phase flow:
    `read_all` then `execute`. Merges are lossless: `execute` `save_entries[].source_ids`
    must list every source entry being consolidated, and the tool appends each source's
-   full original note to the merged entry (see `execute_consolidation` in
-   `tools/knowledge_tools.rs`) while auto-deleting those sources (their content is fully
-   preserved in the merged entry). Content is discarded only for entries removed via
-   `delete_ids` without being listed in any `save_entries[].source_ids` — consolidation
-   never silently compresses or drops original content.
+   full original note to the merged entry while auto-deleting those sources (their
+   content is fully preserved in the merged entry). Content is discarded only for
+   entries removed via `delete_ids` without being listed in any
+   `save_entries[].source_ids` — consolidation never silently compresses or drops
+   original content.
 3. **Semantic search is derived; automatic recall is restricted.** The vector
    index is a pure derived artifact of the canonical memory store, rebuilt lazily
    on first use (or when the configured embedding model changed — see the model

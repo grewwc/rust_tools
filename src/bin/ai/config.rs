@@ -71,33 +71,26 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     })
 }
 
-/// Floor for the derived history budget: the former fixed default. Every
-/// cross-turn compaction rewrites the cached prompt prefix, so a budget below
-/// it would compact more often than before and lose prompt-cache hits; it also
-/// keeps a tiny or misdeclared window from collapsing the budget to 0, which
-/// would mean "compression disabled".
-const MIN_DERIVED_HISTORY_MAX_CHARS: usize = 200_000;
+/// Fixed cross-turn live-history budget in chars when `ai.history.max_chars` is
+/// unset. Deriving the budget from the model window made large-window models
+/// (1M-token deepseek/minimax) keep ~2x more history resident every turn, which
+/// doubled per-request input tokens without a matching quality gain. A single
+/// fixed value keeps the compaction cadence identical across models and
+/// independent of the declared window.
+const DEFAULT_HISTORY_MAX_CHARS: usize = 200_000;
 
 /// Cross-turn live-history budget in chars for `model`.
 ///
 /// An explicit `ai.history.max_chars` always wins (0 keeps compression
-/// disabled). Otherwise the budget is two thirds of the model's static soft
-/// target, leaving the remaining third for the system prompt, tool schemas and
-/// the current turn's growth before request-boundary compression starts, and
-/// never below [`MIN_DERIVED_HISTORY_MAX_CHARS`]. Large windows thus keep far
-/// more history resident (fewer prefix rewrites) while small windows keep the
-/// former compaction cadence. The static default chars-per-token ratio is
-/// deliberate: the value is part of the projection fingerprint, so a
-/// per-request measured ratio would invalidate persisted snapshots every turn.
-pub(super) fn history_max_chars_for_model(cfg: &configw::ConfigW, model: &str) -> usize {
+/// disabled). Otherwise every model uses the same fixed
+/// [`DEFAULT_HISTORY_MAX_CHARS`]: the budget no longer scales with the model
+/// window, so a large declared window cannot inflate resident history and the
+/// per-request token cost stays stable across models. The `model` argument is
+/// retained for call-site compatibility and a future per-model override.
+pub(super) fn history_max_chars_for_model(cfg: &configw::ConfigW, _model: &str) -> usize {
     cfg.get_opt(AiConfig::HISTORY_MAX_CHARS)
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            crate::ai::request::soft_target_chars_for_model(model)
-                .saturating_mul(2)
-                .saturating_div(3)
-                .max(MIN_DERIVED_HISTORY_MAX_CHARS)
-        })
+        .unwrap_or(DEFAULT_HISTORY_MAX_CHARS)
 }
 
 #[allow(dead_code)]

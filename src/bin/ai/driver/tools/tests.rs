@@ -888,8 +888,8 @@ fn schema_gate_rejects_out_of_range_integers_before_dispatch() {
 /// integer parameter fails until its author registers it here.
 const INT_BOUND_REGISTRY: &[(&str, &str, Option<i64>, Option<i64>, &str)] = &[
     ("execute_command", "timeout", Some(1), Some(300), "service clamps 1-300"),
-    ("execute_command", "yield_time_ms", Some(1), Some(30000), "service clamps 1-30000"),
-    ("command_session", "yield_time_ms", Some(1), Some(30000), "service clamps 1-30000"),
+    ("execute_command", "yield_time_ms", Some(5000), Some(60000), "service clamps 5000-60000; each poll is a model round"),
+    ("command_session", "yield_time_ms", Some(5000), Some(60000), "service clamps 5000-60000; each poll is a model round"),
     ("task_wait", "timeout_secs", Some(1), Some(60), "service clamps 1-60"),
     ("search_overflow", "context_lines", Some(0), Some(5), "unwrap_or(2).min(5); 0 is valid"),
     ("search_overflow", "max_results", Some(1), Some(200), "service clamps 1-200"),

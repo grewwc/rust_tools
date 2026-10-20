@@ -5,11 +5,9 @@ Root-level overview and repo-wide invariants only; the nearest scoped
 
 Rust 2024 workspace: utility library + CLI binaries. Primary product is `a`, an
 LLM-based AI agent runtime (AIOS) with process scheduling, agent/skill routing,
-tool registry, and MCP integration. Workspace members: root crate,
-`crates/rust_tools_macros`, `crates/aios_kernel`, `crates/mcp_stdio`,
-`crates/mcp_browser`, `crates/mcp_computer`, `crates/mcp_excel`,
-`crates/mcp_pdf`, `crates/re`.
-macOS-first (`objc2` deps); core library cross-platform.
+tool registry, and MCP integration. Workspace members: the root crate plus the
+`crates/*` listed under Layout. macOS-first (`objc2` deps); core library
+cross-platform.
 
 ## Layout
 

@@ -134,23 +134,8 @@ impl CurrentRequestBudget {
     }
 }
 
-/// Static soft target of `model` in message chars at the default (unmeasured)
-/// chars-per-token ratio: the same limits [`CurrentRequestBudget`] measures
-/// against, minus anything request-specific. Turn-level budgets that must stay
-/// stable for a model (e.g. the cross-turn history projection) derive from this
-/// instead of a fixed character constant.
-pub(crate) fn soft_target_chars_for_model(model: &str) -> usize {
-    let soft_target_tokens = ContextLimits::new(
-        models::context_window_tokens(model),
-        preferred_output_reserve_tokens(models::max_output_tokens(model), None),
-        builder::CONTEXT_WINDOW_SAFETY_MARGIN_TOKENS,
-    )
-    .soft_target_tokens;
-    soft_target_tokens
-        .saturating_mul(default_chars_per_token_milli())
-        .div_ceil(1_000)
-}
-
+/// Minimum output-token reserve so a model with a tiny declared `max_output`
+/// (or none) still leaves room for a complete reply.
 fn preferred_output_reserve_tokens(model_max: Option<u32>, output_override: Option<u32>) -> usize {
     // Keep enough headroom for a useful completion while allowing the request
     // builder to clamp the provider's larger wire ceiling against the actual
