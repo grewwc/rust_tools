@@ -374,6 +374,56 @@ fn decoder_passes_input_frames_through() {
     );
 }
 
+/// The reattach stream must close with the same terminal marker the turn
+/// stream uses. Without it a client cannot tell "the turn ended" from "the
+/// connection dropped": it re-attaches every couple of seconds, and each
+/// attempt tears down and rebuilds its progress view.
+#[tokio::test]
+async fn session_events_stream_ends_with_the_terminal_marker() {
+    use super::EventsQuery;
+    use axum::body::to_bytes;
+    use axum::extract::{Path, Query, State};
+    use axum::response::IntoResponse;
+
+    let state = lifecycle_test_state();
+    // A session whose turn already finished: the backlog replays, then the
+    // stream closes with the terminal marker.
+    let log = state.events.begin("s-finished");
+    log.publish("thinking", r#"{"text":"hi"}"#);
+    log.finish();
+    let response = stream_session_events(
+        State(state.clone()),
+        HeaderMap::new(),
+        Path("s-finished".to_string()),
+        Query(EventsQuery { after: 0 }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("event: thinking"), "{text}");
+    assert!(text.contains("event: done"), "{text}");
+    assert!(
+        text.rfind("event: done") > text.rfind("event: thinking"),
+        "the terminal marker must come last: {text}"
+    );
+
+    // A session with no event log at all: still a terminal marker, not a 404.
+    // A 404 is indistinguishable from a lost stream, which is what made
+    // clients re-attach forever.
+    let response = stream_session_events(
+        State(state),
+        HeaderMap::new(),
+        Path("s-missing".to_string()),
+        Query(EventsQuery { after: 0 }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("event: done"), "{text}");
+}
+
 /// The `/confirm` route pair: the pending question is readable, an answer
 /// reaches the turn child's stdin exactly once, and answering the same
 /// question again is refused instead of writing a second line.

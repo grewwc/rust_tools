@@ -342,6 +342,17 @@ pub(crate) fn terminal_output_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether stdout is a real terminal.
+///
+/// Output meant for a terminal is redrawn in place (a row is rewritten with a
+/// carriage return), which a pipe consumer cannot interpret: it reads whole
+/// lines, so an unterminated row only surfaces once the next line arrives.
+/// Producers that must reach a pipe have to terminate their rows themselves.
+pub(crate) fn stdout_is_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+}
+
 /// Publish the sub-agent's current execution phase into the active phase
 /// slot if one was installed by the spawning tool. Silent no-op when no
 /// slot is set (top-level foreground turn, unit tests, …).

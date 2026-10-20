@@ -344,6 +344,7 @@ struct AttachState {
     pending: std::collections::VecDeque<EventRecord>,
     next_seq: u64,
     done: bool,
+    emitted_done: bool,
 }
 
 pub(crate) async fn stream_session_events(
@@ -359,7 +360,17 @@ pub(crate) async fn stream_session_events(
         return bad_request(format!("invalid session id: {id}")).into_response();
     }
     let Some((backlog, running, log)) = state.events.snapshot(&id, query.after) else {
-        return StatusCode::NOT_FOUND.into_response();
+        // Nothing to attach to: this session has no event log because no turn
+        // ever ran, or the log was retired. Close the stream with the same
+        // terminal marker the turn stream uses, so a client can tell "no live
+        // turn" from a dropped connection. A plain 404 is indistinguishable
+        // from a lost stream, which made clients re-attach in a loop.
+        let done = stream::once(async {
+            Ok::<_, std::convert::Infallible>(ServeSse::new("done", "").into_event())
+        });
+        return Sse::new(done)
+            .keep_alive(axum::response::sse::KeepAlive::default())
+            .into_response();
     };
     let stream = stream::unfold(
         AttachState {
@@ -367,6 +378,7 @@ pub(crate) async fn stream_session_events(
             pending: backlog.into(),
             next_seq: query.after,
             done: !running,
+            emitted_done: false,
         },
         |mut state| async move {
             loop {
@@ -378,7 +390,19 @@ pub(crate) async fn stream_session_events(
                     ));
                 }
                 if state.done {
-                    return None;
+                    if state.emitted_done {
+                        return None;
+                    }
+                    // The turn ended. Close the stream with the terminal marker
+                    // the turn stream uses: without it a reconnecting client
+                    // cannot distinguish a finished turn from a lost stream and
+                    // re-attaches forever, tearing down its progress view on
+                    // every attempt.
+                    state.emitted_done = true;
+                    return Some((
+                        Ok::<_, std::convert::Infallible>(ServeSse::new("done", "").into_event()),
+                        state,
+                    ));
                 }
                 state.log.changed().await;
                 let (events, running) = state.log.since(state.next_seq);

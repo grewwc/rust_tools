@@ -1081,8 +1081,17 @@ fn run_one(
     crate::ai::driver::runtime_ctx::publish_subagent_phase(&progress);
 
     if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
-        // Keep the line open so completion can replace it with a carriage return.
-        print!("{}", format_tool_status_running(&tool_call.function.name));
+        let row = format_tool_status_running(&tool_call.function.name);
+        if crate::ai::driver::runtime_ctx::stdout_is_terminal() {
+            // Keep the line open so completion can replace it with a carriage return.
+            print!("{row}");
+        } else {
+            // A pipe consumer reads whole lines. Without the newline the running
+            // marker only surfaces when the completion row arrives, so a remote
+            // client learns about a tool after it finished instead of when it
+            // started, and a long tool looks like a dead stream.
+            println!("{row}");
+        }
         let _ = std::io::stdout().flush();
     }
 

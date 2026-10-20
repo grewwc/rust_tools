@@ -466,6 +466,10 @@ let eventAbort = null; // AbortController for the reattached event stream
 let eventActive = false; // one reattach stream at a time
 let eventSession = ""; // session the reattach stream belongs to
 let recoveredView = null; // progress card rendered from replayed events
+// True once the reattached event stream closed with the server's terminal
+// marker: the turn it belonged to is over, so re-attaching would only
+// re-render the transcript on every poll.
+let eventStreamEnded = false;
 
 function headers(json) {
   const h = {};
@@ -2718,7 +2722,7 @@ async function attachEvents() {
       while ((idx = buf.indexOf("\n\n")) >= 0) {
         const block = parseBlock(buf.slice(0, idx));
         buf = buf.slice(idx + 2);
-        if (block.kind === "done") { finished = true; break; }
+        if (block.kind === "done") { finished = true; eventStreamEnded = true; break; }
         if (block.kind) handleReplayEvent(sid, block.kind, block.payload, view);
       }
       if (finished || done) break;
@@ -2745,6 +2749,7 @@ function abortEvents() {
   if (eventAbort) { eventAbort.abort(); eventAbort = null; }
   eventActive = false;
   eventSession = "";
+  eventStreamEnded = false;
   if (recoveredView) { recoveredView.remove(); recoveredView = null; }
 }
 
@@ -2762,9 +2767,23 @@ async function pollConfirm() {
   // The same poll reports a live turn for this session: the server is the only
   // source that survives this page losing the stream. A missing field means an
   // older server, treated as "not running".
+  const wasRunning = turnRunning;
   turnRunning = body.running === true;
-  if (turnRunning) { turnRunningAt = Date.now(); armHistoryFollow(); ensureConfirmPoll(); void attachEvents(); }
-  else if (!turns.has(sessionId) && staleSession !== sessionId) stopConfirmPoll();
+  if (turnRunning) {
+    turnRunningAt = Date.now();
+    armHistoryFollow();
+    ensureConfirmPoll();
+    // A stream that closed with the terminal marker belongs to a finished
+    // turn: the server already said so. Re-attaching on every poll would
+    // rebuild the progress view and re-render the transcript each time. A new
+    // turn (running flipped back to true) starts a fresh stream.
+    if (!wasRunning) eventStreamEnded = false;
+    if (!eventStreamEnded) void attachEvents();
+  }
+  else {
+    eventStreamEnded = false;
+    if (!turns.has(sessionId) && staleSession !== sessionId) stopConfirmPoll();
+  }
   syncStopButton();
   const pending = body.pending;
   if (!pending) { if (confirmShown) hideConfirm(); return turnRunning; }

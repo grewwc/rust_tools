@@ -259,6 +259,41 @@ test("EOF without the done event follows server history instead of declaring com
   assert.match(script, /if \(!finished && !turnError\) \{[\s\S]*?stream ended before completion[\s\S]*?goStale/);
 });
 
+test("a finished event stream is not re-attached on every poll, but a new turn is", async () => {
+  let attachCalls = 0;
+  const context = vm.createContext({
+    sessionId: "s", confirmBusy: false, runEpoch: 0,
+    turnRunning: false, turnRunningAt: 0, turns: new Map(), staleSession: "",
+    confirmShown: null, eventStreamEnded: false, NATIVE_PREFIX: "@@",
+    api: async () => ({ json: async () => ({ running: true, pending: null }) }),
+    armHistoryFollow() {}, ensureConfirmPoll() {}, stopConfirmPoll() {},
+    attachEvents() { attachCalls++; },
+    syncStopButton() {}, showConfirm() {}, hideConfirm() {}, handleNativeRequest() {},
+  });
+  const start = script.indexOf("async function pollConfirm()");
+  const end = script.indexOf("function isTurnRunning()", start);
+  assert.ok(start > 0 && end > start);
+  vm.runInContext(script.slice(start, end), context);
+  // The server reports a running turn: the page attaches to the event stream.
+  await vm.runInContext("pollConfirm()", context);
+  assert.equal(attachCalls, 1);
+  // The stream closed with the server's terminal marker, so the turn it
+  // belonged to is over. Polling again must not re-attach: that would rebuild
+  // the progress view and re-render the transcript on every poll.
+  vm.runInContext("eventStreamEnded = true", context);
+  await vm.runInContext("pollConfirm()", context);
+  assert.equal(attachCalls, 1);
+  // The turn ends server-side and a new one starts: attach to the new stream.
+  vm.runInContext("turnRunning = false; eventStreamEnded = false", context);
+  await vm.runInContext("pollConfirm()", context);
+  assert.equal(attachCalls, 2);
+});
+
+test("the terminal marker ends the reattach loop instead of rescheduling it", () => {
+  assert.match(script, /if \(block\.kind === "done"\) \{ finished = true; eventStreamEnded = true; break; \}/);
+  assert.match(script, /if \(!eventStreamEnded\) void attachEvents\(\);/);
+});
+
 test("reconnect does not bind input listeners twice and diagnostics never contain typed text", () => {
   const listeners = [];
   const prompt = { value: "中文 secret", style: { height: "44px" }, addEventListener: (type, fn) => listeners.push({ type, fn }) };
