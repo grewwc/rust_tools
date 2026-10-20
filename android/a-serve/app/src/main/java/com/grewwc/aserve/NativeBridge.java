@@ -10,13 +10,7 @@ import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
-import android.location.Location;
-import android.location.LocationListener;
-import android.location.LocationManager;
 import android.net.Uri;
-import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.provider.AlarmClock;
 import android.provider.CalendarContract;
 import android.provider.ContactsContract;
@@ -42,14 +36,16 @@ import java.util.TimeZone;
  * Narrow native surface for the server-owned page.
  *
  * <p>Only allowlisted actions exist. The page never gets a generic
- * {@code startActivity}, and every action that changes phone state is shown in
- * a native confirmation dialog first. Calls are rejected unless the loaded page
+ * {@code startActivity}. Manual actions use native confirmation; chat-initiated
+ * actions may skip it. Calls are rejected unless the loaded page
  * still belongs to the configured server origin.</p>
  */
 final class NativeBridge {
     static final String NAME = "AServeNative";
 
-    private static final int MAX_LABEL_CHARS = 120;
+    private static final String[] ACTIONS = {"now", "calendar_read", "calendar_add", "sms",
+            "alarm", "timer", "note", "note_create", "note_list", "note_update",
+            "file_import", "file_read", "file_save", "location", "screen_capture", "screen_stop"};
     private static final int MAX_NOTE_CHARS = 3000;
     private static final int MAX_TITLE_CHARS = 200;
     private static final int MAX_PLACE_CHARS = 200;
@@ -58,13 +54,29 @@ final class NativeBridge {
     private static final int MAX_CONTACT_CHARS = 120;
     private static final int MAX_NUMBER_CHARS = 40;
     private static final String LOCAL_DATE_TIME = "yyyy-MM-dd'T'HH:mm";
-    private static final long FRESH_LOCATION_MS = 5 * 60 * 1000L;
-    private static final long LOCATION_TIMEOUT_MS = 12000L;
-
     private final MainActivity activity;
+    private boolean foreground;
+    private ForegroundLocation locationRequest;
+    private final java.util.concurrent.ExecutorService notebookWorker = java.util.concurrent.Executors.newSingleThreadExecutor();
+    private LocalNotebook notebook;
 
     NativeBridge(MainActivity activity) {
         this.activity = activity;
+    }
+
+    void onHostResume() {
+        foreground = true;
+    }
+
+    void onHostPause() {
+        foreground = false;
+        if (locationRequest != null) locationRequest.cancel();
+    }
+
+    void close() {
+        onHostPause();
+        notebookWorker.execute(() -> { if (notebook != null) notebook.close(); });
+        notebookWorker.shutdown();
     }
 
     /** Feature detection for the page; returns a JSON string. */
@@ -73,9 +85,8 @@ final class NativeBridge {
         JSONObject caps = new JSONObject();
         try {
             caps.put("version", BuildConfig.VERSION_NAME);
-            caps.put("actions", new JSONArray()
-                    .put("now").put("calendar_read").put("calendar_add").put("sms")
-                    .put("alarm").put("note").put("location"));
+            caps.put("actions", new JSONArray(java.util.Arrays.asList(ACTIONS)));
+            caps.put("features", new JSONArray(java.util.Arrays.asList("alarm_weekdays", "precise_location", "screen_manual_trigger")));
         } catch (JSONException ignored) {
             // Both keys are constants; serialization cannot fail here.
         }
@@ -86,8 +97,7 @@ final class NativeBridge {
      * Entry point for every native action.
      *
      * @param requestId caller-generated id echoed in {@code AServeNativeResult}
-     * @param action    one of {@code now}, {@code calendar_read}, {@code calendar_add},
-     *                  {@code sms}, {@code alarm}, {@code note}, {@code location}
+     * @param action    one of the action names returned by {@link #capabilities()}
      * @param payloadJson JSON object with action-specific fields
      */
     @JavascriptInterface
@@ -101,6 +111,14 @@ final class NativeBridge {
     private void performOnUi(String requestId, String action, String payloadJson) {
         if (!activity.isTrustedPage()) {
             activity.deliverNativeResult(requestId, false, "untrusted page", null);
+            return;
+        }
+        if (!java.util.Arrays.asList(ACTIONS).contains(action)) {
+            activity.deliverNativeResult(requestId, false, "unknown action", null);
+            return;
+        }
+        if ("location".equals(action) && !foreground) {
+            activity.deliverNativeResult(requestId, false, "app not in foreground", null);
             return;
         }
         JSONObject payload;
@@ -124,6 +142,10 @@ final class NativeBridge {
 
     /** Rerun an action once the activity has granted its runtime permissions. */
     void resumeAfterPermission(String requestId, String action, String payloadJson) {
+        if (!activity.isTrustedPage()) {
+            activity.deliverNativeResult(requestId, false, "untrusted page", null);
+            return;
+        }
         JSONObject payload;
         try {
             String raw = payloadJson == null || payloadJson.trim().isEmpty() ? "{}" : payloadJson;
@@ -140,6 +162,8 @@ final class NativeBridge {
         boolean auto = payload.optBoolean("auto", false);
         if ("alarm".equals(action)) {
             requestAlarm(requestId, payload, auto);
+        } else if ("timer".equals(action)) {
+            requestTimer(requestId, payload, auto);
         } else if ("note".equals(action)) {
             requestNote(requestId, payload, auto);
         } else if ("location".equals(action)) {
@@ -152,6 +176,29 @@ final class NativeBridge {
             addCalendarEvent(requestId, payload, auto);
         } else if ("sms".equals(action)) {
             composeSms(requestId, payload, auto);
+        } else if ("note_create".equals(action) || "note_list".equals(action) || "note_update".equals(action)) {
+            String origin = activity.nativeOrigin();
+            payload.remove("action");
+            payload.remove("auto");
+            notebookWorker.execute(() -> {
+                try {
+                    if (notebook == null) notebook = new LocalNotebook(activity.getApplicationContext());
+                    JSONObject result = notebook.execute(origin, requestId, action, payload);
+                    activity.runOnUiThread(() -> {
+                        if (origin.equals(activity.nativeOrigin()) && activity.isTrustedPage())
+                            activity.deliverNativeResult(requestId, true, null, result);
+                    });
+                } catch (Exception error) {
+                    activity.runOnUiThread(() -> {
+                        if (origin.equals(activity.nativeOrigin()) && activity.isTrustedPage())
+                            activity.deliverNativeResult(requestId, false, error.getMessage(), null);
+                    });
+                }
+            });
+        } else if ("file_import".equals(action) || "file_read".equals(action) || "file_save".equals(action)) {
+            activity.performDocumentAction(requestId, action, payload);
+        } else if ("screen_capture".equals(action) || "screen_stop".equals(action)) {
+            activity.performScreen(requestId, "screen_stop".equals(action));
         } else {
             activity.deliverNativeResult(requestId, false, "unknown action", null);
         }
@@ -166,7 +213,18 @@ final class NativeBridge {
     private String[] missingPermissions(String action, JSONObject payload) {
         List<String> needed = new ArrayList<>();
         if ("location".equals(action)) {
-            needed.add(Manifest.permission.ACCESS_COARSE_LOCATION);
+            // Request an upgrade once for installations with an old coarse-only
+            // grant, then respect the user's choice without repeated prompts.
+            android.content.SharedPreferences choices = activity.getSharedPreferences("location_precision", 0);
+            if (activity.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                    || (activity.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                        && choices.getBoolean("fine_requested", false))) {
+                return new String[0];
+            }
+            choices.edit().putBoolean("fine_requested", true).apply();
+            return new String[]{Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION};
+        } else if ("screen_capture".equals(action) && android.os.Build.VERSION.SDK_INT >= 33) {
+            needed.add(Manifest.permission.POST_NOTIFICATIONS);
         } else if ("calendar_read".equals(action)) {
             needed.add(Manifest.permission.READ_CALENDAR);
         } else if ("calendar_add".equals(action)) {
@@ -185,51 +243,93 @@ final class NativeBridge {
     }
 
     private void requestAlarm(String requestId, JSONObject payload, boolean auto) {
-        int hour = payload.optInt("hour", -1);
-        int minute = payload.optInt("minute", -1);
-        String label = clamp(payload.optString("label", ""), MAX_LABEL_CHARS).trim();
-        if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
-            activity.deliverNativeResult(requestId, false, "invalid time", null);
+        final ClockRequest clock;
+        try {
+            Object weekdays = payload.opt("weekdays");
+            if (weekdays instanceof JSONArray) {
+                List<Object> values = new ArrayList<>();
+                JSONArray array = (JSONArray) weekdays;
+                for (int i = 0; i < array.length(); i++) values.add(array.opt(i));
+                weekdays = values;
+            }
+            clock = ClockRequest.alarm(payload.opt("hour"), payload.opt("minute"),
+                    payload.opt("label"), weekdays);
+        } catch (IllegalArgumentException invalid) {
+            activity.deliverNativeResult(requestId, false, invalid.getMessage(), null);
             return;
         }
-        String detail = String.format(Locale.getDefault(), "设置闹钟 %02d:%02d", hour, minute);
-        if (!label.isEmpty()) detail += "\n标签：" + label;
-        String title = "设置闹钟";
-        String message = detail + "\n\n确认后打开系统时钟并创建该闹钟。";
+        String detail = String.format(Locale.getDefault(), "设置闹钟 %02d:%02d", clock.hour, clock.minute);
+        if (!clock.label.isEmpty()) detail += "\n标签：" + clock.label;
+        if (!clock.weekdays.isEmpty()) detail += "\n重复日期（1=周一，7=周日）：" + clock.weekdays;
+        String message = detail + "\n\n确认后向系统时钟发送请求；是否创建成功请在时钟中确认。";
         if (auto) {
-            setAlarm(requestId, hour, minute, label);
+            dispatchClock(requestId, clock, false);
             return;
         }
-        confirm(requestId, title, message,
-                () -> setAlarm(requestId, hour, minute, label));
+        confirm(requestId, "设置闹钟", message, () -> dispatchClock(requestId, clock, false));
     }
 
-    private void setAlarm(String requestId, int hour, int minute, String label) {
-        Intent intent = new Intent(AlarmClock.ACTION_SET_ALARM)
-                .putExtra(AlarmClock.EXTRA_HOUR, hour)
-                .putExtra(AlarmClock.EXTRA_MINUTES, minute)
-                .putExtra(AlarmClock.EXTRA_SKIP_UI, true);
-        if (!label.isEmpty()) intent.putExtra(AlarmClock.EXTRA_MESSAGE, label);
+    private void requestTimer(String requestId, JSONObject payload, boolean auto) {
+        final ClockRequest clock;
         try {
-            activity.startActivity(intent);
-            Toast.makeText(activity,
-                    String.format(Locale.getDefault(), "闹钟已设置 %02d:%02d", hour, minute),
-                    Toast.LENGTH_SHORT).show();
-            activity.deliverNativeResult(requestId, true, null, null);
-        } catch (ActivityNotFoundException first) {
-            // Some clock apps reject the skip-UI flag; retry with the picker.
-            intent.putExtra(AlarmClock.EXTRA_SKIP_UI, false);
+            clock = ClockRequest.timer(payload.opt("seconds"), payload.opt("label"));
+        } catch (IllegalArgumentException invalid) {
+            activity.deliverNativeResult(requestId, false, invalid.getMessage(), null);
+            return;
+        }
+        if (auto) {
+            dispatchClock(requestId, clock, true);
+            return;
+        }
+        confirm(requestId, "设置计时器", "时长：" + clock.seconds + " 秒\n标签：" + clock.label
+                + "\n\n确认后向系统时钟发送请求；是否启动请在时钟中确认。",
+                () -> dispatchClock(requestId, clock, true));
+    }
+
+    private void dispatchClock(String requestId, ClockRequest clock, boolean timer) {
+        if (!activity.isTrustedPage()) {
+            activity.deliverNativeResult(requestId, false, "untrusted page", null);
+            return;
+        }
+        Intent intent = new Intent(timer ? AlarmClock.ACTION_SET_TIMER : AlarmClock.ACTION_SET_ALARM)
+                .putExtra(AlarmClock.EXTRA_SKIP_UI, true);
+        if (timer) {
+            intent.putExtra(AlarmClock.EXTRA_LENGTH, clock.seconds);
+        } else {
+            intent.putExtra(AlarmClock.EXTRA_HOUR, clock.hour).putExtra(AlarmClock.EXTRA_MINUTES, clock.minute);
+            if (!clock.weekdays.isEmpty()) intent.putIntegerArrayListExtra(AlarmClock.EXTRA_DAYS, clock.calendarDays());
+        }
+        if (!clock.label.isEmpty()) intent.putExtra(AlarmClock.EXTRA_MESSAGE, clock.label);
+        boolean skipUi = true;
+        try {
             try {
                 activity.startActivity(intent);
-                Toast.makeText(activity,
-                        String.format(Locale.getDefault(), "闹钟已设置 %02d:%02d", hour, minute),
-                        Toast.LENGTH_SHORT).show();
-                activity.deliverNativeResult(requestId, true, null, null);
-            } catch (ActivityNotFoundException second) {
-                activity.deliverNativeResult(requestId, false, "no alarm app", null);
+            } catch (ActivityNotFoundException first) {
+                // Some clock apps reject the skip-UI flag; retry with the picker.
+                skipUi = false;
+                intent.putExtra(AlarmClock.EXTRA_SKIP_UI, false);
+                activity.startActivity(intent);
             }
+            JSONObject data = new JSONObject();
+            data.put("action", timer ? "timer" : "alarm");
+            data.put("status", "dispatched");
+            data.put("skip_ui", skipUi);
+            data.put("label", clock.label);
+            if (timer) data.put("seconds", clock.seconds);
+            else {
+                data.put("hour", clock.hour);
+                data.put("minute", clock.minute);
+                data.put("weekdays", new JSONArray(clock.weekdays));
+            }
+            Toast.makeText(activity, timer ? "计时器请求已发送，请在时钟中确认" : "闹钟请求已发送，请在时钟中确认",
+                    Toast.LENGTH_SHORT).show();
+            activity.deliverNativeResult(requestId, true, null, data);
+        } catch (ActivityNotFoundException error) {
+            activity.deliverNativeResult(requestId, false, timer ? "no timer app" : "no alarm app", null);
         } catch (SecurityException error) {
-            activity.deliverNativeResult(requestId, false, "alarm permission denied", null);
+            activity.deliverNativeResult(requestId, false, "clock permission denied", null);
+        } catch (JSONException error) {
+            activity.deliverNativeResult(requestId, false, "clock response unavailable; request may have been dispatched", null);
         }
     }
 
@@ -275,116 +375,33 @@ final class NativeBridge {
             fetchLocation(requestId);
             return;
         }
-        confirm(requestId, "使用大致位置",
-                "获取一次大致位置并填入输入框，用于天气、附近搜索等。\n\n不会在后台持续定位，也不会自动发送。",
+        confirm(requestId, "使用当前位置",
+                "尝试获取一次当前位置，用于天气、附近搜索等；可选择仅提供大致位置。\n\n只在前台定位，结果会附带精度和时效信息。",
                 () -> fetchLocation(requestId));
     }
 
     /** Called by the activity after the runtime permission result, or directly. */
     void fetchLocation(String requestId) {
         activity.runOnUiThread(() -> {
-            LocationManager manager = (LocationManager) activity.getSystemService(Activity.LOCATION_SERVICE);
-            if (manager == null) {
-                activity.deliverNativeResult(requestId, false, "location unavailable", null);
+            if (!foreground || activity.isFinishing() || activity.isDestroyed()) {
+                activity.deliverNativeResult(requestId, false, "app not in foreground", null);
                 return;
             }
-            Location best = null;
-            for (String provider : new String[]{
-                    LocationManager.NETWORK_PROVIDER,
-                    LocationManager.GPS_PROVIDER,
-                    LocationManager.PASSIVE_PROVIDER}) {
-                try {
-                    Location candidate = manager.getLastKnownLocation(provider);
-                    if (candidate != null && (best == null || candidate.getTime() > best.getTime())) {
-                        best = candidate;
-                    }
-                } catch (SecurityException | IllegalArgumentException ignored) {
-                    // Provider missing or not permitted; try the next one.
-                }
-            }
-            if (best != null && System.currentTimeMillis() - best.getTime() <= FRESH_LOCATION_MS) {
-                deliverLocation(requestId, best);
+            if (!activity.isTrustedPage()) {
+                activity.deliverNativeResult(requestId, false, "untrusted page", null);
                 return;
             }
-
-            String provider = null;
-            for (String candidate : new String[]{
-                    LocationManager.NETWORK_PROVIDER,
-                    LocationManager.GPS_PROVIDER}) {
-                try {
-                    if (manager.isProviderEnabled(candidate)) {
-                        provider = candidate;
-                        break;
-                    }
-                } catch (IllegalArgumentException ignored) {
-                    // Unknown provider on this device.
-                }
-            }
-            if (provider == null) {
-                activity.deliverNativeResult(requestId, false, "location services disabled", null);
+            if (locationRequest != null) {
+                activity.deliverNativeResult(requestId, false, "another location request is pending", null);
                 return;
             }
-
-            final LocationManager locationManager = manager;
-            final boolean[] finished = {false};
-            final LocationListener[] listener = new LocationListener[1];
-            Handler handler = new Handler(Looper.getMainLooper());
-            Runnable timeout = () -> {
-                if (finished[0]) return;
-                finished[0] = true;
-                try {
-                    locationManager.removeUpdates(listener[0]);
-                } catch (Exception ignored) {
-                    // Updates already stopped.
-                }
-                activity.deliverNativeResult(requestId, false, "location timeout", null);
-            };
-            listener[0] = new LocationListener() {
-                @Override
-                public void onLocationChanged(Location location) {
-                    if (finished[0]) return;
-                    finished[0] = true;
-                    handler.removeCallbacks(timeout);
-                    try {
-                        locationManager.removeUpdates(this);
-                    } catch (Exception ignored) {
-                        // Updates already stopped.
-                    }
-                    deliverLocation(requestId, location);
-                }
-
-                @Override
-                public void onStatusChanged(String provider, int status, Bundle extras) {}
-
-                @Override
-                public void onProviderEnabled(String provider) {}
-
-                @Override
-                public void onProviderDisabled(String provider) {}
-            };
-            try {
-                locationManager.requestLocationUpdates(provider, 0L, 0f, listener[0], Looper.getMainLooper());
-            } catch (SecurityException error) {
-                finished[0] = true;
-                activity.deliverNativeResult(requestId, false, "location permission denied", null);
-                return;
-            }
-            handler.postDelayed(timeout, LOCATION_TIMEOUT_MS);
+            locationRequest = new ForegroundLocation(activity, (ok, error, data) -> {
+                locationRequest = null;
+                if (!activity.isTrustedPage()) activity.deliverNativeResult(requestId, false, "untrusted page", null);
+                else activity.deliverNativeResult(requestId, ok, error, data);
+            });
+            locationRequest.start();
         });
-    }
-
-    private void deliverLocation(String requestId, Location location) {
-        JSONObject data = new JSONObject();
-        try {
-            data.put("latitude", location.getLatitude());
-            data.put("longitude", location.getLongitude());
-            if (location.hasAccuracy()) data.put("accuracy", Math.round(location.getAccuracy()));
-            data.put("age_ms", Math.max(0L, System.currentTimeMillis() - location.getTime()));
-        } catch (JSONException ignored) {
-            activity.deliverNativeResult(requestId, false, "location unavailable", null);
-            return;
-        }
-        activity.deliverNativeResult(requestId, true, null, data);
     }
 
     /** Local wall clock of the phone; dates in this timezone drive every other action. */

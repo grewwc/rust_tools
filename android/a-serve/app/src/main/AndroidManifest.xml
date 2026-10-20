@@ -1,8 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- Coarse only: enough for weather and nearby search, without precise tracking. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Requested together for a single foreground fix; approximate remains valid. -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <!-- Normal permission: lets the alarm intent reach the system clock app. -->
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
     <!-- Calendar events the user asks the agent to read or create. -->
@@ -21,6 +25,10 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.AServe"
         android:usesCleartextTraffic="false">
+        <service
+            android:name=".ScreenCaptureService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

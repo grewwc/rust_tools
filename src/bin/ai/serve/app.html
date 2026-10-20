@@ -301,7 +301,7 @@ select, summary { touch-action:manipulation; }
 <header>
 <button id="menu" aria-label="sessions">☰</button>
 <b>a</b><span id="info">connecting…</span>
-<a id="apkdownload" href="/a-serve-v1.6.0.apk" download="a-serve-v1.6.0.apk" aria-label="download Android app" title="download Android app"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></a>
+<a id="apkdownload" href="/a-serve-v1.8.0.apk" download="a-serve-v1.8.0.apk" aria-label="download Android app" title="download Android app"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></a>
 <button id="connbtn" aria-label="connection">⚙</button>
 <button id="newbtn" class="primary">＋</button>
 </header>
@@ -588,13 +588,21 @@ function parsePhoneAction(raw) {
   try { spec = JSON.parse(String(raw)); } catch (_) { return null; }
   if (!spec || typeof spec !== "object" || Array.isArray(spec)) return null;
   const action = typeof spec.action === "string" ? spec.action : "";
+  if (action === "screen_capture" || action === "screen_stop") return { action };
   if (action === "alarm") {
     if (typeof spec.hour !== "number" || typeof spec.minute !== "number") return null;
     const hour = Number(spec.hour), minute = Number(spec.minute);
     if (!Number.isInteger(hour) || hour < 0 || hour > 23) return null;
     if (!Number.isInteger(minute) || minute < 0 || minute > 59) return null;
     const label = typeof spec.label === "string" ? spec.label.slice(0, 120) : "";
-    return { action, hour, minute, label };
+    const result = { action, hour, minute, label };
+    if (spec.weekdays !== undefined) {
+      if (!Array.isArray(spec.weekdays) || spec.weekdays.length > 7 ||
+          spec.weekdays.some(day => !Number.isInteger(day) || day < 1 || day > 7) ||
+          new Set(spec.weekdays).size !== spec.weekdays.length) return null;
+      result.weekdays = spec.weekdays;
+    }
+    return result;
   }
   if (action === "note") {
     const text = typeof spec.text === "string" ? spec.text : "";
@@ -606,12 +614,59 @@ function parsePhoneAction(raw) {
   // Only explicit fields reach Android; callers cannot inject Intent options.
   const textField = (key, max) => {
     const value = spec[key] === undefined ? "" : spec[key];
-    return typeof value === "string" && value.length <= max ? value : null;
+    return typeof value === "string" && Array.from(value).length <= max ? value : null;
   };
   const integerField = (key, fallback, min, max) => {
     const value = spec[key] === undefined ? fallback : spec[key];
     return Number.isInteger(value) && value >= min && value <= max ? value : null;
   };
+  const uuidField = key => typeof spec[key] === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(spec[key]) ? spec[key] : null;
+  if (action === "timer") {
+    const seconds = integerField("seconds", null, 1, 86400), label = textField("label", 120);
+    return seconds === null || label === null ? null : { action, seconds, label };
+  }
+  if (action === "file_import") return { action };
+  if (action === "file_read") {
+    const file_id = uuidField("file_id"), offset = integerField("offset", 0, 0, 1048576);
+    const limit = integerField("limit", 3000, 1, 3000);
+    return file_id === null || offset === null || limit === null ? null : { action, file_id, offset, limit };
+  }
+  if (action === "file_save") {
+    const filename = textField("filename", 120), text = textField("text", 3000);
+    if (!filename || !filename.trim() || filename === "." || filename === ".." ||
+        /[/\\\x00-\x1f\x7f-\x9f]/.test(filename) || text === null || !text.trim()) return null;
+    return { action, filename, text };
+  }
+  if (action === "note_create") {
+    const kind = spec.kind === undefined ? "note" : spec.kind;
+    const title = textField("title", 200), text = textField("text", 3000);
+    if (!["note", "todo"].includes(kind) || title === null || text === null || !text.trim()) return null;
+    return { action, kind, title, text };
+  }
+  if (action === "note_list") {
+    const query = textField("query", 200), max = integerField("max", 10, 1, 20);
+    const offset = integerField("offset", 0, 0, 100000);
+    if (query === null || max === null || offset === null ||
+        (spec.kind !== undefined && !["note", "todo"].includes(spec.kind))) return null;
+    return { action, query, max, offset, ...(spec.kind === undefined ? {} : { kind: spec.kind }) };
+  }
+  if (action === "note_update") {
+    const entry_id = uuidField("entry_id");
+    if (!entry_id || !["title", "text", "completed"].some(key => spec[key] !== undefined)) return null;
+    const result = { action, entry_id };
+    for (const [key, max] of [["title", 200], ["text", 3000]]) {
+      if (spec[key] === undefined) continue;
+      const value = textField(key, max);
+      if (value === null || (key === "text" && !value.trim())) return null;
+      result[key] = value;
+    }
+    if (spec.completed !== undefined) {
+      if (typeof spec.completed !== "boolean") return null;
+      result.completed = spec.completed;
+    }
+    return result;
+  }
   if (action === "calendar_read") {
     const days = integerField("days", 7, 1, 30), max = integerField("max", 10, 1, 20);
     return days === null || max === null ? null : { action, days, max };
@@ -939,14 +994,31 @@ const nativePending = new Map();
 const nativeRequests = new Map();
 const NATIVE_PREFIX = "@@aserve-native ";
 let nativeSeq = 0;
-function nativeCall(action, payload) {
+function nativeCall(action, payload, requestId) {
   return new Promise((resolve, reject) => {
     if (!nativeBridgeReady()) { reject(new Error("需要 Android 客户端")); return; }
-    const id = "n" + (++nativeSeq) + "-" + Date.now();
+    let caps = null;
+    try {
+      if (typeof window.AServeNative.capabilities === "function")
+        caps = JSON.parse(window.AServeNative.capabilities());
+    } catch (_) {}
+    const legacy = ["alarm", "note", "location", "now", "calendar_read", "calendar_add", "sms"];
+    const supported = caps && Array.isArray(caps.actions) ? caps.actions.includes(action) : legacy.includes(action);
+    const features = caps && Array.isArray(caps.features) ? caps.features : [];
+    const repeat = action === "alarm" && payload && Array.isArray(payload.weekdays) && payload.weekdays.length > 0;
+    // screen_capture waits for the user to tap the notification action, so an older
+    // shell would grab a different moment than the user expects.
+    if (!supported || (repeat && !features.includes("alarm_weekdays")) || (action === "screen_capture" && !features.includes("screen_manual_trigger"))) {
+      reject(new Error("当前 APK 不支持此操作，请升级到 v1.8.0 或更新版本")); return;
+    }
+    const id = requestId || ("n" + (++nativeSeq) + "-" + Date.now());
+    if (!/^[A-Za-z0-9_-]{1,80}$/.test(id)) { reject(new Error("无效的手机请求编号")); return; }
+    const timeoutMs = action === "file_import" || action === "file_save" ? 180000
+      : action === "screen_capture" ? 120000 : 45000;
     const timer = setTimeout(() => {
       nativePending.delete(id);
       reject(new Error("手机没有响应"));
-    }, 45000);
+    }, timeoutMs);
     nativePending.set(id, { resolve, reject, timer });
     try {
       window.AServeNative.perform(id, action, JSON.stringify(payload || {}));
@@ -1010,7 +1082,7 @@ async function handleNativeRequest(id, token, prompt, sid = sessionId) {
     }
     if (!entry.result) {
       save({ inFlight: true });
-      entry.result = await executeNativeRequest(prompt);
+      entry.result = await executeNativeRequest(prompt, "r" + token + "-" + id);
       save({ result: entry.result });
     }
     await request({ method: "POST", body: JSON.stringify({ id, token, allow: true, text: JSON.stringify(entry.result) }) });
@@ -1029,7 +1101,7 @@ async function handleNativeRequest(id, token, prompt, sid = sessionId) {
     entry.busy = false;
   }
 }
-async function executeNativeRequest(prompt) {
+async function executeNativeRequest(prompt, requestId) {
   const spec = parsePhoneAction(String(prompt).slice(NATIVE_PREFIX.length));
   let result;
   if (!spec) {
@@ -1038,7 +1110,7 @@ async function executeNativeRequest(prompt) {
     result = { ok: false, error: "需要 Android 客户端" };
   } else {
     try {
-      const answer = await nativeCall(spec.action, Object.assign({ auto: true }, spec));
+      const answer = await nativeCall(spec.action, Object.assign({ auto: true }, spec), requestId);
       result = { ok: true, data: answer.data || {} };
     } catch (error) {
       result = { ok: false, error: String(error && error.message ? error.message : error) };

@@ -59,6 +59,11 @@ public final class MainActivity extends Activity {
     private ValueCallback<Uri[]> fileChooserCallback;
     private boolean connectionDialogVisible;
     private NativeBridge nativeBridge;
+    private ScreenCapture screenCapture;
+    private boolean nativeResumed;
+    private Runnable grantedNativeAction;
+    private String pendingPermissionOrigin;
+    private PhoneDocuments phoneDocuments;
     private String pendingPermissionRequestId;
     private String pendingPermissionAction;
     private String pendingPermissionPayload;
@@ -131,6 +136,7 @@ public final class MainActivity extends Activity {
     }
 
     private void loadApp() {
+        if (screenCapture != null) screenCapture.close();
         pageReady = false;
         webView.loadUrl(ServerUrl.freshAppUrl(serverOrigin, System.currentTimeMillis()));
     }
@@ -220,6 +226,21 @@ public final class MainActivity extends Activity {
         return current != null && serverOrigin != null && ServerUrl.isSameOrigin(serverOrigin, current);
     }
 
+    String nativeOrigin() { return serverOrigin; }
+
+    void performScreen(String requestId, boolean stop) {
+        if (screenCapture == null) screenCapture = new ScreenCapture(this);
+        if (stop) {
+            screenCapture.close();
+            deliverNativeResult(requestId, true, null, new JSONObject());
+        } else screenCapture.capture(requestId);
+    }
+
+    void performDocumentAction(String requestId, String action, JSONObject payload) {
+        if (phoneDocuments == null) phoneDocuments = new PhoneDocuments(this);
+        phoneDocuments.perform(requestId, action, payload);
+    }
+
     /**
      * Ask for the runtime permissions one native action needs, at the moment the
      * action runs. Android requires a visible, foreground request; there is no
@@ -239,6 +260,7 @@ public final class MainActivity extends Activity {
                 return;
             }
             pendingPermissionRequestId = requestId;
+            pendingPermissionOrigin = serverOrigin;
             pendingPermissionAction = action;
             pendingPermissionPayload = payloadJson;
             requestPermissions(permissions, NATIVE_PERMISSION_REQUEST);
@@ -253,17 +275,29 @@ public final class MainActivity extends Activity {
         String requestId = pendingPermissionRequestId;
         String action = pendingPermissionAction;
         String payloadJson = pendingPermissionPayload;
+        String origin = pendingPermissionOrigin;
+        pendingPermissionOrigin = null;
         pendingPermissionRequestId = null;
         pendingPermissionAction = null;
         pendingPermissionPayload = null;
         if (requestId == null || action == null) return;
-        for (int result : grantResults) {
-            if (result != PackageManager.PERMISSION_GRANTED) {
-                deliverNativeResult(requestId, false, "permission denied", null);
-                return;
-            }
+        if (origin == null || !origin.equals(serverOrigin) || !isTrustedPage()) return;
+        boolean granted = grantResults.length > 0;
+        if ("location".equals(action)) {
+            granted = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                    || checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+        } else {
+            for (int result : grantResults) granted &= result == PackageManager.PERMISSION_GRANTED;
         }
-        if (nativeBridge != null) nativeBridge.resumeAfterPermission(requestId, action, payloadJson);
+        if (!granted) {
+            deliverNativeResult(requestId, false, "permission denied", null);
+            return;
+        }
+        grantedNativeAction = () -> {
+            if (nativeBridge != null && origin.equals(serverOrigin) && isTrustedPage())
+                nativeBridge.resumeAfterPermission(requestId, action, payloadJson);
+        };
+        if (nativeResumed) { Runnable continuation = grantedNativeAction; grantedNativeAction = null; continuation.run(); }
     }
 
     /** Report one native action result back to the server-owned page. */
@@ -280,7 +314,11 @@ public final class MainActivity extends Activity {
         }
         String js = "window.AServeNativeResult&&window.AServeNativeResult("
                 + JSONObject.quote(result.toString()) + ");";
-        webView.post(() -> webView.evaluateJavascript(js, null));
+        String resultOrigin = serverOrigin;
+        webView.post(() -> {
+            if (!isDestroyed() && resultOrigin != null && resultOrigin.equals(serverOrigin) && isTrustedPage())
+                webView.evaluateJavascript(js, null);
+        });
     }
 
     private boolean handleNavigation(Uri uri) {
@@ -385,6 +423,14 @@ public final class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == ScreenCapture.REQUEST) {
+            if (screenCapture != null) screenCapture.onResult(resultCode, data);
+            return;
+        }
+        if (requestCode == PhoneDocuments.REQUEST) {
+            if (phoneDocuments != null) phoneDocuments.onResult(resultCode, data);
+            return;
+        }
         if (requestCode != FILE_CHOOSER_REQUEST || fileChooserCallback == null) return;
 
         ArrayList<Uri> selected = new ArrayList<>();
@@ -420,6 +466,9 @@ public final class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         webView.onResume();
+        nativeResumed = true;
+        if (nativeBridge != null) nativeBridge.onHostResume();
+        if (grantedNativeAction != null) { Runnable continuation = grantedNativeAction; grantedNativeAction = null; continuation.run(); }
         // The WebView keeps its document across app switches. A document loaded
         // before the current UI generation cannot run the newer reconnect logic,
         // so replace it once the app returns from a real background stay.
@@ -436,6 +485,8 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
+        nativeResumed = false;
+        if (nativeBridge != null) nativeBridge.onHostPause();
         pausedAt = SystemClock.elapsedRealtime();
         webView.onPause();
         super.onPause();
@@ -449,6 +500,8 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (screenCapture != null) screenCapture.close();
+        if (nativeBridge != null) nativeBridge.close();
         if (fileChooserCallback != null) fileChooserCallback.onReceiveValue(null);
         fileChooserCallback = null;
         webView.removeJavascriptInterface(NativeBridge.NAME);

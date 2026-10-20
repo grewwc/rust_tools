@@ -84,6 +84,15 @@ const phoneFixtures = {
   alarm: { action: "alarm", hour: 9, minute: 30, label: "Wake up" },
   note: { action: "note", title: "Note", text: "Content" },
   location: { action: "location" },
+  timer: { action: "timer", seconds: 1200, label: "Tea" },
+  note_create: { action: "note_create", kind: "todo", title: "Shopping", text: "Buy milk" },
+  note_list: { action: "note_list", query: "milk", kind: "todo", max: 10, offset: 0 },
+  note_update: { action: "note_update", entry_id: "12345678-1234-1234-1234-123456789012", completed: true },
+  file_import: { action: "file_import" },
+  file_read: { action: "file_read", file_id: "12345678-1234-1234-1234-123456789012", offset: 3000, limit: 3000 },
+  file_save: { action: "file_save", filename: "summary.txt", text: "结果😀" },
+  screen_capture: { action: "screen_capture" },
+  screen_stop: { action: "screen_stop" },
 };
 
 test("every advertised phone action has a valid browser payload", () => {
@@ -94,6 +103,24 @@ test("every advertised phone action has a valid browser payload", () => {
     const parsed = app.parsePhoneAction(JSON.stringify({ ...spec, auto: false, package: "untrusted" }));
     assert.deepEqual(JSON.parse(JSON.stringify(parsed)), spec, spec.action);
   }
+});
+
+test("new phone actions validate bounds without weakening old actions", () => {
+  const app = load(), parse = spec => app.parsePhoneAction(JSON.stringify(spec));
+  assert.deepEqual(Array.from(parse({ ...phoneFixtures.alarm, weekdays: [1, 2, 3, 4, 5] }).weekdays), [1, 2, 3, 4, 5]);
+  assert.equal(parse({ action: "file_save", filename: "测试.txt", text: "😀".repeat(3000) }).text.length, 6000);
+  for (const spec of [
+    { ...phoneFixtures.alarm, weekdays: [1, 1] }, { ...phoneFixtures.alarm, weekdays: [0] },
+    { ...phoneFixtures.alarm, weekdays: "1,2" }, { action: "timer", seconds: "20" },
+    { action: "timer", seconds: 86401 }, { action: "timer", seconds: 0 },
+    { ...phoneFixtures.note_create, kind: "reminder" }, { ...phoneFixtures.note_create, text: " " },
+    { action: "note_update", entry_id: phoneFixtures.note_update.entry_id },
+    { ...phoneFixtures.note_update, completed: "true" }, { ...phoneFixtures.note_update, entry_id: "bad" },
+    { ...phoneFixtures.note_list, max: 21 }, { ...phoneFixtures.note_list, offset: -1 },
+    { ...phoneFixtures.file_read, limit: 3001 }, { ...phoneFixtures.file_read, offset: 1.5 },
+    { ...phoneFixtures.file_save, filename: "../secret" }, { ...phoneFixtures.file_save, filename: "a\\\\b" },
+    { ...phoneFixtures.file_save, text: "😀".repeat(3001) }, { ...phoneFixtures.file_save, filename: "a\u007fb" },
+  ]) assert.equal(parse(spec), null, JSON.stringify(spec));
 });
 
 test("SMS accepts contact lookup but rejects missing content and unsafe numbers", () => {
@@ -148,7 +175,13 @@ function nativeHarness(storage = new Map(), spec = { action: "alarm", hour: 9, m
       return { ok: true, json: async () => ({ running: true, pending }) };
     },
   });
-  context.window.AServeNative = { perform: (...args) => calls.push(args) };
+  context.window.AServeNative = {
+    perform: (...args) => calls.push(args),
+    capabilities: () => JSON.stringify({
+      actions: Object.keys(phoneFixtures),
+      features: ["alarm_weekdays", "precise_location", "screen_manual_trigger"],
+    }),
+  };
   vm.runInContext(slice, context);
   // The production request path must work without the send closure's setPhase.
   vm.runInContext(script.slice(script.indexOf("async function api("), script.indexOf("const esc =")), context);
@@ -164,6 +197,52 @@ function nativeHarness(storage = new Map(), spec = { action: "alarm", hour: 9, m
   };
 }
 
+test("old APK refuses new actions and never silently drops repeat weekdays", async () => {
+  for (const spec of [phoneFixtures.timer, phoneFixtures.note_create, phoneFixtures.file_import,
+      { ...phoneFixtures.alarm, weekdays: [1, 5] }]) {
+    const app = nativeHarness(new Map(), spec);
+    delete app.context.window.AServeNative.capabilities;
+    await app.request(); await app.settle();
+    assert.equal(app.calls.length, 0);
+    assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
+    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1.8.0/);
+  }
+});
+
+test("file picker has a bounded user-interaction timeout", async () => {
+  const app = nativeHarness(new Map(), phoneFixtures.file_import);
+  const delays = [];
+  app.context.setTimeout = (fn, delay) => { delays.push(delay); return 1; };
+  const request = app.request(); await app.settle();
+  assert.ok(delays.includes(180000));
+  app.result({ ok: false, error: "cancelled" });
+  await request;
+  assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
+  assert.match(JSON.parse(app.posts[0].body.text).error, /已取消/);
+});
+
+test("a shell without the manual trigger cannot pick the capture moment", async () => {
+  const app = nativeHarness(new Map(), phoneFixtures.screen_capture);
+  app.context.window.AServeNative.capabilities = () => JSON.stringify({
+    actions: Object.keys(phoneFixtures), features: ["alarm_weekdays"],
+  });
+  await app.request(); await app.settle();
+  assert.equal(app.calls.length, 0);
+  assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
+  assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.8\.0/);
+});
+
+test("the screen capture waits for the user tap instead of timing out early", async () => {
+  const app = nativeHarness(new Map(), phoneFixtures.screen_capture);
+  const delays = [];
+  app.context.setTimeout = (fn, delay) => { delays.push(delay); return 1; };
+  const request = app.request(); await app.settle();
+  assert.ok(delays.includes(120000));
+  app.result({ ok: true, data: { action: "screen_capture" } });
+  await request;
+  assert.equal(JSON.parse(app.posts[0].body.text).ok, true);
+});
+
 test("every phone action reaches the bridge and returns its acknowledgement unchanged", async () => {
   for (const spec of Object.values(phoneFixtures)) {
     const h = nativeHarness(new Map(), spec);
@@ -171,6 +250,7 @@ test("every phone action reaches the bridge and returns its acknowledgement unch
     await h.settle();
     assert.equal(h.calls.length, 1, spec.action);
     assert.equal(h.calls[0][1], spec.action);
+    assert.equal(h.calls[0][0], "rturn-token-7", "durable actions use the server request identity");
     assert.deepEqual(JSON.parse(h.calls[0][2]), { auto: true, ...spec });
     const result = { ok: true, data: { action: spec.action, ...(spec.action === "sms" ? { sent: false } : {}) } };
     h.result(result);

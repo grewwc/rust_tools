@@ -1,13 +1,13 @@
 {
   "name": "phone_action",
-  "description": "Perform one action on the user's phone when this turn runs inside the a serve Android app. Actions: 'now' returns the phone's local date, time and timezone; 'calendar_read' lists upcoming events; 'calendar_add' creates one timed event; 'sms' opens the messaging composer for a contact with the text pre-filled (it never sends); 'alarm' sets a clock alarm; 'note' opens the share sheet with note text; 'location' returns one coarse position. Use this for direct requests such as 'what is on my calendar tomorrow', 'book 3pm tomorrow with the client', 'text Zhang San that I am late', 'set an alarm for 6 tomorrow', or 'what is the weather here'. Call 'now' before any action that needs a date, because the phone may be in a different timezone than this machine. Only available in the Android client; other clients return an error. Alarms and calendar events are created directly; the SMS composer still needs the user to press send, a note still needs the user to pick an app, and location asks for the Android permission on first use.",
+  "description": "Perform one allowlisted action in the a serve Android app. now returns phone-local time/timezone; calendar_read lists events; calendar_add creates a timed event; sms only opens a pre-filled composer and NEVER sends; note remains a share sheet requiring the user to choose an app/save. alarm/timer dispatch to the clock app: success is NOT verification that an alarm/timer was created. An alarm without weekdays (or []) requests one next occurrence, not a date. Call now before date-dependent actions. location requests foreground precise permission but accepts approximate access: use Android's actual latitude/longitude, accuracy (meters), age_ms, provider and precision; absent metadata is unknown. note_create/note_list/note_update store and edit phone-local notes/todos; todos are text/completion state, NEVER scheduled tasks or reminders. file_import opens the system picker for UTF-8 text only (max 1 MiB); its data is {file_id UUID,filename,mime_type,total_chars,text (first <=3000 codepoints),next_offset,has_more}. Continue with file_read using codepoint offsets. file_save saves UTF-8 only after the user confirms a system create-document destination. Results retain full bounded JSON data (512 KiB response limit), not just a preview; paged results may have has_more. New text bodies are never truncated: serialized requests exceeding the native FIFO limit are rejected before dispatch, so Unicode/escaping may reduce the usable character budget. screen_capture requires explicit Android screen-sharing consent and a visible stoppable foreground service. One consent is reusable only within the same live sharing session (up to 30 minutes), never permanent; screen_stop ends it. screen_capture arms a pending request and waits for the user: ask the user to switch to the target app and tap the '立即截屏' action in the a serve notification, and the frame is captured about a second after that tap. Without a tap the armed request expires after about two minutes. The notification then shows the delivered frame so the user can confirm which moment was sent. The result is a server-local JPEG path: use read_file to view it. Only captures when requested, not continuously uploaded; protected screens remain blank. Use only when the user asks to inspect the screen, not to access another app's hidden history. Only available in the Android client.",
   "parameters": {
     "type": "object",
     "properties": {
       "action": {
         "type": "string",
-        "enum": ["now", "calendar_read", "calendar_add", "sms", "alarm", "note", "location"],
-        "description": "now returns phone local time; calendar_read lists upcoming events; calendar_add creates one timed event; sms opens the composer pre-filled; alarm sets a clock alarm; note opens the share sheet with text; location returns one coarse position."
+        "enum": ["now", "calendar_read", "calendar_add", "sms", "alarm", "timer", "note", "location", "note_create", "note_list", "note_update", "file_import", "file_read", "file_save", "screen_capture", "screen_stop"],
+        "description": "Choose one action. file_import, location and now take no additional arguments. note is the legacy share sheet; note_create stores locally. Alarm/timer success means dispatch only."
       },
       "days": {
         "type": "integer",
@@ -19,11 +19,12 @@
         "type": "integer",
         "minimum": 1,
         "maximum": 20,
-        "description": "calendar_read: maximum events to return (default 10)."
+        "description": "calendar_read/note_list: maximum entries to return (default 10)."
       },
       "title": {
         "type": "string",
-        "description": "calendar_add: event title. note: optional note title."
+        "maxLength": 200,
+        "description": "calendar_add: event title. note/note_create: optional title (default empty). note_update: optional replacement title, including empty."
       },
       "begin_local": {
         "type": "string",
@@ -53,13 +54,14 @@
       },
       "text": {
         "type": "string",
-        "description": "sms: message body (required for sms). note: note body (required for note)."
+        "maxLength": 3000,
+        "description": "Required nonblank body for note/note_create/file_save (<=3000 codepoints), or sms (<=1000). note_update: optional nonblank replacement body <=3000. New stored/file bodies preserve whitespace verbatim; serialized FIFO byte limits also apply."
       },
       "hour": {
         "type": "integer",
         "minimum": 0,
         "maximum": 23,
-        "description": "alarm: hour in 24-hour PHONE local time (call action 'now' first if the phone may be in another timezone). The request carries only hour, minute and label — no repeat days and no date are set, so it fires once at the next occurrence of that time."
+        "description": "alarm: hour in 24-hour PHONE local time. Call now for phone time. With omitted/empty weekdays, request once at the next occurrence, never a specific date; creation is not verified."
       },
       "minute": {
         "type": "integer",
@@ -69,7 +71,63 @@
       },
       "label": {
         "type": "string",
-        "description": "alarm: optional label shown by the clock app."
+        "maxLength": 120,
+        "description": "alarm/timer: optional clock-app label (default empty)."
+      },
+      "weekdays": {
+        "type": "array",
+        "items": {"type": "integer", "minimum": 1, "maximum": 7},
+        "uniqueItems": true,
+        "maxItems": 7,
+        "description": "alarm: optional unique ISO weekdays, Monday=1 through Sunday=7. Omit or [] for one next occurrence; no alarm date is supported."
+      },
+      "seconds": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 86400,
+        "description": "timer: required duration in seconds."
+      },
+      "kind": {
+        "type": "string",
+        "enum": ["note", "todo"],
+        "description": "note_create: entry kind (default note). note_list: optional filter; omitted means both kinds. Todos do not schedule notifications, reminders or tasks."
+      },
+      "query": {
+        "type": "string",
+        "maxLength": 200,
+        "description": "note_list: optional text query (default empty)."
+      },
+      "entry_id": {
+        "type": "string",
+        "format": "uuid",
+        "description": "note_update: required UUID returned by note_create/note_list, in 8-4-4-4-12 form. Supply at least one of title, text, completed."
+      },
+      "completed": {
+        "type": "boolean",
+        "description": "note_update: optional completion state; Android rejects this for non-todo entries. This does not create a schedule."
+      },
+      "file_id": {
+        "type": "string",
+        "format": "uuid",
+        "description": "file_read: required UUID returned by file_import, in 8-4-4-4-12 form (not a filesystem path or URI)."
+      },
+      "offset": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 1048576,
+        "description": "Default 0. note_list: entry offset, maximum 100000. file_read: Unicode codepoint offset, maximum 1048576; use returned next_offset, never UTF-8 bytes or UTF-16 units."
+      },
+      "limit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 3000,
+        "description": "file_read: maximum Unicode codepoints per page (default 3000)."
+      },
+      "filename": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 120,
+        "description": "file_save: required suggested basename, not '.' or '..'; no slash, backslash or control characters. System create-document confirmation is required."
       }
     },
     "required": ["action"]

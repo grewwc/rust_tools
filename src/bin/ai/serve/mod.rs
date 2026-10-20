@@ -1344,7 +1344,7 @@ pub(in crate::ai) async fn run_serve(
         .route("/a-serve-v1.3.0.apk", get(serve_android_apk))
         .route("/a-serve-v1.4.0.apk", get(serve_android_apk))
         .route("/a-serve-v1.5.2.apk", get(serve_android_apk))
-        .route("/a-serve-v1.6.0.apk", get(serve_android_apk))
+        .route("/a-serve-v1.8.0.apk", get(serve_android_apk))
         .route("/info", get(server_info))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/fork", post(fork_session))
