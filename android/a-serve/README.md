@@ -13,6 +13,16 @@ The project needs JDK 11 and Android SDK 33:
   -PserveUrl=https://10.37.110.250:8080
 ```
 
+Point Gradle at the SDK with a `local.properties` next to this README (it is
+gitignored, because the path is machine-specific):
+
+```properties
+sdk.dir=/home/<user>/android-sdk
+```
+
+`ANDROID_HOME` works too, but only for that shell; without either one Gradle
+fails with `SDK location not found`.
+
 The installable APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
 
 ## Device setup

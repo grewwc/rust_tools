@@ -161,7 +161,7 @@ pub(crate) async fn serve_android_apk() -> Response {
     );
     response.headers_mut().insert(
         axum::http::header::CONTENT_DISPOSITION,
-        HeaderValue::from_static("attachment; filename=\"a-serve-v1.5.2.apk\""),
+        HeaderValue::from_static("attachment; filename=\"a-serve-v1.6.0.apk\""),
     );
     response.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,

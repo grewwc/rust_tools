@@ -301,7 +301,7 @@ select, summary { touch-action:manipulation; }
 <header>
 <button id="menu" aria-label="sessions">☰</button>
 <b>a</b><span id="info">connecting…</span>
-<a id="apkdownload" href="/a-serve-v1.5.2.apk" download="a-serve-v1.5.2.apk" aria-label="download Android app" title="download Android app"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></a>
+<a id="apkdownload" href="/a-serve-v1.6.0.apk" download="a-serve-v1.6.0.apk" aria-label="download Android app" title="download Android app"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></a>
 <button id="connbtn" aria-label="connection">⚙</button>
 <button id="newbtn" class="primary">＋</button>
 </header>
@@ -1036,6 +1036,32 @@ async function queueImageFiles(files) {
     added.map((image) => "[[image:" + image.filename + "]]").join("\n");
   growPrompt();
   persistDraft();
+}
+// Entry point for the Android share target. Shared content only pre-fills the
+// composer: a mis-share cannot start a turn, and no image leaves the phone
+// before the user taps send.
+if (typeof window !== "undefined") {
+  window.AServeShare = (raw) => {
+    let share;
+    try { share = typeof raw === "string" ? JSON.parse(raw) : raw; } catch (_) { return false; }
+    if (!share || typeof share !== "object") return false;
+    const prompt = $("prompt");
+    if (!prompt) return false;
+    let text = typeof share.text === "string" ? share.text : "";
+    if (share.kind === "image" && typeof share.data_base64 === "string" && share.data_base64) {
+      if (pendingImages.length >= 10) { note("最多只能附带 10 张图片"); return false; }
+      const filename = String(share.filename || "shared-image").replace(/[^\w.\-]+/g, "_");
+      pendingImages.push({ filename, data_base64: share.data_base64 });
+      text = (text ? text + "\n" : "") + "[[image:" + filename + "]]";
+    }
+    if (!text) return false;
+    prompt.value += (prompt.value && !prompt.value.endsWith("\n") ? "\n" : "") + text;
+    growPrompt();
+    persistDraft();
+    prompt.focus();
+    note("已填入分享内容，确认后发送");
+    return true;
+  };
 }
 function handlePromptPaste(event) {
   const clipboard = event.clipboardData;

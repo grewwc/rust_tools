@@ -1,37 +1,75 @@
 {
   "name": "phone_action",
-  "description": "Perform one action on the user's phone when this turn runs inside the a serve Android app: set an alarm, start a note in the phone's notes app (through the system share sheet), or read the phone's current coarse location. Use this for direct requests such as 'set an alarm for 6 tomorrow' or 'what is the weather here' when the phone's location is needed. Only available in the Android client; other clients return an error. Setting an alarm is silent; a note opens the share sheet and still needs the user to pick an app; location asks for the Android permission on first use.",
+  "description": "Perform one action on the user's phone when this turn runs inside the a serve Android app. Actions: 'now' returns the phone's local date, time and timezone; 'calendar_read' lists upcoming events; 'calendar_add' creates one timed event; 'sms' opens the messaging composer for a contact with the text pre-filled (it never sends); 'alarm' sets a clock alarm; 'note' opens the share sheet with note text; 'location' returns one coarse position. Use this for direct requests such as 'what is on my calendar tomorrow', 'book 3pm tomorrow with the client', 'text Zhang San that I am late', 'set an alarm for 6 tomorrow', or 'what is the weather here'. Call 'now' before any action that needs a date, because the phone may be in a different timezone than this machine. Only available in the Android client; other clients return an error. Alarms and calendar events are created without a further dialog after the agent decides, the SMS composer still needs the user to press send, a note still needs the user to pick an app, and location asks for the Android permission on first use.",
   "parameters": {
     "type": "object",
     "properties": {
       "action": {
         "type": "string",
-        "enum": ["alarm", "note", "location"],
-        "description": "alarm sets a clock alarm; note opens the phone's share sheet with text; location returns one coarse position."
+        "enum": ["now", "calendar_read", "calendar_add", "sms", "alarm", "note", "location"],
+        "description": "now returns phone local time; calendar_read lists upcoming events; calendar_add creates one timed event; sms opens the composer pre-filled; alarm sets a clock alarm; note opens the share sheet with text; location returns one coarse position."
+      },
+      "days": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 30,
+        "description": "calendar_read: how many days ahead to look (default 7)."
+      },
+      "max": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20,
+        "description": "calendar_read: maximum events to return (default 10)."
+      },
+      "title": {
+        "type": "string",
+        "description": "calendar_add: event title. note: optional note title."
+      },
+      "begin_local": {
+        "type": "string",
+        "description": "calendar_add: start as local phone time in YYYY-MM-DDTHH:MM. Call action 'now' first to learn the phone's date and timezone."
+      },
+      "duration_min": {
+        "type": "integer",
+        "minimum": 5,
+        "maximum": 600,
+        "description": "calendar_add: event length in minutes (default 60)."
+      },
+      "location": {
+        "type": "string",
+        "description": "calendar_add: optional event location."
+      },
+      "description": {
+        "type": "string",
+        "description": "calendar_add: optional event description."
+      },
+      "contact": {
+        "type": "string",
+        "description": "sms: contact display name to look up on the phone. Provide this or 'number'."
+      },
+      "number": {
+        "type": "string",
+        "description": "sms: phone number to use instead of a contact lookup. Digits and + - ( ) . spaces only."
+      },
+      "text": {
+        "type": "string",
+        "description": "sms: message body (required for sms). note: note body (required for note)."
       },
       "hour": {
         "type": "integer",
         "minimum": 0,
         "maximum": 23,
-        "description": "Alarm hour in 24-hour local time (required for alarm)."
+        "description": "alarm: hour in 24-hour local time."
       },
       "minute": {
         "type": "integer",
         "minimum": 0,
         "maximum": 59,
-        "description": "Alarm minute (required for alarm)."
+        "description": "alarm: minute."
       },
       "label": {
         "type": "string",
-        "description": "Optional alarm label shown by the clock app."
-      },
-      "title": {
-        "type": "string",
-        "description": "Optional note title (note action)."
-      },
-      "text": {
-        "type": "string",
-        "description": "Note body (required for note)."
+        "description": "alarm: optional label shown by the clock app."
       }
     },
     "required": ["action"]
