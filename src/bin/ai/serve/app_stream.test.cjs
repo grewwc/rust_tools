@@ -40,6 +40,7 @@ function streamHarness() {
   });
   vm.runInContext(script.slice(script.indexOf("function toolArgsOf("), script.indexOf("const FOLD_ROLE_LABELS")), context);
   vm.runInContext(script.slice(script.indexOf("function createThinkingFold("), script.indexOf("// The three override picks")), context);
+  vm.runInContext(script.slice(script.indexOf("function replyPaintDelay("), script.indexOf("function sessionTitle(")), context);
   const start = script.indexOf('  const bubble = addMsgMd("", box);');
   vm.runInContext(script.slice(start, script.indexOf("  let turnStarted = false;", start)), context);
   const dispatchStart = script.indexOf('        if (kind === "done")', start);

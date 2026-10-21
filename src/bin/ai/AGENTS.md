@@ -18,6 +18,7 @@ the nearest child `AGENTS.md`.
   a provider/stream cycle. Add provider wire shapes to `stream/runtime/tests/`.
 - `pipeline/`, `ports/`, and `middleware/`: pipeline stages, traits, and middleware.
 - `tools/`, `mcp/`, and `knowledge/`: tool stack, MCP transport, and retrieval.
+- `serve/`: the HTTP/SSE server and the `--serve-*` process supervisor.
 - `cli.rs`, `theme.rs`, `background.rs`, and `terminal_session/`: user-facing
   process and terminal infrastructure.
 - `tool_descriptions/`: build-discovered per-tool JSON metadata.

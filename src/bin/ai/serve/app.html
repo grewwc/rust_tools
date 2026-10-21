@@ -1261,6 +1261,13 @@ function renderMarkdown(src, allowPreviews) {
   return out.join("");
 }
 
+// A long reply costs more to render and to lay out, so a long reply is
+// painted less often. Repainting the whole reply every 50ms is what made the
+// page feel stuck while a long answer was arriving.
+function replyPaintDelay(length) {
+  return length < 3000 ? 50 : length < 12000 ? 100 : 180;
+}
+
 function sessionTitle(s) {
   return s.summary || s.first_user_prompt || ("new session · " + s.id.slice(0, 8));
 }
@@ -3467,12 +3474,14 @@ async function send() {
     if (answerDirty) {
       bubble.classList.remove("pending");
       bubble.innerHTML = renderMarkdown(raw, false);
-      decorateMath(bubble);
+      // The formulas are not typeset while the reply is still arriving: the
+      // bubble is rebuilt on every paint, so every formula would be typeset
+      // again and again. The finished reply is typeset once, at the end.
       answerDirty = false;
     }
     if (sid === sessionId) followOutput(follow);
   };
-  const schedulePaint = () => { if (paintTimer === null) paintTimer = setTimeout(paint, 50); };
+  const schedulePaint = () => { if (paintTimer === null) paintTimer = setTimeout(paint, replyPaintDelay(raw.length)); };
   const flushPaint = () => {
     if (paintTimer !== null) { clearTimeout(paintTimer); paintTimer = null; }
     paint();
@@ -3676,6 +3685,7 @@ async function send() {
     clearTimeout(stallTimer);
     flushPaint();
     if (raw) bubble.innerHTML = renderMarkdown(raw);
+    decorateAndLoad(bubble); // the formulas are typeset once, when the reply is final
     finishFollow = sid === sessionId && shouldFollowOutput();
     if (turnStarted && !turnError) {
       // The POST was accepted and no server `error` event arrived, so this is
