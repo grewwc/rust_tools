@@ -2,6 +2,9 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+use regex::Regex;
 use reqwest::Url;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{ACCEPT, USER_AGENT};
@@ -24,6 +27,20 @@ const MAX_CONTENT_CHARS: usize = 30_000;
 const MAX_ERROR_CHARS: usize = 2_000;
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+/// Provider entry prefix for a Jina-style service: the query is appended to
+/// the base URL as a path segment and the response body is already markdown.
+const PROVIDER_PREFIX_JINA: &str = "jina:";
+/// Provider entry prefix for an HTML search endpoint: the query replaces the
+/// `{query}` placeholder in the template and the response is parsed into
+/// markdown result entries.
+const PROVIDER_PREFIX_HTML: &str = "html:";
+/// Reader entry that skips the reader services and fetches the target
+/// directly, so an unreachable reader is not paid for on every request.
+const PROVIDER_DIRECT: &str = "direct";
+const SEARCH_QUERY_PLACEHOLDER: &str = "{query}";
+const MAX_SEARCH_RESULTS: usize = 10;
+const MAX_SNIPPET_CHARS: usize = 400;
+const SNIPPET_LOOKAHEAD_CHARS: usize = 1_200;
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
@@ -97,13 +114,252 @@ fn provider_list(config_key: &str, default: &str) -> Vec<String> {
 /// failures are aggregated into one error so the model sees every attempt.
 fn execute_web_search_with_providers(query: &str, providers: &[String]) -> Result<String, String> {
     let mut errors = Vec::new();
-    for base in providers {
-        match execute_web_search_with_base(query, base, true) {
+    for entry in providers {
+        let Some(provider) = parse_provider(entry) else {
+            continue;
+        };
+        match execute_web_search_with_provider(query, &provider) {
             Ok(output) => return Ok(output),
-            Err(error) => errors.push(format!("{base}: {error}")),
+            Err(error) => errors.push(format!("{entry}: {error}")),
         }
     }
+    if errors.is_empty() {
+        errors.push("no usable search provider configured".to_string());
+    }
     Err(aggregate_error("web_search", &errors))
+}
+
+/// The transport a provider entry describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderKind {
+    /// Jina-style service: the query is appended to the base URL as a path
+    /// segment and the response body is already markdown.
+    Jina,
+    /// HTML search endpoint: the query replaces `{query}` in the template and
+    /// the response is parsed into markdown result entries.
+    Html,
+}
+
+struct SearchProvider {
+    kind: ProviderKind,
+    template: String,
+}
+
+/// Parse one provider entry. A bare URL keeps the Jina-style behavior so
+/// existing configurations keep working unchanged.
+fn parse_provider(entry: &str) -> Option<SearchProvider> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return None;
+    }
+    if let Some(template) = entry.strip_prefix(PROVIDER_PREFIX_HTML) {
+        let template = template.trim();
+        if template.is_empty() {
+            return None;
+        }
+        return Some(SearchProvider {
+            kind: ProviderKind::Html,
+            template: template.to_string(),
+        });
+    }
+    let base = entry.strip_prefix(PROVIDER_PREFIX_JINA).unwrap_or(entry).trim();
+    if base.is_empty() {
+        return None;
+    }
+    Some(SearchProvider {
+        kind: ProviderKind::Jina,
+        template: base.to_string(),
+    })
+}
+
+fn execute_web_search_with_provider(
+    query: &str,
+    provider: &SearchProvider,
+) -> Result<String, String> {
+    match provider.kind {
+        ProviderKind::Jina => execute_web_search_with_base(query, &provider.template, true),
+        ProviderKind::Html => execute_html_search(query, &provider.template),
+    }
+}
+
+/// Run a search against an HTML endpoint and turn the result page into
+/// markdown entries. Used when the Jina-style services are unreachable.
+fn execute_html_search(query: &str, template: &str) -> Result<String, String> {
+    if !template.contains(SEARCH_QUERY_PLACEHOLDER) {
+        return Err(format!(
+            "html search provider template must contain {SEARCH_QUERY_PLACEHOLDER}"
+        ));
+    }
+    let url = template.replace(SEARCH_QUERY_PLACEHOLDER, &percent_encode_component(query));
+    let html = fetch_html_document(&url)?;
+    let results = extract_search_results(&html);
+    if results.is_empty() {
+        return Err("no search results found in the response".to_string());
+    }
+    Ok(format_external_output(
+        &format!("Query: {query}"),
+        DownloadedBody {
+            text: results,
+            download_incomplete: false,
+        },
+    ))
+}
+
+/// Fetch an HTML document with a browser user agent.
+fn fetch_html_document(url: &str) -> Result<String, String> {
+    let target = Url::parse(url).map_err(|err| format!("invalid search url: {err}"))?;
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(25))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()
+        .map_err(|err| format!("failed to initialize web client: {err}"))?;
+    let response = client
+        .get(target)
+        .header(USER_AGENT, BROWSER_USER_AGENT)
+        .header(ACCEPT, "text/html,application/xhtml+xml")
+        .send()
+        .map_err(|err| format!("web request failed: {err}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
+    let bytes = response
+        .bytes()
+        .map_err(|err| format!("failed to read web response: {err}"))?;
+    let bytes = if bytes.len() > MAX_DOWNLOAD_BYTES {
+        bytes.slice(..MAX_DOWNLOAD_BYTES)
+    } else {
+        bytes
+    };
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Percent-encode a query for use in a URL query string.
+fn percent_encode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        let ch = *byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') {
+            out.push(ch);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Extract search results from a result page into markdown entries.
+///
+/// Result pages differ per engine, but every mainstream one puts a linked
+/// heading (`h2`/`h3`) in the result block, so a heading anchor plus the
+/// first following paragraph is a workable engine-agnostic shape.
+fn extract_search_results(html: &str) -> String {
+    let heading_re = Regex::new(r"(?is)<h([1-4])\b[^>]*>(.*?)</h[1-4]>").unwrap();
+    let anchor_re =
+        Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#).unwrap();
+    let paragraph_re = Regex::new(r"(?is)<p\b[^>]*>(.*?)</p>").unwrap();
+    let mut entries = String::new();
+    let mut seen: Vec<String> = Vec::new();
+    for heading in heading_re.captures_iter(html) {
+        let inner = heading.get(2).map(|m| m.as_str()).unwrap_or_default();
+        let Some(anchor) = anchor_re.captures(inner) else {
+            continue;
+        };
+        let title = clean_text(anchor.get(2).map(|m| m.as_str()).unwrap_or_default());
+        if title.is_empty() {
+            continue;
+        }
+        let href = decode_entities(anchor.get(1).map(|m| m.as_str()).unwrap_or_default().trim());
+        let url = resolve_result_url(&href);
+        if url.is_empty() || seen.iter().any(|known| known == &url) {
+            continue;
+        }
+        seen.push(url.clone());
+        let heading_end = heading.get(0).map(|m| m.end()).unwrap_or_default();
+        let tail = &html[heading_end..];
+        let window = &tail[..SNIPPET_LOOKAHEAD_CHARS.min(tail.len())];
+        let snippet = match paragraph_re.find(window) {
+            Some(found) if !window[..found.start()].contains("<h") => {
+                let mut text = clean_text(found.as_str());
+                if text.chars().count() > MAX_SNIPPET_CHARS {
+                    text = text.chars().take(MAX_SNIPPET_CHARS).collect::<String>() + "…";
+                }
+                text
+            }
+            _ => String::new(),
+        };
+        entries.push_str(&format!("- [{title}]({url})\n"));
+        if !snippet.is_empty() {
+            entries.push_str(&format!("  {snippet}\n"));
+        }
+        if seen.len() >= MAX_SEARCH_RESULTS {
+            break;
+        }
+    }
+    entries
+}
+
+/// Strip tags, collapse whitespace, and decode entities in a fragment.
+fn clean_text(fragment: &str) -> String {
+    decode_entities(&collapse_whitespace(&strip_tags(fragment)))
+}
+
+fn strip_tags(fragment: &str) -> String {
+    let mut out = String::with_capacity(fragment.len());
+    let mut inside_tag = false;
+    for ch in fragment.chars() {
+        match ch {
+            '<' => inside_tag = true,
+            '>' => inside_tag = false,
+            _ if !inside_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Keep absolute http(s) result links; relative and script links are noise.
+fn resolve_result_url(href: &str) -> String {
+    let href = href.trim();
+    if !(href.starts_with("http://") || href.starts_with("https://")) {
+        return String::new();
+    }
+    decode_bing_redirect(href)
+}
+
+/// Bing wraps result links in `/ck/a?...&u=a1<base64url>`; recover the target.
+fn decode_bing_redirect(url: &str) -> String {
+    if !url.contains("/ck/a") {
+        return url.to_string();
+    }
+    let Some(marker) = url.find("u=a1") else {
+        return url.to_string();
+    };
+    let rest = &url[marker + "u=a1".len()..];
+    let end = rest
+        .find(|ch: char| {
+            !(ch.is_ascii_alphanumeric()
+                || ch == '-'
+                || ch == '_'
+                || ch == '='
+                || ch == '+'
+                || ch == '/')
+        })
+ .unwrap_or(rest.len());
+    let encoded = rest[..end].trim_end_matches('=');
+    if encoded.is_empty() {
+        return url.to_string();
+    }
+    for engine in [&URL_SAFE_NO_PAD, &STANDARD_NO_PAD] {
+        if let Ok(decoded) = engine.decode(encoded)
+            && let Ok(text) = String::from_utf8(decoded)
+            && text.starts_with("http")
+        {
+            return text;
+        }
+    }
+    url.to_string()
 }
 
 /// Try every configured reader provider in order; when all fail and direct
@@ -126,7 +382,15 @@ fn fetch_with_providers_and_direct_with(
     direct_fetcher: impl Fn(&Url) -> Result<DownloadedBody, String>,
 ) -> Result<String, String> {
     let mut errors = Vec::new();
+    // A `direct` entry means "skip the reader services": the reader is
+    // unreachable and paying its timeout on every request is pure latency.
+    let direct_only = providers
+        .iter()
+        .any(|entry| entry.trim().eq_ignore_ascii_case(PROVIDER_DIRECT));
     for base in providers {
+        if direct_only || base.trim().eq_ignore_ascii_case(PROVIDER_DIRECT) {
+            continue;
+        }
         match execute_web_fetch_with_base(target.as_str(), base, true) {
             Ok(output) => return Ok(output),
             Err(error) => errors.push(format!("{base}: {error}")),
@@ -437,20 +701,29 @@ fn html_to_text(html: &str) -> String {
                 let tag: String = chars[i + 1..end].iter().collect();
                 let (bare, is_close) = classify_tag(&tag);
                 if bare.starts_with('!') {
-                    // Comment or doctype: skip through the closing "-->".
-                    let mut close = end + 1;
-                    while close + 2 < chars.len()
-                        && !(chars[close] == '-'
-                            && chars[close + 1] == '-'
-                            && chars[close + 2] == '>')
-                    {
-                        close += 1;
-                    }
-                    i = if close + 2 < chars.len() {
-                        close + 3
+                    // `<!-- ... -->` is a comment; every other `<! ... >` form
+                    // (doctype, CDATA) is a single tag. Treating them alike
+                    // made the scanner hunt for the next "-->" after the
+                    // tag it had already consumed, which swallowed the rest
+                    // of the document whenever a doctype or a CDATA block
+                    // came first.
+                    if bare.starts_with("!--") {
+                        let mut close = i + 4;
+                        while close + 2 < chars.len()
+                            && !(chars[close] == '-'
+                                && chars[close + 1] == '-'
+                                && chars[close + 2] == '>')
+                        {
+                            close += 1;
+                        }
+                        i = if close + 2 < chars.len() {
+                            close + 3
+                        } else {
+                            chars.len()
+                        };
                     } else {
-                        chars.len()
-                    };
+                        i = end + 1;
+                    }
                     continue;
                 }
                 if skip_depth > 0 {
@@ -608,9 +881,12 @@ mod tests {
 
     use super::{
         execute_web_fetch, execute_web_search, execute_web_search_with_base,
-        execute_web_search_with_providers, fetch_and_strip, fetch_with_providers_and_direct_with,
-        html_to_text, validate_direct_target, validate_target_url,
+        execute_web_search_with_providers, extract_search_results, fetch_and_strip,
+        fetch_with_providers_and_direct_with, html_to_text, parse_provider, validate_direct_target,
+        validate_target_url, ProviderKind, JINA_SEARCH_BASE,
     };
+    use crate::ai::config_schema::AiConfig;
+    use super::provider_list;
 
     fn mock_server(status: &str, body: &str) -> (String, thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
@@ -770,5 +1046,121 @@ mod tests {
         assert!(text.contains("a & b"));
         assert!(text.contains('x'));
         assert!(text.contains("1\n2"));
+    }
+
+    #[test]
+    fn html_to_text_keeps_the_body_after_a_doctype_and_cdata() {
+        // A doctype or a CDATA block used to be treated as a comment, so the
+        // scanner hunted for the next "-->" and swallowed the rest of the
+        // document. Only the <title> survived that, which is what made a
+        // direct fetch of a search page return a handful of characters.
+        let html = "<!DOCTYPE html><html><head><!--pc--><title>T</title></head><body>\
+            <script><![CDATA[\nvar x = 1 < 2;\n]]></script><p>kept body text</p></body></html>";
+        let text = html_to_text(html);
+        assert!(
+            text.contains("kept body text"),
+            "body text was dropped: {text:?}"
+        );
+        assert!(text.contains('T'), "title was dropped: {text:?}");
+    }
+
+    #[test]
+    fn parse_provider_recognizes_each_kind() {
+        let jina = parse_provider("https://s.jina.ai/").expect("bare url parses");
+        assert_eq!(jina.kind, ProviderKind::Jina);
+        assert_eq!(jina.template, "https://s.jina.ai/");
+
+        let explicit = parse_provider("jina:https://mirror.example/").expect("jina prefix parses");
+        assert_eq!(explicit.kind, ProviderKind::Jina);
+        assert_eq!(explicit.template, "https://mirror.example/");
+
+        let html = parse_provider("html:https://example.com/search?q={query}").expect("html parses");
+        assert_eq!(html.kind, ProviderKind::Html);
+        assert_eq!(html.template, "https://example.com/search?q={query}");
+
+        assert!(parse_provider("").is_none());
+        assert!(parse_provider("html:").is_none());
+    }
+
+    #[test]
+    fn extract_search_results_reads_heading_anchors() {
+        let html = "<html><body><ol><li class=\"b_algo\"><h2><a href=\"https://example.com/a\">\
+            First &amp; best</a></h2><div><p>Snippet <b>one</b> here.</p></div></li>\
+            <li class=\"b_algo\"><h2><a href=\"https://example.com/b\">Second</a></h2>\
+            <p>Another snippet.</p></li></ol></body></html>";
+        let results = extract_search_results(html);
+        assert!(results.contains("[First & best](https://example.com/a)"), "{results}");
+        assert!(results.contains("Snippet one here."), "{results}");
+        assert!(results.contains("[Second](https://example.com/b)"), "{results}");
+        assert!(results.contains("Another snippet."), "{results}");
+    }
+
+    #[test]
+    fn extract_search_results_decodes_bing_redirects() {
+        // "https://example.com/x" encoded as base64url behind Bing's `u=a1`.
+        let encoded = "aHR0cHM6Ly9leGFtcGxlLmNvbS94";
+        let html = format!(
+            "<h2><a href=\"https://www.bing.com/ck/a?!&&u=a1{encoded}&ntb=1\">Title</a></h2>\
+             <p>Snippet.</p>"
+        );
+        let results = extract_search_results(&html);
+        assert!(
+            results.contains("(https://example.com/x)"),
+            "redirect was not decoded: {results}"
+        );
+    }
+
+    #[test]
+    fn html_search_provider_uses_the_query_template() {
+        let (base, server) = mock_server(
+            "200 OK",
+            "<html><body><h2><a href=\"https://example.com/hit\">Hit</a></h2>\
+             <p>Result body.</p></body></html>",
+        );
+        let template = format!("{base}search?q={{query}}");
+        let output = execute_web_search_with_providers(
+            "rust lang",
+            &[format!("html:{template}")],
+        )
+        .expect("html search succeeds");
+        let request = server.join().expect("mock server finished");
+        assert!(request.contains("q=rust%20lang"), "query not encoded: {request}");
+        assert!(output.contains("[Hit](https://example.com/hit)"), "{output}");
+        assert!(output.contains("Result body."), "{output}");
+    }
+
+    #[test]
+    fn reader_direct_entry_skips_the_reader_services() {
+        let target = Url::parse("https://example.com/page").expect("parse url");
+        let providers = vec!["direct".to_string()];
+        let output = fetch_with_providers_and_direct_with(
+            &target,
+            &providers,
+            true,
+            |_url| {
+                Ok(super::DownloadedBody {
+                    text: "direct body".to_string(),
+                    download_incomplete: false,
+                })
+            },
+        )
+        .expect("direct fetch succeeds");
+        assert!(output.contains("direct body"), "{output}");
+    }
+
+    #[test]
+    #[ignore = "requires network access"]
+    fn html_search_reaches_a_real_search_endpoint() {
+        // Drive the production path: configured providers -> search.
+        // `AI_WEB_TEST_QUERY` lets a caller smoke-test the real providers with
+        // their own query; the default keeps the original English probe.
+        let query = std::env::var("AI_WEB_TEST_QUERY")
+            .unwrap_or_else(|_| "rust programming language".to_string());
+        let providers = provider_list(AiConfig::WEB_SEARCH_PROVIDERS, JINA_SEARCH_BASE);
+        let output = execute_web_search_with_providers(&query, &providers)
+            .expect("html search reaches the endpoint");
+        assert!(output.contains("https://"), "{output}");
+        assert!(output.contains("]("), "no result entries: {output}");
+        println!("{}", &output.chars().take(600).collect::<String>());
     }
 }

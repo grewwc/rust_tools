@@ -294,15 +294,21 @@ impl AiConfig {
     pub const SERVE_CA_CERT: &str = "ai.serve.ca_cert";
 
     // ── Web tools ──────────────────────────────────────────
-    /// Comma-separated list of search service base URLs for `web_search`,
-    /// tried in order until one succeeds. Defaults to Jina Search
-    /// (`https://s.jina.ai/`). Configure a mirror or proxy first in the list
+    /// Comma-separated list of search providers for `web_search`, tried in
+    /// order until one succeeds. Defaults to Jina Search
+    /// (`https://s.jina.ai/`). Each entry is either a Jina-style base URL
+    /// (the query is appended as a path segment and the body is already
+    /// markdown), a `jina:`-prefixed base URL, or an `html:`-prefixed URL
+    /// template containing `{query}` whose HTML result page is parsed into
+    /// markdown result entries. Configure a mirror or proxy first in the list
     /// when the default endpoint is unreachable from your network. At most the
     /// first 8 entries are used.
     pub const WEB_SEARCH_PROVIDERS: &str = "ai.web.search_providers";
-    /// Comma-separated list of reader service base URLs for `web_fetch`,
-    /// tried in order until one succeeds. Defaults to Jina Reader
-    /// (`https://r.jina.ai/`). At most the first 8 entries are used.
+    /// Comma-separated list of reader providers for `web_fetch`, tried in
+    /// order until one succeeds. Defaults to Jina Reader
+    /// (`https://r.jina.ai/`). Each entry is a Jina-style base URL, or the
+    /// literal `direct` to skip the reader services and fetch the target
+    /// directly. At most the first 8 entries are used.
     pub const WEB_READER_PROVIDERS: &str = "ai.web.reader_providers";
     /// When true (default), `web_fetch` falls back to fetching the target URL
     /// directly and stripping HTML to plain text when every reader provider

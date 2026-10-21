@@ -1,6 +1,6 @@
 {
   "name": "web_search",
-  "description": "Search the public web without a browser. Uses the configured search providers (default: Jina Search at s.jina.ai) in order until one succeeds; see the ai.web.search_providers config key for mirrors. Returns a bounded text result marked as untrusted external content. An optional JINA_API_KEY environment variable enables authenticated upstream access.",
+  "description": "Search the public web without a browser. Uses the configured search providers (default: Jina Search at s.jina.ai) in order until one succeeds; see the ai.web.search_providers config key for mirrors and for `html:` endpoints whose result page is parsed into markdown entries. Returns a bounded text result marked as untrusted external content. An optional JINA_API_KEY environment variable enables authenticated upstream access.",
   "parameters": {
     "type": "object",
     "properties": {
