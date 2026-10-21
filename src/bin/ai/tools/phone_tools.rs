@@ -27,6 +27,66 @@ const PHONE_ACTIONS: &str = "now, calendar_read, calendar_add, sms, alarm, timer
     location, note_create, note_list, note_update, file_import, file_read, file_save, screen_capture, \
     screen_stop, camera_capture, camera_stop";
 
+/// Camera budget for one response.
+///
+/// The preview takes over the phone screen, so reopening it after a frame has
+/// been captured is never what the user asked for. One response therefore gets
+/// one captured frame, and at most two preview openings when the first attempt
+/// returns no frame.
+static CAMERA_TURN: std::sync::Mutex<Option<CameraTurn>> = std::sync::Mutex::new(None);
+
+struct CameraTurn {
+    turn: String,
+    attempts: u8,
+    captured: bool,
+}
+
+fn current_turn_key() -> String {
+    crate::ai::driver::runtime_ctx::TURN_IDENTITY
+        .try_with(|identity| identity.0.clone())
+        .unwrap_or_default()
+}
+
+/// Why another camera preview must stay closed in this turn, if it must.
+fn camera_block_reason(turn: &str) -> Option<&'static str> {
+    let state = CAMERA_TURN.lock().ok()?;
+    let entry = state.as_ref()?;
+    if entry.turn != turn {
+        return None;
+    }
+    if entry.captured {
+        return Some(
+            "A camera frame was already captured in this response; answer with that image. \
+             The preview is not reopened, and calling camera_capture again in this response \
+             will not take another picture. Only a new user message can ask for a new photo.",
+        );
+    }
+    (entry.attempts >= 2).then_some(
+        "The camera preview was already opened twice in this response and returned no frame. \
+         It stays closed now; tell the user to send a new message when they want to try again.",
+    )
+}
+
+fn note_camera_attempt(turn: &str, captured: bool) {
+    let Ok(mut state) = CAMERA_TURN.lock() else {
+        return;
+    };
+    let entry = state.get_or_insert_with(|| CameraTurn {
+        turn: turn.to_string(),
+        attempts: 0,
+        captured: false,
+    });
+    if entry.turn != turn {
+        *entry = CameraTurn {
+            turn: turn.to_string(),
+            attempts: 0,
+            captured: false,
+        };
+    }
+    entry.attempts = entry.attempts.saturating_add(1);
+    entry.captured |= captured;
+}
+
 fn string_arg<'a>(args: &'a Value, key: &str, max: usize) -> Result<Option<&'a str>, String> {
     let Some(value) = args.get(key) else {
         return Ok(None);
@@ -369,12 +429,23 @@ fn execute_phone_action(args: &Value) -> Result<String, String> {
                 .to_string(),
         );
     }
+    let action = spec["action"].as_str().unwrap_or_default();
+    let turn = current_turn_key();
+    if action == "camera_capture"
+        && let Some(reason) = camera_block_reason(&turn)
+    {
+        return Ok(reason.to_string());
+    }
     let answer = crate::ai::serve_confirm::native(&spec).ok_or_else(|| {
         "The phone did not answer the action request (client disconnected, cancelled, \
          or the turn ended)."
             .to_string()
     })?;
-    format_phone_result(&spec, &answer)
+    let result = format_phone_result(&spec, &answer);
+    if action == "camera_capture" {
+        note_camera_attempt(&turn, result.is_ok());
+    }
+    result
 }
 
 fn decode_screen_image(data: &Value) -> Result<Vec<u8>, String> {
@@ -596,6 +667,25 @@ mod tests {
     use super::*;
 
     const ID: &str = "12345678-1234-4abc-8def-123456789abc";
+
+    #[test]
+    fn one_response_does_not_reopen_the_camera_preview() {
+        // The only test touching CAMERA_TURN, so the shared slot has one owner.
+        let captured = "phone-tools-camera-captured";
+        assert_eq!(camera_block_reason(captured), None);
+        note_camera_attempt(captured, true);
+        assert!(camera_block_reason(captured).unwrap().contains("already captured"));
+        note_camera_attempt(captured, true);
+        assert!(camera_block_reason(captured).unwrap().contains("already captured"));
+        // A new response starts with a fresh budget.
+        assert_eq!(camera_block_reason("phone-tools-camera-next"), None);
+
+        let failing = "phone-tools-camera-failing";
+        note_camera_attempt(failing, false);
+        assert_eq!(camera_block_reason(failing), None, "one retry is allowed");
+        note_camera_attempt(failing, false);
+        assert!(camera_block_reason(failing).unwrap().contains("twice"));
+    }
 
     #[test]
     fn screen_capture_validates_jpeg_and_exposes_no_silent_consent_override() {

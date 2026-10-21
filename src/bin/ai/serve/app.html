@@ -398,7 +398,7 @@ select, summary { touch-action:manipulation; }
 <header>
 <button id="menu" aria-label="sessions">☰</button>
 <b>a</b><span id="info">connecting…</span>
-<a id="apkdownload" href="/a-serve-v1.11.0.apk" download="a-serve-v1.11.0.apk" aria-label="download Android app" title="download Android app"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></a>
+<a id="apkdownload" href="/a-serve-v1.15.0.apk" download="a-serve-v1.15.0.apk" aria-label="download Android app" title="download Android app"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></a>
 <button id="themebtn" type="button" aria-label="switch to light theme" title="switch to light theme"><svg viewBox="0 0 24 24" aria-hidden="true"><g class="sun"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.4v2.2M12 19.4v2.2M2.4 12h2.2M19.4 12h2.2M5.1 5.1l1.6 1.6M17.3 17.3l1.6 1.6M18.9 5.1l-1.6 1.6M6.7 17.3l-1.6 1.6"/></g><path class="moon" d="M20.4 14.4A8.6 8.6 0 1 1 9.6 3.6a6.8 6.8 0 0 0 10.8 10.8Z"/></svg></button>
 <button id="connbtn" aria-label="connection">⚙</button>
 <button id="newbtn" class="primary">＋</button>
@@ -1316,7 +1316,7 @@ function nativeCall(action, payload, requestId) {
     if (!supported || (repeat && !features.includes("alarm_weekdays")) ||
         (action === "screen_capture" && !features.includes("screen_bubble")) ||
         (action === "camera_capture" && !features.includes("camera_preview"))) {
-      reject(new Error("当前 APK 不支持此操作，请升级到 v1.11.0 或更新版本")); return;
+      reject(new Error("当前 APK 不支持此操作，请升级到 v1.13.0 或更新版本")); return;
     }
     const id = requestId || ("n" + (++nativeSeq) + "-" + Date.now());
     if (!/^[A-Za-z0-9_-]{1,80}$/.test(id)) { reject(new Error("无效的手机请求编号")); return; }
@@ -1324,6 +1324,11 @@ function nativeCall(action, payload, requestId) {
       : action === "screen_capture" ? 120000 : 45000;
     const timer = setTimeout(() => {
       nativePending.delete(id);
+      // A camera preview that outlives its request would strand the user on a
+      // black screen, so ask the shell to close it before giving up.
+      if (action === "camera_capture" || action === "camera_stop") {
+        try { window.AServeNative.perform("c-" + id, "camera_stop", "{}"); } catch (_) { }
+      }
       reject(new Error("手机没有响应"));
     }, timeoutMs);
     nativePending.set(id, { resolve, reject, timer });

@@ -207,7 +207,7 @@ test("old APK refuses new actions and never silently drops repeat weekdays", asy
     await app.request(); await app.settle();
     assert.equal(app.calls.length, 0);
     assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
-    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1.11.0/);
+    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1.13.0/);
   }
 });
 
@@ -231,7 +231,7 @@ test("a shell without the floating bubble cannot pick the capture moment", async
   await app.request(); await app.settle();
   assert.equal(app.calls.length, 0);
   assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
-    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.11\.0/);
+    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.13\.0/);
 });
 
 test("the screen capture waits for the user tap instead of timing out early", async () => {
@@ -253,7 +253,7 @@ test("a shell without the camera preview cannot open the camera", async () => {
   await app.request(); await app.settle();
   assert.equal(app.calls.length, 0);
   assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
-  assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.11\.0/);
+  assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.13\.0/);
 });
 
 test("the camera frame reaches the conversation with the camera caption", async () => {
@@ -268,6 +268,22 @@ test("the camera frame reaches the conversation with the camera caption", async 
   await request;
   assert.equal(JSON.parse(app.posts[0].body.text).ok, true);
   assert.match(app.context.phoneFrameCaption({ capture_source: "camera" }), /相机画面/);
+});
+
+test("a camera request that times out closes the preview instead of stranding the user", async () => {
+  const app = nativeHarness(new Map(), phoneFixtures.camera_capture);
+  const timers = [];
+  app.context.setTimeout = (fn, delay) => { timers.push({ fn, delay }); return timers.length; };
+  const request = app.request(); await app.settle();
+  assert.equal(app.calls.length, 1);
+  assert.equal(app.calls[0][1], "camera_capture");
+  const timeout = timers.find(entry => entry.delay === 45000);
+  assert.ok(timeout, "the camera request needs a timeout");
+  timeout.fn();
+  await request; await app.settle();
+  assert.equal(app.calls.length, 2, "the preview has to be closed when the request gives up");
+  assert.equal(app.calls[1][1], "camera_stop");
+  assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
 });
 
 test("the overlay settings action reaches the native shell", async () => {

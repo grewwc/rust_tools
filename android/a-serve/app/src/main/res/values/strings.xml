@@ -15,4 +15,12 @@
     <string name="tls_untrusted">证书不受信任</string>
     <string name="tls_date_invalid">证书日期无效</string>
     <string name="tls_invalid">证书无效</string>
+    <string name="webview_unavailable">系统 WebView 无法启动。请启用「Android System WebView」或 Chrome，然后点重试。</string>
+    <string name="crash_title">上次启动时崩溃</string>
+    <string name="crash_send">发送给 a</string>
+    <string name="crash_copy">复制</string>
+    <string name="crash_retry">重试启动</string>
+    <string name="crash_dismiss">忽略</string>
+    <string name="crash_copied">已复制崩溃信息</string>
+    <string name="crash_prompt">这是我手机上 a serve APK 的崩溃报告，请帮我定位原因。</string>
 </resources>
