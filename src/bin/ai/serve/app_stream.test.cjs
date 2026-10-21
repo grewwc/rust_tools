@@ -178,6 +178,7 @@ test("restored running sessions distinguish missing live updates from active str
     turnRunning: true, turnRunningAt: 100000, RUNNING_SAMPLE_TTL_MS: 60000,
     Date: { now: () => 100001 },
   });
+  vm.runInContext(script.slice(script.indexOf("let promptComposing = false;"), script.indexOf("function composerBox()")), context);
   vm.runInContext(script.slice(script.indexOf("function isTurnRunning()"), script.indexOf("function note(")), context);
   context.syncStopButton();
   assert.equal(elements.turnstatus.hidden, false);

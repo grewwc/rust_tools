@@ -9,6 +9,12 @@ const { test } = require("node:test");
 const html = fs.readFileSync(path.join(__dirname, "app.html"), "utf8");
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const userOriginHelpers = script.slice(script.indexOf("function isRuntimeSyntheticUser("), script.indexOf("const PHONE_LAYOUT_QUERY"));
+// The layout-hold helpers are shared by the composer and the turn state; the
+// slices below run on their own, so they carry the helpers with them.
+const layoutHoldSrc = script.slice(
+  script.indexOf("let promptComposing = false;"),
+  script.indexOf("function composerBox()"),
+);
 const renderer = script.slice(script.indexOf("const esc ="), script.indexOf("function sessionTitle("));
 const decode = (s) => s.replace(/&(amp|lt|gt|quot);/g, (_, key) => ({ amp: "&", lt: "<", gt: ">", quot: '"' })[key]);
 function nodesOf(markup) {
@@ -99,6 +105,7 @@ test("drafts persist independently for each session and restore on switch", () =
     restoreSkillPick() {},
     isPhoneLayout: () => true,
   });
+  vm.runInContext(layoutHoldSrc, context);
   vm.runInContext('const DRAFT_PREFIX = "serve.draft."; let questionCache = null; let sessionId = "alpha";\n' + script.slice(start, end), context);
   context.switchSession("beta");
   assert.equal(values.get("serve.draft.alpha"), "alpha draft");
@@ -1405,7 +1412,7 @@ test("prompt auto-growth uses a roomier phone cap without changing desktop", () 
 
 test("composer height is reset after send and refreshed after image attachment", () => {
   assert.match(html, /setPromptValue\("", true\);[^\n]*\n\s*\$\("prompt"\)\.style\.height = "auto";/);
-  assert.match(html, /added\.map\([\s\S]*?\.join\("\\n"\);\s*growPrompt\(\);/);
+  assert.match(html, /added\.map\([\s\S]*?\.join\("\\n"\);[\s\S]*?setPromptValue\(prompt\.value \+ marker\)[\s\S]*?growPrompt\(\);/);
   assert.match(html, /e\.key === "Enter" && \(e\.ctrlKey \|\| e\.metaKey\)/);
   assert.match(html, /\$\("prompt"\)\.addEventListener\("paste", handlePromptPaste\);/);
 });
