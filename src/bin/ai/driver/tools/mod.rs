@@ -1,3 +1,4 @@
+use crate::ai::tools::storage::memory_store::MAX_NOTE_BYTES;
 use chrono::{DateTime, Duration, Local, Utc};
 use rust_tools::commonw::FastSet;
 use rust_tools::cw::SkipMap;
@@ -151,7 +152,6 @@ struct CachedFileFingerprint {
 }
 
 const TOOL_CACHE_RECENT_LIMIT: usize = 400;
-const TOOL_CACHE_MAX_RESULT_CHARS: usize = 12_000;
 const TOOL_CACHE_TTL_MINUTES: i64 = 30;
 const TOOL_CACHE_READ_FILE_TOOL: &str = "read_file";
 
@@ -1507,7 +1507,13 @@ fn load_cached_tool_result(
         if entry.tags.get(1).map(String::as_str) != Some(cache_key.as_str()) {
             continue;
         }
-        let payload = serde_json::from_str::<ToolCachePayload>(&entry.note).ok()?;
+        if entry.note.len() > MAX_NOTE_BYTES {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_str::<ToolCachePayload>(&entry.note) else {
+            // Older entries may contain JSON cut off by the memory note cap.
+            continue;
+        };
         if payload.tool_name != tool_call.function.name || payload.args != *args {
             continue;
         }
@@ -1545,12 +1551,17 @@ fn store_tool_cache_result(
     let payload = ToolCachePayload {
         tool_name: tool_call.function.name.clone(),
         args: args.clone(),
-        result: truncate_chars(&tool_result.content, TOOL_CACHE_MAX_RESULT_CHARS),
+        result: tool_result.content.clone(),
         file_fingerprints: collect_tool_cache_file_fingerprints(&tool_call.function.name, args),
     };
     let Ok(note) = serde_json::to_string(&payload) else {
         return;
     };
+    // Include JSON escaping, arguments, and fingerprints in the storage budget.
+    // A miss is safer than caching a shortened result or an unparseable note.
+    if note.len() > MAX_NOTE_BYTES {
+        return;
+    }
     let cache_key = build_tool_cache_key(&tool_call.function.name, args);
     let entry = AgentMemoryEntry {
         id: None,
@@ -1665,15 +1676,6 @@ fn cached_file_fingerprint_for_path(path: &str) -> Option<CachedFileFingerprint>
         size: meta.len(),
         modified_ms,
     })
-}
-
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if max_chars == 0 || s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max_chars).collect();
-    out.push('…');
-    out
 }
 
 #[cfg(test)]

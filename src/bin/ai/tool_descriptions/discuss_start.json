@@ -1,0 +1,42 @@
+{
+  "name": "discuss_start",
+  "description": "Open a multi-session discussion room as host: sends the round-1 brief to every member session's talk inbox and reports who is live vs inactive. Returns the room name for discuss_collect/broadcast/end. Pass either members (existing sessions) or member_count (auto-spawned sessions owned by this room), not both.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "topic": {
+        "type": "string",
+        "description": "The question to argue (e.g. 'tabs vs spaces')."
+      },
+      "members": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Member session ids (1-8, from session_list; must exist, cannot include yourself). Either this or member_count."
+      },
+      "member_count": {
+        "type": "number",
+        "description": "Auto-spawn N member sessions (1-8) owned by this room, e.g. 3. Fresh ids embed the room name; their databases are created by their own processes. Either this or members."
+      },
+      "roles": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional stance per member, positionally aligned (one per member, or empty for none). Without roles, auto-spawned members default to pro/contra/judge/independent stances; explicit members get no stance."
+      },
+      "max_rounds": {
+        "type": "number",
+        "description": "Max rounds before forced close (default 3, clamped 1-10)."
+      },
+      "room": {
+        "type": "string",
+        "description": "Optional room name (max 64 chars); auto-generated when omitted."
+      }
+    },
+    "required": [
+      "topic"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "session"
+  ]
+}

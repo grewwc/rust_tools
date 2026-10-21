@@ -28,7 +28,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -69,6 +69,12 @@ static WIDTH_QUERY_COLS: AtomicU16 = AtomicU16::new(0);
 static WIDTH_QUERY_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 /// Set while the listener thread owns stdin and services fold width requests.
 static LISTENER_ALIVE: AtomicBool = AtomicBool::new(false);
+/// Number of listener worker threads currently alive (0 or 1 in normal
+/// operation). Incremented when the worker thread starts and decremented when
+/// it exits, so the count is an exact thread census — tests use it to prove
+/// that a run_loop wait window holds exactly one listener for its whole
+/// duration rather than one per scheduler wakeup.
+static LISTENER_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Set while the one-line side-note composer is open (Ctrl+G input mode). Transient
 /// in-place status writers (subagent status line, task heartbeat, retry waits) must
 /// not touch the TTY while this is set: their bare `\r\x1b[2K` redraws would displace
@@ -361,6 +367,13 @@ pub(crate) fn side_note_input_enabled() -> bool {
     enabled
 }
 
+/// Number of listener worker threads currently alive (0 or 1 in normal
+/// operation). Exposed for tests: a wait window must hold exactly one listener
+/// thread for its whole duration.
+pub(crate) fn live_listener_threads() -> usize {
+    LISTENER_COUNT.load(Ordering::Acquire)
+}
+
 /// RAII guard: holds the background listener task, requests exit on drop and waits
 /// for the terminal to be restored.
 pub(crate) struct SideNoteInputGuard {
@@ -465,6 +478,9 @@ impl SideNoteInputGuard {
         let task = thread::Builder::new()
             .name("a-side-note-input".to_owned())
             .spawn(move || {
+                // This thread is the listener; count it for its whole lifetime so
+                // tests can assert "exactly one listener per wait window".
+                LISTENER_COUNT.fetch_add(1, Ordering::AcqRel);
                 let mut ready_tx = Some(ready_tx);
                 loop {
                     if task_stop.load(Ordering::Relaxed) {
@@ -584,6 +600,7 @@ impl SideNoteInputGuard {
                 // longer poll/read stdin nor hold cbreak terminal state.
                 LISTENER_ALIVE.store(false, Ordering::Release);
                 let _ = terminal_released_tx.send(());
+                LISTENER_COUNT.fetch_sub(1, Ordering::AcqRel);
             })
             .ok();
         if task.is_none()
@@ -1511,5 +1528,83 @@ mod tests {
         let _ = submit_draft(&sink, &stop, &mut footer, &mut input, &mut pending, &mut in_input);
         assert!(!in_input);
         assert!(!side_note_composer_active());
+    }
+
+    #[test]
+    fn submitted_draft_lands_in_the_foreground_side_note_queue() {
+        // A draft submitted through the composer must persist to the session's
+        // foreground side-note queue so the next turn's
+        // drain_side_notes_and_inject (orchestrator.rs) picks it up — the contract
+        // the wait-window listener relies on while the loop waits for subagents.
+        let dir = std::env::temp_dir().join(format!("a-side-note-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let history_file = dir.join("test-session.sqlite");
+        let sink = SideNoteSink::Local(history_file.clone());
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut footer = FooterReservation { cols: 80, rows: 24 };
+        let mut input: Vec<char> = "deliver this note".chars().collect();
+        let mut pending = Vec::new();
+        let mut in_input = true;
+        // The draft must be persisted before the footer redraw; in tests stdout is
+        // not a tty, so the footer clear can legitimately fail with ENOTTY. Any
+        // other error would mean the persist step itself failed.
+        match submit_draft(&sink, &stop, &mut footer, &mut input, &mut pending, &mut in_input) {
+            Ok(_) => {}
+            Err(err) => assert_eq!(
+                err.raw_os_error(),
+                Some(libc::ENOTTY),
+                "non-footer submit error: {err}"
+            ),
+        }
+        assert!(!in_input);
+        assert!(!side_note_composer_active());
+
+        let notes = crate::ai::driver::side_note::drain_side_notes(&history_file, None);
+        assert_eq!(notes.len(), 1, "exactly one note must land in the foreground queue");
+        assert_eq!(notes[0].content, "deliver this note");
+        assert_eq!(notes[0].from, "user");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_window_holds_exactly_one_listener_thread() {
+        // Mirrors the run_loop wait window: ONE guard created before the wait,
+        // held across every scheduler wakeup, dropped when the window ends. The
+        // thread census must show exactly one listener for the whole multi-second
+        // wait (not one per wakeup) and zero after the guard drops. Where no
+        // terminal is available (CI), the worker exits during startup and the
+        // census stays at zero; the invariant checked there is "never more than
+        // one" and "returns to zero on drop".
+        let guard = SideNoteInputGuard::spawn(
+            std::path::PathBuf::from("/tmp/a-side-note-wait-window-test"),
+            "test-session".to_owned(),
+            "test-persona".to_owned(),
+            "test-model".to_owned(),
+        );
+        let census_deadline = Instant::now() + Duration::from_millis(STARTUP_WAIT_MS + 250);
+        while live_listener_threads() == 0 && Instant::now() < census_deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if live_listener_threads() == 1 {
+            // A terminal is present and the listener took it: it must stay alive
+            // for the entire wait window — sample every 500ms over 3s.
+            for _ in 0..6 {
+                assert_eq!(live_listener_threads(), 1, "listener died mid-wait");
+                thread::sleep(Duration::from_millis(500));
+            }
+        } else {
+            // Non-terminal environment: the worker cannot take stdin, but it must
+            // never leave a thread behind while the guard is held.
+            for _ in 0..3 {
+                assert_eq!(live_listener_threads(), 0, "unexpected listener thread");
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+        drop(guard);
+        let drop_deadline = Instant::now() + Duration::from_millis(SHUTDOWN_WAIT_MS + 250);
+        while live_listener_threads() != 0 && Instant::now() < drop_deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(live_listener_threads(), 0, "listener thread outlived its guard");
     }
 }

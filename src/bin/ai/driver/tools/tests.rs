@@ -509,6 +509,136 @@ fn temp_file_path(name: &str) -> std::path::PathBuf {
     path
 }
 
+fn with_tool_cache_store(check: impl FnOnce(super::MemoryStore, serde_json::Value)) {
+    struct TestDir(std::path::PathBuf);
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = TestDir(temp_file_path("tool_cache_store"));
+    fs::create_dir(&dir.0).unwrap();
+    let source = dir.0.join("source.txt");
+    fs::write(&source, "source content").unwrap();
+    let memory_path = dir.0.join("memory.jsonl");
+    crate::ai::driver::runtime_ctx::SUBAGENT_MEMORY_PATH.sync_scope(memory_path.clone(), || {
+        check(
+            super::MemoryStore::for_tests_with_path(memory_path),
+            json!({"file_path": source, "offset": 1, "limit": 10}),
+        );
+    });
+}
+
+fn store_test_tool_cache(args: &serde_json::Value, content: &str) -> ToolCall {
+    let call = tool_call_with_args("read_file", &args.to_string());
+    super::store_tool_cache_result(
+        "cache-test",
+        &call,
+        args,
+        &crate::ai::types::ToolResult {
+            tool_call_id: call.id.clone(),
+            content: content.to_string(),
+        },
+    );
+    call
+}
+
+#[test]
+fn tool_cache_roundtrip_preserves_content_and_validation() {
+    with_tool_cache_store(|store, args| {
+        let content = "Quoted: \"value\"\\path\nUnicode: 中文🙂\n[truncated: continue offset=11]";
+        let mut call = store_test_tool_cache(&args, content);
+        assert_eq!(store.recent(10).unwrap().len(), 1);
+        call.id = "new-call-id".to_string();
+        let cached = super::load_cached_tool_result("cache-test", &call, &args).unwrap();
+        assert_eq!(cached.content, content);
+        assert_eq!(cached.tool_call_id, call.id);
+        assert!(super::load_cached_tool_result("other-session", &call, &args).is_none());
+        let changed_args = json!({"file_path": args["file_path"], "offset": 2, "limit": 10});
+        assert!(super::load_cached_tool_result("cache-test", &call, &changed_args).is_none());
+        fs::write(
+            args["file_path"].as_str().unwrap(),
+            "changed source content",
+        )
+        .unwrap();
+        assert!(super::load_cached_tool_result("cache-test", &call, &args).is_none());
+    });
+}
+
+#[test]
+fn tool_cache_enforces_serialized_byte_boundary_without_truncation() {
+    with_tool_cache_store(|store, args| {
+        let payload = ToolCachePayload {
+            tool_name: "read_file".to_string(),
+            args: args.clone(),
+            result: String::new(),
+            file_fingerprints: collect_tool_cache_file_fingerprints("read_file", &args),
+        };
+        let budget = super::MAX_NOTE_BYTES - serde_json::to_string(&payload).unwrap().len();
+        for content in [
+            "a".repeat(budget + 1),
+            "中".repeat(budget / 3 + 1),
+            "\n".repeat(budget / 2 + 1),
+            "\0".repeat(budget / 6 + 1),
+            "a".repeat(12_001),
+        ] {
+            let call = store_test_tool_cache(&args, &content);
+            assert!(store.recent(10).unwrap().is_empty());
+            assert!(super::load_cached_tool_result("cache-test", &call, &args).is_none());
+        }
+
+        let content = "a".repeat(budget);
+        let call = store_test_tool_cache(&args, &content);
+        let entries = store.recent(10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].note.len(), super::MAX_NOTE_BYTES);
+        let cached = super::load_cached_tool_result("cache-test", &call, &args).unwrap();
+        assert_eq!(cached.content, content);
+    });
+}
+
+#[test]
+fn tool_cache_skips_corrupt_legacy_notes_without_hiding_valid_entries() {
+    for oversized in [false, true] {
+        with_tool_cache_store(|store, args| {
+            let call = store_test_tool_cache(&args, "complete result");
+            let mut broken = store.recent(10).unwrap().remove(0);
+            broken.id = None;
+            broken.note = if oversized {
+                let mut payload: ToolCachePayload = serde_json::from_str(&broken.note).unwrap();
+                payload.result = "x".repeat(super::MAX_NOTE_BYTES);
+                serde_json::to_string(&payload).unwrap()
+            } else {
+                "{broken JSON".to_string()
+            };
+            store.append(&broken).unwrap();
+            let entries = store.recent(10).unwrap();
+            assert_eq!(entries.len(), 2);
+            assert!(serde_json::from_str::<ToolCachePayload>(&entries[0].note).is_err());
+            if oversized {
+                assert!(
+                    entries[0]
+                        .note
+                        .contains("[note truncated to fit memory store cap]")
+                );
+            }
+            let cached = super::load_cached_tool_result("cache-test", &call, &args).unwrap();
+            assert_eq!(cached.content, "complete result");
+        });
+    }
+}
+
+#[test]
+fn tool_cache_does_not_store_empty_or_failed_results() {
+    with_tool_cache_store(|store, args| {
+        for content in ["", " \n\t", "Error: failed to read file"] {
+            let call = store_test_tool_cache(&args, content);
+            assert!(store.recent(10).unwrap().is_empty());
+            assert!(super::load_cached_tool_result("cache-test", &call, &args).is_none());
+        }
+    });
+}
+
 #[test]
 fn file_backed_cache_validation_rejects_stale_entries() {
     let path = temp_file_path("tool_cache_validation");
@@ -907,8 +1037,8 @@ fn schema_gate_rejects_out_of_range_integers_before_dispatch() {
 }
 
 /// Registered contract for every builtin integer argument: (tool, path,
-/// minimum, maximum, why). `path` uses `.` for nested objects and `[].` for
-/// array items. A `None` bound is intentional only with a reason:
+/// minimum, maximum, why). `path` uses `.` for object fields and `[]` for
+/// array items (for example, `days[]` or `steps[].step`). A `None` bound is intentional only with a reason:
 /// fail-closed service parsing (`as_u64().ok_or`, loud on any bad value, so
 /// there is no silent-default hole) or signed semantics (`as_i64`, where
 /// negatives are valid). The test below walks the whole registry, so a new
@@ -953,6 +1083,15 @@ const INT_BOUND_REGISTRY: &[(&str, &str, Option<i64>, Option<i64>, &str)] = &[
     ("manage_team", "budget.max_total_attempts", Some(1), Some(4096), "validate_budget enforces <=4096"),
     ("manage_team", "budget.max_messages", Some(1), Some(2048), "validate_budget enforces 1-2048"),
     ("manage_team", "lease_secs", Some(1), Some(86400), "service clamps 1-86400"),
+    ("phone_action", "days", Some(1), Some(30), "calendar_read rejects values outside 1-30"),
+    ("phone_action", "max", Some(1), Some(20), "calendar_read and note_list enforce 1-20"),
+    ("phone_action", "duration_min", Some(5), Some(600), "calendar_add rejects durations outside 5-600"),
+    ("phone_action", "hour", Some(0), Some(23), "alarm requires an integer hour in 0-23"),
+    ("phone_action", "minute", Some(0), Some(59), "alarm requires an integer minute in 0-59"),
+    ("phone_action", "weekdays[]", Some(1), Some(7), "alarm validates each unique ISO weekday in 1-7"),
+    ("phone_action", "seconds", Some(1), Some(86400), "timer requires an integer duration in 1-86400"),
+    ("phone_action", "offset", Some(0), Some(1048576), "file_read enforces MAX_FILE_CHARS; note_list enforces the narrower action-specific maximum 100000"),
+    ("phone_action", "limit", Some(1), Some(3000), "file_read enforces 1-3000 Unicode codepoints"),
     ("kill_process", "pid", None, None, "service ok_or fails closed; no silent default"),
     ("reap_process", "pid", None, None, "service ok_or fails closed; no silent default"),
     ("wait_process", "pid", None, None, "service ok_or fails closed; no silent default"),
@@ -972,30 +1111,78 @@ fn collect_int_bounds(
     prefix: String,
     out: &mut Vec<(String, Option<i64>, Option<i64>)>,
 ) {
-    let Some(props) = schema.get("properties").and_then(|v| v.as_object()) else {
-        return;
-    };
-    for (name, prop) in props {
-        let path = if prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{prefix}.{name}")
-        };
-        match prop.get("type").and_then(|v| v.as_str()) {
-            Some("integer") => out.push((
-                path,
-                prop.get("minimum").and_then(|v| v.as_i64()),
-                prop.get("maximum").and_then(|v| v.as_i64()),
-            )),
-            Some("object") => collect_int_bounds(prop, path, out),
-            Some("array") => {
-                if let Some(items) = prop.get("items") {
-                    collect_int_bounds(items, format!("{path}[]"), out);
-                }
-            }
-            _ => {}
+    // Visit the node itself: an array's items can be an integer schema,
+    // not just an object containing integer properties.
+    if schema.get("type").and_then(|v| v.as_str()) == Some("integer") {
+        out.push((
+            prefix.clone(),
+            schema.get("minimum").and_then(|v| v.as_i64()),
+            schema.get("maximum").and_then(|v| v.as_i64()),
+        ));
+    }
+    if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+        for (name, prop) in props {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}.{name}")
+            };
+            collect_int_bounds(prop, path, out);
         }
     }
+    if let Some(items) = schema.get("items") {
+        collect_int_bounds(items, format!("{prefix}[]"), out);
+    }
+}
+
+#[test]
+fn collect_int_bounds_visits_root_integers() {
+    let mut found = Vec::new();
+    collect_int_bounds(
+        &serde_json::json!({"type": "integer", "minimum": -2, "maximum": 3}),
+        String::new(),
+        &mut found,
+    );
+    assert_eq!(found, vec![(String::new(), Some(-2), Some(3))]);
+}
+
+#[test]
+fn collect_int_bounds_preserves_nested_paths_and_optional_bounds() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "count": {"type": "integer", "minimum": 0},
+            "ids": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 7}},
+            "matrix": {"type": "array", "items": {
+                "type": "array", "items": {"type": "integer", "maximum": 9}
+            }},
+            "options": {"type": "object", "properties": {
+                "priority": {"type": "integer"},
+                "label": {"type": "string"}
+            }},
+            "rows": {"type": "array", "items": {
+                "type": "object", "properties": {
+                    "rank": {"type": "integer", "minimum": -5, "maximum": 5},
+                    "tags": {"type": "array", "items": {"type": "string"}}
+                }
+            }},
+            "ratio": {"type": "number", "minimum": 0, "maximum": 1}
+        },
+        "default": {"type": "integer", "minimum": 99}
+    });
+    let mut found = Vec::new();
+    collect_int_bounds(&schema, String::new(), &mut found);
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            ("count".to_string(), Some(0), None),
+            ("ids[]".to_string(), Some(1), Some(7)),
+            ("matrix[][]".to_string(), None, Some(9)),
+            ("options.priority".to_string(), None, None),
+            ("rows[].rank".to_string(), Some(-5), Some(5)),
+        ]
+    );
 }
 
 #[test]

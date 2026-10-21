@@ -158,6 +158,20 @@ pub(super) fn preview_terminal_width() -> usize {
 }
 
 pub(in crate::ai) fn raw_terminal_cols() -> usize {
+    raw_terminal_cols_with(super::super::term_cols_override())
+}
+
+/// Width chain with the explicit override factored out, so the override's
+/// precedence over the local probes is testable without touching the process
+/// environment.
+pub(super) fn raw_terminal_cols_with(override_cols: Option<usize>) -> usize {
+    // Explicit width override: a serve turn child renders rows for a client
+    // that owns the real terminal, while the child's own stdout is a pipe and
+    // every local probe below (ioctl, COLUMNS) reports a width that terminal
+    // never had.
+    if let Some(cols) = override_cols {
+        return cols;
+    }
     // Emulator-truth width cached by the fold's `CSI 18 t` refresh (see
     // `side_note_input::refresh_true_width`): while xterm.js has rewrapped the rows it
     // already drew but the PTY winsize has not reached this process, the kernel width

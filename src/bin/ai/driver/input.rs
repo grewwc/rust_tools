@@ -2952,6 +2952,172 @@ mod tests {
         let ctx = result.expect("serve child first question").expect("question");
         assert_eq!(ctx.question, "hello");
     }
+
+    #[test]
+    fn room_badge_short_member_id() {
+        assert_eq!(
+            super::short_member_id("dc-discuss-1792586970-m1-88cd1f72"),
+            "m1"
+        );
+        assert_eq!(
+            super::short_member_id("task-task-1792592894-w12-a1b2c3d4"),
+            "w12"
+        );
+        // No index segment: fall back to the trailing fragment.
+        assert_eq!(super::short_member_id("plain"), "plain");
+        assert_eq!(super::short_member_id("m"), "m");
+    }
+
+    #[test]
+    fn room_badge_body_formats_ticks_and_counts() {
+        let members = vec![("w1".to_string(), true), ("w2".to_string(), false)];
+        assert_eq!(
+            super::format_room_badge_body("task", "task-1", 3, 5, &members),
+            "[task task-1 r3/5 w1✓ w2…]"
+        );
+        let big: Vec<(String, bool)> = (1..=6).map(|i| (format!("w{i}"), i <= 2)).collect();
+        assert_eq!(
+            super::format_room_badge_body("task", "task-1", 1, 5, &big),
+            "[task task-1 r1/5 ✓2/6]"
+        );
+    }
+
+    #[test]
+    fn room_badge_absent_without_parseable_rooms() {
+        // No tempfile dependency in this project; reuse the existing
+        // std::env::temp_dir + uuid pattern.
+        let dir =
+            std::env::temp_dir().join(format!("badge_test_{}", uuid::Uuid::new_v4().simple()));
+        let history_file = dir.join("history.sqlite");
+        // No rooms directory at all.
+        assert_eq!(super::room_badge_for_input(&history_file), None);
+        // A corrupt state file is skipped, never fatal.
+        let rooms = crate::ai::driver::talk::talk_rooms_dir(&history_file);
+        std::fs::create_dir_all(&rooms).unwrap();
+        std::fs::write(rooms.join("junk.state.json"), b"{not json").unwrap();
+        assert_eq!(super::room_badge_for_input(&history_file), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Short badge id for a spawned member/worker session: the `-m<N>-` /
+/// `-w<N>-` segment (e.g. `m1`), falling back to the trailing id fragment
+/// when the shape is unexpected.
+fn short_member_id(full: &str) -> String {
+    for seg in full.split('-') {
+        let is_index = matches!(seg.chars().next(), Some('m') | Some('w'))
+            && matches!(seg.get(1..), Some(tail) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()));
+        if is_index {
+            return seg.to_string();
+        }
+    }
+    full.rsplit('-').next().unwrap_or(full).to_string()
+}
+
+/// Compact badge body for one open room: round plus per-member ticks
+/// (`✓` replied or waiting in the host inbox, `…` still missing). Large
+/// teams collapse to counts so the title row stays short.
+fn format_room_badge_body(
+    kind: &str,
+    room: &str,
+    round: u32,
+    max_rounds: u32,
+    members: &[(String, bool)],
+) -> String {
+    let mut badge = format!("[{kind} {room} r{round}/{max_rounds}");
+    if members.len() <= 4 {
+        for (id, done) in members {
+            badge.push(' ');
+            badge.push_str(id);
+            badge.push(if *done { '✓' } else { '…' });
+        }
+    } else {
+        let done = members.iter().filter(|(_, d)| *d).count();
+        badge.push_str(&format!(" ✓{done}/{}", members.len()));
+    }
+    badge.push(']');
+    badge
+}
+
+/// Persistent room badge for the input box title row: the most recently
+/// active open task/discuss room, or `None` when this session hosts none.
+/// Read-only: built from room state snapshots, so it never drains, wakes,
+/// or writes. Computed once per input open, not per frame, so file reads
+/// never tax keystrokes. Unparseable state files are skipped, never fatal.
+fn room_badge_for_input(history_file: &Path) -> Option<String> {
+    let mut names = crate::ai::driver::task::list_rooms(history_file);
+    for room in crate::ai::driver::discuss::list_rooms(history_file) {
+        if !names.contains(&room) {
+            names.push(room);
+        }
+    }
+    // Task state wins a shared name because it is tried first; a state file
+    // that parses as neither kind contributes no badge.
+    let mut open: Vec<(String, String, Option<std::time::SystemTime>)> = Vec::new();
+    for room in &names {
+        let state_path = crate::ai::driver::talk::talk_rooms_dir(history_file)
+            .join(format!("{room}.state.json"));
+        let mtime = fs::metadata(&state_path)
+            .and_then(|m| m.modified())
+            .ok();
+        if let Ok(st) = crate::ai::driver::task::room_status(history_file, room) {
+            if st.status != crate::ai::driver::task::TaskStatus::Closed {
+                let members: Vec<(String, bool)> = st
+                    .workers
+                    .iter()
+                    .map(|w| {
+                        (
+                            short_member_id(&w.worker),
+                            w.replied_this_round || w.waiting_in_inbox,
+                        )
+                    })
+                    .collect();
+                open.push((
+                    st.room.clone(),
+                    format_room_badge_body("task", &st.room, st.round, st.max_rounds, &members),
+                    mtime,
+                ));
+                continue;
+            }
+        }
+        if let Ok(st) = crate::ai::driver::discuss::room_status(history_file, room) {
+            if st.status != crate::ai::driver::discuss::DiscussStatus::Closed {
+                let members: Vec<(String, bool)> = st
+                    .members
+                    .iter()
+                    .map(|m| {
+                        (
+                            short_member_id(&m.member),
+                            m.replied_this_round || m.waiting_in_inbox,
+                        )
+                    })
+                    .collect();
+                open.push((
+                    st.room.clone(),
+                    format_room_badge_body(
+                        "discuss",
+                        &st.room,
+                        st.round,
+                        st.max_rounds,
+                        &members,
+                    ),
+                    mtime,
+                ));
+            }
+        }
+    }
+    if open.is_empty() {
+        return None;
+    }
+    // Most recently active first; entries without mtime sort last, ties
+    // break by room name so the pick is deterministic.
+    open.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    let mut badge = open[0].1.clone();
+    if open.len() > 1 {
+        badge.pop(); // drop the closing ']' that format_room_badge_body appends
+        badge.push_str(&format!(" +{} more]", open.len() - 1));
+    }
+    Some(badge)
 }
 
 fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
@@ -2993,6 +3159,7 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
                     .filter(|summary| !summary.is_empty())
             });
         editor.set_session_topic(topic);
+        editor.set_room_badge(room_badge_for_input(app.config.history_file.as_path()));
         return editor.read_multi_line();
     }
 

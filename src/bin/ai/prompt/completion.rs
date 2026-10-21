@@ -100,6 +100,8 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":changes",
         "/diff",
         ":diff",
+        "/discuss",
+        ":discuss",
         "/agent",
         ":agent",
         "/personas",
@@ -108,10 +110,14 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":sessions",
         "/ss",
         ":ss",
+        "/task",
+        ":task",
         "/close",
         ":close",
         "/fork",
         ":fork",
+        "/goal",
+        ":goal",
         "/proc",
         ":proc",
         "/skills",
@@ -316,6 +322,8 @@ impl CommandCompleter {
             ":changes",
             "/diff",
             ":diff",
+            "/discuss",
+            ":discuss",
             "/agent",
             ":agent",
             "/personas",
@@ -324,10 +332,14 @@ impl CommandCompleter {
             ":sessions",
             "/ss",
             ":ss",
+            "/task",
+            ":task",
             "/close",
             ":close",
             "/fork",
             ":fork",
+            "/goal",
+            ":goal",
             "/proc",
             ":proc",
             "/skills",
@@ -682,6 +694,11 @@ impl CommandCompleter {
         &[
             "today", "7d", "30d", "all", "models", "daily", "trend", "days", "help",
         ]
+    }
+
+    /// Subcommands of `/discuss` and `/task` (both take `status [room]`).
+    fn discuss_task_subcommands() -> &'static [&'static str] {
+        &["status"]
     }
 
     /// Subcommands of `/git`.
@@ -1218,6 +1235,9 @@ impl CommandCompleter {
                     "/model" | ":model" => Self::model_subcommands(),
                     // `/effort <TAB>` -> reasoning-effort levels (same set as `/model effort <level>`).
                     "/effort" | ":effort" => Self::model_effort_levels(),
+                    "/discuss" | ":discuss" | "/task" | ":task" => {
+                        Self::discuss_task_subcommands()
+                    }
                     _ => &[],
                 };
                 Self::plain_candidates(
@@ -2663,6 +2683,39 @@ mod tests {
         assert!(pairs.iter().any(|pair| pair.replacement == "fork"));
         assert!(pairs.iter().any(|pair| pair.replacement == "branch"));
         assert!(!pairs.iter().any(|pair| pair.replacement == "rewind"));
+    }
+
+    #[test]
+    fn discuss_task_and_goal_commands_complete() {
+        let completer = CommandCompleter;
+        let history = DefaultHistory::new();
+        for (prefix, expected) in [
+            ("/disc", "/discuss"),
+            (":disc", ":discuss"),
+            ("/task", "/task"),
+            (":task", ":task"),
+            ("/go", "/goal"),
+            (":go", ":goal"),
+        ] {
+            let (_, pairs) = completer
+                .complete(prefix, prefix.len(), &Context::new(&history))
+                .unwrap();
+            assert!(
+                pairs.iter().any(|pair| pair.replacement == expected),
+                "typing {prefix:?} should offer {expected:?}"
+            );
+        }
+        for cmd in ["/discuss ", ":discuss ", "/task ", ":task "] {
+            let (_, pairs) = completer
+                .complete(cmd, cmd.len(), &Context::new(&history))
+                .unwrap();
+            assert!(
+                pairs.iter().any(|pair| pair.replacement == "status"),
+                "second token of {cmd:?} should offer `status`"
+            );
+        }
+        assert!(CommandCompleter::top_level_commands().contains(&"/discuss"));
+        assert!(CommandCompleter::top_level_commands().contains(&"/task"));
     }
 
     #[test]

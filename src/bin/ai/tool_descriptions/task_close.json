@@ -1,0 +1,25 @@
+{
+  "name": "task_close",
+  "description": "Close a task room with an acceptance summary. Records the summary in the room transcript and returns the transcript path. Auto-created worker sessions are retained for inspection.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "room": {
+        "type": "string",
+        "description": "Room name from task_start."
+      },
+      "summary": {
+        "type": "string",
+        "description": "Acceptance conclusion (what passed, what was left open)."
+      }
+    },
+    "required": [
+      "room",
+      "summary"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "session"
+  ]
+}

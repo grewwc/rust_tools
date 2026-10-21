@@ -55,6 +55,14 @@ fn print_commands_help() {
     println!(
         "    /goal [target]            enter goal mode: agent persists until the goal is done"
     );
+    println!(
+        "    /discuss [N] <topic>      host a multi-session debate (N members, default 3)"
+    );
+    println!("    /discuss status [room]    show discussion progress (read-only)");
+    println!(
+        "    /task [N] <goal>          split a goal across worker sessions (N workers, default 3)"
+    );
+    println!("    /task status [room]       show task progress (read-only)");
     println!();
     println!("  Persona management:");
     println!("    /personas                 list personas");

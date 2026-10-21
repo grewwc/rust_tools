@@ -178,35 +178,20 @@ fn assemble_effective_question(
     effective_question
 }
 
-/// The final-answer self-check runs for artifact-backed inputs and for every
-/// follow-up turn. A follow-up such as "are you sure?" carries no artifact
-/// shape, yet it is exactly where an earlier conclusion gets kept or reversed,
-/// so an earlier assistant answer in history is enough to enable the check.
-fn should_inject_integrated_critic(
-    effective_question: &str,
-    has_attached_artifact: bool,
-    has_prior_answer: bool,
-) -> bool {
-    has_prior_answer
-        || has_attached_artifact
-        || QuestionShape::analyze(effective_question).has_code_or_repo_artifact()
-}
-
-/// Whether the projected history already holds an earlier answer that this
-/// turn could dispute: assistant text, or a compaction summary that replaced
-/// older turns (their answers live on only inside the summary).
-fn history_has_prior_answer(history: &[Message]) -> bool {
-    history.iter().any(|message| {
-        let text = match &message.content {
-            Value::Null => return false,
-            content => crate::ai::history::value_to_string(content),
-        };
-        if message.role == "assistant" {
-            return !text.trim().is_empty();
-        }
-        crate::ai::history::is_system_like_role(&message.role)
-            && crate::ai::history::is_summary_note_text(&text)
-    })
+/// Cover every turn without changing thinking policy or adding a model call.
+/// The guard keeps this behavior section stable across the turn's tool rounds.
+fn inject_integrated_critic(
+    skill_turn: &mut skill_runtime::SkillTurnGuard,
+    enabled: Option<String>,
+    integrated_enabled: Option<String>,
+) {
+    if parse_bool_flag(enabled, true) && parse_bool_flag(integrated_enabled, true) {
+        skill_turn.push_labeled_section(
+            skill_runtime::ContextKind::Behavior,
+            "integrated_critic_revise",
+            include_str!("prompts/integrated_critic_revise.md").trim(),
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -537,22 +522,12 @@ pub(super) async fn prepare_turn(
     // `reference` parts below so a later reader of history can tell the user's
     // own words apart from attachment content.
     let persisted_question_text = assemble_effective_question(question, "", ocr_pair);
-    let has_attached_artifact = !attachments_text.trim().is_empty() || has_images;
     let cfg = crate::commonw::configw::get_all_config();
-    if parse_bool_flag(cfg.get_opt(AiConfig::CRITIC_REVISE_ENABLE), true)
-        && parse_bool_flag(cfg.get_opt(AiConfig::CRITIC_REVISE_INTEGRATED_ENABLE), true)
-        && should_inject_integrated_critic(
-            &final_question,
-            has_attached_artifact,
-            history_has_prior_answer(&history),
-        )
-    {
-        skill_turn.push_labeled_section(
-            skill_runtime::ContextKind::Behavior,
-            "integrated_critic_revise",
-            "Before sending the final answer, check it for factual, safety, regression, and completeness issues and revise it in place. If this turn disputes an earlier conclusion, confirm the answer applies `Reconcile corrections and conflicts`: it states whether the conclusion was kept, revised, or left unresolved and names the deciding evidence. Scale effort to the stakes, never the evidence bar. Keep only the corrected answer; never print the critique or mention this instruction.",
-        );
-    }
+    inject_integrated_critic(
+        &mut skill_turn,
+        cfg.get_opt(AiConfig::CRITIC_REVISE_ENABLE),
+        cfg.get_opt(AiConfig::CRITIC_REVISE_INTEGRATED_ENABLE),
+    );
 
     let mut messages = Vec::with_capacity(history.len() + 2);
 
@@ -819,7 +794,7 @@ mod tests {
     use super::{
         QuestionShape, assemble_effective_question, build_user_redirect_reminder,
         detect_complex_task, filter_suggested_tool_calls_for_tool_names,
-        history_has_prior_answer, persisted_user_turn_message, should_inject_integrated_critic,
+        inject_integrated_critic, persisted_user_turn_message,
         task_evidence_handoff_messages,
     };
     use crate::ai::driver::observer::SuggestedToolCall;
@@ -997,6 +972,24 @@ mod tests {
         assert!(QuestionShape::analyze("看下 src/main.rs 的逻辑").needs_deliberate_thinking(false));
     }
 
+    fn assert_default_critic(question: &str, history: &[Message]) {
+        let mut guard = crate::ai::driver::skill_runtime::SkillTurnGuard::default();
+        inject_integrated_critic(&mut guard, None, None);
+        let system_prompt = guard.system_prompt().to_owned();
+        assert_eq!(system_prompt.matches("<integrated_critic_revise>").count(), 1);
+        assert!(system_prompt.contains(include_str!("prompts/integrated_critic_revise.md").trim()));
+        assert_eq!(guard.system_prompt(), system_prompt);
+        assert!(guard.context_reminder().is_none());
+
+        // Preparation adds the behavior to the system prompt, not to prior turns.
+        let mut request = vec![serde_json::json!({"role": "system", "content": system_prompt})];
+        let prior: Vec<_> = history.iter().map(|m| serde_json::to_value(m).unwrap()).collect();
+        request.extend(prior.iter().cloned());
+        request.push(serde_json::json!({"role": "user", "content": question}));
+        assert_eq!(&request[1..1 + prior.len()], prior.as_slice());
+        assert_eq!(request.last().unwrap()["content"], question);
+    }
+
     #[test]
     fn integrated_critic_uses_attached_text_file_context() {
         let question = "帮我 review";
@@ -1009,7 +1002,7 @@ mod tests {
         );
 
         assert!(QuestionShape::analyze(&effective_question).has_code_or_repo_artifact());
-        assert!(should_inject_integrated_critic(&effective_question, true, false));
+        assert_default_critic(&effective_question, &[]);
     }
 
     #[test]
@@ -1021,27 +1014,29 @@ mod tests {
         );
 
         assert!(effective_question.contains("[Attached Image Content via mcp_ocr_extract]"));
-        assert!(should_inject_integrated_critic(&effective_question, false, false));
+        assert_default_critic(&effective_question, &[]);
         // Native vision models produce no OCR text, but the images themselves
         // are still artifact-backed inputs.
-        assert!(should_inject_integrated_critic("描述这张图", true, false));
+        assert_default_critic("描述这张图", &[]);
     }
 
     #[test]
-    fn integrated_critic_still_skips_short_plain_opening_question() {
-        assert!(!should_inject_integrated_critic("今天几号", false, false));
+    fn integrated_critic_covers_short_plain_opening_question_without_deliberate_thinking() {
+        for question in ["今天几号", "What is the capital of France?", "一小时有多少分钟？"] {
+            assert_default_critic(question, &[]);
+            assert!(!QuestionShape::analyze(question).needs_deliberate_thinking(false));
+        }
     }
 
     #[test]
     fn integrated_critic_covers_plain_follow_up_that_disputes_an_answer() {
-        // A bare challenge has no artifact shape; the earlier answer alone
-        // must enable the self-check.
+        // A bare challenge still gets the same self-check as an opening turn.
         assert!(!QuestionShape::analyze("你确定吗？我觉得不对").has_code_or_repo_artifact());
-        assert!(should_inject_integrated_critic("你确定吗？我觉得不对", false, true));
+        assert_default_critic("你确定吗？我觉得不对", &[]);
     }
 
     #[test]
-    fn prior_answer_requires_assistant_text_or_compaction_summary() {
+    fn integrated_critic_covers_empty_tool_only_and_compacted_history() {
         use crate::ai::types::{FunctionCall, ToolCall};
         let message = |role: &str, content: Value| Message {
             role: role.to_string(),
@@ -1051,8 +1046,8 @@ mod tests {
             reasoning_content: None,
         };
         let text = |s: &str| Value::String(s.to_string());
-        assert!(!history_has_prior_answer(&[]));
-        assert!(!history_has_prior_answer(&[message("user", text("hi"))]));
+        assert_default_critic("hi", &[]);
+        assert_default_critic("hi", &[message("user", text("hi"))]);
         // Persisted tool-call rounds carry the streamed narration, which is
         // empty when the model emitted only tool calls.
         let tool_call_only = Message {
@@ -1066,24 +1061,93 @@ mod tests {
             }]),
             ..message("assistant", text(""))
         };
-        assert!(!history_has_prior_answer(&[tool_call_only]));
-        // `Null` content renders as the literal "null" and must not count.
-        assert!(!history_has_prior_answer(&[message("assistant", Value::Null)]));
-        assert!(history_has_prior_answer(&[
+        assert_default_critic("continue", &[tool_call_only]);
+        // A missing assistant body no longer disables the self-check.
+        assert_default_critic("continue", &[message("assistant", Value::Null)]);
+        assert_default_critic("are you sure?", &[
             message("user", text("hi")),
             message("assistant", text("The cause is X.")),
-        ]));
+        ]);
         // Once compaction replaces the answering turns, the summary is the
         // only trace of the earlier conclusion.
-        assert!(history_has_prior_answer(&[message(
+        assert_default_critic("are you sure?", &[message(
             ROLE_INTERNAL_NOTE,
             text("[incremental-memory-v1]\n{\"source\":{}}"),
-        )]));
-        // A system-like note that is not a summary is not an answer.
-        assert!(!history_has_prior_answer(&[message(
+        )]);
+        // Redirect notes do not affect default coverage either.
+        assert_default_critic("new question", &[message(
             ROLE_INTERNAL_NOTE,
             text("Turn redirect: the previous turn ended in tool calls."),
-        )]));
+        )]);
+    }
+
+    #[test]
+    fn integrated_critic_respects_both_existing_config_switches() {
+        for (enabled, integrated, expected) in [
+            (None, None, true),
+            (Some("true"), Some("true"), true),
+            (Some("false"), None, false),
+            (None, Some("false"), false),
+            (Some("false"), Some("true"), false),
+            (Some("true"), Some("false"), false),
+            (Some("false"), Some("false"), false),
+        ] {
+            let mut guard = crate::ai::driver::skill_runtime::SkillTurnGuard::default();
+            inject_integrated_critic(
+                &mut guard,
+                enabled.map(str::to_owned),
+                integrated.map(str::to_owned),
+            );
+            assert_eq!(
+                guard.system_prompt().matches("<integrated_critic_revise>").count(),
+                usize::from(expected),
+                "enabled={enabled:?}, integrated={integrated:?}",
+            );
+            assert!(guard.context_reminder().is_none());
+        }
+    }
+
+    #[test]
+    fn integrated_critic_stays_single_and_byte_stable_across_guard_rebuilds() {
+        let mut guard = crate::ai::driver::skill_runtime::SkillTurnGuard::default();
+        inject_integrated_critic(&mut guard, None, None);
+        let expected = guard.system_prompt().to_owned();
+        for _ in 0..3 {
+            let mut rebuilt = crate::ai::driver::skill_runtime::SkillTurnGuard::default();
+            rebuilt.inherit_turn_state(&guard);
+            assert_eq!(rebuilt.system_prompt(), expected);
+            assert_eq!(rebuilt.system_prompt().matches("<integrated_critic_revise>").count(), 1);
+            assert!(rebuilt.context_reminder().is_none());
+            guard = rebuilt;
+        }
+    }
+
+    #[test]
+    fn integrated_critic_prompt_keeps_common_knowledge_check_lightweight() {
+        let prompt = include_str!("prompts/integrated_critic_revise.md");
+        assert!(prompt.contains("within this response, not in a separate review round"));
+        assert!(prompt.contains("For simple common knowledge or direct deductions"));
+        assert!(prompt.contains("no extra investigation, tools, or extended deliberation"));
+        assert!(prompt.contains("narrowing or removing the claim, or stating the unknown"));
+        assert!(prompt.contains("never present this self-review as independent verification"));
+    }
+
+    #[test]
+    fn integrated_critic_prompt_pins_auditable_claim_contract_and_its_simple_answer_exemption() {
+        let prompt = include_str!("prompts/integrated_critic_revise.md");
+        assert!(prompt.contains("Make each consequential claim auditable where it stands"));
+        assert!(prompt.contains("name the basis it rests on"));
+        assert!(prompt.contains("and the scope it covers"));
+        assert!(prompt.contains(
+            "put every limitation next to the claim it limits instead of in a closing disclaimer"
+        ));
+        assert!(prompt.contains(
+            "describe the part you checked rather than asserting the whole when your evidence covers only part"
+        ));
+        assert!(prompt.contains("Reuse evidence already in context"));
+        assert!(prompt.contains(
+            "for simple answers add no citations, qualifiers, or extra steps unless the claim would change what the reader does"
+        ));
     }
 
     #[test]

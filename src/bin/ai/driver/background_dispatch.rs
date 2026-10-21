@@ -202,19 +202,32 @@ impl SubagentStatusLine {
             self.last_serve_line = Some(status_line.clone());
         }
 
-        // The side-note composer owns the footer row while open: skip the in-place
-        // redraw so its bare `\r\x1b[2K` cannot displace the output cursor or erase
-        // the DECSTBM-reserved composer. Serve frames above still publish, and the
-        // pending line is intentionally not recorded, so `finish` has nothing stale
-        // to finalize and the next refresh after the composer closes redraws it.
-        if crate::ai::stream::side_note_input::side_note_composer_active() {
-            return;
-        }
-        let line = crate::ai::stream::clamp_line_to_terminal_row_with_reserve(&status_line, 0);
-        if self.last_line.as_deref() == Some(line.as_str()) {
-            return;
-        }
-        if !self.is_tty {
+        // The side-note composer (Ctrl+G) owns the footer row / DECSTBM scroll
+        // region while open: the in-place redraw is deferred (see
+        // `redraw_status_line`) so its bare `\r\x1b[2K` cannot displace the
+        // output cursor or erase the composer draft. Serve frames above still
+        // publish. This deferral applies to every scheduler-tick refresh in the
+        // run loop — both the task_wait PARKED wait window and the
+        // background-subagent wait window.
+        self.redraw_status_line(
+            &status_line,
+            crate::ai::stream::side_note_input::side_note_composer_active(),
+        );
+    }
+
+    /// In-place TTY redraw of the status line, gated on the side-note composer.
+    /// While `composer_active` the composer owns the footer row / DECSTBM scroll
+    /// region, so the write is deferred (see `status_line_redraw_deferred`):
+    /// its bare `\r\x1b[2K` would displace the output cursor and erase the
+    /// composer draft, and the deferred line is not recorded.
+    fn redraw_status_line(&mut self, status_line: &str, composer_active: bool) {
+        let line = crate::ai::stream::clamp_line_to_terminal_row_with_reserve(status_line, 0);
+        if status_line_redraw_deferred(
+            composer_active,
+            self.last_line.as_deref(),
+            &line,
+            self.is_tty,
+        ) {
             return;
         }
         print!("\r\x1b[2K{line}");
@@ -226,12 +239,17 @@ impl SubagentStatusLine {
     /// and end the dynamic line so it no longer occupies a cursor row.
     pub(super) fn finish(&mut self) {
         self.last_serve_line = None;
-        // Same ownership rule as `refresh`: never finalize a dynamic line into the
-        // transcript while the composer owns the footer row. The status itself is
-        // not lost (serve frames and tool results carry it); only the transient
-        // TTY redraw is deferred. Keep `last_line` so a later refresh/finish after
-        // the composer closes still sees and finalizes it.
-        if crate::ai::stream::side_note_input::side_note_composer_active() {
+        self.finish_status_line(crate::ai::stream::side_note_input::side_note_composer_active());
+    }
+
+    /// Finalize the dynamic status line, deferred while the side-note composer
+    /// owns the footer row / DECSTBM scroll region: never finalize a dynamic
+    /// line into the transcript while the composer is open. The status itself
+    /// is not lost (serve frames and tool results carry it); only the transient
+    /// TTY redraw is deferred. Keep `last_line` so a later refresh/finish after
+    /// the composer closes still sees and finalizes it.
+    fn finish_status_line(&mut self, composer_active: bool) {
+        if composer_active {
             return;
         }
         let Some(line) = self.last_line.take() else {
@@ -292,6 +310,24 @@ fn is_terminal_subagent_state(state: &str) -> bool {
     )
 }
 
+/// Coexistence rule with the side-note composer (Ctrl+G): while the composer
+/// owns the footer row / DECSTBM scroll region, the in-place status-line
+/// redraw must be deferred — its bare `\r\x1b[2K` would displace the output
+/// cursor and erase the composer draft. The deferred line is also not
+/// recorded, so a later `finish` has nothing stale to finalize; the next
+/// refresh after the composer closes redraws it. Unchanged lines and non-TTY
+/// streams defer for the same reason (nothing new to draw). This applies to
+/// every scheduler-tick refresh in the run loop, i.e. both the task_wait
+/// PARKED wait window and the background-subagent wait window.
+fn status_line_redraw_deferred(
+    composer_active: bool,
+    last_line: Option<&str>,
+    line: &str,
+    is_tty: bool,
+) -> bool {
+    composer_active || last_line == Some(line) || !is_tty
+}
+
 fn format_subagent_elapsed(elapsed_secs: u64) -> String {
     if elapsed_secs < 60 {
         return format!("{elapsed_secs}s");
@@ -314,8 +350,8 @@ impl Drop for SubagentStatusLine {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackgroundSubagentHistoryGuard, format_subagent_elapsed, render_subagent_status_line,
-        sanitize_status_field,
+        BackgroundSubagentHistoryGuard, SubagentStatusLine, format_subagent_elapsed,
+        render_subagent_status_line, sanitize_status_field, status_line_redraw_deferred,
     };
     use crate::ai::tools::task_tools::SubagentTerminalStatus;
 
@@ -366,6 +402,49 @@ mod tests {
         );
         assert_eq!(format_subagent_elapsed(59), "59s");
         assert_eq!(format_subagent_elapsed(60), "1m0s");
+    }
+
+    #[test]
+    fn status_line_redraw_defers_while_side_note_composer_is_open() {
+        // The coexistence rule: an OPEN Ctrl+G side-note composer owns the
+        // footer row / DECSTBM scroll region, so the in-place redraw must be
+        // deferred (and the line not recorded) on every scheduler tick — both
+        // in the task_wait PARKED wait window and during a turn.
+        assert!(status_line_redraw_deferred(true, None, "subagents · 1 active", true));
+        assert!(status_line_redraw_deferred(
+            true,
+            Some("subagents · 1 active"),
+            "subagents · 1 active",
+            true
+        ));
+        // Same-line dedup and non-TTY streams also defer the redraw.
+        assert!(status_line_redraw_deferred(false, Some("line"), "line", true));
+        assert!(status_line_redraw_deferred(false, None, "line", false));
+        // Live path: a new line on a TTY with no composer open is drawn.
+        assert!(!status_line_redraw_deferred(false, None, "subagents · 1 active", true));
+    }
+
+    #[test]
+    fn status_line_redraw_and_finish_skip_writes_while_composer_is_open() {
+        let mut line = SubagentStatusLine::new();
+        line.is_tty = true; // Simulate a live TTY; cargo test captures stdout.
+
+        // Refresh ticks while the composer is open: no record, no write.
+        line.redraw_status_line("subagents · 1 active", true);
+        assert_eq!(line.last_line, None);
+        line.redraw_status_line("subagents · 2 active", true);
+        assert_eq!(line.last_line, None);
+
+        // A normal tick records the drawn line.
+        line.redraw_status_line("subagents · 1 active", false);
+        assert_eq!(line.last_line.as_deref(), Some("subagents · 1 active"));
+
+        // finish while the composer is open defers finalizing the line...
+        line.finish_status_line(true);
+        assert_eq!(line.last_line.as_deref(), Some("subagents · 1 active"));
+        // ...and finalizes it once the composer closes.
+        line.finish_status_line(false);
+        assert_eq!(line.last_line, None);
     }
 
     #[test]

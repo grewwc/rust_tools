@@ -1,0 +1,29 @@
+{
+  "name": "talk_send",
+  "description": "Send a message to another session's talk inbox. The message is stored in the peer's inbox file (never rewrites the peer's database) and appears in the recipient's next turn; inactive sessions see it on resume. Optional room tags the message for a multi-session discussion and records it in the sender-side room log.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "to_session": {
+        "type": "string",
+        "description": "Target session id (letters/digits/'-'/'_', from session_list)."
+      },
+      "message": {
+        "type": "string",
+        "description": "Message body (max 8000 chars). Quoted as peer content on delivery, not a user instruction."
+      },
+      "room": {
+        "type": "string",
+        "description": "Optional discussion room name (max 64 chars); also recorded in the sender-side room log."
+      }
+    },
+    "required": [
+      "to_session",
+      "message"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "session"
+  ]
+}

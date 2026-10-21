@@ -285,8 +285,10 @@ fn should_dedup_learning_entry(entry: &AgentMemoryEntry) -> bool {
     )
 }
 
+/// Structured notes must fit this byte limit to survive storage unchanged.
+pub(crate) const MAX_NOTE_BYTES: usize = 4_096;
+
 fn cap_memory_entry(entry: &AgentMemoryEntry) -> AgentMemoryEntry {
-    const MAX_NOTE_BYTES: usize = 4_096;
     if entry.note.len() <= MAX_NOTE_BYTES {
         return entry.clone();
     }

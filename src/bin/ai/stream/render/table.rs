@@ -711,6 +711,11 @@ fn raw_cols() -> usize {
     // a non-tty fallback. After a resident process is narrowed inside a panel, COLUMNS is a stale
     // snapshot; computing table width from it overflows the real panel, gets hard-wrapped by the
     // terminal, and misaligns the │ borders.
+    // The explicit override comes first: a serve turn child renders tables for
+    // the client that displays them, and its own stdout is a pipe.
+    if let Some(cols) = super::term_cols_override() {
+        return cols;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;

@@ -378,6 +378,14 @@ pub(crate) const SERVE_LIVE_FIFO_ENV: &str = "A_SERVE_LIVE_FIFO";
 /// released. Never set by users; only by `serve`.
 pub(crate) const SERVE_CHILD_ENV: &str = "A_SERVE_CHILD";
 
+/// Display width (in columns) of the client that renders a serve turn's
+/// output. The daemon passes the width the client reported with its turn
+/// request: a turn child's own stdout is a pipe, so no local probe can
+/// report the width of the terminal the user actually sees, and the child
+/// would lay its rows out for a much narrower screen. Never set by users;
+/// only by `serve`.
+pub(crate) const SERVE_TERM_COLS_ENV: &str = "A_SERVE_TERM_COLS";
+
 /// PID of the serve-spawned turn process. Unlike [`SERVE_CHILD_ENV`], this is
 /// intentionally inherited by tool subprocesses so a serve management command
 /// can defer a daemon restart until the turn that requested it has exited.

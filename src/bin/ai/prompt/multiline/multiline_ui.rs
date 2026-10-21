@@ -1957,6 +1957,20 @@ impl PromptEditor {
                     // render.rs), so it cannot jump mid-draw. The hardware
                     // cursor is hidden while ratatui applies the frame diff and
                     // then parked at the box bottom by `park_reflow_anchor`.
+                    // Room badge suffix for the title row. The badge was
+                    // computed once when the input box opened, so combining
+                    // here costs one short format per frame and survives
+                    // background title updates that replace the topic
+                    // mid-typing.
+                    let topic_with_badge: Option<String> = match (
+                        self.session_topic.as_deref(),
+                        self.room_badge.as_deref(),
+                    ) {
+                        (Some(topic), Some(badge)) => Some(format!("{topic} {badge}")),
+                        (Some(topic), None) => Some(topic.to_owned()),
+                        (None, Some(badge)) => Some(badge.to_owned()),
+                        (None, None) => None,
+                    };
                     terminal.hide_cursor()?;
                     terminal
                         .draw(|f| {
@@ -1972,7 +1986,7 @@ impl PromptEditor {
                                 &self.current_model_label,
                                 self.model_remote,
                                 &self.current_reasoning_effort_label,
-                                self.session_topic.as_deref(),
+                                topic_with_badge.as_deref(),
                                 checkpoint_label.as_deref(),
                                 live_paint_width,
                             );
@@ -2279,6 +2293,7 @@ mod tests {
             current_agent_label: "fixture-agent".to_string(),
             current_reasoning_effort_label: "high".to_string(),
             session_topic: Some("fixture-topic".to_string()),
+            room_badge: None,
             remote_checkpoint_status_label: None,
             session_title_update_subscription: subscription,
             session_title_updates: std::sync::Mutex::new(updates),

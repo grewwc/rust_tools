@@ -45,11 +45,14 @@ use crate::ai::{
 };
 use crate::commonw::configw;
 
+mod auto_talk;
 mod agent_routing;
 mod background_dispatch;
 mod distilled_recall;
 pub mod commands;
 pub mod decision_log;
+pub(crate) mod discuss;
+pub(crate) mod task;
 pub mod hook_registry;
 pub mod hooks;
 pub mod input;
@@ -66,6 +69,7 @@ mod scheduler;
 mod session;
 pub mod session_pid;
 pub mod side_note;
+pub mod talk;
 pub mod signal;
 pub mod skill_runtime;
 mod skill_watcher;
@@ -867,6 +871,51 @@ async fn run_foreground_resume(
     }
 }
 
+/// Spawn the same-terminal side-note listener (Ctrl+G) for the `run_loop` wait
+/// windows. The turn-scoped listener in `run_turn` (orchestrator.rs) only lives
+/// while a turn runs, so during the two scheduler wait windows — the foreground
+/// parked after `task_wait` PARKED while a subagent still runs, and the
+/// background-subagents-in-flight window before the interactive input box — no
+/// listener would exist and Ctrl+G would be dead. The caller must hold the
+/// returned guard for the WHOLE window: `scheduler_clock.wait` returns on every
+/// wakeup (completion, deadlines, display-only progress events), so a
+/// branch-scoped guard would respawn one listener per wakeup. `run_loop` keeps
+/// the guard in the hoisted `wait_window_side_note_input` slot and drops it
+/// before every turn-starting path (`run_foreground_resume`) and before the
+/// input box opens, keeping at most one `SideNoteInputGuard` / stdin lease
+/// alive at any time: only this guard during a wait window, only the run_turn
+/// guard during a turn, and none while the input box is open. Same enabling
+/// rules as run_turn's listener (foreground main agent, tty stdin, terminal
+/// output, no live background).
+fn spawn_wait_window_side_note_input(
+    app: &App,
+) -> Option<crate::ai::stream::side_note_input::SideNoteInputGuard> {
+    if crate::ai::stream::side_note_input::side_note_input_enabled() {
+        Some(crate::ai::stream::side_note_input::SideNoteInputGuard::spawn(
+            app.session_history_file.clone(),
+            app.session_id.clone(),
+            app.active_persona.id.clone(),
+            app.current_model.clone(),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Whether the `run_loop` wait window needs the Ctrl+G side-note listener alive:
+/// a foreground process is parked waiting for subagent output (e.g. after
+/// `task_wait` PARKED), or background subagents are still in flight and the
+/// interactive input box must stay closed. one-shot mode has no interactive
+/// input box, so its background wait never needs the listener (the
+/// parked-foreground half still applies in one-shot mode).
+fn wait_window_needs_side_note_listener(
+    has_pending_foreground: bool,
+    one_shot_mode: bool,
+    bg_subagents_in_flight: bool,
+) -> bool {
+    has_pending_foreground || (!one_shot_mode && bg_subagents_in_flight)
+}
+
 /// Main event loop for AIOS.
 /// Coordinates execution of both foreground and background processes.
 ///
@@ -894,7 +943,9 @@ async fn run_loop(
     agent_manifests: &mut Arc<Vec<AgentManifest>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let one_shot_mode = one_shot_cli_mode(&app.cli);
-    let mut should_quit = one_shot_mode;
+    // `--auto-talk` keeps looping after every turn (poll/idle/max-turns decide
+    // the exit); one-shot auto-quit would kill the bot after its first reply.
+    let mut should_quit = one_shot_mode && !app.cli.auto_talk;
     // The auto-created one-shot session is a throwaway: on exit, delete exactly
     // this session. Local session commands (`/ss fork`, `/sessions use`, ...)
     // switch `app.session_id` to another session, and cleanup must never delete
@@ -902,6 +953,50 @@ async fn run_loop(
     // "Forked ... switched to new branch" and then immediately deletes Y.
     let one_shot_auto_session = (one_shot_mode && app.cli.session.is_none())
         .then(|| app.session_id.clone());
+    // ── --auto-talk startup ──
+    // Headless bot loop over the talk inbox. Requires a named `--session` (a
+    // throwaway one-shot session would be deleted on exit) and refuses to
+    // start when another live process already owns the session, since two
+    // writers would interleave history rows in the same sqlite file.
+    let auto_talk = app.cli.auto_talk;
+    let auto_talk_limits = crate::ai::driver::auto_talk::resolve_limits(
+        app.cli.talk_poll_secs,
+        app.cli.talk_max_turns,
+        app.cli.talk_idle_secs,
+    );
+    if auto_talk {
+        if app.cli.session.is_none() {
+            eprintln!(
+                "[talk] --auto-talk requires --session <id> so the conversation persists; refusing a throwaway session."
+            );
+            return Ok(());
+        }
+        match app.session_history_file.parent() {
+            Some(sessions_root) => {
+                if let Err(msg) = crate::ai::driver::auto_talk::check_auto_talk_startup(
+                    sessions_root,
+                    &app.session_id,
+                    std::process::id() as i32,
+                ) {
+                    eprintln!("{msg}");
+                    return Ok(());
+                }
+            }
+            None => {
+                eprintln!("[talk] --auto-talk: cannot locate sessions directory; aborting.");
+                return Ok(());
+            }
+        }
+        println!(
+            "[talk] auto-talk on session '{}': poll every {}s, max {} turns, idle exit after {}s. Ctrl+C to stop.",
+            app.session_id,
+            auto_talk_limits.poll_secs,
+            auto_talk_limits.max_turns,
+            auto_talk_limits.idle_secs
+        );
+    }
+    let mut auto_turns: u32 = 0;
+    let mut auto_last_mail = tokio::time::Instant::now();
     let mut mcp_initialized = false;
     let mut manifests_loaded = false;
     let mut skill_watcher = None;
@@ -960,6 +1055,15 @@ async fn run_loop(
     };
 
     let mut scheduler_clock = SchedulerClock::default();
+    // Wait-window side-note listener (Ctrl+G) for the two scheduler wait windows
+    // below. `scheduler_clock.wait` returns on EVERY wakeup (completion,
+    // task_wait deadlines, display-only progress events), so a branch-scoped
+    // guard would be spawned and dropped once per wakeup; this hoisted slot
+    // keeps exactly ONE listener thread alive for the whole multi-second window.
+    // It is created lazily when a wait window starts and dropped explicitly
+    // before every path that starts a turn or opens the input box (the `fg_proc`
+    // pop below and the fall-through drop after the wait branch).
+    let mut wait_window_side_note_input: Option<crate::ai::stream::side_note_input::SideNoteInputGuard> = None;
     loop {
         let epoch = next_scheduler_epoch();
 
@@ -1025,28 +1129,71 @@ async fn run_loop(
             os.pop_foreground_ready()
         };
         if let Some(proc) = fg_proc {
+            // A turn is about to start: release the wait-window listener (if any)
+            // before `run_foreground_resume` takes foreground stdin. Drop point 1.
+            drop(wait_window_side_note_input.take());
             subagent_status_line.finish();
             run_foreground_resume(app, mcp_client, skill_manifests, agent_manifests, proc).await;
             continue;
         }
 
-        if has_pending_foreground_process(app) {
+        // Ctrl+G side-note window: no turn is running — either the foreground
+        // process is parked (e.g. after `task_wait` PARKED) waiting for subagent
+        // output, or background subagents are still in flight and the interactive
+        // input box must stay closed (it enters raw mode, so subagent streamed
+        // `\n` output lacks `\r` and shifts right line by line; one-shot mode has
+        // no input box, so its background wait needs no listener). The turn-scoped
+        // listener is gone, so keep the wait-window listener alive: create it ONCE
+        // when the window starts, keep it across every `scheduler_clock.wait`
+        // wakeup, and let the two explicit drops (the `fg_proc` pop above and the
+        // fall-through below) release it before a turn or the input box.
+        if wait_window_needs_side_note_listener(
+            has_pending_foreground_process(app),
+            one_shot_mode,
+            bg_subagents_inflight(),
+        ) {
+            if wait_window_side_note_input.is_none() {
+                wait_window_side_note_input = spawn_wait_window_side_note_input(app);
+            }
             scheduler_clock.wait(app).await;
             continue;
         }
 
-        // While background subagents are still in flight, do not open the interactive
-        // input box (it enters raw mode, so subagent streamed `\n` output lacks `\r` and
-        // shifts right line by line). Wait for the background status notification; only
-        // accept new input once subagents have finished writing in cooked mode and the
-        // count is back to zero. one-shot mode has no interactive input box, so it is
-        // unaffected.
-        if !one_shot_mode && bg_subagents_inflight() {
-            scheduler_clock.wait(app).await;
-            continue;
-        }
+        // Wait window over without a turn starting: release the listener before
+        // any turn/input path below (pending side-note flush, auto-talk poll, the
+        // interactive input box). Drop point 2.
+        drop(wait_window_side_note_input.take());
 
         subagent_status_line.finish();
+
+        // ── --auto-talk idle poll ──
+        // Headless bot loop: with no CLI prompt pending and an empty talk
+        // inbox, sleep instead of blocking on terminal input. Mail present
+        // falls through to the pending-talk branch below, which drains it
+        // into the next turn exactly as in interactive mode.
+        if auto_talk && app.cli.args.is_empty() {
+            if !crate::ai::driver::talk::has_pending_talk(&app.session_history_file) {
+                let chunk = std::time::Duration::from_millis(200);
+                let deadline = tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(auto_talk_limits.poll_secs);
+                while tokio::time::Instant::now() < deadline {
+                    if app.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    tokio::time::sleep(chunk).await;
+                }
+                if auto_last_mail.elapsed().as_secs() >= auto_talk_limits.idle_secs {
+                    println!(
+                        "[talk] auto-talk idle for {}s with no new mail; exiting session '{}'.",
+                        auto_talk_limits.idle_secs, app.session_id
+                    );
+                    cleanup_one_shot(app);
+                    return Ok(());
+                }
+                continue;
+            }
+            auto_last_mail = tokio::time::Instant::now();
+        }
 
         {
             // ── Pending side-note → next user input ──
@@ -1075,6 +1222,39 @@ async fn run_loop(
                 .filter(|content| !content.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n\n");
+
+            // ── Pending talk mail → next user input ──
+            // Same delivery guarantee as side-notes, but only when no side-note
+            // took the turn: the side-note branch wins and talk stays queued for
+            // the following iteration-top drain. Draining here is lazy so mail is
+            // never consumed without being delivered.
+            let pending_talk_input = if pending_side_note_input.is_empty() {
+                let pending = crate::ai::driver::talk::drain_talk(&app.session_history_file);
+                if pending.is_empty() {
+                    String::new()
+                } else {
+                    let count = pending.len();
+                    // Single canonical framing shared with headless
+                    // `--auto-talk`: bot and human operator see byte-identical
+                    // peer mail. `format_talk_messages` is unit-tested; the
+                    // two lines below are the only call-site additions.
+                    let mut text = crate::ai::driver::talk::format_talk_messages(&pending);
+                    text.push_str(&format!("\n\n({count} peer message(s) delivered.)"));
+                    if auto_talk {
+                        text.push_str("\n\n");
+                        text.push_str(crate::ai::driver::auto_talk::AUTO_TALK_DIRECTIVE);
+                    }
+                    crate::ai::driver::print::print_tool_note_line(
+                        "talk",
+                        &format!(
+                            "model output ended before delivery; sending {count} pending talk message(s) as the next user input"
+                        ),
+                    );
+                    text
+                }
+            } else {
+                String::new()
+            };
 
             // ── Goal mode auto-continuation ──
             // When a goal is set and the last turn called tools, skip user input and
@@ -1113,6 +1293,18 @@ async fn run_loop(
                     let _ = notifier.send(());
                 }
                 question = pending_side_note_input;
+                attachments_text = String::new();
+                history_count = 0;
+            } else if !pending_talk_input.is_empty() {
+                // Matches the side-note branch above: release the preload waiter
+                // the same way since this path also skips the input box.
+                if let Some(notifier) = initial_skill_manifests
+                    .as_mut()
+                    .and_then(|loader| loader.take_prompt_ready_notifier())
+                {
+                    let _ = notifier.send(());
+                }
+                question = pending_talk_input;
                 attachments_text = String::new();
                 history_count = 0;
             } else if let Some(cont) = goal_continuation {
@@ -1481,17 +1673,19 @@ async fn run_loop(
         let parked_awaiting_subagents =
             matches!(turn_outcome, Ok(turn_runtime::TurnOutcome::Continue))
                 && has_pending_foreground_process(app);
-        let serve_side_note_follow_up = one_shot_mode
+        // A serve child stays alive for another model iteration when either the
+        // side-note queue or the talk inbox still holds foreground mail.
+        let serve_follow_up_for_pending_queues = one_shot_mode
             && can_flush_foreground_side_notes(
                 one_shot_mode,
                 crate::ai::background::is_serve_child(),
                 crate::ai::driver::side_note::current_target_id().is_some(),
             )
-            && crate::ai::driver::side_note::has_pending_side_notes(
+            && (crate::ai::driver::side_note::has_pending_side_notes(
                 &app.session_history_file,
                 None,
-            );
-        if serve_side_note_follow_up && !parked_awaiting_subagents {
+            ) || crate::ai::driver::talk::has_pending_talk(&app.session_history_file));
+        if serve_follow_up_for_pending_queues && !parked_awaiting_subagents {
             continue;
         }
         if (matches!(turn_outcome, Ok(turn_runtime::TurnOutcome::Quit)) || should_quit)
@@ -1520,6 +1714,42 @@ async fn run_loop(
             cleanup_one_shot(app);
             return Ok(());
         }
+        // ── --auto-talk cost cap ──
+        // Every completed turn counts; the loop exits here instead of
+        // returning to a (nonexistent) input box. An explicit model Quit
+        // still exits via the check above.
+        if auto_talk {
+            auto_turns += 1;
+            if auto_turns >= auto_talk_limits.max_turns {
+                println!(
+                    "[talk] auto-talk reached {} turns; exiting session '{}'.",
+                    auto_talk_limits.max_turns, app.session_id
+                );
+                cleanup_one_shot(app);
+                return Ok(());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod wait_window_tests {
+    use super::wait_window_needs_side_note_listener;
+
+    /// The wait-window listener decision truth table: a parked foreground
+    /// process needs the listener in any mode; background subagents in flight
+    /// need it only in interactive mode (one-shot has no input box to protect).
+    #[test]
+    fn wait_window_listener_decision_truth_table() {
+        // Parked foreground (e.g. after `task_wait` PARKED): listener on, any mode.
+        assert!(wait_window_needs_side_note_listener(true, false, false));
+        assert!(wait_window_needs_side_note_listener(true, true, false));
+        // Background subagents in flight, interactive mode: listener on.
+        assert!(wait_window_needs_side_note_listener(false, false, true));
+        // Background subagents in flight, one-shot mode: no input box, so off.
+        assert!(!wait_window_needs_side_note_listener(false, true, true));
+        // Nothing pending: off.
+        assert!(!wait_window_needs_side_note_listener(false, false, false));
     }
 }
 

@@ -546,15 +546,15 @@ pub(super) fn append_cached_tool_results_note(
     let cache_note = Message {
         role: ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(format!(
-            "Context note: reused cached tool results from the current session for identical calls within the recent TTL. Treat these results as already verified context unless the user asks to refresh. Tools: {cached_names}"
+            include_str!("prompts/cached_tool_results.md"),
+            cached_names = cached_names,
         )),
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
     };
-    // 过程性提示：仅在本 turn 内下发给 LLM，不写入 turn_messages 持久化轨道。
-    // 缓存命中是"仅当前回合有效"的上下文，若持久化会在后续每个 turn 反复重放，
-    // 且没有跨 turn 去重，属于单调膨胀的历史污染。
+    // Cache reuse is turn-local context, not canonical history. Persisting this
+    // note would replay an outdated cache claim and accumulate duplicate notes.
     messages.push(cache_note);
 }
 
@@ -1586,6 +1586,30 @@ mod tests {
                 .collect(),
             had_error: false,
         }
+    }
+
+    #[test]
+    fn cached_tool_note_is_transient_and_does_not_claim_verification() {
+        let calls = vec![
+            tool_call("cached", "read_file", serde_json::json!({})),
+            tool_call("fresh", "tree", serde_json::json!({})),
+        ];
+        let mut result = exec_result_from_calls_and_contents(&calls, &["a".into(), "b".into()]);
+        let mut messages = Vec::new();
+        let mut canonical = Vec::new();
+        super::append_cached_tool_results_note(&result, &mut messages, &mut canonical);
+        assert!(messages.is_empty());
+        result.cached_hits[0] = true;
+        super::append_cached_tool_results_note(&result, &mut messages, &mut canonical);
+        assert_eq!(messages.len(), 1);
+        assert!(canonical.is_empty());
+        assert_eq!(messages[0].role, super::ROLE_INTERNAL_NOTE);
+        let note = messages[0].content.as_str().unwrap();
+        assert!(note.contains("does not independently verify"));
+        assert!(note.contains("original result's scope and limitations"));
+        assert!(note.contains("Tools: read_file"));
+        assert!(!note.contains("tree"));
+        assert!(!note.contains("already verified"));
     }
 
     fn checkpoint_path_from_marker(marker: &str) -> PathBuf {

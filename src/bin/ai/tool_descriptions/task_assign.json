@@ -1,0 +1,36 @@
+{
+  "name": "task_assign",
+  "description": "Assign (or rework) one worker's slice of the goal: sets its file boundary and acceptance bar and delivers the task card. The first dispatch keeps the round; every re-dispatch is rework and bumps the round, refused past max_rounds.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "room": {
+        "type": "string",
+        "description": "Room name from task_start."
+      },
+      "worker": {
+        "type": "string",
+        "description": "Worker session id to assign (one id from task_start)."
+      },
+      "scope_files": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "File boundary: the only files this worker may touch (at least one)."
+      },
+      "acceptance": {
+        "type": "string",
+        "description": "Acceptance bar the worker's report must clear (e.g. 'login test passes')."
+      }
+    },
+    "required": [
+      "room",
+      "worker",
+      "scope_files",
+      "acceptance"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "session"
+  ]
+}

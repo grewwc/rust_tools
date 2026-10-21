@@ -96,17 +96,33 @@ const APP_ENTRY_PATHS: [&str; 3] = ["/", "/app", "/app/"];
 /// up the SSE frame budget.
 const MAX_SSE_LINE_CHARS: usize = 8192;
 
+/// Point the turn child at the width its client draws at. The variable is
+/// cleared first: a turn that reported no width must not inherit a stale one
+/// from the daemon's environment, which would lay the child's rows out for a
+/// screen nobody is looking at.
+#[cfg(feature = "serve")]
+fn apply_term_cols_env(cmd: &mut std::process::Command, term_cols: Option<u16>) {
+    cmd.env_remove(background::SERVE_TERM_COLS_ENV);
+    if let Some(cols) = term_cols {
+        cmd.env(background::SERVE_TERM_COLS_ENV, cols.to_string());
+    }
+}
+
 #[cfg(feature = "serve")]
 fn run_one_shot_turn(
     session_id: &str,
     prompt: &str,
     overrides: &TurnOverrides,
     cwd: &std::path::Path,
+    term_cols: Option<u16>,
 ) -> std::io::Result<String> {
     let exe = runtime_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--session").arg(session_id).arg(prompt);
     push_turn_override_args(&mut cmd, overrides);
+    // The child renders the rows this client displays; its own stdout is a
+    // pipe, so the client's width travels through the environment.
+    apply_term_cols_env(&mut cmd, term_cols);
     let out = cmd
         // The turn runs in the session's virtual cwd, so relative paths in
         // every tool resolve per session rather than against the daemon's.
@@ -156,6 +172,9 @@ async fn post_turn(
         Ok(overrides) => overrides,
         Err(err) => return bad_request(err).into_response(),
     };
+    // Display width the client reports for this turn: the child lays its rows
+    // out for the screen the client draws on, not for its own piped stdout.
+    let term_cols = turn_term_cols(&req);
     // A per-turn override wins; absent fields fall back to the session's
     // persisted serve config (then to the server default), so a turn spawned
     // without client flags still runs with the session's picks.
@@ -180,7 +199,7 @@ async fn post_turn(
     let session_id = id.clone();
     let session_cwd = session_cwd(&state, &id);
     let output = tokio::task::spawn_blocking(move || {
-        run_one_shot_turn(&session_id, &prompt, &overrides, &session_cwd)
+        run_one_shot_turn(&session_id, &prompt, &overrides, &session_cwd, term_cols)
     })
     .await
     .map_err(|err| {
@@ -299,6 +318,9 @@ async fn post_turn_sse(
         Ok(overrides) => overrides,
         Err(err) => return bad_request(err).into_response(),
     };
+    // Display width the client reports for this turn: the child lays its rows
+    // out for the screen the client draws on, not for its own piped stdout.
+    let term_cols = turn_term_cols(&req);
     // A per-turn override wins; absent fields fall back to the session's
     // persisted serve config (then to the server default).
     let store = SessionStore::new(state.history_file.as_path());
@@ -378,6 +400,7 @@ async fn post_turn_sse(
                 confirm_enabled,
                 native_client,
                 session_cwd,
+                term_cols,
             )
         })
         .await;
@@ -414,6 +437,7 @@ fn stream_child_turn(
     confirm_enabled: bool,
     native_client: bool,
     session_cwd: std::path::PathBuf,
+    term_cols: Option<u16>,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -467,6 +491,9 @@ fn stream_child_turn(
     if let Some(fifo) = live_fifo.as_ref() {
         cmd.env(background::SERVE_LIVE_FIFO_ENV, &fifo.path);
     }
+    // The child renders the rows this client displays; its own stdout is a
+    // pipe, so the client's width travels through the environment.
+    apply_term_cols_env(&mut cmd, term_cols);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {

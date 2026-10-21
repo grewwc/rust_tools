@@ -6,7 +6,7 @@ use super::*;
 use super::pump_live_fifo;
 use super::{MAX_TURN_IMAGES, clean_sse_line, stage_turn_images};
 use super::{ServeFrameDecoder, ServeImageUpload, ServeLiveEvent, setup_live_fifo};
-use super::{TurnReq, turn_overrides};
+use super::{TurnReq, turn_overrides, turn_term_cols};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
@@ -1915,6 +1915,7 @@ fn turn_req(model: Option<&str>, agent: Option<&str>, reasoning_effort: Option<&
         images: Vec::new(),
         confirm: None,
         skills: Vec::new(),
+        cols: None,
     }
 }
 
@@ -1943,6 +1944,71 @@ fn turn_overrides_normalize_and_reject() {
     assert!(turn_overrides(&turn_req(None, None, Some("ultra"))).is_err());
     let long = "m".repeat(super::MAX_TURN_OVERRIDE_CHARS + 1);
     assert!(turn_overrides(&turn_req(Some(&long), None, None)).is_err());
+}
+
+#[test]
+fn turn_term_cols_keeps_only_usable_widths() {
+    // A client that reports no width keeps the server-side default.
+    assert_eq!(turn_term_cols(&turn_req(None, None, None)), None);
+
+    let mut req = turn_req(None, None, None);
+    req.cols = Some(120);
+    assert_eq!(turn_term_cols(&req), Some(120));
+
+    // Widths that cannot hold a readable row are ignored instead of
+    // collapsing the child's rows.
+    for unusable in [0, 1, 19] {
+        req.cols = Some(unusable);
+        assert_eq!(turn_term_cols(&req), None, "width {unusable}");
+    }
+
+    // A width above the sanity bound is clamped, so an ultra-wide terminal
+    // still gets a wide layout instead of the narrow default.
+    req.cols = Some(5000);
+    assert_eq!(turn_term_cols(&req), Some(super::MAX_TURN_TERM_COLS));
+}
+
+#[test]
+fn turn_child_env_carries_only_the_reported_width() {
+    // A turn that reported no width must not inherit a stale one from the
+    // daemon's environment: the child would lay its rows out for a screen
+    // nobody is looking at.
+    let mut cmd = std::process::Command::new("true");
+    super::apply_term_cols_env(&mut cmd, None);
+    let cleared = cmd.get_envs().any(|(key, value)| {
+        value.is_none() && key == crate::ai::background::SERVE_TERM_COLS_ENV
+    });
+    assert!(
+        cleared,
+        "the width variable must be cleared for a turn that reported none"
+    );
+
+    let mut cmd = std::process::Command::new("true");
+    super::apply_term_cols_env(&mut cmd, Some(120));
+    let reported = cmd.get_envs().any(|(key, value)| {
+        key == crate::ai::background::SERVE_TERM_COLS_ENV
+            && value.is_some_and(|value| value == "120")
+    });
+    assert!(reported, "the reported width must reach the child");
+}
+
+#[test]
+fn turn_req_ignores_a_malformed_width() {
+    // A cosmetic hint must never reject a turn: a width the request cannot
+    // carry is read as "not reported".
+    let req: TurnReq = serde_json::from_str(r#"{"prompt":"hi","cols":120}"#).expect("parse");
+    assert_eq!(req.cols, Some(120));
+    for body in [
+        r#"{"prompt":"hi"}"#,
+        r#"{"prompt":"hi","cols":null}"#,
+        r#"{"prompt":"hi","cols":"wide"}"#,
+        r#"{"prompt":"hi","cols":70000}"#,
+        r#"{"prompt":"hi","cols":-5}"#,
+        r#"{"prompt":"hi","cols":1.5}"#,
+    ] {
+        let req: TurnReq = serde_json::from_str(body).expect("parse");
+        assert_eq!(req.cols, None, "{body}");
+    }
 }
 
 #[test]

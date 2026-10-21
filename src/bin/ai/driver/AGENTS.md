@@ -25,7 +25,11 @@ These are driver-only additions to `src/bin/ai/AGENTS.md` invariant 2.
     structural outstanding-work/`complete` gate has an independent reopen and
     binds only a plan written this turn (or resume/goal-mode turns); older plans
     project as non-binding carried context. Final wording never controls gate
-    decisions.
+    decisions. The per-turn self-check also carries the auditable-answer
+    contract: consequential claims state their basis and scope where they
+    stand, limitations sit next to the claim they limit, and a claim backed by
+    only part of a set describes that part. Simple common-knowledge answers
+    stay plain, with no added citations, qualifiers, or steps.
     - **Completion.** After a provable `apply_patch`/`write_file` mutation, tool
       records alone decide: command intent and temp-only effects do not count; any
       successful post-mutation activity allows, while provable zero activity
@@ -38,3 +42,4 @@ These are driver-only additions to `src/bin/ai/AGENTS.md` invariant 2.
       final receives an unverified-citation warning.
 13. **Scheduler is event-driven.** Foreground wakes via scheduler notifier (completion, shutdown, deadlines, `task_wait` budget) — no polling sleeps. Progress events are display-only (`notify_scheduler` for status line, never `wake_process`).
 14. **Terminal & offloading.** Withhold `Completed` bodies until final gates accept; previews are display-only. Before requests, reclaim eligible old tool evidence only from transient context within bounded limits, preserving recent/protected and task-integration evidence; archive before stubbing and never mutate canonical turns. Runtime evidence, not model claims, controls limits. `request_user_input` metadata is the sole ask protocol.
+15. **Side-note listener lifetime.** The Ctrl+G side-note listener stays alive whenever the driver is not reading stdin: the whole turn AND the subagent wait window (foreground parked after `task_wait` PARKED, or background subagents still in flight). Exactly one listener / one stdin lease exists at a time: run_turn's turn-scoped guard during a turn, run_loop's wait-window guard (`spawn_wait_window_side_note_input`) during a wait, none while the input box is open. The wait-window guard is created once per wait window and kept alive across the whole scheduler wait — scheduler ticks elapse while it lives; it is dropped before the next iteration can start a turn or open the input box, restoring termios. Each spawn binds the current session's history file, so respawn with fresh values after session switches.

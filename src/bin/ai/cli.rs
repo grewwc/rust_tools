@@ -14,6 +14,10 @@ pub(super) struct ParsedCli {
     pub(super) new_session: bool,
     pub(super) resume: bool,
     pub(super) session: Option<String>,
+    pub(super) auto_talk: bool,
+    pub(super) talk_poll_secs: u64,
+    pub(super) talk_max_turns: u32,
+    pub(super) talk_idle_secs: u64,
     pub(super) files: String,
     pub(super) args: Vec<String>,
     pub(super) list_tools: bool,
@@ -317,6 +321,26 @@ fn register_cli_flags(parser: &mut TermParser) {
     parser.alias("s", "sharp");
     parser.add_string("session", "", "session id");
     parser.alias("ss", "session");
+    parser.add_bool(
+        "auto-talk",
+        false,
+        "headless bot loop: poll the talk inbox and auto-reply (requires --session)",
+    );
+    parser.add_string(
+        "talk-poll",
+        "",
+        "with --auto-talk: inbox poll interval in seconds (default: 5)",
+    );
+    parser.add_string(
+        "talk-max-turns",
+        "",
+        "with --auto-talk: max model turns before exiting (default: 30)",
+    );
+    parser.add_string(
+        "talk-idle",
+        "",
+        "with --auto-talk: exit after this many seconds without new mail (default: 180)",
+    );
     parser.add_string("files", "", FILES_USAGE);
     parser.alias("f", "files");
     parser.add_string("mcp-config", "", "mcp config json path override");
@@ -612,6 +636,10 @@ impl Default for ParsedCli {
             new_session: false,
             resume: false,
             session: None,
+            auto_talk: false,
+            talk_poll_secs: 5,
+            talk_max_turns: 30,
+            talk_idle_secs: 180,
             files: String::new(),
             args: Vec::new(),
             list_tools: false,
@@ -705,6 +733,26 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     if parser.contains_flag_strict("session") {
         let val = parser.flag_value_or_default("session");
         cli.session = Some(val);
+    }
+    cli.auto_talk = parser.contains_flag_strict("auto-talk");
+    if parser.contains_flag_strict("talk-poll") {
+        if let Ok(n) = parser.flag_value_or_default("talk-poll").trim().parse::<u64>() {
+            cli.talk_poll_secs = n;
+        }
+    }
+    if parser.contains_flag_strict("talk-max-turns") {
+        if let Ok(n) = parser
+            .flag_value_or_default("talk-max-turns")
+            .trim()
+            .parse::<u32>()
+        {
+            cli.talk_max_turns = n;
+        }
+    }
+    if parser.contains_flag_strict("talk-idle") {
+        if let Ok(n) = parser.flag_value_or_default("talk-idle").trim().parse::<u64>() {
+            cli.talk_idle_secs = n;
+        }
     }
 
     // Handle files.

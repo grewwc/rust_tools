@@ -3348,6 +3348,10 @@ fn post_turn_stream(
         },
         "skills": selection.skills.clone(),
         "confirm": confirm_channel.is_some(),
+        // The width this terminal draws at. The turn child renders the rows
+        // the client displays, but its own stdout is a pipe and cannot know
+        // that width, so it is reported here.
+        "cols": u16::try_from(crate::ai::stream::raw_terminal_cols()).unwrap_or(u16::MAX),
     }))
     .send()?;
     let status = resp.status();

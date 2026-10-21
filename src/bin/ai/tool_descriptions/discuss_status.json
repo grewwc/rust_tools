@@ -1,0 +1,20 @@
+{
+  "name": "discuss_status",
+  "description": "Show a read-only progress snapshot of a discuss room: round, per-member reply/wake/liveness flags, uncollected inbox mail, and recent transcript activity. Never wakes members or consumes mail; safe to call any time, e.g. right after resuming the host session.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "room": {
+        "type": "string",
+        "description": "Room name from discuss_start."
+      }
+    },
+    "required": [
+      "room"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "session"
+  ]
+}

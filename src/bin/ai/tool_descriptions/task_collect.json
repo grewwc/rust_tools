@@ -1,0 +1,28 @@
+{
+  "name": "task_collect",
+  "description": "Gather the current round's worker reports from the host inbox (waits up to timeout_secs for all workers, returns early when everyone reported). Inactive workers are woken headlessly by default. Each report's STATUS line is folded into its assignment; reports are recorded in the room transcript.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "room": {
+        "type": "string",
+        "description": "Room name from task_start."
+      },
+      "timeout_secs": {
+        "type": "number",
+        "description": "How long to wait for reports (default 60, clamped 5-600). Blocks this long only when workers are slow."
+      },
+      "wake": {
+        "type": "boolean",
+        "description": "Wake inactive workers headlessly before waiting (default true)."
+      }
+    },
+    "required": [
+      "room"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "session"
+  ]
+}

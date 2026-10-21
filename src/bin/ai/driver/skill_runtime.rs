@@ -1703,7 +1703,7 @@ fn build_skill_turn_guard(
         ]));
     }
     // Deterministic session-tool routing: a user message referencing a concrete
-    // session id (UUID-shaped) auto-loads the read-only `session` group into the
+    // session id (UUID-shaped) auto-loads the `session` group (inspection plus talk mailbox) into the
     // resident tool set for top-level turns, so the model never has to remember
     // `enable_tools` before it can answer a session question (a real failure
     // mode: it probes the filesystem instead). Subagent and disabled-builtin
@@ -1720,7 +1720,7 @@ fn build_skill_turn_guard(
             .iter()
             .map(|tool| tool.function.name.clone())
             .collect();
-        let missing: Vec<String> = ["session_list", "session_read", "session_search"]
+        let missing: Vec<String> = ["session_list", "session_read", "session_search", "talk_send", "talk_read", "discuss_start", "discuss_collect", "discuss_broadcast", "discuss_end", "discuss_status", "task_start", "task_assign", "task_collect", "task_close", "task_room_status"]
             .iter()
             .filter(|name| !known.contains_str(*name))
             .map(|s| s.to_string())

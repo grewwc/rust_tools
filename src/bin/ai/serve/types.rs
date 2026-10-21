@@ -315,6 +315,13 @@ pub(crate) struct TurnReq {
     /// child consumes it.
     #[serde(default)]
     pub(crate) skills: Vec<String>,
+    /// Display width (in columns) of the client that renders this turn's
+    /// output. The turn child lays its rows out for a terminal it cannot
+    /// see — its own stdout is a pipe — so the client reports the width it
+    /// draws at and the daemon forwards it to the child. Absent (web and
+    /// mobile clients) keeps the server-side default.
+    #[serde(default, deserialize_with = "deserialize_term_cols")]
+    pub(crate) cols: Option<u16>,
 }
 
 /// Max length for one per-turn model/agent override: identifiers are short
@@ -467,6 +474,39 @@ pub(crate) fn turn_overrides(req: &TurnReq) -> Result<TurnOverrides, String> {
         reasoning_effort: sanitize_turn_effort_override(req.reasoning_effort.clone())?,
         skills: sanitize_turn_skills(req.skills.clone())?,
     })
+}
+
+/// Lower bound for a client-reported display width: a narrower row cannot
+/// hold a readable command, so such a value is ignored.
+pub(crate) const MIN_TURN_TERM_COLS: u16 = 20;
+/// Upper bound for a client-reported display width: keeps a bogus value from
+/// stretching the child's rows across an unbounded line. A client above it
+/// is clamped down rather than dropped, so an ultra-wide terminal still
+/// gets a wide layout.
+pub(crate) const MAX_TURN_TERM_COLS: u16 = 2000;
+
+/// Read a client-reported display width. A value that is not a number the
+/// request can carry is read as "not reported": a cosmetic hint must never
+/// reject a turn.
+fn deserialize_term_cols<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| {
+        value
+            .as_u64()
+            .and_then(|cols| u16::try_from(cols).ok())
+    }))
+}
+
+/// Display width a client reported for this turn, when the value is usable.
+/// A width too narrow to hold a readable row is ignored (`None` keeps the
+/// server-side default); a width above the sanity bound is clamped.
+pub(crate) fn turn_term_cols(req: &TurnReq) -> Option<u16> {
+    req.cols
+        .filter(|cols| *cols >= MIN_TURN_TERM_COLS)
+        .map(|cols| cols.min(MAX_TURN_TERM_COLS))
 }
 
 /// Append validated per-turn overrides as child CLI flags. Empty means

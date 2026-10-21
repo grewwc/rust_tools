@@ -1,0 +1,37 @@
+{
+  "name": "task_start",
+  "description": "Open a multi-worker task room as host: splits a goal across worker sessions, sends the round-1 task card to every worker's talk inbox and reports who is live vs inactive. Returns the room name for task_assign/collect/close. Pass either workers (existing sessions) or worker_count (auto-spawned sessions owned by this room), not both.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "goal": {
+        "type": "string",
+        "description": "The work to split across workers (e.g. 'fix login retry')."
+      },
+      "workers": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Worker session ids (1-8, from session_list; must exist, cannot include yourself). Either this or worker_count."
+      },
+      "worker_count": {
+        "type": "number",
+        "description": "Auto-spawn N worker sessions (1-8) owned by this room, e.g. 3. Fresh ids embed the room name; their databases are created by their own processes. Either this or workers."
+      },
+      "max_rounds": {
+        "type": "number",
+        "description": "Max rounds before forced close (default 5, clamped 1-10). Rework assignments consume rounds."
+      },
+      "room": {
+        "type": "string",
+        "description": "Optional room name (max 64 chars); auto-generated when omitted."
+      }
+    },
+    "required": [
+      "goal"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "session"
+  ]
+}

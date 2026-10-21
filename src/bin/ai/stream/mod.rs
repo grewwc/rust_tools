@@ -12,6 +12,11 @@ mod wire_log;
 
 pub(super) use render::markdown::MarkdownStreamRenderer;
 pub(in crate::ai) use render::markdown::clamp_line_to_terminal_row_with_reserve;
+// Only the serve client reports a display width, and it exists only in the
+// serve builds; without the gate this re-export is dead weight in a default
+// build and warns as an unused import.
+#[cfg(any(feature = "serve", feature = "serve-client"))]
+pub(in crate::ai) use render::markdown::raw_terminal_cols;
 
 pub(in crate::ai) const PROVIDER_CONTROL_LEAK_FINISH_REASON: &str = "provider_control_leak";
 

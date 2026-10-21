@@ -1,0 +1,28 @@
+{
+  "name": "discuss_collect",
+  "description": "Gather the current round's member replies from the host inbox (waits up to timeout_secs for all members, returns early when everyone replied). Inactive members are woken headlessly by default. Replies are recorded in the room transcript.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "room": {
+        "type": "string",
+        "description": "Room name from discuss_start."
+      },
+      "timeout_secs": {
+        "type": "number",
+        "description": "How long to wait for replies (default 60, clamped 5-600). Blocks this long only when members are slow."
+      },
+      "wake": {
+        "type": "boolean",
+        "description": "Wake inactive members headlessly before waiting (default true)."
+      }
+    },
+    "required": [
+      "room"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "session"
+  ]
+}

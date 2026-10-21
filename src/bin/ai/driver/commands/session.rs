@@ -428,6 +428,118 @@ pub(crate) fn select_sessions_with_prefix<'a>(
         .collect()
 }
 
+/// Classifies a discuss/task worker session spawned by a host
+/// (`dc-<room>-m<N>-<rand>`, `task-<room>-w<N>-<rand>`). Returns the origin
+/// label and the room part for `/ss workers` grouping; `None` for regular
+/// sessions. Prefix-only on purpose: `/ss` is a display filter, and `/ss all`
+/// still shows everything, so a hand-made id that happens to collide only
+/// hides one row in the default view.
+fn worker_session_room(id: &str) -> Option<(&'static str, String)> {
+    let (rest, marker, label) = if let Some(rest) = id.strip_prefix("dc-") {
+        (rest, "-m", "discuss")
+    } else if let Some(rest) = id.strip_prefix("task-") {
+        (rest, "-w", "task")
+    } else {
+        return None;
+    };
+    // Strip the trailing `-<rand>` (8 hex chars from the spawner), then the
+    // `-m<N>`/`-w<N>` member marker; what remains is the room part. The last
+    // marker match wins, so a room that itself contains `-m<N>` still parses.
+    let (head, rand) = rest.rsplit_once('-')?;
+    if rand.len() != 8 || !rand.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let marker_pos = head.rfind(marker)?;
+    let index = &head[marker_pos + marker.len()..];
+    if index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let room = &head[..marker_pos];
+    if room.is_empty() {
+        return None;
+    }
+    Some((label, room.to_string()))
+}
+
+/// One `/ss` row: mark, id, mtime, size, summary. Shared by the default, `all`
+/// and `workers` views so the three stay byte-aligned.
+fn print_session_row(
+    s: &SessionInfo,
+    current_session_id: &str,
+    max_id_len: usize,
+    verbose: bool,
+) {
+    let mark = if s.id == current_session_id {
+        "*"
+    } else {
+        " "
+    };
+    let time = s
+        .modified_local
+        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let summary = s
+        .summary
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .unwrap_or("-");
+    let size = if verbose {
+        format_size(s.size_bytes)
+    } else {
+        "-".to_string()
+    };
+    let (style_open, style_close) = if s.marked {
+        marked_session_style()
+    } else {
+        ("", "")
+    };
+    println!(
+        "{style_open}{} {:<width$}  {}  {:>8}  {}{style_close}",
+        mark, s.id, time, size, summary,
+        width = max_id_len
+    );
+}
+
+/// `/ss workers`: worker sessions grouped by origin room, rooms in first-seen
+/// order, store order kept inside each group.
+fn print_worker_sessions(sessions: &[SessionInfo], current_session_id: &str, verbose: bool) {
+    let workers: Vec<(&str, String, &SessionInfo)> = sessions
+        .iter()
+        .filter_map(|s| worker_session_room(&s.id).map(|(label, room)| (label, room, s)))
+        .collect();
+    if workers.is_empty() {
+        println!("No worker sessions.");
+        return;
+    }
+    println!("Worker sessions ({}):", workers.len());
+    let max_id_len = workers
+        .iter()
+        .map(|(_, _, s)| s.id.len())
+        .max()
+        .unwrap_or(36);
+    let mut seen: Vec<(&str, String)> = Vec::new();
+    for (label, room, _) in &workers {
+        if !seen.iter().any(|(l, r)| l == label && r == room) {
+            seen.push((label, room.clone()));
+        }
+    }
+    for (label, room) in &seen {
+        let group: Vec<&SessionInfo> = workers
+            .iter()
+            .filter(|(l, r, _)| l == label && r == room)
+            .map(|(_, _, s)| *s)
+            .collect();
+        println!("  [{label}:{room}] ({})", group.len());
+        for s in group {
+            print!("  ");
+            print_session_row(s, current_session_id, max_id_len, verbose);
+        }
+    }
+    if !verbose {
+        println!("(run `/ss workers verbose` to include per-session sizes)");
+    }
+}
+
 /// Whether a side-note submitted while a turn is running should be executed as a
 /// real-time session command instead of being injected into the LLM context.
 ///
@@ -541,8 +653,10 @@ pub fn try_handle_session_command(
         "help" | "h" => {
             println!("Session management commands:");
             println!();
-            println!("  /sessions [list]          list all sessions (default, no sizes)");
-            println!("  /sessions verbose         list all sessions with per-session sizes");
+            println!("  /sessions [list]          list sessions (default, no sizes; discuss/task workers hidden)");
+            println!("  /sessions workers         list discuss/task worker sessions grouped by room");
+            println!("  /sessions all             list all sessions including workers");
+            println!("  /sessions verbose         list sessions with per-session sizes (combines with workers/all)");
             println!("  /sessions current         show current session info");
             println!("  /session [id]             show current session id (bare /session too)");
             println!("  /sessions new             create and switch to new session");
@@ -601,56 +715,61 @@ pub fn try_handle_session_command(
             );
             println!();
         }
-        "list" | "ls" | "" | "verbose" => {
+        "list" | "ls" | "" | "verbose" | "workers" | "all" => {
             // By default do not recursively stat each session's size (the assets
             // recursion is the only heavy work of `/ss`); only explicit `verbose`
             // (`/ss verbose` or `/ss list verbose`) stats them in parallel.
-            let verbose =
-                action == "verbose" || parts.next().map(|t| t == "verbose").unwrap_or(false);
+            // Discuss/task worker sessions are hidden by default: `/ss workers`
+            // shows them grouped by room, `/ss all` shows everything. Tokens
+            // are order-free (`/ss verbose workers` works); `all` wins over
+            // `workers` when both are given.
+            let mut workers_only = action == "workers";
+            let mut show_all = action == "all";
+            let mut verbose = action == "verbose";
+            for token in parts.by_ref().take(2) {
+                match token {
+                    "workers" => workers_only = true,
+                    "all" => show_all = true,
+                    "verbose" => verbose = true,
+                    _ => {}
+                }
+            }
+            if show_all {
+                workers_only = false;
+            }
             let mut sessions = store.list_sessions()?;
             if verbose {
                 // Sizes are stat-ed in parallel on demand: list_sessions reads only
                 // metadata, and the recursive assets stat runs here across cores.
                 store.attach_session_sizes(&mut sessions)?;
             }
-            if sessions.is_empty() {
-                println!("No sessions.");
+            if workers_only {
+                print_worker_sessions(&sessions, &app.session_id, verbose);
             } else {
-                // Compute the max ID length for alignment
-                let max_id_len = sessions.iter().map(|s| s.id.len()).max().unwrap_or(36);
-                for s in &sessions {
-                    let mark = if s.id == app.session_id { "*" } else { " " };
-                    let time = s
-                        .modified_local
-                        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                        .unwrap_or_else(|| "-".to_string());
-                    let summary = s
-                        .summary
-                        .as_deref()
-                        .filter(|v| !v.is_empty())
-                        .unwrap_or("-");
-                    let size = if verbose {
-                        format_size(s.size_bytes)
-                    } else {
-                        "-".to_string()
-                    };
-                    let (style_open, style_close) = if s.marked {
-                        marked_session_style()
-                    } else {
-                        ("", "")
-                    };
-                    println!(
-                        "{style_open}{} {:<width$}  {}  {:>8}  {}{style_close}",
-                        mark,
-                        s.id,
-                        time,
-                        size,
-                        summary,
-                        width = max_id_len
-                    );
+                let hidden = if show_all {
+                    0
+                } else {
+                    let before = sessions.len();
+                    sessions.retain(|s| worker_session_room(&s.id).is_none());
+                    before - sessions.len()
+                };
+                if sessions.is_empty() {
+                    println!("No sessions.");
+                } else {
+                    // Compute the max ID length for alignment
+                    let max_id_len = sessions.iter().map(|s| s.id.len()).max().unwrap_or(36);
+                    for s in &sessions {
+                        print_session_row(s, &app.session_id, max_id_len, verbose);
+                    }
+                    if !verbose {
+                        println!("(run `/ss verbose` to include per-session sizes)");
+                    }
                 }
-                if !verbose {
-                    println!("(run `/ss verbose` to include per-session sizes)");
+                if hidden > 0 {
+                    println!(
+                        "({hidden} worker session{} hidden; `/ss workers` to view, `/ss all` for everything)",
+                        if hidden == 1 { "" } else { "s" }
+                    );
                 }
             }
         }
@@ -3082,6 +3201,37 @@ mod tests {
                 !is_real_time_background_command(cmd),
                 "{cmd:?} should NOT be recognized as a real-time background command"
             );
+        }
+    }
+
+    #[test]
+    fn worker_session_room_classifies_spawned_ids_only() {
+        let (label, room) = worker_session_room("dc-discuss-1792586970-m1-88cd1f72").unwrap();
+        assert_eq!(label, "discuss");
+        assert_eq!(room, "discuss-1792586970");
+        let (label, room) = worker_session_room("task-fix-login-w12-abcdef01").unwrap();
+        assert_eq!(label, "task");
+        assert_eq!(room, "fix-login");
+        // A room that itself contains the member marker still parses: the
+        // last `-m<N>` wins.
+        let (_, room) = worker_session_room("dc-a-m1-m2-12345678").unwrap();
+        assert_eq!(room, "a-m1");
+        // A minimal valid shape stays classified as a worker.
+        let (label, room) = worker_session_room("dc-room-m1-12345678").unwrap();
+        assert_eq!(label, "discuss");
+        assert_eq!(room, "room");
+        // Regular sessions and malformed worker shapes stay visible.
+        for id in [
+            "bd4ef529-1834-4687-bc8a-9345a30fabb1",
+            "my-notes",
+            "dc-notes",
+            "dc-room-m1-nothex!!",
+            "dc-room-m1-1234567",
+            "dc-room-x1-12345678",
+            "dc--m1-12345678",
+            "task-room-12345678",
+        ] {
+            assert!(worker_session_room(id).is_none(), "{id:?} is not a worker");
         }
     }
 }

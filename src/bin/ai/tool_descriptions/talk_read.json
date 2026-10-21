@@ -1,0 +1,12 @@
+{
+  "name": "talk_read",
+  "description": "Read and drain the current session's talk inbox (messages sent by other sessions via talk_send). Destructive: each message is returned once. The active turn also auto-injects pending talk at the next iteration, so an empty result after a fresh delivery usually means it was already injected.",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  },
+  "groups": [
+    "builtin",
+    "session"
+  ]
+}

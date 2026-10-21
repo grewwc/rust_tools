@@ -5,6 +5,7 @@ pub mod checkpoint;
 pub(crate) mod compact;
 pub(crate) mod distill_session;
 pub mod cwd;
+pub mod discuss;
 pub mod export;
 pub mod goal;
 pub mod help;
@@ -16,6 +17,7 @@ pub mod session;
 pub mod share;
 pub mod skills;
 pub mod status_line;
+pub mod task;
 pub mod theme;
 pub mod title;
 pub mod usage;
@@ -32,6 +34,7 @@ pub(crate) use checkpoint::{
     SERVE_CHECKPOINT_CONFIRM_PROBE, SERVE_CHECKPOINT_CONFIRM_YES,
 };
 pub use cwd::try_handle_cwd_command;
+pub use discuss::try_handle_discuss_command;
 pub use export::try_handle_export_command;
 pub use goal::try_handle_goal_command;
 pub use help::try_handle_help_command;
@@ -42,6 +45,7 @@ pub use session::try_handle_clear_command;
 pub use session::try_handle_session_command;
 pub use share::try_handle_share_command;
 pub use skills::try_handle_skills_command;
+pub use task::try_handle_task_command;
 pub use theme::try_handle_theme_command;
 pub use title::try_handle_title_command;
 pub use usage::try_handle_usage_command;
@@ -83,6 +87,7 @@ pub fn is_local_command_start(token: &str) -> bool {
             | "compact"
             | "distill-session"
             | "detach"
+            | "discuss"
             | "diff"
             | "effort"
             | "export"
@@ -109,6 +114,7 @@ pub fn is_local_command_start(token: &str) -> bool {
             | "ss"
             | "suspend"
             | "susp"
+            | "task"
             | "theme"
             | "title"
             | "token"
@@ -182,6 +188,12 @@ pub fn try_handle_local_command(
         return Ok(true);
     }
     if try_handle_goal_command(app, input)? {
+        return Ok(true);
+    }
+    if try_handle_discuss_command(app, input)? {
+        return Ok(true);
+    }
+    if try_handle_task_command(app, input)? {
         return Ok(true);
     }
     if try_handle_model_command(app, input)? {

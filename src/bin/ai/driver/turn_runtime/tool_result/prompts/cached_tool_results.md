@@ -1,0 +1,1 @@
+Context note: reused prior tool results from this session for identical calls within the cache TTL after file-fingerprint checks. Reuse preserves the original result's scope and limitations; it does not independently verify the content or conclusions drawn from it. Refresh when current evidence is needed, not merely because the result is cached. Tools: {cached_names}

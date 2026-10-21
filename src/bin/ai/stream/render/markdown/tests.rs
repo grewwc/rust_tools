@@ -1629,3 +1629,42 @@ make_llm_call_publisher | 一致 | 同一条 on_call complete callback
         assert!(visible.contains('╭'), "got: {visible}");
         assert!(visible.contains("rust"), "got: {visible}");
     }
+
+    #[test]
+    fn serve_term_cols_override_drives_row_width() {
+        // The reported width wins over every local probe: a serve turn child
+        // renders the rows its client displays, while the child's own stdout
+        // is a pipe and no local probe can see that terminal.
+        assert_eq!(
+            super::width::raw_terminal_cols_with(Some(12345)),
+            12345
+        );
+        assert_ne!(super::width::raw_terminal_cols_with(None), 12345);
+
+        let _guard = env_guard();
+        // A width no real terminal reports, so "the override was ignored" and
+        // "the local probe happened to match" cannot be confused.
+        unsafe { std::env::set_var("A_SERVE_TERM_COLS", "9999") };
+        // Only a serve turn child reads the variable: a process that merely
+        // inherited it keeps its own probe.
+        crate::ai::background::set_serve_child_for_test(false);
+        let inherited = super::width::raw_terminal_cols();
+        crate::ai::background::set_serve_child_for_test(true);
+        let long_command = format!("  │ $ {}", "ls -la /home/user/.sessions/".repeat(4));
+        let clamped = clamp_line_to_terminal_row_with_reserve(&long_command, 30);
+        let cols = super::width::raw_terminal_cols();
+        // Clean up before asserting: a failed assertion must not leave the
+        // override behind for the other tests in this binary.
+        unsafe { std::env::remove_var("A_SERVE_TERM_COLS") };
+        crate::ai::background::set_serve_child_for_test(false);
+
+        assert_ne!(
+            inherited, 9999,
+            "an inherited width must not bend a local layout"
+        );
+        assert_eq!(cols, 9999);
+        assert!(
+            !clamped.ends_with('…'),
+            "the reported width must keep the command readable: {clamped}"
+        );
+    }

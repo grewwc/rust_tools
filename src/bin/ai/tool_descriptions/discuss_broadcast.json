@@ -1,0 +1,25 @@
+{
+  "name": "discuss_broadcast",
+  "description": "Advance a discussion room to the next round: sends your round summary plus next prompt to all members. Refused past max_rounds (close with discuss_end instead).",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "room": {
+        "type": "string",
+        "description": "Room name from discuss_start."
+      },
+      "text": {
+        "type": "string",
+        "description": "Round summary plus the next round's prompt for members."
+      }
+    },
+    "required": [
+      "room",
+      "text"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "session"
+  ]
+}

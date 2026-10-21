@@ -1,0 +1,25 @@
+{
+  "name": "discuss_end",
+  "description": "Close a discussion room with a closing summary. The full transcript (all rounds plus summary) stays in the host-side room log; returns its path.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "room": {
+        "type": "string",
+        "description": "Room name from discuss_start."
+      },
+      "summary": {
+        "type": "string",
+        "description": "Meeting conclusion to record in the transcript."
+      }
+    },
+    "required": [
+      "room",
+      "summary"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "session"
+  ]
+}

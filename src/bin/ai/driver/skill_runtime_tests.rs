@@ -902,7 +902,23 @@ fn session_id_reference_makes_session_tools_resident_for_the_turn() {
         .iter()
         .map(|tool| tool.function.name.clone())
         .collect();
-    for session_tool in ["session_list", "session_read", "session_search"] {
+    for session_tool in [
+        "session_list",
+        "session_read",
+        "session_search",
+        "talk_send",
+        "talk_read",
+        "discuss_start",
+        "discuss_collect",
+        "discuss_broadcast",
+        "discuss_end",
+        "discuss_status",
+        "task_start",
+        "task_assign",
+        "task_collect",
+        "task_close",
+        "task_room_status",
+    ] {
         assert!(
             names.iter().any(|name| name == session_tool),
             "{session_tool} should be resident for a session-id turn, got {names:?}"
@@ -930,7 +946,23 @@ fn question_without_session_id_keeps_session_tools_lazy() {
         .iter()
         .map(|tool| tool.function.name.clone())
         .collect();
-    for session_tool in ["session_list", "session_read", "session_search"] {
+    for session_tool in [
+        "session_list",
+        "session_read",
+        "session_search",
+        "talk_send",
+        "talk_read",
+        "discuss_start",
+        "discuss_collect",
+        "discuss_broadcast",
+        "discuss_end",
+        "discuss_status",
+        "task_start",
+        "task_assign",
+        "task_collect",
+        "task_close",
+        "task_room_status",
+    ] {
         assert!(
             !names.iter().any(|name| name == session_tool),
             "{session_tool} must stay lazy without a session id, got {names:?}"
@@ -1920,7 +1952,17 @@ fn system_prompt_guides_optional_skill_discovery_when_available() {
         .join("\n");
     assert!(descriptions.contains("technical keywords"));
     assert!(descriptions.contains("routine source-code, repository, file, or terminal investigation"));
-    assert!(descriptions.contains("Unloads automatically"));
+    let activation_description = &list_skills
+        .iter()
+        .find(|tool| tool.function.name == "activate_skill")
+        .expect("activate_skill must have a registered tool definition")
+        .function
+        .description;
+    // Keep the advertised lifetime aligned with the one-shot continuation
+    // exercised by explicit_user_input_continuation_restores_only_the_next_turn.
+    assert!(activation_description.contains(
+        "It unloads after the turn, except that a turn ending in `request_user_input` restores it for the next user turn."
+    ));
 }
 
 #[test]

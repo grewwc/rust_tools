@@ -1207,6 +1207,31 @@ fn drain_side_notes_and_inject(
     }
 }
 
+/// Drain pending cross-session talk mail for this history file and inject it
+/// into the LLM context. Called next to `drain_side_notes_and_inject` at the
+/// top of every iteration. Subagent turns pass their own child history file,
+/// so foreground mail never leaks into a subagent context.
+fn drain_talk_and_inject(
+    history_file: &std::path::Path,
+    messages: &mut Vec<crate::ai::history::Message>,
+    turn_messages: &mut Vec<crate::ai::history::Message>,
+) {
+    let pending = crate::ai::driver::talk::drain_talk(history_file);
+    if pending.is_empty() {
+        return;
+    }
+    {
+        let injected = crate::ai::driver::talk::talk_to_messages(pending);
+        let n = injected.len();
+        messages.extend(injected.clone());
+        turn_messages.extend(injected);
+        crate::ai::driver::print::print_tool_note_line(
+            "talk",
+            &format!("injected {n} peer message(s)"),
+        );
+    }
+}
+
 /// Records the tools invoked by the current turn's last assistant message. `turn_messages`
 /// contains only the canonical messages for this turn; `messages` is the full context
 /// projection, so a failed first request must not inherit a previous turn's tool calls.
@@ -1468,6 +1493,7 @@ async fn run_turn_body(
         // A `/bg`-family draft never lands in the queue — the side-note listener handles it
         // directly — so every drained note is plain guidance.
         drain_side_notes_and_inject(&app.session_history_file, &mut messages, &mut turn_messages);
+        drain_talk_and_inject(&app.session_history_file, &mut messages, &mut turn_messages);
         let active_skill_name = skill_turn.primary_skill_name().map(str::to_string);
         let compression_report = CompressionReport::default();
         let mut response_model = None;

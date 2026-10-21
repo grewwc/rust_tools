@@ -1,0 +1,20 @@
+{
+  "name": "task_room_status",
+  "description": "Read-only progress view of a task room: round state, per-worker assignment/wake/liveness flags, uncollected mail, and the transcript tail. Never wakes workers or drains the inbox.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "room": {
+        "type": "string",
+        "description": "Room name from task_start."
+      }
+    },
+    "required": [
+      "room"
+    ]
+  },
+  "groups": [
+    "builtin",
+    "session"
+  ]
+}

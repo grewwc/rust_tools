@@ -1500,6 +1500,11 @@ pub(in crate::ai) use width::{
     clamp_line_to_terminal_row, clamp_line_to_terminal_row_with_reserve,
     live_preview_cursor_rows, raw_terminal_rows, wrap_line_to_terminal_rows_with_reserve,
 };
+// The serve client is the only caller that reports a display width, and it
+// exists only in the serve builds; without the gate this re-export is dead
+// weight in a default build and warns as an unused import.
+#[cfg(any(feature = "serve", feature = "serve-client"))]
+pub(in crate::ai) use width::raw_terminal_cols;
 // Impl-only helpers: imported privately for the methods above; not part of the
 // public `markdown` surface.
 use width::{

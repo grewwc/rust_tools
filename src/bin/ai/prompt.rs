@@ -86,6 +86,9 @@ pub(super) struct PromptEditor {
     current_reasoning_effort_label: String,
     /// Current session topic, shown on the same line as the model hint above the input box.
     session_topic: Option<String>,
+    /// Open task/discuss room badge, shown after the topic above the input
+    /// box. Computed once when the input box opens; `None` hides it.
+    room_badge: Option<String>,
     /// Server-authoritative checkpoint label for serve-chat. Local mode leaves
     /// this unset and derives the label from the session checkpoint store.
     remote_checkpoint_status_label: Option<String>,
@@ -167,6 +170,7 @@ impl PromptEditor {
             current_agent_label: String::new(),
             current_reasoning_effort_label: String::new(),
             session_topic: None,
+            room_badge: None,
             remote_checkpoint_status_label: None,
             session_title_update_subscription,
             session_title_updates: Mutex::new(session_title_updates),
@@ -237,6 +241,12 @@ impl PromptEditor {
     /// same line as the model hint.
     pub(super) fn set_session_topic(&mut self, topic: Option<String>) {
         self.session_topic = topic;
+    }
+
+    /// Set the open-room badge; the next `read_multi_line` shows it after the
+    /// session topic. `None` hides it.
+    pub(super) fn set_room_badge(&mut self, badge: Option<String>) {
+        self.room_badge = badge;
     }
 
     pub(super) fn set_remote_checkpoint_status_label(&mut self, label: Option<String>) {

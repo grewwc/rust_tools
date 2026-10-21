@@ -1,7 +1,10 @@
 mod command;
 pub(crate) mod common;
+mod discuss;
 mod file;
 mod side_note;
 mod speech;
+mod talk;
+mod task;
 pub(crate) mod tool_groups;
 pub(crate) mod tool_metadata;
