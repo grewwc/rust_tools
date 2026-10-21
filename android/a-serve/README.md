@@ -40,7 +40,7 @@ the same settings dialog.
 The activity uses `singleTask`, so tapping the launcher icon reuses the
 existing app window instead of creating another browser tab.
 
-## Chat-driven phone tools (1.8.0)
+## Chat-driven phone tools (1.10.0)
 
 Ask in the normal composer; no extra action buttons or skill selection are
 needed. Android-only `phone_action` supports timers, ISO-weekday repeating
@@ -66,12 +66,25 @@ Later changes can be made in Android's app location-permission settings.
 
 `screen_capture` starts a visible, revocable MediaProjection sharing session.
 Android consent is required once per live session, not once forever. After
-consent, a request is only armed: the notification asks you to switch to the
-target app and tap **立即截屏**, and the frame is taken about a second after
-that tap, so the moment is yours rather than the assistant's. An armed request
-expires after about two minutes without a tap, and the session stays alive for
-the next request. The notification then shows the delivered frame, so you can
-confirm which moment was sent. Idle frames are discarded, not uploaded. A
+consent, a request is only armed: a floating capture button appears on the
+phone screen, so you switch to the target app and tap the button, and the
+delivered frame is the screen exactly as it looked at that tap. The button
+floats above the content and is hidden while the frame is taken, so the
+picture is the page you were looking at rather than the one behind a
+notification shade. The button can be dragged; its position is remembered.
+
+Drawing it needs the "display over other apps" permission, which the user
+grants once in the system settings. The chat page has a **悬浮截屏球** entry
+in its connection panel that opens that page. Without the permission the
+notification action **立即截屏** stays the trigger: the shade covers the
+content, so the app keeps a short in-memory history of mirrored frames and
+delivers the one visible just before the tap, and falls back to taking the
+frame once the shade closed.
+
+An armed request expires after about two minutes without a tap, and the session
+stays alive for the next request. The notification then shows the delivered
+frame, and the conversation shows the same frame, so you can confirm which
+moment was sent. Idle frames are discarded, not uploaded. A
 foreground notification always offers **立即截屏** and **停止共享**. Use
 `screen_stop`, the notification, or Android's sharing control to revoke it.
 The session also ends on page replacement, app destruction, system revocation,

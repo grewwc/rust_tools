@@ -4,6 +4,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Special permission, granted once by the user in the system settings:
+         it lets the capture button float above other apps, so the delivered
+         frame is the content the user was looking at. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <!-- Requested together for a single foreground fix; approximate remains valid. -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
@@ -15,6 +19,9 @@
     <!-- Contact lookup only resolves a display name to a number; the message
          is composed by the user's messaging app, never sent from here. -->
     <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <!-- The camera preview stays in this app: the frame is handed to the
+         assistant in memory and never written to the gallery. -->
+    <uses-permission android:name="android.permission.CAMERA" />
 
     <application
         android:allowBackup="false"
@@ -30,9 +37,14 @@
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
         <activity
+            android:name=".CameraActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+        <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density|fontScale|locale|layoutDirection"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

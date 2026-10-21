@@ -45,7 +45,8 @@ final class NativeBridge {
 
     private static final String[] ACTIONS = {"now", "calendar_read", "calendar_add", "sms",
             "alarm", "timer", "note", "note_create", "note_list", "note_update",
-            "file_import", "file_read", "file_save", "location", "screen_capture", "screen_stop"};
+            "file_import", "file_read", "file_save", "location", "screen_capture", "screen_stop",
+            "screen_overlay_settings", "camera_capture", "camera_stop"};
     private static final int MAX_NOTE_CHARS = 3000;
     private static final int MAX_TITLE_CHARS = 200;
     private static final int MAX_PLACE_CHARS = 200;
@@ -86,7 +87,8 @@ final class NativeBridge {
         try {
             caps.put("version", BuildConfig.VERSION_NAME);
             caps.put("actions", new JSONArray(java.util.Arrays.asList(ACTIONS)));
-            caps.put("features", new JSONArray(java.util.Arrays.asList("alarm_weekdays", "precise_location", "screen_manual_trigger")));
+            caps.put("features", new JSONArray(java.util.Arrays.asList("alarm_weekdays", "precise_location",
+                    "screen_manual_trigger", "screen_bubble", "camera_preview")));
         } catch (JSONException ignored) {
             // Both keys are constants; serialization cannot fail here.
         }
@@ -199,6 +201,10 @@ final class NativeBridge {
             activity.performDocumentAction(requestId, action, payload);
         } else if ("screen_capture".equals(action) || "screen_stop".equals(action)) {
             activity.performScreen(requestId, "screen_stop".equals(action));
+        } else if ("camera_capture".equals(action) || "camera_stop".equals(action)) {
+            activity.performCamera(requestId, "camera_stop".equals(action));
+        } else if ("screen_overlay_settings".equals(action)) {
+            activity.openOverlaySettings(requestId);
         } else {
             activity.deliverNativeResult(requestId, false, "unknown action", null);
         }

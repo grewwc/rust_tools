@@ -24,7 +24,8 @@ const MAX_NUMBER_CHARS: usize = 40;
 const MAX_RESULT_BYTES: usize = 512 * 1024;
 const MAX_FILE_CHARS: i64 = 1_048_576;
 const PHONE_ACTIONS: &str = "now, calendar_read, calendar_add, sms, alarm, timer, note, \
-    location, note_create, note_list, note_update, file_import, file_read, file_save, screen_capture, screen_stop";
+    location, note_create, note_list, note_update, file_import, file_read, file_save, screen_capture, \
+    screen_stop, camera_capture, camera_stop";
 
 fn string_arg<'a>(args: &'a Value, key: &str, max: usize) -> Result<Option<&'a str>, String> {
     let Some(value) = args.get(key) else {
@@ -226,7 +227,7 @@ fn build_phone_spec(args: &Value) -> Result<Value, String> {
             Ok(spec)
         }
         "file_import" => Ok(json!({"action": "file_import"})),
-        "screen_capture" | "screen_stop" => Ok(json!({"action": action})),
+        "screen_capture" | "screen_stop" | "camera_capture" | "camera_stop" => Ok(json!({"action": action})),
         "file_read" => Ok(json!({
             "action": "file_read",
             "file_id": uuid_arg(args, "file_id")?,
@@ -413,10 +414,11 @@ fn format_phone_result(spec: &Value, answer: &str) -> Result<String, String> {
     }
     let data = result.get("data").unwrap_or(&Value::Null);
     let action = spec["action"].as_str().unwrap_or("");
-    if action == "screen_capture" {
+    if action == "screen_capture" || action == "camera_capture" {
         let bytes = decode_screen_image(data)?;
         let directory = crate::ai::driver::runtime_ctx::temp_dir().map_err(|e| format!("cannot prepare screenshot directory: {e}"))?;
-        let path = directory.join(format!("phone-screen-{}.jpg", uuid::Uuid::new_v4()));
+        let prefix = if action == "camera_capture" { "phone-camera" } else { "phone-screen" };
+        let path = directory.join(format!("{prefix}-{}.jpg", uuid::Uuid::new_v4()));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -427,13 +429,29 @@ fn format_phone_result(spec: &Value, answer: &str) -> Result<String, String> {
         use std::io::Write;
         let mut file = options.open(&path).map_err(|e| format!("cannot save phone screenshot: {e}"))?;
         file.write_all(&bytes).map_err(|e| format!("cannot save phone screenshot: {e}"))?;
-        return Ok(format!("Phone screenshot saved to {}. Use read_file on this path to inspect the image before answering. The user chose the capture moment from the a serve notification. This is a captured frame, not app history; secure windows may be blank. Sharing remains visible until stopped, and can be stopped with screen_stop.", path.display()));
+        let source = data.get("capture_source").and_then(Value::as_str).unwrap_or("");
+        let moment = if action == "camera_capture" {
+            "The picture was taken from the live camera preview the user framed in the a serve app."
+        } else {
+            match source {
+                "pre_tap" => "The frame is the screen content the user was looking at just before they tapped the capture action in the a serve notification, not the screen as it looked after the notification shade opened.",
+                "live" => "The frame is the screen content at the moment the user tapped the capture action in the a serve notification.",
+                _ => "The frame was captured from the a serve notification capture action.",
+            }
+        };
+        let closing = if action == "camera_capture" {
+            "Nothing was written to the phone gallery; the picture only exists in this session's temp directory."
+        } else {
+            "This is a captured frame, not app history; secure windows may be blank. Sharing remains visible until stopped, and can be stopped with screen_stop."
+        };
+        return Ok(format!("Phone image saved to {}. Use read_file on this path to inspect the image before answering. {moment} {closing}", path.display()));
     }
     if matches!(action, "note_create" | "note_list" | "note_update" | "file_import" | "file_read" | "file_save") && !data.is_object() {
         return Err("the phone returned no result data; the action outcome is unknown".to_string());
     }
     let summary: Result<String, String> = match action {
         "screen_stop" => Ok("Phone screen sharing stopped; another session requires system consent.".to_string()),
+        "camera_stop" => Ok("Phone camera preview closed.".to_string()),
         "alarm" => {
             let hour = spec["hour"].as_i64().unwrap_or(0);
             let minute = spec["minute"].as_i64().unwrap_or(0);
@@ -761,6 +779,8 @@ mod tests {
             json!({"action": "file_save", "filename": "a.txt", "text": "body"}),
             json!({"action": "screen_capture"}),
             json!({"action": "screen_stop"}),
+            json!({"action": "camera_capture"}),
+            json!({"action": "camera_stop"}),
         ];
         let mut implemented: Vec<&str> = fixtures.iter().map(|args| {
             build_phone_spec(args).expect("advertised action must parse");

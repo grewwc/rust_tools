@@ -60,6 +60,8 @@ public final class MainActivity extends Activity {
     private boolean connectionDialogVisible;
     private NativeBridge nativeBridge;
     private ScreenCapture screenCapture;
+    /** The native request waiting for a frame from the camera preview. */
+    private String pendingCameraRequest;
     private boolean nativeResumed;
     private Runnable grantedNativeAction;
     private String pendingPermissionOrigin;
@@ -234,6 +236,59 @@ public final class MainActivity extends Activity {
             screenCapture.close();
             deliverNativeResult(requestId, true, null, new JSONObject());
         } else screenCapture.capture(requestId);
+    }
+
+    /**
+     * Opens the live camera preview. The frame is read out of the preview and
+     * handed back in memory, so nothing is written to the gallery.
+     */
+    void performCamera(String requestId, boolean stop) {
+        if (stop) {
+            CameraActivity.closeRunning();
+            deliverNativeResult(requestId, true, null, new JSONObject());
+            return;
+        }
+        pendingCameraRequest = requestId;
+        try {
+            startActivityForResult(new Intent(this, CameraActivity.class), CameraActivity.REQUEST);
+        } catch (RuntimeException error) {
+            pendingCameraRequest = null;
+            deliverNativeResult(requestId, false, "camera preview unavailable", null);
+        }
+    }
+
+    private void deliverCameraResult(int resultCode, Intent data) {
+        String requestId = pendingCameraRequest;
+        pendingCameraRequest = null;
+        if (requestId == null) return;
+        if (resultCode == RESULT_OK && data != null) {
+            String frame = data.getStringExtra(CameraActivity.EXTRA_FRAME);
+            if (frame == null || frame.isEmpty()) {
+                deliverNativeResult(requestId, false, "camera frame missing", null);
+                return;
+            }
+            JSONObject payload = new JSONObject();
+            try {
+                payload.put("image_base64", frame);
+                payload.put("mime_type", "image/jpeg");
+                payload.put("capture_source", "camera");
+            } catch (JSONException ignored) {
+                // The keys are constants; serialization cannot fail here.
+            }
+            deliverNativeResult(requestId, true, null, payload);
+            return;
+        }
+        String error = data == null ? null : data.getStringExtra(CameraActivity.EXTRA_ERROR);
+        deliverNativeResult(requestId, false, error == null ? "camera cancelled" : error, null);
+    }
+
+    /**
+     * Opens the system page where the floating capture button is allowed.
+     * The grant is stored by the system, so the user only does this once.
+     */
+    void openOverlaySettings(String requestId) {
+        ScreenBubble.openSettings(this);
+        deliverNativeResult(requestId, true, null, new JSONObject());
     }
 
     void performDocumentAction(String requestId, String action, JSONObject payload) {
@@ -425,6 +480,10 @@ public final class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == ScreenCapture.REQUEST) {
             if (screenCapture != null) screenCapture.onResult(resultCode, data);
+            return;
+        }
+        if (requestCode == CameraActivity.REQUEST) {
+            deliverCameraResult(resultCode, data);
             return;
         }
         if (requestCode == PhoneDocuments.REQUEST) {

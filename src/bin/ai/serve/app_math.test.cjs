@@ -1010,7 +1010,7 @@ function previewHarness(paths, api) {
   const requested = [], revoked = [];
   let serial = 0;
   const context = vm.createContext({
-    sessionId: "s", previewUrls: new Map(), $: () => root,
+    sessionId: "s", previewUrls: new Map(), phoneFrameUrls: new Map(), $: () => root,
     api: async (url) => { requested.push(url); return api ? api(url) : { ok: true, blob: async () => ({}) }; },
     URL: { createObjectURL: () => "blob:" + (++serial), revokeObjectURL: (url) => revoked.push(url) },
     document: { createElement: (tag) => ({ tag }), createTextNode: (text) => ({ text }) },

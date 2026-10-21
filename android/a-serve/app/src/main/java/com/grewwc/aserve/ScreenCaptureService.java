@@ -43,6 +43,10 @@ public final class ScreenCaptureService extends Service {
     private static final String IDLE_TITLE = "a · 屏幕共享已开启";
     private static final String IDLE_TEXT = "仅在你请求时截屏并发送给当前助手；点击停止撤销授权";
     private static final DateTimeFormatter CLOCK = DateTimeFormatter.ofPattern("HH:mm:ss");
+    /** How far before the user's tap the delivered frame is taken. */
+    private static final long PRE_TAP_LOOKBACK_MS = 600L;
+    /** How long the delivery may take before the request fails. */
+    private static final long CAPTURE_TIMEOUT_MS = 20_000L;
     private static ScreenCaptureService active;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final HandlerThread frames = new HandlerThread("screen-frame");
@@ -53,6 +57,28 @@ public final class ScreenCaptureService extends Service {
     private String origin;
     private ScreenSession consentSession;
     private final ScreenCaptureState state = new ScreenCaptureState();
+    private final ScreenFrameBuffer frameBuffer = new ScreenFrameBuffer();
+    /** Floating capture button, shown while a request waits for the user. */
+    private ScreenBubble bubble;
+
+    /** How often the overlay is checked while a capture request is armed. */
+    private static final long BUBBLE_WATCH_MS = 2000;
+
+    /**
+     * Some systems take the overlay window down when the app moves into the
+     * background. The request is still armed then, so the button is put back
+     * instead of leaving the user without a way to trigger the capture.
+     */
+    private final Runnable bubbleWatch = new Runnable() {
+        @Override public void run() {
+            if (stopped || state.token() == null) return;
+            if (bubble != null && !bubble.visible()) {
+                if (!bubble.show()) return; // the overlay permission was revoked
+                bubble.setArmed(true);
+            }
+            main.postDelayed(this, BUBBLE_WATCH_MS);
+        }
+    };
     private volatile boolean stopped;
     private volatile boolean capturing;
     private PendingIntent openIntent;
@@ -85,19 +111,88 @@ public final class ScreenCaptureService extends Service {
         main.removeCallbacks(timeout);
         main.removeCallbacks(captureTimeout);
         main.postDelayed(timeout, ScreenCaptureState.ARM_TIMEOUT_MS);
-        updateNotification("a · 等待你确认截屏", "切到目标页面，展开通知栏点『立即截屏』", null);
-        Toast.makeText(this, "已就绪：切到目标页面，展开通知栏点『立即截屏』", Toast.LENGTH_LONG).show();
+        if (showBubble()) {
+            updateNotification("a · 等待你确认截屏", "切到目标页面，点悬浮球截屏", null);
+            Toast.makeText(this, "已就绪：切到目标页面，点悬浮球截屏", Toast.LENGTH_LONG).show();
+            main.removeCallbacks(bubbleWatch);
+            main.postDelayed(bubbleWatch, BUBBLE_WATCH_MS);
+        } else {
+            updateNotification("a · 等待你确认截屏", "切到目标页面，展开通知栏点『立即截屏』", null);
+            Toast.makeText(this, "已就绪：切到目标页面，展开通知栏点『立即截屏』", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /**
+     * Puts the floating capture button on screen. The overlay permission is
+     * optional: without it the notification action stays the only trigger.
+     */
+    private boolean showBubble() {
+        if (bubble == null) {
+            if (!ScreenBubble.permitted(this)) return false;
+            bubble = new ScreenBubble(this);
+            bubble.setOnTap(this::captureFromBubble);
+        }
+        if (!bubble.show()) return false;
+        bubble.setArmed(true);
+        return true;
+    }
+
+    /** Hides the floating button; the request keeps waiting for the user. */
+    private void hideBubble() {
+        if (bubble == null) return;
+        bubble.setArmed(false);
+        bubble.hide();
+    }
+
+    /**
+     * Called when the user taps the floating button: the screen is captured
+     * exactly as it looks at that moment.
+     */
+    private void captureFromBubble() {
+        if (stopped) return;
+        long now = SystemClock.elapsedRealtime();
+        if (!state.trigger(now)) {
+            Toast.makeText(this, "当前没有待截取的请求", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        main.removeCallbacks(captureTimeout);
+        main.postDelayed(captureTimeout, CAPTURE_TIMEOUT_MS);
+        // The bubble floats above the content, so it is hidden while the frame
+        // is taken: the delivered picture is the page the user was looking at.
+        bubble.setDrawn(false);
+        state.scheduleLive(now, ScreenCaptureState.BUBBLE_SETTLE_MS, ScreenCaptureState.SOURCE_BUBBLE);
+        updateNotification("a · 正在截屏", "正在发送你点按时的画面", null);
+        main.postDelayed(() -> { if (bubble != null) bubble.setDrawn(true); },
+                ScreenCaptureState.BUBBLE_SETTLE_MS + 200L);
     }
 
     /** Called from the notification action: the user chose the moment. */
     private void captureNow() {
         if (stopped) return;
-        if (!state.trigger(SystemClock.elapsedRealtime())) {
+        long now = SystemClock.elapsedRealtime();
+        if (!state.trigger(now)) {
+            // The floating bubble already fired this request.
+            if (state.triggered()) return;
             Toast.makeText(this, "当前没有待截取的请求", Toast.LENGTH_SHORT).show();
             return;
         }
         main.removeCallbacks(captureTimeout);
-        main.postDelayed(captureTimeout, ScreenCaptureState.SETTLE_MS + 8_000);
+        main.postDelayed(captureTimeout, CAPTURE_TIMEOUT_MS);
+        // The notification shade covers the content when the tap lands, so the
+        // frame that arrives at that moment is not the one the user meant.
+        // Deliver the frame they were looking at a moment before the tap.
+        ScreenFrameBuffer.Frame frame = frameBuffer.pick(now - PRE_TAP_LOOKBACK_MS);
+        long age = frame == null ? Long.MAX_VALUE : frame.age(now);
+        if (frame != null && age >= ScreenFrameBuffer.MIN_AGE_MS && age <= ScreenFrameBuffer.HISTORY_MS) {
+            updateNotification("a · 正在截屏", "正在发送你点按前的画面", null);
+            final String requestToken = state.token();
+            final Handler target = worker;
+            if (target == null) { failPending("screen capture unavailable"); return; }
+            target.post(() -> deliver(requestToken, frame, ScreenCaptureState.SOURCE_PRE_TAP));
+            return;
+        }
+        // No usable history: take whatever is on screen once the shade closed.
+        state.scheduleLive(now);
         updateNotification("a · 正在截屏", "即将截取当前画面", null);
         Toast.makeText(this, "正在截取屏幕…", Toast.LENGTH_SHORT).show();
     }
@@ -118,6 +213,8 @@ public final class ScreenCaptureService extends Service {
     private void failPending(String error) {
         String requestToken = state.token();
         state.clear();
+        hideBubble();
+        main.removeCallbacks(bubbleWatch);
         main.removeCallbacks(timeout);
         main.removeCallbacks(captureTimeout);
         if (requestToken != null) ScreenCapture.finish(requestToken, false, error, null);
@@ -206,45 +303,48 @@ public final class ScreenCaptureService extends Service {
     }
 
     private void consumeFrame(ImageReader source) {
-        String requestToken = state.token();
-        Bitmap bitmap = null;
+        if (stopped || capturing) { drain(source); return; }
+        long now = SystemClock.elapsedRealtime();
+        if (state.due(now)) { captureLive(source); return; }
+        bufferFrame(source, now);
+    }
+
+    /** Drops the newest frame without keeping it. */
+    private static void drain(ImageReader source) {
         try (Image image = source.acquireLatestImage()) {
-            if (image == null || stopped || capturing || requestToken == null) return;
-            if (!state.due(SystemClock.elapsedRealtime())) return;
-            // Stop consuming this request while encoding; subsequent idle frames are drained.
-            capturing = true;
-            int width = image.getWidth(), height = image.getHeight();
+            // Closing the image releases it back to the reader.
+        }
+    }
+
+    /**
+     * Keeps a short history of mirrored frames. The notification shade covers
+     * the content when the user taps the capture action, so the frame that
+     * arrives at that moment is not the one they meant to share.
+     */
+    private void bufferFrame(ImageReader source, long now) {
+        if (!frameBuffer.readyToSample(now)) { drain(source); return; }
+        try (Image image = source.acquireLatestImage()) {
+            if (image == null) return;
             Image.Plane plane = image.getPlanes()[0];
-            ByteBuffer buffer = plane.getBuffer();
-            int base = buffer.position(), rowStride = plane.getRowStride(), pixelStride = plane.getPixelStride();
-            bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
-            int[] row = new int[width];
-            for (int y = 0; y < height; y++) {
-                for (int x = 0; x < width; x++) {
-                    int at = base + y * rowStride + x * pixelStride;
-                    row[x] = 0xff000000 | ((buffer.get(at) & 255) << 16)
-                            | ((buffer.get(at + 1) & 255) << 8) | (buffer.get(at + 2) & 255);
-                }
-                bitmap.setPixels(row, 0, width, 0, y, width, 1);
-            }
-            byte[] bytes;
-            while (true) {
-                ByteArrayOutputStream output = new ByteArrayOutputStream();
-                if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 85, output)) throw new IllegalStateException("JPEG encoding failed");
-                bytes = output.toByteArray();
-                if (bytes.length <= 256 * 1024) break;
-                Bitmap smaller = Bitmap.createScaledBitmap(bitmap,
-                        Math.max(1, bitmap.getWidth() * 3 / 4), Math.max(1, bitmap.getHeight() * 3 / 4), true);
-                bitmap.recycle(); bitmap = smaller;
-            }
-            JSONObject result = new JSONObject().put("image_base64", Base64.encodeToString(bytes, Base64.NO_WRAP))
-                    .put("mime_type", "image/jpeg").put("filename", "screen.jpg")
-                    .put("width", bitmap.getWidth()).put("height", bitmap.getHeight());
-            Bitmap thumbnail = thumbnail(bitmap);
-            main.post(() -> finishFrame(requestToken, true, null, result, thumbnail));
+            frameBuffer.offer(plane.getBuffer(), image.getWidth(), image.getHeight(),
+                    plane.getRowStride(), plane.getPixelStride(), now, System.currentTimeMillis());
+        }
+    }
+
+    /** Fallback capture: takes the frame that is on screen once the shade closed. */
+    private void captureLive(ImageReader source) {
+        final String requestToken = state.token();
+        capturing = true;
+        try (Image image = source.acquireLatestImage()) {
+            if (image == null) throw new IllegalStateException("screen image unavailable");
+            Image.Plane plane = image.getPlanes()[0];
+            byte[] raw = copyPlane(plane.getBuffer(), image.getWidth(), image.getHeight(),
+                    plane.getRowStride(), plane.getPixelStride());
+            deliver(requestToken, raw, image.getWidth(), image.getHeight(),
+                    plane.getRowStride(), plane.getPixelStride(), System.currentTimeMillis(), state.source());
         } catch (Exception | OutOfMemoryError error) {
-            main.post(() -> finishFrame(requestToken, false, "screen image unavailable", null, null));
-        } finally { if (bitmap != null) bitmap.recycle(); }
+            main.post(() -> finishFrame(requestToken, false, "screen image unavailable", null, null, 0L));
+        }
     }
 
     /** Small preview of the delivered frame, so the user can verify which moment was sent. */
@@ -256,21 +356,106 @@ public final class ScreenCaptureService extends Service {
         return thumb == source ? source.copy(Bitmap.Config.ARGB_8888, false) : thumb;
     }
 
-    private void finishFrame(String requestToken, boolean ok, String error, JSONObject data, Bitmap thumbnail) {
+    /** Decodes, encodes and hands one frame to the page. */
+    private void deliver(String requestToken, ScreenFrameBuffer.Frame frame, String source) {
+        deliver(requestToken, frame.pixels, frame.width, frame.height, frame.rowStride, frame.pixelStride,
+                frame.wallAt, source);
+    }
+
+    private void deliver(String requestToken, byte[] raw, int width, int height, int rowStride, int pixelStride,
+            long wallAt, String source) {
+        Bitmap bitmap = null;
+        try {
+            bitmap = decodeRgba(raw, width, height, rowStride, pixelStride);
+            byte[] bytes = encodeJpeg(bitmap);
+            JSONObject result = new JSONObject().put("image_base64", Base64.encodeToString(bytes, Base64.NO_WRAP))
+                    .put("mime_type", "image/jpeg").put("filename", "screen.jpg")
+                    .put("width", bitmap.getWidth()).put("height", bitmap.getHeight())
+                    .put("captured_at", wallAt)
+                    .put("capture_source", source);
+            Bitmap thumb = thumbnail(bitmap);
+            main.post(() -> finishFrame(requestToken, true, null, result, thumb, wallAt));
+        } catch (Exception | OutOfMemoryError error) {
+            main.post(() -> finishFrame(requestToken, false, "screen image unavailable", null, null, 0L));
+        } finally { if (bitmap != null) bitmap.recycle(); }
+    }
+
+    /** Copies one RGBA frame out of the reader's plane buffer. */
+    private static byte[] copyPlane(ByteBuffer buffer, int width, int height, int rowStride, int pixelStride) {
+        int base = buffer.position();
+        int needed = (height - 1) * rowStride + width * pixelStride;
+        ByteBuffer source = buffer.duplicate();
+        if (source.limit() - base < needed) throw new IllegalStateException("screen frame truncated");
+        source.position(base);
+        byte[] raw = new byte[needed];
+        source.get(raw, 0, needed);
+        return raw;
+    }
+
+    /** Converts a raw RGBA frame into an ARGB bitmap. */
+    private static Bitmap decodeRgba(byte[] raw, int width, int height, int rowStride, int pixelStride) {
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        int[] row = new int[width];
+        for (int y = 0; y < height; y++) {
+            int base = y * rowStride;
+            for (int x = 0; x < width; x++) {
+                int at = base + x * pixelStride;
+                row[x] = 0xff000000 | ((raw[at] & 255) << 16)
+                        | ((raw[at + 1] & 255) << 8) | (raw[at + 2] & 255);
+            }
+            bitmap.setPixels(row, 0, width, 0, y, width, 1);
+        }
+        return bitmap;
+    }
+
+    /** Encodes the frame as JPEG, shrinking it until it fits the transfer limit. */
+    private static byte[] encodeJpeg(Bitmap source) {
+        Bitmap bitmap = source;
+        byte[] bytes;
+        while (true) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 85, output)) {
+                if (bitmap != source) bitmap.recycle();
+                throw new IllegalStateException("JPEG encoding failed");
+            }
+            bytes = output.toByteArray();
+            if (bytes.length <= 256 * 1024) break;
+            Bitmap smaller = Bitmap.createScaledBitmap(bitmap,
+                    Math.max(1, bitmap.getWidth() * 3 / 4), Math.max(1, bitmap.getHeight() * 3 / 4), true);
+            if (bitmap != source) bitmap.recycle();
+            bitmap = smaller;
+        }
+        if (bitmap != source) bitmap.recycle();
+        return bytes;
+    }
+
+    private void finishFrame(String requestToken, boolean ok, String error, JSONObject data, Bitmap thumbnail,
+            long capturedAt) {
         capturing = false;
         if (stopped || requestToken == null || !requestToken.equals(state.token())) return;
         state.clear();
+        hideBubble();
+        main.removeCallbacks(bubbleWatch);
         main.removeCallbacks(timeout);
         main.removeCallbacks(captureTimeout);
-        if (ok) updateNotification("a · 已截取 " + LocalTime.now().format(CLOCK),
+        if (ok) updateNotification("a · 已截取 " + stamp(capturedAt),
                 "助手已收到这一帧；要其它画面请再说一次", thumbnail);
         else updateNotification(IDLE_TITLE, IDLE_TEXT, null);
         ScreenCapture.finish(requestToken, ok, error, data);
     }
 
+    /** Wall-clock time of the delivered frame, falling back to now. */
+    private static String stamp(long capturedAt) {
+        if (capturedAt <= 0) return LocalTime.now().format(CLOCK);
+        return java.time.Instant.ofEpochMilli(capturedAt)
+                .atZone(java.time.ZoneId.systemDefault()).toLocalTime().format(CLOCK);
+    }
+
     private void endSession(String error) {
         if (stopped) return;
         stopped = true;
+        hideBubble();
+        frameBuffer.clear();
         if (consentSession != null) consentSession.stop();
         if (active == this) active = null;
         main.removeCallbacksAndMessages(null);

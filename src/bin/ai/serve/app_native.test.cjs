@@ -93,6 +93,8 @@ const phoneFixtures = {
   file_save: { action: "file_save", filename: "summary.txt", text: "结果😀" },
   screen_capture: { action: "screen_capture" },
   screen_stop: { action: "screen_stop" },
+  camera_capture: { action: "camera_capture" },
+  camera_stop: { action: "camera_stop" },
 };
 
 test("every advertised phone action has a valid browser payload", () => {
@@ -179,7 +181,7 @@ function nativeHarness(storage = new Map(), spec = { action: "alarm", hour: 9, m
     perform: (...args) => calls.push(args),
     capabilities: () => JSON.stringify({
       actions: Object.keys(phoneFixtures),
-      features: ["alarm_weekdays", "precise_location", "screen_manual_trigger"],
+      features: ["alarm_weekdays", "precise_location", "screen_manual_trigger", "screen_bubble", "camera_preview"],
     }),
   };
   vm.runInContext(slice, context);
@@ -205,7 +207,7 @@ test("old APK refuses new actions and never silently drops repeat weekdays", asy
     await app.request(); await app.settle();
     assert.equal(app.calls.length, 0);
     assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
-    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1.8.0/);
+    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1.11.0/);
   }
 });
 
@@ -221,7 +223,7 @@ test("file picker has a bounded user-interaction timeout", async () => {
   assert.match(JSON.parse(app.posts[0].body.text).error, /已取消/);
 });
 
-test("a shell without the manual trigger cannot pick the capture moment", async () => {
+test("a shell without the floating bubble cannot pick the capture moment", async () => {
   const app = nativeHarness(new Map(), phoneFixtures.screen_capture);
   app.context.window.AServeNative.capabilities = () => JSON.stringify({
     actions: Object.keys(phoneFixtures), features: ["alarm_weekdays"],
@@ -229,7 +231,7 @@ test("a shell without the manual trigger cannot pick the capture moment", async 
   await app.request(); await app.settle();
   assert.equal(app.calls.length, 0);
   assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
-  assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.8\.0/);
+    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.11\.0/);
 });
 
 test("the screen capture waits for the user tap instead of timing out early", async () => {
@@ -241,6 +243,52 @@ test("the screen capture waits for the user tap instead of timing out early", as
   app.result({ ok: true, data: { action: "screen_capture" } });
   await request;
   assert.equal(JSON.parse(app.posts[0].body.text).ok, true);
+});
+
+test("a shell without the camera preview cannot open the camera", async () => {
+  const app = nativeHarness(new Map(), phoneFixtures.camera_capture);
+  app.context.window.AServeNative.capabilities = () => JSON.stringify({
+    actions: Object.keys(phoneFixtures), features: ["alarm_weekdays", "screen_bubble"],
+  });
+  await app.request(); await app.settle();
+  assert.equal(app.calls.length, 0);
+  assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
+  assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.11\.0/);
+});
+
+test("the camera frame reaches the conversation with the camera caption", async () => {
+  const app = nativeHarness(new Map(), phoneFixtures.camera_capture);
+  app.context.window.AServeNative.capabilities = () => JSON.stringify({
+    actions: Object.keys(phoneFixtures), features: ["alarm_weekdays", "screen_bubble", "camera_preview"],
+  });
+  const request = app.request(); await app.settle();
+  assert.equal(app.calls.length, 1);
+  assert.equal(app.calls[0][1], "camera_capture");
+  app.result({ ok: true, data: { action: "camera_capture" } });
+  await request;
+  assert.equal(JSON.parse(app.posts[0].body.text).ok, true);
+  assert.match(app.context.phoneFrameCaption({ capture_source: "camera" }), /相机画面/);
+});
+
+test("the overlay settings action reaches the native shell", async () => {
+  const app = nativeHarness(new Map(), phoneFixtures.now);
+  app.context.window.AServeNative.capabilities = () => JSON.stringify({
+    actions: Object.keys(phoneFixtures).concat(["screen_overlay_settings"]),
+    features: ["alarm_weekdays", "screen_bubble"],
+  });
+  const request = app.context.nativeCall("screen_overlay_settings", {}, "ovl-1");
+  await app.settle();
+  assert.equal(app.calls.length, 1);
+  assert.equal(app.calls[0][1], "screen_overlay_settings");
+  app.context.window.AServeNativeResult(JSON.stringify({ id: "ovl-1", ok: true }));
+  assert.equal((await request).ok, true);
+});
+
+test("the shell reports the floating bubble as an optional capability", () => {
+  const app = nativeHarness(new Map(), phoneFixtures.now);
+  assert.ok(app.context.nativeFeatures().includes("screen_bubble"));
+  delete app.context.window.AServeNative.capabilities;
+  assert.equal(app.context.nativeFeatures().length, 0);
 });
 
 test("every phone action reaches the bridge and returns its acknowledgement unchanged", async () => {

@@ -14,10 +14,23 @@ public class ScreenCaptureStateTest {
         assertFalse(state.due(1000 + ScreenCaptureState.ARM_TIMEOUT_MS - 1));
     }
 
-    @Test public void triggerSchedulesTheFrameAfterTheSettleDelay() {
+    @Test public void triggerAloneDoesNotScheduleALiveCapture() {
         ScreenCaptureState state = new ScreenCaptureState();
         state.arm("t1", 1000);
         assertTrue(state.trigger(5000));
+        assertTrue(state.triggered());
+        // The tapped moment is served from the frame history, so a live
+        // capture is only scheduled when that history has nothing usable.
+        assertFalse(state.due(5000));
+        assertFalse(state.due(5000 + ScreenCaptureState.SETTLE_MS - 1));
+        assertFalse(state.due(5000 + ScreenCaptureState.SETTLE_MS));
+    }
+
+    @Test public void theFallbackCaptureRunsAfterTheSettleDelay() {
+        ScreenCaptureState state = new ScreenCaptureState();
+        state.arm("t1", 1000);
+        assertTrue(state.trigger(5000));
+        state.scheduleLive(5000);
         assertFalse(state.due(5000 + ScreenCaptureState.SETTLE_MS - 1));
         assertTrue(state.due(5000 + ScreenCaptureState.SETTLE_MS));
     }
@@ -58,5 +71,24 @@ public class ScreenCaptureStateTest {
         state.clear();
         assertFalse(state.due(9999));
         assertEquals(ScreenCaptureState.NEVER, state.captureAfter());
+    }
+
+    @Test public void theSecondTriggerIsIgnored() {
+        ScreenCaptureState state = new ScreenCaptureState();
+        state.arm("t1", 1000);
+        assertTrue(state.trigger(2000));
+        // The bubble and the notification action both trigger the same request;
+        // only the first one may pick the moment.
+        assertFalse(state.trigger(2100));
+    }
+
+    @Test public void theBubbleCaptureUsesItsOwnShortDelay() {
+        ScreenCaptureState state = new ScreenCaptureState();
+        state.arm("t1", 1000);
+        assertTrue(state.trigger(5000));
+        state.scheduleLive(5000, ScreenCaptureState.BUBBLE_SETTLE_MS, ScreenCaptureState.SOURCE_BUBBLE);
+        assertEquals(ScreenCaptureState.SOURCE_BUBBLE, state.source());
+        assertFalse(state.due(5000 + ScreenCaptureState.BUBBLE_SETTLE_MS - 1));
+        assertTrue(state.due(5000 + ScreenCaptureState.BUBBLE_SETTLE_MS));
     }
 }
