@@ -137,10 +137,7 @@ fn run_one_shot_turn(
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let mut combined = format!("turn failed: {stderr}{stdout}");
-        if combined.len() > MAX_TURN_ERROR_CHARS {
-            let skip = combined.len() - MAX_TURN_ERROR_CHARS;
-            combined = format!("...[truncated]...{}", &combined[skip..]);
-        }
+        combined = truncate_turn_error(&combined);
         Err(std::io::Error::new(std::io::ErrorKind::Other, combined))
     }
 }
@@ -1116,6 +1113,20 @@ fn strip_non_sgr_csi(line: &str) -> String {
         }
     }
     kept
+}
+
+/// Trim a failed turn's combined output to the display cap.
+///
+/// The text carries the child's stderr, which can contain multi-byte
+/// characters: a byte offset may land inside one and panic while reporting
+/// the failure.
+#[cfg(feature = "serve")]
+fn truncate_turn_error(combined: &str) -> String {
+    if combined.len() > MAX_TURN_ERROR_CHARS {
+        last_chars(combined, MAX_TURN_ERROR_CHARS)
+    } else {
+        combined.to_string()
+    }
 }
 
 #[cfg(feature = "serve")]

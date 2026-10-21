@@ -249,6 +249,18 @@ fn percent_encode_component(value: &str) -> String {
     out
 }
 
+/// Longest prefix of `text` that holds at most `max_chars` characters.
+///
+/// The cut has to land on a UTF-8 character boundary: a byte offset that
+/// splits a multi-byte character panics, and Chinese result pages hit that
+/// case on nearly every entry.
+fn char_prefix(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth(max_chars) {
+        Some((offset, _)) => &text[..offset],
+        None => text,
+    }
+}
+
 /// Extract search results from a result page into markdown entries.
 ///
 /// Result pages differ per engine, but every mainstream one puts a linked
@@ -278,7 +290,7 @@ fn extract_search_results(html: &str) -> String {
         seen.push(url.clone());
         let heading_end = heading.get(0).map(|m| m.end()).unwrap_or_default();
         let tail = &html[heading_end..];
-        let window = &tail[..SNIPPET_LOOKAHEAD_CHARS.min(tail.len())];
+        let window = char_prefix(tail, SNIPPET_LOOKAHEAD_CHARS);
         let snippet = match paragraph_re.find(window) {
             Some(found) if !window[..found.start()].contains("<h") => {
                 let mut text = clean_text(found.as_str());
@@ -880,10 +892,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        execute_web_fetch, execute_web_search, execute_web_search_with_base,
+        char_prefix, execute_web_fetch, execute_web_search, execute_web_search_with_base,
         execute_web_search_with_providers, extract_search_results, fetch_and_strip,
         fetch_with_providers_and_direct_with, html_to_text, parse_provider, validate_direct_target,
-        validate_target_url, ProviderKind, JINA_SEARCH_BASE,
+        validate_target_url, ProviderKind, JINA_SEARCH_BASE, SNIPPET_LOOKAHEAD_CHARS,
     };
     use crate::ai::config_schema::AiConfig;
     use super::provider_list;
@@ -1162,5 +1174,41 @@ mod tests {
         assert!(output.contains("https://"), "{output}");
         assert!(output.contains("]("), "no result entries: {output}");
         println!("{}", &output.chars().take(600).collect::<String>());
+    }
+
+    #[test]
+    fn char_prefix_cuts_on_character_boundaries() {
+        let text = "小".repeat(10);
+        assert_eq!(char_prefix(&text, 5), "小".repeat(5));
+        assert_eq!(char_prefix(&text, 5).len(), 15);
+        assert_eq!(char_prefix(&text, 10), text);
+        assert_eq!(char_prefix(&text, 99), text);
+        assert_eq!(char_prefix("abc", 0), "");
+    }
+
+    #[test]
+    fn extract_search_results_survives_a_multibyte_cut_at_the_lookahead_edge() {
+        // The snippet lookahead used to slice the page tail by byte offset with
+        // a character count, so a Chinese result page panicked with "byte
+        // index 1200 is not a char boundary" and took the whole turn down.
+        let body_open = r#"<div class="b_caption"><p class="b_lineclamp2">"#;
+        // The old code cut the tail at byte SNIPPET_LOOKAHEAD_CHARS. Pad the
+        // filler so that cut lands inside a 3-byte character rather than on
+        // its boundary.
+        let padding = if body_open.len() % 3 == 0 { 1 } else { 0 };
+        let filler = format!("{}{}", "x".repeat(padding), "小".repeat(500));
+        let html = format!(
+            r#"<h2><a href="https://example.com/a">标题</a></h2>{body_open}{filler}</p></div>"#
+        );
+        let heading_end = html.find("</h2>").expect("heading end") + "</h2>".len();
+        let tail = &html[heading_end..];
+        assert!(
+            !tail.is_char_boundary(SNIPPET_LOOKAHEAD_CHARS),
+            "precondition: the old byte cut must land inside a character"
+        );
+
+        let results = extract_search_results(&html);
+        assert!(results.contains("[标题](https://example.com/a)"), "{results}");
+        assert!(results.contains("小"), "{results}");
     }
 }
