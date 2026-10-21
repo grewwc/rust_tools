@@ -5,10 +5,12 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.Typeface;
 import android.database.Cursor;
 import android.net.Uri;
 import android.net.http.SslError;
@@ -33,6 +35,7 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -41,6 +44,8 @@ import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 
@@ -76,18 +81,41 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // Installed first: anything that fails below must still be recoverable
+        // on the next launch instead of closing the app without a trace.
+        CrashGuard.install(this);
         getWindow().setStatusBarColor(Color.rgb(17, 20, 27));
         getWindow().setNavigationBarColor(Color.rgb(8, 10, 15));
 
         preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
         serverOrigin = ServerUrl.normalize(
                 preferences.getString(SERVER_ORIGIN, BuildConfig.DEFAULT_SERVER_URL));
-        createWebView();
+        String previousCrash = CrashGuard.read(this);
+        try {
+            createWebView();
+        } catch (Throwable error) {
+            // A WebView that the system refuses to provide (for example a
+            // disabled or broken "Android System WebView" package) fails here,
+            // before any UI exists. Show the reason in native views instead of
+            // letting the process disappear.
+            CrashGuard.record(this, error);
+            if (webView != null) {
+                try {
+                    webView.destroy();
+                } catch (Throwable ignored) {
+                    // The view never became usable; dropping the reference is enough.
+                }
+                webView = null;
+            }
+            showStartupFailure(CrashGuard.describe(BuildConfig.VERSION_NAME, error));
+            return;
+        }
 
         boolean configure = CONFIGURE_ACTION.equals(getIntent().getAction());
         if (serverOrigin != null) loadApp();
         handleShareIntent(getIntent());
         if (configure || serverOrigin == null) showServerDialog(null, serverOrigin == null);
+        if (previousCrash != null) showCrashReport(previousCrash);
     }
 
     private void createWebView() {
@@ -138,6 +166,7 @@ public final class MainActivity extends Activity {
     }
 
     private void loadApp() {
+        if (webView == null) return;
         if (screenCapture != null) screenCapture.close();
         pageReady = false;
         webView.loadUrl(ServerUrl.freshAppUrl(serverOrigin, System.currentTimeMillis()));
@@ -180,8 +209,12 @@ public final class MainActivity extends Activity {
         if (pendingShareJson == null || !pageReady || webView == null) return;
         String json = pendingShareJson;
         pendingShareJson = null;
-        webView.post(() -> webView.evaluateJavascript(
-                "window.AServeShare&&window.AServeShare(" + JSONObject.quote(json) + ");", null));
+        WebView view = webView;
+        view.post(() -> {
+            if (view != webView) return;
+            view.evaluateJavascript(
+                    "window.AServeShare&&window.AServeShare(" + JSONObject.quote(json) + ");", null);
+        });
     }
 
     private String readSharedImage(Uri uri) {
@@ -248,11 +281,20 @@ public final class MainActivity extends Activity {
             deliverNativeResult(requestId, true, null, new JSONObject());
             return;
         }
+        // One preview owns the pending frame. Overwriting the field would stack a
+        // second preview and hand its cancellation to this request instead.
+        if (pendingCameraRequest != null) {
+            deliverNativeResult(requestId, false,
+                    "camera preview is already open; finish that one first", null);
+            return;
+        }
         pendingCameraRequest = requestId;
         try {
+            CameraRequest.markLive(true);
             startActivityForResult(new Intent(this, CameraActivity.class), CameraActivity.REQUEST);
         } catch (RuntimeException error) {
             pendingCameraRequest = null;
+            CameraRequest.markLive(false);
             deliverNativeResult(requestId, false, "camera preview unavailable", null);
         }
     }
@@ -260,12 +302,22 @@ public final class MainActivity extends Activity {
     private void deliverCameraResult(int resultCode, Intent data) {
         String requestId = pendingCameraRequest;
         pendingCameraRequest = null;
+        CameraRequest.markLive(false);
         if (requestId == null) return;
         if (resultCode == RESULT_OK && data != null) {
-            String frame = data.getStringExtra(CameraActivity.EXTRA_FRAME);
-            if (frame == null || frame.isEmpty()) {
+            String path = data.getStringExtra(CameraActivity.EXTRA_FRAME_PATH);
+            if (path == null || path.isEmpty()) {
                 deliverNativeResult(requestId, false, "camera frame missing", null);
                 return;
+            }
+            String frame;
+            try {
+                frame = readBase64(new File(path));
+            } catch (IOException | RuntimeException error) {
+                deliverNativeResult(requestId, false, "camera frame unreadable", null);
+                return;
+            } finally {
+                new File(path).delete();
             }
             JSONObject payload = new JSONObject();
             try {
@@ -280,6 +332,20 @@ public final class MainActivity extends Activity {
         }
         String error = data == null ? null : data.getStringExtra(CameraActivity.EXTRA_ERROR);
         deliverNativeResult(requestId, false, error == null ? "camera cancelled" : error, null);
+    }
+
+    /** Reads a file into a base64 string, the shape the page expects. */
+    private static String readBase64(File file) throws IOException {
+        byte[] bytes = new byte[(int) file.length()];
+        try (FileInputStream in = new FileInputStream(file)) {
+            int read = 0;
+            while (read < bytes.length) {
+                int step = in.read(bytes, read, bytes.length - read);
+                if (step < 0) break;
+                read += step;
+            }
+        }
+        return Base64.encodeToString(bytes, Base64.NO_WRAP);
     }
 
     /**
@@ -370,9 +436,12 @@ public final class MainActivity extends Activity {
         String js = "window.AServeNativeResult&&window.AServeNativeResult("
                 + JSONObject.quote(result.toString()) + ");";
         String resultOrigin = serverOrigin;
-        webView.post(() -> {
-            if (!isDestroyed() && resultOrigin != null && resultOrigin.equals(serverOrigin) && isTrustedPage())
-                webView.evaluateJavascript(js, null);
+        WebView view = webView;
+        if (view == null) return;
+        view.post(() -> {
+            if (!isDestroyed() && view == webView && resultOrigin != null
+                    && resultOrigin.equals(serverOrigin) && isTrustedPage())
+                view.evaluateJavascript(js, null);
         });
     }
 
@@ -460,6 +529,113 @@ public final class MainActivity extends Activity {
         return dialog;
     }
 
+    /**
+     * Native-only screen for a failed startup. The page never loaded, so this
+     * must not depend on the WebView in any way.
+     */
+    private void showStartupFailure(String report) {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.rgb(8, 10, 15));
+        int pad = dp(20);
+        root.setPadding(pad, pad, pad, pad);
+
+        TextView heading = new TextView(this);
+        heading.setText(R.string.webview_unavailable);
+        heading.setTextColor(Color.WHITE);
+        heading.setTextSize(17);
+        heading.setTypeface(Typeface.DEFAULT_BOLD);
+        root.addView(heading);
+
+        TextView body = new TextView(this);
+        body.setText(report);
+        body.setTextColor(Color.rgb(205, 212, 224));
+        body.setTextSize(11);
+        body.setTypeface(Typeface.MONOSPACE);
+        body.setTextIsSelectable(true);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(body, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+        root.addView(scroll, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        LinearLayout actions = new LinearLayout(this);
+        TextView copy = new TextView(this);
+        copy.setText(R.string.crash_copy);
+        copy.setTextColor(Color.rgb(59, 130, 246));
+        copy.setPadding(0, dp(12), dp(24), dp(12));
+        copy.setOnClickListener(view -> copyToClipboard(report));
+        TextView retry = new TextView(this);
+        retry.setText(R.string.crash_retry);
+        retry.setTextColor(Color.rgb(59, 130, 246));
+        retry.setPadding(0, dp(12), 0, dp(12));
+        retry.setOnClickListener(view -> recreate());
+        actions.addView(copy);
+        actions.addView(retry);
+        root.addView(actions);
+
+        setContentView(root);
+    }
+
+    /** Report the previous run's crash now that the page can receive text. */
+    private void showCrashReport(String report) {
+        if (isFinishing()) return;
+        try {
+            ScrollView scroll = new ScrollView(this);
+            TextView body = new TextView(this);
+            body.setText(report);
+            body.setTextSize(11);
+            body.setTypeface(Typeface.MONOSPACE);
+            body.setTextIsSelectable(true);
+            scroll.addView(body, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT));
+            new AlertDialog.Builder(this)
+                    .setTitle(R.string.crash_title)
+                    .setView(scroll)
+                    .setPositiveButton(R.string.crash_send,
+                            (dialog, which) -> sendReportToAgent(report))
+                    .setNeutralButton(R.string.crash_copy,
+                            (dialog, which) -> copyToClipboard(report))
+                    .setNegativeButton(R.string.crash_dismiss,
+                            (dialog, which) -> CrashGuard.clear(this))
+                    .create()
+                    .show();
+        } catch (Throwable error) {
+            // A diagnostic dialog must never become the next crash.
+        }
+    }
+
+    /**
+     * Route the report through the composer: the page already holds the
+     * credentials, so the text reaches the agent without a second channel.
+     */
+    private void sendReportToAgent(String report) {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("kind", "text");
+            payload.put("text", getString(R.string.crash_prompt) + "\n\n" + report);
+            pendingShareJson = payload.toString();
+            flushShare();
+            CrashGuard.clear(this);
+        } catch (Throwable ignored) {
+            // The copy button remains available.
+        }
+    }
+
+    private void copyToClipboard(String text) {
+        try {
+            ClipboardManager clipboard =
+                    (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (clipboard == null) return;
+            clipboard.setPrimaryClip(ClipData.newPlainText("a serve crash", text));
+            Toast.makeText(this, R.string.crash_copied, Toast.LENGTH_SHORT).show();
+        } catch (Throwable ignored) {
+            // Nothing else can be offered if the clipboard is unavailable.
+        }
+    }
+
     private void openFileChooser() {
         if (fileChooserCallback == null) return;
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT)
@@ -524,6 +700,9 @@ public final class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        // Startup may have failed before a WebView existed; the native error
+        // screen stays usable only if the lifecycle callbacks stop here.
+        if (webView == null) return;
         webView.onResume();
         nativeResumed = true;
         if (nativeBridge != null) nativeBridge.onHostResume();
@@ -547,13 +726,14 @@ public final class MainActivity extends Activity {
         nativeResumed = false;
         if (nativeBridge != null) nativeBridge.onHostPause();
         pausedAt = SystemClock.elapsedRealtime();
-        webView.onPause();
+        if (webView != null) webView.onPause();
         super.onPause();
     }
 
     @Override
     public void onBackPressed() {
-        if (webView.canGoBack()) webView.goBack();
+        if (webView == null) super.onBackPressed();
+        else if (webView.canGoBack()) webView.goBack();
         else super.onBackPressed();
     }
 
@@ -563,11 +743,18 @@ public final class MainActivity extends Activity {
         if (nativeBridge != null) nativeBridge.close();
         if (fileChooserCallback != null) fileChooserCallback.onReceiveValue(null);
         fileChooserCallback = null;
-        webView.removeJavascriptInterface(NativeBridge.NAME);
-        webView.stopLoading();
-        webView.setWebChromeClient(null);
-        webView.setWebViewClient(null);
-        webView.destroy();
+        if (webView != null) {
+            try {
+                webView.removeJavascriptInterface(NativeBridge.NAME);
+                webView.stopLoading();
+                webView.setWebChromeClient(null);
+                webView.setWebViewClient(null);
+                webView.destroy();
+            } catch (Throwable ignored) {
+                // A half-built WebView must not crash the shutdown path too.
+            }
+            webView = null;
+        }
         super.onDestroy();
     }
 

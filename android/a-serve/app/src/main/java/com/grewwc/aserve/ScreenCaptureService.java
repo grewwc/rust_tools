@@ -73,8 +73,9 @@ public final class ScreenCaptureService extends Service {
         @Override public void run() {
             if (stopped || state.token() == null) return;
             if (bubble != null && !bubble.visible()) {
-                if (!bubble.show()) return; // the overlay permission was revoked
-                bubble.setArmed(true);
+                // A failed re-attach must not end the watch: the overlay
+                // permission can be granted again while the request waits.
+                if (bubble.show()) bubble.setArmed(true);
             }
             main.postDelayed(this, BUBBLE_WATCH_MS);
         }
