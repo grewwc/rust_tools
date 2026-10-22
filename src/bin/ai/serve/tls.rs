@@ -320,6 +320,96 @@ fn generate_ca(stage: &Path) -> Result<(PathBuf, PathBuf), Box<dyn std::error::E
     Ok((cert, key))
 }
 
+/// A single subject alternative name extracted from a certificate's SAN
+/// extension. DNS names are compared as strings; IP addresses are compared
+/// after parsing so equivalent textual forms (e.g. `::1` vs
+/// `0:0:0:0:0:0:0:1`) still match.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+enum SanEntry {
+    Dns(String),
+    Ip(IpAddr),
+}
+
+fn collect_san_entries(line: &str, entries: &mut BTreeSet<SanEntry>) {
+    for token in line.split(',') {
+        let token = token.trim();
+        if let Some(name) = token.strip_prefix("DNS:") {
+            if !name.is_empty() {
+                entries.insert(SanEntry::Dns(name.to_string()));
+            }
+        } else if let Some(addr) = token.strip_prefix("IP Address:") {
+            if let Ok(ip) = addr.parse::<IpAddr>() {
+                entries.insert(SanEntry::Ip(ip));
+            }
+        }
+    }
+}
+
+/// Read the `X509v3 Subject Alternative Name` extension from the
+/// human-readable `openssl x509 -noout -text` output. Both LibreSSL and
+/// OpenSSL 1.1/3 render it as a comma-separated `DNS:name` / `IP Address:addr`
+/// list, so this avoids the `-checkip`/`-checkhost` options that only OpenSSL
+/// supports.
+fn parse_certificate_san(cert: &Path) -> Result<BTreeSet<SanEntry>, Box<dyn std::error::Error>> {
+    let output = require_openssl(&["x509", "-in", path_arg(cert)?, "-noout", "-text"])?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut entries = BTreeSet::new();
+    let mut in_san = false;
+    for line in text.lines() {
+        if in_san {
+            let trimmed = line.trim();
+            if trimmed == "critical" {
+                continue;
+            }
+            if line.starts_with(char::is_whitespace)
+                && (line.contains("DNS:") || line.contains("IP Address:"))
+            {
+                collect_san_entries(line, &mut entries);
+                continue;
+            }
+            in_san = false;
+        }
+        if let Some((_, rest)) = line.split_once("Subject Alternative Name:") {
+            collect_san_entries(rest, &mut entries);
+            in_san = true;
+        }
+    }
+    if entries.is_empty() {
+        return Err("certificate has no parseable X509v3 Subject Alternative Name entries".into());
+    }
+    Ok(entries)
+}
+
+/// True when every expected name in `names` really appears in the
+/// certificate's SAN extension. A certificate whose SAN cannot be read (no
+/// extension, corrupt output, openssl failure) is treated as not current, so
+/// the caller reissues it instead of failing hard; a missing name likewise
+/// means the certificate must be reissued, never silently reused.
+fn certificate_san_matches(
+    cert: &Path,
+    names: &[String],
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Ok(entries) = parse_certificate_san(cert) else {
+        return Ok(false);
+    };
+    for name in names {
+        let (kind, value) = name
+            .split_once(':')
+            .ok_or("invalid generated subjectAltName")?;
+        let found = match kind {
+            "IP" => value
+                .parse::<IpAddr>()
+                .map(|ip| entries.contains(&SanEntry::Ip(ip)))
+                .unwrap_or(false),
+            _ => entries.contains(&SanEntry::Dns(value.to_string())),
+        };
+        if !found {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn server_certificate_is_current(
     cert: &Path,
     key: &Path,
@@ -329,6 +419,7 @@ fn server_certificate_is_current(
     if !cert.is_file() || !key.is_file() || !certificate_matches_key(cert, key) {
         return Ok(false);
     }
+    // Chain validity and the renewal window must not be relaxed.
     if !openssl_ok(&["verify", "-CAfile", path_arg(ca_cert)?, path_arg(cert)?])
         || !openssl_ok(&[
             "x509",
@@ -341,25 +432,7 @@ fn server_certificate_is_current(
     {
         return Ok(false);
     }
-    for name in names {
-        let (flag, value) = name
-            .split_once(':')
-            .map(|(kind, value)| {
-                if kind == "IP" {
-                    ("-checkip", value)
-                } else {
-                    ("-checkhost", value)
-                }
-            })
-            .ok_or("invalid generated subjectAltName")?;
-        let check = run_openssl(&["x509", "-in", path_arg(cert)?, "-noout", flag, value])?;
-        if !check.status.success()
-            || !String::from_utf8_lossy(&check.stdout).contains("does match certificate")
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    certificate_san_matches(cert, names)
 }
 
 fn generate_server_certificate(
@@ -659,6 +732,114 @@ mod tests {
         let err = init_serve_tls_in(&dir, "192.0.2.10:8080").unwrap_err();
         assert!(err.to_string().contains("incomplete CA files"));
         assert_eq!(fs::read(dir.join(CA_CERT_FILE)).unwrap(), b"do not replace");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn san_matching_rejects_a_missing_expected_ip() {
+        if !openssl_ok(&["version"]) {
+            eprintln!("skipping SAN matching test because openssl is unavailable");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("a-serve-tls-san-{}", uuid::Uuid::new_v4()));
+        let stage = create_stage_dir(&dir).expect("stage dir");
+        let (ca_cert, ca_key) = generate_ca(&stage).expect("CA generation");
+        let names = vec![
+            "DNS:localhost".to_string(),
+            "IP:127.0.0.1".to_string(),
+            "IP:192.0.2.10".to_string(),
+            "IP:::1".to_string(),
+        ];
+        let (cert, _key) =
+            generate_server_certificate(&stage, &ca_cert, &ca_key, &names).expect("server cert");
+        assert!(
+            certificate_san_matches(&cert, &names).expect("SAN check succeeds for present names")
+        );
+        let missing = vec!["IP:192.0.2.11".to_string()];
+        assert!(
+            !certificate_san_matches(&cert, &missing).expect("SAN check runs for an absent IP")
+        );
+        let missing_dns = vec!["DNS:notlocalhost".to_string()];
+        assert!(
+            !certificate_san_matches(&cert, &missing_dns)
+                .expect("SAN check runs for an absent DNS")
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn damaged_server_certificate_is_reissued_instead_of_erroring() {
+        if !openssl_ok(&["version"]) {
+            eprintln!("skipping damaged certificate test because openssl is unavailable");
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("a-serve-tls-damaged-{}", uuid::Uuid::new_v4()));
+        let first = init_serve_tls_in(&dir, "192.0.2.10:8080").expect("initial TLS generation");
+        assert_eq!(first.status, TlsInitStatus::Generated);
+        let ca_before = fs::read(dir.join(CA_CERT_FILE)).expect("read CA");
+
+        // Replace the server certificate with a CA-signed leaf that carries no
+        // SAN extension at all: init must reissue it, not error out.
+        let stage = create_stage_dir(&dir).expect("stage dir");
+        let key = stage.join("nosan-key.pem");
+        let csr = stage.join("nosan.csr");
+        let nosan = stage.join("nosan.pem");
+        require_openssl(&[
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-out",
+            path_arg(&key).expect("key path"),
+        ])
+        .expect("SAN-less key generation");
+        require_openssl(&[
+            "req",
+            "-new",
+            "-key",
+            path_arg(&key).expect("key path"),
+            "-out",
+            path_arg(&csr).expect("CSR path"),
+            "-subj",
+            "/CN=a serve",
+        ])
+        .expect("SAN-less CSR generation");
+        // No -extfile: the leaf gets no extensions, hence no SAN.
+        require_openssl(&[
+            "x509",
+            "-req",
+            "-in",
+            path_arg(&csr).expect("CSR path"),
+            "-CA",
+            path_arg(&dir.join(CA_CERT_FILE)).expect("CA path"),
+            "-CAkey",
+            path_arg(&dir.join(CA_KEY_FILE)).expect("CA key path"),
+            "-set_serial",
+            "0xfeed",
+            "-out",
+            path_arg(&nosan).expect("leaf path"),
+            "-days",
+            "825",
+            "-sha256",
+        ])
+        .expect("SAN-less leaf generation");
+        fs::copy(&key, dir.join(SERVER_KEY_FILE)).expect("install SAN-less key");
+        fs::copy(&nosan, dir.join(SERVER_CERT_FILE)).expect("install SAN-less certificate");
+        let _ = fs::remove_dir_all(&stage);
+
+        let reissued =
+            init_serve_tls_in(&dir, "192.0.2.10:8080").expect("reissue a SAN-less certificate");
+        assert_eq!(reissued.status, TlsInitStatus::Reissued);
+        assert_eq!(fs::read(dir.join(CA_CERT_FILE)).unwrap(), ca_before);
+
+        // A corrupt certificate must also trigger a reissue instead of an error.
+        fs::write(dir.join(SERVER_CERT_FILE), b"not a certificate").expect("corrupt certificate");
+        let reissued =
+            init_serve_tls_in(&dir, "192.0.2.10:8080").expect("reissue a corrupt certificate");
+        assert_eq!(reissued.status, TlsInitStatus::Reissued);
+        assert_eq!(fs::read(dir.join(CA_CERT_FILE)).unwrap(), ca_before);
         let _ = fs::remove_dir_all(dir);
     }
 }
