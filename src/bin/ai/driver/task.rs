@@ -52,6 +52,9 @@ pub(crate) enum AssignmentStatus {
     Working,
     Done,
     Failed,
+    /// Worker is stuck on something only the host can decide and is waiting
+    /// for an answer; set from a `STATUS: blocked` report line.
+    Blocked,
 }
 
 impl AssignmentStatus {
@@ -61,6 +64,7 @@ impl AssignmentStatus {
             AssignmentStatus::Working => "working",
             AssignmentStatus::Done => "done",
             AssignmentStatus::Failed => "failed",
+            AssignmentStatus::Blocked => "blocked",
         }
     }
 }
@@ -186,7 +190,7 @@ pub(crate) fn task_brief_for(state: &TaskState, worker: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or("(no acceptance bar assigned yet — confirm with the host before reporting done)");
     format!(
-        "[task room={} round={}/{} host={}]\nGoal: {}\n\nYou are a worker in this task room. Do ONLY your own assignment; touch only these files: {scope_text}\nAcceptance bar: {acceptance}\n\nSend ONE report with the talk_send tool: to_session=\"{}\" room=\"{}\". The report must start with a STATUS line (`STATUS: done` when the acceptance bar is met, `STATUS: failed` otherwise), then the list of files you changed, then your test output (summary only, not the full log). If talk_send is not in your tool list, call enable_tools for it first. Do not create new sessions and do not spawn further workers.",
+        "[task room={} round={}/{} host={}]\nGoal: {}\n\nYou are a worker in this task room. Do ONLY your own assignment; touch only these files: {scope_text}\nAcceptance bar: {acceptance}\n\nSend ONE report with the talk_send tool: to_session=\"{}\" room=\"{}\". The report must start with a STATUS line (`STATUS: done` when the acceptance bar is met, `STATUS: failed` otherwise, `STATUS: blocked` when you are stuck on something only the host can decide), then the list of files you changed, then your test output (summary only, not the full log). A blocked report must put its question on a `QUESTION:` line right after STATUS, followed by what you already tried; then stop and wait for the host's answer instead of guessing — do not ask other workers. If talk_send is not in your tool list, call enable_tools for it first. Do not create new sessions and do not spawn further workers.",
         state.room,
         state.round,
         state.max_rounds,
@@ -242,8 +246,9 @@ fn spawn_worker_id(store: &SessionStore, room_part: &str, index: usize) -> Resul
 }
 
 /// Parse a worker report's STATUS line: the first line starting with
-/// `STATUS:` (case-insensitive) decides; anything else leaves the assignment
-/// untouched so prose-heavy reports never flip state by accident.
+/// `STATUS:` (case-insensitive) decides (`done` / `failed` / `blocked`);
+/// anything else leaves the assignment untouched so prose-heavy reports
+/// never flip state by accident.
 pub(crate) fn parse_worker_status(body: &str) -> Option<AssignmentStatus> {
     for line in body.lines() {
         let trimmed = line.trim();
@@ -259,6 +264,7 @@ pub(crate) fn parse_worker_status(body: &str) -> Option<AssignmentStatus> {
         match verdict {
             "done" => return Some(AssignmentStatus::Done),
             "failed" => return Some(AssignmentStatus::Failed),
+            "blocked" => return Some(AssignmentStatus::Blocked),
             _ => return None,
         }
     }
@@ -947,7 +953,13 @@ pub(crate) fn format_room_status(st: &RoomStatus) -> String {
     } else if st.uncollected > 0 {
         s.push_str("Next: run task_collect to gather the waiting reports.");
     } else if st.workers.iter().all(|w| w.replied_this_round) {
-        if st.round >= st.max_rounds {
+        if st.workers.iter().any(|w| w.assignment == "blocked") {
+            if st.round >= st.max_rounds {
+                s.push_str("Some workers are blocked with questions (see transcript), but this was the final round: task_assign refuses rework at the round cap. Record each open question and the decision you would have sent in your task_close summary instead.");
+            } else {
+                s.push_str("Some workers are blocked with questions (see transcript): answer by folding your decision into their scope/acceptance, then run task_assign for them.");
+            }
+        } else if st.round >= st.max_rounds {
             s.push_str(
                 "All workers reported on the final round: run task_close with an acceptance summary.",
             );
@@ -1083,6 +1095,8 @@ mod tests {
         assert!(brief.contains("src/login.rs"), "{brief}");
         assert!(brief.contains("login test passes"), "{brief}");
         assert!(brief.contains("STATUS: done"), "{brief}");
+        assert!(brief.contains("STATUS: blocked"), "{brief}");
+        assert!(brief.contains("QUESTION:"), "{brief}");
         assert!(brief.contains("talk_send"), "{brief}");
         assert!(brief.contains("enable_tools"), "{brief}");
         assert!(brief.contains("Do not create new sessions"), "{brief}");
@@ -1090,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_status_line_parses_done_and_failed_only() {
+    fn worker_status_line_parses_verdicts() {
         assert_eq!(
             parse_worker_status("STATUS: done\nchanged a.rs\ntests ok"),
             Some(AssignmentStatus::Done)
@@ -1098,6 +1112,10 @@ mod tests {
         assert_eq!(
             parse_worker_status("status: FAILED\nnothing worked"),
             Some(AssignmentStatus::Failed)
+        );
+        assert_eq!(
+            parse_worker_status("STATUS: blocked\nQUESTION: which approach?\ntried X"),
+            Some(AssignmentStatus::Blocked)
         );
         // Prose without a STATUS line leaves the assignment untouched.
         assert_eq!(parse_worker_status("all done, ship it"), None);
@@ -1149,6 +1167,37 @@ mod tests {
     }
 
     #[test]
+    fn collect_folds_blocked_question_into_assignment() {
+        let (dir, store, host_hist, w1_hist, _w2) = fixture();
+        let mut state = start(&store, &host_hist, "g", &workers(), None, Some("t-blocked"))
+            .unwrap()
+            .state;
+        assign_task(
+            &store,
+            &host_hist,
+            &mut state,
+            "worker-1",
+            vec!["a.rs".to_string()],
+            "bar one",
+        )
+        .unwrap();
+        talk::push_talk(
+            &store,
+            &w1_hist,
+            "host-sess",
+            Some("t-blocked"),
+            "STATUS: blocked\nQUESTION: which approach?\ntried X and Y",
+            false,
+        )
+        .unwrap();
+        let out = collect_task(&host_hist, &mut state, 5);
+        assert_eq!(out.replies.len(), 1);
+        let w1 = state.assignments.iter().find(|a| a.worker == "worker-1").unwrap();
+        assert_eq!(w1.status, AssignmentStatus::Blocked);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn assign_rework_counts_round_and_refuses_at_max() {
         let (dir, store, host_hist, _w1, _w2) = fixture();
         let mut state = start(&store, &host_hist, "g", &workers(), Some(2), Some("t-rework"))
@@ -1196,6 +1245,41 @@ mod tests {
             assign_task(&store, &host_hist, &mut state, "worker-2", Vec::new(), "bar").is_err()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn status_fixture(round: u32, max_rounds: u32, assignment: &str) -> RoomStatus {
+        RoomStatus {
+            room: "t-room".to_string(),
+            goal: "g".to_string(),
+            status: TaskStatus::Open,
+            round,
+            max_rounds,
+            workers: vec![WorkerProgress {
+                worker: "worker-1".to_string(),
+                scope_files: vec!["a.rs".to_string()],
+                acceptance: "bar".to_string(),
+                assignment: assignment.to_string(),
+                live: false,
+                woken_this_round: true,
+                replied_this_round: true,
+                waiting_in_inbox: false,
+            }],
+            uncollected: 0,
+            recent: Vec::new(),
+            transcript_path: PathBuf::from("/tmp/t-room.jsonl"),
+        }
+    }
+
+    #[test]
+    fn final_round_blocked_points_at_close_not_assign() {
+        // task_assign hard-refuses rework at the round cap, so the status
+        // page must not send the host there for a blocked worker.
+        let text = format_room_status(&status_fixture(3, 3, "blocked"));
+        assert!(text.contains("task_close"), "{text}");
+        assert!(!text.contains("run task_assign"), "{text}");
+        // Below the cap the answer-through-assign path still applies.
+        let text = format_room_status(&status_fixture(2, 3, "blocked"));
+        assert!(text.contains("run task_assign"), "{text}");
     }
 
     #[test]

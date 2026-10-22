@@ -218,6 +218,7 @@ pub(crate) fn execute_task_collect(args: &Value) -> Result<String, String> {
                 task::AssignmentStatus::Working => "working",
                 task::AssignmentStatus::Done => "done",
                 task::AssignmentStatus::Failed => "failed",
+                task::AssignmentStatus::Blocked => "blocked (waiting on host answer)",
             }
         ));
     }

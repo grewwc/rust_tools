@@ -1,11 +1,14 @@
 use crate::ai::agents::{self, AgentManifest};
 
+use super::discuss::print_discuss_help;
+use super::task::print_task_help;
+
 /// Command sections of the interactive help (everything except shortcuts/notes).
 fn print_commands_help() {
     println!("Interactive commands:");
     println!();
     println!("  General:");
-    println!("    /help [cmd|shortcuts]    show this help message (optional topic)");
+    println!("    /help [cmd|shortcuts|discuss|task]    show this help message (optional topic)");
     println!("    /model [name]             list or switch models");
     println!(
         "    /effort [level]           show or set reasoning effort (shortcut for /model effort)"
@@ -165,7 +168,7 @@ pub fn try_handle_help_command(input: &str) -> bool {
         None => print_interactive_help(),
         Some(topic) if matches!(topic, "shortcuts" | "cmd" | "commands") => {
             if parts.next().is_some() {
-                println!("Too many arguments. Usage: /help [{topic}]");
+                println!("Too many arguments. Usage: /help [cmd|shortcuts|discuss|task]");
             } else if topic == "shortcuts" {
                 print_shortcuts_help();
                 println!();
@@ -173,9 +176,25 @@ pub fn try_handle_help_command(input: &str) -> bool {
                 print_commands_help();
             }
         }
+        Some(topic)
+            if matches!(
+                topic.trim_start_matches(['/', ':']),
+                "discuss" | "task"
+            ) =>
+        {
+            if parts.next().is_some() {
+                println!("Too many arguments. Usage: /help [cmd|shortcuts|discuss|task]");
+            } else if topic.trim_start_matches(['/', ':']) == "discuss" {
+                print_discuss_help();
+            } else {
+                print_task_help();
+            }
+        }
         Some(other) => {
-            println!("Unknown help topic: '{other}'. Available topics: cmd, shortcuts");
-            println!("Usage: /help [cmd|shortcuts]");
+            println!(
+                "Unknown help topic: '{other}'. Available topics: cmd, shortcuts, discuss, task"
+            );
+            println!("Usage: /help [cmd|shortcuts|discuss|task]");
         }
     }
     true

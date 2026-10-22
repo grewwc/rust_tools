@@ -696,9 +696,9 @@ impl CommandCompleter {
         ]
     }
 
-    /// Subcommands of `/discuss` and `/task` (both take `status [room]`).
+    /// Subcommands of `/discuss` and `/task` (both take `status [room]` or `help`).
     fn discuss_task_subcommands() -> &'static [&'static str] {
-        &["status"]
+        &["status", "help"]
     }
 
     /// Subcommands of `/git`.
@@ -913,15 +913,19 @@ impl CommandCompleter {
             .map(|idx| idx + 1)
             .unwrap_or(0);
         let token = &before[token_start..];
-        if token.is_empty() && token_start == 0 && !before.is_empty() {
+        // Multi-line sends (`/task <goal>` plus a `/skills ...` line) complete
+        // per line: the command context is the current line's first token, not
+        // the buffer's, so every line after the first behaves like a fresh one.
+        let line_start = before.rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        if token.is_empty() && token_start == line_start && !before[line_start..].is_empty() {
             return (pos, Vec::new());
         }
 
-        if token_start == 0 && Self::is_model_command(token) {
-            return (0, Self::model_command_candidates(token));
+        if token_start == line_start && Self::is_model_command(token) {
+            return (token_start, Self::model_command_candidates(token));
         }
 
-        let candidates = if token_start == 0 {
+        let candidates = if token_start == line_start {
             // Prefix-match with Tries: "/" / ":" go through the command Trie, "--" / "-" through the option Trie;
             // sort the results for determinism (HashMap iteration order is unordered). Client-registered
             // words (see EXTRA_COMMAND_WORDS) join the command branch and are deduped against the trie.
@@ -939,7 +943,7 @@ impl CommandCompleter {
                 Vec::new()
             }
         } else {
-            let mut words = before[..token_start].split_whitespace();
+            let mut words = before[line_start..token_start].split_whitespace();
             let Some(first) = words.next() else {
                 return (token_start, Vec::new());
             };
@@ -1191,7 +1195,7 @@ impl CommandCompleter {
                         // Argument tokens already typed (before the cursor, excluding the command itself) — for multi-skill
                         // completion exclude already-picked names so `/skills a <TAB>` can pick the next one.
                         let consumed: Vec<&str> =
-                            before[..token_start].split_whitespace().skip(1).collect();
+                            before[line_start..token_start].split_whitespace().skip(1).collect();
                         let mut matched: Vec<(u8, CompletionCandidate)> = Vec::new();
                         if consumed.is_empty() {
                             // First argument position: subcommand literals join the hints too (`/skills us<TAB>` → use)
@@ -2719,6 +2723,38 @@ mod tests {
     }
 
     #[test]
+    fn multiline_send_completes_per_line() {
+        // A `/skills` line after `/task` offers the same skill names as a
+        // standalone `/skills` line (previously it offered `status`).
+        let (_, single) = CommandCompleter::complete_for_line("/skills ", 8);
+        let line = "/task fix login\n/skills ";
+        let (_, multi) = CommandCompleter::complete_for_line(line, line.len());
+        let names = |pairs: Vec<CompletionCandidate>| {
+            pairs
+                .into_iter()
+                .map(|candidate| candidate.replacement)
+                .collect::<Vec<_>>()
+        };
+        assert!(!single.is_empty());
+        assert_eq!(names(multi), names(single));
+        // A second-line `/sk` prefix completes to `/skills` via the trie.
+        let line = "/task fix login\n/sk";
+        let (_, pairs) = CommandCompleter::complete_for_line(line, line.len());
+        assert!(
+            pairs.iter().any(|c| c.replacement == "/skills"),
+            "second line must complete commands, got: {:?}",
+            pairs.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+        );
+        // A second-line `/task ` still offers the `status` subcommand.
+        let line = "/discuss tabs\n/task ";
+        let (_, pairs) = CommandCompleter::complete_for_line(line, line.len());
+        assert!(
+            pairs.iter().any(|c| c.replacement == "status"),
+            "second-line /task must offer `status`"
+        );
+    }
+
+    #[test]
     fn model_command_completion_lists_full_command_candidates() {
         let completer = CommandCompleter;
         let history = DefaultHistory::new();
@@ -2753,6 +2789,15 @@ mod tests {
             .expect("model candidates should not be empty");
         assert_eq!(first.replacement, current);
         assert!(first.display.contains("current"));
+    }
+
+    #[test]
+    fn model_completion_on_second_line_starts_at_line_start() {
+        let line = "/task fix login\n/model";
+        let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
+        assert_eq!(start, "/task fix login\n".len());
+        assert!(!candidates.is_empty());
+        assert_eq!(&line[start..], "/model");
     }
 
     #[test]

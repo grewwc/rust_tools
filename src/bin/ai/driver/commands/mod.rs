@@ -24,7 +24,7 @@ pub mod usage;
 
 use std::sync::Arc;
 
-use crate::ai::{agents::AgentManifest, skills::SkillManifest, types::App};
+use crate::ai::{agents::AgentManifest, skills::SkillManifest, types::{App, ForcedSkillSource}};
 
 pub use agent::try_handle_agent_command;
 pub use checkpoint::try_handle_checkpoint_command;
@@ -187,6 +187,30 @@ pub fn try_handle_local_command(
     if changes::try_handle_changes_command(input)? {
         return Ok(true);
     }
+    // Reject ambiguous multi-main sends before handler order can silently
+    // decide: each of /task, /discuss, /goal sets a competing forced
+    // question, and the per-handler split would swallow the losing command
+    // line into the winner's topic/goal text.
+    {
+        let conflicts = conflicting_main_commands(input);
+        if conflicts.len() >= 2 {
+            let mut distinct: Vec<&str> = Vec::new();
+            for kind in conflicts {
+                if !distinct.contains(&kind) {
+                    distinct.push(kind);
+                }
+            }
+            let names = distinct
+                .iter()
+                .map(|kind| format!("/{kind}"))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            println!(
+                "Ambiguous input: this message contains multiple main commands ({names}). Send one main command per message (optional /skills lines are fine); nothing was started."
+            );
+            return Ok(true);
+        }
+    }
     if try_handle_goal_command(app, input)? {
         return Ok(true);
     }
@@ -291,6 +315,187 @@ fn looks_like_slash_command(input: &str) -> bool {
     !token.contains('/')
 }
 
+/// True when the trimmed line starts with `prefix` on a word boundary, so
+/// `/tasks` never matches `/task` and `/discussion` never matches `/discuss`.
+fn command_line_matches(trimmed_line: &str, prefix: &str) -> bool {
+    match trimmed_line.strip_prefix(prefix) {
+        None => false,
+        Some(rest) => rest.is_empty() || rest.starts_with(char::is_whitespace),
+    }
+}
+
+/// Names a main command when the trimmed line invokes it. Each of `/task`,
+/// `/discuss`, `/goal` sets a competing `forced_question`; `/skills` lines are
+/// deliberately not main commands because they are legal companions to any
+/// single main command.
+fn main_command_kind(trimmed_line: &str) -> Option<&'static str> {
+    for (kind, prefixes) in [
+        ("task", ["/task", ":task"]),
+        ("discuss", ["/discuss", ":discuss"]),
+        ("goal", ["/goal", ":goal"]),
+    ] {
+        if prefixes
+            .iter()
+            .any(|prefix| command_line_matches(trimmed_line, prefix))
+        {
+            return Some(kind);
+        }
+    }
+    None
+}
+
+/// Parse a fenced-code marker: the fence character (backtick or tilde), the
+/// run length, and whatever follows the run. Returns `None` for lines that
+/// cannot start a fence (fewer than three fence characters, wrong leading
+/// character). Follows CommonMark: a closing fence uses the same character,
+/// is at least as long as the opening run, and carries no info string; an
+/// opening backtick fence's info string must not contain a backtick.
+/// Command scans skip fenced lines so code examples mentioning `/task` or
+/// `/skills` stay question text.
+fn fence_marker(trimmed_line: &str) -> Option<(char, usize, &str)> {
+    let first = trimmed_line.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let run = trimmed_line.chars().take_while(|c| *c == first).count();
+    if run < 3 {
+        return None;
+    }
+    Some((first, run, &trimmed_line[run..]))
+}
+
+/// Update fence state for one trimmed line. Returns true when the line is a
+/// fence delimiter or fenced content (the caller skips command parsing for
+/// it). Tracks the opening character and length so a shorter or
+/// cross-character run inside the block (e.g. a ``` example inside a ````
+/// block) stays content instead of toggling the state early.
+fn feed_fence_line(open: &mut Option<(char, usize)>, trimmed_line: &str) -> bool {
+    let Some((ch, len, rest)) = fence_marker(trimmed_line) else {
+        return open.is_some();
+    };
+    match *open {
+        None => {
+            if ch == '`' && rest.contains('`') {
+                return false;
+            }
+            *open = Some((ch, len));
+            true
+        }
+        Some((open_ch, open_len)) => {
+            if ch == open_ch && len >= open_len && rest.trim().is_empty() {
+                *open = None;
+            }
+            true
+        }
+    }
+}
+
+/// Every main-command line in `input`, in order of appearance.
+///
+/// Engages only when a `/task` / `/discuss` handler would claim the input:
+/// the first non-empty line starts with `/` or `:` and is a main command or
+/// a `/skills` selection. Plain prose stays a question even when later lines
+/// happen to start with a command word, so it is never rejected here.
+fn conflicting_main_commands(input: &str) -> Vec<&'static str> {
+    let first = input.lines().map(str::trim).find(|line| !line.is_empty());
+    let Some(first) = first else {
+        return Vec::new();
+    };
+    if !(first.starts_with('/') || first.starts_with(':')) {
+        return Vec::new();
+    }
+    if main_command_kind(first).is_none()
+        && skills::parse_embedded_skills_line(first).is_none()
+    {
+        return Vec::new();
+    }
+    let mut open: Option<(char, usize)> = None;
+    let mut kinds = Vec::new();
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if feed_fence_line(&mut open, trimmed) {
+            continue;
+        }
+        if let Some(kind) = main_command_kind(trimmed) {
+            kinds.push(kind);
+        }
+    }
+    kinds
+}
+
+/// Split a combined multi-line submission into its main command input plus
+/// embedded `/skills` selections.
+///
+/// Engages only when the first non-empty line starts with `/` or `:` (plain
+/// prose stays a question even when a later line mentions a command) and is
+/// either the main command or a skills selection; otherwise returns `None`
+/// and the caller leaves the input alone. The main command is the first line
+/// starting with one of `prefixes`; the cleaned input puts that line first so
+/// the existing single-line parsers apply unchanged, with all non-selection
+/// lines preserved after it.
+pub(crate) fn split_combined_command(
+    input: &str,
+    prefixes: &[&str],
+) -> Option<(String, Vec<String>)> {
+    let first = input.lines().map(str::trim).find(|line| !line.is_empty())?;
+    if !(first.starts_with('/') || first.starts_with(':')) {
+        return None;
+    }
+    let starts_main = prefixes.iter().any(|p| command_line_matches(first, p));
+    if !starts_main && skills::parse_embedded_skills_line(first).is_none() {
+        return None;
+    }
+    let mut main_line: Option<&str> = None;
+    let mut kept: Vec<&str> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut open: Option<(char, usize)> = None;
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if feed_fence_line(&mut open, trimmed) {
+            kept.push(line);
+            continue;
+        }
+        if main_line.is_none() && prefixes.iter().any(|p| command_line_matches(trimmed, p)) {
+            main_line = Some(line);
+            continue;
+        }
+        if let Some(picked) = skills::parse_embedded_skills_line(trimmed) {
+            for name in picked {
+                if !names.iter().any(|known: &String| known.eq_ignore_ascii_case(&name)) {
+                    names.push(name);
+                }
+            }
+            continue;
+        }
+        kept.push(line);
+    }
+    let main = main_line?;
+    let mut cleaned = Vec::with_capacity(kept.len() + 1);
+    cleaned.push(main);
+    cleaned.extend(kept);
+    Some((cleaned.join("\n"), names))
+}
+
+/// Apply skills extracted from a combined send. A started room activates them
+/// on the host turn (mirrors `/skills-inline`); a read-only status view keeps
+/// them pending for the next turn (mirrors `/skills use`).
+pub(crate) fn apply_embedded_skills(app: &mut App, names: &[String], same_turn: bool) {
+    if names.is_empty() {
+        return;
+    }
+    app.forced_skills = names.to_vec();
+    app.forced_skill_source = Some(if same_turn {
+        ForcedSkillSource::SkillsCommandInline
+    } else {
+        ForcedSkillSource::SkillsCommandNextTurn
+    });
+    if same_turn {
+        println!("Skills for this session: {}", names.join(", "));
+    } else {
+        println!("Skills selected for next turn: {}", names.join(", "));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::looks_like_slash_command;
@@ -308,5 +513,118 @@ mod tests {
         assert!(!looks_like_slash_command(":)"));
         assert!(!looks_like_slash_command("plain prompt"));
         assert!(!looks_like_slash_command(""));
+    }
+
+    #[test]
+    fn combined_send_splits_main_command_and_skills() {
+        use super::split_combined_command;
+        // Forward order: main first, skills stripped from the goal.
+        let (main, names) =
+            split_combined_command("/task fix login\n/skills s1 s2", &["/task", ":task"])
+                .expect("combined send must engage");
+        assert_eq!(main, "/task fix login");
+        assert_eq!(names, vec!["s1", "s2"]);
+        // Reverse order: the main line moves first so single-line parsers apply.
+        let (main, names) =
+            split_combined_command("/skills use s1\n/discuss topic here", &["/discuss", ":discuss"])
+                .expect("reverse order must engage");
+        assert_eq!(main, "/discuss topic here");
+        assert_eq!(names, vec!["s1"]);
+        // No skills lines: still engages with an empty selection.
+        let (main, names) =
+            split_combined_command("/task fix login", &["/task", ":task"])
+                .expect("plain command must engage");
+        assert_eq!(main, "/task fix login");
+        assert!(names.is_empty());
+        // Other-command lines and prose are preserved, never claimed.
+        let (main, names) =
+            split_combined_command("/task x\n/discuss y", &["/task", ":task"])
+                .expect("main command must engage");
+        assert_eq!(main, "/task x\n/discuss y");
+        assert!(names.is_empty());
+        assert!(split_combined_command("hello\n/task x", &["/task", ":task"]).is_none());
+        assert!(split_combined_command("/help", &["/task", ":task"]).is_none());
+        assert!(split_combined_command("", &["/task", ":task"]).is_none());
+        // Fenced code examples stay body text: no skills stripped, no main moved.
+        let (main, names) = split_combined_command(
+            "/task fix login\n```\n/skills s1\n/discuss API options\n```",
+            &["/task", ":task"],
+        )
+        .expect("fenced body must engage");
+        assert!(names.is_empty());
+        assert!(main.contains("/skills s1"));
+        assert!(main.contains("/discuss API options"));
+        // Nested fences: a ``` example inside a ```` block stays content, so
+        // neither the skills line nor the discuss line escapes the fence.
+        let (main, names) = split_combined_command(
+            "/task fix login\n````\n```\n/skills s1\n/discuss API options\n````",
+            &["/task", ":task"],
+        )
+        .expect("nested fence must engage");
+        assert!(names.is_empty());
+        assert!(main.contains("/skills s1"));
+        assert!(main.contains("/discuss API options"));
+    }
+
+    #[test]
+    fn multi_main_send_reports_every_command_line() {
+        use super::conflicting_main_commands;
+        // The reported case: handler order used to silently start discuss and
+        // swallow the /task line into its topic.
+        assert_eq!(
+            conflicting_main_commands("/skills code-review\n/task fix login\n/discuss API options"),
+            vec!["task", "discuss"]
+        );
+        // Any order and any pair among task/discuss/goal conflicts.
+        assert_eq!(
+            conflicting_main_commands("/discuss API options\n/task fix login"),
+            vec!["discuss", "task"]
+        );
+        assert_eq!(
+            conflicting_main_commands("/goal ship it\n/task fix login"),
+            vec!["goal", "task"]
+        );
+        // A repeated single command is still one send only if it appears once.
+        assert!(conflicting_main_commands("/task fix login").len() < 2);
+        assert!(conflicting_main_commands("/task a\n/task b").len() >= 2);
+        // Single main plus skills is the legal combined send.
+        assert!(conflicting_main_commands("/skills s1 s2\n/task fix login").len() < 2);
+        assert!(conflicting_main_commands("/task status").len() < 2);
+        // Word boundaries and prose are never commands.
+        assert!(conflicting_main_commands("/tasks are many").is_empty());
+        assert!(conflicting_main_commands("/discussion notes").is_empty());
+        assert!(conflicting_main_commands("how do I use /task?\n/discuss this").is_empty());
+        assert!(conflicting_main_commands("").is_empty());
+        // Fenced code examples are body text, never conflicting commands.
+        assert!(conflicting_main_commands(
+            "/task fix login\n```\n/discuss API options\n```"
+        )
+        .len()
+            < 2);
+        assert!(conflicting_main_commands(
+            "/task fix login\n~~~\n/task second\n~~~"
+        )
+        .len()
+            < 2);
+        // Nested fences: the inner ``` run is shorter than the ```` opener,
+        // so it cannot close the block and the /discuss line stays fenced.
+        assert!(
+            conflicting_main_commands(
+                "/task fix login\n````\n```\n/discuss API options\n````"
+            )
+            .len()
+                < 2
+        );
+        // Cross-character runs never close: ~~~ inside a ``` block is content.
+        assert!(
+            conflicting_main_commands("/task fix login\n```\n~~~\n/discuss API options\n```")
+                .len()
+                < 2
+        );
+        // A shorter backtick run cannot close a longer opener: the second
+        // /task line is still fenced, so no conflict is reported.
+        assert!(
+            conflicting_main_commands("/task a\n````\n```\n/task b\n````").len() < 2
+        );
     }
 }

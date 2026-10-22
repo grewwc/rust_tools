@@ -276,6 +276,59 @@ fn resolve_implicit_selection<'m>(
     (names, rest)
 }
 
+/// Parse one input line as an embedded `/skills` selection for combined
+/// multi-line sends (`/task <goal>` plus a `/skills <name>...` line, in
+/// either order).
+///
+/// Accepts `/skills`, `:skills`, `/skill` and `:skill` heads with an optional
+/// `use`/`select`/`switch` keyword. Read-only views (`list`, `current`,
+/// `help`, ...) and a bare head with no names return `None` so those lines
+/// stay question text. Names come back raw in input order; validation stays
+/// with turn activation, which resolves each name against the manifests and
+/// reports unknown ones without sinking the whole set.
+pub(crate) fn parse_embedded_skills_line(line: &str) -> Option<Vec<String>> {
+    let head = line
+        .trim()
+        .strip_prefix('/')
+        .or_else(|| line.trim().strip_prefix(':'))?;
+    let mut words = head.split_whitespace();
+    match words.next()? {
+        "skills" | "skill" => {}
+        _ => return None,
+    }
+    let mut words = words.peekable();
+    if matches!(
+        words.peek().map(|word| word.to_ascii_lowercase()).as_deref(),
+        Some("use" | "select" | "switch")
+    ) {
+        words.next();
+    }
+    let names: Vec<String> = words
+        .map(|word| {
+            word.trim_matches(|c| c == ',' || c == ';')
+                .trim_start_matches('@')
+                .to_string()
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    let first_is_reserved = names.first().is_some_and(|name| {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "list"
+                | "ls"
+                | "current"
+                | "cur"
+                | "help"
+                | "h"
+                | "--help"
+        )
+    });
+    if names.is_empty() || first_is_reserved {
+        return None;
+    }
+    Some(names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{SkillManifest, resolve_implicit_selection};
@@ -412,5 +465,31 @@ mod tests {
         let (names, rest) = resolve("fizzbuzz");
         assert!(names.is_empty());
         assert_eq!(rest.as_deref(), Some("fizzbuzz"));
+    }
+
+    #[test]
+    fn embedded_skills_line_shapes() {
+        let parse = super::parse_embedded_skills_line;
+        assert_eq!(
+            parse("/skills code-review docs-review").unwrap(),
+            vec!["code-review", "docs-review"]
+        );
+        assert_eq!(
+            parse("  :skills use code-review  ").unwrap(),
+            vec!["code-review"]
+        );
+        assert_eq!(parse("/skill code-review").unwrap(), vec!["code-review"]);
+        // Read-only views and bare heads are not selections: they stay text.
+        for line in [
+            "/skills",
+            "/skills list",
+            "/skills current",
+            "/skills help",
+            "/skills use",
+            "just some prose",
+            "/task fix bug",
+        ] {
+            assert_eq!(parse(line), None, "{line:?} must not parse as a selection");
+        }
     }
 }

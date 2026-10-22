@@ -2,6 +2,8 @@ use colored::Colorize;
 
 use crate::ai::{driver::discuss, history::SessionStore, types::App};
 
+use super::{apply_embedded_skills, split_combined_command};
+
 /// Default member count for a bare `/discuss <topic>`.
 const DEFAULT_DISCUSS_MEMBERS: usize = 3;
 
@@ -20,6 +22,16 @@ pub(crate) fn build_discuss_host_prompt(topic: &str, member_count: usize) -> Str
 enum DiscussCommand {
     Start { topic: String, member_count: usize },
     Status { room: Option<String> },
+    Help,
+}
+
+/// Detailed help for `/discuss` (also reachable via `/help discuss`).
+pub(crate) fn print_discuss_help() {
+    println!("Host a multi-session debate across worker sessions.");
+    println!("  /discuss [N] <topic>      start a debate (1-8 members, default 3)");
+    println!("  /discuss status [room]    show discussion progress (read-only)");
+    println!("  /discuss help             show this help");
+    println!("Combine with skills in one send: put /discuss first, /skills lines after.");
 }
 
 /// Bare host-tool names that must not silently become a topic: a lone
@@ -45,6 +57,9 @@ fn parse_discuss_command(input: &str) -> Option<Result<DiscussCommand, String>> 
         return Some(Err(
             "Usage: /discuss [members] <topic> | /discuss status [room]".to_string(),
         ));
+    }
+    if matches!(rest.as_str(), "help" | "h" | "--help") {
+        return Some(Ok(DiscussCommand::Help));
     }
     if rest == "status" {
         return Some(Ok(DiscussCommand::Status { room: None }));
@@ -99,7 +114,14 @@ pub fn try_handle_discuss_command(
     app: &mut App,
     input: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let Some(parsed) = parse_discuss_command(input) else {
+    // Combined send: `/discuss <topic>` plus `/skills <name>...` lines in
+    // either order. Discuss stays the main command; the picked skills ride
+    // the host turn.
+    let Some((main_input, embedded)) = split_combined_command(input, &["/discuss", ":discuss"])
+    else {
+        return Ok(false);
+    };
+    let Some(parsed) = parse_discuss_command(&main_input) else {
         return Ok(false);
     };
     let cmd = match parsed {
@@ -116,6 +138,7 @@ pub fn try_handle_discuss_command(
         } => {
             let prompt = build_discuss_host_prompt(&topic, member_count);
             app.forced_question = Some(prompt);
+            apply_embedded_skills(app, &embedded, true);
             println!(
                 "{} Hosting a discussion with {} members. Topic: {}",
                 "[discuss]".cyan().bold(),
@@ -125,6 +148,7 @@ pub fn try_handle_discuss_command(
             Ok(true)
         }
         DiscussCommand::Status { room } => {
+            apply_embedded_skills(app, &embedded, false);
             let store = SessionStore::new(app.config.history_file.as_path());
             let history_file = store.session_history_file(&app.session_id);
             let room = match room {
@@ -155,6 +179,11 @@ pub fn try_handle_discuss_command(
                 Ok(st) => println!("{}", discuss::format_room_status(&st)),
                 Err(error) => println!("{} {error}", "[discuss]".red()),
             }
+            Ok(true)
+        }
+        DiscussCommand::Help => {
+            apply_embedded_skills(app, &embedded, false);
+            print_discuss_help();
             Ok(true)
         }
     }
@@ -254,5 +283,100 @@ mod tests {
                 member_count: DEFAULT_DISCUSS_MEMBERS,
             }
         );
+    }
+
+    fn test_app() -> App {
+        use std::sync::{Arc, atomic::AtomicBool};
+        crate::ai::types::App {
+            cli: crate::ai::cli::ParsedCli::default(),
+            scoped_preflight_required: Vec::new(),
+            config: crate::ai::types::AppConfig {
+                api_key: String::new(),
+                base_history_file: std::path::PathBuf::new(),
+                history_file: std::path::PathBuf::new(),
+                endpoint: String::new(),
+                vl_default_model: String::new(),
+                history_max_chars: 8000,
+                history_keep_last: 10,
+                history_summary_max_chars: 4000,
+                intent_model: None,
+            },
+            session_id: "test".to_string(),
+            session_history_file: std::path::PathBuf::new(),
+            active_persona: crate::ai::persona::default_persona(),
+            client: reqwest::Client::builder().build().unwrap(),
+            current_model: "test".to_string(),
+            current_agent: "build".to_string(),
+            current_agent_manifest: None,
+            pending_files: None,
+            forced_skills: Vec::new(),
+            forced_skill_source: None,
+            pending_skill_continuation: None,
+            forced_question: None,
+            attached_image_files: Vec::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            streaming: Arc::new(AtomicBool::new(false)),
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            ignore_next_prompt_interrupt: false,
+            prompt_editor: None,
+            agent_context: None,
+            last_skill_bias: None,
+            os: crate::ai::driver::new_local_kernel(),
+            agent_reload_counter: None,
+            observers: Vec::new(),
+            last_known_prompt_tokens: None,
+            last_known_cached_prompt_tokens: None,
+            goal_mode: None,
+            last_turn_had_tool_calls: false,
+            last_turn_interrupted: false,
+            prune_marks: Default::default(),
+            turn_reasoning_items: Default::default(),
+            turn_tool_errors: Default::default(),
+            stale_patch_targets: Default::default(),
+            tool_middlewares: Vec::new(),
+            llm_middlewares: Vec::new(),
+            hooks: Default::default(),
+        }
+    }
+
+    #[test]
+    fn combined_send_selects_skills_on_start() {
+        use crate::ai::types::ForcedSkillSource;
+        for input in [
+            "/discuss tabs vs spaces\n/skills s1 s2",
+            "/skills use s1 s2\n/discuss tabs vs spaces",
+        ] {
+            let mut app = test_app();
+            assert!(try_handle_discuss_command(&mut app, input).unwrap());
+            let question = app.forced_question.expect("start must set a host prompt");
+            assert!(question.contains("tabs vs spaces"), "topic lost: {question}");
+            assert!(!question.contains("s1"), "skills line leaked: {question}");
+            assert_eq!(app.forced_skills, vec!["s1", "s2"]);
+            assert_eq!(
+                app.forced_skill_source,
+                Some(ForcedSkillSource::SkillsCommandInline)
+            );
+        }
+    }
+
+    #[test]
+    fn combined_status_keeps_skills_for_next_turn() {
+        use crate::ai::types::ForcedSkillSource;
+        let mut app = test_app();
+        assert!(try_handle_discuss_command(&mut app, "/discuss status\n/skills s1").unwrap());
+        assert!(app.forced_question.is_none());
+        assert_eq!(app.forced_skills, vec!["s1"]);
+        assert_eq!(
+            app.forced_skill_source,
+            Some(ForcedSkillSource::SkillsCommandNextTurn)
+        );
+    }
+
+    #[test]
+    fn prose_containing_discuss_is_not_claimed() {
+        let mut app = test_app();
+        assert!(!try_handle_discuss_command(&mut app, "hello\n/discuss x").unwrap());
+        assert!(app.forced_question.is_none());
+        assert!(app.forced_skills.is_empty());
     }
 }
