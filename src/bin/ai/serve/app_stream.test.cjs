@@ -8,6 +8,7 @@ const vm = require("node:vm");
 const script = fs.readFileSync(path.join(__dirname, "app.html"), "utf8").match(/<script>([\s\S]*?)<\/script>/)[1];
 
 function streamHarness() {
+  const timers = [];
   const box = {
     children: [],
     insertBefore(node, before) {
@@ -24,7 +25,7 @@ function streamHarness() {
   }
   const context = vm.createContext({
     box, sid: "s", sessionId: "s", finished: false, turnError: false,
-    setTimeout: () => 1, clearTimeout() {},
+    setTimeout: (fn, delay) => { timers.push(delay); return timers.length; }, clearTimeout() {},
     shouldFollowOutput: () => false, followOutput() {},
     renderMarkdown: (text) => text, decorateMath() {},
     showConfirm() {}, hideConfirm() {}, confirmShown: null,
@@ -43,18 +44,36 @@ function streamHarness() {
   vm.runInContext(script.slice(script.indexOf("function replyPaintDelay("), script.indexOf("function sessionTitle(")), context);
   const start = script.indexOf('  const bubble = addMsgMd("", box);');
   vm.runInContext(script.slice(start, script.indexOf("  let turnStarted = false;", start)), context);
-  const dispatchStart = script.indexOf('        if (kind === "done")', start);
+  // The watchdogs are `const` in the real script, so they are script-scoped
+  // there. As globals here they are reachable from the block loop, which is
+  // what arms them for every event, keep-alive comments included.
+  const wdStart = script.indexOf("  const STREAM_STALL_MS");
+  const wdEnd = script.indexOf("  const goStale", wdStart);
+  assert.ok(wdStart > 0 && wdEnd > wdStart);
+  vm.runInContext(
+    script.slice(wdStart, wdEnd)
+      .replace(/\b(const|let) (STREAM_STALL_MS|STREAM_SILENCE_MS|armStall|armProgress|stalled|stallTimer|silenceTimer|reader|wentStale)\b/g, "var $2"),
+    context,
+  );
+  // The block loop arms the watchdogs before it dispatches the event, so the
+  // slice has to start there: a keep-alive comment must reach the watchdog.
+  const dispatchStart = script.indexOf("        armStall();", start);
   const dispatchEnd = script.indexOf("      if (finished) break;", dispatchStart);
   // Remove the SSE block loop's closing brace and supply a loop for done's break.
   const dispatch = script.slice(dispatchStart, dispatchEnd).replace(/\s*}\s*$/, "");
   return {
     context,
     box,
+    timers,
     connect() {
       const begin = script.indexOf("  let turnStarted = false;", start);
       const end = script.indexOf("  try {\n    const res = await fetch", begin);
       assert.ok(end > begin);
-      vm.runInContext(script.slice(begin, end), context);
+      vm.runInContext(
+        script.slice(begin, end)
+          .replace(/\b(const|let) (STREAM_STALL_MS|STREAM_SILENCE_MS|armStall|armProgress|stalled|stallTimer|silenceTimer|reader|wentStale)\b/g, "var $2"),
+        context,
+      );
     },
     emit(kind, value) {
       context.kind = kind;
@@ -330,4 +349,29 @@ test("failed cached tool result is not displayed as success and truncated previe
   assert.match(h.titles()[0], /^! read_file · cached$/);
   assert.match(h.bodies()[0], /full output in history/);
   assert.doesNotMatch(h.pending(), /Running/);
+});
+
+test("a keep-alive comment proves the connection is alive, and only a real event counts as progress", () => {
+  const h = streamHarness();
+  h.connect();
+  const stall = Number(/const STREAM_STALL_MS = (\d+)/.exec(script)[1]);
+  const silence = Number(/const STREAM_SILENCE_MS = (\d+)/.exec(script)[1]);
+  assert.ok(silence > stall, "a quiet turn must get more room than a dead connection");
+  h.timers.length = 0;
+  h.emit("", ""); // the keep-alive comment the server sends every 15s
+  assert.ok(h.timers.includes(stall), "a keep-alive must re-arm the transport watchdog");
+  assert.ok(!h.timers.includes(silence), "a keep-alive is not progress");
+  h.timers.length = 0;
+  h.emit("delta", { text: "hi" });
+  assert.ok(h.timers.includes(stall));
+  assert.ok(h.timers.includes(silence), "a real event is progress");
+});
+
+test("a feed that dies mid-turn reattaches to the retained event stream", () => {
+  const at = script.indexOf("turns.delete(sid);");
+  assert.ok(at > 0);
+  const tail = script.slice(at, at + 900);
+  assert.match(tail, /wentStale/, "the stale path must be marked");
+  assert.match(tail, /attachEvents\(\)/, "the stale path must reattach to the retained stream");
+  assert.match(tail, /box\.remove\(\)/, "the dead live box must be replaced by the reattached view");
 });
