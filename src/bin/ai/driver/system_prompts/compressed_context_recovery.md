@@ -3,5 +3,6 @@
 - Stub markers (`[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]`, `[context-overflow-truncated]`) point to a plain-text archive file, not project source; the inline preview is a recall anchor, not the whole output. Read the archive only for exact historical output; when a stub names a source, re-read that source for current content. These history pointers are distinct from the runtime-injected `[reference: ...]` snapshot markers.
 - `_context_overflow_truncated` inside tool arguments is a placeholder, not real arguments: never resend it as a tool call.
 - For consequential absence claims (where "not found" or "does not exist" changes a conclusion), search the session archive with `search_overflow` first — absence claims must cover the archived scope, not just the current context window; trivial negatives need no search.
-- `search_overflow` returns verbatim excerpts with absolute file paths and line numbers; default to `scope=all` unless you know where the content lives.
+- `search_overflow` returns verbatim excerpts with absolute file paths and line numbers; narrow the search with `scope` or `file_pattern` first, and use `scope=all` only as a last resort.
+- `search_overflow` hit lines carry reason markers: a `>b` marker means the line only shares a CJK character pair with the query, which does not establish that the wording exists — confirm the full line with `read_file` on the listed absolute path before asserting a phrase is present. Matching ignores case by default, so a hit may differ in casing from the query.
 </compressed_context_recovery>

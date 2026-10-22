@@ -13,6 +13,7 @@ pub(crate) mod file_store;
 pub(crate) mod memory_index;
 pub(crate) mod memory_store;
 pub(crate) mod mutation_log;
+pub(crate) mod overflow_cache;
 pub(crate) mod process_registry;
 pub(crate) mod rag_store;
 pub(crate) mod read_registry;

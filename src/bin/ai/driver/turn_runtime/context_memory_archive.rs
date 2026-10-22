@@ -7,6 +7,7 @@ use std::{
     fs::{self, File},
     io::Read,
     path::{Component, Path, PathBuf},
+    time::SystemTime,
 };
 
 /// Text-bearing recovery directories, not arbitrary session assets such as images
@@ -18,6 +19,58 @@ pub(super) const RECOVERY_DIRECTORIES: &[&str] = &[
     "context-checkpoints",
     "tool-overflow",
 ];
+
+/// Identity of one file version observed on an open descriptor: length and
+/// modification time plus, on Unix, the device/inode pair and the metadata
+/// change time. Length plus mtime alone cannot distinguish an equal-length
+/// replacement that restores the mtime, nor an in-place rewrite of the same
+/// inode; the device/inode pair catches replacement by rename, and the change
+/// time catches in-place rewrites whose mtime was restored, because updating
+/// the mtime itself advances the change time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct FileIdentity {
+    /// File length in bytes, observed on the descriptor.
+    pub len: u64,
+    /// File modification time, observed on the descriptor.
+    pub mtime: SystemTime,
+    /// Owning device, Unix only; zero elsewhere.
+    pub dev: u64,
+    /// Inode number, Unix only; zero elsewhere.
+    pub ino: u64,
+    /// Metadata change time, seconds since the Unix epoch; zero elsewhere.
+    pub ctime_sec: i64,
+    /// Metadata change time, sub-second nanoseconds; zero elsewhere.
+    pub ctime_nsec: i64,
+}
+
+fn identity_of(metadata: &fs::Metadata, len: u64, mtime: SystemTime) -> FileIdentity {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        FileIdentity {
+            len,
+            mtime,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            ctime_sec: metadata.ctime(),
+            // ctime_nsec is i32 on some targets and i64 on others; narrow
+            // explicitly so the struct shape stays stable across platforms.
+            ctime_nsec: metadata.ctime_nsec() as i64,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        FileIdentity {
+            len,
+            mtime,
+            dev: 0,
+            ino: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+        }
+    }
+}
 
 pub(super) struct ArchiveRoot {
     path: PathBuf,
@@ -151,22 +204,76 @@ impl ArchiveRoot {
         max_file_bytes: usize,
         remaining_bytes: &mut usize,
     ) -> Option<String> {
+        let (file, _) = self.open_versioned(path)?;
+        self.read_opened_text(file, max_file_bytes, remaining_bytes)
+            .map(|(content, _)| content)
+    }
+
+    /// Identity of the held session root directory itself: the device/inode
+    /// pair of the directory descriptor captured at `new` time. Callers bind
+    /// cached file bodies to this pair so entries from one session directory
+    /// can never be served for another path that merely reuses the same
+    /// spelling after the directory was replaced.
+    pub(super) fn root_identity(&self) -> (u64, u64) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            return self
+                .directory
+                .metadata()
+                .ok()
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+                .unwrap_or((0, 0));
+        }
+        #[cfg(not(unix))]
+        {
+            (0, 0)
+        }
+    }
+
+    /// Opens `path` through the session-bound safe path (every component opened
+    /// with O_NOFOLLOW relative to a held directory descriptor) and returns the
+    /// open descriptor plus the file identity observed on that descriptor.
+    /// The identity covers length, mtime, device/inode, and change time so an
+    /// equal-length replacement that restores the mtime is still a mismatch.
+    pub(super) fn open_versioned(&self, path: &Path) -> Option<(File, FileIdentity)> {
+        let file = self.open(path)?;
+        let metadata = file.metadata().ok()?;
+        let mtime = metadata.modified().ok()?;
+        let len = metadata.len();
+        Some((file, identity_of(&metadata, len, mtime)))
+    }
+
+    /// Reads an already-open descriptor with the same size limit and UTF-8
+    /// validation as `read_text`, and returns the content plus the file
+    /// identity observed on the same descriptor after the read. Callers must
+    /// compare the before/after identities and reject the read when they
+    /// differ: the content may be torn by a concurrent rewrite.
+    pub(super) fn read_opened_text(
+        &self,
+        file: File,
+        max_file_bytes: usize,
+        remaining_bytes: &mut usize,
+    ) -> Option<(String, FileIdentity)> {
         if *remaining_bytes == 0 {
             return None;
         }
-        let file = self.open(path)?;
         let metadata = file.metadata().ok()?;
         let limit = max_file_bytes.min(remaining_bytes.saturating_sub(1));
         if !metadata.is_file() || metadata.len() > limit as u64 {
             return None;
         }
         let mut bytes = Vec::new();
-        let result = file.take(limit as u64 + 1).read_to_end(&mut bytes);
+        let result = (&file).take(limit as u64 + 1).read_to_end(&mut bytes);
         *remaining_bytes = remaining_bytes.saturating_sub(bytes.len());
         if result.is_err() || bytes.len() > limit {
             return None;
         }
-        String::from_utf8(bytes).ok()
+        let content = String::from_utf8(bytes).ok()?;
+        let after = file.metadata().ok()?;
+        let after_mtime = after.modified().ok()?;
+        let after_len = after.len();
+        Some((content, identity_of(&after, after_len, after_mtime)))
     }
 
     #[cfg(unix)]

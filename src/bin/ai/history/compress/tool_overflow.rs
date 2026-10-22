@@ -1100,9 +1100,9 @@ fn fingerprint_token_score(token: &str) -> i32 {
 
 /// Extract up to `FINGERPRINT_KEY_COUNT` discriminative keywords from content.
 ///
-/// Casing is preserved verbatim: `search_overflow` matches literally and defaults
-/// to case-sensitive, so a keyword only helps retrieval if it still occurs exactly
-/// in the archived text.
+/// Casing is preserved verbatim: the keyword keeps the casing it had in the
+/// content. `search_overflow` matches case-insensitively by default, so a casing
+/// difference no longer blocks retrieval.
 pub(super) fn extract_fingerprint_keywords(content: &str) -> Vec<String> {
     const MIN_TOKEN_LEN: usize = 5;
     const MAX_TOKEN_LEN: usize = 32;

@@ -1228,3 +1228,95 @@ fn builtin_integer_schemas_match_registered_bounds() {
         "integer bound registry mismatch:\nnew unregistered: {unregistered:?}\ndrifted: {drifted:?}\nstale entries: {stale:?}"
     );
 }
+
+#[test]
+fn search_overflow_description_stays_in_sync_with_implementation() {
+    // Drift guard between the model-facing tool description (the contract the
+    // model reads when choosing a query) and the implementation's actual
+    // behavior. When the case_sensitive default flipped to false, the
+    // description still advertised true and still advised retrying with
+    // case_sensitive=false; that drift silently changed how the model searched
+    // without any build failure. This test pins the description to the
+    // implementation contract so the same class of drift fails the build.
+    let raw = include_str!("../../tool_descriptions/search_overflow.json");
+    let schema: serde_json::Value =
+        serde_json::from_str(raw).expect("search_overflow.json must stay valid JSON");
+    let case_sensitive_desc = schema["parameters"]["properties"]["case_sensitive"]["description"]
+        .as_str()
+        .unwrap_or_default();
+
+    // The published default is compared against the value the parser actually
+    // applies, not merely pinned on its own: a check that only reads the
+    // description stays green when the implementation flips, so the two sides
+    // are derived and compared.
+    let impl_default = crate::ai::tools::SEARCH_OVERFLOW_CASE_SENSITIVE_DEFAULT;
+    assert!(
+        !(case_sensitive_desc.contains("default: false")
+            && case_sensitive_desc.contains("default: true")),
+        "the case_sensitive description must not state two different defaults: {case_sensitive_desc}"
+    );
+    let documented_default = if case_sensitive_desc.contains("default: false") {
+        false
+    } else if case_sensitive_desc.contains("default: true") {
+        true
+    } else {
+        panic!("the case_sensitive description must state its default: {case_sensitive_desc}");
+    };
+    assert_eq!(
+        documented_default, impl_default,
+        "the documented case_sensitive default drifted from the implementation default"
+    );
+    // The "retry with case_sensitive=false" advice became obsolete the moment
+    // false became the default; a stale copy would again mislead the model.
+    assert!(
+        !raw.contains("retry with case_sensitive=false"),
+        "obsolete case_sensitive=false retry advice still present in search_overflow.json"
+    );
+
+    // The hit-reason markers the renderer emits (>> phrase / >t term / >b CJK
+    // fragment) must be documented so the model reads a >b line as a near-miss
+    // instead of proof that the wording is present.
+    assert!(
+        raw.contains(">> whole-query phrase hit") && raw.contains(">b CJK-fragment hit"),
+        "hit-reason legend missing from search_overflow.json"
+    );
+
+    // The legend must also state the matching mode: under the case-insensitive
+    // default the archived casing of a hit may differ from the query, and a
+    // legend that omits this reads as "the wording is present exactly as typed".
+    assert!(
+        raw.contains("matching ignores case by default"),
+        "hit-reason legend must state the case-insensitive default"
+    );
+
+    // A regex query inherits the same default, so its description must say so
+    // instead of letting the model assume a pattern is matched verbatim.
+    let is_regex_desc = schema["parameters"]["properties"]["is_regex"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        is_regex_desc.contains("case-insensitively"),
+        "is_regex description must state the case-insensitive default: {is_regex_desc}"
+    );
+
+    // The parameter set is a stable model-facing contract: silently adding or
+    // removing a parameter must fail the build rather than change the surface
+    // the model can call.
+    let keys: std::collections::BTreeSet<String> = schema["parameters"]["properties"]
+        .as_object()
+        .expect("parameters.properties must be an object")
+        .keys()
+        .cloned()
+        .collect();
+    let expected: std::collections::BTreeSet<String> = [
+        "query", "scope", "file_pattern", "is_regex", "case_sensitive", "context_lines",
+        "max_results",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(
+        keys, expected,
+        "search_overflow parameter set drifted from the documented contract"
+    );
+}

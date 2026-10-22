@@ -1,7 +1,7 @@
 {
   "name": "search_overflow",
   "description": "Search session content moved out of context. Returns verbatim excerpts with file paths and line numbers.",
-  "first_use_guidance": "Guidance for reading later search_overflow answers in this turn:\n- Only content moved out of context is searched (never canonical session history or project files), and every file the filters keep is scanned in full.\n- The footer reports files scanned plus matching line(s) that were selected but not written; those lines stay reachable by narrowing the query, scope, or file_pattern, or by raising max_results.\n- A zero-hit answer names what it scanned (files searched, file_pattern exclusions, unreadable files, and which terms came up empty; when nothing was scanned it says so and names the roots probed); read it as 'not found in this archive', not as proof the content never existed, and retry with case_sensitive=false, a wider scope, or more distinctive words.\n- Excerpts window long lines around the match, with \u2026 marking elided text on either side, so a window is not the whole line: use read_file on the listed absolute path for the full line.",
+  "first_use_guidance": "Guidance for reading later search_overflow answers in this turn:\n- Only content moved out of context is searched (never canonical session history or project files), and every file the filters keep is scanned in full.\n- Narrow with scope or file_pattern first; scope=all is a last resort.\n- The footer reports files scanned plus matching line(s) that were selected but not written; those lines stay reachable by narrowing the query, scope, or file_pattern, or by raising max_results.\n- Each matching line carries a reason marker; the legend is: markers: >> whole-query phrase hit, >t typed-term hit, >b CJK-fragment hit (the phrase may be absent — verify with read_file), two spaces = context line; matching ignores case by default, so a hit may differ in casing from the query. A >b hit only means the line shares a character pair with the query, so asserting that the exact wording actually appears requires read_file on the listed absolute path to read the full line.\n- A zero-hit answer names what it scanned (files searched, file_pattern exclusions, unreadable files, and which terms came up empty; when nothing was scanned it says so and names the roots probed) and names the matching mode, so a case-insensitive zero hit rules out other casings too; read it as 'not found in this archive', not as proof the content never existed, and retry with a wider scope, more distinctive words, or case_sensitive=true to narrow to one specific casing.\n- Excerpts window long lines around the match, with \u2026 marking elided text on either side, so a window is not the whole line: use read_file on the listed absolute path for the full line.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -20,15 +20,15 @@
       },
       "file_pattern": {
         "type": "string",
-        "description": "Optional glob to restrict searched archive files (e.g. '*execute_command*')."
+        "description": "Optional glob to restrict searched archive files, matched against the path relative to the archive root or the file name (e.g. '*execute_command*', '*internal-note-overflow*')."
       },
       "is_regex": {
         "type": "boolean",
-        "description": "Treat query as a regex (default: false, literal substring)."
+        "description": "Treat query as a regex (default: false, literal substring). The pattern is matched case-insensitively unless case_sensitive is true; an inline flag in the pattern itself (e.g. `(?i)`, `(?-i)`) overrides that."
       },
       "case_sensitive": {
         "type": "boolean",
-        "description": "Case-sensitive match (default: true)."
+        "description": "Case-sensitive match (default: false — matching ignores case by default, so the query also hits other casings; set true to narrow to one exact casing)."
       },
       "context_lines": {
         "type": "integer",

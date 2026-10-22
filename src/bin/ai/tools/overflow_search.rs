@@ -65,6 +65,7 @@ use crate::ai::tools::common::{
     ToolRetryPolicyRegistration, ToolSpec,
 };
 use crate::ai::tools::storage::file_store::current_session_assets_dir;
+use crate::ai::tools::storage::overflow_cache;
 
 // Share the content-read boundary with automatic recall, but not its scan
 // budgets: manual recovery must still reach large files and late/deep paths.
@@ -72,11 +73,91 @@ use crate::ai::tools::storage::file_store::current_session_assets_dir;
 mod archive_files;
 
 fn read_archive_text(archive: &archive_files::ArchiveRoot, path: &Path) -> Option<String> {
-    // Preserve full-file manual search semantics. Output is bounded separately;
-    // scan work and resident hit metadata are not bounded by automatic-recall
-    // limits. A fresh budget on each read prevents earlier files hiding later ones.
-    let mut remaining_bytes = usize::MAX;
-    archive.read_text(path, usize::MAX, &mut remaining_bytes)
+    read_archive_text_versioned(archive, path).map(|(content, _)| content)
+}
+
+/// Same as `read_archive_text`, plus the (length, mtime) version the content
+/// corresponds to — the identity observed on the safe-open descriptor. A cache
+/// hit only ever returns a body stored under exactly this version, so the
+/// caller can rely on it for scan/render version comparisons.
+fn read_archive_text_versioned(
+    archive: &archive_files::ArchiveRoot,
+    path: &Path,
+) -> Option<(String, overflow_cache::FileVersion)> {
+    // Always open through the session-bound safe path (O_NOFOLLOW on every
+    // component) before touching the cache: a body must never be served for a
+    // path the safe reader would refuse, so a symlink swap can never bypass
+    // the boundary through a cached copy. The descriptor also yields the
+    // version the cache is keyed on, tying the body to the file actually
+    // opened.
+    // A read that raced a concurrent rewrite is torn: the content may mix the
+    // old and new files, and the pre-read markers would mislabel it. Retry a
+    // bounded number of times, then give up and report the file as unreadable
+    // so the caller falls back to a path-carrying pointer instead of a
+    // mislabeled excerpt.
+    for _ in 0..3 {
+        let (file, before) = archive.open_versioned(path)?;
+        let (root_dev, root_ino) = archive.root_identity();
+        let version = overflow_cache::FileVersion {
+            len: before.len,
+            mtime: before.mtime,
+            dev: before.dev,
+            ino: before.ino,
+            ctime_sec: before.ctime_sec,
+            ctime_nsec: before.ctime_nsec,
+            root_dev,
+            root_ino,
+        };
+        if let Some(cached) = overflow_cache::cached_text(path, version) {
+            return Some((cached, version));
+        }
+        // Preserve full-file manual search semantics. Output is bounded
+        // separately; scan work and resident hit metadata are not bounded by
+        // automatic-recall limits. A fresh budget on each read prevents earlier
+        // files hiding later ones.
+        let mut remaining_bytes = usize::MAX;
+        let Some((content, after)) =
+            archive.read_opened_text(file, usize::MAX, &mut remaining_bytes)
+        else {
+            return None;
+        };
+        if after != before {
+            continue;
+        }
+        // Test-only seam: let a test rewrite the file inside the read-to-store
+        // window, proving the cache binds a body only to the identity observed on
+        // the descriptor that produced it.
+        #[cfg(test)]
+        STORE_HOOK.with(|cell| {
+            if let Some(hook) = cell.borrow_mut().take() {
+                hook();
+            }
+        });
+        overflow_cache::store_text(path, version, &content);
+        return Some((content, version));
+    }
+    None
+}
+
+// Test-only seam: a hook fired once after pass A/B completes and before
+// excerpt rendering, so a test can modify archive files between the scan and
+// the render pass. Lives in the calling thread, where the whole search runs
+// (parallel pass A uses scoped worker threads), so parallel tests cannot
+// observe each other's hooks.
+#[cfg(test)]
+thread_local! {
+    static RENDER_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// Test-only seam: a hook fired once after the content is read and before it is
+// stored in the cache, so a test can rewrite the file inside the read-to-store
+// window — the exact window in which a pre-fix cache could bind an old body to
+// a new file's fingerprint. Same one-shot per-thread pattern as `RENDER_HOOK`.
+#[cfg(test)]
+thread_local! {
+    static STORE_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Hard ceiling of matched lines returned (mirrors the shared engine cap).
@@ -133,9 +214,9 @@ impl SearchScope {
 struct OverflowSearchParams<'a> {
     query: &'a str,
     is_regex: bool,
-    /// Tool-entry default keeps the historical strict behavior
-    /// (`unwrap_or(true)`, preserved from the pre-ranking implementation);
-    /// callers opting into fuzzy recall pass `case_sensitive: false`.
+    /// Tool-entry default is case-insensitive (`unwrap_or(false)`), so an
+    /// unspecified flag cannot silently miss case-variant archived text;
+    /// callers pin strict matching with `case_sensitive: true`.
     case_sensitive: bool,
     context_lines: usize,
     max_results: usize,
@@ -143,21 +224,23 @@ struct OverflowSearchParams<'a> {
     scope: SearchScope,
 }
 
-fn execute_search_overflow(args: &Value) -> Result<String, String> {
+/// Parses tool arguments into the normalized search parameters, without the
+/// driver-context lookup, so the tool-entry defaults (in particular
+/// `case_sensitive`) are testable without a live session.
+fn parse_search_params<'a>(args: &'a Value) -> Result<OverflowSearchParams<'a>, String> {
     let query = args["query"].as_str().ok_or("Missing 'query' parameter")?;
     if query.trim().is_empty() {
         return Err("query must not be empty".to_string());
     }
-    let assets_dir = current_session_assets_dir().ok_or(
-        "No active session archive: cannot resolve the current session's overflow directory.",
-    )?;
-
-    let params = OverflowSearchParams {
+    Ok(OverflowSearchParams {
         query,
         is_regex: args["is_regex"].as_bool().unwrap_or(false),
-        // Parity with the previous implementation: unspecified means strict
-        // case matching. The normalized ranking still honors the flag below.
-        case_sensitive: args["case_sensitive"].as_bool().unwrap_or(true),
+        // Unspecified means case-insensitive: a case-variant query must not
+        // silently miss archived text. The normalized ranking still honors
+        // the flag below.
+        case_sensitive: args["case_sensitive"]
+            .as_bool()
+            .unwrap_or(super::SEARCH_OVERFLOW_CASE_SENSITIVE_DEFAULT),
         context_lines: args["context_lines"].as_u64().unwrap_or(2).min(5) as usize,
         max_results: args["max_results"]
             .as_u64()
@@ -168,7 +251,14 @@ fn execute_search_overflow(args: &Value) -> Result<String, String> {
             .as_str()
             .map(SearchScope::parse)
             .unwrap_or(SearchScope::All),
-    };
+    })
+}
+
+fn execute_search_overflow(args: &Value) -> Result<String, String> {
+    let params = parse_search_params(args)?;
+    let assets_dir = current_session_assets_dir().ok_or(
+        "No active session archive: cannot resolve the current session's overflow directory.",
+    )?;
     run_overflow_search(&assets_dir, &params)
 }
 
@@ -352,6 +442,13 @@ struct FileScan {
     root_idx: usize,
     /// Absolute path, ready for `read_file` round-trips.
     display_path: String,
+    /// Version identity (length, mtime, device/inode, change time, session
+    /// root) observed on the descriptor the file content was read from at
+    /// scan time. The render pass compares its own re-read version against
+    /// this: a mismatch means the file changed between the passes, so the
+    /// scan-time hit markers and counts no longer describe the current
+    /// content and the file must be re-scanned.
+    version: overflow_cache::FileVersion,
     hits: Vec<RawHit>,
     /// Line count of the archive file at scan time. The file text itself is
     /// dropped after scanning and re-read only for the few files that survive
@@ -423,18 +520,232 @@ fn collect_files(archive: &archive_files::ArchiveRoot, root: &Path) -> Vec<PathB
     out
 }
 
-fn path_matches_glob(path: &Path, root: &Path, glob: Option<&Regex>) -> bool {
+fn path_matches_glob(path: &Path, root: &Path, archive_root: &Path, glob: Option<&Regex>) -> bool {
     let Some(glob) = glob else { return true };
     let rel = path.strip_prefix(root).unwrap_or(path);
     glob.is_match(rel.to_string_lossy().as_ref())
         || path
             .file_name()
             .is_some_and(|name| glob.is_match(name.to_string_lossy().as_ref()))
+        // The recovery directory is part of how a reader names a file: the
+        // internal notes live in `internal-note-overflow/<digest>.md`, and the
+        // scope-root-relative path never carries that directory name. Matching
+        // the archive-relative path as well lets a glob select a directory.
+        || path
+            .strip_prefix(archive_root)
+            .ok()
+            .is_some_and(|rel| glob.is_match(rel.to_string_lossy().as_ref()))
+}
+
+// ─── Pass A: scanning ─────────────────────────────────────────────────────────
+
+/// Parallelize pass A only above this candidate count; below it thread setup
+/// would dominate the scan. The serial path is the reference implementation.
+const PARALLEL_SCAN_THRESHOLD: usize = 64;
+
+fn parallel_scan_enabled(candidate_count: usize) -> bool {
+    candidate_count > PARALLEL_SCAN_THRESHOLD
+        && std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) >= 2
+}
+
+/// Worker count for the parallel scan: the host's parallelism, capped at 8
+/// (measurements on a 119 MiB / 8k-file archive showed no further gain
+/// beyond 8 threads).
+fn scan_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(8)
+}
+
+/// Result of scanning one candidate file. `scan` is `None` when the file was
+/// unreadable or held no matching line; `df_contrib` carries the per-pattern
+/// hit flags that feed document frequencies (only when the file had hits);
+/// `unreadable` keeps the zero-hit answer honest about what was probed.
+struct PerFileScan {
+    scan: Option<FileScan>,
+    df_contrib: Option<Vec<bool>>,
+    unreadable: bool,
+}
+
+/// Computes the raw hit lines of `content` under `patterns`, plus the
+/// per-file pattern hit flags that feed document frequencies and the line
+/// count. Shared by the initial scan (pass A) and the render-time re-scan of a
+/// file whose version changed between the passes, so both passes classify
+/// lines, score them, and choose gutter markers identically.
+fn compute_hits(content: &str, patterns: &[TermPattern]) -> (Vec<RawHit>, Vec<bool>, usize) {
+    let mut hits: Vec<RawHit> = Vec::new();
+    let mut file_term_hits: Vec<bool> = vec![false; patterns.len()];
+    let mut total_lines = 0usize;
+    for (line_index, line) in content.lines().enumerate() {
+        total_lines = line_index + 1;
+        let mut matched: Vec<usize> = Vec::new();
+        for (pid, pattern) in patterns.iter().enumerate() {
+            if pattern.regex.is_match(line) {
+                matched.push(pid);
+                file_term_hits[pid] = true;
+            }
+        }
+        if !matched.is_empty() {
+            // Line-local scoring happens here while the text is
+            // available; corpus-wide IDF weights are added in pass B.
+            let mut local_score = 0.0;
+            for &pid in &matched {
+                // Whole-word hits carry more information than substring hits.
+                let re = &patterns[pid].regex;
+                if let Some(m) = re.find(line) {
+                    let bytes = line.as_bytes();
+                    let left_ok = m.start() == 0 || !is_identifier_byte(bytes[m.start() - 1]);
+                    let right_ok =
+                        m.end() >= line.len() || !is_identifier_byte(bytes[m.end()]);
+                    if left_ok && right_ok {
+                        local_score += 2.0;
+                    }
+                    // Lead-proximity bonus, mirroring the shared engine style.
+                    let lead_chars = line[..m.start()].chars().count();
+                    local_score += 2.0 * (1.0 - (lead_chars.min(40) as f64) / 40.0);
+                }
+            }
+            if line_has_exact_phrase_bonus(patterns, &matched) {
+                // Exact whole-query phrase/regex hit.
+                local_score += PHRASE_WEIGHT;
+            }
+            hits.push(RawHit {
+                line_index,
+                matched,
+                local_score,
+            });
+        }
+    }
+    (hits, file_term_hits, total_lines)
+}
+
+/// Scans one candidate archive file. The file text lives only inside this
+/// call, so a worker (serial or parallel) holds at most one file's content at
+/// a time; resident memory scales with hit count, not corpus size.
+fn scan_one_file(
+    archive: &archive_files::ArchiveRoot,
+    root_idx: usize,
+    file: &Path,
+    patterns: &[TermPattern],
+) -> PerFileScan {
+    // Unreadable, unsafe, or non-UTF-8 files were not searched;
+    // exclude them from the corpus size used by IDF.
+    let Some((content, version)) = read_archive_text_versioned(archive, file) else {
+        return PerFileScan {
+            scan: None,
+            df_contrib: None,
+            unreadable: true,
+        };
+    };
+    let (hits, file_term_hits, total_lines) = compute_hits(&content, patterns);
+    if hits.is_empty() {
+        return PerFileScan {
+            scan: None,
+            df_contrib: None,
+            unreadable: false,
+        };
+    }
+    PerFileScan {
+        scan: Some(FileScan {
+            root_idx,
+            display_path: file.to_string_lossy().to_string(),
+            version,
+            hits,
+            total_lines,
+        }),
+        df_contrib: Some(file_term_hits),
+        unreadable: false,
+    }
+}
+
+/// Aggregated outcome of pass A over every candidate, in candidate order.
+struct ScanAggregate {
+    scans: Vec<FileScan>,
+    df: Vec<usize>,
+    files_seen: usize,
+    files_unreadable: usize,
+}
+
+fn fold_scan_result(aggregate: &mut ScanAggregate, result: PerFileScan) {
+    if result.unreadable {
+        aggregate.files_unreadable += 1;
+    } else {
+        aggregate.files_seen += 1;
+    }
+    let Some(scan) = result.scan else { return };
+    if let Some(contrib) = result.df_contrib {
+        for (pid, hit) in contrib.into_iter().enumerate() {
+            if hit {
+                aggregate.df[pid] += 1;
+            }
+        }
+    }
+    aggregate.scans.push(scan);
+}
+
+/// Pass A over all candidates. With `parallel`, the candidate list is split
+/// into non-overlapping contiguous slices scanned by `std::thread::scope`
+/// workers (at most `scan_thread_count()` of them); results fold back in
+/// candidate order, so the aggregate — and therefore the rendered answer —
+/// is byte-identical to the serial path. The session-bound `ArchiveRoot` is
+/// read-only (a directory fd plus paths), so it is shared by reference.
+fn scan_candidates(
+    archive: &archive_files::ArchiveRoot,
+    candidates: &[(usize, PathBuf)],
+    patterns: &[TermPattern],
+    parallel: bool,
+) -> ScanAggregate {
+    let mut aggregate = ScanAggregate {
+        scans: Vec::new(),
+        df: vec![0; patterns.len()],
+        files_seen: 0,
+        files_unreadable: 0,
+    };
+    if !parallel || candidates.len() <= 1 {
+        for &(root_idx, ref file) in candidates {
+            fold_scan_result(&mut aggregate, scan_one_file(archive, root_idx, file, patterns));
+        }
+        return aggregate;
+    }
+    let threads = scan_thread_count().min(candidates.len());
+    let chunk_size = candidates.len().div_ceil(threads);
+    let results: Vec<PerFileScan> = std::thread::scope(|scope| {
+        let handles: Vec<_> = candidates
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&(root_idx, ref file)| {
+                            scan_one_file(archive, root_idx, file, patterns)
+                        })
+                        .collect::<Vec<PerFileScan>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("pass A worker panicked"))
+            .collect()
+    });
+    for result in results {
+        fold_scan_result(&mut aggregate, result);
+    }
+    aggregate
 }
 
 fn run_overflow_search(
     assets_dir: &Path,
     params: &OverflowSearchParams<'_>,
+) -> Result<String, String> {
+    run_overflow_search_inner(assets_dir, params, None)
+}
+
+fn run_overflow_search_inner(
+    assets_dir: &Path,
+    params: &OverflowSearchParams<'_>,
+    force_parallel: Option<bool>,
 ) -> Result<String, String> {
     let Some(archive) = archive_files::ArchiveRoot::new(assets_dir) else {
         return Ok("No matches found: the session archive root is missing or unavailable; nothing was scanned.".to_string());
@@ -478,14 +789,13 @@ fn run_overflow_search(
     let patterns = build_patterns(params)?;
 
     // Pass A: scan every file once, collecting raw hits plus document
-    // frequencies feeding the IDF weights.
-    let mut scans: Vec<FileScan> = Vec::new();
-    let mut df: Vec<usize> = vec![0; patterns.len()];
-    let mut files_seen: usize = 0;
+    // frequencies feeding the IDF weights. Candidates are collected up front
+    // so the scan can be split over non-overlapping contiguous slices when
+    // the corpus is large enough for threads to pay off.
+    let mut candidates: Vec<(usize, PathBuf)> = Vec::new();
     // Counted separately so a zero-hit answer can say whether the corpus was
     // empty, filtered away, or unreadable instead of implying absence.
     let mut files_excluded_by_pattern: usize = 0;
-    let mut files_unreadable: usize = 0;
 
     // Compiled once: the glob is fixed for the whole search. A pattern that
     // trims to empty is treated as "no filter" — an empty glob would only match
@@ -496,78 +806,21 @@ fn run_overflow_search(
 
     for (root_idx, root) in &roots {
         for file in collect_files(&archive, root) {
-            if !path_matches_glob(&file, root, glob.as_ref()) {
+            if !path_matches_glob(&file, root, archive.path(), glob.as_ref()) {
                 files_excluded_by_pattern += 1;
                 continue;
             }
-            let Some(content) = read_archive_text(&archive, &file) else {
-                // Unreadable, unsafe, or non-UTF-8 files were not searched;
-                // exclude them from the corpus size used by IDF.
-                files_unreadable += 1;
-                continue;
-            };
-            files_seen += 1;
-
-            let mut hits: Vec<RawHit> = Vec::new();
-            let mut file_term_hits: Vec<bool> = vec![false; patterns.len()];
-            let mut total_lines = 0usize;
-            for (line_index, line) in content.lines().enumerate() {
-                total_lines = line_index + 1;
-                let mut matched: Vec<usize> = Vec::new();
-                for (pid, pattern) in patterns.iter().enumerate() {
-                    if pattern.regex.is_match(line) {
-                        matched.push(pid);
-                        file_term_hits[pid] = true;
-                    }
-                }
-                if !matched.is_empty() {
-                    // Line-local scoring happens here while the text is
-                    // available; corpus-wide IDF weights are added in pass B.
-                    let mut local_score = 0.0;
-                    for &pid in &matched {
-                        // Whole-word hits carry more information than substring hits.
-                        let re = &patterns[pid].regex;
-                        if let Some(m) = re.find(line) {
-                            let bytes = line.as_bytes();
-                            let left_ok =
-                                m.start() == 0 || !is_identifier_byte(bytes[m.start() - 1]);
-                            let right_ok =
-                                m.end() >= line.len() || !is_identifier_byte(bytes[m.end()]);
-                            if left_ok && right_ok {
-                                local_score += 2.0;
-                            }
-                            // Lead-proximity bonus, mirroring the shared engine style.
-                            let lead_chars = line[..m.start()].chars().count();
-                            local_score += 2.0 * (1.0 - (lead_chars.min(40) as f64) / 40.0);
-                        }
-                    }
-                    if line_has_exact_phrase_bonus(&patterns, &matched) {
-                        // Exact whole-query phrase/regex hit.
-                        local_score += PHRASE_WEIGHT;
-                    }
-                    hits.push(RawHit {
-                        line_index,
-                        matched,
-                        local_score,
-                    });
-                }
-            }
-            if hits.is_empty() {
-                continue;
-            }
-            for (pid, hit_all) in file_term_hits.into_iter().enumerate() {
-                if hit_all {
-                    df[pid] += 1;
-                }
-            }
-            scans.push(FileScan {
-                root_idx: *root_idx,
-                display_path: file.to_string_lossy().to_string(),
-                hits,
-                total_lines,
-            });
+            candidates.push((*root_idx, file));
         }
     }
+
+    let parallel = force_parallel.unwrap_or_else(|| parallel_scan_enabled(candidates.len()));
+    let ScanAggregate {
+        scans,
+        df,
+        files_seen,
+        files_unreadable,
+    } = scan_candidates(&archive, &candidates, &patterns, parallel);
 
     if scans.is_empty() {
         // A bare "No matches found" invites unwarranted absence claims: the
@@ -639,10 +892,21 @@ fn run_overflow_search(
         } else {
             String::new()
         };
+        // The effective matching mode belongs in the answer: under
+        // case-insensitive matching a zero hit also rules out every other
+        // casing, so the caller can state the absence at that strength instead
+        // of hedging it. A query with no ASCII letters has no casing to vary,
+        // so the note would be noise there. Regex mode stays silent: a raw
+        // pattern can carry an inline `(?-i)` flag that turns case folding off
+        // for part of it, so the effective mode is not derivable from the
+        // parameter alone and claiming it would be a false absence claim.
+        // Literal mode escapes the query, so no inline flag can apply there.
         let case_note = if params.case_sensitive {
             " Matching is case-sensitive here: retry with case_sensitive=false to widen it."
-        } else {
+        } else if params.is_regex || !params.query.chars().any(|c| c.is_ascii_alphabetic()) {
             ""
+        } else {
+            " Matching ignored case, so no other casing of these terms is present in the searched files either."
         };
         return Ok(format!(
             "No matches found in the session archive for query: '{}'. {files_seen} file(s) were searched and no term matched (terms: {listed}{expansion_note}{pattern_note}{unreadable_note}{scope_note}); terms are ORed, so every one of them came up empty.{case_note} This archive holds only content moved out of context; canonical session history is not searched here.",
@@ -706,6 +970,13 @@ fn run_overflow_search(
         });
     }
 
+    #[cfg(test)]
+    RENDER_HOOK.with(|cell| {
+        if let Some(hook) = cell.borrow_mut().take() {
+            hook();
+        }
+    });
+
     render_selection(scored_files, params, &patterns, files_seen, &archive)
 }
 
@@ -720,6 +991,27 @@ fn is_identifier_byte(b: u8) -> bool {
 /// plain term, and checking only `matched[0]` would silently disable the bonus.
 fn line_has_exact_phrase_bonus(patterns: &[TermPattern], matched: &[usize]) -> bool {
     matched.iter().any(|&pid| patterns[pid].term_id.is_none())
+}
+
+/// Two-character gutter marker explaining why a rendered match line was
+/// selected: `>>` when a whole-query phrase or regex pattern matched, `>t`
+/// when a caller-typed term matched, and `>b` when only derived CJK bigram
+/// fragments matched — the wording as typed may be absent, so the model
+/// should verify `>b` lines with `read_file` before quoting. A `>>` or `>t`
+/// hit proves the wording is present, but matching ignores case by default,
+/// so its casing may differ from the query. Context lines render with two
+/// spaces instead.
+fn match_marker(patterns: &[TermPattern], matched: &[usize]) -> &'static str {
+    if matched.iter().any(|&pid| patterns[pid].term_id.is_none()) {
+        ">>"
+    } else if matched
+        .iter()
+        .any(|&pid| patterns[pid].term_id.is_some() && !is_derived_pattern(&patterns[pid]))
+    {
+        ">t"
+    } else {
+        ">b"
+    }
 }
 
 /// Byte offset of the earliest pattern match on `line`, used to keep the
@@ -887,21 +1179,23 @@ fn render_selection(
     }
 
     // Emit grouped by file in global relevance order, expanding context windows
-    // around chosen lines; `'>'` marks matched lines, numbers are absolute
-    // archive-file line numbers usable as `read_file` offsets.
+    // around chosen lines; two-character markers (`>>`/`>t`/`>b`) explain why
+    // each matched line was selected and two spaces mark context lines;
+    // numbers are absolute archive-file line numbers usable as `read_file`
+    // offsets.
     let mut out = String::new();
     // Counted only when an excerpt is really written below: the previous flow
     // counted every selected line and then truncated the rendered text, so the
     // footer could report lines that the caller never received.
     let mut shown_matches = 0usize;
     let mut shown_files = 0usize;
-    let total_matches_all: usize = files.iter().map(|f| f.total_matches).sum();
+    let mut total_matches_all: usize = files.iter().map(|f| f.total_matches).sum();
     // Excerpt rendering stops before the truncation notice and the footer would
     // no longer fit.
     let render_budget = MAX_OUTPUT_CHARS.saturating_sub(FOOTER_RESERVE_CHARS);
     let mut budget_exhausted = false;
 
-    for (file_pos, file) in files.iter().enumerate() {
+    for (file_pos, file) in files.iter_mut().enumerate() {
         // Sorted ascending so context ranges merge correctly; dedup guards
         // against any duplicate selection.
         let mut lis: Vec<usize> = chosen
@@ -914,13 +1208,111 @@ fn render_selection(
         if lis.is_empty() {
             continue;
         }
-        let hidden_here = file.total_matches.saturating_sub(lis.len());
         // One file's section is assembled in `chunk` and committed once its
         // lines are known to fit the excerpt budget, so the shown counts always
         // describe text that is really present in the answer.
         let mut chunk = String::new();
         let mut chunk_matches = 0usize;
         let mut chunk_complete = true;
+
+        // The scan pass retained only indices and scores, never the archive
+        // text. Re-read the file to render the selected excerpts so at most
+        // one archive file is resident at a time — and only files that
+        // survived selection are re-read at all.
+        let Some((content, version)) =
+            read_archive_text_versioned(archive, Path::new(&file.scan.display_path))
+        else {
+            // Vanished or unreadable between scan and render (should not
+            // happen within one search): fall back to a pointer, never
+            // fabricate excerpts. Keep the absolute path so the pointer is
+            // directly usable with `read_file`.
+            chunk.push_str(&format!(
+                "... [file unreadable during excerpt rendering: {}; use read_file for surrounding context] ...\n\n",
+                &file.scan.display_path
+            ));
+            if out.len() + chunk.len() > render_budget {
+                budget_exhausted = true;
+                break;
+            }
+            out.push_str(&chunk);
+            continue;
+        };
+        let content_lines: Vec<&str> = content.lines().collect();
+        let n_lines = content_lines.len();
+        if n_lines == 0 {
+            // Empty between scan and render (concurrent truncation): nothing
+            // to excerpt, and indexing below would panic. Keep the absolute
+            // path so the pointer is directly usable with `read_file`.
+            // The scan-time matches no longer exist: drop them from the
+            // corpus total before reporting, or the footer would still claim
+            // hidden matches for an empty file.
+            total_matches_all = total_matches_all.saturating_sub(file.total_matches);
+            file.total_matches = 0;
+            file.scan.hits.clear();
+            file.scan.total_lines = 0;
+            chunk.push_str(&format!(
+                "... [file empty during excerpt rendering: {}; use read_file for surrounding context] ...\n\n",
+                &file.scan.display_path
+            ));
+            if out.len() + chunk.len() > render_budget {
+                budget_exhausted = true;
+                break;
+            }
+            out.push_str(&chunk);
+            continue;
+        }
+
+        if version != file.scan.version {
+            // The file changed between scan and render: the scan-time hit
+            // markers and counts describe content that is no longer there.
+            // Re-scan the current content with the same patterns and recompute
+            // the displayed lines; the old markers are never applied to the
+            // new text.
+            let (hits, _, total_lines) = compute_hits(&content, patterns);
+            total_matches_all = total_matches_all.saturating_sub(file.total_matches);
+            if hits.is_empty() {
+                file.total_matches = 0;
+                // No matches remain in the current content: presenting the
+                // file as a hit source would lie, so note the change instead.
+                // Keep the absolute path so the pointer is directly usable
+                // with `read_file`.
+                chunk.push_str(&format!(
+                    "... [file changed during search: {}; its current content no longer matches; use read_file for the current text] ...\n\n",
+                    &file.scan.display_path
+                ));
+                if out.len() + chunk.len() > render_budget {
+                    budget_exhausted = true;
+                    break;
+                }
+                out.push_str(&chunk);
+                continue;
+            }
+            file.scan.hits = hits;
+            file.scan.total_lines = total_lines;
+            file.total_matches = file.scan.hits.len();
+            total_matches_all += file.total_matches;
+            let new_hit_lines: FxHashSet<usize> =
+                file.scan.hits.iter().map(|h| h.line_index).collect();
+            lis.retain(|li| new_hit_lines.contains(li));
+            if lis.is_empty() {
+                // The selected lines are gone, though the file still holds
+                // other matches: present the change instead of stale excerpts.
+                // Keep the absolute path so the pointer is directly usable
+                // with `read_file`.
+                chunk.push_str(&format!(
+                    "... [file changed during search: {}; previously selected lines no longer match; use read_file for the current text] ...\n\n",
+                    &file.scan.display_path
+                ));
+                if out.len() + chunk.len() > render_budget {
+                    budget_exhausted = true;
+                    break;
+                }
+                out.push_str(&chunk);
+                continue;
+            }
+        }
+
+        let hidden_here = file.total_matches.saturating_sub(lis.len());
         // The section header is written before any excerpt, so it is charged to
         // the same budget: a session-asset path long enough to fill the excerpt
         // budget on its own stops the rendering instead of pushing the answer
@@ -935,41 +1327,6 @@ fn render_selection(
             break;
         }
         chunk.push_str(&header);
-
-        // The scan pass retained only indices and scores, never the archive
-        // text. Re-read the file to render the selected excerpts so at most
-        // one archive file is resident at a time — and only files that
-        // survived selection are re-read at all.
-        let Some(content) = read_archive_text(archive, Path::new(&file.scan.display_path)) else {
-            // Vanished or unreadable between scan and render (should not
-            // happen within one search): fall back to a pointer, never
-            // fabricate excerpts.
-            chunk.push_str(
-                "... [file unreadable during excerpt rendering; use read_file for surrounding context] ...\n\n",
-            );
-            if out.len() + chunk.len() > render_budget {
-                budget_exhausted = true;
-                break;
-            }
-            out.push_str(&chunk);
-            continue;
-        };
-        let content_lines: Vec<&str> = content.lines().collect();
-        let n_lines = content_lines.len();
-        if n_lines == 0 {
-            // Empty between scan and render (concurrent truncation): nothing
-            // to excerpt, and indexing below would panic. Keep the header so the
-            // caller sees that the file was reached but held no lines.
-            chunk.push_str(
-                "... [file empty during excerpt rendering; use read_file for surrounding context] ...\n\n",
-            );
-            if out.len() + chunk.len() > render_budget {
-                budget_exhausted = true;
-                break;
-            }
-            out.push_str(&chunk);
-            continue;
-        }
 
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         for li in &lis {
@@ -990,10 +1347,24 @@ fn render_selection(
         }
 
         let mut match_set: std::collections::BTreeSet<usize> = lis.iter().copied().collect();
+        // The scan pass kept raw hits per file (scan.hits), so the gutter
+        // marker can still classify why each selected line matched.
         'lines: for (start, end) in ranges {
             for li in start..=end {
                 let is_match = match_set.remove(&li);
                 let line = content_lines[li];
+                let marker = if is_match {
+                    let matched = file
+                        .scan
+                        .hits
+                        .iter()
+                        .find(|hit| hit.line_index == li)
+                        .map(|hit| hit.matched.as_slice())
+                        .unwrap_or(&[]);
+                    match_marker(patterns, matched)
+                } else {
+                    "  "
+                };
                 let window = render_line_window(
                     line,
                     if is_match {
@@ -1002,12 +1373,7 @@ fn render_selection(
                         None
                     },
                 );
-                let rendered = format!(
-                    "{:>7}{} {}\n",
-                    li + 1,
-                    if is_match { ">" } else { " " },
-                    window
-                );
+                let rendered = format!("{:>7}{} {}\n", li + 1, marker, window);
                 if out.len() + chunk.len() + rendered.len() > render_budget {
                     // Whole lines only: cutting the rendered text afterwards
                     // could remove the matching text while still counting the
@@ -1059,6 +1425,9 @@ fn render_selection(
         total_matches_all,
         files_seen
     ));
+    out.push_str(
+        "markers: >> whole-query phrase hit, >t typed-term hit, >b CJK-fragment hit (the phrase may be absent — verify with read_file), two spaces = context line; matching ignores case by default, so a hit may differ in casing from the query\n",
+    );
     debug_assert!(
         out.len() <= MAX_OUTPUT_CHARS,
         "the excerpt budget must leave room for the notice and the footer"
@@ -1169,6 +1538,22 @@ mod tests {
             .expect("footer must report how many lines were shown")
     }
 
+    /// Count of rendered lines whose gutter carries a hit marker (`>>`/`>t`/
+    /// `>b`), matching the `shown_matches` accounting. Context lines (two
+    /// spaces in the marker column) and the footer legend are excluded by
+    /// requiring digits followed by a marker right after the gutter.
+    fn rendered_marker_lines(out: &str) -> usize {
+        out.lines()
+            .filter(|line| {
+                let rest = line.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                let marker = rest
+                    .trim_start_matches(|c: char| c.is_ascii_digit())
+                    .get(..2);
+                matches!(marker, Some(">>" | ">t" | ">b"))
+            })
+            .count()
+    }
+
     #[test]
     fn search_all_scopes_both_locations() {
         let dir = make_temp_dir();
@@ -1210,7 +1595,7 @@ mod tests {
             p.scope = scope;
             let out = run_overflow_search(&dir, &p).unwrap();
             assert!(out.contains("context-checkpoints/opaque.md"), "{out}");
-            assert!(out.contains("2> rare_checkpoint_keyword decision"), "{out}");
+            assert!(out.contains("2>t rare_checkpoint_keyword decision"), "{out}");
             p.query = "rare_tool_keyword";
             assert!(
                 run_overflow_search(&dir, &p)
@@ -1244,11 +1629,30 @@ mod tests {
             p.context_lines = 0;
             let out = run_overflow_search(&dir, &p).unwrap();
             assert!(
-                out.contains("4098> late_history_keyword recovered decision"),
+                out.contains("4098>t late_history_keyword recovered decision"),
                 "{out}"
             );
             assert!(out.contains("files scanned 1"), "{out}");
         }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_pattern_can_select_a_recovery_directory() {
+        // The archive note tells the reader to reach the internal notes with
+        // `file_pattern '*internal-note-overflow*'`. The recovery directory name
+        // never appears in the scope-root-relative path nor in the bare file
+        // name, so a glob that only sees those excludes every candidate and
+        // sends the reader to an empty result.
+        let dir = make_temp_dir();
+        seed_archive(&dir);
+        let mut p = params("internal foo state");
+        p.scope = SearchScope::ToolOutputs;
+        p.file_pattern = Some("*internal-note-overflow*");
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert!(!out.contains("Nothing was scanned"), "{out}");
+        assert!(out.contains("internal foo state"), "{out}");
+        assert!(out.contains("internal-note-overflow"), "{out}");
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1355,11 +1759,25 @@ mod tests {
         let path = dir.join("overflow-history.md");
         fs::write(&path, "needle original\n").unwrap();
         assert!(read_archive_text(&archive, &path).is_some());
+        // Capture the version observed at "scan time" (before the swap) so the
+        // render pass can compare against its own re-read version.
+        let (_, before) = archive.open_versioned(&path).unwrap();
+        let (root_dev, root_ino) = archive.root_identity();
         let file = ScoredFile {
             root_idx: 0,
             scan: FileScan {
                 root_idx: 0,
                 display_path: path.to_string_lossy().into_owned(),
+                version: overflow_cache::FileVersion {
+                    len: before.len,
+                    mtime: before.mtime,
+                    dev: before.dev,
+                    ino: before.ino,
+                    ctime_sec: before.ctime_sec,
+                    ctime_nsec: before.ctime_nsec,
+                    root_dev,
+                    root_ino,
+                },
                 hits: Vec::new(),
                 total_lines: 1,
             },
@@ -1380,6 +1798,165 @@ mod tests {
         );
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_body_is_not_served_after_symlink_replacement() {
+        let dir = make_temp_dir();
+        let outside = make_temp_dir();
+        let archive = archive_files::ArchiveRoot::new(&dir).unwrap();
+        let path = dir.join("overflow-history.md");
+        fs::write(&path, "cached_needle original body\n").unwrap();
+        // The first read stores the body in the cache.
+        assert!(read_archive_text(&archive, &path).is_some());
+        // Replace the file with a symlink to an outside file whose body is
+        // identical in length AND whose mtime is pinned to the original's. A
+        // fingerprint that merely follows the symlink would then match the
+        // cached entry exactly and serve the stale body, so only the O_NOFOLLOW
+        // safe open can refuse the swap. The safe open happens before the cache
+        // lookup, so the session boundary cannot be bypassed through a cached
+        // copy.
+        let orig_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::rename(&path, dir.join("saved.md")).unwrap();
+        fs::write(outside.join("external.md"), "cached_needle external body\n").unwrap();
+        fs::File::open(outside.join("external.md"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(orig_mtime))
+            .unwrap();
+        std::os::unix::fs::symlink(outside.join("external.md"), &path).unwrap();
+        assert!(read_archive_text(&archive, &path).is_none());
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn equal_length_replacement_is_not_served_from_cache() {
+        let dir = make_temp_dir();
+        let archive = archive_files::ArchiveRoot::new(&dir).unwrap();
+        let path = dir.join("overflow-history.md");
+        fs::write(&path, "equal_needle old body\n").unwrap();
+        // Rewrite the file with a same-length new body inside the read-to-store
+        // window of the FIRST read (via the test-only seam). A cache that
+        // fingerprints the path at store time would bind the old body to the
+        // new file and serve it forever; the reader-side fix binds the body
+        // only to the identity observed on the producing descriptor, so the
+        // next read misses and re-reads the new content.
+        let hook_path = path.clone();
+        STORE_HOOK.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move || {
+                fs::write(&hook_path, "equal_needle new body\n").unwrap();
+                let file = fs::File::open(&hook_path).unwrap();
+                file.set_times(
+                    std::fs::FileTimes::new().set_modified(
+                        std::time::SystemTime::now() + std::time::Duration::from_secs(2),
+                    ),
+                )
+                .unwrap();
+            }));
+        });
+        assert!(read_archive_text(&archive, &path).is_some());
+        STORE_HOOK.with(|cell| {
+            assert!(
+                cell.borrow().is_none(),
+                "store hook must have fired exactly once"
+            );
+        });
+        // The replacement happened during the first read; the second read must
+        // return the new body, never the cached old one.
+        assert_eq!(
+            read_archive_text(&archive, &path).as_deref(),
+            Some("equal_needle new body\n")
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mtime_preserving_in_place_rewrite_is_not_served_from_cache() {
+        // Same inode, same length, same mtime: length-plus-mtime alone would
+        // still match, so the second read would serve the stale old body.
+        // The device/inode-plus-change-time identity must still miss.
+        let dir = make_temp_dir();
+        let archive = archive_files::ArchiveRoot::new(&dir).unwrap();
+        let path = dir.join("overflow-history.md");
+        fs::write(&path, "equal_needle old body\n").unwrap();
+        assert!(read_archive_text(&archive, &path).is_some());
+        let orig_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        // In-place truncate-and-write keeps the inode; restoring the mtime
+        // keeps length and mtime identical while the change time advances.
+        fs::write(&path, "equal_needle new body\n").unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(orig_mtime))
+            .unwrap();
+        assert_eq!(
+            read_archive_text(&archive, &path).as_deref(),
+            Some("equal_needle new body\n")
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_changed_between_scan_and_render_is_not_counted_as_hit() {
+        let dir = make_temp_dir();
+        let path = dir.join("overflow-history.md");
+        fs::write(&path, "alpha beta\n").unwrap();
+        let hook_path = path.clone();
+        RENDER_HOOK.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move || {
+                // Same-length rewrite that no longer matches the query.
+                fs::write(&hook_path, "gamma zeta\n").unwrap();
+            }));
+        });
+        let out = run_overflow_search(&dir, &params("alpha beta")).unwrap();
+        RENDER_HOOK.with(|cell| {
+            assert!(
+                cell.borrow().is_none(),
+                "render hook must have fired exactly once"
+            );
+        });
+        assert!(
+            !out.contains("gamma zeta"),
+            "changed body must not be rendered as an excerpt: {out}"
+        );
+        assert_eq!(
+            rendered_marker_lines(&out),
+            0,
+            "no line may carry a hit marker over the changed content: {out}"
+        );
+        assert_eq!(
+            shown_count(&out),
+            0,
+            "the changed file must not be counted as a hit: {out}"
+        );
+        assert!(out.contains("file changed during search"), "{out}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_changed_between_scan_and_render_is_rescanned_with_new_markers() {
+        let dir = make_temp_dir();
+        let path = dir.join("overflow-history.md");
+        fs::write(&path, "alpha beta\n").unwrap();
+        let hook_path = path.clone();
+        RENDER_HOOK.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move || {
+                // Same-length rewrite that still matches one term but not the
+                // whole-query phrase: the marker must regrade from `>>` to `>t`.
+                fs::write(&hook_path, "alpha zeta\n").unwrap();
+            }));
+        });
+        let out = run_overflow_search(&dir, &params("alpha beta")).unwrap();
+        assert!(
+            out.contains("1>t alpha zeta"),
+            "new content must render with the re-scanned marker: {out}"
+        );
+        assert!(
+            !out.contains(">> alpha zeta"),
+            "the old whole-query marker must not label new content: {out}"
+        );
+        assert_eq!(shown_count(&out), 1, "{out}");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1427,11 +2004,98 @@ mod tests {
     }
 
     #[test]
-    fn search_case_sensitive_default_misses_other_case() {
+    fn search_case_sensitive_explicit_true_misses_other_case() {
+        // `params()` pins strict matching explicitly; this asserts the flag is
+        // still honored when the caller asks for it (the tool-entry default is
+        // now case-insensitive, see `case_sensitive_defaults_to_false`).
         let dir = make_temp_dir();
         seed_archive(&dir);
         let out = run_overflow_search(&dir, &params("FOO")).unwrap();
         assert!(out.contains("No matches found"), "exact-case miss: {out}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn case_sensitive_defaults_to_false() {
+        // Tool-entry default is case-insensitive: an unspecified flag must not
+        // silently miss case-variant archived text.
+        let dir = make_temp_dir();
+        seed_archive(&dir);
+        let args = serde_json::json!({ "query": "FOO" });
+        let parsed = parse_search_params(&args).unwrap();
+        assert!(
+            !parsed.case_sensitive,
+            "unspecified case_sensitive must default to false"
+        );
+        let out = run_overflow_search(&dir, &parsed).unwrap();
+        assert!(
+            out.contains("foo line 1"),
+            "default search must hit the other-case text:\n{out}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parallel_and_serial_scans_are_byte_identical() {
+        // The parallel pass A must produce the same answer as the serial one,
+        // byte for byte: workers scan the same files with the same per-file
+        // logic and results fold back in candidate order.
+        let dir = make_temp_dir();
+        let tool_dir = dir.join("tool-overflow-compressed");
+        fs::create_dir_all(&tool_dir).unwrap();
+        // 70 candidates put the production path over the parallel threshold
+        // (>64), with one multi-term file to exercise ordering-sensitive
+        // scoring and rendering.
+        for index in 0..69 {
+            fs::write(tool_dir.join(format!("f-{index:02}.txt")), format!("needle {index}\n"))
+                .unwrap();
+        }
+        fs::write(tool_dir.join("phrase.txt"), "needle tail\nneedle tail again\n").unwrap();
+        let mut p = params("needle tail");
+        p.scope = SearchScope::ToolOutputs;
+        p.context_lines = 0;
+        p.max_results = 60;
+        let serial = run_overflow_search_inner(&dir, &p, Some(false)).unwrap();
+        let parallel = run_overflow_search_inner(&dir, &p, Some(true)).unwrap();
+        assert_eq!(
+            serial, parallel,
+            "parallel pass A must be byte-identical to the serial path"
+        );
+        assert!(parallel_scan_enabled(70), "70 candidates cross the threshold");
+        assert!(!parallel_scan_enabled(64), "64 candidates stay serial");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hit_markers_distinguish_phrase_term_and_fragment_hits() {
+        let dir = make_temp_dir();
+        fs::write(
+            dir.join("overflow-history.md"),
+            "alpha beta\n压缩文档的完整性\n",
+        )
+        .unwrap();
+
+        // Whole-query phrase hit: '>>'.
+        let phrase = run_overflow_search(&dir, &params("alpha beta")).unwrap();
+        assert!(phrase.contains("1>> alpha beta"), "{phrase}");
+
+        // Caller-typed term hit: '>t'.
+        let term = run_overflow_search(&dir, &params("alpha")).unwrap();
+        assert!(term.contains("1>t alpha beta"), "{term}");
+
+        // Derived CJK bigram fragment only: '>b' (the phrase as typed is
+        // absent from the line).
+        let fragment = run_overflow_search(&dir, &params("压缩的文档")).unwrap();
+        assert!(fragment.contains("2>b 压缩文档的完整性"), "{fragment}");
+
+        // Context lines render with two spaces in the marker column.
+        assert!(fragment.contains("1   alpha beta"), "{fragment}");
+
+        // The footer legend is appended verbatim.
+        let legend = "markers: >> whole-query phrase hit, >t typed-term hit, >b CJK-fragment hit (the phrase may be absent — verify with read_file), two spaces = context line; matching ignores case by default, so a hit may differ in casing from the query";
+        for out in [&phrase, &term, &fragment] {
+            assert!(out.contains(legend), "footer legend missing:\n{out}");
+        }
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1628,7 +2292,7 @@ mod tests {
         p.max_results = 1;
         let out = run_overflow_search(&dir, &p).unwrap();
         assert!(
-            out.contains("1> a "),
+            out.contains("1>t a "),
             "whole-word line must win the single slot:\n{out}"
         );
         fs::remove_dir_all(&dir).ok();
@@ -1785,7 +2449,7 @@ mod tests {
         assert!(shown >= 1, "at least one windowed line must render:\n{out}");
         assert_eq!(
             shown,
-            out.matches("> ").count(),
+            rendered_marker_lines(&out),
             "reported shown count must match the rendered markers:\n{out}"
         );
         fs::remove_dir_all(&dir).ok();
@@ -1903,8 +2567,78 @@ mod tests {
         assert!(out.contains("file(s) were searched"), "{out}");
         assert!(out.contains("'zzz_absent'"), "{out}");
         assert!(out.contains("case_sensitive=false"), "{out}");
+        assert!(!out.contains("Matching ignored case"), "{out}");
         assert!(!out.contains("Nothing was scanned"), "{out}");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn zero_hit_reports_the_effective_matching_mode() {
+        // A zero hit means different things under the two matching modes: with
+        // case-insensitive matching it also rules out every other casing, so the
+        // answer must state which mode produced it instead of leaving the
+        // caller to guess how strong the absence is.
+        let dir = make_temp_dir();
+        seed_archive(&dir);
+        let mut p = params("zzz_absent");
+        p.case_sensitive = false;
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert!(out.contains("No matches found"), "{out}");
+        assert!(
+            out.contains("Matching ignored case"),
+            "a case-insensitive zero hit must say so: {out}"
+        );
+        assert!(!out.contains("case_sensitive=false"), "{out}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn zero_hit_omits_the_casing_note_for_a_query_without_letters() {
+        // A query with no ASCII letters has no casing to vary, so the casing
+        // note would be noise rather than information.
+        let dir = make_temp_dir();
+        seed_archive(&dir);
+        let mut p = params("压缩文档");
+        p.case_sensitive = false;
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert!(out.contains("No matches found"), "{out}");
+        assert!(!out.contains("Matching ignored case"), "{out}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn zero_hit_omits_the_casing_note_in_regex_mode() {
+        // A raw regex can carry an inline `(?-i)` flag that turns case folding
+        // off for part of it, so the effective mode is not derivable from the
+        // parameter alone. Claiming the archive holds no other casing would be
+        // a false absence claim, so regex mode stays silent.
+        let dir = make_temp_dir();
+        seed_archive(&dir);
+        let mut p = params("zzz_absent.*");
+        p.is_regex = true;
+        p.case_sensitive = false;
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert!(out.contains("No matches found"), "{out}");
+        assert!(!out.contains("Matching ignored case"), "{out}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn regex_inline_case_flag_overrides_the_tool_level_default() {
+        // The tool description tells the caller that regex patterns follow the
+        // `case_sensitive` flag, which is only true while the pattern does not
+        // set its own case flag. Pin the precedence here so the description and
+        // the zero-hit wording stay in step with the engine.
+        let re = compile_pattern("(?-i)Foo", true, false).unwrap();
+        assert!(
+            !re.is_match("FOO"),
+            "an inline `(?-i)` must win over the tool-level case-insensitive default"
+        );
+        let re = compile_pattern("(?i)Foo", true, true).unwrap();
+        assert!(
+            re.is_match("FOO"),
+            "an inline `(?i)` must win over the tool-level case-sensitive default"
+        );
     }
 
     #[test]
@@ -1940,7 +2674,7 @@ mod tests {
             let out = run_overflow_search(&dir, &p).unwrap();
             assert_eq!(
                 shown_count(&out),
-                out.matches("> ").count(),
+                rendered_marker_lines(&out),
                 "max_results={max_results} context_lines={context_lines}:\n{out}"
             );
         }

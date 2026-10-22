@@ -66,6 +66,13 @@ pub(crate) fn eager_baseline_tool_names() -> &'static [&'static str] {
     EAGER_BASELINE_TOOL_NAMES
 }
 
+/// Tool-entry default for the `search_overflow` `case_sensitive` flag.
+///
+/// The model-facing description in `tool_descriptions/search_overflow.json`
+/// documents the same value, and the drift guard compares the two, so the
+/// default and its documentation have to move together.
+pub(crate) const SEARCH_OVERFLOW_CASE_SENSITIVE_DEFAULT: bool = false;
+
 const SUBAGENT_ORCHESTRATION_TOOL_NAMES: &[&str] = &[
     "task",
     "task_spawn",

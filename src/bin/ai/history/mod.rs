@@ -644,12 +644,36 @@ fn context_projection_fingerprint(
     // v16: recall-anchor previews tag diff lines as `[+]`/`[-]`/`[ctx]` and label
     // prefix-less lines as `#<idx>`, so a preview cannot present unchanged context
     // as part of the change or an index as a line address.
-    const PROJECTION_VERSION: u8 = 16;
+    // v17: the archived internal-note recovery prompt now recommends a narrow
+    // `scope=tool_outputs` search with a directory-level `file_pattern` instead
+    // of a full `scope=all` scan; old projection snapshots keep serving the stale
+    // broad guidance, so they must be invalidated and rebuilt.
+    const PROJECTION_VERSION: u8 = 17;
+    projection_cache_key(
+        PROJECTION_VERSION,
+        history_max_chars,
+        history_keep_last,
+        history_summary_max_chars,
+        overflow_dir,
+    )
+}
+
+/// Cache key of a persisted projection snapshot. The version number is part of
+/// the key: any strategy change that alters generated projections (see the `vN`
+/// notes in `context_projection_fingerprint`) must bump `PROJECTION_VERSION` so
+/// older snapshots fail the fingerprint lookup instead of being reused.
+fn projection_cache_key(
+    version: u8,
+    history_max_chars: usize,
+    history_keep_last: usize,
+    history_summary_max_chars: usize,
+    overflow_dir: Option<&Path>,
+) -> String {
     let overflow_dir = overflow_dir
         .map(|path| path.to_string_lossy())
         .unwrap_or_default();
     format!(
-        "v{PROJECTION_VERSION}|max={history_max_chars}|keep={history_keep_last}|summary={history_summary_max_chars}|assets={overflow_dir}"
+        "v{version}|max={history_max_chars}|keep={history_keep_last}|summary={history_summary_max_chars}|assets={overflow_dir}"
     )
 }
 
@@ -1032,6 +1056,35 @@ mod tests {
                 .map(context_snapshot_retry_delay)
                 .sum::<Duration>()
                 < CONTEXT_SNAPSHOT_WRITE_DEADLINE
+        );
+    }
+
+    #[test]
+    fn projection_cache_key_is_versioned_and_v17_never_reuses_v16_snapshots() {
+        let params = (
+            8_000usize,
+            2usize,
+            4_000usize,
+            Some(Path::new("/sessions/example/archives")),
+        );
+        let v16_key = projection_cache_key(16, params.0, params.1, params.2, params.3);
+        let v17_key = projection_cache_key(17, params.0, params.1, params.2, params.3);
+        assert_ne!(
+            v16_key,
+            v17_key,
+            "identical projection parameters must not collide across projection versions"
+        );
+        assert!(v16_key.starts_with("v16|"));
+        assert!(v17_key.starts_with("v17|"));
+        // The live fingerprint must carry the current version, so a snapshot
+        // materialized under v16 (which served the broad scope=all recovery
+        // guidance for archived internal notes) can no longer be looked up after
+        // the v17 narrow-search prompt change. Updating the v17 literal is a
+        // deliberate tripwire for the next projection-strategy change.
+        let live = context_projection_fingerprint(params.0, params.1, params.2, params.3);
+        assert_eq!(
+            live,
+            projection_cache_key(17, params.0, params.1, params.2, params.3)
         );
     }
 

@@ -755,6 +755,19 @@ fn system_prompt_bridges_compressed_context_recovery_via_search_overflow() {
     assert!(prompt.contains("absence claims must cover the archived scope"));
     assert!(prompt.contains("verbatim excerpts"));
     assert!(prompt.contains("scope=all"));
+    // Narrowing guidance: prefer scope/file_pattern over the widest search, so
+    // the model does not default to the slowest path for every query.
+    assert!(prompt.contains("narrow the search with `scope` or `file_pattern` first"));
+    assert!(prompt.contains("use `scope=all` only as a last resort"));
+    // A >b marker only proves a shared CJK character pair, never that the
+    // wording exists; the model must verify the full line before asserting a
+    // phrase is present.
+    assert!(prompt.contains("does not establish that the wording exists"));
+    assert!(prompt.contains("confirm the full line with `read_file`"));
+    // The resident guidance must also state the matching mode, so a hit's
+    // casing difference from the query is never read as "absent" or as an
+    // exact-casing quote.
+    assert!(prompt.contains("Matching ignores case by default"));
 }
 
 #[test]
@@ -1365,6 +1378,10 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "If the root cause is not established, say so",
                     "do not invent a cause or prescribe an unsupported redesign",
                     "Reuse sufficiently current, relevant evidence already inspected",
+                    "If a safe, authorized new observation can answer the same question at lower overall cost than recovering historical evidence, obtain it directly",
+                    "within side-effect and spending limits",
+                    "For questions about a past state or execution, recover the original evidence or state what remains unknown",
+                    "never present a new result as the historical one",
                     "reopen only for a material change, contradiction, or untested dependency",
                     "Stopping investigation is not stopping execution",
                     "finish independent safe work that remains",

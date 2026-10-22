@@ -379,8 +379,9 @@ pub(super) fn insert_internal_note_archive_note_if_needed(
         return;
     };
     let archive_note = format!(
-        "{ARCHIVE_NOTE_PREFIX}\nEarlier internal context notes were archived verbatim.\n{ARCHIVE_DIRECTORY_PATH_PREFIX}{}\nUse search_overflow with scope=all to locate relevant entries, then use read_file to inspect the source file.",
-        archive_dir.to_string_lossy()
+        "{ARCHIVE_NOTE_PREFIX}\nEarlier internal context notes were archived verbatim.\n{ARCHIVE_DIRECTORY_PATH_PREFIX}{}\nUse search_overflow with scope=tool_outputs and file_pattern '*{}*' to locate relevant entries, then use read_file to inspect the source file.",
+        archive_dir.to_string_lossy(),
+        INTERNAL_NOTE_OVERFLOW_DIR
     );
     insert_archive_note_if_missing(messages, archive_note);
 }
@@ -571,6 +572,11 @@ mod tests {
         let note = messages[0].content.as_str().expect("archive note text");
         assert!(note.starts_with("[archive-pointer-v2]\n"));
         assert!(note.contains("archive_directory_path: /sessions/example/internal-note-overflow"));
+        // Recovery guidance must stay narrow (tool_outputs + directory-level
+        // file_pattern); widening it again also requires a PROJECTION_VERSION
+        // bump so persisted projections cannot keep serving the old guidance.
+        assert!(note.contains("scope=tool_outputs"));
+        assert!(note.contains("file_pattern '*internal-note-overflow*'"));
         assert!(note.is_ascii());
     }
 
