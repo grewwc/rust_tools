@@ -491,6 +491,12 @@ pub(crate) fn has_subagent_wrap_up_pending() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether this turn installed a pre-timeout wrap-up signal at all. Distinguishes
+/// "no signal for this turn" from "signal installed but not yet sent".
+pub(crate) fn has_subagent_wrap_up_signal() -> bool {
+    SUBAGENT_WRAP_UP_SIGNAL.try_with(|_| ()).is_ok()
+}
+
 // =============================================================================
 // DRIVER_CTX fallback for parallel read-only batch threads
 // =============================================================================
@@ -547,6 +553,32 @@ pub(crate) fn auto_model_fallback_spec() -> Option<AutoModelFallbackSpec> {
 /// (no `SUBAGENT_DEPTH` task-local set). Each spawn level increments by 1.
 pub(crate) fn current_subagent_depth() -> usize {
     SUBAGENT_DEPTH.try_with(|d| *d).unwrap_or(0)
+}
+
+/// Wall-clock budget for one model request inside a sub-agent turn.
+///
+/// A sub-agent is a bounded leaf task: one request that keeps streaming, or keeps
+/// retrying its headers, must not consume the whole task budget. The budget is per
+/// request; the turn itself stays bounded by the caller's hard timeout and the
+/// iteration cap.
+const SUBAGENT_MODEL_REQUEST_BUDGET: Duration = Duration::from_secs(5 * 60);
+/// A forced wrap-up request only synthesizes evidence already collected, so it gets
+/// a shorter budget instead of another full request window.
+const SUBAGENT_WRAP_UP_REQUEST_BUDGET: Duration = Duration::from_secs(90);
+
+/// Absolute deadline for the current model request, or `None` for foreground turns.
+///
+/// `force_final` selects the shorter wrap-up budget. The deadline covers the whole
+/// request (headers, retries, and streaming), not a single network attempt.
+pub(crate) fn subagent_model_request_deadline(force_final: bool) -> Option<Instant> {
+    (current_subagent_depth() > 0).then(|| {
+        Instant::now()
+            + if force_final {
+                SUBAGENT_WRAP_UP_REQUEST_BUDGET
+            } else {
+                SUBAGENT_MODEL_REQUEST_BUDGET
+            }
+    })
 }
 
 /// Read the current sub-agent task id when inside a sub-agent dispatch.
@@ -663,6 +695,23 @@ mod tests {
 
         assert!(first);
         assert!(!second);
+    }
+
+    #[test]
+    fn model_request_deadline_is_subagent_only_and_shorter_for_wrap_up() {
+        assert!(subagent_model_request_deadline(false).is_none());
+
+        let (normal, wrap_up) = SUBAGENT_DEPTH.sync_scope(1, || {
+            (
+                subagent_model_request_deadline(false),
+                subagent_model_request_deadline(true),
+            )
+        });
+        let normal = normal.expect("subagent request should have a deadline");
+        let wrap_up = wrap_up.expect("subagent wrap-up request should have a deadline");
+
+        assert!(normal > wrap_up);
+        assert!(wrap_up > Instant::now());
     }
 
     #[test]

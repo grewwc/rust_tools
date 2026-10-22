@@ -1,0 +1,21 @@
+{
+  "key": "deepseek-v4.1-flash-opencode",
+  "aliases": [
+    "DEEPSEEK_V4_1_FLASH_OPENCODE"
+  ],
+  "name": "deepseek-v4.1-flash",
+  "adapter": "opencode",
+  "quality_tier": "strong",
+  "is_vl": true,
+  "search_enabled": false,
+  "tools_default_enabled": true,
+  "enable_thinking": true,
+  "subagent_priority": 85,
+  "default_reasoning_effort": "max",
+  "reasoning_effort_wire": "top_level",
+  "reasoning_content_replay": true,
+  "context_window_tokens": 1024000,
+  "max_output_tokens": 393216,
+  "endpoint": "https://opencode.ai/inference/go/v1/chat/completions",
+  "_comment": "OpenCode Go model (https://opencode.ai/v2/docs/console/go): model id deepseek-v4.1-flash, priced off-peak $0.15 input / $0.60 output and peak $0.30 / $1.20 per 1M tokens (peak hours 01:00-04:00 and 06:00-10:00 UTC on weekdays). Same model as DeepSeek-V4.1-Flash on api.deepseek.com: 1M context, 384K max output, vision input, thinking on by default (DeepSeek `thinking` object, sent by the OpenCode DeepSeek dialect). Off-peak/peak billing doubles during peak hours."
+}

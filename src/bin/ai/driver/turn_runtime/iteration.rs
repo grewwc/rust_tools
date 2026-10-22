@@ -3,7 +3,7 @@ use rust_tools::commonw::FastSet;
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ai::{
     driver::{drain_response, input, skill_runtime},
@@ -964,6 +964,39 @@ async fn wait_for_request_interrupt(
     }
 }
 
+/// Sentinel surfaced by `stream_model_response` when a sub-agent request hit its
+/// wall-clock deadline. The caller turns it into `RequestDeadlineExceeded` with the
+/// partial text accumulated so far.
+const SUBAGENT_REQUEST_DEADLINE_ERR: &str = "__subagent_model_request_deadline__";
+
+/// Sleep until `deadline`; never resolve when there is no deadline, so callers can
+/// use it as an unconditional `tokio::select!` arm.
+async fn wait_until_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Sentinel surfaced when the parent asks a sub-agent to wrap up while it is already streaming.
+const SUBAGENT_WRAP_UP_ERR: &str = "__subagent_wrap_up_signal__";
+
+/// Resolve when the parent's pre-timeout wrap-up signal is pending. Foreground turns stay
+/// pending, and a sub-agent without a signal keeps streaming under its own request budget.
+async fn wait_for_subagent_wrap_up() {
+    if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0
+        || !crate::ai::driver::runtime_ctx::has_subagent_wrap_up_signal()
+    {
+        return std::future::pending().await;
+    }
+    loop {
+        if crate::ai::driver::runtime_ctx::has_subagent_wrap_up_pending() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 pub(in crate::ai::driver::turn_runtime) fn no_tool_handoff_note() -> &'static str {
     "Enter no-tool wrap-up mode: do not call any tools for the rest of this turn.\n\
 Produce a wrap-up/handoff reply based on the information already gathered:\n\
@@ -1610,13 +1643,36 @@ async fn stream_model_response(
     terminal_dedupe_candidate: Option<&str>,
     _active_skill_name: Option<&str>,
     _iteration: usize,
+    deadline: Option<Instant>,
 ) -> Result<StreamResult, String> {
-    match stream::stream_response(app, response, current_history, terminal_dedupe_candidate).await {
-        Ok(result) => Ok(result),
-        Err(err) => {
+    crate::ai::driver::runtime_ctx::publish_subagent_phase("streaming response");
+    // The stream future borrows `app` and `current_history`; drop it before touching
+    // either on the timeout path.
+    let outcome = {
+        let stream =
+            stream::stream_response(app, response, current_history, terminal_dedupe_candidate);
+        tokio::pin!(stream);
+        match deadline {
+            Some(_) => {
+                tokio::select! {
+                    result = &mut stream => Some(result),
+                    _ = wait_until_deadline(deadline) => None,
+                }
+            }
+            None => Some(stream.await),
+        }
+    };
+    match outcome {
+        Some(Ok(result)) => Ok(result),
+        Some(Err(err)) => {
             app.streaming
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             Err(err.to_string())
+        }
+        None => {
+            app.streaming
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            Err(SUBAGENT_REQUEST_DEADLINE_ERR.to_string())
         }
     }
 }
@@ -1712,6 +1768,12 @@ pub(super) async fn execute_turn_iteration(
     request::clear_stale_request_interrupt_before_request(app);
     let _streaming_guard = StreamingFlagGuard::new(&app.streaming);
     crate::ai::driver::runtime_ctx::publish_subagent_phase("calling model");
+    // Sub-agents get one absolute deadline per model request, covering the header
+    // wait, transport retries, and the stream. Foreground turns get None and keep
+    // their existing unbounded-per-attempt behavior.
+    let request_deadline = crate::ai::driver::runtime_ctx::subagent_model_request_deadline(
+        force_final_response,
+    );
 
     let shutdown = app.shutdown.clone();
     let cancel_stream = app.cancel_stream.clone();
@@ -1740,6 +1802,13 @@ pub(super) async fn execute_turn_iteration(
                     return Ok(IterationExecution::WrapUpFinal);
                 }
             }
+        }
+        _ = wait_until_deadline(request_deadline) => {
+            return Ok(IterationExecution::RequestDeadlineExceeded(StreamResult {
+                outcome: StreamOutcome::Truncated,
+                stream_error: true,
+                ..Default::default()
+            }));
         }
     };
 
@@ -1784,16 +1853,26 @@ pub(super) async fn execute_turn_iteration(
         if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
             request::print_info(app, &actual_model);
         }
-        match stream_model_response(
-            app,
-            &mut response,
-            &mut current_history,
-            terminal_dedupe_candidate,
-            active_skill_name,
-            iteration,
-        )
-        .await
-        {
+        // A stream can run for minutes, so the parent's wrap-up signal must be able to cut
+        // it without waiting for the request budget. Cutting here preserves the text
+        // accumulated so far and routes it through the same forced-wrap-up path.
+        let stream_outcome = tokio::select! {
+            result = stream_model_response(
+                app,
+                &mut response,
+                &mut current_history,
+                terminal_dedupe_candidate,
+                active_skill_name,
+                iteration,
+                request_deadline,
+            ) => result,
+            _ = wait_for_subagent_wrap_up() => {
+                app.streaming
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                Err(SUBAGENT_WRAP_UP_ERR.to_string())
+            }
+        };
+        match stream_outcome {
             Ok(stream_result) => {
                 // Wrap-up hook on the successful stream-parse path (on_after_stream → ParseStream.after).
                 app.fire_after_stream_hooks();
@@ -1810,11 +1889,30 @@ pub(super) async fn execute_turn_iteration(
                 )
                 .await;
             }
+            Err(err_msg) if err_msg == SUBAGENT_REQUEST_DEADLINE_ERR => {
+                return Ok(IterationExecution::RequestDeadlineExceeded(StreamResult {
+                    assistant_text: std::mem::take(&mut current_history),
+                    outcome: StreamOutcome::Truncated,
+                    stream_error: true,
+                    ..Default::default()
+                }));
+            }
+            Err(err_msg) if err_msg == SUBAGENT_WRAP_UP_ERR => {
+                return Ok(IterationExecution::RequestDeadlineExceeded(StreamResult {
+                    assistant_text: std::mem::take(&mut current_history),
+                    outcome: StreamOutcome::Truncated,
+                    stream_error: true,
+                    ..Default::default()
+                }));
+            }
             Err(err_msg) => {
                 if stream_attempt < MAX_STREAM_RETRIES
                     && request::is_retryable_stream_error(&err_msg)
                 {
                     stream_attempt += 1;
+                    crate::ai::driver::runtime_ctx::publish_subagent_phase(&format!(
+                        "retrying stream ({stream_attempt}/{MAX_STREAM_RETRIES})"
+                    ));
                     if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
                         eprintln!(
                             "\n[Info] 流式响应中断（{}），第 {}/{} 次重试...",
@@ -1846,10 +1944,22 @@ pub(super) async fn execute_turn_iteration(
 
                     request::clear_stale_request_interrupt_before_request(app);
                     let llm_client = build_llm_request_client(app);
-                    let retry_request = if force_final_response {
-                        send_llm_request(&*llm_client, app, &actual_model, messages, false).await
-                    } else {
-                        send_llm_request(&*llm_client, app, &actual_model, messages, true).await
+                    let retry_request = tokio::select! {
+                        result = async {
+                            if force_final_response {
+                                send_llm_request(&*llm_client, app, &actual_model, messages, false).await
+                            } else {
+                                send_llm_request(&*llm_client, app, &actual_model, messages, true).await
+                            }
+                        } => result,
+                        _ = wait_until_deadline(request_deadline) => {
+                            return Ok(IterationExecution::RequestDeadlineExceeded(StreamResult {
+                                assistant_text: std::mem::take(&mut current_history),
+                                outcome: StreamOutcome::Truncated,
+                                stream_error: true,
+                                ..Default::default()
+                            }));
+                        }
                     };
                     match retry_request {
                         Ok(new_response) => {
@@ -2225,6 +2335,28 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("short-circuited by test middleware")
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_until_deadline_resolves_only_when_a_deadline_exists() {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(20);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::wait_until_deadline(Some(deadline)),
+        )
+        .await
+        .expect("an absolute deadline must resolve");
+
+        let no_deadline = tokio::time::timeout(
+            std::time::Duration::from_millis(40),
+            super::wait_until_deadline(None),
+        )
+        .await;
+        assert!(
+            no_deadline.is_err(),
+            "a foreground turn without a deadline must stay pending"
         );
     }
 

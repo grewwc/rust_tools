@@ -97,6 +97,12 @@ pub(crate) struct TaskState {
     /// this list is the host's ownership record, alongside the room transcript.
     #[serde(default)]
     pub spawned: Vec<String>,
+    /// Skills the `/task` command propagated to this room's workers. Rendered
+    /// into every task card as `@skills:` mentions so each wake (headless
+    /// re-exec or live inbox card) force-activates them. `#[serde(default)]`
+    /// keeps rooms started before skill propagation loadable.
+    #[serde(default)]
+    pub skills: Vec<String>,
     pub max_rounds: u32,
     /// Current round: 1 right after start. Rework assignments bump it; the
     /// room refuses further rework once it reaches `max_rounds`.
@@ -189,8 +195,19 @@ pub(crate) fn task_brief_for(state: &TaskState, worker: &str) -> String {
         .map(|a| a.acceptance.trim())
         .filter(|s| !s.is_empty())
         .unwrap_or("(no acceptance bar assigned yet — confirm with the host before reporting done)");
+    let skills_lines = if state.skills.is_empty() {
+        String::new()
+    } else {
+        let mentions = state
+            .skills
+            .iter()
+            .map(|s| format!("@skills:{s}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{mentions}\nAssigned skills: {}\n", state.skills.join(", "))
+    };
     format!(
-        "[task room={} round={}/{} host={}]\nGoal: {}\n\nYou are a worker in this task room. Do ONLY your own assignment; touch only these files: {scope_text}\nAcceptance bar: {acceptance}\n\nSend ONE report with the talk_send tool: to_session=\"{}\" room=\"{}\". The report must start with a STATUS line (`STATUS: done` when the acceptance bar is met, `STATUS: failed` otherwise, `STATUS: blocked` when you are stuck on something only the host can decide), then the list of files you changed, then your test output (summary only, not the full log). A blocked report must put its question on a `QUESTION:` line right after STATUS, followed by what you already tried; then stop and wait for the host's answer instead of guessing — do not ask other workers. If talk_send is not in your tool list, call enable_tools for it first. Do not create new sessions and do not spawn further workers.",
+        "[task room={} round={}/{} host={}]\n{skills_lines}Goal: {}\n\nYou are a worker in this task room. Do ONLY your own assignment; touch only these files: {scope_text}\nAcceptance bar: {acceptance}\n\nSend ONE report with the talk_send tool: to_session=\"{}\" room=\"{}\". The report must start with a STATUS line (`STATUS: done` when the acceptance bar is met, `STATUS: failed` otherwise, `STATUS: blocked` when you are stuck on something only the host can decide), then the list of files you changed, then your test output (summary only, not the full log). A blocked report must put its question on a `QUESTION:` line right after STATUS, followed by what you already tried; then stop and wait for the host's answer instead of guessing — do not ask other workers. If talk_send is not in your tool list, call enable_tools for it first. Do not create new sessions and do not spawn further workers.",
         state.room,
         state.round,
         state.max_rounds,
@@ -317,13 +334,16 @@ pub(crate) fn start_task(
     }
     let use_explicit = !req.workers.is_empty();
     if use_explicit && req.worker_count.is_some() {
-        return Err("pass either workers or worker_count, not both".to_string());
+        return Err(format!(
+            "pass either workers or worker_count, not both (received {} workers and worker_count={})",
+            req.workers.len(),
+            req.worker_count.unwrap_or(0)
+        ));
     }
     if !use_explicit && req.worker_count.is_none() {
-        return Err(
-            "task needs workers (existing session ids) or worker_count (auto-spawned workers)"
-                .to_string(),
-        );
+        return Err(format!(
+            "task needs workers (an array of existing session ids) or worker_count (an integer 1-{MAX_TASK_WORKERS}); neither was provided"
+        ));
     }
     let host = host_id(from_history_file);
     let max_rounds = req
@@ -342,7 +362,8 @@ pub(crate) fn start_task(
     let (workers, spawned): (Vec<String>, Vec<String>) = if use_explicit {
         if req.workers.len() > MAX_TASK_WORKERS {
             return Err(format!(
-                "task supports at most {MAX_TASK_WORKERS} workers"
+                "task supports at most {MAX_TASK_WORKERS} workers (received {})",
+                req.workers.len()
             ));
         }
         let mut seen = std::collections::HashSet::new();
@@ -366,7 +387,7 @@ pub(crate) fn start_task(
         let n = req.worker_count.unwrap_or(0);
         if n == 0 || n > MAX_TASK_WORKERS {
             return Err(format!(
-                "worker_count must be between 1 and {MAX_TASK_WORKERS}"
+                "worker_count must be between 1 and {MAX_TASK_WORKERS} (received {n})"
             ));
         }
         let room_part = sanitize_room_for_id(&room);
@@ -386,6 +407,10 @@ pub(crate) fn start_task(
             status: AssignmentStatus::Pending,
         })
         .collect();
+    // Read the skills snapshot written by the `/task` command without
+    // consuming it: any failure below must leave the payload for a retry, and
+    // `clear_pending_room_skills` runs only on the success path.
+    let room_skills = talk::peek_pending_room_skills(from_history_file);
     let mut state = TaskState {
         room: room.clone(),
         goal: goal.to_string(),
@@ -393,6 +418,7 @@ pub(crate) fn start_task(
         workers,
         assignments,
         spawned,
+        skills: room_skills,
         max_rounds,
         round: 1,
         status: TaskStatus::Open,
@@ -456,6 +482,9 @@ pub(crate) fn start_task(
     )
     .map_err(|e| format!("write opening transcript: {e}"))?;
     save_state(from_history_file, &state)?;
+    // Room started: the snapshot has done its job and must not leak into a
+    // later room started without a fresh `/task` command.
+    talk::clear_pending_room_skills(from_history_file);
     Ok(StartOutcome { state, deliveries })
 }
 
@@ -606,7 +635,10 @@ pub(crate) fn assign_task(
     acceptance: &str,
 ) -> Result<String, String> {
     if state.status != TaskStatus::Open {
-        return Err(format!("room '{}' is closed", state.room));
+        return Err(format!(
+            "room '{}' is closed; start a new room with task_start",
+            state.room
+        ));
     }
     let pos = state
         .workers
@@ -1100,6 +1132,57 @@ mod tests {
         assert!(brief.contains("talk_send"), "{brief}");
         assert!(brief.contains("enable_tools"), "{brief}");
         assert!(brief.contains("Do not create new sessions"), "{brief}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn task_brief_renders_assigned_skills_mentions() {
+        let (dir, store, host_hist, _w1, _w2) = fixture();
+        let mut state = start(&store, &host_hist, "fix login", &workers(), None, Some("t-skills"))
+            .unwrap()
+            .state;
+        let brief = task_brief_for(&state, "worker-1");
+        assert!(!brief.contains("@skills:"), "no skills yet: {brief}");
+
+        state.skills = vec!["s1".to_string(), "s2".to_string()];
+        let brief = task_brief_for(&state, "worker-1");
+        assert!(brief.contains("@skills:s1"), "{brief}");
+        assert!(brief.contains("@skills:s2"), "{brief}");
+        assert!(brief.contains("Assigned skills: s1, s2"), "{brief}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn task_state_round_trips_skills_with_old_state_compat() {
+        // State files written before skill propagation lack the field;
+        // `#[serde(default)]` must load them with an empty list.
+        let old = r#"{"room":"r","goal":"g","host":"h","workers":["w"],"assignments":[],"spawned":[],"max_rounds":2,"round":1,"status":"Open","woken_round":1,"woken":[]}"#;
+        let state: TaskState = serde_json::from_str(old).expect("old state must load");
+        assert!(state.skills.is_empty());
+
+        let with_skills = TaskState {
+            skills: vec!["s1".to_string()],
+            ..state
+        };
+        let encoded = serde_json::to_string(&with_skills).unwrap();
+        let decoded: TaskState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.skills, vec!["s1"]);
+    }
+
+    #[test]
+    fn start_keeps_snapshot_on_failure_and_clears_it_on_success() {
+        let (dir, store, host_hist, w1_hist, w2_hist) = fixture();
+        // Failed start (invalid input) must leave the payload for a retry.
+        assert!(talk::write_pending_room_skills(&host_hist, &["s1".to_string()]).is_ok());
+        assert!(start(&store, &host_hist, "   ", &workers(), None, None).is_err());
+        assert_eq!(talk::peek_pending_room_skills(&host_hist), vec!["s1"]);
+
+        // Successful start consumes the snapshot: the skills land in state and
+        // must not leak into a later room started without a fresh command.
+        let out = start(&store, &host_hist, "g", &workers(), None, Some("t-skills-snap"))
+            .unwrap();
+        assert_eq!(out.state.skills, vec!["s1"]);
+        assert!(talk::peek_pending_room_skills(&host_hist).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

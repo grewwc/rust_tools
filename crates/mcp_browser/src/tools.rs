@@ -12,14 +12,10 @@ use serde_json::{Value, json};
 use crate::browser::{BrowserSession, ensure_session};
 use mcp_stdio::{JsonRpcErr, cap_text, text_content, with_timeout};
 
-/// Per-operation timeout (milliseconds). Defaults to 90s, shorter than the host request_timeout_ms (recommended 120s),
-/// so timeouts are handled server-side with a clean error instead of the host killing the whole session.
-pub(crate) fn op_timeout_ms() -> u64 {
-    std::env::var("MCP_BROWSER_OP_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(90_000)
-}
+/// Per-operation timeout, defined in `browser.rs` (the session layer) so the
+/// runtime never depends on the schema layer. Re-exported here because
+/// `applescript.rs` imports it via `crate::tools::op_timeout_ms`.
+pub(crate) use crate::browser::op_timeout_ms;
 
 /// Result of initialize.
 pub fn initialize_result() -> Value {
@@ -36,7 +32,7 @@ pub fn tools_list_result() -> Value {
         "tools": [
             {
                 "name": "navigate",
-                "description": "Launch/reuse a controlled Chrome and navigate to a URL, waiting for load. Keeps the session (cookies/login) alive across calls. If the response contains [USER_ACTION_REQUIRED: <category>], the page needs manual user intervention (captcha/slider/sms_otp/twofa/login_required/payment_verify/identity_verify) - stop further browser automation, hand control back to the user, and resume only after they confirm.",
+                "description": "Navigate the browser session to a URL and wait for load (CDP mode: a controlled Chrome; AppleScript mode: a tab in your own Chrome, keeping cookies/login). Keeps the session (cookies/login) alive across calls. If the response contains [USER_ACTION_REQUIRED: <category>], the page needs manual user intervention (captcha/slider/sms_otp/twofa/login_required/payment_verify/identity_verify) - stop further browser automation, hand control back to the user, and resume only after they confirm.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -144,7 +140,7 @@ pub fn tools_list_result() -> Value {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Optional output path; defaults to MCP_BROWSER_SCREENSHOT_DIR / temp dir" },
-                        "full_page": { "type": "boolean", "description": "Capture the full scrollable page (default false)", "default": false }
+                        "full_page": { "type": "boolean", "description": "Capture the full scrollable page (default false; in AppleScript mode this degrades to a window capture, noted in the result)", "default": false }
                     }
                 }
             },
@@ -161,12 +157,12 @@ pub fn tools_list_result() -> Value {
             },
             {
                 "name": "list_tabs",
-                "description": "List open tabs (index and URL) in the controlled browser.",
+                "description": "List open tabs (index and URL) in the current browser session.",
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
                 "name": "close_browser",
-                "description": "Close the controlled Chrome and release the session.",
+                "description": "Close the browser session: CDP mode quits the controlled Chrome; AppleScript mode closes only the session tab and never quits your own Chrome.",
                 "inputSchema": { "type": "object", "properties": {} }
             }
         ]
@@ -417,11 +413,10 @@ async fn tool_type_text(
     args: &Value,
 ) -> Result<Value, JsonRpcErr> {
     let selector = require_str(args, "selector")?;
-    let text = args
-        .get("text")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| JsonRpcErr::new(-32602, "missing 'text'", None))?
-        .to_string();
+    // The AppleScript driver rejects an empty 'text' (require_str), so enforce the
+    // same contract here: an empty string is not a meaningful type operation and
+    // silently typing 0 chars only confuses the model.
+    let text = require_str(args, "text")?;
     let submit = args
         .get("submit")
         .and_then(|v| v.as_bool())
@@ -484,7 +479,26 @@ async fn tool_press_key(
             .find_element(target.clone())
             .await
             .map_err(|e| format!("focus target '{target}' not found: {e}"))?;
-        el.focus().await.map_err(|e| format!("focus failed: {e}"))?;
+        if selector.is_some() {
+            el.focus().await.map_err(|e| format!("focus failed: {e}"))?;
+        } else {
+            // No explicit target: the trusted CDP key event lands on the page's
+            // *currently focused* element (chromiumoxide sends Input.dispatchKeyEvent),
+            // so focusing <body> here would steal focus from an input the model just
+            // typed into, and a following Enter would no longer submit the form (the
+            // AppleScript driver keeps `document.activeElement` instead). Only give
+            // body focus when nothing else has it, so page-level keys (Tab/ArrowDown)
+            // still have a target.
+            s.page
+                .evaluate_expression(
+                    "(() => { const a = document.activeElement; \
+                     if (!a || a === document.body || a === document.documentElement) \
+                       (document.body || document.documentElement).focus(); \
+                     return true; })()",
+                )
+                .await
+                .map_err(|e| format!("focus prep failed: {e}"))?;
+        }
         el.press_key(&key)
             .await
             .map_err(|e| format!("press_key '{key}' failed: {e}"))?;
@@ -541,8 +555,11 @@ async fn tool_wait_for(
         .get("timeout_ms")
         .and_then(|v| v.as_u64())
         .unwrap_or(15_000);
-    // Poll cap = min(operation cap, user timeout), so the server cap takes precedence.
-    let cap = op_timeout_ms().min(timeout_ms);
+    // The outer with_timeout keeps ONLY the operation cap (op_timeout_ms, <= 90s).
+    // The user's timeout_ms belongs to the loop's own deadline below: squeezing the
+    // outer cap to it used to make with_timeout fire at the same instant, returning
+    // the misleading "server cap" wording and leaving the not-found branch dead.
+    let cap = op_timeout_ms();
     let s = ensure_session(session)
         .await
         .map_err(|e| JsonRpcErr::new(-32000, &e, None))?;

@@ -1,6 +1,6 @@
 {
   "name": "discuss_start",
-  "description": "Open a multi-session discussion room as host: sends the round-1 brief to every member session's talk inbox and reports who is live vs inactive. Returns the room name for discuss_collect/broadcast/end. Pass either members (existing sessions) or member_count (auto-spawned sessions owned by this room), not both.",
+  "description": "Open a multi-session discussion room as host: send the round-1 brief to each member session's talk inbox and report who is live vs inactive. Returns the room name for discuss_collect/broadcast/end. Pass exactly one of members (existing session ids) or member_count (auto-spawned sessions owned by this room); counts are integers.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -11,24 +11,34 @@
       "members": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "Member session ids (1-8, from session_list; must exist, cannot include yourself). Either this or member_count."
+        "minItems": 1,
+        "maxItems": 8,
+        "description": "1-8 existing member session ids from session_list; must exist and cannot include the host. Either this or member_count."
       },
       "member_count": {
-        "type": "number",
-        "description": "Auto-spawn N member sessions (1-8) owned by this room, e.g. 3. Fresh ids embed the room name; their databases are created by their own processes. Either this or members."
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 8,
+        "description": "Whole number of member sessions to auto-spawn (1-8, e.g. 2). Fresh ids embed the room name; their databases are created by their own processes. Either this or members."
       },
       "roles": {
         "type": "array",
         "items": { "type": "string" },
+        "maxItems": 8,
         "description": "Optional stance per member, positionally aligned (one per member, or empty for none). Without roles, auto-spawned members default to pro/contra/judge/independent stances; explicit members get no stance."
       },
       "max_rounds": {
-        "type": "number",
-        "description": "Max rounds before forced close (default 3, clamped 1-10)."
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 10,
+        "default": 3,
+        "description": "Whole number of rounds before forced close (default 3)."
       },
       "room": {
         "type": "string",
-        "description": "Optional room name (max 64 chars); auto-generated when omitted."
+        "minLength": 1,
+        "maxLength": 64,
+        "description": "Optional room name (1-64 chars); auto-generated when omitted."
       }
     },
     "required": [

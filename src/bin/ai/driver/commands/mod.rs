@@ -125,11 +125,21 @@ pub fn is_local_command_start(token: &str) -> bool {
 }
 
 /// True when `token` starts a local command that serve-chat must not forward
-/// as a turn. `/memo` is the exception: the serve turn child's one-shot loop
-/// reaches `try_handle_memo_command`, so serve-chat forwards it like a prompt
-/// and the save lands in the shared memory store.
+/// as a turn. The exceptions all execute inside the turn child's one-shot
+/// loop: `/memo` reaches `try_handle_memo_command` (the save lands in the
+/// shared memory store), and `/task`/`/discuss`/`/goal` only inject a
+/// `forced_question` and let the turn continue, exactly like a prompt — so
+/// serve-chat forwards them and the host flow runs server-side.
 pub(crate) fn is_serve_local_command_start(token: &str) -> bool {
-    is_local_command_start(token) && memo::memo_command_args(token).is_none()
+    if !is_local_command_start(token) || memo::memo_command_args(token).is_some() {
+        return false;
+    }
+    let rest = token
+        .trim()
+        .strip_prefix('/')
+        .or_else(|| token.trim().strip_prefix(':'));
+    let word = rest.and_then(|r| r.split_whitespace().next()).unwrap_or("");
+    !matches!(word, "task" | "discuss" | "goal")
 }
 
 /// Dash-flag tokens owned by the named local command's own grammar.

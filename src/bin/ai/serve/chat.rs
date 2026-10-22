@@ -2409,6 +2409,12 @@ mod serve_history_tests {
         // must forward it (and `:memo`) like a prompt instead of blocking it.
         assert!(!is_serve_local_command_start("/memo"));
         assert!(!is_serve_local_command_start(":memo 记住这个"));
+        // `/task`, `/discuss` and `/goal` only inject a `forced_question` and
+        // let the turn continue, so the turn child runs them like a prompt.
+        assert!(!is_serve_local_command_start("/task fix login"));
+        assert!(!is_serve_local_command_start(":discuss API options"));
+        assert!(!is_serve_local_command_start("/goal refactor parser"));
+        assert!(!is_serve_local_command_start("/task status"));
         assert!(!is_serve_local_command_start("/tmp/foo"));
         assert!(!is_serve_local_command_start("plain prompt"));
     }
@@ -3542,7 +3548,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
 
     println!("Connected to {base}, session {session_id}.");
     println!(
-        "Enter inserts a newline, Esc or Alt+Enter submits; Ctrl+C interrupts the running remote turn (a second Ctrl+C exits); /quit exits, /bg backgrounds the current session and exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions (/sessions current|id shows the current one), /fork branches the current session, /close deletes it and exits. /cd switches the remote working directory (Tab completes remote paths; /pwd prints it). /model, /effort, /agent switch the remote turn like the local REPL."
+        "Enter inserts a newline, Esc or Alt+Enter submits; Ctrl+C interrupts the running remote turn (a second Ctrl+C exits); /quit exits, /bg backgrounds the current session and exits, /new starts a new session, /sessions (or /ss, same as the local REPL) lists remote sessions (/sessions current|id shows the current one), /fork branches the current session, /close deletes it and exits. /cd switches the remote working directory (Tab completes remote paths; /pwd prints it). /model, /effort, /agent switch the remote turn like the local REPL. /task and /discuss run multi-worker rooms on the server (/task help, /discuss help)."
     );
     let mut editor = PromptEditor::new(&session_id, &app_config.history_file);
     // Command words the shared completion table does not carry: serve-chat-only
@@ -3630,7 +3636,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first); /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first); /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
                 );
                 continue;
             }

@@ -9,6 +9,7 @@
 // the host inbox and must never be replayed).
 use serde_json::Value;
 
+use super::{arg_bool, arg_str, arg_string_list, arg_u64};
 use crate::ai::{
     driver::{task, talk},
     history::SessionStore,
@@ -22,56 +23,6 @@ fn current_ctx() -> Result<(SessionStore, std::path::PathBuf), String> {
     let store = SessionStore::new(&ctx.app_proto.config.history_file);
     let history_file = ctx.app_proto.session_history_file.clone();
     Ok((store, history_file))
-}
-
-fn arg_str<'a>(args: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter()
-        .filter_map(|k| args.get(*k))
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .find(|s| !s.is_empty())
-}
-
-fn arg_workers(args: &Value) -> Option<Vec<String>> {
-    let arr = args.get("workers")?.as_array()?;
-    let out: Vec<String> = arr
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    if out.is_empty() { None } else { Some(out) }
-}
-
-fn arg_scope_files(args: &Value) -> Vec<String> {
-    for k in ["scope_files", "scope", "files"] {
-        if let Some(arr) = args.get(k).and_then(Value::as_array) {
-            return arr
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-        }
-    }
-    Vec::new()
-}
-
-fn arg_u64(args: &Value, keys: &[&str]) -> Option<u64> {
-    for k in keys {
-        if let Some(v) = args.get(*k) {
-            if let Some(n) = v.as_u64() {
-                return Some(n);
-            }
-            if let Some(s) = v.as_str()
-                && let Ok(n) = s.trim().parse::<u64>()
-            {
-                return Some(n);
-            }
-        }
-    }
-    None
 }
 
 fn format_reports(replies: &[talk::TalkMessage]) -> String {
@@ -89,15 +40,26 @@ fn format_reports(replies: &[talk::TalkMessage]) -> String {
 /// ToolSpec adapter: `ToolSpec.execute` returns model-visible text directly;
 /// `ToolResult` wrapping is done by the registry path.
 pub(crate) fn execute_task_start(args: &Value) -> Result<String, String> {
-    let goal = arg_str(args, &["goal", "task", "objective"])
+    let goal = arg_str(args, &["goal", "task", "objective"])?
         .ok_or_else(|| "goal must not be empty (the work to split across workers)".to_string())?;
     // Exactly one of `workers` (existing sessions) or `worker_count`
     // (host-owned auto-spawn); `start_task` enforces the either/or.
-    let workers = arg_workers(args).unwrap_or_default();
-    let worker_count =
-        arg_u64(args, &["worker_count", "count", "workers_count", "n"]).map(|n| n as usize);
-    let max_rounds = arg_u64(args, &["max_rounds", "rounds"]).map(|n| n as u32);
-    let room = arg_str(args, &["room"]).map(str::to_string);
+    let workers = arg_string_list(args, &["workers"], "workers", true)?.unwrap_or_default();
+    let worker_count = arg_u64(
+        args,
+        &["worker_count", "count", "workers_count", "n"],
+        1,
+        task::MAX_TASK_WORKERS as u64,
+    )?
+    .map(|n| n as usize);
+    let max_rounds = arg_u64(
+        args,
+        &["max_rounds", "rounds"],
+        1,
+        task::MAX_TASK_ROUNDS as u64,
+    )?
+    .map(|n| n as u32);
+    let room = arg_str(args, &["room"])?.map(str::to_string);
 
     let (store, history_file) = current_ctx()?;
     let req = task::StartRequest {
@@ -129,13 +91,15 @@ pub(crate) fn execute_task_start(args: &Value) -> Result<String, String> {
 }
 
 pub(crate) fn execute_task_assign(args: &Value) -> Result<String, String> {
-    let room = arg_str(args, &["room"])
+    let room = arg_str(args, &["room"])?
         .ok_or_else(|| "room must not be empty (from task_start)".to_string())?;
-    let worker = arg_str(args, &["worker", "member", "session"])
+    let worker = arg_str(args, &["worker", "member", "session"])?
         .ok_or_else(|| "worker must not be empty (one worker session id from task_start)".to_string())?;
-    let acceptance = arg_str(args, &["acceptance", "bar", "criteria"])
+    let acceptance = arg_str(args, &["acceptance", "bar", "criteria"])?
         .ok_or_else(|| "acceptance must not be empty (the bar this worker must clear)".to_string())?;
-    let scope_files = arg_scope_files(args);
+    let scope_files =
+        arg_string_list(args, &["scope_files", "scope", "files"], "scope_files", true)?
+            .unwrap_or_default();
     if scope_files.is_empty() {
         return Err("scope_files must name at least one file boundary".to_string());
     }
@@ -149,17 +113,27 @@ pub(crate) fn execute_task_assign(args: &Value) -> Result<String, String> {
 }
 
 pub(crate) fn execute_task_collect(args: &Value) -> Result<String, String> {
-    let room = arg_str(args, &["room"])
+    let room = arg_str(args, &["room"])?
         .ok_or_else(|| "room must not be empty (from task_start)".to_string())?;
+    let timeout = arg_u64(
+        args,
+        &["timeout_secs", "timeout"],
+        task::MIN_COLLECT_TIMEOUT_SECS,
+        task::MAX_COLLECT_TIMEOUT_SECS,
+    )?
+    .unwrap_or(task::DEFAULT_COLLECT_TIMEOUT_SECS);
+    let wake = arg_bool(args, "wake", true)?;
     let (store, history_file) = current_ctx()?;
     let mut state = task::load_state(&history_file, room)?;
     if state.status != task::TaskStatus::Open {
-        return Err(format!("room '{}' is closed", state.room));
+        return Err(format!(
+            "room '{}' is closed; start a new room with task_start",
+            state.room
+        ));
     }
     let round = state.round;
     // Wake pass first: inactive workers that have not been woken this round
     // get a headless one-shot; their reports land in the host inbox below.
-    let wake = args.get("wake").and_then(Value::as_bool).unwrap_or(true);
     let mut wake_notes = Vec::new();
     if wake {
         for w in state.workers.clone() {
@@ -173,7 +147,6 @@ pub(crate) fn execute_task_collect(args: &Value) -> Result<String, String> {
         // idempotence optimization, not truth.
         let _ = task::save_state(&history_file, &state);
     }
-    let timeout = arg_u64(args, &["timeout_secs", "timeout"]).unwrap_or(task::DEFAULT_COLLECT_TIMEOUT_SECS);
     // Reports are already in the transcript: collect_task appends every
     // newly drained report before the next poll, so a killed wait loses
     // nothing already drained. STATUS lines are folded into assignments.
@@ -231,9 +204,9 @@ pub(crate) fn execute_task_collect(args: &Value) -> Result<String, String> {
 }
 
 pub(crate) fn execute_task_close(args: &Value) -> Result<String, String> {
-    let room = arg_str(args, &["room"])
+    let room = arg_str(args, &["room"])?
         .ok_or_else(|| "room must not be empty (from task_start)".to_string())?;
-    let summary = arg_str(args, &["summary", "conclusion", "text"])
+    let summary = arg_str(args, &["summary", "conclusion", "text"])?
         .ok_or_else(|| "summary must not be empty (the acceptance conclusion)".to_string())?;
     let (_, history_file) = current_ctx()?;
     let mut state = task::load_state(&history_file, room)?;
@@ -256,11 +229,52 @@ pub(crate) fn execute_task_close(args: &Value) -> Result<String, String> {
 /// and the transcript tail. Never wakes workers or drains the inbox, so it is
 /// safe to call any time — including right after resuming the host session.
 pub(crate) fn execute_task_room_status(args: &Value) -> Result<String, String> {
-    let room = arg_str(args, &["room"])
+    let room = arg_str(args, &["room"])?
         .ok_or_else(|| "room must not be empty (from task_start)")?;
     let (_, history_file) = current_ctx()?;
     let st = task::room_status(&history_file, room)?;
     // Formatting is shared with the `/task status` local command so both
     // surfaces read identically; see `driver::task::format_room_status`.
     Ok(task::format_room_status(&st))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{execute_task_collect, execute_task_start};
+
+    #[test]
+    fn invalid_arg_worker_count_is_reported() {
+        let err = execute_task_start(&json!({"goal": "g", "worker_count": 2.5})).unwrap_err();
+        assert!(err.contains("worker_count"), "{err}");
+        assert!(err.contains("received 2.5"), "{err}");
+    }
+
+    #[test]
+    fn integral_worker_count_is_not_treated_as_missing() {
+        let err = execute_task_start(&json!({"goal": "g", "worker_count": 2.0})).unwrap_err();
+        assert!(err.contains("active driver context"), "{err}");
+        assert!(!err.contains("needs workers"), "{err}");
+    }
+
+    #[test]
+    fn invalid_arg_workers_type_is_reported() {
+        let err = execute_task_start(&json!({"goal": "g", "workers": "abc"})).unwrap_err();
+        assert!(err.contains("workers must be an array of strings"), "{err}");
+    }
+
+    #[test]
+    fn invalid_arg_timeout_is_reported() {
+        let err =
+            execute_task_collect(&json!({"room": "r", "timeout_secs": "abc"})).unwrap_err();
+        assert!(err.contains("timeout_secs"), "{err}");
+        assert!(err.contains("between 5 and 600"), "{err}");
+    }
+
+    #[test]
+    fn invalid_arg_wake_is_reported() {
+        let err = execute_task_collect(&json!({"room": "r", "wake": "false"})).unwrap_err();
+        assert!(err.contains("wake must be a boolean"), "{err}");
+    }
 }

@@ -1,22 +1,27 @@
-//! `mcp_stdio` — 两个 async stdio JSON-RPC MCP server(`mcp_browser`、`mcp_excel`）
-//! 共享的协议骨架。承载与"操作什么软件"无关的 MCP-over-stdio 样板：
+//! `mcp_stdio` — shared protocol skeleton for the async stdio JSON-RPC MCP
+//! servers (`mcp_browser`, `mcp_excel`, ...). Carries everything that is
+//! unrelated to "which app is driven":
 //!
-//! - 传输层：`JsonRpcErr`、`write_result`/`write_err`（async，每行写完 flush）、
-//!   `text_content` MCP content 信封、`cap_text` 文本截断、`with_timeout` 每操作超时。
-//! - 主循环：`run<S: McpServer>()` —— 读行 → 解析 → 方法分发 → 写回，各 server 只需
-//!   实现 `McpServer` trait（initialize/tools_list/tools_call/可选 shutdown）。
+//! - Transport: `JsonRpcErr`, `write_result`/`write_err` (async, flush per line),
+//!   the `text_content` MCP content envelope, `cap_text` text truncation, and
+//!   `with_timeout` per-operation timeouts.
+//! - Main loop: `run<S: McpServer>()` — read line → parse → dispatch → write back.
+//!   A new server only implements the `McpServer` trait (initialize / tools_list /
+//!   tools_call / optional shutdown).
 //!
-//! 未来新增"驱动 OS 本地 application"的 MCP server（word/photoshop/pdf preview...）
-//! 时，只写自己的工具集与驱动层，协议样板零重复复用本 crate。
+//! Future "drive an OS-native app" MCP servers (word / photoshop / pdf preview...)
+//! should reuse this crate for the protocol boilerplate and only write their own
+//! tool set and driver layer.
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-/// 提取文本/HTML 的字符上限。宿主超过约 32K 会把结果卸载到磁盘、只给模型看 800
-/// 字符 stub（见 driver/turn_runtime/mod.rs），所以这里截断到 24K 并加提示。
+/// Character cap for extracted text/HTML. The host offloads results above ~32K to
+/// disk and only shows the model an 800-char stub (see driver/turn_runtime/mod.rs),
+/// so servers truncate here at 24K and append a hint.
 pub const CAP_CHARS: usize = 24_000;
 
-/// JSON-RPC 错误载体。
+/// JSON-RPC error carrier.
 pub struct JsonRpcErr {
     pub code: i32,
     pub message: String,
@@ -33,14 +38,16 @@ impl JsonRpcErr {
     }
 }
 
-/// 把一段文本包成 MCP 的 `{"content":[{"type":"text","text":...}]}` 信封。
-/// 宿主 `call_tool` 只会读取 `content[0].text`，所以一切都必须走这里回传。
+/// Wrap a text payload in the MCP `{"content":[{"type":"text","text":...}]}`
+/// envelope. The host's `call_tool` reads only `content[0].text`, so every payload
+/// must go through this.
 pub fn text_content(text: impl Into<String>) -> Value {
     json!({ "content": [ { "type": "text", "text": text.into() } ] })
 }
 
-/// 把文本截断到 `CAP_CHARS` 个字符（按 char 边界，避免切坏 UTF-8），
-/// 超长时追加一行说明。提示措辞保持领域中立，浏览器/表格等各 server 通用。
+/// Truncate text to `CAP_CHARS` characters (on char boundaries, so UTF-8 is never
+/// split) and append a hint line when the input was cut. The hint wording stays
+/// domain-neutral so every server (browser, spreadsheet, ...) can reuse it.
 pub fn cap_text(s: &str) -> String {
     if s.chars().count() <= CAP_CHARS {
         return s.to_string();
@@ -51,7 +58,7 @@ pub fn cap_text(s: &str) -> String {
     )
 }
 
-/// 写出一条成功的 JSON-RPC 响应行并 flush。
+/// Write one successful JSON-RPC response line and flush.
 pub async fn write_result<W: AsyncWrite + Unpin>(
     stdout: &mut W,
     id: Option<&Value>,
@@ -68,7 +75,7 @@ pub async fn write_result<W: AsyncWrite + Unpin>(
     let _ = stdout.flush().await;
 }
 
-/// 写出一条 JSON-RPC 错误响应行并 flush。
+/// Write one JSON-RPC error response line and flush.
 pub async fn write_err<W: AsyncWrite + Unpin>(
     stdout: &mut W,
     id: Option<&Value>,
@@ -91,14 +98,14 @@ pub async fn write_err<W: AsyncWrite + Unpin>(
     let _ = stdout.flush().await;
 }
 
-/// 给每个 server 内部操作套一个上限（默认 90s，短于宿主 120s 的
-/// request_timeout_ms），超时返回干净的 JSON-RPC error（-32001）。
+/// Bound one server-side operation (default 90s, below the host's configured
+/// request_timeout_ms); a timeout returns a clean JSON-RPC error (-32001).
 ///
-/// 关键：超时/错误消息**绝不能**包含宿主的 transport 触发词
-/// （"mcp response timeout" / "broken pipe" / "closed the stream" /
-///  "process exited" / "failed to read response" /
-///  "failed waiting for mcp response"，见 mcp/client.rs），
-/// 否则宿主会 kill+restart 子进程、丢掉整个会话。
+/// Critical: the timeout/error wording must never contain the host's transport
+/// trigger phrases ("mcp response timeout" / "broken pipe" / "closed the stream
+/// unexpectedly" / "process exited with status" / "failed to read response" /
+/// "failed waiting for mcp response", see src/bin/ai/mcp/client.rs), or the host
+/// kills + restarts the subprocess and the whole session is lost.
 pub async fn with_timeout<F, T>(ms: u64, fut: F) -> Result<T, JsonRpcErr>
 where
     F: std::future::Future<Output = Result<T, String>>,
@@ -114,28 +121,33 @@ where
     }
 }
 
-/// 一个 stdio MCP server 需要实现的最小接口。协议样板（读行/分发/写回）由
-/// [`run`] 统一承担，实现者只提供三段与自身工具集相关的内容 + 可选收尾。
+/// Minimal interface a stdio MCP server must implement. The protocol boilerplate
+/// (line read / dispatch / write back) is handled by [`run`]; implementors only
+/// provide the three tool-related sections plus an optional shutdown hook.
 ///
-/// `async fn` 直接写在 trait 上（不引 `async-trait`）：`run` 只被各 bin 的
-/// `#[tokio::main]` `block_on`、绝不 `tokio::spawn`，故 server future 无需 `Send`。
+/// `async fn` sits directly on the trait (no `async-trait`): `run` is only ever
+/// `block_on`-ed by each binary's `#[tokio::main]`, never `tokio::spawn`, so the
+/// server future does not need to be `Send`.
 #[allow(async_fn_in_trait)]
 pub trait McpServer {
-    /// `initialize` 方法的返回体（serverInfo / capabilities / protocolVersion）。
+    /// Return body of the `initialize` method (serverInfo / capabilities / protocolVersion).
     fn initialize_result(&self) -> Value;
-    /// `tools/list` 方法的返回体（工具 schema 列表）。
+    /// Return body of the `tools/list` method (the tool schema list).
     fn tools_list_result(&self) -> Value;
-    /// `tools/call` 方法的分发：按 params 里的工具名执行并回结果。
+    /// Dispatch of the `tools/call` method: run the tool named in params and return its result.
     async fn handle_tools_call(&mut self, params: Option<Value>) -> Result<Value, JsonRpcErr>;
-    /// 主循环退出（EOF 或读错误）后的收尾。默认空实现；持有长活会话的
-    /// server（如 mcp_browser）覆写它做优雅关闭。
+    /// Cleanup after the main loop exits (EOF or a read error). Defaults to a no-op;
+    /// servers holding a long-lived session (like mcp_browser) override it for
+    /// graceful shutdown.
     async fn shutdown(&mut self) {}
 }
 
-/// 共享的 stdio JSON-RPC 主循环：从 stdin 逐行读 → 解析 → 方法分发 → 写回 stdout。
+/// Shared stdio JSON-RPC main loop: read lines from stdin → parse → dispatch →
+/// write back to stdout.
 ///
-/// 仅由各 bin 的 `#[tokio::main]` `block_on`，绝不 `tokio::spawn`（故 future 无需
-/// `Send`；`&mut server` 跨 `.await` 始终在 block_on 线程上，不跨线程）。
+/// Only ever `block_on`-ed by each binary's `#[tokio::main]`, never `tokio::spawn`
+/// (hence the future needs no `Send`; `&mut server` stays on the block_on thread
+/// across `.await` and never crosses threads).
 pub async fn run<S: McpServer>(mut server: S) {
     let mut reader = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
@@ -162,6 +174,9 @@ pub async fn run<S: McpServer>(mut server: S) {
         };
 
         let id = req.get("id").cloned();
+        // JSON-RPC 2.0 §2.2: a request without an "id" is a notification and must
+        // never be answered — not even with an error for an unknown method.
+        let is_notification = id.is_none();
         let method = req
             .get("method")
             .and_then(|v| v.as_str())
@@ -171,7 +186,6 @@ pub async fn run<S: McpServer>(mut server: S) {
 
         let res = match method.as_str() {
             "initialize" => Ok(server.initialize_result()),
-            "notifications/initialized" => Ok(json!({})),
             "tools/list" => Ok(server.tools_list_result()),
             "tools/call" => server.handle_tools_call(params).await,
             "resources/list" => Ok(json!({ "resources": [] })),
@@ -183,12 +197,19 @@ pub async fn run<S: McpServer>(mut server: S) {
             )),
         };
 
+        if is_notification {
+            // Notifications still run their side effects (for known methods) but
+            // produce no response line at all.
+            continue;
+        }
+
         match res {
             Ok(r) => write_result(&mut stdout, id.as_ref(), r).await,
             Err(e) => write_err(&mut stdout, id.as_ref(), e.code, &e.message, e.data).await,
         }
     }
 
-    // EOF 与读错误两种退出都会走到这里；无会话的 server 用默认空实现。
+    // Both EOF and read-error exits land here; servers without a session use the
+    // default no-op shutdown.
     server.shutdown().await;
 }

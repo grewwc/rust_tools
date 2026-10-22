@@ -44,9 +44,10 @@ pub(super) const STREAM_DECLARED_ITEM_TIMEOUT_SECS: u64 = 300;
 /// runaway guard. On expiry the open call is dropped and the attempt replays through the truncation path.
 pub(super) const STREAM_TOOL_ARGS_STALL_TIMEOUT_SECS: u64 = 180;
 /// First-chunk timeout: the request was sent but the server never sends the first byte (queued, stuck gateway, ...).
-/// A stream that produced nothing yet gets this shorter window: unlike a stall after work has been delivered, there
-/// is nothing to preserve by waiting longer, so the retry may start earlier.
-pub(super) const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 90;
+/// A stream that produced nothing yet gets this window: unlike a stall after work has been delivered, there is nothing
+/// to preserve, so the retry may start earlier than a post-progress stall. It is still wide enough for a gateway that
+/// queues the request before it starts generating — a slow first byte is not a dead connection.
+pub(super) const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 180;
 /// Default visible-window height for `thinking` in the terminal. Only affects display, not reasoning accumulation.
 /// Streaming shows the most recent N lines (default 2); when thinking ends, `finalize_fold` forces a pure-summary
 /// fold (redraws with a 0-line window) so conclusions/questions restated at the tail of thinking are not shown twice

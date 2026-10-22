@@ -9,11 +9,15 @@
         "description": "Room name from discuss_start."
       },
       "timeout_secs": {
-        "type": "number",
-        "description": "How long to wait for replies (default 60, clamped 5-600). Blocks this long only when members are slow."
+        "type": "integer",
+        "minimum": 5,
+        "maximum": 600,
+        "default": 60,
+        "description": "Whole seconds to wait for replies (default 60; values outside 5-600 are rejected). Blocks this long only when members are slow."
       },
       "wake": {
         "type": "boolean",
+        "default": true,
         "description": "Wake inactive members headlessly before waiting (default true)."
       }
     },

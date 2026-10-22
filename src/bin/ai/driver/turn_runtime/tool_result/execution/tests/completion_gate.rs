@@ -119,6 +119,16 @@ fn completion_and_outstanding_gates_each_reopen_once() {
         .updated_at_ms;
     crate::ai::tools::plan_state::record_completion_claim(&app, "Done", Some(plan_updated))
         .unwrap();
+    let complete_pair = vec![
+        assistant_tool_call_message(test_tool_call(
+            "call_complete",
+            "complete",
+            serde_json::json!({ "summary": "Done" }),
+        )),
+        tool_result_message("call_complete", "Completion assertion recorded: Done"),
+    ];
+    messages.extend(complete_pair.clone());
+    turn_messages.extend(complete_pair);
     let third_step = handle_iteration_execution(
         &mut app,
         "fix the bug",
@@ -344,10 +354,22 @@ fn completion_evidence_gate_allows_unrecognized_post_mutation_activity_silently(
         "python3 校验虽未被识别为检查，也应记为变更后活动"
     );
 
-    let mut app = test_app_with_tools(&["apply_patch", "execute_command"]);
+    let (mut app, base) =
+        super::outstanding::test_app_with_session_and_tools(&["apply_patch", "execute_command"]);
+    crate::ai::tools::plan_state::record_completion_claim(&app, "done", None).unwrap();
     let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
-    let mut messages = evidence_messages.clone();
+    let complete = test_tool_call(
+        "call_complete",
+        "complete",
+        serde_json::json!({ "summary": "done" }),
+    );
     let mut turn_messages = evidence_messages;
+    turn_messages.push(assistant_tool_call_message(complete));
+    turn_messages.push(tool_result_message(
+        "call_complete",
+        "Completion assertion recorded: done",
+    ));
+    let mut messages = turn_messages.clone();
     let mut persisted_turn_messages = 0usize;
     let mut final_assistant_text = String::new();
     let mut final_assistant_recorded = false;
@@ -418,6 +440,7 @@ fn completion_evidence_gate_allows_unrecognized_post_mutation_activity_silently(
         0,
         "有变更后活动时不应注入 completion_evidence_required 重开笔记"
     );
+    let _ = fs::remove_dir_all(&base);
 }
 
 #[test]

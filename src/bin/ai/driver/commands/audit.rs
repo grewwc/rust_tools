@@ -198,6 +198,13 @@ pub(crate) fn terminal_audit_result(payload: &str) -> String {
 /// 命中它说明确实没有结论，回退到通用提示而非把占位串展示给用户。
 const SUBAGENT_NO_FINAL_TEXT_SENTINEL: &str = "(subagent did not produce any final assistant text)";
 
+/// Full audit payload for the lead-agent fix loop: unlike the terminal view
+/// (which hides timeout-recovery evidence), the fixer needs every collected
+/// fact. Only the parent-reminder suffix is stripped.
+pub(crate) fn audit_report_for_fix(payload: &str) -> String {
+    strip_parent_reminder(payload).trim().to_string()
+}
+
 /// 剥离 payload 末尾的父提醒（finalize / sync 都会附加 `SUBAGENT_PARENT_SUMMARY_REMINDER`）。
 fn strip_parent_reminder(text: &str) -> &str {
     text.trim()
@@ -247,6 +254,25 @@ fn compose_audit_prompt(instruction: &str, changes_context: &str) -> String {
          ===== Files changed by the main agent in this session =====\n\
          {changes_context}\n\
          ===== End of file changes ====="
+    )
+}
+
+/// Build the lead-agent follow-up question that verifies and fixes audit
+/// findings. `/audit` auto-fixes by default: after the synchronous audit
+/// subagent prints its terminal report, the same turn continues with this
+/// prompt in the normal model loop. Pure function for testing.
+pub(crate) fn build_audit_fix_followup(original_instruction: &str, audit_report: &str) -> String {
+    format!(
+        "The `/audit` subagent has finished. Verify each finding below against the \
+         current workspace (read the cited files/lines; do not trust the report blindly), \
+         fix every confirmed issue, and explain why any false positive is not actionable. \
+         Run the narrowest focused checks the fix requires.\n\n\
+         Original audit request: {instruction}\n\n\
+         ===== Audit report =====\n\
+         {report}\n\
+         ===== End of audit report =====",
+        instruction = original_instruction.trim(),
+        report = audit_report.trim()
     )
 }
 
@@ -371,7 +397,8 @@ mod tests {
     use super::{
         AUDIT_PROCEDURE_SKILL, AUDIT_SUBAGENT_HARD_TIMEOUT, AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME,
         AuditCommand, FAST_AUDIT_SUBAGENT_HARD_TIMEOUT, FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME,
-        compose_audit_prompt, format_mutation_log, inject_self_generated_audit_note,
+        build_audit_fix_followup, compose_audit_prompt, format_mutation_log,
+        inject_self_generated_audit_note,
         parse_audit_command, terminal_audit_result, turn_spawned_audit_subagent,
     };
     use crate::ai::history::Message;
@@ -381,6 +408,15 @@ mod tests {
     #[test]
     fn audit_subagent_hard_timeout_is_fifteen_minutes() {
         assert_eq!(AUDIT_SUBAGENT_HARD_TIMEOUT, Duration::from_secs(15 * 60));
+    }
+
+    #[test]
+    fn audit_fix_followup_carries_instruction_and_report() {
+        let prompt = build_audit_fix_followup("review my diff", "P1: foo is broken");
+        assert!(prompt.contains("review my diff"), "{prompt}");
+        assert!(prompt.contains("P1: foo is broken"), "{prompt}");
+        // Must not re-trigger `/audit` parsing when fed back as the turn question.
+        assert!(parse_audit_command(&prompt).is_none(), "{prompt}");
     }
 
     #[test]

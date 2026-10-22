@@ -1193,7 +1193,9 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     // member; evidence about one file/run/turn never proves a claim about
     // another.
     assert!(prompt.contains("Evidence stays with the subject it was measured on"));
-    assert!(prompt.contains("Do not pursue perfect certainty or unrelated detail"));
+    // The stop-investigation boundary is single-sourced in guardrails; the
+    // convergence block states only task-completion reporting.
+    assert_eq!(prompt.matches("not eliminate unrelated unknowns").count(), 1);
 }
 
 #[test]
@@ -1256,9 +1258,8 @@ fn system_prompt_groups_guardrails_under_topic_headings() {
     let available = SkipSet::new(16);
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
-    // Slimmed guardrails: the Conclusions section was folded into
-    // intellectual_honesty (conclusion gate) and task_convergence (stopping
-    // rule), so only three topic headings remain.
+    // The stopping boundary precedes the topic-specific guardrails;
+    // task_convergence retains execution and completion criteria.
     for heading in [
         "### Scope and change impact",
         "### Evidence and verification",
@@ -1345,7 +1346,23 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                         .render_system_prompt();
                 let (_, guardrails) = prompt.split_once("<correctness_guardrails>").unwrap();
                 let (guardrails, _) = guardrails.split_once("</correctness_guardrails>").unwrap();
+                let stop = guardrails.find("**Stop at sufficient evidence.**").unwrap();
+                assert!(guardrails.find("Emphasis:").unwrap() < stop);
+                assert!(stop < guardrails.find("### ").unwrap());
                 for rule in [
+                    "**Stop at sufficient evidence.**",
+                    "violating it invalidates the answer",
+                    "Lack of emphasis does not weaken a requirement",
+                    "**Change authorization.**",
+                    "Do not implement refactors or optimizations unrelated to the task",
+                    "Report an adjacent critical correctness, data-loss, or security risk",
+                    "but do not fix it without user approval",
+                    "**Preserve existing changes.**",
+                    "**Evidence provenance.**",
+                    "Once evidence or a valid derivation settles the question at the task's required scope",
+                    "reopen only for a material change, contradiction, or untested dependency",
+                    "Further investigation must address a gap that could materially change the answer or completion of requested work, not eliminate unrelated unknowns",
+                    "Complete requested actions and necessary verification, then reply without repeating settled reasoning",
                     "**Reconcile corrections and conflicts.**",
                     "**Match the metric to the objective.**",
                     "**Check the inference before concluding.**",
@@ -1382,7 +1399,6 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "within side-effect and spending limits",
                     "For questions about a past state or execution, recover the original evidence or state what remains unknown",
                     "never present a new result as the historical one",
-                    "reopen only for a material change, contradiction, or untested dependency",
                     "Stopping investigation is not stopping execution",
                     "finish independent safe work that remains",
                 ] {
@@ -1397,8 +1413,31 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "NEVER infer beyond a field's documented semantics",
                     "adopt a claim merely to match the user's position",
                     "A challenge alone is not a reason to retract a supported conclusion",
+                    "while everything unmarked is guidance",
+                    "Stop reasoning as soon as the evidence already in context determines the answer",
+                    "prefer acting with tools over describing what you might do next",
                 ] {
                     assert!(!prompt.contains(obsolete));
+                }
+                let (_, thinking) = prompt.split_once("<thinking_scope>").unwrap();
+                let (thinking, _) = thinking.split_once("</thinking_scope>").unwrap();
+                assert!(thinking.contains("**Proportional reasoning.**"));
+                assert!(thinking.contains("Reasoning depth and length must match the task"));
+                assert!(!thinking.contains("Stop at sufficient evidence"));
+                if goal_mode {
+                    assert!(!prompt.contains("<scope_discipline>"));
+                    assert!(!prompt.contains("<autonomous_execution>"));
+                } else {
+                    let (_, scope) = prompt.split_once("<scope_discipline>").unwrap();
+                    let (scope, _) = scope.split_once("</scope_discipline>").unwrap();
+                    assert!(scope.contains("Investigate only the request plus its direct dependencies"));
+                    assert!(!scope.contains("Do not implement refactors"));
+                    let (_, execution) = prompt.split_once("<autonomous_execution>").unwrap();
+                    let (execution, _) = execution.split_once("</autonomous_execution>").unwrap();
+                    assert!(execution.contains("**Deliver the requested outcome.**"));
+                    assert!(execution.contains("Answer questions with supported conclusions"));
+                    assert!(execution.contains("carry out authorized actions rather than merely proposing them"));
+                    assert!(execution.contains("Use tools when needed for evidence or execution, not as a substitute for answering"));
                 }
                 if !skills.is_empty() {
                     assert!(prompt.contains("correctness guardrails (including git-safety rules)"));
@@ -1409,7 +1448,7 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                 assert!(prompt.contains(
                     "Valid deductions from explicit, supported premises can also be answered directly"
                 ));
-                assert!(prompt.contains("Do not pursue perfect certainty or unrelated detail"));
+                assert_eq!(prompt.matches("not eliminate unrelated unknowns").count(), 1);
                 assert!(
                     prompt.contains(
                         "When the user is right, say so plainly and accept the correction"
@@ -1477,19 +1516,19 @@ fn system_prompt_scope_discipline_bullets_have_no_leaked_indentation() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
     assert!(prompt.contains("<scope_discipline>"));
-    // The three bullets must each start at column 0 (bullet marker), not be
-    // prefixed by leaked source indentation.
+    // Investigation bullets and the separate change-authorization rule must
+    // start at column 0, without leaked source indentation.
     assert!(
         prompt.contains(
             "\n- Investigate only the request plus its direct dependencies"
         )
     );
     assert!(
-        prompt.contains("\n- Do not implement refactors or optimizations unrelated to the task.")
+        prompt.contains("\n- **Change authorization.** Edit only files the current task requires")
     );
     assert!(prompt.contains("\n- For broad requests, define investigation boundaries"));
     // Guard against the exact defect: no bullet prefixed by leading spaces.
-    assert!(!prompt.contains("\n             - Do not implement refactors"));
+    assert!(!prompt.contains("\n             - **Change authorization.**"));
     assert!(!prompt.contains("\n             - For broad requests, define"));
 }
 

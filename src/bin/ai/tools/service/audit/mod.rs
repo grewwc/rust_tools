@@ -23,6 +23,7 @@ fn config_blocked_commands() -> Vec<String> {
 mod exec;
 mod git;
 mod lexer;
+mod osascript;
 mod substitute;
 mod wrapper;
 
@@ -1164,6 +1165,62 @@ mod kill_target_tests {
             err.contains("not a process started by this agent session"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn kill_with_redirection_targets_the_same_process() {
+        process_registry::register(TEST_SESSION, 4242);
+        // A redirection is not a kill target: the audited target set stays the
+        // literal pid.
+        validate_kill_pids(&tokens(&["kill", "4242", "2>&1"]), TEST_SESSION).unwrap();
+        validate_kill_pids(&tokens(&["kill", "4242", ">", "log"]), TEST_SESSION).unwrap();
+        validate_kill_pids(&tokens(&["kill", "4242", "2>", "log"]), TEST_SESSION).unwrap();
+        validate_kill_pids(&tokens(&["kill", "4242", ">>", "log"]), TEST_SESSION).unwrap();
+        validate_kill_pids(&tokens(&["kill", "4242", ">&1"]), TEST_SESSION).unwrap();
+        // The redirection does not smuggle an unverified target past the check.
+        let err = validate_kill_pids(&tokens(&["kill", "4243", "2>&1"]), TEST_SESSION).unwrap_err();
+        assert!(
+            err.contains("not a process started by this agent session"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn open_new_instance_is_blocked() {
+        for command in [
+            "open -n Safari",
+            "open -na \"Google Chrome\" --args --user-data-dir=/tmp/profile",
+            "open --new /Applications/Notes.app",
+        ] {
+            let err = validate_execute_command(command).unwrap_err();
+            assert!(err.contains("detached"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn open_without_new_instance_is_allowed() {
+        validate_execute_command("open -a Safari").unwrap();
+        validate_execute_command("open notes.txt").unwrap();
+    }
+
+    #[test]
+    fn osascript_gui_scripting_is_blocked_end_to_end() {
+        let err = validate_execute_command(
+            "osascript -e 'tell application \"System Events\" to keystroke \"q\" using command down'",
+        )
+        .unwrap_err();
+        assert!(err.contains("System Events"), "got: {err}");
+        // `keystroke` types into the frontmost application on its own, without
+        // naming System Events.
+        let err = validate_execute_command("osascript -e 'keystroke \"q\" using command down'")
+            .unwrap_err();
+        assert!(err.contains("GUI scripting is blocked"), "got: {err}");
+        // The same script behind a wrapper is blocked as well.
+        let err = validate_execute_command(
+            "env osascript -e 'tell application \"System Events\" to keystroke \"q\"'",
+        )
+        .unwrap_err();
+        assert!(err.contains("System Events"), "got: {err}");
     }
 
     #[test]

@@ -19,9 +19,18 @@ pub(in crate::ai) fn load_mcp_config_from_file(
 
     let mut result = SkipMap::default();
     for (name, value) in servers {
-        let server_config: McpServerConfig = serde_json::from_value(value.clone())
-            .map_err(|e| format!("Invalid server config for '{}': {}", name, e))?;
-        result.insert(name.clone(), server_config);
+        // A single malformed entry must not disable every configured server:
+        // skip it with a warning and keep loading the rest. The caller (driver
+        // mcp_init) only logs the overall load error, so an early `?` here
+        // would silently kill all MCP servers (browser, excel, ...) on one typo.
+        match serde_json::from_value::<McpServerConfig>(value.clone()) {
+            Ok(server_config) => {
+                result.insert(name.clone(), server_config);
+            }
+            Err(e) => {
+                eprintln!("[mcp] skipping invalid server config '{}': {}", name, e);
+            }
+        }
     }
 
     Ok(result)

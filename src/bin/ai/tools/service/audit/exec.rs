@@ -4,6 +4,7 @@ use super::lexer::{
     command_word_index, effective_chain_uses_xargs, effective_command_tokens,
     indirect_command_index, tokenize_shell_words,
 };
+use super::osascript;
 use super::substitute::{expand_tilde_and_home, normalize_path, validate_substitution_positions};
 use super::wrapper::{
     find_has_blocked_exec_semantics, is_interpreter_program, is_python_program, is_shell_program,
@@ -192,6 +193,18 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
             "program '{program}' is blocked by sandbox policy (ai.sandbox.blocked_commands)"
         ));
     }
+
+    // `osascript` runs AppleScript that the program blacklist never sees:
+    // System Events GUI injection, `quit` on another app and `do shell script`
+    // all reach outside this session. See `audit::osascript` for the rules.
+    if osascript::is_osascript_program(program) {
+        osascript::validate_osascript(raw_command_tokens)?;
+    }
+
+    // `open -n` asks LaunchServices for a detached new app instance: the
+    // sandbox can neither prove such a process belongs to this session nor
+    // terminate it later. See `validate_open_launch` below.
+    validate_open_launch(program, raw_command_tokens)?;
 
     // `kill` / `pkill` / `killall` are allowed only against processes this
     // agent session started itself (background process groups registered by
@@ -438,6 +451,12 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
                 return Err(xargs_rm_blocked_message());
             }
             validate_rm_targets(&effective)?;
+        } else if osascript::is_osascript_program(eff_program) {
+            // Wrappers (`env osascript ...`, `timeout 5 osascript ...`) must not
+            // smuggle an AppleScript past the scanner.
+            osascript::validate_osascript(&effective)?;
+        } else if eff_program == "open" {
+            validate_open_launch(eff_program, &effective)?;
         }
     }
 
@@ -462,6 +481,55 @@ fn is_kill_program(program: &str) -> bool {
         program.to_ascii_lowercase().as_str(),
         "kill" | "pkill" | "killall"
     )
+}
+
+// =========================================================================
+// detached app launches
+// =========================================================================
+//
+// `open -n` asks LaunchServices for an additional instance of an app. That
+// process is detached from the session: it is re-parented to launchd (ppid 1)
+// and gets its own process group, so the sandbox can never prove it belongs to
+// this session and can never terminate it later — the exact situation that
+// once pushed a cleanup attempt towards a GUI keystroke. Apps started through
+// the normal background path (`cmd &`) keep the session's process group and
+// stay registrable, so the rejection points the caller there instead.
+
+/// Reject `open` variants that launch a detached new app instance.
+fn validate_open_launch(program: &str, raw_tokens: &[String]) -> Result<(), String> {
+    let basename = std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    if !basename.eq_ignore_ascii_case("open") {
+        return Ok(());
+    }
+    for token in raw_tokens.iter().skip(1) {
+        if token == "--" {
+            break;
+        }
+        if token == "--new" {
+            return Err(detached_launch_message());
+        }
+        if token.starts_with('-') && !token.starts_with("--") {
+            // Short option cluster (`-n`, `-na`, `-an`): `n` is the new-instance
+            // flag. Other clusters (`-a`, `-e`, `-t`, ...) are unaffected.
+            if token[1..].contains('n') {
+                return Err(detached_launch_message());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn detached_launch_message() -> String {
+    "open with a new-instance flag (-n) launches an app detached from this session \
+     (it is re-parented to launchd and gets its own process group), so the sandbox \
+     can neither prove it is session-owned nor terminate it later; launch the app \
+     binary directly with `&` (for example \
+     `'/Applications/Foo.app/Contents/MacOS/Foo' --flag &`) so the session can \
+     register and clean it up"
+        .to_string()
 }
 
 fn xargs_kill_blocked_message() -> String {
@@ -522,10 +590,22 @@ pub(crate) fn validate_kill_pids(raw_tokens: &[String], session_id: &str) -> Res
                 }
                 Ok(_) => return Err(format!("kill target '{token}' is not a valid positive pid")),
                 Err(_) => {
-                    return Err(format!(
-                        "kill target '{token}' is not a literal pid; the sandbox can only \
-                         verify literal numeric targets (run `pgrep` first and pass the pid)"
-                    ));
+                    // A redirection is not a kill target: `kill 123 2>&1` and
+                    // `kill 123 > log` address the same process as `kill 123`.
+                    // Only tokens that cannot be a pid are treated this way, so
+                    // a real pid is never skipped.
+                    if token_is_redirection(token) {
+                        // `> log` keeps the redirect target in the next token;
+                        // `>log` and `2>&1` carry it inside the operator token.
+                        if redirection_target_is_next_token(token) {
+                            i += 1;
+                        }
+                    } else {
+                        return Err(format!(
+                            "kill target '{token}' is not a literal pid; the sandbox can only \
+                             verify literal numeric targets (run `pgrep` first and pass the pid)"
+                        ));
+                    }
                 }
             }
         }
@@ -540,6 +620,19 @@ pub(crate) fn validate_kill_pids(raw_tokens: &[String], session_id: &str) -> Res
         }
     }
     Ok(())
+}
+
+/// True when a token carries a shell redirection operator (`>`, `>>`, `<`,
+/// `&>`, `>&`). Such a token is never a kill target.
+fn token_is_redirection(token: &str) -> bool {
+    token.contains('>') || token.contains('<')
+}
+
+/// True when the redirection operator ends the token, so the redirect target is
+/// the *next* token (`> out`) instead of being attached to the operator
+/// (`>out`, `2>&1`).
+fn redirection_target_is_next_token(token: &str) -> bool {
+    token.ends_with('>') || token.ends_with('<')
 }
 
 pub(crate) enum PgrepMode {
@@ -710,7 +803,9 @@ fn kill_target_denied_message(target: i64) -> String {
     };
     format!(
         "cannot signal {subject}: not a process started by this agent session \
-         (only background processes launched via execute_command are killable)"
+         (only background processes launched via execute_command are killable; a process \
+         launched through a detaching launcher such as `open -n` is re-parented to launchd \
+         and can never be registered, so it cannot be terminated later either)"
     )
 }
 

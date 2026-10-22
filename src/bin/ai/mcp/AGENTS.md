@@ -24,3 +24,14 @@ Applies to `src/bin/ai/mcp/**` (flat module: `client.rs`, `connection.rs`,
    hidden MCP catalog and load tools on demand through `enable_tools`.
 7. **Name consistency.** Prompt hints, hidden catalogs, and enablement behavior
    must stay consistent with the real configured MCP tool names.
+8. **The request deadline covers trickling data.** The read loop must check the
+   deadline on every iteration, not only when the fd is idle: a server that
+   streams one response line in many small writes must not hold the caller past
+   `request_timeout_ms`.
+9. **One malformed server config does not disable the rest.** A single typo in
+   one `mcpServers` entry is skipped with a warning; it must not take down
+   every other configured server.
+10. **A restart invalidates the cached schemas.** The tool/resource/prompt
+    cache is rebuilt after a connection restart, otherwise the catalog keeps
+    serving pre-restart schemas while the live connection holds a new
+    generation. Rebuild outside the per-server lock (outer → inner order).

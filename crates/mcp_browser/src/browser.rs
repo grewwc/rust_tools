@@ -23,6 +23,25 @@ const DEFAULT_CHROME: &str = "/Applications/Google Chrome.app/Contents/MacOS/Goo
 /// Shared by GC and launch to avoid naming drift.
 const TEMP_PROFILE_PREFIX: &str = "mcp_browser-profile-";
 
+/// Per-operation timeout (milliseconds), hard-clamped to 90_000.
+///
+/// This server cannot observe the host's configured `request_timeout_ms`, so 90s is
+/// the only safe ceiling that stays strictly below every allowed host timeout
+/// (host default 30s; recommended 120s — crates/mcp_stdio/AGENTS.md invariant 5).
+/// Without the clamp, a large `MCP_BROWSER_OP_TIMEOUT_MS` would let a per-op wait
+/// outlast the host timeout, and the host would kill+restart the subprocess (losing
+/// the whole session) instead of the server returning its clean timeout error.
+/// Unset or non-numeric values fall back to the ceiling; parsed values above it are
+/// clamped down, so no per-op wait can ever exceed 90s.
+pub(crate) fn op_timeout_ms() -> u64 {
+    const HARD_CAP_MS: u64 = 90_000;
+    std::env::var("MCP_BROWSER_OP_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.min(HARD_CAP_MS))
+        .unwrap_or(HARD_CAP_MS)
+}
+
 /// Startup garbage collection: remove leftover temp profile dirs belonging to **dead
 /// processes**.
 ///
@@ -89,6 +108,11 @@ pub struct BrowserSession {
     pub browser: Browser,
     pub page: Page,
     handler_task: JoinHandle<()>,
+    /// Whether this process launched the browser itself (a controlled instance) or
+    /// attached to an existing one via MCP_BROWSER_WS_URL. A self-launched browser
+    /// is closed whole on shutdown; an attached browser only ever has its session
+    /// tab closed (closing the whole browser would quit the user's Chrome).
+    owns_browser: bool,
     /// Auto-generated temp profile dir, cleaned up on shutdown; None when the user
     /// explicitly set one or in attach mode.
     temp_profile_dir: Option<PathBuf>,
@@ -349,8 +373,30 @@ impl BrowserSession {
     /// - `MCP_BROWSER_USER_DATA_DIR`: explicit profile dir (persists login state); not
     ///   cleaned up, and sharing it across processes causes conflicts. When unset, each
     ///   process gets a unique temp dir that is removed on exit.
+    ///
+    /// The whole launch is bounded by the per-operation cap ([`op_timeout_ms`]):
+    /// callers invoke it outside `with_timeout` (tools.rs wraps only the per-tool
+    /// work), so without this outer bound a hung launch could outlive the host's
+    /// request_timeout_ms and get the subprocess killed mid-launch.
     pub async fn launch() -> Result<Self, String> {
-        let (browser, mut handler, temp_profile_dir) =
+        let cap_ms = op_timeout_ms();
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(cap_ms),
+            Self::launch_inner(),
+        )
+        .await
+        {
+            Ok(Ok(session)) => Ok(session),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(format!(
+                "browser session launch exceeded the {cap_ms} ms server operation cap"
+            )),
+        }
+    }
+
+    /// The actual launch work, bounded by [`launch`]'s per-operation cap.
+    async fn launch_inner() -> Result<Self, String> {
+        let (mut browser, mut handler, owns_browser, temp_profile_dir) =
             if let Ok(ws) = std::env::var("MCP_BROWSER_WS_URL") {
                 let ws = resolve_ws_url(&ws)
                     .await
@@ -358,7 +404,7 @@ impl BrowserSession {
                 let (browser, handler) = Browser::connect(ws).await.map_err(|e| {
                     format!("failed to connect to browser at MCP_BROWSER_WS_URL: {e}")
                 })?;
-                (browser, handler, None)
+                (browser, handler, false, None)
             } else {
                 let chrome = configured_chrome_executable()?;
                 let headless = headless_from_env();
@@ -393,21 +439,33 @@ impl BrowserSession {
                 let (browser, handler) = Browser::launch(config).await.map_err(|e| {
                     format!("failed to launch Chrome at '{}': {e}", chrome.display())
                 })?;
-                (browser, handler, temp)
+                (browser, handler, true, temp)
             };
 
         // The Handler must be polled continuously, otherwise CDP calls make no progress.
         let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
-        let page = browser
-            .new_page("about:blank")
-            .await
-            .map_err(|e| format!("failed to open initial page: {e}"))?;
+        let page = match browser.new_page("about:blank").await {
+            Ok(page) => page,
+            Err(e) => {
+                // Do not leak a half-started session on failure: in controlled mode
+                // close the whole instance so the Chrome process exits (an orphan
+                // would keep holding the per-pid profile dir and collide with the
+                // next launch, which reuses that same dir); in attach mode dropping
+                // `browser` closes the connection. Always stop the polling task.
+                if owns_browser {
+                    let _ = browser.close().await;
+                }
+                handler_task.abort();
+                return Err(format!("failed to open initial page: {e}"));
+            }
+        };
 
         Ok(BrowserSession {
             browser,
             page,
             handler_task,
+            owns_browser,
             temp_profile_dir,
             pending_human: None,
         })
@@ -419,9 +477,15 @@ impl BrowserSession {
     /// never `close` the whole browser (that would quit the user's browser); only close
     /// the session tab we created. Only a self-launched controlled instance is closed whole.
     pub async fn shutdown(mut self) {
-        if self.temp_profile_dir.is_some() {
-            let _ = self.browser.close().await;
+        if self.owns_browser {
+            // Close the whole controlled instance. Bounded: if Chrome ignores the
+            // close command, give up after 5s so the temp-dir cleanup below still
+            // runs (the startup GC reclaims any leftover dir on the next start).
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(5), self.browser.close()).await;
         } else {
+            // Attach mode: never close the whole browser (that would quit the
+            // user's Chrome); only close the session tab we created.
             let _ = self.page.close().await;
         }
         self.handler_task.abort();

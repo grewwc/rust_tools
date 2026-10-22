@@ -312,6 +312,10 @@ async fn request_messages_with_key(
             Err(_) => {
                 if attempt < retry_policy.max_attempts {
                     let delay = retry_delay(attempt);
+                    crate::ai::driver::runtime_ctx::publish_subagent_phase(&format!(
+                        "retrying request ({attempt}/{})",
+                        retry_policy.max_attempts
+                    ));
                     super::emit_request_diagnostic(format_args!(
                         "[Warning] {}等待响应头超时 ({}s) - sleep {} 秒后重试 (attempt {}/{})",
                         retry_scope_tag(),
@@ -815,6 +819,10 @@ async fn do_request_messages_with_tool_mode(
             break;
         }
         let delay = round_retry_after.unwrap_or_else(|| retry_delay_429(attempt));
+        crate::ai::driver::runtime_ctx::publish_subagent_phase(&format!(
+            "retrying rate-limited request ({attempt}/{})",
+            retry_policy.max_attempts_429
+        ));
         super::emit_request_diagnostic(format_args!(
             "[Warning] {}429 Too Many Requests - {} 个 key 均配额超限，sleep {} 秒后重试 (attempt {}/{})",
             retry_scope_tag(),

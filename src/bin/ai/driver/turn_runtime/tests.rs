@@ -55,6 +55,20 @@ fn subagent_pre_timeout_wrap_up_note_requires_immediate_final_answer() {
 }
 
 #[test]
+fn subagent_request_budget_wrap_up_note_requires_partial_conclusions() {
+    let mut messages = Vec::new();
+    inject_subagent_request_budget_wrap_up_note(&mut messages);
+
+    let note = messages
+        .last()
+        .and_then(|message| message.content.as_str())
+        .expect("request-budget note should be textual");
+    assert!(note.contains("cut off by the runtime"));
+    assert!(note.contains("no-tool wrap-up mode"));
+    assert!(note.contains("verified conclusions"));
+}
+
+#[test]
 fn force_final_reason_is_request_only_and_deduplicated() {
     let mut messages = Vec::new();
 

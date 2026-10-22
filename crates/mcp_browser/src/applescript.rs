@@ -8,7 +8,10 @@
 //! user's real cookies/login state throughout, **never quitting the user's browser**.
 //!
 //! Prerequisite: Chrome must have "View > Developer > Allow JavaScript from Apple Events"
-//! enabled (off by default; enable once. When disabled, an actionable error is returned).
+//! enabled (off by default). Chrome reads that preference **at startup only**: ticking the
+//! menu item in a running browser (or editing the profile on disk) does not change the
+//! running process, so the gate stays closed until Chrome is fully quit and restarted.
+//! The error returned in that case names the restart step explicitly.
 //!
 //! Key differences from CDP mode:
 //! - Every operation is an independent `osascript` subprocess (the only state kept is
@@ -194,16 +197,23 @@ pub const DETECT_USER_ACTION_JS: &str = r#"(function(){
     if (jo('login_required') || jo('login-required') || jo('please login') || jo('请登录') || jo('登录后')) out = out || 'login_required';
     if (jo('payment_verify') || jo('payment-verify') || jo('verify payment') || jo('验证支付')) out = out || 'payment_verify';
     if (jo('identity_verify') || jo('identity-verify') || jo('verify identity') || jo('实名') || jo('身份验证')) out = out || 'identity_verify';
-    var ifr = document.querySelectorAll('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="captcha"]');
-    for (var i = 0; i < ifr.length; i++) {
-      var f = ifr[i];
-      if (!vis(f)) continue;
-      var resp = f.contentDocument && (f.contentDocument.querySelector('textarea[name="g-recaptcha-response"], textarea[name="h-captcha-response"]') ||
-                                       f.contentDocument.querySelector('[name="g-recaptcha-response"], [name="h-captcha-response"]'));
-      var filled = resp && resp.value && resp.value.length > 0;
-      if (!filled) { out = out || 'captcha'; break; }
+    // The solved state must be read from the HOST document: reCAPTCHA/hCaptcha
+    // store their response token in a textarea on the host page, and the widget
+    // iframe itself is cross-origin, so its contentDocument is null here and
+    // can never be read. A visible captcha iframe/class only counts as a blocker
+    // while unsolved - after solving, the anchor iframe stays in the DOM with a
+    // checkmark, so "present" alone is not "blocked".
+    var solved = (function(){
+      var ta = document.querySelector('textarea[name="g-recaptcha-response"], textarea[name="h-captcha-response"]');
+      return !!(ta && ta.value && ta.value.length > 0);
+    })();
+    if (!solved) {
+      var ifr = document.querySelectorAll('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="captcha"]');
+      for (var i = 0; i < ifr.length; i++) {
+        if (vis(ifr[i])) { out = out || 'captcha'; break; }
+      }
     }
-    if (!out) {
+    if (!out && !solved) {
       var caps = document.querySelectorAll('[class*="captcha"], [id*="captcha"], [class*="Captcha"], [id*="Captcha"]');
       for (var j = 0; j < caps.length; j++) {
         var el = caps[j];
@@ -280,14 +290,10 @@ async fn run_osascript(script: &str) -> Result<String, String> {
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     if !out.status.success() {
-        // Contains "applescript" (supports URL) => "Allow JavaScript from Apple Events" is off
-        if stderr.to_lowercase().contains("applescript") {
-            return Err(format!(
-                "Chrome 未开启 AppleScript JavaScript 执行（execute javascript 被拒绝）。\
-                 请先在 Chrome 菜单 View > Developer > Allow JavaScript from Apple Events \
-                 （显示 > 开发者 > 允许来自 Apple 事件的 JavaScript）开启后重试。原始错误：{}",
-                stderr.trim()
-            ));
+        // Chrome refuses `execute javascript` while "Allow JavaScript from Apple Events"
+        // is off; the refusal names AppleScript and JavaScript in every locale.
+        if is_js_apple_events_disabled(&stderr) {
+            return Err(js_apple_events_message(&stderr));
         }
         return Err(stderr.trim().to_string());
     }
@@ -700,15 +706,38 @@ end tell"#,
         }
     }
 
+    /// Detect human verification and record the result in the session
+    /// (`pending_human` flag): on a hit, stores the category and returns the tag
+    /// to append; on a miss, clears the flag and returns an empty string.
+    /// Mirrors `detect_and_mark` in tools.rs (CDP driver) so the
+    /// [HUMAN_ACTION_PENDING: ...] prefix on mutating tools reflects the actual
+    /// page state: present while a blocker is detected, gone once it clears.
+    async fn detect_and_mark(&mut self) -> String {
+        if let Some(cat) = self.detect_user_action_required().await {
+            self.pending_human = Some(cat.clone());
+            user_action_tag(&cat)
+        } else {
+            self.pending_human = None;
+            String::new()
+        }
+    }
+
     /// Wait for the user to handle it manually (same contract: status=resolved /
     /// still_waiting; 60s budget, resolved only after 2 consecutive clean polls).
-    pub async fn wait_for_human_tool(&mut self, expect: Option<&str>) -> String {
+    /// `message` (the tool's `message` argument) is relayed verbatim to the user
+    /// in the still_waiting output, mirroring the CDP driver.
+    pub async fn wait_for_human_tool(
+        &mut self,
+        expect: Option<&str>,
+        message: Option<&str>,
+    ) -> String {
         let op_cap = op_timeout_ms();
         let ceiling = op_cap.saturating_sub(15_000).max(5_000);
         let budget_ms = 60_000u64.min(ceiling);
         let deadline = Instant::now() + Duration::from_millis(budget_ms);
         let mut clean_streak: u32 = 0;
         let mut note = String::new();
+        let mut last_cat: Option<String> = None;
         let cat = expect
             .map(|e| e.trim().to_string())
             .filter(|e| !e.is_empty());
@@ -726,24 +755,29 @@ end tell"#,
                         );
                     }
                 }
-                Some(c) => {
+                Some(c) if c != "poll_timeout" => {
                     clean_streak = 0;
+                    last_cat = Some(c.clone());
                     note = format!("current blocker: [USER_ACTION_REQUIRED: {}]", c);
+                }
+                Some(_) => {
+                    // A hung poll is "still blocked" but carries no real category;
+                    // do not record the internal poll_timeout marker as a blocker.
+                    clean_streak = 0;
                 }
             }
             if Instant::now() >= deadline {
-                let hint = cat
+                let cat = last_cat
                     .clone()
-                    .map(|c| format!(" (expect: {})", c))
+                    .or_else(|| cat.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                self.pending_human = Some(cat.clone());
+                let relay = message
+                    .map(|m| format!("\nInstruction for the user: {m}"))
                     .unwrap_or_default();
-                self.pending_human = expect
-                    .map(|e| e.trim().to_string())
-                    .filter(|e| !e.is_empty());
                 return format!(
                     "status=still_waiting\nStill waiting for the user to complete '{}' in the visible browser window after {} ms.{}",
-                    cat.unwrap_or_default(),
-                    budget_ms,
-                    hint
+                    cat, budget_ms, relay
                 );
             }
             tokio::time::sleep(Duration::from_millis(2000)).await;
@@ -892,25 +926,71 @@ end tell"#,
 
 /// osascript error translation: give actionable hints for lost session tab/window errors.
 fn translate_err(e: &str) -> String {
-    let le = e.to_lowercase();
-    if le.contains("applescript") && (le.contains("javascript") || le.contains("java script")) {
-        "Chrome 未开启“Apple 事件中的 JavaScript”：请在 Chrome 菜单 视图(View) > 开发者(Developer) > \
-         允许 Apple 事件中的 JavaScript(Allow JavaScript from Apple Events) 打开后重试（一次性设置）。"
-            .to_string()
-    } else if le.contains("不能获得") || le.contains("can't get") || le.contains("-1728") {
-        "会话标签页/窗口已丢失（可能被手动关闭或切到别的 Chrome 窗口/实例）。\
-         请重新调用 navigate 打开新标签页，或把浏览器窗口切回会话窗口。"
-            .to_string()
-    } else {
-        e.to_string()
-    }
+    translate_known_error(e).unwrap_or_else(|| e.to_string())
 }
 
-/// Strip the outer quotes from a JSON.stringify result (keeping the escaped content verbatim).
+/// Chrome's "Allow JavaScript from Apple Events" gate is closed.
+///
+/// Chrome reads that preference **only at startup**, so ticking the menu item in a
+/// running browser (or editing the profile on disk) leaves the running process refusing
+/// `execute javascript`. Only a full quit + relaunch makes it effective, so every error
+/// reporting this gate must spell that out: "enable it and retry" alone sends the user
+/// back into the failure they just came from.
+const JS_APPLE_EVENTS_HINT: &str = "\
+Chrome 未开启“Apple 事件中的 JavaScript”（Allow JavaScript from Apple Events）：\
+请在 Chrome 菜单 视图(View) > 开发者(Developer) > 允许 Apple 事件中的 JavaScript 打开，\
+然后**完全退出 Chrome（⌘Q）并重新启动**——该开关只在 Chrome 启动时读取，\
+运行中勾选或改配置文件都不会生效。";
+
+/// Detect Chrome's "executing JavaScript through AppleScript is turned off" error.
+///
+/// The wording is locale-dependent ("通过 AppleScript 执行 JavaScript 的功能已关闭" in
+/// zh-CN, "Executing JavaScript through AppleScript is turned off" in en), but every
+/// variant names AppleScript and JavaScript and links
+/// `https://support.google.com/chrome/?p=applescript`, so those two lowercase
+/// substrings are the locale-independent markers.
+fn is_js_apple_events_disabled(err: &str) -> bool {
+    let le = err.to_lowercase();
+    le.contains("applescript") && (le.contains("javascript") || le.contains("java script"))
+}
+
+/// User-facing message for a closed "Allow JavaScript from Apple Events" gate.
+fn js_apple_events_message(raw_error: &str) -> String {
+    format!("{} 原始错误：{}", JS_APPLE_EVENTS_HINT, raw_error.trim())
+}
+
+/// Map a known osascript/Chrome failure to an actionable message.
+///
+/// Returns `None` for errors without a specific hint, so the caller can keep the
+/// original text.
+fn translate_known_error(e: &str) -> Option<String> {
+    // `run_osascript` already wrapped the gate error; keep that wording (and the
+    // original stderr it quotes) instead of wrapping it a second time.
+    if e.contains(JS_APPLE_EVENTS_HINT) {
+        return Some(e.to_string());
+    }
+    if is_js_apple_events_disabled(e) {
+        return Some(js_apple_events_message(e));
+    }
+    let le = e.to_lowercase();
+    if le.contains("不能获得") || le.contains("can't get") || le.contains("-1728") {
+        return Some(
+            "会话标签页/窗口已丢失（可能被手动关闭或切到别的 Chrome 窗口/实例）。\
+             请重新调用 navigate 打开新标签页，或把浏览器窗口切回会话窗口。"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Decode a JSON.stringify result: when it is a quoted string, parse it as JSON
+/// (unescapes `\"`, `\n`, `\t`, `\\` etc., so page text/HTML comes back readable
+/// instead of JSON-escaped); otherwise return it unchanged (non-string results
+/// like `{"ok":false}` are not quoted JSON strings).
 fn unquote(s: &str) -> String {
     let s = s.trim();
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        s[1..s.len() - 1].to_string()
+        serde_json::from_str::<String>(s).unwrap_or_else(|_| s[1..s.len() - 1].to_string())
     } else {
         s.to_string()
     }
@@ -928,12 +1008,15 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 
 fn require_str(args: &Value, key: &str) -> Result<String, JsonRpcErr> {
     str_arg(args, key)
+        .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| JsonRpcErr::new(-32602, &format!("missing '{key}'"), None))
+        .ok_or_else(|| JsonRpcErr::new(-32602, &format!("missing or empty '{key}'"), None))
 }
 
 fn opt_str(args: &Value, key: &str) -> Option<String> {
-    str_arg(args, key).map(str::to_string)
+    str_arg(args, key)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 impl ApplescriptSession {
@@ -971,10 +1054,7 @@ pub async fn handle_tools_call(
             let summary = with_timeout(ms, async {
                 session.navigate(&url, wait_selector.as_deref()).await?;
                 let (u, t) = session.url_title().await?;
-                let tag = session
-                    .detect_user_action_required()
-                    .await
-                    .map_or(String::new(), |c| user_action_tag(&c));
+                let tag = session.detect_and_mark().await;
                 Ok(format!("{pend}Navigated to {u}\nTitle: {t}{tag}"))
             })
             .await?;
@@ -985,10 +1065,7 @@ pub async fn handle_tools_call(
             let pend = pending_warning(session);
             let summary = with_timeout(ms, async {
                 session.click(&sel).await?;
-                let tag = session
-                    .detect_user_action_required()
-                    .await
-                    .map_or(String::new(), |c| user_action_tag(&c));
+                let tag = session.detect_and_mark().await;
                 Ok(format!("{pend}Clicked {sel}{tag}"))
             })
             .await?;
@@ -1000,13 +1077,13 @@ pub async fn handle_tools_call(
             let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(false);
             let pend = pending_warning(session);
             let summary = with_timeout(ms, async {
-                let n = session.type_text(&sel, &text, submit).await?;
-                let tag = session
-                    .detect_user_action_required()
-                    .await
-                    .map_or(String::new(), |c| user_action_tag(&c));
-                let suffix = if submit { " and pressed Enter" } else { "" };
-                Ok(format!("{pend}Typed {n} chars into {sel}{suffix}{tag}"))
+                // type_text already returns the complete summary
+                // ("Typed N chars into <sel> [and pressed Enter]"); use it
+                // verbatim instead of re-formatting it as if it were a char
+                // count (that duplicated the message and the suffix).
+                let msg = session.type_text(&sel, &text, submit).await?;
+                let tag = session.detect_and_mark().await;
+                Ok(format!("{pend}{msg}{tag}"))
             })
             .await?;
             Ok(text_content(&summary))
@@ -1017,10 +1094,7 @@ pub async fn handle_tools_call(
             let pend = pending_warning(session);
             let summary = with_timeout(ms, async {
                 session.press_key(&key, sel.as_deref()).await?;
-                let tag = session
-                    .detect_user_action_required()
-                    .await
-                    .map_or(String::new(), |c| user_action_tag(&c));
+                let tag = session.detect_and_mark().await;
                 Ok(format!("{pend}Pressed {key}{tag}"))
             })
             .await?;
@@ -1035,13 +1109,14 @@ pub async fn handle_tools_call(
                 session
                     .scroll(x.map(|v| v as i64), y.map(|v| v as i64), sel.as_deref())
                     .await?;
-                let tag = session
-                    .detect_user_action_required()
-                    .await
-                    .map_or(String::new(), |c| user_action_tag(&c));
+                let tag = session.detect_and_mark().await;
                 Ok(match &sel {
                     Some(s) => format!("{pend}Scrolled {s} into view{tag}"),
-                    None => format!("{pend}Scrolled window to ({x:?}, {y:?}){tag}"),
+                    None => format!(
+                        "{pend}Scrolled window to ({}, {}){tag}",
+                        x.map(|v| v as i64).unwrap_or(0),
+                        y.map(|v| v as i64).unwrap_or(0)
+                    ),
                 })
             })
             .await?;
@@ -1052,13 +1127,10 @@ pub async fn handle_tools_call(
             let timeout_ms = args
                 .get("timeout_ms")
                 .and_then(Value::as_u64)
-                .unwrap_or(10_000);
+                .unwrap_or(15_000);
             let summary = with_timeout(ms, async {
                 let waited = session.wait_for_selector(&sel, timeout_ms).await?;
-                let tag = session
-                    .detect_user_action_required()
-                    .await
-                    .map_or(String::new(), |c| user_action_tag(&c));
+                let tag = session.detect_and_mark().await;
                 Ok(format!("Found {sel} after {waited} ms{tag}"))
             })
             .await?;
@@ -1073,27 +1145,32 @@ pub async fn handle_tools_call(
             let sel = opt_str(&args, "selector");
             let pend = pending_warning(session);
             let summary = with_timeout(ms, async {
-                let mut t = session.get_text_sel(sel.as_deref()).await?;
-                if let Some(c) = session.detect_user_action_required().await {
-                    t.push_str(&user_action_tag(&c));
-                }
-                Ok(format!("{pend}{t}"))
+                let t = session.get_text_sel(sel.as_deref()).await?;
+                let tag = session.detect_and_mark().await;
+                Ok((t, tag))
             })
             .await?;
-            Ok(text_content(&cap_text(&summary)))
+            let (t, tag) = summary;
+            // Cap the body BEFORE appending the tag: cap_text must never swallow
+            // the [USER_ACTION_REQUIRED] marker (the body alone can sit at the
+            // 24K cap, so capping the whole summary afterwards would cut the tag).
+            let mut out = cap_text(&t);
+            out.push_str(&tag);
+            Ok(text_content(format!("{pend}{out}")))
         }
         "get_html" => {
             let sel = opt_str(&args, "selector");
             let pend = pending_warning(session);
             let summary = with_timeout(ms, async {
-                let mut t = session.get_html_sel(sel.as_deref()).await?;
-                if let Some(c) = session.detect_user_action_required().await {
-                    t.push_str(&user_action_tag(&c));
-                }
-                Ok(format!("{pend}{t}"))
+                let t = session.get_html_sel(sel.as_deref()).await?;
+                let tag = session.detect_and_mark().await;
+                Ok((t, tag))
             })
             .await?;
-            Ok(text_content(&cap_text(&summary)))
+            let (t, tag) = summary;
+            let mut out = cap_text(&t);
+            out.push_str(&tag);
+            Ok(text_content(format!("{pend}{out}")))
         }
         "screenshot" => {
             let path = opt_str(&args, "path");
@@ -1107,10 +1184,7 @@ pub async fn handle_tools_call(
                 let (p, extra) = session
                     .screenshot(&out_path.to_string_lossy(), full_page)
                     .await?;
-                let tag = session
-                    .detect_user_action_required()
-                    .await
-                    .map_or(String::new(), |c| user_action_tag(&c));
+                let tag = session.detect_and_mark().await;
                 Ok(format!(
                     "{pend}Saved screenshot to {p} (full_page={full_page}){extra}{tag}"
                 ))
@@ -1120,8 +1194,13 @@ pub async fn handle_tools_call(
         }
         "wait_for_human" => {
             let expect = opt_str(&args, "expect");
+            let message = opt_str(&args, "message");
             let summary = with_timeout(ms, async {
-                Ok::<_, String>(session.wait_for_human_tool(expect.as_deref()).await)
+                Ok::<_, String>(
+                    session
+                        .wait_for_human_tool(expect.as_deref(), message.as_deref())
+                        .await,
+                )
             })
             .await?;
             Ok(text_content(&summary))
@@ -1149,5 +1228,88 @@ pub async fn handle_tools_call(
             &format!("unknown tool: {cmd}"),
             None,
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unquote_decodes_json_stringify_output() {
+        // Escapes produced by JSON.stringify must be decoded, not kept verbatim:
+        // page text comes back with real newlines and HTML with real quotes.
+        assert_eq!(unquote(r#""line1\nline2""#), "line1\nline2");
+        assert_eq!(unquote(r#""<div class=\"x\">""#), "<div class=\"x\">");
+        assert_eq!(unquote(r#""a\"b\\c""#), "a\"b\\c");
+        // Non-string JSON results (objects) and plain text are left unchanged.
+        assert_eq!(unquote("{\"ok\":false}"), "{\"ok\":false}");
+        assert_eq!(unquote("\"null\""), "null");
+        assert_eq!(unquote("plain"), "plain");
+        assert_eq!(unquote(""), "");
+    }
+
+    #[test]
+    fn require_str_rejects_empty() {
+        let empty = json!({ "url": "" });
+        assert!(require_str(&empty, "url").is_err());
+        let ok = json!({ "url": "https://example.com" });
+        assert_eq!(
+            require_str(&ok, "url").ok(),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    /// Chrome's own wording when the gate is closed (zh-CN build).
+    const CHROME_JS_GATE_ERROR: &str = "36:87: execution error: “Google Chrome”遇到一个错误：通过 AppleScript 执行 JavaScript 的功能已关闭。要开启此功能，请在菜单栏中依次转到“查看”>“开发者”>“允许 Apple 事件中的 JavaScript”。如需更多信息，请访问 https://support.google.com/chrome/?p=applescript (12)";
+
+    #[test]
+    fn js_gate_error_names_the_restart_step() {
+        // Chrome reads the preference at startup only, so a hint that says "enable it
+        // and retry" leaves the user in a loop: the restart step must be in the message.
+        let msg = translate_err(CHROME_JS_GATE_ERROR);
+        assert!(
+            msg.contains("完全退出 Chrome"),
+            "missing restart step: {}",
+            msg
+        );
+        assert!(
+            msg.contains("允许 Apple 事件中的 JavaScript"),
+            "missing menu path: {}",
+            msg
+        );
+        assert!(msg.contains("功能已关闭"), "original error lost: {}", msg);
+    }
+
+    #[test]
+    fn english_js_gate_error_is_detected() {
+        let msg = translate_err(
+            "Executing JavaScript through AppleScript is turned off. To turn on this feature, \
+             go to View > Developer > Allow JavaScript from Apple Events.",
+        );
+        assert!(
+            msg.contains("完全退出 Chrome"),
+            "missing restart step: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn js_gate_message_is_not_applied_twice() {
+        // `run_osascript` already wraps the raw stderr; translating again must not
+        // duplicate the hint or the quoted original error.
+        let once = js_apple_events_message(CHROME_JS_GATE_ERROR);
+        assert_eq!(once, translate_err(&once));
+    }
+
+    #[test]
+    fn stale_tab_error_keeps_its_own_hint() {
+        let msg = translate_err("execution error: 不能获得“window id 999999”。 (-1728)");
+        assert!(
+            msg.contains("会话标签页/窗口已丢失"),
+            "unexpected message: {}",
+            msg
+        );
+        assert!(!msg.contains("完全退出 Chrome"), "wrong hint: {}", msg);
     }
 }

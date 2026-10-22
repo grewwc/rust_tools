@@ -7,6 +7,8 @@ use crate::ai::tools::common::{
     ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
 };
 
+pub(crate) const COMPLETE_CLAIM_RECORDED_PREFIX: &str = "Completion assertion recorded:";
+
 fn execute_complete(args: &Value) -> Result<String, String> {
     let summary = args["summary"].as_str().unwrap_or("").trim();
     if summary.is_empty() {
@@ -43,7 +45,7 @@ fn execute_complete(args: &Value) -> Result<String, String> {
             plan_updated_at_ms,
         ) {
             Ok(_) => Ok(format!(
-                "Completion assertion recorded: {summary}\n\
+                "{COMPLETE_CLAIM_RECORDED_PREFIX} {summary}\n\
                  Now write the final response text for this turn. The runtime verifies \
                  the assertion against the session plan: if plan steps are still \
                  unsettled, the turn reopens instead of ending."

@@ -402,3 +402,21 @@ pub(super) fn inject_subagent_pre_timeout_wrap_up_note(
         reasoning_content: None,
     });
 }
+
+/// When a sub-agent's own model request hits its wall-clock budget, ask it to stop
+/// expanding and deliver verifiable conclusions from the evidence already collected.
+pub(super) fn inject_subagent_request_budget_wrap_up_note(
+    messages: &mut Vec<crate::ai::history::Message>,
+) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+
+    let note = include_str!("prompts/subagent_request_budget_wrap_up.md");
+    messages.push(Message {
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(note.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}

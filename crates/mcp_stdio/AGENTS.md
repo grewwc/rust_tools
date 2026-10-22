@@ -52,3 +52,9 @@ No focused unit tests - the gate is the consuming binaries' build + smoke test.
    that needs longer must still stay under the host's configured cap.
 6. **New "drive an OS-native app" MCP servers** reuse this crate (per root
    AGENTS.md): implement `McpServer` + the app driver, nothing else.
+7. **Notifications get no response.** A parsed request without an `id` is a
+   JSON-RPC 2.0 notification: its side effects still run, but no response line
+   is written — not even `-32601` for an unknown method. Never answer
+   `notifications/initialized` with an ack; the host skips id-less lines
+   anyway, but a stray `{"id":null,...}` line can be mistaken for the next
+   request's reply.

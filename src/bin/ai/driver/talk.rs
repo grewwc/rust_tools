@@ -22,6 +22,11 @@ use crate::ai::history::{Message, SessionStore, runtime_synthetic_user_message};
 const TALK_DIR: &str = "talk";
 const INBOX_FILE: &str = "inbox.jsonl";
 const ROOMS_DIR: &str = "rooms";
+/// File that carries skills selected with a `/task`/`/discuss` command to the
+/// room's start call: `<host>.assets/pending-room-skills.json`. Written by the
+/// command layer before the host turn consumes `app.forced_skills`, read and
+/// deleted by the first room start afterwards.
+const PENDING_ROOM_SKILLS_FILE: &str = "pending-room-skills.json";
 
 /// Single-message body limit, mirroring the side-note queue.
 pub(crate) const MAX_TALK_BODY_CHARS: usize = 8_000;
@@ -68,6 +73,10 @@ fn sanitize_room(room: &str) -> String {
         .collect()
 }
 
+pub fn talk_dir(history_file: &Path) -> PathBuf {
+    super::side_note::assets_dir_for_history(history_file).join(TALK_DIR)
+}
+
 fn session_id_for_history(history_file: &Path) -> String {
     history_file
         .file_stem()
@@ -75,10 +84,6 @@ fn session_id_for_history(history_file: &Path) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or("default")
         .to_string()
-}
-
-pub fn talk_dir(history_file: &Path) -> PathBuf {
-    super::side_note::assets_dir_for_history(history_file).join(TALK_DIR)
 }
 
 pub fn talk_inbox_file(history_file: &Path) -> PathBuf {
@@ -97,6 +102,67 @@ pub fn talk_state_file(history_file: &Path, room: &str) -> PathBuf {
     talk_dir(history_file)
         .join(ROOMS_DIR)
         .join(format!("{}.state.json", sanitize_room(room)))
+}
+
+/// Path of the pending room-skills snapshot for `history_file`'s session.
+fn pending_room_skills_file(history_file: &Path) -> PathBuf {
+    // Same per-session assets-dir convention as the rest of talk:
+    // `history_file` must be `SessionStore::session_history_file(id)`
+    // (`<root>/<id>.sqlite`), never the persona base file — mixing the two
+    // resolves to different directories.
+    super::side_note::assets_dir_for_history(history_file).join(PENDING_ROOM_SKILLS_FILE)
+}
+
+/// Persist the skills to propagate to the next room started from this
+/// session. Always writes: an empty list clears a stale snapshot so skills
+/// never leak into a later room that was started without a new selection.
+pub(crate) fn write_pending_room_skills(
+    history_file: &Path,
+    names: &[String],
+) -> Result<(), String> {
+    let file = pending_room_skills_file(history_file);
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create pending-skills dir: {e}"))?;
+    }
+    let content =
+        serde_json::to_string(names).map_err(|e| format!("encode pending skills: {e}"))?;
+    fs::write(&file, content).map_err(|e| format!("write pending skills: {e}"))
+}
+
+/// Read this session's pending room skills without consuming them; empty when
+/// absent or unreadable (room start must not fail over it).
+pub(crate) fn peek_pending_room_skills(history_file: &Path) -> Vec<String> {
+    let file = pending_room_skills_file(history_file);
+    let raw = match fs::read_to_string(&file) {
+        Ok(raw) => raw,
+        Err(_) => return Vec::new(),
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Delete the pending room-skills snapshot. Called only after a room start
+/// fully succeeded, so a failed start leaves the payload for a retry.
+pub(crate) fn clear_pending_room_skills(history_file: &Path) {
+    let file = pending_room_skills_file(history_file);
+    if let Err(err) = fs::remove_file(&file) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("[talk] failed to remove pending skills file: {err}");
+        }
+    }
+}
+
+/// If `body` is a host-rendered room card (`[task room=` / `[discuss room=`
+/// from `task_brief_for` / `round_brief_for`), extract its `@skills:<name>`
+/// mentions and strip them from `body` in place, mirroring the user-input
+/// extraction so every delivery path shows identical card text. Any other
+/// body returns nothing untouched: peer mail must not force skill activation.
+pub(crate) fn take_room_card_skills(body: &mut String) -> Vec<String> {
+    let trimmed = body.trim_start();
+    if trimmed.starts_with("[task room=") || trimmed.starts_with("[discuss room=") {
+        super::input::extract_forced_skill_references(body)
+    } else {
+        Vec::new()
+    }
 }
 
 /// Whether this session's inbox currently holds at least one message.
@@ -425,6 +491,33 @@ mod tests {
             format_talk_messages(&msgs),
             "[talk from=sess-a room=-] hi\n\n[talk from=sess-b room=argue] yo"
         );
+    }
+
+    #[test]
+    fn take_room_card_skills_extracts_only_host_rendered_cards() {
+        // Task card: mentions are extracted and stripped from the body.
+        let mut card =
+            "[task room=r round=1/2 host=h]\nAssigned skills: s1, s2\n@skills:s1 @skills:s2\nGoal: x"
+                .to_string();
+        assert_eq!(take_room_card_skills(&mut card), vec!["s1", "s2"]);
+        assert!(!card.contains("@skills:"), "mention leaked: {card}");
+        assert!(card.contains("Assigned skills: s1, s2"), "NL line kept: {card}");
+
+        // Discuss card: same handling.
+        let mut card2 =
+            "[discuss room=r round=1/2 host=h]\n@skills:pro\nTopic: t".to_string();
+        assert_eq!(take_room_card_skills(&mut card2), vec!["pro"]);
+        assert!(!card2.contains("@skill"), "discuss mention leaked: {card2}");
+
+        // Arbitrary peer mail must not force skill activation.
+        let mut mail = "please use @skills:coding for this".to_string();
+        assert!(take_room_card_skills(&mut mail).is_empty());
+        assert!(mail.contains("@skills:coding"), "peer body was touched: {mail}");
+
+        // A card without mentions extracts nothing.
+        let mut plain = "[task room=r round=1/2 host=h]\nGoal: x".to_string();
+        assert!(take_room_card_skills(&mut plain).is_empty());
+        assert_eq!(plain, "[task room=r round=1/2 host=h]\nGoal: x");
     }
 
     #[test]

@@ -91,8 +91,9 @@ use crate::ai::stream::state;
 /// backstop against a stream that never finishes, not a normal-path timeout; `MAX_TOOL_ARG_BYTES` remains the primary
 /// runaway guard. On expiry the open call is dropped and the attempt replays through the truncation path.
 /// First-chunk timeout: the request was sent but the server never sends the first byte (queued, stuck gateway, ...).
-/// A stream that produced nothing yet gets this shorter window: unlike a stall after work has been delivered, there
-/// is nothing to preserve by waiting longer, so the retry may start earlier.
+/// A stream that produced nothing yet gets this window: unlike a stall after work has been delivered, there is nothing
+/// to preserve, so the retry may start earlier than a post-progress stall. It is still wide enough for a gateway that
+/// queues the request before it starts generating — a slow first byte is not a dead connection.
 /// Default visible-window height for `thinking` in the terminal. Only affects display, not reasoning accumulation.
 /// Streaming shows the most recent N lines (default 2); when thinking ends, `finalize_fold` forces a pure-summary
 /// fold (redraws with a 0-line window) so conclusions/questions restated at the tail of thinking are not shown twice
@@ -149,9 +150,10 @@ impl StreamPayloadOutcome {
 /// A held open output item is a state the provider declared, so it selects the declared-item allowance (reasoning
 /// items stream no content while they are open, and an open `function_call` item is an argument payload being
 /// generated server-side). Every other case is a connection bound: anything delivered makes the stream worth
-/// preserving through a quiet stretch, while a stream that has produced nothing at all gets the shorter
-/// first-chunk window because there is nothing to preserve. Empty packets, usage-only and heartbeat events do not
-/// refresh the timer, so a provider pushing useless packets cannot keep the stream open forever.
+/// preserving through a quiet stretch, while a stream that has produced nothing at all gets the first-chunk window
+/// (`STREAM_FIRST_CHUNK_TIMEOUT_SECS`): nothing has been delivered to preserve, but a queued first byte may still be
+/// on its way. Empty packets, usage-only and heartbeat events do not refresh the timer, so a provider pushing useless
+/// packets cannot keep the stream open forever.
 ///
 /// A model may widen the connection bound through the registry (`stream_silence_timeout_secs`); the declared-item
 /// and first-chunk allowances stay global.

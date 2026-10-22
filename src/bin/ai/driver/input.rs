@@ -1319,10 +1319,12 @@ fn extract_at_file_references(question: &mut String) -> crate::ai::types::FilePa
     parsed
 }
 
-/// 从输入中提取并移除 `@skills:<name>` / `@skill:<name>` 引用（用户通过补全选择的
-/// 强制 skill）。返回最后一个命中的 skill 名（多次出现以最后一个为准）。被提取的
-/// token 从 `question` 中删除，避免污染发送给模型的文本。
-fn extract_forced_skill_references(question: &mut String) -> Vec<String> {
+/// Extract and remove `@skills:<name>` / `@skill:<name>` references (user
+/// skill selections) from the input. Returns the selected names, deduplicated
+/// case-insensitively. Extracted tokens are deleted from `question` so they
+/// never reach the model text; the live talk-card path uses this too so
+/// room-delivered mentions force-activate exactly like user input.
+pub(crate) fn extract_forced_skill_references(question: &mut String) -> Vec<String> {
     let chars: Vec<char> = question.chars().collect();
     let mut rewritten = String::with_capacity(question.len());
     let mut i = 0usize;

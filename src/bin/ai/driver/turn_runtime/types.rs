@@ -48,6 +48,10 @@ pub(super) enum IterationExecution {
     /// have the orchestrator immediately enter a forced wrap-up (no-tool) iteration instead of
     /// waiting for the current iteration to end naturally.
     WrapUpFinal,
+    /// A sub-agent model request exceeded its wall-clock budget. Carries the partial
+    /// stream result (possibly empty) so the orchestrator can enter a forced wrap-up
+    /// iteration and, if that also expires, still report the collected work.
+    RequestDeadlineExceeded(crate::ai::types::StreamResult),
     FinalResponse(crate::ai::types::StreamResult),
     ToolCall(ToolCallExecution),
 }

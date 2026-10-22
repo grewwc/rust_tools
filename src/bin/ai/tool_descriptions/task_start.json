@@ -1,6 +1,6 @@
 {
   "name": "task_start",
-  "description": "Open a multi-worker task room as host: splits a goal across worker sessions, sends the round-1 task card to every worker's talk inbox and reports who is live vs inactive. Returns the room name for task_assign/collect/close. Pass either workers (existing sessions) or worker_count (auto-spawned sessions owned by this room), not both.",
+  "description": "Open a multi-worker task room as host: split a goal across worker sessions, send the round-1 task card to each worker's talk inbox, and report who is live vs inactive. Returns the room name for task_assign/collect/close. Pass exactly one of workers (existing session ids) or worker_count (auto-spawned sessions owned by this room); counts are integers.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -11,19 +11,28 @@
       "workers": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "Worker session ids (1-8, from session_list; must exist, cannot include yourself). Either this or worker_count."
+        "minItems": 1,
+        "maxItems": 8,
+        "description": "1-8 existing worker session ids from session_list; must exist and cannot include the host. Either this or worker_count."
       },
       "worker_count": {
-        "type": "number",
-        "description": "Auto-spawn N worker sessions (1-8) owned by this room, e.g. 3. Fresh ids embed the room name; their databases are created by their own processes. Either this or workers."
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 8,
+        "description": "Whole number of worker sessions to auto-spawn (1-8, e.g. 2). Fresh ids embed the room name; their databases are created by their own processes. Either this or workers."
       },
       "max_rounds": {
-        "type": "number",
-        "description": "Max rounds before forced close (default 5, clamped 1-10). Rework assignments consume rounds."
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 10,
+        "default": 5,
+        "description": "Whole number of rounds before forced close (default 5). Rework assignments consume rounds."
       },
       "room": {
         "type": "string",
-        "description": "Optional room name (max 64 chars); auto-generated when omitted."
+        "minLength": 1,
+        "maxLength": 64,
+        "description": "Optional room name (1-64 chars); auto-generated when omitted."
       }
     },
     "required": [

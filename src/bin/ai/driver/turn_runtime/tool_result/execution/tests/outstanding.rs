@@ -51,6 +51,13 @@ fn last_note(messages: &[Message]) -> &str {
         .expect("gate note must be a string message")
 }
 
+fn tool_exchange(id: &str, name: &str, content: &str) -> Vec<Message> {
+    vec![
+        assistant_tool_call_message(test_tool_call(id, name, serde_json::json!({}))),
+        tool_result_message(id, content),
+    ]
+}
+
 #[test]
 fn no_plan_file_allows_final() {
     let (app, base) = test_app_with_session();
@@ -73,6 +80,141 @@ fn no_plan_still_consumes_claim() {
         load_completion_claim(&app).unwrap().is_none(),
         "no-plan evaluation must still consume the single-use claim"
     );
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn tool_assisted_turn_without_complete_reopens() {
+    let (app, base) = test_app_with_session();
+    let turn_messages = tool_exchange("work", "execute_command", "[command exited: exit code 0]");
+    let mut messages = Vec::new();
+    let action = super::super::outstanding_work_gate_action_with_turn_messages(
+        &app,
+        &mut messages,
+        &turn_messages,
+        false,
+        0,
+        16,
+    );
+    assert_eq!(action, OutstandingWorkGateAction::Reopen);
+    assert!(last_note(&messages).contains("no successful `complete` assertion"));
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn tool_assisted_turn_allows_complete_after_latest_result() {
+    let (app, base) = test_app_with_session();
+    record_completion_claim(&app, "done", None).unwrap();
+    let mut turn_messages = tool_exchange("work", "execute_command", "ok");
+    turn_messages.extend(tool_exchange(
+        "done",
+        "complete",
+        "Completion assertion recorded: done",
+    ));
+    let mut messages = Vec::new();
+    let action = super::super::outstanding_work_gate_action_with_turn_messages(
+        &app,
+        &mut messages,
+        &turn_messages,
+        false,
+        0,
+        16,
+    );
+    assert_eq!(action, OutstandingWorkGateAction::Allow);
+    assert!(load_completion_claim(&app).unwrap().is_none());
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn binding_plan_complete_before_later_tool_result_does_not_cover_it() {
+    let (app, base) = test_app_with_session();
+    two_step_plan(&app);
+    for step in 1..=2 {
+        update_plan_step(&app, step, StepStatus::Done, None).unwrap();
+    }
+    let updated_at_ms = crate::ai::tools::plan_state::load_plan_state(&app)
+        .unwrap()
+        .unwrap()
+        .updated_at_ms;
+    record_completion_claim(&app, "done", Some(updated_at_ms)).unwrap();
+    let mut turn_messages =
+        tool_exchange("done", "complete", "Completion assertion recorded: done");
+    turn_messages.extend(tool_exchange("work", "execute_command", "ok"));
+    let mut messages = Vec::new();
+    let action = super::super::outstanding_work_gate_action_with_turn_messages(
+        &app,
+        &mut messages,
+        &turn_messages,
+        false,
+        0,
+        16,
+    );
+    assert_eq!(action, OutstandingWorkGateAction::Reopen);
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn request_user_input_does_not_require_complete() {
+    let (app, base) = test_app_with_session();
+    let turn_messages = tool_exchange("ask", "request_user_input", "Input requested.");
+    let mut messages = Vec::new();
+    let action = super::super::outstanding_work_gate_action_with_turn_messages(
+        &app,
+        &mut messages,
+        &turn_messages,
+        false,
+        0,
+        16,
+    );
+    assert_eq!(action, OutstandingWorkGateAction::Allow);
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn recoverable_pre_execution_pause_uses_its_own_gate() {
+    let (app, base) = test_app_with_session();
+    let pause = format!("Error: {SCOPED_INSTRUCTIONS_PAUSE_PREFIX}");
+    let turn_messages = tool_exchange("patch", "apply_patch", &pause);
+    let mut messages = Vec::new();
+    let action = super::super::outstanding_work_gate_action_with_turn_messages(
+        &app,
+        &mut messages,
+        &turn_messages,
+        false,
+        0,
+        16,
+    );
+    assert_eq!(action, OutstandingWorkGateAction::Allow);
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn recoverable_pause_supersedes_earlier_actionable_result() {
+    let (app, base) = test_app_with_session();
+    let mut turn_messages = tool_exchange("work", "execute_command", "ok");
+    let pause = format!("Error: {SCOPED_INSTRUCTIONS_PAUSE_PREFIX}");
+    turn_messages.extend(tool_exchange("patch", "apply_patch", &pause));
+    let mut messages = Vec::new();
+    let action = super::super::outstanding_work_gate_action_with_turn_messages(
+        &app,
+        &mut messages,
+        &turn_messages,
+        false,
+        0,
+        16,
+    );
+    assert_eq!(action, OutstandingWorkGateAction::Allow);
+
+    turn_messages.extend(tool_exchange("retry", "apply_patch", "ok"));
+    let action = super::super::outstanding_work_gate_action_with_turn_messages(
+        &app,
+        &mut messages,
+        &turn_messages,
+        false,
+        0,
+        16,
+    );
+    assert_eq!(action, OutstandingWorkGateAction::Reopen);
     let _ = fs::remove_dir_all(&base);
 }
 

@@ -59,6 +59,12 @@ pub(crate) struct DiscussState {
     /// this list is the host's ownership record, alongside the room transcript.
     #[serde(default)]
     pub spawned: Vec<String>,
+    /// Skills the `/discuss` command propagated to this room's members.
+    /// Rendered into every round brief as `@skills:` mentions so each wake
+    /// force-activates them. `#[serde(default)]` keeps rooms started before
+    /// skill propagation loadable.
+    #[serde(default)]
+    pub skills: Vec<String>,
     pub max_rounds: u32,
     /// Current round: 1 right after start (round-1 brief sent).
     pub round: u32,
@@ -150,8 +156,19 @@ pub(crate) fn save_state(history_file: &Path, state: &DiscussState) -> Result<()
 /// one; spawned members always carry one (host-provided or the default argue
 /// cycle).
 pub(crate) fn round_brief_for(state: &DiscussState, role: &str) -> String {
+    let skills_lines = if state.skills.is_empty() {
+        String::new()
+    } else {
+        let mentions = state
+            .skills
+            .iter()
+            .map(|s| format!("@skills:{s}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{mentions}\nAssigned skills: {}\n", state.skills.join(", "))
+    };
     let base = format!(
-        "[discuss room={} round={}/{} host={}]\nTopic: {}\n\nYou are a participant in this discussion. Send ONE reply with the talk_send tool: to_session=\"{}\" room=\"{}\". Keep it to your own viewpoint plus direct responses to others (no pleasantries). If talk_send is not in your tool list, call enable_tools for it first.",
+        "[discuss room={} round={}/{} host={}]\n{skills_lines}Topic: {}\n\nYou are a participant in this discussion. Send ONE reply with the talk_send tool: to_session=\"{}\" room=\"{}\". Keep it to your own viewpoint plus direct responses to others (no pleasantries). If talk_send is not in your tool list, call enable_tools for it first.",
         state.room,
         state.round,
         state.max_rounds,
@@ -290,11 +307,16 @@ pub(crate) fn start_room(
     }
     let use_explicit = !req.members.is_empty();
     if use_explicit && req.member_count.is_some() {
-        return Err("pass either members or member_count, not both".to_string());
+        return Err(format!(
+            "pass either members or member_count, not both (received {} members and member_count={})",
+            req.members.len(),
+            req.member_count.unwrap_or(0)
+        ));
     }
     if !use_explicit && req.member_count.is_none() {
-        return Err("discuss needs members (existing session ids) or member_count (auto-spawned members)"
-            .to_string());
+        return Err(format!(
+            "discuss needs members (an array of existing session ids) or member_count (an integer 1-{MAX_DISCUSS_MEMBERS}); neither was provided"
+        ));
     }
     let host = host_id(from_history_file);
     let max_rounds = req
@@ -314,7 +336,8 @@ pub(crate) fn start_room(
     let (members, roles, spawned): (Vec<String>, Vec<String>, Vec<String>) = if use_explicit {
         if req.members.len() > MAX_DISCUSS_MEMBERS {
             return Err(format!(
-                "discuss supports at most {MAX_DISCUSS_MEMBERS} members"
+                "discuss supports at most {MAX_DISCUSS_MEMBERS} members (received {})",
+                req.members.len()
             ));
         }
         let mut seen = std::collections::HashSet::new();
@@ -339,7 +362,7 @@ pub(crate) fn start_room(
         let n = req.member_count.unwrap_or(0);
         if n == 0 || n > MAX_DISCUSS_MEMBERS {
             return Err(format!(
-                "member_count must be between 1 and {MAX_DISCUSS_MEMBERS}"
+                "member_count must be between 1 and {MAX_DISCUSS_MEMBERS} (received {n})"
             ));
         }
         let room_part = sanitize_room_for_id(&room);
@@ -357,6 +380,10 @@ pub(crate) fn start_room(
         let spawned = fresh.clone();
         (fresh, roles, spawned)
     };
+    // Read the skills snapshot written by the `/discuss` command without
+    // consuming it: any failure below must leave the payload for a retry, and
+    // `clear_pending_room_skills` runs only on the success path.
+    let room_skills = talk::peek_pending_room_skills(from_history_file);
     let mut state = DiscussState {
         room: room.clone(),
         topic: topic.to_string(),
@@ -364,6 +391,7 @@ pub(crate) fn start_room(
         members,
         roles,
         spawned,
+        skills: room_skills,
         max_rounds,
         round: 1,
         status: DiscussStatus::Open,
@@ -425,6 +453,9 @@ pub(crate) fn start_room(
     )
     .map_err(|e| format!("write opening transcript: {e}"))?;
     save_state(from_history_file, &state)?;
+    // Room started: the snapshot has done its job and must not leak into a
+    // later room started without a fresh `/discuss` command.
+    talk::clear_pending_room_skills(from_history_file);
     Ok(StartOutcome { state, deliveries })
 }
 
@@ -696,7 +727,10 @@ pub(crate) fn broadcast_round(
         return Err("broadcast text must not be empty".to_string());
     }
     if state.status != DiscussStatus::Open {
-        return Err(format!("room '{}' is closed", state.room));
+        return Err(format!(
+            "room '{}' is closed; start a new room with discuss_start",
+            state.room
+        ));
     }
     if state.round >= state.max_rounds {
         return Err(format!(
@@ -1099,6 +1133,45 @@ mod tests {
     }
 
     #[test]
+    fn round_brief_renders_assigned_skills_mentions() {
+        let (dir, store, host_hist, _m1, _m2) = fixture();
+        let out = start(&store, &host_hist, "tabs vs spaces", &members(), None, Some("r-skills"))
+            .unwrap();
+        let brief = round_brief_for(&out.state, "pro");
+        assert!(!brief.contains("@skills:"), "no skills yet: {brief}");
+
+        let mut state = out.state;
+        state.skills = vec!["pro-skill".to_string(), "argue".to_string()];
+        let brief = round_brief_for(&state, "pro");
+        assert!(brief.contains("@skills:pro-skill"), "{brief}");
+        assert!(brief.contains("@skills:argue"), "{brief}");
+        assert!(
+            brief.contains("Assigned skills: pro-skill, argue"),
+            "{brief}"
+        );
+        // The role line still appends after the skills lines.
+        assert!(brief.contains("Your role in this discussion: pro"), "{brief}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn start_keeps_snapshot_on_failure_and_clears_it_on_success() {
+        let (dir, store, host_hist, _m1, _m2) = fixture();
+        // Failed start (invalid input) must leave the payload for a retry.
+        assert!(talk::write_pending_room_skills(&host_hist, &["s1".to_string()]).is_ok());
+        assert!(start(&store, &host_hist, "   ", &members(), None, None).is_err());
+        assert_eq!(talk::peek_pending_room_skills(&host_hist), vec!["s1"]);
+
+        // Successful start consumes the snapshot: the skills land in state and
+        // must not leak into a later room started without a fresh command.
+        let out = start(&store, &host_hist, "t", &members(), None, Some("t-skills-snap"))
+            .unwrap();
+        assert_eq!(out.state.skills, vec!["s1"]);
+        assert!(talk::peek_pending_room_skills(&host_hist).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn broadcast_increments_and_refuses_past_max() {
         let (dir, store, host_hist, _m1, _m2) = fixture();
         let mut state = start(&store, &host_hist, "t", &members(), Some(2), Some("r2"))
@@ -1357,7 +1430,7 @@ mod tests {
         let mut mismatch_count = spawn_req("t", 2, "r-mismatch");
         mismatch_count.roles = vec!["only-one".to_string()];
         assert!(start_room(&store, &host_hist, &mismatch_count, None).is_err());
-        let mut mismatch_explicit = StartRequest {
+        let mismatch_explicit = StartRequest {
             topic: "t".to_string(),
             members: members(),
             roles: vec!["a".to_string(), "b".to_string(), "c".to_string()],

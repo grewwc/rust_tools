@@ -1228,12 +1228,25 @@ async fn run_loop(
             // took the turn: the side-note branch wins and talk stays queued for
             // the following iteration-top drain. Draining here is lazy so mail is
             // never consumed without being delivered.
+            let mut card_skills: Vec<String> = Vec::new();
             let pending_talk_input = if pending_side_note_input.is_empty() {
-                let pending = crate::ai::driver::talk::drain_talk(&app.session_history_file);
+                let mut pending = crate::ai::driver::talk::drain_talk(&app.session_history_file);
                 if pending.is_empty() {
                     String::new()
                 } else {
                     let count = pending.len();
+                    // Room cards are host-rendered (`task_brief_for` /
+                    // `round_brief_for`); they may carry `@skills:<name>`
+                    // mentions assigned by the `/task`/`/discuss` command.
+                    // Force-activate them exactly like the CLI-args path, but
+                    // strip the mentions from the delivered text and only for
+                    // these card bodies, so arbitrary peer mail cannot force
+                    // skill activation and every delivery path shows the same
+                    // card text.
+                    for msg in &mut pending {
+                        card_skills
+                            .extend(crate::ai::driver::talk::take_room_card_skills(&mut msg.body));
+                    }
                     // Single canonical framing shared with headless
                     // `--auto-talk`: bot and human operator see byte-identical
                     // peer mail. `format_talk_messages` is unit-tested; the
@@ -1303,6 +1316,11 @@ async fn run_loop(
                     .and_then(|loader| loader.take_prompt_ready_notifier())
                 {
                     let _ = notifier.send(());
+                }
+                if !card_skills.is_empty() {
+                    app.forced_skills = card_skills;
+                    app.forced_skill_source =
+                        Some(crate::ai::types::ForcedSkillSource::RoomCard);
                 }
                 question = pending_talk_input;
                 attachments_text = String::new();

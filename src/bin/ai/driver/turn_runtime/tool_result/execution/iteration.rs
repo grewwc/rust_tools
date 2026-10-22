@@ -93,6 +93,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
         // Pre-timeout finalization is intercepted by the orchestrator before this
         // function is called; this arm is only an exhaustive-match fallback.
         IterationExecution::WrapUpFinal => Ok(TurnLoopStep::Continue),
+        // Sub-agent request-budget finalization is also intercepted by the
+        // orchestrator; this arm only keeps the match exhaustive.
+        IterationExecution::RequestDeadlineExceeded(_) => Ok(TurnLoopStep::Continue),
         IterationExecution::RequestFailed(text) => {
             *final_assistant_text = text;
             Ok(TurnLoopStep::Break)
@@ -311,9 +314,10 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 }
                 CompletionEvidenceGateAction::Warn => true,
             };
-            let warn_outstanding_work = match outstanding_work_gate_action(
+            let warn_outstanding_work = match outstanding_work_gate_action_with_turn_messages(
                 app,
                 messages,
+                turn_messages,
                 !outstanding_work_reopen_allowed,
                 iteration,
                 max_iterations,

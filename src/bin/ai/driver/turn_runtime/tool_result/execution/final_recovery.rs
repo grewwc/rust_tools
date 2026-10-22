@@ -37,6 +37,7 @@ impl FinalGateState {
             COMPLETION_EVIDENCE_REQUIRED_MARKER,
             RECOVERABLE_PAUSE_RETRY_MARKER,
             FINAL_CITATION_RETRY_MARKER,
+            OUTSTANDING_WORK_REQUIRED_MARKER,
         ]
         .iter()
         .any(|marker| current_turn_has_internal_marker(messages, marker));
@@ -72,8 +73,10 @@ impl FinalGateState {
     }
 
     pub(super) fn consume_outstanding_work_retry(&mut self) {
-        // Persistent gate: no per-turn budget to consume. Kept so the call site
-        // stays explicit about which gate fired.
+        // Outstanding work may reopen again because it has an independent
+        // structural budget, but the same reopen spends the shared quality-gate
+        // retry so later gates cannot cascade another retry onto this turn.
+        self.retry_consumed = true;
     }
 
     pub(super) fn no_tool_retry_consumed(&self) -> bool {

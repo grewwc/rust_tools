@@ -351,6 +351,9 @@ pub(super) enum ForcedSkillSource {
     SkillsCommandInline,
     SkillsCommandNextTurn,
     InlineReference,
+    /// Skills assigned by a host-rendered task/discuss room card delivered
+    /// through the talk inbox (see `driver/task.rs` and `driver/discuss.rs`).
+    RoomCard,
 }
 
 impl ForcedSkillSource {
@@ -359,6 +362,7 @@ impl ForcedSkillSource {
             Self::SkillsCommandInline => "/skills-inline",
             Self::SkillsCommandNextTurn => "/skills-next-turn",
             Self::InlineReference => "@skills",
+            Self::RoomCard => "room-card",
         }
     }
 }

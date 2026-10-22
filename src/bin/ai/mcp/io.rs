@@ -115,6 +115,14 @@ pub(super) fn read_line_with_timeout_buf<R: std::io::Read>(
         if tool_cancel_requested() {
             return Err(tool_cancel_error());
         }
+        // Enforce the deadline even while data keeps arriving. The WouldBlock
+        // arm below checks it too, but a server that trickles a response line
+        // out in many small writes (e.g. a very large single-line response)
+        // would otherwise never reach that arm and could hold the caller past
+        // the configured request timeout indefinitely.
+        if Instant::now() >= deadline {
+            return Err(format!("MCP response timeout after {} ms", timeout_ms));
+        }
 
         // 先尝试从 BufReader 内部缓冲区读取。
         // 当之前 fill_buf 已将多行数据读入内部缓冲区时（例如

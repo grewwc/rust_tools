@@ -1,6 +1,6 @@
 use colored::Colorize;
 
-use crate::ai::{driver::discuss, history::SessionStore, types::App};
+use crate::ai::{driver::{discuss, talk}, history::SessionStore, types::App};
 
 use super::{apply_embedded_skills, split_combined_command};
 
@@ -136,9 +136,21 @@ pub fn try_handle_discuss_command(
             topic,
             member_count,
         } => {
+            let store = SessionStore::new(app.config.history_file.as_path());
+            // Per-session history file: the room-start consumer resolves the
+            // snapshot from this same path, so both sides agree on
+            // `<sessions_root>/<id>.assets/pending-room-skills.json`.
+            let history_file = store.session_history_file(&app.session_id);
             let prompt = build_discuss_host_prompt(&topic, member_count);
             app.forced_question = Some(prompt);
             apply_embedded_skills(app, &embedded, true);
+            // Snapshot the skills selected for this command (embedded lines or
+            // an earlier `/skills` pick) so the room started during the host
+            // turn can propagate them to its members. Always writes: an empty
+            // list clears a stale snapshot from an earlier command.
+            if let Err(error) = talk::write_pending_room_skills(&history_file, &app.forced_skills) {
+                println!("{} {error}", "[discuss]".red());
+            }
             println!(
                 "{} Hosting a discussion with {} members. Topic: {}",
                 "[discuss]".cyan().bold(),
@@ -293,7 +305,12 @@ mod tests {
             config: crate::ai::types::AppConfig {
                 api_key: String::new(),
                 base_history_file: std::path::PathBuf::new(),
-                history_file: std::path::PathBuf::new(),
+                // Real path so the pending-room-skills snapshot (and any other
+                // asset write) lands in the OS temp dir, never relative to
+                // cwd. Module-unique name: the task command tests use their
+                // own file, and the two `start_snapshots` tests race the same
+                // pending-skills file when they share a path.
+                history_file: std::env::temp_dir().join("a-commands-discuss-test.sqlite"),
                 endpoint: String::new(),
                 vl_default_model: String::new(),
                 history_max_chars: 8000,
@@ -357,6 +374,30 @@ mod tests {
                 Some(ForcedSkillSource::SkillsCommandInline)
             );
         }
+    }
+
+    #[test]
+    fn start_snapshots_skills_to_the_pending_file() {
+        // Combined send: the selected skills land in the pending file so the
+        // room started during the host turn can propagate them to members.
+        let mut app = test_app();
+        assert!(
+            try_handle_discuss_command(&mut app, "/skills use s1 s2\n/discuss tabs vs spaces")
+                .unwrap()
+        );
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let history_file = store.session_history_file(&app.session_id);
+        let pending = crate::ai::driver::talk::peek_pending_room_skills(&history_file);
+        assert_eq!(pending, vec!["s1", "s2"]);
+
+        // A plain start with no skills clears the snapshot instead of leaving
+        // a stale payload for a later room.
+        let mut app = test_app();
+        assert!(try_handle_discuss_command(&mut app, "/discuss tabs vs spaces").unwrap());
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let history_file = store.session_history_file(&app.session_id);
+        let pending = crate::ai::driver::talk::peek_pending_room_skills(&history_file);
+        assert!(pending.is_empty());
     }
 
     #[test]

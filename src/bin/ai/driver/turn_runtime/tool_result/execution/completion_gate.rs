@@ -80,6 +80,12 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
         };
 
         let tool_succeeded = completion_tool_result_succeeded(&message.content);
+        // `complete` is only a structured assertion. Treating its receipt as
+        // post-mutation activity would let the required handshake erase the
+        // separate evidence gate's missing-verification warning.
+        if tool_call.function.name == "complete" {
+            continue;
+        }
         if tool_call.function.name == "execute_command" {
             let effects = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
                 .ok()
@@ -346,7 +352,7 @@ pub(in crate::ai::driver::turn_runtime) enum RecoverablePauseGateAction {
 /// text in this repository, so a `read_file`/`grep` result can quote them
 /// verbatim. Every reply `rejection.rs` builds is an error result, and an error
 /// result always starts with `Error: ` — file and command output does not.
-fn is_recoverable_pause_reply(text: &str) -> bool {
+pub(super) fn is_recoverable_pause_reply(text: &str) -> bool {
     text.starts_with("Error: ")
         && (text.contains(SCOPED_INSTRUCTIONS_PAUSE_PREFIX)
             || text.contains(PATCH_RETRY_PAUSE_PREFIX))

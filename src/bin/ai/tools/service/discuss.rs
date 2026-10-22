@@ -9,6 +9,7 @@
 // never be replayed).
 use serde_json::Value;
 
+use super::{arg_bool, arg_str, arg_string_list, arg_u64};
 use crate::ai::{
     driver::{discuss, talk},
     history::SessionStore,
@@ -22,58 +23,6 @@ fn current_ctx() -> Result<(SessionStore, std::path::PathBuf), String> {
     let store = SessionStore::new(&ctx.app_proto.config.history_file);
     let history_file = ctx.app_proto.session_history_file.clone();
     Ok((store, history_file))
-}
-
-fn arg_str<'a>(args: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter()
-        .filter_map(|k| args.get(*k))
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .find(|s| !s.is_empty())
-}
-
-fn arg_members(args: &Value) -> Option<Vec<String>> {
-    let arr = args.get("members")?.as_array()?;
-    let out: Vec<String> = arr
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    if out.is_empty() { None } else { Some(out) }
-}
-
-/// Optional per-member roles, positionally aligned with `members` (or with the
-/// auto-spawned members for `member_count`). Empty entries are kept — an empty
-/// role means "no assigned stance", so filtering would break alignment.
-fn arg_roles(args: &Value) -> Vec<String> {
-    for k in ["roles", "stances"] {
-        if let Some(arr) = args.get(k).and_then(Value::as_array) {
-            return arr
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|s| s.trim().to_string())
-                .collect();
-        }
-    }
-    Vec::new()
-}
-
-fn arg_u64(args: &Value, keys: &[&str]) -> Option<u64> {
-    for k in keys {
-        if let Some(v) = args.get(*k) {
-            if let Some(n) = v.as_u64() {
-                return Some(n);
-            }
-            if let Some(s) = v.as_str()
-                && let Ok(n) = s.trim().parse::<u64>()
-            {
-                return Some(n);
-            }
-        }
-    }
-    None
 }
 
 fn format_replies(replies: &[talk::TalkMessage]) -> String {
@@ -91,16 +40,43 @@ fn format_replies(replies: &[talk::TalkMessage]) -> String {
 /// ToolSpec adapter: `ToolSpec.execute` returns model-visible text directly;
 /// `ToolResult` wrapping is done by the registry path.
 pub(crate) fn execute_discuss_start(args: &Value) -> Result<String, String> {
-    let topic = arg_str(args, &["topic", "question", "subject"])
+    let topic = arg_str(args, &["topic", "question", "subject"])?
         .ok_or_else(|| "topic must not be empty (the question to argue)".to_string())?;
     // Exactly one of `members` (existing sessions) or `member_count`
-    // (host-owned auto-spawn); `start_room` enforces the either/or.
-    let members = arg_members(args).unwrap_or_default();
-    let member_count =
-        arg_u64(args, &["member_count", "count", "members_count", "n"]).map(|n| n as usize);
-    let roles = arg_roles(args);
-    let max_rounds = arg_u64(args, &["max_rounds", "rounds"]).map(|n| n as u32);
-    let room = arg_str(args, &["room"]).map(str::to_string);
+    // (host-owned auto-spawn); `start_room` enforces the either/or. Surface
+    // the violation here, before parsing `members`: a caller that passes both
+    // (e.g. an empty `members` placeholder next to `member_count`) would
+    // otherwise get a confusing "members[0] must not be empty" that hides the
+    // real problem.
+    let member_count = arg_u64(
+        args,
+        &["member_count", "count", "members_count", "n"],
+        1,
+        discuss::MAX_DISCUSS_MEMBERS as u64,
+    )?
+    .map(|n| n as usize);
+    let members_provided = match args.get("members") {
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(value) => !value.is_null(),
+        None => false,
+    };
+    if member_count.is_some() && members_provided {
+        return Err(
+            "pass either members (existing session ids) or member_count (auto-spawned sessions), not both"
+                .to_string(),
+        );
+    }
+    let members = arg_string_list(args, &["members"], "members", true)?.unwrap_or_default();
+    let roles =
+        arg_string_list(args, &["roles", "stances"], "roles", false)?.unwrap_or_default();
+    let max_rounds = arg_u64(
+        args,
+        &["max_rounds", "rounds"],
+        1,
+        discuss::MAX_DISCUSS_ROUNDS as u64,
+    )?
+    .map(|n| n as u32);
+    let room = arg_str(args, &["room"])?.map(str::to_string);
 
     let (store, history_file) = current_ctx()?;
     let req = discuss::StartRequest {
@@ -134,17 +110,27 @@ pub(crate) fn execute_discuss_start(args: &Value) -> Result<String, String> {
 }
 
 pub(crate) fn execute_discuss_collect(args: &Value) -> Result<String, String> {
-    let room = arg_str(args, &["room"])
+    let room = arg_str(args, &["room"])?
         .ok_or_else(|| "room must not be empty (from discuss_start)".to_string())?;
+    let timeout = arg_u64(
+        args,
+        &["timeout_secs", "timeout"],
+        discuss::MIN_COLLECT_TIMEOUT_SECS,
+        discuss::MAX_COLLECT_TIMEOUT_SECS,
+    )?
+    .unwrap_or(discuss::DEFAULT_COLLECT_TIMEOUT_SECS);
+    let wake = arg_bool(args, "wake", true)?;
     let (store, history_file) = current_ctx()?;
     let mut state = discuss::load_state(&history_file, room)?;
     if state.status != discuss::DiscussStatus::Open {
-        return Err(format!("room '{}' is closed", state.room));
+        return Err(format!(
+            "room '{}' is closed; start a new room with discuss_start",
+            state.room
+        ));
     }
     let round = state.round;
     // Wake pass first: inactive members that have not been woken this round
     // get a headless one-shot; their replies land in the host inbox below.
-    let wake = args.get("wake").and_then(Value::as_bool).unwrap_or(true);
     let mut wake_notes = Vec::new();
     if wake {
         for m in state.members.clone() {
@@ -158,7 +144,6 @@ pub(crate) fn execute_discuss_collect(args: &Value) -> Result<String, String> {
         // idempotence optimization, not truth.
         let _ = discuss::save_state(&history_file, &state);
     }
-    let timeout = arg_u64(args, &["timeout_secs", "timeout"]).unwrap_or(discuss::DEFAULT_COLLECT_TIMEOUT_SECS);
     // Replies are already in the transcript: collect_round appends every
     // newly drained reply before the next poll, so a killed wait loses
     // nothing already drained.
@@ -167,7 +152,7 @@ pub(crate) fn execute_discuss_collect(args: &Value) -> Result<String, String> {
     // dead wake marks so silent inactive members are re-woken on retry.
     discuss::release_dead_wakes(&history_file, &mut state, &out.missing);
     let mut s = format!(
-        "Room '{}' round {}/{} collect: {} replie(s), {} missing.\n",
+        "Room '{}' round {}/{} collect: {} reply(ies), {} missing.\n",
         state.room,
         round,
         state.max_rounds,
@@ -196,9 +181,9 @@ pub(crate) fn execute_discuss_collect(args: &Value) -> Result<String, String> {
 }
 
 pub(crate) fn execute_discuss_broadcast(args: &Value) -> Result<String, String> {
-    let room = arg_str(args, &["room"])
+    let room = arg_str(args, &["room"])?
         .ok_or_else(|| "room must not be empty (from discuss_start)".to_string())?;
-    let text = arg_str(args, &["text", "message", "prompt"])
+    let text = arg_str(args, &["text", "message", "prompt"])?
         .ok_or_else(|| "text must not be empty (round summary plus next prompt)".to_string())?;
     let (store, history_file) = current_ctx()?;
     let mut state = discuss::load_state(&history_file, room)?;
@@ -215,9 +200,9 @@ pub(crate) fn execute_discuss_broadcast(args: &Value) -> Result<String, String> 
 }
 
 pub(crate) fn execute_discuss_end(args: &Value) -> Result<String, String> {
-    let room = arg_str(args, &["room"])
+    let room = arg_str(args, &["room"])?
         .ok_or_else(|| "room must not be empty (from discuss_start)".to_string())?;
-    let summary = arg_str(args, &["summary", "conclusion", "text"])
+    let summary = arg_str(args, &["summary", "conclusion", "text"])?
         .ok_or_else(|| "summary must not be empty (the meeting conclusion)".to_string())?;
     let (_, history_file) = current_ctx()?;
     let mut state = discuss::load_state(&history_file, room)?;
@@ -240,11 +225,69 @@ pub(crate) fn execute_discuss_end(args: &Value) -> Result<String, String> {
 /// and the transcript tail. Never wakes members or drains the inbox, so it is
 /// safe to call any time — including right after resuming the host session.
 pub(crate) fn execute_discuss_status(args: &Value) -> Result<String, String> {
-    let room = arg_str(args, &["room"])
+    let room = arg_str(args, &["room"])?
         .ok_or_else(|| "room must not be empty (from discuss_start)")?;
     let (_, history_file) = current_ctx()?;
     let st = discuss::room_status(&history_file, room)?;
     // Formatting is shared with the `/discuss status` local command so both
     // surfaces read identically; see `driver::discuss::format_room_status`.
     Ok(discuss::format_room_status(&st))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::execute_discuss_start;
+
+    #[test]
+    fn invalid_arg_member_count_is_reported() {
+        let err = execute_discuss_start(&json!({"topic": "t", "member_count": 2.5})).unwrap_err();
+        assert!(err.contains("member_count"), "{err}");
+        assert!(err.contains("received 2.5"), "{err}");
+    }
+
+    #[test]
+    fn integral_member_count_is_not_treated_as_missing() {
+        let err = execute_discuss_start(&json!({"topic": "t", "member_count": 2.0})).unwrap_err();
+        assert!(err.contains("active driver context"), "{err}");
+        assert!(!err.contains("needs members"), "{err}");
+    }
+
+    #[test]
+    fn invalid_arg_roles_type_is_reported() {
+        let err = execute_discuss_start(
+            &json!({"topic": "t", "members": ["m"], "roles": "pro"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("roles must be an array of strings"), "{err}");
+    }
+
+    #[test]
+    fn both_members_and_member_count_are_rejected_with_a_clear_error() {
+        // The observed production failure: an empty `members` placeholder next
+        // to `member_count` must report the either/or violation, not a
+        // confusing per-item "members[0] must not be empty".
+        let err =
+            execute_discuss_start(&json!({"topic": "t", "member_count": 3, "members": [""]}))
+                .unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+        assert!(!err.contains("members[0]"), "{err}");
+    }
+
+    #[test]
+    fn empty_members_item_is_still_rejected_without_member_count() {
+        let err = execute_discuss_start(&json!({"topic": "t", "members": [""]})).unwrap_err();
+        assert!(err.contains("members[0] must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn empty_members_array_with_member_count_is_not_a_both_error() {
+        // An empty members array counts as absent (same as arg_string_list and
+        // the driver's `use_explicit`), so member_count alone stays valid.
+        let err =
+            execute_discuss_start(&json!({"topic": "t", "member_count": 2, "members": []}))
+                .unwrap_err();
+        assert!(!err.contains("not both"), "{err}");
+    }
 }

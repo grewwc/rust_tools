@@ -26,7 +26,7 @@ use super::{
     iteration::{
         execute_turn_iteration, finish_interrupted_turn, refresh_skill_turn_for_iteration,
     },
-    persistence::persist_pending_turn_messages,
+    persistence::{persist_pending_turn_messages, persist_pending_turn_messages_for_model},
     prepare::prepare_turn,
     turn_signals::{SignalKind, TurnSignalBudget},
     tool_result::{
@@ -37,6 +37,13 @@ use super::{
     },
     types::{IterationExecution, TurnLoopStep, TurnOutcome, TurnPreparation},
 };
+
+/// Final text when a sub-agent's request budget expires before either the original
+/// request or its wrap-up round produced visible output.
+const SUBAGENT_REQUEST_BUDGET_EMPTY_RESULT: &str =
+    "[subagent-request-budget] The model request exceeded its wall-clock budget before \
+     producing a final answer. No verified conclusions were returned; inspect the persisted \
+     sub-agent history for partial evidence.";
 
 /// Tool-call loop detection windows:
 /// - soft: 4 consecutive rounds with an identical (tool_name, normalized_args) pair trigger a
@@ -986,7 +993,7 @@ pub(in crate::ai::driver) async fn run_turn(
     mcp_client: &SharedMcpClient,
     skill_manifests: &[crate::ai::skills::SkillManifest],
     history_count: usize,
-    question: String,
+    mut question: String,
     attachments_text: String,
     next_model: String,
     precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
@@ -1015,11 +1022,11 @@ pub(in crate::ai::driver) async fn run_turn(
     app.fire_turn_start_hooks(turn_index);
 
     let result = (async {
-        // `/audit` is a synchronous subagent call directly requested by the user. It must be handled
-        // after the parent DRIVER_CTX is established but before the child agent enters a recursive
-        // turn, so that the task's isolation and evidence lifecycle can be reused.
-        // `/audit` / `/audit -f` without an instruction is NOT short-circuited: the audit scope
-        // is left to the lead agent, which must generate the audit content itself in a normal
+        // `/audit` with an instruction runs the audit subagent synchronously, then
+        // auto-fixes by default: the same turn continues in the normal model loop
+        // with the audit report as the fix prompt. `/audit` / `/audit -f` without
+        // an instruction is NOT short-circuited: the audit scope is left to the
+        // lead agent, which must generate the audit content itself in a normal
         // turn (the note is injected in run_turn_body). Subagents (depth > 0) never match.
         let self_generated_audit =
             if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0 {
@@ -1027,7 +1034,29 @@ pub(in crate::ai::driver) async fn run_turn(
                     Some(crate::ai::driver::commands::audit::AuditCommand::SelfGenerated {
                         fast,
                     }) => Some(fast),
-                    Some(command) => return Ok(execute_audit_command(app, command, should_quit)),
+                    Some(
+                        crate::ai::driver::commands::audit::AuditCommand::Run {
+                            instruction,
+                            fast,
+                        },
+                    ) => match run_audit_subagent(app, &instruction, fast) {
+                        Some(report) => {
+                            question =
+                                crate::ai::driver::commands::audit::build_audit_fix_followup(
+                                    &instruction,
+                                    &report,
+                                );
+                            None
+                        }
+                        // Subagent failed to start: nothing to fix, end the turn.
+                        None => {
+                            return Ok(if should_quit {
+                                TurnOutcome::Quit
+                            } else {
+                                TurnOutcome::Continue
+                            })
+                        }
+                    },
                     None => None,
                 }
             } else {
@@ -1107,73 +1136,67 @@ pub(in crate::ai::driver) async fn run_turn(
     result
 }
 
-fn execute_audit_command(
-    app: &App,
-    command: crate::ai::driver::commands::audit::AuditCommand,
-    should_quit: bool,
-) -> TurnOutcome {
-    match command {
-        // run_turn intercepts SelfGenerated before calling this function; keep the arm only for
-        // match exhaustiveness.
-        crate::ai::driver::commands::audit::AuditCommand::SelfGenerated { .. } => {
-            unreachable!("SelfGenerated is handled in run_turn, never reaches execute_audit_command")
-        }
-        crate::ai::driver::commands::audit::AuditCommand::Run { instruction, fast } => {
-            // By default only cwd/skills are inherited, keeping unrelated parent conversation and
-            // memory out of the audit task. But the subagent cannot see the parent conversation at
-            // all, so it must be told explicitly what the main agent has changed: several
-            // requirements are often modified in parallel, and only by seeing the current workspace
-            // diff can the subagent judge which changes belong to this audit.
-            let prompt = crate::ai::driver::commands::audit::build_audit_prompt(&instruction);
-            let description = if fast {
-                format!("/audit --fast {instruction}")
-            } else {
-                format!("/audit {instruction}")
-            };
-            // fast mode: the audit-fast agent (fewer steps) carries the lightweight audit contract;
-            // the model is pinned to the current session model (bypassing the automatic tier bump
-            // from prompt-difficulty classification) and thinking is pinned to high; the timeout
-            // shrinks accordingly.
-            let agent_name = if fast { "audit-fast" } else { "audit" };
-            let (hard_timeout, wrap_up_lead_time) = if fast {
-                (
-                    crate::ai::driver::commands::audit::FAST_AUDIT_SUBAGENT_HARD_TIMEOUT,
-                    Some(crate::ai::driver::commands::audit::FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME),
-                )
-            } else {
-                (
-                    crate::ai::driver::commands::audit::AUDIT_SUBAGENT_HARD_TIMEOUT,
-                    Some(crate::ai::driver::commands::audit::AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME),
-                )
-            };
-            let mut args = serde_json::json!({
-                "description": description,
-                "prompt": prompt,
-                "agent": agent_name,
-            });
-            if fast {
-                args["model"] = serde_json::Value::String(app.current_model.clone());
-                args["reasoning_effort"] = serde_json::Value::String("high".to_string());
-            }
-            match crate::ai::driver::tools::execute_direct_subagent_task(
-                "slash-audit",
-                &args,
-                hard_timeout,
-                wrap_up_lead_time,
-            ) {
-                Ok(result) => println!(
-                    "\n{}",
-                    crate::ai::driver::commands::audit::terminal_audit_result(&result.content)
-                ),
-                Err(error) => println!("\n[audit] Unable to start audit subagent: {error}"),
-            }
-        }
-    }
-
-    if should_quit {
-        TurnOutcome::Quit
+/// Run the audit subagent synchronously and print its terminal report.
+/// Returns the full report for the lead-agent fix loop, or `None` when the
+/// subagent could not start (nothing to fix). `/audit` auto-fixes by default:
+/// the caller feeds the returned report into the normal model loop instead of
+/// ending the turn.
+fn run_audit_subagent(app: &App, instruction: &str, fast: bool) -> Option<String> {
+    // By default only cwd/skills are inherited, keeping unrelated parent conversation and
+    // memory out of the audit task. But the subagent cannot see the parent conversation at
+    // all, so it must be told explicitly what the main agent has changed: several
+    // requirements are often modified in parallel, and only by seeing the current workspace
+    // diff can the subagent judge which changes belong to this audit.
+    let prompt = crate::ai::driver::commands::audit::build_audit_prompt(instruction);
+    let description = if fast {
+        format!("/audit --fast {instruction}")
     } else {
-        TurnOutcome::Continue
+        format!("/audit {instruction}")
+    };
+    // fast mode: the audit-fast agent (fewer steps) carries the lightweight audit contract;
+    // the model is pinned to the current session model (bypassing the automatic tier bump
+    // from prompt-difficulty classification) and thinking is pinned to high; the timeout
+    // shrinks accordingly.
+    let agent_name = if fast { "audit-fast" } else { "audit" };
+    let (hard_timeout, wrap_up_lead_time) = if fast {
+        (
+            crate::ai::driver::commands::audit::FAST_AUDIT_SUBAGENT_HARD_TIMEOUT,
+            Some(crate::ai::driver::commands::audit::FAST_AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME),
+        )
+    } else {
+        (
+            crate::ai::driver::commands::audit::AUDIT_SUBAGENT_HARD_TIMEOUT,
+            Some(crate::ai::driver::commands::audit::AUDIT_SUBAGENT_WRAP_UP_LEAD_TIME),
+        )
+    };
+    let mut args = serde_json::json!({
+        "description": description,
+        "prompt": prompt,
+        "agent": agent_name,
+    });
+    if fast {
+        args["model"] = serde_json::Value::String(app.current_model.clone());
+        args["reasoning_effort"] = serde_json::Value::String("high".to_string());
+    }
+    match crate::ai::driver::tools::execute_direct_subagent_task(
+        "slash-audit",
+        &args,
+        hard_timeout,
+        wrap_up_lead_time,
+    ) {
+        Ok(result) => {
+            println!(
+                "\n{}",
+                crate::ai::driver::commands::audit::terminal_audit_result(&result.content)
+            );
+            Some(crate::ai::driver::commands::audit::audit_report_for_fix(
+                &result.content,
+            ))
+        }
+        Err(error) => {
+            println!("\n[audit] Unable to start audit subagent: {error}");
+            None
+        }
     }
 }
 
@@ -1563,6 +1586,60 @@ async fn run_turn_body(
             inject_subagent_pre_timeout_wrap_up_note(&mut messages);
             continue 'turn;
         }
+        // A sub-agent model request that runs past its wall-clock budget is cut by
+        // the iteration layer. Spend one no-tool wrap-up round on the evidence
+        // already collected; if that round also expires, report the partial text
+        // instead of issuing another request.
+        let execution = match execution {
+            IterationExecution::RequestDeadlineExceeded(partial) => {
+                if force_final_response {
+                    let mut partial = partial;
+                    if partial.assistant_text.trim().is_empty() {
+                        partial.assistant_text = SUBAGENT_REQUEST_BUDGET_EMPTY_RESULT.to_string();
+                    }
+                    IterationExecution::FinalResponse(partial)
+                } else {
+                    // The parent's pre-timeout signal and this budget express the
+                    // same intent; consume it so the next iteration does not inject
+                    // a second wrap-up note.
+                    let _ = crate::ai::driver::runtime_ctx::take_subagent_wrap_up_request();
+                    pre_timeout_wrap_up_requested = true;
+                    record_force_final_reason(
+                        &mut messages,
+                        "subagent_model_request_deadline",
+                        iteration,
+                        None,
+                    );
+                    force_final_response = true;
+                    // Keep text that arrived before the cutoff (audit checkpoints,
+                    // partial reports): the wrap-up round must see it.
+                    if !partial.assistant_text.trim().is_empty() {
+                        let assistant_message = history::Message {
+                            role: "assistant".to_string(),
+                            content: serde_json::Value::String(partial.assistant_text),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            reasoning_content: None,
+                        };
+                        messages.push(assistant_message.clone());
+                        turn_messages.push(assistant_message);
+                        // Persist before the wrap-up request: if the parent's hard timeout
+                        // aborts this sub-agent mid-request, recovery reads only the
+                        // persisted history and would otherwise lose the partial output.
+                        persist_pending_turn_messages_for_model(
+                            app,
+                            response_model.as_deref().unwrap_or(&app.current_model),
+                            one_shot_mode,
+                            &turn_messages,
+                            &mut persisted_turn_messages,
+                        );
+                    }
+                    inject_subagent_request_budget_wrap_up_note(&mut messages);
+                    continue 'turn;
+                }
+            }
+            other => other,
+        };
         let was_final_response = matches!(&execution, IterationExecution::FinalResponse(_));
         let had_tool_call_execution = matches!(&execution, IterationExecution::ToolCall(_));
         // Piggyback collection: while the image digest is unresolved, cache this round's
@@ -2479,7 +2556,9 @@ async fn run_turn_body(
                     "[image] backfilled {backfilled_digests} image digest(s) into history metadata"
                 );
             }
-            match finalize_turn(
+            // `?` (not `match`) so the boxed error never lives across the
+            // forced-audit fix `await` below (`Box<dyn Error>` is not `Send`).
+            let outcome = finalize_turn(
                 app,
                 &next_model,
                 output.response_model.as_deref().unwrap_or(&next_model),
@@ -2494,38 +2573,60 @@ async fn run_turn_body(
                 should_quit,
                 output.had_tool_error,
             )
-            .await
+            .await?;
+            // Self-generated `/audit` enforcement: the injected note tells the lead agent
+            // to start the audit subagent itself through the task tool. If the turn ended
+            // without that (and was not interrupted), force a synchronous `/audit` with
+            // this turn's final text as the instruction, so the audit always runs in a
+            // subagent instead of silently degrading to a lead-agent self-audit.
+            if let Some(fast) = self_generated_audit
+                && !app.last_turn_interrupted
+                && !crate::ai::driver::commands::audit::turn_spawned_audit_subagent(
+                    turn_messages.as_slice(),
+                )
             {
-                Ok(outcome) => {
-                    // Self-generated `/audit` enforcement: the injected note tells the lead agent
-                    // to start the audit subagent itself through the task tool. If the turn ended
-                    // without that (and was not interrupted), force a synchronous `/audit` with
-                    // this turn's final text as the instruction, so the audit always runs in a
-                    // subagent instead of silently degrading to a lead-agent self-audit.
-                    if let Some(fast) = self_generated_audit
-                        && !app.last_turn_interrupted
-                        && !crate::ai::driver::commands::audit::turn_spawned_audit_subagent(
-                            turn_messages.as_slice(),
-                        )
-                    {
-                        println!(
-                            "\n[audit] The lead agent did not start an audit subagent this turn; \
-                             forcing `/audit{}` with this turn's output as the audit instruction.",
-                            if fast { " --fast" } else { "" }
-                        );
-                        return Ok(execute_audit_command(
+                println!(
+                    "\n[audit] The lead agent did not start an audit subagent this turn; \
+                     forcing `/audit{}` with this turn's output as the audit instruction.",
+                    if fast { " --fast" } else { "" }
+                );
+                // Forced audit also auto-fixes by default: run the audit
+                // subagent, then continue the same turn with the report
+                // as the fix prompt.
+                let instruction = output.assistant_text.clone();
+                match run_audit_subagent(app, &instruction, fast) {
+                    Some(report) => {
+                        let fix_question =
+                            crate::ai::driver::commands::audit::build_audit_fix_followup(
+                                &instruction,
+                                &report,
+                            );
+                        return Box::pin(run_turn_body(
                             app,
-                            crate::ai::driver::commands::audit::AuditCommand::Run {
-                                instruction: output.assistant_text.clone(),
-                                fast,
-                            },
+                            mcp_client,
+                            skill_manifests,
+                            history_count,
+                            turn_index,
+                            fix_question,
+                            attachments_text.clone(),
+                            next_model.clone(),
+                            None,
+                            one_shot_mode,
+                            None,
                             should_quit,
-                        ));
+                        ))
+                        .await;
                     }
-                    Ok(outcome)
+                    None => {
+                        return Ok(if should_quit {
+                            TurnOutcome::Quit
+                        } else {
+                            TurnOutcome::Continue
+                        })
+                    }
                 }
-                Err(error) => Err(error),
             }
+            Ok(outcome)
         }
         Err(err_str) => Err(err_str.into()),
     }
