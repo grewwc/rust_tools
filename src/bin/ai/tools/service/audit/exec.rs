@@ -617,7 +617,11 @@ pub(crate) fn validate_pattern_kill(
 /// Run `pgrep [filters] <pattern>` and return the matched pids. Exit status
 /// 0 = matched, 1 = no match (empty set, nothing to kill), anything else is a
 /// resolution failure that fails closed.
-fn resolve_pattern_pids(
+///
+/// `pub(super)`: the kill-target unit tests call it to prove that a test
+/// pattern really resolves to a live process — an unmatched pattern would
+/// pass `validate_pattern_kill` vacuously.
+pub(super) fn resolve_pattern_pids(
     filters: &[String],
     pattern: &str,
     program: &str,

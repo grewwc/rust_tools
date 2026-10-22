@@ -1087,6 +1087,24 @@ mod kill_target_tests {
         words.iter().map(|w| w.to_string()).collect()
     }
 
+    /// Escape extended-regular-expression metacharacters so a literal string
+    /// (e.g. an argv element) matches only itself when used as a `pgrep -f`
+    /// pattern. Paths may legally contain `.`, `+`, `[`, etc.; without
+    /// escaping those would widen the match to unrelated processes.
+    fn escape_regex_literal(s: &str) -> String {
+        let mut escaped = String::with_capacity(s.len());
+        for ch in s.chars() {
+            if matches!(
+                ch,
+                '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+            ) {
+                escaped.push('\\');
+            }
+            escaped.push(ch);
+        }
+        escaped
+    }
+
     // Kill validation is session-scoped: register the fake/real pgids under a
     // dedicated session id and validate against it, so tests never depend on
     // a live DRIVER_CTX and never touch other tests' entries.
@@ -1199,21 +1217,60 @@ mod kill_target_tests {
 
     #[test]
     fn pkill_matching_registered_process_is_allowed() {
-        // Kill the test process itself by its exact executable path: register
-        // its pgid, then `pkill -f <binary path>` must pass verification.
+        // `pkill -f` is allowed when every process its pattern matches was
+        // started by this agent session. The target is a process this test
+        // spawns rather than the test process itself: `pgrep` never matches
+        // its own parent, so a pattern built from this process's own command
+        // line would resolve to nothing at all.
+        //
+        // The child carries a unique marker in its command line, so the
+        // pattern matches exactly that one process. A bare `pkill -f <binary
+        // path>` would instead match every process whose command line
+        // contains that path — including orphans leaked by earlier test
+        // runs, which are not registered and are rightly refused as external
+        // processes — so the outcome would depend on what else happens to be
+        // running on the machine.
+        use std::os::unix::process::CommandExt as _;
+        // The timestamp keeps the marker unique per run, so a leftover target
+        // from an earlier run cannot be matched again after the pid is reused.
+        let marker = format!(
+            "a-kill-target-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        );
+        let mut target = std::process::Command::new("sleep")
+            .arg0(&marker)
+            .arg("10")
+            .spawn()
+            .expect("spawn the pattern target");
+        let target_pid = target.id();
+        // The child inherits this process's process group, so registering that
+        // pgid makes the child a target this session owns.
         let pgid = process_group_of(std::process::id()).expect("ps must resolve the test pgid");
         process_registry::register(TEST_SESSION, pgid);
-        let binary = std::env::current_exe()
-            .expect("test binary path")
-            .to_string_lossy()
-            .to_string();
+        let pattern = escape_regex_literal(&marker);
+        // Non-vacuous guard: an unmatched pattern would let the validator
+        // return Ok (pkill with no matches signals nothing), so assert the
+        // pattern really resolves to the target before exercising the
+        // validator, proving the "hits a registered process" semantics.
+        let matched = super::exec::resolve_pattern_pids(&["-f".to_string()], &pattern, "pkill")
+            .expect("pgrep must resolve the pattern");
+        assert!(
+            matched.contains(&target_pid),
+            "pattern must resolve to the spawned target, got: {matched:?}; pattern: {pattern}"
+        );
         validate_pattern_kill(
-            &tokens(&["pkill", "-f", &binary]),
+            &tokens(&["pkill", "-f", &pattern]),
             TEST_SESSION,
             "pkill",
             PgrepMode::Pkill,
         )
         .unwrap();
+        let _ = target.kill();
+        let _ = target.wait();
     }
 
     #[test]
