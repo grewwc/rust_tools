@@ -1011,7 +1011,7 @@ mod tests {
             }
             Err(e) => {
                 assert!(
-                    e.contains("无可导出变更"),
+                    e.contains("无可导出的变更"),
                     "无活动会话时不得报缺少会话错误，实际: {e}"
                 );
             }
