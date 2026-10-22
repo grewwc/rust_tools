@@ -55,6 +55,12 @@ make install-all
 a --serve-restart
 ```
 
+`a --serve-restart` run from inside a serve turn is *deferred*: a detached
+helper waits for the turn to finish (at most 30 min, then it gives up) and
+restarts afterwards, so the restart cannot be confirmed in the same turn.
+Verify it later with `a --serve-status` plus the daemon's `/proc/<pid>/exe`
+hash. Read `src/bin/ai/serve/AGENTS.md` before restarting from a turn.
+
 ## Global Engineering Rules
 
 1. **Module boundaries**: `pub(super)` / `pub(crate)`.

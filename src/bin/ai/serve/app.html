@@ -1261,6 +1261,13 @@ function renderMarkdown(src, allowPreviews) {
   return out.join("");
 }
 
+// A long reply costs more to render and to lay out, so a long reply is
+// painted less often. Repainting the whole reply every 50ms is what made the
+// page feel stuck while a long answer was arriving.
+function replyPaintDelay(length) {
+  return length < 3000 ? 50 : length < 12000 ? 100 : 180;
+}
+
 function sessionTitle(s) {
   return s.summary || s.first_user_prompt || ("new session · " + s.id.slice(0, 8));
 }
@@ -2891,6 +2898,9 @@ async function rewindTo(index, preview, targetSession = sessionId) {
 async function reloadStale() {
   if (!staleSession || staleSession !== sessionId || staleTries >= STALE_FOLLOW_TRIES) { stopStaleFollow(); return; }
   if (document.visibilityState !== "visible" || staleBusy) return;
+  // A live event stream owns the truth again: it delivers the reply itself,
+  // and a history refresh would take its view down with it.
+  if (eventActive) return;
   staleBusy = true;
   try {
     staleTries += 1;
@@ -3467,12 +3477,14 @@ async function send() {
     if (answerDirty) {
       bubble.classList.remove("pending");
       bubble.innerHTML = renderMarkdown(raw, false);
-      decorateMath(bubble);
+      // The formulas are not typeset while the reply is still arriving: the
+      // bubble is rebuilt on every paint, so every formula would be typeset
+      // again and again. The finished reply is typeset once, at the end.
       answerDirty = false;
     }
     if (sid === sessionId) followOutput(follow);
   };
-  const schedulePaint = () => { if (paintTimer === null) paintTimer = setTimeout(paint, 50); };
+  const schedulePaint = () => { if (paintTimer === null) paintTimer = setTimeout(paint, replyPaintDelay(raw.length)); };
   const flushPaint = () => {
     if (paintTimer !== null) { clearTimeout(paintTimer); paintTimer = null; }
     paint();
@@ -3507,14 +3519,29 @@ async function send() {
   let turnStarted = false;
   let turnError = false;
   let finishFollow = false;
-  const STREAM_STALL_MS = 60000; // no meaningful block for this long => stalled
+  const STREAM_STALL_MS = 60000; // no bytes at all for this long => the connection is dead
+  // A turn can be quiet for a long time (a slow tool call, a long provider
+  // pause) while the connection stays perfectly healthy. The keep-alive
+  // comment the server sends every 15s proves the transport is alive, so it
+  // re-arms the transport watchdog, but it is not progress: a turn that
+  // produces nothing at all for this long is the stuck one.
+  const STREAM_SILENCE_MS = 300000;
   let stalled = false; // set by the watchdog; the read loop then exits via cancel
   let stallTimer = null;
+  let silenceTimer = null;
   let reader = null; // assigned once the stream opens, so the watchdog can cancel it
   const armStall = () => {
     clearTimeout(stallTimer);
     stallTimer = setTimeout(() => { stalled = true; try { if (reader) reader.cancel(); } catch (_) {} }, STREAM_STALL_MS);
   };
+  const armProgress = () => {
+    clearTimeout(silenceTimer);
+    silenceTimer = setTimeout(() => { stalled = true; try { if (reader) reader.cancel(); } catch (_) {} }, STREAM_SILENCE_MS);
+  };
+  // Set when this feed died while its turn was still running. The turn keeps
+  // going on the server, and the server kept its event stream, so the page
+  // reattaches to that stream instead of waiting for the turn to end.
+  let wentStale = false;
   const goStale = (msg) => {
     staleSession = sessionId;
     staleBox = box;
@@ -3524,6 +3551,7 @@ async function send() {
     staleDone = false;
     fail(msg);
     startStaleFollow();
+    wentStale = true;
   };
   // The request itself may take time; show Connecting before awaiting headers.
   flushPaint();
@@ -3541,7 +3569,8 @@ async function send() {
     reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
-    armStall(); // the first meaningful block must arrive within STREAM_STALL_MS
+    armStall(); // the first block must arrive within STREAM_STALL_MS
+    armProgress(); // and the turn must produce something within STREAM_SILENCE_MS
     let finished = false;
     setPhase("Waiting for model…");
     for (;;) {
@@ -3552,7 +3581,10 @@ async function send() {
       while ((idx = buf.indexOf("\n\n")) >= 0) {
         const { kind, payload } = parseBlock(buf.slice(0, idx));
         buf = buf.slice(idx + 2);
-        if (kind !== "" || payload) armStall(); // keep-alive comments (empty) must not mask a stalled turn
+        // Any block at all, a keep-alive comment included, proves that the
+        // connection is still there. Only a real event counts as progress.
+        armStall();
+        if (kind !== "" || payload) armProgress();
         if (kind === "done") {
           closeThinkingPhase();
           activity.finish("ended");
@@ -3659,6 +3691,7 @@ async function send() {
       if (done) break;
     }
     clearTimeout(stallTimer);
+    clearTimeout(silenceTimer);
     flushPaint(); // flush the tail before final decoration or stale recovery
     finishFollow = sid === sessionId && shouldFollowOutput();
     if (raw) bubble.innerHTML = renderMarkdown(raw); // previews belong to the finished reply
@@ -3667,15 +3700,17 @@ async function send() {
       // Only the session on screen can be followed from history here; a stalled
       // turn in a session the user has left is retired, and its reply is what
       // that session renders when it is opened again.
-      const reason = stalled ? "stream stalled (no updates for 60s)" : "stream ended before completion";
+      const reason = stalled ? "stream stalled (no progress for 5 minutes)" : "stream ended before completion";
       if (sid === sessionId) goStale(reason + " — checking server history");
       else dropBackgroundTurn(box, reason);
     }
     else if (!raw) bubble.innerHTML = "<span style='color:var(--dim)'>(empty reply)</span>";
   } catch (e) {
     clearTimeout(stallTimer);
+    clearTimeout(silenceTimer);
     flushPaint();
     if (raw) bubble.innerHTML = renderMarkdown(raw);
+    decorateAndLoad(bubble); // the formulas are typeset once, when the reply is final
     finishFollow = sid === sessionId && shouldFollowOutput();
     if (turnStarted && !turnError) {
       // The POST was accepted and no server `error` event arrived, so this is
@@ -3690,6 +3725,15 @@ async function send() {
   // This turn is over, so its session may send again: the entry goes away
   // whether or not the box stays on screen.
   turns.delete(sid);
+  if (wentStale && sid === sessionId) {
+    // The live feed died but its turn is still running on the server, and the
+    // server kept that turn's event stream: reattach to it so the reply keeps
+    // streaming (with its thinking and its partial answer) instead of leaving
+    // the transcript empty until the turn ends. The history follow stays armed
+    // as the fallback: it idles while the reattached stream is live.
+    box.remove();
+    void attachEvents();
+  }
   // The feed that just ended owns the truth about the turn it carried, same
   // as at stream start: the live-stream leg drops with the map entry above,
   // and a `turnRunning` sample taken mid-turn (screen locked, app switched)

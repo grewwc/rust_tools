@@ -7,9 +7,27 @@ use super::pump_live_fifo;
 use super::{MAX_TURN_IMAGES, clean_sse_line, stage_turn_images};
 use super::{ServeFrameDecoder, ServeImageUpload, ServeLiveEvent, setup_live_fifo};
 use super::{TurnReq, turn_overrides, turn_term_cols};
+use super::{MAX_TURN_ERROR_CHARS, truncate_turn_error};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
+
+/// The failed-turn text is the child's stderr, which routinely carries
+/// multi-byte characters. Truncating it by byte offset could land inside a
+/// character and panic while reporting the failure.
+#[test]
+fn truncate_turn_error_cuts_on_character_boundaries() {
+    let short = "turn failed: 小".to_string();
+    assert_eq!(truncate_turn_error(&short), short);
+
+    let long = format!("turn failed: {}", "小".repeat(MAX_TURN_ERROR_CHARS));
+    let trimmed = truncate_turn_error(&long);
+    let prefix = "...[truncated]...";
+    assert!(trimmed.starts_with(prefix), "{trimmed}");
+    let kept = trimmed.strip_prefix(prefix).expect("truncation prefix");
+    assert!(kept.chars().all(|c| c == '小'), "unexpected char in kept tail");
+    assert_eq!(kept.chars().count(), MAX_TURN_ERROR_CHARS, "{kept}");
+}
 
 /// Handler-level coverage for the two session-lifecycle routes: a
 /// missing fork source 404s, a malformed id 400s, and deleting a

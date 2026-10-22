@@ -754,16 +754,18 @@ fn execute_tool_call_with_args_impl(
         return Err(unknown_tool_error_message(name));
     };
     let started = std::time::Instant::now();
-    let exec = if let Some(stream_exec) = TOOL_STREAM_INDEX.get_ref(&name.to_string()).copied() {
-        let mut sink = |_chunk: &[u8]| {};
-        let writer = match on_chunk {
-            Some(writer) => writer,
-            None => &mut sink,
-        };
-        stream_exec(args, writer)
-    } else {
-        (spec.execute)(args)
-    };
+    let exec = run_tool_guarded(&name, || {
+        if let Some(stream_exec) = TOOL_STREAM_INDEX.get_ref(&name.to_string()).copied() {
+            let mut sink = |_chunk: &[u8]| {};
+            let writer = match on_chunk {
+                Some(writer) => writer,
+                None => &mut sink,
+            };
+            stream_exec(args, writer)
+        } else {
+            (spec.execute)(args)
+        }
+    });
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match exec {
         Ok(result) => {
@@ -780,6 +782,35 @@ fn execute_tool_call_with_args_impl(
             Err(err)
         }
     }
+}
+
+/// Run a tool implementation, turning a panic into an ordinary tool error.
+///
+/// A panicking tool must not take the turn down with it: the model can read an
+/// error result and decide what to do next, whereas an unwinding panic aborts
+/// the process that runs the turn and loses every tool result of that turn.
+fn run_tool_guarded<F>(tool_name: &str, run: F) -> Result<String, String>
+where
+    F: FnOnce() -> Result<String, String>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(result) => result,
+        Err(payload) => Err(format!(
+            "tool '{tool_name}' panicked: {}",
+            panic_payload_message(payload.as_ref())
+        )),
+    }
+}
+
+/// Recover the readable message from a panic payload.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic payload".to_string()
 }
 
 /// Tier A1: write tool call results into the DecisionLog (write-only; downstream consumption is a separate PR).
@@ -872,6 +903,27 @@ mod history_policy_tests {
         assert_eq!(canonical_tool_name("lsp"), "lsp");
         assert_eq!(canonical_tool_name("read_file"), "read_file");
         assert_eq!(canonical_tool_name("execute_command"), "execute_command");
+    }
+
+    #[test]
+    fn a_panicking_tool_becomes_a_tool_error_instead_of_killing_the_turn() {
+        // A tool that panics used to unwind out of the turn process, so one
+        // buggy tool destroyed the whole turn and every tool result in it.
+        let error = run_tool_guarded("boom", || -> Result<String, String> {
+            panic!("tool exploded");
+        })
+        .expect_err("a panicking tool must report an error");
+        assert!(error.contains("boom"), "{error}");
+        assert!(error.contains("tool exploded"), "{error}");
+    }
+
+    #[test]
+    fn a_panicking_tool_with_a_string_payload_keeps_its_message() {
+        let error = run_tool_guarded("boom", || -> Result<String, String> {
+            panic!("{}", "formatted payload");
+        })
+        .expect_err("a panicking tool must report an error");
+        assert!(error.contains("formatted payload"), "{error}");
     }
 
     #[test]

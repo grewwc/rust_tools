@@ -841,7 +841,7 @@ test("a math slot cannot manufacture a link or inject markup into href", () => {
   }
 });
 
-test("the real streaming paint typesets completed formulas before the final event", async () => {
+test("the real streaming paint leaves the formulas for the final render", async () => {
   const h = harness();
   const bubble = {
     set innerHTML(markup) { h.msgs.nodes = nodesOf(markup); },
@@ -862,13 +862,24 @@ test("the real streaming paint typesets completed formulas before the final even
   h.context.raw = "$x$";
   h.context.answerDirty = true;
   runPaint();
+  // The bubble is rebuilt on every paint, so typesetting it on every paint
+  // typesets every formula again and again. The finished reply is typeset
+  // once, at the end.
+  assert.equal(h.assets.length, 0);
+  assert.equal(h.msgs.nodes[0].textContent, "$x$");
+  h.context.decorateMath(h.msgs);
   assert.equal(h.assets.length, 2);
   await h.finishLoading();
   assert.equal(h.msgs.nodes[0].textContent, "typeset:x");
-  h.context.raw += " and $y$";
-  h.context.answerDirty = true;
-  runPaint();
-  assert.deepEqual(h.msgs.nodes.map((node) => node.textContent), ["typeset:x", "typeset:y"]);
+});
+
+test("a long reply is painted less often than a short one", () => {
+  const h = harness();
+  assert.equal(h.context.replyPaintDelay(500), 50);
+  assert.equal(h.context.replyPaintDelay(5000), 100);
+  assert.equal(h.context.replyPaintDelay(50000), 180);
+  // The delay never grows without bound: the reply still moves.
+  assert.ok(h.context.replyPaintDelay(1000000) <= 200);
 });
 
 test("stream paint batches answer, thinking and progress into one follow pass", () => {
