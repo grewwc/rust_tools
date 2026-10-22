@@ -4,7 +4,7 @@
 
 Standalone stdio JSON-RPC **MCP server** for browser automation (navigate/click/type/extract/screenshot). Not a library — spawned as MCP subprocess via `mcp_stdio::run()`.
 
-**Two drivers, one server:** `MCP_BROWSER_DRIVER=applescript` (default macOS, drives user's running Chrome via `osascript`) vs `cdp` (`chromiumoxide`/CDP; non-macOS default, or forced by `MCP_BROWSER_WS_URL`). `MCP_BROWSER_WS_URL` may be `ws://` or `http://host:port`/bare `host:port` (fetches `webSocketDebuggerUrl`). Both inherit cookies/login; `close_browser` only closes session tab — never quits user's browser.
+**Two drivers, one server:** `MCP_BROWSER_DRIVER=applescript` (default macOS, drives user's running Chrome via `osascript`) vs `cdp` (`chromiumoxide`/CDP; non-macOS default, or forced by `MCP_BROWSER_WS_URL`). `MCP_BROWSER_WS_URL` may be `ws://` or `http://host:port`/bare `host:port` (fetches `webSocketDebuggerUrl`). The AppleScript driver and CDP-attach (`MCP_BROWSER_WS_URL`) reuse the user's real cookies/login; a CDP controlled launch uses a throwaway profile. `close_browser` only closes the session tab — never quits the user's browser.
 
 ## Layout
 
@@ -25,14 +25,14 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | ./target/debug/mcp_browser
 ```
 
-No focused unit tests (needs real Chrome). Gate = build + smoke test above; add `tools/call navigate` for full round-trip (`MCP_BROWSER_HEADLESS=1` to avoid window). AppleScript smoke: needs Chrome *Allow JavaScript from Apple Events* once, verify one tab opens/closes without touching others.
+Unit tests in `src/main.rs` (capability gating) run without Chrome; there are no end-to-end tests (they need real Chrome). Gate = build + smoke test above; add `tools/call navigate` for full round-trip (`MCP_BROWSER_HEADLESS=1` to avoid window). AppleScript smoke: needs Chrome *Allow JavaScript from Apple Events* once, verify one tab opens/closes without touching others.
 
 ## Invariants (do not break)
 
-1. **Server cap < host timeout** (`crates/mcp_stdio/AGENTS.md` invariant 5). No per-tool override — the host kills+restarts the subprocess on `request_timeout_ms`, so every CDP/osascript op stays under the **90s** cap (host **120s**).
+1. **Server cap < host timeout** (`crates/mcp_stdio/AGENTS.md` invariant 5). No per-tool override — the host kills+restarts the subprocess on `request_timeout_ms`, so every CDP/osascript op stays under the **90s** cap, which must stay below the host's *configured* `request_timeout_ms` (the code default is 30s — `src/bin/ai/types.rs:455-457` — and this host's `~/.config/mcp.json` sets 120000 for this server).
 2. **Error wording avoids host transport triggers** — the trigger list and the shared timeout wording live in `crates/mcp_stdio/AGENTS.md` invariant 2.
-3. **Only `content[0].text` reaches model.** Screenshots save to disk and return the path; extracted text/HTML is capped by `cap_text` (`mcp_stdio`; host offloads >32K).
-4. **Sequential + Handler polling.** `main` owns `Option<BrowserSession>` by `&mut`; host serializes requests so one reused `Page` keeps cookies. CDP `Handler` must be continuously polled, else all CDP hangs.
+3. **Only `content[0].text` reaches the model** (see `crates/mcp_stdio/AGENTS.md` invariant 4). Screenshots save to disk and return the path, never image bytes.
+4. **Sequential + Handler polling.** `main` owns one `Session` (`Option<Session>`) by `&mut`; host serializes requests so one reused `Page` keeps cookies. CDP `Handler` must be continuously polled, else all CDP hangs.
 5. **launch vs connect.** `Browser::launch` = new controlled Chrome (throwaway profile). `Browser::connect` (when `MCP_BROWSER_WS_URL` set) = attach existing `--remote-debugging` instance. Default is launch.
 6. **Per-pid profile dir + startup GC.** A shared profile path collides (`SingletonLock`), and the host usually SIGKILLs the subprocess so `shutdown()` never runs — `launch()` uses a per-pid dir and `gc_stale_profiles()` at startup removes dirs whose pid is dead. Do not revert to a shared dir.
 7. **Human-required detection + `wait_for_human`.**
@@ -58,7 +58,7 @@ No focused unit tests (needs real Chrome). Gate = build + smoke test above; add 
 
 Same 13 tools/args as CDP; `wait_for_human` never `unavailable`. Dedicated invariants:
 
-1. **Never steal focus.** No `activate`; `open_tab` records the frontmost app before creating the tab and restores it afterwards (skip when already in Chrome). Ops address `window id W` + `whose id is "T"` (int window + quoted tab; other forms -1719/-1728) → stray events fail dry instead of mutating foreign tabs. Chrome self-activates on a new tab — hence the restore.
+1. **Never steal focus.** No `activate`; `open_tab` records the frontmost app before creating the tab and restores it afterwards (skip when already in Chrome). Ops address `window id W` + `whose id is "T"` (int window id + quoted tab id; a stale reference fails with the -1728 `can't get` error that the server maps to a rebuild hint) → stray events fail dry instead of mutating foreign tabs. Chrome self-activates on a new tab — hence the restore.
 2. **Allow JavaScript from Apple Events** (View > Developer). Server detects disabled error (message carries support URL) and returns menu-path instruction.
 3. **JS embeds as one AppleScript string literal** — escape `\`/`"`/newlines via `esc_applescript`; the whole script goes over `osascript -` stdin, no temp files. Multi-line JS (detect/wait polling) is fine.
 4. **One session tab, reused.** `navigate` re-sets `URL of` tab unless vanished (then fresh tab in session window; first session uses front window). Tab becomes active tab *of its window* (for `screencapture -l`) but window stays background.
@@ -84,4 +84,4 @@ Keyboard/typing must go through **`Element`**; `Page` has no `press_key`, so foc
 
 ## Host registration
 
-`~/.config/mcp.json` → `mcpServers` (tools `mcp_browser_*`). Keep `request_timeout_ms` 120000 > server cap 90000.
+`~/.config/mcp.json` → `mcpServers` (tools `mcp_browser_*`). Keep `request_timeout_ms` 120000 > server cap 90000 — that 120000 is this host's per-server configuration, not a code default (the code default is 30s, `src/bin/ai/types.rs:455-457`).

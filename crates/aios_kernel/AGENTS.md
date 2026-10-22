@@ -23,10 +23,8 @@ src/types.rs        # FastMap / FastSet (rustc-hash re-exports)
 
 ## Build / Test
 
-```bash
-cargo check -p aios_kernel
-cargo test -p aios_kernel test_name
-```
+Use the root ladder's narrowest targets: `cargo check -p aios_kernel`,
+`cargo test -p aios_kernel <test_name>`.
 
 ## Invariants (do not break)
 
@@ -39,13 +37,12 @@ cargo test -p aios_kernel test_name
 3. **PID identity is runtime-provided.** `current_process_id()` resolves through
    `register_current_pid_provider` (task-local in `a`). Kernel code must not
    assume a global PID.
-4. **Collections**: use `FastMap`/`FastSet` from `types` (rustc-hash).
-5. **Module boundaries**: `pub(super)` / `pub(crate)`; keep the public surface
+4. **Module boundaries**: `pub(super)` / `pub(crate)`; keep the public surface
    minimal (`lib.rs` re-exports the four modules).
-6. **`LocalOS` state is guarded by the caller** via
+5. **`LocalOS` state is guarded by the caller** via
    `SharedKernel = Arc<Mutex<Box<dyn Kernel + Send>>>` - kernel methods must
    not block or await.
-7. **Process-table lifecycle.** Removing a process reattaches its surviving
+6. **Process-table lifecycle.** Removing a process reattaches its surviving
    children to a live foreground owner instead of orphaning them, so child-scoped
    ops (`kill_process` / `signal_process` / `reap_process` / `wait_on`) always have
    a manageable owner. A target pid absent from the process table reports

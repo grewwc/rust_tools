@@ -5,8 +5,7 @@
 Standalone MCP server that gives the `a` agent **generic computer-use** control of
 the local desktop: screen capture, display / window / application queries, and
 mouse / keyboard / scroll injection. Reuses the `mcp_stdio` skeleton for the
-protocol (read loop, dispatch, `with_timeout`, `cap_text`) and adds only the tool
-surface plus one backend per platform.
+protocol and adds only the tool surface plus one backend per platform.
 
 Product framing: this is the *desktop* counterpart of `mcp_browser` (which drives
 one browser). It is deliberately app-agnostic — it drives whatever is on screen —
@@ -35,22 +34,27 @@ src/backend/unsupported.rs # every call reports a clear "no backend on this OS" 
    `activate_app(String)`, `list_windows(Option<String>)`, `screen_info()` (all `Result<String, String>`).
    Queries return a model-facing report; actions return `Ok(())` or a model-facing error.
    Coordinates are global screen points, top-left origin, on every platform.
-2. **No silent no-ops.** A parameter a platform cannot honour (a window id without
-   an X11 capture tool, the `pixel` scroll unit on Linux) is an error naming the
-   limitation, never a dropped argument.
-3. **Screenshots return a path, not image content.** The host reads only
-   `content[0].text`, so bytes in the envelope would be discarded; the path plus
-   `a`'s image-aware `read_file` is what shows the frame to a vision model.
+2. **No silent no-ops.** A parameter a platform cannot honour (the `display`
+   parameter or the `pixel` scroll unit on Linux, `include_cursor` with
+   ImageMagick's `import`) is an error naming the limitation, never a dropped
+   argument.
+3. **Screenshots return a path, not image content.** Only `content[0].text`
+   reaches the model (`crates/mcp_stdio/AGENTS.md` invariant 4), so image bytes
+   in the envelope would be discarded; the path plus `a`'s image-aware `read_file`
+   is what shows the frame to a vision model.
 4. **Error text must avoid the host's transport trigger words** (the list lives
    in `crates/mcp_stdio/AGENTS.md` invariant 2). Helper stderr is forwarded to
    the model, so each backend scans it (`sanitize`) first; forwarding one of
    those phrases makes the host kill and restart this server.
 5. **Backend calls run under `with_timeout` on a blocking thread.** Capture and
    injection block (subprocess + sleeps), so `tools.rs` goes through `spawn_blocking`:
-   run inline they would hold the server's only executor thread and the per-op cap
-   (default 90s, `MCP_COMPUTER_OP_TIMEOUT_MS`) could never fire before the host's
-   120s `request_timeout_ms` kills the subprocess. On timeout the helper is left
-   running to completion — the cap bounds what the model waits for, not the platform.
+   run inline they would hold the server's only executor thread, the per-op cap
+   (default 90s, `MCP_COMPUTER_OP_TIMEOUT_MS`) could never fire, and a hung helper
+   would surface as the host's transport timeout — which kills and restarts this
+   subprocess. Keep the cap below the host's *configured* `request_timeout_ms`
+   (code default 30s — `src/bin/ai/types.rs:455-457`; this host's
+   `~/.config/mcp.json` sets 120000). On timeout the helper is left running to
+   completion — the cap bounds what the model waits for, not the platform.
 6. **Permissions are reported, not assumed.** `screen_info` states whether
    Accessibility (input injection) and Screen Recording (capture) are granted,
    because an empty capture from a missing grant is otherwise indistinguishable

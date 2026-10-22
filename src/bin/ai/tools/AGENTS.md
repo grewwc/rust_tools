@@ -16,7 +16,8 @@ Applies to `src/bin/ai/tools/**`. Layers: `registry/` (schema/metadata), `servic
    `tool_descriptions/<tool>.json` owns description, compact schema, group, and
    optional post-first-call guidance; do not duplicate schema or driver policy.
    Groups resolve to the closed `ToolGroup` enum and every registered tool needs
-   non-empty groups; `hidden: true` defers eager loading. `ToolSpec` has no groups.
+   a present `groups` field (may be `[]` for driver-injected control tools);
+   `hidden: true` defers eager loading. `ToolSpec` has no groups.
 5. **History policy.** Lossy compression and pruning are independent. Preserve
    truth-bearing reads/commands/tasks via overflow stubs; only superseded plans
    may compress. Task evidence prunes only after the durable ledger proves every

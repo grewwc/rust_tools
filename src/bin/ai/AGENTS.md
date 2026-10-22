@@ -30,25 +30,22 @@ may inspect session data only read-only and only through the `session` tools
 (`session_list` / `session_read` / `session_search`, loaded via `enable_tools`);
 `/sessions` owns lifecycle. The on-disk session storage (sqlite and asset
 files) is not a sanctioned read path — `session_search` surfaces asset content
-at runtime.
+at runtime, and `history.sessions/` at the repo root is gitignored test data,
+not the store (root AGENTS.md pitfall). Capability-first: a question that names
+a session id must be answered with the `session` tools — never by probing the
+filesystem or sqlite.
 `build_skill_turn_guard` injects that `session_context` guidance when the turn
 looks session-related or references a concrete session id (UUID-shaped,
 `session_id_referenced`); a top-level turn with a session id also auto-loads
 the `session` group into the resident tool set so the model never needs
 `enable_tools` first. Other turns carry a one-line session id only.
 
-Capability-first: a question that names a session id must be answered with the
-`session` tools — never by probing the filesystem or sqlite. The repo-root
-`history.sessions/` directory is gitignored test session data, not the runtime
-session store; treat it like any other non-sanctioned storage. Never grep or
-open the on-disk store to find sessions.
-
 ## Runtime-wide invariants
 
 1. **Verification.** Follow root ladder; keep Cargo commands scoped.
 2. **Driver owns the turn.** Prompt assembly, model calls, tool loops, history mutation, and final response flow through `driver/`; no ad-hoc side effects.
 3. **Provider/request boundary.** Routing/normalization in `request/`; wire differences in `provider/` adapter hooks. `ApiProvider` is the adapter axis (details in `provider/AGENTS.md`).
-4. **Tool contracts.** Names/schemas/display/history policy are registry-driven. Per-turn visibility is progressive (`core` default, `enable_tools` for lazy `builtin`); hidden MCP/catalog hints must match real registry names.
+4. **Tool contracts.** Names/schemas/display/history policy are registry-driven; visibility and naming rules live in `tools/AGENTS.md` and `mcp/AGENTS.md`.
 5. **Path/session authority.** `runtime_ctx::effective_cwd()` is the working-directory authority for user paths (tools and sub-agents); runtime helpers for session/temp state.
 6. **History is truth.** Canonical `turn_messages` vs rebuildable context projection: compression replaces only the projection, never canonical history (only explicit user lifecycle ops truncate). Preserve pruned evidence via overflow/file pointers; persist delivered subagent results and require explicit `task_integrate`.
 7. **Derived-context provenance.** Runtime policy notes may map to `system`; model-authored self-notes/checkpoints stay `assistant`-derived and unverified. Never promote prior assistant wording into system fact; project via user/assistant handoff pairs only.
@@ -56,13 +53,13 @@ open the on-disk store to find sessions.
 9. **Compression purity.** Speculative fold/summary candidates stay pure until
    selected; persist evidence only for accepted candidates with deterministic
    asset paths; retain raw messages if archive commit fails. Summary increments
-   bind the removed projection bytes in `summary-sources/`; prior summaries never
-   become fresh summarizer input. Increments are compaction products too: their
-   inline window is capped (`MAX_INCREMENTAL_SUMMARY_INLINE_CHARS`) and older
-   records are archived verbatim behind one back-reference before removal — never
-   merged into a single claim set, and never dropped without an archive write.
-   Binding is a recovery locator, not claim verification. Bump the projection
-   fingerprint when persisted projection semantics change.
+   bind removed projection bytes in `summary-sources/`; prior summaries never
+   become fresh summarizer input, and increments cap their inline window
+   (`MAX_INCREMENTAL_SUMMARY_INLINE_CHARS`), archiving older records verbatim
+   behind one back-reference before removal — never merged into a single claim
+   set, never dropped without an archive write. Binding is a recovery locator,
+   not claim verification. Bump the projection fingerprint when persisted
+   projection semantics change.
 10. **Model-visible wording is English.** Base prompt / gate notes / injected notes use one English system; keep Chinese only in keyword-match lists and terminal text.
 11. **Output post-processing is display-only.** `ai.output.postprocess_command`
     is a best-effort final-body filter before rendering; failures show the

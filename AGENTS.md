@@ -5,11 +5,12 @@ Root-level overview and repo-wide invariants only; the nearest scoped
 
 Rust 2024 workspace: utility library + CLI binaries. Primary product is `a`, an
 LLM-based AI agent runtime (AIOS) with process scheduling, agent/skill routing,
-tool registry, and MCP integration. Workspace members: the root crate plus the
-`crates/*` listed under Layout. macOS-first (`objc2` deps); core library
+tool registry, and MCP integration. macOS-first (`objc2` deps); core library
 cross-platform.
 
 ## Layout
+
+Workspace members are the root crate plus the `crates/*` below.
 
 - `src/bin/a.rs` + `src/bin/ai/`: agent entry point and runtime; `src/bin/ff/`
   is embedded into `a` via `include!`.
@@ -27,7 +28,10 @@ The `mcp_*` crates are not dependencies of `a`; new OS-app servers should reuse
 
 `cargo check` / `cargo test` are expensive (heavy deps, slow incremental).
 Don't run speculatively, but do run when the ladder demands it — reading code
-cannot confirm compilation. Always scope to the narrowest target.
+cannot confirm compilation. Always scope to the narrowest target, and never run a
+bare `cargo test` / `cargo build --release` / workspace-wide command for routine
+verification. Never repeat `cargo test` without a code change, and prefer an
+existing focused test over writing a new one.
 
 ```bash
 cargo check --bin a                  # fast type-check for the main binary
@@ -35,6 +39,13 @@ cargo check -p aios_kernel           # type-check one crate
 cargo test --bin a test_name         # run one targeted test in `a`
 cargo test -p aios_kernel test_name  # run one targeted test in a crate
 ```
+
+**Verification ladder:**
+1. **No code change / docs-only**: no Cargo command required.
+2. **Type-level / compile-risk / mechanical refactor**: narrowest `cargo check`.
+3. **Runtime behavior changed, focused test exists**: run that named test.
+4. **Runtime behavior changed, no focused test**: narrowest `cargo check`; note no test found.
+5. **Bug fix with regression/new test**: run that named test; on failure fix and re-run.
 
 To deploy changes to the server-capable `a`, build and install all release
 features, then restart the managed server:
@@ -44,25 +55,16 @@ make install-all
 a --serve-restart
 ```
 
-Never run bare `cargo test` / `cargo build --release` / workspace-wide commands
-for routine verification, and never repeat `cargo test` without a code change.
-Prefer an existing focused test before running one.
-
-**Verification ladder:**
-1. **No code change / docs-only**: no Cargo command required.
-2. **Type-level / compile-risk / mechanical refactor**: narrowest `cargo check`.
-3. **Runtime behavior changed, focused test exists**: run that named test.
-4. **Runtime behavior changed, no focused test**: narrowest `cargo check`; note no test found.
-5. **Bug fix with regression/new test**: run that named test; on failure fix and re-run.
-
 ## Global Engineering Rules
 
 1. **Module boundaries**: `pub(super)` / `pub(crate)`.
 2. **English comments**: all line, block, and doc comments must be English; when
    modifying code, translate any Chinese comments you touch.
-3. **Collections**: `rustc-hash` FastMap/FastSet via re-exports.
+3. **Collections**: `rustc-hash` FastMap/FastSet via re-exports
+   (`rust_tools::commonw::{FastMap, FastSet}`).
 4. **Config keys**: add only in `src/bin/ai/config_schema.rs`.
-5. **Tests**: keep close to changed module; serial tests use `test_support::ENV_LOCK`.
+5. **Tests**: keep close to changed module; serial tests use
+   `test_support::ENV_LOCK` (`src/bin/ai/mod.rs`).
 6. **Extensibility**: data-driven/registration-based over hardcoded `if`/`else`.
 7. **AGENTS.md maintenance**: update only superseded nearby rules, in place; never
    append history. Keep injected instructions concise and delete stale rules.
