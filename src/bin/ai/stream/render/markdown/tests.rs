@@ -284,6 +284,12 @@
 
     #[test]
     fn blockquote_and_rule_render_with_cleaner_structure() {
+        // The thematic break length is `28.min(preview_terminal_width())`, which depends on
+        // the ambient terminal width. Pin COLUMNS (under the shared env lock, like every
+        // sibling test that touches it) so the cap of 28 always applies and the assertion
+        // is independent of the runner's COLUMNS and of concurrent env-mutating tests.
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "200") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
 
         let quote = renderer.consume_line("> note", false);
@@ -292,7 +298,7 @@
         let quote_visible = strip_ansi_for_test(&quote);
         let rule_visible = strip_ansi_for_test(&rule);
         assert!(quote_visible.contains("▍ note"));
-        assert!(rule_visible.contains(&"─".repeat(28)));
+        assert_eq!(rule_visible, format!("{}\n", "─".repeat(28)));
     }
 
     #[test]
