@@ -10,7 +10,7 @@
   "search_enabled": false,
   "tools_default_enabled": true,
   "enable_thinking": true,
-  "default_reasoning_effort": "high",
+  "default_reasoning_effort": "max",
   "subagent_priority": 80,
   "endpoint": "https://opencode.ai/inference/go/v1/chat/completions",
   "_comment": "OpenCode Go model (https://opencode.ai/v2/docs/console/go): free for a limited time; not available in Angola, Belarus, Cambodia, China (incl. Hong Kong and Macau), Cuba, DRC, Equatorial Guinea, Iran, Iraq, Laos, Libya, Nigeria, North Korea, Russia, Syria, Turkmenistan, Uzbekistan, Venezuela, and the Crimea/Donetsk/Luhansk regions. Context/output limits are not published; per-tier fallback applies."
