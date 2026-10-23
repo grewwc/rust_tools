@@ -22,12 +22,15 @@ pub(in crate::ai::driver::turn_runtime) const INJECTED_CONTEXT_ECHO_STOP: &str =
 /// Turn-local state for final-response recovery. Prompt markers remain useful context for
 /// the model, but runtime control flow must not infer retry budgets from persisted text:
 /// old markers can survive into later turns. General quality gates share one retry, while
-/// the structural outstanding-work assertion reopens until forced or at the
-/// iteration cap, so another gate cannot suppress the required `complete` prompt.
+/// the structural outstanding-work assertion has its own bounded retry budget so another
+/// gate cannot suppress the required `complete` prompt or make it spin to the iteration cap.
+pub(in crate::ai::driver::turn_runtime) const OUTSTANDING_WORK_MAX_REOPENS: usize = 3;
+
 #[derive(Debug, Default)]
 pub(in crate::ai::driver::turn_runtime) struct FinalGateState {
     retry_consumed: bool,
     no_tool_retry_consumed: bool,
+    outstanding_work_reopens: usize,
 }
 
 impl FinalGateState {
@@ -47,6 +50,10 @@ impl FinalGateState {
                 messages,
                 NO_TOOL_SYNTHESIS_RETRY_MARKER,
             ),
+            outstanding_work_reopens: usize::from(current_turn_has_internal_marker(
+                messages,
+                OUTSTANDING_WORK_REQUIRED_MARKER,
+            )),
         }
     }
 
@@ -69,14 +76,18 @@ impl FinalGateState {
         iteration: usize,
         max_iterations: usize,
     ) -> bool {
-        !force_final_response && iteration < max_iterations
+        self.outstanding_work_reopens < OUTSTANDING_WORK_MAX_REOPENS
+            && !force_final_response
+            && iteration < max_iterations
     }
 
-    pub(super) fn consume_outstanding_work_retry(&mut self) {
+    pub(super) fn consume_outstanding_work_retry(&mut self) -> usize {
         // Outstanding work may reopen again because it has an independent
         // structural budget, but the same reopen spends the shared quality-gate
         // retry so later gates cannot cascade another retry onto this turn.
         self.retry_consumed = true;
+        self.outstanding_work_reopens = self.outstanding_work_reopens.saturating_add(1);
+        self.outstanding_work_reopens
     }
 
     pub(super) fn no_tool_retry_consumed(&self) -> bool {

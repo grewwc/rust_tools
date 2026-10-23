@@ -17,7 +17,7 @@
 //!   - plan settled, no claim    -> Reopen, demanding a `complete` call
 //!   - work open, fresh claim    -> Reopen, naming the contradiction
 //!   - work open, no/stale claim -> Reopen, naming the open steps
-//!   - forced / at cap          -> Warn (the final lands, annotated with steps)
+//!   - forced / retry cap / iteration cap -> Warn (the final lands, annotated with steps)
 //! The claim is single-use — consumed on every evaluation — so an assertion
 //! never leaks into a later round, and any `plan`/`plan_update` in between
 //! silently invalidates it via the `updated_at_ms` snapshot.
@@ -33,6 +33,29 @@ pub(in crate::ai::driver::turn_runtime) const OUTSTANDING_WORK_REQUIRED_MARKER: 
     "[outstanding-work-retry]";
 pub(in crate::ai::driver::turn_runtime) const OUTSTANDING_WORK_WARNING: &str = "[Runtime warning] The session plan still has unsettled steps, so this final response may describe incomplete work.";
 pub(in crate::ai::driver::turn_runtime) const OUTSTANDING_WORK_UNASSERTED_WARNING: &str = "[Runtime warning] No `complete` call asserted completion, so this final response may end unfinished work.";
+
+fn upsert_outstanding_work_note(messages: &mut Vec<Message>, note: String) {
+    let turn_start = crate::ai::history::last_real_user_index(messages).unwrap_or(0);
+    let mut index = messages.len();
+    while index > turn_start {
+        index -= 1;
+        let is_existing = messages[index].role == ROLE_INTERNAL_NOTE
+            && messages[index]
+                .content
+                .as_str()
+                .is_some_and(|text| text.starts_with(OUTSTANDING_WORK_REQUIRED_MARKER));
+        if is_existing {
+            messages.remove(index);
+        }
+    }
+    messages.push(Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: serde_json::Value::String(note),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::ai::driver::turn_runtime) enum OutstandingWorkGateAction {
@@ -175,17 +198,14 @@ pub(in crate::ai::driver::turn_runtime) fn outstanding_work_gate_action_with_tur
             return OutstandingWorkGateAction::WarnUnasserted;
         }
         log_outstanding_work_reopen(app, "tool_assisted_turn_no_claim", None, iteration);
-        messages.push(Message {
-            role: ROLE_INTERNAL_NOTE.to_string(),
-            content: serde_json::Value::String(format!(
+        upsert_outstanding_work_note(
+            messages,
+            format!(
                 "{OUTSTANDING_WORK_REQUIRED_MARKER}\n\
                  This turn has tool results, but no successful `complete` assertion was recorded after the latest tool result.\n\
                  This is not a final answer. Inspect the user's request and the tool evidence: if work remains, continue using tools; otherwise call `complete`, then write the final response."
-            )),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        });
+            ),
+        );
         return OutstandingWorkGateAction::Reopen;
     }
     let plan = plan.expect("binding plan must exist");
@@ -227,17 +247,14 @@ pub(in crate::ai::driver::turn_runtime) fn outstanding_work_gate_action_with_tur
             return OutstandingWorkGateAction::WarnUnasserted;
         }
         log_outstanding_work_reopen(app, "settled_plan_no_claim", None, iteration);
-        messages.push(Message {
-            role: ROLE_INTERNAL_NOTE.to_string(),
-            content: serde_json::Value::String(format!(
+        upsert_outstanding_work_note(
+            messages,
+            format!(
                 "{OUTSTANDING_WORK_REQUIRED_MARKER}\n\
                  The session plan has no unsettled steps, but no `complete` call asserts completion for this turn.\n\
                  This is not a final answer. If the work is done, call `complete` and write the final response; otherwise keep working with tools."
-            )),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        });
+            ),
+        );
         return OutstandingWorkGateAction::Reopen;
     }
 
@@ -260,13 +277,7 @@ pub(in crate::ai::driver::turn_runtime) fn outstanding_work_gate_action_with_tur
              This is not a final answer. Finish or explicitly skip the open steps with `plan_update`, then call `complete` and write the final response."
         )
     };
-    messages.push(Message {
-        role: ROLE_INTERNAL_NOTE.to_string(),
-        content: serde_json::Value::String(note),
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    });
+    upsert_outstanding_work_note(messages, note);
     OutstandingWorkGateAction::Reopen
 }
 

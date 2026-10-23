@@ -2545,6 +2545,7 @@ fn progress_budget_uses_pre_compress_current_round_for_apply_patch_progress() {
     let signal = supervisor.record_tool_signatures_for_progress(
         &compressed_messages,
         &current_round,
+        true,
         PROGRESS_FREE_EXPLORE_ROUNDS,
     );
 
@@ -2553,6 +2554,26 @@ fn progress_budget_uses_pre_compress_current_round_for_apply_patch_progress() {
         "apply_patch in the raw current round must not be hidden by compressed messages"
     );
     assert_eq!(supervisor.progress.consecutive_no_progress, 0);
+}
+
+#[test]
+fn no_tool_final_retries_do_not_record_previous_tool_round() {
+    let mut supervisor = TurnSupervisor::default();
+    let messages = vec![pb_apply_patch_msg("patch-before-final")];
+
+    for _ in 0..TOOL_LOOP_SOFT_WINDOW {
+        let signal = supervisor.record_tool_signatures_for_progress(
+            &messages,
+            &messages,
+            false,
+            PROGRESS_FREE_EXPLORE_ROUNDS,
+        );
+        assert!(matches!(signal, ToolLoopSignal::None));
+    }
+
+    assert!(supervisor.tool_signature_history.is_empty());
+    assert!(supervisor.tool_signature_history_coarse.is_empty());
+    assert!(supervisor.tool_target_history.is_empty());
 }
 
 #[test]

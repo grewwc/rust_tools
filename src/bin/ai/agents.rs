@@ -536,12 +536,12 @@ fn load_scoped_project_instruction_docs_for_target_tiers_from(
             continue;
         }
         if content.chars().count() != doc.content.chars().count() {
-            eprintln!(
-                "[project-instructions] truncated {} (kept {}/{} chars)",
-                doc.path,
-                content.chars().count(),
-                doc.content.chars().count()
-            );
+            // eprintln!(
+            //     "[project-instructions] truncated {} (kept {}/{} chars)",
+            //     doc.path,
+            //     content.chars().count(),
+            //     doc.content.chars().count()
+            // );
         }
         used += content.chars().count();
         selected.push(ProjectInstructionDoc {
@@ -742,12 +742,12 @@ fn push_instruction_doc(
     if content.chars().count() != trimmed.chars().count() {
         // Report on stderr only: the prompt keeps its existing `…` marker, and
         // the user needs to know the file was cut short (debugging aid).
-        eprintln!(
-            "[project-instructions] truncated {} (kept {}/{} chars)",
-            canonical_key,
-            content.chars().count(),
-            trimmed.chars().count()
-        );
+        // eprintln!(
+        //     "[project-instructions] truncated {} (kept {}/{} chars)",
+        //     canonical_key,
+        //     content.chars().count(),
+        //     trimmed.chars().count()
+        // );
     }
     if !content.is_empty() {
         docs.push(ProjectInstructionDoc {
@@ -782,12 +782,12 @@ fn limit_project_instruction_docs(
             continue;
         }
         if content.chars().count() != doc.content.chars().count() {
-            eprintln!(
-                "[project-instructions] truncated {} (kept {}/{} chars)",
-                doc.path,
-                content.chars().count(),
-                doc.content.chars().count()
-            );
+            // eprintln!(
+            //     "[project-instructions] truncated {} (kept {}/{} chars)",
+            //     doc.path,
+            //     content.chars().count(),
+            //     doc.content.chars().count()
+            // );
         }
         used += content.chars().count();
         docs.push(ProjectInstructionDoc {

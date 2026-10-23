@@ -324,7 +324,15 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             ) {
                 OutstandingWorkGateAction::Allow => None,
                 OutstandingWorkGateAction::Reopen => {
-                    final_gate_state.consume_outstanding_work_retry();
+                    let attempt = final_gate_state.consume_outstanding_work_retry();
+                    drop(final_validation_status.take());
+                    print_tool_note_line(
+                        "final-gate",
+                        &format!(
+                            "missing `complete` or unsettled plan; reopening final response \
+                             ({attempt}/{OUTSTANDING_WORK_MAX_REOPENS})"
+                        ),
+                    );
                     // Completed drafts are transactionally deferred and were never
                     // user-visible, so they must not become a dedupe candidate.
                     *terminal_dedupe_candidate = None;

@@ -944,3 +944,15 @@ fn outstanding_marker_spends_shared_reopen_budget() {
         "no marker means the budget is still available"
     );
 }
+
+#[test]
+fn outstanding_work_reopen_budget_stops_after_three_retries() {
+    let mut state = FinalGateState::default();
+
+    for attempt in 1..=OUTSTANDING_WORK_MAX_REOPENS {
+        assert!(state.can_reopen_outstanding_work(false, 0, 16));
+        assert_eq!(state.consume_outstanding_work_retry(), attempt);
+    }
+
+    assert!(!state.can_reopen_outstanding_work(false, 0, 16));
+}

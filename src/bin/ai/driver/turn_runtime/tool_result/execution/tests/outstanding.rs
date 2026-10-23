@@ -102,6 +102,52 @@ fn tool_assisted_turn_without_complete_reopens() {
 }
 
 #[test]
+fn outstanding_reopens_three_times_then_warns_without_duplicate_marker() {
+    let (app, base) = test_app_with_session();
+    let turn_messages = tool_exchange("work", "execute_command", "ok");
+    let mut messages = Vec::new();
+    let mut gate_state = FinalGateState::default();
+
+    for attempt in 1..=OUTSTANDING_WORK_MAX_REOPENS {
+        assert!(gate_state.can_reopen_outstanding_work(false, attempt, 16));
+        let action = super::super::outstanding_work_gate_action_with_turn_messages(
+            &app,
+            &mut messages,
+            &turn_messages,
+            false,
+            attempt,
+            16,
+        );
+        assert_eq!(action, OutstandingWorkGateAction::Reopen);
+        assert_eq!(gate_state.consume_outstanding_work_retry(), attempt);
+    }
+    assert!(!gate_state.can_reopen_outstanding_work(false, 4, 16));
+    let final_action = super::super::outstanding_work_gate_action_with_turn_messages(
+        &app,
+        &mut messages,
+        &turn_messages,
+        true,
+        4,
+        16,
+    );
+    assert_eq!(final_action, OutstandingWorkGateAction::WarnUnasserted);
+
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| {
+                message
+                    .content
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(OUTSTANDING_WORK_REQUIRED_MARKER))
+            })
+            .count(),
+        1
+    );
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
 fn tool_assisted_turn_allows_complete_after_latest_result() {
     let (app, base) = test_app_with_session();
     record_completion_claim(&app, "done", None).unwrap();

@@ -580,15 +580,19 @@ impl TurnSupervisor {
         messages: &[crate::ai::history::Message],
         free_explore_rounds: usize,
     ) -> ToolLoopSignal {
-        self.record_tool_signatures_for_progress(messages, messages, free_explore_rounds)
+        self.record_tool_signatures_for_progress(messages, messages, true, free_explore_rounds)
     }
 
     fn record_tool_signatures_for_progress(
         &mut self,
         messages: &[crate::ai::history::Message],
         progress_messages: &[crate::ai::history::Message],
+        had_tool_call_execution: bool,
         free_explore_rounds: usize,
     ) -> ToolLoopSignal {
+        if !had_tool_call_execution {
+            return ToolLoopSignal::None;
+        }
         let signature_messages = if progress_messages.is_empty() {
             messages
         } else {
@@ -2257,6 +2261,7 @@ async fn run_turn_body(
                 } else {
                     &progress_messages
                 },
+                had_tool_call_execution,
                 PROGRESS_FREE_EXPLORE_ROUNDS,
             )
         };
@@ -2426,7 +2431,7 @@ async fn run_turn_body(
         // the just-completed mutation as a failure. When a more specific health signal already
         // fired this round, the checkpoint is skipped so multiple convergence prompts do not stack.
         let effective_max_iterations = supervisor.effective_max_iterations(max_iterations);
-        if !health_signal_injected && !force_final_before_health {
+        if had_tool_call_execution && !health_signal_injected && !force_final_before_health {
             let checkpoint_phase = tool_round_checkpoint_phase(&progress_messages, &turn_messages);
             if let Some(checkpoint) = supervisor.maybe_inject_tool_round_checkpoint(
                 &mut messages,
