@@ -1118,6 +1118,21 @@ impl CommandCompleter {
                             .filter(|c| c.starts_with(token))
                             .map(|c| c.to_string()),
                     ),
+                    Some(sub) if matches!(sub, "save" | "commit" | "s") => {
+                        let rest: Vec<&str> = words.collect();
+                        if rest.iter().any(|arg| {
+                            matches!(*arg, "-m" | "--message") || arg.starts_with("--message=")
+                        }) {
+                            Vec::new()
+                        } else {
+                            Self::plain_candidates(
+                                ["-m", "--message"]
+                                    .into_iter()
+                                    .filter(|candidate| candidate.starts_with(token))
+                                    .map(str::to_string),
+                            )
+                        }
+                    }
                     Some(sub) if matches!(sub, "checkout" | "co") => {
                         let rest: Vec<&str> = words.collect();
                         match rest.as_slice() {
@@ -2323,6 +2338,18 @@ mod tests {
         assert!(removed_fork.is_empty());
         let (_, removed_rollback) = CommandCompleter::complete_for_line("/git roll", 9);
         assert!(removed_rollback.is_empty());
+        let (_, commit_options) = CommandCompleter::complete_for_line("/git commit ", 12);
+        assert!(
+            commit_options
+                .iter()
+                .any(|candidate| candidate.replacement == "-m")
+        );
+        let (_, message_value) = CommandCompleter::complete_for_line("/git commit -m ", 15);
+        assert!(message_value.is_empty());
+        let quoted_message = r#"/git commit -m "fix --mes"#;
+        let (_, quoted_value) =
+            CommandCompleter::complete_for_line(quoted_message, quoted_message.len());
+        assert!(quoted_value.is_empty());
         CommandCompleter::clear_checkpoint_candidates();
         let (_, cleared_switch) = CommandCompleter::complete_for_line("/git switch fe", 14);
         assert!(cleared_switch.is_empty());

@@ -28,6 +28,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex, RwLock},
 };
 
+use base64::Engine as _;
 use chrono::{DateTime, Local};
 #[cfg(unix)]
 use libc::{LOCK_EX, LOCK_SH, LOCK_UN, flock};
@@ -54,6 +55,7 @@ const GENERATION_ASSETS_DIR: &str = "assets";
 const GENERATION_MANIFEST_FILE: &str = "checkpoint.manifest";
 const GENERATION_STAGE_MARKER: &str = ".stage-";
 const GENERATION_PREVIOUS_MARKER: &str = ".previous-";
+const GENERATION_PUBLISH_READY_MARKER: &str = ".publish-ready";
 /// Git-style pointer to the most recently preserved checkpoint. It is a plain
 /// file (not a checkpoint directory), so it never shows up in listings; it
 /// only records a name for the `HEAD` (`@`) alias to resolve. `-` is the
@@ -89,6 +91,7 @@ static CHECKPOINT_ROOT_LOCKS: LazyLock<Mutex<FastMap<PathBuf, Arc<RwLock<()>>>>>
 #[derive(Debug, Clone)]
 pub(in crate::ai) struct CheckpointInfo {
     pub(in crate::ai) name: String,
+    pub(in crate::ai) message: Option<String>,
     pub(in crate::ai) modified_local: Option<DateTime<Local>>,
     pub(in crate::ai) size_bytes: u64,
     /// Bytes charged to the per-session checkpoint quota. COW-cloned file data
@@ -268,6 +271,15 @@ impl CheckpointStore {
     /// Save the current session history as a checkpoint named `name`.
     /// Returns the checkpoint file path.
     pub(in crate::ai) fn save(&self, name: &str) -> io::Result<PathBuf> {
+        self.save_with_message(name, None)
+    }
+
+    /// Save the current session history with an optional commit message.
+    pub(in crate::ai) fn save_with_message(
+        &self,
+        name: &str,
+        message: Option<&str>,
+    ) -> io::Result<PathBuf> {
         let normalized_name = sanitize_name(name);
         if is_reserved_checkpoint_name(name) || is_reserved_checkpoint_name(&normalized_name) {
             return Err(io::Error::new(
@@ -308,7 +320,8 @@ impl CheckpointStore {
                     total.saturating_add(checkpoint.storage_bytes)
                 })
                 .saturating_add(store.branch_storage_size_unlocked(&branches)?);
-            let staged = store.stage_generation(&normalized_name, parent.as_deref())?;
+            let staged =
+                store.stage_generation(&normalized_name, parent.as_deref(), message)?;
             let sqlite = staged.path.join(GENERATION_SQLITE_FILE);
             let logical_base = checkpoint_storage_size(
                 &sqlite,
@@ -331,6 +344,7 @@ impl CheckpointStore {
                 logical_base,
                 storage_base,
                 staged_messages,
+                message,
             );
             fs::write(staged.path.join(GENERATION_MANIFEST_FILE), manifest)?;
             let mut result = validate_checkpoint_budget(
@@ -342,6 +356,7 @@ impl CheckpointStore {
                 MAX_CHECKPOINTS_PER_SESSION,
                 MAX_CHECKPOINT_STORAGE_BYTES,
             )
+            .and_then(|()| store.mark_generation_publish_ready(&staged.path))
             .and_then(|()| store.publish_generation(&normalized_name, &staged.path));
             if result.is_ok()
                 && let Err(pointer_error) = store.advance_after_save_unlocked(&normalized_name)
@@ -1263,9 +1278,11 @@ impl CheckpointStore {
                     .as_ref()
                     .and_then(|manifest| manifest.storage_bytes)
                     .unwrap_or(size_bytes);
+                let message = known.as_ref().and_then(|manifest| manifest.message.clone());
                 out.push((
                     CheckpointInfo {
                         name: name.to_string(),
+                        message,
                         modified_local: manifest_saved_time(known.as_ref())
                             .or(manifest_mtime)
                             .or(mtime),
@@ -1291,6 +1308,7 @@ impl CheckpointStore {
             out.push((
                 CheckpointInfo {
                     name: stem.to_string(),
+                    message: None,
                     modified_local: metadata.modified().ok().map(DateTime::<Local>::from),
                     size_bytes,
                     storage_bytes: size_bytes,
@@ -1360,7 +1378,12 @@ impl CheckpointStore {
         Ok(size)
     }
 
-    fn stage_generation(&self, name: &str, parent: Option<&str>) -> io::Result<StagedGeneration> {
+    fn stage_generation(
+        &self,
+        name: &str,
+        parent: Option<&str>,
+        message: Option<&str>,
+    ) -> io::Result<StagedGeneration> {
         fs::create_dir_all(&self.dir)?;
         let staged = self.dir.join(format!(
             ".{name}{GENERATION_STAGE_MARKER}{}",
@@ -1373,7 +1396,7 @@ impl CheckpointStore {
                 copy_directory_snapshot(&self.session_assets, &staged.join(GENERATION_ASSETS_DIR))?;
             fs::write(
                 staged.join(GENERATION_MANIFEST_FILE),
-                generation_manifest_body(parent, unix_now_secs(), None, None, None),
+                generation_manifest_body(parent, unix_now_secs(), None, None, None, message),
             )?;
             Ok(copied_asset_bytes)
         })();
@@ -1405,12 +1428,20 @@ impl CheckpointStore {
         if had_previous {
             let _ = fs::remove_dir_all(previous);
         }
+        let _ = fs::remove_dir(destination.join(GENERATION_PUBLISH_READY_MARKER));
         // The new generation is now the single source of truth; the legacy
         // layout is only kept for compatible reads. A later cleanup failure
         // cannot break the published checkpoint; the next lock-held operation
         // reaps it again.
         let _ = self.remove_legacy_checkpoint(name);
         Ok(())
+    }
+
+    fn mark_generation_publish_ready(&self, staged: &Path) -> io::Result<()> {
+        // Directory creation atomically publishes the approval after quota
+        // validation. Recovery can distinguish it from an earlier interrupted
+        // stage without adding bytes to the checkpoint's quota accounting.
+        fs::create_dir(staged.join(GENERATION_PUBLISH_READY_MARKER))
     }
 
     fn remove_legacy_checkpoint(&self, name: &str) -> io::Result<bool> {
@@ -1598,7 +1629,7 @@ impl CheckpointStore {
         }
 
         for (name, stage) in staged {
-            if !generation_is_ready(&stage) {
+            if !generation_is_ready(&stage) || !generation_is_publish_ready(&stage) {
                 fs::remove_dir_all(stage)?;
                 continue;
             }
@@ -1608,6 +1639,7 @@ impl CheckpointStore {
                 continue;
             }
             fs::rename(&stage, &destination)?;
+            let _ = fs::remove_dir(destination.join(GENERATION_PUBLISH_READY_MARKER));
             if let Some(index) = previous
                 .iter()
                 .position(|(previous_name, _)| previous_name == &name)
@@ -1925,6 +1957,10 @@ fn generation_is_ready(path: &Path) -> bool {
         && path.join(GENERATION_ASSETS_DIR).is_dir()
 }
 
+fn generation_is_publish_ready(path: &Path) -> bool {
+    path.join(GENERATION_PUBLISH_READY_MARKER).is_dir()
+}
+
 fn cleanup_live_rollback_transaction(transaction: &Path) {
     if let Err(err) = fs::remove_dir_all(transaction) {
         eprintln!(
@@ -2152,6 +2188,7 @@ fn sanitize_name(name: &str) -> String {
 /// walk/query behavior.
 struct GenerationManifest {
     parent: Option<String>,
+    message: Option<String>,
     saved_at: Option<u64>,
     size_bytes: Option<u64>,
     storage_bytes: Option<u64>,
@@ -2174,9 +2211,9 @@ fn read_generation_manifest(generation: &Path) -> Option<GenerationManifest> {
         Some(parent.to_string())
     };
     // Third line is optional: manifests written before timestamps existed
-    // have no `saved_at` line and fall back to mtime. Fourth (`size:`) and
-    // Remaining lines are optional caches written at save time; missing
-    // storage falls back to logical size for pre-COW snapshots.
+    // have no `saved_at` line and fall back to mtime. Remaining lines are
+    // optional caches or encoded commit metadata; missing storage falls back
+    // to logical size for pre-COW snapshots.
     let saved_at = match lines.next() {
         None => None,
         Some(line) => Some(line.strip_prefix("saved_at: ")?.parse::<u64>().ok()?),
@@ -2184,6 +2221,7 @@ fn read_generation_manifest(generation: &Path) -> Option<GenerationManifest> {
     let mut size_bytes = None;
     let mut storage_bytes = None;
     let mut message_count = None;
+    let mut message = None;
     for line in lines {
         if let Some(value) = line.strip_prefix("size: ")
             && size_bytes.is_none()
@@ -2201,10 +2239,20 @@ fn read_generation_manifest(generation: &Path) -> Option<GenerationManifest> {
             && message_count.is_none()
         {
             message_count = value.parse::<usize>().ok();
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("message-base64: ")
+            && message.is_none()
+        {
+            message = base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok());
         }
     }
     Some(GenerationManifest {
         parent,
+        message,
         saved_at,
         size_bytes,
         storage_bytes,
@@ -2249,6 +2297,7 @@ fn generation_manifest_body(
     size_bytes: Option<u64>,
     storage_bytes: Option<u64>,
     message_count: Option<usize>,
+    message: Option<&str>,
 ) -> String {
     let parent_line = match parent {
         Some(name) => format!("parent: {name}\n"),
@@ -2264,6 +2313,10 @@ fn generation_manifest_body(
     if let Some(count) = message_count {
         body.push_str(&format!("messages: {count}\n"));
     }
+    if let Some(message) = message {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(message);
+        body.push_str(&format!("message-base64: {encoded}\n"));
+    }
     body
 }
 
@@ -2273,6 +2326,7 @@ fn generation_manifest_with_sizes(
     logical_base: u64,
     storage_base: u64,
     message_count: Option<usize>,
+    message: Option<&str>,
 ) -> (String, u64, u64) {
     let mut logical_size = logical_base;
     let mut storage_size = storage_base;
@@ -2283,6 +2337,7 @@ fn generation_manifest_with_sizes(
             Some(logical_size),
             Some(storage_size),
             message_count,
+            message,
         );
         let body_size = body.len() as u64;
         let next_logical = logical_base.saturating_add(body_size);
@@ -2366,7 +2421,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_save_recovers_complete_staged_generation() {
+    fn checkpoint_recovery_publishes_validated_staged_generation() {
         let history_file = temp_history_file();
         let store = CheckpointStore::new(&history_file, "sess-stage");
         append_history_messages(
@@ -2384,6 +2439,7 @@ mod tests {
         fs::create_dir_all(staged.join(GENERATION_ASSETS_DIR)).unwrap();
         backup_sqlite(&store.session_file, &staged.join(GENERATION_SQLITE_FILE)).unwrap();
         fs::write(staged.join(GENERATION_MANIFEST_FILE), b"checkpoint-v1\n").unwrap();
+        store.mark_generation_publish_ready(&staged).unwrap();
 
         let listed = store.list().unwrap();
 
@@ -2391,6 +2447,38 @@ mod tests {
         assert_eq!(listed[0].name, "stable");
         assert!(!staged.exists());
         assert!(store.checkpoint_path("stable").exists());
+        assert!(
+            !store
+                .generation_dir("stable")
+                .join(GENERATION_PUBLISH_READY_MARKER)
+                .exists()
+        );
+        if let Some(root) = history_file.parent() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn checkpoint_recovery_discards_complete_unvalidated_staged_generation() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-stage-unvalidated");
+        append_history_messages(
+            &store.session_file,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("unvalidated history".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        let staged = store.stage_generation("unvalidated", None, None).unwrap();
+        assert!(generation_is_ready(&staged.path));
+
+        assert!(store.list().unwrap().is_empty());
+        assert!(!staged.path.exists());
+        assert!(!store.generation_dir("unvalidated").exists());
         if let Some(root) = history_file.parent() {
             let _ = fs::remove_dir_all(root);
         }
@@ -2562,6 +2650,41 @@ mod tests {
         assert_eq!(remaining[0].name, "c2");
 
         // Cleanup.
+        if let Some(grandparent) = history_file.parent() {
+            let _ = fs::remove_dir_all(grandparent);
+        }
+    }
+
+    #[test]
+    fn commit_message_roundtrips_without_changing_legacy_saves() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-message");
+        append_history_messages(&store.session_file, &[lineage_msg("v1")]).unwrap();
+
+        let message = "Fix login flow\n\nKeep the old checkpoint format readable. 🚀";
+        store
+            .save_with_message("with-message", Some(message))
+            .unwrap();
+        store.save("legacy").unwrap();
+
+        let listed = store.list().unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|checkpoint| checkpoint.name == "with-message")
+                .and_then(|checkpoint| checkpoint.message.as_deref()),
+            Some(message)
+        );
+        assert_eq!(
+            listed
+                .iter()
+                .find(|checkpoint| checkpoint.name == "legacy")
+                .and_then(|checkpoint| checkpoint.message.as_deref()),
+            None
+        );
+
+        let manifest = read_generation_manifest(&store.generation_dir("with-message")).unwrap();
+        assert_eq!(manifest.message.as_deref(), Some(message));
         if let Some(grandparent) = history_file.parent() {
             let _ = fs::remove_dir_all(grandparent);
         }
@@ -3254,11 +3377,11 @@ mod tests {
         assert_eq!(read_generation_parent(&write("garbage", b"nope\n")), None);
         assert_eq!(read_generation_parent(&root.join("missing")), None);
         assert_eq!(
-            generation_manifest_body(None, 0, None, None, None),
+            generation_manifest_body(None, 0, None, None, None, None),
             "checkpoint-v2\nparent: -\nsaved_at: 0\n"
         );
         assert_eq!(
-            generation_manifest_body(Some("a"), 7, None, None, None),
+            generation_manifest_body(Some("a"), 7, None, None, None, None),
             "checkpoint-v2\nparent: a\nsaved_at: 7\n"
         );
         // Pre-timestamp manifests still parse (timestamp falls back to mtime).

@@ -31,6 +31,100 @@ fn prompt_checkpoint_confirmation(prompt: &str) -> Option<bool> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct SaveArgs {
+    name: Option<String>,
+    message: Option<String>,
+}
+
+fn parse_save_args(input: &str) -> Result<SaveArgs, String> {
+    let uses_message_option = input
+        .split_whitespace()
+        .any(|arg| matches!(arg, "-m" | "--message") || arg.starts_with("--message="));
+    if !uses_message_option {
+        return Ok(SaveArgs {
+            // Preserve the legacy contract: the first whitespace-delimited
+            // token is the name and any later tokens are ignored.
+            name: input.split_whitespace().next().map(str::to_string),
+            message: None,
+        });
+    }
+
+    let words = split_quoted_args(input)?;
+    let mut name = None;
+    let mut messages = Vec::new();
+    let mut index = 0;
+    while index < words.len() {
+        let word = &words[index];
+        if matches!(word.as_str(), "-m" | "--message") {
+            index += 1;
+            let Some(message) = words.get(index) else {
+                return Err(format!("option '{word}' requires a message"));
+            };
+            messages.push(message.clone());
+        } else if let Some(message) = word.strip_prefix("--message=") {
+            messages.push(message.to_string());
+        } else if name.is_none() {
+            name = Some(word.clone());
+        }
+        index += 1;
+    }
+    if messages.iter().any(|message| message.trim().is_empty()) {
+        return Err("commit message cannot be empty".to_string());
+    }
+    Ok(SaveArgs {
+        name,
+        message: Some(messages.join("\n\n")),
+    })
+}
+
+fn split_quoted_args(input: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut in_word = false;
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            } else if ch == '\\' && delimiter == '"' {
+                word.push(chars.next().ok_or("trailing escape in commit arguments")?);
+            } else {
+                word.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                in_word = true;
+            }
+            '\\' => {
+                word.push(chars.next().ok_or("trailing escape in commit arguments")?);
+                in_word = true;
+            }
+            ch if ch.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            _ => {
+                word.push(ch);
+                in_word = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return Err("unterminated quote in commit arguments".to_string());
+    }
+    if in_word {
+        words.push(word);
+    }
+    Ok(words)
+}
+
 pub fn try_handle_checkpoint_command(
     app: &mut App,
     input: &str,
@@ -62,11 +156,21 @@ pub fn try_handle_checkpoint_command(
             print_help();
         }
         "save" | "commit" | "s" => {
-            let name = parts
-                .next()
-                .map(str::to_string)
+            let raw_args = normalized
+                .split_once(action)
+                .map(|(_, rest)| rest.trim_start())
+                .unwrap_or_default();
+            let parsed = match parse_save_args(raw_args) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    println!("Failed to save checkpoint: {err}");
+                    return Ok(true);
+                }
+            };
+            let name = parsed
+                .name
                 .unwrap_or_else(|| Local::now().format("commit-%Y%m%d-%H%M%S-%3f").to_string());
-            match store.save(&name) {
+            match store.save_with_message(&name, parsed.message.as_deref()) {
                 Ok(_) => {
                     println!("Saved checkpoint '{name}'.");
                     publish_checkpoint_names(&store);
@@ -670,7 +774,12 @@ pub fn try_handle_checkpoint_command(
 fn print_help() {
     println!("Checkpoint commands (current session):");
     println!();
-    println!("  /git save [name]       create an immutable commit; advances the current branch");
+    println!("  /git commit [name] [-m <message>]");
+    println!(
+        "                                create an immutable commit; repeat -m for paragraphs"
+    );
+    println!("  /git save [name] [-m <message>]");
+    println!("                                compatible alias; name and message are optional");
     println!(
         "  /git tree              show commit ancestry and branch pointers (default; `list` works too)"
     );
@@ -1027,6 +1136,9 @@ fn print_tree(app: &App, store: &CheckpointStore) -> Result<(), Box<dyn std::err
         if cp.name.starts_with("auto-") {
             tags.push_str(&"[auto] ".dimmed().to_string());
         }
+        if let Some(subject) = checkpoint_message_subject(cp.message.as_deref()) {
+            tags.push_str(&format!("— {subject}").bold().to_string());
+        }
         println!(
             "  {}{} {}{}{}  {size_cell}  {when:<19}  {tags}",
             row.prefix.dimmed(),
@@ -1092,6 +1204,24 @@ fn truncate_middle(name: &str, max_chars: usize) -> String {
         .rev()
         .collect();
     format!("{head}…{tail}")
+}
+
+fn checkpoint_message_subject(message: Option<&str>) -> Option<String> {
+    let line = message?.lines().find(|line| !line.trim().is_empty())?;
+    // Persisted metadata is untrusted terminal text. Make controls visible
+    // instead of letting ANSI escapes or other control bytes affect output.
+    let safe_line: String = line
+        .chars()
+        .map(|ch| if ch.is_control() { '�' } else { ch })
+        .collect();
+    let subject = safe_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_SUBJECT_CHARS: usize = 72;
+    if subject.chars().count() <= MAX_SUBJECT_CHARS {
+        return Some(subject);
+    }
+    let mut short: String = subject.chars().take(MAX_SUBJECT_CHARS - 1).collect();
+    short.push('…');
+    Some(short)
 }
 
 /// One printable branch-pointer row for the `Branches` block in `print_tree`.
@@ -1387,9 +1517,9 @@ fn refresh_runtime_after_rollback(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BranchRow, SwitchPreparation, branch_rows, commit_graph, effective_head,
-        format_human_bytes, is_head_alias, is_latest_alias, is_previous_alias,
-        parse_navigation_args, switch_preparation, truncate_middle,
+        BranchRow, SwitchPreparation, branch_rows, checkpoint_message_subject, commit_graph,
+        effective_head, format_human_bytes, is_head_alias, is_latest_alias, is_previous_alias,
+        parse_navigation_args, parse_save_args, switch_preparation, truncate_middle,
     };
     use crate::ai::history::{CheckpointBranch, CheckpointInfo};
 
@@ -1397,9 +1527,54 @@ mod tests {
         words.iter().map(|s| s.to_string()).collect()
     }
 
+    #[test]
+    fn save_args_preserve_legacy_name_behavior_without_message_flags() {
+        let parsed = parse_save_args("release ignored words").unwrap();
+        assert_eq!(parsed.name.as_deref(), Some("release"));
+        assert_eq!(parsed.message, None);
+    }
+
+    #[test]
+    fn save_args_parse_git_style_messages_and_optional_names() {
+        let parsed = parse_save_args(r#"-m "fix login flow""#).unwrap();
+        assert_eq!(parsed.name, None);
+        assert_eq!(parsed.message.as_deref(), Some("fix login flow"));
+
+        let parsed = parse_save_args(r#"release -m "subject" -m 'details'"#).unwrap();
+        assert_eq!(parsed.name.as_deref(), Some("release"));
+        assert_eq!(parsed.message.as_deref(), Some("subject\n\ndetails"));
+
+        let parsed = parse_save_args("--message=subject release").unwrap();
+        assert_eq!(parsed.name.as_deref(), Some("release"));
+        assert_eq!(parsed.message.as_deref(), Some("subject"));
+    }
+
+    #[test]
+    fn save_args_reject_missing_empty_or_unterminated_messages() {
+        assert!(parse_save_args("-m").is_err());
+        assert!(parse_save_args(r#"-m """#).is_err());
+        assert!(parse_save_args(r#"-m "unterminated"#).is_err());
+    }
+
+    #[test]
+    fn commit_subject_uses_first_nonempty_line_and_truncates() {
+        assert_eq!(
+            checkpoint_message_subject(Some("\n  subject  with   spaces\n\nbody")).as_deref(),
+            Some("subject with spaces")
+        );
+        let long = "x".repeat(100);
+        let subject = checkpoint_message_subject(Some(&long)).unwrap();
+        assert_eq!(subject.chars().count(), 72);
+        assert!(subject.ends_with('…'));
+        let escaped = checkpoint_message_subject(Some("\u{1b}[2Jspoof")).unwrap();
+        assert_eq!(escaped, "�[2Jspoof");
+        assert!(!escaped.chars().any(char::is_control));
+    }
+
     fn forest_info(name: &str, parent: Option<&str>) -> CheckpointInfo {
         CheckpointInfo {
             name: name.to_string(),
+            message: None,
             modified_local: None,
             size_bytes: 0,
             storage_bytes: 0,
