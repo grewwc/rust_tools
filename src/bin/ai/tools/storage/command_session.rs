@@ -359,9 +359,7 @@ pub(crate) fn start(
                 return Err(std::io::Error::last_os_error());
             }
             #[cfg(target_os = "linux")]
-            unsafe {
-                let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-            }
+            let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
             #[cfg(target_os = "macos")]
             let _ = proc_setpcontrol(PROC_SETPC_TERMINATE);
             Ok(())
