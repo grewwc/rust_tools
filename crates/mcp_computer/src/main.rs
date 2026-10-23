@@ -18,6 +18,7 @@
 //!   transport trigger words, so a failing tool never costs the host the process.
 
 mod backend;
+mod frame;
 mod tools;
 
 #[tokio::main]

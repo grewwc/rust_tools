@@ -9,7 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 # Shared MCP-over-stdio protocol skeleton (JsonRpcErr / cap_text / with_timeout / run / McpServer).
+image = { version = "0.25.8", default-features = false, features = ["png"] }
 mcp_stdio = { path = "../mcp_stdio" }
+rust_tools = { path = "../.." }
+sha2 = "0.11.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "time"] }
 serde_json = "1"
 

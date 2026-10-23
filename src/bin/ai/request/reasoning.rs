@@ -397,15 +397,19 @@ pub(crate) fn resolve_reasoning_effort(app: &App, model: &str) -> Option<Reasoni
 /// Apply the truncation ladder's last-resort force-off fallback to the reasoning-effort value.
 ///
 /// When `thinking_disabled_override` is active (set by the orchestrator after repeated
-/// truncation when lowering effort alone cannot converge), thinking must actually be turned off
-/// on the wire. For dialects that control thinking solely through `reasoning_effort` (OpenAI
-/// family / Responses — `NoThinkingDialect` sends no thinking field), the only wire value that
-/// disables thinking is `"none"`, so the effort is mapped to `ReasoningEffort::None`. Dialects
-/// with a real off-switch (DashScope `enable_thinking: false`, DeepSeek
-/// `thinking: {"type":"disabled"}`) are already handled through `enable_thinking=false`;
-/// `reasoning_effort_reduces_thinking_for` is false for them, so their effort passes through
-/// unchanged. The graduated effort ladder itself deliberately never sends `"none"`
-/// (orchestrator.rs) — this maps only the force-off fallback, not ladder retries.
+/// truncation, or by the reasoning-only recovery), the request layer must express "thinking
+/// off" per the dialect's declared off capability — never by blindly sending `"none"`:
+/// - [`ThinkingOffCapability::EffortNone`] dialects (OpenAI family / Responses —
+///   `NoThinkingDialect` sends no thinking field): the only wire value that disables thinking
+///   is `"none"`, so the effort is mapped to `ReasoningEffort::None`;
+/// - [`ThinkingOffCapability::RealSwitch`] dialects (DashScope `enable_thinking: false`,
+///   DeepSeek `thinking: {"type":"disabled"}`) are already turned off through
+///   `enable_thinking=false`; the effort passes through unchanged;
+/// - [`ThinkingOffCapability::Unsupported`] dialects (MiniMax M2.x, beam) have no off
+///   mechanism — sending `"none"` is rejected or ignored there — so the current tier passes
+///   through unchanged and thinking stays on. The graduated effort ladder itself deliberately
+///   never sends `"none"` (orchestrator.rs) — this maps only the force-off fallback, not
+///   ladder retries.
 pub(crate) fn apply_thinking_force_off_effort<'a>(
     thinking_disabled_override: bool,
     provider: ApiProvider,
@@ -415,6 +419,10 @@ pub(crate) fn apply_thinking_force_off_effort<'a>(
 ) -> Option<&'a str> {
     if thinking_disabled_override
         && reasoning_effort_reduces_thinking_for(provider, model, endpoint)
+        && matches!(
+            thinking_off_capability_for(provider, model, endpoint),
+            ThinkingOffCapability::EffortNone
+        )
     {
         Some(ReasoningEffort::None.as_str())
     } else {
@@ -608,6 +616,33 @@ mod force_off_effort_tests {
                 Some("xhigh"),
             ),
             Some("xhigh"),
+        );
+    }
+
+    #[test]
+    fn force_off_passes_effort_through_for_unsupported_dialects() {
+        // MiniMax always-on reasoning and beam (whose gateway rejects "none"
+        // with 400) have no off mechanism: the force-off fallback must keep
+        // the current tier instead of emitting the bogus "none".
+        assert_eq!(
+            apply_thinking_force_off_effort(
+                true,
+                ApiProvider::OpenCode,
+                "mimo-v2.5-pro",
+                "https://opencode.ai/inference/go/v1/chat/completions",
+                Some("low"),
+            ),
+            Some("low"),
+        );
+        assert_eq!(
+            apply_thinking_force_off_effort(
+                true,
+                ApiProvider::OpenCode,
+                "beam-free",
+                "https://opencode.ai/inference/go/v1/chat/completions",
+                Some("max"),
+            ),
+            Some("max"),
         );
     }
 

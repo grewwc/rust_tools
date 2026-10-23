@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use objc2_core_foundation::{CGPoint, CFRetained};
+use objc2_core_foundation::{CFRetained, CGPoint};
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
     CGEventType, CGMouseButton, CGScrollEventUnit,
@@ -77,6 +77,7 @@ fn post_mouse(
 }
 
 pub(crate) fn move_mouse(x: f64, y: f64) -> Result<(), String> {
+    super::screen::ensure_accessibility_permission()?;
     post_mouse(
         CGEventType::MouseMoved,
         CGPoint::new(x, y),
@@ -92,6 +93,7 @@ pub(crate) fn click(
     count: u32,
     modifiers: &[String],
 ) -> Result<(), String> {
+    super::screen::ensure_accessibility_permission()?;
     let button = parse_button(button)?;
     let flags = parse_modifiers(modifiers)?;
     let point = CGPoint::new(x, y);
@@ -136,6 +138,7 @@ pub(crate) fn drag(
     modifiers: &[String],
     steps: u32,
 ) -> Result<(), String> {
+    super::screen::ensure_accessibility_permission()?;
     let button = parse_button(button)?;
     let flags = parse_modifiers(modifiers)?;
     let (down_type, drag_type, up_type) = if button == CGMouseButton::Right {
@@ -162,10 +165,7 @@ pub(crate) fn drag(
     let steps = steps.clamp(2, 200);
     for step in 1..=steps {
         let t = step as f64 / steps as f64;
-        let point = CGPoint::new(
-            from_x + (to_x - from_x) * t,
-            from_y + (to_y - from_y) * t,
-        );
+        let point = CGPoint::new(from_x + (to_x - from_x) * t, from_y + (to_y - from_y) * t);
         post_mouse(drag_type, point, button, flags)?;
         std::thread::sleep(Duration::from_millis(DRAG_STEP_MS));
     }
@@ -184,6 +184,7 @@ pub(crate) fn scroll(
     dy: f64,
     unit: &str,
 ) -> Result<(), String> {
+    super::screen::ensure_accessibility_permission()?;
     if let (Some(x), Some(y)) = (x, y) {
         move_mouse(x, y)?;
         std::thread::sleep(Duration::from_millis(MOVE_SETTLE_MS));
@@ -216,6 +217,7 @@ pub(crate) fn scroll(
 /// `CGEventKeyboardSetUnicodeString`, so it is character-agnostic: no keycode
 /// table and no keyboard layout is involved, and non-ASCII text works.
 pub(crate) fn type_text(text: &str) -> Result<(), String> {
+    super::screen::ensure_accessibility_permission()?;
     if text.is_empty() {
         return Ok(());
     }
@@ -246,6 +248,7 @@ pub(crate) fn type_text(text: &str) -> Result<(), String> {
 
 /// Press a named key or chord, e.g. `escape`, `return`, `f5`, `cmd+shift+t`.
 pub(crate) fn press_key(chord: &str) -> Result<(), String> {
+    super::screen::ensure_accessibility_permission()?;
     let parts: Vec<&str> = chord
         .split('+')
         .map(str::trim)
@@ -254,7 +257,10 @@ pub(crate) fn press_key(chord: &str) -> Result<(), String> {
     let Some((base, modifier_names)) = parts.split_last() else {
         return Err("press_key needs a key, e.g. `escape` or `cmd+shift+t`".to_string());
     };
-    let modifiers: Vec<String> = modifier_names.iter().map(|name| (*name).to_string()).collect();
+    let modifiers: Vec<String> = modifier_names
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
     let flags = parse_modifiers(&modifiers)?;
     let keycode = keycode_for(base).ok_or_else(|| {
         format!(

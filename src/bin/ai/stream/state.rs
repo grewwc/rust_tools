@@ -72,8 +72,8 @@ pub(super) struct StreamProcessingState {
     /// Last-seen `(echoed_model, usage)` from any chunk during this stream.
     /// Handed to the kernel's `/dev/llm` when the stream finalizes.
     pub(super) pending_llm_usage: Option<(String, super::super::request::StreamUsage)>,
-    /// Opt-in raw-wire recorder (see `wire_log`): inert unless the
-    /// `AIOS_STREAM_WIRE_LOG` switch is set when the response stream starts.
+    /// Raw-wire recorder (see `wire_log`): inert when the
+    /// `AIOS_STREAM_WIRE_LOG` switch is set to `0` when the response stream starts.
     pub(super) wire_log: StreamWireLog,
     /// Per-model silence allowance (`models/*.json` → `stream_silence_timeout_secs`) resolved when
     /// the response stream starts; `None` keeps the runtime's calibrated connection bound.

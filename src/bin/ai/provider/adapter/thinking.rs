@@ -19,9 +19,10 @@
 //! - [`EnableThinkingDialect`]: DashScope compatible-mode (Bailian) → `enable_thinking: bool`
 //! - [`DeepSeekThinkingDialect`]: DeepSeek (OpenCode Zen gateway / official api.deepseek.com) → `thinking: {"type":...}`
 //! - [`NoThinkingDialect`]: plain OpenAI / OpenRouter etc. → sends no fields
-//! - [`MinimaxThinkingDialect`]: MiniMax M2.x ("MiMo") → sends no fields, and
-//!   declares [`ThinkingOffCapability::Unsupported`] (always-on reasoning, no
-//!   reliable gateway off switch)
+//! - [`NoOffSwitchDialect`]: effort-only models with no reliable gateway off
+//!   switch (MiniMax M2.x ("MiMo") always-on reasoning; beam, whose gateway
+//!   rejects `reasoning_effort: "none"`) → sends no fields, declares
+//!   [`ThinkingOffCapability::Unsupported`]
 //!
 //! Each dialect also declares how (or whether) it can express "thinking off"
 //! via [`ThinkingDialect::thinking_off_capability`] — the per-vendor adaptation
@@ -47,9 +48,10 @@ pub(in crate::ai) enum ThinkingOffCapability {
     /// `ReasoningEffort::None`.
     EffortNone,
     /// The gateway offers no reliable way to turn thinking off (e.g. MiniMax
-    /// M2.x always-on reasoning). The request layer omits the thinking/effort
-    /// fields and reports the limitation honestly instead of sending a bogus
-    /// switch.
+    /// M2.x always-on reasoning, or beam whose gateway rejects "none"). The
+    /// request layer omits the thinking/effort fields on explicit off and
+    /// keeps the current tier on automatic force-off, reporting the
+    /// limitation honestly instead of sending a bogus switch.
     Unsupported,
 }
 
@@ -234,17 +236,19 @@ impl ThinkingDialect for NoThinkingDialect {
     }
 }
 
-/// MiniMax M2.x family ("MiMo", e.g. mimo-v2.5-pro): always-on reasoning with
-/// no reliable gateway off switch — sending `reasoning_effort: "none"` may be
-/// ignored or rejected. Sends no thinking fields (like [`NoThinkingDialect`])
-/// and declares [`ThinkingOffCapability::Unsupported`], so the request layer
-/// omits the thinking/effort fields on `/effort off` and the command handler
-/// reports the limitation honestly instead of claiming thinking was disabled.
-/// Effort tiers pass through verbatim via the trait default `adapt_effort` —
-/// this family's accepted value set is unverified.
-pub(in crate::ai) struct MinimaxThinkingDialect;
+/// Effort-only models with no reliable gateway off switch. Sends no thinking
+/// fields (like [`NoThinkingDialect`]) and declares
+/// [`ThinkingOffCapability::Unsupported`], so the request layer never sends
+/// `reasoning_effort: "none"` for these models: `/effort off` omits the
+/// effort field (and the command handler reports the limitation honestly),
+/// and the truncation/recovery force-off fallback keeps the current tier.
+/// Effort tiers pass through verbatim via the trait default `adapt_effort`.
+/// Covers the MiniMax M2.x family ("MiMo", e.g. mimo-v2.5-pro, whose
+/// always-on reasoning ignores or rejects "none") and beam (e.g. beam-free,
+/// whose gateway rejects "none" — accepted tiers are max/xhigh/high/medium/low).
+pub(in crate::ai) struct NoOffSwitchDialect;
 
-impl ThinkingDialect for MinimaxThinkingDialect {
+impl ThinkingDialect for NoOffSwitchDialect {
     fn fields(
         &self,
         _enable: bool,
@@ -307,7 +311,7 @@ static ENABLE_THINKING: EnableThinkingDialect = EnableThinkingDialect;
 static ANTHROPIC_THINKING: AnthropicThinkingDialect = AnthropicThinkingDialect;
 static DEEPSEEK_THINKING: DeepSeekThinkingDialect = DeepSeekThinkingDialect;
 static NO_THINKING: NoThinkingDialect = NoThinkingDialect;
-static MINIMAX_THINKING: MinimaxThinkingDialect = MinimaxThinkingDialect;
+static NO_OFF_SWITCH_THINKING: NoOffSwitchDialect = NoOffSwitchDialect;
 
 /// Whether the endpoint is DashScope (Alibaba Cloud Bailian) compatible-mode,
 /// which controls thinking via `enable_thinking: bool`. The matching logic is
@@ -336,20 +340,29 @@ fn is_minimax_model(model: &str) -> bool {
     m.contains("mimo") || m.contains("minimax")
 }
 
+/// Whether the model is a beam model (e.g. beam-free). Like MiniMax, beam
+/// shares gateway endpoints with models whose "none" does work (the OpenCode
+/// inference gateway), so the model name is the discriminator. Wire evidence:
+/// the gateway rejects `reasoning_effort: "none"` with 400 while accepting
+/// max/xhigh/high/medium/low.
+fn is_beam_model(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().contains("beam")
+}
+
 /// Picks the thinking dialect by gateway (provider + endpoint) and model,
 /// decoupled from the provider auth / response-consumption axis. The dispatch
 /// strictly mirrors [`super::adapter_for`]:
 /// - OpenRouter endpoint → sends nothing (same as OpenAI, relies only on reasoning_effort)
 /// - Alibaba → `enable_thinking` (DashScope compatible-mode)
 /// - Compatible → DashScope endpoint uses `enable_thinking`; official DeepSeek
-///   endpoint (api.deepseek.com) uses the `thinking` object; MiniMax models use
-///   [`MinimaxThinkingDialect`]; everything else (e.g. internal modelhub, other
+///   endpoint (api.deepseek.com) uses the `thinking` object; MiniMax/beam models use
+///   [`NoOffSwitchDialect`]; everything else (e.g. internal modelhub, other
 ///   OpenAI-compatible gateways) sends no thinking field, relying only on
 ///   top-level `reasoning_effort`
-/// - OpenAi → DashScope endpoint uses `enable_thinking`; MiniMax models use
-///   [`MinimaxThinkingDialect`]; plain OpenAI endpoints send nothing
-/// - OpenCode → DeepSeek models use the `thinking` object; MiniMax models use
-///   [`MinimaxThinkingDialect`]; Anthropic Messages endpoints (`/v1/messages`)
+/// - OpenAi → DashScope endpoint uses `enable_thinking`; MiniMax/beam models use
+///   [`NoOffSwitchDialect`]; plain OpenAI endpoints send nothing
+/// - OpenCode → DeepSeek models use the `thinking` object; MiniMax/beam models use
+///   [`NoOffSwitchDialect`]; Anthropic Messages endpoints (`/v1/messages`)
 ///   use [`AnthropicThinkingDialect`]; everything else sends nothing
 ///
 /// Historically `Compatible` always used the DashScope dialect, so pure
@@ -385,8 +398,8 @@ pub(in crate::ai) fn thinking_dialect_for(
                 &ENABLE_THINKING
             } else if is_deepseek_official_endpoint(endpoint) {
                 &DEEPSEEK_THINKING
-            } else if is_minimax_model(model) {
-                &MINIMAX_THINKING
+            } else if is_minimax_model(model) || is_beam_model(model) {
+                &NO_OFF_SWITCH_THINKING
             } else {
                 &NO_THINKING
             }
@@ -394,8 +407,8 @@ pub(in crate::ai) fn thinking_dialect_for(
         ApiProvider::OpenAi => {
             if is_dashscope_endpoint(endpoint) {
                 &ENABLE_THINKING
-            } else if is_minimax_model(model) {
-                &MINIMAX_THINKING
+            } else if is_minimax_model(model) || is_beam_model(model) {
+                &NO_OFF_SWITCH_THINKING
             } else {
                 &NO_THINKING
             }
@@ -403,8 +416,8 @@ pub(in crate::ai) fn thinking_dialect_for(
         ApiProvider::OpenCode => {
             if model.to_ascii_lowercase().contains("deepseek") {
                 &DEEPSEEK_THINKING
-            } else if is_minimax_model(model) {
-                &MINIMAX_THINKING
+            } else if is_minimax_model(model) || is_beam_model(model) {
+                &NO_OFF_SWITCH_THINKING
             } else {
                 &NO_THINKING
             }
@@ -606,6 +619,35 @@ mod tests {
         );
         assert!(dialect.fields(true, Some("high")).is_empty());
         assert_eq!(dialect.adapt_effort(Some("high")), Some("high"));
+    }
+
+    #[test]
+    fn beam_off_capability_is_unsupported() {
+        // beam-free shares the OpenCode inference gateway with models whose
+        // "none" works, but its own gateway rejects `reasoning_effort: "none"`
+        // with 400 (accepted tiers: max/xhigh/high/medium/low) — detected by
+        // model name, like MiniMax. The graded tiers still reduce thinking.
+        assert!(matches!(
+            thinking_off_capability_for(
+                ApiProvider::OpenCode,
+                "beam-free",
+                "https://opencode.ai/inference/go/v1/chat/completions"
+            ),
+            ThinkingOffCapability::Unsupported
+        ));
+        assert!(reasoning_effort_reduces_thinking_for(
+            ApiProvider::OpenCode,
+            "beam-free",
+            "https://opencode.ai/inference/go/v1/chat/completions"
+        ));
+        // No thinking fields; tiers pass through verbatim.
+        let dialect = thinking_dialect_for(
+            ApiProvider::OpenCode,
+            "beam-free",
+            "https://opencode.ai/inference/go/v1/chat/completions",
+        );
+        assert!(dialect.fields(true, Some("max")).is_empty());
+        assert_eq!(dialect.adapt_effort(Some("max")), Some("max"));
     }
 
     #[test]

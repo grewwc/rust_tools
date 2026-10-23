@@ -13,6 +13,12 @@ fn unsupported<T>() -> Result<T, String> {
     ))
 }
 
+pub(crate) struct Screenshot {
+    pub(crate) report: String,
+    pub(crate) origin: Option<(f64, f64)>,
+    pub(crate) point_size: Option<(f64, f64)>,
+}
+
 pub(crate) fn screen_info() -> Result<String, String> {
     unsupported()
 }
@@ -22,7 +28,8 @@ pub(crate) fn screenshot(
     _window_id: Option<u32>,
     _display: Option<u32>,
     _include_cursor: bool,
-) -> Result<String, String> {
+    _path: &std::path::Path,
+) -> Result<Screenshot, String> {
     unsupported()
 }
 
@@ -31,6 +38,10 @@ pub(crate) fn list_windows(_app_filter: Option<String>) -> Result<String, String
 }
 
 pub(crate) fn activate_app(_app: String) -> Result<String, String> {
+    unsupported()
+}
+
+pub(crate) fn activate_window(_window_id: u32) -> Result<String, String> {
     unsupported()
 }
 

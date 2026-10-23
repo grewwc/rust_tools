@@ -1,6 +1,6 @@
 use super::{
-    AgentModelTier, BUILTIN_AGENTS, load_project_instruction_docs_from,
-    load_scoped_project_instruction_docs_for_target_priority_from,
+    AgentModelTier, BUILTIN_AGENTS, ProjectInstructionDoc, load_project_instruction_docs_from,
+    limit_project_instruction_docs, load_scoped_project_instruction_docs_for_target_priority_from,
     load_scoped_project_instruction_docs_for_target_tiers_from,
     load_scoped_project_instruction_docs_for_targets_from, parse_agent_front_matter,
 };
@@ -309,6 +309,51 @@ fn project_instruction_docs_include_user_config_dir_for_project() {
         user_doc.is_some_and(|doc| doc.path.contains("rust_tools")),
         "config doc path must live under the config dir: {:?}",
         user_doc.map(|d| &d.path)
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_instruction_docs_config_dir_prioritized_over_project_root_same_family() {
+    // When ~/.config/rust_tools/<project>/ provides an instruction file (e.g. agents.md),
+    // and the project root has the same family (e.g. AGENTS.md), BOTH must load, with
+    // the config copy first: priority on conflict, not shadowing. A different family
+    // (e.g. CLAUDE.md) must survive untouched.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let root = temp_dir("project_cfg_priority");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("AGENTS.md"), "# Repo root rules\n").unwrap();
+    fs::write(root.join("CLAUDE.md"), "# Repo claude rules\n").unwrap();
+
+    let fake_home = root.join("home");
+    let project_name = root.file_name().unwrap().to_string_lossy().into_owned();
+    let config_dir = fake_home
+        .join(".config")
+        .join("rust_tools")
+        .join(&project_name);
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("agents.md"), "# User pinned rules\n").unwrap();
+
+    let docs = with_fake_home(&fake_home, || load_project_instruction_docs_from(&root));
+
+    let repo_idx = docs
+        .iter()
+        .position(|doc| doc.content.contains("Repo root rules"))
+        .expect("project-root AGENTS.md must still load");
+    let cfg_idx = docs
+        .iter()
+        .position(|doc| doc.content.contains("User pinned rules"))
+        .expect("config agents.md must load");
+    assert!(
+        cfg_idx < repo_idx,
+        "config copy must come before the project-root copy on same-family conflict, got: {:?}",
+        docs.iter().map(|d| &d.path).collect::<Vec<_>>()
+    );
+    assert!(
+        docs.iter()
+            .any(|doc| doc.content.contains("Repo claude rules")),
+        "a different family (CLAUDE.md) must still load"
     );
 
     let _ = fs::remove_dir_all(root);
@@ -660,4 +705,48 @@ fn target_scoped_instruction_docs_ignore_paths_outside_project() {
 
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_dir_all(outside.parent().unwrap());
+}
+
+#[test]
+fn project_instruction_docs_budget_truncates_and_omits_in_order() {
+    // The total budget applies in vector order: a doc that partially fits is
+    // truncated with a trailing `…` (reported on stderr), and docs beyond the
+    // budget are omitted entirely (also reported on stderr). The returned
+    // vector is what the prompt sees; this test pins that behavior.
+    let docs = vec![
+        ProjectInstructionDoc {
+            path: "/tmp/budget_a.md".into(),
+            content: "a".repeat(300),
+        },
+        ProjectInstructionDoc {
+            path: "/tmp/budget_b.md".into(),
+            content: "b".repeat(500),
+        },
+        ProjectInstructionDoc {
+            path: "/tmp/budget_c.md".into(),
+            content: "c".repeat(200),
+        },
+    ];
+
+    // 600 chars: a fits, b keeps 300 chars plus the ellipsis, c is omitted.
+    let limited = limit_project_instruction_docs(docs, 600);
+    assert_eq!(limited.len(), 2);
+    assert_eq!(limited[0].content, "a".repeat(300));
+    assert_eq!(limited[1].content.chars().count(), 301);
+    assert!(limited[1].content.ends_with('…'));
+
+    // Budget exhausted before the second doc: only the first survives.
+    let docs = vec![
+        ProjectInstructionDoc {
+            path: "/tmp/budget_a.md".into(),
+            content: "a".repeat(300),
+        },
+        ProjectInstructionDoc {
+            path: "/tmp/budget_b.md".into(),
+            content: "b".repeat(50),
+        },
+    ];
+    let limited = limit_project_instruction_docs(docs, 100);
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0].content.chars().count(), 101);
 }

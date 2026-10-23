@@ -285,6 +285,16 @@ async fn request_messages_with_key(
     estimated_prompt_tokens: usize,
 ) -> Result<Response, RequestError> {
     let http_body = super::protocol::build_http_body_for_request(model, endpoint, request_body);
+    super::outcome_log::append_request_record(
+        &app.session_id,
+        model,
+        endpoint,
+        app.cli.thinking_disabled_override,
+        app.cli
+            .reasoning_effort_override
+            .map(|override_value| override_value.map(|level| level.as_str())),
+        request_body,
+    );
     for attempt in 1..=retry_policy.max_attempts {
         let client = app.client.clone();
         let build_request = || {
@@ -369,6 +379,13 @@ async fn request_messages_with_key(
                 // 429 (quota/rate limit) is not backed off within a single key: return immediately with the clamped retry_after,
                 // let the upper layer rotate other keys first, and only then decide on backoff retry once keys are exhausted.
                 if status_code == 429 {
+                    super::outcome_log::append_request_error(
+                        &app.session_id,
+                        model,
+                        endpoint,
+                        status.as_u16(),
+                        &body,
+                    );
                     let mut err = RequestError::status(status, body);
                     err.retry_after = retry_after_delay;
                     return Err(err);
@@ -406,6 +423,13 @@ async fn request_messages_with_key(
                     }
                     continue;
                 }
+                super::outcome_log::append_request_error(
+                    &app.session_id,
+                    model,
+                    endpoint,
+                    status.as_u16(),
+                    &body,
+                );
                 return Err(RequestError::status(status, body));
             }
             Err(err) => {
@@ -653,12 +677,13 @@ async fn prepare_request_projection(
         core.reasoning_effort
     };
     // Truncation-ladder force-off fallback (orchestrator.rs): after repeated truncation the
-    // ladder sets thinking_disabled_override to force thinking off. For effort-only dialects
+    // ladder sets thinking_disabled_override to force thinking off. For EffortNone dialects
     // (OpenAI family / Responses) resolve_thinking=false emits nothing on the wire
     // (NoThinkingDialect sends no thinking field) and the ladder's Low effort keeps thinking on,
     // making the fallback a no-op; map it to `reasoning_effort: "none"`, the only value that
     // actually disables thinking there. Switch-based dialects keep their effort (their off-switch
-    // is already driven by enable_thinking=false).
+    // is already driven by enable_thinking=false), as do Unsupported dialects (MiniMax, beam),
+    // whose gateways reject "none".
     let reasoning_effort = apply_thinking_force_off_effort(
         app.cli.thinking_disabled_override,
         models::model_adapter(model),
@@ -977,24 +1002,28 @@ mod budget_tests {
 }
 
 pub(crate) fn print_info(app: &App, model: &str) {
-    let effort_label = if app.cli.thinking_disabled_override
-        || app.cli.reasoning_effort_override == Some(None)
-    {
-        // The truncation fallback or the user's explicit `/effort off` turns thinking off
-        // (via the wire switch or `reasoning_effort:"none"`); label it explicitly to avoid
-        // confusion with "auto / model default".
-        if app.cli.reasoning_effort_override == Some(None)
-            && matches!(
-                model_thinking_off_capability(model),
-                ThinkingOffCapability::Unsupported
-            )
-        {
-            // No vendor off mechanism: the intent is stored but the wire cannot
-            // express it — label honestly instead of implying thinking is off.
+    // The header must show what the wire actually carries. The user's explicit
+    // `/effort off` and the automatic force-off fallback both mean "thinking
+    // off" — except on Unsupported dialects, where the wire keeps the tier
+    // (no off mechanism exists) and the resolved effort is shown instead.
+    let off_unsupported = matches!(
+        model_thinking_off_capability(model),
+        ThinkingOffCapability::Unsupported
+    );
+    let effort_label = if app.cli.reasoning_effort_override == Some(None) {
+        // The user's explicit `/effort off`: intent stored, but on Unsupported
+        // dialects the wire cannot express it — label honestly instead of
+        // implying thinking was turned off.
+        if off_unsupported {
             "off (unsupported)"
         } else {
             "off"
         }
+    } else if app.cli.thinking_disabled_override && !off_unsupported {
+        // The truncation/recovery force-off fallback turns thinking off (via
+        // the wire switch or `reasoning_effort:"none"`); label it explicitly
+        // to avoid confusion with "auto / model default".
+        "off"
     } else {
         match resolve_reasoning_effort(app, model) {
             Some(_) if !model_effort_graded(model) => {

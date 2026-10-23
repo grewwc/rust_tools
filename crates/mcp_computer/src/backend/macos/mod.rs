@@ -13,7 +13,7 @@ mod screen;
 
 pub(crate) use capture::screenshot;
 pub(crate) use input::{click, drag, move_mouse, press_key, scroll, type_text};
-pub(crate) use screen::{activate_app, list_windows, screen_info};
+pub(crate) use screen::{activate_app, activate_window, list_windows, screen_info};
 
 /// Phrases the host treats as transport failures (`src/bin/ai/mcp/client.rs`).
 /// Error text that reached this module came from a helper binary, so it is scanned

@@ -8,6 +8,7 @@ mod error;
 mod image_digest;
 mod logging;
 mod normalize;
+mod outcome_log;
 mod prompt_feedback;
 pub(crate) use normalize::{
     DERIVED_CONTEXT_HANDOFF, DERIVED_CONTEXT_RETURN, HISTORY_SUMMARY_CONTEXT_HEADER,

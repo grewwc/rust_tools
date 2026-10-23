@@ -20,13 +20,12 @@ use std::time::Duration;
 
 use core::ffi::c_void;
 
-use objc2_core_foundation::{CFDictionary, CFNumber, CFString};
+use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFString};
 use objc2_core_graphics::{
     CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMode, CGDisplayPixelsHigh,
-    CGDisplayPixelsWide, CGEvent, CGEventSource, CGEventSourceStateID, CGEventType,
-    CGGetActiveDisplayList, CGMainDisplayID, CGMouseButton, CGWindowListCopyWindowInfo,
-    CGWindowListOption, kCGWindowBounds, kCGWindowLayer, kCGWindowName, kCGWindowNumber,
-    kCGWindowOwnerName,
+    CGDisplayPixelsWide, CGEvent, CGGetActiveDisplayList, CGMainDisplayID,
+    CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowBounds, kCGWindowLayer, kCGWindowName,
+    kCGWindowNumber, kCGWindowOwnerName, kCGWindowOwnerPID,
 };
 
 use super::sanitize;
@@ -41,6 +40,25 @@ unsafe extern "C" {
     /// `Boolean AXIsProcessTrusted(void)` — true when this process may inject
     /// events, i.e. has Accessibility access.
     fn AXIsProcessTrusted() -> u8;
+    fn AXUIElementCreateApplication(pid: i32) -> *const c_void;
+    fn AXUIElementCopyAttributeValue(
+        element: *const c_void,
+        attribute: *const c_void,
+        value: *mut *const c_void,
+    ) -> i32;
+    fn AXUIElementSetAttributeValue(
+        element: *const c_void,
+        attribute: *const c_void,
+        value: *const c_void,
+    ) -> i32;
+    fn AXUIElementPerformAction(element: *const c_void, action: *const c_void) -> i32;
+    fn _AXUIElementGetWindow(element: *const c_void, window_id: *mut u32) -> i32;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    static kCFBooleanTrue: *const c_void;
+    fn CFRelease(value: *const c_void);
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -50,6 +68,63 @@ unsafe extern "C" {
     /// `CGRequestScreenCaptureAccess` it never prompts, which is what a tool call
     /// should do.
     fn CGPreflightScreenCaptureAccess() -> u8;
+}
+
+pub(super) fn ensure_accessibility_permission() -> Result<(), String> {
+    // SAFETY: this function only reads a process-level permission flag.
+    if unsafe { AXIsProcessTrusted() } != 0 {
+        return Ok(());
+    }
+    Err(
+        "Accessibility permission is not granted to the process that starts mcp_computer; enable it in System Settings > Privacy & Security > Accessibility, then fully quit and reopen that host application before retrying"
+            .to_string(),
+    )
+}
+
+pub(super) fn ensure_screen_recording_permission() -> Result<(), String> {
+    // SAFETY: this function only reads a process-level permission flag and never prompts.
+    if unsafe { CGPreflightScreenCaptureAccess() } != 0 {
+        return Ok(());
+    }
+    Err(
+        "Screen Recording permission is not granted to the process that starts mcp_computer; enable it in System Settings > Privacy & Security > Screen & System Audio Recording, then fully quit and reopen that host application before retrying"
+            .to_string(),
+    )
+}
+
+struct OwnedCf(*const c_void);
+
+impl Drop for OwnedCf {
+    fn drop(&mut self) {
+        // SAFETY: every `OwnedCf` is created by a Create/Copy API and released once.
+        unsafe { CFRelease(self.0) };
+    }
+}
+
+fn copy_ax_attribute(element: *const c_void, name: &str) -> Result<OwnedCf, String> {
+    let attribute = CFString::from_str(name);
+    let mut value = std::ptr::null();
+    // SAFETY: `element` is a live AX object and `value` receives one retained CF object.
+    let code =
+        unsafe { AXUIElementCopyAttributeValue(element, key_pointer(&attribute), &mut value) };
+    if code != 0 || value.is_null() {
+        return Err(format!(
+            "Accessibility attribute {name} is unavailable (AXError={code})"
+        ));
+    }
+    Ok(OwnedCf(value))
+}
+
+fn ax_window_id(element: *const c_void) -> Result<u32, String> {
+    let mut window_id = 0;
+    // SAFETY: `_AXUIElementGetWindow` only reads the supplied live AX window object.
+    let code = unsafe { _AXUIElementGetWindow(element, &mut window_id) };
+    if code != 0 {
+        return Err(format!(
+            "Accessibility could not resolve a window id (AXError={code})"
+        ));
+    }
+    Ok(window_id)
 }
 
 /// A rectangle in screen points plus the pixels-per-point scale of the display it
@@ -184,14 +259,7 @@ pub(crate) fn frame_at_point(x: f64, y: f64) -> Result<Frame, String> {
 }
 
 pub(crate) fn cursor_position() -> Option<(f64, f64)> {
-    // A null mouse event carries the current pointer position; there is no
-    // standalone "get cursor" call in CoreGraphics.
-    let event = CGEvent::new_mouse_event(
-        CGEventSource::new(CGEventSourceStateID::HIDSystemState).as_deref(),
-        CGEventType::Null,
-        objc2_core_foundation::CGPoint::new(0.0, 0.0),
-        CGMouseButton::Left,
-    )?;
+    let event = CGEvent::new(None)?;
     let point = CGEvent::location(Some(&*event));
     Some((point.x, point.y))
 }
@@ -199,6 +267,7 @@ pub(crate) fn cursor_position() -> Option<(f64, f64)> {
 /// One on-screen window, in the order CoreGraphics returned it (front to back).
 pub(crate) struct WindowRow {
     id: u32,
+    pid: i32,
     app: String,
     title: Option<String>,
     layer: i64,
@@ -231,9 +300,13 @@ fn window_rows() -> Result<Vec<WindowRow>, String> {
         let Some(id) = dictionary_number(dictionary, unsafe { kCGWindowNumber }) else {
             continue;
         };
+        let Some(pid) = dictionary_number(dictionary, unsafe { kCGWindowOwnerPID }) else {
+            continue;
+        };
         let (x, y, width, height) = dictionary_bounds(dictionary).unwrap_or((0.0, 0.0, 0.0, 0.0));
         rows.push(WindowRow {
             id: id as u32,
+            pid: pid as i32,
             app: dictionary_string(dictionary, unsafe { kCGWindowOwnerName })
                 .unwrap_or_else(|| "unknown".to_string()),
             title: dictionary_string(dictionary, unsafe { kCGWindowName }),
@@ -357,7 +430,11 @@ pub(crate) fn screen_info() -> Result<String, String> {
     let screen_recording = unsafe { CGPreflightScreenCaptureAccess() } != 0;
     text.push_str(&format!(
         "accessibility (mouse/keyboard injection): {}\n",
-        if accessibility { "granted" } else { "NOT granted" }
+        if accessibility {
+            "granted"
+        } else {
+            "NOT granted"
+        }
     ));
     text.push_str(&format!(
         "screen recording (screenshot): {}\n",
@@ -384,9 +461,7 @@ pub(crate) fn list_windows(app_filter: Option<String>) -> Result<String, String>
         .map(|value| value.trim().to_lowercase())
         .filter(|value| !value.is_empty());
 
-    let mut text = String::from(
-        "on-screen windows, front to back:\n",
-    );
+    let mut text = String::from("on-screen windows, front to back:\n");
     let mut shown = 0usize;
     for row in &rows {
         if let Some(filter) = &filter {
@@ -451,7 +526,9 @@ pub(crate) fn activate_app(app: String) -> Result<String, String> {
     // that is unambiguously an identifier.
     let bundle_identifier = name.contains('.') && !name.contains(' ');
     let mut command = Command::new("/usr/bin/open");
-    command.arg(if bundle_identifier { "-b" } else { "-a" }).arg(name);
+    command
+        .arg(if bundle_identifier { "-b" } else { "-a" })
+        .arg(name);
     let output = command
         .output()
         .map_err(|error| format!("could not run /usr/bin/open: {error}"))?;
@@ -475,5 +552,75 @@ pub(crate) fn activate_app(app: String) -> Result<String, String> {
         .ok()
         .and_then(|rows| frontmost_app(&rows))
         .unwrap_or_else(|| "unknown".to_string());
-    Ok(format!("activation requested for {name:?}; frontmost app is now {frontmost:?}"))
+    Ok(format!(
+        "activation requested for {name:?}; frontmost app is now {frontmost:?}"
+    ))
+}
+
+pub(crate) fn activate_window(window_id: u32) -> Result<String, String> {
+    ensure_accessibility_permission()?;
+    let rows = window_rows()?;
+    let row = rows
+        .iter()
+        .find(|row| row.id == window_id)
+        .ok_or_else(|| format!("window id {window_id} is not an on-screen window"))?;
+    if row.layer != 0 {
+        return Err(format!(
+            "window id {window_id} is layer {}; only normal application windows can be activated safely",
+            row.layer
+        ));
+    }
+    let pid = row.pid;
+    let app = row.app.clone();
+    let title = row.title.clone().unwrap_or_default();
+
+    // CoreGraphics supplies the stable id while Accessibility supplies the exact
+    // per-window raise action. Matching the two prevents app activation from
+    // selecting a different window owned by the same process.
+    let application_ptr = unsafe { AXUIElementCreateApplication(pid) };
+    if application_ptr.is_null() {
+        return Err(format!(
+            "could not inspect windows for {app:?}; no input was sent"
+        ));
+    }
+    let application = OwnedCf(application_ptr);
+    let windows_owner = copy_ax_attribute(application.0, "AXWindows")?;
+    let windows = unsafe { &*(windows_owner.0 as *const CFArray) };
+    let target = (0..windows.count())
+        .map(|index| unsafe { windows.value_at_index(index) })
+        .find(|element| !element.is_null() && ax_window_id(*element) == Ok(window_id))
+        .ok_or_else(|| {
+            format!("window id {window_id} is not exposed by Accessibility; no input was sent")
+        })?;
+
+    let frontmost = CFString::from_str("AXFrontmost");
+    let code = unsafe {
+        AXUIElementSetAttributeValue(application.0, key_pointer(&frontmost), kCFBooleanTrue)
+    };
+    if code != 0 {
+        return Err(format!(
+            "could not bring the owner of window id {window_id} forward (AXError={code}); no input was sent"
+        ));
+    }
+    let main = CFString::from_str("AXMain");
+    let _ = unsafe { AXUIElementSetAttributeValue(target, key_pointer(&main), kCFBooleanTrue) };
+    let raise = CFString::from_str("AXRaise");
+    let code = unsafe { AXUIElementPerformAction(target, key_pointer(&raise)) };
+    if code != 0 {
+        return Err(format!(
+            "could not raise exact window id {window_id} (AXError={code}); no input was sent"
+        ));
+    }
+
+    std::thread::sleep(Duration::from_millis(250));
+    let focused = copy_ax_attribute(application.0, "AXFocusedWindow")?;
+    let focused_id = ax_window_id(focused.0)?;
+    if focused_id != window_id {
+        return Err(format!(
+            "requested window id {window_id} did not become the focused window (focused={focused_id}); no input was sent"
+        ));
+    }
+    Ok(format!(
+        "activated window_id={window_id} app={app:?} title={title:?}"
+    ))
 }

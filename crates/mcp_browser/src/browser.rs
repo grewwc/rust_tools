@@ -16,9 +16,6 @@ use futures_util::StreamExt;
 use std::path::{Path, PathBuf};
 use tokio::task::JoinHandle;
 
-/// Standard macOS Chrome executable path used by the AppleScript app probe.
-const DEFAULT_CHROME: &str = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-
 /// Prefix for auto-generated temp profile dirs: `<temp>/mcp_browser-profile-<pid>`.
 /// Shared by GC and launch to avoid naming drift.
 const TEMP_PROFILE_PREFIX: &str = "mcp_browser-profile-";
@@ -313,7 +310,7 @@ fn current_user_has_gui_session() -> bool {
 
 #[cfg(target_os = "macos")]
 async fn find_applescript_chrome() -> Option<PathBuf> {
-    let mut candidates = vec![PathBuf::from(DEFAULT_CHROME)];
+    let mut candidates = vec![PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")];
     if let Some(home) = std::env::var_os("HOME") {
         candidates.push(
             PathBuf::from(home).join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),

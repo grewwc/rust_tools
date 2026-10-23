@@ -1,8 +1,8 @@
-//! Opt-in raw-wire recorder for streamed model responses.
+//! Raw-wire recorder for streamed model responses.
 //!
-//! Enabled by the `AIOS_STREAM_WIRE_LOG` environment switch (set it to any
-//! non-empty value other than `0`). While enabled, every response stream
-//! appends one JSONL line to `<session assets>/stream_wire.log` describing
+//! On by default; set the `AIOS_STREAM_WIRE_LOG` environment switch to `0` to
+//! disable it. While enabled, every response stream appends one JSONL line to
+//! `<session assets>/stream_wire.log` describing
 //! what the provider actually sent over the wire: per-event-type counts, the
 //! tail of the event sequence, the terminal event payload, usage numbers, the
 //! output-item summary and the client-side outcome classification.
@@ -17,8 +17,8 @@
 //! message item.
 //!
 //! Design constraints:
-//! - Off by default: nothing is written unless the switch is set when the
-//!   response stream starts.
+//! - On by default: every response stream records one line unless the switch
+//!   is set to `0` when the stream starts.
 //! - Best-effort: recording never influences streaming; failures are dropped.
 //!   One line is written per streamed response by `Drop`, so every exit path
 //!   (completion, error, cancellation, panic unwind) leaves the same evidence.
@@ -48,7 +48,7 @@ use crate::ai::{
     types::StreamOutcome,
 };
 
-/// Environment switch that turns the recorder on.
+/// Environment switch that turns the recorder off when set to `0`.
 const ENABLE_ENV: &str = "AIOS_STREAM_WIRE_LOG";
 
 /// Log file name inside the session assets directory.
@@ -156,8 +156,8 @@ impl StreamWireLog {
         }
     }
 
-    /// Arm the recorder for a new response stream. With the switch unset this
-    /// resolves nothing and every later call is a no-op.
+    /// Arm the recorder for a new response stream. With the switch set to `0`
+    /// this resolves nothing and every later call is a no-op.
     pub(super) fn arm(&mut self, model: &str) {
         self.enabled = stream_wire_log_enabled();
         if !self.enabled {
@@ -286,8 +286,9 @@ impl StreamWireLog {
     }
 
     /// Always-on outcome record: one minimal JSONL line per finalized response in
-    /// `<session assets>/stream_outcomes.jsonl`, independent of the opt-in verbose
-    /// wire log. Called right after `note_outcome`, so `self.client` already holds
+    /// `<session assets>/stream_outcomes.jsonl`, independent of the verbose wire
+    /// log. Request-side records (`request::outcome_log`) share this file.
+    /// Called right after `note_outcome`, so `self.client` already holds
     /// the classification; best-effort and silent without a session dir.
     pub(super) fn append_outcome_record(&self) {
         let Some(dir) = current_session_assets_dir() else {
@@ -530,7 +531,7 @@ fn stream_wire_log_enabled() -> bool {
             let value = value.trim();
             !value.is_empty() && value != "0"
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn outcome_label(outcome: StreamOutcome) -> &'static str {
@@ -630,8 +631,13 @@ fn rotate_if_large(path: &Path) {
         .map(|meta| meta.len() > MAX_LOG_BYTES)
         .unwrap_or(false);
     if too_large {
-        let rotated = path.with_file_name(format!("{WIRE_LOG_FILE}.1"));
-        let _ = std::fs::rename(path, rotated);
+        // Derive the rotated name from the actual file: this helper also rotates
+        // `stream_outcomes.jsonl`, which must not overwrite `stream_wire.log.1`.
+        let name = path
+            .file_name()
+            .map(|name| format!("{}.1", name.to_string_lossy()))
+            .unwrap_or_default();
+        let _ = std::fs::rename(path, path.with_file_name(name));
     }
 }
 
@@ -856,7 +862,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         unsafe { std::env::remove_var(ENABLE_ENV) };
-        assert!(!stream_wire_log_enabled(), "unset must stay off");
+        assert!(stream_wire_log_enabled(), "unset must stay on");
         unsafe { std::env::set_var(ENABLE_ENV, "0") };
         assert!(!stream_wire_log_enabled());
         unsafe { std::env::set_var(ENABLE_ENV, " ") };

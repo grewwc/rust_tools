@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
-use crate::commonw::{configw, utils::expanduser};
+use crate::commonw::{configw, utils::expanduser, FastSet};
 
 const BUILTIN_AGENTS: &[(&str, &str)] = &[
     ("build.agent", include_str!("builtin_agents/build.agent")),
@@ -522,12 +522,26 @@ fn load_scoped_project_instruction_docs_for_target_tiers_from(
         .chain(observed_candidates)
     {
         if used >= TARGET_SCOPED_INSTRUCTION_MAX_TOTAL_CHARS {
+            // Report on stderr: the user needs to know a scoped instruction file
+            // was dropped because the tier budget ran out (debugging aid).
+            eprintln!(
+                "[project-instructions] omitted {} (budget exhausted: {used}/{} chars)",
+                doc.path, TARGET_SCOPED_INSTRUCTION_MAX_TOTAL_CHARS
+            );
             break;
         }
         let remaining = TARGET_SCOPED_INSTRUCTION_MAX_TOTAL_CHARS - used;
         let content = truncate_instruction_doc(&doc.content, remaining);
         if content.is_empty() {
             continue;
+        }
+        if content.chars().count() != doc.content.chars().count() {
+            eprintln!(
+                "[project-instructions] truncated {} (kept {}/{} chars)",
+                doc.path,
+                content.chars().count(),
+                doc.content.chars().count()
+            );
         }
         used += content.chars().count();
         selected.push(ProjectInstructionDoc {
@@ -648,6 +662,106 @@ fn load_project_instruction_candidates_from(cwd: &Path) -> Vec<ProjectInstructio
     discover_project_instruction_docs(cwd)
 }
 
+fn discover_project_instruction_docs(cwd: &Path) -> Vec<ProjectInstructionDoc> {
+    let scope = project_instruction_search_scope(cwd);
+    let project_root = scope.first().map(PathBuf::as_path).unwrap_or(cwd);
+    let cfg_dir = project_config_instruction_dir(project_root);
+    // Instruction families (case-insensitive basenames, e.g. `agents.md`) present in
+    // the user-pinned config dir and at the project root.
+    let cfg_families: FastSet<String> = cfg_dir
+        .as_deref()
+        .map(|cfg| {
+            PROJECT_INSTRUCTION_FILENAMES
+                .iter()
+                .filter(|name| cfg.join(name).is_file())
+                .map(|name| name.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    let root_families: FastSet<String> = PROJECT_INSTRUCTION_FILENAMES
+        .iter()
+        .filter(|name| project_root.join(name).is_file())
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+
+    let mut docs = Vec::new();
+    let mut seen_paths = std::collections::BTreeSet::new();
+    for dir in &scope {
+        let at_project_root = dir.as_path() == project_root;
+        let mut family_seen = FastSet::<String>::default();
+        for name in PROJECT_INSTRUCTION_FILENAMES {
+            let family = name.to_ascii_lowercase();
+            if at_project_root && family_seen.insert(family.clone()) {
+                // Same-family conflict priority: when both the config dir and the
+                // project root provide this family, the user-pinned config copy loads
+                // before the project-root copy. Both files are kept; only the order
+                // changes, so the config copy appears first in the prompt and is not
+                // starved by the repo copy under the total instruction budget.
+                if cfg_families.contains(&family) && root_families.contains(&family) {
+                    if let Some(cfg) = cfg_dir.as_deref() {
+                        for cfg_name in PROJECT_INSTRUCTION_FILENAMES
+                            .iter()
+                            .filter(|n| n.to_ascii_lowercase() == family)
+                        {
+                            push_instruction_doc(cfg, cfg_name, &mut docs, &mut seen_paths);
+                        }
+                    }
+                }
+            }
+            push_instruction_doc(dir, name, &mut docs, &mut seen_paths);
+        }
+    }
+    docs
+}
+
+/// Push the instruction file `<dir>/<name>` when it exists, is non-empty, and its
+/// canonical path has not been pushed yet.
+fn push_instruction_doc(
+    dir: &Path,
+    name: &str,
+    docs: &mut Vec<ProjectInstructionDoc>,
+    seen_paths: &mut std::collections::BTreeSet<String>,
+) {
+    let path = dir.join(name);
+    if !path.is_file() {
+        return;
+    }
+    let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    let canonical_key = canonical.display().to_string();
+    if !seen_paths.insert(canonical_key.clone()) {
+        return;
+    }
+    let Ok(content) = fs::read_to_string(&path) else {
+        return;
+    };
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let content = truncate_instruction_doc(trimmed, PROJECT_INSTRUCTION_MAX_DOC_CHARS);
+    if content.chars().count() != trimmed.chars().count() {
+        // Report on stderr only: the prompt keeps its existing `…` marker, and
+        // the user needs to know the file was cut short (debugging aid).
+        eprintln!(
+            "[project-instructions] truncated {} (kept {}/{} chars)",
+            canonical_key,
+            content.chars().count(),
+            trimmed.chars().count()
+        );
+    }
+    if !content.is_empty() {
+        docs.push(ProjectInstructionDoc {
+            path: canonical_key,
+            content,
+        });
+    }
+}
+
+/// Applies a total character budget across the candidate docs in order. Earlier
+/// docs keep their bytes first; docs beyond the budget are omitted entirely and
+/// a doc that only partially fits is truncated with a trailing `…`. Omissions
+/// and truncations are reported on stderr so the user can tell why an
+/// instruction file had no effect.
 fn limit_project_instruction_docs(
     candidates: Vec<ProjectInstructionDoc>,
     max_chars: usize,
@@ -656,51 +770,30 @@ fn limit_project_instruction_docs(
     let mut used = 0usize;
     for doc in candidates {
         if used >= max_chars {
-            break;
+            eprintln!(
+                "[project-instructions] omitted {} (budget exhausted: {used}/{max_chars} chars)",
+                doc.path
+            );
+            continue;
         }
         let budget = max_chars - used;
         let content = truncate_instruction_doc(&doc.content, budget);
         if content.is_empty() {
             continue;
         }
+        if content.chars().count() != doc.content.chars().count() {
+            eprintln!(
+                "[project-instructions] truncated {} (kept {}/{} chars)",
+                doc.path,
+                content.chars().count(),
+                doc.content.chars().count()
+            );
+        }
         used += content.chars().count();
         docs.push(ProjectInstructionDoc {
             path: doc.path,
             content,
         });
-    }
-    docs
-}
-
-fn discover_project_instruction_docs(cwd: &Path) -> Vec<ProjectInstructionDoc> {
-    let mut docs = Vec::new();
-    let mut seen_paths = std::collections::BTreeSet::new();
-    for dir in project_instruction_search_scope(cwd) {
-        for name in PROJECT_INSTRUCTION_FILENAMES {
-            let path = dir.join(name);
-            if !path.is_file() {
-                continue;
-            }
-            let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            let canonical_key = canonical.display().to_string();
-            if !seen_paths.insert(canonical_key.clone()) {
-                continue;
-            }
-            let Ok(content) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let content = truncate_instruction_doc(trimmed, PROJECT_INSTRUCTION_MAX_DOC_CHARS);
-            if !content.is_empty() {
-                docs.push(ProjectInstructionDoc {
-                    path: canonical_key,
-                    content,
-                });
-            }
-        }
     }
     docs
 }
@@ -733,6 +826,8 @@ fn project_instruction_search_scope(cwd: &Path) -> Vec<PathBuf> {
     // (AGENTS.md / agents.md / ...), where `<project-name>` is the leaf name of the project
     // root. Insert right after the project root so these are treated as project-level docs
     // (loaded before deeper repo-local files and not starved by the total instruction budget).
+    // On a same-family conflict the config copy loads first (priority); both files are kept
+    // before the project-root copy of the same family (see `discover_project_instruction_docs`).
     let project_root = scope.first().map(PathBuf::as_path).unwrap_or(cwd);
     if let Some(cfg_dir) = project_config_instruction_dir(project_root)
         && !scope.iter().any(|dir| dir == &cfg_dir)

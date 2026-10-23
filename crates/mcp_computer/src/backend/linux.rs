@@ -22,7 +22,6 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Capture helpers, most capable first. `grim` is Wayland-only, the other two are
 /// X11 (ImageMagick's `import` also works on XWayland).
@@ -34,6 +33,12 @@ const WINDOW_TOOLS: [&str; 2] = ["wmctrl", "xdotool"];
 const MAX_WINDOWS: usize = 40;
 /// Upper bound on drag interpolation steps, matching the macOS backend's clamp.
 const MAX_DRAG_STEPS: u32 = 200;
+
+pub(crate) struct Screenshot {
+    pub(crate) report: String,
+    pub(crate) origin: Option<(f64, f64)>,
+    pub(crate) point_size: Option<(f64, f64)>,
+}
 
 /// Phrases the host treats as transport failures (`src/bin/ai/mcp/client.rs`).
 /// Helper stderr is forwarded to the model, so it is scanned first: forwarding one
@@ -86,29 +91,25 @@ fn which(name: &str) -> Option<PathBuf> {
 }
 
 fn is_executable(path: &Path) -> bool {
-    std::fs::metadata(path).map(|meta| meta.is_file()).unwrap_or(false)
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file())
+        .unwrap_or(false)
 }
 
 /// The helper to use, or an error naming what to install. `hint` is the package
 /// hint appended so the model can tell the user what a session would need.
 fn helper(names: &[&str], hint: &str) -> Result<PathBuf, String> {
-    find_helper(names).ok_or_else(|| {
-        format!(
-            "none of {} is available on PATH ({hint})",
-            names.join(", ")
-        )
-    })
+    find_helper(names)
+        .ok_or_else(|| format!("none of {} is available on PATH ({hint})", names.join(", ")))
 }
 
 /// Run a helper and return its trimmed stdout. `what` names the operation in the
 /// error, and stderr is passed through [`sanitize`] before it reaches the model.
 fn run(program: &Path, args: &[String], what: &str) -> Result<String, String> {
-    let output = Command::new(program).args(args).output().map_err(|error| {
-        format!(
-            "could not run {} for {what}: {error}",
-            program.display()
-        )
-    })?;
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| format!("could not run {} for {what}: {error}", program.display()))?;
     if !output.status.success() {
         let stderr = sanitize(String::from_utf8_lossy(&output.stderr).trim());
         let detail = if stderr.is_empty() {
@@ -187,7 +188,11 @@ pub(crate) fn move_mouse(x: f64, y: f64) -> Result<(), String> {
     if let Some(tool) = find_helper(&["xdotool"]) {
         return run(
             &tool,
-            &["mousemove".to_string(), whole(x).to_string(), whole(y).to_string()],
+            &[
+                "mousemove".to_string(),
+                whole(x).to_string(),
+                whole(y).to_string(),
+            ],
             "moving the pointer",
         )
         .map(|_| ());
@@ -252,7 +257,11 @@ pub(crate) fn click(
     let tool = helper(&["ydotool"], "install ydotool for Wayland input")?;
     let button = ydotool_button(button)?;
     for _ in 0..count {
-        run(&tool, &["click".to_string(), button.to_string()], "clicking")?;
+        run(
+            &tool,
+            &["click".to_string(), button.to_string()],
+            "clicking",
+        )?;
     }
     Ok(())
 }
@@ -305,7 +314,11 @@ pub(crate) fn drag(
         let y = from_y + (to_y - from_y) * t;
         run(
             &tool,
-            &["mousemove".to_string(), whole(x).to_string(), whole(y).to_string()],
+            &[
+                "mousemove".to_string(),
+                whole(x).to_string(),
+                whole(y).to_string(),
+            ],
             "dragging",
         )?;
     }
@@ -427,7 +440,12 @@ pub(crate) fn type_text(text: &str) -> Result<(), String> {
     {
         return run(&tool, &["-".to_string(), text.to_string()], "typing text").map(|_| ());
     }
-    run(&tool, &["type".to_string(), text.to_string()], "typing text").map(|_| ())
+    run(
+        &tool,
+        &["type".to_string(), text.to_string()],
+        "typing text",
+    )
+    .map(|_| ())
 }
 
 pub(crate) fn press_key(chord: &str) -> Result<(), String> {
@@ -454,8 +472,7 @@ pub(crate) fn press_key(chord: &str) -> Result<(), String> {
         .unwrap_or(false);
     if !is_wtype {
         return Err(
-            "pressing named keys needs xdotool or wtype; ydotool takes raw key codes"
-                .to_string(),
+            "pressing named keys needs xdotool or wtype; ydotool takes raw key codes".to_string(),
         );
     }
     // wtype spells modifiers as flags, and the key itself as the trailing argument.
@@ -486,32 +503,13 @@ pub(crate) fn press_key(chord: &str) -> Result<(), String> {
     run(&tool, &args, "pressing a key").map(|_| ())
 }
 
-fn screenshot_path() -> Result<PathBuf, String> {
-    let dir = env::var("MCP_COMPUTER_SCREENSHOT_DIR")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".cache/mcp_computer"))
-        })
-        .ok_or_else(|| "HOME is not set, so there is nowhere to write the capture".to_string())?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or(0);
-    Ok(dir.join(format!("screen-{millis}.png")))
-}
-
 pub(crate) fn screenshot(
     region: Option<(f64, f64, f64, f64)>,
     window_id: Option<u32>,
     display: Option<u32>,
     include_cursor: bool,
-) -> Result<String, String> {
-    let path = screenshot_path()?;
+    path: &Path,
+) -> Result<Screenshot, String> {
     if let Some((_, _, width, height)) = region {
         if width <= 0.0 || height <= 0.0 {
             return Err("the screenshot region needs a positive width and height".to_string());
@@ -526,10 +524,17 @@ pub(crate) fn screenshot(
                 .to_string(),
         );
     }
-    let tool = helper(
-        &CAPTURE_TOOLS,
-        "install grim (Wayland), scrot or imagemagick (X11) to capture the screen",
-    )?;
+    let tool = if window_id.is_some() {
+        helper(
+            &["import"],
+            "install imagemagick to capture a window by id on Linux",
+        )?
+    } else {
+        helper(
+            &CAPTURE_TOOLS,
+            "install grim (Wayland), scrot or imagemagick (X11) to capture the screen",
+        )?
+    };
     let name = tool
         .file_name()
         .and_then(|value| value.to_str())
@@ -538,6 +543,9 @@ pub(crate) fn screenshot(
     let path_text = path.to_string_lossy().to_string();
     if name.starts_with("grim") {
         let mut args = Vec::new();
+        if include_cursor {
+            args.push("-c".to_string());
+        }
         if let Some((x, y, width, height)) = region {
             args.push("-g".to_string());
             args.push(format!(
@@ -550,7 +558,7 @@ pub(crate) fn screenshot(
         }
         args.push(path_text);
         run(&tool, &args, "capturing the screen")?;
-        return Ok(capture_report(&path, include_cursor));
+        return Ok(screenshot_metadata(include_cursor, region, window_id));
     }
     if name.starts_with("scrot") {
         let mut args = Vec::new();
@@ -570,14 +578,14 @@ pub(crate) fn screenshot(
         }
         args.push(path_text);
         run(&tool, &args, "capturing the screen")?;
-        return Ok(capture_report(&path, include_cursor));
+        return Ok(screenshot_metadata(include_cursor, region, window_id));
     }
     // ImageMagick's `import`: `-window <id>` captures a window, `-window root` the
     // whole screen, and `-crop` a region. It has no pointer option.
     if include_cursor {
         return Err(
             "the `include_cursor` flag is not available with ImageMagick's import; \
-             install grim or scrot for a capture that shows the pointer"
+             install scrot for a capture that shows the pointer"
                 .to_string(),
         );
     }
@@ -601,15 +609,45 @@ pub(crate) fn screenshot(
     }
     args.push(path_text);
     run(&tool, &args, "capturing the screen")?;
-    Ok(capture_report(&path, include_cursor))
+    Ok(screenshot_metadata(include_cursor, region, window_id))
 }
 
-fn capture_report(path: &Path, include_cursor: bool) -> String {
-    let mut report = format!("captured the screen to {}", path.display());
-    if !include_cursor {
-        report.push_str("\n(the pointer is not part of this capture)");
+fn screenshot_metadata(
+    include_cursor: bool,
+    region: Option<(f64, f64, f64, f64)>,
+    window_id: Option<u32>,
+) -> Screenshot {
+    let (origin, point_size) = if let Some((x, y, width, height)) = region {
+        (Some((x, y)), Some((width, height)))
+    } else if let Some(window_id) = window_id {
+        window_rows()
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter()
+                    .find(|row| parse_window_id(&row.id) == Some(window_id))
+            })
+            .map(|row| {
+                (
+                    Some((row.x as f64, row.y as f64)),
+                    Some((row.width as f64, row.height as f64)),
+                )
+            })
+            .unwrap_or((None, None))
+    } else {
+        (Some((0.0, 0.0)), None)
+    };
+    Screenshot {
+        report: capture_report(include_cursor),
+        origin,
+        point_size,
     }
-    report
+}
+
+fn capture_report(include_cursor: bool) -> String {
+    format!(
+        "pointer included: {}",
+        if include_cursor { "yes" } else { "no" }
+    )
 }
 
 pub(crate) fn screen_info() -> Result<String, String> {
@@ -696,6 +734,17 @@ struct WindowRow {
     y: i64,
     width: i64,
     height: i64,
+}
+
+fn parse_window_id(value: &str) -> Option<u32> {
+    let value = value.trim();
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(
+            || value.parse().ok(),
+            |hex| u32::from_str_radix(hex, 16).ok(),
+        )
 }
 
 fn window_rows() -> Result<Vec<WindowRow>, String> {
@@ -856,4 +905,25 @@ pub(crate) fn activate_app(app: String) -> Result<String, String> {
         "activating an application",
     )?;
     Ok(format!("activated {app}"))
+}
+
+pub(crate) fn activate_window(window_id: u32) -> Result<String, String> {
+    // `--sync` does not return until this exact X11 window is active, which is the
+    // verification click_text needs before translating a captured window into a
+    // global pointer coordinate. wmctrl can request activation but cannot provide
+    // the same completion guarantee, so it is intentionally not a fallback here.
+    let tool = helper(
+        &["xdotool"],
+        "install xdotool for verified exact-window activation",
+    )?;
+    run(
+        &tool,
+        &[
+            "windowactivate".to_string(),
+            "--sync".to_string(),
+            window_id.to_string(),
+        ],
+        "activating a window",
+    )?;
+    Ok(format!("activated window_id={window_id}"))
 }

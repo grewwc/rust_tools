@@ -1293,10 +1293,12 @@ fn system_prompt_evidence_decisions_require_reconciliation_and_scoped_inference(
         "your earlier wording is not that evidence",
         "The reply MUST state the outcome — kept, revised, or unresolved",
         "when the original conclusion was itself unsupported, say so",
-        "make the targeted check most likely to resolve the remaining gap",
+        "test a plausible competing explanation when it could materially change the answer and a targeted check can distinguish it",
         "otherwise label the conclusion as inference and name the unchecked gap",
-        "proving a settled conclusion does not require ruling out every alternative",
-        // The resolve-the-gap check must not demote stable knowledge or valid
+        "Do not invent, enumerate, or eliminate every possible alternative",
+        "When direct evidence or a valid derivation establishes the conclusion at the required scope, answer directly",
+        "Familiarity, confidence, or plausibility alone does not establish a conclusion",
+        // The competing-explanation check must not demote stable knowledge or valid
         // deductions, which the same block says to answer directly.
         "This check does not apply to stable general knowledge or to valid deductions from explicit, supported premises",
         "Retract or correct only what the evidence no longer supports",
@@ -1367,6 +1369,9 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "**Reconcile corrections and conflicts.**",
                     "**Match the metric to the objective.**",
                     "**Check the inference before concluding.**",
+                    "test a plausible competing explanation when it could materially change the answer and a targeted check can distinguish it",
+                    "Do not invent, enumerate, or eliminate every possible alternative",
+                    "Familiarity, confidence, or plausibility alone does not establish a conclusion",
                     "A challenge alone NEVER justifies retracting a supported conclusion",
                     "you MUST re-check it before replying",
                     "An attempt or a plan is not a completed action",

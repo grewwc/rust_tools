@@ -587,6 +587,29 @@ fn decode_flate_image(stream: &lopdf::Stream) -> Option<DynamicImage> {
     }
 }
 
+/// A recognized text line in top-left-origin pixels of the source image.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OcrLine {
+    pub text: String,
+    pub bounds: OcrRect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct OcrRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OcrResult {
+    pub text: String,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub lines: Vec<OcrLine>,
+}
+
 pub fn ocr_image_to_text(img: &DynamicImage, langs: &[&str]) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
@@ -598,8 +621,44 @@ pub fn ocr_image_to_text(img: &DynamicImage, langs: &[&str]) -> Result<String, S
     }
 }
 
+/// Recognize text with line-level bounds in source-image pixels.
+pub fn ocr_image_with_regions(img: &DynamicImage, langs: &[&str]) -> Result<OcrResult, String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_vision_ocr_with_regions(img, langs)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        tesseract_ocr_with_regions(img, langs)
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 fn tesseract_ocr(img: &DynamicImage, langs: &[&str]) -> Result<String, String> {
+    let stdout = tesseract_output(img, langs, None)?;
+    let text = String::from_utf8_lossy(&stdout);
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let normalized = normalize_ocr_line(line);
+        if !normalized.is_empty() {
+            lines.push(normalized);
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tesseract_ocr_with_regions(img: &DynamicImage, langs: &[&str]) -> Result<OcrResult, String> {
+    let stdout = tesseract_output(img, langs, Some("tsv"))?;
+    parse_tesseract_tsv(&String::from_utf8_lossy(&stdout), img.width(), img.height())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tesseract_output(
+    img: &DynamicImage,
+    langs: &[&str],
+    config: Option<&str>,
+) -> Result<Vec<u8>, String> {
     use std::{io::Write, process::Command};
 
     let mut png = Vec::new();
@@ -618,6 +677,9 @@ fn tesseract_ocr(img: &DynamicImage, langs: &[&str]) -> Result<String, String> {
     cmd.arg(&input_path).arg("stdout");
     if let Some(lang) = build_tesseract_lang_arg(langs) {
         cmd.arg("-l").arg(lang);
+    }
+    if let Some(config) = config {
+        cmd.arg(config);
     }
 
     let out = crate::fork_guard::output(&mut cmd).map_err(|e| {
@@ -638,15 +700,7 @@ fn tesseract_ocr(img: &DynamicImage, langs: &[&str]) -> Result<String, String> {
         return Err(format!("tesseract failed: {}", stderr));
     }
 
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut lines = Vec::new();
-    for line in text.lines() {
-        let normalized = normalize_ocr_line(line);
-        if !normalized.is_empty() {
-            lines.push(normalized);
-        }
-    }
-    Ok(lines.join("\n"))
+    Ok(out.stdout)
 }
 
 #[cfg(any(not(target_os = "macos"), test))]
@@ -681,8 +735,105 @@ fn map_lang_for_tesseract(lang: &str) -> String {
     }
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
+fn parse_tesseract_tsv(
+    tsv: &str,
+    image_width: u32,
+    image_height: u32,
+) -> Result<OcrResult, String> {
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct LineBuilder {
+        words: Vec<String>,
+        left: u32,
+        top: u32,
+        right: u32,
+        bottom: u32,
+        has_bounds: bool,
+    }
+
+    let mut grouped: BTreeMap<(u32, u32, u32, u32), LineBuilder> = BTreeMap::new();
+    for (index, row) in tsv.lines().enumerate() {
+        if row.trim().is_empty() || (index == 0 && row.starts_with("level\t")) {
+            continue;
+        }
+        let fields: Vec<&str> = row.splitn(12, '\t').collect();
+        if fields.len() != 12 {
+            return Err(format!(
+                "invalid tesseract TSV row {}: expected 12 columns",
+                index + 1
+            ));
+        }
+        let parse = |column: usize, name: &str| -> Result<u32, String> {
+            fields[column]
+                .parse::<u32>()
+                .map_err(|_| format!("invalid tesseract TSV row {}: bad {name}", index + 1))
+        };
+        if parse(0, "level")? != 5 || fields[11].trim().is_empty() {
+            continue;
+        }
+        let key = (
+            parse(1, "page number")?,
+            parse(2, "block number")?,
+            parse(3, "paragraph number")?,
+            parse(4, "line number")?,
+        );
+        let left = parse(6, "left")?.min(image_width);
+        let top = parse(7, "top")?.min(image_height);
+        let right = left.saturating_add(parse(8, "width")?).min(image_width);
+        let bottom = top.saturating_add(parse(9, "height")?).min(image_height);
+        let builder = grouped.entry(key).or_default();
+        builder.words.push(fields[11].trim().to_string());
+        if builder.has_bounds {
+            builder.left = builder.left.min(left);
+            builder.top = builder.top.min(top);
+            builder.right = builder.right.max(right);
+            builder.bottom = builder.bottom.max(bottom);
+        } else {
+            builder.left = left;
+            builder.top = top;
+            builder.right = right;
+            builder.bottom = bottom;
+            builder.has_bounds = true;
+        }
+    }
+
+    let mut lines = Vec::new();
+    for builder in grouped.into_values() {
+        let text = normalize_ocr_line(&builder.words.join(" "));
+        if text.is_empty() || !builder.has_bounds {
+            continue;
+        }
+        lines.push(OcrLine {
+            text,
+            bounds: OcrRect {
+                x: builder.left,
+                y: builder.top,
+                width: builder.right.saturating_sub(builder.left),
+                height: builder.bottom.saturating_sub(builder.top),
+            },
+        });
+    }
+    Ok(OcrResult {
+        text: lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        image_width,
+        image_height,
+        lines,
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn macos_vision_ocr(img: &DynamicImage, langs: &[&str]) -> Result<String, String> {
+    macos_vision_ocr_with_regions(img, langs).map(|result| result.text)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_vision_ocr_with_regions(img: &DynamicImage, langs: &[&str]) -> Result<OcrResult, String> {
     // Hold the global fork lock: serialize child-process spawns against other threads
     // to avoid a race between fork and ObjC class initialization.
     let _guard = crate::fork_guard::lock();
@@ -748,10 +899,55 @@ fn macos_vision_ocr(img: &DynamicImage, langs: &[&str]) -> Result<String, String
         if normalized.is_empty() {
             continue;
         }
-        lines.push(normalized);
+        let rect = unsafe { obs.boundingBox() };
+        lines.push(OcrLine {
+            text: normalized,
+            bounds: vision_rect_to_pixels(
+                rect.origin.x,
+                rect.origin.y,
+                rect.size.width,
+                rect.size.height,
+                img.width(),
+                img.height(),
+            ),
+        });
     }
 
-    Ok(lines.join("\n"))
+    Ok(OcrResult {
+        text: lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        image_width: img.width(),
+        image_height: img.height(),
+        lines,
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn vision_rect_to_pixels(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    image_width: u32,
+    image_height: u32,
+) -> OcrRect {
+    let pixel_width = f64::from(image_width);
+    let pixel_height = f64::from(image_height);
+    let left = (x * pixel_width).floor().clamp(0.0, pixel_width) as u32;
+    let top = ((1.0 - y - height) * pixel_height)
+        .floor()
+        .clamp(0.0, pixel_height) as u32;
+    let right = ((x + width) * pixel_width).ceil().clamp(0.0, pixel_width) as u32;
+    let bottom = ((1.0 - y) * pixel_height).ceil().clamp(0.0, pixel_height) as u32;
+    OcrRect {
+        x: left,
+        y: top,
+        width: right.saturating_sub(left),
+        height: bottom.saturating_sub(top),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -858,5 +1054,45 @@ mod tests {
             build_tesseract_lang_arg(&["zh-Hans", "en-US"]).as_deref(),
             Some("chi_sim+eng")
         );
+    }
+
+    #[test]
+    fn vision_bounds_convert_from_bottom_left_to_top_left_pixels() {
+        assert_eq!(
+            vision_rect_to_pixels(0.25, 0.60, 0.50, 0.20, 200, 100),
+            OcrRect {
+                x: 50,
+                y: 20,
+                width: 100,
+                height: 20,
+            }
+        );
+    }
+
+    #[test]
+    fn tesseract_tsv_groups_words_and_unions_their_bounds() {
+        let tsv = concat!(
+            "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n",
+            "5\t1\t1\t1\t1\t1\t10\t20\t30\t10\t95\tHello\n",
+            "5\t1\t1\t1\t1\t2\t45\t18\t25\t14\t90\tworld\n",
+            "5\t1\t1\t1\t2\t1\t12\t50\t20\t10\t80\tNext\n",
+        );
+        let result = parse_tesseract_tsv(tsv, 100, 80).unwrap();
+        assert_eq!(result.text, "Hello world\nNext");
+        assert_eq!(
+            result.lines[0].bounds,
+            OcrRect {
+                x: 10,
+                y: 18,
+                width: 60,
+                height: 14,
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_tesseract_tsv_is_an_error() {
+        let error = parse_tesseract_tsv("5\t1\ttoo-short", 100, 80).unwrap_err();
+        assert!(error.contains("expected 12 columns"));
     }
 }

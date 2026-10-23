@@ -16,6 +16,7 @@ so it is the fallback path for any GUI that has no dedicated MCP server.
 ```text
 src/main.rs              # mod backend; mod tools; -> mcp_stdio::run(ComputerServer)
 src/tools.rs             # tool schemas + tools/call dispatch + per-op timeout
+src/frame.rs             # capture scope + temporary probe lifecycle + visual frame ids
 src/backend.rs           # the platform seam: cfg-selects one backend, nothing else
 src/backend/macos/       # CoreGraphics: input.rs (CGEvent), capture.rs (screencapture),
                          #   screen.rs (displays / windows / permissions)
@@ -27,12 +28,14 @@ src/backend/unsupported.rs # every call reports a clear "no backend on this OS" 
 
 1. **Adding a platform must not touch `tools.rs`.** A backend exposes exactly these
    signatures; `backend.rs` picks one by `cfg`:
-   `screenshot(Option<(f64, f64, f64, f64)>, Option<u32>, Option<u32>, bool) -> Result<String, String>`,
+   `screenshot(Option<(f64, f64, f64, f64)>, Option<u32>, Option<u32>, bool, &Path) -> Result<Screenshot, String>`,
    `click(f64, f64, &str, u32, &[String])`, `drag(f64, f64, f64, f64, &str, &[String], u32)`,
    `move_mouse(f64, f64)`, `scroll(Option<f64>, Option<f64>, f64, f64, &str)`,
    `type_text(&str)`, `press_key(&str)` (all `Result<(), String>`),
-   `activate_app(String)`, `list_windows(Option<String>)`, `screen_info()` (all `Result<String, String>`).
-   Queries return a model-facing report; actions return `Ok(())` or a model-facing error.
+   `activate_app(String)`, `activate_window(u32)`, `list_windows(Option<String>)`,
+   `screen_info()` (all `Result<String, String>`).
+   `Screenshot` carries the model-facing report plus an optional image-pixel to
+   screen-point mapping. Queries return a report; actions return `Ok(())` or an error.
    Coordinates are global screen points, top-left origin, on every platform.
 2. **No silent no-ops.** A parameter a platform cannot honour (the `display`
    parameter or the `pixel` scroll unit on Linux, `include_cursor` with
@@ -41,7 +44,15 @@ src/backend/unsupported.rs # every call reports a clear "no backend on this OS" 
 3. **Screenshots return a path, not image content.** Only `content[0].text`
    reaches the model (`crates/mcp_stdio/AGENTS.md` invariant 4), so image bytes
    in the envelope would be discarded; the path plus `a`'s image-aware `read_file`
-   is what shows the frame to a vision model.
+   is what shows the frame to a vision model. `frame.rs` hashes decoded pixels and
+   binds each `frame_id` to its normalized capture scope; unchanged probe files are
+   deleted, while a changed frame remains readable at the returned path.
+   `find_text` and `click_text` reuse `rust_tools::pdfw` OCR; coordinates are
+   source-image pixels mapped through the typed capture geometry. `click_text`
+   never acts unless exactly one OCR line matches. For a window capture it first
+   activates and verifies that exact window, takes a fresh OCR frame, and verifies
+   it again immediately before input; an activation failure returns without a
+   click, while `find_text` remains background-safe and never activates a window.
 4. **Error text must avoid the host's transport trigger words** (the list lives
    in `crates/mcp_stdio/AGENTS.md` invariant 2). Helper stderr is forwarded to
    the model, so each backend scans it (`sanitize`) first; forwarding one of
@@ -95,5 +106,3 @@ That check proves it compiles, not that the Linux helpers behave.
   `CGDisplayMode::pixel_width`); `CGDisplayPixelsWide` returns the *point* size on a
   HiDPI mode. `capture.rs` also re-measures the ratio from the PNG it wrote, so the
   pixel→point mapping the model is given stays right for window captures too.
-- `screen_info` reports `cursor: unknown` when CoreGraphics refuses the null mouse
-  event used to read the pointer position (`screen.rs::cursor_position`).
