@@ -1293,9 +1293,10 @@ fn system_prompt_evidence_decisions_require_reconciliation_and_scoped_inference(
         "your earlier wording is not that evidence",
         "The reply MUST state the outcome — kept, revised, or unresolved",
         "when the original conclusion was itself unsupported, say so",
-        "you MUST make the targeted check most likely to refute it",
-        "otherwise label the conclusion as inference and name the unchecked refuter",
-        // The refutation duty must not demote stable knowledge or valid
+        "make the targeted check most likely to resolve the remaining gap",
+        "otherwise label the conclusion as inference and name the unchecked gap",
+        "proving a settled conclusion does not require ruling out every alternative",
+        // The resolve-the-gap check must not demote stable knowledge or valid
         // deductions, which the same block says to answer directly.
         "This check does not apply to stable general knowledge or to valid deductions from explicit, supported premises",
         "Retract or correct only what the evidence no longer supports",

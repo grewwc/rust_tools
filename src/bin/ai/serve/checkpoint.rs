@@ -63,12 +63,17 @@ fn run_checkpoint_child(
     id: &str,
     command: &str,
     confirmed: bool,
+    cwd: &std::path::Path,
 ) -> std::io::Result<std::process::Output> {
     let mut child = std::process::Command::new(runtime_exe()?);
     child
         .arg("--session")
         .arg(id)
         .arg(command)
+        // The checkpoint runs in the session's virtual cwd, exactly like
+        // every turn child, so cwd-relative reads resolve per session
+        // rather than against the daemon's directory.
+        .current_dir(cwd)
         .env(background::SERVE_CHILD_ENV, "1")
         .env(
             SERVE_CHECKPOINT_CONFIRM_ENV,
@@ -167,12 +172,16 @@ pub(crate) async fn post_checkpoint_command(
 
     let lock = session_lock(&state, &id).await;
     let _guard = lock.lock().await;
-    let result = match run_checkpoint_child(&id, req.command.trim(), req.confirmed) {
+    let session_cwd = session_cwd(&state, &id);
+    let result = match run_checkpoint_child(&id, req.command.trim(), req.confirmed, &session_cwd)
+    {
         Ok(result) => result,
         Err(err) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": err.to_string()})),
+                Json(serde_json::json!({
+                    "error": format!("failed to spawn checkpoint helper: {err}")
+                })),
             )
                 .into_response();
         }
@@ -182,7 +191,9 @@ pub(crate) async fn post_checkpoint_command(
     if !result.status.success() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("{stderr}{stdout}")})),
+            Json(
+                serde_json::json!({"error": format!("checkpoint command failed: {stderr}{stdout}")}),
+            ),
         )
             .into_response();
     }

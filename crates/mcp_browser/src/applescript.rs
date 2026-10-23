@@ -380,12 +380,21 @@ impl ApplescriptSession {
         // Wait for loading to finish (up to ~20s; keep going past the deadline since pages may load slowly due to ads).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
-            let state = self
-                .exec_js("document.readyState")
-                .await
-                .unwrap_or_default();
-            if state.trim() == "complete" || std::time::Instant::now() >= deadline {
-                break;
+            match self.exec_js("document.readyState").await {
+                Ok(state) => {
+                    if state.trim() == "complete" || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
+                // The JS gate stays closed until Chrome quits and restarts: retrying
+                // for 20s cannot help, so fail fast with the actionable hint.
+                Err(e) if is_gate_closed_message(&e) => return Err(e),
+                Err(_) => {
+                    // Transient page error (mid-navigation, no document yet): keep waiting.
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
@@ -959,6 +968,17 @@ fn js_apple_events_message(raw_error: &str) -> String {
     format!("{} 原始错误：{}", JS_APPLE_EVENTS_HINT, raw_error.trim())
 }
 
+/// Whether an `exec_js` failure means Chrome's JS gate is closed (permanent
+/// until Chrome quits and restarts), rather than a transient page error.
+///
+/// Polling callers (e.g. `navigate`'s readyState wait) use this to fail fast
+/// instead of swallowing the actionable hint and retrying a hopeless gate.
+/// The hint marker survives `exec_js`'s timeout wrapping, while page text can
+/// never contain this exact string unless it quotes our own message.
+fn is_gate_closed_message(msg: &str) -> bool {
+    msg.contains(JS_APPLE_EVENTS_HINT)
+}
+
 /// Map a known osascript/Chrome failure to an actionable message.
 ///
 /// Returns `None` for errors without a specific hint, so the caller can keep the
@@ -1311,5 +1331,25 @@ mod tests {
             msg
         );
         assert!(!msg.contains("完全退出 Chrome"), "wrong hint: {}", msg);
+    }
+
+    #[test]
+    fn gate_closed_message_is_recognized_through_exec_js_wrapping() {
+        // `navigate`'s readyState wait fails fast only on this marker: it must
+        // survive `exec_js`'s timeout wrapping, while transient errors stay false.
+        let inner = js_apple_events_message(CHROME_JS_GATE_ERROR);
+        assert!(is_gate_closed_message(&inner));
+        let wrapped = format!(
+            "执行 JS 失败(超过 90000ms 上限或 osascript 出错): {}",
+            inner
+        );
+        assert!(is_gate_closed_message(&wrapped));
+        assert!(!is_gate_closed_message(""));
+        assert!(!is_gate_closed_message(
+            "execution error: 不能获得“window id 999999”。 (-1728)"
+        ));
+        assert!(!is_gate_closed_message(
+            "operation reached the 90000 ms server cap"
+        ));
     }
 }
