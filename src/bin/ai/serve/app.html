@@ -235,12 +235,88 @@ select, summary { touch-action:manipulation; }
 #sidenote { display:none; }
 .msg .prog { font-size:13px; color:var(--dim); }
 .msg.err { border-color:var(--err); color:var(--err); }
-#ovr { display:flex; gap:6px; padding:8px 12px 0; }
-#ovr select { flex:1; min-width:0; font-size:13px; padding:6px 8px; }
+#ovr { display:flex; gap:8px; padding:10px 12px 0; }
+/* Agent and effort keep the platform picker (its dropdown is the right phone
+   interaction), but replace its default chrome with the app's field style: a
+   stable touch target, a themed surface, and a chevron drawn from the palette
+   so it follows every theme. */
+#ovr select {
+  flex:1; min-width:0; height:38px; padding:0 34px 0 12px;
+  font-size:13px; font-weight:600; color:var(--fg);
+  background-color:var(--surface);
+  border:1px solid var(--line); border-radius:10px;
+  -webkit-appearance:none; appearance:none;
+  background-image:linear-gradient(45deg, transparent 50%, var(--dim) 50%),
+    linear-gradient(135deg, var(--dim) 50%, transparent 50%);
+  background-position:calc(100% - 17px) 50%, calc(100% - 12px) 50%;
+  background-size:5px 5px, 5px 5px; background-repeat:no-repeat;
+  box-shadow:0 1px 2px rgba(0,0,0,.12);
+  text-overflow:ellipsis; white-space:nowrap; overflow:hidden; cursor:pointer;
+}
+@media (hover:hover) { #ovr select:hover { border-color:var(--line-2); } }
+#ovr select:focus { border-color:var(--acc-focus); box-shadow:0 0 0 2px var(--focus-ring); outline:none; }
+/* The platform draws a <select> popup itself and ignores option styling, so the
+   model list uses a sheet instead. The select stays hidden as the value store:
+   session config, the summary, and request code keep reading one source. */
+#modelpickfield { flex:1; min-width:0; }
+#omodelbtn {
+  display:flex; align-items:center; justify-content:space-between; gap:8px;
+  width:100%; height:38px; padding:0 12px; text-align:left;
+  font-size:16px; font-weight:600; color:var(--fg);
+  background:var(--surface); border:1px solid var(--line); border-radius:10px;
+  box-shadow:0 1px 2px rgba(0,0,0,.12);
+  -webkit-appearance:none; appearance:none;
+}
+#omodelbtnlabel { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#omodelchev { flex:0 0 auto; width:7px; height:7px; margin-top:-3px; border-right:1.5px solid var(--dim); border-bottom:1.5px solid var(--dim); transform:rotate(45deg); }
+@media (hover:hover) { #omodelbtn:hover { border-color:var(--line-2); } }
+#omodelbtn:focus-visible { border-color:var(--acc-focus); box-shadow:0 0 0 2px var(--focus-ring); outline:none; }
+#omodelbtn:disabled { opacity:.5; }
+#modelpick[hidden] { display:none; }
+#modelpick { position:fixed; inset:0; z-index:15; }
+#modelpickscrim { position:absolute; inset:0; background:rgba(0,0,0,.55); animation:model-fade .18s ease-out; touch-action:none; }
+#modelpickpanel {
+  position:absolute; left:0; right:0; bottom:0; margin:0 auto;
+  display:flex; flex-direction:column; width:min(100%,560px); max-height:82dvh;
+  padding:0 12px calc(10px + env(safe-area-inset-bottom));
+  background:var(--panel); border:1px solid var(--line); border-bottom:0;
+  border-radius:22px 22px 0 0; box-shadow:0 -12px 40px rgba(0,0,0,.5);
+  animation:model-up .24s cubic-bezier(.2,.8,.2,1);
+}
+#modelpickhandle { flex:0 0 auto; width:38px; height:4px; margin:8px auto 4px; border-radius:2px; background:var(--line-2); }
+#modelpickhead { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:4px 4px 10px; }
+#modelpicktitle { font-size:17px; font-weight:600; }
+#modelpicknote { margin-top:2px; font-size:12px; color:var(--dim); }
+#modelpickclose {
+  flex:0 0 auto; display:grid; place-items:center; width:36px; height:36px; padding:0;
+  border-radius:50%; background:var(--surface); color:var(--dim); font-size:22px; line-height:1;
+}
+@media (hover:hover) { #modelpickclose:hover { border-color:var(--line-2); color:var(--fg); } }
+#modelpicklist { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y; padding:2px 0 4px; }
+.modelrow {
+  display:flex; align-items:center; gap:12px; width:100%; min-height:54px;
+  padding:10px 12px; border:1px solid transparent; border-radius:12px;
+  background:transparent; color:var(--fg); text-align:left;
+}
+.modelrow + .modelrow { margin-top:2px; }
+.modelrow:active { background:var(--surface-hover); }
+@media (hover:hover) { .modelrow:hover { background:var(--surface-2); } }
+.modelrow[aria-selected="true"] { background:var(--tint-3); border-color:var(--acc-line-soft); }
+#modelpicklist .modelrow:focus-visible { outline:2px solid var(--acc-focus); outline-offset:-2px; }
+.modelrowtext { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
+.modelrowname { font-size:15px; font-weight:600; line-height:1.3; overflow-wrap:anywhere; }
+.modelrowmeta { font-size:12px; color:var(--dim); overflow-wrap:anywhere; }
+.modelrowcheck { position:relative; flex:0 0 auto; width:22px; height:22px; border:1.5px solid var(--line-2); border-radius:50%; }
+.modelrow[aria-selected="true"] .modelrowcheck { background:var(--acc); border-color:var(--acc); }
+.modelrow[aria-selected="true"] .modelrowcheck::after { content:""; position:absolute; left:7px; top:3px; width:6px; height:11px; border:solid var(--on-acc); border-width:0 2px 2px 0; transform:rotate(45deg); }
+.modelfamily { display:inline-block; margin-right:6px; padding:1px 6px; border:1px solid var(--line); border-radius:999px; background:var(--surface-2); color:var(--dim); font-size:11px; font-weight:600; letter-spacing:.02em; vertical-align:1px; }
+#modelpicklist .modelrowdefault { border-bottom:1px solid var(--line); border-radius:12px 12px 0 0; margin-bottom:4px; }
+@keyframes model-up { from { transform:translateY(24px); opacity:.7; } to { transform:translateY(0); opacity:1; } }
+@keyframes model-fade { from { opacity:0; } to { opacity:1; } }
 #skillpicker { position:relative; flex:1; min-width:0; }
 #skillfield { position:relative; }
-#oskill { width:100%; padding:6px 36px 6px 8px; font-size:16px; }
-#oskill:focus { outline:2px solid var(--acc-focus); outline-offset:1px; }
+#oskill { width:100%; padding:6px 36px 6px 8px; font-size:16px; background-color:var(--surface); border-radius:10px; }
+#oskill:focus { border-color:var(--acc-focus); box-shadow:0 0 0 2px var(--focus-ring); outline:none; }
 #skillclear { position:absolute; right:1px; top:1px; bottom:1px; width:34px; padding:0; background:transparent; border:0; color:var(--dim); }
 #skillmenu { position:absolute; bottom:calc(100% + 8px); left:0; right:0; z-index:12; max-height:min(240px,35dvh); overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y; padding:5px; background:var(--panel); border:1px solid var(--acc-line); border-radius:12px; box-shadow:0 8px 24px #0008; }
 #skillmenu [role="option"] { padding:10px; min-height:44px; border-radius:8px; cursor:pointer; overflow-wrap:anywhere; }
@@ -361,9 +437,13 @@ select, summary { touch-action:manipulation; }
   /* Override picks collapse into one summary row showing the current picks. */
   #ovrwrap { display:block; border-top:1px solid var(--line); }
   #ovrwrap > summary { display:block; padding:8px 12px; font-size:12px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  #ovr { flex-direction:column; padding:8px 12px 10px; }
-  #ovr select { width:100%; padding:10px 8px; }
-  #oskill { min-height:44px; padding:10px 44px 10px 8px; }
+  #ovr { flex-direction:column; gap:8px; padding:10px 12px 10px; }
+  #ovr select { flex:0 0 auto; width:100%; height:46px; padding:0 40px 0 12px; font-size:15px; }
+  #modelpickfield { flex:0 0 auto; width:100%; }
+  #omodelbtn { height:46px; padding:0 14px; font-size:15px; }
+  #modelpickpanel { max-height:88dvh; }
+  .modelrow { min-height:56px; }
+  #oskill { min-height:46px; padding:10px 44px 10px 12px; }
   #skillclear { width:42px; }
   #msgs { padding:10px; }
   #jumpbottom { display:grid; }
@@ -422,6 +502,7 @@ select, summary { touch-action:manipulation; }
   #conn.open #save { flex:1; min-height:44px; }
 }
 @media (prefers-reduced-motion:reduce) { #jumpbottom, #prompt { transition:none; } body, header, #sessbar, #composer, #msgs, .msg, button, select, input, textarea, #sessions, #conn, #connstat, #questionpanel, #skillmenu, #turnstatus, .code-preview, .code-preview-toolbar, .code-block-toolbar, .mediaprev { transition:none; } }
+@media (prefers-reduced-motion:reduce) { #modelpickpanel, #modelpickscrim { animation:none; } }
 /* Server-side images in a reply: the path text stays, the fetched picture
    sits under it (see decorateMedia in the script below). */
 .mediaprev { display:block; margin:6px 0; }
@@ -481,7 +562,13 @@ select, summary { touch-action:manipulation; }
 <details id="ovrwrap" open>
 <summary id="ovrsummary">model · agent · effort · skill</summary>
 <div id="ovr">
-<select id="omodel" aria-label="model override"></select>
+<div id="modelpickfield">
+<button id="omodelbtn" type="button" aria-haspopup="listbox" aria-controls="modelpicklist" aria-expanded="false" aria-label="model override" disabled>
+<span id="omodelbtnlabel">model: loading…</span>
+<span id="omodelchev" aria-hidden="true"></span>
+</button>
+<select id="omodel" aria-label="model override" hidden></select>
+</div>
 <select id="oagent" aria-label="agent override"></select>
 <select id="oeffort" aria-label="reasoning effort override"></select>
 <div id="skillpicker">
@@ -494,6 +581,17 @@ select, summary { touch-action:manipulation; }
 </div>
 </div>
 </details>
+<div id="modelpick" hidden>
+<div id="modelpickscrim"></div>
+<section id="modelpickpanel" role="dialog" aria-modal="true" aria-labelledby="modelpicktitle">
+<div id="modelpickhandle" aria-hidden="true"></div>
+<div id="modelpickhead">
+<div><div id="modelpicktitle">model</div><div id="modelpicknote">applies to this session</div></div>
+<button id="modelpickclose" type="button" aria-label="close model picker">×</button>
+</div>
+<div id="modelpicklist" role="listbox" aria-labelledby="modelpicktitle"></div>
+</section>
+</div>
 <div id="composer">
 <button id="img" aria-label="attach image">🖼</button>
 <input id="file" type="file" accept="image/*" multiple hidden>
@@ -2197,6 +2295,7 @@ function applySessionConfig(cfg) {
   set($("omodel"), cfg.model || "");
   set($("oagent"), cfg.agent || "");
   set($("oeffort"), cfg.reasoning_effort || "");
+  syncModelTrigger();
   syncOvrSummary();
 }
 function resetPicks() {
@@ -2214,6 +2313,7 @@ async function persistPicks() {
 // A changed pick belongs to the session it was changed in: push it to the
 // server instead of this browser's storage, and refresh the collapsed summary.
 function savePick() {
+  syncModelTrigger();
   syncOvrSummary();
   persistPicks();
 }
@@ -2222,9 +2322,8 @@ function fillSelect(sel, entries, currentLabel, kind) {
   sel.innerHTML = "";
   const def = document.createElement("option");
   def.value = "";
-  // A phone-width select clips its text with no ellipsis, so the option keeps
-  // only the short form: "model: server default (deepseek-…)" was reading as a
-  // truncated "model: serve". The full label stays in the header line.
+  // The summary and the model trigger use the short form; the full label with
+  // the current server model stays in title for the picker and desktop hover.
   const full = kind + ": server default" + (currentLabel ? " (" + currentLabel + ")" : "");
   def.textContent = kind + ": default";
   def.title = full;
@@ -2237,6 +2336,148 @@ function fillSelect(sel, entries, currentLabel, kind) {
     sel.appendChild(o);
   }
   sel.value = (prev && [...sel.options].some((o) => o.value === prev)) ? prev : "";
+}
+// A platform <select> popup is drawn outside the page, so its rows cannot be
+// themed. Keep the hidden select as the value store and let a sheet render the
+// same options with the app's typography and touch targets.
+let modelSheetReturnFocus = null;
+let modelSheetHistoryPushed = false;
+function modelFamily(id) {
+  const match = /^([A-Za-z]{2,12})(.*)$/.exec(id);
+  if (!match) return null;
+  const rest = match[2].replace(/^[-_.]+/, "");
+  return rest ? { family: match[1].toLowerCase(), rest } : null;
+}
+function syncModelTrigger() {
+  const sel = $("omodel"), btn = $("omodelbtn"), label = $("omodelbtnlabel");
+  const option = sel.options[sel.selectedIndex];
+  const text = option ? option.textContent : "";
+  label.textContent = !sel.options.length ? "model: loading…"
+    : (sel.value ? "model: " + text : (text || "model: default"));
+  btn.disabled = sel.options.length === 0;
+  btn.setAttribute("aria-label", sel.options.length
+    ? "model override: " + (sel.value ? text : "default")
+    : "model override: loading");
+  btn.title = option ? (option.title || text) : "";
+}
+function renderModelSheet() {
+  const sel = $("omodel"), list = $("modelpicklist");
+  list.textContent = "";
+  for (const option of [...sel.options]) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.tabIndex = -1;
+    row.className = option.value ? "modelrow" : "modelrow modelrowdefault";
+    row.dataset.value = option.value;
+    row.setAttribute("role", "option");
+    row.setAttribute("aria-selected", String(option.value === sel.value));
+    row.title = option.title || option.textContent;
+    const text = document.createElement("span");
+    text.className = "modelrowtext";
+    const name = document.createElement("span");
+    name.className = "modelrowname";
+    let meta = null;
+    if (option.value) {
+      const parts = modelFamily(option.textContent);
+      if (parts) {
+        const family = document.createElement("span");
+        family.className = "modelfamily";
+        family.textContent = parts.family;
+        const variant = document.createElement("span");
+        variant.textContent = parts.rest;
+        name.append(family, variant);
+      } else {
+        name.textContent = option.textContent;
+      }
+    } else {
+      name.textContent = "server default";
+      meta = document.createElement("span");
+      meta.className = "modelrowmeta";
+      const configured = /\(([^()]*)\)\s*$/.exec(option.title || "");
+      meta.textContent = configured ? configured[1] : "use the server's configured model";
+    }
+    text.appendChild(name);
+    if (meta) text.appendChild(meta);
+    const check = document.createElement("span");
+    check.className = "modelrowcheck";
+    check.setAttribute("aria-hidden", "true");
+    row.append(text, check);
+    row.onclick = () => chooseModelOption(option.value);
+    list.appendChild(row);
+  }
+}
+function openModelSheet() {
+  const sel = $("omodel");
+  if (!sel.options.length) return;
+  renderModelSheet();
+  $("modelpick").hidden = false;
+  $("omodelbtn").setAttribute("aria-expanded", "true");
+  modelSheetReturnFocus = $("omodelbtn");
+  const rows = [...$("modelpicklist").querySelectorAll('[role="option"]')];
+  const selected = rows.find((row) => row.getAttribute("aria-selected") === "true") || rows[0];
+  if (selected) {
+    try { selected.focus({ preventScroll: true }); } catch (e) { selected.focus(); }
+    selected.scrollIntoView({ block: "nearest" });
+  }
+  if (typeof history !== "undefined" && history.pushState) {
+    try { history.pushState({ modelSheet: true }, ""); modelSheetHistoryPushed = true; }
+    catch (e) { modelSheetHistoryPushed = false; }
+  }
+}
+function closeModelSheet(fromHistory = false) {
+  const modal = $("modelpick");
+  if (modal.hidden) return;
+  modal.hidden = true;
+  $("omodelbtn").setAttribute("aria-expanded", "false");
+  const target = modelSheetReturnFocus || $("omodelbtn");
+  modelSheetReturnFocus = null;
+  if (target && target.focus) {
+    try { target.focus({ preventScroll: true }); } catch (e) { target.focus(); }
+  }
+  if (!fromHistory && modelSheetHistoryPushed) {
+    modelSheetHistoryPushed = false;
+    try { history.back(); } catch (e) {}
+  } else {
+    modelSheetHistoryPushed = false;
+  }
+}
+function chooseModelOption(value) {
+  const sel = $("omodel");
+  if (value && ![...sel.options].some((option) => option.value === value)) {
+    closeModelSheet();
+    return;
+  }
+  sel.value = value;
+  syncModelTrigger();
+  savePick();
+  closeModelSheet();
+}
+function modelSheetKeydown(e) {
+  if (e.key === "Escape") {
+    e.preventDefault();
+    closeModelSheet();
+    return;
+  }
+  if (e.key === "Tab") {
+    const rows = [...$("modelpicklist").querySelectorAll('[role="option"]')];
+    const order = [$("modelpickclose"), ...rows];
+    const current = order.indexOf(document.activeElement);
+    if (current < 0) return;
+    e.preventDefault();
+    order[(current + (e.shiftKey ? -1 : 1) + order.length) % order.length].focus();
+    return;
+  }
+  if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
+  const rows = [...$("modelpicklist").querySelectorAll('[role="option"]')];
+  if (!rows.length) return;
+  const current = rows.indexOf(document.activeElement);
+  let next = current;
+  if (e.key === "Home") next = 0;
+  else if (e.key === "End") next = rows.length - 1;
+  else if (e.key === "ArrowDown") next = (current + 1) % rows.length;
+  else next = (current - 1 + rows.length) % rows.length;
+  e.preventDefault();
+  rows[next].focus();
 }
 // Skills are pending next-turn choices, not persistent session configuration.
 // Keep drafts per server/session while the page is open; object identity keeps
@@ -2434,6 +2675,7 @@ async function loadInfo() {
     const parts = [info.model_label || info.model, info.agent, info.reasoning_effort].filter(Boolean);
     $("info").textContent = parts.join(" · ") + " (remote)";
     fillSelect($("omodel"), (info.models || []).map((m) => [m.id, m.label || m.id]), info.model_label || info.model, "model");
+    syncModelTrigger();
     fillSelect($("oagent"), (info.agents || []).map((a) => [a, a]), info.agent, "agent");
     fillSelect($("oeffort"), (info.efforts || []).map((e) => [e, e]), info.reasoning_effort, "effort");
     // The three picks are per-session and live on the server; loadSessionConfig
@@ -3872,6 +4114,11 @@ function wire() {
   $("omodel").onchange = () => savePick();
   $("oagent").onchange = () => savePick();
   $("oeffort").onchange = () => savePick();
+  $("omodelbtn").onclick = openModelSheet;
+  $("modelpickclose").onclick = () => closeModelSheet();
+  $("modelpickscrim").onclick = () => closeModelSheet();
+  $("modelpickpanel").onkeydown = modelSheetKeydown;
+  window.addEventListener("popstate", () => { if (!$("modelpick").hidden) closeModelSheet(true); });
   $("oskill").onfocus = renderSkillMenu;
   $("oskill").onclick = renderSkillMenu;
   $("oskill").onblur = closeSkillMenu;
