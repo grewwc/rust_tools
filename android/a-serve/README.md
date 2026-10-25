@@ -81,18 +81,20 @@ content, so the app keeps a short in-memory history of mirrored frames and
 delivers the one visible just before the tap, and falls back to taking the
 frame once the shade closed.
 
-An armed request expires after about two minutes without a tap, and the session
-stays alive for the next request. The notification then shows the delivered
-frame, and the conversation shows the same frame, so you can confirm which
-moment was sent. Idle frames are discarded, not uploaded. A
-foreground notification always offers **立即截屏** and **停止共享**. Use
-`screen_stop`, the notification, or Android's sharing control to revoke it.
-The session also ends on page replacement, app destruction, system revocation,
-or after 30 minutes; no consent token survives restart. Protected screens are
-not bypassed. Screen images are resized to at most 2048 pixels per side and
-encoded as JPEG (at most 256 KiB); the tool saves one server-side temporary
-image for model inspection. Screen contents can therefore reach the configured
-model provider, just like manually uploaded images.
+An armed request expires after about two minutes without a tap. Sharing is
+one-shot: the session ends automatically when the request finishes, including
+after a delivered frame or an expired or failed request, so no sharing
+indicator remains to be stopped manually. The conversation shows the delivered
+frame, so you can confirm which moment was sent. Idle frames are discarded, not
+uploaded. While a request is waiting, the foreground notification offers
+**立即截屏** and **停止共享**. Use `screen_stop`, the notification, or Android's
+sharing control to revoke it early. The session also ends on page replacement,
+app destruction, system revocation, or after 30 minutes; no consent token
+survives restart. Protected screens are not bypassed. Screen images are resized
+to at most 2048 pixels per side and encoded as JPEG (at most 256 KiB); the tool
+saves one server-side temporary image for model inspection. Screen contents can
+therefore reach the configured model provider, just like manually uploaded
+images.
 
 Unit tests do not emulate vendor clock apps, Android permission dialogs,
 document providers, SQLite device storage, or MediaProjection. Test these on a

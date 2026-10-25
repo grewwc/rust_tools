@@ -513,7 +513,7 @@ fn format_phone_result(spec: &Value, answer: &str) -> Result<String, String> {
         let closing = if action == "camera_capture" {
             "Nothing was written to the phone gallery; the picture only exists in this session's temp directory."
         } else {
-            "This is a captured frame, not app history; secure windows may be blank. Sharing remains visible until stopped, and can be stopped with screen_stop."
+            "This is a captured frame, not app history; secure windows may be blank. Screen sharing ends automatically after this frame; another capture requires fresh system consent."
         };
         return Ok(format!("Phone image saved to {}. Use read_file on this path to inspect the image before answering. {moment} {closing}", path.display()));
     }

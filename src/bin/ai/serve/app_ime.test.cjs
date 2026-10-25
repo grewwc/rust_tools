@@ -45,6 +45,10 @@ const syncStopSrc = script.slice(
   script.indexOf("function syncStopButton() {"),
   script.indexOf("// Transient note through the existing #connstat line"),
 );
+const noteSrc = script.slice(
+  script.indexOf("// Transient note through the existing #connstat line"),
+  script.indexOf("async function sendSideNote("),
+);
 
 function makeContext(extra) {
   const listeners = new Map();
@@ -272,6 +276,36 @@ test("a layout change waits for the composition to end", () => {
   assert.deepEqual(context.marks, ["sideNote"], "the held change was not applied afterwards");
 });
 
+test("a transient note does not move the composer during a composition", () => {
+  const classes = new Set();
+  const connstat = {
+    textContent: "",
+    classList: {
+      add(...names) { names.forEach((name) => classes.add(name)); },
+      remove(...names) { names.forEach((name) => classes.delete(name)); },
+    },
+  };
+  const context = makeContext({
+    $: (id) => (id === "connstat" ? connstat : null),
+  });
+  run(context, "let noteTimer = null;");
+  vm.runInContext(noteSrc, context);
+  run(context, "promptComposing = true;");
+  run(context, "note('working');");
+  assert.equal(connstat.textContent, "", "the note appeared while a word was being composed");
+  assert.equal(context.timers.length, 0, "the note timer started while a word was being composed");
+  run(context, "promptComposing = false;");
+  run(context, "flushLayout();");
+  assert.equal(connstat.textContent, "working");
+  assert.ok(classes.has("show") && classes.has("note"), "the held note was not shown");
+  run(context, "promptComposing = true;");
+  context.timers.shift()();
+  assert.ok(classes.has("show"), "the note hid while a word was being composed");
+  run(context, "promptComposing = false;");
+  run(context, "flushLayout();");
+  assert.ok(!classes.has("show"), "the note stayed after its timer");
+});
+
 test("the side note column does not resize the composer during a composition", () => {
   const toggles = [];
   const composer = { classList: { toggle: (name, on) => toggles.push("composer." + name + "=" + on) } };
@@ -317,6 +351,9 @@ test("a dropped composition puts the word back instead of losing it", () => {
   // the user assembled never reached the field.
   context.prompt.dispatch("compositionend", { data: "" });
   assert.equal(context.prompt.value, "pu'sh", "the word being composed was lost");
+  assert.equal(notes.length, 0, "the note changed layout inside the commit task");
+  assert.ok(context.timers.length >= 1, "the deferred composition work was not scheduled");
+  context.timers.shift()();
   assert.equal(notes.length, 1, "the drop was not reported");
   assert.match(notes[0], /输入被打断/);
 });

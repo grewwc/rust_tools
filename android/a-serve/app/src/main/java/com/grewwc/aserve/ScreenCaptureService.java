@@ -35,7 +35,9 @@ import org.json.JSONObject;
 /**
  * Explicitly authorized, visible sharing session. The user picks the capture
  * moment: a request is armed, and the frame is taken only after the user taps
- * the notification action. Only requested frames leave the phone.
+ * the notification action. Only requested frames leave the phone. The session
+ * is one-shot: it ends when the request finishes, so no sharing indicator is
+ * left behind for the user to stop manually.
  */
 public final class ScreenCaptureService extends Service {
     private static final String CHANNEL = "screen_capture";
@@ -205,7 +207,7 @@ public final class ScreenCaptureService extends Service {
 
     static void stopSession() { if (active != null) active.endSession("screen sharing stopped"); }
 
-    /** Drops the pending request but keeps the consent session for later requests. */
+    /** Drops the pending request and ends the one-shot sharing session. */
     static void cancelPending() {
         if (active == null || active.stopped) return;
         active.failPending("screen capture timed out");
@@ -219,7 +221,9 @@ public final class ScreenCaptureService extends Service {
         main.removeCallbacks(timeout);
         main.removeCallbacks(captureTimeout);
         if (requestToken != null) ScreenCapture.finish(requestToken, false, error, null);
-        updateNotification(IDLE_TITLE, IDLE_TEXT, null);
+        // An expired or failed request must not leave a visible sharing session
+        // behind; the next capture asks for system consent again.
+        endSession(error);
     }
 
     @Override public IBinder onBind(Intent intent) { return null; }
@@ -440,9 +444,12 @@ public final class ScreenCaptureService extends Service {
         main.removeCallbacks(timeout);
         main.removeCallbacks(captureTimeout);
         if (ok) updateNotification("a · 已截取 " + stamp(capturedAt),
-                "助手已收到这一帧；要其它画面请再说一次", thumbnail);
-        else updateNotification(IDLE_TITLE, IDLE_TEXT, null);
+                "屏幕共享已关闭", thumbnail);
         ScreenCapture.finish(requestToken, ok, error, data);
+        // Deliver the frame first, then drop the projection: one request owns
+        // the session, so no sharing indicator outlives the capture.
+        endSession(ok ? "screen sharing ended after capture"
+                : error == null ? "screen capture ended" : error);
     }
 
     /** Wall-clock time of the delivered frame, falling back to now. */

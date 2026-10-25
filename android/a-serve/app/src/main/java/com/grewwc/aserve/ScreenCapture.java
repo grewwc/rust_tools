@@ -44,7 +44,8 @@ public final class ScreenCapture {
         request.timeout = () -> {
             consentToken = null;
             finish(request.token, false, "screen capture timed out", null);
-            // Keep the consent session alive so the next request reuses it.
+            // The service ends its one-shot sharing session when the request is
+            // dropped; the next capture asks for system consent again.
             ScreenCaptureService.cancelPending();
         };
         MAIN.postDelayed(request.timeout, 120_000);

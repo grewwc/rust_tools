@@ -1249,7 +1249,7 @@ async fn serve_app_returns_mobile_client() {
     assert!(body.contains("rel=\"manifest\" href=\"/app.webmanifest\""));
     assert!(body.contains("rel=\"icon\" href=\"/app-icon.svg\""));
     assert!(body.contains(
-        "href=\"/a-serve-v1.15.0.apk\" download=\"a-serve-v1.15.0.apk\""
+        "href=\"/a-serve-v1.15.1.apk\" download=\"a-serve-v1.15.1.apk\""
     ));
     assert!(body.contains("serviceWorker.register(\"/app-sw.js\", { scope: \"/\" })"));
     assert!(body.contains("parsePhoneAction"));
@@ -1276,7 +1276,7 @@ async fn serve_android_apk_returns_installable_attachment() {
             .headers()
             .get(axum::http::header::CONTENT_DISPOSITION)
             .and_then(|v| v.to_str().ok()),
-        Some("attachment; filename=\"a-serve-v1.15.0.apk\"")
+        Some("attachment; filename=\"a-serve-v1.15.1.apk\"")
     );
     assert_eq!(
         response

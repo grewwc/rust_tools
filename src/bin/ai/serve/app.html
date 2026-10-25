@@ -519,7 +519,7 @@ select, summary { touch-action:manipulation; }
 <header>
 <button id="menu" aria-label="sessions">☰</button>
 <b>a</b><span id="info">connecting…</span>
-<a id="apkdownload" href="/a-serve-v1.15.0.apk" download="a-serve-v1.15.0.apk" aria-label="download Android app" title="download Android app"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></a>
+<a id="apkdownload" href="/a-serve-v1.15.1.apk" download="a-serve-v1.15.1.apk" aria-label="download Android app" title="download Android app"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg></a>
 <button id="themebtn" type="button" aria-label="switch theme" title="switch theme"><svg viewBox="0 0 24 24" aria-hidden="true"><g class="sun"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.4v2.2M12 19.4v2.2M2.4 12h2.2M19.4 12h2.2M5.1 5.1l1.6 1.6M17.3 17.3l1.6 1.6M18.9 5.1l-1.6 1.6M6.7 17.3l-1.6 1.6"/></g><path class="moon" d="M20.4 14.4A8.6 8.6 0 1 1 9.6 3.6a6.8 6.8 0 0 0 10.8 10.8Z"/><g class="leaf"><path d="M5 19c0-8 5.5-13 14-13 0 8.5-5 13-11 13a3 3 0 0 1-3-3Z"/><path d="M9.6 14.4c1.6-2.4 3.6-4 6-5.2"/></g></svg></button>
 <button id="connbtn" aria-label="connection">⚙</button>
 <button id="newbtn" class="primary">＋</button>
@@ -3496,18 +3496,39 @@ function syncStopButton() {
   const text = !detached ? "" : fresh
     ? "Turn running on server · live updates unavailable"
     : "Live connection lost · checking server history…";
-  if (status.textContent !== text) status.textContent = text;
-  // The status row sits directly above the composer: showing or hiding it
-  // moves the focused field.
-  holdLayout("status", () => { status.hidden = !text; });
+  // The status row sits directly above the composer: changing its text can
+  // wrap it to another line, and showing or hiding it moves the focused field.
+  holdLayout("status", () => {
+    if (status.textContent !== text) status.textContent = text;
+    status.hidden = !text;
+  });
 }
 // Transient note through the existing #connstat line; no new toast element.
+// Showing, changing, or hiding this line changes the space above the
+// composer, so all three go through holdLayout and an active IME composition
+// is never moved. The newest note replaces an older pending one.
 function note(msg) {
+  if (noteTimer !== null) {
+    clearTimeout(noteTimer);
+    noteTimer = null;
+  }
+  holdLayout("note", () => {
+    const el = $("connstat");
+    el.textContent = msg;
+    el.classList.add("show", "note");
+    noteTimer = setTimeout(() => {
+      noteTimer = null;
+      hideNote();
+    }, 3000);
+  });
+}
+function hideNote() {
+  if (promptComposing) {
+    holdLayout("note", hideNote);
+    return;
+  }
   const el = $("connstat");
-  el.textContent = msg;
-  el.classList.add("show", "note");
-  if (noteTimer !== null) clearTimeout(noteTimer);
-  noteTimer = setTimeout(() => { el.classList.remove("show", "note"); noteTimer = null; }, 3000);
+  el.classList.remove("show", "note");
 }
 async function sendSideNote() {
   if (sideNoteBusy || !sessionId) return;
@@ -4149,12 +4170,13 @@ function wire() {
     const lost = !committed && composingText && prompt.value === composingStartValue &&
       document.activeElement === prompt;
     promptComposing = false;
+    let dropped = false;
     if (lost) {
       const restored = composingStartValue + composingText;
       setPromptValue(restored, true);
       try { prompt.setSelectionRange(restored.length, restored.length); } catch (_) {}
-      note("输入被打断，已把你正在输入的内容放回输入框");
       traceMark("compositionDropped");
+      dropped = true;
     }
     composingText = "";
     composingStartValue = "";
@@ -4163,6 +4185,7 @@ function wire() {
     // still in flight, and a layout change inside it loses the word.
     setTimeout(() => {
       flushLayout();
+      if (dropped) note("输入被打断，已把你正在输入的内容放回输入框");
       // A share or an image that landed mid-composition is applied now that
       // the field is free again.
       if (pendingShare) {
