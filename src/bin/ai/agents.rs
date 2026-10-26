@@ -524,10 +524,10 @@ fn load_scoped_project_instruction_docs_for_target_tiers_from(
         if used >= TARGET_SCOPED_INSTRUCTION_MAX_TOTAL_CHARS {
             // Report on stderr: the user needs to know a scoped instruction file
             // was dropped because the tier budget ran out (debugging aid).
-            eprintln!(
-                "[project-instructions] omitted {} (budget exhausted: {used}/{} chars)",
-                doc.path, TARGET_SCOPED_INSTRUCTION_MAX_TOTAL_CHARS
-            );
+            // eprintln!(
+            //     "[project-instructions] omitted {} (budget exhausted: {used}/{} chars)",
+            //     doc.path, TARGET_SCOPED_INSTRUCTION_MAX_TOTAL_CHARS
+            // );
             break;
         }
         let remaining = TARGET_SCOPED_INSTRUCTION_MAX_TOTAL_CHARS - used;
@@ -770,10 +770,10 @@ fn limit_project_instruction_docs(
     let mut used = 0usize;
     for doc in candidates {
         if used >= max_chars {
-            eprintln!(
-                "[project-instructions] omitted {} (budget exhausted: {used}/{max_chars} chars)",
-                doc.path
-            );
+            // eprintln!(
+            //     "[project-instructions] omitted {} (budget exhausted: {used}/{max_chars} chars)",
+            //     doc.path
+            // );
             continue;
         }
         let budget = max_chars - used;
