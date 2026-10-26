@@ -1133,24 +1133,30 @@ mod tests {
     }
 
     #[test]
-    fn integrated_critic_prompt_pins_auditable_claim_contract_and_its_simple_answer_exemption() {
+    fn integrated_critic_reuses_base_evidence_and_outcome_contract() {
         let prompt = include_str!("prompts/integrated_critic_revise.md");
-        assert!(prompt.contains("Make each consequential claim auditable where it stands"));
-        assert!(prompt.contains("name the basis it rests on"));
-        assert!(prompt.contains("and the scope it covers"));
-        assert!(prompt.contains(
+        let base = include_str!("../system_prompts/correctness_guardrails.md");
+        assert!(prompt.contains("Apply the base evidence and outcome-reporting rules"));
+        assert!(prompt.contains("do not introduce additional acceptance criteria"));
+        assert!(prompt.contains("Investigate further only if a newly identified gap materially affects delivery or safety"));
+        assert!(base.contains("Make each consequential claim auditable where it stands"));
+        assert!(base.contains("name the basis it rests on"));
+        assert!(base.contains("and the scope it covers"));
+        assert!(base.contains(
             "put every limitation next to the claim it limits instead of in a closing disclaimer"
         ));
-        assert!(prompt.contains(
+        assert!(base.contains(
             "describe the part you checked rather than asserting the whole when your evidence covers only part"
         ));
         assert!(prompt.contains("Reuse evidence already in context"));
-        assert!(prompt.contains(
+        assert!(base.contains(
             "for simple answers add no citations, qualifiers, or extra steps unless the claim would change what the reader does"
         ));
-        // The consequential-claim check is a named guardrails rule, not a
-        // restatement: the critic references it so both blocks stay single-sourced.
-        assert!(prompt.contains("apply `Match the evidence to the claim it supports`"));
+        assert!(base.contains("Distinguish implementation, verification, and user confirmation"));
+        assert!(base.contains("do not treat it as a blocker for independently verified work"));
+        // The self-review must not impose an evidence-axis checklist, directly
+        // or through a named rule.
+        assert!(!prompt.contains("Match the evidence to the claim it supports"));
         assert!(!prompt.contains(
             "check the subject, time window, measurement scope, and artifact version"
         ));

@@ -743,7 +743,7 @@ fn system_prompt_pins_impact_surface_workflow() {
 #[test]
 fn system_prompt_bridges_compressed_context_recovery_via_search_overflow() {
     // search_overflow is a core resident tool but must be explicitly bridged to the compression pipeline:
-    // after context compression, absence claims must first search the session archive instead of directly asserting "not found".
+    // Historical absence claims need the archive; current-state claims need current evidence.
     let mut available = SkipSet::new(16);
     available.insert("search_overflow".to_string());
 
@@ -751,8 +751,10 @@ fn system_prompt_bridges_compressed_context_recovery_via_search_overflow() {
         .render_system_prompt();
 
     assert!(prompt.contains("<compressed_context_recovery>"));
-    assert!(prompt.contains("search the session archive with `search_overflow`"));
-    assert!(prompt.contains("absence claims must cover the archived scope"));
+    assert!(prompt.contains("search the relevant session archive with `search_overflow`"));
+    assert!(prompt.contains("absence claim about past conversation or tool evidence that may have been compressed"));
+    assert!(prompt.contains("the visible context window alone cannot establish that absence"));
+    assert!(prompt.contains("Claims about current source or external state should be checked against that object, not the session archive"));
     assert!(prompt.contains("verbatim excerpts"));
     assert!(prompt.contains("scope=all"));
     // Narrowing guidance: prefer scope/file_pattern over the widest search, so
@@ -1098,14 +1100,36 @@ fn system_prompt_uses_criterion_based_parallel_delegation() {
     // Tool-local semantics (task_wait blocking/timeout/wait_policy, the
     // task_status peek, model/inherit defaults, task_integrate disposition,
     // task_cancel collect-later) stay in the always-visible tool schemas and
-    // runtime follow-ups; the prompt keeps only cross-tool decisions plus the
-    // final no-dropped-task check, which no schema or runtime gate owns.
+    // runtime follow-ups; the prompt keeps cross-tool decisions and the parent's
+    // responsibility to close task work despite bounded runtime recovery.
     assert!(prompt.contains("never spawn-wait-spawn-wait serially"));
     assert!(prompt.contains("Never silently drop a spawned task"));
     assert!(!prompt.contains("non-blocking peek while continuing"));
     assert!(!prompt.contains("wait_policy"));
     assert!(!prompt.contains("reuses your (parent) model"));
     assert!(!prompt.contains("certainty is not required"));
+}
+
+#[test]
+fn system_prompt_does_not_require_status_as_a_finishing_ritual() {
+    for tools in [vec![], vec!["task_status"], vec!["task_spawn", "task_status"]] {
+        let mut available = SkipSet::new(16);
+        for tool in &tools {
+            available.insert((*tool).to_string());
+        }
+        let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+            .render_system_prompt();
+        assert!(!prompt.contains("Before finishing your answer, call `task_status`"));
+        assert_eq!(
+            prompt.contains("Use `task_status` when unresolved task state matters to the next decision"),
+            tools.contains(&"task_status")
+        );
+        if tools.contains(&"task_status") {
+            assert!(prompt.contains("Never silently drop a spawned task"));
+            assert!(prompt.contains("never substitute a status query for reviewing and explicitly integrating evidence"));
+            assert!(prompt.contains("runtime final-response gates provide bounded recovery"));
+        }
+    }
 }
 
 #[test]
@@ -1174,7 +1198,7 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
     assert!(prompt.contains("<correctness_guardrails>"));
-    assert!(prompt.contains("Ground claims about the current workspace, system, and session"));
+    assert!(prompt.contains("Ground facts about a particular workspace, execution, session, or current external state"));
     assert!(prompt.contains("state what is verified, what is unknown"));
     assert!(prompt.contains("limit absence claims to the scope actually searched"));
     assert!(prompt.contains("plus its callers and dependents anywhere in the workspace"));
@@ -1185,8 +1209,8 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     // fabrication, and convergence bounds investigation without abandoning
     // unfinished actions.
     assert!(prompt.contains("navigation aids rather than independent proof"));
-    assert!(prompt.contains("MUST trace to evidence observed in this session"));
-    assert!(prompt.contains("make a targeted check that can resolve the gap"));
+    assert!(prompt.contains("in evidence observed in this session"));
+    assert!(prompt.contains("Investigate an unresolved fact only when it can materially change the answer"));
     assert!(prompt.contains("claims of success require successful results"));
     assert!(prompt.contains("An attempt or a plan is not a completed action"));
     // Subject-scope bullet: set-level aggregates never describe a single
@@ -1195,7 +1219,7 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     assert!(prompt.contains("Evidence stays with the subject it was measured on"));
     // The stop-investigation boundary is single-sourced in guardrails; the
     // convergence block states only task-completion reporting.
-    assert_eq!(prompt.matches("not eliminate unrelated unknowns").count(), 1);
+    assert_eq!(prompt.matches("Omit optional unsupported claims rather than researching them merely to strengthen the answer").count(), 1);
 }
 
 #[test]
@@ -1220,18 +1244,16 @@ fn system_prompt_requires_self_contained_comments() {
 
 #[test]
 fn system_prompt_answers_stable_general_knowledge_without_a_probe() {
-    // Common-sense and widely established facts are knowledge, not unverified
-    // evidence: no throwaway script or probe to re-derive them. Executed
-    // verification stays required for claims about this workspace / system /
-    // session, for version- or time-sensitive facts, and on explicit request.
+    // Stable knowledge and supported deductions need no probe. Concrete
+    // facts need evidence suited to the claim, not mandatory execution.
     let available = SkipSet::new(16);
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
     assert!(prompt.contains("Answer stable general knowledge directly"));
-    assert!(prompt.contains("are knowledge, not unverified evidence"));
-    assert!(prompt.contains("skip the throwaway script or probe"));
+    assert!(prompt.contains("Where the conclusion follows deductively from inspected code or math"));
+    assert!(prompt.contains("instead of adding executed tests to re-prove it"));
     assert!(prompt.contains(
-        "Valid deductions from explicit, supported premises can also be answered directly"
+        "This check does not apply to stable general knowledge or to valid deductions from explicit, supported premises"
     ));
     // One qualifier for the deduction exemption everywhere it appears, so no
     // reader can infer that explicit but unverified premises are exempt.
@@ -1239,15 +1261,14 @@ fn system_prompt_answers_stable_general_knowledge_without_a_probe() {
     assert!(!prompt.contains("deductions from supported premises"));
     assert!(prompt.contains("Confidence does not replace evidence"));
     assert!(prompt.contains(
-        "restates the same assumption instead of checking it against an independent source"
+        "a script that merely restates an assumption adds no independent support"
     ));
-    assert!(prompt.contains("for version- or time-sensitive facts"));
+    assert!(prompt.contains("current external state in evidence observed in this session"));
     assert!(prompt.contains(
-        "Executed verification is required for claims about the current workspace"
+        "inspect source for code structure, compile for compilation claims, and observe the running system for runtime state"
     ));
-    // The "execute it" rule is scoped to the code/data at hand so it cannot be
-    // read as a mandate to probe general knowledge.
-    assert!(prompt.contains("Where execution settles a claim about the code or data at hand"));
+    assert!(prompt.contains("Where execution settles a material claim that deduction cannot close"));
+    assert!(prompt.contains("An explicit request to check a fact makes it part of delivery"));
 }
 
 #[test]
@@ -1364,25 +1385,25 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "**Evidence provenance.**",
                     "Once evidence or a valid derivation settles the question at the task's required scope",
                     "reopen only for a material change, contradiction, or untested dependency",
-                    "Further investigation must address a gap that could materially change the answer or completion of requested work, not eliminate unrelated unknowns",
+                    "Investigate an unresolved fact only when it can materially change the answer, the requested action, or a necessary safety judgment",
+                    "An explicit request to check a fact makes it part of delivery",
                     "Complete requested actions and necessary verification, then answer with what the evidence supports",
-                    "a verification rule is not a reason to keep checking once the current context already settles the question at the required scope",
-                    "if a material fact is still missing, state the unknown instead of guessing",
+                    "Omit optional unsupported claims rather than researching them merely to strengthen the answer",
+                    "If an important gap cannot be resolved, state what is verified, what is unknown, and what would settle it",
                     "do not repeat settled reasoning",
+                    "a verification rule or checklist is not a reason to keep checking",
+                    "Use the fewest checks sufficient to cover the acceptance conditions, not a fixed check count",
+                    "Complete required authorization, safety checks, impact mapping, and edit-target inspection before acting",
+                    "If an action is deferred beyond this turn, report it as scheduled, not completed",
+                    "Distinguish implementation, verification, and user confirmation",
+                    "do not treat it as a blocker for independently verified work",
+                    "A cause claim that drives an action is reported as a hypothesis",
                     "**Reconcile corrections and conflicts.**",
                     "**Match the metric to the objective.**",
                     "**Check the inference before concluding.**",
                     "test a plausible competing explanation when it could materially change the answer and a targeted check can distinguish it",
                     "Do not invent, enumerate, or eliminate every possible alternative",
                     "Familiarity, confidence, or plausibility alone does not establish a conclusion",
-                    "**Match the evidence to the claim it supports.**",
-                    "the measurement scope (a whole turn, a single request, and one tool call are different quantities and do not subtract from each other)",
-                    "the artifact version or binary actually in effect then",
-                    "once a candidate cause has been refuted, do not present another as the cause without a check that separates it from the survivors",
-                    "if the evidence supports no candidate, say the claim is unresolved instead of inventing one",
-                    "Unclear context alone does not create a missing axis",
-                    "An axis that does not apply is not missing evidence",
-                    "Simple read-only answers, direct observations of current source, and stable knowledge stay direct and need none of this",
                     "**A refuted premise invalidates its dependents.**",
                     "Replacing the explanation while keeping the conclusion is the same error in new words",
                     "A challenge alone NEVER justifies retracting a supported conclusion",
@@ -1394,11 +1415,28 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     assert!(guardrails.contains(rule));
                     assert_eq!(prompt.matches(rule).count(), 1);
                 }
+                // The rendered prompt must not impose an evidence-axis checklist.
+                for rule in [
+                    "**Match the evidence to the claim it supports.**",
+                    "the measurement scope (a whole turn, a single request, and one tool call are different quantities and do not subtract from each other)",
+                    "the artifact version or binary actually in effect then",
+                    "once a candidate cause has been refuted, do not present another as the cause without a check that separates it from the survivors",
+                    "if the evidence supports no candidate, say the claim is unresolved instead of inventing one",
+                    "Unclear context alone does not create a missing axis",
+                    "An axis that does not apply is not missing evidence",
+                    "Simple read-only answers, direct observations of current source, and stable knowledge stay direct and need none of this",
+                ] {
+                    assert!(!prompt.contains(rule));
+                }
                 let (_, honesty) = prompt.split_once("<intellectual_honesty>").unwrap();
                 let (honesty, _) = honesty.split_once("</intellectual_honesty>").unwrap();
                 for rule in [
                     "NEVER fabricate or misrepresent what you know",
                     "Never present planned or attempted work as completed",
+                    "form and state your best-supported conclusion and its decisive basis",
+                    "rather than merely mirroring the user or listing options without evaluating them",
+                    "Distinguish facts, inferences, and recommendations",
+                    "uncertainty should bound the judgment, not erase what the evidence does establish",
                     "NEVER infer additional properties from a field's name, type, or metadata alone",
                     "independent supporting evidence or a valid derivation from explicit, supported premises",
                 ] {
@@ -1413,17 +1451,39 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "otherwise use the supported local fix or the next discriminating check",
                     "If the root cause is not established, say so",
                     "do not invent a cause or prescribe an unsupported redesign",
-                    "Reuse sufficiently current, relevant evidence already inspected",
-                    "If a safe, authorized new observation can answer the same question at lower overall cost than recovering historical evidence, obtain it directly",
-                    "within side-effect and spending limits",
-                    "For questions about a past state or execution, recover the original evidence or state what remains unknown",
-                    "never present a new result as the historical one",
+                    "Choose between local fixes and structural changes by weighing scope, structural coherence, regression risk, and maintenance cost",
+                    "do not optimize for the smallest diff or add unrelated refactors",
+                    "Apply the base evidence rules when deciding whether to investigate, verify, or reuse a result",
                     "Stopping investigation is not stopping execution",
                     "finish independent safe work that remains",
                 ] {
                     assert!(convergence.contains(rule));
                     assert_eq!(prompt.matches(rule).count(), 1);
                 }
+                let (_, tool_evidence) = prompt.split_once("<tool_result_evidence>").unwrap();
+                let (tool_evidence, _) = tool_evidence.split_once("</tool_result_evidence>").unwrap();
+                for rule in [
+                    "If capability availability is unknown and the operation is safe and authorized",
+                    "Reuse an existing failure unless relevant conditions changed",
+                    "A policy prohibition or missing authorization is a reason to stop, not to probe execution",
+                    "prefer a safe, authorized fresh observation if it costs less than recovering historical records",
+                    "within side-effect and spending limits",
+                    "For questions about a past state or execution, recover evidence of that state or report the unknown",
+                    "never substitute a new result for the historical one",
+                ] {
+                    assert!(tool_evidence.contains(rule));
+                    assert_eq!(prompt.matches(rule).count(), 1);
+                }
+                // Recovery guidance is capability-gated, unlike the base evidence rules.
+                assert!(!prompt.contains("<compressed_context_recovery>"));
+                let mut recovery_tools = SkipSet::new(16);
+                recovery_tools.insert("search_overflow".to_string());
+                let recovery_prompt = build_system_prompt(active_agent, skills, &Box::new(recovery_tools), &ctx)
+                    .render_system_prompt();
+                let (_, recovery) = recovery_prompt.split_once("<compressed_context_recovery>").unwrap();
+                let (recovery, _) = recovery.split_once("</compressed_context_recovery>").unwrap();
+                assert!(recovery.contains("absence claim about past conversation or tool evidence that may have been compressed"));
+                assert!(recovery.contains("Claims about current source or external state should be checked against that object, not the session archive"));
                 for obsolete in [
                     "A factual statement made without verified support is a lie",
                     "When a stated explanation is challenged or shown unsupported, retract it",
@@ -1465,9 +1525,9 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                 }
                 assert!(prompt.contains("Answer stable general knowledge directly"));
                 assert!(prompt.contains(
-                    "Valid deductions from explicit, supported premises can also be answered directly"
+                    "Where the conclusion follows deductively from inspected code or math, state the derivation instead of adding executed tests to re-prove it"
                 ));
-                assert_eq!(prompt.matches("not eliminate unrelated unknowns").count(), 1);
+                assert_eq!(prompt.matches("Omit optional unsupported claims").count(), 1);
                 assert!(
                     prompt.contains(
                         "When the user is right, say so plainly and accept the correction"
@@ -1497,14 +1557,13 @@ fn system_prompt_resists_sycophancy() {
         "Agreement must be earned by the facts, not granted because the user holds the view"
     ));
     assert!(default_prompt.contains("say so directly and respectfully"));
-    // Insistence alone must not move a factual position, and the two
-    // "do not re-check" rules must carve out a disputed conclusion so they
-    // cannot steer a challenged turn toward unchecked agreement.
+    // Insistence alone must not move a factual position; the shared correction
+    // rule requires re-evaluation without reflexive agreement or a mandatory probe.
     assert!(default_prompt.contains(
         "change a factual position because the user holds, repeats, or insists on another one"
     ));
     assert!(default_prompt.contains("When the user disputes a factual conclusion you stated"));
-    assert!(default_prompt.contains("a user dispute of an earlier conclusion"));
+    assert!(default_prompt.contains("re-derive it or reopen the evidence it rested on"));
 
     let goal_ctx = PromptContext {
         goal_mode: Some("ship the feature".to_string()),
@@ -1659,8 +1718,8 @@ fn system_prompt_bounds_tool_exploration() {
         .render_system_prompt();
     assert!(prompt.contains("Give every call a concrete decision goal"));
     assert!(prompt.contains("how the result could change the answer or next action"));
-    assert!(prompt.contains("Reuse sufficiently current, relevant evidence already inspected"));
-    assert!(prompt.contains("stop investigating that question; reopen only for a material change"));
+    assert!(prompt.contains("Reuse adequate evidence"));
+    assert!(prompt.contains("reopen only for a material change, contradiction, or untested dependency that matters to this request"));
     assert!(prompt.contains("before exploring, decide which question it answers"));
     assert!(prompt.contains("Do not batch code reads or reread visible content"));
 }
@@ -2219,6 +2278,19 @@ fn render_keeps_capabilities_in_system_prompt_out_of_fact_reminder() {
     assert!(!reminder.contains("Configured MCP tools can be loaded"));
     assert!(reminder.contains("Project Type"));
     assert!(reminder.contains("## Project Type"));
+    let check = reminder
+        .find("Behavior check (mandatory, every turn)")
+        .expect("fact reminder must carry the near-end behavior check");
+    let hedge = reminder
+        .find("IMPORTANT: this context")
+        .expect("fact reminder must keep its hedge for facts");
+    assert!(
+        check > hedge,
+        "the behavior check must sit after the fact hedge instead of under it"
+    );
+    assert!(reminder.contains("apply the base evidence and outcome-reporting rules"));
+    assert!(reminder.contains("Resolve only gaps that materially affect delivery"));
+    assert!(reminder.contains("reuse sufficient evidence and keep conclusions within its support"));
 }
 
 #[test]

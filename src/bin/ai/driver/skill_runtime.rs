@@ -163,6 +163,10 @@ impl SystemPromptBuilder {
             }
         }
         out.push_str("IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\n</system-reminder>");
+        // Keep a constant near-end pointer to the base behavior contracts,
+        // outside the optional fact context. Do not define a second acceptance
+        // standard here; recorded reminders still replay byte-identically.
+        out.push_str("\n<system-reminder>\nBehavior check (mandatory, every turn): apply the base evidence and outcome-reporting rules. Resolve only gaps that materially affect delivery; otherwise reuse sufficient evidence and keep conclusions within its support.\n</system-reminder>");
         Some(out)
     }
 }
@@ -1578,8 +1582,8 @@ fn build_system_prompt(
         // task_spawn routing, model/inherit defaults, wait timeout/wait_policy,
         // task_integrate disposition, task_cancel collect-later) live in the
         // always-visible tool schemas and runtime follow-ups, so repeating them
-        // here would add resident tokens without adding constraints. The final
-        // `task_status` check below stays: no schema or runtime gate owns it.
+        // here would add resident tokens without adding constraints. Final-response
+        // gates check outstanding tasks and unintegrated evidence with bounded retries.
         let mut lines = Vec::new();
         if has_tool(available_tools, "task_spawn") {
             if has_tool(available_tools, "task") {
@@ -1594,7 +1598,7 @@ fn build_system_prompt(
             lines.push("Once you identify multiple qualifying subtasks with no data dependency, spawn ALL of them in one `task_spawn` call (1-8 tasks) so preflight, dispatch, and returned task ids preserve input order; continue every independent parent-side step while they run — never spawn-wait-spawn-wait serially.".to_string());
         }
         if has_tool(available_tools, "task_status") {
-            lines.push("Before finishing your answer, call `task_status` to confirm no spawned subagent is still running. Never silently drop a spawned task.".to_string());
+            lines.push("Use `task_status` when unresolved task state matters to the next decision, not as a mandatory finishing step. Reuse delivered results; never substitute a status query for reviewing and explicitly integrating evidence. Never silently drop a spawned task; runtime final-response gates provide bounded recovery, not a substitute for closing task work.".to_string());
         }
         push_tool_guidance_section(
             &mut b,
