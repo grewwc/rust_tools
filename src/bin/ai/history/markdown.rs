@@ -15,8 +15,8 @@ pub(in crate::ai) fn messages_to_markdown(messages: &[Message], session_id: &str
 
 /// Explicit export variant with a character budget. Appending stops as soon as
 /// the budget is exhausted and the number of dropped messages is noted at the
-/// end. Unit tests and scenarios such as sessions export that need a larger
-/// budget can call this function directly.
+/// end. Unit tests and scenarios such as the `/sessions markdown` export that
+/// need a larger budget can call this function directly.
 pub(in crate::ai) fn messages_to_markdown_capped(
     messages: &[Message],
     session_id: &str,

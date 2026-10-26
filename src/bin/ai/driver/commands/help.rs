@@ -102,11 +102,9 @@ fn print_commands_help() {
     println!("    /sessions clear-history   clear current session history (keeps session alive)");
     println!("    /sessions clear-all       delete all sessions");
     println!("    /sessions dump-history <id>              dump session history to JSON");
-    println!("    /sessions export <id|current|last> [output.md]   export session to Markdown");
-    println!(
-        "    /sessions archive <id|current|last> [output.zip] full session archive for migration"
-    );
-    println!("    /sessions import <file.zip> [as=<id>]           import session from archive");
+    println!("    /sessions export <id|current|last> [output.zip]  export session to a portable zip");
+    println!("    /sessions markdown <id|current|last> [output.md] export session to Markdown");
+    println!("    /sessions import <file.zip> [as=<id>]           import a session export zip");
     println!("    /sessions fork [src=<id>] [as=<id>]      copy session to a new branch");
     println!("    /sessions branch <keep_turns> [src=<id>] [as=<id>] retain complete user turns");
     println!(

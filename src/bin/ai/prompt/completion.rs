@@ -685,6 +685,72 @@ impl CommandCompleter {
         crate::ai::driver::commands::session::CANONICAL_SESSION_SUBCOMMANDS
     }
 
+    /// Second-token candidates of `/sessions` (`/ss`): canonical subcommands.
+    fn session_subcommand_candidates(token: &str) -> Vec<CompletionCandidate> {
+        Self::plain_candidates(
+            Self::session_subcommands()
+                .iter()
+                .filter(|sub| sub.starts_with(token))
+                .map(|sub| (*sub).to_string()),
+        )
+    }
+
+    /// Argument candidates of `/sessions <sub> <TAB>`, where `arg_index` counts
+    /// the argument being completed (0 is the token right after `<sub>`).
+    ///
+    /// Only the export/import family is position-aware: `export` and `markdown`
+    /// take a session selector and then an output path, the
+    /// `export-<selector>` shorthands already imply the selector, and `import`
+    /// takes a `.zip` path. Every other position keeps the plain subcommand
+    /// list.
+    fn session_argument_candidates(
+        sub: &str,
+        arg_index: usize,
+        token: &str,
+    ) -> Vec<CompletionCandidate> {
+        match (sub, arg_index) {
+            ("export", 0) | ("markdown" | "md", 0) => Self::session_selector_candidates(token),
+            ("export", 1) | ("markdown" | "md", 1) => Self::output_path_candidates(token),
+            ("export-current" | "export-cur" | "export-last" | "export-latest", 0) => {
+                Self::output_path_candidates(token)
+            }
+            ("import", 0) => distill_zip_candidates(token),
+            // Extra arguments of the export/import family have nothing to offer;
+            // every other subcommand keeps the pre-existing subcommand list.
+            (
+                "export"
+                | "markdown"
+                | "md"
+                | "export-current"
+                | "export-cur"
+                | "export-last"
+                | "export-latest"
+                | "import",
+                _,
+            ) => Vec::new(),
+            _ => Self::session_subcommand_candidates(token),
+        }
+    }
+
+    /// `<id|current|last>` session selectors: the literals first, then stored
+    /// session ids from the sessions root.
+    fn session_selector_candidates(token: &str) -> Vec<CompletionCandidate> {
+        let mut candidates = Self::plain_candidates(
+            ["current", "last"]
+                .into_iter()
+                .filter(|selector| selector.starts_with(token))
+                .map(str::to_string),
+        );
+        candidates.extend(Self::history_session_id_candidates(token));
+        candidates
+    }
+
+    /// Output-path candidates of `/sessions export|markdown [output]`: the same
+    /// listing as file references, without the `@` prefix those carry.
+    fn output_path_candidates(token: &str) -> Vec<CompletionCandidate> {
+        Self::plain_candidates(complete_path_fragment(token, None))
+    }
+
     fn persona_subcommands() -> &'static [&'static str] {
         &["list", "current", "create", "new", "use", "delete", "help"]
     }
@@ -1204,6 +1270,19 @@ impl CommandCompleter {
                     }
                     _ => Vec::new(),
                 }
+            } else if matches!(first, "/sessions" | ":sessions" | "/ss" | ":ss") {
+                match words.next() {
+                    // `/sessions <TAB>`: canonical subcommands.
+                    None => Self::session_subcommand_candidates(token),
+                    // `/sessions <sub> <TAB>`: the export/import family resolves a
+                    // session or reads a zip, so complete their arguments; tokens
+                    // past the first argument of other subcommands keep the plain
+                    // subcommand list.
+                    Some(sub) => {
+                        let arg_index = words.count();
+                        Self::session_argument_candidates(sub, arg_index, token)
+                    }
+                }
             } else {
                 let sources: &[&str] = match first {
                     "/skills" | ":skills" | "/skill" | ":skill" => {
@@ -1245,7 +1324,6 @@ impl CommandCompleter {
                             .collect();
                         return (token_start, candidates);
                     }
-                    "/sessions" | ":sessions" | "/ss" | ":ss" => Self::session_subcommands(),
                     "/personas" | ":personas" => Self::persona_subcommands(),
                     "/usage" | ":usage" => Self::usage_subcommands(),
                     "/help" | ":help" => Self::help_topics(),
@@ -2714,6 +2792,65 @@ mod tests {
         assert!(pairs.iter().any(|pair| pair.replacement == "fork"));
         assert!(pairs.iter().any(|pair| pair.replacement == "branch"));
         assert!(!pairs.iter().any(|pair| pair.replacement == "rewind"));
+    }
+
+    /// The `/sessions` surface exposes the export/import pair: `markdown` is a
+    /// subcommand, the retired `archive` literal is gone, and the arguments of
+    /// the export family complete session selectors and paths instead of
+    /// subcommand names.
+    #[test]
+    fn session_command_completion_covers_export_markdown_and_import() {
+        let completer = CommandCompleter;
+        let history = DefaultHistory::new();
+
+        let (_, pairs) = completer
+            .complete(
+                "/sessions mar",
+                "/sessions mar".len(),
+                &Context::new(&history),
+            )
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == "markdown"));
+
+        let (_, pairs) = completer
+            .complete("/sessions ar", "/sessions ar".len(), &Context::new(&history))
+            .unwrap();
+        assert!(!pairs.iter().any(|pair| pair.replacement == "archive"));
+
+        // Selector position of `export`: `current`/`last`, not subcommand names.
+        let (_, pairs) = completer
+            .complete(
+                "/sessions export ",
+                "/sessions export ".len(),
+                &Context::new(&history),
+            )
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == "current"));
+        assert!(pairs.iter().any(|pair| pair.replacement == "last"));
+        assert!(!pairs.iter().any(|pair| pair.replacement == "clear-all"));
+
+        // The new `markdown` subcommand completes the same selector argument.
+        let (_, pairs) = completer
+            .complete(
+                "/sessions markdown l",
+                "/sessions markdown l".len(),
+                &Context::new(&history),
+            )
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == "last"));
+        assert!(!pairs.iter().any(|pair| pair.replacement == "list"));
+
+        // Second argument of `export <selector>` is an output path, so the
+        // subcommand list must not reappear there.
+        let (_, pairs) = completer
+            .complete(
+                "/sessions export last ",
+                "/sessions export last ".len(),
+                &Context::new(&history),
+            )
+            .unwrap();
+        assert!(!pairs.iter().any(|pair| pair.replacement == "clear-all"));
+        assert!(!pairs.iter().any(|pair| pair.replacement == "verbose"));
     }
 
     #[test]

@@ -32,7 +32,7 @@ pub(in crate::ai) const CANONICAL_SESSION_SUBCOMMANDS: &[&str] = &[
     "clear-all",
     "dump-history",
     "export",
-    "archive",
+    "markdown",
     "import",
     "fork",
     "branch",
@@ -698,13 +698,13 @@ pub fn try_handle_session_command(
                 "  /sessions dump-history <id>              dump session history to JSON (<id>-history.json)"
             );
             println!(
-                "  /sessions export <id|current|last> [output.md]   export session to Markdown"
+                "  /sessions export <id|current|last> [output.zip]  export session to a portable zip"
             );
             println!(
-                "  /sessions archive <id|current|last> [output.zip] full session archive for migration"
+                "  /sessions markdown <id|current|last> [output.md] export session to Markdown"
             );
             println!(
-                "  /sessions import <file.zip> [as=<id>]           import session from archive"
+                "  /sessions import <file.zip> [as=<id>]           import a session export zip"
             );
             println!(
                 "  /sessions fork [<src>|src=<id>] [as=<id>]  copy session to a new branch"
@@ -1186,7 +1186,7 @@ pub fn try_handle_session_command(
                 "export" => {
                     let Some(selector) = parts.next() else {
                         println!(
-                            "missing session selector. try: /sessions export <id|current|last> [output.md]"
+                            "missing session selector. try: /sessions export <id|current|last> [output.zip]"
                         );
                         return Ok(true);
                     };
@@ -1203,10 +1203,13 @@ pub fn try_handle_session_command(
                     return Ok(true);
                 }
             };
-            let output_path = std::path::Path::new(output.unwrap_or("session_export.md"));
+            let output_path = std::path::Path::new(output.unwrap_or("session_export.zip"));
 
-            match store.export_session_to_markdown(&id, output_path) {
-                Ok(()) => println!("Exported session '{id}' to '{}'", output_path.display()),
+            match store.export_session_archive(&id, output_path) {
+                Ok(()) => println!(
+                    "Exported session '{id}' to '{}' (restore with /sessions import).",
+                    output_path.display()
+                ),
                 Err(error) => eprintln!("Failed to export session: {error}"),
             }
         }
@@ -1243,54 +1246,33 @@ pub fn try_handle_session_command(
                 }
             }
         }
-        "archive"
-        | "export-archive"
-        | "export-bundle"
-        | "pack"
-        | "export-archive-current"
-        | "export-bundle-current"
-        | "pack-current"
-        | "pack-cur"
-        | "export-archive-last"
-        | "export-bundle-last"
-        | "pack-last"
-        | "pack-latest" => {
-            let (selector, output) = match action {
-                "archive" | "export-archive" | "export-bundle" | "pack" => {
-                    let Some(selector) = parts.next() else {
-                        println!(
-                            "missing session selector. try: /sessions archive <id|current|last> [output.zip]"
-                        );
-                        return Ok(true);
-                    };
-                    (selector, parts.next())
-                }
-                "export-archive-current"
-                | "export-bundle-current"
-                | "pack-current"
-                | "pack-cur" => ("current", parts.next()),
-                "export-archive-last" | "export-bundle-last" | "pack-last" | "pack-latest" => {
-                    ("last", parts.next())
-                }
-                _ => unreachable!("matched archive action"),
+        "markdown" | "md" => {
+            let Some(selector) = parts.next() else {
+                println!(
+                    "missing session selector. try: /sessions markdown <id|current|last> [output.md]"
+                );
+                return Ok(true);
             };
             let id = match resolve_existing_session_selector(&store, &app.session_id, selector) {
                 Ok(id) => id,
                 Err(error) => {
-                    eprintln!("Failed to archive session: {error}");
+                    eprintln!("Failed to export session to Markdown: {error}");
                     return Ok(true);
                 }
             };
-            let output_path = std::path::Path::new(output.unwrap_or("session_archive.zip"));
+            let output_path = std::path::Path::new(parts.next().unwrap_or("session_export.md"));
 
-            match store.export_session_archive(&id, output_path) {
-                Ok(()) => println!("Archived session '{id}' to '{}'", output_path.display()),
-                Err(error) => eprintln!("Failed to archive session: {error}"),
+            match store.export_session_to_markdown(&id, output_path) {
+                Ok(()) => println!(
+                    "Exported session '{id}' to Markdown '{}'",
+                    output_path.display()
+                ),
+                Err(error) => eprintln!("Failed to export session to Markdown: {error}"),
             }
         }
-        "import" | "import-archive" | "unpack" => {
+        "import" => {
             let Some(file) = parts.next() else {
-                println!("missing archive file. try: /sessions import <file.zip> [as=<id>]");
+                println!("missing session file. try: /sessions import <file.zip> [as=<id>]");
                 return Ok(true);
             };
             let archive_path = std::path::Path::new(file);
@@ -2374,6 +2356,73 @@ mod tests {
         assert_eq!(
             imported_messages[1].content,
             Value::String("hi there".to_string())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The command surface must pair `export` with `import` (one zip moves in
+    /// both directions) while Markdown stays on its own subcommand.
+    #[test]
+    fn sessions_export_and_import_move_one_zip_while_markdown_stays_separate() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let src_id = app.session_id.clone();
+        append_history_messages(
+            &store.session_history_file(&src_id),
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("roundtrip payload".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+
+        let zip_path = root.join("session-roundtrip.zip");
+        assert!(
+            try_handle_session_command(
+                &mut app,
+                &format!("/sessions export {src_id} {}", zip_path.display())
+            )
+            .unwrap()
+        );
+        let zip_bytes = fs::read(&zip_path).expect("export must write the zip");
+        assert_eq!(&zip_bytes[..2], b"PK", "export must produce a zip container");
+
+        let markdown_path = root.join("session-roundtrip.md");
+        assert!(
+            try_handle_session_command(
+                &mut app,
+                &format!(
+                    "/sessions markdown {src_id} {}",
+                    markdown_path.display()
+                )
+            )
+            .unwrap()
+        );
+        let markdown = fs::read_to_string(&markdown_path).expect("markdown export must write");
+        assert!(markdown.contains("roundtrip payload"));
+
+        let dst_id = "imported-from-export";
+        assert!(
+            try_handle_session_command(
+                &mut app,
+                &format!("/sessions import {} as={dst_id}", zip_path.display())
+            )
+            .unwrap()
+        );
+        assert_eq!(app.session_id, dst_id, "import switches to the restored session");
+        let restored = store.read_all_messages(dst_id).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored[0].content,
+            Value::String("roundtrip payload".to_string())
         );
 
         let _ = fs::remove_dir_all(root);
