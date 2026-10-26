@@ -1389,11 +1389,9 @@ function syncOvrSummary() {
 // The composer grows with its content (up to the CSS cap) instead of
 // trapping multi-line input in a 44px box with an inner scroll.
 let promptComposing = false;
-// Android WebView drops an in-flight IME composition when the field's value
-// is written, when its box is resized, and when the page around it moves: the
-// pinyin the user is still assembling never reaches the composer and the
-// keyboard stops committing words. Every write, every resize and every layout
-// change around the composer therefore waits for the composition to end.
+// Avoid programmatic value and layout changes while the IME owns the field.
+// Deferred work must check this state when it runs, not just when queued:
+// another composition may have started in the meantime.
 let composingText = "";        // the word the keyboard is assembling
 let composingStartValue = "";  // the field content when the composition began
 let composingBox = null;       // the focused field's box during the composition
@@ -1401,16 +1399,15 @@ let compositionWatch = 0;
 let traceMark = () => {};
 let pendingShare = "";
 let pendingAppend = "";
-// A layout change above the composer moves the focused field, and Android
-// drops the word being composed when that happens. The change is held back
-// until the composition ends; the newest state wins because the pending
-// entry is replaced rather than queued.
+// Hold composer-adjacent layout changes until composition ends. The newest
+// state wins because each pending entry is replaced rather than queued.
 const pendingLayout = { sideNote: null, question: null, status: null };
 function holdLayout(key, apply) {
   pendingLayout[key] = apply;
   if (!promptComposing) flushLayout();
 }
 function flushLayout() {
+  if (promptComposing) return;
   for (const key of Object.keys(pendingLayout)) {
     const apply = pendingLayout[key];
     pendingLayout[key] = null;
@@ -3303,6 +3300,7 @@ function recoveredProgressView() {
       paintPhase();
     },
     delta(text) { endThinking(); answer += text; bubble.classList.remove("pending"); bubble.textContent = answer; },
+    replace(text) { endThinking(); answer = text; bubble.classList.remove("pending"); bubble.textContent = answer; paintPhase(); },
     tool(event) { endThinking(); activity.setPhase("Processing…"); activity.tool(event); paintPhase(); },
     subagents(text) { activity.subagents(text); },
     phase(text, waiting) { activity.setPhase(text, waiting); paintPhase(); },
@@ -3323,6 +3321,8 @@ function handleReplayEvent(sid, kind, payload, view) {
     view.subagents(payload);
   } else if (kind === "delta") {
     try { view.delta(JSON.parse(payload).delta || ""); } catch (_) {}
+  } else if (kind === "replace") {
+    try { view.replace(JSON.parse(payload).text || ""); } catch (_) {}
   } else if (kind === "answer_pending") {
     view.phase("Processing response…");
   } else if (kind === "confirm_request") {
@@ -3867,6 +3867,13 @@ async function send() {
           answerDirty = true;
           schedulePaint();
         }
+        else if (kind === "replace") {
+          closeThinkingPhase();
+          try { raw = JSON.parse(payload).text || ""; }
+          catch (_) { raw = payload; }
+          answerDirty = true;
+          schedulePaint();
+        }
         else if (kind === "answer_pending" && !raw) {
           // Buffered prose may precede more tool calls; it is not a final reply.
           setPhase("Processing response…");
@@ -3905,6 +3912,8 @@ async function send() {
         }
         else if (kind === "subagent_progress") {
           mutateTranscript(() => activity.subagents(payload));
+          activityDirty = true;
+          schedulePaint();
         }
         else if (kind === "confirm_request") {
           setPhase("Waiting for confirmation…", true);
@@ -4050,14 +4059,15 @@ function createInputTrace(prompt) {
         viewportHeight: window.innerHeight, cssHeight: prompt.style.height });
       if (events.length > 300) events.shift();
     },
-    clear() { events.length = 0; },
+    clear() {
+      events.length = 0;
+      counters.composition = counters.compositionInput = counters.directInput = 0;
+    },
     export() {
-      // A Chinese keyboard announces itself with composition events. A log
-      // without a single one was taken while the IME was in direct input
-      // mode, which is the "only latin letters come out" symptom: the pinyin
-      // was never composed, so no page side effect could have cancelled it.
+      // DOM input types describe editing operations, not the keyboard's
+      // language or native InputConnection state. Report observations only.
       const hint = counters.composition === 0 && counters.directInput > 0
-        ? "no IME composition was observed: the keyboard was in direct (latin) input mode, so pinyin was never composed into Chinese"
+        ? "no DOM composition events observed; insertText alone does not identify the input language or keyboard mode"
         : "";
       return JSON.stringify({
         version: 2,
@@ -4085,8 +4095,8 @@ function wire() {
   uiWired = true;
   const inputTrace = createInputTrace($("prompt"));
   // Programmatic writes and resizes leave no DOM event behind, so they are
-  // marked explicitly: a marker recorded while `composing` is true identifies
-  // what broke an IME composition.
+  // marked explicitly so their timing can be compared with composition events;
+  // the trace alone cannot establish a native IME failure's cause.
   traceMark = (what) => inputTrace.record({ type: what, isComposing: promptComposing, inputType: "" });
   for (const type of ["focus", "blur", "compositionstart", "compositionupdate", "compositionend", "beforeinput", "input"]) {
     $("prompt").addEventListener(type, (event) => inputTrace.record(event));
@@ -4181,11 +4191,12 @@ function wire() {
     composingText = "";
     composingStartValue = "";
     composingBox = null;
-    // Everything that changes the page waits for a later task: the commit is
-    // still in flight, and a layout change inside it loses the word.
+    // Leave the commit event before applying page changes. A newer composition
+    // may start before this task runs; keep its pending work for the next end.
     setTimeout(() => {
-      flushLayout();
       if (dropped) note("输入被打断，已把你正在输入的内容放回输入框");
+      if (promptComposing) return;
+      flushLayout();
       // A share or an image that landed mid-composition is applied now that
       // the field is free again.
       if (pendingShare) {

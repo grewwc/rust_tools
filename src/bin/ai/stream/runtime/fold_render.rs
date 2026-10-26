@@ -77,8 +77,8 @@ pub(super) fn write_thinking_content_folded(
 /// would miss it and leave the remote fold open until end-of-stream, letting
 /// the answer interleave with the chat client's thinking status line.
 /// Splitting here keeps the close on time. Text after the marker is already
-/// answer text (the content path never sees this chunk). Serve keeps that
-/// provisional prose hidden and only signals that an answer is pending.
+/// answer text (the content path never sees this chunk). Serve only signals
+/// that an answer is pending here; the body arrives on the content path.
 pub(super) fn split_serve_thinking_chunk<'a>(
     content: &'a str,
     thinking_tag: &str,

@@ -1217,6 +1217,7 @@ fn publish_live_assistant_text(text: &str, state: &mut StreamProcessingState) {
         return;
     }
     if crate::ai::background::serve_live_streaming()
+        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
         && !state.render.serve_body_pending_published
     {
         crate::ai::background::publish_serve_frame(
@@ -1224,6 +1225,17 @@ fn publish_live_assistant_text(text: &str, state: &mut StreamProcessingState) {
             "",
         );
         state.render.serve_body_pending_published = true;
+    }
+    if crate::ai::background::serve_live_streaming()
+        && crate::ai::driver::runtime_ctx::terminal_output_enabled()
+    {
+        let visible = state.render.serve_body_digest_filter.push(text);
+        if !visible.is_empty() {
+            crate::ai::background::publish_serve_frame(
+                crate::ai::background::ServeLiveKind::Delta,
+                &visible,
+            );
+        }
     }
     crate::ai::background::publish_live_output(text);
 }

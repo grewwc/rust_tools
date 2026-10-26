@@ -292,8 +292,8 @@ fn open_live_output_fifo(_session_id: &str) -> std::io::Result<()> {
 /// Publish one committed assistant-text chunk to the live-output FIFO opened
 /// by a real-time `/bg` handoff. Best-effort by contract: never blocks, never
 /// fails the caller, and silently drops chunks while nobody is attached.
-/// Serve children withhold these provisional chunks until the driver accepts
-/// the final response; the `/bg` byte protocol remains live and untouched.
+/// Serve children publish these chunks through their framed FIFO; the `/bg`
+/// byte protocol remains live and untouched.
 pub(crate) fn publish_live_output(text: &str) {
     if text.is_empty() {
         return;
@@ -310,13 +310,11 @@ pub(crate) fn publish_live_output(text: &str) {
     publish_live_output_bytes(text.as_bytes());
 }
 
-/// Publish the accepted assistant body to a serve client. This is deliberately
-/// separate from [`publish_live_output`], because only the driver finalizer may
-/// make provisional model prose visible remotely.
+/// Publish the accepted assistant body to a serve client. The driver may have
+/// streamed provisional prose earlier, so this replaces the whole remote body
+/// with the final accepted text (an empty replacement clears rejected prose).
 pub(crate) fn publish_committed_serve_output(text: &str) {
-    if !text.is_empty() {
-        publish_serve_frame(ServeLiveKind::Delta, text);
-    }
+    publish_serve_frame(ServeLiveKind::Replace, text);
 }
 
 fn publish_live_output_bytes(bytes: &[u8]) {
@@ -518,6 +516,8 @@ pub(crate) enum ServeLiveKind {
     InputDone = 10,
     AssistantBodyPending = 11,
     Tool = 12,
+    /// Final accepted body; replaces all provisional `Delta` text.
+    Replace = 13,
 }
 
 /// Max payload bytes per serve frame: header (5) + payload stays under the

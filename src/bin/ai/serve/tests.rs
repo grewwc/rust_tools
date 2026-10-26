@@ -2246,6 +2246,7 @@ fn transactional_serve_body_frame_decoder_reassembles_pending() {
         test_frame(ServeLiveKind::Thinking, "带来".as_bytes()),
         test_frame(ServeLiveKind::ThinkingDone, b""),
         test_frame(ServeLiveKind::AssistantBodyPending, b""),
+        test_frame(ServeLiveKind::Replace, "final".as_bytes()),
         test_frame(ServeLiveKind::OutputComplete, b""),
     ]
     .concat();
@@ -2255,7 +2256,7 @@ fn transactional_serve_body_frame_decoder_reassembles_pending() {
     // Header complete (5 + "h" + first byte of "é" = 9 bytes fed): the
     // delta frame still waits for its tail.
     assert_eq!(decoder.push(&wire[2..9]), vec![]);
-    // The rest completes the delta plus all five trailing frames.
+    // The rest completes the delta plus all six trailing frames.
     assert_eq!(
         decoder.push(&wire[9..]),
         vec![
@@ -2264,6 +2265,7 @@ fn transactional_serve_body_frame_decoder_reassembles_pending() {
             ServeLiveEvent::Thinking("带来".to_string()),
             ServeLiveEvent::ThinkingDone,
             ServeLiveEvent::AssistantBodyPending,
+            ServeLiveEvent::Replace("final".to_string()),
             ServeLiveEvent::OutputComplete,
         ]
     );

@@ -693,8 +693,10 @@ enum ServeLiveEvent {
     InputRequest(String),
     /// Raw JSON payload closing an input request.
     InputDone(String),
-    /// Assistant prose is buffered until the final-response gates accept it.
+    /// Assistant prose is about to stream; the final body follows as `Replace`.
     AssistantBodyPending,
+    /// Final accepted assistant body; replaces any provisional delta text.
+    Replace(String),
     /// Bounded JSON describing an actual tool dispatch or its completed result.
     Tool(String),
 }
@@ -734,6 +736,7 @@ impl ServeFrameDecoder {
                 || kind == background::ServeLiveKind::InputRequest as u8
                 || kind == background::ServeLiveKind::InputDone as u8
                 || kind == background::ServeLiveKind::AssistantBodyPending as u8
+                || kind == background::ServeLiveKind::Replace as u8
                 || kind == background::ServeLiveKind::Tool as u8;
             if !known || len > background::MAX_SERVE_FRAME_LEN as usize {
                 self.buf.clear();
@@ -775,6 +778,9 @@ impl ServeFrameDecoder {
                 }
                 k if k == background::ServeLiveKind::AssistantBodyPending as u8 => {
                     ServeLiveEvent::AssistantBodyPending
+                }
+                k if k == background::ServeLiveKind::Replace as u8 => {
+                    ServeLiveEvent::Replace(payload)
                 }
                 k if k == background::ServeLiveKind::Tool as u8 => ServeLiveEvent::Tool(payload),
                 // Every kind accepted by the `known` gate above must have an
@@ -839,6 +845,10 @@ fn live_event(event: ServeLiveEvent) -> Option<ServeSse> {
         ServeLiveEvent::AssistantBodyPending => {
             Some(ServeSse::new("answer_pending", ""))
         }
+        ServeLiveEvent::Replace(text) => Some(ServeSse::new(
+            "replace",
+            serde_json::json!({"text": text}).to_string(),
+        )),
         // Confirmation and input frames are built by `forward_live_event`,
         // which holds the pending state and adds the answer token; they never
         // get here.

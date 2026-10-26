@@ -216,7 +216,7 @@ test("the composer box gives its height back when the text is deleted", () => {
   assert.equal(context.prompt.style.height, "40px", "the composer box kept the height of the deleted line");
 });
 
-test("the input trace reports whether the keyboard ever composed a word", () => {
+test("the input trace reports DOM observations without inferring keyboard mode", () => {
   const prompt = { value: "", style: { height: "44px" } };
   const context = vm.createContext({
     document: { activeElement: prompt },
@@ -225,16 +225,19 @@ test("the input trace reports whether the keyboard ever composed a word", () => 
   });
   vm.runInContext(traceSrc, context);
 
-  // Latin letters committed directly: the keyboard never composed, so the
-  // report has to say so instead of leaving it to guesswork.
+  // insertText can carry Chinese without DOM composition events; it cannot
+  // identify an input language or a native keyboard mode.
   const direct = context.createInputTrace(prompt);
+  prompt.value = "中文";
   direct.record({ type: "input", inputType: "insertText", isComposing: false });
   const directReport = JSON.parse(direct.export());
   assert.equal(directReport.ime.compositionEvents, 0);
   assert.equal(directReport.ime.directInputs, 1);
-  assert.match(directReport.ime.hint, /direct \(latin\) input mode/);
+  assert.equal(directReport.ime.hint,
+    "no DOM composition events observed; insertText alone does not identify the input language or keyboard mode");
+  assert.ok(!direct.export().includes("中文"), "diagnostics leaked the input text");
 
-  // A real pinyin session announces itself with composition events.
+  // Recorded composition events remain visible in the summary.
   const composed = context.createInputTrace(prompt);
   composed.record({ type: "compositionstart" });
   composed.record({ type: "input", inputType: "insertCompositionText", isComposing: true });
@@ -248,7 +251,12 @@ test("the input trace reports whether the keyboard ever composed a word", () => 
   for (let i = 0; i < 400; i++) composed.record({ type: "input", inputType: "insertText" });
   assert.equal(JSON.parse(composed.export()).events.length, 300);
   composed.clear();
-  assert.equal(JSON.parse(composed.export()).events.length, 0);
+  const clearedReport = JSON.parse(composed.export());
+  assert.equal(clearedReport.events.length, 0);
+  assert.deepEqual(clearedReport.ime,
+    { compositionEvents: 0, compositionInputs: 0, directInputs: 0, hint: "" });
+  composed.record({ type: "input", inputType: "insertText" });
+  assert.deepEqual(JSON.parse(composed.export()).ime, directReport.ime);
 });
 
 test("the committed word is not resized inside the commit task", () => {
@@ -274,6 +282,45 @@ test("a layout change waits for the composition to end", () => {
   run(context, "promptComposing = false;");
   run(context, "flushLayout();");
   assert.deepEqual(context.marks, ["sideNote"], "the held change was not applied afterwards");
+});
+
+test("flushing layout cannot bypass an active composition", () => {
+  const context = makeContext();
+  run(context, "promptComposing = true; holdLayout('status', () => marks.push('status'));");
+  run(context, "flushLayout();");
+  assert.deepEqual(context.marks, [], "a direct flush bypassed the composition guard");
+  run(context, "promptComposing = false; flushLayout();");
+  assert.deepEqual(context.marks, ["status"], "the deferred update was discarded");
+});
+
+test("a previous commit callback preserves work queued during the next composition", () => {
+  const context = makeContext({ persistDraft: () => {}, note: () => {} });
+  vm.runInContext(script.slice(
+    script.indexOf('$("prompt").addEventListener("compositionstart"'),
+    script.indexOf('$("prompt").addEventListener("input"'),
+  ), context);
+  context.document.activeElement = context.prompt;
+  context.prompt.dispatch("compositionstart");
+  context.prompt.value = "你";
+  context.prompt.dispatch("compositionend", { data: "你" });
+  const previousCommit = context.timers.shift();
+
+  context.prompt.dispatch("compositionstart");
+  run(context, "pendingShare = ' share'; pendingAppend = ' image';");
+  run(context, "holdLayout('status', () => marks.push('old'));");
+  run(context, "holdLayout('status', () => marks.push('latest'));");
+  previousCommit();
+  assert.deepEqual(context.marks, [], "the earlier commit changed the next composition's layout");
+  assert.equal(context.prompt.value, "你");
+  assert.equal(run(context, "pendingShare"), " share", "queued share was lost");
+  assert.equal(run(context, "pendingAppend"), " image", "queued attachment was lost");
+
+  context.prompt.value = "你好";
+  context.prompt.dispatch("compositionend", { data: "好" });
+  context.timers.shift()();
+  assert.deepEqual(context.marks, ["latest"]);
+  assert.equal(context.prompt.value, "你好 share image");
+  assert.equal(run(context, "pendingShare + pendingAppend"), "");
 });
 
 test("a transient note does not move the composer during a composition", () => {

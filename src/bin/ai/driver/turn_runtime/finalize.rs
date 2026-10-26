@@ -496,10 +496,14 @@ pub(super) async fn finalize_turn(
             persisted_turn_messages,
         );
         if crate::ai::background::serve_live_streaming()
-            && let Some(visible_text) =
-                serve_final_text_to_commit(final_assistant_text, user_visible_final_suffix)
+            && crate::ai::driver::runtime_ctx::terminal_output_enabled()
         {
-            let visible_text = crate::ai::request::strip_digest_blocks(&visible_text);
+            // Live deltas are provisional. Commit the authoritative body even
+            // when it is empty so prose from a rejected attempt is cleared.
+            let visible_text =
+                serve_final_text_to_commit(final_assistant_text, user_visible_final_suffix)
+                    .map(|text| crate::ai::request::strip_digest_blocks(&text))
+                    .unwrap_or_default();
             crate::ai::background::publish_committed_serve_output(&visible_text);
         }
         // Task boundary detection: no tool calls in this turn means the agent has delivered its answer —

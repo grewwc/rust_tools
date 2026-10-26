@@ -269,11 +269,28 @@ test("parallel tool completion and confirmation preserve the remaining active st
 test("subagent snapshots stay distinct from logs and empty thinking markers", () => {
   const h = streamHarness();
   h.emit("thinking_start"); h.emit("thinking_done");
+  const scheduled = h.timers.length;
   h.emit("subagent_progress", "worker: running");
+  assert.ok(h.timers.length > scheduled, "subagent progress must schedule a paint");
   h.emit("subagent_progress", "worker: finished");
   assert.equal(h.titles().length, 1);
   assert.match(h.titles()[0], /subagents/);
   assert.equal(h.bodies()[0], "worker: finished");
+});
+
+test("a final replace supersedes provisional streaming text", () => {
+  const h = streamHarness();
+  h.emit("answer_pending");
+  h.emit("delta", { delta: "provisional" });
+  h.emit("replace", { text: "authoritative" });
+  assert.equal(h.reply(), "authoritative");
+});
+
+test("replayed final text replaces provisional deltas", () => {
+  const h = replayHarness();
+  h.emit("delta", { delta: "provisional" });
+  h.emit("replace", { text: "authoritative" });
+  assert.equal(h.status(), "authoritative");
 });
 
 test("EOF without the done event follows server history instead of declaring completion", () => {
