@@ -24,8 +24,9 @@
 //!    terms searched as an OR, plus the full query as a phrase when it has more
 //!    than one term. A near-miss on one word no longer produces zero hits.
 //! 2. **TF-IDF-flavoured scoring**: rare-in-corpus terms outweigh common ones,
-//!    whole-word and path hits get bonuses, and multi-term coverage lifts a
-//!    snapshot file above single-term files.
+//!    whole-word and path hits get bonuses, and multi-term coverage lifts
+//!    full-cover lines and files above single-term ones, with nearer terms
+//!    outranking scattered ones.
 //! 3. **Fair-share visibility**: files are picked globally by relevance, but one
 //!    root can only take ~2× its fair share of the result budget while other
 //!    roots still demand attention; the same reservation applies per file while
@@ -53,8 +54,9 @@
 #[cfg(not(unix))]
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use regex::{Regex, RegexBuilder};
+use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
@@ -72,7 +74,7 @@ use crate::ai::tools::storage::overflow_cache;
 #[path = "../driver/turn_runtime/context_memory_archive.rs"]
 mod archive_files;
 
-fn read_archive_text(archive: &archive_files::ArchiveRoot, path: &Path) -> Option<String> {
+fn read_archive_text(archive: &archive_files::ArchiveRoot, path: &Path) -> Option<Arc<str>> {
     read_archive_text_versioned(archive, path).map(|(content, _)| content)
 }
 
@@ -83,7 +85,7 @@ fn read_archive_text(archive: &archive_files::ArchiveRoot, path: &Path) -> Optio
 fn read_archive_text_versioned(
     archive: &archive_files::ArchiveRoot,
     path: &Path,
-) -> Option<(String, overflow_cache::FileVersion)> {
+) -> Option<(Arc<str>, overflow_cache::FileVersion)> {
     // Always open through the session-bound safe path (O_NOFOLLOW on every
     // component) before touching the cache: a body must never be served for a
     // path the safe reader would refuse, so a symlink swap can never bypass
@@ -134,7 +136,7 @@ fn read_archive_text_versioned(
             }
         });
         overflow_cache::store_text(path, version, &content);
-        return Some((content, version));
+        return Some((Arc::from(content.as_str()), version));
     }
     None
 }
@@ -172,6 +174,18 @@ const MAX_SNIPPETS_PER_FILE: usize = 12;
 const FAIR_SHARE_MULTIPLE: usize = 2;
 /// Fixed weight of an exact whole-query phrase hit versus single-term IDF mass.
 const PHRASE_WEIGHT: f64 = 6.0;
+/// Flat bonus for a line holding every caller-typed term of a multi-term
+/// query. Such a line is stronger evidence than a line holding one term,
+/// even when that one is rare; it stays below `PHRASE_WEIGHT` so an exact
+/// phrase still outranks a scattered full cover.
+const FULL_COVERAGE_LINE_BONUS: f64 = 3.0;
+/// Maximum proximity bonus for a line with two or more caller-typed matches,
+/// decaying linearly to zero over `PROXIMITY_WINDOW_CHARS`.
+const PROXIMITY_WEIGHT: f64 = 2.0;
+/// Character window for the proximity bonus: the smallest gap between two
+/// caller-typed matches on the line, mapped linearly from full bonus at zero
+/// gap to no bonus at or beyond this width.
+const PROXIMITY_WINDOW_CHARS: usize = 80;
 /// Score weight of a derived CJK bigram relative to a term as typed. The
 /// expansion exists to widen recall in unsegmented text; a line that merely
 /// shares a two-character fragment must not outweigh one holding the full run.
@@ -202,11 +216,18 @@ enum SearchScope {
 }
 
 impl SearchScope {
-    fn parse(raw: &str) -> SearchScope {
+    /// Parses the caller-supplied scope. Unknown values are rejected instead
+    /// of widening to the full corpus: a typo'd scope would otherwise scan
+    /// everything (slow) and drown the answer in out-of-scope noise.
+    fn parse(raw: &str) -> Result<SearchScope, String> {
         match raw.trim() {
-            "history" => SearchScope::History,
-            "tool_outputs" => SearchScope::ToolOutputs,
-            _ => SearchScope::All, // "all" and unknown values fall back to full scope
+            "all" => Ok(SearchScope::All),
+            "history" => Ok(SearchScope::History),
+            "tool_outputs" => Ok(SearchScope::ToolOutputs),
+            other => Err(format!(
+                "Invalid scope '{}': expected one of 'all', 'history', 'tool_outputs'",
+                other
+            )),
         }
     }
 }
@@ -247,10 +268,10 @@ fn parse_search_params<'a>(args: &'a Value) -> Result<OverflowSearchParams<'a>, 
             .unwrap_or(50)
             .clamp(1, MAX_MATCHES as u64) as usize,
         file_pattern: args["file_pattern"].as_str(),
-        scope: args["scope"]
-            .as_str()
-            .map(SearchScope::parse)
-            .unwrap_or(SearchScope::All),
+        scope: match args["scope"].as_str() {
+            None => SearchScope::All,
+            Some(raw) => SearchScope::parse(raw)?,
+        },
     })
 }
 
@@ -319,12 +340,19 @@ fn build_patterns(params: &OverflowSearchParams<'_>) -> Result<Vec<TermPattern>,
     Ok(patterns)
 }
 
-fn compile_pattern(source: &str, is_regex: bool, case_sensitive: bool) -> Result<Regex, String> {
-    let body = if is_regex {
+/// Regex body for one query pattern: the raw source in regex mode, the
+/// escaped literal otherwise. Shared by the per-pattern matchers and the
+/// single-pass set matcher so both classify lines identically.
+fn pattern_body(source: &str, is_regex: bool) -> String {
+    if is_regex {
         source.to_string()
     } else {
         regex::escape(source)
-    };
+    }
+}
+
+fn compile_pattern(source: &str, is_regex: bool, case_sensitive: bool) -> Result<Regex, String> {
+    let body = pattern_body(source, is_regex);
     RegexBuilder::new(&body)
         .case_insensitive(!case_sensitive)
         .build()
@@ -335,6 +363,67 @@ fn compile_pattern(source: &str, is_regex: bool, case_sensitive: bool) -> Result
                 format!("Internal regex error: {}", e)
             }
         })
+}
+
+/// A compiled query: the per-pattern matchers plus a single-pass set matcher
+/// over the same bodies and the lowercased sources for path scoring.
+///
+/// The set reports, in one scan of a line, which patterns match anywhere in
+/// it — exactly the union of the per-pattern `is_match` probes it replaces —
+/// so per-line scan work no longer scales with pattern count (term fan-out
+/// plus CJK bigram expansion can yield ~30 patterns per query). Offsets for
+/// the matched patterns still come from the individual matchers.
+struct CompiledQuery {
+    patterns: Vec<TermPattern>,
+    set: RegexSet,
+    /// Lowercased pattern sources, aligned with `patterns`; the path bonus
+    /// compares against these instead of lowercasing every source per file.
+    lowered_sources: Vec<String>,
+    /// Count of caller-typed term patterns (derived CJK expansions excluded).
+    /// Lines covering all of these earn the full-coverage bonus.
+    typed_term_count: usize,
+}
+
+impl CompiledQuery {
+    fn compile(params: &OverflowSearchParams<'_>) -> Result<Self, String> {
+        let patterns = build_patterns(params)?;
+        Self::from_patterns(patterns, params.is_regex, params.case_sensitive)
+    }
+
+    fn from_patterns(
+        patterns: Vec<TermPattern>,
+        is_regex: bool,
+        case_sensitive: bool,
+    ) -> Result<Self, String> {
+        let bodies: Vec<String> = patterns
+            .iter()
+            .map(|pattern| pattern_body(&pattern.source, is_regex))
+            .collect();
+        let set = RegexSetBuilder::new(bodies)
+            .case_insensitive(!case_sensitive)
+            .build()
+            .map_err(|e| {
+                if is_regex {
+                    format!("Invalid regex: {}", e)
+                } else {
+                    format!("Internal regex error: {}", e)
+                }
+            })?;
+        let lowered_sources = patterns
+            .iter()
+            .map(|pattern| pattern.source.to_lowercase())
+            .collect();
+        let typed_term_count = patterns
+            .iter()
+            .filter(|pattern| pattern.term_id.is_some() && !is_derived_pattern(pattern))
+            .count();
+        Ok(Self {
+            patterns,
+            set,
+            lowered_sources,
+            typed_term_count,
+        })
+    }
 }
 
 /// Whether `ch` belongs to a script written without inter-word spaces, where
@@ -367,6 +456,11 @@ fn is_derived_pattern(pattern: &TermPattern) -> bool {
 /// Runs shorter than three characters are skipped (their single bigram is the
 /// run itself) and at most `MAX_CJK_BIGRAMS` patterns are added. A query with
 /// no CJK text leaves the pattern set untouched.
+///
+/// When the query holds more distinct bigrams than the cap, the survivors are
+/// sampled evenly across the whole query (in query order) instead of taking
+/// the head: truncating the head would silently drop recall for the tail of a
+/// long sentence.
 fn add_cjk_bigram_patterns(
     params: &OverflowSearchParams<'_>,
     patterns: &mut Vec<TermPattern>,
@@ -375,7 +469,7 @@ fn add_cjk_bigram_patterns(
         .iter()
         .map(|pattern| pattern.source.clone())
         .collect();
-    let mut added = 0usize;
+    let mut candidates: Vec<(String, usize)> = Vec::new();
     for (term_id, term) in params.query.split_whitespace().enumerate() {
         let mut run: Vec<char> = Vec::new();
         // The synthetic separator flushes a trailing run instead of duplicating
@@ -387,25 +481,31 @@ fn add_cjk_bigram_patterns(
             }
             if run.len() >= 3 {
                 for pair in run.windows(2) {
-                    if added == MAX_CJK_BIGRAMS {
-                        return Ok(());
-                    }
                     let bigram: String = pair.iter().collect();
                     if !seen.insert(bigram.clone()) {
                         continue;
                     }
-                    let regex = compile_pattern(&bigram, false, params.case_sensitive)?;
-                    patterns.push(TermPattern {
-                        source: bigram,
-                        term_id: Some(term_id),
-                        weight: CJK_BIGRAM_WEIGHT,
-                        regex,
-                    });
-                    added += 1;
+                    candidates.push((bigram, term_id));
                 }
             }
             run.clear();
         }
+    }
+    // Even stride over the candidates, keeping query order: index `i` of the
+    // output takes candidate `(i * len / MAX)`, so head, middle, and tail of
+    // a long query all keep recall. At or below the cap every candidate is
+    // kept, byte-identical to taking them in order.
+    let total = candidates.len();
+    let take = total.min(MAX_CJK_BIGRAMS);
+    for i in 0..take {
+        let (bigram, term_id) = &candidates[i * total / take];
+        let regex = compile_pattern(bigram, false, params.case_sensitive)?;
+        patterns.push(TermPattern {
+            source: bigram.clone(),
+            term_id: Some(*term_id),
+            weight: CJK_BIGRAM_WEIGHT,
+            regex,
+        });
     }
     Ok(())
 }
@@ -431,6 +531,9 @@ struct RawHit {
     line_index: usize,
     /// Indices into `patterns` that matched this line (deduped, unordered).
     matched: Vec<usize>,
+    /// Byte offset of the earliest pattern match on the line, recorded while
+    /// the text is in hand so excerpt windowing never re-runs the matchers.
+    first_match: usize,
     /// IDF-independent line score, computed while the line text is in hand
     /// during the scan pass: whole-word (+2.0), lead-proximity, and exact
     /// phrase bonuses. Corpus-wide IDF weights are added in pass B.
@@ -573,49 +676,106 @@ struct PerFileScan {
 /// count. Shared by the initial scan (pass A) and the render-time re-scan of a
 /// file whose version changed between the passes, so both passes classify
 /// lines, score them, and choose gutter markers identically.
-fn compute_hits(content: &str, patterns: &[TermPattern]) -> (Vec<RawHit>, Vec<bool>, usize) {
+///
+/// Each line is classified by one set-matcher scan no matter how many
+/// patterns the query expanded to; the individual matchers run only for the
+/// patterns that matched, to obtain the offsets that local scoring and
+/// excerpt windowing need.
+fn compute_hits(content: &str, query: &CompiledQuery) -> (Vec<RawHit>, Vec<bool>, usize) {
+    let patterns = &query.patterns;
     let mut hits: Vec<RawHit> = Vec::new();
     let mut file_term_hits: Vec<bool> = vec![false; patterns.len()];
     let mut total_lines = 0usize;
     for (line_index, line) in content.lines().enumerate() {
         total_lines = line_index + 1;
-        let mut matched: Vec<usize> = Vec::new();
-        for (pid, pattern) in patterns.iter().enumerate() {
-            if pattern.regex.is_match(line) {
-                matched.push(pid);
-                file_term_hits[pid] = true;
-            }
+        let set_matches = query.set.matches(line);
+        if !set_matches.matched_any() {
+            continue;
         }
-        if !matched.is_empty() {
-            // Line-local scoring happens here while the text is
-            // available; corpus-wide IDF weights are added in pass B.
-            let mut local_score = 0.0;
-            for &pid in &matched {
-                // Whole-word hits carry more information than substring hits.
-                let re = &patterns[pid].regex;
-                if let Some(m) = re.find(line) {
-                    let bytes = line.as_bytes();
-                    let left_ok = m.start() == 0 || !is_identifier_byte(bytes[m.start() - 1]);
-                    let right_ok =
-                        m.end() >= line.len() || !is_identifier_byte(bytes[m.end()]);
-                    if left_ok && right_ok {
+        // `SetMatches::iter` yields pattern ids in increasing order, the same
+        // order the per-pattern probe loop below replaced.
+        let matched: Vec<usize> = set_matches.iter().collect();
+        for &pid in &matched {
+            file_term_hits[pid] = true;
+        }
+        // Line-local scoring happens here while the text is
+        // available; corpus-wide IDF weights are added in pass B.
+        let mut local_score = 0.0;
+        let mut first_match = usize::MAX;
+        // Caller-typed term ids covered by this line plus their first-match
+        // spans, feeding the full-coverage and proximity bonuses below.
+        // Derived expansions never count: they widen recall, not precision.
+        let mut covered_terms: Vec<usize> = Vec::new();
+        let mut typed_spans: Vec<(usize, usize)> = Vec::new();
+        for &pid in &matched {
+            // Whole-word hits carry more information than substring hits.
+            let re = &patterns[pid].regex;
+            if let Some(m) = re.find(line) {
+                first_match = first_match.min(m.start());
+                // Byte-mode regexes (`(?-u)` patterns) can match inside a
+                // character. Such a fragment still counts as a hit, but text
+                // bonuses need character boundaries, so they are skipped.
+                if line.is_char_boundary(m.start()) && line.is_char_boundary(m.end()) {
+                    if is_whole_word_match(line, m.start(), m.end()) {
                         local_score += 2.0;
                     }
                     // Lead-proximity bonus, mirroring the shared engine style.
                     let lead_chars = line[..m.start()].chars().count();
                     local_score += 2.0 * (1.0 - (lead_chars.min(40) as f64) / 40.0);
+                    let pattern = &patterns[pid];
+                    if let Some(term_id) = pattern.term_id {
+                        if !is_derived_pattern(pattern) {
+                            if !covered_terms.contains(&term_id) {
+                                covered_terms.push(term_id);
+                            }
+                            typed_spans.push((m.start(), m.end()));
+                        }
+                    }
                 }
             }
-            if line_has_exact_phrase_bonus(patterns, &matched) {
-                // Exact whole-query phrase/regex hit.
-                local_score += PHRASE_WEIGHT;
-            }
-            hits.push(RawHit {
-                line_index,
-                matched,
-                local_score,
-            });
         }
+        if line_has_exact_phrase_bonus(patterns, &matched) {
+            // Exact whole-query phrase/regex hit.
+            local_score += PHRASE_WEIGHT;
+        }
+        // A line holding every caller-typed term outranks a line holding one
+        // of them, even when that one is rare. Single-term queries cover
+        // their only term trivially, so the bonus applies to multi-term
+        // queries only.
+        if query.typed_term_count > 1 && covered_terms.len() == query.typed_term_count {
+            local_score += FULL_COVERAGE_LINE_BONUS;
+        }
+        // Among lines with several typed matches, nearer terms outrank
+        // scattered ones. Only the smallest gap is measured, in characters.
+        if typed_spans.len() >= 2 {
+            typed_spans.sort_unstable();
+            let mut min_gap = (0usize, usize::MAX);
+            for pair in typed_spans.windows(2) {
+                let gap = pair[1].0.saturating_sub(pair[0].1);
+                if gap < min_gap.1 {
+                    min_gap = (pair[0].1, gap);
+                }
+            }
+            // Match boundaries are character boundaries, so this slice is safe;
+            // overlapping matches yield an empty (zero-gap) slice.
+            let gap_chars = line[min_gap.0..min_gap.0 + min_gap.1].chars().count();
+            if gap_chars < PROXIMITY_WINDOW_CHARS {
+                local_score +=
+                    PROXIMITY_WEIGHT * (1.0 - gap_chars as f64 / PROXIMITY_WINDOW_CHARS as f64);
+            }
+        }
+        // The set reported at least one match, so at least one individual
+        // matcher found an offset above; the fallback only guards against a
+        // matcher/set disagreement that cannot happen.
+        if first_match == usize::MAX {
+            first_match = 0;
+        }
+        hits.push(RawHit {
+            line_index,
+            matched,
+            first_match,
+            local_score,
+        });
     }
     (hits, file_term_hits, total_lines)
 }
@@ -627,7 +787,7 @@ fn scan_one_file(
     archive: &archive_files::ArchiveRoot,
     root_idx: usize,
     file: &Path,
-    patterns: &[TermPattern],
+    query: &CompiledQuery,
 ) -> PerFileScan {
     // Unreadable, unsafe, or non-UTF-8 files were not searched;
     // exclude them from the corpus size used by IDF.
@@ -638,7 +798,7 @@ fn scan_one_file(
             unreadable: true,
         };
     };
-    let (hits, file_term_hits, total_lines) = compute_hits(&content, patterns);
+    let (hits, file_term_hits, total_lines) = compute_hits(&content, query);
     if hits.is_empty() {
         return PerFileScan {
             scan: None,
@@ -693,18 +853,18 @@ fn fold_scan_result(aggregate: &mut ScanAggregate, result: PerFileScan) {
 fn scan_candidates(
     archive: &archive_files::ArchiveRoot,
     candidates: &[(usize, PathBuf)],
-    patterns: &[TermPattern],
+    query: &CompiledQuery,
     parallel: bool,
 ) -> ScanAggregate {
     let mut aggregate = ScanAggregate {
         scans: Vec::new(),
-        df: vec![0; patterns.len()],
+        df: vec![0; query.patterns.len()],
         files_seen: 0,
         files_unreadable: 0,
     };
     if !parallel || candidates.len() <= 1 {
         for &(root_idx, ref file) in candidates {
-            fold_scan_result(&mut aggregate, scan_one_file(archive, root_idx, file, patterns));
+            fold_scan_result(&mut aggregate, scan_one_file(archive, root_idx, file, query));
         }
         return aggregate;
     }
@@ -718,7 +878,7 @@ fn scan_candidates(
                     chunk
                         .iter()
                         .map(|&(root_idx, ref file)| {
-                            scan_one_file(archive, root_idx, file, patterns)
+                            scan_one_file(archive, root_idx, file, query)
                         })
                         .collect::<Vec<PerFileScan>>()
                 })
@@ -786,7 +946,8 @@ fn run_overflow_search_inner(
         ));
     }
 
-    let patterns = build_patterns(params)?;
+    let query = CompiledQuery::compile(params)?;
+    let patterns = &query.patterns;
 
     // Pass A: scan every file once, collecting raw hits plus document
     // frequencies feeding the IDF weights. Candidates are collected up front
@@ -820,7 +981,7 @@ fn run_overflow_search_inner(
         df,
         files_seen,
         files_unreadable,
-    } = scan_candidates(&archive, &candidates, &patterns, parallel);
+    } = scan_candidates(&archive, &candidates, &query, parallel);
 
     if scans.is_empty() {
         // A bare "No matches found" invites unwarranted absence claims: the
@@ -924,6 +1085,10 @@ fn run_overflow_search_inner(
 
     // Pass B: score lines and files.
     let mut scored_files: Vec<ScoredFile> = Vec::new();
+    // The path bonus matches the archive-relative path only: the absolute
+    // session-directory prefix (a temp path plus a session id) is noise that
+    // must never earn relevance.
+    let archive_prefix = archive.path().to_string_lossy().into_owned();
     for scan in scans.into_iter() {
         // Pattern id → its scoring weight, deduplicated so the coverage bonus
         // still counts each matched pattern exactly once.
@@ -938,15 +1103,20 @@ fn run_overflow_search_inner(
             scored.push((hit.line_index, line_score));
         }
 
-        // Path-hit bonus weighted by term rarity.
-        let hay_lower_path = scan.display_path.to_lowercase();
+        // Path-hit bonus weighted by term rarity, matched against the
+        // archive-relative path.
+        let rel_path = scan
+            .display_path
+            .strip_prefix(archive_prefix.as_str())
+            .unwrap_or(scan.display_path.as_str());
+        let hay_lower_path = rel_path.to_lowercase();
         let mut path_bonus = 0.0;
-        for (pid, pattern) in patterns.iter().enumerate() {
+        for (pid, pattern) in query.patterns.iter().enumerate() {
             if !params.case_sensitive {
-                if hay_lower_path.contains(&pattern.source.to_lowercase()) {
+                if hay_lower_path.contains(&query.lowered_sources[pid]) {
                     path_bonus += idf[pid] * pattern.weight;
                 }
-            } else if scan.display_path.contains(&pattern.source) {
+            } else if rel_path.contains(&pattern.source) {
                 path_bonus += idf[pid] * pattern.weight;
             }
         }
@@ -977,11 +1147,46 @@ fn run_overflow_search_inner(
         }
     });
 
-    render_selection(scored_files, params, &patterns, files_seen, &archive)
+    render_selection(scored_files, params, &query, files_seen, &archive)
 }
 
-fn is_identifier_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+/// Whether `ch` continues a word for whole-word bonus purposes: letters and
+/// digits in any script plus underscore. A CJK bigram fragment inside a
+/// longer run is therefore a substring hit, never a whole-word hit.
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+/// Whether the match spanning `line[start..end]` stands alone as a word.
+/// ASCII neighbors decide immediately; only multibyte neighbors pay for
+/// character decoding.
+fn is_whole_word_match(line: &str, start: usize, end: usize) -> bool {
+    let bytes = line.as_bytes();
+    let left_ok = if start == 0 {
+        true
+    } else if bytes[start - 1].is_ascii() {
+        let b = bytes[start - 1];
+        !(b.is_ascii_alphanumeric() || b == b'_')
+    } else {
+        line[..start]
+            .chars()
+            .next_back()
+            .map(|ch| !is_word_char(ch))
+            .unwrap_or(true)
+    };
+    let right_ok = if end >= line.len() {
+        true
+    } else if bytes[end].is_ascii() {
+        let b = bytes[end];
+        !(b.is_ascii_alphanumeric() || b == b'_')
+    } else {
+        line[end..]
+            .chars()
+            .next()
+            .map(|ch| !is_word_char(ch))
+            .unwrap_or(true)
+    };
+    left_ok && right_ok
 }
 
 /// Whether a hit line earns the flat whole-query bonus: any matched pattern
@@ -1014,40 +1219,65 @@ fn match_marker(patterns: &[TermPattern], matched: &[usize]) -> &'static str {
     }
 }
 
-/// Byte offset of the earliest pattern match on `line`, used to keep the
-/// matching text inside a windowed excerpt. Recomputed at render time because
-/// the scan pass retains only line indices and scores, never the text.
-fn first_match_offset(patterns: &[TermPattern], line: &str) -> Option<usize> {
-    patterns
-        .iter()
-        .filter_map(|pattern| pattern.regex.find(line).map(|m| m.start()))
-        .min()
-}
-
 /// Renders one archive line, windowed around `first_match` when the line is
 /// longer than `MAX_RENDERED_LINE_CHARS`. An arbitrarily long line (minified
 /// JSON, a base64 payload) can exceed the whole output budget, and trimming it
 /// from the front would cut away the very term that matched it. Leading and
 /// trailing `…` mark elided text, so a window is never mistaken for the whole
 /// line.
+///
+/// The character count stops early once it runs past `first_match + MAX`:
+/// beyond that point both the window clamp and the trailing-ellipsis decision
+/// are already exact, so a megabyte-long line with an early match no longer
+/// pays a full scan.
 fn render_line_window(line: &str, first_match: Option<usize>) -> String {
-    let total = line.chars().count();
-    if total <= MAX_RENDERED_LINE_CHARS {
+    // Byte length bounds character count from above, so short lines (the
+    // common case) return without counting characters at all.
+    if line.len() <= MAX_RENDERED_LINE_CHARS {
         return line.to_string();
     }
-    let match_chars = first_match
-        .and_then(|byte| line.get(..byte))
-        .map(|prefix| prefix.chars().count())
-        .unwrap_or(0);
+    let match_byte = first_match.unwrap_or(0);
+    let mut total_chars = 0usize;
+    let mut match_chars = 0usize;
+    let mut seen_match = false;
+    for (byte_idx, _) in line.char_indices() {
+        if byte_idx == match_byte {
+            match_chars = total_chars;
+            seen_match = true;
+        }
+        total_chars += 1;
+        // Past `match + MAX` the window below is already exact: `start` is
+        // `match - MAX/2` (the true-length clamp cannot bind there) and the
+        // trailing ellipsis is known to apply. Lines at or below the limit
+        // never reach this break, so their count stays exact.
+        if seen_match && total_chars > match_chars + MAX_RENDERED_LINE_CHARS {
+            break;
+        }
+    }
+    if total_chars <= MAX_RENDERED_LINE_CHARS {
+        return line.to_string();
+    }
+    if !seen_match {
+        // Unreachable for scan-produced offsets (regex match starts are always
+        // character boundaries), kept for the same inputs the previous
+        // `line.get(..byte)` fallback accepted: a match at the very end of
+        // the line (empty-width regex match) counts the whole line, anything
+        // else degrades to a head window.
+        match_chars = if match_byte == line.len() {
+            total_chars
+        } else {
+            0
+        };
+    }
     let start = match_chars
         .saturating_sub(MAX_RENDERED_LINE_CHARS / 2)
-        .min(total - MAX_RENDERED_LINE_CHARS);
+        .min(total_chars - MAX_RENDERED_LINE_CHARS);
     let mut window = String::with_capacity(MAX_RENDERED_LINE_CHARS + 8);
     if start > 0 {
         window.push('…');
     }
     window.extend(line.chars().skip(start).take(MAX_RENDERED_LINE_CHARS));
-    if start + MAX_RENDERED_LINE_CHARS < total {
+    if start + MAX_RENDERED_LINE_CHARS < total_chars {
         window.push('…');
     }
     window
@@ -1071,17 +1301,25 @@ fn render_line_window(line: &str, first_match: Option<usize>) -> String {
 /// the budget only while no other file still holds a candidate, so the soft
 /// per-file ceiling (`MAX_SNIPPETS_PER_FILE`, raised to the per-file share when
 /// the budget allows) reserves room without making surplus lines unreachable.
-fn render_selection(
-    mut files: Vec<ScoredFile>,
+/// Selects and renders excerpts (see `render_selection`), with an explicit
+/// context width. Reports whether the render budget ran out, so the caller
+/// can retry bare matches when context lines crowd matches out.
+fn render_with_context(
+    files: &mut Vec<ScoredFile>,
     params: &OverflowSearchParams<'_>,
-    patterns: &[TermPattern],
+    query: &CompiledQuery,
     files_seen: usize,
     archive: &archive_files::ArchiveRoot,
-) -> Result<String, String> {
+    context_lines: usize,
+) -> Result<(String, bool), String> {
+    let patterns = &query.patterns;
     files.sort_by(|a, b| {
         b.file_score
             .partial_cmp(&a.file_score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            // Newer archives first: when scores tie, recently folded context
+            // is usually what the caller is recovering.
+            .then_with(|| b.scan.version.mtime.cmp(&a.scan.version.mtime))
             .then_with(|| a.scan.display_path.cmp(&b.scan.display_path))
     });
 
@@ -1172,10 +1410,10 @@ fn render_selection(
     }
 
     if chosen.is_empty() {
-        return Ok(format!(
+        return Ok((format!(
             "No matches found in the session archive for query: '{}'",
             params.query
-        ));
+        ), false));
     }
 
     // Emit grouped by file in global relevance order, expanding context windows
@@ -1268,7 +1506,7 @@ fn render_selection(
             // Re-scan the current content with the same patterns and recompute
             // the displayed lines; the old markers are never applied to the
             // new text.
-            let (hits, _, total_lines) = compute_hits(&content, patterns);
+            let (hits, _, total_lines) = compute_hits(&content, query);
             total_matches_all = total_matches_all.saturating_sub(file.total_matches);
             if hits.is_empty() {
                 file.total_matches = 0;
@@ -1330,11 +1568,11 @@ fn render_selection(
 
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         for li in &lis {
-            let start = li.saturating_sub(params.context_lines);
+            let start = li.saturating_sub(context_lines);
             // Clamp against both the scan-time line count and the re-read
             // length so a concurrently truncated file can never cause an
             // out-of-bounds index.
-            let end = (*li + params.context_lines)
+            let end = (*li + context_lines)
                 .min(file.scan.total_lines.saturating_sub(1))
                 .min(n_lines.saturating_sub(1));
             if let Some(last) = ranges.last_mut() {
@@ -1349,30 +1587,35 @@ fn render_selection(
         let mut match_set: std::collections::BTreeSet<usize> = lis.iter().copied().collect();
         // The scan pass kept raw hits per file (scan.hits), so the gutter
         // marker can still classify why each selected line matched.
+        // Hits are indexed by line for O(1) lookups: the previous linear scan
+        // of `hits` ran once per rendered match line, and excerpt windowing
+        // reuses the scan-time first-match offsets instead of re-running the
+        // matchers over every pattern.
+        let hit_by_line: FxHashMap<usize, &RawHit> = file
+            .scan
+            .hits
+            .iter()
+            .map(|hit| (hit.line_index, hit))
+            .collect();
         'lines: for (start, end) in ranges {
             for li in start..=end {
                 let is_match = match_set.remove(&li);
                 let line = content_lines[li];
+                let hit = if is_match {
+                    hit_by_line.get(&li).copied()
+                } else {
+                    None
+                };
                 let marker = if is_match {
-                    let matched = file
-                        .scan
-                        .hits
-                        .iter()
-                        .find(|hit| hit.line_index == li)
-                        .map(|hit| hit.matched.as_slice())
-                        .unwrap_or(&[]);
-                    match_marker(patterns, matched)
+                    // `lis` always names lines present in `hits` (the re-scan
+                    // path retains only those), so the fallback is unreachable;
+                    // it mirrors the previous lookup's empty-slice default.
+                    hit.map(|hit| match_marker(patterns, &hit.matched))
+                        .unwrap_or_else(|| match_marker(patterns, &[]))
                 } else {
                     "  "
                 };
-                let window = render_line_window(
-                    line,
-                    if is_match {
-                        first_match_offset(patterns, line)
-                    } else {
-                        None
-                    },
-                );
+                let window = render_line_window(line, hit.map(|hit| hit.first_match));
                 let rendered = format!("{:>7}{} {}\n", li + 1, marker, window);
                 if out.len() + chunk.len() + rendered.len() > render_budget {
                     // Whole lines only: cutting the rendered text afterwards
@@ -1432,7 +1675,38 @@ fn render_selection(
         out.len() <= MAX_OUTPUT_CHARS,
         "the excerpt budget must leave room for the notice and the footer"
     );
-    Ok(out)
+    Ok((out, budget_exhausted))
+}
+
+/// Renders the selected excerpts, dropping context lines and retrying once
+/// when they crowd matches out of the output budget.
+///
+/// A wide `max_results` with context lines can fill the whole budget with a
+/// few files while other matches go unwritten; the retry shows bare matches
+/// instead, which strictly helps recovery (surrounding lines stay one
+/// `read_file` away), and says so in a trailing note.
+fn render_selection(
+    mut files: Vec<ScoredFile>,
+    params: &OverflowSearchParams<'_>,
+    query: &CompiledQuery,
+    files_seen: usize,
+    archive: &archive_files::ArchiveRoot,
+) -> Result<String, String> {
+    let (out, budget_exhausted) = render_with_context(
+        &mut files,
+        params,
+        query,
+        files_seen,
+        archive,
+        params.context_lines,
+    )?;
+    if !budget_exhausted || params.context_lines == 0 {
+        return Ok(out);
+    }
+    let (bare, _) = render_with_context(&mut files, params, query, files_seen, archive, 0)?;
+    Ok(format!(
+        "{bare}[archive search] context lines were dropped to fit more matches; re-run with a smaller max_results to restore context.\n"
+    ))
 }
 
 inventory::submit!(ToolRegistration {
@@ -1789,8 +2063,8 @@ mod tests {
         fs::write(outside.join("external.md"), "needle external_secret_body\n").unwrap();
         std::os::unix::fs::symlink(outside.join("external.md"), &path).unwrap();
         let needle = params("needle");
-        let patterns = build_patterns(&needle).unwrap();
-        let out = render_selection(vec![file], &needle, &patterns, 1, &archive).unwrap();
+        let query = CompiledQuery::compile(&needle).unwrap();
+        let out = render_selection(vec![file], &needle, &query, 1, &archive).unwrap();
         assert!(!out.contains("external_secret_body"), "{out}");
         assert!(
             out.contains("file unreadable during excerpt rendering"),
@@ -2841,5 +3115,196 @@ mod tests {
             "the typed term is listed and the expansion disclosed separately:\n{out}"
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn full_coverage_line_outranks_rare_single_term_line() {
+        // A line holding every typed term beats a line holding one of them,
+        // even when that one sits at column zero as a whole word: the
+        // full-coverage bonus must exceed any single-term local score.
+        let p = params("alpha beta");
+        let query = CompiledQuery::compile(&p).unwrap();
+        let (pair, _, _) = compute_hits("xxalpha y xxbeta\n", &query);
+        let (single, _, _) = compute_hits("alpha\n", &query);
+        // Pair line: alpha lead 1.9 + beta lead 1.4 (both substrings, no
+        // whole-word) + full coverage 3.0 + proximity over the 5-char gap
+        // 1.875 = 8.175. Single line: whole-word 2.0 + lead 2.0 = 4.0.
+        assert!((pair[0].local_score - 8.175).abs() < 1e-9, "{}", pair[0].local_score);
+        assert!(
+            (single[0].local_score - 4.0).abs() < 1e-9,
+            "{}",
+            single[0].local_score
+        );
+        assert!(
+            pair[0].local_score > single[0].local_score + FULL_COVERAGE_LINE_BONUS,
+            "full cover must win by more than the bonus itself"
+        );
+    }
+
+    #[test]
+    fn nearby_terms_outrank_scattered_terms() {
+        // Same terms, no exact phrase either way: the line with the terms
+        // close together must outrank the line with them scattered.
+        let p = params("alpha beta");
+        let query = CompiledQuery::compile(&p).unwrap();
+        let (near, _, _) = compute_hits("alpha x beta\n", &query);
+        let far_line = format!("alpha {}beta\n", "y ".repeat(30));
+        let (far, _, _) = compute_hits(&far_line, &query);
+        assert!(
+            near[0].local_score > far[0].local_score,
+            "near ({}) must beat far ({})",
+            near[0].local_score,
+            far[0].local_score
+        );
+    }
+
+    #[test]
+    fn cjk_expansion_samples_head_and_tail() {
+        // 39 distinct bigrams capped to 24: head truncation would keep only
+        // indices 0..24 and silently drop recall for the query tail, so the
+        // survivors must span the whole query in order.
+        let distinct: String = (0x4E00u32..0x4E00 + 40)
+            .filter_map(char::from_u32)
+            .collect();
+        let all: Vec<String> = distinct
+            .chars()
+            .collect::<Vec<char>>()
+            .windows(2)
+            .map(|pair| pair.iter().collect())
+            .collect();
+        let patterns = build_patterns(&params(&distinct)).unwrap();
+        let sampled: Vec<usize> = patterns
+            .iter()
+            .filter(|p| is_derived_pattern(p))
+            .map(|p| all.iter().position(|b| b == &p.source).unwrap())
+            .collect();
+        assert_eq!(sampled.len(), MAX_CJK_BIGRAMS);
+        assert_eq!(sampled[0], 0, "the head bigram must survive");
+        let max_index = *sampled.iter().max().unwrap();
+        assert!(
+            max_index >= 30,
+            "sampling must reach the query tail, got max index {max_index}"
+        );
+        let mut ordered = sampled.clone();
+        ordered.sort_unstable();
+        assert_eq!(sampled, ordered, "sampling must keep query order");
+    }
+
+    #[test]
+    fn unknown_scope_surfaces_an_error() {
+        // A typo'd scope must fail loudly with the valid values, never
+        // silently widen to the full corpus.
+        let args = serde_json::json!({"query": "x", "scope": "bogus"});
+        let err = parse_search_params(&args)
+            .err()
+            .expect("unknown scope must be rejected");
+        assert!(err.contains("Invalid scope"), "{err}");
+        assert!(err.contains("'all'"), "{err}");
+        for valid in ["all", "history", "tool_outputs"] {
+            let args = serde_json::json!({"query": "x", "scope": valid});
+            assert!(parse_search_params(&args).is_ok(), "{valid}");
+        }
+        let args = serde_json::json!({"query": "x"});
+        assert_eq!(parse_search_params(&args).unwrap().scope, SearchScope::All);
+    }
+
+    #[test]
+    fn recency_breaks_equal_score_ties() {
+        // Identical content, distinct mtimes: the newer archive file must be
+        // listed first when scores tie.
+        let dir = make_temp_dir();
+        let tool_dir = dir.join("tool-overflow-compressed");
+        fs::create_dir_all(&tool_dir).unwrap();
+        let old_path = tool_dir.join("old.md");
+        let new_path = tool_dir.join("new.md");
+        fs::write(&old_path, "alpha marker\n").unwrap();
+        fs::write(&new_path, "alpha marker\n").unwrap();
+        let old_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let new_time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000);
+        fs::File::options()
+            .write(true)
+            .open(&old_path)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&new_path)
+            .unwrap()
+            .set_modified(new_time)
+            .unwrap();
+        let out = run_overflow_search(&dir, &params("alpha marker")).unwrap();
+        let new_at = out.find("new.md").expect("newer file shown:\n{out}");
+        let old_at = out.find("old.md").expect("older file shown:\n{out}");
+        assert!(new_at < old_at, "newer file must come first:\n{out}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn budget_exhaustion_retries_without_context_lines() {
+        // Twenty files with long surrounding lines: rendering with context
+        // cannot fit, so the answer must fall back to bare matches (showing
+        // all of them) and say so — instead of truncating mid-list.
+        let dir = make_temp_dir();
+        let tool_dir = dir.join("tool-overflow-compressed");
+        fs::create_dir_all(&tool_dir).unwrap();
+        for i in 0..20 {
+            let filler = "x".repeat(440);
+            fs::write(
+                tool_dir.join(format!("f{i:02}.md")),
+                format!("{filler}\n{filler}\nneedle {filler}\n{filler}\n{filler}\n"),
+            )
+            .unwrap();
+        }
+        let mut p = params("needle");
+        p.context_lines = 2;
+        p.max_results = 200;
+        let out = run_overflow_search(&dir, &p).unwrap();
+        assert!(
+            out.contains("context lines were dropped to fit more matches"),
+            "fallback must be disclosed:\n{out}"
+        );
+        assert_eq!(
+            shown_count(&out),
+            20,
+            "all bare matches must fit:\n{out}"
+        );
+        assert_eq!(
+            shown_count(&out),
+            rendered_marker_lines(&out),
+            "accounting must match rendered markers:\n{out}"
+        );
+        // Control: asking for bare matches directly shows the same lines
+        // with no fallback note.
+        p.context_lines = 0;
+        let bare = run_overflow_search(&dir, &p).unwrap();
+        assert_eq!(shown_count(&bare), 20, "control must show all:\n{bare}");
+        assert!(
+            !bare.contains("context lines were dropped"),
+            "no fallback happened, no note expected:\n{bare}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unicode_word_boundary_denies_fragment_bonus() {
+        // "caf" inside "café" is a substring hit on both sides ('é' is a word
+        // character), while "caf bar" is a whole-word hit.
+        let p = params("caf");
+        let query = CompiledQuery::compile(&p).unwrap();
+        let (fragment, _, _) = compute_hits("café x\n", &query);
+        let (whole, _, _) = compute_hits("caf bar\n", &query);
+        assert!(
+            (fragment[0].local_score - 2.0).abs() < 1e-9,
+            "lead bonus only: {}",
+            fragment[0].local_score
+        );
+        assert!(
+            (whole[0].local_score - 4.0).abs() < 1e-9,
+            "whole-word plus lead: {}",
+            whole[0].local_score
+        );
     }
 }

@@ -7,7 +7,7 @@
     "properties": {
       "query": {
         "type": "string",
-        "description": "Search term (plain substring by default; is_regex=true for regex). A multi-word query matches lines holding any one of its words, and ranks lines holding the whole phrase higher, so a hit does not prove the phrase is present. For CJK queries the adjacent character pairs of each run of three or more characters match as well (at most 24 pairs per query), so a hit may rest on a shared pair rather than the full run."
+        "description": "Search term (plain substring by default; is_regex=true for regex). A multi-word query matches lines holding any one of its words, and ranks lines holding the whole phrase highest, then lines holding all words close together, so a hit does not prove the phrase is present. For CJK queries the adjacent character pairs of each run of three or more characters match as well (at most 24 pairs per query, sampled across the whole query), so a hit may rest on a shared pair rather than the full run."
       },
       "scope": {
         "type": "string",

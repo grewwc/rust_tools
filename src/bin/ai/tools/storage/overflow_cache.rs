@@ -18,17 +18,19 @@
 //! memory. It is a pure performance layer, never a scan or byte budget: the
 //! search still scans every archive file on every call, and absence results
 //! remain based on the full scan.
+//!
+//! Bodies are shared as `Arc<str>`, so a cache hit is a reference-count bump
+//! instead of a full-text copy, and recency is a per-entry monotonic counter,
+//! so the hot read path is O(1) with a tiny critical section under the global
+//! lock (eviction scans for the oldest counter, but only on the cold insert
+//! path when a cap is exceeded).
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
 use rustc_hash::FxHashMap;
-
-#[cfg(test)]
-use std::sync::Arc;
 
 /// Maximum number of cached files.
 const MAX_ENTRIES: usize = 512;
@@ -67,14 +69,18 @@ struct CacheEntry {
     /// version.
     version: FileVersion,
     size: usize,
-    content: String,
+    /// Shared body: hits clone the `Arc`, never the text.
+    content: Arc<str>,
+    /// Last-use stamp from the cache clock; higher means more recent. Unique
+    /// per touch, so it totally orders entries by recency.
+    last_used: u64,
 }
 
 struct OverflowCache {
     entries: FxHashMap<PathBuf, CacheEntry>,
-    /// LRU order: back = most recently used.
-    order: VecDeque<PathBuf>,
     total_bytes: usize,
+    /// Monotonic recency clock, advanced on every touch/insert.
+    clock: u64,
     max_entries: usize,
     max_total_bytes: usize,
     max_file_bytes: usize,
@@ -106,8 +112,8 @@ impl OverflowCache {
     fn with_limits(max_entries: usize, max_total_bytes: usize, max_file_bytes: usize) -> Self {
         OverflowCache {
             entries: FxHashMap::default(),
-            order: VecDeque::new(),
             total_bytes: 0,
+            clock: 0,
             max_entries,
             max_total_bytes,
             max_file_bytes,
@@ -116,24 +122,33 @@ impl OverflowCache {
         }
     }
 
-    fn get(&mut self, path: &Path, version: FileVersion) -> Option<String> {
+    /// Advances the recency clock, returning the stamp for this touch.
+    /// Wrapping is harmless: only the relative order of live stamps matters,
+    /// and two live entries can never share a stamp within 2^64 touches.
+    fn tick(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    fn get(&mut self, path: &Path, version: FileVersion) -> Option<Arc<str>> {
         if version.len > self.max_file_bytes as u64 {
             return None;
         }
-        let entry = self.entries.get(path)?;
+        // Stamp first: the relative order of hits is what matters, and an
+        // unconsumed stamp on a miss path is harmless.
+        let stamp = self.tick();
+        let entry = self.entries.get_mut(path)?;
         if entry.version != version {
-            // The borrow of `entry` ends here; the stale entry is dropped.
-            self.remove(path);
+            let stale = self.entries.remove(path).expect("entry just observed");
+            self.total_bytes = self.total_bytes.saturating_sub(stale.size);
             return None;
         }
-        let content = entry.content.clone();
-        // LRU touch: the entry moves to the back of the order.
-        self.order.retain(|p| p != path);
-        self.order.push_back(path.to_path_buf());
-        Some(content)
+        // LRU touch: O(1) stamp bump, no order-list scan.
+        entry.last_used = stamp;
+        Some(Arc::clone(&entry.content))
     }
 
-    fn put(&mut self, path: PathBuf, version: FileVersion, content: String) {
+    fn put(&mut self, path: PathBuf, version: FileVersion, content: Arc<str>) {
         if content.len() > self.max_file_bytes {
             return;
         }
@@ -145,15 +160,16 @@ impl OverflowCache {
         self.remove(&path);
         let size = content.len();
         self.total_bytes += size;
+        let stamp = self.tick();
         self.entries.insert(
-            path.clone(),
+            path,
             CacheEntry {
                 version,
                 size,
                 content,
+                last_used: stamp,
             },
         );
-        self.order.push_back(path);
         self.evict();
     }
 
@@ -161,18 +177,22 @@ impl OverflowCache {
         if let Some(entry) = self.entries.remove(path) {
             self.total_bytes = self.total_bytes.saturating_sub(entry.size);
         }
-        self.order.retain(|p| p != path);
     }
 
-    /// Drops least-recently-used entries until both caps hold.
+    /// Drops least-recently-used entries until both caps hold. The oldest-stamp
+    /// scan is O(entries) but runs only on the insert path when a cap is
+    /// exceeded, never on the hot read path.
     fn evict(&mut self) {
         while self.entries.len() > self.max_entries || self.total_bytes > self.max_total_bytes {
-            let Some(oldest) = self.order.pop_front() else {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(path, _)| path.clone())
+            else {
                 break;
             };
-            if let Some(entry) = self.entries.remove(&oldest) {
-                self.total_bytes = self.total_bytes.saturating_sub(entry.size);
-            }
+            self.remove(&oldest);
         }
     }
 }
@@ -188,7 +208,7 @@ static GLOBAL_COPY_BYTES: LazyLock<Arc<AtomicUsize>> =
 
 /// Returns the cached body of `path` when an entry exists for exactly this
 /// file version; `None` otherwise (uncached, different version, oversized).
-pub(crate) fn cached_text(path: &Path, version: FileVersion) -> Option<String> {
+pub(crate) fn cached_text(path: &Path, version: FileVersion) -> Option<Arc<str>> {
     let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.get(path, version)
 }
@@ -201,11 +221,11 @@ fn prepare_body(
     copied: Option<&AtomicUsize>,
     max_file_bytes: usize,
     content: &str,
-) -> Option<String> {
+) -> Option<Arc<str>> {
     if content.len() > max_file_bytes {
         return None; // rejected before a single byte is copied
     }
-    let body = content.to_string();
+    let body: Arc<str> = Arc::from(content);
     if let Some(copied) = copied {
         copied.fetch_add(body.len(), Ordering::Relaxed);
     }
@@ -290,7 +310,7 @@ mod tests {
         let v1 = version(4, epoch());
         let v2 = version(4, epoch() + Duration::from_secs(1));
         let mut cache = OverflowCache::with_limits(8, 4096, 4096);
-        cache.put(path.clone(), v1, "body".to_string());
+        cache.put(path.clone(), v1, Arc::from("body"));
         assert_eq!(cache.get(&path, v1).as_deref(), Some("body"));
         // Unchanged version: the second read is a cache hit too.
         assert_eq!(cache.get(&path, v1).as_deref(), Some("body"));
@@ -302,7 +322,7 @@ mod tests {
             "stale entry must be cleared on mismatch"
         );
         // Re-storing at the new version makes it servable again.
-        cache.put(path.clone(), v2, "body".to_string());
+        cache.put(path.clone(), v2, Arc::from("body"));
         assert_eq!(cache.get(&path, v2).as_deref(), Some("body"));
     }
 
@@ -313,7 +333,7 @@ mod tests {
         let mut cache = OverflowCache::with_limits(8, 4096, 4096);
         // Body length must equal version.len: a mismatch can never be served
         // coherently, so the store is refused and no entry appears.
-        cache.put(path.clone(), v, "old".to_string());
+        cache.put(path.clone(), v, Arc::from("old"));
         assert_eq!(cache.get(&path, v), None);
         assert!(!cache.entries.contains_key(&path));
     }
@@ -326,7 +346,11 @@ mod tests {
             .collect();
         for (index, path) in files.iter().enumerate() {
             let content = format!("content {index}");
-            cache.put(path.clone(), version(content.len(), epoch()), content);
+            cache.put(
+                path.clone(),
+                version(content.len(), epoch()),
+                Arc::from(content.as_str()),
+            );
         }
         assert!(
             cache.get(&files[0], version(9, epoch())).is_none(),
@@ -346,7 +370,7 @@ mod tests {
         cache.put(
             PathBuf::from("/virtual/f5.txt"),
             version(9, epoch()),
-            "content 5".to_string(),
+            Arc::from("content 5"),
         );
         assert!(
             cache.get(&files[1], version(9, epoch())).is_none(),
@@ -367,7 +391,7 @@ mod tests {
             cache.put(
                 PathBuf::from(format!("/virtual/b{index}.txt")),
                 v,
-                "0123456789".to_string(),
+                Arc::from("0123456789"),
             );
         }
         // 4 x 10 bytes = 40 > 30: exactly one entry must go, oldest first.
@@ -388,7 +412,7 @@ mod tests {
         let content = "x".repeat(1025); // > max_file_bytes of 1024
         let v = version(content.len(), epoch());
         let mut cache = OverflowCache::with_limits(8, 4096, 1024);
-        cache.put(path.clone(), v, content);
+        cache.put(path.clone(), v, Arc::from(content.as_str()));
         assert_eq!(cache.get(&path, v), None, "oversized content must not cache");
         assert_eq!(cache.total_bytes, 0);
     }
