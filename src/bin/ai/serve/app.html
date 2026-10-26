@@ -3778,12 +3778,58 @@ function parseBlock(raw) {
   return { id, kind, payload: data.join("\n") };
 }
 
+// `/cd` changes the session's working directory on the server, not the turn
+// child's: a child that ran it exits and takes the change with it, so the next
+// turn is back in the old directory. Mobile answers the command locally
+// through the session endpoint instead of starting a turn.
+const CD_LINE_RE = /^[:/]cd(?:\s|$)/;
+function cdCommandLine(text) {
+  const t = text.trim();
+  return t && !t.includes("\n") && CD_LINE_RE.test(t) ? t : "";
+}
+
+async function runCdCommand(text) {
+  const command = cdCommandLine(text);
+  if (!command || pendingImages.length) return false;
+  if (!sessionId) {
+    try { sessionId = (await (await api("/sessions", { method: "POST" })).json()).id; }
+    catch (e) { addMsg("err", "create session failed: " + e.message, "asst err"); return true; }
+    localStorage.setItem("serve.session", sessionId);
+  }
+  const sid = sessionId;
+  setPromptValue("", true);
+  $("prompt").style.height = "auto";
+  clearDraft(sid);
+  addMsg("user", command, "user rewindable");
+  let out = "";
+  try {
+    const res = await api("/sessions/" + sid + "/cd", { method: "POST", body: JSON.stringify({ command }) });
+    if (!res.ok) {
+      let detail = res.statusText;
+      try { detail = (await res.json()).error || detail; } catch (_) {}
+      throw new Error(res.status + " " + detail);
+    }
+    const data = await res.json();
+    out = [data.stdout || "", data.stderr || ""].filter(Boolean).join("\n").trim();
+  } catch (e) {
+    addMsg("err", "cd failed: " + e.message, "asst err");
+    return true;
+  }
+  const last = out.split("\n").filter(Boolean).pop() || "done";
+  addFold("activity log (1) · " + shortLine(last, 80), out).box.classList.add("tool-activity");
+  scrollToLatest(false);
+  return true;
+}
+
 async function send() {
   if (sendBusy) return; // one send's own setup at a time
   if (typeof abortEvents === "function") abortEvents();
   const text = $("prompt").value.trim();
   if (!text && !pendingImages.length) return;
   if (!validateSkillInput()) return;
+
+  // A cd line belongs to the session, not to this turn (see runCdCommand).
+  if (await runCdCommand(text)) return;
   const draftSession = sessionId;
   sendBusy = true;
   let sid;
