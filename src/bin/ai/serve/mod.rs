@@ -1430,6 +1430,7 @@ pub(in crate::ai) async fn run_serve(
         confirms: Arc::new(std::sync::Mutex::new(HashMap::new())),
         events: Arc::new(SessionEventBus::default()),
     };
+    let apk_download_route = format!("/{}", android_apk_filename());
     let app = APP_ENTRY_PATHS
         .into_iter()
         .fold(Router::new(), |router, path| {
@@ -1453,7 +1454,7 @@ pub(in crate::ai) async fn run_serve(
         .route("/a-serve-v1.13.0.apk", get(serve_android_apk))
         .route("/a-serve-v1.15.0.apk", get(serve_android_apk))
         .route("/a-serve-v1.15.1.apk", get(serve_android_apk))
-        .route("/a-serve-v1.15.2.apk", get(serve_android_apk))
+        .route(&apk_download_route, get(serve_android_apk))
         .route("/info", get(server_info))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/fork", post(fork_session))

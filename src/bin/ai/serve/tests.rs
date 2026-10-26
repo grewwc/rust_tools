@@ -1251,20 +1251,43 @@ async fn serve_app_returns_mobile_client() {
         !body.contains("__ASERVE_PAGE_ID__"),
         "the placeholder must be replaced in the served body"
     );
+    assert!(
+        !body.contains("__ASERVE_APK_FILENAME__"),
+        "the download link must carry the resolved package name"
+    );
     assert!(body.contains("/sessions/"));
     assert!(body.contains("turns/stream"));
     assert!(body.contains("/rewind"));
     assert!(body.contains("rel=\"manifest\" href=\"/app.webmanifest\""));
     assert!(body.contains("rel=\"icon\" href=\"/app-icon.svg\""));
-    assert!(body.contains(
-        "href=\"/a-serve-v1.15.2.apk\" download=\"a-serve-v1.15.2.apk\""
-    ));
+    let apk = super::android_apk_filename();
+    assert!(
+        body.contains(&format!("href=\"{apk}\" download=\"{apk}\"")),
+        "the page link and its download name must equal the served package name"
+    );
     assert!(body.contains("serviceWorker.register(\"/app-sw.js\", { scope: \"/\" })"));
     assert!(body.contains("parsePhoneAction"));
     assert!(body.contains("@@aserve-native "));
     assert!(
         body.contains("/file?path="),
         "the page must fetch server-side images through the authed preview route"
+    );
+}
+
+/// The publish name is a Rust constant while the package is built by gradle;
+/// nothing at build time ties them together, so this test does.
+#[test]
+fn android_apk_version_matches_the_gradle_build() {
+    let gradle = include_str!("../../../../android/a-serve/app/build.gradle");
+    let declared = gradle
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("versionName "))
+        .map(|rest| rest.trim().trim_matches('"'))
+        .expect("build.gradle declares versionName");
+    assert_eq!(
+        declared,
+        super::ANDROID_APK_VERSION,
+        "the published download name must match the APK gradle builds"
     );
 }
 
@@ -1279,12 +1302,13 @@ async fn serve_android_apk_returns_installable_attachment() {
             .and_then(|v| v.to_str().ok()),
         Some("application/vnd.android.package-archive")
     );
+    let expected = format!("attachment; filename=\"{}\"", super::android_apk_filename());
     assert_eq!(
         response
             .headers()
             .get(axum::http::header::CONTENT_DISPOSITION)
             .and_then(|v| v.to_str().ok()),
-        Some("attachment; filename=\"a-serve-v1.15.2.apk\"")
+        Some(expected.as_str())
     );
     assert_eq!(
         response

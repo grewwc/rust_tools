@@ -16,14 +16,27 @@ pub(crate) async fn healthz() -> Json<Healthz> {
 /// an installed PWA. The page
 /// itself carries no session data; the bearer token lives in the phone's
 /// `localStorage` and every API call reuses the existing authed routes.
+/// Android shell version published by the download route. `versionName` in
+/// `android/a-serve/app/build.gradle` is its build-side twin; a test keeps the
+/// two equal so bumping one cannot leave the download advertising the other.
+pub(crate) const ANDROID_APK_VERSION: &str = "1.15.2";
+
+/// Download filename derived from [`ANDROID_APK_VERSION`]. The route, the
+/// `Content-Disposition` header, and the page's download link all use it.
+pub(crate) fn android_apk_filename() -> String {
+    format!("a-serve-v{ANDROID_APK_VERSION}.apk")
+}
+
 /// Page body with `__ASERVE_PAGE_ID__` stamped to a short hash of the source
-/// bytes. The page displays that id, so a screenshot identifies which page
-/// build a phone actually runs.
+/// bytes and `__ASERVE_APK_FILENAME__` stamped to the current download name.
+/// The page displays the id, so a screenshot identifies which page build a
+/// phone actually runs.
 static APP_PAGE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     let raw = include_str!("app.html");
     let digest = Sha256::digest(raw.as_bytes());
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     raw.replace("__ASERVE_PAGE_ID__", &hex[..8])
+        .replace("__ASERVE_APK_FILENAME__", &android_apk_filename())
 });
 
 // `no-store` keeps phones from running a stale cached copy of this page
@@ -172,7 +185,7 @@ pub(crate) async fn serve_android_apk() -> Response {
     );
     response.headers_mut().insert(
         axum::http::header::CONTENT_DISPOSITION,
-        HeaderValue::from_static("attachment; filename=\"a-serve-v1.15.2.apk\""),
+        apk_content_disposition(),
     );
     response.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,
@@ -183,6 +196,19 @@ pub(crate) async fn serve_android_apk() -> Response {
         HeaderValue::from_static("nosniff"),
     );
     response
+}
+
+/// `Content-Disposition` naming the served package. Built once from the shared
+/// filename so the header cannot drift from the route or the page link.
+fn apk_content_disposition() -> HeaderValue {
+    static VALUE: std::sync::LazyLock<HeaderValue> = std::sync::LazyLock::new(|| {
+        HeaderValue::from_str(&format!(
+            "attachment; filename=\"{}\"",
+            android_apk_filename()
+        ))
+        .expect("apk filename is header-safe")
+    });
+    VALUE.clone()
 }
 
 fn public_app_asset(
