@@ -1,16 +1,10 @@
 use std::error::Error;
 use std::fs;
 use std::io;
-use std::io::BufReader;
-use std::os::unix::process::CommandExt;
 
-use crate::ai::mcp::{
-    McpClient,
-    connection::{McpServerConnection, spawn_stderr_drain},
-};
+use crate::ai::mcp::{McpClient, connection::McpServerConnection};
 use crate::ai::types::{App, McpPrompt, McpResource, McpServerConfig, McpTool};
 use rust_tools::cw::SkipMap;
-use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
 pub struct McpConfigProbe {
@@ -295,53 +289,7 @@ fn connect_single_server(
     if config.disabled {
         return Err("Server is disabled".to_string());
     }
-
-    let mut cmd = Command::new(&config.command);
-    cmd.args(&config.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    unsafe {
-        let _ = cmd.pre_exec(|| {
-            libc::signal(libc::SIGINT, libc::SIG_IGN);
-            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-            Ok(())
-        });
-    }
-
-    for (key, value) in &config.env {
-        cmd.env(key, value);
-    }
-
-    let mut process = crate::fork_guard::spawn(&mut cmd)
-        .map_err(|e| format!("Failed to start MCP server '{}': {}", name, e))?;
-
-    let stdin = process.stdin.take().ok_or("Failed to get stdin")?;
-    let stdout = process.stdout.take().ok_or("Failed to get stdout")?;
-    let stderr = process.stderr.take().ok_or("Failed to get stderr")?;
-    let stderr_tail = spawn_stderr_drain(stderr);
-
-    // Set the stdout pipe to non-blocking mode so that BufReader::fill_buf
-    // returns WouldBlock when the pipe has no data instead of blocking forever.
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        super::super::mcp::set_fd_nonblocking(stdout.as_raw_fd())
-            .map_err(|e| format!("Failed to set nonblocking mode: {}", e))?;
-    }
-
-    let mut conn = McpServerConnection {
-        config: config.clone(),
-        process,
-        stdin,
-        stdout: BufReader::new(stdout),
-        stderr_tail,
-        request_timeout_ms: config.request_timeout_ms.max(100),
-        tools: Vec::new(),
-        resources: Vec::new(),
-        prompts: Vec::new(),
-    };
+    let mut conn = McpServerConnection::connect(name, config)?;
 
     // Use a dedicated request-ID counter.
     let next_id = std::sync::atomic::AtomicU64::new(1);
@@ -364,7 +312,7 @@ fn initialize_server(
     use serde_json::json;
 
     let params = json!({
-        "protocolVersion": "2024-11-05",
+        "protocolVersion": conn.protocol_version(),
         "capabilities": {
             "tools": {},
             "resources": {},
@@ -389,13 +337,12 @@ fn list_tools(
     conn: &mut McpServerConnection,
     next_id: &std::sync::atomic::AtomicU64,
 ) -> Result<Vec<McpTool>, String> {
-    use crate::ai::mcp::send_request_to_conn;
+    use crate::ai::mcp::{is_method_not_found, send_request_to_conn};
     let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let result = match send_request_to_conn(conn, id, "tools/list", None) {
         Ok(v) => v,
         Err(err) => {
-            let is_method_not_found = err.contains("-32601") && err.contains("tools/list");
-            if is_method_not_found {
+            if is_method_not_found(&err) {
                 return Ok(Vec::new());
             }
             return Err(err);
@@ -416,13 +363,12 @@ fn list_resources(
     conn: &mut McpServerConnection,
     next_id: &std::sync::atomic::AtomicU64,
 ) -> Result<Vec<McpResource>, String> {
-    use crate::ai::mcp::send_request_to_conn;
+    use crate::ai::mcp::{is_method_not_found, send_request_to_conn};
     let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let result = match send_request_to_conn(conn, id, "resources/list", None) {
         Ok(v) => v,
         Err(err) => {
-            let is_method_not_found = err.contains("-32601") && err.contains("resources/list");
-            if is_method_not_found {
+            if is_method_not_found(&err) {
                 return Ok(Vec::new());
             }
             return Err(err);
@@ -443,13 +389,12 @@ fn list_prompts(
     conn: &mut McpServerConnection,
     next_id: &std::sync::atomic::AtomicU64,
 ) -> Result<Vec<McpPrompt>, String> {
-    use crate::ai::mcp::send_request_to_conn;
+    use crate::ai::mcp::{is_method_not_found, send_request_to_conn};
     let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let result = match send_request_to_conn(conn, id, "prompts/list", None) {
         Ok(v) => v,
         Err(err) => {
-            let is_method_not_found = err.contains("-32601") && err.contains("prompts/list");
-            if is_method_not_found {
+            if is_method_not_found(&err) {
                 return Ok(Vec::new());
             }
             return Err(err);

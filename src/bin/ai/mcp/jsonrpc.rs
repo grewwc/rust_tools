@@ -39,6 +39,10 @@ pub(super) enum InboundJsonRpc {
 pub(super) fn classify_inbound_jsonrpc(line: &str) -> Result<InboundJsonRpc, String> {
     let raw: Value =
         serde_json::from_str(line).map_err(|e| format!("Failed to parse response: {}", e))?;
+    classify_inbound_value(raw)
+}
+
+pub(super) fn classify_inbound_value(raw: Value) -> Result<InboundJsonRpc, String> {
     let Some(jsonrpc) = raw.get("jsonrpc").and_then(Value::as_str) else {
         return Err("Missing JSON-RPC version".to_string());
     };

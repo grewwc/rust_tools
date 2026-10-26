@@ -31,11 +31,11 @@ pub(in crate::ai) fn set_fd_nonblocking(fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
-fn tool_cancel_error() -> String {
+pub(super) fn tool_cancel_error() -> String {
     "MCP request canceled by user".to_string()
 }
 
-fn tool_cancel_requested() -> bool {
+pub(super) fn tool_cancel_requested() -> bool {
     crate::ai::tools::registry::common::is_tool_cancel_requested()
 }
 

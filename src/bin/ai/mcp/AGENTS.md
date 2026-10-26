@@ -3,12 +3,15 @@
 ## Scope
 
 Applies to `src/bin/ai/mcp/**` (flat module: `client.rs`, `connection.rs`,
-`config.rs`, `io.rs`, `jsonrpc.rs`).
+`config.rs`, `http.rs`, `io.rs`, `jsonrpc.rs`).
 
 ## Key invariants
 
-1. **Transport model.** MCP servers are stdio JSON-RPC subprocesses, not HTTP
-   services.
+1. **Transport model.** MCP servers can be stdio subprocesses, Streamable HTTP
+   endpoints (`type: "http"` or a bare `url`), or legacy HTTP+SSE endpoints
+   (`type: "sse"`). `connection.rs` owns the transport enum; request/notify
+   must go through it so HTTP and stdio share correlation, timeout, and restart
+   behavior.
 2. **Routing vs execution.** `routing_snapshot()` is metadata for discovery and
    routing; real tool execution must use the live shared client/connection set.
 3. **Initialized notification.** `notifications/initialized` is a JSON-RPC
@@ -35,3 +38,10 @@ Applies to `src/bin/ai/mcp/**` (flat module: `client.rs`, `connection.rs`,
     cache is rebuilt after a connection restart, otherwise the catalog keeps
     serving pre-restart schemas while the live connection holds a new
     generation. Rebuild outside the per-server lock (outer → inner order).
+11. **Streamable HTTP session state.** Capture `Mcp-Session-Id` from responses,
+    replay it on every POST, and send `MCP-Protocol-Version` after initialize.
+    A 404 means the session is gone and restart is required.
+12. **Legacy SSE is a long-lived GET.** Wait for the `endpoint` event before
+    posting `initialize`; responses arrive on the GET stream, not the POST
+    response. The stream reader runs on its own thread, so shutdown is
+    best-effort and must not block tool execution.

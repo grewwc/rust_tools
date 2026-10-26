@@ -443,17 +443,69 @@ pub(super) struct AgentContext {
     pub(super) max_iterations: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(in crate::ai) enum McpTransportKind {
+    Stdio,
+    #[serde(alias = "streamable-http", alias = "streamable_http")]
+    Http,
+    Sse,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(in crate::ai) struct McpServerConfig {
+    /// Stdio transport: executable to spawn. Empty for HTTP/SSE servers.
+    #[serde(default)]
     pub(in crate::ai) command: String,
     #[serde(default)]
     pub(in crate::ai) args: Vec<String>,
     #[serde(default)]
     pub(in crate::ai) env: SkipMap<String, String>,
+    /// HTTP/SSE transport: MCP endpoint URL. Empty for stdio servers.
+    #[serde(default)]
+    pub(in crate::ai) url: String,
+    /// Extra HTTP headers (for example `Authorization`) for HTTP/SSE servers.
+    #[serde(default)]
+    pub(in crate::ai) headers: SkipMap<String, String>,
+    /// Explicit transport. When omitted, `command` means stdio and `url` means
+    /// Streamable HTTP. `type: "sse"` selects the legacy HTTP+SSE transport.
+    #[serde(default, rename = "type", alias = "transport")]
+    pub(in crate::ai) transport: Option<McpTransportKind>,
     #[serde(default = "default_mcp_request_timeout_ms")]
     pub(in crate::ai) request_timeout_ms: u64,
     #[serde(default)]
     pub(in crate::ai) disabled: bool,
+}
+
+impl McpServerConfig {
+    /// Resolve the configured transport and reject ambiguous entries. Keeping
+    /// this check next to the config type means the stdio and HTTP connection
+    /// paths cannot disagree about which fields are required.
+    pub(in crate::ai) fn transport_kind(&self) -> Result<McpTransportKind, String> {
+        let has_command = !self.command.trim().is_empty();
+        let has_url = !self.url.trim().is_empty();
+        match (has_command, has_url) {
+            (true, true) => {
+                Err("configure either 'command' (stdio) or 'url' (HTTP/SSE), not both".to_string())
+            }
+            (false, false) => Err("missing 'command' for stdio or 'url' for HTTP/SSE".to_string()),
+            (true, false) => match self.transport.unwrap_or(McpTransportKind::Stdio) {
+                McpTransportKind::Stdio => Ok(McpTransportKind::Stdio),
+                other => Err(format!(
+                    "transport '{:?}' requires 'url', but only 'command' is configured",
+                    other
+                )),
+            },
+            (false, true) => match self.transport.unwrap_or(McpTransportKind::Http) {
+                McpTransportKind::Http => Ok(McpTransportKind::Http),
+                McpTransportKind::Sse => Ok(McpTransportKind::Sse),
+                McpTransportKind::Stdio => Err(
+                    "transport 'stdio' requires 'command', but only 'url' is configured"
+                        .to_string(),
+                ),
+            },
+        }
+    }
 }
 
 fn default_mcp_request_timeout_ms() -> u64 {

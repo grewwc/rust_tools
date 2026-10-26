@@ -1,17 +1,7 @@
-use std::{
-    io::BufReader,
-    process::{Command, Stdio},
-    sync::{
-        Arc, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
+use std::sync::{
+    Arc, Mutex, RwLock,
+    atomic::{AtomicU64, Ordering},
 };
-
-#[cfg(unix)]
-use libc;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 use rust_tools::cw::SkipMap;
 use serde_json::{Value, json};
@@ -20,133 +10,27 @@ use crate::ai::types::{
     FunctionDefinition, McpPrompt, McpResource, McpServerConfig, McpTool, ToolDefinition,
 };
 
-fn reject_server_request(
-    conn: &mut McpServerConnection,
-    id: Value,
-    method: &str,
-) -> Result<(), String> {
-    let payload = unsupported_server_request_payload(id, method);
-    writeln!(conn.stdin_mut(), "{}", payload).map_err(|e| {
-        conn.decorate_transport_error(format!("Failed to reject server request: {}", e))
-    })
-}
+use super::connection::McpServerConnection;
 
-/// Sends a JSON-RPC request to an MCP server connection (standalone function,
-/// callable from any context).
+/// Sends a JSON-RPC request to an MCP server connection. The transport owns
+/// request/response correlation, so stdio and HTTP share this entry point.
 pub(in crate::ai) fn send_request_to_conn(
     conn: &mut McpServerConnection,
     id: u64,
     method: &str,
     params: Option<Value>,
 ) -> Result<Value, String> {
-    let request = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        id,
-        method: method.to_string(),
-        params,
-    };
-
-    let request_str = serde_json::to_string(&request)
-        .map_err(|e| format!("Failed to serialize request: {}", e))?;
-
-    writeln!(conn.stdin_mut(), "{}", request_str)
-        .map_err(|e| conn.decorate_transport_error(format!("Failed to send request: {}", e)))?;
-
-    let deadline = Instant::now() + Duration::from_millis(conn.request_timeout_ms);
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(conn.decorate_transport_error(format!(
-                "MCP response timeout after {} ms",
-                conn.request_timeout_ms
-            )));
-        }
-        let remaining_ms = deadline
-            .saturating_duration_since(now)
-            .as_millis()
-            .clamp(1, u64::MAX as u128) as u64;
-        let response_line = conn.read_response_line_with_timeout(remaining_ms)?;
-        match classify_inbound_jsonrpc(&response_line)? {
-            InboundJsonRpc::Notification { .. } => continue,
-            InboundJsonRpc::Request {
-                id: request_id,
-                method,
-            } => {
-                reject_server_request(conn, request_id, &method)?;
-                continue;
-            }
-            InboundJsonRpc::Response(response) => {
-                // Skip responses without an id (null or missing id).
-                // Some MCP servers (such as mcp_ocr) send a redundant
-                // acknowledgement {"jsonrpc":"2.0","id":null,"result":{}} for
-                // the notifications/initialized notification. If not skipped,
-                // that response would be consumed as the next request's reply,
-                // leaving the real response stuck in the buffer and causing an
-                // id mismatch error.
-                let Some(resp_id) = response.id else {
-                    continue;
-                };
-                if resp_id != id {
-                    return Err(format!(
-                        "MCP response id mismatch: expected {}, got {}",
-                        id, resp_id
-                    ));
-                }
-
-                if let Some(error) = response.error {
-                    if let Some(data) = error.data {
-                        return Err(format!(
-                            "MCP error {}: {} ({})",
-                            error.code, error.message, data
-                        ));
-                    } else {
-                        return Err(format!("MCP error {}: {}", error.code, error.message));
-                    }
-                }
-
-                return response.result.ok_or("No result in response".to_string());
-            }
-        }
-    }
+    conn.request(id, method, params)
 }
 
-/// Sends a JSON-RPC notification to an MCP server connection (no id, does not
-/// wait for a response).
-///
-/// In the MCP protocol, messages such as `notifications/initialized` are
-/// notifications, not requests: they carry no `id` field and the server must
-/// not reply. If sent as a request instead (with an `id` and a wait for a
-/// response), some MCP servers close the stdio stream as a protocol violation,
-/// causing an "MCP server closed the stream unexpectedly"
-/// error.
+/// Sends a JSON-RPC notification (no id, no response expected).
 pub(in crate::ai) fn send_notification_to_conn(
     conn: &mut McpServerConnection,
     method: &str,
     params: Option<Value>,
 ) -> Result<(), String> {
-    let mut payload = json!({
-        "jsonrpc": "2.0",
-        "method": method,
-    });
-    if let Some(p) = params {
-        payload["params"] = p;
-    }
-    let payload_str = serde_json::to_string(&payload)
-        .map_err(|e| format!("Failed to serialize notification: {}", e))?;
-
-    writeln!(conn.stdin_mut(), "{}", payload_str).map_err(|e| {
-        conn.decorate_transport_error(format!("Failed to send notification: {}", e))
-    })?;
-    Ok(())
+    conn.notify(method, params)
 }
-
-use super::{
-    connection::{McpServerConnection, spawn_stderr_drain},
-    jsonrpc::{
-        InboundJsonRpc, JsonRpcRequest, classify_inbound_jsonrpc,
-        unsupported_server_request_payload,
-    },
-};
 
 pub(in crate::ai) type SharedMcpClient = Arc<std::sync::Mutex<McpClient>>;
 
@@ -185,16 +69,28 @@ impl McpClient {
             servers: SkipMap::default(),
             next_id: AtomicU64::new(self.next_id.load(Ordering::Relaxed)),
             cached_tool_definitions: RwLock::new(Arc::clone(
-                &*self.cached_tool_definitions.read().unwrap_or_else(|e| e.into_inner()),
+                &*self
+                    .cached_tool_definitions
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner()),
             )),
             cached_resources: RwLock::new(Arc::clone(
-                &*self.cached_resources.read().unwrap_or_else(|e| e.into_inner()),
+                &*self
+                    .cached_resources
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner()),
             )),
             cached_prompts: RwLock::new(Arc::clone(
-                &*self.cached_prompts.read().unwrap_or_else(|e| e.into_inner()),
+                &*self
+                    .cached_prompts
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner()),
             )),
             cached_server_prefixes: RwLock::new(Arc::clone(
-                &*self.cached_server_prefixes.read().unwrap_or_else(|e| e.into_inner()),
+                &*self
+                    .cached_server_prefixes
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner()),
             )),
         }
     }
@@ -208,52 +104,7 @@ impl McpClient {
             return Ok(());
         }
 
-        let mut cmd = Command::new(&config.command);
-        cmd.args(&config.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        unsafe {
-            let _ = cmd.pre_exec(|| {
-                {
-                    libc::signal(libc::SIGINT, libc::SIG_IGN);
-                    libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-                }
-                Ok(())
-            });
-        }
-
-        for (key, value) in &config.env {
-            cmd.env(key, value);
-        }
-
-        let mut process = crate::fork_guard::spawn(&mut cmd)
-            .map_err(|e| format!("Failed to start MCP server '{}': {}", name, e))?;
-
-        let stdin = process.stdin.take().ok_or("Failed to get stdin")?;
-        let stdout = process.stdout.take().ok_or("Failed to get stdout")?;
-        let stderr = process.stderr.take().ok_or("Failed to get stderr")?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            super::io::set_fd_nonblocking(stdout.as_raw_fd())
-                .map_err(|e| format!("Failed to set nonblocking mode: {}", e))?;
-        }
-        let stderr_tail = spawn_stderr_drain(stderr);
-
-        let mut conn = McpServerConnection {
-            config: config.clone(),
-            process,
-            stdin,
-            stdout: BufReader::new(stdout),
-            stderr_tail,
-            request_timeout_ms: config.request_timeout_ms.max(100),
-            tools: Vec::new(),
-            resources: Vec::new(),
-            prompts: Vec::new(),
-        };
+        let mut conn = McpServerConnection::connect(name, config)?;
 
         self.initialize_server(&mut conn)?;
         conn.tools = self.list_tools(&mut conn)?;
@@ -271,11 +122,15 @@ impl McpClient {
         e.contains("broken pipe")
             || e.contains("closed the stream unexpectedly")
             || e.contains("mcp response timeout")
+            || e.contains("mcp http")
+            || e.contains("mcp sse")
             || e.contains("failed waiting for mcp response")
             || e.contains("failed to read response")
             || e.contains("process exited with status")
             || e.contains("failed to get stdin")
             || e.contains("failed to get stdout")
+            || e.contains("connection refused")
+            || e.contains("error sending request")
     }
 
     fn is_protocol_desync_error(err: &str) -> bool {
@@ -293,51 +148,7 @@ impl McpClient {
     }
 
     fn restart_connection(&self, conn: &mut McpServerConnection) -> Result<(), String> {
-        let cfg = conn.config.clone();
-
-        conn.shutdown_and_reap();
-
-        let mut cmd = Command::new(&cfg.command);
-        cmd.args(&cfg.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        unsafe {
-            let _ = cmd.pre_exec(|| {
-                {
-                    libc::signal(libc::SIGINT, libc::SIG_IGN);
-                    libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-                }
-                Ok(())
-            });
-        }
-        for (key, value) in &cfg.env {
-            cmd.env(key, value);
-        }
-
-        let mut process = crate::fork_guard::spawn(&mut cmd)
-            .map_err(|e| format!("Failed to restart MCP server: {}", e))?;
-        let stdin = process.stdin.take().ok_or("Failed to get stdin")?;
-        let stdout = process.stdout.take().ok_or("Failed to get stdout")?;
-        let stderr = process.stderr.take().ok_or("Failed to get stderr")?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            super::io::set_fd_nonblocking(stdout.as_raw_fd())
-                .map_err(|e| format!("Failed to set nonblocking mode: {}", e))?;
-        }
-        let stderr_tail = spawn_stderr_drain(stderr);
-
-        conn.process = process;
-        conn.stdin = stdin;
-        conn.stdout = BufReader::new(stdout);
-        conn.stderr_tail = stderr_tail;
-        conn.request_timeout_ms = cfg.request_timeout_ms.max(100);
-        conn.tools.clear();
-        conn.resources.clear();
-        conn.prompts.clear();
+        conn.restart()?;
 
         self.initialize_server(conn)?;
         conn.tools = self.list_tools(conn)?;
@@ -434,7 +245,7 @@ impl McpClient {
 
     fn initialize_server(&self, conn: &mut McpServerConnection) -> Result<(), String> {
         let params = json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": conn.protocol_version(),
             "capabilities": {
                 "tools": {},
                 "resources": {},
@@ -458,8 +269,7 @@ impl McpClient {
         let result = match self.send_request(conn, "tools/list", None) {
             Ok(v) => v,
             Err(err) => {
-                let is_method_not_found = err.contains("-32601") && err.contains("tools/list");
-                if is_method_not_found {
+                if super::is_method_not_found(&err) {
                     return Ok(Vec::new());
                 }
                 return Err(err);
@@ -482,8 +292,7 @@ impl McpClient {
         let result = match self.send_request(conn, "resources/list", None) {
             Ok(v) => v,
             Err(err) => {
-                let is_method_not_found = err.contains("-32601") && err.contains("resources/list");
-                if is_method_not_found {
+                if super::is_method_not_found(&err) {
                     return Ok(Vec::new());
                 }
                 return Err(err);
@@ -506,8 +315,7 @@ impl McpClient {
         let result = match self.send_request(conn, "prompts/list", None) {
             Ok(v) => v,
             Err(err) => {
-                let is_method_not_found = err.contains("-32601") && err.contains("prompts/list");
-                if is_method_not_found {
+                if super::is_method_not_found(&err) {
                     return Ok(Vec::new());
                 }
                 return Err(err);
@@ -587,12 +395,8 @@ impl McpClient {
                             .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
                         let id2 = self.next_request_id();
                         let params2 = json!({ "name": tool_name, "arguments": arguments.clone() });
-                        let result = send_request_to_conn(
-                            &mut conn2,
-                            id2,
-                            "tools/call",
-                            Some(params2),
-                        )?;
+                        let result =
+                            send_request_to_conn(&mut conn2, id2, "tools/call", Some(params2))?;
                         let content = result["content"]
                             .as_array()
                             .and_then(|arr| arr.first())
@@ -624,7 +428,7 @@ impl McpClient {
     /// holding the `SharedMcpClient` outer lock. The old
     /// `McpClient::call_tool(&self, ...)` required the caller to already hold
     /// the outer lock (`guard.call_tool`), which kept it held throughout
-    /// `writeln` / `read_response_line_with_timeout` / `restart_connection`,
+    /// the blocking transport request/read and `restart_connection`,
     /// blocking other servers' `tool_definitions` / `is_available`. This
     /// method instead holds the outer lock only briefly for the `servers`
     /// lookup and `next_id` allocation, then releases it and does IO while
@@ -721,12 +525,8 @@ impl McpClient {
                         let mut conn2 = conn_arc
                             .lock()
                             .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-                        let result = send_request_to_conn(
-                            &mut *conn2,
-                            id2,
-                            "tools/call",
-                            Some(params2),
-                        )?;
+                        let result =
+                            send_request_to_conn(&mut *conn2, id2, "tools/call", Some(params2))?;
                         let content = result["content"]
                             .as_array()
                             .and_then(|arr| arr.first())
