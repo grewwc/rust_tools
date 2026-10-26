@@ -1243,6 +1243,14 @@ async fn serve_app_returns_mobile_client() {
     );
     let body = resp.1.0;
     assert!(body.contains("id=\"serve-app\""));
+    assert!(
+        body.contains("window.__aserveUi = \"ui-"),
+        "the served page must carry the stamped page id"
+    );
+    assert!(
+        !body.contains("__ASERVE_PAGE_ID__"),
+        "the placeholder must be replaced in the served body"
+    );
     assert!(body.contains("/sessions/"));
     assert!(body.contains("turns/stream"));
     assert!(body.contains("/rewind"));

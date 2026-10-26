@@ -30,6 +30,12 @@ const traceSrc = script.slice(
   script.indexOf("function createInputTrace("),
   script.indexOf("let uiWired = false;"),
 );
+// The IME re-attach after a return to the app: armed on every return, fired
+// once when the keyboard opens again.
+const imeRebindSrc = script.slice(
+  script.indexOf("let imeRebindArmed = true;"),
+  script.indexOf("let uiWired = false;"),
+);
 // The commit path: the input handler that carries a committed word, the
 // composition handler that ends a word, and the turn state that resizes the
 // composer around the focused field.
@@ -422,4 +428,74 @@ test("a committed word is not put back into the field", () => {
   run(context, "promptComposing = true; composingText = \"pu'sh\"; composingStartValue = '';");
   context.prompt.dispatch("compositionend", { data: "朴实" });
   assert.equal(context.prompt.value, "朴实", "the committed word was replaced");
+});
+
+test("the keyboard that opens after a return asks native to re-attach the IME", () => {
+  const calls = [];
+  const context = makeContext({});
+  context.window.AServeNative = { perform: (...args) => { calls.push(args); } };
+  vm.runInContext(imeRebindSrc, context);
+  context.window.innerHeight = 800;
+  run(context, "watchKeyboardViewport();");
+  assert.deepEqual(calls, [], "a closed keyboard must not call native");
+  context.window.innerHeight = 430; // the resize the page sees when the keyboard opens
+  run(context, "watchKeyboardViewport();");
+  assert.equal(calls.length, 1, "the keyboard opening did not ask for a re-attach");
+  assert.equal(calls[0][1], "rebind_ime");
+  assert.equal(calls[0][2], "{}");
+  run(context, "watchKeyboardViewport();");
+  assert.equal(calls.length, 1, "one keyboard opening asked twice");
+});
+
+test("a later keyboard only re-attaches after the app was entered again", () => {
+  const calls = [];
+  const context = makeContext({});
+  context.window.AServeNative = { perform: (...args) => { calls.push(args); } };
+  vm.runInContext(imeRebindSrc, context);
+  context.window.innerHeight = 800;
+  run(context, "watchKeyboardViewport();");
+  context.window.innerHeight = 430;
+  run(context, "watchKeyboardViewport();");
+  assert.equal(calls.length, 1, "the first keyboard was not re-attached");
+  context.window.innerHeight = 800;
+  run(context, "watchKeyboardViewport();");
+  context.window.innerHeight = 430; // a keyboard inside the same visit stays untouched
+  run(context, "watchKeyboardViewport();");
+  assert.equal(calls.length, 1, "a keyboard inside one visit asked again");
+  context.window.innerHeight = 800;
+  run(context, "watchKeyboardViewport(); armImeRebind();");
+  context.window.innerHeight = 430; // the keyboard after coming back to the app
+  run(context, "watchKeyboardViewport();");
+  assert.equal(calls.length, 2, "the keyboard after a return was not re-attached");
+});
+
+test("a shell without the action leaves the page quiet", () => {
+  const context = makeContext({});
+  vm.runInContext(imeRebindSrc, context);
+  context.window.innerHeight = 800;
+  run(context, "watchKeyboardViewport();");
+  context.window.innerHeight = 430;
+  assert.doesNotThrow(() => run(context, "watchKeyboardViewport();"), "a missing bridge must not throw");
+  assert.equal(run(context, "rebindImeForKeyboard();"), false, "no bridge must report no request");
+});
+
+test("a bridge that rejects the call keeps the page alive", () => {
+  const context = makeContext({});
+  context.window.AServeNative = { perform: () => { throw new Error("unknown action"); } };
+  vm.runInContext(imeRebindSrc, context);
+  context.window.innerHeight = 800;
+  run(context, "watchKeyboardViewport();");
+  context.window.innerHeight = 430;
+  assert.doesNotThrow(() => run(context, "watchKeyboardViewport();"), "a rejected action must not throw");
+});
+
+test("the first resize a fresh page sees can already be the keyboard", () => {
+  const calls = [];
+  const context = makeContext({});
+  context.window.AServeNative = { perform: (...args) => { calls.push(args); } };
+  vm.runInContext(imeRebindSrc, context);
+  // No resize at load: the keyboard opening is the first resize this page sees.
+  context.window.innerHeight = 430;
+  run(context, "watchKeyboardViewport();");
+  assert.equal(calls.length, 1, "the keyboard opening was mistaken for the baseline");
 });

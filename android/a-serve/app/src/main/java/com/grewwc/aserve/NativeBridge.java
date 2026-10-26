@@ -46,7 +46,7 @@ final class NativeBridge {
     private static final String[] ACTIONS = {"now", "calendar_read", "calendar_add", "sms",
             "alarm", "timer", "note", "note_create", "note_list", "note_update",
             "file_import", "file_read", "file_save", "location", "screen_capture", "screen_stop",
-            "screen_overlay_settings", "camera_capture", "camera_stop"};
+            "screen_overlay_settings", "camera_capture", "camera_stop", "rebind_ime"};
     private static final int MAX_NOTE_CHARS = 3000;
     private static final int MAX_TITLE_CHARS = 200;
     private static final int MAX_PLACE_CHARS = 200;
@@ -205,6 +205,12 @@ final class NativeBridge {
             activity.performCamera(requestId, "camera_stop".equals(action));
         } else if ("screen_overlay_settings".equals(action)) {
             activity.openOverlaySettings(requestId);
+        } else if ("rebind_ime".equals(action)) {
+            // The page asks for this when the keyboard appears after the app was
+            // away: the IME can still be attached to a connection that no longer
+            // reaches the page, and a keyboard in that state types into nothing.
+            activity.rebindIme();
+            activity.deliverNativeResult(requestId, true, null, null);
         } else {
             activity.deliverNativeResult(requestId, false, "unknown action", null);
         }

@@ -21,6 +21,7 @@ import android.util.Base64;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.inputmethod.InputMethodManager;
 import android.webkit.CookieManager;
 import android.webkit.SslErrorHandler;
 import android.webkit.ValueCallback;
@@ -167,9 +168,36 @@ public final class MainActivity extends Activity {
 
     private void loadApp() {
         if (webView == null) return;
+        releaseIme();
         if (screenCapture != null) screenCapture.close();
         pageReady = false;
         webView.loadUrl(ServerUrl.freshAppUrl(serverOrigin, System.currentTimeMillis()));
+    }
+
+    /**
+     * Hand the keyboard back before a document swap.
+     *
+     * <p>A page replaced while the IME still holds a connection can leave the
+     * replacement's composer typing into a dead connection: the field keeps DOM
+     * focus and the keyboard stays up, yet no keystroke reaches the renderer.</p>
+     */
+    private void releaseIme() {
+        try {
+            InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            if (imm != null) imm.hideSoftInputFromWindow(webView.getWindowToken(), 0);
+            webView.clearFocus();
+        } catch (Throwable ignored) {
+            // A half-built WebView must not break the reload path.
+        }
+    }
+
+    /** Re-attach the IME to whatever the page has focused right now. */
+    void rebindIme() {
+        runOnUiThread(() -> {
+            if (webView == null) return;
+            InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            if (imm != null) imm.restartInput(webView);
+        });
     }
 
     /**
@@ -695,6 +723,17 @@ public final class MainActivity extends Activity {
         // A singleTask activity receives another launcher intent when its icon is
         // tapped again. Keep the live document so WebView focus and IME composition
         // survive; cold starts and explicit server changes still call loadApp().
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        // Another window (a dialog, the app switcher) can take the IME away and
+        // hand back a binding that never reaches this WebView. When the keyboard
+        // is still up, make it re-attach to the field the page has focused.
+        if (!hasFocus || webView == null) return;
+        InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (imm != null && imm.isAcceptingText()) rebindIme();
     }
 
     @Override

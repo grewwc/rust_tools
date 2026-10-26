@@ -3,6 +3,7 @@
 
 use super::*;
 use axum::response::Redirect;
+use sha2::{Digest, Sha256};
 
 pub(crate) async fn healthz() -> Json<Healthz> {
     Json(Healthz {
@@ -15,6 +16,16 @@ pub(crate) async fn healthz() -> Json<Healthz> {
 /// an installed PWA. The page
 /// itself carries no session data; the bearer token lives in the phone's
 /// `localStorage` and every API call reuses the existing authed routes.
+/// Page body with `__ASERVE_PAGE_ID__` stamped to a short hash of the source
+/// bytes. The page displays that id, so a screenshot identifies which page
+/// build a phone actually runs.
+static APP_PAGE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let raw = include_str!("app.html");
+    let digest = Sha256::digest(raw.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    raw.replace("__ASERVE_PAGE_ID__", &hex[..8])
+});
+
 // `no-store` keeps phones from running a stale cached copy of this page
 // after an upgrade (a stale page hides new diagnostics like the stored
 // token length below the save row).
@@ -24,7 +35,7 @@ pub(crate) async fn serve_app() -> (
 ) {
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
-        Html(include_str!("app.html")),
+        Html(APP_PAGE.as_str()),
     )
 }
 

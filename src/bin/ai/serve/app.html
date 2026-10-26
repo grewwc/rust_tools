@@ -627,9 +627,12 @@ select, summary { touch-action:manipulation; }
 <div id="viewer"><img id="viewerimg" alt=""></div>
 <script>
 "use strict";
-// Document generation marker: the Android shell reloads a document that
-// predates it, because an old page cannot run the newer reconnect logic.
-window.__aserveUi = "2026-10-20";
+// Document generation marker: the Android shell reloads a document whose
+// marker is missing, because an old page cannot run the newer reconnect
+// logic. The server stamps the value on every `/app` response with a content
+// hash of this file, so a screenshot shows the exact page build a phone runs.
+window.__aserveUi = "ui-__ASERVE_PAGE_ID__";
+const PAGE_ID = window.__aserveUi;
 // Minimal mobile client for the serve HTTP API (same routes as serve-chat).
 // Same-origin by default: when opened via http://<host>:<port>/app the base is
 // this page's origin. Token is kept in localStorage, never in the URL.
@@ -2737,13 +2740,13 @@ function renderSessionBar() {
   const s = lastItems.find((x) => x.id === sessionId);
   if (!s) {
     $("sesstitle").textContent = sessionId ? "session " + sessionId.slice(0, 8) + "…" : "no session — tap ＋";
-    $("sessmeta").textContent = "";
+    $("sessmeta").textContent = PAGE_ID;
     return;
   }
   $("sesstitle").textContent = (s.marked ? "★ " : "") + sessionTitle(s);
   let meta = s.id.slice(0, 8) + " · " + Math.max(1, Math.round(s.size_bytes / 1024)) + " KB";
   if (lastMsgCount != null) meta += " · " + lastMsgCount + " msgs";
-  $("sessmeta").textContent = meta;
+  $("sessmeta").textContent = meta + " · " + PAGE_ID;
 }
 let sessFilter = "";
 const SESSION_HOLD_MS = 650;
@@ -4302,6 +4305,30 @@ function createInputTrace(prompt) {
     },
   };
 }
+// After the app was in the background the keyboard can come back attached to a
+// connection that no longer reaches this page: the field keeps focus and the
+// keyboard stays up while every keystroke produces no DOM event at all. Ask the
+// native shell to re-attach the IME once the keyboard appears again; a shell
+// that does not know the action answers "unknown action" and changes nothing.
+let imeRebindArmed = true;
+// The page loads with the keyboard down, so this is the height to compare a
+// later resize against; the first resize a fresh page sees is often the
+// keyboard appearing, which must not be mistaken for the baseline.
+let imeViewportHeight = window.innerHeight;
+function armImeRebind() { imeRebindArmed = true; }
+function rebindImeForKeyboard() {
+  if (!imeRebindArmed) return false;
+  const bridge = window.AServeNative;
+  if (!bridge || typeof bridge.perform !== "function") return false;
+  imeRebindArmed = false;
+  try { bridge.perform("ime-" + Date.now(), "rebind_ime", "{}"); } catch (error) { return false; }
+  return true;
+}
+function watchKeyboardViewport() {
+  const height = window.innerHeight;
+  if (height >= imeViewportHeight * 0.8) { imeViewportHeight = Math.max(imeViewportHeight, height); return; }
+  rebindImeForKeyboard();
+}
 let uiWired = false;
 function wire() {
   // Show what is actually stored: typing alone never reaches localStorage
@@ -4322,6 +4349,13 @@ function wire() {
   }
   window.addEventListener("resize", (event) => inputTrace.record(event));
   document.addEventListener("visibilitychange", (event) => inputTrace.record(event));
+  // Arm the IME re-attach on every return to the app, then fire it when the
+  // keyboard appears again: the field already has focus by then, so the native
+  // shell can re-attach to what is actually focused.
+  window.addEventListener("resize", watchKeyboardViewport, { passive: true });
+  window.addEventListener("focus", armImeRebind);
+  window.addEventListener("pageshow", () => { imeViewportHeight = window.innerHeight; armImeRebind(); });
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") armImeRebind(); });
   $("inputdiagnostics").onclick = () => {
     const output = $("inputtrace");
     output.value = inputTrace.export();
