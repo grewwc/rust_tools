@@ -524,6 +524,12 @@ test("phone display formula spacing stays compact", () => {
   assert.match(html, /@media \(max-width:700px\) \{[\s\S]*?\.msg\.md \.math\.display \{ margin:4px 0; padding:0; \}/);
 });
 
+test("assistant cards span the row so a collapsed fold stays tappable", () => {
+  const rule = html.match(/\.msg\.asst \{[^}]*\}/);
+  assert.ok(rule, "the assistant bubble rule is missing");
+  assert.match(rule[0], /align-self:stretch/, "a content-sized assistant card leaves unclickable dead space beside a collapsed fold");
+});
+
 test("all delimiters and multiline TeX are protected before Markdown", () => {
   const { render } = harness();
   const input = String.raw`$x^2$ \(y_1\) $$a*b*c$$ \[\begin{aligned}

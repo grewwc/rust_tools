@@ -292,6 +292,8 @@ test("prose split by a tool round renders as separate answer bubbles", () => {
   const answers = h.box.children.filter((item) => item.classList && !item.summary && !item.body);
   const texts = answers.map((item) => item.innerHTML).filter(Boolean);
   assert.deepEqual(texts, ["first segment.", "second segment."]);
+  const shape = h.box.children.map((item) => (item.summary ? "fold" : item.innerHTML || "status"));
+  assert.deepEqual(shape, ["first segment.", "fold", "second segment.", "status"]);
 });
 
 test("replayed phases remain visible after an early assistant answer", () => {

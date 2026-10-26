@@ -225,8 +225,12 @@ select, summary { touch-action:manipulation; }
 .msg.md pre, .msg.md code { letter-spacing:normal; }
 .msg.pending { color:var(--dim); font-style:italic; }
 .msg.user { align-self:flex-end; background:var(--acc-solid); color:var(--on-acc); }
-.msg.asst { align-self:flex-start; background:var(--panel); border:1px solid var(--line); }
-.msg details { font-size:13px; color:var(--dim); }
+/* Assistant cards span the row (capped by max-width) so a collapsed fold stays
+   tappable across the whole card instead of only over its text. */
+.msg.asst { align-self:stretch; background:var(--panel); border:1px solid var(--line); }
+/* `touch-action:manipulation` keeps a double tap on a fold from zooming the page,
+   so the second tap still lands as a click (see collapseFoldForTap). */
+.msg details { font-size:13px; color:var(--dim); touch-action:manipulation; }
 /* Desktop keeps the compact whole-bubble shortcut; phones use the explicit
    action below so a normal transcript tap cannot destroy history. */
 .msg.rewindable { cursor:pointer; }
@@ -993,6 +997,24 @@ function handlePreviewClick(event) {
   const button = target.closest("[data-preview-view]");
   const preview = button && button.closest(".code-preview");
   if (preview) setPreviewView(preview, button.dataset.previewView);
+}
+// Folding an open card back from its own header means scrolling up to a summary
+// that has already left the viewport, so a double tap anywhere else on an open
+// fold closes it. Single taps keep their meaning: keyboard activation reports
+// detail 0, and taps on controls inside the fold are left to those controls.
+let lastFoldTap = { at: 0, x: 0, y: 0 };
+function collapseFoldForTap(event) {
+  if (!event.detail) return;
+  const target = event.target;
+  if (!target || !target.closest || target.closest("button, a, input, select, textarea, summary")) return;
+  const now = Date.now();
+  const double = now - lastFoldTap.at < 350 &&
+    Math.abs(event.clientX - lastFoldTap.x) < 40 && Math.abs(event.clientY - lastFoldTap.y) < 40;
+  lastFoldTap = double ? { at: 0, x: 0, y: 0 } : { at: now, x: event.clientX, y: event.clientY };
+  if (!double) return;
+  for (let node = target; node; node = node.parentNode) {
+    if (node.tagName === "DETAILS" && node.open) { node.open = false; break; }
+  }
 }
 // The agent sends a phone action as JSON over the serve input channel. The
 // page validates it again before the bridge sees it and drops unknown fields.
@@ -4322,6 +4344,7 @@ function wire() {
   $("callow").onclick = () => answerConfirm(true);
   $("cdeny").onclick = () => answerConfirm(false);
   $("msgs").addEventListener("click", handlePreviewClick);
+  $("msgs").addEventListener("click", collapseFoldForTap);
   $("msgs").addEventListener("scroll", scheduleJumpButtonUpdate, { passive: true });
   $("jumpbottom").onclick = () => scrollToLatest(true);
   $("questionbtn").onclick = (event) => { event.stopPropagation(); openQuestionPanel(); };

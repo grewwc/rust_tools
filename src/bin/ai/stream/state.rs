@@ -124,9 +124,6 @@ pub(super) struct SseEvent {
 
 pub(super) struct StreamRenderState {
     pub(super) markdown: MarkdownStreamRenderer,
-    /// Separate digest filter for serve deltas: terminal display and remote
-    /// streaming consume the same chunks independently.
-    pub(super) serve_body_digest_filter: DigestTerminalFilter,
     /// Withhold non-thinking assistant prose until the stream outcome and the
     /// driver's final-response gates are known.
     pub(super) defer_assistant_body: bool,
@@ -161,7 +158,6 @@ impl StreamRenderState {
     fn new() -> Self {
         Self {
             markdown: MarkdownStreamRenderer::new(),
-            serve_body_digest_filter: DigestTerminalFilter::new(),
             defer_assistant_body: false,
             serve_body_pending_published: false,
             waiting_hint_active: false,

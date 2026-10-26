@@ -1123,11 +1123,11 @@ mod tests {
     }
 
     #[test]
-    fn integrated_critic_prompt_keeps_common_knowledge_check_lightweight() {
+    fn integrated_critic_prompt_keeps_simple_answer_check_lightweight() {
         let prompt = include_str!("prompts/integrated_critic_revise.md");
         assert!(prompt.contains("within this response, not in a separate review round"));
-        assert!(prompt.contains("For simple common knowledge or direct deductions"));
-        assert!(prompt.contains("no extra investigation, tools, or extended deliberation"));
+        assert!(prompt.contains("For simple answers or direct deductions"));
+        assert!(prompt.contains("no extra investigation solely for this check"));
         assert!(prompt.contains("narrowing or removing the claim, or stating the unknown"));
         assert!(prompt.contains("never present this self-review as independent verification"));
     }
@@ -1151,6 +1151,9 @@ mod tests {
         // The consequential-claim check is a named guardrails rule, not a
         // restatement: the critic references it so both blocks stay single-sourced.
         assert!(prompt.contains("apply `Match the evidence to the claim it supports`"));
+        assert!(!prompt.contains(
+            "check the subject, time window, measurement scope, and artifact version"
+        ));
         assert!(prompt.contains("apply `A refuted premise invalidates its dependents`"));
         // Simple, already-determined answers must not turn into a confirmation loop.
         assert!(prompt.contains("no confirmation question when the answer is already determined"));
