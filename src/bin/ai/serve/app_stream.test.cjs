@@ -11,6 +11,7 @@ function streamHarness() {
   const timers = [];
   const box = {
     children: [],
+    appendChild(node) { if (!this.children.includes(node)) this.children.push(node); },
     insertBefore(node, before) {
       this.children = this.children.filter((child) => child !== node);
       this.children.splice(this.children.indexOf(before), 0, node);
@@ -25,9 +26,10 @@ function streamHarness() {
   }
   const context = vm.createContext({
     box, sid: "s", sessionId: "s", finished: false, turnError: false,
+    runEpoch: 0, eventFailures: 0, confirmPollSeq: 0,
     setTimeout: (fn, delay) => { timers.push(delay); return timers.length; }, clearTimeout() {},
     shouldFollowOutput: () => false, followOutput() {},
-    renderMarkdown: (text) => text, decorateMath() {},
+    renderMarkdown: (text) => text, decorateMath() {}, decorateAndLoad() {},
     showConfirm() {}, hideConfirm() {}, confirmShown: null,
     addMsgMd() { const item = node(); box.children.push(item); return item; },
     addFold(title, text) {
@@ -42,7 +44,8 @@ function streamHarness() {
   vm.runInContext(script.slice(script.indexOf("function toolArgsOf("), script.indexOf("const FOLD_ROLE_LABELS")), context);
   vm.runInContext(script.slice(script.indexOf("function createThinkingFold("), script.indexOf("// The three override picks")), context);
   vm.runInContext(script.slice(script.indexOf("function replyPaintDelay("), script.indexOf("function sessionTitle(")), context);
-  const start = script.indexOf('  const bubble = addMsgMd("", box);');
+  const start = script.indexOf('  let bubble = addMsgMd("", box);');
+  assert.ok(start > 0);
   vm.runInContext(script.slice(start, script.indexOf("  let turnStarted = false;", start)), context);
   // The watchdogs are `const` in the real script, so they are script-scoped
   // there. As globals here they are reachable from the block loop, which is
@@ -82,9 +85,11 @@ function streamHarness() {
     },
     titles: () => box.children.filter((item) => item.summary).map((item) => item.summary.textContent),
     bodies: () => box.children.filter((item) => item.body).map((item) => item.body.textContent),
-    pending: () => vm.runInContext("bubble.textContent", context),
+    pending: () => vm.runInContext("phaseBubble.textContent", context),
+    pendingVisible: () => vm.runInContext("box.children.includes(phaseBubble)", context),
     fail: () => vm.runInContext('fail("turn failed")', context),
-    reply: () => vm.runInContext("bubble.innerHTML", context),
+    reply: () => vm.runInContext("(bubble || answerBubbles.at(-1)).innerHTML", context),
+    answerCount: () => vm.runInContext("answerBubbles.filter((b) => b.innerHTML).length", context),
   };
 }
 
@@ -119,7 +124,45 @@ function replayHarness() {
     context, msgs, view, requests,
     emit(kind, payload) { context.handleReplayEvent("s", kind, JSON.stringify(payload ?? {}), view); },
     status: () => view.box.children.at(-1).textContent,
+    reply: () => view.box.children.at(-2).textContent,
     titles: () => view.box.children.filter((item) => item.summary).map((item) => item.summary.textContent),
+  };
+}
+
+function attachmentHarness(headersOnly = false) {
+  const h = replayHarness(), c = h.context, timers = new Map(), requests = [];
+  h.view.remove();
+  let timerId = 0, polls = 0, loads = 0;
+  Object.assign(c, {
+    eventActive: false, eventAbort: null, eventSession: "", recoveredView: null,
+    eventStreamEnded: false, turns: new Map(), store: { base: "https://server" },
+    turnRunning: true, turnRunningAt: Date.now(), RUNNING_SAMPLE_TTL_MS: 60000,
+    AbortController, TextDecoder, headers: () => ({}), syncStopButton() {},
+    ensureConfirmPoll() { polls++; }, stopConfirmPoll() {}, addMsg() {},
+    loadHistory() { loads++; },
+    setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    async fetch(url, { signal }) {
+      const request = { url, signal }; requests.push(request);
+      if (headersOnly) return new Promise((resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+      return { ok: true, body: { getReader: () => ({ read: () => new Promise((resolve, reject) => {
+        request.frame = (frame) => resolve({ value: new TextEncoder().encode(frame), done: false });
+        signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      }) }) } };
+    },
+  });
+  vm.runInContext(script.slice(script.indexOf("function parseBlock("), script.indexOf("async function send()")), c);
+  const settle = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+  return {
+    c, requests, timers, settle, polls: () => polls, loads: () => loads,
+    fire(ms) {
+      const timer = [...timers].find(([, item]) => item.ms === ms);
+      assert.ok(timer, `missing ${ms}ms timer`);
+      timers.delete(timer[0]); timer[1].fn();
+    },
+    async frame(text) { requests.at(-1).frame(text); await settle(); },
   };
 }
 
@@ -141,7 +184,8 @@ test("replayed phases paint visible status and separate thinking across tools", 
   h.emit("thinking", { text: "second phase" });
   assert.equal(h.titles().filter((title) => title === "thinking").length, 2);
   h.emit("delta", { delta: "answer" });
-  assert.equal(h.status(), "answer");
+  assert.equal(h.reply(), "answer");
+  assert.equal(h.status(), "Responding…");
 });
 
 test("a reattach rebuilds fresh DOM from the retained log on every connection", async () => {
@@ -176,6 +220,89 @@ test("a reattach rebuilds fresh DOM from the retained log on every connection", 
   assert.deepEqual(statuses, ["Thinking…", "Thinking…"]);
   assert.equal(urls.length, 2);
   assert.ok(urls.every((url) => url.endsWith("after=0")));
+});
+
+for (const headersOnly of [true, false]) test(`a stalled event stream reconnects without switching screens (headers=${headersOnly})`, async () => {
+  const h = attachmentHarness(headersOnly), pending = h.c.attachEvents();
+  await h.settle();
+  assert.ok(h.polls() > 0, "state fallback stays enabled while events are attached");
+  h.fire(25000);
+  await pending;
+  assert.equal(h.requests[0].signal.aborted, true);
+  h.fire(2000);
+  await h.settle();
+  assert.equal(h.requests.length, 2);
+  assert.ok(h.requests.every((r) => r.url.endsWith("/events?after=0")), "only GET replay is retried, never the user POST");
+  h.c.abortEvents();
+  await h.settle();
+  assert.equal(h.timers.size, 0);
+});
+
+test("replay heartbeats renew liveness without timing out a pending confirmation", async () => {
+  const h = attachmentHarness(), pending = h.c.attachEvents();
+  await h.settle();
+  const first = [...h.timers].find(([, t]) => t.ms === 25000)[0];
+  await h.frame(': keepalive\n\n');
+  assert.equal(h.timers.has(first), false);
+  await h.frame('event: confirm_request\ndata: {"id":1,"token":"wait","prompt":"continue?"}\n\n');
+  h.fire(300000);
+  assert.equal(h.requests[0].signal.aborted, false);
+  await h.frame('event: confirm_done\ndata: {}\n\n');
+  h.fire(300000);
+  await pending;
+  assert.equal(h.requests[0].signal.aborted, true);
+});
+
+test("replay transport failures fall back to history after a bounded retry budget", async () => {
+  const h = attachmentHarness(true);
+  h.c.eventFailures = 4;
+  const pending = h.c.attachEvents();
+  await h.settle(); h.fire(25000); await pending;
+  assert.equal(h.c.eventFailures, 5);
+  await h.c.attachEvents();
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.loads(), 1);
+  assert.ok(h.polls() > 0);
+});
+
+test("live phases remain visible after an early assistant answer", () => {
+  const h = streamHarness();
+  h.connect();
+  h.emit("delta", { delta: "I will check that." });
+  h.emit("tool", { id: "read", name: "read_file", phase: "started" });
+  assert.match(h.pending(), /Running read_file/);
+  assert.equal(h.reply(), "I will check that.");
+  h.emit("tool", { id: "read", name: "read_file", phase: "finished", ok: true });
+  assert.match(h.pending(), /Processing/);
+  h.emit("thinking", { text: "next step" });
+  assert.match(h.pending(), /Thinking/);
+  assert.equal(h.reply(), "I will check that.");
+});
+
+test("prose split by a tool round renders as separate answer bubbles", () => {
+  const h = streamHarness();
+  h.connect();
+  h.emit("delta", { delta: "first segment." });
+  h.emit("answer_pending");
+  h.emit("tool", { id: "read", name: "read_file", phase: "started" });
+  h.emit("tool", { id: "read", name: "read_file", phase: "finished", ok: true });
+  h.emit("delta", { delta: "second segment." });
+  h.flush && h.flush();
+  assert.equal(h.answerCount(), 2);
+  const answers = h.box.children.filter((item) => item.classList && !item.summary && !item.body);
+  const texts = answers.map((item) => item.innerHTML).filter(Boolean);
+  assert.deepEqual(texts, ["first segment.", "second segment."]);
+});
+
+test("replayed phases remain visible after an early assistant answer", () => {
+  const h = replayHarness();
+  h.emit("delta", { delta: "I will check that." });
+  h.emit("tool", { id: "read", name: "read_file", phase: "started" });
+  assert.equal(h.status(), "Running read_file…");
+  h.emit("tool", { id: "read", name: "read_file", phase: "finished", ok: true });
+  assert.equal(h.status(), "Processing…");
+  h.emit("thinking", { text: "next step" });
+  assert.equal(h.status(), "Thinking…");
 });
 
 test("pending HTTP request paints a connection indicator before any SSE event", () => {
@@ -249,6 +376,7 @@ test("live tools separate real thinking phases, while logs cannot split tokens",
   h.emit("delta", { delta: "Final answer" });
   h.emit("done");
   assert.equal(h.reply(), "Final answer");
+  assert.equal(h.pendingVisible(), false, "a completed turn must not retain a running indicator");
 });
 
 test("parallel tool completion and confirmation preserve the remaining active status", () => {
@@ -290,7 +418,11 @@ test("replayed final text replaces provisional deltas", () => {
   const h = replayHarness();
   h.emit("delta", { delta: "provisional" });
   h.emit("replace", { text: "authoritative" });
-  assert.equal(h.status(), "authoritative");
+  assert.equal(h.reply(), "authoritative");
+  assert.equal(h.status(), "Responding…");
+  h.emit("replace", { text: "" });
+  assert.equal(h.reply(), "");
+  assert.equal(h.status(), "Processing…");
 });
 
 test("EOF without the done event follows server history instead of declaring completion", () => {
@@ -300,7 +432,8 @@ test("EOF without the done event follows server history instead of declaring com
 test("a finished event stream is not re-attached on every poll, but a new turn is", async () => {
   let attachCalls = 0;
   const context = vm.createContext({
-    sessionId: "s", confirmBusy: false, runEpoch: 0,
+    sessionId: "s", confirmBusy: false, runEpoch: 0, confirmPollSeq: 0,
+    eventActive: false, eventSession: "", eventFailures: 0,
     turnRunning: false, turnRunningAt: 0, turns: new Map(), staleSession: "",
     confirmShown: null, eventStreamEnded: false, NATIVE_PREFIX: "@@",
     api: async () => ({ json: async () => ({ running: true, pending: null }) }),
@@ -328,8 +461,35 @@ test("a finished event stream is not re-attached on every poll, but a new turn i
 });
 
 test("the terminal marker ends the reattach loop instead of rescheduling it", () => {
-  assert.match(script, /if \(block\.kind === "done"\) \{ finished = true; eventStreamEnded = true; break; \}/);
+  assert.match(script, /if \(block\.kind === "done"\) \{\s+finished = true; eventStreamEnded = true; eventFailures = 0; confirmPollSeq\+\+;\s+break;\s+\}/);
   assert.match(script, /if \(!eventStreamEnded\) void attachEvents\(\);/);
+});
+
+test("a terminal replay leaves no running view or retry timers", async () => {
+  const h = attachmentHarness(), pending = h.c.attachEvents();
+  await h.settle();
+  await h.frame('event: done\ndata: {}\n\n');
+  await pending;
+  assert.equal(h.c.eventStreamEnded, true);
+  assert.equal(h.c.eventActive, false);
+  assert.equal(h.c.recoveredView, null);
+  assert.equal(h.timers.size, 0);
+  assert.equal(h.loads(), 1);
+});
+
+test("a stale running sample cannot undo a newer idle sample", async () => {
+  const h = attachmentHarness(), c = h.c, responses = [];
+  Object.assign(c, { confirmBusy: false, staleSession: "", confirmShown: null,
+    api: () => new Promise((resolve) => responses.push((body) => resolve({ json: async () => body }))),
+  });
+  vm.runInContext(script.slice(script.indexOf("async function pollConfirm()"), script.indexOf("function isTurnRunning()")), c);
+  const old = c.pollConfirm(), fresh = c.pollConfirm();
+  responses[1]({ running: false, pending: null });
+  await fresh;
+  responses[0]({ running: true, pending: null });
+  assert.equal(await old, null);
+  assert.equal(c.turnRunning, false);
+  assert.equal(h.requests.length, 0);
 });
 
 test("reconnect does not bind input listeners twice and diagnostics never contain typed text", () => {

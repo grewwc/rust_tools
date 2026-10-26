@@ -216,6 +216,15 @@ test("the composer box gives its height back when the text is deleted", () => {
   assert.equal(context.prompt.style.height, "40px", "the composer box kept the height of the deleted line");
 });
 
+test("native field-sizing engines never get a scripted height write", () => {
+  const context = makeContext({ CSS: { supports: (_prop, _value) => true } });
+  context.prompt.value = "multi\nline\ntext";
+  run(context, "traceMark = (what) => { marks.push(what); };");
+  run(context, "growPrompt();");
+  assert.equal(context.prompt.style.height, "44px", "the focused field's geometry was rewritten");
+  assert.deepEqual(context.marks, [], "a resize mark fired on a native-sizing engine");
+});
+
 test("the input trace reports DOM observations without inferring keyboard mode", () => {
   const prompt = { value: "", style: { height: "44px" } };
   const context = vm.createContext({

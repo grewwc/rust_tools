@@ -2494,6 +2494,10 @@ fn render_turn_stream_to_with_confirm(
     // exactly like the local turn output. Piped output stays raw so
     // captures keep clean bytes.
     let mut markdown = MarkdownStreamRenderer::new_with_tty(tty);
+    // Body bytes already painted by `delta`. `replace` is authoritative and
+    // usually repeats them; a terminal cannot rewind the rows, so only the
+    // not-yet-rendered suffix is printed.
+    let mut streamed_body = String::new();
     loop {
         raw.clear();
         if reader.read_line(&mut raw)? == 0 {
@@ -2690,6 +2694,7 @@ fn render_turn_stream_to_with_confirm(
                     let _ = write!(out, "{text}");
                 }
                 if !text.is_empty() {
+                    streamed_body.push_str(&text);
                     line_open = !text.ends_with('\n');
                 }
                 let _ = out.flush();
@@ -2758,6 +2763,59 @@ fn render_turn_stream_to_with_confirm(
                 // The child's own resolution frame: an answered question already
                 // cleared the slot server-side, so there is nothing to render
                 // (and it must not fall into the `_` arm's footer).
+            }
+            "replace" => {
+                // The daemon sends the accepted final body after the
+                // provisional `delta` stream. Render only the part beyond what
+                // was already painted (typically a final-gate suffix such as a
+                // runtime warning); an identical body is a no-op, and a body
+                // received without deltas renders in full. This event must
+                // never reach the observer-row arm below: that arm prints its
+                // payload verbatim, which leaks the `{"text":...}` envelope
+                // into the scrollback.
+                hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
+                answer_pending = false;
+                if tty {
+                    let _ = markdown.flush_pending_to(out);
+                }
+                close_thinking_status(
+                    &mut thinking_active,
+                    &mut line_open,
+                    thinking_summary(thinking_newlines, thinking_chars),
+                    &mut thinking_body,
+                    tty,
+                    out,
+                );
+                let text = serde_json::from_str::<serde_json::Value>(payload)
+                    .ok()
+                    .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
+                    .unwrap_or_default();
+                if let Some(suffix) = text.strip_prefix(streamed_body.as_str()) {
+                    if !suffix.is_empty() {
+                        if tty {
+                            let _ = markdown.write_chunk_to(out, suffix, false);
+                        } else {
+                            let _ = write!(out, "{suffix}");
+                        }
+                        line_open = !suffix.ends_with('\n');
+                        let _ = out.flush();
+                    }
+                } else {
+                    // The accepted body is not an extension of the streamed
+                    // text (a gate rewrote or rejected it). Printing the
+                    // payload would expose raw JSON and duplicating the whole
+                    // body would leave two conflicting answers; point at the
+                    // canonical answer instead.
+                    if line_open {
+                        let _ = writeln!(out);
+                        line_open = false;
+                    }
+                    let _ = writeln!(
+                        out,
+                        "[serve-chat] final answer was revised; run /history last to view it."
+                    );
+                }
+                streamed_body = text;
             }
             _ => {
                 // Same ordering guarantee as the `delta` arm: observer footers
@@ -4032,6 +4090,46 @@ mod tests {
             "unexpected: {}",
             String::from_utf8_lossy(&buf)
         );
+    }
+
+    #[test]
+    fn sse_replace_event_never_leaks_its_json_envelope() {
+        // `replace` repeats the final accepted body after the deltas. The
+        // scrollback must not print the `{"text":...}` envelope as a footer,
+        // on a TTY or when piped.
+        let body = "event: delta\ndata: {\"delta\": \"answer\"}\n\nevent: replace\ndata: {\"text\": \"answer\"}\n\nevent: done\ndata: \n\n";
+        for tty in [false, true] {
+            let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+            let mut buf = Vec::new();
+            render_turn_stream_to(resp, &mut buf, tty).expect("render");
+            let out = String::from_utf8(buf).expect("utf8");
+            assert!(out.contains("answer"), "missing body: {out}");
+            assert!(!out.contains("{\"text\""), "raw replace payload: {out}");
+            assert!(!out.contains("\\\"text\\\""), "raw escaped payload: {out}");
+        }
+    }
+
+    #[test]
+    fn sse_replace_event_renders_only_the_appended_suffix() {
+        // The accepted body may append a final-gate warning after the streamed
+        // prose. Only that suffix is missing from the scrollback.
+        let body = "event: delta\ndata: {\"delta\": \"answer\"}\n\nevent: replace\ndata: {\"text\": \"answer\\n\\n[Runtime warning] revised\"}\n\nevent: done\ndata: \n\n";
+        let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        assert_eq!(
+            String::from_utf8(buf).expect("utf8"),
+            "answer\n\n[Runtime warning] revised\n"
+        );
+    }
+
+    #[test]
+    fn sse_replace_event_without_deltas_renders_the_final_body() {
+        let body = "event: replace\ndata: {\"text\": \"full answer\"}\n\nevent: done\ndata: \n\n";
+        let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        assert_eq!(String::from_utf8(buf).expect("utf8"), "full answer\n");
     }
 
     #[test]

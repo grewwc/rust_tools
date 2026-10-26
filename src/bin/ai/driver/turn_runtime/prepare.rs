@@ -1148,6 +1148,12 @@ mod tests {
         assert!(prompt.contains(
             "for simple answers add no citations, qualifiers, or extra steps unless the claim would change what the reader does"
         ));
+        // The consequential-claim check is a named guardrails rule, not a
+        // restatement: the critic references it so both blocks stay single-sourced.
+        assert!(prompt.contains("apply `Match the evidence to the claim it supports`"));
+        assert!(prompt.contains("apply `A refuted premise invalidates its dependents`"));
+        // Simple, already-determined answers must not turn into a confirmation loop.
+        assert!(prompt.contains("no confirmation question when the answer is already determined"));
     }
 
     #[test]

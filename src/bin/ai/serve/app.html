@@ -328,6 +328,16 @@ select, summary { touch-action:manipulation; }
   flex:1; min-height:44px; max-height:30dvh; padding:9px 10px; resize:none;
   -webkit-user-select:text; user-select:text; -webkit-touch-callout:default;
 }
+/* Let the browser own the textarea's height where it can. Some Android
+   keyboards (observed on Chrome/148 WebView) drive pinyin without DOM
+   composition events, so JS cannot tell when an IME owns the field; a
+   scripted height rewrite mid-input then restarts the input connection and
+   candidate commits never reach the field. Native sizing changes geometry
+   without touching the input connection. Older engines ignore this and keep
+   the measured JS fallback below. */
+@supports (field-sizing: content) {
+  #prompt { field-sizing: content; }
+}
 #conn { display:none; gap:6px; padding:8px 12px; background:var(--panel); border-top:1px solid var(--line); }
 #conn.open { display:flex; }
 #conn:not(.open) ~ #inputtrace { display:none; }
@@ -703,6 +713,8 @@ let lastMsgCount = null; // message count from the last history load
 let canonicalHistoryTotal = 0; // full canonical count, including rows outside the 200-row window
 let historySession = ""; // session whose canonical rows back historyKeys
 let historyKeys = []; // visible canonical rows currently mounted before any live turn UI
+let historyLoadSeq = 0;
+const pendingUserInputs = new Map(); // local rows survive until canonical history acknowledges them
 // Live turns, one entry per session that is streaming right now: the page can
 // hold a turn in one session, switch to another, and start a second turn there.
 // Each entry owns the container its stream writes into, so concurrent streams
@@ -755,6 +767,8 @@ let confirmShown = null; // {id, prompt} currently on screen; null when hidden
 let confirmBusy = false; // one answer POST at a time: a double tap must not send two
 let confirmPollTimer = null; // keeps answering native requests even when history follow stops
 let eventAbort = null; // AbortController for the reattached event stream
+let eventFailures = 0;
+let confirmPollSeq = 0;
 let eventActive = false; // one reattach stream at a time
 let eventSession = ""; // session the reattach stream belongs to
 let recoveredView = null; // progress card rendered from replayed events
@@ -1464,6 +1478,11 @@ function composerInUse() {
 }
 function growPrompt() {
   const p = $("prompt");
+  // When the browser sizes the field itself, a scripted height write is both
+  // unnecessary and harmful: it can restart the input connection on keyboards
+  // that do not emit DOM composition events, so leave geometry to the engine.
+  if (typeof CSS !== "undefined" && !!CSS &&
+      typeof CSS.supports === "function" && CSS.supports("field-sizing", "content")) return;
   const phone = window.matchMedia && window.matchMedia("(max-width:700px)").matches;
   const viewportRatio = phone ? 0.38 : 0.3;
   if (promptComposing) return; // a resize mid-composition cancels the word
@@ -2208,9 +2227,13 @@ function createLiveActivity(parent, before) {
   let phase = "Connecting…";
   let waiting = false;
   let subagents = null;
+  // Tool/thinking cards insert before the *current* answer bubble. A turn can
+  // hold several answer bubbles (prose, then tools, then more prose), so the
+  // answer-segment owner moves this anchor whenever it seals a bubble.
+  let anchor = before;
   const insert = (title) => {
     const fold = addFold(title, "", parent);
-    parent.insertBefore(fold.box, before);
+    parent.insertBefore(fold.box, anchor);
     return fold;
   };
   const renderTool = (tool) => {
@@ -2222,6 +2245,7 @@ function createLiveActivity(parent, before) {
     tool.fold.set(title, args + (tool.output || "") + (tool.output_truncated ? "\n[preview truncated; full output in history]" : ""));
   };
   return {
+    anchor(node) { anchor = node; },
     setPhase(text, needsInput = false) { phase = text; waiting = needsInput; },
     label() {
       const active = [...tools.values()].filter((tool) => tool.running);
@@ -2950,15 +2974,16 @@ function armHistoryFollow() {
 // stream keeps updating the live node), so every exit of loadHistory re-attaches
 // it; a session with nothing to attach follows the turn from history instead.
 function attachLiveBox() {
-  const live = turns.get(sessionId);
-  if (!live) { armHistoryFollow(); return; }
+  const root = $("msgs");
+  const follow = shouldFollowOutput(root);
+  for (const input of pendingUserInputs.get(sessionId) || []) root.appendChild(input.row);
+  const box = turns.get(sessionId)?.box || (eventSession === sessionId ? recoveredView?.box : null);
+  if (!box) { followOutput(follow, root); armHistoryFollow(); return; }
   // A failed feed is now represented by canonical history. reloadStale can
   // finish before send() removes this map entry, so do not re-attach its
   // retired live box beside the newly rendered reply.
-  if (live.box === staleBox) return;
-  const root = $("msgs");
-  const follow = shouldFollowOutput(root);
-  root.appendChild(live.box);
+  if (box === staleBox) return;
+  root.appendChild(box);
   followOutput(follow, root);
 }
 // A turn the user has left whose feed is gone: its box is retired here, and
@@ -2968,6 +2993,7 @@ function dropBackgroundTurn(box, why) {
   note("a turn in another session is no longer live (" + why + ") — open that session to follow it");
 }
 async function loadHistory(prefetched) {
+  const loadId = ++historyLoadSeq;
   if (!sessionId) {
     revokePreviews();
     $("msgs").textContent = "";
@@ -2998,13 +3024,13 @@ async function loadHistory(prefetched) {
       msgs = await res.json();
     }
     catch (e) {
-      if (forSession !== sessionId) return; // a switch already re-rendered the transcript
+      if (forSession !== sessionId || loadId !== historyLoadSeq) return;
       addMsg("err", "history failed: " + e.message, "asst err");
       attachLiveBox();
       return;
     }
   }
-  if (forSession !== sessionId) return; // the user switched while the fetch was in flight
+  if (forSession !== sessionId || loadId !== historyLoadSeq) return;
   const history = historyRowsOf(msgs, histTotal, !!(prefetched && prefetched.showAll));
   canonicalHistoryTotal = histTotal || msgs.length;
   lastMsgCount = history.shownCount;
@@ -3026,9 +3052,36 @@ async function loadHistory(prefetched) {
   const appendOnly = retained > 0
     && nextKeys.slice(0, retained).every((key, i) => key === historyKeys[start + i])
     && root.children.length >= historyKeys.length;
-  const liveBox = turns.get(forSession)?.box;
+  const pending = [];
+  const baseIndex = Math.max(0, (histTotal || msgs.length) - msgs.length);
+  let acknowledgedThrough = 0;
+  for (const input of pendingUserInputs.get(forSession) || []) {
+    const floor = Math.max(input.minIndex, acknowledgedThrough);
+    // Image tokens become reference parts, or OCR is appended for non-vision models.
+    const expected = input.prompt.replace(/\[\[image:[\s\S]*?\]\]/g, "").trim();
+    const hadImages = expected !== input.prompt.trim();
+    const found = msgs.findIndex((message, index) => {
+      if (baseIndex + index < floor || message.role !== "user" || isRuntimeSyntheticUser(message)) return false;
+      const actual = textOf(message.content).trim();
+      return actual === expected || (hadImages && actual.startsWith(expected)
+        && /^\s*\[Attached Image Content via [^\]\r\n]+\]\n/.test(actual.slice(expected.length)));
+    });
+    if (found >= 0) {
+      acknowledgedThrough = baseIndex + found + 1;
+      input.row.remove();
+      revokePreviews(input.row);
+    } else {
+      input.minIndex = floor;
+      pending.push(input);
+    }
+  }
+  if (pending.length) pendingUserInputs.set(forSession, pending);
+  else pendingUserInputs.delete(forSession);
+  const protectedRows = new Set(pending.map((input) => input.row));
+  const liveBox = turns.get(forSession)?.box || (eventSession === forSession ? recoveredView?.box : null);
+  if (liveBox) protectedRows.add(liveBox);
   const removeRow = (node) => {
-    if (node !== liveBox) revokePreviews(node);
+    if (!protectedRows.has(node)) revokePreviews(node);
     node.remove();
   };
   if (appendOnly) {
@@ -3039,7 +3092,7 @@ async function loadHistory(prefetched) {
     // Fetching has completed, so this synchronous clear-and-render is painted
     // as one frame instead of exposing an empty transcript during network I/O.
     // A still-running box is reattached below; its previews remain owned by it.
-    if (liveBox) liveBox.remove();
+    for (const row of protectedRows) row.remove();
     revokePreviews(root);
     root.textContent = "";
     for (const row of history.rows) renderHistoryRow(row, root);
@@ -3122,6 +3175,11 @@ async function rewindTo(index, preview, targetSession = sessionId) {
     const res = await (await api("/sessions/" + targetSession + "/rewind", {
       method: "POST", body: JSON.stringify({ message_index: index }),
     })).json();
+    for (const input of pendingUserInputs.get(targetSession) || []) {
+      input.row.remove();
+      revokePreviews(input.row);
+    }
+    pendingUserInputs.delete(targetSession);
     await loadSessions();
     if (sessionId !== targetSession) { note("rewound the background session"); return; }
     await loadHistory();
@@ -3140,6 +3198,7 @@ async function reloadStale() {
   // A live event stream owns the truth again: it delivers the reply itself,
   // and a history refresh would take its view down with it.
   if (eventActive) return;
+  const forSession = sessionId, epoch = runEpoch;
   staleBusy = true;
   try {
     staleTries += 1;
@@ -3149,18 +3208,21 @@ async function reloadStale() {
     // "reply landed" exit below, because a question can stay pending while the
     // transcript already ends in an assistant message.
     const running = await pollConfirm();
+    if (sessionId !== forSession || runEpoch !== epoch || eventActive) return;
     if (staleDone) { stopStaleFollow(); return; }
+    const loadId = ++historyLoadSeq;
     let msgs;
     let histTotal = 0;
     try {
-      const res = await api("/sessions/" + sessionId + "/history?limit=201");
+      const res = await api("/sessions/" + forSession + "/history?limit=201");
       histTotal = Number(res.headers.get("x-history-total")) || 0;
       msgs = await res.json();
     }
     catch (_) { return; } // transient (hidden mid-flight, server restarting): retry next tick
     // The fetch can outlive the follow it belongs to (a new turn or another
     // session stops it, the page goes hidden): re-check before re-rendering.
-    if (!staleSession || staleSession !== sessionId || document.visibilityState !== "visible") return;
+    if (!staleSession || staleSession !== forSession || sessionId !== forSession
+        || runEpoch !== epoch || loadId !== historyLoadSeq || eventActive || document.visibilityState !== "visible") return;
     if (histKey(msgs) !== staleKey) await loadHistory({ messages: msgs, histTotal, appendOnly: true });
     if (staleDone) { stopStaleFollow(); return; } // the reply landed: nothing left to follow
     // A successful server poll is authoritative. If it says the turn no longer
@@ -3263,7 +3325,9 @@ function ensureConfirmPoll() {
   if (confirmPollTimer !== null) return;
   confirmPollTimer = setInterval(async () => {
     if (document.visibilityState !== "visible") return;
+    const sid = sessionId, epoch = runEpoch;
     const running = await pollConfirm();
+    if (sid !== sessionId || epoch !== runEpoch) return;
     if (running === false && !turns.has(sessionId) && staleSession !== sessionId) stopConfirmPoll();
   }, 10000); // fallback only; the reattached event stream is the primary path
 }
@@ -3278,30 +3342,65 @@ function stopConfirmPoll() {
 function recoveredProgressView() {
   const box = document.createElement("div");
   box.className = "turn recovered";
-  const bubble = document.createElement("div");
-  bubble.className = "msg asst pending";
+  let bubble = document.createElement("div");
+  bubble.className = "msg asst";
+  bubble.hidden = true;
   box.appendChild(bubble);
+  const phaseBubble = document.createElement("div");
+  phaseBubble.className = "msg asst pending";
+  box.appendChild(phaseBubble);
   $("msgs").appendChild(box);
   const activity = createLiveActivity(box, bubble);
+  const answerBubbles = [bubble];
   let think = null;
   let thinking = "";
   let answer = "";
-  const paintPhase = () => { if (!answer) bubble.textContent = activity.label(); };
+  const sealAnswerSegment = () => {
+    if (!bubble || bubble.dataset.segmentSealed) return;
+    if (answer.trim()) {
+      bubble.dataset.segmentSealed = "1";
+      bubble.hidden = false;
+      bubble.textContent = answer;
+    } else {
+      bubble.remove();
+      answerBubbles.pop();
+    }
+    bubble = null;
+    answer = "";
+    activity.anchor(phaseBubble);
+  };
+  const ensureAnswerBubble = () => {
+    if (bubble) return;
+    bubble = document.createElement("div");
+    bubble.className = "msg asst";
+    bubble.hidden = true;
+    box.insertBefore(bubble, phaseBubble);
+    answerBubbles.push(bubble);
+    activity.anchor(bubble);
+  };
+  const paintPhase = () => { phaseBubble.textContent = activity.label(); };
+  const paintAnswer = () => {
+    if (bubble) { bubble.hidden = !answer; bubble.textContent = answer; }
+    activity.setPhase(answer ? "Responding…" : "Processing…");
+    paintPhase();
+  };
   const endThinking = () => { think = null; thinking = ""; };
   paintPhase();
   return {
     box,
     endThinking,
+    sealAnswerSegment,
     thinkingText(text) {
+      sealAnswerSegment();
       thinking += text;
-      if (!think) think = createThinkingFold(box, bubble);
+      if (!think) think = createThinkingFold(box, phaseBubble);
       think.set("thinking", thinking.length > 6000 ? "…" + thinking.slice(-6000) : thinking);
       activity.setPhase("Thinking…");
       paintPhase();
     },
-    delta(text) { endThinking(); answer += text; bubble.classList.remove("pending"); bubble.textContent = answer; },
-    replace(text) { endThinking(); answer = text; bubble.classList.remove("pending"); bubble.textContent = answer; paintPhase(); },
-    tool(event) { endThinking(); activity.setPhase("Processing…"); activity.tool(event); paintPhase(); },
+    delta(text) { endThinking(); ensureAnswerBubble(); answer += text; paintAnswer(); },
+    replace(text) { endThinking(); ensureAnswerBubble(); answer = text; paintAnswer(); },
+    tool(event) { endThinking(); sealAnswerSegment(); activity.setPhase("Processing…"); activity.tool(event); paintPhase(); },
     subagents(text) { activity.subagents(text); },
     phase(text, waiting) { activity.setPhase(text, waiting); paintPhase(); },
     remove() { box.remove(); },
@@ -3353,18 +3452,37 @@ function handleReplayEvent(sid, kind, payload, view) {
 // path after a reload: it replays progress and delivers a pending native or
 // confirmation request without waiting for a poll interval.
 async function attachEvents() {
-  if (!sessionId || eventActive || turns.has(sessionId)) return;
+  if (!sessionId || eventActive || turns.has(sessionId) || eventFailures >= 5) return;
   const sid = sessionId;
+  const epoch = runEpoch;
   const controller = new AbortController();
   eventAbort = controller;
   eventActive = true;
   eventSession = sid;
   syncStopButton();
-  stopConfirmPoll();
+  ensureConfirmPoll();
   const view = recoveredProgressView();
   recoveredView = view;
+  view.phase("Reconnecting…");
   let buf = "";
   let finished = false;
+  let timedOut = false, waiting = false;
+  let silenceTimer = null, progressTimer = null;
+  const ownsStream = () => sid === sessionId && epoch === runEpoch && eventAbort === controller;
+  const expire = () => { if (ownsStream()) { timedOut = true; controller.abort(); } };
+  const armSilence = () => {
+    clearTimeout(silenceTimer);
+    silenceTimer = setTimeout(expire, 25000);
+  };
+  const armProgress = () => {
+    clearTimeout(progressTimer);
+    progressTimer = setTimeout(() => {
+      if (waiting || confirmShown) armProgress();
+      else expire();
+    }, 5 * 60 * 1000);
+  };
+  armSilence(); // Covers both response headers and a reader that never resolves.
+  armProgress();
   try {
     // This connection builds a fresh view; a cursor from a discarded view
     // would skip the very events needed to reconstruct its state.
@@ -3373,39 +3491,59 @@ async function attachEvents() {
       headers: headers(false), signal: controller.signal,
     });
     if (!res.ok || !res.body) throw new Error("event stream " + res.status);
+    if (!ownsStream() || controller.signal.aborted) return;
+    armSilence();
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     for (;;) {
       const { done, value } = await reader.read();
+      if (!ownsStream() || controller.signal.aborted) return;
+      if (value && value.length) armSilence();
       if (value) buf += dec.decode(value, { stream: true });
       let idx;
       while ((idx = buf.indexOf("\n\n")) >= 0) {
         const block = parseBlock(buf.slice(0, idx));
         buf = buf.slice(idx + 2);
-        if (block.kind === "done") { finished = true; eventStreamEnded = true; break; }
-        if (block.kind) handleReplayEvent(sid, block.kind, block.payload, view);
+        if (block.kind === "done") {
+          finished = true; eventStreamEnded = true; eventFailures = 0; confirmPollSeq++;
+          break;
+        }
+        if (block.kind) {
+          if (block.kind === "confirm_request" || block.kind === "input_request") waiting = true;
+          if (block.kind === "confirm_done" || block.kind === "input_done") waiting = false;
+          armProgress();
+          handleReplayEvent(sid, block.kind, block.payload, view);
+        }
       }
       if (finished || done) break;
     }
   } catch (error) {
-    if (!controller.signal.aborted && sid === sessionId && !String(error.message).includes("404")) {
+    if (!controller.signal.aborted && ownsStream() && !String(error.message).includes("404")) {
       addMsg("err", "live progress unavailable: " + error.message, "asst err");
     }
   } finally {
+    clearTimeout(silenceTimer);
+    clearTimeout(progressTimer);
+    const owned = ownsStream();
     view.remove();
     if (recoveredView === view) recoveredView = null;
     if (eventAbort === controller) { eventAbort = null; eventActive = false; eventSession = ""; syncStopButton(); }
     const fresh = turnRunning && Date.now() - turnRunningAt < RUNNING_SAMPLE_TTL_MS;
-    if (sid === sessionId && !finished && fresh && !controller.signal.aborted) {
+    if (!owned) return;
+    if (!finished && (timedOut || !controller.signal.aborted)) eventFailures++;
+    if (!finished && fresh && !turns.has(sid) && eventFailures < 5 && (timedOut || !controller.signal.aborted)) {
       ensureConfirmPoll(); // fallback while the event stream is down
-      setTimeout(attachEvents, 2000);
-    } else if (sid === sessionId && !controller.signal.aborted) {
+      setTimeout(() => {
+        if (sid === sessionId && epoch === runEpoch) void attachEvents();
+      }, 2000);
+    } else if (!turns.has(sid) && (timedOut || !controller.signal.aborted)) {
       await loadHistory();
     }
   }
 }
 
 function abortEvents() {
+  eventFailures = 0;
   if (eventAbort) { eventAbort.abort(); eventAbort = null; }
   eventActive = false;
   eventSession = "";
@@ -3415,6 +3553,7 @@ function abortEvents() {
 
 async function pollConfirm() {
   if (!sessionId || confirmBusy) return null;
+  const seq = ++confirmPollSeq;
   const sid = sessionId;
   const epoch = runEpoch;
   let body;
@@ -3423,7 +3562,7 @@ async function pollConfirm() {
   // The fetch can outlive what it describes (answered while it was in flight,
   // session switched, newer turn started): re-check before touching anything.
   if (confirmBusy || sid !== sessionId) return null;
-  if (epoch !== runEpoch) return null; // a newer turn owns the button and the dialog now
+  if (epoch !== runEpoch || seq !== confirmPollSeq) return null;
   // The same poll reports a live turn for this session: the server is the only
   // source that survives this page losing the stream. A missing field means an
   // older server, treated as "not running".
@@ -3437,11 +3576,16 @@ async function pollConfirm() {
     // turn: the server already said so. Re-attaching on every poll would
     // rebuild the progress view and re-render the transcript each time. A new
     // turn (running flipped back to true) starts a fresh stream.
-    if (!wasRunning) eventStreamEnded = false;
+    if (!wasRunning) { eventStreamEnded = false; eventFailures = 0; }
     if (!eventStreamEnded) void attachEvents();
   }
   else {
     eventStreamEnded = false;
+    if (eventActive && eventSession === sid) {
+      abortEvents();
+      await loadHistory();
+      if (sid !== sessionId || epoch !== runEpoch || seq !== confirmPollSeq) return null;
+    }
     if (!turns.has(sessionId) && staleSession !== sessionId) stopConfirmPoll();
   }
   syncStopButton();
@@ -3658,7 +3802,10 @@ async function send() {
   questionCache = null;
   document.querySelectorAll("#msgs .turn-interrupted").forEach((node) => node.remove());
   lastHistoryEndsUnanswered = false;
-  addLiveUserBubble(text || "(images only)", prompt, sid, rewindFloor);
+  const userBubble = addLiveUserBubble(text || "(images only)", prompt, sid, rewindFloor);
+  const pendingInputs = pendingUserInputs.get(sid) || [];
+  pendingInputs.push({ row: userBubble.parentNode, prompt, minIndex: rewindFloor });
+  pendingUserInputs.set(sid, pendingInputs);
   scrollToLatest(false);
 
   stopStaleFollow(); // this turn's own stream owns the view from here on
@@ -3674,7 +3821,14 @@ async function send() {
   syncStopButton(); // only now does isTurnRunning() see this session's own turn
   // Progress and thinking folds are inserted lazily in stream order ahead of
   // the final reply, so tool phases remain visible between reasoning phases.
-  const bubble = addMsgMd("", box);
+  let bubble = addMsgMd("", box);
+  bubble.hidden = true;
+  // One model response can emit prose, call tools, then emit more prose. Each
+  // prose round is a separate canonical assistant message, so it gets its own
+  // live bubble instead of being concatenated into the first one.
+  const answerBubbles = [bubble];
+  const phaseBubble = addMsgMd("", box);
+  phaseBubble.classList.add("pending");
   const activity = createLiveActivity(box, bubble);
   let activityDirty = true;
   const setPhase = (label, waiting = false) => {
@@ -3717,10 +3871,7 @@ async function send() {
     if (!answerDirty && !progressDirty && !thinkingDirty && !thinkingDoneDirty && !activityDirty) return;
     const follow = sid === sessionId && shouldFollowOutput();
     if (activityDirty) {
-      if (!raw) {
-        bubble.classList.add("pending");
-        bubble.textContent = "◌ " + activity.label();
-      }
+      phaseBubble.textContent = "◌ " + activity.label();
       activityDirty = false;
     }
     if (progressDirty && prog) {
@@ -3738,6 +3889,7 @@ async function send() {
       thinkingDoneDirty = false;
     }
     if (answerDirty) {
+      bubble.hidden = !raw;
       bubble.classList.remove("pending");
       bubble.innerHTML = renderMarkdown(raw, false);
       // The formulas are not typeset while the reply is still arriving: the
@@ -3751,6 +3903,34 @@ async function send() {
   const flushPaint = () => {
     if (paintTimer !== null) { clearTimeout(paintTimer); paintTimer = null; }
     paint();
+  };
+  // Finalize the current prose round as its own bubble once a tool call or a new
+  // thinking phase starts. The next streamed text opens a fresh bubble, matching
+  // the separate assistant messages canonical history stores per model response.
+  const sealAnswerSegment = () => {
+    if (!bubble || bubble.dataset.segmentSealed) return;
+    if (raw.trim()) {
+      bubble.dataset.segmentSealed = "1";
+      bubble.hidden = false;
+      bubble.classList.remove("pending");
+      bubble.innerHTML = renderMarkdown(raw, false);
+      decorateAndLoad(bubble);
+    } else {
+      bubble.remove();
+      answerBubbles.pop();
+    }
+    bubble = null;
+    raw = "";
+    answerDirty = false;
+    activity.anchor(phaseBubble);
+  };
+  const ensureAnswerBubble = () => {
+    if (bubble) return;
+    bubble = addMsgMd("", box);
+    bubble.hidden = true;
+    box.insertBefore(bubble, phaseBubble);
+    answerBubbles.push(bubble);
+    activity.anchor(bubble);
   };
   const closeThinkingPhase = () => {
     if (!think) return;
@@ -3766,8 +3946,12 @@ async function send() {
   };
   const fail = (msg) => {
     if (paintTimer !== null) { clearTimeout(paintTimer); paintTimer = null; }
+    if (sid === sessionId) confirmPollSeq++;
     activity.finish("interrupted");
     activityDirty = false;
+    phaseBubble.remove();
+    if (!bubble) { bubble = addMsgMd("", box); box.appendChild(bubble); answerBubbles.push(bubble); }
+    bubble.hidden = false;
     bubble.classList.remove("pending");
     bubble.classList.add("err");
     bubble.textContent = msg;
@@ -3852,7 +4036,9 @@ async function send() {
           closeThinkingPhase();
           activity.finish("ended");
           activityDirty = false;
-          if (!answerDirty) mutateTranscript(() => {
+          if (sid === sessionId) confirmPollSeq++;
+          mutateTranscript(() => phaseBubble.remove());
+          if (!answerDirty && bubble) mutateTranscript(() => {
             bubble.classList.remove("pending");
             if (!raw) bubble.textContent = "";
           });
@@ -3862,24 +4048,27 @@ async function send() {
         else if (kind === "error") { turnError = true; throw new Error(JSON.parse(payload).error || "turn failed"); }
         else if (kind === "delta") {
           closeThinkingPhase();
+          ensureAnswerBubble();
           try { raw += JSON.parse(payload).delta || ""; }
           catch (_) { raw += payload; }
           answerDirty = true;
-          schedulePaint();
+          setPhase("Responding…");
         }
         else if (kind === "replace") {
           closeThinkingPhase();
+          ensureAnswerBubble();
           try { raw = JSON.parse(payload).text || ""; }
           catch (_) { raw = payload; }
           answerDirty = true;
-          schedulePaint();
+          setPhase(raw ? "Responding…" : "Processing…");
         }
-        else if (kind === "answer_pending" && !raw) {
+        else if (kind === "answer_pending") {
           // Buffered prose may precede more tool calls; it is not a final reply.
           setPhase("Processing response…");
         }
         else if (kind === "thinking_start") {
           closeThinkingPhase();
+          sealAnswerSegment();
           setPhase("Waiting for model…");
         }
         else if (kind === "thinking") {
@@ -3887,8 +4076,9 @@ async function send() {
             const text = JSON.parse(payload).text || "";
             if (text) {
               setPhase("Thinking…");
+              sealAnswerSegment();
               if (!think) mutateTranscript(() => {
-                think = createThinkingFold(box, bubble);
+                think = createThinkingFold(box, phaseBubble);
                 thinkingFolds.push(think);
               });
               thinkRaw += text;
@@ -3905,6 +4095,7 @@ async function send() {
           try {
             const event = JSON.parse(payload);
             closeThinkingPhase();
+            sealAnswerSegment();
             mutateTranscript(() => activity.tool(event));
             activityDirty = true;
             schedulePaint();
@@ -3966,8 +4157,8 @@ async function send() {
     clearTimeout(silenceTimer);
     flushPaint(); // flush the tail before final decoration or stale recovery
     finishFollow = sid === sessionId && shouldFollowOutput();
-    if (raw) bubble.innerHTML = renderMarkdown(raw); // previews belong to the finished reply
-    decorateAndLoad(bubble); // reply paths become previews only once it is final
+    if (bubble && raw.trim()) bubble.innerHTML = renderMarkdown(raw); // previews belong to the finished reply
+    if (bubble) decorateAndLoad(bubble); // reply paths become previews only once it is final
     if (!finished && !turnError) {
       // Only the session on screen can be followed from history here; a stalled
       // turn in a session the user has left is retired, and its reply is what
@@ -3976,13 +4167,19 @@ async function send() {
       if (sid === sessionId) goStale(reason + " — checking server history");
       else dropBackgroundTurn(box, reason);
     }
-    else if (!raw) bubble.innerHTML = "<span style='color:var(--dim)'>(empty reply)</span>";
+    else if (bubble && !raw.trim()) {
+      // A turn that ended on a tool round can leave an empty trailing bubble
+      // after earlier prose segments were sealed: drop it instead of labelling
+      // the whole reply empty.
+      if (answerBubbles.length > 1) bubble.remove();
+      else { bubble.hidden = false; bubble.innerHTML = "<span style='color:var(--dim)'>(empty reply)</span>"; }
+    }
   } catch (e) {
     clearTimeout(stallTimer);
     clearTimeout(silenceTimer);
     flushPaint();
-    if (raw) bubble.innerHTML = renderMarkdown(raw);
-    decorateAndLoad(bubble); // the formulas are typeset once, when the reply is final
+    if (bubble && raw.trim()) bubble.innerHTML = renderMarkdown(raw);
+    if (bubble) decorateAndLoad(bubble); // the formulas are typeset once, when the reply is final
     finishFollow = sid === sessionId && shouldFollowOutput();
     if (turnStarted && !turnError) {
       // The POST was accepted and no server `error` event arrived, so this is

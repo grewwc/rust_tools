@@ -2276,6 +2276,109 @@ fn transactional_serve_body_frame_decoder_reassembles_pending() {
     assert_eq!(cut.finish(), vec![]);
 }
 
+#[test]
+fn committed_body_beyond_one_frame_is_reassembled_into_one_replace() {
+    use crate::ai::background::{MAX_SERVE_FRAME_BYTES, ServeLiveKind, serve_body_frames};
+
+    // A body inside one atomic frame keeps the plain single-frame protocol; an
+    // empty body still clears provisional text.
+    assert_eq!(
+        serve_body_frames("短答复"),
+        vec![(ServeLiveKind::Replace, "短答复")]
+    );
+    assert_eq!(serve_body_frames(""), vec![(ServeLiveKind::Replace, "")]);
+
+    // A larger body is tagged start/chunk/end; its payloads concatenate back to
+    // the exact text, and no frame splits a character or breaks the atomicity
+    // bound.
+    let body = "长回答 with mixed 中英文 punctuation。\n".repeat(400);
+    assert!(body.len() > MAX_SERVE_FRAME_BYTES);
+    let plan = serve_body_frames(&body);
+    assert!(plan.len() >= 3);
+    assert_eq!(plan[0].0, ServeLiveKind::ReplaceStart);
+    assert_eq!(plan[plan.len() - 1].0, ServeLiveKind::ReplaceEnd);
+    assert!(
+        plan[1..plan.len() - 1]
+            .iter()
+            .all(|(kind, _)| *kind == ServeLiveKind::ReplaceChunk)
+    );
+    assert!(
+        plan.iter()
+            .all(|(_, chunk)| chunk.len() <= MAX_SERVE_FRAME_BYTES)
+    );
+    assert_eq!(plan.iter().map(|(_, chunk)| *chunk).collect::<String>(), body);
+
+    // The decoder collapses the whole sequence into one authoritative event, so
+    // the client applies the full body instead of the last fragment. Read
+    // boundaries are arbitrary on purpose.
+    let wire = plan
+        .iter()
+        .map(|(kind, chunk)| test_frame(*kind, chunk.as_bytes()))
+        .collect::<Vec<_>>()
+        .concat();
+    let mut decoder = ServeFrameDecoder::default();
+    let mut events = Vec::new();
+    for part in wire.chunks(997) {
+        events.extend(decoder.push(part));
+    }
+    events.extend(decoder.finish());
+    assert_eq!(events, vec![ServeLiveEvent::Replace(body.clone())]);
+
+    // The output-complete marker still follows the reassembled replace.
+    let mut full = ServeFrameDecoder::default();
+    let with_tail = [wire.clone(), test_frame(ServeLiveKind::OutputComplete, b"")].concat();
+    assert_eq!(
+        full.push(&with_tail),
+        vec![
+            ServeLiveEvent::Replace(body),
+            ServeLiveEvent::OutputComplete
+        ]
+    );
+
+    // A sequence cut off before its end (a truncated write) emits nothing.
+    let mut cut = ServeFrameDecoder::default();
+    assert_eq!(cut.push(&wire[..wire.len() - 5]), vec![]);
+    assert_eq!(cut.finish(), vec![]);
+
+    // A tail or continuation whose start never arrived (a dropped frame) must
+    // not surface as an authoritative fragment either.
+    let mut orphan = ServeFrameDecoder::default();
+    assert_eq!(
+        orphan.push(&test_frame(ServeLiveKind::ReplaceEnd, b"tail")),
+        vec![]
+    );
+    assert_eq!(
+        orphan.push(&test_frame(ServeLiveKind::ReplaceChunk, b"more")),
+        vec![]
+    );
+}
+
+#[test]
+fn chunked_replace_assembly_survives_interleaved_frames() {
+    use crate::ai::background::ServeLiveKind;
+
+    // Frames from other producer threads can land between the chunks of a
+    // committed body: they are emitted as-is, and the replacement only becomes
+    // visible once its end arrives.
+    let wire = [
+        test_frame(ServeLiveKind::ReplaceStart, b"aaaa"),
+        test_frame(ServeLiveKind::Tool, br#"{"id":"c1","name":"ls"}"#),
+        test_frame(ServeLiveKind::ReplaceChunk, b"bb"),
+        test_frame(ServeLiveKind::Delta, b"ignored"),
+        test_frame(ServeLiveKind::ReplaceEnd, b"cc"),
+    ]
+    .concat();
+    let mut decoder = ServeFrameDecoder::default();
+    assert_eq!(
+        decoder.push(&wire),
+        vec![
+            ServeLiveEvent::Tool(r#"{"id":"c1","name":"ls"}"#.to_string()),
+            ServeLiveEvent::Delta("ignored".to_string()),
+            ServeLiveEvent::Replace("aaaabbcc".to_string()),
+        ]
+    );
+}
+
 /// Offline pump wiring check with a fake writer (no model key needed):
 /// framed bytes written into the FIFO must surface as SSE events, an
 /// output-complete frame must end the turn while the child is still

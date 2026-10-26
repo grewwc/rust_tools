@@ -314,7 +314,53 @@ pub(crate) fn publish_live_output(text: &str) {
 /// streamed provisional prose earlier, so this replaces the whole remote body
 /// with the final accepted text (an empty replacement clears rejected prose).
 pub(crate) fn publish_committed_serve_output(text: &str) {
-    publish_serve_frame(ServeLiveKind::Replace, text);
+    for (kind, payload) in serve_body_frames(text) {
+        publish_serve_frame(kind, payload);
+    }
+}
+
+/// Frame plan for the committed body. A client applies `replace` to the whole
+/// body, so a body that does not fit one atomic frame must be tagged as a
+/// start/chunk/end sequence for the serve decoder to reassemble; sending bare
+/// `Replace` fragments would make each fragment overwrite the previous one and
+/// leave only the tail visible.
+pub(crate) fn serve_body_frames(text: &str) -> Vec<(ServeLiveKind, &str)> {
+    let chunks = serve_payload_chunks(text);
+    if chunks.len() <= 1 {
+        return vec![(ServeLiveKind::Replace, text)];
+    }
+    let last = chunks.len() - 1;
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            let kind = if index == 0 {
+                ServeLiveKind::ReplaceStart
+            } else if index == last {
+                ServeLiveKind::ReplaceEnd
+            } else {
+                ServeLiveKind::ReplaceChunk
+            };
+            (kind, chunk)
+        })
+        .collect()
+}
+
+/// Payload slices of at most [`MAX_SERVE_FRAME_BYTES`], each boundary backed up
+/// to a char boundary: one frame is one atomic pipe write, and a frame never
+/// splits a character.
+fn serve_payload_chunks(text: &str) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < text.len() {
+        let mut end = (start + MAX_SERVE_FRAME_BYTES).min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(&text[start..end]);
+        start = end;
+    }
+    chunks
 }
 
 fn publish_live_output_bytes(bytes: &[u8]) {
@@ -518,6 +564,12 @@ pub(crate) enum ServeLiveKind {
     Tool = 12,
     /// Final accepted body; replaces all provisional `Delta` text.
     Replace = 13,
+    /// First chunk of a committed body too large for one atomic frame.
+    ReplaceStart = 14,
+    /// Continuation chunk of a chunked committed body.
+    ReplaceChunk = 15,
+    /// Last chunk of a chunked committed body; completes the replacement.
+    ReplaceEnd = 16,
 }
 
 /// Max payload bytes per serve frame: header (5) + payload stays under the
@@ -584,6 +636,11 @@ pub(crate) fn serve_tool_finished_payload(
 /// `/bg` runs never take this path). Best-effort like [`publish_live_output`]:
 /// oversized payloads are split at char boundaries, a missing reader drops
 /// the frame, never fails the turn.
+///
+/// Splitting is only sound for kinds whose client semantics append each frame
+/// (`Delta`, thinking text, observer lines). A body that is authoritative as a
+/// whole must go through [`publish_committed_serve_output`], which tags the
+/// fragments for reassembly.
 pub(crate) fn publish_serve_frame(kind: ServeLiveKind, text: &str) {
     if !serve_live_streaming() {
         return;
@@ -593,20 +650,12 @@ pub(crate) fn publish_serve_frame(kind: ServeLiveKind, text: &str) {
         publish_live_output_bytes(&frame);
         return;
     }
-    let bytes = text.as_bytes();
-    let mut start = 0usize;
-    while start < bytes.len() {
-        let mut end = (start + MAX_SERVE_FRAME_BYTES).min(bytes.len());
-        while end < bytes.len() && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let payload = &bytes[start..end];
+    for payload in serve_payload_chunks(text) {
         let mut frame = Vec::with_capacity(5 + payload.len());
         frame.push(kind as u8);
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        frame.extend_from_slice(payload);
+        frame.extend_from_slice(payload.as_bytes());
         publish_live_output_bytes(&frame);
-        start = end;
     }
 }
 

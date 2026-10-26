@@ -962,7 +962,7 @@ test("delta blocks defer layout work to the coalesced paint", () => {
   assert.doesNotMatch(blockDispatch, /shouldFollowOutput|followOutput/);
   assert.match(blockDispatch, /kind === "delta"[\s\S]*?answerDirty = true;[\s\S]*?schedulePaint\(\)/);
   assert.match(blockDispatch, /kind === "thinking_start"[\s\S]*?closeThinkingPhase\(\)/);
-  assert.match(blockDispatch, /kind === "thinking"[\s\S]*?if \(text\)[\s\S]*?createThinkingFold\(box, bubble\)[\s\S]*?thinkingDirty = true;[\s\S]*?schedulePaint\(\)/);
+  assert.match(blockDispatch, /kind === "thinking"[\s\S]*?if \(text\)[\s\S]*?createThinkingFold\(box, phaseBubble\)[\s\S]*?thinkingDirty = true;[\s\S]*?schedulePaint\(\)/);
   assert.doesNotMatch(blockDispatch, /kind !== "thinking_start" && kind !== "thinking" && kind !== "thinking_done"/);
   assert.match(blockDispatch, /kind === "done"[\s\S]*?closeThinkingPhase\(\)/);
   assert.match(blockDispatch, /kind === "subagent_progress"[\s\S]*?activity.subagents\(payload\)/);
@@ -1093,7 +1093,7 @@ function historyHarness({ delayed = false, existingKeys = [], existingNodes = []
   const pending = delayed ? new Promise((resolve) => { resolveResponse = () => resolve(response); }) : Promise.resolve(response);
   const root = {
     children: [], scrollTop: 0, scrollHeight: 100,
-    appendChild(node) { this.children.push(node); node.parent = this; return node; },
+    appendChild(node) { if (node.remove) node.remove(); this.children.push(node); node.parent = this; return node; },
     get lastElementChild() { return this.children[this.children.length - 1]; },
     set textContent(value) { assert.equal(value, ""); clears += 1; this.children = []; },
   };
@@ -1109,6 +1109,9 @@ function historyHarness({ delayed = false, existingKeys = [], existingNodes = []
   const context = vm.createContext({
     sessionId: "s", historySession: existingKeys.length ? "s" : "", historyKeys: existingKeys.slice(),
     lastMsgCount: null, staleKey: "", staleDone: false, previewUrls: new Map(), turns: new Map(),
+    pendingUserInputs: new Map(), historyLoadSeq: 0, staleBox: null,
+    recoveredView: null, eventSession: "", armHistoryFollow() {},
+    textOf: (content) => content, isRuntimeSyntheticUser: (message) => !!message.synthetic,
     $: () => root,
     api: async () => { apiCalls += 1; return pending; },
     historyRowsOf: () => ({ rows, shownCount: rows.length }),
@@ -1131,6 +1134,7 @@ function historyHarness({ delayed = false, existingKeys = [], existingNodes = []
   const start = script.indexOf("async function loadHistory(");
   const end = script.indexOf("// Historical user inputs", start);
   vm.runInContext(script.slice(start, end), context);
+  vm.runInContext(script.slice(script.indexOf("function attachLiveBox("), script.indexOf("// A turn the user has left")), context);
   return {
     context, root, rows, resolveResponse,
     apiCalls: () => apiCalls, clears: () => clears, revokes: () => retired.length, retired,
@@ -1207,6 +1211,92 @@ test("a changed canonical row rebuilds safely without retiring a running box", a
   assert.equal(h.clears(), 1);
   assert.equal(liveWasDetached, true);
   assert.equal(h.root.lastElementChild, live);
+});
+
+for (const prefix of ["old", "different"]) test(`unacknowledged user input survives history refresh (${prefix})`, async () => {
+  const old = { key: "old" }, user = { key: "pending-user" }, live = { key: "running" };
+  const h = historyHarness({ existingKeys: [prefix], existingNodes: [old, user, live] });
+  h.context.pendingUserInputs.set("s", [{ row: user, prompt: "prompt", minIndex: 2 }]);
+  h.context.turns.set("s", { box: live });
+  const older = [{ role: "user", content: "prompt" }, { role: "assistant", content: "reply" }];
+  await h.context.loadHistory({ messages: older, histTotal: 2 });
+  assert.deepEqual(h.root.children.slice(-2), [user, live]);
+  assert.equal(h.retired.includes(user), false, "pending input previews must stay owned by the input");
+  h.rows.push({ key: "canonical-user", text: "prompt" });
+  await h.context.loadHistory({ messages: [...older, { role: "user", content: "prompt" }], histTotal: 3 });
+  assert.equal(h.root.children.includes(user), false, "canonical acknowledgement replaces, not duplicates, the pending input");
+  assert.equal(h.root.children.filter((node) => node.key === "canonical-user").length, 1);
+  assert.equal(h.context.pendingUserInputs.has("s"), false);
+});
+
+for (const caption of ["caption", ""]) for (const ocr of [false, true]) test(`persisted image input replaces its pending bubble (${caption || "image only"}, OCR=${ocr})`, async () => {
+  const user = { key: "pending-user" };
+  const h = historyHarness({ existingNodes: [user] });
+  vm.runInContext(script.slice(script.indexOf("function textOf("), script.indexOf("// Persisted runtime origin sidecar")), h.context);
+  h.context.pendingUserInputs.set("s", [{ row: user, prompt: caption + "\n[[image:p.png]]", minIndex: 0 }]);
+  const content = ocr ? caption + "\n\n[Attached Image Content via ocr]\nrecognized text" : [
+    { type: "reference", kind: "image", name: "p.png", asset: "attachments/p.png" },
+    { type: "text", text: caption },
+  ];
+  h.rows.splice(0, h.rows.length, { key: "canonical-user" }, { key: "reply" });
+  const history = { messages: [{ role: "user", content }, { role: "assistant", content: "reply" }], histTotal: 2 };
+  await h.context.loadHistory(history);
+  assert.equal(h.context.pendingUserInputs.has("s"), false);
+  assert.deepEqual(h.root.children.map((node) => node.key), ["canonical-user", "reply"]);
+  await h.context.loadHistory(history);
+  assert.deepEqual(h.root.children.map((node) => node.key), ["canonical-user", "reply"]);
+});
+
+for (const prefix of ["old", "different"]) test(`history refresh retains the active recovered stream (${prefix})`, async () => {
+  const old = { key: "old" }, live = { key: "recovered" };
+  const h = historyHarness({ existingKeys: [prefix], existingNodes: [old, live] });
+  h.context.eventSession = "s";
+  h.context.recoveredView = { box: live };
+  let retiredLive = false;
+  h.context.revokePreviews = (node) => { retiredLive ||= node === live || !!node.children?.includes(live); };
+  await h.context.loadHistory({ messages: [], histTotal: 2 });
+  assert.equal(h.root.lastElementChild, live, "the stream must keep painting a mounted view");
+  assert.equal(retiredLive, false, "stream previews must survive canonical history refresh");
+  assert.equal(h.root.children.filter((node) => node === live).length, 1);
+});
+
+test("an older in-flight history response cannot overwrite a newer snapshot", async () => {
+  const h = historyHarness();
+  const responses = [];
+  h.context.api = () => new Promise((resolve) => responses.push(resolve));
+  h.context.historyRowsOf = (messages) => ({ rows: messages.map((m) => ({ key: m.content })), shownCount: messages.length });
+  const old = h.context.loadHistory(), fresh = h.context.loadHistory();
+  const respond = (text) => ({ headers: { get: () => "1" }, json: async () => [{ role: "assistant", content: text }] });
+  responses[1](respond("new"));
+  await fresh;
+  responses[0](respond("old"));
+  await old;
+  assert.deepEqual(h.root.children.map((node) => node.key), ["new"]);
+});
+
+for (const change of ["refresh", "turn", "session", "stream"]) test(`stale history fetch cannot outlive a newer ${change}`, async () => {
+  const oldRow = { key: "mounted" };
+  const h = historyHarness({ existingNodes: [oldRow] }), c = h.context;
+  let respond;
+  Object.assign(c, {
+    staleSession: "s", staleTries: 0, STALE_FOLLOW_TRIES: 60, staleBusy: false,
+    staleDone: false, eventActive: false, runEpoch: 0, document: { visibilityState: "visible" },
+    pollConfirm: async () => true, stopStaleFollow() {},
+    api: () => new Promise((resolve) => { respond = resolve; }),
+    histKey: JSON.stringify,
+    historyRowsOf: (messages) => ({ rows: messages.map((m) => ({ key: m.content })), shownCount: messages.length }),
+  });
+  vm.runInContext(script.slice(script.indexOf("async function reloadStale()"), script.indexOf("// A restart can end a turn")), c);
+  const loading = c.reloadStale();
+  await new Promise(setImmediate);
+  if (change === "refresh") await c.loadHistory({ messages: [{ role: "assistant", content: "new" }], histTotal: 1 });
+  if (change === "turn") c.runEpoch++;
+  if (change === "session") { c.sessionId = "other"; c.staleSession = "other"; }
+  if (change === "stream") c.eventActive = true;
+  const expected = h.root.children.slice();
+  respond({ headers: { get: () => "1" }, json: async () => [{ role: "assistant", content: "stale" }] });
+  await loading;
+  assert.deepEqual(h.root.children, expected);
 });
 
 test("user image references stay visible as placeholders; assistant media stays Markdown", () => {
@@ -1302,7 +1392,8 @@ test("a stale live box is not reattached beside canonical history", () => {
   const root = { appended: [], appendChild(node) { this.appended.push(node); }, scrollTop: 0, scrollHeight: 10 };
   const context = vm.createContext({
     sessionId: "s", staleBox: box, turns: new Map([["s", { box }]]),
-    $: () => root, armHistoryFollow() {},
+    $: () => root, armHistoryFollow() {}, pendingUserInputs: new Map(),
+    shouldFollowOutput: () => true, followOutput() {},
   });
   const start = script.indexOf("function attachLiveBox(");
   const end = script.indexOf("// A turn the user has left", start);

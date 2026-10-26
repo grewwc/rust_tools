@@ -673,7 +673,8 @@ fn setup_live_fifo(_session_id: &str) -> Option<LiveFifo> {
 /// discriminants (1 = delta, 2 = thinking start, 3 = thinking chunk,
 /// 4 = thinking done, 5 = output complete, 6 = confirmation request,
 /// 7 = confirmation resolved, 8 = subagent progress, 9 = input request,
-/// 10 = input resolved, 11 = assistant body pending, 12 = tool lifecycle).
+/// 10 = input resolved, 11 = assistant body pending, 12 = tool lifecycle,
+/// 13 = committed body, 14/15/16 = chunked committed body start/chunk/end).
 #[derive(Debug, PartialEq, Eq)]
 #[cfg(feature = "serve")]
 enum ServeLiveEvent {
@@ -707,14 +708,37 @@ enum ServeLiveEvent {
 /// a defensive fallback. An unknown kind or absurd length resets the buffer
 /// instead of desynchronizing the stream (impossible from our producer, only
 /// from a foreign writer on the same inode).
+///
+/// A committed body too large for one atomic frame arrives as a
+/// `ReplaceStart`/`ReplaceChunk`/`ReplaceEnd` sequence and is buffered until it
+/// completes: a client applies every `replace` it receives to the whole body,
+/// so emitting fragments would leave only the last one visible.
 #[derive(Default)]
 #[cfg(feature = "serve")]
 struct ServeFrameDecoder {
     buf: Vec<u8>,
+    /// In-flight chunked committed body, present between `ReplaceStart` and
+    /// `ReplaceEnd`.
+    pending_replace: Option<String>,
 }
 
 #[cfg(feature = "serve")]
 impl ServeFrameDecoder {
+    /// Append one continuation chunk of a chunked committed body. A chunk with
+    /// no start in flight names no body and is dropped; a body past the
+    /// defensive cap is abandoned (dropped, never emitted) so a foreign writer
+    /// cannot grow it without bound.
+    fn append_replace_chunk(&mut self, chunk: &str) {
+        let Some(mut body) = self.pending_replace.take() else {
+            return;
+        };
+        if body.len() + chunk.len() > background::MAX_SERVE_FRAME_LEN as usize {
+            return;
+        }
+        body.push_str(chunk);
+        self.pending_replace = Some(body);
+    }
+
     fn push(&mut self, bytes: &[u8]) -> Vec<ServeLiveEvent> {
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
@@ -737,6 +761,9 @@ impl ServeFrameDecoder {
                 || kind == background::ServeLiveKind::InputDone as u8
                 || kind == background::ServeLiveKind::AssistantBodyPending as u8
                 || kind == background::ServeLiveKind::Replace as u8
+                || kind == background::ServeLiveKind::ReplaceStart as u8
+                || kind == background::ServeLiveKind::ReplaceChunk as u8
+                || kind == background::ServeLiveKind::ReplaceEnd as u8
                 || kind == background::ServeLiveKind::Tool as u8;
             if !known || len > background::MAX_SERVE_FRAME_LEN as usize {
                 self.buf.clear();
@@ -747,47 +774,76 @@ impl ServeFrameDecoder {
             }
             let payload = String::from_utf8_lossy(&self.buf[5..5 + len]).into_owned();
             self.buf.drain(..5 + len);
-            out.push(match kind {
-                k if k == background::ServeLiveKind::Delta as u8 => ServeLiveEvent::Delta(payload),
+            let event = match kind {
+                k if k == background::ServeLiveKind::Delta as u8 => {
+                    Some(ServeLiveEvent::Delta(payload))
+                }
                 k if k == background::ServeLiveKind::ThinkingStart as u8 => {
-                    ServeLiveEvent::ThinkingStart
+                    Some(ServeLiveEvent::ThinkingStart)
                 }
                 k if k == background::ServeLiveKind::Thinking as u8 => {
-                    ServeLiveEvent::Thinking(payload)
+                    Some(ServeLiveEvent::Thinking(payload))
                 }
                 k if k == background::ServeLiveKind::ThinkingDone as u8 => {
-                    ServeLiveEvent::ThinkingDone
+                    Some(ServeLiveEvent::ThinkingDone)
                 }
                 k if k == background::ServeLiveKind::ConfirmRequest as u8 => {
-                    ServeLiveEvent::ConfirmRequest(payload)
+                    Some(ServeLiveEvent::ConfirmRequest(payload))
                 }
                 k if k == background::ServeLiveKind::ConfirmDone as u8 => {
-                    ServeLiveEvent::ConfirmDone(payload)
+                    Some(ServeLiveEvent::ConfirmDone(payload))
                 }
                 k if k == background::ServeLiveKind::InputRequest as u8 => {
-                    ServeLiveEvent::InputRequest(payload)
+                    Some(ServeLiveEvent::InputRequest(payload))
                 }
                 k if k == background::ServeLiveKind::InputDone as u8 => {
-                    ServeLiveEvent::InputDone(payload)
+                    Some(ServeLiveEvent::InputDone(payload))
                 }
                 k if k == background::ServeLiveKind::SubagentProgress as u8 => {
-                    ServeLiveEvent::SubagentProgress(payload)
+                    Some(ServeLiveEvent::SubagentProgress(payload))
                 }
                 k if k == background::ServeLiveKind::OutputComplete as u8 => {
-                    ServeLiveEvent::OutputComplete
+                    Some(ServeLiveEvent::OutputComplete)
                 }
                 k if k == background::ServeLiveKind::AssistantBodyPending as u8 => {
-                    ServeLiveEvent::AssistantBodyPending
+                    Some(ServeLiveEvent::AssistantBodyPending)
                 }
                 k if k == background::ServeLiveKind::Replace as u8 => {
-                    ServeLiveEvent::Replace(payload)
+                    Some(ServeLiveEvent::Replace(payload))
                 }
-                k if k == background::ServeLiveKind::Tool as u8 => ServeLiveEvent::Tool(payload),
+                k if k == background::ServeLiveKind::ReplaceStart as u8 => {
+                    // A new body supersedes an unfinished one.
+                    self.pending_replace = Some(payload);
+                    None
+                }
+                k if k == background::ServeLiveKind::ReplaceChunk as u8 => {
+                    self.append_replace_chunk(&payload);
+                    None
+                }
+                k if k == background::ServeLiveKind::ReplaceEnd as u8 => {
+                    match self.pending_replace.take() {
+                        Some(mut body) => {
+                            body.push_str(&payload);
+                            Some(ServeLiveEvent::Replace(body))
+                        }
+                        // A tail whose start never arrived (a dropped frame, or
+                        // an abandoned oversized body) emits nothing: a fragment
+                        // must never become the authoritative body, so the client
+                        // keeps whatever text it already streamed.
+                        None => None,
+                    }
+                }
+                k if k == background::ServeLiveKind::Tool as u8 => {
+                    Some(ServeLiveEvent::Tool(payload))
+                }
                 // Every kind accepted by the `known` gate above must have an
                 // arm here: falling through would end the turn for a frame
                 // that is not an output-complete marker.
-                _ => ServeLiveEvent::OutputComplete,
-            });
+                _ => Some(ServeLiveEvent::OutputComplete),
+            };
+            if let Some(event) = event {
+                out.push(event);
+            }
         }
         out
     }
