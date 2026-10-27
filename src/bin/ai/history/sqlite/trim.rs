@@ -14,7 +14,10 @@ use super::outcomes::{
     clear_llm_prune_marks_meta, clear_prompt_residency_meta,
     drop_ambiguous_tool_execution_outcomes, prune_orphan_tool_execution_outcomes,
 };
-use super::revision::{bump_history_revision, invalidate_context_snapshot};
+use super::revision::{
+    bump_history_revision, invalidate_context_snapshot,
+    invalidate_context_snapshot_unless_covered_by,
+};
 use super::store::decode_message_content;
 
 /// Relocate the asset paths recorded in the history to a new session.
@@ -262,7 +265,9 @@ fn truncate_messages_sqlite_unlocked(path: &Path, keep: usize) -> io::Result<()>
         let removed = tx
             .execute("DELETE FROM messages WHERE id > ?1", params![cutoff_id])
             .map_err(|e| io::Error::other(e.to_string()))?;
-        invalidate_context_snapshot(&tx)?;
+        if removed > 0 {
+            invalidate_context_snapshot_unless_covered_by(&tx, cutoff_id)?;
+        }
         clear_llm_prune_marks_meta(&tx)?;
         if removed > 0 {
             clear_prompt_residency_meta(&tx)?;
@@ -318,7 +323,7 @@ fn truncate_messages_to_user_turns_sqlite_unlocked(
             params![next_turn_start],
         )
         .map_err(|error| io::Error::other(error.to_string()))?;
-        invalidate_context_snapshot(&tx)?;
+        invalidate_context_snapshot_unless_covered_by(&tx, next_turn_start.saturating_sub(1))?;
         clear_llm_prune_marks_meta(&tx)?;
         clear_prompt_residency_meta(&tx)?;
     }

@@ -1037,6 +1037,480 @@ fn stale_context_snapshot_cannot_resurrect_truncated_history() {
 }
 
 #[test]
+fn rewind_after_snapshot_watermark_reuses_covered_projection() {
+    const PROJECTION: &str = "rewind-covered";
+    let dir = std::env::temp_dir().join(format!(
+        "rewind_covered_snapshot_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    let first_turn = vec![msg("user", "first"), msg("assistant", "first answer")];
+    append_history_sqlite(&path, first_turn.clone()).unwrap();
+    let source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    let summary = msg(ROLE_INTERNAL_NOTE, "[summary] first turn");
+    assert!(
+        write_context_snapshot_sqlite(
+            &path,
+            std::slice::from_ref(&summary),
+            source.source_message_id,
+            source.canonical_generation,
+            PROJECTION,
+        )
+        .unwrap()
+    );
+    // The next turn is appended after the snapshot watermark; rewinding it
+    // leaves every canonical message covered by the snapshot intact.
+    append_history_sqlite(
+        &path,
+        vec![msg("user", "second"), msg("assistant", "second answer")],
+    )
+    .unwrap();
+    truncate_messages_sqlite(&path, first_turn.len()).unwrap();
+
+    let projected = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert_eq!(projected.messages, vec![summary]);
+    assert!(projected.snapshot_is_current);
+    assert_eq!(projected.source_message_id, source.source_message_id);
+    assert!(projected.canonical_generation > source.canonical_generation);
+    assert_eq!(read_all_messages_sqlite(&path).unwrap(), first_turn);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rewind_last_compacted_turn_restores_archived_projection() {
+    const PROJECTION: &str = "rewind-previous";
+    let dir = std::env::temp_dir().join(format!(
+        "rewind_previous_snapshot_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    let first_turn = vec![msg("user", "first"), msg("assistant", "first answer")];
+    append_history_sqlite(&path, first_turn.clone()).unwrap();
+    let first_source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    let first_summary = msg(ROLE_INTERNAL_NOTE, "[summary] first turn");
+    assert!(
+        write_context_snapshot_sqlite(
+            &path,
+            std::slice::from_ref(&first_summary),
+            first_source.source_message_id,
+            first_source.canonical_generation,
+            PROJECTION,
+        )
+        .unwrap()
+    );
+
+    // Completing and compacting the second turn replaces the first-turn
+    // snapshot, which is retained as the rewind fallback.
+    append_history_sqlite(
+        &path,
+        vec![msg("user", "second"), msg("assistant", "second answer")],
+    )
+    .unwrap();
+    let second_source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    let second_summary = msg(ROLE_INTERNAL_NOTE, "[summary] second turn");
+    assert!(
+        write_context_snapshot_sqlite(
+            &path,
+            std::slice::from_ref(&second_summary),
+            second_source.source_message_id,
+            second_source.canonical_generation,
+            PROJECTION,
+        )
+        .unwrap()
+    );
+
+    // Rewinding the second turn must promote the retained first-turn
+    // projection instead of rebuilding from canonical history.
+    truncate_messages_sqlite(&path, first_turn.len()).unwrap();
+    let projected = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert_eq!(projected.messages, vec![first_summary]);
+    assert!(projected.snapshot_is_current);
+    assert_eq!(projected.source_message_id, first_source.source_message_id);
+    assert!(projected.canonical_generation > second_source.canonical_generation);
+    assert_eq!(read_all_messages_sqlite(&path).unwrap(), first_turn);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rewind_absorbs_surviving_tail_into_retained_projection() {
+    const PROJECTION: &str = "rewind-tail";
+    let dir = std::env::temp_dir().join(format!(
+        "rewind_tail_snapshot_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    let first_turn = vec![msg("user", "first"), msg("assistant", "first answer")];
+    append_history_sqlite(&path, first_turn.clone()).unwrap();
+    let first_source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    let first_summary = msg(ROLE_INTERNAL_NOTE, "[summary] first turn");
+    assert!(
+        write_context_snapshot_sqlite(
+            &path,
+            std::slice::from_ref(&first_summary),
+            first_source.source_message_id,
+            first_source.canonical_generation,
+            PROJECTION,
+        )
+        .unwrap()
+    );
+
+    let second_turn = vec![msg("user", "second"), msg("assistant", "second answer")];
+    append_history_sqlite(&path, second_turn.clone()).unwrap();
+    let second_source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    let second_summary = msg(ROLE_INTERNAL_NOTE, "[summary] second turn");
+    assert!(
+        write_context_snapshot_sqlite(
+            &path,
+            std::slice::from_ref(&second_summary),
+            second_source.source_message_id,
+            second_source.canonical_generation,
+            PROJECTION,
+        )
+        .unwrap()
+    );
+
+    // The third turn starts past the snapshot watermark; rewinding only its
+    // assistant reply leaves the user message as a surviving tail.
+    append_history_sqlite(
+        &path,
+        vec![msg("user", "third"), msg("assistant", "third answer")],
+    )
+    .unwrap();
+    let kept = first_turn.len() + second_turn.len() + 1;
+    truncate_messages_sqlite(&path, kept).unwrap();
+
+    let projected = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert_eq!(
+        projected.messages,
+        vec![second_summary, msg("user", "third")]
+    );
+    assert!(projected.snapshot_is_current);
+    assert_eq!(
+        projected.source_message_id,
+        second_source.source_message_id + 1
+    );
+    assert!(projected.canonical_generation > second_source.canonical_generation);
+    assert_eq!(read_all_messages_sqlite(&path).unwrap().len(), kept);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rewind_promotes_archived_projection_and_absorbs_tail() {
+    const PROJECTION: &str = "rewind-promoted-tail";
+    let dir = std::env::temp_dir().join(format!(
+        "rewind_promoted_tail_snapshot_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    let first_turn = vec![msg("user", "first"), msg("assistant", "first answer")];
+    append_history_sqlite(&path, first_turn.clone()).unwrap();
+    let first_source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    let first_summary = msg(ROLE_INTERNAL_NOTE, "[summary] first turn");
+    assert!(
+        write_context_snapshot_sqlite(
+            &path,
+            std::slice::from_ref(&first_summary),
+            first_source.source_message_id,
+            first_source.canonical_generation,
+            PROJECTION,
+        )
+        .unwrap()
+    );
+
+    let second_turn = vec![msg("user", "second"), msg("assistant", "second answer")];
+    append_history_sqlite(&path, second_turn).unwrap();
+    let second_source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    let second_summary = msg(ROLE_INTERNAL_NOTE, "[summary] second turn");
+    assert!(
+        write_context_snapshot_sqlite(
+            &path,
+            std::slice::from_ref(&second_summary),
+            second_source.source_message_id,
+            second_source.canonical_generation,
+            PROJECTION,
+        )
+        .unwrap()
+    );
+
+    // Keep the first turn plus the second turn's user message. The current
+    // snapshot covers the removed reply, so the rewind falls back to the
+    // previous snapshot and must absorb that user message into it.
+    let kept = first_turn.len() + 1;
+    truncate_messages_sqlite(&path, kept).unwrap();
+
+    let projected = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert_eq!(projected.messages, vec![first_summary, msg("user", "second")]);
+    assert!(projected.snapshot_is_current);
+    assert_eq!(
+        projected.source_message_id,
+        second_source.source_message_id - 1
+    );
+    assert_eq!(read_all_messages_sqlite(&path).unwrap().len(), kept);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn consecutive_rewinds_reuse_archived_snapshots() {
+    const PROJECTION: &str = "rewind-ring";
+    let dir = std::env::temp_dir().join(format!(
+        "consecutive_rewind_snapshot_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+
+    let mut summaries = Vec::new();
+    for turn in 1..=4 {
+        append_history_sqlite(
+            &path,
+            vec![
+                msg("user", &format!("user {turn}")),
+                msg("assistant", &format!("answer {turn}")),
+            ],
+        )
+        .unwrap();
+        let source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+        let summary = msg(ROLE_INTERNAL_NOTE, &format!("[summary] turn {turn}"));
+        assert!(
+            write_context_snapshot_sqlite(
+                &path,
+                std::slice::from_ref(&summary),
+                source.source_message_id,
+                source.canonical_generation,
+                PROJECTION,
+            )
+            .unwrap()
+        );
+        summaries.push(summary);
+    }
+
+    // The first rewind cuts inside the newest snapshot: the ring promotes turn
+    // 3's projection and absorbs the surviving user message.
+    truncate_messages_sqlite(&path, 7).unwrap();
+    let projected = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert_eq!(
+        projected.messages,
+        vec![summaries[2].clone(), msg("user", "user 4")]
+    );
+    assert!(projected.snapshot_is_current);
+
+    // The next rewind moves below the promoted watermark; turn 2's boundary is
+    // still archived, so the projection is reused again.
+    truncate_messages_sqlite(&path, 5).unwrap();
+    let projected = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert_eq!(
+        projected.messages,
+        vec![summaries[1].clone(), msg("user", "user 3")]
+    );
+    assert!(projected.snapshot_is_current);
+
+    // The oldest archived boundary still covers the cutoff.
+    truncate_messages_sqlite(&path, 3).unwrap();
+    let projected = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert_eq!(
+        projected.messages,
+        vec![summaries[0].clone(), msg("user", "user 2")]
+    );
+    assert!(projected.snapshot_is_current);
+
+    // Past the oldest boundary no archived projection can cover the cutoff.
+    truncate_messages_sqlite(&path, 1).unwrap();
+    let projected = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert_eq!(projected.messages, vec![msg("user", "user 1")]);
+    assert!(!projected.snapshot_is_current);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rewind_keeps_promoted_projection_for_a_deeper_rewind() {
+    const PROJECTION: &str = "rewind-promoted-ring";
+    let dir = std::env::temp_dir().join(format!(
+        "rewind_promoted_ring_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    let mut summaries = Vec::new();
+    for turn in 1..=4 {
+        append_history_sqlite(
+            &path,
+            vec![
+                msg("user", &format!("user {turn}")),
+                msg("assistant", &format!("answer {turn}")),
+            ],
+        )
+        .unwrap();
+        // Snapshot only the first and the last boundary so the ring holds one
+        // entry after the second write.
+        if turn == 1 || turn == 4 {
+            let source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+            let summary = msg(ROLE_INTERNAL_NOTE, &format!("[summary] turn {turn}"));
+            assert!(
+                write_context_snapshot_sqlite(
+                    &path,
+                    std::slice::from_ref(&summary),
+                    source.source_message_id,
+                    source.canonical_generation,
+                    PROJECTION,
+                )
+                .unwrap()
+            );
+            summaries.push(summary);
+        }
+    }
+
+    // The first rewind promotes the only archived boundary and absorbs the
+    // surviving tail. The promoted row must stay archived for the next cut.
+    truncate_messages_sqlite(&path, 5).unwrap();
+    let projected = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert_eq!(
+        projected.messages,
+        vec![
+            summaries[0].clone(),
+            msg("user", "user 2"),
+            msg("assistant", "answer 2"),
+            msg("user", "user 3"),
+        ]
+    );
+    assert!(projected.snapshot_is_current);
+
+    // Cutting below the extended watermark still finds the promoted boundary.
+    truncate_messages_sqlite(&path, 3).unwrap();
+    let projected = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert_eq!(
+        projected.messages,
+        vec![summaries[0].clone(), msg("user", "user 2")]
+    );
+    assert!(projected.snapshot_is_current);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rollback_clears_context_snapshot_history() {
+    const PROJECTION: &str = "rollback-previous";
+    let dir = std::env::temp_dir().join(format!(
+        "rollback_previous_snapshot_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    append_history_sqlite(
+        &path,
+        vec![msg("user", "first"), msg("assistant", "first answer")],
+    )
+    .unwrap();
+    let first_source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert!(
+        write_context_snapshot_sqlite(
+            &path,
+            &[msg(ROLE_INTERNAL_NOTE, "[summary] first turn")],
+            first_source.source_message_id,
+            first_source.canonical_generation,
+            PROJECTION,
+        )
+        .unwrap()
+    );
+    append_history_sqlite(
+        &path,
+        vec![msg("user", "second"), msg("assistant", "second answer")],
+    )
+    .unwrap();
+    let second_source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert!(
+        write_context_snapshot_sqlite(
+            &path,
+            &[msg(ROLE_INTERNAL_NOTE, "[summary] second turn")],
+            second_source.source_message_id,
+            second_source.canonical_generation,
+            PROJECTION,
+        )
+        .unwrap()
+    );
+
+    // A checkpoint restore rewrites canonical history; every derived snapshot
+    // must go, including the archived rewind ring.
+    let conn = open_history_db(&path).unwrap();
+    let generation_before = super::revision::history_generation(&conn).unwrap();
+    for table in ["context_snapshot_history", "context_messages_history"] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "{table} should hold an archive before the rebase");
+    }
+    drop(conn);
+    super::rollback::rebase_metadata_after_rollback(
+        &path,
+        second_source.canonical_generation,
+        0,
+        0,
+        None,
+    )
+    .unwrap();
+    let conn = open_history_db(&path).unwrap();
+    assert!(super::revision::history_generation(&conn).unwrap() > generation_before);
+    for table in [
+        "context_snapshot",
+        "context_messages",
+        "context_snapshot_history",
+        "context_messages_history",
+    ] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table} should be cleared by the rollback rebase");
+    }
+    drop(conn);
+    // With no derived snapshot left, the next read rebuilds from canonical
+    // history instead of serving the pre-rollback projection.
+    let rebuilt = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert_eq!(rebuilt.messages.len(), 4);
+    assert!(
+        rebuilt
+            .messages
+            .iter()
+            .all(|message| message.role != ROLE_INTERNAL_NOTE)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn context_snapshot_is_ignored_when_projection_policy_changes() {
     let dir = std::env::temp_dir().join(format!(
         "context_snapshot_policy_test_{}_{}",
@@ -1107,6 +1581,56 @@ fn stale_context_snapshot_cannot_resurrect_cleared_history() {
             .messages,
         vec![current]
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn truncate_after_clear_cannot_promote_pre_clear_ring_entry() {
+    const PROJECTION: &str = "test-policy-a";
+    let dir = std::env::temp_dir().join(format!(
+        "truncate_after_clear_ring_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    append_history_sqlite(&path, vec![msg("user", "before clear")]).unwrap();
+    let cleared_source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert!(
+        write_context_snapshot_sqlite(
+            &path,
+            &[msg(ROLE_INTERNAL_NOTE, "[summary] cleared turn")],
+            cleared_source.source_message_id,
+            cleared_source.canonical_generation,
+            PROJECTION,
+        )
+        .unwrap()
+    );
+
+    clear_session_history_sqlite(&path).unwrap();
+    let surviving = msg("user", "after clear");
+    append_history_sqlite(&path, vec![surviving.clone()]).unwrap();
+    // AUTOINCREMENT keeps the new row's id above the cleared snapshot's
+    // watermark, so a watermark-only promotion would treat the pre-clear ring
+    // entry as a projection covering the surviving prefix.
+    truncate_messages_sqlite(&path, 1).unwrap();
+
+    let conn = open_history_db(&path).unwrap();
+    for table in ["context_snapshot_history", "context_messages_history"] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table} must stay empty after a clear");
+    }
+    drop(conn);
+    let projected = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert_eq!(projected.messages, vec![surviving]);
+    assert!(!projected.snapshot_is_current);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

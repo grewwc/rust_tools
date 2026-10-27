@@ -130,7 +130,7 @@ pub(in crate::ai) fn read_live_rollback_metadata(path: &Path) -> io::Result<Live
 /// - `history_revision` is strictly greater than the live value -> cross-connection file caches observe the change and reload.
 /// Everything commits in a single Immediate transaction, avoiding an inconsistent window of
 /// “rolled back but counters not raised” after the overwrite.
-fn rebase_metadata_after_rollback(
+pub(super) fn rebase_metadata_after_rollback(
     path: &Path,
     live_generation: i64,
     live_revision: i64,
@@ -147,6 +147,12 @@ fn rebase_metadata_after_rollback(
     tx.execute("DELETE FROM context_messages", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
     tx.execute("DELETE FROM context_snapshot", [])
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    // The rewind ring is derived state too; a checkpoint restore must not
+    // leave a projection that a later truncation could promote.
+    tx.execute("DELETE FROM context_messages_history", [])
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    tx.execute("DELETE FROM context_snapshot_history", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
     // Each counter takes MAX(checkpoint value, live value) then +1 (generation/revision must strictly
     // increase; turn_seq can simply take the live value, since it is the “next number to allocate”).

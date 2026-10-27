@@ -2728,21 +2728,54 @@ mod tests {
             )
             .unwrap()
         );
+        append_history_messages(
+            &source_db,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("again".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        let second = read_context_history_sqlite(&source_db, "test-projection").unwrap();
+        assert!(
+            write_context_snapshot_sqlite(
+                &source_db,
+                &snapshot,
+                second.source_message_id,
+                second.canonical_generation,
+                "test-projection",
+            )
+            .unwrap()
+        );
 
         store.fork_session(source_id, target_id).unwrap();
 
-        let count_snapshot_rows = |db: &std::path::Path| -> i64 {
+        let count_rows = |db: &std::path::Path, table: &str| -> i64 {
             let conn = rusqlite::Connection::open(db).unwrap();
-            conn.query_row("SELECT COUNT(*) FROM context_snapshot", [], |row| {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                 row.get(0)
             })
             .unwrap()
         };
-        assert_eq!(count_snapshot_rows(&source_db), 1);
-        assert_eq!(
-            count_snapshot_rows(&store.session_history_file(target_id)),
-            0
-        );
+        // The second write archives the first projection, so the source carries
+        // both a current snapshot and one ring entry; the fork must drop both.
+        assert_eq!(count_rows(&source_db, "context_snapshot"), 1);
+        assert_eq!(count_rows(&source_db, "context_snapshot_history"), 1);
+        for table in [
+            "context_snapshot",
+            "context_messages",
+            "context_snapshot_history",
+            "context_messages_history",
+        ] {
+            assert_eq!(
+                count_rows(&store.session_history_file(target_id), table),
+                0,
+                "forked {table} must not carry derived state"
+            );
+        }
 
         let _ = fs::remove_dir_all(store.sessions_root());
     }

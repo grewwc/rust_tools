@@ -160,13 +160,76 @@ pub(super) fn invalidate_context_snapshot(conn: &Connection) -> io::Result<()> {
         .map_err(|error| io::Error::other(error.to_string()))?;
     conn.execute("DELETE FROM context_snapshot", [])
         .map_err(|error| io::Error::other(error.to_string()))?;
+    conn.execute("DELETE FROM context_messages_history", [])
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    conn.execute("DELETE FROM context_snapshot_history", [])
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    bump_history_generation(conn)?;
+    Ok(())
+}
+
+/// Invalidate the derived context snapshot unless every canonical message it
+/// covers survives a truncation that keeps rows up to `max_kept_id`.
+///
+/// A rewind that cuts after the snapshot watermark leaves the snapshot's whole
+/// source range intact, so the compressed projection can still serve as the
+/// prefix of the shortened history. Rewinding a large session otherwise forces
+/// the next turn to recompress the entire canonical history from scratch.
+///
+/// The generation still advances and the retained snapshot is re-stamped: a
+/// writer that read the pre-truncation history must not be able to commit a
+/// snapshot covering rows that were just removed.
+pub(super) fn invalidate_context_snapshot_unless_covered_by(
+    conn: &Connection,
+    max_kept_id: i64,
+) -> io::Result<()> {
+    let canonical_generation = history_generation(conn)?;
+    if snapshot_watermark(conn)?.is_some_and(|(source, generation)| {
+        generation == canonical_generation && source <= max_kept_id
+    }) {
+        restamp_context_snapshot(conn)?;
+        return super::context::extend_context_snapshot_through_latest(conn);
+    }
+    // Consecutive rewinds move the cutoff below several archived turn
+    // boundaries; restore the newest projection that still only covers
+    // surviving rows. Its generation is expected to lag behind after an
+    // earlier rewind; the watermark is what proves the coverage.
+    let generation = bump_history_generation(conn)?;
+    if super::context::promote_context_snapshot_from_history(conn, max_kept_id, generation)? {
+        return super::context::extend_context_snapshot_through_latest(conn);
+    }
+    invalidate_context_snapshot(conn)
+}
+
+fn snapshot_watermark(conn: &Connection) -> io::Result<Option<(i64, i64)>> {
+    conn.query_row(
+        "SELECT source_message_id, source_generation
+         FROM context_snapshot WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))
+}
+
+fn restamp_context_snapshot(conn: &Connection) -> io::Result<()> {
+    let generation = bump_history_generation(conn)?;
+    conn.execute(
+        "UPDATE context_snapshot SET source_generation = ?1 WHERE singleton = 1",
+        params![generation],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(())
+}
+
+fn bump_history_generation(conn: &Connection) -> io::Result<i64> {
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('history_generation', '1')
          ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
         [],
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(())
+    history_generation(conn)
 }
 pub(super) fn read_i64_meta_from_conn(conn: &Connection, key: &str) -> Option<i64> {
     conn.query_row(

@@ -62,6 +62,78 @@ fn read_projected_canonical_messages_after_id(
     }
     Ok(messages)
 }
+
+/// Append the canonical messages that survive a truncation but lie past the
+/// retained snapshot watermark, so the snapshot covers the whole surviving
+/// prefix and `snapshot_is_current` holds on the next turn.
+///
+/// Truncation already deleted everything past the cutoff, so every row after
+/// the watermark belongs to the surviving history. The appended rows use the
+/// same persisted projection as a freshly written snapshot; guidance filtering
+/// still runs whenever the projection is served.
+pub(super) fn extend_context_snapshot_through_latest(conn: &Connection) -> io::Result<()> {
+    let watermark: Option<i64> = conn
+        .query_row(
+            "SELECT source_message_id FROM context_snapshot WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let Some(watermark) = watermark else {
+        return Ok(());
+    };
+    let latest: i64 = conn
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    if latest <= watermark {
+        return Ok(());
+    }
+    let tail = read_projected_canonical_messages_after_id(conn, watermark)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let next_position: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM context_messages",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut stmt = conn
+        .prepare(
+            "INSERT INTO context_messages
+                (position, role, content, tool_calls, tool_call_id, reasoning_content)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    for (offset, message) in tail.iter().enumerate() {
+        let content = serde_json::to_string(&message.content)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let tool_calls = message
+            .tool_calls
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        stmt.execute(params![
+            next_position + offset as i64,
+            message.role,
+            content,
+            tool_calls,
+            message.tool_call_id,
+            message.reasoning_content,
+        ])
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    }
+    drop(stmt);
+    conn.execute(
+        "UPDATE context_snapshot SET source_message_id = ?1 WHERE singleton = 1",
+        params![latest],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(())
+}
 pub(in crate::ai) fn read_context_history_sqlite(
     path: &Path,
     projection_fingerprint: &str,
@@ -178,6 +250,8 @@ pub(in crate::ai) fn write_context_snapshot_sqlite_with_busy_timeout(
             return Ok(false);
         }
 
+        archive_context_snapshot(&tx, path)?;
+        prune_context_snapshot_history(&tx, path)?;
         tx.execute("DELETE FROM context_messages", [])
             .map_err(|error| sqlite_error(path, "clear context_messages", error))?;
         insert_context_messages(&tx, path, messages)?;
@@ -201,6 +275,162 @@ pub(in crate::ai) fn write_context_snapshot_sqlite_with_busy_timeout(
             .map_err(|error| sqlite_error(path, "commit context snapshot transaction", error))?;
         Ok(true)
     })
+}
+
+/// Number of replaced snapshots kept as rewind fallbacks.
+///
+/// Each entry holds one projection: the compressed prefix plus whatever raw
+/// tail a retained rewind appended. The ring is therefore bounded in entries
+/// rather than bytes, which still keeps the fallback tables small.
+const CONTEXT_SNAPSHOT_HISTORY_KEEP: usize = 8;
+
+/// Move the snapshot being replaced into the bounded rewind ring.
+///
+/// A rewind that cuts before the newest snapshot's watermark cannot reuse it,
+/// but an older projection whose watermark still survives can serve as the
+/// prefix. Keeping several turn boundaries lets consecutive rewinds stay fast
+/// instead of recompressing the whole canonical history.
+fn archive_context_snapshot(conn: &Connection, path: &Path) -> io::Result<()> {
+    let current: Option<(i64, i64, String)> = conn
+        .query_row(
+            "SELECT source_message_id, source_generation, projection_fingerprint
+             FROM context_snapshot WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| sqlite_error(path, "read context_snapshot", error))?;
+    let Some((source_message_id, source_generation, fingerprint)) = current else {
+        return Ok(());
+    };
+    if source_generation != history_generation(conn)? {
+        // A canonical rewrite already invalidated the projection; it cannot
+        // prove coverage of any surviving prefix, and neither can older rows.
+        conn.execute("DELETE FROM context_messages_history", [])
+            .map_err(|error| sqlite_error(path, "clear context_messages_history", error))?;
+        conn.execute("DELETE FROM context_snapshot_history", [])
+            .map_err(|error| sqlite_error(path, "clear context_snapshot_history", error))?;
+        return Ok(());
+    }
+    // History watermarks increase monotonically; an equivalent or newer range
+    // is not an older fallback.
+    let newest = conn
+        .query_row(
+            "SELECT source_message_id FROM context_snapshot_history
+             ORDER BY source_message_id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| sqlite_error(path, "read context_snapshot_history", error))?;
+    if newest.is_some_and(|watermark| watermark >= source_message_id) {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO context_snapshot_history (source_message_id, projection_fingerprint)
+         VALUES (?1, ?2)",
+        params![source_message_id, fingerprint],
+    )
+    .map_err(|error| sqlite_error(path, "save context_snapshot_history", error))?;
+    let snapshot_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO context_messages_history
+            (snapshot_id, position, role, content, tool_calls, tool_call_id, reasoning_content)
+         SELECT ?1, position, role, content, tool_calls, tool_call_id, reasoning_content
+         FROM context_messages",
+        [snapshot_id],
+    )
+    .map_err(|error| sqlite_error(path, "save context_messages_history", error))?;
+    Ok(())
+}
+
+/// Drop the oldest archived projections beyond the rewind ring.
+fn prune_context_snapshot_history(conn: &Connection, path: &Path) -> io::Result<()> {
+    conn.execute(
+        "DELETE FROM context_messages_history
+         WHERE snapshot_id IN (
+            SELECT snapshot_id FROM context_snapshot_history
+            ORDER BY source_message_id DESC, snapshot_id DESC
+            LIMIT -1 OFFSET ?1
+         )",
+        [CONTEXT_SNAPSHOT_HISTORY_KEEP as i64],
+    )
+    .map_err(|error| sqlite_error(path, "prune context_messages_history", error))?;
+    conn.execute(
+        "DELETE FROM context_snapshot_history
+         WHERE snapshot_id IN (
+            SELECT snapshot_id FROM context_snapshot_history
+            ORDER BY source_message_id DESC, snapshot_id DESC
+            LIMIT -1 OFFSET ?1
+         )",
+        [CONTEXT_SNAPSHOT_HISTORY_KEEP as i64],
+    )
+    .map_err(|error| sqlite_error(path, "prune context_snapshot_history", error))?;
+    Ok(())
+}
+
+/// Restore the newest archived projection whose whole source range survives a
+/// truncation that keeps rows up to `max_kept_id`.
+///
+/// Archived projections that cover removed rows can never serve a later rewind
+/// and are dropped. The promoted row itself stays in the ring: it still covers
+/// only surviving rows, so a deeper rewind can reuse it. Returns whether a
+/// projection was restored.
+pub(super) fn promote_context_snapshot_from_history(
+    conn: &Connection,
+    max_kept_id: i64,
+    generation: i64,
+) -> io::Result<bool> {
+    let snapshot_id = conn
+        .query_row(
+            "SELECT snapshot_id FROM context_snapshot_history
+             WHERE source_message_id <= ?1
+             ORDER BY source_message_id DESC LIMIT 1",
+            [max_kept_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let Some(snapshot_id) = snapshot_id else {
+        return Ok(false);
+    };
+    conn.execute("DELETE FROM context_messages", [])
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    conn.execute(
+        "INSERT INTO context_messages
+            (position, role, content, tool_calls, tool_call_id, reasoning_content)
+         SELECT position, role, content, tool_calls, tool_call_id, reasoning_content
+         FROM context_messages_history WHERE snapshot_id = ?1",
+        [snapshot_id],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    conn.execute(
+        "INSERT INTO context_snapshot
+            (singleton, source_message_id, source_generation, projection_fingerprint)
+         SELECT 1, source_message_id, ?2, projection_fingerprint
+         FROM context_snapshot_history WHERE snapshot_id = ?1
+         ON CONFLICT(singleton) DO UPDATE SET
+            source_message_id = excluded.source_message_id,
+            source_generation = excluded.source_generation,
+            projection_fingerprint = excluded.projection_fingerprint",
+        params![snapshot_id, generation],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    conn.execute(
+        "DELETE FROM context_messages_history
+         WHERE snapshot_id IN (
+                SELECT snapshot_id FROM context_snapshot_history
+                WHERE source_message_id > ?1
+            )",
+        [max_kept_id],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    conn.execute(
+        "DELETE FROM context_snapshot_history WHERE source_message_id > ?1",
+        [max_kept_id],
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(true)
 }
 
 fn insert_context_messages(conn: &Connection, path: &Path, messages: &[Message]) -> io::Result<()> {

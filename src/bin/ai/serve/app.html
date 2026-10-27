@@ -751,6 +751,11 @@ const RUNNING_SAMPLE_TTL_MS = 60000; // a running sample older than this is stal
 let stopBusy = false; // one interrupt POST at a time: a double tap must not send two
 let sideNoteBusy = false; // one queued note at a time; the running turn itself continues
 let noteTimer = null; // pending auto-clear of the transient #connstat note
+let infoRetryTimer = null; // retries GET /info after a transient failure
+let resumeBusy = false; // one foreground/network resync at a time
+let booted = false; // boot() finished; resume handlers may refresh now
+let bootComplete = false; // boot() also loaded sessions, history and picks
+let bootCompleting = false; // one completeBoot() at a time
 let pendingImages = []; // {filename, data_base64}
 // A turn stream that dies on the wire (page backgrounded, network switched) is
 // not a failed turn: the turn child keeps running server-side and only this
@@ -766,6 +771,7 @@ let staleBusy = false; // one history fetch at a time; ticks may overlap a slow 
 let lastHistoryEndsUnanswered = false; // loaded history has no reply after its user turn
 const STALE_FOLLOW_MS = 4000; // follow-up reload interval
 const STALE_FOLLOW_TRIES = 300; // ~20 min of visible following, then ↻ takes over
+const LIVE_STALL_MS = 60000; // no byte at all for this long => the live socket is dead
 
 // A turn can stop and ask for confirmation, and the question is answered over
 // HTTP rather than the stream, so it outlives the feed that delivered it: the
@@ -2198,6 +2204,14 @@ function shortLine(v, max) {
   const line = String(v === undefined || v === null ? "" : v).split("\n")[0].trim();
   return line.length > max ? line.slice(0, max - 1) + "…" : line;
 }
+function formatElapsed(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = String(total % 60).padStart(2, "0");
+  if (hours) return hours + ":" + String(minutes).padStart(2, "0") + ":" + seconds;
+  return minutes + ":" + seconds;
+}
 function baseNameOf(p) {
   const parts = String(p).split("/");
   return parts[parts.length - 1] || String(p);
@@ -2727,10 +2741,28 @@ async function loadInfo() {
     // The three picks are per-session and live on the server; loadSessionConfig
     // mirrors them into these selects once the current session is known.
     syncOvrSummary();
+    if (infoRetryTimer !== null) { clearTimeout(infoRetryTimer); infoRetryTimer = null; }
+    $("info").title = "";
+    // A boot that stopped at the health check still has sessions, history and
+    // per-session picks to load; a successful retry is the moment to finish it.
+    if (booted && !bootComplete) void completeBoot();
   } catch (e) {
     let msg = "offline: " + e.message;
-    if (/401/.test(e.message)) msg += " (re-save the token; serve reads ai.serve.token only at startup, so restart it after changing the token)";
-    $("info").textContent = msg;
+    if (/401/.test(e.message)) {
+      msg += " (re-save the token; serve reads ai.serve.token only at startup, so restart it after changing the token)";
+      if (infoRetryTimer !== null) { clearTimeout(infoRetryTimer); infoRetryTimer = null; }
+      $("info").textContent = msg;
+      $("info").title = msg;
+      return;
+    }
+    // A failed /info fetch is usually a dropped phone connection, not a dead
+    // server: keep the bar short, expose the detail in the tooltip, and retry
+    // until it succeeds (online/foreground recovery triggers an immediate one).
+    $("info").textContent = "offline — retrying…";
+    $("info").title = msg;
+    if (infoRetryTimer === null) {
+      infoRetryTimer = setTimeout(() => { infoRetryTimer = null; void loadInfo(); }, 10000);
+    }
   }
 }
 // The drawer only highlights the current session while open, so mirror it
@@ -3283,6 +3315,74 @@ function checkInterruptedTurn() {
   const root = $("msgs");
   if (root.querySelector(".turn-interrupted")) return;
   addMsg("err", "这条消息没有收到回复：上一轮可能被服务重启中断。可以重新发送。", "asst err turn-interrupted");
+}
+// boot() returns early when its health check fails, before loading sessions,
+// history or the session's picks. A later online/foreground resume (or the
+// /info retry) calls this once the server is reachable again, so recovery ends
+// in the same fully initialized page as a normal boot instead of a bare stream.
+async function completeBoot() {
+  if (bootComplete || bootCompleting) return;
+  bootCompleting = true;
+  try {
+    void loadSkills();
+    await loadSessions();
+    if (!sessionId) { bootComplete = true; return; }
+    if (historySession !== sessionId) await loadHistory();
+    await loadSessionConfig();
+    const running = await pollConfirm();
+    checkInterruptedTurn();
+    if (running !== null) bootComplete = true;
+  } finally {
+    bootCompleting = false;
+  }
+}
+// A phone that backgrounded the page or changed networks cannot trust its old
+// socket. On return, ask the server for the authoritative running state, then
+// either reattach the retained event stream or rebuild the transcript once.
+// This does not wait for a stale mark, whose own timer may have been suspended
+// while the page was hidden.
+async function resumeSync() {
+  if (!booted || resumeBusy) return;
+  resumeBusy = true;
+  try {
+    void loadInfo();
+    if (!bootComplete) {
+      await completeBoot();
+      if (!bootComplete) startStaleFollow();
+      return;
+    }
+    const sid = sessionId, epoch = runEpoch;
+    const hadEvents = eventActive;
+    const running = await pollConfirm();
+    if (sid !== sessionId || epoch !== runEpoch) return;
+    checkInterruptedTurn();
+    if (!sid) return;
+    if (running === true) {
+      if (turns.has(sid)) {
+        const live = turns.get(sid);
+        // Timers are throttled while hidden, so a dead socket can survive the
+        // stream's own watchdog. A full stall window with no bytes means the
+        // retained stream, not the turn, is gone: let the normal stale path
+        // reattach instead of leaving the old "Thinking…" box on screen.
+        if (live && Date.now() - (live.lastEventAt || 0) > LIVE_STALL_MS) live.recover?.();
+      } else if (!eventActive) {
+        void attachEvents();
+      }
+      startStaleFollow();
+    } else if (running === false) {
+      if (turns.has(sid)) {
+        // The server says the turn is over, but this page's own feed never
+        // delivered the terminal event. Release the reader; its normal
+        // stale/history path renders the persisted reply.
+        turns.get(sid)?.recover?.("server reports the turn ended — refreshing history", true);
+      } else if (!hadEvents && !eventActive) {
+        // The reply may have landed while the page was hidden or offline.
+        await loadHistory();
+      }
+    } else {
+      startStaleFollow();
+    }
+  } finally { resumeBusy = false; }
 }
 function stopStaleFollow() {
   if (staleTimer !== null) { clearInterval(staleTimer); staleTimer = null; }
@@ -3901,7 +4001,24 @@ async function send() {
   const box = document.createElement("div");
   box.className = "turn";
   $("msgs").appendChild(box);
-  turns.set(sid, { box });
+  // The stream's watchdog and a foreground resume both need to know whether
+  // this feed is still moving. `recover` runs the same cancel path as the
+  // timer, but from outside the send() closure.
+  let stalled = false;
+  let recoverReason = ""; // set when a foreground resync, not the timer, stopped the feed
+  let recoverEnded = false; // the server said the turn is already over
+  let reader = null;
+  const liveEntry = {
+    box,
+    lastEventAt: Date.now(),
+    recover: (reason = "", ended = false) => {
+      recoverReason = reason;
+      recoverEnded = ended;
+      stalled = !reason;
+      try { if (reader) reader.cancel(); } catch (_) {}
+    },
+  };
+  turns.set(sid, liveEntry);
   syncStopButton(); // only now does isTurnRunning() see this session's own turn
   // Progress and thinking folds are inserted lazily in stream order ahead of
   // the final reply, so tool phases remain visible between reasoning phases.
@@ -3914,6 +4031,14 @@ async function send() {
   const phaseBubble = addMsgMd("", box);
   phaseBubble.classList.add("pending");
   const activity = createLiveActivity(box, bubble);
+  const clockStart = Date.now();
+  const phaseLine = () => "◌ " + activity.label() + " · " + formatElapsed(Date.now() - clockStart);
+  const phaseTimer = setInterval(() => {
+    // The box is parked while the user reads another session; keep the clock
+    // live through that detach so it is current when attachLiveBox restores it.
+    if (turns.get(sid) !== liveEntry) { clearInterval(phaseTimer); return; }
+    phaseBubble.textContent = phaseLine();
+  }, 1000);
   let activityDirty = true;
   const setPhase = (label, waiting = false) => {
     activity.setPhase(label, waiting);
@@ -3955,7 +4080,7 @@ async function send() {
     if (!answerDirty && !progressDirty && !thinkingDirty && !thinkingDoneDirty && !activityDirty) return;
     const follow = sid === sessionId && shouldFollowOutput();
     if (activityDirty) {
-      phaseBubble.textContent = "◌ " + activity.label();
+      phaseBubble.textContent = phaseLine();
       activityDirty = false;
     }
     if (progressDirty && prog) {
@@ -4050,20 +4175,17 @@ async function send() {
   let turnStarted = false;
   let turnError = false;
   let finishFollow = false;
-  const STREAM_STALL_MS = 60000; // no bytes at all for this long => the connection is dead
   // A turn can be quiet for a long time (a slow tool call, a long provider
   // pause) while the connection stays perfectly healthy. The keep-alive
   // comment the server sends every 15s proves the transport is alive, so it
   // re-arms the transport watchdog, but it is not progress: a turn that
   // produces nothing at all for this long is the stuck one.
   const STREAM_SILENCE_MS = 300000;
-  let stalled = false; // set by the watchdog; the read loop then exits via cancel
   let stallTimer = null;
   let silenceTimer = null;
-  let reader = null; // assigned once the stream opens, so the watchdog can cancel it
   const armStall = () => {
     clearTimeout(stallTimer);
-    stallTimer = setTimeout(() => { stalled = true; try { if (reader) reader.cancel(); } catch (_) {} }, STREAM_STALL_MS);
+    stallTimer = setTimeout(() => { stalled = true; try { if (reader) reader.cancel(); } catch (_) {} }, LIVE_STALL_MS);
   };
   const armProgress = () => {
     clearTimeout(silenceTimer);
@@ -4100,13 +4222,16 @@ async function send() {
     reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
-    armStall(); // the first block must arrive within STREAM_STALL_MS
+    armStall(); // the first block must arrive within LIVE_STALL_MS
     armProgress(); // and the turn must produce something within STREAM_SILENCE_MS
     let finished = false;
     setPhase("Waiting for model…");
     for (;;) {
       const { done, value } = await reader.read();
-      if (value) buf += dec.decode(value, { stream: true });
+      if (value) {
+        liveEntry.lastEventAt = Date.now();
+        buf += dec.decode(value, { stream: true });
+      }
       // Consume complete blocks; the tail may hold a partial block.
       let idx;
       while ((idx = buf.indexOf("\n\n")) >= 0) {
@@ -4247,7 +4372,7 @@ async function send() {
       // Only the session on screen can be followed from history here; a stalled
       // turn in a session the user has left is retired, and its reply is what
       // that session renders when it is opened again.
-      const reason = stalled ? "stream stalled (no progress for 5 minutes)" : "stream ended before completion";
+      const reason = recoverReason || (stalled ? "stream stalled (no progress for 5 minutes)" : "stream ended before completion");
       if (sid === sessionId) goStale(reason + " — checking server history");
       else dropBackgroundTurn(box, reason);
     }
@@ -4277,6 +4402,7 @@ async function send() {
   }
   // This turn is over, so its session may send again: the entry goes away
   // whether or not the box stays on screen.
+  clearInterval(phaseTimer);
   turns.delete(sid);
   // The server persisted this input before it ran the turn, so history keeps
   // it even if the page's message count drifted.
@@ -4288,7 +4414,9 @@ async function send() {
     // the transcript empty until the turn ends. The history follow stays armed
     // as the fallback: it idles while the reattached stream is live.
     box.remove();
-    void attachEvents();
+    // A turn the server already reports as over has nothing left to reattach;
+    // the history follow above is enough and avoids rebuilding an ended turn.
+    if (!recoverEnded) void attachEvents();
   }
   // The feed that just ended owns the truth about the turn it carried, same
   // as at stream start: the live-stream leg drops with the map entry above,
@@ -4454,8 +4582,13 @@ function wire() {
   // until it is visible again, so coming back is where recovery has to start.
   // A question the turn is blocked on survives a reconnect, so coming back to
   // the page is also where the confirm dialog has to be rebuilt.
-  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { void pollConfirm().then(checkInterruptedTurn); startStaleFollow(); } });
-  window.addEventListener("pageshow", () => { void pollConfirm().then(checkInterruptedTurn); startStaleFollow(); }); // bfcache restore fires no visibility change
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") void resumeSync(); });
+  window.addEventListener("pageshow", () => { void resumeSync(); }); // bfcache restore fires no visibility change
+  window.addEventListener("online", () => { void resumeSync(); });
+  window.addEventListener("offline", () => {
+    $("info").textContent = "offline — waiting for network…";
+    $("info").title = "The browser reports no network connection";
+  });
   if (window.matchMedia && matchMedia("(max-width: 700px)").matches) $("ovrwrap").open = false;
   $("scrim").onclick = () => setDrawer(false);
   $("omodel").onchange = () => savePick();
@@ -4649,7 +4782,13 @@ function registerAppServiceWorker() {
 async function boot() {
   registerAppServiceWorker();
   wire();
-  try { await api("/healthz"); } catch (e) { $("info").textContent = "cannot reach server: " + e.message + " — tap ⚙"; return; }
+  try { await api("/healthz"); } catch (e) {
+    $("info").textContent = "offline — retrying…";
+    $("info").title = "cannot reach server: " + e.message;
+    booted = true; // let online/foreground recovery run even though boot stopped early
+    void loadInfo(); // shares the same base/token and arms the retry timer
+    return;
+  }
   await loadInfo();
   loadSkills(); // Optional catalog must not delay history or the composer.
   await loadSessions();
@@ -4657,6 +4796,8 @@ async function boot() {
   await loadSessionConfig(); // restore this session's picks from the server
   await pollConfirm(); // cold boot mid-turn (or a remote turn) has no live event; derive once
   checkInterruptedTurn();
+  bootComplete = true;
+  booted = true;
 }
 boot();
 </script>

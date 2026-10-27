@@ -332,6 +332,10 @@ fn coalesce_repeated_wait_wake_notes_sqlite_unlocked(
         tx.execute("DELETE FROM messages WHERE id=?1", params![id])
             .map_err(|e| io::Error::other(e.to_string()))?;
     }
+    // Deleting canonical rows punches an interior hole that a snapshot covering
+    // them cannot represent, so the derived projection (and every ring entry)
+    // must go before the deletion becomes visible.
+    invalidate_context_snapshot(&tx)?;
     bump_history_revision(&tx)?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))?;
     Ok(true)
