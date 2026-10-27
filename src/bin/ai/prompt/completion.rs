@@ -498,31 +498,54 @@ impl CommandCompleter {
                 let key = model.key.to_ascii_lowercase();
                 let name = model.name.to_ascii_lowercase();
                 let platform = crate::ai::model_names::platform_slug(model).to_ascii_lowercase();
-                let head_matches = key.starts_with(&head) || name.starts_with(&head);
+                // Encrypted `enc:...` names are opaque blobs: never match their
+                // literal prefix (mirrors the fuzzy-tier field filter below).
+                let head_matches = key.starts_with(&head)
+                    || (!Self::is_encrypted_model_name(&model.name) && name.starts_with(&head));
                 if head_matches && platform.starts_with(tail) {
                     return Some(1);
                 }
             }
         }
         // Fuzzy subsequence fallback over key/name/platform/aliases, graded by score
-        // but always ranked below the structured tiers above (min rank 2).
-        Self::fuzzy_match_score(&token, &Self::model_searchable_text(model))
+        // but always ranked below the structured tiers above (min rank 2). Each
+        // field scores independently (best wins) so a match can never span field
+        // boundaries, e.g. `f` from the key plus `re` from the platform.
+        Self::model_search_fields(model)
+            .iter()
+            .filter_map(|field| Self::fuzzy_match_score(&token, field))
+            .max()
             .map(|score| Self::fuzzy_score_to_rank(score, 2))
     }
 
-    /// Search text used for fuzzy matching: key + name + platform + aliases.
-    fn model_searchable_text(model: &crate::ai::model_names::ModelDef) -> String {
-        let mut text = format!("{} {}", model.key, model.name);
+    /// Encrypted model names (`enc:...`) are opaque ciphertext, not human text:
+    /// matching them produces random hits (e.g. `fre` hitting bytes inside the
+    /// blob). Mirrors the display-side rule in `model_names::model_handle`,
+    /// which already substitutes the key for such names.
+    fn is_encrypted_model_name(name: &str) -> bool {
+        name.starts_with("enc:")
+    }
+
+    /// Search fields used for fuzzy matching: key, name, platform, aliases.
+    /// Encrypted names and empty fields are excluded.
+    fn model_search_fields(model: &crate::ai::model_names::ModelDef) -> Vec<String> {
+        let mut fields = Vec::new();
+        if !model.key.trim().is_empty() {
+            fields.push(model.key.clone());
+        }
+        if !model.name.trim().is_empty() && !Self::is_encrypted_model_name(&model.name) {
+            fields.push(model.name.clone());
+        }
         let platform = crate::ai::model_names::platform_slug(model);
-        if !platform.is_empty() {
-            text.push(' ');
-            text.push_str(&platform);
+        if !platform.trim().is_empty() {
+            fields.push(platform);
         }
         for alias in &model.aliases {
-            text.push(' ');
-            text.push_str(alias);
+            if !alias.trim().is_empty() {
+                fields.push(alias.clone());
+            }
         }
-        text
+        fields
     }
 
     /// Fuzzy subsequence match used as the generic name-matching fallback (agents,
@@ -535,8 +558,14 @@ impl CommandCompleter {
     /// skipped between two matches so long gaps sink loose matches. Returns `None`
     /// when `query` is not an in-order subsequence of `candidate`; an empty query
     /// matches nothing here (callers rank empty tokens via their exact-prefix tier).
+    /// Quality gate: a subsequence only counts when the query is a contiguous
+    /// substring of the candidate or its first matched character sits on a word
+    /// boundary. This rejects the worst class (mid-word start plus scattered
+    /// rest, e.g. `fre` inside random bytes) while keeping anchored shorthand
+    /// (`asc` → `async-agent-auditor`) and plain substrings (`ync` → `async`).
     fn fuzzy_match_score(query: &str, candidate: &str) -> Option<i64> {
-        let query: Vec<char> = query.trim().to_ascii_lowercase().chars().collect();
+        let lowered_query = query.trim().to_ascii_lowercase();
+        let query: Vec<char> = lowered_query.chars().collect();
         if query.is_empty() {
             return None;
         }
@@ -544,6 +573,7 @@ impl CommandCompleter {
         let lowered: Vec<char> = candidate.to_ascii_lowercase().chars().collect();
         let mut qi = 0;
         let mut prev: Option<usize> = None;
+        let mut first: Option<usize> = None;
         let mut score: i64 = 0;
         for (i, ch) in lowered.iter().enumerate() {
             if qi == query.len() {
@@ -553,12 +583,7 @@ impl CommandCompleter {
                 continue;
             }
             score += 1;
-            // ASCII case folding is 1:1 per char, so `chars[i]` is the original-case
-            // counterpart of `lowered[i]` and keeps camelCase boundaries detectable.
-            let boundary = i == 0
-                || matches!(chars[i - 1], '-' | '.' | '_' | '/' | ':' | ' ')
-                || (chars[i - 1].is_ascii_lowercase() && chars[i].is_ascii_uppercase());
-            if boundary {
+            if Self::is_fuzzy_boundary(&chars, i) {
                 score += 8;
             }
             if let Some(p) = prev {
@@ -570,9 +595,27 @@ impl CommandCompleter {
                 }
             }
             prev = Some(i);
+            if first.is_none() {
+                first = Some(i);
+            }
             qi += 1;
         }
-        (qi == query.len()).then_some(score)
+        if qi != query.len() {
+            return None;
+        }
+        let anchored = first.is_some_and(|i| Self::is_fuzzy_boundary(&chars, i));
+        let contiguous = candidate.to_ascii_lowercase().contains(&lowered_query);
+        (anchored || contiguous).then_some(score)
+    }
+
+    /// Word-boundary test shared by fuzzy scoring and its quality gate: start
+    /// of candidate, right after a `- . _ / : space` separator, or an ASCII
+    /// camelCase hump. ASCII case folding is 1:1 per char, so `chars` keeps the
+    /// original case and camelCase boundaries stay detectable.
+    fn is_fuzzy_boundary(chars: &[char], i: usize) -> bool {
+        i == 0
+            || matches!(chars[i - 1], '-' | '.' | '_' | '/' | ':' | ' ')
+            || (chars[i - 1].is_ascii_lowercase() && chars[i].is_ascii_uppercase())
     }
 
     /// Map a fuzzy score (higher = better) onto the rank scale (lower = better)
@@ -588,6 +631,8 @@ impl CommandCompleter {
     /// - 1..=255: fuzzy subsequence match on the replacement, graded by match quality
     ///   (word-boundary hits and consecutive runs rank above loose gap matches), e.g.
     ///   `fast` → `audit-fast`, `own` → `audit_own_changes`, `asc` → `async-agent-auditor`
+    ///   The fuzzy tier applies the shared quality gate (contiguous substring or
+    ///   boundary-anchored first character); see `fuzzy_match_score`.
     /// Only the name itself participates: descriptions are display-only and never matched (preventing `audit_o`
     /// from falsely hitting unrelated skills whose descriptions contain words like "audits of").
     /// Returns None when nothing matches.
@@ -841,6 +886,195 @@ impl CommandCompleter {
         let mut candidates = Self::checkpoint_branch_candidates(token);
         candidates.extend(Self::checkpoint_name_candidates(token, true));
         candidates
+    }
+
+    /// Candidates for `/git checkout` / `/git switch` arguments
+    /// (`<target> [--save <name> | --discard]`, plus the `-b`/`-c`
+    /// create form). Walks the quote-aware typed words (same splitting
+    /// the parser uses, so `--save "my work"` counts as one value) so
+    /// the preservation flags stay available after a target, value
+    /// slots stay silent, and the mutually exclusive `--save`/`--discard`
+    /// pair never offers its other half. An unterminated quote means
+    /// the cursor is still inside a value being typed, so nothing is
+    /// offered rather than corrupting it. `base` holds the token-filtered
+    /// target candidates (revisions for checkout, branches for switch);
+    /// after a create flag both offer revisions as the start point.
+    /// `dash_alias` adds the `-` previous-checkout target for switch.
+    fn navigation_candidates(
+        args_span: &str,
+        token: &str,
+        create_flag: &str,
+        create_hint: &str,
+        base: Vec<CompletionCandidate>,
+        dash_alias: bool,
+    ) -> Vec<CompletionCandidate> {
+        if Self::has_open_quote(args_span) {
+            return Vec::new();
+        }
+        let rest = Self::split_quoted_words(args_span);
+        let mut create_seen = false;
+        let mut target_seen = false;
+        let mut save_seen = false;
+        let mut discard_seen = false;
+        let mut index = 0;
+        while index < rest.len() {
+            let arg = rest[index].as_str();
+            if arg == create_flag || arg == "--create" {
+                if index + 1 >= rest.len() {
+                    return Vec::new();
+                }
+                create_seen = true;
+                index += 2;
+            } else if arg == "--save" || arg == "--as" {
+                if index + 1 >= rest.len() {
+                    return Vec::new();
+                }
+                save_seen = true;
+                index += 2;
+            } else if arg.starts_with("--save=") || arg.starts_with("--as=") {
+                save_seen = true;
+                index += 1;
+            } else if arg == "--discard" {
+                discard_seen = true;
+                index += 1;
+            } else if arg.len() > 1 && arg.starts_with('-') {
+                // Unknown option: the parser rejects the line, so no
+                // continuation is valid. A bare `-` is the
+                // previous-checkout target, not an option.
+                return Vec::new();
+            } else if !target_seen {
+                target_seen = true;
+                index += 1;
+            } else {
+                // A second positional is the save-as name.
+                save_seen = true;
+                index += 1;
+            }
+        }
+        let mut candidates = Vec::new();
+        if !target_seen {
+            if create_seen {
+                candidates.extend(Self::checkpoint_revision_candidates(token));
+            } else {
+                candidates.extend(base);
+                if create_flag.starts_with(token) {
+                    candidates.push(CompletionCandidate {
+                        display: format!("{create_flag} · {create_hint}"),
+                        replacement: create_flag.to_string(),
+                    });
+                }
+                if dash_alias && "-".starts_with(token) {
+                    candidates.push(CompletionCandidate {
+                        display: "- · previous checkout".to_string(),
+                        replacement: "-".to_string(),
+                    });
+                }
+            }
+        }
+        if !save_seen && !discard_seen {
+            for (flag, hint) in [
+                ("--save", "preserve dirty history under a name"),
+                ("--discard", "drop un-checkpointed turns"),
+            ] {
+                if flag.starts_with(token) {
+                    candidates.push(CompletionCandidate {
+                        display: format!("{flag} · {hint}"),
+                        replacement: flag.to_string(),
+                    });
+                }
+            }
+        }
+        candidates
+    }
+
+    /// Whether `text` ends inside an unterminated single/double quote
+    /// (same escape rules as the `/git commit` argument splitter: `\`
+    /// escapes the next char, except inside single quotes where it is
+    /// literal). Keeps flag candidates out of an open message.
+    fn has_open_quote(text: &str) -> bool {
+        let mut quote = None;
+        let mut chars = text.chars();
+        while let Some(ch) = chars.next() {
+            if let Some(delimiter) = quote {
+                if ch == delimiter {
+                    quote = None;
+                } else if ch == '\\' && delimiter == '"' {
+                    chars.next();
+                }
+            } else if ch == '\\' {
+                chars.next();
+            } else if ch == '\'' || ch == '"' {
+                quote = Some(ch);
+            }
+        }
+        quote.is_some()
+    }
+
+    /// Quote-aware word split mirroring the `/git` argument splitter
+    /// (`split_quoted_args` in the checkpoint driver): quotes group
+    /// words, `\` escapes the next character (literal inside single
+    /// quotes). Callers only pass balanced text (`has_open_quote` is
+    /// false), so this is infallible; a trailing `\` is kept literally
+    /// as an unreachable-in-practice fallback (the span always ends at
+    /// a whitespace boundary).
+    fn split_quoted_words(text: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut quote = None;
+        let mut in_word = false;
+        let mut chars = text.chars();
+        while let Some(ch) = chars.next() {
+            if let Some(delimiter) = quote {
+                if ch == delimiter {
+                    quote = None;
+                } else if ch == '\\' && delimiter == '"' {
+                    if let Some(escaped) = chars.next() {
+                        word.push(escaped);
+                    }
+                } else {
+                    word.push(ch);
+                }
+                continue;
+            }
+            match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    in_word = true;
+                }
+                '\\' => {
+                    if let Some(escaped) = chars.next() {
+                        word.push(escaped);
+                    } else {
+                        word.push('\\');
+                    }
+                    in_word = true;
+                }
+                ch if ch.is_whitespace() => {
+                    if in_word {
+                        words.push(std::mem::take(&mut word));
+                        in_word = false;
+                    }
+                }
+                _ => {
+                    word.push(ch);
+                    in_word = true;
+                }
+            }
+        }
+        if in_word {
+            words.push(word);
+        }
+        words
+    }
+
+    /// The argument text after the `/git` subcommand word. `span` starts
+    /// with `/git <sub>` (or the `:` alias) and the `/git ` prefix holds
+    /// no subcommand word, so the first occurrence of `sub` is the
+    /// subcommand itself (same remainder trick the parser uses).
+    fn args_after_subcommand<'a>(span: &'a str, sub: &str) -> &'a str {
+        span.split_once(sub)
+            .map(|(_, rest)| rest.trim_start())
+            .unwrap_or_default()
     }
 
     /// Topics of `/help` (same set `try_handle_help_command` accepts).
@@ -1191,10 +1425,28 @@ impl CommandCompleter {
                             .map(|c| c.to_string()),
                     ),
                     Some(sub) if matches!(sub, "save" | "commit" | "s") => {
+                        // `/git commit [name] [-m <message>]...`: `-m`
+                        // repeats for paragraphs, so flags stay available
+                        // after a finished message. Only the message-value
+                        // slot itself and an unterminated quoted message
+                        // suppress candidates.
                         let rest: Vec<&str> = words.collect();
-                        if rest.iter().any(|arg| {
-                            matches!(*arg, "-m" | "--message") || arg.starts_with("--message=")
-                        }) {
+                        let mut expect_value = false;
+                        let mut message_seen = false;
+                        for arg in &rest {
+                            if matches!(*arg, "-m" | "--message") {
+                                expect_value = true;
+                                message_seen = true;
+                            } else if arg.starts_with("--message=") {
+                                expect_value = false;
+                                message_seen = true;
+                            } else {
+                                expect_value = false;
+                            }
+                        }
+                        if expect_value
+                            || (message_seen && Self::has_open_quote(&before[line_start..]))
+                        {
                             Vec::new()
                         } else {
                             Self::plain_candidates(
@@ -1206,49 +1458,23 @@ impl CommandCompleter {
                         }
                     }
                     Some(sub) if matches!(sub, "checkout" | "co") => {
-                        let rest: Vec<&str> = words.collect();
-                        match rest.as_slice() {
-                            [] => {
-                                let mut candidates = Self::checkpoint_revision_candidates(token);
-                                if "-b".starts_with(token) {
-                                    candidates.push(CompletionCandidate {
-                                        display: "-b · create and checkout a new branch"
-                                            .to_string(),
-                                        replacement: "-b".to_string(),
-                                    });
-                                }
-                                candidates
-                            }
-                            ["-b" | "--create"] => Vec::new(),
-                            ["-b" | "--create", _] => Self::checkpoint_revision_candidates(token),
-                            _ => Vec::new(),
-                        }
+                        Self::navigation_candidates(
+                            Self::args_after_subcommand(&before[line_start..token_start], sub),
+                            token,
+                            "-b",
+                            "create and checkout a new branch",
+                            Self::checkpoint_revision_candidates(token),
+                            false,
+                        )
                     }
-                    Some("switch") => {
-                        let rest: Vec<&str> = words.collect();
-                        match rest.as_slice() {
-                            [] => {
-                                let mut candidates = Self::checkpoint_branch_candidates(token);
-                                if "-c".starts_with(token) {
-                                    candidates.push(CompletionCandidate {
-                                        display: "-c · create and switch to a new branch"
-                                            .to_string(),
-                                        replacement: "-c".to_string(),
-                                    });
-                                }
-                                if "-".starts_with(token) {
-                                    candidates.push(CompletionCandidate {
-                                        display: "- · previous checkout".to_string(),
-                                        replacement: "-".to_string(),
-                                    });
-                                }
-                                candidates
-                            }
-                            ["-c" | "--create"] => Vec::new(),
-                            ["-c" | "--create", _] => Self::checkpoint_revision_candidates(token),
-                            _ => Vec::new(),
-                        }
-                    }
+                    Some("switch") => Self::navigation_candidates(
+                        Self::args_after_subcommand(&before[line_start..token_start], "switch"),
+                        token,
+                        "-c",
+                        "create and switch to a new branch",
+                        Self::checkpoint_branch_candidates(token),
+                        true,
+                    ),
                     Some("branch") => match words.next() {
                         None => Self::plain_candidates(
                             ["--delete", "-b"]
@@ -2454,6 +2680,145 @@ mod tests {
     }
 
     #[test]
+    fn command_completion_git_commit_repeats_message_flags() {
+        // Flag-only candidates: no checkpoint cache involved.
+        let replacements = |line: &str| {
+            CommandCompleter::complete_for_line(line, line.len())
+                .1
+                .iter()
+                .map(|candidate| candidate.replacement.clone())
+                .collect::<Vec<_>>()
+        };
+        // A finished message still offers `-m` again (repeat for paragraphs).
+        let repeated = replacements(r#"/git commit -m "first" "#);
+        assert!(repeated.contains(&"-m".to_string()));
+        assert!(repeated.contains(&"--message".to_string()));
+        let long_form = replacements(r#"/git commit --message "first" "#);
+        assert!(long_form.contains(&"-m".to_string()));
+        // Partial flags keep working after a name plus a message.
+        let partial = replacements(r#"/git commit checkpoint-name -m "first" --"#);
+        assert_eq!(partial, vec!["--message".to_string()]);
+        // The message-value slot itself stays silent.
+        assert!(replacements(r#"/git commit -m "first" -m "#).is_empty());
+        assert!(replacements(r#"/git commit --message "#).is_empty());
+        // An unterminated quoted message stays silent too.
+        assert!(replacements(r#"/git commit -m "open quote "#).is_empty());
+        // An escaped quote does not end the message early.
+        let escaped = replacements(r#"/git commit -m "a\"b" "#);
+        assert!(escaped.contains(&"-m".to_string()));
+        // The `save` alias shares the same argument shape.
+        let save = replacements(r#"/git save -m "first" "#);
+        assert!(save.contains(&"-m".to_string()));
+    }
+
+    #[test]
+    fn command_completion_git_navigation_offers_save_and_discard() {
+        // Target candidates come from the global checkpoint caches;
+        // serialize with sibling writers like the checkout test above.
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        CommandCompleter::set_checkpoint_name_candidates(vec!["after_edit".to_string()]);
+        CommandCompleter::set_checkpoint_branch_candidates(vec!["main".to_string()]);
+        let replacements = |line: &str| {
+            CommandCompleter::complete_for_line(line, line.len())
+                .1
+                .iter()
+                .map(|candidate| candidate.replacement.clone())
+                .collect::<Vec<_>>()
+        };
+        // A target still offers the preservation flags.
+        let after_target = replacements("/git checkout main ");
+        assert!(after_target.contains(&"--save".to_string()));
+        assert!(after_target.contains(&"--discard".to_string()));
+        let after_switch_target = replacements("/git switch main ");
+        assert!(after_switch_target.contains(&"--save".to_string()));
+        assert!(after_switch_target.contains(&"--discard".to_string()));
+        // A partial flag narrows to the matching half.
+        assert_eq!(
+            replacements("/git checkout main --s"),
+            vec!["--save".to_string()]
+        );
+        // The pair is mutually exclusive: each half hides once the
+        // other is present.
+        let after_save = replacements("/git checkout main --save work ");
+        assert!(!after_save.contains(&"--discard".to_string()));
+        assert!(!after_save.contains(&"--save".to_string()));
+        let after_discard = replacements("/git switch main --discard ");
+        assert!(!after_discard.contains(&"--save".to_string()));
+        assert!(!after_discard.contains(&"--discard".to_string()));
+        // Value slots stay silent.
+        assert!(replacements("/git checkout main --save ").is_empty());
+        assert!(replacements("/git checkout --discard -b ").is_empty());
+        // Flags in any position still leave the target slot open.
+        let after_flag = replacements("/git checkout --discard ");
+        assert!(after_flag.contains(&"main".to_string()));
+        // A bare `-` is the previous-checkout target, not an option.
+        let after_dash = replacements("/git switch - ");
+        assert!(after_dash.contains(&"--save".to_string()));
+        assert!(after_dash.contains(&"--discard".to_string()));
+        // A create flag keeps offering revisions as the start point.
+        let start = replacements("/git switch -c feature ");
+        assert!(start.contains(&"after_edit".to_string()));
+        CommandCompleter::clear_checkpoint_candidates();
+    }
+
+    #[test]
+    fn command_completion_git_navigation_handles_quoted_names() {
+        // Same global checkpoint caches as the navigation test above.
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        CommandCompleter::set_checkpoint_name_candidates(vec!["after_edit".to_string()]);
+        CommandCompleter::set_checkpoint_branch_candidates(vec!["main".to_string()]);
+        let replacements = |line: &str| {
+            CommandCompleter::complete_for_line(line, line.len())
+                .1
+                .iter()
+                .map(|candidate| candidate.replacement.clone())
+                .collect::<Vec<_>>()
+        };
+        // A quoted save value counts as one word: the target slot stays open.
+        let after_quoted_save = replacements("/git checkout --save \"my work\" ");
+        assert!(after_quoted_save.contains(&"main".to_string()));
+        assert!(!after_quoted_save.contains(&"--save".to_string()));
+        assert!(!after_quoted_save.contains(&"--discard".to_string()));
+        let after_quoted_switch_save = replacements("/git switch --save \"my work\" ");
+        assert!(after_quoted_switch_save.contains(&"main".to_string()));
+        // Single quotes group the same way.
+        let after_single_quoted = replacements("/git checkout --save 'my work' ");
+        assert!(after_single_quoted.contains(&"main".to_string()));
+        // A quoted target still offers the preservation flags.
+        let after_quoted_target = replacements("/git checkout \"my branch\" ");
+        assert!(after_quoted_target.contains(&"--save".to_string()));
+        assert!(after_quoted_target.contains(&"--discard".to_string()));
+        // An escaped space joins the same way the parser reads it.
+        let after_escaped_space = replacements("/git checkout my\\ work ");
+        assert!(after_escaped_space.contains(&"--save".to_string()));
+        assert!(after_escaped_space.contains(&"--discard".to_string()));
+        // A quoted create name keeps offering revisions as the start point.
+        let quoted_start = replacements("/git switch -c \"my branch\" ");
+        assert!(quoted_start.contains(&"after_edit".to_string()));
+        // Target plus quoted save fills every slot: nothing left to offer.
+        assert!(replacements("/git checkout main --save \"my work\" ").is_empty());
+        // An unterminated quote means the cursor is still inside a value.
+        assert!(replacements("/git checkout --save \"my wo").is_empty());
+        assert!(replacements("/git checkout \"ma").is_empty());
+        CommandCompleter::clear_checkpoint_candidates();
+    }
+
+    #[test]
+    fn split_quoted_words_matches_plain_whitespace_splitting() {
+        // Quoteless input must behave exactly like the old whitespace split.
+        for plain in ["", "  ", "main", "  main   --discard  ", "-b feature main"] {
+            let words = CommandCompleter::split_quoted_words(plain);
+            let expected: Vec<String> =
+                plain.split_whitespace().map(str::to_string).collect();
+            assert_eq!(words, expected, "plain input must split like before: {plain:?}");
+        }
+    }
+
+    #[test]
     fn command_completion_resume_completes_row_numbers() {
         // Both resume tests share the global serve-session cache; serialize
         // them so a parallel reset cannot empty the cache mid-assertion.
@@ -3312,6 +3677,40 @@ mod tests {
             CommandCompleter::name_token_match_rank("zzz", "audit_own_changes"),
             None
         );
+    }
+
+    #[test]
+    fn fuzzy_match_rejects_unanchored_scattered_matches() {
+        // Contiguous substrings match even mid-word (`ync` in `async`).
+        assert!(CommandCompleter::fuzzy_match_score("ync", "async-agent-auditor").is_some());
+        // Boundary-anchored shorthand still matches (`asc`: `a` at candidate start).
+        assert!(CommandCompleter::fuzzy_match_score("asc", "async-agent-auditor").is_some());
+        // Single characters behave as plain containment (keeps `@skills:{letter}` filters working).
+        assert!(CommandCompleter::fuzzy_match_score("e", "beam-free").is_some());
+        // Mid-word start plus scattered rest does not match (the random-bytes noise class).
+        assert_eq!(CommandCompleter::fuzzy_match_score("fre", "xxfxxrxxe"), None);
+        // ... but the same query hits a genuine contiguous occurrence.
+        assert!(CommandCompleter::fuzzy_match_score("fre", "beam-free").is_some());
+    }
+
+    #[test]
+    fn model_completion_ignores_encrypted_names() {
+        // Regression: `fre` matched `gpt-5.6-terra` through bytes inside its
+        // encrypted `enc:...` name. Encrypted names must not participate.
+        let Some(terra) = crate::ai::model_names::find_by_identifier("gpt-5.6-terra") else {
+            return; // skip when the model registry (models/) lacks this model
+        };
+        assert!(CommandCompleter::model_search_fields(terra)
+            .iter()
+            .all(|field| !field.starts_with("enc:")));
+        assert_eq!(CommandCompleter::model_token_match_rank("fre", terra), None);
+        // ... while the same model is still reachable by its real key text.
+        assert!(CommandCompleter::model_token_match_rank("terra", terra).is_some());
+        // ... and genuine `free` models still match via contiguous substring.
+        let Some(beam) = crate::ai::model_names::find_by_identifier("beam-free") else {
+            return;
+        };
+        assert!(CommandCompleter::model_token_match_rank("fre", beam).is_some());
     }
 
     #[test]

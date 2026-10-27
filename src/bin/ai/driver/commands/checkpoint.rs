@@ -50,7 +50,7 @@ fn parse_save_args(input: &str) -> Result<SaveArgs, String> {
         });
     }
 
-    let words = split_quoted_args(input)?;
+    let words = split_quoted_args(input, "commit arguments")?;
     let mut name = None;
     let mut messages = Vec::new();
     let mut index = 0;
@@ -78,7 +78,12 @@ fn parse_save_args(input: &str) -> Result<SaveArgs, String> {
     })
 }
 
-fn split_quoted_args(input: &str) -> Result<Vec<String>, String> {
+/// Split command arguments on whitespace, honoring single/double quotes
+/// and `\` escapes (same rules everywhere it is used). Inputs without
+/// quote or backslash characters split exactly like `split_whitespace`.
+/// `args_what` names the argument list in error messages (e.g.
+/// "commit arguments").
+fn split_quoted_args(input: &str, args_what: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quote = None;
@@ -89,7 +94,11 @@ fn split_quoted_args(input: &str) -> Result<Vec<String>, String> {
             if ch == delimiter {
                 quote = None;
             } else if ch == '\\' && delimiter == '"' {
-                word.push(chars.next().ok_or("trailing escape in commit arguments")?);
+                word.push(
+                    chars
+                        .next()
+                        .ok_or_else(|| format!("trailing escape in {args_what}"))?,
+                );
             } else {
                 word.push(ch);
             }
@@ -101,7 +110,11 @@ fn split_quoted_args(input: &str) -> Result<Vec<String>, String> {
                 in_word = true;
             }
             '\\' => {
-                word.push(chars.next().ok_or("trailing escape in commit arguments")?);
+                word.push(
+                    chars
+                        .next()
+                        .ok_or_else(|| format!("trailing escape in {args_what}"))?,
+                );
                 in_word = true;
             }
             ch if ch.is_whitespace() => {
@@ -117,7 +130,7 @@ fn split_quoted_args(input: &str) -> Result<Vec<String>, String> {
         }
     }
     if quote.is_some() {
-        return Err("unterminated quote in commit arguments".to_string());
+        return Err(format!("unterminated quote in {args_what}"));
     }
     if in_word {
         words.push(word);
@@ -257,7 +270,27 @@ pub fn try_handle_checkpoint_command(
             // Navigation requires a clean live tree by default; callers must
             // explicitly save or discard un-checkpointed work.
             let is_switch = action == "switch";
-            let args: Vec<String> = parts.map(|s| s.to_string()).collect();
+            // Quote-aware splitting (same splitter `/git commit` uses, same
+            // `split_once` remainder trick as the save arm above):
+            // `--save "my work"` is one name, not three tokens.
+            let raw_args = normalized
+                .split_once(action)
+                .map(|(_, rest)| rest.trim_start())
+                .unwrap_or_default();
+            let args = match split_quoted_args(
+                raw_args,
+                if is_switch {
+                    "switch arguments"
+                } else {
+                    "checkout arguments"
+                },
+            ) {
+                Ok(args) => args,
+                Err(err) => {
+                    println!("Invalid {action} arguments: {err}");
+                    return Ok(true);
+                }
+            };
             let parsed = match parse_navigation_args(&args, if is_switch { "-c" } else { "-b" }) {
                 Ok(parsed) => parsed,
                 Err(err) => {
@@ -1519,7 +1552,8 @@ mod tests {
     use super::{
         BranchRow, SwitchPreparation, branch_rows, checkpoint_message_subject, commit_graph,
         effective_head, format_human_bytes, is_head_alias, is_latest_alias, is_previous_alias,
-        parse_navigation_args, parse_save_args, switch_preparation, truncate_middle,
+        parse_navigation_args, parse_save_args, split_quoted_args, switch_preparation,
+        truncate_middle,
     };
     use crate::ai::history::{CheckpointBranch, CheckpointInfo};
 
@@ -1689,6 +1723,36 @@ mod tests {
 
         assert!(parse_navigation_args(&args(&["-c"]), "-c").is_err());
         assert!(parse_navigation_args(&args(&["-b", "feature"]), "-c").is_err());
+    }
+
+    #[test]
+    fn split_quoted_args_groups_quoted_navigation_names() {
+        // A quoted save name survives as one word end to end.
+        let words = split_quoted_args(r#"main --save "my work""#, "checkout arguments").unwrap();
+        assert_eq!(words, args(&["main", "--save", "my work"]));
+        let parsed = parse_navigation_args(&words, "-b").unwrap();
+        assert_eq!(parsed.target.as_deref(), Some("main"));
+        assert_eq!(parsed.explicit_save.as_deref(), Some("my work"));
+
+        // Single quotes and backslash escapes follow the commit rules.
+        let words = split_quoted_args(r#"-b 'my branch' main"#, "checkout arguments").unwrap();
+        assert_eq!(words, args(&["-b", "my branch", "main"]));
+        let words = split_quoted_args(r"main --save my\ work", "switch arguments").unwrap();
+        assert_eq!(words, args(&["main", "--save", "my work"]));
+
+        // Quoteless input splits exactly like whitespace splitting.
+        for plain in ["", "  ", "main", "  main   --discard  ", "-b feature main"] {
+            let words = split_quoted_args(plain, "checkout arguments").unwrap();
+            let expected: Vec<String> =
+                plain.split_whitespace().map(str::to_string).collect();
+            assert_eq!(words, expected, "plain input must split like before: {plain:?}");
+        }
+
+        // Malformed quoting is a clear error naming the argument list,
+        // not a silently wrong name.
+        let err = split_quoted_args("main --save \"oops", "checkout arguments").unwrap_err();
+        assert!(err.contains("checkout arguments"), "unexpected error: {err}");
+        assert!(split_quoted_args("main\\", "switch arguments").is_err());
     }
 
     #[test]
