@@ -3085,14 +3085,23 @@ async function loadHistory(prefetched) {
     // Image tokens become reference parts, or OCR is appended for non-vision models.
     const expected = input.prompt.replace(/\[\[image:[\s\S]*?\]\]/g, "").trim();
     const hadImages = expected !== input.prompt.trim();
-    const found = msgs.findIndex((message, index) => {
-      if (baseIndex + index < floor || message.role !== "user" || isRuntimeSyntheticUser(message)) return false;
+    const matches = (message) => {
+      if (message.role !== "user" || isRuntimeSyntheticUser(message)) return false;
       const actual = textOf(message.content).trim();
       return actual === expected || (hadImages && actual.startsWith(expected)
         && /^\s*\[Attached Image Content via [^\]\r\n]+\]\n/.test(actual.slice(expected.length)));
-    });
+    };
+    let found = msgs.findIndex((message, index) => baseIndex + index >= floor && matches(message));
+    if (found < 0 && input.settled) {
+      // The floor only separates this input from an older identical one. Once
+      // the turn was accepted this input is certainly persisted, so a page
+      // count that drifted above the store (for example a session rewound by
+      // another client) must not strand the local row at the tail: its own
+      // message is the newest row carrying this text.
+      for (let i = msgs.length - 1; i >= 0; i--) if (matches(msgs[i])) { found = i; break; }
+    }
     if (found >= 0) {
-      acknowledgedThrough = baseIndex + found + 1;
+      acknowledgedThrough = Math.max(acknowledgedThrough, baseIndex + found + 1);
       input.row.remove();
       revokePreviews(input.row);
     } else {
@@ -3875,7 +3884,11 @@ async function send() {
   lastHistoryEndsUnanswered = false;
   const userBubble = addLiveUserBubble(text || "(images only)", prompt, sid, rewindFloor);
   const pendingInputs = pendingUserInputs.get(sid) || [];
-  pendingInputs.push({ row: userBubble.parentNode, prompt, minIndex: rewindFloor });
+  // `settled` flips once the turn's POST is accepted: from then on this input
+  // is in canonical history, so an exact text match anywhere in the transcript
+  // belongs to it. Before that, a match may still be an older identical input.
+  const userInput = { row: userBubble.parentNode, prompt, minIndex: rewindFloor, settled: false };
+  pendingInputs.push(userInput);
   pendingUserInputs.set(sid, pendingInputs);
   scrollToLatest(false);
 
@@ -4265,6 +4278,9 @@ async function send() {
   // This turn is over, so its session may send again: the entry goes away
   // whether or not the box stays on screen.
   turns.delete(sid);
+  // The server persisted this input before it ran the turn, so history keeps
+  // it even if the page's message count drifted.
+  if (turnStarted) userInput.settled = true;
   if (wentStale && sid === sessionId) {
     // The live feed died but its turn is still running on the server, and the
     // server kept that turn's event stream: reattach to it so the reply keeps

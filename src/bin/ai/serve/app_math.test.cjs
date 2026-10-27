@@ -1087,14 +1087,17 @@ test("a failed retired preview cannot retry its basename in a different session"
   assert.equal(h.slots[0].replacement, undefined);
 });
 
-function historyHarness({ delayed = false, existingKeys = [], existingNodes = [], follow = true } = {}) {
+function historyHarness({
+  delayed = false, existingKeys = [], existingNodes = [], follow = true,
+  messages = [{ role: "user", content: "prompt" }, { role: "assistant", content: "reply" }], total = "2",
+} = {}) {
   let resolveResponse;
   let apiCalls = 0;
   let clears = 0;
   const retired = [];
   const response = {
-    headers: { get: () => "2" },
-    json: async () => [{ role: "user", content: "prompt" }, { role: "assistant", content: "reply" }],
+    headers: { get: () => total },
+    json: async () => messages,
   };
   const pending = delayed ? new Promise((resolve) => { resolveResponse = () => resolve(response); }) : Promise.resolve(response);
   const root = {
@@ -1179,6 +1182,41 @@ test("stale history appends canonical progress without replacing its prefix", as
   assert.equal(h.root.children[0], old);
   assert.equal(h.root.children[1], firstProgress);
   assert.deepEqual(h.root.children.map((node) => node.key), ["mounted-old", "new", "newer"]);
+});
+
+test("a settled input whose recorded floor drifted is reconciled, not duplicated", async () => {
+  // The page can believe the session is longer than the store (another client
+  // rewound it), so the floor captured at send time sits past the message.
+  // A settled input is certainly persisted: leaving its local row in the
+  // transcript showed the same question twice, with the copy pinned to the end.
+  const row = { key: "pending-user", remove() {} };
+  const h = historyHarness({ messages: [
+    { role: "user", content: "定一个中午11点的闹钟" },
+    { role: "assistant", content: "reply" },
+  ] });
+  h.context.pendingUserInputs.set("s", [
+    { row, prompt: "定一个中午11点的闹钟", minIndex: 9, settled: true },
+  ]);
+  await h.context.loadHistory();
+  assert.equal(h.context.pendingUserInputs.has("s"), false, "the input leaves the pending list");
+  assert.equal(h.retired.includes(row), true, "the acknowledged local row is dropped");
+});
+
+test("an in-flight input never claims an older identical message", async () => {
+  // Until the turn's POST returns, an equal text in history can only be an
+  // earlier input: dropping the local row there is the "my message vanished"
+  // regression.
+  const row = { key: "pending-user", remove() {} };
+  const h = historyHarness({ messages: [
+    { role: "user", content: "定一个中午11点的闹钟" },
+    { role: "assistant", content: "reply" },
+  ] });
+  h.context.pendingUserInputs.set("s", [
+    { row, prompt: "定一个中午11点的闹钟", minIndex: 9, settled: false },
+  ]);
+  await h.context.loadHistory();
+  assert.equal(h.context.pendingUserInputs.has("s"), true, "it stays pending");
+  assert.equal(h.root.children.includes(row), true, "its local row stays in the transcript");
 });
 
 test("history retains image nodes and URLs across repeated progress and normal refresh", async () => {
