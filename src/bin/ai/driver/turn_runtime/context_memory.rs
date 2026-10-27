@@ -16,6 +16,7 @@ use crate::ai::history::{
     is_runtime_synthetic_user_message, last_real_user_index, message_billable_chars,
     value_to_string,
 };
+use crate::ai::tools::storage::file_store::{parse_session_asset_alias, session_asset_for_alias};
 
 const MIN_RECOVERABLE_MEMORY_CHARS: usize = 8_192;
 const MIN_NET_SAVINGS_CHARS: usize = 2_048;
@@ -713,7 +714,11 @@ fn parse_checkpoint_target(value: &str) -> Option<(String, usize)> {
 }
 
 fn insert_target(targets: &mut BTreeSet<RecoveryTarget>, value: &str, directory: bool) {
-    if !Path::new(value).is_absolute() {
+    // Absolute runtime paths and validated `session-asset:` aliases are both
+    // recoverable; anything else (relative paths, model-invented pointers) is
+    // dropped. Aliases resolve against the runtime assets dir at read time,
+    // never against a root taken from message content.
+    if !Path::new(value).is_absolute() && parse_session_asset_alias(value).is_none() {
         return;
     }
     if directory {
@@ -951,7 +956,14 @@ fn recall_archive_pair(
     for target in targets.iter().take(512) {
         match target {
             RecoveryTarget::File(path) => {
-                paths.insert(std::path::PathBuf::from(path));
+                // Session-relative aliases resolve against this session's assets;
+                // the result passes through the same ArchiveRoot containment
+                // check as absolute paths below, so a forged alias cannot escape.
+                if let Some(resolved) = session_asset_for_alias(path, assets_dir) {
+                    paths.insert(resolved);
+                } else {
+                    paths.insert(std::path::PathBuf::from(path));
+                }
             }
             RecoveryTarget::Directory(path) => {
                 paths.extend(root.collect_files(Path::new(path), MAX_RECALL_FILES, &mut entries));
@@ -1632,6 +1644,61 @@ mod tests {
         )));
         let index = build_recovery_index(&targets).expect("index");
         assert_eq!(recovery_targets_from_index(&index), targets);
+    }
+
+    #[test]
+    fn recovery_targets_accept_validated_session_asset_aliases() {
+        let text = "compressed_tool_round: 2 tool calls (folded for context budget)\n\
+             - archive_file_path: session-asset:folded-tool-groups/aaaaaaaaaaaaaaaaaaaaaaaa.md\n\
+             - archive_file_path: /tmp/archive/evidence.txt\n\
+             - archive_file_path: session-asset:unknown-dir/evil.txt\n\
+             - archive_file_path: session-asset:folded-tool-groups/../escape.txt\n\
+             - archive_file_path: relative/path.txt";
+
+        let targets = extract_recovery_targets(text);
+
+        assert!(targets.contains(&RecoveryTarget::File(
+            "session-asset:folded-tool-groups/aaaaaaaaaaaaaaaaaaaaaaaa.md".to_string()
+        )));
+        assert!(targets.contains(&RecoveryTarget::File(
+            "/tmp/archive/evidence.txt".to_string()
+        )));
+        assert_eq!(targets.len(), 2);
+        let index = build_recovery_index(&targets).expect("index");
+        assert_eq!(recovery_targets_from_index(&index), targets);
+    }
+
+    #[test]
+    fn archive_recall_resolves_session_asset_alias_targets() {
+        let fixture = RecallFixture::new();
+        let archive_dir = fixture.0.join("folded-tool-groups");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(
+            archive_dir.join("recall-topic.md"),
+            "folded evidence\nledger_router gamma decision\nsource C",
+        )
+        .unwrap();
+        let mut projected = vec![
+            message("system", "exact system"),
+            message(
+                ROLE_INTERNAL_NOTE,
+                "compressed_tool_round: 1 tool calls (folded for context budget)\n\
+                 [compressed-tool-evidence]\n\
+                 - archive_file_path: session-asset:folded-tool-groups/recall-topic.md\n\
+                 assistant_checkpoint: folded evidence",
+            ),
+            message("user", "ledger_router"),
+        ];
+        let stats = apply_query_aware_memory_projection_with_context(
+            &mut projected,
+            100_000,
+            &fixture.0,
+            "",
+        );
+        assert!(stats.changed);
+        let recalled = recalled_text(&projected);
+        assert!(recalled.contains("ledger_router"), "{recalled}");
+        assert!(recalled.contains("Archive lines: 1-3"), "{recalled}");
     }
 
     #[test]

@@ -17,20 +17,24 @@ use super::outcomes::{
 use super::revision::{bump_history_revision, invalidate_context_snapshot};
 use super::store::decode_message_content;
 
-/// Relocate the asset paths of the context checkpoint markers in the history to a new session.
+/// Relocate the asset paths recorded in the history to a new session.
 /// On fork, the source assets directory is passed in for an exact prefix replacement; on archive import the source path is unknown, so only
-/// the controlled relative tail of `context-checkpoints/<file>` is accepted, avoiding rewrites of arbitrary text or absolute paths.
-pub(in crate::ai) fn remap_context_checkpoint_paths_sqlite(
+/// controlled relative tails are accepted, avoiding rewrites of arbitrary text or absolute paths.
+/// Covers checkpoint markers, archive pointers, incremental-summary sources and fold provenance (see `compress::asset_remap`).
+/// The derived context snapshot is always discarded: it is a rebuildable projection of canonical messages and may embed
+/// source-session paths even when no canonical row needed a rewrite. Rebuild on next use regenerates target-local
+/// pointers through the normal cold-start path.
+pub(in crate::ai) fn remap_session_asset_paths_sqlite(
     history_file: &Path,
     source_assets: Option<&Path>,
     target_assets: &Path,
 ) -> io::Result<usize> {
     with_session_state_lock(history_file, || {
-        remap_context_checkpoint_paths_sqlite_unlocked(history_file, source_assets, target_assets)
+        remap_session_asset_paths_sqlite_unlocked(history_file, source_assets, target_assets)
     })
 }
 
-fn remap_context_checkpoint_paths_sqlite_unlocked(
+fn remap_session_asset_paths_sqlite_unlocked(
     history_file: &Path,
     source_assets: Option<&Path>,
     target_assets: &Path,
@@ -43,15 +47,26 @@ fn remap_context_checkpoint_paths_sqlite_unlocked(
     let rows = {
         let mut stmt = tx
             .prepare(
-                "SELECT id, content
+                "SELECT id, content, reasoning_content
                  FROM messages
                  WHERE role = ?1
-                   AND instr(content, '[context_checkpoint path=') > 0",
+                   AND (instr(content, '[context_checkpoint path=') > 0
+                     OR instr(content, 'archive_file_path') > 0
+                     OR instr(content, 'archive_directory_path') > 0
+                     OR instr(content, 'source_projection_archive') > 0
+                     OR instr(content, '归档文件') > 0
+                     OR instr(content, '归档目录') > 0
+                     OR instr(content, '[[PRESERVED_CONTENT_STUB_V1]]') > 0
+                     OR instr(reasoning_content, 'archive_file_path') > 0)",
             )
             .map_err(|e| io::Error::other(e.to_string()))?;
         let rows = stmt
             .query_map([ROLE_INTERNAL_NOTE], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })
             .map_err(|e| io::Error::other(e.to_string()))?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -59,29 +74,54 @@ fn remap_context_checkpoint_paths_sqlite_unlocked(
     };
 
     let mut remapped = 0usize;
-    for (id, encoded_content) in rows {
+    for (id, encoded_content, reasoning_content) in rows {
         let content = decode_message_content(&encoded_content);
         let Some(text) = content.as_str() else {
             continue;
         };
-        let Some(remapped_text) =
-            remap_context_checkpoint_marker(text, source_assets, target_assets)
-        else {
+        // Checkpoint markers keep their original rewrite rules (behavior frozen).
+        let (after_checkpoint, checkpoint_changed) =
+            match remap_context_checkpoint_marker(text, source_assets, target_assets) {
+                Some(remapped) => (remapped, true),
+                None => (text.to_string(), false),
+            };
+        let (new_content, new_reasoning) = super::super::compress::remap_message_for_session_move(
+            &after_checkpoint,
+            reasoning_content.as_deref(),
+            checkpoint_changed,
+            text,
+            source_assets,
+            target_assets,
+        );
+        if !checkpoint_changed && new_content.is_none() && new_reasoning.is_none() {
             continue;
-        };
-        let encoded = serde_json::to_string(&Value::String(remapped_text))
+        }
+        let content_changed = checkpoint_changed || new_content.is_some();
+        let final_content = new_content.unwrap_or(after_checkpoint);
+        // Re-encode exactly like the writer: content is a JSON string value,
+        // reasoning_content is stored raw (see `store.rs` message insert).
+        if content_changed {
+            let encoded = serde_json::to_string(&Value::String(final_content))
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            tx.execute(
+                "UPDATE messages SET content = ?1 WHERE id = ?2",
+                params![encoded, id],
+            )
             .map_err(|e| io::Error::other(e.to_string()))?;
-        tx.execute(
-            "UPDATE messages SET content = ?1 WHERE id = ?2",
-            params![encoded, id],
-        )
-        .map_err(|e| io::Error::other(e.to_string()))?;
+        }
+        if let Some(reasoning) = new_reasoning {
+            tx.execute(
+                "UPDATE messages SET reasoning_content = ?1 WHERE id = ?2",
+                params![reasoning, id],
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        }
         remapped += 1;
     }
-    if remapped > 0 {
-        invalidate_context_snapshot(&tx)?;
-        bump_history_revision(&tx)?;
-    }
+    // A moved session is a new epoch: derived snapshots must be rebuilt even
+    // when no canonical row changed.
+    invalidate_context_snapshot(&tx)?;
+    bump_history_revision(&tx)?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))?;
     Ok(remapped)
 }

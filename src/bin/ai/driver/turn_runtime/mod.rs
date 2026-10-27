@@ -593,6 +593,19 @@ mod tests {
                 .contains("Output too large; full result saved")
         );
         let path = extract_stub_path(&prepared.content_for_model).unwrap();
+        // Live tool-overflow stubs carry a session-asset alias; resolve it
+        // against this session's assets for the filesystem assertions below.
+        let locator = path.to_string_lossy().into_owned();
+        assert!(
+            locator.starts_with("session-asset:tool-overflow/"),
+            "{locator}"
+        );
+        let assets = store.session_assets_dir(&app.session_id);
+        let path =
+            crate::ai::tools::storage::file_store::session_asset_for_alias(&locator, &assets)
+                .expect("alias must resolve under this session's assets");
+        // Match the canonicalized comparison below (/tmp -> /private/tmp).
+        let path = path.canonicalize().unwrap_or(path);
         assert!(path.is_absolute());
         assert!(path.exists());
         let expected_dir = store

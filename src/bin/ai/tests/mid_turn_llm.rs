@@ -132,10 +132,11 @@ fn assert_summary_source(messages: &[Message], expected: &[Message], app: &types
             .iter()
             .all(|entry| entry["status"] == "derived_unverified")
     );
-    let path = std::path::Path::new(record["source"]["archive_file_path"].as_str().unwrap());
+    let locator = record["source"]["archive_file_path"].as_str().unwrap();
     let assets = SessionStore::new(&app.config.history_file).session_assets_dir(&app.session_id);
-    assert!(path.starts_with(assets.join("summary-sources")));
-    let source = std::fs::read_to_string(path).expect("summary source must be readable");
+    let path = crate::ai::tools::storage::file_store::session_asset_for_alias(locator, &assets)
+        .expect("source locator must be a resolvable session-asset alias");
+    let source = std::fs::read_to_string(&path).expect("summary source must be readable");
     let restored: Vec<Message> = source
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())

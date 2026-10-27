@@ -56,10 +56,12 @@ a --serve-restart
 ```
 
 `a --serve-restart` run from inside a serve turn is *deferred*: a detached
-helper waits for the turn to finish (at most 30 min, then it gives up) and
-restarts afterwards, so the restart cannot be confirmed in the same turn.
-Verify it later with `a --serve-status` plus the daemon's `/proc/<pid>/exe`
-hash. Read `src/bin/ai/serve/AGENTS.md` before restarting from a turn.
+helper restarts after the turn exits, so the restart cannot be confirmed in
+the same turn.
+Verify it later with `a --serve-status` (new pid/uptime) plus the daemon
+binary's hash: `/proc/<pid>/exe` on Linux; on macOS (no `/proc`) compare the
+frozen-copy name under `<state-dir>/run/a-<content-hash>` instead. Read
+`src/bin/ai/serve/AGENTS.md` before restarting from a turn.
 
 ## Global Engineering Rules
 
@@ -74,13 +76,15 @@ hash. Read `src/bin/ai/serve/AGENTS.md` before restarting from a turn.
 6. **Extensibility**: data-driven/registration-based over hardcoded `if`/`else`.
 7. **AGENTS.md maintenance**: update only superseded nearby rules, in place; never
    append history. Keep injected instructions concise and delete stale rules.
+   Reference code by symbol + file, never by line number (line refs rot on any
+   edit); keep tuning numbers in code, only structure and invariants in docs.
 8. **Git safety**: never `stash`/`stash drop` others' uncommitted changes. Use temp branch/worktree or stash only your own.
 9. **Architecture-first**: many fallbacks = wrong data flow — refactor the happy path instead.
 
 ## High-Value Pitfalls
 
-1. `.agent` / builtin `.skill` files are compiled via `include_str!`; user `.skill`
-   files load at runtime.
+1. `src/bin/ai/builtin_agents/*.agent` and `src/bin/ai/builtin_skills/*.skill`
+   are compiled via `include_str!`; user `.skill` files load at runtime.
 2. `objc2*` dependencies are macOS-only.
 3. Runtime sessions live in the session store, reachable only through the
    `session` tools; `history.sessions/` at the repo root is gitignored test

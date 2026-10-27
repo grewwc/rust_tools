@@ -67,7 +67,7 @@ fn merge_old_user_overflow_stubs_collapses_old_stubs_keeps_recent() {
         msg("assistant", "a6"),
         msg("user", "最近的用户轮次"),
     ];
-    merge_old_user_overflow_stubs(&mut messages, 1);
+    merge_old_user_overflow_stubs(&mut messages, 1, None);
 
     // Four old stubs become one internal note; the three recent user boundaries remain.
     assert_eq!(messages.len(), 11, "{messages:?}");
@@ -118,7 +118,7 @@ fn merged_stub_survives_request_normalization_with_all_directories() {
         user_stub("/sessions/session-b/assets", "20260106T000000Z-user-6"),
         msg("user", "最近轮次"),
     ];
-    merge_old_user_overflow_stubs(&mut messages, 1);
+    merge_old_user_overflow_stubs(&mut messages, 1, None);
 
     // 模拟修复前已经落入上下文快照的首版格式：它把目录误标成「归档文件」。
     // 新版本必须兼容恢复，不能只修复新生成的指针。
@@ -178,14 +178,14 @@ fn repeated_merge_absorbs_new_stubs_into_one_pointer() {
         user_stub(dir, "20260106T000000Z-user-6"),
         msg("user", "最近轮次"),
     ];
-    merge_old_user_overflow_stubs(&mut messages, 1);
+    merge_old_user_overflow_stubs(&mut messages, 1, None);
     for ordinal in 7..=10 {
         messages.insert(
             messages.len() - 1,
             user_stub(dir, &format!("202601{ordinal:02}T000000Z-user-{ordinal}")),
         );
     }
-    merge_old_user_overflow_stubs(&mut messages, 1);
+    merge_old_user_overflow_stubs(&mut messages, 1, None);
 
     // 一个聚合指针 + 两个结构边界 stub + 最新 user，消息数仍是 O(1)。
     assert_eq!(messages.len(), 4, "{messages:?}");
@@ -218,7 +218,7 @@ fn merge_old_user_overflow_stubs_keeps_below_threshold() {
         user_stub(dir, "20260103T000000Z-user-3"),
         msg("user", "最近"),
     ];
-    merge_old_user_overflow_stubs(&mut messages, 1);
+    merge_old_user_overflow_stubs(&mut messages, 1, None);
     assert_eq!(messages.len(), 4);
     // 3 条 stub 原样保留（不足阈值不合并），最近轮次不受影响。
     assert!(
@@ -380,7 +380,7 @@ fn merge_old_user_overflow_stubs_migrates_role_of_single_old_merged_stub() {
         msg("user", "recent"),
         msg("assistant", "recent-resp"),
     ];
-    merge_old_user_overflow_stubs(&mut messages, 1);
+    merge_old_user_overflow_stubs(&mut messages, 1, None);
     assert_eq!(
         messages[0].role, "internal_note",
         "旧版 role=user 合并指针应迁移为 internal_note: {messages:?}"
@@ -478,4 +478,133 @@ fn spilled_user_message_does_not_replay_its_request_reminder() {
     assert!(is_preserved_user_or_image_stub(&value_to_string(&messages[1].content)));
     assert_eq!(messages[1].reasoning_content, None);
     let _ = std::fs::remove_dir_all(&overflow_dir);
+}
+
+/// New alias-form stubs merge exactly like legacy absolute ones: the merged
+/// pointer keeps an absolute directory (the model passes it to `tree`), while
+/// an unresolvable alias (no overflow dir this round) stays single instead of
+/// merging with a wrong directory.
+#[test]
+fn merge_old_user_overflow_stubs_resolves_session_asset_aliases() {
+    let root = std::env::temp_dir().join(format!("ai-merge-alias-{}", uuid::Uuid::new_v4()));
+    let assets = root.join("session.assets");
+    std::fs::create_dir_all(assets.join(PRESERVED_USER_OVERFLOW_DIR)).unwrap();
+    let alias_stub = |name: &str| {
+        msg(
+            "user",
+            &format!(
+                "[preserved-message-pointer-v2]\ncontent_kind: user\narchive_file_path: session-asset:{}/{name}\nEarlier user content was archived verbatim.",
+                PRESERVED_USER_OVERFLOW_DIR
+            ),
+        )
+    };
+    let fixture = || {
+        let mut messages = vec![msg("system", "sys")];
+        for index in 1..=6 {
+            messages.push(alias_stub(&format!("user-{index}.json")));
+            messages.push(msg("assistant", &format!("a{index}")));
+        }
+        messages.push(msg("user", "recent turn"));
+        messages
+    };
+    let mut messages = fixture();
+    merge_old_user_overflow_stubs(&mut messages, 1, Some(&assets));
+    let merged = messages
+        .iter()
+        .find(|message| {
+            value_to_string(&message.content).starts_with("[preserved-messages-pointer-v2]")
+        })
+        .expect("alias stubs must merge with an overflow dir");
+    assert_eq!(merged.role, ROLE_INTERNAL_NOTE);
+    let expected_dir = assets.join(PRESERVED_USER_OVERFLOW_DIR);
+    assert!(
+        value_to_string(&merged.content).contains(&format!(
+            "archive_directory_path: {}",
+            expected_dir.display()
+        )),
+        "merged pointer must carry the resolved absolute dir: {}",
+        value_to_string(&merged.content)
+    );
+
+    // Without an overflow dir the aliases cannot resolve: they stay single
+    // (reachable) instead of merging with a bogus directory.
+    let mut messages = fixture();
+    merge_old_user_overflow_stubs(&mut messages, 1, None);
+    assert!(
+        messages
+            .iter()
+            .all(|message| !value_to_string(&message.content)
+                .starts_with("[preserved-messages-pointer-v2]")),
+        "unresolvable aliases must stay single: {messages:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Content-addressed spill naming: re-spilling identical content reuses one
+/// file instead of orphaning a timestamp+uuid file per round.
+#[test]
+fn spill_reuses_one_file_for_identical_content() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-spill-dedup-{}", uuid::Uuid::new_v4()));
+    let body = "long user input ".repeat(USER_OVERFLOW_SPILL_MIN_CHARS);
+    let mut messages = vec![
+        msg("system", "sys"),
+        msg("user", &body),
+        msg("assistant", "a1"),
+        msg("user", &body),
+        msg("assistant", "a2"),
+        msg("user", "u3"),
+        msg("assistant", "a3"),
+        msg("user", "u4"),
+        msg("assistant", "a4"),
+        msg("user", "recent turn"),
+    ];
+    assert!(try_spill_preserved_message_to_stub(
+        &mut messages,
+        &overflow_dir,
+        1_000
+    ));
+    assert!(try_spill_preserved_message_to_stub(
+        &mut messages,
+        &overflow_dir,
+        1_000
+    ));
+    let first = value_to_string(&messages[1].content);
+    let second = value_to_string(&messages[3].content);
+    assert!(is_preserved_user_or_image_stub(&first));
+    assert!(is_preserved_user_or_image_stub(&second));
+    assert_eq!(
+        first, second,
+        "identical content must spill to the same alias"
+    );
+    let entries: Vec<_> = std::fs::read_dir(overflow_dir.join(PRESERVED_USER_OVERFLOW_DIR))
+        .unwrap()
+        .collect();
+    assert_eq!(entries.len(), 1, "identical spills must share one file");
+    let _ = std::fs::remove_dir_all(&overflow_dir);
+}
+
+/// Old sessions carry absolute-path single stubs (e.g. in persisted
+/// snapshots); normalization rebuilds them into session-relative aliases
+/// without needing the session directory.
+#[test]
+fn normalize_rebuilds_legacy_absolute_spill_stub_into_alias() {
+    let absolute = format!(
+        "/sessions/old/assets/{}/20260101T000000Z-user-abc.json",
+        PRESERVED_USER_OVERFLOW_DIR
+    );
+    let mut messages = vec![msg(
+        "user",
+        &format!(
+            "[preserved-message-pointer-v2]\ncontent_kind: user\narchive_file_path: {absolute}\nEarlier user content was archived verbatim."
+        ),
+    )];
+    normalize_preserved_message_stubs_for_model(&mut messages);
+    let text = value_to_string(&messages[0].content);
+    assert!(
+        text.contains("archive_file_path: session-asset:user-overflow-preserved/20260101T000000Z-user-abc.json"),
+        "legacy absolute stub must rebuild into an alias: {text}"
+    );
+    assert!(!text.contains("/sessions/old/assets"), "{text}");
+    assert_eq!(messages[0].role, "user");
 }

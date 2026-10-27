@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::ai::errors::AiError;
+use crate::ai::history::compress::SESSION_ASSET_ALIAS_DIRS;
 use crate::ai::tools::storage::temp_registry;
 use aios_kernel::primitives::{VfsError, VfsReadRange, VfsStat};
 
@@ -706,13 +707,19 @@ pub(crate) fn session_asset_for_alias(
     alias: &str,
     session_assets: &Path,
 ) -> Option<PathBuf> {
+    let (directory, name) = parse_session_asset_alias(alias)?;
+    Some(session_assets.join(directory).join(name))
+}
+
+/// Validate a `session-asset:<dir>/<name>` reference without resolving it.
+/// Only allowlisted asset directories and single-component file names pass;
+/// anything else (absolute paths, traversal, unknown dirs) fails closed.
+pub(crate) fn parse_session_asset_alias(alias: &str) -> Option<(&str, &str)> {
     let (directory, name) = alias.strip_prefix("session-asset:")?.split_once('/')?;
-    if !["tool-overflow", "tool-overflow-compressed"].contains(&directory)
-        || !is_bare_file_name(name)
-    {
+    if !SESSION_ASSET_ALIAS_DIRS.contains(&directory) || !is_bare_file_name(name) {
         return None;
     }
-    Some(session_assets.join(directory).join(name))
+    Some((directory, name))
 }
 
 fn blocked_overflow_read_reason(path: &Path) -> Option<String> {

@@ -14,9 +14,11 @@
 // =============================================================================
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use rust_tools::commonw::FastSet;
 
 use crate::ai::{history, mcp::SharedMcpClient, types::App};
 
@@ -214,10 +216,15 @@ const PROGRESS_EPISODE_COOLDOWN: usize = 16;
 /// Extra consecutive no-progress rounds required to escalate from "soft prompt / ledger" to
 /// "hard-stop convergence".
 const PROGRESS_NO_PROGRESS_HARD_MARGIN: usize = 16;
-/// Scoped-instruction preflight uses a separate budget and does not consume normal tool iterations;
-/// this cap stops the model from indefinitely extending a single turn by switching directories
-/// repeatedly.
+/// Scoped-instruction preflight uses a separate budget for pauses that introduce a new target;
+/// repeated pauses of an already-seen target do not consume it. This cap stops the model from
+/// indefinitely extending a single turn by switching to new directories.
 const MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS: usize = 8;
+/// Repeats do not consume the new-target budget, and pause rounds return before the
+/// iteration-limit branch, so this total-grant cap provides the hard bound on a
+/// pause-only loop.
+const MAX_SCOPED_PREFLIGHT_TOTAL_GRACE_ROUNDS: usize =
+    MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS * 2;
 
 #[derive(Default)]
 struct ScopedPreflightTargets {
@@ -355,7 +362,18 @@ struct TurnSupervisor {
     coarse_loop_note_injected: bool,
     next_tool_round_checkpoint_level: usize,
     iteration_limit_note_injected: bool,
+    /// Total granted scoped-preflight pause rounds, including repeats; this is the
+    /// effective iteration-budget extension and is capped by
+    /// `MAX_SCOPED_PREFLIGHT_TOTAL_GRACE_ROUNDS`.
     scoped_preflight_grace_rounds: usize,
+    /// Pause rounds that introduced at least one new target and therefore consumed
+    /// the distinct-target budget.
+    scoped_preflight_target_rounds: usize,
+    /// Targets whose first pause already consumed a grace round; a repeated pause of
+    /// the same target does not consume the distinct-target budget. Keys are the
+    /// paths as reported by the tool call, so alternate spellings can count
+    /// separately; the total-grant cap bounds that case.
+    scoped_preflight_seen_targets: FastSet<PathBuf>,
     task_anchor_injected: bool,
     last_compress_iteration: usize,
     last_compress_after_chars: usize,
@@ -534,11 +552,26 @@ impl TurnSupervisor {
         self.iteration
     }
 
-    fn grant_scoped_preflight_grace(&mut self) -> bool {
-        if self.scoped_preflight_grace_rounds >= MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS {
+    fn grant_scoped_preflight_grace(&mut self, targets: &[PathBuf]) -> bool {
+        if self.scoped_preflight_grace_rounds >= MAX_SCOPED_PREFLIGHT_TOTAL_GRACE_ROUNDS {
             return false;
         }
+        let introduces_new_target = targets
+            .iter()
+            .any(|target| !self.scoped_preflight_seen_targets.contains(target));
+        if introduces_new_target {
+            if self.scoped_preflight_target_rounds >= MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS {
+                return false;
+            }
+            self.scoped_preflight_target_rounds += 1;
+        }
+        // A repeated pause of an already-seen target does not consume the new-target
+        // budget, but it is still a real model round. Pause rounds return before the
+        // iteration-limit branch, so the total-grant cap above, not the effective
+        // iteration budget, is what bounds a repeat-only loop.
         self.scoped_preflight_grace_rounds += 1;
+        self.scoped_preflight_seen_targets
+            .extend(targets.iter().cloned());
         true
     }
 
@@ -2176,7 +2209,7 @@ async fn run_turn_body(
             record_turn_tool_uses(&turn_messages, &mut tools_used_this_turn);
             match step {
                 TurnLoopStep::ScopedPreflightContinue(targets) => {
-                    if supervisor.grant_scoped_preflight_grace() {
+                    if supervisor.grant_scoped_preflight_grace(&targets) {
                         scoped_preflight_targets.record_pause(targets);
                         // This round performed no mutation and must not count toward progress/loop statistics.
                         continue 'turn;

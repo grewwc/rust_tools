@@ -95,13 +95,18 @@ fn assert_source_bound_summary(
     assert_eq!(source["start_line"], 1);
     assert_eq!(source["encoding"], "one_raw_message_json_per_line");
     assert_eq!(source.get("source_model"), Some(&Value::Null));
-    let path = std::path::Path::new(source["archive_file_path"].as_str().unwrap());
-    assert!(path.starts_with(overflow_dir.join("summary-sources")));
+    // The locator is a session-relative alias; the file name carries the
+    // leading 24 hex chars while `sha256` keeps the full digest.
+    let locator = source["archive_file_path"].as_str().unwrap();
+    let alias_name = locator
+        .strip_prefix("session-asset:summary-sources/")
+        .expect("source locator must be a session-asset alias");
     assert_eq!(
-        path.file_stem().and_then(|stem| stem.to_str()),
-        source["sha256"].as_str()
+        alias_name.strip_suffix(".jsonl"),
+        Some(&source["sha256"].as_str().unwrap()[..24])
     );
-    let raw = std::fs::read_to_string(path).expect("source locator must be readable");
+    let path = overflow_dir.join("summary-sources").join(alias_name);
+    let raw = std::fs::read_to_string(&path).expect("source locator must be readable");
     let restored: Vec<Message> = raw
         .lines()
         .map(|line| serde_json::from_str(line).expect("complete source message"))
@@ -832,10 +837,26 @@ fn compression_spills_old_user_message_to_session_temp_file() {
             extract_stub_file_path(text).map(|_| text.to_string())
         })
         .expect("expected preserved user overflow stub");
-    let file_path = extract_stub_file_path(&stub).expect("stub should contain overflow file path");
+    let locator = extract_stub_file_path(&stub).expect("stub should contain overflow file path");
     assert!(
-        std::path::Path::new(&file_path).exists(),
-        "user overflow file path from stub should exist: {file_path}"
+        locator.starts_with("session-asset:user-overflow-preserved/user-"),
+        "user spill stub must carry a session-asset alias: {locator}"
+    );
+    let file_path =
+        crate::ai::tools::storage::file_store::session_asset_for_alias(&locator, &overflow_dir)
+            .expect("alias must resolve under this session's assets");
+    assert_eq!(
+        file_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::len),
+        Some("user-".len() + 24 + ".json".len()),
+        "spill file must use kind + 24-hex content hash naming"
+    );
+    assert!(
+        file_path.exists(),
+        "user overflow file path from stub should exist: {}",
+        file_path.display()
     );
     assert!(
         !stub.contains("[[PRESERVED_CONTENT_STUB_V1]]"),
@@ -937,10 +958,18 @@ fn compression_spills_old_image_message_to_session_temp_file() {
             extract_stub_file_path(text).map(|_| text.to_string())
         })
         .expect("expected preserved image overflow stub");
-    let file_path = extract_stub_file_path(&stub).expect("stub should contain overflow file path");
+    let locator = extract_stub_file_path(&stub).expect("stub should contain overflow file path");
     assert!(
-        std::path::Path::new(&file_path).exists(),
-        "image overflow file path from stub should exist: {file_path}"
+        locator.starts_with("session-asset:image-overflow-preserved/image-"),
+        "image spill stub must carry a session-asset alias: {locator}"
+    );
+    let file_path =
+        crate::ai::tools::storage::file_store::session_asset_for_alias(&locator, &overflow_dir)
+            .expect("alias must resolve under this session's assets");
+    assert!(
+        file_path.exists(),
+        "image overflow file path from stub should exist: {}",
+        file_path.display()
     );
     let persisted = std::fs::read_to_string(&file_path).expect("should read persisted image file");
     assert!(

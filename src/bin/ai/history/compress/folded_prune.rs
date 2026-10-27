@@ -201,6 +201,49 @@ pub(super) fn attach_provenance(
     note.reasoning_content = provenance.encode();
 }
 
+/// Rewrite the archived path inside fold provenance after a session move and
+/// rebind the content hash to the (possibly rewritten) note body, so the note
+/// keeps its pruning authority in the new session.
+/// Returns the re-encoded sidecar, or `None` when `reasoning` carries no
+/// structurally valid provenance or nothing needed changing. Structural checks
+/// mirror `provenance()` except the content hash, which is rebound here rather
+/// than verified — but only after the old hash is verified against the
+/// pre-move body, so a move never launders an already-invalid sidecar into
+/// pruning authority it did not have.
+pub(super) fn remap_provenance_for_session_move(
+    reasoning: &str,
+    pre_move_content: &str,
+    new_content: &str,
+    content_changed: bool,
+    source_assets: Option<&Path>,
+    target_assets: &Path,
+) -> Option<String> {
+    let encoded = reasoning.strip_prefix(FOLDED_TOOL_ORIGIN)?;
+    let mut meta: FoldProvenance = serde_json::from_str(encoded).ok()?;
+    if meta.archive_file_path.is_empty() || meta.sources.is_empty() {
+        return None;
+    }
+    if content_changed && meta.content_sha256 != content_sha256_hex(pre_move_content.as_bytes()) {
+        // The sidecar was already stale or tampered before the move; leave it
+        // untouched so the note stays unauthorized, exactly as before.
+        return None;
+    }
+    let mut changed = false;
+    if let Some(remapped) = super::asset_remap::remap_asset_path(
+        Path::new(&meta.archive_file_path),
+        source_assets,
+        target_assets,
+    ) {
+        meta.archive_file_path = remapped.to_string_lossy().into_owned();
+        changed = true;
+    }
+    if content_changed {
+        meta.content_sha256 = content_sha256_hex(new_content.as_bytes());
+        changed = true;
+    }
+    changed.then(|| meta.encode()).flatten()
+}
+
 /// Persisted sidecars are accepted only on unchanged, structurally valid folds.
 /// Legacy notes, altered summaries and marker strings inside tool results cannot
 /// acquire pruning authority by resembling a runtime fold.

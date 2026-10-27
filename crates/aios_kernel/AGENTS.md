@@ -3,8 +3,8 @@
 ## Scope
 
 Standalone lib crate implementing the AIOS "process OS" for AI agents: process
-table, scheduling, IPC mailboxes, shared memory, signals, plus the primitive
-facilities (futex, trace, epoll, rlimit, llm-usage, vfs, daemon, ipc). Pure
+table, scheduling, IPC mailboxes, shared memory, signals, plus primitive
+facilities (see `src/primitives.rs`). Pure
 `std` + `rustc-hash` - **no tokio / async runtime dependency**; the async side
 (`tokio::task_local!` pid provider, waiters) lives in the `a` binary
 (`src/bin/ai/driver/`).

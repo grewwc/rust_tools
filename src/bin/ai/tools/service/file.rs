@@ -1068,7 +1068,7 @@ mod tests {
         let cwd = root.join("project");
         fs::create_dir_all(&cwd).unwrap();
         let name = "pruned-execute_command-fixture.txt";
-        for directory in ["tool-overflow", "tool-overflow-compressed"] {
+        for &directory in crate::ai::history::compress::SESSION_ASSET_ALIAS_DIRS {
             fs::create_dir_all(assets.join(directory)).unwrap();
             fs::write(assets.join(directory).join(name), directory).unwrap();
         }
@@ -1082,7 +1082,7 @@ mod tests {
             assert_eq!(read(name).unwrap(), "tool-overflow-compressed");
             fs::write(cwd.join(name), "project file").unwrap();
             assert_eq!(read(name).unwrap(), "project file");
-            for directory in ["tool-overflow", "tool-overflow-compressed"] {
+            for &directory in crate::ai::history::compress::SESSION_ASSET_ALIAS_DIRS {
                 let alias = format!("session-asset:{directory}/{name}");
                 assert_eq!(read(&alias).unwrap(), directory);
                 let absolute = assets.join(directory).join(name);

@@ -42,30 +42,25 @@ src/backend/unsupported.rs # every call reports a clear "no backend on this OS" 
    ImageMagick's `import`) is an error naming the limitation, never a dropped
    argument.
 3. **Screenshots return a path, not image content.** Only `content[0].text`
-   reaches the model (`crates/mcp_stdio/AGENTS.md` invariant 4), so image bytes
-   in the envelope would be discarded; the path plus `a`'s image-aware `read_file`
-   is what shows the frame to a vision model. `frame.rs` hashes decoded pixels and
-   binds each `frame_id` to its normalized capture scope; unchanged probe files are
-   deleted, while a changed frame remains readable at the returned path.
-   `find_text` and `click_text` reuse `rust_tools::pdfw` OCR; coordinates are
-   source-image pixels mapped through the typed capture geometry. `click_text`
-   never acts unless exactly one OCR line matches. For a window capture it first
-   activates and verifies that exact window, takes a fresh OCR frame, and verifies
-   it again immediately before input; an activation failure returns without a
-   click, while `find_text` remains background-safe and never activates a window.
+   reaches the model (`crates/mcp_stdio/AGENTS.md` invariant 4), so the path
+   plus `a`'s image-aware `read_file` is what shows the frame to a vision
+   model. `frame.rs` binds each `frame_id` to its capture scope; unchanged
+   probe files are deleted. `find_text`/`click_text` reuse
+   `rust_tools::pdfw` OCR; `click_text` never acts unless exactly one OCR
+   line matches, and for window captures it activates and verifies the exact
+   window — before the fresh OCR frame and again immediately before input.
+   An activation failure returns without a click; `find_text` never activates.
 4. **Error text must avoid the host's transport trigger words** (the list lives
    in `crates/mcp_stdio/AGENTS.md` invariant 2). Helper stderr is forwarded to
    the model, so each backend scans it (`sanitize`) first; forwarding one of
    those phrases makes the host kill and restart this server.
 5. **Backend calls run under `with_timeout` on a blocking thread.** Capture and
    injection block (subprocess + sleeps), so `tools.rs` goes through `spawn_blocking`:
-   run inline they would hold the server's only executor thread, the per-op cap
-   (default 90s, `MCP_COMPUTER_OP_TIMEOUT_MS`) could never fire, and a hung helper
-   would surface as the host's transport timeout — which kills and restarts this
-   subprocess. Keep the cap below the host's *configured* `request_timeout_ms`
-   (code default 30s — `src/bin/ai/types.rs:455-457`; this host's
-   `~/.config/mcp.json` sets 120000). On timeout the helper is left running to
-   completion — the cap bounds what the model waits for, not the platform.
+   run inline they would hold the server's only executor thread and the per-op cap
+   (default 90s, `MCP_COMPUTER_OP_TIMEOUT_MS`) could never fire. Keep the cap below
+   the host's *configured* `request_timeout_ms` (see `mcp_stdio` invariant 5).
+   On timeout the helper is left running to completion — the cap bounds what the
+   model waits for, not the platform.
 6. **Permissions are reported, not assumed.** `screen_info` states whether
    Accessibility (input injection) and Screen Recording (capture) are granted,
    because an empty capture from a missing grant is otherwise indistinguishable

@@ -130,6 +130,14 @@ fn scoped_instruction_preflight_blocks_first_mutation_until_rules_are_loaded() {
             paused.contains("Applicable instruction documents: "),
             "{paused}"
         );
+        assert!(
+            paused.contains("If the runtime grants a recovery round"),
+            "{paused}"
+        );
+        assert!(
+            paused.contains("If this pause exhausts the scoped-preflight recovery budget"),
+            "{paused}"
+        );
         for doc in &docs {
             assert!(
                 paused.contains(&doc.path),

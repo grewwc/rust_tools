@@ -264,6 +264,26 @@ pub(in crate::ai) const PRESERVED_USER_OVERFLOW_DIR: &str = "user-overflow-prese
 
 pub(in crate::ai) const PRESERVED_IMAGE_OVERFLOW_DIR: &str = "image-overflow-preserved";
 
+/// Session-asset directories addressable through `session-asset:<dir>/<name>`
+/// aliases. Stubs emit the alias form instead of repeating the full session
+/// path; every entry holds immutable direct-child files, so an alias always
+/// resolves to exactly one file under the current session's assets. This list
+/// is the single registry shared by the emitter
+/// (`tool_overflow::stub_archive_display_path`), the resolver
+/// (`tools::storage::file_store::session_asset_for_alias`), and the recall
+/// sampler (`driver::turn_runtime::context_memory`).
+pub(in crate::ai) const SESSION_ASSET_ALIAS_DIRS: &[&str] = &[
+    // Live (uncompressed) tool artifacts; emitted by
+    // `driver::turn_runtime::tool_result::overflow`.
+    "tool-overflow",
+    PRESERVED_TOOL_OVERFLOW_DIR,
+    PRESERVED_USER_OVERFLOW_DIR,
+    PRESERVED_IMAGE_OVERFLOW_DIR,
+    super::tool_groups::FOLDED_TOOL_GROUP_ARCHIVE_DIR,
+    INTERNAL_NOTE_OVERFLOW_DIR,
+    SOURCE_DIR,
+];
+
 pub(in crate::ai) const PRESERVED_CONTENT_STUB_PREFIX: &str = "[[PRESERVED_CONTENT_STUB_V1]]";
 
 pub(in crate::ai) const USER_OVERFLOW_SPILL_MIN_CHARS: usize = 1_024;

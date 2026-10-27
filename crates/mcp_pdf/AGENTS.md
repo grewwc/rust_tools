@@ -39,5 +39,5 @@ text come back through `content[0].text`.
 ## Host registration
 
 `~/.config/mcp.json` -> `mcpServers`. Keep `request_timeout_ms` above the
-server's 90s per-op cap (`crates/mcp_pdf/src/tools.rs:16`); the host default is
-only 30s (`src/bin/ai/types.rs:455-457`), so the host kills the server first.
+server's per-op cap (`op_timeout_ms()` in `src/tools.rs`); see the timeout
+ordering in `crates/mcp_stdio/AGENTS.md` invariant 5.

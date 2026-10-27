@@ -108,14 +108,69 @@ fn scoped_preflight_grace_has_separate_bounded_budget() {
     let mut supervisor = TurnSupervisor::default();
     assert_eq!(supervisor.effective_max_iterations(1), 1);
     for expected_rounds in 1..=MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS {
-        assert!(supervisor.grant_scoped_preflight_grace());
+        let target = std::path::PathBuf::from(format!("target-{expected_rounds}.rs"));
+        assert!(supervisor.grant_scoped_preflight_grace(&[target]));
         assert_eq!(supervisor.effective_max_iterations(1), 1 + expected_rounds);
     }
-    assert!(!supervisor.grant_scoped_preflight_grace());
+    assert!(!supervisor.grant_scoped_preflight_grace(&[std::path::PathBuf::from(
+        "target-over-budget.rs"
+    )]));
     assert_eq!(
         supervisor.effective_max_iterations(1),
         1 + MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS
     );
+}
+
+#[test]
+fn repeated_scoped_preflight_target_does_not_consume_new_budget() {
+    let mut supervisor = TurnSupervisor::default();
+    let repeated = std::path::PathBuf::from("src/bin/ai/tools/AGENTS.md");
+
+    // First pause of a target consumes one new-target budget round; the repeat is a
+    // retry of the same scope, so it must not consume another new-target round.
+    // Both are real model rounds, so both extend the effective iteration budget.
+    assert!(supervisor.grant_scoped_preflight_grace(std::slice::from_ref(&repeated)));
+    assert!(supervisor.grant_scoped_preflight_grace(std::slice::from_ref(&repeated)));
+    assert_eq!(supervisor.effective_max_iterations(1), 3);
+
+    // Fill the remaining new-target budget.
+    for index in 1..MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS {
+        let target = std::path::PathBuf::from(format!("new-target-{index}.rs"));
+        assert!(supervisor.grant_scoped_preflight_grace(&[target]));
+    }
+    assert_eq!(
+        supervisor.effective_max_iterations(1),
+        2 + MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS
+    );
+
+    // A repeated target remains recoverable without consuming a new-target round...
+    assert!(supervisor.grant_scoped_preflight_grace(std::slice::from_ref(&repeated)));
+    assert_eq!(
+        supervisor.effective_max_iterations(1),
+        3 + MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS
+    );
+
+    // ...while a new target beyond the budget is denied.
+    assert!(!supervisor.grant_scoped_preflight_grace(&[std::path::PathBuf::from(
+        "new-target-over-budget.rs"
+    )]));
+}
+
+#[test]
+fn repeated_scoped_preflight_pauses_have_total_backstop() {
+    let mut supervisor = TurnSupervisor::default();
+    let repeated = std::path::PathBuf::from("src/bin/ai/tools/AGENTS.md");
+
+    // Repeats bypass the new-target budget, but pause rounds return before the
+    // iteration-limit branch, so the total-grant cap is the hard bound.
+    for _ in 0..MAX_SCOPED_PREFLIGHT_TOTAL_GRACE_ROUNDS {
+        assert!(supervisor.grant_scoped_preflight_grace(std::slice::from_ref(&repeated)));
+    }
+    assert_eq!(
+        supervisor.effective_max_iterations(1),
+        1 + MAX_SCOPED_PREFLIGHT_TOTAL_GRACE_ROUNDS
+    );
+    assert!(!supervisor.grant_scoped_preflight_grace(std::slice::from_ref(&repeated)));
 }
 
 #[test]

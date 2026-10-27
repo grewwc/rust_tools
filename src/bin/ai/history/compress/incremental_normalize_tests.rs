@@ -73,7 +73,11 @@ fn prior_increment(dir: &Path) -> Message {
     plan.message().clone()
 }
 
-fn assert_increment_source(message: &Message, expected: &[Message]) {
+fn assert_increment_source(
+    overflow_dir: &std::path::Path,
+    message: &Message,
+    expected: &[Message],
+) {
     let body = value_to_string(&message.content);
     let record: Value = serde_json::from_str(
         body.strip_prefix(INCREMENTAL_SUMMARY_PREFIX)
@@ -81,8 +85,11 @@ fn assert_increment_source(message: &Message, expected: &[Message]) {
             .trim(),
     )
     .unwrap();
-    let bytes =
-        std::fs::read_to_string(record["source"]["archive_file_path"].as_str().unwrap()).unwrap();
+    let locator = record["source"]["archive_file_path"].as_str().unwrap();
+    let source_path =
+        crate::ai::tools::storage::file_store::session_asset_for_alias(locator, overflow_dir)
+            .expect("source locator must be a resolvable session-asset alias");
+    let bytes = std::fs::read_to_string(&source_path).unwrap();
     let restored: Vec<Message> = bytes
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -124,7 +131,7 @@ fn summary_shrink_appends_chronological_increments_after_system_prefix() {
             .collect();
         assert_eq!(first_increments.len(), 2);
         assert_eq!(first_increments[0], prior);
-        assert_increment_source(&first_increments[1], &fresh);
+        assert_increment_source(&dir.0, &first_increments[1], &fresh);
         assert_eq!(summary_delta_messages(&first), tail);
 
         let (next_fresh, next_tail) = shrink_dialogue("second");
@@ -141,7 +148,7 @@ fn summary_shrink_appends_chronological_increments_after_system_prefix() {
         assert_eq!(increments[..2], first_increments);
         let mut next_source = tail;
         next_source.extend(next_fresh);
-        assert_increment_source(&increments[2], &next_source);
+        assert_increment_source(&dir.0, &increments[2], &next_source);
         assert_eq!(summary_delta_messages(&second), next_tail);
         assert!(messages_total_chars(&second) <= 12_000);
         assert_eq!(coalesce_accumulated_summary_notes(second.clone()), second);

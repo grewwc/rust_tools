@@ -1375,6 +1375,51 @@ fn shortened_stub_carries_typed_archive_alias_for_session_archives() {
 }
 
 #[test]
+fn shortened_stub_alias_covers_all_archive_dirs_and_round_trips() {
+    // Every allowlisted archive dir shortens; the mapping is idempotent so
+    // stub normalization can rebuild old absolute pointers without a session
+    // directory at hand.
+    for (dir, name) in [
+        (
+            PRESERVED_TOOL_OVERFLOW_DIR,
+            "spilled-read_file-aaaaaaaaaaaaaaaaaaaaaaaa.txt",
+        ),
+        (
+            PRESERVED_USER_OVERFLOW_DIR,
+            "user-bbbbbbbbbbbbbbbbbbbbbbbb.json",
+        ),
+        (
+            PRESERVED_IMAGE_OVERFLOW_DIR,
+            "image-cccccccccccccccccccccccc.json",
+        ),
+        ("folded-tool-groups", "dddddddddddddddddddddddd.md"),
+        ("internal-note-overflow", "eeeeeeeeeeeeeeeeeeeeeeee.md"),
+        ("summary-sources", "ffffffffffffffffffffffff.jsonl"),
+    ] {
+        let absolute = std::path::Path::new("/sessions/abc.assets")
+            .join(dir)
+            .join(name);
+        let alias = super::tool_overflow::stub_archive_display_path(&absolute);
+        assert_eq!(alias, format!("session-asset:{dir}/{name}"));
+        assert_eq!(
+            super::tool_overflow::stub_archive_display_path(std::path::Path::new(&alias)),
+            alias,
+            "alias must round-trip for {dir}"
+        );
+    }
+    // Unknown dirs and non-archive layouts keep the full path.
+    for plain in [
+        "/sessions/abc.assets/pruned-folds/note.txt",
+        "/sessions/abc.assets/overflow-history.md",
+    ] {
+        assert_eq!(
+            super::tool_overflow::stub_archive_display_path(std::path::Path::new(plain)),
+            plain
+        );
+    }
+}
+
+#[test]
 fn archived_asset_reuse_accepts_typed_aliases_and_legacy_paths_safely() {
     let overflow_dir = std::env::temp_dir().join(format!(
         "ai-bare-name-reuse-{}",

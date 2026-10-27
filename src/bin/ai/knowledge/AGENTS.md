@@ -6,7 +6,7 @@ Applies to `src/bin/ai/knowledge/**`. Shared types and the semantic-index
 building blocks: `types.rs` (`Category`), `entry.rs` (path-leak guard),
 `config.rs` (hybrid-search weight), `indexing/similarity.rs` (lexical scoring +
 vector similarity), `indexing/embedder.rs` (remote OpenAI-compatible embedding
-provider, default `doubao-embedding-vision`), `storage/vector_store.rs`
+provider), `storage/vector_store.rs`
 (SQLite-backed vector index), and `distilled.rs` (verified distilled entries for
 automatic recall, see invariant 3). The orchestration layer lives in
 `tools/storage/rag_store.rs` (rebuild + hybrid merge) and the

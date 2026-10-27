@@ -137,6 +137,15 @@ fn archive_path(note: &Message) -> PathBuf {
         .expect("the note must carry an archive locator")
 }
 
+/// Resolve a stub locator to a filesystem path: `session-asset:` aliases go
+/// through the real resolver, anything else (absolute legacy/pruned-folds
+/// paths) passes through untouched.
+fn resolve_archive_locator_for_test(dir: &std::path::Path, locator: &std::path::Path) -> PathBuf {
+    let locator = locator.to_string_lossy();
+    crate::ai::tools::storage::file_store::session_asset_for_alias(&locator, dir)
+        .unwrap_or_else(|| locator.into_owned().into())
+}
+
 fn assert_complete_pairs(messages: &[Message]) {
     let mut pending = FxHashSet::default();
     for message in messages {
@@ -184,7 +193,7 @@ fn folded_prune_planning_binds_complete_sources_without_writing_archives() {
     assert!(meta.allows_prune());
     assert!(!meta.is_offloaded());
     assert!(canonical_fold_ids(&canonical).contains(&meta.id()));
-    let path = archive_path(note);
+    let path = resolve_archive_locator_for_test(&overflow, &archive_path(note));
     assert!(!path.exists());
 
     assert!(plan.commit());
@@ -204,7 +213,10 @@ fn folded_prune_two_independent_marks_archive_exact_note_and_leave_canonical_unc
     let note = fold_group(&canonical, dir.path());
     let id = provenance(&note).unwrap().id();
     let original_text = note.content.as_str().unwrap().to_string();
-    let source_archive = archive_path(&note);
+    let source_archive = resolve_archive_locator_for_test(dir.path(), &archive_path(&note));
+    // The offload note re-emits the provenance path verbatim; production
+    // attaches the absolute path while the stub shows the alias.
+    let provenance_archive = provenance(&note).unwrap().archive_file_path.clone();
     let checkpoint = original_text
         .lines()
         .find(|line| line.starts_with("assistant_checkpoint:"))
@@ -259,7 +271,7 @@ fn folded_prune_two_independent_marks_archive_exact_note_and_leave_canonical_unc
     assert!(stub_text.contains("archive_scope: exact_folded_note_before_explicit_prune"));
     assert!(stub_text.contains(&format!(
         "source_projection_archive: {}",
-        source_archive.display()
+        provenance_archive
     )));
     assert!(stub_text.lines().any(|line| line == checkpoint));
     assert!(stub_text.contains("offload-0"));
@@ -307,7 +319,7 @@ fn folded_prune_large_note_does_not_inherit_raw_single_mark_exception() {
     let dir = TestDir::new();
     let raw = raw_group("large-fold", &["read_file"]);
     let mut note = fold_group(&raw, dir.path());
-    let source_archive = archive_path(&note);
+    let source_archive = resolve_archive_locator_for_test(dir.path(), &archive_path(&note));
     let mut content = note.content.as_str().unwrap().to_string();
     content.push_str(&"\nAdditional preserved preview evidence.".repeat(1_000));
     note.content = Value::String(content);
@@ -339,7 +351,8 @@ fn folded_prune_automatically_archives_without_marks_and_is_idempotent() {
     let note = fold_group(&canonical, dir.path());
     let id = provenance(&note).unwrap().id();
     let original_text = note.content.as_str().unwrap().to_string();
-    let source_archive = archive_path(&note);
+    let source_archive = resolve_archive_locator_for_test(dir.path(), &archive_path(&note));
+    let provenance_archive = provenance(&note).unwrap().archive_file_path.clone();
     append_recent_raw(&mut canonical, KEEP_RECENT_TOOL_GROUPS);
     let canonical_before = canonical.clone();
     let projection_before = old_fold_projection(note);
@@ -356,7 +369,7 @@ fn folded_prune_automatically_archives_without_marks_and_is_idempotent() {
     assert!(source_archive.is_file());
     assert!(stub_text.contains(&format!(
         "source_projection_archive: {}",
-        source_archive.display()
+        provenance_archive
     )));
     assert_eq!(
         first.freed_chars,
@@ -508,7 +521,7 @@ fn folded_prune_provenance_requires_complete_unique_call_result_pairing() {
     let dir = TestDir::new();
     let raw = raw_group("pairing", &["read_file", "execute_command"]);
     let template = fold_group(&raw, dir.path());
-    let path = archive_path(&template);
+    let path = resolve_archive_locator_for_test(dir.path(), &archive_path(&template));
     let mut malformed = Vec::new();
 
     let mut missing = raw.clone();
@@ -665,7 +678,7 @@ fn folded_prune_requires_archive_provenance_and_minimum_character_count() {
     let dir = TestDir::new();
     let raw = raw_group("size", &["read_file"]);
     let template = fold_group(&raw, dir.path());
-    let path = archive_path(&template);
+    let path = resolve_archive_locator_for_test(dir.path(), &archive_path(&template));
     let mut unbound = template.clone();
     unbound.reasoning_content = None;
     attach_provenance(&mut unbound, &raw, &[0, 1], None);

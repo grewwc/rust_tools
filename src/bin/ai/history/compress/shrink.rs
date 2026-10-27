@@ -303,7 +303,7 @@ pub(in crate::ai) fn shrink_messages_to_fit(
     // their nominal cost). Merge old stubs outside the protected tail window into
     // one pointer carrying the archive directory, converging placeholder overhead
     // from O(N) to O(1).
-    merge_old_user_overflow_stubs(&mut messages, keep_recent_turns);
+    merge_old_user_overflow_stubs(&mut messages, keep_recent_turns, overflow_dir);
 
     // Proactively slim down the giant arguments of write_file/apply_patch calls
     // that were "successfully written": once the file is on disk and the result
@@ -724,7 +724,7 @@ pub(in crate::ai) fn shrink_messages_to_fit_with_summary_outcome(
     // Symmetric with plain shrink: merge user/image spill stubs outside the
     // protected tail window, preventing placeholder messages from accumulating
     // monotonically as the session grows.
-    merge_old_user_overflow_stubs(&mut messages, keep_recent_turns);
+    merge_old_user_overflow_stubs(&mut messages, keep_recent_turns, overflow_dir);
 
     // Symmetric with shrink_messages_to_fit: proactively replace giant arguments
     // of successfully-written write_file/apply_patch calls with archive stubs

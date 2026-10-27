@@ -25,11 +25,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | ./target/debug/mcp_browser
 ```
 
-Unit tests in `src/main.rs` (capability gating) and `src/applescript.rs` (error translation) run without Chrome; there are no end-to-end tests (they need real Chrome). Gate = build + smoke test above; add `tools/call navigate` for full round-trip (`MCP_BROWSER_HEADLESS=1` to avoid window). AppleScript smoke: needs Chrome *Allow JavaScript from Apple Events* enabled **and Chrome fully restarted** (the preference is read at startup only), verify one tab opens/closes without touching others.
+Unit tests in `src/main.rs` (capability gating) and `src/applescript.rs` (error translation) run without Chrome; there are no end-to-end tests (they need real Chrome). Gate = build + smoke test above; add `tools/call navigate` for full round-trip (`MCP_BROWSER_HEADLESS=1` to avoid window). AppleScript smoke: with JS-from-Apple-Events enabled, verify one tab opens/closes without touching others.
 
 ## Invariants (do not break)
 
-1. **Server cap < host timeout** (`crates/mcp_stdio/AGENTS.md` invariant 5). No per-tool override — the host kills+restarts the subprocess on `request_timeout_ms`, so every CDP/osascript op stays under the **90s** cap, which must stay below the host's *configured* `request_timeout_ms` (the code default is 30s — `src/bin/ai/types.rs:455-457` — and this host's `~/.config/mcp.json` sets 120000 for this server). `MCP_BROWSER_OP_TIMEOUT_MS` may only *lower* that cap: `op_timeout_ms()` (`src/browser.rs`) clamps it to 90_000, because the server cannot read the host's configured timeout.
+1. **Server cap < host timeout** (`crates/mcp_stdio/AGENTS.md` invariant 5). No per-tool override — every CDP/osascript op stays under the **90s** cap, which must stay below the host's *configured* `request_timeout_ms`. `MCP_BROWSER_OP_TIMEOUT_MS` may only *lower* that cap: `op_timeout_ms()` (`src/browser.rs`) clamps it to 90_000, because the server cannot read the host's configured timeout.
 2. **Error wording avoids host transport triggers** — the trigger list and the shared timeout wording live in `crates/mcp_stdio/AGENTS.md` invariant 2.
 3. **Only `content[0].text` reaches the model** (see `crates/mcp_stdio/AGENTS.md` invariant 4). Screenshots save to disk and return the path, never image bytes.
 4. **Sequential + Handler polling.** `main` owns one `Session` (`Option<Session>`) by `&mut`; host serializes requests so one reused `Page` keeps cookies. CDP `Handler` must be continuously polled, else all CDP hangs.
@@ -46,7 +46,8 @@ Unit tests in `src/main.rs` (capability gating) and `src/applescript.rs` (error 
      text clues come from visibility-safe `body.innerText` plus a visible input.
      Both drivers share the same keyword rules.
    - **Tag** `[USER_ACTION_REQUIRED: <category>]` **after** `cap_text` (never
-     truncated), from the single source `user_action_tag()`; cap the body once
+     truncated), from `user_action_tag()` — one copy per driver (`src/tools.rs`,
+     `src/applescript.rs`), kept byte-identical; cap the body once
      and append the tag afterwards — a second cap over the summary cuts the tag
      off on long pages. Captcha counts only while present *and* unsolved: the
      solved state is read from the **host** document
@@ -55,8 +56,7 @@ Unit tests in `src/main.rs` (capability gating) and `src/applescript.rs` (error 
      hit and cleared on a miss (`detect_and_mark` in both drivers), so mutating
      tools prepend `[HUMAN_ACTION_PENDING: <category>]` exactly while a blocker
      is still on the page.
-   - **`wait_for_human`** waits in bounded segments under the host timeout (60s
-     budget) and returns `status=still_waiting` — a normal result, not an error:
+   - **`wait_for_human`** waits in bounded segments under the host timeout and returns `status=still_waiting` — a normal result, not an error:
      the model ends the turn and asks the user. Headless reports
      `status=unavailable`. Detector internals live in `src/tools.rs` (CDP) and
      `src/applescript.rs` (AppleScript).
@@ -92,4 +92,4 @@ Keyboard/typing must go through **`Element`**; `Page` has no `press_key`. `Eleme
 
 ## Host registration
 
-`~/.config/mcp.json` → `mcpServers` (tools `mcp_browser_*`). Keep `request_timeout_ms` 120000 > server cap 90000 — that 120000 is this host's per-server configuration, not a code default (the code default is 30s, `src/bin/ai/types.rs:455-457`).
+`~/.config/mcp.json` → `mcpServers` (tools `mcp_browser_*`). Keep `request_timeout_ms` above the 90s server cap (invariant 1).

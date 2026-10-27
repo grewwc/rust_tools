@@ -129,6 +129,9 @@ pub(in crate::ai) fn count_user_turns_sqlite(path: &Path) -> io::Result<usize> {
 /// Cheaply measure the payload size of persisted messages, so history-to-disk compaction still triggers when the user-turn count is low
 /// but tool output has grown large. The sqlite file size cannot be used: WAL/free pages are not
 /// reclaimed right after messages are replaced, which would make every turn misjudge the budget as exceeded.
+/// This counts raw stored bytes per field, so it is NOT comparable to the in-memory char budget: images bill a
+/// nominal `IMAGE_BUDGET_CHARS` in memory (see `compress::billable`) but their full base64 here. Use this only
+/// for sqlite-side size gating, never against request-side thresholds.
 pub(in crate::ai) fn total_message_chars_sqlite(path: &Path) -> io::Result<usize> {
     if !path.exists() {
         return Ok(0);

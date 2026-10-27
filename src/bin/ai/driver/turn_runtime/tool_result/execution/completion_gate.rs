@@ -319,8 +319,9 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_gate_action(
 /// Marker and texts of the recoverable-pause gate.
 ///
 /// A pre-execution pause is a runtime-side condition the paused call is expected
-/// to survive inside the same turn: the scoped-instruction pause is self-healing
-/// (the missing documents are added on the next model step), while the
+/// to survive inside the same turn when the recovery budget grants another round:
+/// the scoped-instruction pause is self-healing (the missing documents are added
+/// on the next model step), while the
 /// patch-retry pause clears only once the caller re-reads the target — which is
 /// why the reopen note defers to the recovery the pause reply prescribed instead
 /// of promising that a bare retry succeeds. The completion gate cannot see this

@@ -41,6 +41,6 @@ diagnostic). The three that cost the most when broken:
 
 ## Environment / Tool set / Host
 
-- `MCP_EXCEL_OP_TIMEOUT_MS=90000` per-op cap (keep below the host's *configured* `request_timeout_ms`: code default 30s — `src/bin/ai/types.rs:455-457`; this host's `~/.config/mcp.json` sets 120000). macOS-only (Excel + `osascript`).
+- `MCP_EXCEL_OP_TIMEOUT_MS` per-op cap (default 90000; keep below the host's *configured* `request_timeout_ms` — see `mcp_stdio` invariant 5). macOS-only (Excel + `osascript`).
 - 9 verbs (no raw AppleScript): `open_workbook` · `list_sheets` · `read_cell` · `read_range` · `write_cell` · `write_range` · `export_csv` · `save_workbook` (experimental) · `close_workbook` — reads/writes are in-memory; `export_csv` persists.
 - `~/.config/mcp.json` → `mcpServers` (tools `mcp_excel_*`).

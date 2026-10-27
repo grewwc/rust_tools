@@ -19,14 +19,13 @@ use super::{
     compress::is_preserved_user_or_image_stub,
     markdown::messages_to_markdown,
     sqlite::{
-        SessionListMetadata, backup_sqlite, read_all_messages_sqlite,
+        MarkMessageUpdate, SessionListMetadata, backup_sqlite, read_all_messages_sqlite,
         read_first_user_prompt_sqlite, read_session_archived_sqlite,
         read_session_list_metadata_sqlite, read_session_mark_message_sqlite,
         read_session_marked_sqlite, read_session_serve_config_sqlite,
         read_session_title_origin_sqlite, read_session_title_sqlite,
-        remap_context_checkpoint_paths_sqlite, with_session_state_lock,
-        write_session_archived_sqlite, write_session_mark_sqlite,
-        write_session_serve_config_sqlite, write_session_title_sqlite, MarkMessageUpdate,
+        remap_session_asset_paths_sqlite, with_session_state_lock, write_session_archived_sqlite,
+        write_session_mark_sqlite, write_session_serve_config_sqlite, write_session_title_sqlite,
     },
     types::Message,
 };
@@ -64,6 +63,10 @@ pub(in crate::ai) fn with_sessions_lifecycle_lock<T>(
 /// yet). Used by fork_session to copy the assets directory completely:
 /// checkpoint bodies live in nested directories, and a shallow copy would
 /// leave forked markers pointing at missing files.
+/// A full copy (not a hard link) is required: archives such as
+/// `overflow-history.md` are appended in place, so linked files would leak
+/// writes across sessions. On APFS the bytes are still cheap via the
+/// copy-on-write clone in `copy_file_fast`.
 pub(super) fn copy_dir_recursively(src: &Path, dst: &Path) -> io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
@@ -73,10 +76,47 @@ pub(super) fn copy_dir_recursively(src: &Path, dst: &Path) -> io::Result<()> {
         if entry.file_type()?.is_dir() {
             copy_dir_recursively(&from, &to)?;
         } else {
-            fs::copy(&from, &to)?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // Skip crash debris: archive commits write `.{name}.*.tmp` and
+            // rename on success, so surviving temp files are never referenced
+            // by any pointer.
+            if name.starts_with('.') && name.ends_with(".tmp") {
+                continue;
+            }
+            copy_file_fast(&from, &to)?;
         }
     }
     Ok(())
+}
+
+/// Copy one file, using an APFS copy-on-write clone on macOS when possible.
+/// A clone has exact copy semantics (later appends never affect the source),
+/// unlike a hard link, so it is safe for append-in-place archives; any failure
+/// falls back to a regular byte copy.
+fn copy_file_fast(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if clonefile_fast(from, to) {
+        return Ok(());
+    }
+    fs::copy(from, to).map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn clonefile_fast(from: &Path, to: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(src) = CString::new(from.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let Ok(dst) = CString::new(to.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `clonefile` only reads both NUL-terminated paths; flags=0
+    // requests a plain copy-on-write clone. Any failure (cross-filesystem,
+    // unsupported FS, existing dst) returns nonzero and the caller falls back
+    // to `fs::copy`.
+    unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) == 0 }
 }
 
 #[derive(Debug, Clone)]
@@ -1236,15 +1276,20 @@ impl SessionStore {
                         let _ = fs::remove_dir_all(&dst_assets);
                         return Err(error);
                     }
-                    if let Err(error) = remap_context_checkpoint_paths_sqlite(
-                        &dst_path,
-                        Some(&src_assets),
-                        &dst_assets,
-                    ) {
-                        let _ = delete_history_artifacts(&dst_path);
-                        let _ = fs::remove_dir_all(&dst_assets);
-                        return Err(error);
-                    }
+                }
+                // Always remap: even without an assets directory the derived
+                // snapshot must be discarded. Checkpoint markers become
+                // target-local; archive pointers stay untouched unless their
+                // target exists (the anchor rule has an existence gate), so
+                // without a target tree they keep pointing at the source until
+                // a later move heals them — dangling either way, never silently
+                // redirected at a guessed location.
+                let source = src_assets.is_dir().then_some(src_assets.as_path());
+                if let Err(error) = remap_session_asset_paths_sqlite(&dst_path, source, &dst_assets)
+                {
+                    let _ = delete_history_artifacts(&dst_path);
+                    let _ = fs::remove_dir_all(&dst_assets);
+                    return Err(error);
                 }
                 after_fork(&dst_path)
             },
@@ -1462,7 +1507,7 @@ impl SessionStore {
                     std::io::copy(&mut entry, &mut out)?;
                 }
 
-                remap_context_checkpoint_paths_sqlite(&dst_sqlite, None, &dst_assets)?;
+                remap_session_asset_paths_sqlite(&dst_sqlite, None, &dst_assets)?;
                 Ok(dst_id.to_string())
             })();
             if result.is_err() {
@@ -2460,6 +2505,245 @@ mod tests {
         );
 
         let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(store.sessions_root());
+    }
+
+    /// Build internal-note messages carrying every archive-pointer form, and
+    /// create the referenced asset files.
+    fn archive_pointer_messages(store: &SessionStore, session_id: &str) -> Vec<Message> {
+        use sha2::{Digest, Sha256};
+
+        let assets = store.session_assets_dir(session_id);
+        let overflow = assets.join("overflow-history.md");
+        let note_dir = assets.join("internal-note-overflow");
+        let user_file = assets.join("user-overflow-preserved").join("u.json");
+        let source_file = assets.join("summary-sources").join("abc123.jsonl");
+        let fold_file = assets.join("folded-tool-groups").join("fold-1.md");
+        fs::create_dir_all(&note_dir).unwrap();
+        fs::write(&overflow, "overflow body").unwrap();
+        fs::write(note_dir.join("n.md"), "note body").unwrap();
+        fs::create_dir_all(user_file.parent().unwrap()).unwrap();
+        fs::write(&user_file, "user body").unwrap();
+        fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        fs::write(&source_file, "source body").unwrap();
+        fs::create_dir_all(fold_file.parent().unwrap()).unwrap();
+        fs::write(&fold_file, "fold body").unwrap();
+
+        let note = |content: String, reasoning_content: Option<String>| Message {
+            role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(content),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content,
+        };
+        let fold_content = format!(
+            "compressed_tool_round: 1 tool calls (folded; recoverable)\n[compressed-tool-evidence]\n- archive_file_path: {}\nprune_id: fold_test_1",
+            fold_file.display()
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(fold_content.as_bytes());
+        let sha: String = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let provenance = format!(
+            "{}{{\"sources\":[{{\"id\":\"call_1\",\"name\":\"read_file\",\"arguments_sha256\":\"a\",\"result_sha256\":\"b\"}}],\"content_sha256\":\"{sha}\",\"archive_file_path\":\"{}\",\"offloaded\":false}}",
+            crate::ai::history::types::FOLDED_TOOL_ORIGIN,
+            fold_file.display()
+        );
+        vec![
+            note(
+                format!(
+                    "[archive-pointer-v2]\narchive_file_path: {}\narchive_directory_path: {}",
+                    overflow.display(),
+                    note_dir.display()
+                ),
+                None,
+            ),
+            note(
+                format!(
+                    "[preserved-message-pointer-v2]\ncontent_kind: user\narchive_file_path: {}",
+                    user_file.display()
+                ),
+                None,
+            ),
+            note(
+                format!(
+                    "incremental summary record\n{{\"source\":{{\"archive_file_path\":\"{}\",\"sha256\":\"0\"}}}}",
+                    source_file.display()
+                ),
+                None,
+            ),
+            note(fold_content, Some(provenance)),
+        ]
+    }
+
+    /// Every pointer must resolve inside the target assets dir, and fold
+    /// provenance must stay valid (rebound hash matches the rewritten body).
+    fn assert_pointers_remapped(store: &SessionStore, target_id: &str) {
+        use sha2::{Digest, Sha256};
+
+        let target_assets = store.session_assets_dir(target_id);
+        let target_prefix = target_assets.to_string_lossy().into_owned();
+        let messages = store.read_all_messages(target_id).unwrap();
+        assert_eq!(messages.len(), 4);
+        let bodies: Vec<String> = messages
+            .iter()
+            .map(|m| m.content.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            bodies[0].contains(&format!("{target_prefix}/overflow-history.md")),
+            "{bodies:?}"
+        );
+        assert!(
+            bodies[0].contains(&format!("{target_prefix}/internal-note-overflow")),
+            "{bodies:?}"
+        );
+        assert!(
+            bodies[1].contains(&format!("{target_prefix}/user-overflow-preserved/u.json")),
+            "{bodies:?}"
+        );
+        assert!(
+            bodies[2].contains(&format!("{target_prefix}/summary-sources/abc123.jsonl")),
+            "{bodies:?}"
+        );
+        assert!(
+            bodies[3].contains(&format!("{target_prefix}/folded-tool-groups/fold-1.md")),
+            "{bodies:?}"
+        );
+        let sidecar = messages[3].reasoning_content.as_deref().unwrap();
+        let encoded = sidecar
+            .strip_prefix(crate::ai::history::types::FOLDED_TOOL_ORIGIN)
+            .unwrap();
+        let meta: Value = serde_json::from_str(encoded).unwrap();
+        assert_eq!(
+            meta.get("archive_file_path").and_then(Value::as_str),
+            Some(format!("{target_prefix}/folded-tool-groups/fold-1.md").as_str())
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(bodies[3].as_bytes());
+        assert_eq!(
+            meta.get("content_sha256").and_then(Value::as_str),
+            Some(
+                hasher
+                    .finalize()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+                    .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn fork_remaps_archive_pointers_and_rebinds_fold_provenance() {
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        let source_id = "source";
+        let target_id = "target";
+        let source_db = store.session_history_file(source_id);
+        let messages = archive_pointer_messages(&store, source_id);
+        append_history_messages(&source_db, &messages).unwrap();
+
+        store.fork_session(source_id, target_id).unwrap();
+        assert_pointers_remapped(&store, target_id);
+
+        // Target owns its bytes: readable after the source assets are gone.
+        fs::remove_dir_all(store.session_assets_dir(source_id)).unwrap();
+        let target_assets = store.session_assets_dir(target_id);
+        assert_eq!(
+            fs::read_to_string(target_assets.join("overflow-history.md")).unwrap(),
+            "overflow body"
+        );
+        assert_eq!(
+            fs::read_to_string(target_assets.join("summary-sources").join("abc123.jsonl")).unwrap(),
+            "source body"
+        );
+
+        let _ = fs::remove_dir_all(store.sessions_root());
+    }
+
+    #[test]
+    fn archive_import_remaps_archive_pointers() {
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        let source_id = "source";
+        let target_id = "imported";
+        let source_db = store.session_history_file(source_id);
+        let messages = archive_pointer_messages(&store, source_id);
+        append_history_messages(&source_db, &messages).unwrap();
+
+        let archive = std::env::temp_dir().join(format!(
+            "ai-session-archive-test-{}.zip",
+            uuid::Uuid::new_v4()
+        ));
+        store.export_session_archive(source_id, &archive).unwrap();
+        // Import resolves against the extracted assets, not the live source.
+        fs::remove_dir_all(store.session_assets_dir(source_id)).unwrap();
+        store.import_session_archive(&archive, target_id).unwrap();
+        assert_pointers_remapped(&store, target_id);
+
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(store.sessions_root());
+    }
+
+    #[test]
+    fn fork_discards_derived_context_snapshot() {
+        use crate::ai::history::sqlite::{
+            read_context_history_sqlite, write_context_snapshot_sqlite,
+        };
+
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        let source_id = "source";
+        let target_id = "target";
+        let source_db = store.session_history_file(source_id);
+        append_history_messages(
+            &source_db,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("hello".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        let source = read_context_history_sqlite(&source_db, "test-projection").unwrap();
+        let snapshot = vec![Message {
+            role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String("[History summary]\nhello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        assert!(
+            write_context_snapshot_sqlite(
+                &source_db,
+                &snapshot,
+                source.source_message_id,
+                source.canonical_generation,
+                "test-projection",
+            )
+            .unwrap()
+        );
+
+        store.fork_session(source_id, target_id).unwrap();
+
+        let count_snapshot_rows = |db: &std::path::Path| -> i64 {
+            let conn = rusqlite::Connection::open(db).unwrap();
+            conn.query_row("SELECT COUNT(*) FROM context_snapshot", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(count_snapshot_rows(&source_db), 1);
+        assert_eq!(
+            count_snapshot_rows(&store.session_history_file(target_id)),
+            0
+        );
+
         let _ = fs::remove_dir_all(store.sessions_root());
     }
 

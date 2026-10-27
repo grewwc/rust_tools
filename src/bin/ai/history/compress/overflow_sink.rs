@@ -363,7 +363,10 @@ pub(super) fn archive_internal_notes_deduplicated(
             raw_json
         );
         let digest = content_sha256_hex(body.as_bytes());
-        let write = PlannedArchiveWrite::new(archive_dir.join(format!("{digest}.md")), body);
+        // 24 hex chars (96 bits); readers locate these files by scanning the
+        // directory, never by reconstructing the name from the digest.
+        let write =
+            PlannedArchiveWrite::new(archive_dir.join(format!("{}.md", &digest[..24])), body);
         if !write.commit() {
             return Err(());
         }

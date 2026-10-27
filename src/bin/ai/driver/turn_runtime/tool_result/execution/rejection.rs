@@ -113,7 +113,8 @@ Do NOT retry patches in this batch — doing so will only fail again. Required r
                 "Error: '{tool_name}' {SCOPED_INSTRUCTIONS_PAUSE_PREFIX}. \
 Paused target(s): {target_list}\n\
 {doc_line}\
-No file was changed. The runtime will add the applicable instruction documents on the next model step. Review those rules, then retry the mutation in a later tool round; do not repeat it in this batch."
+No file was changed. If the runtime grants a recovery round, it will add the applicable instruction documents on the next model step; review those rules, then retry the mutation in a later tool round; do not repeat it in this batch. \
+If this pause exhausts the scoped-preflight recovery budget, the runtime will stop tool calls instead: do not retry; summarize what was completed and list this mutation as remaining work."
             )
         }
     }

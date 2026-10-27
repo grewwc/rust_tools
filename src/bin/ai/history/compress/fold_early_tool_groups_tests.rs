@@ -106,6 +106,40 @@ fn archive_file_path_from_text(text: &str) -> String {
         .to_string()
 }
 
+fn resolve_stub_locator_for_test(
+    overflow_dir: &std::path::Path,
+    locator: &str,
+) -> std::path::PathBuf {
+    crate::ai::tools::storage::file_store::session_asset_for_alias(locator, overflow_dir)
+        .expect("stub locator must be a resolvable session-asset alias")
+}
+
+#[test]
+fn folded_group_archive_uses_short_content_hash_name() {
+    let dir = std::env::temp_dir().join(format!("ai-fold-short-name-{}", uuid::Uuid::new_v4()));
+    let messages = single_turn_with_groups(6, 2_000);
+    let (folded, count) = fold_early_tool_groups(&messages, 4, Some(&dir), &FxHashSet::default());
+    assert_eq!(count, 2);
+    for note in folded
+        .iter()
+        .filter(|message| is_compressed_tool_evidence_note(message))
+    {
+        let locator = archive_file_path_from_text(note.content.as_str().unwrap());
+        let name = locator.rsplit('/').next().unwrap();
+        let stem = name.strip_suffix(".md").expect("fold archive must be .md");
+        assert_eq!(stem.len(), 24, "fold archive must use 24-hex names: {name}");
+        assert!(stem.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+        // The locator itself must be session-relative.
+        assert!(
+            locator.starts_with("session-asset:folded-tool-groups/"),
+            "{locator}"
+        );
+        // ... and still resolve to a real file (old absolute forms keep working).
+        assert!(resolve_stub_locator_for_test(&dir, &locator).is_file());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn recursive_file_count(path: &std::path::Path) -> usize {
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
@@ -164,8 +198,9 @@ fn compact_fold_guidance_keeps_each_record_self_describing_and_archived() {
             "recovery_guidance: use evidence/archive before re-running; split large reads/patches."
         ));
         assert!(super::folded_prune::provenance(note).is_some());
-        let path = archive_file_path_from_text(text);
-        let archive = std::fs::read_to_string(path).unwrap();
+        let locator = archive_file_path_from_text(text);
+        let archive =
+            std::fs::read_to_string(resolve_stub_locator_for_test(&dir, &locator)).unwrap();
         let start = 2 + 2 * index;
         let exact_group = serde_json::to_string_pretty(&messages[start..start + 2]).unwrap();
         assert!(archive.contains(&exact_group));
@@ -1419,9 +1454,12 @@ fn folded_tool_group_points_to_raw_group_archive() {
         stub.contains("- archive_scope: folded_tool_group_projection_messages"),
         "{stub}"
     );
-    let archive_path = archive_file_path_from_text(&stub);
-    let archived = std::fs::read_to_string(&archive_path)
-        .expect("folded group raw archive should be readable");
+    let archive_locator = archive_file_path_from_text(&stub);
+    let archived = std::fs::read_to_string(resolve_stub_locator_for_test(
+        &overflow_dir,
+        &archive_locator,
+    ))
+    .expect("folded group raw archive should be readable");
     assert!(archived.contains("grep-raw"), "{archived}");
     assert!(archived.contains("text_grep"), "{archived}");
     assert!(
@@ -1478,9 +1516,12 @@ fn folded_lossy_group_advises_archive_read_and_archive_header_is_honest() {
         "lossy-only groups must not claim a recoverable pointer: {stub}"
     );
 
-    let archive_path = archive_file_path_from_text(&stub);
-    let archived =
-        std::fs::read_to_string(&archive_path).expect("folded group archive should be readable");
+    let archive_locator = archive_file_path_from_text(&stub);
+    let archived = std::fs::read_to_string(resolve_stub_locator_for_test(
+        &overflow_dir,
+        &archive_locator,
+    ))
+    .expect("folded group archive should be readable");
     assert!(
         archived.starts_with("# Folded tool group (request-projection copy)"),
         "{archived}"

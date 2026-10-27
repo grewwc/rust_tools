@@ -33,10 +33,11 @@ use super::{
     IMAGE_OVERFLOW_SPILL_MIN_CHARS, KEEP_RECENT_TOOL_GROUPS,
     KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX, PRESERVED_CONTENT_STUB_PREFIX,
     PRESERVED_IMAGE_OVERFLOW_DIR, PRESERVED_TOOL_OVERFLOW_DIR, PRESERVED_USER_OVERFLOW_DIR,
-    PlannedArchiveWrite, USER_OVERFLOW_SPILL_MIN_CHARS, automatic_summary_body, content_sha256_hex,
-    dedup_adjacent, keep_recent_user_turns_when_trimming, message_contains_image,
-    normalize_whitespace, redact_images_except_last, strip_nested_prior_summary_prefixes,
-    tool_message_indices, value_to_string,
+    PlannedArchiveWrite, SESSION_ASSET_ALIAS_DIRS, USER_OVERFLOW_SPILL_MIN_CHARS,
+    automatic_summary_body, content_sha256_hex, dedup_adjacent,
+    keep_recent_user_turns_when_trimming, message_contains_image, normalize_whitespace,
+    redact_images_except_last, strip_nested_prior_summary_prefixes, tool_message_indices,
+    value_to_string,
 };
 
 pub(super) const PRESERVED_TOOL_OVERFLOW_STUB_PREFIX: &str = "[[PRESERVED_TOOL_OVERFLOW_STUB_V1]]";
@@ -697,24 +698,30 @@ pub(super) fn archived_asset_path_from_raw(raw_path: &str, overflow_dir: &Path) 
     archived_asset_bare_name_from_raw(raw_path, &preserved_dir)
 }
 
-/// Short display form for the archive path carried by a tool overflow stub.
+/// Short display form for the archive path carried by an overflow stub.
 ///
-/// Archive files are direct children of `<session>.assets/tool-overflow-compressed/`
+/// Archive files are direct children of a `<session>.assets/<dir>/` directory
 /// with content-addressed unique names, so the directory prefix repeats verbatim
 /// across hundreds of stubs while carrying no per-stub information. Emit a
 /// typed session-asset reference so callers do not mistake it for a cwd-relative
-/// path. `read_file` and compression reuse resolve it against this session's
-/// assets. Other layouts keep the full path; legacy bare names remain readable.
+/// path. `read_file`, compression reuse, and the recall sampler resolve it
+/// against this session's assets. The accepted directories are the shared
+/// `SESSION_ASSET_ALIAS_DIRS` registry; other layouts keep the full path and
+/// legacy bare names remain readable.
+///
+/// The mapping is idempotent: an already-aliased `session-asset:<dir>/<name>`
+/// value round-trips to itself, so stub normalization can rebuild old absolute
+/// pointers into aliases without a session directory at hand.
 pub(super) fn stub_archive_display_path(path: &Path) -> String {
-    let is_session_archive_child = path
+    let alias_dir = path
         .parent()
         .and_then(|parent| parent.file_name())
         .and_then(|name| name.to_str())
-        == Some(PRESERVED_TOOL_OVERFLOW_DIR);
-    if is_session_archive_child
+        .filter(|dir| SESSION_ASSET_ALIAS_DIRS.contains(dir));
+    if let Some(dir) = alias_dir
         && let Some(name) = path.file_name().and_then(|name| name.to_str())
     {
-        return format!("session-asset:{PRESERVED_TOOL_OVERFLOW_DIR}/{name}");
+        return format!("session-asset:{dir}/{name}");
     }
     path.to_string_lossy().into_owned()
 }
@@ -1558,13 +1565,14 @@ fn build_merged_preserved_message_stub(count: usize, dirs: &[String]) -> String 
 /// so long sessions (especially once images are billed at nominal cost) let
 /// the stubs accumulate monotonically with no convergence path. Folding old
 /// stubs into a single merged pointer shrinks placeholder overhead from O(N)
-/// to O(1); the originals stay zero-compressed on disk, and the
-/// directory + timestamp naming allows read-back via tree + read_file. Only
-/// stubs outside the protected tail window are merged; the most recent turns
-/// keep per-stub pointers for precise recall.
+/// to O(1); the originals stay zero-compressed on disk, and the directory +
+/// kind-prefixed content-hash naming allows read-back via tree + read_file.
+/// Only stubs outside the protected tail window are merged; the most recent
+/// turns keep per-stub pointers for precise recall.
 pub(super) fn merge_old_user_overflow_stubs(
     messages: &mut Vec<Message>,
     keep_recent_user_turns: usize,
+    overflow_dir: Option<&Path>,
 ) {
     const MERGE_MIN_STUB_COUNT: usize = 4;
 
@@ -1603,10 +1611,22 @@ pub(super) fn merge_old_user_overflow_stubs(
         let Some((_kind, file_path)) = parse_preserved_message_stub(text) else {
             continue;
         };
+        // New stubs carry a session-relative `session-asset:` alias; resolve it
+        // against this session's assets so the merged pointer keeps an absolute
+        // directory the model can pass to `tree`. Legacy absolute pointers keep
+        // the old parent-dir behavior. An alias that cannot resolve (no overflow
+        // dir this round) is left single rather than merged with a wrong or
+        // missing directory: it stays reachable and converges on a later round.
+        let stub_path =
+            match overflow_dir.and_then(|root| session_asset_for_alias(&file_path, root)) {
+                Some(resolved) => resolved,
+                None if file_path.starts_with("session-asset:") => continue,
+                None => PathBuf::from(&file_path),
+            };
         stub_indices.push(idx);
         single_stub_count += 1;
         archived_message_count = archived_message_count.saturating_add(1);
-        if let Some(parent) = Path::new(&file_path).parent() {
+        if let Some(parent) = stub_path.parent() {
             let dir = parent.to_string_lossy().into_owned();
             if !dirs.iter().any(|d| d == &dir) {
                 dirs.push(dir);
@@ -1782,13 +1802,6 @@ fn write_preserved_message_overflow_file(
     };
     let dir = overflow_dir.join(subdir);
     std::fs::create_dir_all(&dir).ok()?;
-    let file_name = format!(
-        "{}-{}-{}.json",
-        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
-        kind,
-        uuid::Uuid::new_v4().simple()
-    );
-    let path = dir.join(file_name);
 
     let mut payload = serde_json::Map::new();
     payload.insert("role".to_string(), Value::String(message.role.clone()));
@@ -1808,11 +1821,17 @@ fn write_preserved_message_overflow_file(
     }
 
     let serialized = serde_json::to_string_pretty(&Value::Object(payload)).ok()?;
+    // Content-addressed name: re-spilling identical content reuses one file
+    // instead of orphaning a timestamp+uuid file per round. 24 hex chars
+    // (96 bits) match the folded/spilled tool-overflow precedent; `commit`
+    // additionally only reuses same-size files, and temp files stay unique per
+    // attempt so concurrent identical spills cannot corrupt each other.
+    let digest = content_sha256_hex(serialized.as_bytes());
+    let path = dir.join(format!("{kind}-{}.json", &digest[..24]));
     // Use atomic temp+fsync+rename via `PlannedArchiveWrite::commit` instead of
-    // bare `fs::write`. The file name is unique (timestamp + uuid), but a crash
-    // mid-write still leaves a truncated asset that the stub permanently points
-    // at. The atomic path only publishes the target after a fully synced temp
-    // file, matching the content-addressed tool overflow fix.
+    // bare `fs::write`: a crash mid-write must not leave a truncated asset
+    // that the stub permanently points at. The atomic path only publishes the
+    // target after a fully synced temp file.
     if PlannedArchiveWrite::new(path.clone(), serialized).commit() {
         Some(path)
     } else {
@@ -1823,7 +1842,7 @@ fn write_preserved_message_overflow_file(
 fn build_preserved_message_overflow_stub(path: &Path, kind: &str) -> String {
     format!(
         "{PRESERVED_MESSAGE_POINTER_PREFIX}\n{PRESERVED_CONTENT_KIND_PREFIX}{kind}\n{ARCHIVE_FILE_PATH_PREFIX}{}\nEarlier user content was archived verbatim. This is context recovery metadata, not a new user request. Use read_file only if the current task needs the original content.",
-        path.display()
+        stub_archive_display_path(path)
     )
 }
 

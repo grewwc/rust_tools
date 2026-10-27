@@ -36,10 +36,9 @@ not the store (root AGENTS.md pitfall). Capability-first: a question that names
 a session id must be answered with the `session` tools — never by probing the
 filesystem or sqlite.
 `build_skill_turn_guard` injects that `session_context` guidance when the turn
-looks session-related or references a concrete session id (UUID-shaped,
-`session_id_referenced`); a top-level turn with a session id also auto-loads
-the `session` group into the resident tool set so the model never needs
-`enable_tools` first. Other turns carry a one-line session id only.
+looks session-related or references a concrete session id; a top-level turn
+with a session id also auto-loads the `session` group. Other turns carry a
+one-line session id only.
 
 ## Runtime-wide invariants
 
@@ -52,15 +51,13 @@ the `session` group into the resident tool set so the model never needs
 7. **Derived-context provenance.** Runtime policy notes may map to `system`; model-authored self-notes/checkpoints stay `assistant`-derived and unverified. Never promote prior assistant wording into system fact; project via user/assistant handoff pairs only.
 8. **Synthetic user messages.** Runtime-injected `role=="user"` (subagent handoff, image followup, etc.) must use `history::runtime_synthetic_user_message` and be detected via `history::is_runtime_synthetic_user_message`/`last_real_user_index` — never bare `rposition(role=="user")`. Clear the origin sidecar in `request/normalize` before provider serialization. `reasoning_content` on user/internal-note messages is runtime metadata (origin, request reminder, fold provenance): check `history::has_runtime_message_metadata` before treating it as model reasoning.
 9. **Compression purity.** Speculative fold/summary candidates stay pure until
-   selected; persist evidence only for accepted candidates with deterministic
-   asset paths; retain raw messages if archive commit fails. Summary increments
-   bind removed projection bytes in `summary-sources/`; prior summaries never
-   become fresh summarizer input, and increments cap their inline window
-   (`MAX_INCREMENTAL_SUMMARY_INLINE_CHARS`), archiving older records verbatim
-   behind one back-reference before removal — never merged into a single claim
-   set, never dropped without an archive write. Binding is a recovery locator,
-   not claim verification. Bump the projection fingerprint when persisted
-   projection semantics change.
+   selected; persist evidence only for accepted candidates; retain raw messages
+   if archive commit fails. Summary increments bind removed projection bytes in
+   `summary-sources/`; prior summaries never become fresh summarizer input, and
+   older records archive verbatim behind one back-reference before removal —
+   never merged, never dropped without an archive write. Binding is a recovery
+   locator, not claim verification. Bump the projection fingerprint when
+   persisted projection semantics change.
 10. **Model-visible wording is English.** Base prompt / gate notes / injected notes use one English system; keep Chinese only in keyword-match lists and terminal text.
 11. **Output post-processing is display-only.** `ai.output.postprocess_command`
     is a best-effort final-body filter before rendering; failures show the

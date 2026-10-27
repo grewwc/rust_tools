@@ -78,7 +78,7 @@ pub(in crate::ai) use store::{
     read_all_messages_with_models_sqlite, replace_all_messages_sqlite, reserve_turn_index_sqlite,
 };
 pub(in crate::ai) use trim::{
-    clear_session_history_sqlite, remap_context_checkpoint_paths_sqlite, truncate_messages_sqlite,
+    clear_session_history_sqlite, remap_session_asset_paths_sqlite, truncate_messages_sqlite,
     truncate_messages_to_user_turns_sqlite,
 };
 

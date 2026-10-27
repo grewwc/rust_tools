@@ -2,7 +2,7 @@
 
 set -e
 
-DEFAULT_BINS="a configw his j ns oo re tt"
+DEFAULT_BINS="a his j oo re tt"
 INSTALL_DIR="${INSTALL_DIR:-$(pwd)/bin}"
 
 FORCE=""

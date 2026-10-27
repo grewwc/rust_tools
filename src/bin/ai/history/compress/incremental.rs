@@ -7,6 +7,7 @@
 //! instead, with older records archived verbatim before they leave the projection
 //! (`overflow_sink::trim_incremental_summary_notes_to_inline_budget`).
 
+use super::tool_overflow::stub_archive_display_path;
 use super::*;
 
 pub(super) const INCREMENTAL_SUMMARY_PREFIX: &str = "[incremental-memory-v1]";
@@ -132,9 +133,14 @@ pub(super) fn plan_incremental_summary(
         archive_bytes.push('\n');
     }
     let digest = content_sha256_hex(archive_bytes.as_bytes());
-    let archive_path = root.join(SOURCE_DIR).join(format!("{digest}.jsonl"));
+    // The file name carries only the leading 24 hex chars (96 bits); the
+    // record below keeps the full digest in `sha256` for verification, and no
+    // reader reconstructs the path from it.
+    let archive_path = root
+        .join(SOURCE_DIR)
+        .join(format!("{}.jsonl", &digest[..24]));
     let source = serde_json::json!({
-        "archive_file_path": archive_path.to_string_lossy(),
+        "archive_file_path": stub_archive_display_path(&archive_path),
         "sha256": digest,
         // Message projections do not carry per-message model provenance. Never
         // substitute the active summarizer's model for an unknown source model.
@@ -333,7 +339,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             record["source"]["archive_file_path"],
-            plan.archive_path.to_string_lossy().as_ref()
+            format!(
+                "session-asset:summary-sources/{}",
+                plan.archive_path.file_name().unwrap().to_string_lossy()
+            )
         );
         assert_eq!(
             record["source"]["sha256"],

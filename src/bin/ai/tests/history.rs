@@ -376,7 +376,11 @@ fn context_history_summarizes_beyond_history_count_instead_of_dropping() {
     let record: Value = serde_json::from_str(
         context[0].content.as_str().unwrap().strip_prefix("[incremental-memory-v1]\n").unwrap(),
     ).unwrap();
-    let archived = std::fs::read_to_string(record["source"]["archive_file_path"].as_str().unwrap()).unwrap();
+    let locator = record["source"]["archive_file_path"].as_str().unwrap();
+    let archived_path =
+        crate::ai::tools::storage::file_store::session_asset_for_alias(locator, &overflow_dir)
+            .expect("source locator must be a resolvable session-asset alias");
+    let archived = std::fs::read_to_string(&archived_path).unwrap();
     assert!(archived.contains("question-0"));
     assert_eq!(build_message_arr(usize::MAX, &path).unwrap().len(), 480);
     std::fs::remove_dir_all(overflow_dir).unwrap();
@@ -524,7 +528,11 @@ fn context_history_summary_keeps_tool_names_and_results() {
     assert!(summary.contains("issue-0"));
     assert!(summary.contains("ERROR") || summary.contains("repeated failure"));
 
-    let archived = std::fs::read_to_string(record["source"]["archive_file_path"].as_str().unwrap()).unwrap();
+    let locator = record["source"]["archive_file_path"].as_str().unwrap();
+    let archived_path =
+        crate::ai::tools::storage::file_store::session_asset_for_alias(locator, &overflow_dir)
+            .expect("source locator must be a resolvable session-asset alias");
+    let archived = std::fs::read_to_string(&archived_path).unwrap();
     assert!(archived.contains("issue-0"));
     assert!(archived.contains("ERROR: repeated failure"));
     assert!(crate::ai::history::messages_total_chars_pub(&context) <= 3_600);

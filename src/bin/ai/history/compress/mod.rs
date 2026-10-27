@@ -88,6 +88,8 @@ mod mid_turn;
 pub(in crate::ai) use mid_turn::*;
 mod billable;
 pub(in crate::ai) use billable::*;
+mod asset_remap;
+pub(in crate::ai) use asset_remap::remap_message_for_session_move;
 
 /// When the context char count is at or below this threshold, prefer keeping 3
 /// recent user turns.

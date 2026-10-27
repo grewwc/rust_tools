@@ -14,6 +14,7 @@ use super::text_utils::truncate_to_chars;
 use super::tool_overflow::{
     build_tool_overflow_recall_lines, is_non_compressible_tool, is_preserved_tool_overflow_stub,
     is_preserved_user_or_image_stub, plan_noncompressible_tool_result_for_fold,
+    stub_archive_display_path,
 };
 use super::{
     COMPRESSED_TOOL_EVIDENCE_MARKER, PlannedArchiveWrite, content_sha256_hex,
@@ -253,9 +254,13 @@ fn plan_tool_call_group_fold(
         let raw_messages = serde_json::to_string_pretty(&group_messages).ok()?;
         let content = format!("{FOLDED_GROUP_ARCHIVE_HEADER}{raw_messages}\n```\n");
         let digest = content_sha256_hex(content.as_bytes());
+        // 24 hex chars (96 bits) keep the name short for model transcription;
+        // the full digest is unnecessary here because nothing derives content
+        // identity back from the file name (fold provenance hashes the note
+        // body, not the archive file).
         let path = dir
             .join(FOLDED_TOOL_GROUP_ARCHIVE_DIR)
-            .join(format!("{digest}.md"));
+            .join(format!("{}.md", &digest[..24]));
         archives.push(PlannedArchiveWrite::new(path.clone(), content));
         Some(path.to_string_lossy().to_string())
     } else {
@@ -271,7 +276,10 @@ fn plan_tool_call_group_fold(
     lines.push("recovery_guidance: use evidence/archive before re-running; split large reads/patches.".to_string());
     lines.push(COMPRESSED_TOOL_EVIDENCE_MARKER.to_string());
     if let Some(path) = archive_file_path.as_deref() {
-        lines.push(format!("- archive_file_path: {path}"));
+        lines.push(format!(
+            "- archive_file_path: {}",
+            stub_archive_display_path(Path::new(path))
+        ));
         lines.push("- archive_scope: folded_tool_group_projection_messages".to_string());
     }
 
