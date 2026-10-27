@@ -180,6 +180,11 @@ pub(crate) struct AgentMemoryEntry {
     /// Verified provenance and historical revisions are not searchable note text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) distilled: Option<crate::ai::knowledge::distilled::DistilledMetadata>,
+    /// Model that produced this entry's content (`None` for user-typed,
+    /// rule-generated, or pre-provenance rows). Old JSONL rows without this
+    /// field still deserialize via `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
 }
 
 fn default_priority() -> Option<u8> {
@@ -200,6 +205,7 @@ impl Default for AgentMemoryEntry {
             owner_pid: None,
             owner_pgid: None,
             image_path: None,
+            model: None,
         }
     }
 }

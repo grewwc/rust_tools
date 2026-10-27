@@ -18,7 +18,7 @@ struct Options {
     dry_run: bool,
 }
 
-fn command_args(input: &str) -> Option<&str> {
+pub(crate) fn command_args(input: &str) -> Option<&str> {
     let input = input.trim();
     let rest = input
         .strip_prefix('/')

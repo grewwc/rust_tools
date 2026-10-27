@@ -27,6 +27,7 @@ const PROMPT_RESIDENCY_META_KEY: &str = "prompt_residency_v1";
 const LLM_PRUNE_MARKS_META_KEY: &str = "llm_prune_marks_v1";
 const LAST_ACTIVITY_META_KEY: &str = "last_activity_unix_ms";
 const SESSION_MARKED_META_KEY: &str = "session_marked";
+const SESSION_ARCHIVED_META_KEY: &str = "session_archived";
 const SESSION_MARK_MESSAGE_META_KEY: &str = "session_mark_message";
 const SESSION_SERVE_MODEL_META_KEY: &str = "serve_model";
 const SESSION_SERVE_AGENT_META_KEY: &str = "serve_agent";
@@ -46,10 +47,10 @@ pub(in crate::ai) use context::{
     read_recent_turn_window_sqlite, write_context_snapshot_sqlite_with_busy_timeout,
 };
 pub(in crate::ai) use metadata::{
-    read_first_user_prompt_sqlite, read_session_list_metadata_sqlite, read_session_mark_message_sqlite,
-    read_session_marked_sqlite, read_session_origin_sqlite, read_session_serve_config_sqlite,
-    read_session_title_origin_sqlite,
-    read_session_title_sqlite, write_session_mark_sqlite, write_session_serve_config_sqlite,
+    read_first_user_prompt_sqlite, read_session_archived_sqlite, read_session_list_metadata_sqlite,
+    read_session_mark_message_sqlite, read_session_marked_sqlite, read_session_origin_sqlite,
+    read_session_serve_config_sqlite, read_session_title_origin_sqlite, read_session_title_sqlite,
+    write_session_archived_sqlite, write_session_mark_sqlite, write_session_serve_config_sqlite,
     write_session_title_sqlite, MarkMessageUpdate,
 };
 pub(in crate::ai) use outcomes::{

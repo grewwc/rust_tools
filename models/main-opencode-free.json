@@ -1,19 +1,19 @@
 {
-  "key": "longcat-2.5-preview-free",
+  "key": "iceman-contributor-free",
   "aliases": [
-    "minimax-m3.1-flash"
+    "iceman"
   ],
-  "name": "longcat-2.5-preview-free",
+  "name": "iceman-contributor-free",
   "adapter": "opencode",
   "quality_tier": "basic",
-  "is_vl": true,
+  "is_vl": false,
   "search_enabled": false,
   "tools_default_enabled": true,
   "enable_thinking": true,
-  "default_reasoning_effort": "max",
-  "reasoning_content_replay": true,
+  "default_reasoning_effort": "xhigh",
   "subagent_priority": 80,
-  "context_window_tokens": 1000000,
+  "context_window_tokens": 262144,
   "max_output_tokens": 131072,
-  "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions"
+  "endpoint": "https://opencode.ai/inference/go/openai/v1/chat/completions",
+  "_comment": "OpenCode Go model (https://opencode.ai/docs/go/): free for a limited time with unlimited usage on both Go and Go Plus (id iceman-contributor-free, released 2026-10-24, stealth model). Text-only input, not VL. Contributor model: prompts and completions are used to improve the model (training: Yes, retention: Not ZDR) - enable only if that is acceptable, same class as the Muse Spark contributor entries. Limits per models.dev: 256K context, 128K output."
 }

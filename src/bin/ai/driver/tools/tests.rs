@@ -458,6 +458,7 @@ fn tool_cache_entry_obeys_ttl() {
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        model: None,
     };
     let stale = AgentMemoryEntry {
         timestamp: (Utc::now() - Duration::minutes(TOOL_CACHE_TTL_MINUTES + 1)).to_rfc3339(),

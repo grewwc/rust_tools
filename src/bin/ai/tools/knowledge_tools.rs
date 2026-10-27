@@ -69,7 +69,8 @@ use crate::ai::tools::common::{
     ToolRetryPolicyRegistration, ToolSpec,
 };
 use crate::ai::tools::service::memory::{
-    MemoryOwnerScope, next_memory_id, prepare_memory_save_entry,
+    MemoryOwnerScope, current_write_model, format_preserved_source, next_memory_id,
+    prepare_memory_save_entry,
 };
 use crate::ai::tools::storage::memory_store::{
     AgentMemoryEntry, KnowledgeAppendOutcome, MemoryStore,
@@ -465,6 +466,9 @@ fn read_all_entries() -> Result<String, String> {
             if let Some(src) = &entry.source {
                 result.push_str(&format!("   source: {}\n", src));
             }
+            if let Some(model) = entry.model.as_deref().filter(|m| !m.trim().is_empty()) {
+                result.push_str(&format!("   model: {}\n", model));
+            }
             result.push_str(&format!("   priority: {}  |  timestamp: {}\n", prio, ts));
             result.push_str(&format!("   content: {}\n\n", preview));
         }
@@ -538,13 +542,13 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
         // 由合并条目取代它们，避免"旧条目 + 合并条目"并存。
         let mut note = content.to_string();
         if let Some(source_ids) = entry_val["source_ids"].as_array() {
-            let mut preserved_originals: Vec<&str> = Vec::new();
+            let mut preserved_originals: Vec<String> = Vec::new();
             for v in source_ids {
                 let Some(sid) = v.as_str() else { continue };
                 if let Some(src) = originals.get(sid) {
                     let trimmed = src.note.trim();
                     if !trimmed.is_empty() {
-                        preserved_originals.push(trimmed);
+                        preserved_originals.push(format_preserved_source(src, trimmed));
                     }
                     if !delete_ids.iter().any(|d| d == sid) {
                         delete_ids.push(sid.to_string());
@@ -574,6 +578,7 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
             owner_pid: None,
             owner_pgid: None,
             image_path: None,
+            model: current_write_model(),
         });
     }
 
@@ -668,6 +673,7 @@ mod tests {
             owner_pid: None,
             owner_pgid: None,
             image_path: None,
+            model: None,
         }
     }
 
@@ -1012,6 +1018,7 @@ mod tests {
                 owner_pid: None,
                 owner_pgid: None,
                 image_path: None,
+                model: None,
             },
             AgentMemoryEntry {
                 id: Some("mem_old_2".to_string()),
@@ -1025,6 +1032,7 @@ mod tests {
                 owner_pid: None,
                 owner_pgid: None,
                 image_path: None,
+                model: None,
             },
         ];
         let mut buf = String::new();
@@ -1097,11 +1105,12 @@ mod tests {
                 category: "user_memory".to_string(),
                 note: long_note_1.clone(),
                 tags: vec!["a".to_string()],
-                source: None,
+                source: Some("cli_note".to_string()),
                 priority: Some(150),
                 owner_pid: None,
                 owner_pgid: None,
                 image_path: None,
+                model: Some("seed-model-1".to_string()),
             },
             AgentMemoryEntry {
                 id: Some("mem_src_2".to_string()),
@@ -1110,11 +1119,12 @@ mod tests {
                 category: "user_memory".to_string(),
                 note: long_note_2.to_string(),
                 tags: vec!["b".to_string()],
-                source: None,
+                source: Some("session:s1".to_string()),
                 priority: Some(150),
                 owner_pid: None,
                 owner_pgid: None,
                 image_path: None,
+                model: None,
             },
         ];
         let mut buf = String::new();
@@ -1151,6 +1161,22 @@ mod tests {
         assert!(entries[0].note.contains(long_note_2));
         assert!(entries[0].note.contains("--- 原文保留（合并来源）---"));
         assert!(entries[0].note.starts_with("合并后的简短摘要"));
+        // Provenance: each preserved source keeps its id/category/timestamp,
+        // plus source/model when the source row carries them.
+        assert!(entries[0].note.contains(
+            "[id: mem_src_1 | category: user_memory | timestamp: 2025-01-01T00:00:00Z | source: cli_note | model: seed-model-1]"
+        ));
+        assert!(entries[0].note.contains(
+            "[id: mem_src_2 | category: user_memory | timestamp: 2025-01-01T00:00:01Z | source: session:s1]"
+        ));
+        // Absent optional provenance stays absent: mem_src_2 carries no model,
+        // so its header line must not grow a model segment.
+        let src2_header = entries[0]
+            .note
+            .lines()
+            .find(|line| line.contains("id: mem_src_2"))
+            .unwrap();
+        assert!(!src2_header.contains("model:"));
 
         cleanup_memory_artifacts(&path);
         unsafe {

@@ -139,7 +139,8 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
         Err(_) => None,
     };
 
-    let note_content = if let Some(image_path) = &clipboard_image_path {
+    let (note_content, note_model): (String, Option<String>) =
+        if let Some(image_path) = &clipboard_image_path {
         // Image present: ask the vision model to interpret the content
         println!("[note] Detected image in clipboard, analyzing...");
 
@@ -159,8 +160,11 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
 
         // Call the model
         match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
-            Ok(response) => crate::ai::request::extract_response_text(&response)
-                .unwrap_or_else(|| "无法获取模型响应".to_string()),
+            Ok(response) => (
+                crate::ai::request::extract_response_text(&response)
+                    .unwrap_or_else(|| "无法获取模型响应".to_string()),
+                Some(model),
+            ),
             Err(err) => {
                 eprintln!("[note] Failed to analyze image: {}", err);
                 let _ = fs::remove_file(image_path);
@@ -206,15 +210,22 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
             }),
         ];
         match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
-            Ok(response) => crate::ai::request::extract_response_text(&response)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(raw),
+            Ok(response) => {
+                match crate::ai::request::extract_response_text(&response)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                {
+                    // Raw input saved only when the model yields nothing; that
+                    // fallback carries no model attribution.
+                    Some(text) => (text, Some(model.clone())),
+                    None => (raw, None),
+                }
+            }
             Err(err) => {
                 // On organization failure fall back to saving the raw input so user
                 // content is not lost.
                 eprintln!("[note] 整理失败，保存原始输入: {}", err);
-                raw
+                (raw, None)
             }
         }
     };
@@ -234,6 +245,7 @@ pub(super) async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::e
         owner_pgid: None,
         image_path: clipboard_image_path.clone(),
         distilled: None,
+        model: note_model,
     };
 
     match store.append(&entry) {
@@ -638,6 +650,7 @@ fn consolidation_candidates(
 fn build_consolidation_merge_entries(
     category: &str,
     source: Option<&str>,
+    model_name: &str,
     merge_plan: &[&serde_json::Value],
     eligible_ids: &FxHashSet<&str>,
     originals: &FxHashMap<&str, &AgentMemoryEntry>,
@@ -665,14 +678,18 @@ fn build_consolidation_merge_entries(
             continue;
         }
 
-        // Lossless merge: model summary first, then the full text of every source
-        // entry, so no detail is lost.
+        // Lossless merge: model summary first, then every source entry's full
+        // text with its provenance header, so no detail or origin is lost.
         let mut note = content.to_string();
-        let original_texts: Vec<&str> = ids
+        let original_texts: Vec<String> = ids
             .iter()
             .filter_map(|id| originals.get(*id))
-            .map(|entry| entry.note.trim())
-            .filter(|text| !text.is_empty())
+            .filter_map(|entry| {
+                let trimmed = entry.note.trim();
+                (!trimmed.is_empty()).then(|| {
+                    crate::ai::tools::service::memory::format_preserved_source(entry, trimmed)
+                })
+            })
             .collect();
         if !original_texts.is_empty() {
             note.push_str("\n\n--- 原文保留（合并来源）---\n");
@@ -693,6 +710,7 @@ fn build_consolidation_merge_entries(
             owner_pgid: None,
             image_path: None,
             distilled: None,
+            model: (!model_name.trim().is_empty()).then(|| model_name.to_string()),
         });
     }
 
@@ -730,6 +748,7 @@ async fn consolidate_scope(
             "tags": entry.tags,
             "date": ts_short,
             "src": entry.source.as_deref().unwrap_or(""),
+            "model": entry.model.as_deref().unwrap_or(""),
             "text": preview,
         }));
     }
@@ -813,6 +832,7 @@ async fn consolidate_scope(
     let (merge_delete_ids, merged_count, new_entries) = build_consolidation_merge_entries(
         scope.merged_category(),
         scope.merged_source(),
+        &model,
         &merge_plan,
         &eligible_ids,
         &originals,
@@ -1519,6 +1539,7 @@ mod tests {
             owner_pid: None,
             owner_pgid: None,
             image_path: None,
+            model: Some("test-model-a".to_string()),
         };
         let entry_b = AgentMemoryEntry {
             distilled: None,
@@ -1532,11 +1553,13 @@ mod tests {
             owner_pid: None,
             owner_pgid: None,
             image_path: None,
+            model: None,
         };
         let originals = FxHashMap::from_iter([("id_a", &entry_a), ("id_b", &entry_b)]);
         let (delete_ids, merged_count, new_entries) = build_consolidation_merge_entries(
             "memo",
             Some("test"),
+            "test-model",
             &merge_plan_refs,
             &eligible_ids,
             &originals,
@@ -1554,12 +1577,14 @@ mod tests {
                 .as_deref()
                 .is_some_and(|id| id.starts_with("mem_"))
         );
-        // Lossless merge: summary + the full text of every source entry.
+        // Lossless merge: summary + every source entry's full text with its
+        // provenance header; the merged entry is attributed to the merging model.
         assert_eq!(
             new_entries[0].note,
-            "合并后的内容\n\n--- 原文保留（合并来源）---\n完整原文A：详细的排障步骤与具体命令\n\n完整原文B：关键标识符与复现步骤"
+            "合并后的内容\n\n--- 原文保留（合并来源）---\n[id: id_a | category: memo | timestamp: 2026-07-24T00:00:00Z | source: cli_note | model: test-model-a]\n完整原文A：详细的排障步骤与具体命令\n\n[id: id_b | category: memo | timestamp: 2026-07-24T00:00:00Z | source: cli_note]\n完整原文B：关键标识符与复现步骤"
         );
         assert_eq!(new_entries[0].tags, vec!["consolidated".to_string()]);
+        assert_eq!(new_entries[0].model.as_deref(), Some("test-model"));
     }
 
     #[test]
@@ -1576,6 +1601,7 @@ mod tests {
             owner_pid: None,
             owner_pgid: None,
             image_path: image_path.map(str::to_string),
+            model: None,
         };
         let entries = vec![
             entry("memo_a", "memo", None),
@@ -1605,6 +1631,7 @@ mod tests {
         let (delete_ids, merged_count, new_entries) = build_consolidation_merge_entries(
             "memo",
             Some("cli_note"),
+            "test-model",
             &merge_plan_refs,
             &eligible_ids,
             &originals,

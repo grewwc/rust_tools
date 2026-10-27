@@ -3,14 +3,14 @@
 
 #[cfg(feature = "serve")]
 use super::*;
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 #[cfg(feature = "serve")]
 use std::collections::VecDeque;
 #[cfg(feature = "serve")]
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "serve")]
 use tokio::sync::Notify;
-use base64::Engine as _;
-use serde::{Deserialize, Serialize};
 
 pub(crate) const DEFAULT_BIND: &str = "127.0.0.1:8080";
 
@@ -193,11 +193,8 @@ impl SessionEventLog {
     /// Wake on a change, with a bounded wait so a missed notification cannot
     /// leave a reconnecting page parked forever.
     pub(crate) async fn changed(&self) {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.notify.notified(),
-        )
-        .await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(2), self.notify.notified()).await;
     }
 }
 
@@ -234,6 +231,9 @@ pub(crate) struct SessionItem {
     pub(crate) summary: Option<String>,
     pub(crate) first_user_prompt: Option<String>,
     pub(crate) marked: bool,
+    /// Formal archive flag (`/archive`). Clients hide these from the default
+    /// listing and expose them through a dedicated archive view.
+    pub(crate) archived: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,9 +251,8 @@ pub(crate) struct HistoryQuery {
     pub(crate) limit: Option<usize>,
     /// `?meta=roles` returns only the per-message roles (a bare array of
     /// role strings, one per canonical message) instead of full message
-    /// bodies. serve-chat rewinds fetch this lightweight shape to resolve
-    /// `u<N>` ordinals without shipping the session payload; unknown values
-    /// are ignored so an older client never breaks a newer server.
+    /// bodies. Runtime-synthetic users use a distinct sentinel so they do not
+    /// consume a `u<N>` ordinal. Unknown values are ignored by older clients.
     #[serde(default)]
     pub(crate) meta: Option<String>,
     /// serve-chat preview views: filter by role before the tail cut.
@@ -271,6 +270,11 @@ pub(crate) struct HistoryQuery {
     /// local error wording.
     #[serde(default)]
     pub(crate) conclusion: Option<usize>,
+    /// serve-chat `/history u<N>`: 1-based real-user ordinal whose final
+    /// assistant conclusion should be returned. The scan stops at the next
+    /// real user row; runtime-synthetic users remain inside the current turn.
+    #[serde(default)]
+    pub(crate) user_conclusion: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -493,11 +497,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value.and_then(|value| {
-        value
-            .as_u64()
-            .and_then(|cols| u16::try_from(cols).ok())
-    }))
+    Ok(value.and_then(|value| value.as_u64().and_then(|cols| u16::try_from(cols).ok())))
 }
 
 /// Display width a client reported for this turn, when the value is usable.

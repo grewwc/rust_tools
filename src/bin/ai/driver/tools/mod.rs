@@ -1575,6 +1575,8 @@ fn store_tool_cache_result(
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        // Tool outputs cached verbatim; no model produced this content.
+        model: None,
     };
     let store = MemoryStore::from_env_or_config();
     let _ = store.append(&entry);

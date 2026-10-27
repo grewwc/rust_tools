@@ -1,14 +1,14 @@
 {
   "name": "execute_command",
-  "description": "Start a shell command. Destructive, privilege-escalation, remote-shell, and network-listener commands are blocked; ordinary HTTP clients and package managers are allowed. Truncated output reports shown/total counts; narrow or page instead of rerunning variants. Failures report the exit code. The blocking path kills the whole process group when `timeout` expires and returns only the output captured so far, so anything that might outlive the timeout must be started with `yield_time_ms` — a timed-out build is lost, not paused.",
-  "first_use_guidance": "Guidance for later execute_command calls in this turn:\n- Servers, REPLs, and multi-step interactive commands: start with `yield_time_ms` (5000-60000, default 30000), then use `command_session` with action=poll/write/close. Prefer this over `&` plus log-file polling.\n- Finite work that fits in `timeout` (builds, tests, formatters): omit `yield_time_ms` and let the call block up to `timeout` (default 60s, max 300s). Do not start a session just because a command is slow: each `command_session` poll is a full model round.\n- Polling waits at least 5000ms; do not poll in a tight loop, and never add `sleep` to wait for output. Use `task_wait` for subagent tasks.",
+  "description": "Start a shell command. Destructive, privilege-escalation, remote-shell, and network-listener commands are blocked; ordinary HTTP clients and package managers are allowed. Truncated output reports shown/total counts; narrow or page instead of rerunning variants. Failures report the exit code. The blocking path kills the whole process group when `timeout` expires and returns only the output captured so far, so anything that might outlive the timeout must be started with `yield_time_ms`.",
+  "first_use_guidance": "Guidance for later execute_command calls in this turn:\n- Servers, REPLs, and multi-step interactive commands: prefer `yield_time_ms` plus `command_session` (action=poll/write/close) over `&` plus log-file polling.\n- Finite work that fits in `timeout` (builds, tests, formatters): omit `yield_time_ms` and let the call block. Do not start a session just because a command is slow.\n- Never add `sleep` to wait for output; use `task_wait` for subagent tasks.",
   "raw_body_parameter": "command",
   "parameters": {
     "type": "object",
     "properties": {
       "command": {
         "type": "string",
-        "description": "Shell command to start. Servers, REPLs, multi-step interactive work, and any command that may outlive the blocking `timeout` should use `yield_time_ms`; short finite commands should rely on the 60-300s blocking timeout. Do not pipe through `tail` or `grep`: they buffer output until the process exits, so every poll reports no new output. `head` ends the pipeline early instead."
+        "description": "Shell command to start. Servers, REPLs, multi-step interactive work, and any command that may outlive the blocking `timeout` should use `yield_time_ms`; short finite commands should rely on the blocking timeout. Do not pipe through `tail` or `grep`: they buffer output until the process exits, so every poll reports no new output. `head` ends the pipeline early instead."
       },
       "cwd": {
         "type": "string",
@@ -31,7 +31,7 @@
       },
       "yield_time_ms": {
         "type": "integer",
-        "description": "Start a persistent command session and wait up to this many milliseconds for output (5000-60000, default 30000). Returns a session id when the process is still running or has buffered output left to read; a command that finishes and drains inside the yield returns its output directly. Use this for servers, REPLs, multi-step interactive commands, and any command that may outlive the blocking `timeout` — the blocking timeout kills the work rather than pausing it.",
+        "description": "Start a persistent command session and wait up to this many milliseconds for output (5000-60000, default 30000). Returns a session id when the process is still running or has buffered output left to read; a command that finishes and drains inside the yield returns its output directly. Use this for servers, REPLs, multi-step interactive commands, and any command that may outlive the blocking `timeout`.",
         "minimum": 5000,
         "maximum": 60000
       }

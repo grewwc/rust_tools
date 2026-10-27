@@ -259,6 +259,9 @@ pub(in crate::ai) async fn run_distill_source_command(
             continue;
         }
         let mut entry = prepared.entry;
+        // Distilled conclusions are produced by the extraction model; stamp it
+        // explicitly since distill may run outside a DRIVER_CTX turn.
+        entry.model = Some(model.clone());
         let old = existing.iter().find(|entry| {
             active_distilled_metadata(entry)
                 .is_some_and(|metadata| metadata.topic_key == conclusion.topic_key)

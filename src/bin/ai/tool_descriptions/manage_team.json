@@ -20,7 +20,7 @@
           "status",
           "cancel"
         ],
-        "description": "Operation. create requires name, goal, and members; add_task requires team_id and task; claim requires team_id and member_id; complete requires team_id, task_id, member_id, and status; send_message requires team_id, from, to, and body; all other non-create actions require team_id."
+        "description": "Operation. create requires name, goal, and members; add_task requires team_id and task; claim requires team_id and member_id; complete requires team_id, task_id, member_id, and status; send_message requires team_id, from, to, and body."
       },
       "team_id": {
         "type": "string",

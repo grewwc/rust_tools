@@ -10,8 +10,9 @@ use super::migrations::init_history_schema;
 use super::revision::{read_i64_meta_from_conn, touch_session_activity};
 use super::store::{SessionListMetadata, decode_message_content, decode_tool_calls};
 use super::{
-    LAST_ACTIVITY_META_KEY, SESSION_MARKED_META_KEY, SESSION_MARK_MESSAGE_META_KEY,
-    SESSION_SERVE_AGENT_META_KEY, SESSION_SERVE_EFFORT_META_KEY, SESSION_SERVE_MODEL_META_KEY,
+    LAST_ACTIVITY_META_KEY, SESSION_ARCHIVED_META_KEY, SESSION_MARKED_META_KEY,
+    SESSION_MARK_MESSAGE_META_KEY, SESSION_SERVE_AGENT_META_KEY, SESSION_SERVE_EFFORT_META_KEY,
+    SESSION_SERVE_MODEL_META_KEY,
 };
 use super::super::sessions::SessionServeConfig;
 
@@ -163,6 +164,7 @@ pub(in crate::ai) fn read_session_list_metadata_sqlite(
             .or_else(|| read_latest_message_activity_unix_ms(&conn)),
         history_revision: read_i64_meta_from_conn(&conn, "history_revision").unwrap_or(0),
         marked: read_session_marked_from_conn(&conn),
+        archived: read_session_archived_from_conn(&conn),
     })
 }
 
@@ -184,6 +186,47 @@ fn read_session_marked_from_conn(conn: &Connection) -> bool {
 pub(in crate::ai) fn read_session_marked_sqlite(path: &Path) -> io::Result<bool> {
     let conn = open_history_db_read_only(path)?;
     Ok(read_session_marked_from_conn(&conn))
+}
+
+/// Read the formal-archive flag stored under meta key `session_archived`.
+/// Missing or unparsable values are treated as active (no session is
+/// archived by default, so old databases keep working unchanged).
+fn read_session_archived_from_conn(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key='session_archived' LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .unwrap_or(None)
+    .is_some_and(|value| value == "1")
+}
+
+/// Read the formal-archive flag (`/archive`).
+pub(in crate::ai) fn read_session_archived_sqlite(path: &Path) -> io::Result<bool> {
+    let conn = open_history_db_read_only(path)?;
+    Ok(read_session_archived_from_conn(&conn))
+}
+
+/// Persist the formal-archive flag in one lock + one transaction.
+/// Like the mark write, it refreshes the session activity clock, so an
+/// archive racing a prune confirmation is caught by prune's unchanged
+/// check instead of deleting a just-archived session.
+pub(in crate::ai) fn write_session_archived_sqlite(path: &Path, archived: bool) -> io::Result<()> {
+    with_session_state_lock(path, || {
+        let mut conn = open_history_db(path)?;
+        init_history_schema(&conn)?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value, created_at) VALUES (?1, ?2, unixepoch())",
+            rusqlite::params![SESSION_ARCHIVED_META_KEY, if archived { "1" } else { "0" }],
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+        touch_session_activity(&tx)?;
+        tx.commit().map_err(|e| io::Error::other(e.to_string()))
+    })
 }
 
 /// Message part of an atomic mark write (`/mark` / `/unmark`): `Keep` leaves any

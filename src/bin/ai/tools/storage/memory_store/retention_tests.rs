@@ -24,6 +24,7 @@ fn entry(category: &str, note: &str, ts: &str, priority: u8) -> AgentMemoryEntry
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        model: None,
     }
 }
 

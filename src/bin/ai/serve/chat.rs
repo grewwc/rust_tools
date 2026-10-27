@@ -26,7 +26,10 @@ use super::super::{
     agents,
     cli::ParsedCli,
     config_schema::AiConfig,
-    driver::{commands::is_serve_local_command_start, input::inline_image_filenames},
+    driver::{
+        commands::{ServeInputRoute, classify_serve_input},
+        input::inline_image_filenames,
+    },
     history::{SessionStore, current_terminal_key},
     model_names, models,
     prompt::{PromptEditor, completion::CommandCompleter},
@@ -139,7 +142,7 @@ fn clear_serve_chat_binding() {
 /// One entry of `GET /sessions` (newest first). `summary` is the generated
 /// title when the server has one; otherwise the client falls back to the
 /// first user prompt. Optional fields default so older servers still parse.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RemoteSession {
     id: String,
     #[serde(default)]
@@ -148,6 +151,10 @@ struct RemoteSession {
     first_user_prompt: Option<String>,
     #[serde(default)]
     marked: bool,
+    /// Older servers do not report the formal archive flag; they also have no
+    /// archive view, so a missing field degrades to "not archived".
+    #[serde(default)]
+    archived: bool,
 }
 
 /// Fetch all remote sessions (`GET /sessions`, newest first). No client-side
@@ -1155,7 +1162,9 @@ struct RemoteHistoryMessage {
     content: serde_json::Value,
     #[serde(default)]
     tool_calls: Option<Vec<serde_json::Value>>,
-    /// Global user ordinal attached by the server on filtered view fetches
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    /// Global real-user ordinal attached by the server on filtered view fetches
     /// (`?role`/`?count`), so `u<N>` markers stay exact on a partial
     /// response. Absent on full fetches and older servers; the renderer
     /// falls back to counting locally then.
@@ -1268,10 +1277,38 @@ fn fetch_serve_history_conclusion(
     session_id: &str,
     nth_back: usize,
 ) -> Result<Vec<RemoteHistoryMessage>, String> {
+    fetch_serve_history_selected_conclusion(client, base, token, session_id, "conclusion", nth_back)
+}
+
+fn fetch_serve_history_user_conclusion(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    user_ordinal: usize,
+) -> Result<Vec<RemoteHistoryMessage>, String> {
+    fetch_serve_history_selected_conclusion(
+        client,
+        base,
+        token,
+        session_id,
+        "user_conclusion",
+        user_ordinal,
+    )
+}
+
+fn fetch_serve_history_selected_conclusion(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+    session_id: &str,
+    query_key: &str,
+    ordinal: usize,
+) -> Result<Vec<RemoteHistoryMessage>, String> {
     let resp = auth(
         client
             .get(format!("{base}/sessions/{session_id}/history"))
-            .query(&[("conclusion", nth_back.to_string())]),
+            .query(&[(query_key, ordinal.to_string())]),
         token,
     )
     .send()
@@ -1317,17 +1354,25 @@ fn serve_truncate_for_terminal(value: &str, max_chars: usize) -> String {
     out
 }
 
-/// Canonical (0-based) index of the Nth stored user message, counting every
-/// `role == "user"` row exactly like the local rewind resolver so ordinals
-/// match on both sides. A runtime-injected row still resolves here; the
-/// server rejects it with 400, same rule as local.
+fn is_remote_real_user_message(message: &RemoteHistoryMessage) -> bool {
+    let message = crate::ai::history::Message {
+        role: message.role.clone(),
+        content: serde_json::Value::Null,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: message.reasoning_content.clone(),
+    };
+    message.role == "user" && !crate::ai::history::is_runtime_synthetic_user_message(&message)
+}
+
+/// Canonical (0-based) index of the Nth stored real user message.
 fn serve_user_message_index(messages: &[RemoteHistoryMessage], ordinal: usize) -> Option<usize> {
     if ordinal == 0 {
         return None;
     }
     let mut seen = 0usize;
     for (idx, message) in messages.iter().enumerate() {
-        if message.role != "user" {
+        if !is_remote_real_user_message(message) {
             continue;
         }
         seen += 1;
@@ -1339,14 +1384,16 @@ fn serve_user_message_index(messages: &[RemoteHistoryMessage], ordinal: usize) -
 }
 
 fn serve_user_message_count(messages: &[RemoteHistoryMessage]) -> usize {
-    messages.iter().filter(|m| m.role == "user").count()
+    messages
+        .iter()
+        .filter(|message| is_remote_real_user_message(message))
+        .count()
 }
 
 /// Role-array counterparts of the message-based helpers above: the
 /// `?meta=roles` response carries no message bodies, only one role string
-/// per canonical row. Ordinals must count every stored `user` row exactly
-/// like the full-message resolver so `u<N>` means the same thing on both
-/// shapes.
+/// per canonical row. Runtime-synthetic users carry a distinct role sentinel,
+/// so only literal `user` rows participate in ordinals.
 fn serve_role_user_message_index(roles: &[String], ordinal: usize) -> Option<usize> {
     if ordinal == 0 {
         return None;
@@ -1494,27 +1541,23 @@ fn render_serve_history(messages: &[RemoteHistoryMessage], view: &ServeHistoryVi
         .as_deref()
         .map(|grep| format!(" matching \"{grep}\""))
         .unwrap_or_default();
-    // Ordinals count every stored user message before filtering, like local.
+    // Ordinals count real user turns before filtering, like local.
     let mut user_ordinal = 0usize;
     let mut filtered = Vec::new();
     for message in messages {
         // The server attaches each user row's global ordinal on filtered
         // fetches; fall back to local counting on full fetches (grep, older
         // servers), where every user row is present anyway.
-        let ordinal = match message.user_ordinal {
-            Some(n) => Some(n),
-            None => {
-                if message.role == "user" {
-                    user_ordinal += 1;
-                    Some(user_ordinal)
-                } else {
-                    None
-                }
-            }
+        let is_real_user = is_remote_real_user_message(message);
+        let ordinal = if is_real_user {
+            user_ordinal += 1;
+            message.user_ordinal.or(Some(user_ordinal))
+        } else {
+            None
         };
         let role_matches = match view.role {
             ServeHistoryRole::All => true,
-            ServeHistoryRole::User => message.role == "user",
+            ServeHistoryRole::User => is_real_user,
             ServeHistoryRole::Assistant => message.role == "assistant",
             ServeHistoryRole::Tool => message.role == "tool",
             // Same rule as the local system filter (system + internal notes).
@@ -1631,8 +1674,25 @@ fn print_serve_history_last_rendered(
     messages: &[RemoteHistoryMessage],
     nth_back: usize,
 ) -> Result<(), String> {
+    print_serve_history_selected_rendered(messages, serve_history_last_header(nth_back))
+}
+
+fn print_serve_history_user_reply_rendered(
+    messages: &[RemoteHistoryMessage],
+    user_ordinal: usize,
+) -> Result<(), String> {
+    print_serve_history_selected_rendered(
+        messages,
+        format!("[history] Assistant reply to user message u{user_ordinal}:"),
+    )
+}
+
+fn print_serve_history_selected_rendered(
+    messages: &[RemoteHistoryMessage],
+    header: String,
+) -> Result<(), String> {
     let body = serve_history_searchable_text(&messages[0].content);
-    let rendered = format!("{}\n{}", serve_history_last_header(nth_back), body);
+    let rendered = format!("{header}\n{body}");
     let (header, body) = rendered.split_once('\n').unwrap_or((rendered.as_str(), ""));
     println!("{header}");
     let body = super::super::driver::turn_runtime::postprocess_terminal_text(body.to_string());
@@ -1896,6 +1956,28 @@ fn install_serve_cd_completion(
     })));
 }
 
+fn parse_history_user_reply_selector(args: &[&str]) -> Result<Option<usize>, String> {
+    let Some(first) = args.first().copied() else {
+        return Ok(None);
+    };
+    let Some(raw) = first.strip_prefix('u').or_else(|| first.strip_prefix('U')) else {
+        return Ok(None);
+    };
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
+    }
+    if args.len() > 1 {
+        return Err("`/history u<N>` takes no additional arguments".into());
+    }
+    let user_ordinal = raw
+        .parse::<usize>()
+        .map_err(|_| format!("invalid user message selector: {first}"))?;
+    if user_ordinal == 0 {
+        return Err("user ordinal must be >= 1".into());
+    }
+    Ok(Some(user_ordinal))
+}
+
 /// Remote `/history` entry: first-token verbs dispatch like the local
 /// grammar; everything else is a preview. Prints the result; `Err` carries
 /// the detail the caller prefixes with `[serve-chat]`.
@@ -1910,6 +1992,12 @@ fn run_serve_history_command(
     let Some(first) = args.first().copied() else {
         return show_serve_history(client, base, token, session_id, &[]);
     };
+    if let Some(user_ordinal) = parse_history_user_reply_selector(&args)? {
+        let messages =
+            fetch_serve_history_user_conclusion(client, base, token, session_id, user_ordinal)?;
+        print_serve_history_user_reply_rendered(&messages, user_ordinal)?;
+        return Ok(());
+    }
     match first {
         "help" => {
             print_serve_history_help();
@@ -1942,7 +2030,8 @@ fn run_serve_history_command(
             if nth_back == 0 {
                 return Err("invalid /history last argument: 0. try: /history last [N]".into());
             }
-            let messages = fetch_serve_history_conclusion(client, base, token, session_id, nth_back)?;
+            let messages =
+                fetch_serve_history_conclusion(client, base, token, session_id, nth_back)?;
             print_serve_history_last_rendered(&messages, nth_back)?;
             Ok(())
         }
@@ -2051,7 +2140,7 @@ fn check_serve_rewind_syntax(args: &[&str]) -> Result<(), String> {
 
 fn print_serve_history_help() {
     println!(
-        "/history usage (remote session):\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history grep <keyword>  Search messages\n  /history last [N]      Replay the Nth recent assistant conclusion (full text)\n  /history replay        Replay the last assistant conclusion (text only)\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history help          Show this help\n\nCopy/export and other-session views are local-only: print the view here and save or copy it locally. Assistant rows carry no model tag; the history route serves bare messages.",
+        "/history usage (remote session):\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history u<N>          Replay the assistant reply to user message u<N>\n  /history grep <keyword>  Search messages\n  /history last [N]      Replay the Nth recent assistant conclusion (full text)\n  /history replay        Replay the last assistant conclusion (text only)\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history help          Show this help\n\nCopy/export and other-session views are local-only: print the view here and save or copy it locally. Assistant rows carry no model tag; the history route serves bare messages.",
         SERVE_HISTORY_DEFAULT_COUNT
     );
 }
@@ -2059,6 +2148,7 @@ fn print_serve_history_help() {
 #[cfg(test)]
 mod serve_history_tests {
     use super::*;
+    use crate::ai::driver::commands::is_serve_local_command_start;
     use serde_json::json;
 
     fn test_message(role: &str, text: &str) -> RemoteHistoryMessage {
@@ -2066,6 +2156,7 @@ mod serve_history_tests {
             role: role.to_string(),
             content: json!(text),
             tool_calls: None,
+            reasoning_content: None,
             user_ordinal: None,
         }
     }
@@ -2094,6 +2185,18 @@ mod serve_history_tests {
         let (view, action) = parse_serve_history_view(&[]).expect("parse");
         assert_eq!(view, default_view());
         assert_eq!(action, ServeHistoryAction::Show);
+    }
+
+    #[test]
+    fn serve_history_user_reply_selector_matches_local_syntax() {
+        assert_eq!(
+            parse_history_user_reply_selector(&["u205"]).unwrap(),
+            Some(205)
+        );
+        assert_eq!(parse_history_user_reply_selector(&["U7"]).unwrap(), Some(7));
+        assert_eq!(parse_history_user_reply_selector(&["user"]).unwrap(), None);
+        assert!(parse_history_user_reply_selector(&["u0"]).is_err());
+        assert!(parse_history_user_reply_selector(&["u2", "full"]).is_err());
     }
 
     #[test]
@@ -2148,6 +2251,34 @@ mod serve_history_tests {
     }
 
     #[test]
+    fn serve_user_ordinals_skip_runtime_synthetic_rows() {
+        let synthetic = crate::ai::history::runtime_synthetic_user_message(json!("follow-up"));
+        let messages = vec![
+            test_message("user", "first"),
+            RemoteHistoryMessage {
+                role: synthetic.role,
+                content: synthetic.content,
+                tool_calls: None,
+                reasoning_content: synthetic.reasoning_content,
+                user_ordinal: None,
+            },
+            test_message("assistant", "answer"),
+            test_message("user", "second"),
+        ];
+        assert_eq!(serve_user_message_count(&messages), 2);
+        assert_eq!(serve_user_message_index(&messages, 2), Some(3));
+
+        let roles = vec![
+            "user".to_string(),
+            "runtime_synthetic_user".to_string(),
+            "assistant".to_string(),
+            "user".to_string(),
+        ];
+        assert_eq!(serve_role_user_message_count(&roles), 2);
+        assert_eq!(serve_role_user_message_index(&roles, 2), Some(3));
+    }
+
+    #[test]
     fn serve_role_ordinals_match_message_resolver() {
         let messages = sample_history();
         let roles: Vec<String> = messages.iter().map(|m| m.role.clone()).collect();
@@ -2166,10 +2297,7 @@ mod serve_history_tests {
     #[test]
     fn serve_view_role_param_maps_roles() {
         assert_eq!(serve_view_role_param(ServeHistoryRole::All), None);
-        assert_eq!(
-            serve_view_role_param(ServeHistoryRole::User),
-            Some("user")
-        );
+        assert_eq!(serve_view_role_param(ServeHistoryRole::User), Some("user"));
         assert_eq!(
             serve_view_role_param(ServeHistoryRole::Assistant),
             Some("assistant")
@@ -2240,7 +2368,8 @@ mod serve_history_tests {
         assert!(err.contains("must be >= 1"), "{err}");
         let err = resolve_serve_rewind_target_from_roles(&roles, &[]).expect_err("empty");
         assert!(err.contains("missing rewind target"), "{err}");
-        let err = resolve_serve_rewind_target_from_roles(&roles, &["grep", "foo"]).expect_err("grep");
+        let err =
+            resolve_serve_rewind_target_from_roles(&roles, &["grep", "foo"]).expect_err("grep");
         assert!(err.contains("needs message content"), "{err}");
     }
 
@@ -2302,6 +2431,7 @@ mod serve_history_tests {
             role: "assistant".to_string(),
             content: json!("tool answer"),
             tool_calls: Some(vec![json!({"id": "1"})]),
+            reasoning_content: None,
             user_ordinal: None,
         });
         messages.push(test_message("assistant", "   "));
@@ -2415,8 +2545,34 @@ mod serve_history_tests {
         assert!(!is_serve_local_command_start(":discuss API options"));
         assert!(!is_serve_local_command_start("/goal refactor parser"));
         assert!(!is_serve_local_command_start("/task status"));
+        // `/distill-session` and `/archive` execute in the server turn child,
+        // so serve-chat forwards them like a prompt instead of blocking them.
+        assert!(!is_serve_local_command_start("/distill-session"));
+        assert!(!is_serve_local_command_start("/archive"));
+        assert_eq!(
+            classify_serve_input("/distill-session current"),
+            ServeInputRoute::ServerCommand
+        );
+        assert_eq!(
+            classify_serve_input("/archive"),
+            ServeInputRoute::ServerCommand
+        );
+        // Unknown command shapes are rejected locally, never forwarded.
+        assert_eq!(
+            classify_serve_input("/no-such-command x"),
+            ServeInputRoute::UnknownCommand
+        );
+        assert_eq!(
+            classify_serve_input(":no-such-command"),
+            ServeInputRoute::UnknownCommand
+        );
         assert!(!is_serve_local_command_start("/tmp/foo"));
         assert!(!is_serve_local_command_start("plain prompt"));
+        assert_eq!(classify_serve_input("/tmp/foo"), ServeInputRoute::Prompt);
+        assert_eq!(
+            classify_serve_input("plain prompt"),
+            ServeInputRoute::Prompt
+        );
     }
 }
 
@@ -3514,12 +3670,18 @@ fn serve_connection(
 /// Print one `GET /sessions` listing as `N. <id>  <title>` rows (newest
 /// first) on stdout, so `--serve-sessions` output stays pipeable for scripts
 /// and later mobile clients; the interactive client reuses the same format.
-fn print_remote_sessions(items: &[RemoteSession]) {
+fn print_remote_sessions(items: &[RemoteSession], empty_message: &str) {
     if items.is_empty() {
-        println!("No remote sessions.");
+        println!("{empty_message}");
     } else {
         for (i, item) in items.iter().enumerate() {
-            println!("{}. {}  {}", i + 1, item.id, remote_session_title(item));
+            let archived = if item.archived { "  [archived]" } else { "" };
+            println!(
+                "{}. {}  {}{archived}",
+                i + 1,
+                item.id,
+                remote_session_title(item)
+            );
         }
     }
 }
@@ -3530,16 +3692,21 @@ pub(in crate::ai) fn run_serve_sessions(cli: &ParsedCli) -> Result<(), Box<dyn s
     let (client, base, token) = serve_connection(cli, "serve-sessions")?;
     let items = fetch_remote_sessions(&client, &base, &token)
         .map_err(|err| format!("[serve-sessions] {err}"))?;
-    print_remote_sessions(&items);
+    print_remote_sessions(&items, "No remote sessions.");
     Ok(())
 }
 
 /// What `/sessions|/ss|/ls [arg]` should do in serve-chat, mirroring the
-/// local REPL subcommands: bare/`list` lists all sessions, `current` (also
-/// `cur`/`curr`) shows the current one, `id` prints just its id, and any
-/// other argument is rejected instead of silently listing everything.
+/// local REPL subcommands: bare/`list` lists active sessions (archived hidden,
+/// current always shown), `all` lists everything, `archive` lists formally
+/// archived sessions, `current` (also `cur`/`curr`) shows the current one,
+/// `id` prints just its id, and any other argument is rejected instead of
+/// silently listing everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeSessionsArg {
     List,
+    All,
+    Archive,
     Current,
     Id,
     Unknown,
@@ -3548,10 +3715,31 @@ enum ServeSessionsArg {
 fn classify_serve_sessions_arg(arg: &str) -> ServeSessionsArg {
     match arg {
         "" | "list" | "ls" | "verbose" => ServeSessionsArg::List,
+        "all" => ServeSessionsArg::All,
+        "archive" => ServeSessionsArg::Archive,
         "current" | "cur" | "curr" => ServeSessionsArg::Current,
         "id" => ServeSessionsArg::Id,
         _ => ServeSessionsArg::Unknown,
     }
+}
+
+/// Rows shown by one `/ss` listing view. The default view hides formally
+/// archived sessions but keeps the current one visible, so archiving never
+/// hides where the user is; `all` shows everything; `archive` shows only
+/// archived sessions.
+fn sessions_for_view(
+    items: Vec<RemoteSession>,
+    view: ServeSessionsArg,
+    current_session_id: &str,
+) -> Vec<RemoteSession> {
+    items
+        .into_iter()
+        .filter(|item| match view {
+            ServeSessionsArg::All => true,
+            ServeSessionsArg::Archive => item.archived,
+            _ => !item.archived || item.id == current_session_id,
+        })
+        .collect()
 }
 
 /// Run the interactive serve chat: connect to a running serve instance and
@@ -3625,7 +3813,10 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
     let current_session: Arc<std::sync::Mutex<String>> =
         Arc::new(std::sync::Mutex::new(session_id.clone()));
     install_serve_cd_completion(&client, &base, &token, current_session.clone());
-    // Last `/sessions` output: backs `/resume <number|id-prefix>`.
+    // Last `/sessions` view and its rows: backs `/resume <number|id-prefix>`.
+    // The silent refresh below re-applies the view, so a filtered listing keeps
+    // the row numbers the user just saw.
+    let mut listed_view = ServeSessionsArg::List;
     let mut listed: Vec<RemoteSession> = Vec::new();
     // Client-side per-turn selection, seeded from the server (`GET /info`)
     // and switched locally by `/model`/`/effort`/`/agent`; every turn carries
@@ -3647,16 +3838,18 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
         sigint_state.bind_session(&session_id);
         // Silent live refresh before every input box: server-generated titles
         // (they appear after the first turn) and fresh `/resume` completion
-        // candidates. Failures keep the previous listing; the prompt is never
+        // candidates. The last explicit view is re-applied so its numbering
+        // stays valid. Failures keep the previous listing; the prompt is never
         // blocked by this.
         if let Some(items) = refresh_listing_quiet(&client, &base, &token) {
+            editor.set_session_topic(current_remote_title(&items, &session_id));
+            let items = sessions_for_view(items, listed_view, &session_id);
             CommandCompleter::set_serve_session_candidates(
                 items
                     .iter()
                     .map(|s| (s.id.clone(), remote_session_title(s)))
                     .collect(),
             );
-            editor.set_session_topic(current_remote_title(&items, &session_id));
             listed = items;
         }
         if let Ok(checkpoint_state) =
@@ -3694,7 +3887,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first); /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first, archived hidden); /sessions all - include archived; /sessions archive - list archived; /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|u<N>|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/distill-session [session-id|archive.zip] [--dry-run] [--limit N] - distill a session into knowledge on the server (paths resolve on the server)\n/archive [<id>|current|last] - toggle the server-side formal archive flag (default: current)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
                 );
                 continue;
             }
@@ -3711,24 +3904,37 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                 Err(err) => eprintln!("[serve-chat] {err}"),
             },
             // `/ss` matches the local REPL shorthand (`/ss` === `/sessions`
-            // list) and its subcommands (`current`/`id`) so the same muscle
-            // memory works on both sides; unknown arguments are rejected
-            // instead of silently listing every session.
+            // list) and its subcommands (`all`/`archive`/`current`/`id`) so the
+            // same muscle memory works on both sides; unknown arguments are
+            // rejected instead of silently listing every session.
             "/sessions" | "/ss" | "/ls" => match classify_serve_sessions_arg(arg) {
-                ServeSessionsArg::List => match fetch_remote_sessions(&client, &base, &token) {
-                    Ok(items) => {
-                        print_remote_sessions(&items);
-                        // Back `/resume` Tab-completion until the next listing.
-                        CommandCompleter::set_serve_session_candidates(
-                            items
-                                .iter()
-                                .map(|s| (s.id.clone(), remote_session_title(s)))
-                                .collect(),
-                        );
-                        listed = items;
+                view @ (ServeSessionsArg::List
+                | ServeSessionsArg::All
+                | ServeSessionsArg::Archive) => {
+                    match fetch_remote_sessions(&client, &base, &token) {
+                        Ok(items) => {
+                            let items = sessions_for_view(items, view, &session_id);
+                            let empty = if view == ServeSessionsArg::Archive {
+                                "No archived sessions."
+                            } else {
+                                "No remote sessions."
+                            };
+                            print_remote_sessions(&items, empty);
+                            // Back `/resume` Tab-completion and numbering with
+                            // the rows just printed; the silent refresh before
+                            // the next input re-applies this view.
+                            listed_view = view;
+                            CommandCompleter::set_serve_session_candidates(
+                                items
+                                    .iter()
+                                    .map(|s| (s.id.clone(), remote_session_title(s)))
+                                    .collect(),
+                            );
+                            listed = items;
+                        }
+                        Err(err) => eprintln!("[serve-chat] {err}"),
                     }
-                    Err(err) => eprintln!("[serve-chat] {err}"),
-                },
+                }
                 ServeSessionsArg::Current => {
                     // Local `/ss current` reads the local store; remotely the
                     // listing carries the same per-session fields, so refresh
@@ -3741,21 +3947,20 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                             if let Some(item) = items.iter().find(|s| s.id == session_id) {
                                 println!("title: {}", remote_session_title(item));
                                 println!("marked: {}", if item.marked { "yes" } else { "no" });
+                                println!(
+                                    "archived: {}",
+                                    if item.archived { "yes" } else { "no" }
+                                );
                             }
-                            CommandCompleter::set_serve_session_candidates(
-                                items
-                                    .iter()
-                                    .map(|s| (s.id.clone(), remote_session_title(s)))
-                                    .collect(),
-                            );
-                            listed = items;
                         }
                         Err(err) => eprintln!("[serve-chat] {err}"),
                     }
                 }
                 ServeSessionsArg::Id => println!("{session_id}"),
                 ServeSessionsArg::Unknown => {
-                    println!("unknown /sessions subcommand: '{arg}'. try: /sessions help")
+                    println!(
+                        "unknown /sessions subcommand: '{arg}'. try: /ss list|current|id|all|archive"
+                    )
                 }
             },
             "/resume" => match resolve_session_ref(arg, &listed) {
@@ -3907,28 +4112,43 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                 }
             }
             _ => {
-                // A local slash command is never a prompt: the local REPL
-                // would swallow it, so forwarding it as a turn only burns a
-                // model round-trip at best and hangs the session at worst
-                // (`/history rewind` used to block a turn child on stdin).
-                // `/memo` is the exception (it executes in the turn child) and
-                // is excluded by is_serve_local_command_start. Anything
-                // already handled above never reaches this arm.
-                if is_serve_local_command_start(&trimmed) {
-                    let command = trimmed.split_whitespace().next().unwrap_or(&trimmed);
-                    eprintln!(
-                        "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /cd, /pwd, /git, /history, /model, /effort, /agent, /skills, /sessions, /resume, /fork, /close, /bg, /new (see /help)."
-                    );
-                } else if let Err(err) = post_turn_stream(
-                    &client,
-                    &base,
-                    &token,
-                    &session_id,
-                    &trimmed,
-                    &app_config.history_file,
-                    &mut selection,
-                ) {
-                    eprintln!("[serve-chat] {err}");
+                match classify_serve_input(&trimmed) {
+                    // A local slash command is never a prompt: the local REPL
+                    // would swallow it, so forwarding it as a turn only burns a
+                    // model round-trip at best and hangs the session at worst
+                    // (`/history rewind` used to block a turn child on stdin).
+                    // Anything already handled above never reaches this arm.
+                    ServeInputRoute::Unsupported => {
+                        let command = trimmed.split_whitespace().next().unwrap_or(&trimmed);
+                        eprintln!(
+                            "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /cd, /pwd, /git, /history, /model, /effort, /agent, /skills, /sessions, /resume, /fork, /close, /bg, /new, /distill-session, /archive (see /help)."
+                        );
+                    }
+                    // Unknown command shapes must not fall through to the
+                    // model, which would answer a command the user meant to
+                    // execute.
+                    ServeInputRoute::UnknownCommand => {
+                        let command = trimmed.split_whitespace().next().unwrap_or(&trimmed);
+                        eprintln!(
+                            "[serve-chat] unknown command: {command}; it was not sent. Run /help to list commands supported over serve-chat."
+                        );
+                    }
+                    // `/memo`, `/task`, `/discuss`, `/goal`,
+                    // `/distill-session`, and `/archive` execute in the server
+                    // turn child; everything else is ordinary prompt text.
+                    ServeInputRoute::ServerCommand | ServeInputRoute::Prompt => {
+                        if let Err(err) = post_turn_stream(
+                            &client,
+                            &base,
+                            &token,
+                            &session_id,
+                            &trimmed,
+                            &app_config.history_file,
+                            &mut selection,
+                        ) {
+                            eprintln!("[serve-chat] {err}");
+                        }
+                    }
                 }
             }
         }
@@ -4659,23 +4879,26 @@ mod tests {
             summary: summary.map(str::to_string),
             first_user_prompt: prompt.map(str::to_string),
             marked: false,
+            archived: false,
         }
     }
 
     #[test]
     fn parse_remote_sessions_drops_empty_ids() {
         let items = parse_remote_sessions(
-            r#"[{"id":"a1","summary":"Fix bug","size_bytes":10,"marked":false},{"id":"  "}]"#,
+            r#"[{"id":"a1","summary":"Fix bug","size_bytes":10,"marked":false,"archived":true},{"id":"  "}]"#,
         )
         .expect("parse");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "a1");
         assert_eq!(items[0].summary.as_deref(), Some("Fix bug"));
+        assert!(items[0].archived);
         parse_remote_sessions("not json").expect_err("malformed must fail");
         // Older servers without the optional fields still parse.
         let legacy = parse_remote_sessions(r#"[{"id":"old"}]"#).expect("legacy");
         assert!(legacy[0].summary.is_none());
         assert!(!legacy[0].marked);
+        assert!(!legacy[0].archived);
     }
 
     #[test]
@@ -4697,14 +4920,57 @@ mod tests {
                 "{cur:?}"
             );
         }
+        assert!(matches!(classify_serve_sessions_arg("all"), All));
+        assert!(matches!(classify_serve_sessions_arg("archive"), Archive));
         assert!(matches!(classify_serve_sessions_arg("id"), Id));
         // Anything else is rejected, never silently treated as a listing.
-        for unknown in ["foo", "use", "delete", "all"] {
+        for unknown in ["foo", "use", "delete", "workers"] {
             assert!(
                 matches!(classify_serve_sessions_arg(unknown), Unknown),
                 "{unknown:?}"
             );
         }
+    }
+
+    #[test]
+    fn sessions_for_view_hides_archived_except_current() {
+        use ServeSessionsArg::*;
+        let active = listed_session("active", Some("A"), None);
+        let mut old = listed_session("old", Some("O"), None);
+        old.archived = true;
+        let mut current = listed_session("current", Some("C"), None);
+        current.archived = true;
+        let items = vec![active, old, current];
+        let ids = |rows: Vec<RemoteSession>| -> Vec<String> {
+            rows.into_iter().map(|row| row.id).collect()
+        };
+        assert_eq!(
+            ids(sessions_for_view(items.clone(), List, "current")),
+            vec!["active", "current"]
+        );
+        assert_eq!(
+            ids(sessions_for_view(items.clone(), All, "current")),
+            vec!["active", "old", "current"]
+        );
+        assert_eq!(
+            ids(sessions_for_view(items, Archive, "current")),
+            vec!["old", "current"]
+        );
+    }
+
+    #[test]
+    fn archive_view_row_numbers_resolve_against_archived_rows() {
+        use ServeSessionsArg::*;
+        let active = listed_session("active", Some("A"), None);
+        let mut old = listed_session("old", Some("O"), None);
+        old.archived = true;
+        let mut older = listed_session("older", Some("O2"), None);
+        older.archived = true;
+        // The rows the archive view prints are the rows `/resume <number>`
+        // resolves against, so the visible numbering stays meaningful.
+        let view = sessions_for_view(vec![active, old, older], Archive, "active");
+        assert_eq!(resolve_session_ref("1", &view).unwrap(), "old");
+        assert_eq!(resolve_session_ref("2", &view).unwrap(), "older");
     }
 
     #[test]
@@ -4803,12 +5069,14 @@ mod tests {
                 summary: Some("Hello".to_string()),
                 first_user_prompt: None,
                 marked: false,
+                archived: false,
             },
             RemoteSession {
                 id: "s2".to_string(),
                 summary: None,
                 first_user_prompt: Some("question\nbody".to_string()),
                 marked: false,
+                archived: false,
             },
         ];
         assert_eq!(

@@ -872,6 +872,8 @@ fn record_tool_stat(name: &str, ok: bool) {
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        // Rule-emitted stats; no model produced this content.
+        model: None,
     };
     let store = MemoryStore::from_env_or_config();
     let _ = store.append(&entry);

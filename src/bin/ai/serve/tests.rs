@@ -4,10 +4,10 @@ use super::*;
 
 #[cfg(unix)]
 use super::pump_live_fifo;
+use super::{MAX_TURN_ERROR_CHARS, truncate_turn_error};
 use super::{MAX_TURN_IMAGES, clean_sse_line, stage_turn_images};
 use super::{ServeFrameDecoder, ServeImageUpload, ServeLiveEvent, setup_live_fifo};
 use super::{TurnReq, turn_overrides, turn_term_cols};
-use super::{MAX_TURN_ERROR_CHARS, truncate_turn_error};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
@@ -25,7 +25,10 @@ fn truncate_turn_error_cuts_on_character_boundaries() {
     let prefix = "...[truncated]...";
     assert!(trimmed.starts_with(prefix), "{trimmed}");
     let kept = trimmed.strip_prefix(prefix).expect("truncation prefix");
-    assert!(kept.chars().all(|c| c == '小'), "unexpected char in kept tail");
+    assert!(
+        kept.chars().all(|c| c == '小'),
+        "unexpected char in kept tail"
+    );
     assert_eq!(kept.chars().count(), MAX_TURN_ERROR_CHARS, "{kept}");
 }
 
@@ -339,7 +342,9 @@ fn decoder_passes_subagent_progress_through() {
 
 #[tokio::test]
 async fn serve_tool_lifecycle_decoder_and_sse_preserve_order() {
-    use crate::ai::background::{ServeLiveKind, serve_tool_finished_payload, serve_tool_started_payload};
+    use crate::ai::background::{
+        ServeLiveKind, serve_tool_finished_payload, serve_tool_started_payload,
+    };
     use axum::response::IntoResponse;
     let call = crate::ai::types::ToolCall {
         id: "tool-id".into(),
@@ -354,15 +359,28 @@ async fn serve_tool_lifecycle_decoder_and_sse_preserve_order() {
     let wire = [
         test_frame(ServeLiveKind::Tool, started.as_bytes()),
         test_frame(ServeLiveKind::Tool, finished.as_bytes()),
-    ].concat();
+    ]
+    .concat();
     let mut decoder = ServeFrameDecoder::default();
-    let events: Vec<_> = wire.iter().flat_map(|byte| decoder.push(&[*byte])).collect();
-    assert_eq!(events, vec![ServeLiveEvent::Tool(started.clone()), ServeLiveEvent::Tool(finished.clone())]);
+    let events: Vec<_> = wire
+        .iter()
+        .flat_map(|byte| decoder.push(&[*byte]))
+        .collect();
+    assert_eq!(
+        events,
+        vec![
+            ServeLiveEvent::Tool(started.clone()),
+            ServeLiveEvent::Tool(finished.clone())
+        ]
+    );
     assert!(decoder.finish().is_empty());
     let response = Sse::new(stream::iter(events.into_iter().map(|event| {
         Ok::<_, std::convert::Infallible>(live_event(event).unwrap().into_event())
-    }))).into_response();
-    let bytes = axum::body::to_bytes(response.into_body(), 16384).await.unwrap();
+    })))
+    .into_response();
+    let bytes = axum::body::to_bytes(response.into_body(), 16384)
+        .await
+        .unwrap();
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert_eq!(text.matches("event: tool").count(), 2, "{text}");
     assert!(text.contains(&started), "{text}");
@@ -1474,6 +1492,7 @@ async fn history_total_header_reports_precut_count() {
             role: None,
             count: None,
             conclusion: None,
+            user_conclusion: None,
         }),
     )
     .await
@@ -1534,6 +1553,7 @@ async fn history_redacts_inline_image_payloads() {
             role: None,
             count: None,
             conclusion: None,
+            user_conclusion: None,
         }),
     )
     .await
@@ -1557,7 +1577,7 @@ async fn history_redacts_inline_image_payloads() {
 
 #[tokio::test]
 async fn history_roles_shape_omits_content() {
-    use crate::ai::history::{Message, append_history_messages};
+    use crate::ai::history::{Message, append_history_messages, runtime_synthetic_user_message};
     use axum::{
         extract::{Path, Query, State},
         http::{HeaderMap, StatusCode},
@@ -1589,6 +1609,7 @@ async fn history_roles_shape_omits_content() {
             tool_call_id: None,
             reasoning_content: None,
         },
+        runtime_synthetic_user_message(serde_json::json!("runtime follow-up")),
     ];
     append_history_messages(&path, &messages).expect("seed messages");
 
@@ -1602,6 +1623,7 @@ async fn history_roles_shape_omits_content() {
             role: None,
             count: None,
             conclusion: None,
+            user_conclusion: None,
         }),
     )
     .await
@@ -1611,7 +1633,7 @@ async fn history_roles_shape_omits_content() {
         resp.headers()
             .get("x-history-total")
             .and_then(|v| v.to_str().ok()),
-        Some("2")
+        Some("3")
     );
     let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
@@ -1620,7 +1642,14 @@ async fn history_roles_shape_omits_content() {
     // Roles only: neither the message text nor the base64 payload leaves
     // the server.
     let roles: Vec<String> = serde_json::from_str(&body).expect("role array");
-    assert_eq!(roles, vec!["user".to_string(), "assistant".to_string()]);
+    assert_eq!(
+        roles,
+        vec![
+            "user".to_string(),
+            "assistant".to_string(),
+            "runtime_synthetic_user".to_string(),
+        ]
+    );
     assert!(!body.contains("look at this"));
     assert!(!body.contains(&secret_payload));
 }
@@ -1736,6 +1765,7 @@ async fn history_role_count_filters_and_attaches_ordinals() {
         role: Some("user".to_string()),
         count: Some(2),
         conclusion: None,
+        user_conclusion: None,
     })
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1757,6 +1787,7 @@ async fn history_role_count_filters_and_attaches_ordinals() {
         role: None,
         count: Some(3),
         conclusion: None,
+        user_conclusion: None,
     })
     .await;
     let rows: Vec<serde_json::Value> = serde_json::from_str(&body).expect("rows");
@@ -1774,6 +1805,7 @@ async fn history_role_count_filters_and_attaches_ordinals() {
         role: Some("system".to_string()),
         count: Some(10),
         conclusion: None,
+        user_conclusion: None,
     })
     .await;
     let rows: Vec<serde_json::Value> = serde_json::from_str(&body).expect("rows");
@@ -1790,6 +1822,7 @@ async fn history_role_count_filters_and_attaches_ordinals() {
         role: Some("bogus".to_string()),
         count: None,
         conclusion: None,
+        user_conclusion: None,
     })
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1798,7 +1831,7 @@ async fn history_role_count_filters_and_attaches_ordinals() {
 
 #[tokio::test]
 async fn history_conclusion_back_selects_and_errors() {
-    use crate::ai::history::{Message, append_history_messages};
+    use crate::ai::history::{Message, append_history_messages, runtime_synthetic_user_message};
     use crate::ai::types::{FunctionCall, ToolCall};
     use axum::{
         extract::{Path, Query, State},
@@ -1846,13 +1879,14 @@ async fn history_conclusion_back_selects_and_errors() {
         user("q1"),
         assistant(""),
         user("q2"),
+        runtime_synthetic_user_message(serde_json::json!("runtime follow-up")),
         assistant("conclusion 1"),
         user("q3"),
         assistant("conclusion 2"),
     ];
     append_history_messages(&path, &messages).expect("seed messages");
 
-    let call = |conclusion: Option<usize>| {
+    let call = |conclusion: Option<usize>, user_conclusion: Option<usize>| {
         let state = state.clone();
         async move {
             let resp = super::read_history(
@@ -1865,6 +1899,7 @@ async fn history_conclusion_back_selects_and_errors() {
                     role: None,
                     count: None,
                     conclusion,
+                    user_conclusion,
                 }),
             )
             .await
@@ -1878,31 +1913,41 @@ async fn history_conclusion_back_selects_and_errors() {
         }
     };
 
-    let (status, body) = call(Some(1)).await;
+    let (status, body) = call(Some(1), None).await;
     assert_eq!(status, StatusCode::OK);
     let rows: Vec<serde_json::Value> = serde_json::from_str(&body).expect("rows");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["content"], "conclusion 2");
 
-    let (status, body) = call(Some(2)).await;
+    let (status, body) = call(Some(2), None).await;
     assert_eq!(status, StatusCode::OK);
     let rows: Vec<serde_json::Value> = serde_json::from_str(&body).expect("rows");
     assert_eq!(rows[0]["content"], "conclusion 1");
 
     // The tool-call-only and empty assistant rows are not conclusions.
-    let (status, body) = call(Some(3)).await;
+    let (status, body) = call(Some(3), None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
         body.contains("Only 2 assistant message(s) in history."),
         "{body}"
     );
 
-    let (status, body) = call(Some(0)).await;
+    let (status, body) = call(Some(0), None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(
-        body.contains("invalid /history last argument: 0"),
-        "{body}"
-    );
+    assert!(body.contains("invalid /history last argument: 0"), "{body}");
+
+    let (status, body) = call(None, Some(3)).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&body).expect("rows");
+    assert_eq!(rows[0]["content"], "conclusion 1");
+
+    let (status, body) = call(None, Some(2)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("No assistant conclusion found for user message u2"));
+
+    let (status, body) = call(None, Some(5)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("User message u5 was not found"));
 }
 
 #[tokio::test]
@@ -2025,9 +2070,9 @@ fn turn_child_env_carries_only_the_reported_width() {
     // nobody is looking at.
     let mut cmd = std::process::Command::new("true");
     super::apply_term_cols_env(&mut cmd, None);
-    let cleared = cmd.get_envs().any(|(key, value)| {
-        value.is_none() && key == crate::ai::background::SERVE_TERM_COLS_ENV
-    });
+    let cleared = cmd
+        .get_envs()
+        .any(|(key, value)| value.is_none() && key == crate::ai::background::SERVE_TERM_COLS_ENV);
     assert!(
         cleared,
         "the width variable must be cleared for a turn that reported none"
@@ -2338,7 +2383,10 @@ fn committed_body_beyond_one_frame_is_reassembled_into_one_replace() {
         plan.iter()
             .all(|(_, chunk)| chunk.len() <= MAX_SERVE_FRAME_BYTES)
     );
-    assert_eq!(plan.iter().map(|(_, chunk)| *chunk).collect::<String>(), body);
+    assert_eq!(
+        plan.iter().map(|(_, chunk)| *chunk).collect::<String>(),
+        body
+    );
 
     // The decoder collapses the whole sequence into one authoritative event, so
     // the client applies the full body instead of the last fragment. Read

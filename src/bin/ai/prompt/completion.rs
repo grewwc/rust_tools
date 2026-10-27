@@ -126,6 +126,8 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":mark",
         "/unmark",
         ":unmark",
+        "/archive",
+        ":archive",
         "/title",
         ":title",
         "/cd",
@@ -348,6 +350,8 @@ impl CommandCompleter {
             ":mark",
             "/unmark",
             ":unmark",
+            "/archive",
+            ":archive",
             "/theme",
             ":theme",
         ]
@@ -701,8 +705,9 @@ impl CommandCompleter {
     /// Only the export/import family is position-aware: `export` and `markdown`
     /// take a session selector and then an output path, the
     /// `export-<selector>` shorthands already imply the selector, and `import`
-    /// takes a `.zip` path. Every other position keeps the plain subcommand
-    /// list.
+    /// takes a `.zip` path. `archive` is a list view like `workers`/`all` (an
+    /// optional `verbose` combines with it). Every other position keeps the
+    /// plain subcommand list.
     fn session_argument_candidates(
         sub: &str,
         arg_index: usize,
@@ -715,8 +720,9 @@ impl CommandCompleter {
                 Self::output_path_candidates(token)
             }
             ("import", 0) => distill_zip_candidates(token),
-            // Extra arguments of the export/import family have nothing to offer;
-            // every other subcommand keeps the pre-existing subcommand list.
+            // Extra arguments of the export/import family have nothing
+            // to offer; every other subcommand keeps the pre-existing
+            // subcommand list.
             (
                 "export"
                 | "markdown"
@@ -1282,6 +1288,14 @@ impl CommandCompleter {
                         let arg_index = words.count();
                         Self::session_argument_candidates(sub, arg_index, token)
                     }
+                }
+            } else if matches!(first, "/archive" | ":archive") {
+                // Top-level toggle: the first argument is a session selector
+                // (`current`/`last`/id); anything past it has nothing to offer.
+                if words.next().is_none() {
+                    Self::session_selector_candidates(token)
+                } else {
+                    Vec::new()
                 }
             } else {
                 let sources: &[&str] = match first {
@@ -2690,6 +2704,35 @@ mod tests {
     }
 
     #[test]
+    fn command_completion_suggests_top_level_archive_and_selectors() {
+        let completer = CommandCompleter;
+        let history = DefaultHistory::new();
+        let (_, pairs) = completer
+            .complete("/arch", 5, &Context::new(&history))
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == "/archive"));
+        let (_, pairs) = completer
+            .complete(":arch", 5, &Context::new(&history))
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == ":archive"));
+        // First argument is a session selector for the toggle.
+        let (_, pairs) = completer
+            .complete("/archive ", "/archive ".len(), &Context::new(&history))
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == "current"));
+        assert!(pairs.iter().any(|pair| pair.replacement == "last"));
+        // Nothing past the selector.
+        let (_, pairs) = completer
+            .complete(
+                "/archive last ",
+                "/archive last ".len(),
+                &Context::new(&history),
+            )
+            .unwrap();
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
     fn command_completion_expands_top_level_theme_command() {
         let completer = CommandCompleter;
         let history = DefaultHistory::new();
@@ -2795,9 +2838,9 @@ mod tests {
     }
 
     /// The `/sessions` surface exposes the export/import pair: `markdown` is a
-    /// subcommand, the retired `archive` literal is gone, and the arguments of
-    /// the export family complete session selectors and paths instead of
-    /// subcommand names.
+    /// subcommand, `archive` is a list view, and the arguments of the export
+    /// family complete session selectors and paths instead of subcommand
+    /// names.
     #[test]
     fn session_command_completion_covers_export_markdown_and_import() {
         let completer = CommandCompleter;
@@ -2815,7 +2858,7 @@ mod tests {
         let (_, pairs) = completer
             .complete("/sessions ar", "/sessions ar".len(), &Context::new(&history))
             .unwrap();
-        assert!(!pairs.iter().any(|pair| pair.replacement == "archive"));
+        assert!(pairs.iter().any(|pair| pair.replacement == "archive"));
 
         // Selector position of `export`: `current`/`last`, not subcommand names.
         let (_, pairs) = completer
@@ -2828,6 +2871,21 @@ mod tests {
         assert!(pairs.iter().any(|pair| pair.replacement == "current"));
         assert!(pairs.iter().any(|pair| pair.replacement == "last"));
         assert!(!pairs.iter().any(|pair| pair.replacement == "clear-all"));
+
+        // `archive` is a list view: it completes list modifiers (`verbose`),
+        // not session selectors (toggling moved to top-level `/archive`).
+        let (_, pairs) = completer
+            .complete(
+                "/sessions archive ",
+                "/sessions archive ".len(),
+                &Context::new(&history),
+            )
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == "verbose"));
+        // `last` is selector-only (never a subcommand), so its absence proves
+        // the selector list is gone; `current` can't discriminate because it
+        // is also a `/sessions` subcommand.
+        assert!(!pairs.iter().any(|pair| pair.replacement == "last"));
 
         // The new `markdown` subcommand completes the same selector argument.
         let (_, pairs) = completer

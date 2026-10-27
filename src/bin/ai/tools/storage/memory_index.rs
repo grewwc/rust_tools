@@ -475,6 +475,7 @@ mod tests {
             owner_pid: None,
             owner_pgid: None,
             image_path: None,
+            model: None,
         }
     }
 

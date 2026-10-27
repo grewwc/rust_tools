@@ -20,13 +20,13 @@ use super::{
     markdown::messages_to_markdown,
     sqlite::{
         SessionListMetadata, backup_sqlite, read_all_messages_sqlite,
-        read_first_user_prompt_sqlite, read_session_list_metadata_sqlite,
-        read_session_mark_message_sqlite, read_session_marked_sqlite,
-        read_session_serve_config_sqlite,
+        read_first_user_prompt_sqlite, read_session_archived_sqlite,
+        read_session_list_metadata_sqlite, read_session_mark_message_sqlite,
+        read_session_marked_sqlite, read_session_serve_config_sqlite,
         read_session_title_origin_sqlite, read_session_title_sqlite,
         remap_context_checkpoint_paths_sqlite, with_session_state_lock,
-        write_session_mark_sqlite, write_session_serve_config_sqlite,
-        write_session_title_sqlite, MarkMessageUpdate,
+        write_session_archived_sqlite, write_session_mark_sqlite,
+        write_session_serve_config_sqlite, write_session_title_sqlite, MarkMessageUpdate,
     },
     types::Message,
 };
@@ -94,6 +94,8 @@ pub(in crate::ai) struct SessionInfo {
     pub(in crate::ai) summary: Option<String>,
     /// Whether the user marked this session as important via `/mark`.
     pub(in crate::ai) marked: bool,
+    /// Whether the user formally archived this session via `/archive`.
+    pub(in crate::ai) archived: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +265,7 @@ impl SessionStore {
                 last_activity_unix_ms,
                 history_revision,
                 marked,
+                archived,
             ) = match metadata_results[idx].take() {
                 Some(metadata) => (
                     metadata.first_user_prompt,
@@ -270,8 +273,9 @@ impl SessionStore {
                     metadata.last_activity_unix_ms,
                     metadata.history_revision,
                     metadata.marked,
+                    metadata.archived,
                 ),
-                None => (None, None, None, 0, false),
+                None => (None, None, None, 0, false, false),
             };
             // New databases use the logical activity time maintained inside
             // transactions; for old databases the metadata reader falls back
@@ -312,6 +316,7 @@ impl SessionStore {
                     first_user_prompt,
                     summary,
                     marked,
+                    archived,
                 },
             );
         }
@@ -1121,6 +1126,27 @@ impl SessionStore {
         write_session_mark_sqlite(&self.session_history_file(session_id), marked, message)
     }
 
+    /// Whether the user formally archived the session via `/archive`.
+    /// A missing or unreadable session is treated as active.
+    pub(in crate::ai) fn read_session_archived(&self, session_id: &str) -> io::Result<bool> {
+        Self::validate_session_id(session_id)?;
+        let path = self.session_history_file(session_id);
+        if !path.exists() {
+            return Ok(false);
+        }
+        read_session_archived_sqlite(&path)
+    }
+
+    /// Persist the formal-archive flag (see `write_session_archived_sqlite`).
+    pub(in crate::ai) fn write_session_archived(
+        &self,
+        session_id: &str,
+        archived: bool,
+    ) -> io::Result<()> {
+        Self::validate_session_id(session_id)?;
+        write_session_archived_sqlite(&self.session_history_file(session_id), archived)
+    }
+
     /// Read the session's persisted serve-mode config. A missing session (or
     /// one without stored picks) yields all-defaults, matching how titles and
     /// marks read as absent for a session that does not exist yet.
@@ -1223,6 +1249,14 @@ impl SessionStore {
                 after_fork(&dst_path)
             },
         )
+        .and_then(|result| {
+            // A fork/branch is new active work even when cut from an archived
+            // session, so never inherit the formal-archive flag. The source
+            // session is untouched. Runs after the checkpoint locks are
+            // released, matching how later commands would write the flag.
+            write_session_archived_sqlite(&dst_path, false)?;
+            Ok(result)
+        })
     }
 
     /// Copy the `src` session wholesale to `dst` as a new branch. The source
@@ -1436,6 +1470,13 @@ impl SessionStore {
                 let _ = delete_assets_dir(&dst_assets);
             }
             result
+        })
+        .and_then(|id| {
+            // An import is new live work the handler switches into, so never
+            // inherit the formal-archive flag (mirrors fork). Runs after the
+            // checkpoint locks are released.
+            write_session_archived_sqlite(&dst_sqlite, false)?;
+            Ok(id)
         })
     }
 }
@@ -2458,6 +2499,42 @@ mod tests {
         assert!(!store.session_assets_dir("imported").exists());
 
         let _ = fs::remove_file(archive_path);
+        let _ = fs::remove_dir_all(store.sessions_root());
+    }
+
+    #[test]
+    fn import_of_archived_session_starts_unarchived() {
+        let history_file = temp_history_file();
+        let store = SessionStore::new(&history_file);
+        let source_id = "arch-export-src";
+        let target_id = "arch-import-dst";
+        let source_db = store.session_history_file(source_id);
+        append_history_messages(
+            &source_db,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("export me".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        store.write_session_archived(source_id, true).unwrap();
+
+        let archive = std::env::temp_dir().join(format!(
+            "ai-session-archive-import-test-{}.zip",
+            uuid::Uuid::new_v4()
+        ));
+        store.export_session_archive(source_id, &archive).unwrap();
+        let imported = store.import_session_archive(&archive, target_id).unwrap();
+
+        // The source stays archived; the import is new live work.
+        assert_eq!(imported, target_id);
+        assert!(store.read_session_archived(source_id).unwrap());
+        assert!(!store.read_session_archived(target_id).unwrap());
+
+        let _ = fs::remove_file(archive);
         let _ = fs::remove_dir_all(store.sessions_root());
     }
 

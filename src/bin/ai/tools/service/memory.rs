@@ -178,6 +178,35 @@ pub(crate) fn next_memory_id() -> String {
     format!("mem_{}", Uuid::new_v4().simple())
 }
 
+/// Model attribution for a newly written memory entry: the model driving the
+/// current turn, or `None` outside a turn (CLI helpers, tests) where no model
+/// produced the content.
+pub(crate) fn current_write_model() -> Option<String> {
+    crate::ai::driver::runtime_ctx::try_current()
+        .map(|ctx| ctx.app_proto.current_model.clone())
+        .filter(|model| !model.trim().is_empty())
+}
+
+/// Provenance header for a losslessly merged source entry: keeps the source's
+/// id/category/timestamp/origin/model with its full text, so consolidation
+/// never drops the when/who behind the content it replaces.
+pub(crate) fn format_preserved_source(src: &AgentMemoryEntry, trimmed_note: &str) -> String {
+    let mut header = format!(
+        "[id: {} | category: {} | timestamp: {}",
+        src.id.as_deref().unwrap_or("unknown"),
+        src.category,
+        src.timestamp,
+    );
+    if let Some(source) = src.source.as_deref().filter(|s| !s.trim().is_empty()) {
+        header.push_str(&format!(" | source: {source}"));
+    }
+    if let Some(model) = src.model.as_deref().filter(|s| !s.trim().is_empty()) {
+        header.push_str(&format!(" | model: {model}"));
+    }
+    header.push(']');
+    format!("{header}\n{trimmed_note}")
+}
+
 fn normalized_category(raw: Option<&str>, fallback: &str) -> String {
     let value = raw.unwrap_or(fallback).trim().to_lowercase();
     if value.is_empty() {
@@ -342,6 +371,7 @@ pub(crate) fn prepare_memory_save_entry(
             owner_pid,
             owner_pgid,
             image_path: None,
+            model: current_write_model(),
         },
     })
 }
@@ -408,6 +438,7 @@ pub(crate) fn execute_memory_append(args: &Value) -> Result<String, String> {
         owner_pid,
         owner_pgid,
         image_path: None,
+        model: current_write_model(),
     };
 
     let store = MemoryStore::from_env_or_config();
@@ -905,6 +936,7 @@ fn build_gc_summaries(evicted: &[AgentMemoryEntry], max_days: i64) -> Vec<AgentM
             owner_pid: None,
             owner_pgid: None,
             image_path: None,
+            model: None,
         });
     }
     out
@@ -1459,6 +1491,7 @@ mod tests {
             owner_pid: None,
             owner_pgid: None,
             image_path: None,
+            model: None,
         };
         let msg = update_memo_entry(&target, "ida 交接文档 更新后的内容").unwrap();
         assert!(msg.contains("Memory updated"));
@@ -1504,6 +1537,7 @@ mod tests {
             owner_pid: None,
             owner_pgid: None,
             image_path: None,
+            model: None,
         };
         let archived_memo = AgentMemoryEntry {
             id: Some("archived-memo".to_string()),
@@ -1517,6 +1551,7 @@ mod tests {
             owner_pid: None,
             owner_pgid: None,
             image_path: None,
+            model: None,
         };
         let decoy_line = serde_json::to_string(&non_memo_decoy).unwrap();
         let archived_line = serde_json::to_string(&archived_memo).unwrap();
@@ -1536,6 +1571,7 @@ mod tests {
                 owner_pid: None,
                 owner_pgid: None,
                 image_path: None,
+                model: None,
             })
             .unwrap();
 
@@ -1587,6 +1623,7 @@ mod tests {
             owner_pid: None,
             owner_pgid: None,
             image_path: None,
+            model: None,
         };
         std::fs::write(
             &archive,
@@ -1608,6 +1645,7 @@ mod tests {
                 owner_pid: None,
                 owner_pgid: None,
                 image_path: None,
+                model: None,
             })
             .unwrap();
 
@@ -1714,6 +1752,7 @@ mod tests {
             owner_pid: None,
             owner_pgid: None,
             image_path: None,
+            model: None,
         };
         assert!(is_memory_visible_to(&entry, None));
         assert!(is_memory_visible_to(&entry, Some(1)));
@@ -1734,6 +1773,7 @@ mod tests {
             owner_pid: Some(42),
             owner_pgid: None,
             image_path: None,
+            model: None,
         };
         assert!(is_memory_visible_to(&entry, Some(42)));
         assert!(!is_memory_visible_to(&entry, Some(99)));
@@ -1753,6 +1793,7 @@ mod tests {
             owner_pid: Some(42),
             owner_pgid: Some(10),
             image_path: None,
+            model: None,
         };
         assert!(is_memory_visible_to(&entry, None));
     }
@@ -1805,6 +1846,7 @@ mod tests {
             owner_pid: Some(child_a),
             owner_pgid: Some(100),
             image_path: None,
+            model: None,
         };
 
         assert!(is_memory_visible_to(&entry_a, Some(child_b)));
@@ -1851,6 +1893,7 @@ mod tests {
             owner_pid: Some(child),
             owner_pgid: None,
             image_path: None,
+            model: None,
         };
 
         assert!(is_memory_visible_to(&child_entry, Some(root)));
@@ -1911,6 +1954,7 @@ mod tests {
             owner_pid: Some(child_a),
             owner_pgid: None,
             image_path: None,
+            model: None,
         };
 
         assert!(!is_memory_visible_to(&entry_a, Some(child_b)));

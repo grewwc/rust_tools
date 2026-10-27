@@ -359,6 +359,7 @@ fn execute_session_list(args: &Value) -> Result<String, String> {
             .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_else(|| "-".to_string());
         let marked = if session.marked { " [marked]" } else { "" };
+        let archived = if session.archived { " [archived]" } else { "" };
         let prompt = session
             .first_user_prompt
             .as_deref()
@@ -372,12 +373,13 @@ fn execute_session_list(args: &Value) -> Result<String, String> {
             format!(" | {}", prompt.replace('\n', " "))
         };
         out.push_str(&format!(
-            "{:>3}. {} | {} | {}{}{}\n",
+            "{:>3}. {} | {} | {}{}{}{}\n",
             shown + 1,
             session.id,
             modified,
             title,
             marked,
+            archived,
             prompt
         ));
         shown += 1;
@@ -428,6 +430,9 @@ fn execute_session_read(args: &Value) -> Result<String, String> {
             }
             if info.marked {
                 out.push_str("marked: yes\n");
+            }
+            if info.archived {
+                out.push_str("archived: yes (read-only via session tools; attach refused)\n");
             }
             if let Some(prompt) = info.first_user_prompt.as_deref() {
                 out.push_str(&format!(

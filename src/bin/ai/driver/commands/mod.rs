@@ -78,6 +78,7 @@ pub fn is_local_command_start(token: &str) -> bool {
         word,
         "agent"
             | "agents"
+            | "archive"
             | "audit"
             | "bg"
             | "cd"
@@ -124,14 +125,16 @@ pub fn is_local_command_start(token: &str) -> bool {
     )
 }
 
-/// True when `token` starts a local command that serve-chat must not forward
-/// as a turn. The exceptions all execute inside the turn child's one-shot
-/// loop: `/memo` reaches `try_handle_memo_command` (the save lands in the
-/// shared memory store), and `/task`/`/discuss`/`/goal` only inject a
-/// `forced_question` and let the turn continue, exactly like a prompt — so
-/// serve-chat forwards them and the host flow runs server-side.
-pub(crate) fn is_serve_local_command_start(token: &str) -> bool {
-    if !is_local_command_start(token) || memo::memo_command_args(token).is_some() {
+/// Commands serve-chat forwards to the turn child even though the local REPL
+/// also recognizes them. The child executes them server-side: `/memo` after
+/// pre-turn dispatch, `/archive` in the pre-turn local-command path, `/task`,
+/// `/discuss`, and `/goal` inject a `forced_question` into the turn, and
+/// `/distill-session` runs in the turn dispatcher.
+fn is_serve_forwarded_command_start(token: &str) -> bool {
+    if memo::memo_command_args(token).is_some() {
+        return true;
+    }
+    if !is_local_command_start(token) {
         return false;
     }
     let rest = token
@@ -139,7 +142,46 @@ pub(crate) fn is_serve_local_command_start(token: &str) -> bool {
         .strip_prefix('/')
         .or_else(|| token.trim().strip_prefix(':'));
     let word = rest.and_then(|r| r.split_whitespace().next()).unwrap_or("");
-    !matches!(word, "task" | "discuss" | "goal")
+    matches!(
+        word,
+        "task" | "discuss" | "goal" | "distill-session" | "archive"
+    )
+}
+
+/// True when `token` starts a local command that serve-chat must not forward
+/// as a turn. Commands in [`is_serve_forwarded_command_start`] run server-side
+/// and are forwarded like a prompt instead.
+pub(crate) fn is_serve_local_command_start(token: &str) -> bool {
+    is_local_command_start(token) && !is_serve_forwarded_command_start(token)
+}
+
+/// Routing decision for one line submitted to a remote client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServeInputRoute {
+    /// A local command this client cannot execute: reject without sending.
+    Unsupported,
+    /// A command the server turn child executes: forward as a prompt.
+    ServerCommand,
+    /// A slash/colon command shape no handler claims: reject without sending.
+    UnknownCommand,
+    /// Ordinary prompt text: send as a turn.
+    Prompt,
+}
+
+/// Classify a submitted line so a remote client never silently turns an
+/// unsupported command into a model prompt.
+pub(crate) fn classify_serve_input(input: &str) -> ServeInputRoute {
+    let trimmed = input.trim();
+    if is_serve_local_command_start(trimmed) {
+        return ServeInputRoute::Unsupported;
+    }
+    if is_serve_forwarded_command_start(trimmed) {
+        return ServeInputRoute::ServerCommand;
+    }
+    if looks_like_slash_command(trimmed) {
+        return ServeInputRoute::UnknownCommand;
+    }
+    ServeInputRoute::Prompt
 }
 
 /// Dash-flag tokens owned by the named local command's own grammar.
@@ -263,6 +305,20 @@ pub fn try_handle_local_command(
     Ok(false)
 }
 
+/// True when `input` must skip pre-turn command/activation dispatch and be
+/// handled later on the turn path.
+///
+/// `/compact` and `/distill-session` run in the turn dispatcher and need its
+/// persona/session scope; `/audit` needs `DRIVER_CTX` (and takes precedence
+/// over a same-named skill); `/memo` is handled just after this dispatcher and
+/// needs `&mut App` plus an async model call.
+fn is_turn_deferred_command(input: &str) -> bool {
+    compact::compact_command_args(input).is_some()
+        || distill_session::command_args(input).is_some()
+        || audit::parse_audit_command(input).is_some()
+        || memo::memo_command_args(input).is_some()
+}
+
 pub fn try_handle_interactive_command(
     app: &mut App,
     input: &str,
@@ -272,19 +328,9 @@ pub fn try_handle_interactive_command(
     if try_handle_local_command(app, input)? {
         return Ok(true);
     }
-    // Async compaction belongs to the turn dispatcher, not skill activation.
-    if compact::compact_command_args(input).is_some() {
-        return Ok(false);
-    }
-    // `/audit` must be deferred to a turn that already has DRIVER_CTX, so the
-    // session/task identity is not lost during local-command dispatch; it also
-    // takes precedence over explicit activation of a skill with the same name.
-    if audit::parse_audit_command(input).is_some() {
-        return Ok(false);
-    }
-    // `/memo` needs `&mut App` plus an async model call to organize the content
-    // before saving, so it is deferred to the turn dispatcher as well.
-    if memo::memo_command_args(input).is_some() {
+    // Commands that need the turn's session scope, `DRIVER_CTX`, or async
+    // model access skip pre-turn dispatch and run inside the turn itself.
+    if is_turn_deferred_command(input) {
         return Ok(false);
     }
     if try_handle_agent_command(app, input, agent_manifests)? {
@@ -306,8 +352,9 @@ pub fn try_handle_interactive_command(
 /// True when `input` looks like a slash-command invocation: the first
 /// whitespace-separated token starts with `/` or `:` followed by an ASCII
 /// alphanumeric, and contains no further `/`. Absolute paths (`/tmp/foo`),
-/// `//` comments and `:)` emoticons are not commands.
-fn looks_like_slash_command(input: &str) -> bool {
+/// `//` comments and `:)` emoticons are not commands. Remote clients use this
+/// to reject unknown command-shaped input instead of forwarding it to a model.
+pub(crate) fn looks_like_slash_command(input: &str) -> bool {
     let trimmed = input.trim_start();
     let rest = if let Some(rest) = trimmed.strip_prefix('/') {
         rest
@@ -523,6 +570,71 @@ mod tests {
         assert!(!looks_like_slash_command(":)"));
         assert!(!looks_like_slash_command("plain prompt"));
         assert!(!looks_like_slash_command(""));
+    }
+
+    #[test]
+    fn serve_input_routing_separates_local_server_unknown_and_prompt() {
+        use super::{ServeInputRoute, classify_serve_input};
+
+        assert_eq!(
+            classify_serve_input("/history rewind u4"),
+            ServeInputRoute::Unsupported
+        );
+        assert_eq!(
+            classify_serve_input("/compact"),
+            ServeInputRoute::Unsupported
+        );
+        assert_eq!(
+            classify_serve_input("/distill-session abc --dry-run"),
+            ServeInputRoute::ServerCommand
+        );
+        assert_eq!(
+            classify_serve_input("/archive last"),
+            ServeInputRoute::ServerCommand
+        );
+        assert_eq!(
+            classify_serve_input("/memo keep this"),
+            ServeInputRoute::ServerCommand
+        );
+        assert_eq!(
+            classify_serve_input("/task fix login"),
+            ServeInputRoute::ServerCommand
+        );
+        assert_eq!(
+            classify_serve_input("/no-such-command x"),
+            ServeInputRoute::UnknownCommand
+        );
+        assert_eq!(
+            classify_serve_input(":no-such-command"),
+            ServeInputRoute::UnknownCommand
+        );
+        // Path-shaped absolute paths and ordinary prose stay prompts.
+        assert_eq!(
+            classify_serve_input("/tmp/foo"),
+            ServeInputRoute::Prompt
+        );
+        assert_eq!(
+            classify_serve_input("plain prompt"),
+            ServeInputRoute::Prompt
+        );
+    }
+
+    #[test]
+    fn turn_deferred_commands_skip_pre_turn_dispatch() {
+        use super::is_turn_deferred_command;
+
+        for input in [
+            "/compact",
+            "/distill-session",
+            ":distill-session session-1 --dry-run",
+            "/audit -f",
+            "/memo remember this",
+        ] {
+            assert!(is_turn_deferred_command(input), "{input}");
+        }
+        for input in ["/history last", "/archive", "/task x", "plain prompt"] {
+            assert!(!is_turn_deferred_command(input), "{input}");
+        }
     }
 
     #[test]

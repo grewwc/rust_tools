@@ -29,7 +29,7 @@ const HISTORY_PREVIEW_MAX_CHARS: usize = 160;
 
 fn print_history_help() {
     println!(
-        "/history usage:\n  /history [N]           Show last N messages (default: {default}, max: {max})\n  /history full          Show full messages (up to {full})\n  /history user/assistant/tool/system\n                         Filter by role (up to {max} matching messages)\n  /history grep <keyword>  Search messages by keyword\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history export [path] Export to file\n  /history copy          Copy to clipboard\n  /history last          Replay the last assistant message with markdown rendering\n  /history replay        Replay the last turn's assistant conclusion (text only)\n  /history <session> [N] Show last N messages of another session (no switch)\n  /history <session> last [N]\n                         Replay the Nth recent assistant message of another session with markdown rendering\n  /history <session> replay\n                         Replay the last assistant conclusion of another session\n  /history help            Show this help",
+        "/history usage:\n  /history [N]           Show last N messages (default: {default}, max: {max})\n  /history full          Show full messages (up to {full})\n  /history user/assistant/tool/system\n                         Filter by role (up to {max} matching messages)\n  /history u<N>          Replay the assistant reply to user message u<N>\n  /history grep <keyword>  Search messages by keyword\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history export [path] Export to file\n  /history copy          Copy to clipboard\n  /history last          Replay the last assistant message with markdown rendering\n  /history replay        Replay the last turn's assistant conclusion (text only)\n  /history <session> [N] Show last N messages of another session (no switch)\n  /history @<session> ... Explicitly select a session whose id conflicts with a command\n  /history <session> last [N]\n                         Replay the Nth recent assistant message of another session with markdown rendering\n  /history <session> replay\n                         Replay the last assistant conclusion of another session\n  /history help            Show this help",
         default = HISTORY_PREVIEW_DEFAULT_COUNT,
         max = HISTORY_PREVIEW_MAX_COUNT,
         full = HISTORY_PREVIEW_FULL_COUNT,
@@ -141,6 +141,7 @@ enum LocalCommand {
     CopyHistory(HistoryPreviewOptions),
     RewindHistory(HistoryRewindTarget),
     RenderHistoryMessageAt(usize),
+    RenderHistoryUserReply(usize),
     ReplayHistory,
     ShowOtherSessionHistory {
         session_id: String,
@@ -220,6 +221,9 @@ fn handle_local_command_inner(app: &mut App, input: &str) -> Result<bool, Box<dy
         LocalCommand::RenderHistoryMessageAt(nth_back) => {
             render_history_message_at(app, nth_back)?;
         }
+        LocalCommand::RenderHistoryUserReply(user_ordinal) => {
+            render_history_user_reply(app, user_ordinal)?;
+        }
         LocalCommand::ReplayHistory => {
             println!("{}", render_history_replay(app)?);
         }
@@ -227,8 +231,7 @@ fn handle_local_command_inner(app: &mut App, input: &str) -> Result<bool, Box<dy
             session_id,
             options,
         } => {
-            let (resolved_id, history_file) =
-                resolve_other_session_history_file(app, &session_id)?;
+            let (resolved_id, history_file) = resolve_other_session_history_file(app, &session_id)?;
             println!(
                 "{}",
                 render_history_preview_for_path(Some(&resolved_id), &history_file, options)?
@@ -239,29 +242,28 @@ fn handle_local_command_inner(app: &mut App, input: &str) -> Result<bool, Box<dy
             options,
             path,
         } => {
-            let (resolved_id, history_file) =
-                resolve_other_session_history_file(app, &session_id)?;
-            let path =
-                path.unwrap_or_else(|| default_other_session_export_path(&resolved_id));
+            let (resolved_id, history_file) = resolve_other_session_history_file(app, &session_id)?;
+            let path = path.unwrap_or_else(|| default_other_session_export_path(&resolved_id));
             let rendered =
                 render_history_preview_for_path(Some(&resolved_id), &history_file, options)?;
             fs::write(&path, rendered)?;
-            println!("[history] Exported session {resolved_id} to {}", path.display());
+            println!(
+                "[history] Exported session {resolved_id} to {}",
+                path.display()
+            );
         }
         LocalCommand::CopyOtherSessionHistory {
             session_id,
             options,
         } => {
-            let (resolved_id, history_file) =
-                resolve_other_session_history_file(app, &session_id)?;
+            let (resolved_id, history_file) = resolve_other_session_history_file(app, &session_id)?;
             let rendered =
                 render_history_preview_for_path(Some(&resolved_id), &history_file, options)?;
             string_content::set_clipboard_content(&rendered)?;
             println!("[history] Copied session {resolved_id} preview to clipboard.");
         }
         LocalCommand::ReplayOtherSessionHistory { session_id } => {
-            let (resolved_id, history_file) =
-                resolve_other_session_history_file(app, &session_id)?;
+            let (resolved_id, history_file) = resolve_other_session_history_file(app, &session_id)?;
             println!(
                 "{}",
                 render_history_replay_for_path(Some(&resolved_id), &history_file)?
@@ -271,8 +273,7 @@ fn handle_local_command_inner(app: &mut App, input: &str) -> Result<bool, Box<dy
             session_id,
             nth_back,
         } => {
-            let (resolved_id, history_file) =
-                resolve_other_session_history_file(app, &session_id)?;
+            let (resolved_id, history_file) = resolve_other_session_history_file(app, &session_id)?;
             render_other_session_message_at(&resolved_id, &history_file, nth_back)?;
         }
         LocalCommand::HelpHistory => {
@@ -336,6 +337,30 @@ fn parse_history_local_command(args: &[&str]) -> Result<Option<LocalCommand>, Bo
     if args.first().copied() == Some("rewind") {
         return parse_history_rewind_command(&args[1..])
             .map(|target| Some(LocalCommand::RewindHistory(target)));
+    }
+    if let Some(&first) = args.first()
+        && let Some(session_id) = first.strip_prefix('@')
+    {
+        if session_id.is_empty() {
+            return Err("missing session id after `@`".into());
+        }
+        return parse_other_session_history_command(session_id.to_string(), &args[1..]).map(Some);
+    }
+    if let Some(&first) = args.first()
+        && let Some(raw) = first.strip_prefix('u').or_else(|| first.strip_prefix('U'))
+        && !raw.is_empty()
+        && raw.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        if args.len() > 1 {
+            return Err("`/history u<N>` takes no additional arguments".into());
+        }
+        let user_ordinal = raw
+            .parse::<usize>()
+            .map_err(|_| format!("invalid user message selector: {first}"))?;
+        if user_ordinal == 0 {
+            return Err("user ordinal must be >= 1".into());
+        }
+        return Ok(Some(LocalCommand::RenderHistoryUserReply(user_ordinal)));
     }
     if let Some(&first) = args.first()
         && is_history_session_selector(first)
@@ -497,10 +522,7 @@ fn resolve_other_session_history_file(
         .filter(|session| session.id.starts_with(selector))
         .collect::<Vec<_>>();
     match matches.len() {
-        0 => Err(format!(
-            "session '{selector}' not found; list sessions with /sessions"
-        )
-        .into()),
+        0 => Err(format!("session '{selector}' not found; list sessions with /sessions").into()),
         1 => {
             let id = matches[0].id.clone();
             let path = store.session_history_file(&id);
@@ -750,6 +772,58 @@ pub(crate) fn assistant_conclusion_text_at(
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HistoryUserReplyLookup {
+    Found(String, Option<String>),
+    UserNotFound,
+    ReplyNotFound,
+}
+
+fn is_real_history_user(message: &history::Message) -> bool {
+    message.role == "user" && !history::is_runtime_synthetic_user_message(message)
+}
+
+fn history_user_reply_at_path(
+    history_file: &Path,
+    target_ordinal: usize,
+) -> Result<HistoryUserReplyLookup, Box<dyn Error>> {
+    let messages = history::build_message_arr_for_history_view(history_file)?;
+    let mut user_ordinal = 0usize;
+    let mut target_found = false;
+    let mut reply = None;
+
+    for (message, source_model) in messages {
+        if is_real_history_user(&message) {
+            if target_found {
+                break;
+            }
+            user_ordinal += 1;
+            target_found = user_ordinal == target_ordinal;
+            continue;
+        }
+        if !target_found || message.role != "assistant" {
+            continue;
+        }
+        if message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+        {
+            continue;
+        }
+        let text = searchable_history_content(&message.content);
+        if !text.trim().is_empty() {
+            reply = Some((text, source_model));
+        }
+    }
+
+    Ok(match (target_found, reply) {
+        (_, Some((text, source_model))) => HistoryUserReplyLookup::Found(text, source_model),
+        (true, None) => HistoryUserReplyLookup::ReplyNotFound,
+        (false, None) => HistoryUserReplyLookup::UserNotFound,
+    })
+}
+
 /// `/history last [N]`: replay the Nth most recent assistant conclusion
 /// message (1 = latest), rendered through the terminal markdown renderer.
 fn render_history_message_at(app: &App, nth_back: usize) -> Result<(), Box<dyn Error>> {
@@ -773,6 +847,32 @@ fn render_history_message_at(app: &App, nth_back: usize) -> Result<(), Box<dyn E
             Ok(())
         }
     }
+}
+
+/// `/history u<N>`: replay the final assistant conclusion associated with the
+/// selected user row, stopping at the next user row that `/history user` would
+/// number. Tool-call steps and empty assistant messages are not conclusions.
+fn render_history_user_reply(app: &App, user_ordinal: usize) -> Result<(), Box<dyn Error>> {
+    let history_file = active_history_path(app);
+    match history_user_reply_at_path(&history_file, user_ordinal)? {
+        HistoryUserReplyLookup::Found(text, source_model) => {
+            match source_model {
+                Some(model) => println!(
+                    "[history] Assistant reply to user message u{user_ordinal} (model: {model}):"
+                ),
+                None => println!("[history] Assistant reply to user message u{user_ordinal}:"),
+            }
+            let text = super::turn_runtime::postprocess_terminal_text(text);
+            crate::ai::stream::render_markdown_block(&text)?;
+        }
+        HistoryUserReplyLookup::UserNotFound => {
+            println!("[history] User message u{user_ordinal} was not found.");
+        }
+        HistoryUserReplyLookup::ReplyNotFound => {
+            println!("[history] No assistant conclusion found for user message u{user_ordinal}.");
+        }
+    }
+    Ok(())
 }
 
 /// `/history <session> last [N]`: replay the Nth most recent assistant
@@ -944,7 +1044,8 @@ fn collect_history_messages_for_path(
     let filtered = messages
         .into_iter()
         .filter_map(|(message, source_model)| {
-            let ordinal = if message.role == "user" {
+            let is_real_user = is_real_history_user(&message);
+            let ordinal = if is_real_user {
                 user_ordinal += 1;
                 Some(user_ordinal)
             } else {
@@ -952,7 +1053,7 @@ fn collect_history_messages_for_path(
             };
             let role_matches = match options.role_filter {
                 HistoryRoleFilter::All => true,
-                HistoryRoleFilter::User => message.role == "user",
+                HistoryRoleFilter::User => is_real_user,
                 HistoryRoleFilter::Assistant => message.role == "assistant",
                 HistoryRoleFilter::Tool => message.role == "tool",
                 HistoryRoleFilter::System => crate::ai::history::is_system_like_role(&message.role),
@@ -989,7 +1090,8 @@ fn collect_history_messages(
     let filtered = messages
         .into_iter()
         .filter_map(|(message, source_model)| {
-            let ordinal = if message.role == "user" {
+            let is_real_user = is_real_history_user(&message);
+            let ordinal = if is_real_user {
                 user_ordinal += 1;
                 Some(user_ordinal)
             } else {
@@ -997,7 +1099,7 @@ fn collect_history_messages(
             };
             let role_matches = match options.role_filter {
                 HistoryRoleFilter::All => true,
-                HistoryRoleFilter::User => message.role == "user",
+                HistoryRoleFilter::User => is_real_user,
                 HistoryRoleFilter::Assistant => message.role == "assistant",
                 HistoryRoleFilter::Tool => message.role == "tool",
                 HistoryRoleFilter::System => crate::ai::history::is_system_like_role(&message.role),
@@ -1090,7 +1192,7 @@ fn resolve_rewind_target(
         HistoryRewindTarget::LatestUser => {
             let count = messages
                 .iter()
-                .filter(|message| message.role == "user")
+                .filter(|message| is_real_history_user(message))
                 .count();
             if count == 0 {
                 Err("no user input found in history".into())
@@ -1103,7 +1205,7 @@ fn resolve_rewind_target(
             let mut matches = Vec::new();
             let mut ordinal = 0usize;
             for message in messages {
-                if message.role != "user" {
+                if !is_real_history_user(message) {
                     continue;
                 }
                 ordinal += 1;
@@ -1144,7 +1246,7 @@ fn find_user_message_by_ordinal(
 ) -> Option<(usize, String)> {
     let mut ordinal = 0usize;
     for (idx, message) in messages.iter().enumerate() {
-        if message.role != "user" {
+        if !is_real_history_user(message) {
             continue;
         }
         ordinal += 1;
@@ -1187,8 +1289,7 @@ fn searchable_history_content(value: &serde_json::Value) -> String {
         other => {
             let mut redacted = other.clone();
             history::redact_inline_image_data(&mut redacted);
-            serde_json::to_string(&redacted)
-                .unwrap_or_else(|_| "<non-string content>".to_string())
+            serde_json::to_string(&redacted).unwrap_or_else(|_| "<non-string content>".to_string())
         }
     }
 }
@@ -1262,7 +1363,9 @@ pub(in crate::ai) fn inline_image_filenames(prompt: &str) -> Vec<String> {
         let Some(end_rel) = rest[search_start..].find(IMAGE_PLACEHOLDER_SUFFIX) else {
             break;
         };
-        let name = rest[search_start..search_start + end_rel].trim().to_string();
+        let name = rest[search_start..search_start + end_rel]
+            .trim()
+            .to_string();
         if !name.is_empty() && !names.contains(&name) {
             names.push(name);
         }
@@ -1651,15 +1754,14 @@ fn finalize_question(
 mod tests {
     use super::{
         HISTORY_PREVIEW_DEFAULT_COUNT, HISTORY_PREVIEW_FULL_COUNT, HISTORY_PREVIEW_MAX_COUNT,
-        HistoryAction,
-        HistoryPreviewOptions, HistoryRewindTarget, HistoryRoleFilter, LocalCommand,
-        apply_history_rewind, assistant_conclusion_text_at, extract_at_file_references,
+        HistoryAction, HistoryPreviewOptions, HistoryRewindTarget, HistoryRoleFilter,
+        HistoryUserReplyLookup, LocalCommand, apply_history_rewind, assistant_conclusion_text_at,
+        collect_history_messages_for_path, extract_at_file_references,
         extract_forced_skill_references, finalize_question, highlight_history_keyword,
-        last_assistant_conclusion_text, parse_history_preview_options, parse_local_command,
-        plan_history_rewind, render_history_preview, render_history_replay,
-        inline_image_filenames, resolve_inline_image_path, searchable_history_content,
-        summarize_history_content,
-        truncate_for_terminal,
+        history_user_reply_at_path, inline_image_filenames, last_assistant_conclusion_text,
+        parse_history_preview_options, parse_local_command, plan_history_rewind,
+        render_history_preview, render_history_replay, resolve_inline_image_path,
+        searchable_history_content, summarize_history_content, truncate_for_terminal,
     };
     use crate::ai::{
         history::{self, Message, append_history_messages, append_history_messages_for_model},
@@ -1813,7 +1915,7 @@ mod tests {
             last_turn_interrupted: false,
             prune_marks: Default::default(),
             turn_reasoning_items: Default::default(),
-        turn_tool_errors: Default::default(),
+            turn_tool_errors: Default::default(),
             stale_patch_targets: Default::default(),
             tool_middlewares: Vec::new(),
             llm_middlewares: Vec::new(),
@@ -2011,6 +2113,16 @@ mod tests {
         assert!(parse_local_command("/history last x").is_err());
         assert!(parse_local_command("/history last 2 3").is_err());
         assert_eq!(
+            parse_local_command("/history u205").unwrap(),
+            Some(LocalCommand::RenderHistoryUserReply(205))
+        );
+        assert_eq!(
+            parse_local_command(":history U7").unwrap(),
+            Some(LocalCommand::RenderHistoryUserReply(7))
+        );
+        assert!(parse_local_command("/history u0").is_err());
+        assert!(parse_local_command("/history u2 full").is_err());
+        assert_eq!(
             parse_local_command("/history copy").unwrap(),
             Some(LocalCommand::CopyHistory(HistoryPreviewOptions {
                 count: 6,
@@ -2090,6 +2202,24 @@ mod tests {
                 session_id: "abc123".to_string(),
             })
         );
+        assert!(matches!(
+            parse_local_command("/history @u205").unwrap(),
+            Some(LocalCommand::ShowOtherSessionHistory { session_id, .. }) if session_id == "u205"
+        ));
+        assert_eq!(
+            parse_local_command("/history @u205 last 2").unwrap(),
+            Some(LocalCommand::RenderOtherSessionMessageAt {
+                session_id: "u205".to_string(),
+                nth_back: 2,
+            })
+        );
+        assert_eq!(
+            parse_local_command("/history @u205 replay").unwrap(),
+            Some(LocalCommand::ReplayOtherSessionHistory {
+                session_id: "u205".to_string(),
+            })
+        );
+        assert!(parse_local_command("/history @").is_err());
         assert!(parse_local_command("/history abc123 rewind u3").is_err());
         // Bare numbers and reserved words keep their current-session meaning.
         assert!(matches!(
@@ -2138,7 +2268,10 @@ mod tests {
             HISTORY_PREVIEW_MAX_COUNT
         );
         assert_eq!(
-            parse_history_preview_options(&["assistant"]).unwrap().0.count,
+            parse_history_preview_options(&["assistant"])
+                .unwrap()
+                .0
+                .count,
             HISTORY_PREVIEW_MAX_COUNT
         );
         // `full` keeps its own small count, even combined with a role filter.
@@ -2147,17 +2280,26 @@ mod tests {
             HISTORY_PREVIEW_FULL_COUNT
         );
         assert_eq!(
-            parse_history_preview_options(&["user", "full"]).unwrap().0.count,
+            parse_history_preview_options(&["user", "full"])
+                .unwrap()
+                .0
+                .count,
             HISTORY_PREVIEW_FULL_COUNT
         );
         // A keyword search is not a role filter: it keeps the quick peek.
         assert_eq!(
-            parse_history_preview_options(&["grep", "boom"]).unwrap().0.count,
+            parse_history_preview_options(&["grep", "boom"])
+                .unwrap()
+                .0
+                .count,
             HISTORY_PREVIEW_DEFAULT_COUNT
         );
         // An explicit count wins over the cap default and is clamped to it.
         assert_eq!(
-            parse_history_preview_options(&["user", "50"]).unwrap().0.count,
+            parse_history_preview_options(&["user", "50"])
+                .unwrap()
+                .0
+                .count,
             50
         );
         assert_eq!(
@@ -2262,8 +2404,8 @@ mod tests {
 
     #[test]
     fn history_role_filter_returns_every_match_not_only_the_default_peek() {
-        let history_path = std::env::temp_dir()
-            .join(format!("ai-history-role-filter-{}.sqlite", Uuid::new_v4()));
+        let history_path =
+            std::env::temp_dir().join(format!("ai-history-role-filter-{}.sqlite", Uuid::new_v4()));
         let mut app = test_app();
         app.session_history_file = history_path.clone();
 
@@ -2295,8 +2437,8 @@ mod tests {
 
     #[test]
     fn render_history_preview_shows_source_model_for_assistant_messages() {
-        let history_path = std::env::temp_dir()
-            .join(format!("ai-history-model-{}.sqlite", Uuid::new_v4()));
+        let history_path =
+            std::env::temp_dir().join(format!("ai-history-model-{}.sqlite", Uuid::new_v4()));
         let mut app = test_app();
         app.session_history_file = history_path.clone();
 
@@ -2612,6 +2754,115 @@ mod tests {
             Some("first answer")
         );
         assert_eq!(assistant_conclusion_text_at(&app, 4).unwrap(), None);
+
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn history_user_reply_selects_final_conclusion_before_next_user() {
+        let history_path =
+            std::env::temp_dir().join(format!("ai-history-user-reply-{}.sqlite", Uuid::new_v4()));
+        let tool_step = Message {
+            role: "assistant".to_string(),
+            content: Value::String("tool preface".to_string()),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: "call_1".to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        append_history_messages_for_model(
+            &history_path,
+            &[
+                test_message("user", "first question"),
+                test_message("assistant", "first answer"),
+                test_message("user", "middle question"),
+                tool_step,
+                test_message("tool", "tool result"),
+                test_message("assistant", "draft answer"),
+                test_message("assistant", "final middle answer"),
+                test_message("user", "later question"),
+                test_message("assistant", "later answer"),
+                test_message("user", "unanswered question"),
+            ],
+            "reply-model",
+        )
+        .unwrap();
+
+        assert_eq!(
+            history_user_reply_at_path(&history_path, 2).unwrap(),
+            HistoryUserReplyLookup::Found(
+                "final middle answer".to_string(),
+                Some("reply-model".to_string())
+            )
+        );
+        assert_eq!(
+            history_user_reply_at_path(&history_path, 4).unwrap(),
+            HistoryUserReplyLookup::ReplyNotFound
+        );
+        assert_eq!(
+            history_user_reply_at_path(&history_path, 5).unwrap(),
+            HistoryUserReplyLookup::UserNotFound
+        );
+
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn history_user_ordinals_ignore_runtime_synthetic_messages() {
+        let history_path = std::env::temp_dir().join(format!(
+            "ai-history-real-user-ordinals-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let synthetic =
+            history::runtime_synthetic_user_message(serde_json::json!("runtime image follow-up"));
+        append_history_messages(
+            &history_path,
+            &[
+                test_message("user", "first question"),
+                synthetic,
+                test_message("assistant", "first answer after follow-up"),
+                test_message("user", "second question"),
+                test_message("assistant", "second answer"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            history_user_reply_at_path(&history_path, 1).unwrap(),
+            HistoryUserReplyLookup::Found("first answer after follow-up".to_string(), None)
+        );
+        assert_eq!(
+            history_user_reply_at_path(&history_path, 2).unwrap(),
+            HistoryUserReplyLookup::Found("second answer".to_string(), None)
+        );
+
+        let users = collect_history_messages_for_path(
+            &history_path,
+            HistoryPreviewOptions {
+                count: 20,
+                full: false,
+                role_filter: HistoryRoleFilter::User,
+                grep: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].user_ordinal, Some(1));
+        assert_eq!(users[1].user_ordinal, Some(2));
+
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+        let rewind = plan_history_rewind(&app, HistoryRewindTarget::UserOrdinal(2))
+            .expect("second real user should resolve");
+        assert_eq!(rewind.user_ordinal, 2);
+        assert_eq!(rewind.keep_messages.len(), 3);
+        assert_eq!(rewind.removed_messages, 2);
 
         let _ = std::fs::remove_file(history_path);
     }
@@ -2951,7 +3202,9 @@ mod tests {
         app.config.history_file = std::env::temp_dir().join("serve-guard-history.sqlite");
         let result = super::next_question(&mut app);
         crate::ai::background::set_serve_child_for_test(false);
-        let ctx = result.expect("serve child first question").expect("question");
+        let ctx = result
+            .expect("serve child first question")
+            .expect("question");
         assert_eq!(ctx.question, "hello");
     }
 
@@ -3059,9 +3312,7 @@ fn room_badge_for_input(history_file: &Path) -> Option<String> {
     for room in &names {
         let state_path = crate::ai::driver::talk::talk_rooms_dir(history_file)
             .join(format!("{room}.state.json"));
-        let mtime = fs::metadata(&state_path)
-            .and_then(|m| m.modified())
-            .ok();
+        let mtime = fs::metadata(&state_path).and_then(|m| m.modified()).ok();
         if let Ok(st) = crate::ai::driver::task::room_status(history_file, room) {
             if st.status != crate::ai::driver::task::TaskStatus::Closed {
                 let members: Vec<(String, bool)> = st
@@ -3096,13 +3347,7 @@ fn room_badge_for_input(history_file: &Path) -> Option<String> {
                     .collect();
                 open.push((
                     st.room.clone(),
-                    format_room_badge_body(
-                        "discuss",
-                        &st.room,
-                        st.round,
-                        st.max_rounds,
-                        &members,
-                    ),
+                    format_room_badge_body("discuss", &st.room, st.round, st.max_rounds, &members),
                     mtime,
                 ));
             }

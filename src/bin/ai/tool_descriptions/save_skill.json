@@ -1,6 +1,6 @@
 {
   "name": "save_skill",
-  "description": "Render and save a skill into the configured skills directory. Simple skills are saved as a single .skill file; complex skills with references/examples/scripts and nested sub-skills are saved as a directory package (SKILL.md + subskills/). Use proactively to persist reusable skills, including splitting a complex skill into multiple sub-skills. Saving a package for a name that already exists as a single `.skill` file deletes that old file permanently; pass `overwrite=false` to fail instead.",
+  "description": "Render and save a skill into the configured skills directory. Simple skills are saved as a single .skill file; complex skills are saved as a directory package (SKILL.md + subskills/). Use proactively to persist reusable skills, including splitting a complex skill into multiple sub-skills. Saving a package for a name that already exists as a single `.skill` file deletes that old file.",
   "first_use_guidance": "Guidance for distilling session experience into a reusable skill:\n- Gather evidence first with search_overflow (past turns) and knowledge_search (saved facts); quote behavior, not project specifics.\n- Generalize before saving: no absolute paths, hostnames, tokens, or single-project identifiers; state goal, inputs, steps, and done criteria.\n- Iterate safely: save_skill with dry_run=true previews the rendered skill without writing; validate_skill checks the exact arguments; only then save without dry_run.\n- Prefer validate_skill over re-saving to fix drafts, and delete_skill to remove a bad skill.",
   "parameters": {
     "type": "object",
@@ -56,7 +56,7 @@
       },
       "file_name": {
         "type": "string",
-        "description": "Optional output filename for simple single-file mode (forces .skill suffix, sanitized). In package mode (when resources/references/examples/scripts/subskills are provided) this field is IGNORED — directory name is derived from `name` via safe_skill_dir_name; do not rely on file_name to name the package directory."
+        "description": "Optional output filename for simple single-file mode (forces .skill suffix, sanitized). In package mode this field is IGNORED — directory name is derived from `name` via safe_skill_dir_name; do not rely on file_name to name the package directory."
       },
       "overwrite": {
         "type": "boolean",

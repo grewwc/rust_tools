@@ -1,6 +1,6 @@
 {
   "name": "task_wait",
-  "description": "Wait for one or more task_spawn subagent tasks to complete and collect their results. timeout_secs bounds this call: on expiry it returns the collected results plus a note that the rest are still running — call again with the same task_ids. Responses include pending tasks' latest live progress/checkpoint snapshots. It can also return early with a PARKED status while tasks are still running; re-call with the same task_ids.",
+  "description": "Wait for one or more task_spawn subagent tasks to complete and collect their results. timeout_secs bounds this call: on expiry it returns the collected results plus a note that the rest are still running. Responses include pending tasks' latest live progress/checkpoint snapshots. It can also return early with a PARKED status while tasks are still running; in both cases call again with the same task_ids.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -23,7 +23,7 @@
           "all",
           "any"
         ],
-        "description": "'any' (default) returns on the first finisher; 'all' collects every finished result but returns early (PARKED) while any task is still running; call `task_wait` again with the same task_ids. Remaining tasks stay alive and can be retrieved later."
+        "description": "'any' (default) returns on the first finisher; 'all' collects every finished result but returns early (PARKED) while any task is still running. Remaining tasks stay alive and can be retrieved later."
       }
     },
     "required": [

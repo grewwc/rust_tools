@@ -44,6 +44,10 @@ pub(in crate::ai) struct SessionListMetadata {
     pub(in crate::ai) history_revision: i64,
     /// Whether the user marked this session as important via `/mark`.
     pub(in crate::ai) marked: bool,
+    /// Whether the user formally archived this session via `/archive`.
+    /// Archived sessions stay readable but are hidden from the default
+    /// `/ss` list, refused by `/ss use`, and skipped by prune.
+    pub(in crate::ai) archived: bool,
 }
 /// Atomically reserves a session-global turn sequence number.
 ///

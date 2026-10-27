@@ -32,6 +32,7 @@ pub(in crate::ai) const CANONICAL_SESSION_SUBCOMMANDS: &[&str] = &[
     "clear-all",
     "dump-history",
     "export",
+    "archive",
     "markdown",
     "import",
     "fork",
@@ -398,18 +399,21 @@ pub(crate) const MAX_PRUNE_DAYS: i64 = 3_650_000;
 
 /// Selects sessions inactive for N days: those whose `modified_local` is earlier
 /// than `cutoff` count as expired. The current session and sessions marked
-/// important via `/mark` are never deleted; sessions without a timestamp cannot
-/// be age-ordered and are conservatively skipped.
+/// important via `/mark` are never deleted. Formally archived sessions
+/// (`/archive`) are skipped unless `include_archived` is set; sessions
+/// without a timestamp cannot be age-ordered and are conservatively skipped.
 pub(crate) fn select_stale_sessions<'a>(
     sessions: &'a [SessionInfo],
     current_session_id: &str,
     cutoff: chrono::DateTime<chrono::Local>,
+    include_archived: bool,
 ) -> Vec<&'a SessionInfo> {
     sessions
         .iter()
         .filter(|s| {
             s.id != current_session_id
                 && !s.marked
+                && (include_archived || !s.archived)
                 && s.modified_local.map(|t| t < cutoff).unwrap_or(false)
         })
         .collect()
@@ -461,8 +465,10 @@ fn worker_session_room(id: &str) -> Option<(&'static str, String)> {
     Some((label, room.to_string()))
 }
 
-/// One `/ss` row: mark, id, mtime, size, summary. Shared by the default, `all`
-/// and `workers` views so the three stay byte-aligned.
+/// One `/ss` row: mark, id, mtime, size, summary. Shared by the default,
+/// `all`, `workers` and `archive` views so they stay byte-aligned.
+/// Archived sessions carry an explicit ` [archived]` suffix (visible in
+/// piped output too) and render dimmed on a terminal.
 fn print_session_row(
     s: &SessionInfo,
     current_session_id: &str,
@@ -483,6 +489,11 @@ fn print_session_row(
         .as_deref()
         .filter(|v| !v.is_empty())
         .unwrap_or("-");
+    let summary = if s.archived {
+        format!("{summary} [archived]")
+    } else {
+        summary.to_string()
+    };
     let size = if verbose {
         format_size(s.size_bytes)
     } else {
@@ -490,6 +501,8 @@ fn print_session_row(
     };
     let (style_open, style_close) = if s.marked {
         marked_session_style()
+    } else if s.archived && std::io::stdout().is_terminal() {
+        (crate::ai::theme::DIM, crate::ai::theme::RESET)
     } else {
         ("", "")
     };
@@ -617,6 +630,7 @@ pub fn try_handle_session_command(
     let top_level_fork = cmd == "fork";
     let top_level_mark = cmd == "mark";
     let top_level_unmark = cmd == "unmark";
+    let top_level_archive = cmd == "archive";
     if cmd != "sessions"
         && cmd != "session"
         && cmd != "ss"
@@ -625,6 +639,7 @@ pub fn try_handle_session_command(
         && !top_level_fork
         && !top_level_mark
         && !top_level_unmark
+        && !top_level_archive
     {
         return Ok(false);
     }
@@ -638,6 +653,8 @@ pub fn try_handle_session_command(
         "mark"
     } else if top_level_unmark {
         "unmark"
+    } else if top_level_archive {
+        "archive"
     } else if cmd == "session" {
         // Bare `/session` (no subcommand) shows the current session id — the
         // intuitive reading of the singular name. `/sessions` and `/ss` keep
@@ -653,10 +670,11 @@ pub fn try_handle_session_command(
         "help" | "h" => {
             println!("Session management commands:");
             println!();
-            println!("  /sessions [list]          list sessions (default, no sizes; discuss/task workers hidden)");
+            println!("  /sessions [list]          list sessions (default, no sizes; workers and archived sessions hidden, current always shown)");
             println!("  /sessions workers         list discuss/task worker sessions grouped by room");
-            println!("  /sessions all             list all sessions including workers");
-            println!("  /sessions verbose         list sessions with per-session sizes (combines with workers/all)");
+            println!("  /sessions archive         list formally archived sessions");
+            println!("  /sessions all             list all sessions including workers and archived");
+            println!("  /sessions verbose         list sessions with per-session sizes (combines with workers/archive/all)");
             println!("  /sessions current         show current session info");
             println!("  /session [id]             show current session id (bare /session too)");
             println!("  /sessions new             create and switch to new session");
@@ -673,6 +691,9 @@ pub fn try_handle_session_command(
             );
             println!(
                 "  /unmark [<id>|current|last|--]  remove the important mark from a session (default: current; `--` forces current)"
+            );
+            println!(
+                "  /archive [<id>|current|last]     toggle formal archive of a session (default: current; archived sessions are hidden from `/ss`, refused by `/ss use`, and skipped by prune; `/ss archive` lists them)"
             );
             println!(
                 "  /sessions message [id]     show the mark message of a session (default: current; `last` = most recent)"
@@ -692,7 +713,7 @@ pub fn try_handle_session_command(
             );
             println!("  /sessions clear-all       delete all sessions");
             println!(
-                "  /sessions prune <days>    delete sessions inactive for N days (current and marked sessions are kept)"
+                "  /sessions prune <days> [--include-archived]  delete sessions inactive for N days (current, marked and (by default) archived sessions are kept)"
             );
             println!(
                 "  /sessions dump-history <id>              dump session history to JSON (<id>-history.json)"
@@ -720,9 +741,12 @@ pub fn try_handle_session_command(
             // recursion is the only heavy work of `/ss`); only explicit `verbose`
             // (`/ss verbose` or `/ss list verbose`) stats them in parallel.
             // Discuss/task worker sessions are hidden by default: `/ss workers`
-            // shows them grouped by room, `/ss all` shows everything. Tokens
-            // are order-free (`/ss verbose workers` works); `all` wins over
-            // `workers` when both are given.
+            // shows them grouped by room, `/ss all` shows everything.
+            // Formally archived sessions are hidden by default as well
+            // (`/ss archive` lists them); the current session is always shown
+            // even when archived, so archiving it never hides where you are.
+            // Tokens are order-free (`/ss verbose workers` works); `all` wins
+            // over `workers` when both are given.
             let mut workers_only = action == "workers";
             let mut show_all = action == "all";
             let mut verbose = action == "verbose";
@@ -746,12 +770,15 @@ pub fn try_handle_session_command(
             if workers_only {
                 print_worker_sessions(&sessions, &app.session_id, verbose);
             } else {
-                let hidden = if show_all {
-                    0
+                let (hidden_workers, hidden_archived) = if show_all {
+                    (0, 0)
                 } else {
                     let before = sessions.len();
                     sessions.retain(|s| worker_session_room(&s.id).is_none());
-                    before - sessions.len()
+                    let hidden_workers = before - sessions.len();
+                    let before = sessions.len();
+                    sessions.retain(|s| !s.archived || s.id == app.session_id);
+                    (hidden_workers, before - sessions.len())
                 };
                 if sessions.is_empty() {
                     println!("No sessions.");
@@ -765,10 +792,16 @@ pub fn try_handle_session_command(
                         println!("(run `/ss verbose` to include per-session sizes)");
                     }
                 }
-                if hidden > 0 {
+                if hidden_workers > 0 {
                     println!(
-                        "({hidden} worker session{} hidden; `/ss workers` to view, `/ss all` for everything)",
-                        if hidden == 1 { "" } else { "s" }
+                        "({hidden_workers} worker session{} hidden; `/ss workers` to view, `/ss all` for everything)",
+                        if hidden_workers == 1 { "" } else { "s" }
+                    );
+                }
+                if hidden_archived > 0 {
+                    println!(
+                        "({hidden_archived} archived session{} hidden; `/ss archive` to view, `/ss all` for everything)",
+                        if hidden_archived == 1 { "" } else { "s" }
                     );
                 }
             }
@@ -788,6 +821,8 @@ pub fn try_handle_session_command(
                 println!("size: {}", format_size(size));
                 let marked = store.read_session_marked(&app.session_id).unwrap_or(false);
                 println!("marked: {}", if marked { "yes" } else { "no" });
+                let archived = store.read_session_archived(&app.session_id).unwrap_or(false);
+                println!("archived: {}", if archived { "yes" } else { "no" });
                 if marked {
                     match store.read_session_mark_message(&app.session_id) {
                         Ok(message) if !message.is_empty() => println!("mark-message: {message}"),
@@ -883,6 +918,88 @@ pub fn try_handle_session_command(
                 Err(err) => eprintln!("[unmark] failed to unmark session: {err}"),
             }
         }
+        "archive" => {
+            // Top-level `/archive` toggles only; `/ss archive` lists only.
+            // The toggle defaults to the current session (like `/mark`); the
+            // list accepts an order-free `verbose` for per-session sizes.
+            if top_level_archive {
+                let words: Vec<&str> = parts.collect();
+                // First token is the selector; the rest is drained (mirrors
+                // `/unmark`). `verbose` is not special here: `/archive
+                // verbose` fails to resolve instead of archiving current by
+                // surprise.
+                let selector = words.first().copied().unwrap_or("current");
+                // `current` (and the bare default) skips the existence check:
+                // the write path creates the record, and a fresh session has
+                // no history file yet. Explicit ids and `last` still must
+                // exist.
+                let target = if selector == "current" {
+                    app.session_id.clone()
+                } else {
+                    match resolve_existing_session_selector(&store, &app.session_id, selector) {
+                        Ok(id) => id,
+                        Err(error) => {
+                            eprintln!("Failed to resolve session '{selector}': {error}");
+                            return Ok(true);
+                        }
+                    }
+                };
+                let archived = store.read_session_archived(&target).unwrap_or(false);
+                if let Err(err) = store.write_session_archived(&target, !archived) {
+                    eprintln!("[archive] failed to update session: {err}");
+                    return Ok(true);
+                }
+                if archived {
+                    println!("Unarchived session: {target}");
+                } else {
+                    // A suspended binding would let the next `a` launch silently
+                    // resume back into the just-archived session, so drop it like
+                    // `/close` does. Unarchiving restores nothing: the user
+                    // re-suspends naturally if needed.
+                    let suspended = SuspendedSessionStore::new();
+                    if let Err(err) = suspended.remove_for_session(&target, None) {
+                        eprintln!("[archive] failed to clear suspended bindings: {err}");
+                    }
+                    println!(
+                        "Archived session: {target} (hidden from `/ss`, refused by `/ss use`, skipped by prune; run `/archive {target}` again to unarchive)"
+                    );
+                }
+                return Ok(true);
+            }
+            let words: Vec<&str> = parts.collect();
+            let verbose = words.iter().any(|w| *w == "verbose");
+            if let Some(stray) = words.iter().find(|w| **w != "verbose") {
+                println!(
+                    "`/ss archive` only lists archived sessions; run `/archive {stray}` to toggle."
+                );
+            }
+            let mut sessions = match store.list_sessions() {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    eprintln!("Failed to list sessions: {error}");
+                    return Ok(true);
+                }
+            };
+            if verbose {
+                if let Err(error) = store.attach_session_sizes(&mut sessions) {
+                    eprintln!("Failed to compute session sizes: {error}");
+                    return Ok(true);
+                }
+            }
+            let archived: Vec<&SessionInfo> =
+                sessions.iter().filter(|s| s.archived).collect();
+            if archived.is_empty() {
+                println!("No archived sessions.");
+                return Ok(true);
+            }
+            let max_id_len = archived.iter().map(|s| s.id.len()).max().unwrap_or(36);
+            for s in archived {
+                print_session_row(s, &app.session_id, max_id_len, verbose);
+            }
+            if !verbose {
+                println!("(run `/ss archive verbose` to include per-session sizes)");
+            }
+        }
         "message" | "mark-message" | "mark_message" => {
             let selector = parts.next().unwrap_or("current");
             let id = match resolve_existing_session_selector(&store, &app.session_id, selector)
@@ -922,6 +1039,14 @@ pub fn try_handle_session_command(
             }
             if !store.session_exists(id)? {
                 println!("Session not found: {id}");
+                return Ok(true);
+            }
+            // Archived sessions cannot be attached for continued conversation;
+            // unarchiving is an explicit `/archive` toggle first.
+            if store.read_session_archived(id).unwrap_or(false) {
+                println!(
+                    "Session is archived and cannot be attached: {id} (run `/archive {id}` to unarchive it first)"
+                );
                 return Ok(true);
             }
             crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
@@ -1341,12 +1466,15 @@ pub fn try_handle_session_command(
             println!("Deleted {deleted} session(s). Switched to new session: {new_id}");
         }
         "prune" | "delete-old" | "delete_old" | "purge" | "gc" | "stale" => {
-            // /sessions prune <days>: delete sessions inactive for N days (the
-            // current session is never deleted).
+            // /sessions prune <days> [--include-archived]: delete sessions
+            // inactive for N days (the current session is never deleted;
+            // archived sessions are skipped unless opted in).
             let Some(days_str) = parts.next() else {
                 println!("missing days. try: /sessions prune <days>");
                 return Ok(true);
             };
+            let rest: Vec<&str> = parts.collect();
+            let include_archived = rest.iter().any(|arg| *arg == "--include-archived");
             let Ok(days) = days_str.parse::<i64>() else {
                 println!("invalid days: '{}'", days_str);
                 return Ok(true);
@@ -1364,7 +1492,8 @@ pub fn try_handle_session_command(
             }
             let cutoff = chrono::Local::now() - chrono::Duration::days(days);
             let sessions = store.list_sessions()?;
-            let stale = select_stale_sessions(&sessions, &app.session_id, cutoff);
+            let stale =
+                select_stale_sessions(&sessions, &app.session_id, cutoff, include_archived);
             // Marked sessions are excluded above; report how many were spared so
             // the "nothing deleted" case does not look like missing data.
             let marked_kept = sessions
@@ -1375,15 +1504,38 @@ pub fn try_handle_session_command(
                         && s.modified_local.map(|t| t < cutoff).unwrap_or(false)
                 })
                 .count();
+            // Archived sessions are excluded by default; report them the same
+            // way (an archive racing the confirmation is also caught below by
+            // the unchanged check, since archiving refreshes activity time).
+            let archived_kept = if include_archived {
+                0
+            } else {
+                sessions
+                    .iter()
+                    .filter(|s| {
+                        s.id != app.session_id
+                            && s.archived
+                            && s.modified_local.map(|t| t < cutoff).unwrap_or(false)
+                    })
+                    .count()
+            };
             if stale.is_empty() {
                 println!("No sessions inactive for {} day(s).", days);
                 if marked_kept > 0 {
                     println!("({marked_kept} marked session(s) kept)");
                 }
+                if archived_kept > 0 {
+                    println!("({archived_kept} archived session(s) kept; pass --include-archived to prune them too)");
+                }
                 return Ok(true);
             }
+            let kept_clause = if include_archived {
+                "current and marked sessions kept"
+            } else {
+                "current, marked and archived sessions kept"
+            };
             println!(
-                "Found {} session(s) inactive for {} day(s) (current and marked sessions kept):",
+                "Found {} session(s) inactive for {} day(s) ({kept_clause}):",
                 stale.len(),
                 days
             );
@@ -2478,6 +2630,7 @@ mod tests {
             first_user_prompt: None,
             summary: None,
             marked: false,
+            archived: false,
         }
     }
 
@@ -2492,11 +2645,131 @@ mod tests {
                 marked: true,
                 ..make_session_info("marked-old", Some(40))
             },
+            SessionInfo {
+                archived: true,
+                ..make_session_info("archived-old", Some(40))
+            },
         ];
         let cutoff = Local::now() - Duration::days(30);
-        let stale = select_stale_sessions(&sessions, "current", cutoff);
+        let stale = select_stale_sessions(&sessions, "current", cutoff, false);
         let stale_ids: Vec<&str> = stale.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(stale_ids, vec!["old"]);
+        // Opting in prunes archived sessions too, while marked/current stay kept.
+        let stale = select_stale_sessions(&sessions, "current", cutoff, true);
+        let stale_ids: Vec<&str> = stale.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(stale_ids, vec!["old", "archived-old"]);
+    }
+
+    fn write_single_user_message(store: &SessionStore, id: &str) {
+        append_history_messages(
+            &store.session_history_file(id),
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("hi".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn archive_toggle_blocks_use_until_unarchived() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let id = "arch-target-1";
+        write_single_user_message(&store, id);
+
+        // First toggle archives; the flag is visible via both the direct
+        // read and the store list.
+        assert!(try_handle_session_command(&mut app, "/archive arch-target-1").unwrap());
+        assert!(store.read_session_archived(id).unwrap());
+        assert!(
+            store
+                .list_sessions()
+                .unwrap()
+                .iter()
+                .find(|s| s.id == id)
+                .is_some_and(|s| s.archived)
+        );
+
+        // Attach is refused while archived; the app stays on its session.
+        let before = app.session_id.clone();
+        assert!(try_handle_session_command(&mut app, "/sessions use arch-target-1").unwrap());
+        assert_eq!(app.session_id, before);
+
+        // Toggling again unarchives (no separate unarchive command), and
+        // attach works.
+        assert!(try_handle_session_command(&mut app, "/archive arch-target-1").unwrap());
+        assert!(!store.read_session_archived(id).unwrap());
+        assert!(try_handle_session_command(&mut app, "/sessions use arch-target-1").unwrap());
+        assert_eq!(app.session_id, id);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bare_archive_toggles_current_session() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let current = app.session_id.clone();
+        write_single_user_message(&store, &current);
+
+        // Bare `/archive` toggles the current session (like `/mark`); the
+        // archived list lives under `/ss archive` now.
+        assert!(try_handle_session_command(&mut app, "/archive").unwrap());
+        assert!(store.read_session_archived(&current).unwrap());
+        assert!(try_handle_session_command(&mut app, "/archive").unwrap());
+        assert!(!store.read_session_archived(&current).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bare_archive_works_on_fresh_current_session() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let current = app.session_id.clone();
+        // No message written: the fresh current session has no record yet.
+
+        assert!(!store.session_exists(&current).unwrap());
+        assert!(try_handle_session_command(&mut app, "/archive").unwrap());
+        assert!(store.read_session_archived(&current).unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fork_of_archived_session_starts_unarchived() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        write_single_user_message(&store, "arch-src-1");
+        store.write_session_archived("arch-src-1", true).unwrap();
+
+        store.fork_session("arch-src-1", "arch-fork-1").unwrap();
+
+        // The source stays archived; the new branch is active work.
+        assert!(store.read_session_archived("arch-src-1").unwrap());
+        assert!(!store.read_session_archived("arch-fork-1").unwrap());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2698,7 +2971,7 @@ mod tests {
 
         let cutoff = Local::now() - Duration::days(30);
         let sessions = store.list_sessions().unwrap();
-        let stale = select_stale_sessions(&sessions, &app.session_id, cutoff);
+        let stale = select_stale_sessions(&sessions, &app.session_id, cutoff, false);
         let mut stale_ids: Vec<String> = stale.iter().map(|s| s.id.clone()).collect();
         stale_ids.sort();
         assert_eq!(
@@ -2960,7 +3233,8 @@ mod tests {
                 .find(|s| s.id == "sess-marked-old")
                 .is_some_and(|s| s.marked)
         );
-        let stale_ids: Vec<String> = select_stale_sessions(&sessions, &app.session_id, cutoff)
+        let stale_ids: Vec<String> =
+            select_stale_sessions(&sessions, &app.session_id, cutoff, false)
             .iter()
             .map(|s| s.id.clone())
             .collect();

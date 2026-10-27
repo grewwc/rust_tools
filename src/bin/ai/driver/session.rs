@@ -241,6 +241,21 @@ where
         startup_notice: None,
     };
 
+    // An archived session cannot be attached for continued conversation, the
+    // same rule `/ss use` enforces. A missing session reads as active, so
+    // `--session <new-id>` still creates on demand.
+    if cli.session.is_some()
+        && SessionStore::new(&choice.history_file)
+            .read_session_archived(&choice.session_id)
+            .unwrap_or(false)
+    {
+        return Err(format!(
+            "session '{}' is archived and cannot be attached (run `a /archive {}` to unarchive it first)",
+            choice.session_id, choice.session_id
+        )
+        .into());
+    }
+
     if !should_resume_suspended_terminal_session(cli) {
         return Ok(choice);
     }
@@ -285,6 +300,19 @@ where
                     Some("[resume] 选中的挂起 session 已不存在，已创建新 session。".to_string());
                 return Ok(choice);
             };
+            // The binding was already consumed above; when its session was
+            // archived after suspending, start fresh instead of resuming into
+            // an archived session.
+            let archived = SessionStore::new(entry.history_file.as_path())
+                .read_session_archived(&entry.session_id)
+                .unwrap_or(false);
+            if archived {
+                choice.startup_notice = Some(format!(
+                    "[resume] 选中的挂起 session {} 已归档，无法恢复，已创建新 session。（先运行 `a /archive {}` 解档）",
+                    entry.session_id, entry.session_id
+                ));
+                return Ok(choice);
+            }
             choice.history_file = entry.history_file.clone();
             choice.session_id = entry.session_id.clone();
             // Restore the model saved at suspension time instead of using the default model.

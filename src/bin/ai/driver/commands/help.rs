@@ -18,15 +18,22 @@ fn print_commands_help() {
         "    /cd [dir]                 show or change the session working directory (\"-\" goes back)"
     );
     println!("    /pwd                      show the session working directory (same as bare /cd)");
-    println!("    /audit <instruction>      run the audit subagent synchronously (up to 15 min), then verify and fix findings");
+    println!(
+        "    /audit <instruction>      run the audit subagent synchronously (up to 15 min), then verify and fix findings"
+    );
     println!(
         "    /changes [/diff] [--stat|--json|--patch|--open]  show session file changes & open diff externally"
     );
     println!("    /clear                    clear the terminal screen");
     println!("    /compact                  compact session context; preserve full history");
-    println!("    /distill-session [id|zip] [--dry-run] [--limit N]  distill into the knowledge base (default: current session)");
+    println!(
+        "    /distill-session [id|zip] [--dry-run] [--limit N]  distill into the knowledge base (default: current session)"
+    );
     println!("    /usage [models|today|7d|30d|all|daily]   show LLM token usage statistics");
-    println!("    /history [full|user|assistant|tool|system] [N]     show session messages (role filters: up to 2000)");
+    println!(
+        "    /history [full|user|assistant|tool|system] [N]     show session messages (role filters: up to 2000)"
+    );
+    println!("    /history u<N>                 replay the assistant reply to user message u<N>");
     println!("    /history grep <keyword>      search recent messages by keyword");
     println!("    /history rewind u<N>|last    remove a user input and all following messages");
     println!("    /history export [file.txt]   export current preview to a file");
@@ -40,6 +47,7 @@ fn print_commands_help() {
     println!(
         "    /history <session> [N]         show last N messages of another session (no switch; Tab completes ids)"
     );
+    println!("    /history @<session> ...       explicitly select a conflicting session id");
     println!(
         "    /history <session> last [N]    replay the Nth recent assistant message of another session with markdown rendering"
     );
@@ -58,9 +66,7 @@ fn print_commands_help() {
     println!(
         "    /goal [target]            enter goal mode: agent persists until the goal is done"
     );
-    println!(
-        "    /discuss [N] <topic>      host a multi-session debate (N members, default 3)"
-    );
+    println!("    /discuss [N] <topic>      host a multi-session debate (N members, default 3)");
     println!("    /discuss status [room]    show discussion progress (read-only)");
     println!(
         "    /task [N] <goal>          split a goal across worker sessions (N workers, default 3)"
@@ -102,7 +108,9 @@ fn print_commands_help() {
     println!("    /sessions clear-history   clear current session history (keeps session alive)");
     println!("    /sessions clear-all       delete all sessions");
     println!("    /sessions dump-history <id>              dump session history to JSON");
-    println!("    /sessions export <id|current|last> [output.zip]  export session to a portable zip");
+    println!(
+        "    /sessions export <id|current|last> [output.zip]  export session to a portable zip"
+    );
     println!("    /sessions markdown <id|current|last> [output.md] export session to Markdown");
     println!("    /sessions import <file.zip> [as=<id>]           import a session export zip");
     println!("    /sessions fork [src=<id>] [as=<id>]      copy session to a new branch");
@@ -174,12 +182,7 @@ pub fn try_handle_help_command(input: &str) -> bool {
                 print_commands_help();
             }
         }
-        Some(topic)
-            if matches!(
-                topic.trim_start_matches(['/', ':']),
-                "discuss" | "task"
-            ) =>
-        {
+        Some(topic) if matches!(topic.trim_start_matches(['/', ':']), "discuss" | "task") => {
             if parts.next().is_some() {
                 println!("Too many arguments. Usage: /help [cmd|shortcuts|discuss|task]");
             } else if topic.trim_start_matches(['/', ':']) == "discuss" {

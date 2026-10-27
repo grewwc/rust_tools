@@ -20,6 +20,15 @@ fn serve_searchable_text(content: &serde_json::Value) -> String {
     }
 }
 
+fn is_serve_assistant_conclusion(message: &Message) -> bool {
+    message.role == "assistant"
+        && message
+            .tool_calls
+            .as_ref()
+            .is_none_or(|calls| calls.is_empty())
+        && !serve_searchable_text(&message.content).trim().is_empty()
+}
+
 /// Request body for `POST /sessions/{id}/rewind`: the canonical (0-based)
 /// index into the session's full message list of the user message to rewind
 /// to. The mobile client learns that index as
@@ -137,13 +146,23 @@ pub(crate) async fn read_history(
                 .into_response();
         }
     };
-    // `?meta=roles`: bare array of role strings indexed by canonical
-    // position, so serve-chat can resolve `u<N>` rewind ordinals and count
-    // user turns without shipping the session payload. `limit` is ignored
+    // `?meta=roles`: bare array indexed by canonical position, so serve-chat
+    // can resolve `u<N>` rewind ordinals without shipping the session payload.
+    // Runtime-synthetic users use a distinct sentinel because they are not
+    // real turn boundaries. `limit` is ignored
     // on purpose: a tail cut would renumber the rows and invalidate rewind
     // anchors, and the whole point of this shape is exactness at tiny size.
     if q.meta.as_deref() == Some("roles") {
-        let roles: Vec<String> = messages.iter().map(|m| m.role.clone()).collect();
+        let roles: Vec<String> = messages
+            .iter()
+            .map(|message| {
+                if is_runtime_synthetic_user_message(message) {
+                    "runtime_synthetic_user".to_string()
+                } else {
+                    message.role.clone()
+                }
+            })
+            .collect();
         let total = roles.len();
         let mut resp = (StatusCode::OK, Json(roles)).into_response();
         resp.headers_mut().insert(
@@ -168,13 +187,7 @@ pub(crate) async fn read_history(
         let mut seen = 0usize;
         let mut found: Option<&Message> = None;
         for message in messages.iter().rev() {
-            if message.role != "assistant" {
-                continue;
-            }
-            if !message.tool_calls.as_ref().is_none_or(|calls| calls.is_empty()) {
-                continue;
-            }
-            if serve_searchable_text(&message.content).trim().is_empty() {
+            if !is_serve_assistant_conclusion(message) {
                 continue;
             }
             seen += 1;
@@ -195,6 +208,43 @@ pub(crate) async fn read_history(
         redact_inline_image_data(&mut message.content);
         return (StatusCode::OK, Json(vec![message])).into_response();
     }
+    // `?user_conclusion=N`: the final assistant conclusion after user row uN
+    // and before the next user row. User ordinals match the `user_ordinal`
+    // values attached to role-filtered `/history user` responses.
+    if let Some(target_ordinal) = q.user_conclusion {
+        if target_ordinal == 0 {
+            return bad_request("user ordinal must be >= 1".to_string()).into_response();
+        }
+        let mut user_ordinal = 0usize;
+        let mut target_found = false;
+        let mut found: Option<&Message> = None;
+        for message in &messages {
+            if message.role == "user" && !is_runtime_synthetic_user_message(message) {
+                if target_found {
+                    break;
+                }
+                user_ordinal += 1;
+                target_found = user_ordinal == target_ordinal;
+                continue;
+            }
+            if target_found && is_serve_assistant_conclusion(message) {
+                found = Some(message);
+            }
+        }
+        let Some(message) = found else {
+            let detail = if target_found {
+                format!(
+                    "[history] No assistant conclusion found for user message u{target_ordinal}."
+                )
+            } else {
+                format!("[history] User message u{target_ordinal} was not found.")
+            };
+            return bad_request(detail).into_response();
+        };
+        let mut message = message.clone();
+        redact_inline_image_data(&mut message.content);
+        return (StatusCode::OK, Json(vec![message])).into_response();
+    }
     // serve-chat preview views are bounded tails, so `?role` + `?count`
     // filter and tail-cut here and only the subset travels. Each user row
     // carries its global `user_ordinal` (counted before filtering, like the
@@ -205,12 +255,14 @@ pub(crate) async fn read_history(
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let mut user_ordinal = 0usize;
         for message in &messages {
-            if message.role == "user" {
+            let is_real_user =
+                message.role == "user" && !is_runtime_synthetic_user_message(message);
+            if is_real_user {
                 user_ordinal += 1;
             }
             let role_matches = match q.role.as_deref() {
                 None => true,
-                Some("user") => message.role == "user",
+                Some("user") => is_real_user,
                 Some("assistant") => message.role == "assistant",
                 Some("tool") => message.role == "tool",
                 // Same rule as the client system filter (system + internal notes).
@@ -233,7 +285,7 @@ pub(crate) async fn read_history(
                         .into_response();
                 }
             };
-            if message.role == "user" {
+            if is_real_user {
                 value["user_ordinal"] = serde_json::json!(user_ordinal);
             }
             rows.push(value);

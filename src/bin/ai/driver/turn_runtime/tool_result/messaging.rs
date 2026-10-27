@@ -115,6 +115,8 @@ pub(super) fn record_hidden_self_note(
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        // Hidden reflection is model output; attribute it to the driving model.
+        model: (!app.current_model.trim().is_empty()).then(|| app.current_model.clone()),
     };
     let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
     let _ = store.append(&entry);

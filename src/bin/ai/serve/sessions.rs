@@ -33,6 +33,7 @@ pub(crate) async fn list_sessions(
             summary: s.summary,
             first_user_prompt: s.first_user_prompt,
             marked: s.marked,
+            archived: s.archived,
         })
         .collect();
     (StatusCode::OK, Json(serde_json::json!(out))).into_response()

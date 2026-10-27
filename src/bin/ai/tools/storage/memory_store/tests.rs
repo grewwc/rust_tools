@@ -477,6 +477,7 @@ fn test_search_recall_ngram() {
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        model: None,
     };
     let e2 = AgentMemoryEntry {
         id: None,
@@ -490,6 +491,7 @@ fn test_search_recall_ngram() {
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        model: None,
     };
     store.append(&e1).unwrap();
     store.append(&e2).unwrap();
@@ -519,6 +521,7 @@ fn test_search_recall_synonym_login() {
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        model: None,
     };
     store.append(&e).unwrap();
     let out = store.search("signin failure", 3).unwrap();
@@ -547,6 +550,7 @@ fn test_search_recall_chinese_login_variants() {
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        model: None,
     };
     store.append(&e).unwrap();
     let out = store.search("登陆失败", 3).unwrap();
@@ -577,6 +581,7 @@ fn append_dedup_scans_tail_window_across_bad_lines() {
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        model: None,
     };
     // Write the JSONL directly with trailing corrupt/blank lines to cover
     // the backward scan's tolerance for bad tail lines.
@@ -624,6 +629,7 @@ fn learning_entries_deduplicate_recent_exact_writes() {
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        model: None,
     };
 
     store.append(&entry).unwrap();
@@ -661,6 +667,7 @@ fn idempotent_knowledge_write_returns_existing_entry_without_appending() {
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        model: None,
     };
     let retry = AgentMemoryEntry {
         id: Some("mem_retry".to_string()),
@@ -674,6 +681,7 @@ fn idempotent_knowledge_write_returns_existing_entry_without_appending() {
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        model: None,
     };
 
     assert_eq!(
@@ -714,6 +722,7 @@ fn delete_subagent_memory_removes_only_its_knowledge_dedup_cache_entry() {
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        model: None,
     };
 
     for path in [&removed_path, &retained_path] {
@@ -762,6 +771,7 @@ fn apply_batch_update_rewrites_delete_and_append_in_one_pass() {
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        model: None,
     };
     let write_lines = |entries: &[AgentMemoryEntry]| {
         let mut buf = String::new();
@@ -846,6 +856,7 @@ fn apply_batch_update_deletes_across_rotation_archives() {
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        model: None,
     };
     let write_lines = |path: &std::path::Path, entries: &[AgentMemoryEntry]| {
         let mut buf = String::new();
@@ -911,4 +922,24 @@ fn apply_batch_update_deletes_across_rotation_archives() {
     assert!(all_ids.contains(&"merged_1".to_string()));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn legacy_rows_without_model_field_still_deserialize() {
+    // Pre-provenance JSONL rows carry no `model` key; `#[serde(default)]` must
+    // keep them readable, and re-serializing a model-less entry must not emit
+    // a `model` key (skip_serializing_if keeps old rows byte-stable).
+    let row = r#"{"id":"mem_legacy","timestamp":"2025-06-01T00:00:00+08:00","category":"user_memory","note":"legacy note","tags":[],"source":"cli_note","priority":150}"#;
+    let entry: AgentMemoryEntry = serde_json::from_str(row).unwrap();
+    assert_eq!(entry.model, None);
+    let reserialized = serde_json::to_string(&entry).unwrap();
+    assert!(!reserialized.contains("\"model\""));
+    let with_model = AgentMemoryEntry {
+        model: Some("test-model".to_string()),
+        ..entry
+    };
+    let reserialized = serde_json::to_string(&with_model).unwrap();
+    assert!(reserialized.contains("\"model\":\"test-model\""));
+    let roundtrip: AgentMemoryEntry = serde_json::from_str(&reserialized).unwrap();
+    assert_eq!(roundtrip.model.as_deref(), Some("test-model"));
 }

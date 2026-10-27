@@ -93,16 +93,21 @@ async fn execute_memo_save(app: &mut App, arg: String) -> Result<(), Box<dyn std
             "content": raw_text,
         }),
     ];
-    let note_content =
+    let (note_content, tidy_model): (String, Option<String>) =
         match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
-            Ok(response) => crate::ai::request::extract_response_text(&response)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(raw_text.clone()),
+            Ok(response) => {
+                match crate::ai::request::extract_response_text(&response)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(text) => (text, Some(model.clone())),
+                    None => (raw_text.clone(), None),
+                }
+            }
             Err(err) => {
                 clear_status();
                 report_status(&format!("[memo] 整理失败，保存原始输入: {}", err));
-                raw_text.clone()
+                (raw_text.clone(), None)
             }
         };
 
@@ -122,6 +127,7 @@ async fn execute_memo_save(app: &mut App, arg: String) -> Result<(), Box<dyn std
         owner_pid: None,
         owner_pgid: None,
         image_path: None,
+        model: tidy_model,
     };
 
     match store.append(&entry) {
