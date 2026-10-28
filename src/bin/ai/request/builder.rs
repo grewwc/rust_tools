@@ -14,15 +14,16 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 use super::RequestBody;
-use super::reasoning::resolve_reasoning_wire_controls;
+use super::reasoning::resolve_reasoning_wire_controls_from_parts;
 use crate::ai::{
     files,
     history::{
         Message,
         compress::{self, BillableCounts},
     },
+    model_names::ReasoningEffortWire,
     models,
-    provider::{adapter_for, compatible_wire_shapes},
+    provider::{ApiProvider, adapter_for, compatible_wire_shapes},
     request_protocol::RequestProtocolDialect,
     types::ToolDefinition,
 };
@@ -284,6 +285,26 @@ fn estimate_reasoning_items_tokens(
     messages: &[Message],
     items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
 ) -> usize {
+    estimate_reasoning_items_projected(messages, items, 4, BillableCounts::tokens)
+}
+
+/// Pessimistic twin of [`estimate_reasoning_items_tokens`]: opaque encrypted
+/// bytes at 2 chars/token, text counts via [`BillableCounts::tokens_upper`].
+fn estimate_reasoning_items_tokens_upper(
+    messages: &[Message],
+    items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
+) -> usize {
+    estimate_reasoning_items_projected(messages, items, 2, BillableCounts::tokens_upper)
+}
+
+/// Shared replay walk behind both reasoning estimates. The lower estimate
+/// passes the historical divisor/projection, so its arithmetic is unchanged.
+fn estimate_reasoning_items_projected(
+    messages: &[Message],
+    items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
+    encrypted_divisor: usize,
+    project: fn(BillableCounts) -> usize,
+) -> usize {
     const ENCRYPTED_ENVELOPE_BYTES: usize = 650;
     let Some(items) = items.filter(|items| !items.is_empty()) else {
         return 0;
@@ -307,14 +328,16 @@ fn estimate_reasoning_items_tokens(
                 ("encrypted_content", Value::String(encoded)) => {
                     let decoded = encoded.len().saturating_mul(3) / 4;
                     encrypted_tokens = encrypted_tokens.saturating_add(
-                        decoded.saturating_sub(ENCRYPTED_ENVELOPE_BYTES).div_ceil(4),
+                        decoded
+                            .saturating_sub(ENCRYPTED_ENVELOPE_BYTES)
+                            .div_ceil(encrypted_divisor),
                     );
                 }
                 _ => counts += compact_json_counts(value),
             }
         }
     }
-    encrypted_tokens.saturating_add(counts.tokens())
+    encrypted_tokens.saturating_add(project(counts))
 }
 
 /// Script mix of the compact JSON text `serde_json::to_string` produces for
@@ -371,6 +394,13 @@ fn estimate_tools_tokens(tools: Option<&Value>) -> usize {
     tools.map_or(0, |tools| compact_json_counts(tools).tokens())
 }
 
+/// Pessimistic twin of [`estimate_tools_tokens`]: identical counts projected
+/// with [`BillableCounts::tokens_upper`]. Upper-bound input only; budgets and
+/// clamps keep the lower estimate.
+fn estimate_tools_tokens_upper(tools: Option<&Value>) -> usize {
+    tools.map_or(0, |tools| compact_json_counts(tools).tokens_upper())
+}
+
 /// Compact-JSON counts of `serde_json::to_value(defs)` computed directly from
 /// the definitions, without building the intermediate `Value`. Mirrors serde's
 /// struct layout field-for-field (`preserve_order` keeps declaration order):
@@ -413,6 +443,16 @@ pub(super) fn estimate_tools_tokens_from_definitions(defs: Option<&[ToolDefiniti
     defs.map_or(0, |defs| tools_definitions_compact_json_counts(defs).tokens())
 }
 
+/// Pessimistic twin of [`estimate_tools_tokens_from_definitions`] for the
+/// preview path. Same counts, [`BillableCounts::tokens_upper`] projection.
+pub(super) fn estimate_tools_tokens_upper_from_definitions(
+    defs: Option<&[ToolDefinition]>,
+) -> usize {
+    defs.map_or(0, |defs| {
+        tools_definitions_compact_json_counts(defs).tokens_upper()
+    })
+}
+
 /// Preview-path prompt estimate: messages, tool schemas, and reasoning replay,
 /// none materialized as JSON. Matches `estimate_request_prompt_tokens` on the
 /// equivalent wire body (parity-tested) while skipping the schema deep clone.
@@ -440,6 +480,19 @@ pub(super) fn estimate_request_prompt_from_definitions(
     (tokens, counts)
 }
 
+/// Pessimistic twin of [`estimate_request_prompt_from_definitions`] for the
+/// preview path. The counts walk is shared in spirit but projected with
+/// `tokens_upper`, so this needs its own pass over the same inputs.
+pub(super) fn estimate_request_prompt_upper_from_definitions(
+    messages: &[Message],
+    defs: Option<&[ToolDefinition]>,
+    reasoning_items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
+) -> usize {
+    message_prompt_counts(messages).tokens_upper()
+        + estimate_tools_tokens_upper_from_definitions(defs)
+        + estimate_reasoning_items_tokens_upper(messages, reasoning_items)
+}
+
 /// Estimates input tokens for this request: messages + tool schemas + any
 /// reasoning replay the wire body splices in.
 /// The request transport's TPM preflight gate and max_tokens clamp share this path so
@@ -464,6 +517,20 @@ fn estimate_request_prompt(
     (tokens, counts)
 }
 
+/// Pessimistic twin of [`estimate_request_prompt`]: same inputs, every
+/// component projected with its `_upper` variant. Stored on the wire body
+/// next to the lower estimate (via `PromptTokenFeedback`) for the water
+/// meter's display interval.
+pub(super) fn estimate_request_prompt_upper(
+    messages: &[Message],
+    tools: Option<&Value>,
+    reasoning_items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
+) -> usize {
+    message_prompt_counts(messages).tokens_upper()
+        + estimate_tools_tokens_upper(tools)
+        + estimate_reasoning_items_tokens_upper(messages, reasoning_items)
+}
+
 /// Clamp the output cap to the estimated remaining context window. Any supplied
 /// prompt count must already describe this request, not an earlier response.
 /// The output floor is a last-resort allowance, not proof that input fits.
@@ -485,12 +552,60 @@ pub(crate) fn clamp_max_tokens_for_prompt(
 
 /// Reuse a current-request estimate without walking the history again.
 pub(super) fn clamp_with_estimated_prompt(model: &str, est_prompt: usize, model_max: u32) -> u32 {
-    let window = models::context_window_tokens(model);
+    clamp_with_estimated_prompt_from_parts(models::context_window_tokens(model), est_prompt, model_max)
+}
+
+/// Registry-free core of [`clamp_with_estimated_prompt`] over the resolved
+/// context window.
+pub(super) fn clamp_with_estimated_prompt_from_parts(
+    context_window: usize,
+    est_prompt: usize,
+    model_max: u32,
+) -> u32 {
+    let window = context_window;
     let remaining = window
         .saturating_sub(est_prompt)
         .saturating_sub(CONTEXT_WINDOW_SAFETY_MARGIN_TOKENS);
     let remaining = u32::try_from(remaining).unwrap_or(u32::MAX);
     model_max.min(remaining).max(MIN_OUTPUT_TOKENS_FLOOR)
+}
+
+/// Pre-resolved registry inputs for request-body assembly: every `models::*`
+/// lookup `build_request_body` needs, resolved once from the registry key.
+/// Behavior tests construct this literally with synthetic values so wire
+/// assertions never depend on registry keys (which churn on renames).
+pub(super) struct RequestModelInputs {
+    pub request_model: String,
+    pub endpoint: String,
+    pub adapter: ApiProvider,
+    pub effort_wire: Option<ReasoningEffortWire>,
+    pub dialect: RequestProtocolDialect,
+    pub max_output: Option<u32>,
+    pub encrypted_replay: bool,
+    pub context_window: usize,
+}
+
+impl RequestModelInputs {
+    pub(super) fn resolve(model: &str) -> Self {
+        let endpoint = models::endpoint_for_model(model, "");
+        Self::resolve_with_endpoint(model, &endpoint)
+    }
+
+    /// Resolve with a caller-supplied endpoint (e.g. the app-level override
+    /// from `endpoint_for_request_model`): the dialect is re-resolved against
+    /// it because undeclared models infer protocol from endpoint shape.
+    pub(super) fn resolve_with_endpoint(model: &str, endpoint: &str) -> Self {
+        Self {
+            request_model: models::request_model_name(model),
+            adapter: models::model_adapter(model),
+            effort_wire: models::reasoning_effort_wire(model),
+            dialect: models::request_protocol_dialect(model, endpoint),
+            max_output: models::max_output_tokens(model),
+            encrypted_replay: models::reasoning_encrypted_replay_enabled(model),
+            context_window: models::context_window_tokens(model),
+            endpoint: endpoint.to_string(),
+        }
+    }
 }
 
 /// Resolve the wire `enable_search` field shared by body assembly and the
@@ -504,10 +619,26 @@ pub(super) fn resolve_wire_enable_search(
     enable_search: Option<bool>,
 ) -> Option<bool> {
     let adapter_kind = models::model_adapter(model);
-    if models::request_protocol_dialect(model, endpoint) == RequestProtocolDialect::Responses {
+    resolve_wire_enable_search_from_parts(
+        adapter_kind,
+        models::request_protocol_dialect(model, endpoint),
+        endpoint,
+        enable_search,
+    )
+}
+
+/// Registry-free core of [`resolve_wire_enable_search`] over pre-resolved
+/// inputs.
+pub(super) fn resolve_wire_enable_search_from_parts(
+    adapter_kind: ApiProvider,
+    dialect: RequestProtocolDialect,
+    endpoint: &str,
+    enable_search: Option<bool>,
+) -> Option<bool> {
+    if dialect == RequestProtocolDialect::Responses {
         return enable_search;
     }
-    if adapter_kind == crate::ai::provider::ApiProvider::Compatible {
+    if adapter_kind == ApiProvider::Compatible {
         let (enable_search, _, _) = compatible_wire_shapes(endpoint, enable_search, None);
         return enable_search;
     }
@@ -530,13 +661,57 @@ pub(super) fn build_request_body<'a>(
     current_prompt_tokens: Option<u64>,
     reasoning_items: Option<&'a rustc_hash::FxHashMap<String, Vec<Value>>>,
 ) -> RequestBody<'a> {
-    let endpoint = models::endpoint_for_model(model, "");
-    let request_model = models::request_model_name(model);
+    build_request_body_from_parts(
+        &RequestModelInputs::resolve(model),
+        messages,
+        stream,
+        enable_thinking,
+        enable_search,
+        tools,
+        tool_choice,
+        reasoning_effort,
+        max_tokens_override,
+        current_prompt_tokens,
+        reasoning_items,
+    )
+}
+
+/// Registry-free core of [`build_request_body`]: identical assembly over
+/// pre-resolved [`RequestModelInputs`]. Behavior tests construct the inputs
+/// literally; production resolves them once via [`RequestModelInputs::resolve`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_request_body_from_parts<'a>(
+    inputs: &RequestModelInputs,
+    messages: &'a [Message],
+    stream: bool,
+    enable_thinking: bool,
+    enable_search: Option<bool>,
+    tools: Option<Value>,
+    tool_choice: Option<Value>,
+    reasoning_effort: Option<&'a str>,
+    max_tokens_override: Option<u32>,
+    current_prompt_tokens: Option<u64>,
+    reasoning_items: Option<&'a rustc_hash::FxHashMap<String, Vec<Value>>>,
+) -> RequestBody<'a> {
+    let endpoint = &inputs.endpoint;
+    let request_model = inputs.request_model.clone();
     let (thinking, reasoning_effort, reasoning) =
-        resolve_reasoning_wire_controls(model, &endpoint, enable_thinking, reasoning_effort);
+        resolve_reasoning_wire_controls_from_parts(
+            inputs.adapter,
+            &request_model,
+            endpoint,
+            inputs.effort_wire,
+            enable_thinking,
+            reasoning_effort,
+        );
     // Responses maps search to the built-in web_search tool; for Chat Completions,
     // the provider dialect still decides whether to retain `enable_search`.
-    let enable_search = resolve_wire_enable_search(model, &endpoint, enable_search);
+    let enable_search = resolve_wire_enable_search_from_parts(
+        inputs.adapter,
+        inputs.dialect,
+        endpoint,
+        enable_search,
+    );
     // Explicitly request streaming usage: some adapters (DashScope compatible-mode) omit
     // usage by default and require stream_options.include_usage for token accounting.
     let stream_options = stream.then(|| json!({ "include_usage": true }));
@@ -551,11 +726,11 @@ pub(super) fn build_request_body<'a>(
     // drops it on the wire only overestimates.
     let (est_prompt, message_counts) =
         estimate_request_prompt(messages, tools.as_ref(), reasoning_items);
-    let max_tokens = models::max_output_tokens(model).map(|model_max| {
+    let max_tokens = inputs.max_output.map(|model_max| {
         let current = current_prompt_tokens
             .map(|tokens| usize::try_from(tokens).unwrap_or(usize::MAX))
             .unwrap_or(est_prompt);
-        clamp_with_estimated_prompt(model, current, model_max)
+        clamp_with_estimated_prompt_from_parts(inputs.context_window, current, model_max)
     });
     // Adapt to zero-output truncation: after completion=0 + finish_reason=length, the
     // orchestrator lowers max_tokens_override. Replace the clamp result with that value
@@ -578,7 +753,7 @@ pub(super) fn build_request_body<'a>(
         max_tokens,
         reasoning_items,
         tool_errors: None,
-        reasoning_encrypted_replay: models::reasoning_encrypted_replay_enabled(model),
+        reasoning_encrypted_replay: inputs.encrypted_replay,
         estimated_prompt_tokens: est_prompt,
         message_counts,
         prompt_cache_key: None,

@@ -2482,6 +2482,12 @@ async fn run_turn_body(
                         checkpoint.phase.action(),
                     ),
                 );
+                // Persist a one-line marker so post-hoc debugging can recover which
+                // checkpoint the model saw; the full guidance stays transient.
+                turn_messages.push(tool_round_checkpoint_record(
+                    supervisor.iteration,
+                    checkpoint,
+                ));
                 supervisor.maybe_inject_task_anchor(
                     &mut messages,
                     &question,

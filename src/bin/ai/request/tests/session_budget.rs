@@ -1,4 +1,4 @@
-use super::common::{test_app, first_openai_model_name};
+use super::common::test_app;
 use super::super::*;
 use serde_json::Value;
 
@@ -434,8 +434,23 @@ fn prompt_cache_breakpoints_noop_without_system_user_or_tool_message() {
 
 #[test]
 fn dashscope_builtin_models_do_not_enable_anthropic_prompt_cache() {
-    for model in ["deepseek-v4-flash-0731-alibaba", "qwen3.8-flash-alibaba"] {
-        assert!(!models::explicit_prompt_cache_enabled(model), "{model}");
+    // Registry-wide over the live Alibaba class: every entry must resolve
+    // with the Anthropic cache off. Hard-fails when the class disappears so
+    // the test cannot go vacuous silently.
+    let entries: Vec<_> = crate::ai::model_names::all()
+        .into_iter()
+        .filter(|m| m.adapter == crate::ai::provider::ApiProvider::Alibaba)
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "registry must keep at least one Alibaba entry"
+    );
+    for entry in entries {
+        assert!(
+            !models::explicit_prompt_cache_enabled(&entry.key),
+            "{}",
+            entry.key
+        );
     }
 }
 
@@ -448,13 +463,25 @@ fn prompt_cache_model_support_does_not_guess_by_name() {
 }
 
 #[test]
-fn prompt_cache_model_support_rejects_plain_openai_model() {
-    let Some(model) = first_openai_model_name() else {
-        eprintln!(
-            "[test] skipping prompt_cache_model_support_rejects_plain_openai_model: \
-                 no OpenAi model present in model registry"
+fn prompt_cache_model_support_rejects_non_anthropic_dialect_models() {
+    // The registry currently holds no OpenAi-adapter entry, so the old
+    // OpenAi-only probe always skipped. Cover the live non-Anthropic
+    // classes (Compatible + OpenAi) instead: none may enable the
+    // Anthropic cache. Hard-fails when both classes disappear.
+    use crate::ai::provider::ApiProvider;
+    let entries: Vec<_> = crate::ai::model_names::all()
+        .into_iter()
+        .filter(|m| matches!(m.adapter, ApiProvider::Compatible | ApiProvider::OpenAi))
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "registry must keep at least one Compatible/OpenAi entry"
+    );
+    for entry in entries {
+        assert!(
+            !models::explicit_prompt_cache_enabled(&entry.key),
+            "{}",
+            entry.key
         );
-        return;
-    };
-    assert!(!models::explicit_prompt_cache_enabled(&model));
+    }
 }

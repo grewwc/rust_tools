@@ -17,14 +17,14 @@ pub(super) static TASK_WAIT_NOOP_COUNTS: LazyLock<Mutex<FxHashMap<TaskWaitKey, u
     LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 pub(super) fn bump_task_wait_noop_count(key: &TaskWaitKey) -> u32 {
-    let mut counts = TASK_WAIT_NOOP_COUNTS.lock().unwrap();
+    let mut counts = lock_unpoisoned(&TASK_WAIT_NOOP_COUNTS);
     let count = counts.entry(key.clone()).or_insert(0);
     *count += 1;
     *count
 }
 
 pub(super) fn reset_task_wait_noop_count(key: &TaskWaitKey) {
-    TASK_WAIT_NOOP_COUNTS.lock().unwrap().remove(key);
+    lock_unpoisoned(&TASK_WAIT_NOOP_COUNTS).remove(key);
 }
 
 pub(super) const OUTSTANDING_SUBAGENT_TASKS_NOTE_PREFIX: &str = "[pending-subagent-tasks]";
@@ -43,7 +43,7 @@ pub(super) static LAST_SPAWN_BATCH: LazyLock<Mutex<Option<LastSpawnBatch>>> =
     LazyLock::new(|| Mutex::new(None));
 
 pub(super) fn record_last_spawn_batch(task_ids: Vec<String>) {
-    *LAST_SPAWN_BATCH.lock().unwrap() = Some(LastSpawnBatch {
+    *lock_unpoisoned(&LAST_SPAWN_BATCH) = Some(LastSpawnBatch {
         task_ids,
         hinted: false,
     });
@@ -78,7 +78,7 @@ pub(super) fn lone_spawn_hint_note(waited_task_ids: &[String]) -> Option<String>
 
 #[cfg(test)]
 pub(crate) fn reset_last_spawn_batch_for_test() {
-    *LAST_SPAWN_BATCH.lock().unwrap() = None;
+    *lock_unpoisoned(&LAST_SPAWN_BATCH) = None;
 }
 
 pub(super) fn load_or_create_task_wait_state(
@@ -86,7 +86,7 @@ pub(super) fn load_or_create_task_wait_state(
     timeout_secs: u64,
 ) -> TaskWaitState {
     let now = Instant::now();
-    let mut states = TASK_WAIT_STATES.lock().unwrap();
+    let mut states = lock_unpoisoned(&TASK_WAIT_STATES);
     let mut inserted = false;
     let state = states.entry(key.clone()).or_insert_with(|| {
         inserted = true;
@@ -108,7 +108,7 @@ pub(super) fn load_or_create_task_wait_state(
 }
 
 pub(super) fn clear_task_wait_state(key: &TaskWaitKey) {
-    let mut states = TASK_WAIT_STATES.lock().unwrap();
+    let mut states = lock_unpoisoned(&TASK_WAIT_STATES);
     states.remove(key);
 }
 
@@ -119,9 +119,7 @@ pub(super) fn clear_task_wait_state(key: &TaskWaitKey) {
 /// occurs, the scheduler must still wake itself up at the real deadline returned here.
 pub(crate) fn next_task_wait_wakeup_delay() -> Option<Duration> {
     let now = Instant::now();
-    TASK_WAIT_STATES
-        .lock()
-        .unwrap()
+    lock_unpoisoned(&TASK_WAIT_STATES)
         .values()
         .filter(|state| !state.expired)
         .map(|state| state.deadline.saturating_duration_since(now))
@@ -130,7 +128,7 @@ pub(crate) fn next_task_wait_wakeup_delay() -> Option<Duration> {
 
 #[cfg(test)]
 pub(crate) fn expire_task_wait_states_for_test() {
-    let mut states = TASK_WAIT_STATES.lock().unwrap();
+    let mut states = lock_unpoisoned(&TASK_WAIT_STATES);
     let expired_at = Instant::now() - Duration::from_secs(1);
     for state in states.values_mut() {
         state.deadline = expired_at;
@@ -140,18 +138,18 @@ pub(crate) fn expire_task_wait_states_for_test() {
 
 #[cfg(test)]
 pub(crate) fn task_wait_state_count_for_test() -> usize {
-    TASK_WAIT_STATES.lock().unwrap().len()
+    lock_unpoisoned(&TASK_WAIT_STATES).len()
 }
 
 #[cfg(test)]
 pub(crate) fn reset_task_wait_noop_counts_for_test() {
-    TASK_WAIT_NOOP_COUNTS.lock().unwrap().clear();
+    lock_unpoisoned(&TASK_WAIT_NOOP_COUNTS).clear();
 }
 
 pub(crate) fn wake_expired_task_waits() {
     let expired = {
         let now = Instant::now();
-        let mut states = TASK_WAIT_STATES.lock().unwrap();
+        let mut states = lock_unpoisoned(&TASK_WAIT_STATES);
         states
             .iter_mut()
             .filter_map(|(key, state)| {
@@ -201,7 +199,7 @@ pub(crate) fn wake_expired_task_waits() {
     .unwrap_or_default();
 
     if !orphaned.is_empty() {
-        let mut states = TASK_WAIT_STATES.lock().unwrap();
+        let mut states = lock_unpoisoned(&TASK_WAIT_STATES);
         for key in orphaned {
             states.remove(&key);
         }
@@ -253,7 +251,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     //          collected by further task_wait calls (for fan-out where results are gathered as
     //          they arrive).
     let current_owner_pid = current_task_owner_pid()?;
-    let mut registry = TASK_REGISTRY.lock().unwrap();
+    let registry = lock_task_registry();
     let mut foreign_session_task_ids = Vec::new();
     let mut foreign_owner_task_ids = Vec::new();
     let mut missing_task_ids = Vec::new();
@@ -283,6 +281,24 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             foreign_owner_task_ids.join(", ")
         ));
     }
+    // Snapshot the validated entries and release the registry lock before any kernel call. The
+    // kernel closure must never run under the registry lock: the foreground status line takes the
+    // kernel first, and holding registry -> kernel here would create a lock cycle. Removal happens
+    // after the kernel closure returns, so a failure on a later task cannot strand entries that
+    // were already collected.
+    let entries = task_ids_filtered
+        .iter()
+        .map(|tid| {
+            (
+                tid.clone(),
+                registry
+                    .get_ref(tid)
+                    .expect("validated task id")
+                    .clone(),
+            )
+        })
+        .collect::<FxHashMap<_, _>>();
+    drop(registry);
     // A registry miss can mean either the task was normally cleaned up after delivery, or the
     // model mistyped an id, referenced a stale cross-process id, or hit a registry anomaly. Only a
     // tombstone actually present in the durable evidence ledger proves the task was delivered.
@@ -379,7 +395,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     // hosting Tokio Future. So first abort every worker that exceeded its total lifetime, then
     // enter the kernel critical section to publish the terminal state.
     for tid in &task_ids {
-        let entry = registry.get_ref(tid).expect("validated");
+        let entry = entries.get(tid).expect("validated");
         if entry.started_at.elapsed() > SUBAGENT_WALL_CLOCK_TIMEOUT {
             entry.cancel_stream.store(true, Ordering::Release);
             if let Some(handle) = &entry.abort_handle {
@@ -390,9 +406,9 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     // The closure borrows wait_policy / registry / pending / ready / finished by reference by
     // default; no `move` is added, so code after the closure (e.g. `if !pending.is_empty()`) can
     // still access them.
-    let wait_message = with_os_kernel(|os| {
+    let wait_result = with_os_kernel(|os| {
         for tid in &task_ids {
-            let entry = registry.get_ref(tid).expect("validated");
+            let entry = entries.get(tid).expect("validated");
             // ⚠️ This block previously marked a task TIMEOUT and destroyed its channel/futex as
             // soon as `entry.started_at.elapsed() >= timeout_secs` — that was a bug:
             // `started_at` is the spawn time, not the start of this task_wait call. If the main
@@ -421,31 +437,19 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                     entry.pid,
                     entry.result_channel_id,
                     entry.completion_futex_addr,
-                    "timeout",
+                    TaskTerminalStatus::Timeout.as_str(),
                     &format!(
                         "Subagent exceeded wall-clock lifetime of {}s (likely stuck in a non-returning tool execution)",
                         SUBAGENT_WALL_CLOCK_TIMEOUT.as_secs()
                     ),
                 );
             }
-            if let Some(rendered) = collect_ready_task_result(os, tid, entry)? {
-                ready.push(rendered);
-                cleanup_collected_task(os, entry, "subagent result collected");
-                finished.push(tid.clone());
-            } else if is_task_pending(os, entry.pid)? {
-                pending.push((tid.clone(), entry.pid));
-            } else {
-                // Process is no longer pending and never wrote a result.
-                // Treat as failed-without-output and free the kernel
-                // resources so we do not leak channels/futexes.
-                // When a subagent process terminated without publishing a result, it never ran its
-                // own cleanup to release the producer holder, so both the consumer and the producer
-                // must be released here; otherwise channel_destroy fails on a non-zero ref_count
-                // and the channel + futex leak permanently.
-                let rendered = collect_missing_task_result(tid, entry)?;
-                cleanup_collected_task(os, entry, "subagent terminated without output");
-                ready.push(rendered);
-                finished.push(tid.clone());
+            match drain_task_result(os, tid, entry, "subagent result collected")? {
+                Some(collected) => {
+                    ready.push(collected.rendered);
+                    finished.push(tid.clone());
+                }
+                None => pending.push((tid.clone(), entry.pid)),
             }
         }
 
@@ -459,7 +463,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 .iter()
                 .map(|(tid, _)| tid.clone())
                 .collect::<Vec<_>>();
-            let wait_sources = task_wait_sources(os, &pending_ids, &registry)?;
+            let wait_sources = task_wait_sources(os, &pending_ids, &entries)?;
             // `task_wait`'s `wait_policy=all` is tool-layer semantics: all task results must be
             // collected before returning. The underlying park cannot use `WaitPolicy::All` to wait
             // on every event source, because the sources also include the cancel futex used to
@@ -480,22 +484,18 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             // still pending after the re-scan and the wait really did suspend.
             pending.clear();
             for tid in &pending_ids {
-                let entry = registry.get_ref(tid).expect("validated after wait");
-                if let Some(rendered) = collect_ready_task_result(os, tid, entry)? {
-                    ready.push(rendered);
-                    cleanup_collected_task(os, entry, "subagent result collected after wait");
-                    finished.push(tid.clone());
-                } else if is_task_pending(os, entry.pid)? {
-                    pending.push((tid.clone(), entry.pid));
-                } else {
-                    let rendered = collect_missing_task_result(tid, entry)?;
-                    cleanup_collected_task(
-                        os,
-                        entry,
-                        "subagent terminated without output after wait",
-                    );
-                    ready.push(rendered);
-                    finished.push(tid.clone());
+                let entry = entries.get(tid).expect("validated after wait");
+                match drain_task_result(
+                    os,
+                    tid,
+                    entry,
+                    "subagent result collected after wait",
+                )? {
+                    Some(collected) => {
+                        ready.push(collected.rendered);
+                        finished.push(tid.clone());
+                    }
+                    None => pending.push((tid.clone(), entry.pid)),
                 }
             }
             // Tasks are still pending after the re-scan and the wait really suspended (a
@@ -544,10 +544,14 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             }
         }
         Ok(None)
-    })?;
+    });
+    // Remove collected entries before propagating a mid-batch kernel error: their channels and
+    // futexes are already destroyed, so keeping them would make every later task_wait/task_status
+    // call fail on a missing channel.
     for tid in &finished {
-        registry.remove(tid);
+        remove_task_entry(tid);
     }
+    let wait_message = wait_result?;
     if let Some(message) = wait_message {
         return Ok(append_lone_spawn_hint(message, lone_spawn_hint.as_deref()));
     }
@@ -584,14 +588,6 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         );
         append_task_progress_snapshots(&mut elapsed_message, &pending_ids);
         parts.push(elapsed_message);
-        // Only remove the registry entries for task_ids that are already ready; pending tasks must
-        // be kept, otherwise the next task_wait fails with "Unknown task_id".
-        let pending_set: SkipSet<&str> = pending_ids.iter().map(String::as_str).collect();
-        for tid in &task_ids {
-            if !pending_set.contains(&tid.as_str()) {
-                registry.remove(tid);
-            }
-        }
         clear_task_wait_state(&wait_key);
         return Ok(append_lone_spawn_hint(
             parts.join("\n\n---\n\n"),
@@ -599,9 +595,6 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         ));
     }
 
-    for tid in &task_ids {
-        registry.remove(tid);
-    }
     clear_task_wait_state(&wait_key);
     Ok(append_lone_spawn_hint(
         ready.join("\n\n---\n\n"),
@@ -659,12 +652,12 @@ pub(super) fn write_terminal_subagent_result(
 pub(super) fn task_wait_sources(
     os: &mut dyn Kernel,
     task_ids: &[String],
-    registry: &SkipMap<String, AsyncTaskEntry>,
+    entries: &FxHashMap<String, AsyncTaskEntry>,
 ) -> Result<Vec<WaitManySource>, String> {
     let mut sources = Vec::new();
     for tid in task_ids {
-        let entry = registry
-            .get_ref(tid)
+        let entry = entries
+            .get(tid)
             .ok_or_else(|| format!("Unknown task_id: {}", tid))?;
         sources.extend(wait_sources_for_channel_and_futex(
             os,

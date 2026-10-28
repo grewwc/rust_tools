@@ -1,5 +1,6 @@
 //! Tests for the `completion_gate` cluster.
 
+use crate::ai::tools::FINAL_RESPONSE_END_MARKER;
 use super::super::*;
 use super::common::*;
 
@@ -36,12 +37,13 @@ fn completion_and_outstanding_gates_each_reopen_once() {
     let mut final_assistant_recorded = false;
     let mut force_final_response = false;
     let mut terminal_dedupe_candidate = None;
+    const TERMINATED_FINAL_RESPONSE: &str = "已修复。\n[END]";
     let mut turn_had_tool_error = false;
 
     let final_response = || {
         IterationExecution::FinalResponse(crate::ai::types::StreamResult {
             outcome: crate::ai::types::StreamOutcome::Completed,
-            assistant_text: "已修复。".to_string(),
+            assistant_text: TERMINATED_FINAL_RESPONSE.to_string(),
             skip_response_drain: true,
             ..Default::default()
         })
@@ -154,6 +156,7 @@ fn completion_and_outstanding_gates_each_reopen_once() {
     assert!(matches!(third_step, TurnLoopStep::Break));
     assert!(final_assistant_recorded);
     assert!(final_assistant_text.starts_with("已修复。"));
+    assert!(!final_assistant_text.contains(FINAL_RESPONSE_END_MARKER));
     assert!(final_assistant_text.contains(COMPLETION_EVIDENCE_WARNING));
     assert_eq!(
         terminal_dedupe_candidate.as_deref(),
@@ -380,7 +383,7 @@ fn completion_evidence_gate_allows_unrecognized_post_mutation_activity_silently(
     let final_response = || {
         IterationExecution::FinalResponse(crate::ai::types::StreamResult {
             outcome: crate::ai::types::StreamOutcome::Completed,
-            assistant_text: "已修复。".to_string(),
+            assistant_text: "已修复。\n[END]".to_string(),
             skip_response_drain: true,
             ..Default::default()
         })
@@ -412,6 +415,7 @@ fn completion_evidence_gate_allows_unrecognized_post_mutation_activity_silently(
     assert!(matches!(step, TurnLoopStep::Break));
     assert!(final_assistant_recorded);
     assert!(final_assistant_text.starts_with("已修复。"));
+    assert!(!final_assistant_text.contains(FINAL_RESPONSE_END_MARKER));
     assert!(
         !final_assistant_text.contains(COMPLETION_EVIDENCE_WARNING),
         "变更后活动静默 Allow，不应追加'未观察到检查'的虚假警告"

@@ -27,9 +27,7 @@ pub(super) fn execute_task_retry(args: &Value) -> Result<String, String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "task_retry requires non-empty 'task_id'".to_string())?;
-    let record = TASK_RETRY_REGISTRY
-        .lock()
-        .unwrap()
+    let record = lock_unpoisoned(&TASK_RETRY_REGISTRY)
         .get_ref(&task_id.to_string())
         .cloned()
         .ok_or_else(|| format!("task_retry: unknown task_id '{task_id}'"))?;
@@ -122,7 +120,7 @@ pub(crate) fn reap_timed_out_subagents() {
     // Step 1: hold only the registry lock to collect timed-out candidates (pid / channel /
     // futex), then release immediately.
     let candidates = {
-        let registry = TASK_REGISTRY.lock().unwrap();
+        let registry = lock_task_registry();
         registry
             .iter()
             .filter(|(_, e)| e.started_at.elapsed() > SUBAGENT_WALL_CLOCK_TIMEOUT)
@@ -164,7 +162,7 @@ pub(crate) fn reap_timed_out_subagents() {
                 pid,
                 result_channel_id,
                 completion_futex_addr,
-                "timeout",
+                TaskTerminalStatus::Timeout.as_str(),
                 &format!(
                     "Subagent exceeded wall-clock lifetime of {}s (reaped by scheduler; likely stuck in a non-returning tool execution)",
                     SUBAGENT_WALL_CLOCK_TIMEOUT.as_secs()
@@ -369,7 +367,10 @@ pub(super) fn execute_task_integrate(args: &Value) -> Result<String, String> {
         .ok_or("task_integrate requires an active driver turn")?;
     let history_file = context.app_proto.config.history_file.as_path();
     let session_id = context.app_proto.session_id.as_str();
+    // Validate the whole batch before touching the store. A later invalid item must not leave
+    // earlier items integrated while the tool reports an overall failure.
     let mut integrated = Vec::new();
+    let mut seen = FxHashSet::default();
     for task in tasks {
         let task_id = task
             .get("task_id")
@@ -397,25 +398,37 @@ pub(super) fn execute_task_integrate(args: &Value) -> Result<String, String> {
                 "Integration summary for {task_id} exceeds 6000 characters"
             ));
         }
-        let found = crate::ai::history::integrate_task_evidence(
-            history_file,
-            session_id,
-            task_id,
-            disposition,
-            summary,
-        )
-        .map_err(|error| format!("failed to integrate {task_id}: {error}"))?;
-        if !found {
+        if !seen.insert(task_id.to_string()) {
             return Err(format!(
-                "Unknown task_id in durable task evidence ledger (no delivered result): {task_id}"
+                "Duplicate task_id in task_integrate batch: {task_id}"
             ));
         }
-        integrated.push(task_id.to_string());
+        integrated.push((
+            task_id.to_string(),
+            disposition.to_string(),
+            summary.to_string(),
+        ));
+    }
+    let unknown = crate::ai::history::integrate_task_evidence_batch(
+        history_file,
+        session_id,
+        &integrated,
+    )
+    .map_err(|error| format!("failed to integrate task results: {error}"))?;
+    if let Some(task_id) = unknown.first() {
+        return Err(format!(
+            "Unknown task_id in durable task evidence ledger (no delivered result): {task_id}. \
+             No integrations were applied."
+        ));
     }
     Ok(format!(
         "Integrated {} task result(s): {}",
         integrated.len(),
-        integrated.join(", ")
+        integrated
+            .iter()
+            .map(|(task_id, _, _)| task_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
 }
 
@@ -486,7 +499,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
     name: "task_cancel",
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
-        prune: ToolPrunePolicy::Never,
+        prune: ToolPrunePolicy::AfterIntegration,
         counts_toward_precision_inline_budget: false,
     },
 });
@@ -498,7 +511,7 @@ inventory::submit!(ToolHistoryPolicyRegistration {
 /// derived history be recreated.
 pub(crate) fn discard_tasks_for_session(session_id: &str) {
     let candidates = {
-        let registry = TASK_REGISTRY.lock().unwrap();
+        let registry = lock_task_registry();
         registry
             .iter()
             .filter(|(_, entry)| entry.session_id == session_id)
@@ -543,19 +556,19 @@ pub(crate) fn discard_tasks_for_session(session_id: &str) {
         .map(|(task_id, _, _, _, _, _)| task_id)
         .collect::<Vec<_>>();
     {
-        let mut registry = TASK_REGISTRY.lock().unwrap();
+        let mut registry = lock_task_registry();
         for task_id in &task_ids {
             registry.remove(task_id);
         }
     }
     {
-        let mut progress_registry = TASK_PROGRESS_REGISTRY.lock().unwrap();
+        let mut progress_registry = lock_unpoisoned(&TASK_PROGRESS_REGISTRY);
         for task_id in &task_ids {
             progress_registry.remove(task_id);
         }
     }
     {
-        let mut retry_registry = TASK_RETRY_REGISTRY.lock().unwrap();
+        let mut retry_registry = lock_unpoisoned(&TASK_RETRY_REGISTRY);
         let retry_task_ids = retry_registry
             .iter()
             .filter(|(_, spec)| spec.session_id == session_id)
@@ -604,7 +617,7 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
     // neither the Tokio task abort nor the kernel terminal write may overlap with the registry
     // lock, to avoid forming a lock cycle with the collection path.
     let candidates = {
-        let registry = TASK_REGISTRY.lock().unwrap();
+        let registry = lock_task_registry();
         task_ids
             .iter()
             .filter_map(|tid| match registry.get_ref(tid) {
@@ -656,7 +669,7 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
                 pid,
                 result_channel_id,
                 completion_futex_addr,
-                "cancelled",
+                TaskTerminalStatus::Cancelled.as_str(),
                 &reason,
             );
             Ok(true)
@@ -709,23 +722,11 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
     let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
     let current_owner_pid = current_task_owner_pid()?;
     let tracked = {
-        let registry = TASK_REGISTRY.lock().unwrap();
+        let registry = lock_task_registry();
         registry
             .iter()
             .filter(|(_, entry)| task_entry_owned_by(entry, &current_session_id, current_owner_pid))
-            .map(|(tid, entry)| {
-                (
-                    tid.clone(),
-                    entry.owner_pid,
-                    entry.pid,
-                    entry.result_channel_id,
-                    entry.completion_futex_addr,
-                    entry.description.clone(),
-                    entry.agent_name.clone(),
-                    entry.model.clone(),
-                    entry.started_at,
-                )
-            })
+            .map(|(tid, entry)| (tid.clone(), entry.clone()))
             .collect::<Vec<_>>()
     };
     if tracked.is_empty() {
@@ -733,7 +734,7 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
     }
 
     let mut lines = vec![
-        "TaskID              PID      Agent          Model          State       Description"
+        "TaskID                               PID      Agent          Model          State       Description"
             .to_string(),
     ];
     // For subtasks that already wrote their result back to the channel, **consume and clean up**
@@ -744,74 +745,35 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
     // to the model here, treat it as collected.
     let mut completed_outputs: Vec<String> = Vec::new();
     let mut finished_ids: Vec<String> = Vec::new();
-    with_os_kernel(|os| {
-        for (
-            tid,
-            owner_pid,
-            pid,
-            result_channel_id,
-            completion_futex_addr,
-            description,
-            agent_name,
-            model,
-            started_at,
-        ) in &tracked
-        {
-            let state_str = task_state_string(os, *result_channel_id, *pid)?;
-            let short_id = if tid.len() > 19 { &tid[..19] } else { tid };
+    let kernel_result = with_os_kernel(|os| {
+        for (tid, entry) in &tracked {
+            let state_str = task_state_string(os, entry.result_channel_id, entry.pid)?;
             lines.push(format!(
-                "{:<19} {:<8} {:<14} {:<14} {:<11} {}",
-                short_id, pid, agent_name, model, state_str, description
+                "{:<37} {:<8} {:<14} {:<14} {:<11} {}",
+                tid, entry.pid, entry.agent_name, entry.model, state_str, entry.description
             ));
             if let Some(progress) = current_task_progress(tid) {
                 lines.push(format!("  progress[{tid}]: {progress}"));
             }
-            let entry = AsyncTaskEntry {
-                session_id: current_session_id.clone(),
-                result_observed: false,
-                owner_pid: *owner_pid,
-                pid: *pid,
-                result_channel_id: *result_channel_id,
-                completion_futex_addr: *completion_futex_addr,
-                description: description.clone(),
-                agent_name: agent_name.clone(),
-                model: model.clone(),
-                is_model_auto_selected: false,
-                auto_model_fallback: None,
-                selection_explanation: String::new(),
-                inherit: InheritOptions::default(),
-                started_at: *started_at,
-                last_progress_notification_at: None,
-                last_progress_persisted_at: None,
-                abort_handle: None,
-                cancel_stream: Arc::new(AtomicBool::new(false)),
-            };
-            if let Some(rendered) = collect_ready_task_result(os, tid, &entry)? {
-                completed_outputs.push(rendered);
-                cleanup_collected_task(os, &entry, "subagent result collected by task_status");
-                finished_ids.push(tid.clone());
-            } else if !is_task_pending(os, *pid)? {
-                // Consistent with task_wait: when the process terminated without writing back a
-                // result, the task must also be closed out and both sides of the channel
-                // ownership released, so polling only task_status does not leak.
-                let rendered = collect_missing_task_result(tid, &entry)?;
-                completed_outputs.push(rendered);
-                cleanup_collected_task(
-                    os,
-                    &entry,
-                    "subagent terminated without output before task_status collection",
-                );
+            if let Some(collected) =
+                drain_task_result(os, tid, entry, "subagent result collected by task_status")?
+            {
+                completed_outputs.push(collected.rendered);
                 finished_ids.push(tid.clone());
             }
         }
         Ok(())
-    })?;
+    });
+    // Remove collected entries even when a later task failed mid-batch. Their channels and
+    // futexes are already destroyed, so a stranded entry would make every later task_status /
+    // task_wait call fail on a missing channel.
     if !finished_ids.is_empty() {
-        let mut registry = TASK_REGISTRY.lock().unwrap();
+        let mut registry = lock_task_registry();
         for task_id in &finished_ids {
             registry.remove(task_id);
         }
     }
+    kernel_result?;
 
     if !completed_outputs.is_empty() {
         lines.push(String::new());

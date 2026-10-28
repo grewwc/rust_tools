@@ -349,6 +349,7 @@ pub(super) fn inject_tool_round_checkpoint_note(
         "[tool-round-checkpoint] level={} phase={} round={iteration} threshold={}.\n\
         {}\n\
         {}\n\
+        Precedence: if the two paragraphs above appear to conflict, the level paragraph governs pacing and the phase paragraph only suggests what to do next. Checkpoints are advisory pacing only: no checkpoint forbids tool calls or requires ending the turn.\n\
         Checkpoint does not change delegation rules: do not hand off the current branch due to context or iteration pressure; delegate bounded sub-steps (serial or parallel) and review their results.",
         checkpoint.level.label(),
         checkpoint.phase.recent_progress(),
@@ -363,6 +364,29 @@ pub(super) fn inject_tool_round_checkpoint_note(
         tool_call_id: None,
         reasoning_content: None,
     });
+}
+
+/// One-line canonical-history marker for a fired tool-round checkpoint. The full
+/// guidance stays transient (context budget), but the fact that a checkpoint fired
+/// — and which level/phase the model saw — must stay recoverable post-hoc. This
+/// past-tense record is an observation, never an instruction.
+pub(super) fn tool_round_checkpoint_record(
+    iteration: usize,
+    checkpoint: ToolRoundCheckpoint,
+) -> crate::ai::history::Message {
+    crate::ai::history::Message {
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+        content: serde_json::Value::String(format!(
+            "[tool-round-checkpoint recorded level={} phase={} round={iteration} threshold={} action={}]",
+            checkpoint.level.label(),
+            checkpoint.phase.recent_progress(),
+            checkpoint.threshold,
+            checkpoint.phase.action(),
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }
 }
 
 /// Self-reflection prompt after max_iterations is hit (replaces an outright force_final surrender).

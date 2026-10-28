@@ -151,14 +151,25 @@ impl SubagentStatusLine {
         session_ids.sort();
         session_ids.dedup();
 
+        // Snapshot the task registry before taking the kernel lock. The registry is never held
+        // while the kernel is locked, so the status line cannot form the reverse of the
+        // registry -> kernel order used by the task tools.
+        let snapshots_by_session = session_ids
+            .into_iter()
+            .map(|session_id| {
+                let snapshots =
+                    crate::ai::tools::task_tools::subagent_status_snapshots(&session_id);
+                (session_id, snapshots)
+            })
+            .collect::<Vec<_>>();
         let statuses_by_session = {
             let mut os = app.os.lock().unwrap_or_else(|err| err.into_inner());
-            session_ids
+            snapshots_by_session
                 .into_iter()
-                .map(|session_id| {
+                .map(|(session_id, snapshots)| {
                     let statuses = crate::ai::tools::task_tools::subagent_terminal_statuses(
                         os.as_mut(),
-                        &session_id,
+                        snapshots,
                     );
                     (session_id, statuses)
                 })

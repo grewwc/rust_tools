@@ -30,6 +30,7 @@ pub(in crate::ai::driver::turn_runtime) const OUTSTANDING_WORK_MAX_REOPENS: usiz
 pub(in crate::ai::driver::turn_runtime) struct FinalGateState {
     retry_consumed: bool,
     no_tool_retry_consumed: bool,
+    final_terminator_retry_consumed: bool,
     outstanding_work_reopens: usize,
 }
 
@@ -49,6 +50,10 @@ impl FinalGateState {
             no_tool_retry_consumed: current_turn_has_internal_marker(
                 messages,
                 NO_TOOL_SYNTHESIS_RETRY_MARKER,
+            ),
+            final_terminator_retry_consumed: current_turn_has_internal_marker(
+                messages,
+                FINAL_TERMINATOR_RETRY_MARKER,
             ),
             outstanding_work_reopens: usize::from(current_turn_has_internal_marker(
                 messages,
@@ -96,6 +101,21 @@ impl FinalGateState {
 
     pub(super) fn consume_no_tool_retry(&mut self) {
         self.no_tool_retry_consumed = true;
+    }
+
+    pub(super) fn can_reopen_final_terminator(
+        &self,
+        force_final_response: bool,
+        iteration: usize,
+        max_iterations: usize,
+    ) -> bool {
+        !self.final_terminator_retry_consumed
+            && !force_final_response
+            && iteration < max_iterations
+    }
+
+    pub(super) fn consume_final_terminator_retry(&mut self) {
+        self.final_terminator_retry_consumed = true;
     }
 }
 

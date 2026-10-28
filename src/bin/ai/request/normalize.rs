@@ -15,6 +15,7 @@ use crate::ai::history::{
     is_summary_note_text, is_system_like_role,
 };
 use crate::ai::models;
+use crate::ai::tools::storage::mutation_log;
 use crate::ai::types::App;
 
 const IMAGE_PLACEHOLDER: &str = "[image omitted]";
@@ -264,6 +265,62 @@ fn is_query_memory_index_note(message: &Message) -> bool {
             .content
             .as_str()
             .is_some_and(|text| text.trim_start().starts_with(QUERY_MEMORY_INDEX_PREFIX))
+}
+
+/// Asset path carried by a projected checkpoint marker, if it has one.
+/// Markers without a path (`save_failed`, forged shapes) yield None and are
+/// left unannotated: the freshness signal fails closed to "no claim".
+fn checkpoint_asset_path(marker: &str) -> Option<&str> {
+    marker
+        .trim_start()
+        .strip_prefix("[context_checkpoint path=")
+        .and_then(|rest| rest.split(']').next())
+        .filter(|path| !path.is_empty())
+}
+
+/// Freshness verdict from filesystem stats only: the asset's mtime stands in
+/// for the checkpoint save time, the mutation log's mtime for the latest
+/// tool-recorded project write. Pure so the branch table is unit-testable;
+/// the asset-missing branch resolves in the IO wrapper below. The verdict is
+/// monotonic per checkpoint (fresh flips to changed at most once, when the
+/// first post-save write lands), so the calibration prefix pays at most one
+/// break per checkpoint.
+fn checkpoint_freshness_from_mtimes(
+    asset_modified: Option<std::time::SystemTime>,
+    log_modified: Option<std::time::SystemTime>,
+) -> Option<&'static str> {
+    let asset_time = asset_modified?;
+    match log_modified {
+        // No log: no tool-recorded writes exist, or logging is inactive
+        // (tests, one-shot calls) — either way there is no positive evidence
+        // either direction, so no claim. The header above still says
+        // verify-before-rely.
+        None => None,
+        Some(log_time) if log_time <= asset_time => Some(
+            "(fresh: no tool-recorded project writes since this checkpoint was saved)",
+        ),
+        Some(_) => Some(
+            "(changed: project files were written after this checkpoint — re-verify before relying)",
+        ),
+    }
+}
+
+/// Projection-time freshness annotation for one checkpoint marker. Stat-only
+/// (no log reads: this runs on every preview); every failure mode degrades
+/// to either an explicit stale note or no claim at all, never a false fresh.
+fn checkpoint_freshness_note(marker: &str) -> Option<&'static str> {
+    let asset = checkpoint_asset_path(marker)?;
+    let asset_time = match std::fs::metadata(asset).and_then(|meta| meta.modified()) {
+        Ok(time) => time,
+        // The body cannot even be read back: say so loudly rather than
+        // letting the model plan around an unreadable checkpoint.
+        Err(_) => {
+            return Some("(stale: checkpoint asset missing or unreadable — content unverifiable)")
+        }
+    };
+    let log_time = mutation_log::log_path()
+        .and_then(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok());
+    checkpoint_freshness_from_mtimes(Some(asset_time), log_time)
 }
 
 pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
@@ -1020,6 +1077,10 @@ evidence before relying on them.\n",
         );
         for marker in checkpoint_markers.iter().rev() {
             checkpoint_context.push_str(marker);
+            if let Some(note) = checkpoint_freshness_note(marker) {
+                checkpoint_context.push(' ');
+                checkpoint_context.push_str(note);
+            }
             checkpoint_context.push('\n');
         }
         derived_sections.push(checkpoint_context);
@@ -1598,6 +1659,41 @@ mod final_assistant_whitespace_tests {
         assert_eq!(
             last.content,
             Value::String(DERIVED_CONTEXT_RETURN.to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_freshness_tests {
+    use super::*;
+
+    #[test]
+    fn freshness_branches_fail_closed() {
+        use std::time::{Duration, SystemTime};
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let later = base + Duration::from_secs(60);
+        // No log: no claim either way (logging may simply be inactive).
+        assert_eq!(checkpoint_freshness_from_mtimes(Some(base), None), None);
+        // No asset stat: no claim (the IO wrapper reports stale instead).
+        assert_eq!(checkpoint_freshness_from_mtimes(None, Some(later)), None);
+        // Log not newer than the save: fresh.
+        assert_eq!(
+            checkpoint_freshness_from_mtimes(Some(base), Some(base)),
+            Some("(fresh: no tool-recorded project writes since this checkpoint was saved)")
+        );
+        // Log newer than the save: changed.
+        assert_eq!(
+            checkpoint_freshness_from_mtimes(Some(base), Some(later)),
+            Some("(changed: project files were written after this checkpoint — re-verify before relying)")
+        );
+        // Marker shapes without a path yield no asset to stat.
+        assert_eq!(
+            checkpoint_asset_path("[context_checkpoint save_failed] x"),
+            None
+        );
+        assert_eq!(
+            checkpoint_asset_path("[context_checkpoint path=/tmp/a.md] summary"),
+            Some("/tmp/a.md")
         );
     }
 }

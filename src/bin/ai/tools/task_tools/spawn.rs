@@ -334,6 +334,31 @@ pub(crate) fn spawn_subagent_kernel_task(
     spawn_subagent_kernel_task_attempt(prepared, None)
 }
 
+/// IPC objects created before `os.spawn` succeeds. Goal encoding or spawn can fail, and no
+/// collector ever learns about such a task, so the guard releases the channel and futex on the
+/// error path instead of leaking them.
+struct PendingTaskIpc {
+    result_channel: ChannelId,
+    completion_futex: FutexAddr,
+    committed: bool,
+}
+
+impl Drop for PendingTaskIpc {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let _ = with_os_kernel(|os| {
+            let _ = os.channel_close(None, self.result_channel);
+            let _ = os.channel_release_named(self.result_channel, "task_result.consumer");
+            let _ = os.channel_release_named(self.result_channel, "task_result.producer");
+            let _ = os.channel_destroy(None, self.result_channel);
+            let _ = os.futex_destroy(self.completion_futex);
+            Ok(())
+        });
+    }
+}
+
 pub(super) fn spawn_subagent_kernel_task_attempt(
     prepared: &PreparedSubagentTask,
     retry_of: Option<&str>,
@@ -349,7 +374,7 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
         ));
     }
     {
-        let registry = TASK_REGISTRY.lock().unwrap();
+        let registry = lock_task_registry();
         if registry.len() >= MAX_TASK_REGISTRY_SIZE {
             return Err(format!(
                 "Subagent task registry is full ({MAX_TASK_REGISTRY_SIZE}). \
@@ -358,7 +383,8 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
         }
     }
     let task_id = next_task_id();
-    let (owner_pid, pid, result_channel_id, completion_futex_addr) = with_os_kernel(|os| {
+    let mut pending_ipc = None;
+    let spawned = with_os_kernel(|os| {
         let parent_pid = os
             .current_process_id()
             .ok_or("subagent task requires an active AIOS process context.".to_string())?;
@@ -373,6 +399,11 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
             ],
         );
         let completion_futex = os.futex_create(0, format!("task_completion:{task_id}"));
+        pending_ipc = Some(PendingTaskIpc {
+            result_channel,
+            completion_futex,
+            committed: false,
+        });
         let process_goal = encode_os_task_goal(&OsTaskGoal {
             task_id: task_id.clone(),
             result_channel_id: result_channel.raw(),
@@ -398,14 +429,17 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
         )?;
         Ok((parent_pid, pid, result_channel.raw(), completion_futex))
     })?;
+    if let Some(ipc) = pending_ipc.as_mut() {
+        ipc.committed = true;
+    }
+    let (owner_pid, pid, result_channel_id, completion_futex_addr) = spawned;
 
     {
-        let mut registry = TASK_REGISTRY.lock().unwrap();
+        let mut registry = lock_task_registry();
         registry.insert(
             task_id.clone(),
             AsyncTaskEntry {
                 session_id: crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
-                result_observed: false,
                 owner_pid,
                 pid,
                 result_channel_id,
@@ -425,7 +459,7 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
             },
         );
     }
-    TASK_PROGRESS_REGISTRY.lock().unwrap().insert(
+    lock_unpoisoned(&TASK_PROGRESS_REGISTRY).insert(
         task_id.clone(),
         crate::ai::driver::runtime_ctx::new_subagent_progress_slot(),
     );

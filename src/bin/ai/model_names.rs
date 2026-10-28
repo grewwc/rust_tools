@@ -640,9 +640,9 @@ fn build_builtin_key_index() -> SkipMap<String, usize> {
 
 /// Phase 2 of key-index building: insert backward-compat `name-adapter`
 /// aliases only when they do not collide with an already-inserted key or
-/// handle. A registry entry keyed `deepseek-v4-flash-0731-alibaba` must not
+/// handle. A registry entry keyed `example-model-alibaba` must not
 /// be hijacked by another entry's legacy alias of the same shape (e.g. a
-/// token-plan twin whose `name` is `deepseek-v4-flash-0731` under the
+/// token-plan twin whose `name` is `example-model` under the
 /// `alibaba` adapter); keys always win over aliases.
 fn insert_legacy_aliases_after_keys(index: &mut SkipMap<String, usize>, models: &[ModelDef]) {
     for (i, m) in models.iter().enumerate() {

@@ -38,6 +38,11 @@ pub(crate) struct PromptTokenFeedback {
     settings: Option<u64>,
     messages: Option<Vec<u64>>,
     estimated_prompt_tokens: usize,
+    /// Pessimistic twin of `estimated_prompt_tokens`: identical inputs, every
+    /// component projected with its `_upper` variant. Upper-bound input for
+    /// the context water meter only; calibration and budgets keep the lower
+    /// estimate. Always `>= estimated_prompt_tokens` by construction.
+    estimated_prompt_tokens_upper: usize,
     message_counts: BillableCounts,
     actual_prompt_tokens: Option<usize>,
     awaiting_usage: bool,
@@ -239,6 +244,11 @@ impl PromptTokenFeedback {
             settings: Some(fingerprint_settings(body)),
             messages: Some(body.messages.iter().map(fingerprint_message).collect()),
             estimated_prompt_tokens: body.estimated_prompt_tokens,
+            estimated_prompt_tokens_upper: super::builder::estimate_request_prompt_upper(
+                body.messages,
+                body.tools.as_ref(),
+                body.reasoning_items,
+            ),
             message_counts: body.message_counts,
             actual_prompt_tokens: None,
             awaiting_usage: true,
@@ -270,6 +280,7 @@ impl PromptTokenFeedback {
         reasoning_encrypted_replay: bool,
         stream: bool,
         estimated_prompt_tokens: usize,
+        estimated_prompt_tokens_upper: usize,
         message_counts: BillableCounts,
     ) -> Self {
         let mut hasher = rustc_hash::FxHasher::default();
@@ -301,6 +312,7 @@ impl PromptTokenFeedback {
             settings: Some(hasher.finish()),
             messages: Some(messages.iter().map(fingerprint_message).collect()),
             estimated_prompt_tokens,
+            estimated_prompt_tokens_upper,
             message_counts,
             actual_prompt_tokens: None,
             awaiting_usage: true,
@@ -343,6 +355,16 @@ impl PromptTokenFeedback {
 
     pub(crate) fn prefix_reuse(&self) -> Option<PrefixReuse> {
         self.prefix_reuse
+    }
+
+    /// Whether the captured request begins with this exact message. The water
+    /// meter uses this to preserve its prior fixed-band prefix long enough to
+    /// apply compatible provider usage before deciding whether to change bands.
+    pub(super) fn starts_with_message(&self, message: &Message) -> bool {
+        self.messages
+            .as_ref()
+            .and_then(|messages| messages.first())
+            .is_some_and(|fingerprint| *fingerprint == fingerprint_message(message))
     }
 
     /// Consume the pending observation even when usage is missing or mismatched.
@@ -401,6 +423,25 @@ impl PromptTokenFeedback {
             .estimated_prompt_tokens
             .saturating_sub(previous.estimated_prompt_tokens);
         calibrated_context_tokens(previous.estimated_prompt_tokens, actual, growth)
+    }
+
+    /// Pessimistic twin of [`context_prompt_tokens`](Self::context_prompt_tokens):
+    /// the verified prefix stays exact (`actual`), only the growth is
+    /// projected with the upper estimate. The trailing `max` keeps the
+    /// interval valid (`upper >= lower`) even if a future ratio change ever
+    /// narrows the pessimistic projection. Read by the water meter only.
+    pub(super) fn context_prompt_tokens_upper(&self, previous: Option<&Self>) -> usize {
+        let lower = self.context_prompt_tokens(previous);
+        let Some((previous, actual)) = previous.and_then(|previous| {
+            self.compatible_usage(previous)
+                .map(|actual| (previous, actual))
+        }) else {
+            return self.estimated_prompt_tokens_upper.max(lower);
+        };
+        let growth = self
+            .estimated_prompt_tokens_upper
+            .saturating_sub(previous.estimated_prompt_tokens_upper);
+        calibrated_context_tokens(previous.estimated_prompt_tokens, actual, growth).max(lower)
     }
 
     /// Message chars per prompt token, in thousandths, for translating token
@@ -766,6 +807,11 @@ mod tests {
                 ),
                 body.estimated_prompt_tokens,
             );
+            let estimated_upper =
+                super::super::builder::estimate_request_prompt_upper_from_definitions(
+                    &messages, tools_defs, None,
+                );
+            assert_eq!(estimated_upper, expected.estimated_prompt_tokens_upper);
             let actual = PromptTokenFeedback::capture_preview(
                 "session",
                 &model,
@@ -780,6 +826,7 @@ mod tests {
                 body.reasoning_encrypted_replay,
                 body.stream,
                 body.estimated_prompt_tokens,
+                estimated_upper,
                 body.message_counts,
             );
             assert_eq!(actual.settings, expected.settings);
@@ -787,6 +834,10 @@ mod tests {
             assert_eq!(
                 actual.estimated_prompt_tokens,
                 expected.estimated_prompt_tokens
+            );
+            assert_eq!(
+                actual.estimated_prompt_tokens_upper,
+                expected.estimated_prompt_tokens_upper
             );
             assert_eq!(actual.message_counts, expected.message_counts);
         }

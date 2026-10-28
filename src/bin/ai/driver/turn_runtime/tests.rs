@@ -1111,6 +1111,84 @@ fn tool_round_checkpoints_are_staged() {
     assert_eq!(messages.len(), 3);
 }
 
+#[test]
+fn tool_round_checkpoint_never_forbids_tool_calls_at_any_level() {
+    let phases = [
+        ToolRoundCheckpointPhase::Explore,
+        ToolRoundCheckpointPhase::ImplementedNeedsVerification,
+        ToolRoundCheckpointPhase::VerifiedNeedsFinalization,
+        ToolRoundCheckpointPhase::RecoveringFromError,
+    ];
+    for level_index in 0..3 {
+        for phase in phases {
+            let checkpoint = ToolRoundCheckpoint {
+                level: ToolRoundCheckpointLevel::from_index(level_index),
+                phase,
+                threshold: 24,
+            };
+            let mut messages = Vec::new();
+            inject_tool_round_checkpoint_note(&mut messages, 24, checkpoint);
+            let text = messages[0]
+                .content
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                text.contains("Checkpoints are advisory pacing only")
+                    && text.contains("no checkpoint forbids tool calls"),
+                "level {level_index} phase {phase:?} must carry the advisory-only guarantee"
+            );
+            assert!(
+                text.contains("Precedence:"),
+                "level {level_index} phase {phase:?} must carry the level-over-phase precedence rule"
+            );
+            for forbidden in [
+                "do not call any more tools",
+                "do not call further tools",
+                "wrap up immediately",
+                "complete the answer",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "level {level_index} phase {phase:?} must not force a stop, found: {forbidden}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn tool_round_checkpoint_record_is_a_persistable_one_line_marker() {
+    let checkpoint = ToolRoundCheckpoint {
+        level: ToolRoundCheckpointLevel::from_index(2),
+        phase: ToolRoundCheckpointPhase::VerifiedNeedsFinalization,
+        threshold: 96,
+    };
+    let record = tool_round_checkpoint_record(96, checkpoint);
+    assert_eq!(record.role, crate::ai::history::ROLE_INTERNAL_NOTE);
+    let text = record.content.as_str().unwrap_or_default().to_string();
+    assert!(
+        text.starts_with("[tool-round-checkpoint recorded "),
+        "marker must be past-tense observation, got: {text}"
+    );
+    assert!(!text.contains('\n'), "marker must stay one line");
+    for part in [
+        "level=finalize",
+        "phase=verification-success",
+        "round=96",
+        "threshold=96",
+        "action=checkpoint-and-continue",
+    ] {
+        assert!(text.contains(part), "marker must contain {part}, got: {text}");
+    }
+    for instruction in ["do not", "Do not", "must", "should"] {
+        assert!(
+            !text.contains(instruction),
+            "marker must not read as an instruction, found: {instruction}"
+        );
+    }
+}
+
 fn checkpoint_tool_round(
     call_id: &str,
     name: &str,

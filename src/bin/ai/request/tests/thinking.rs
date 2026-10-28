@@ -1,5 +1,6 @@
 use super::common::{test_app};
 use super::super::*;
+use crate::ai::provider::{ReasoningEffort, ThinkingOffCapability};
 use serde_json::Value;
 
 
@@ -14,42 +15,35 @@ fn thinking_disabled_override_forces_thinking_off() {
     // Once truncation fallback sets thinking_disabled_override, resolve_thinking
     // must short-circuit to false even when the model supports thinking — the
     // last resort for suppressing the reasoning chains of always-thinking models
-    // (GLM via enable_thinking).
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let mut app = test_app();
-    app.cli.thinking_disabled_override = true;
-    let enabled = rt.block_on(super::super::resolve_thinking(
-        &app,
-        "deepseek-v4-flash-0731-alibaba",
-        &[],
-    ));
-    assert!(!enabled, "override 置位时 thinking 必须关闭");
+    // (GLM via enable_thinking). Synthetic inputs mirror a thinking-capable
+    // switch-dialect model whose default effort would otherwise enable thinking.
+    let enabled = super::super::thinking::resolve_thinking_static(
+        true,
+        None,
+        ThinkingOffCapability::RealSwitch,
+        false,
+        true,
+        true,
+        Some(ReasoningEffort::Max),
+    );
+    assert_eq!(enabled, Some(false), "override 置位时 thinking 必须关闭");
 }
 
 #[test]
-fn dashscope_deepseek_defaults_to_thinking_for_simple_requests() {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let app = test_app();
-    let messages = vec![Message {
-        role: "user".to_string(),
-        content: Value::String("你好".to_string()),
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    }];
-
-    let enabled = rt.block_on(super::super::resolve_thinking(
-        &app,
-        "deepseek-v4-flash-0731-alibaba",
-        &messages,
-    ));
-    assert!(enabled);
+fn default_effort_short_circuits_thinking_on() {
+    // Models with a declared default reasoning effort always think — the
+    // short-circuit that bypasses both the local heuristic and the model gate.
+    // (Previously pinned via the DashScope DeepSeek key; same branch.)
+    let enabled = super::super::thinking::resolve_thinking_static(
+        false,
+        None,
+        ThinkingOffCapability::RealSwitch,
+        false,
+        true,
+        true,
+        Some(ReasoningEffort::Max),
+    );
+    assert_eq!(enabled, Some(true));
 }
 
 #[test]
@@ -57,53 +51,44 @@ fn effort_off_turns_off_thinking_for_switch_dialects() {
     // `/effort off` (Some(None)) must flip thinking off on dialects with a real
     // off-switch: DashScope `enable_thinking:false` (alibaba adapter) and the
     // DeepSeek `thinking:{"type":"disabled"}` object (official api.deepseek.com).
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let mut app = test_app();
-    app.cli.reasoning_effort_override = Some(None);
-    let messages = vec![Message {
-        role: "user".to_string(),
-        content: Value::String("hi".to_string()),
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    }];
-    for model in ["deepseek-v4-flash-0731-alibaba", "deepseek-flash-official"] {
-        let enabled = rt.block_on(super::super::resolve_thinking(&app, model, &messages));
-        assert!(!enabled, "effort off must disable thinking for {model}");
-    }
+    // Both map to RealSwitch, so one synthetic case pins the shared branch.
+    let enabled = super::super::thinking::resolve_thinking_static(
+        false,
+        Some(None),
+        ThinkingOffCapability::RealSwitch,
+        false,
+        true,
+        true,
+        Some(ReasoningEffort::Max),
+    );
+    assert_eq!(enabled, Some(false), "effort off must disable thinking for RealSwitch dialects");
 }
 
 #[test]
 fn effort_off_keeps_local_flag_for_effort_only_dialects() {
     // Volcano DeepSeek (NoThinkingDialect) has no wire off-switch: resolve_thinking
-    // keeps its normal decision (the registry default-effort short-circuit), and the
+    // keeps its normal decision (the default-effort short-circuit), and the
     // actual thinking-off happens via `reasoning_effort: "none"` in
     // resolve_reasoning_effort — the only lever that dialect has.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let mut app = test_app();
-    app.cli.reasoning_effort_override = Some(None);
-    let messages = vec![Message {
-        role: "user".to_string(),
-        content: Value::String("hi".to_string()),
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    }];
-    let enabled = rt.block_on(super::super::resolve_thinking(
-        &app,
-        "deepseek-v4-flash-volcano",
-        &messages,
-    ));
-    assert!(enabled, "NoThinkingDialect keeps the local flag (wire off happens via effort none)");
+    let enabled = super::super::thinking::resolve_thinking_static(
+        false,
+        Some(None),
+        ThinkingOffCapability::EffortNone,
+        false,
+        true,
+        true,
+        Some(ReasoningEffort::Max),
+    );
+    assert_eq!(enabled, Some(true), "NoThinkingDialect keeps the local flag (wire off happens via effort none)");
     assert_eq!(
-        super::super::reasoning::resolve_reasoning_effort(&app, "deepseek-v4-flash-volcano"),
-        Some(crate::ai::provider::ReasoningEffort::None),
+        super::super::reasoning::resolve_reasoning_effort_from_parts(
+            Some(None),
+            "",
+            ThinkingOffCapability::EffortNone,
+            true,
+            Some(ReasoningEffort::Max),
+        ),
+        Some(ReasoningEffort::None),
         "effort off must send reasoning_effort: none for effort-only dialects"
     );
 }
@@ -112,87 +97,120 @@ fn effort_off_keeps_local_flag_for_effort_only_dialects() {
 fn effort_off_omits_effort_for_switch_dialects() {
     // Switch-based dialects express thinking off through their switch; the effort
     // field is omitted (None), never "none" (an unverified value on DashScope).
-    let mut app = test_app();
-    app.cli.reasoning_effort_override = Some(None);
     assert_eq!(
-        super::super::reasoning::resolve_reasoning_effort(&app, "deepseek-v4-flash-0731-alibaba"),
-        None,
-    );
-    assert_eq!(
-        super::super::reasoning::resolve_reasoning_effort(&app, "deepseek-flash-official"),
+        super::super::reasoning::resolve_reasoning_effort_from_parts(
+            Some(None),
+            "",
+            ThinkingOffCapability::RealSwitch,
+            true,
+            Some(ReasoningEffort::Max),
+        ),
         None,
     );
 }
 
 #[test]
-fn effort_off_on_minimax_is_a_noop() {
-    // MiniMax M2.x (Unsupported capability) has no reliable off switch:
-    // `/effort off` must NOT change the thinking decision (it stays whatever
-    // auto-detection decides) and must NOT emit `reasoning_effort:"none"` (an
-    // unverified value the gateway may ignore or reject).
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let messages = vec![Message {
-        role: "user".to_string(),
-        content: Value::String("hi".to_string()),
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    }];
-    for model in ["mimo-v2.5-pro", "mimo-v2.5-free-opencode"] {
-        let mut app = test_app();
-        let baseline = rt.block_on(super::super::resolve_thinking(&app, model, &messages));
-        app.cli.reasoning_effort_override = Some(None);
-        let with_off = rt.block_on(super::super::resolve_thinking(&app, model, &messages));
-        assert_eq!(
-            with_off, baseline,
-            "/effort off must not change thinking for Unsupported model {model}"
-        );
-        assert_eq!(
-            super::super::reasoning::resolve_reasoning_effort(&app, model),
-            None,
-            "effort off must not emit reasoning_effort for {model}"
-        );
-    }
+fn effort_off_on_unsupported_dialect_is_a_noop() {
+    // Unsupported-capability dialects (MiniMax M2.x, beam) have no reliable
+    // off switch: `/effort off` must NOT change the thinking decision (it
+    // stays whatever auto-detection decides) and must NOT emit
+    // `reasoning_effort:"none"` (an unverified value the gateway may ignore
+    // or reject).
+    let baseline = super::super::thinking::resolve_thinking_static(
+        false,
+        None,
+        ThinkingOffCapability::Unsupported,
+        false,
+        true,
+        true,
+        Some(ReasoningEffort::Max),
+    );
+    let with_off = super::super::thinking::resolve_thinking_static(
+        false,
+        Some(None),
+        ThinkingOffCapability::Unsupported,
+        false,
+        true,
+        true,
+        Some(ReasoningEffort::Max),
+    );
+    assert_eq!(
+        with_off, baseline,
+        "/effort off must not change thinking for Unsupported dialects"
+    );
+    assert_eq!(
+        super::super::reasoning::resolve_reasoning_effort_from_parts(
+            Some(None),
+            "",
+            ThinkingOffCapability::Unsupported,
+            true,
+            Some(ReasoningEffort::Max),
+        ),
+        None,
+        "effort off must not emit reasoning_effort for Unsupported dialects"
+    );
 }
 
 #[test]
 fn reasoning_effort_display_label_reflects_explicit_off() {
     // The status line must show the user's explicit off, not fold Some(None)
     // back into "auto" (which would misrepresent the off state).
-    let mut app = test_app();
-    app.cli.reasoning_effort_override = Some(None);
     assert_eq!(
-        super::super::reasoning::reasoning_effort_display_label(&app, "deepseek-v4-flash-0731-alibaba"),
+        super::super::reasoning::reasoning_effort_display_label_from_parts(
+            Some(None),
+            "",
+            ThinkingOffCapability::RealSwitch,
+            true,
+            Some(ReasoningEffort::Max),
+        ),
         "off"
     );
-    // Unsupported (MiniMax): the honest "off (unsupported)" instead of a
-    // success-sounding "off".
+    // Unsupported (beam; the registry currently carries no MiniMax entry):
+    // the honest "off (unsupported)" instead of a success-sounding "off".
     assert_eq!(
-        super::super::reasoning::reasoning_effort_display_label(&app, "mimo-v2.5-pro"),
+        super::super::reasoning::reasoning_effort_display_label_from_parts(
+            Some(None),
+            "",
+            ThinkingOffCapability::Unsupported,
+            true,
+            Some(ReasoningEffort::Max),
+        ),
         "off (unsupported)"
     );
-    // No override: registry default applies, or "server default" when the model
-    // declares none (never the misleading "auto").
-    let app2 = test_app();
+    // No override: the declared default applies ("max" here, as on the Volcano
+    // DeepSeek entry), or "server default" when the model declares none (never
+    // the misleading "auto").
     assert_eq!(
-        super::super::reasoning::reasoning_effort_display_label(&app2, "deepseek-v4-flash-volcano"),
+        super::super::reasoning::reasoning_effort_display_label_from_parts(
+            None,
+            "",
+            ThinkingOffCapability::EffortNone,
+            true,
+            Some(ReasoningEffort::Max),
+        ),
         "max"
     );
+    // Intentionally-unregistered probe: exercises the no-default fallback
+    // branch (every registry entry currently declares a default). Key literal
+    // stays — it tests the registry-miss fallback itself.
+    let app2 = test_app();
     assert_eq!(
-        super::super::reasoning::reasoning_effort_display_label(&app2, "mimo-v2.5-pro"),
+        super::super::reasoning::reasoning_effort_display_label(&app2, "unregistered-model-no-default"),
         "server default"
     );
 }
 
 #[test]
 fn effort_defaults_to_registry_when_no_override() {
-    let app = test_app();
     assert_eq!(
-        super::super::reasoning::resolve_reasoning_effort(&app, "deepseek-v4-flash-volcano"),
-        Some(crate::ai::provider::ReasoningEffort::Max),
+        super::super::reasoning::resolve_reasoning_effort_from_parts(
+            None,
+            "",
+            ThinkingOffCapability::EffortNone,
+            true,
+            Some(ReasoningEffort::Max),
+        ),
+        Some(ReasoningEffort::Max),
     );
 }
 
@@ -202,39 +220,62 @@ fn sharp_agent_implies_low_effort_from_live_agent() {
     // parse, so a live `/agent sharp` never picked it up while `/agent build`
     // (and startup fallbacks to build) kept a stale `low`. It is now derived
     // from the live agent at resolve time, so no switch path can go stale.
-    let mut app = test_app();
     // Live `/agent sharp` with no explicit override.
-    app.current_agent = "sharp".to_string();
     assert_eq!(
-        super::super::reasoning::resolve_reasoning_effort(&app, "deepseek-v4-flash-volcano"),
-        Some(crate::ai::provider::ReasoningEffort::Low),
+        super::super::reasoning::resolve_reasoning_effort_from_parts(
+            None,
+            "sharp",
+            ThinkingOffCapability::EffortNone,
+            true,
+            Some(ReasoningEffort::Max),
+        ),
+        Some(ReasoningEffort::Low),
     );
     assert_eq!(
-        super::super::reasoning::reasoning_effort_display_label(&app, "deepseek-v4-flash-volcano"),
+        super::super::reasoning::reasoning_effort_display_label_from_parts(
+            None,
+            "sharp",
+            ThinkingOffCapability::EffortNone,
+            true,
+            Some(ReasoningEffort::Max),
+        ),
         "low",
     );
     // Switching back (`/agent build`, or a startup fallback to build after an
     // unresolvable `--agent sharp`) drops the implied low with no state to clear.
-    app.current_agent = "build".to_string();
     assert_eq!(
-        super::super::reasoning::resolve_reasoning_effort(&app, "deepseek-v4-flash-volcano"),
-        Some(crate::ai::provider::ReasoningEffort::Max),
+        super::super::reasoning::resolve_reasoning_effort_from_parts(
+            None,
+            "build",
+            ThinkingOffCapability::EffortNone,
+            true,
+            Some(ReasoningEffort::Max),
+        ),
+        Some(ReasoningEffort::Max),
     );
 }
 
 #[test]
 fn explicit_effort_override_wins_over_sharp_default() {
-    let mut app = test_app();
-    app.current_agent = "sharp".to_string();
-    app.cli.reasoning_effort_override = Some(Some(crate::ai::provider::ReasoningEffort::Max));
     assert_eq!(
-        super::super::reasoning::resolve_reasoning_effort(&app, "deepseek-v4-flash-volcano"),
-        Some(crate::ai::provider::ReasoningEffort::Max),
+        super::super::reasoning::resolve_reasoning_effort_from_parts(
+            Some(Some(ReasoningEffort::Max)),
+            "sharp",
+            ThinkingOffCapability::EffortNone,
+            true,
+            Some(ReasoningEffort::Max),
+        ),
+        Some(ReasoningEffort::Max),
     );
     // Explicit off also wins over the sharp default.
-    app.cli.reasoning_effort_override = Some(None);
     assert_eq!(
-        super::super::reasoning::resolve_reasoning_effort(&app, "deepseek-v4-flash-0731-alibaba"),
+        super::super::reasoning::resolve_reasoning_effort_from_parts(
+            Some(None),
+            "sharp",
+            ThinkingOffCapability::RealSwitch,
+            true,
+            Some(ReasoningEffort::Max),
+        ),
         None,
     );
 }

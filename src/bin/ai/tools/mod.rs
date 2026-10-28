@@ -27,7 +27,7 @@ mod web_tools;
 #[cfg(test)]
 pub use command_tools::validate_execute_command;
 
-pub(crate) use complete_tools::COMPLETE_CLAIM_RECORDED_PREFIX;
+pub(crate) use complete_tools::{COMPLETE_CLAIM_RECORDED_PREFIX, FINAL_RESPONSE_END_MARKER};
 pub(crate) use patch_tools::{PATCH_TEXT_BLOCK_START, apply_patch_target_paths_from_patch};
 #[cfg(test)]
 pub(crate) use registry::common::ToolReplayRegistration;

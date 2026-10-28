@@ -2334,9 +2334,14 @@ mod tests {
         ];
         // 1M-token window model (registered name, not the file name): inline
         // line is 64K, the 40K result stays raw.
+        let wide_key = crate::ai::model_names::all()
+            .iter()
+            .map(|m| m.key.clone())
+            .find(|key| crate::ai::models::context_window_tokens(key) >= 1_000_000)
+            .expect("registry must keep at least one 1M-window model");
         let wide = apply_pre_request_context_budget(
             &app,
-            "deepseek-v4-pro",
+            &wide_key,
             &mut messages.clone(),
         );
         assert_eq!(

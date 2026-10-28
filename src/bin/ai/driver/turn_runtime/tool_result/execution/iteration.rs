@@ -276,6 +276,11 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 iteration,
                 max_iterations,
             );
+            let final_terminator_reopen_allowed = final_gate_state.can_reopen_final_terminator(
+                *force_final_response,
+                iteration,
+                max_iterations,
+            );
             let echo_action = if !final_gate_reopen_allowed
                 && looks_like_injected_context_echo(&stream_result.assistant_text)
             {
@@ -292,6 +297,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     return Ok(TurnLoopStep::Continue);
                 }
                 FinalRecoveryAction::Warn => {
+                    crate::ai::tools::plan_state::consume_completion_claim(app);
                     *final_assistant_text = INJECTED_CONTEXT_ECHO_STOP.to_string();
                     return Ok(TurnLoopStep::Break);
                 }
@@ -313,37 +319,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     return Ok(TurnLoopStep::Continue);
                 }
                 CompletionEvidenceGateAction::Warn => true,
-            };
-            let warn_outstanding_work = match outstanding_work_gate_action_with_turn_messages(
-                app,
-                messages,
-                turn_messages,
-                !outstanding_work_reopen_allowed,
-                iteration,
-                max_iterations,
-            ) {
-                OutstandingWorkGateAction::Allow => None,
-                OutstandingWorkGateAction::Reopen => {
-                    let attempt = final_gate_state.consume_outstanding_work_retry();
-                    drop(final_validation_status.take());
-                    print_tool_note_line(
-                        "final-gate",
-                        &format!(
-                            "missing `complete` or unsettled plan; reopening final response \
-                             ({attempt}/{OUTSTANDING_WORK_MAX_REOPENS})"
-                        ),
-                    );
-                    // Completed drafts are transactionally deferred and were never
-                    // user-visible, so they must not become a dedupe candidate.
-                    *terminal_dedupe_candidate = None;
-                    return Ok(TurnLoopStep::Continue);
-                }
-                OutstandingWorkGateAction::Warn(steps) => Some(format!(
-                    "{OUTSTANDING_WORK_WARNING} Unsettled steps: {steps}."
-                )),
-                OutstandingWorkGateAction::WarnUnasserted => {
-                    Some(OUTSTANDING_WORK_UNASSERTED_WARNING.to_string())
-                }
             };
             let warn_unretried_pause = match recoverable_pause_gate_action(
                 messages,
@@ -397,6 +372,62 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 }
                 FinalCitationGateAction::Warn => true,
             };
+            let warn_outstanding_work = match preflight_outstanding_work_gate_action(
+                app,
+                messages,
+                turn_messages,
+                !outstanding_work_reopen_allowed,
+                iteration,
+                max_iterations,
+            ) {
+                OutstandingWorkGateAction::Allow => None,
+                OutstandingWorkGateAction::Reopen => {
+                    crate::ai::tools::plan_state::consume_completion_claim(app);
+                    let attempt = final_gate_state.consume_outstanding_work_retry();
+                    drop(final_validation_status.take());
+                    print_tool_note_line(
+                        "final-gate",
+                        &format!(
+                            "missing `complete` or unsettled plan; reopening final response \
+                             ({attempt}/{OUTSTANDING_WORK_MAX_REOPENS})"
+                        ),
+                    );
+                    // Completed drafts are transactionally deferred and were never
+                    // user-visible, so they must not become a dedupe candidate.
+                    *terminal_dedupe_candidate = None;
+                    return Ok(TurnLoopStep::Continue);
+                }
+                OutstandingWorkGateAction::Warn(steps) => Some(format!(
+                    "{OUTSTANDING_WORK_WARNING} Unsettled steps: {steps}."
+                )),
+                OutstandingWorkGateAction::WarnUnasserted => {
+                    Some(OUTSTANDING_WORK_UNASSERTED_WARNING.to_string())
+                }
+            };
+            let warn_missing_final_terminator = match final_terminator_gate_action(
+                app,
+                messages,
+                turn_messages,
+                &mut stream_result.assistant_text,
+                final_terminator_reopen_allowed,
+            ) {
+                FinalTerminatorGateAction::Allow => false,
+                FinalTerminatorGateAction::Reopen => {
+                    final_gate_state.consume_final_terminator_retry();
+                    drop(final_validation_status.take());
+                    print_tool_note_line(
+                        "final-gate",
+                        "missing final terminator; rewriting final response (1/1)",
+                    );
+                    // Keep the completion claim for the replacement draft. It
+                    // is consumed only after a final is accepted or the
+                    // outstanding-work gate rejects it.
+                    *terminal_dedupe_candidate = None;
+                    return Ok(TurnLoopStep::Continue);
+                }
+                FinalTerminatorGateAction::Warn => true,
+            };
+            crate::ai::tools::plan_state::consume_completion_claim(app);
             let previously_rendered_body_matches = terminal_dedupe_candidate
                 .as_deref()
                 .is_some_and(|candidate| {
@@ -407,6 +438,16 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             // complete accepted answer below so finalize renders it exactly once; if an
             // identical tool-round narration was already visible, only new warnings remain.
             *terminal_dedupe_candidate = None;
+            if warn_missing_final_terminator {
+                append_runtime_warning_once(
+                    &mut stream_result.assistant_text,
+                    FINAL_TERMINATOR_WARNING,
+                );
+                append_user_visible_final_notice(
+                    terminal_dedupe_candidate,
+                    FINAL_TERMINATOR_WARNING,
+                );
+            }
             if warn_unverified_completion {
                 append_runtime_warning_once(
                     &mut stream_result.assistant_text,

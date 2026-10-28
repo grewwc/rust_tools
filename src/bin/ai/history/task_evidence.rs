@@ -410,6 +410,56 @@ pub(in crate::ai) fn integrate_task_evidence(
     })
 }
 
+/// Integrates a batch of delivered task results in one store transaction.
+///
+/// Returns the ids that have no delivered evidence. When the returned list is non-empty the
+/// transaction is rolled back, so either every id is integrated or none is.
+pub(in crate::ai) fn integrate_task_evidence_batch(
+    history_file: &Path,
+    session_id: &str,
+    integrations: &[(String, String, String)],
+) -> io::Result<Vec<String>> {
+    with_store_lock(history_file, session_id, || {
+        let mut connection = open_store(history_file, session_id)?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| sqlite_error("begin task evidence integration", error))?;
+        let mut unknown = Vec::new();
+        for (task_id, _, _) in integrations {
+            let delivered = transaction
+                .query_row(
+                    "SELECT delivered_at_unix_ms FROM task_evidence WHERE task_id = ?1",
+                    [task_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| sqlite_error("find delivered task evidence", error))?;
+            if !matches!(delivered, Some(delivered_at) if delivered_at > 0) {
+                unknown.push(task_id.clone());
+            }
+        }
+        if !unknown.is_empty() {
+            return Ok(unknown);
+        }
+        let now = unix_timestamp_ms();
+        for (task_id, disposition, summary) in integrations {
+            transaction
+                .execute(
+                    "UPDATE task_evidence
+                     SET integrated_at_unix_ms = ?2, disposition = ?3, integration_summary = ?4
+                     WHERE task_id = ?1 AND delivered_at_unix_ms > 0",
+                    params![task_id, now, disposition, summary],
+                )
+                .map_err(|error| sqlite_error("integrate task evidence", error))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| sqlite_error("commit task evidence integration", error))?;
+        refresh_task_evidence_checkpoint(&connection, history_file, session_id)?;
+        Ok(Vec::new())
+    })
+}
+
 pub(in crate::ai) fn task_evidence_exists(
     history_file: &Path,
     session_id: &str,

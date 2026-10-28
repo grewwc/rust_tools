@@ -99,6 +99,17 @@ impl BillableCounts {
     pub(in crate::ai) fn tokens(self) -> usize {
         (self.ascii + self.other * 3 + self.images * IMAGE_TOKEN_THIRDS).div_ceil(THIRDS_PER_TOKEN)
     }
+
+    /// Pessimistic prompt-token bound over the same counts: ASCII at 2
+    /// chars/token (the historical flat ratio, conservative for prose, code,
+    /// and tool schemas alike), non-ASCII and images exactly as in
+    /// [`tokens`](Self::tokens). Display-only input for the context water
+    /// meter: compression and clamping keep using `tokens()`, so the control
+    /// plane is unchanged. Always `>= tokens()` by construction.
+    pub(in crate::ai) fn tokens_upper(self) -> usize {
+        const IMAGE_TOKENS: usize = IMAGE_BUDGET_CHARS / 2;
+        self.ascii.div_ceil(2) + self.other + self.images * IMAGE_TOKENS
+    }
 }
 
 impl std::ops::Add for BillableCounts {

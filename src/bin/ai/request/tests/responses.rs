@@ -1,5 +1,7 @@
-use super::super::protocol::build_http_body_for_json_messages;
+use super::super::builder::RequestModelInputs;
+use super::super::protocol::build_http_body_for_json_messages_from_parts;
 use super::super::*;
+use crate::ai::provider::ApiProvider;
 use serde_json::Value;
 
 #[test]
@@ -15,25 +17,49 @@ fn responses_protocol_dialect_infers_from_endpoint_when_unspecified() {
 }
 
 #[test]
-fn json_messages_aux_body_uses_responses_protocol_for_modelhub_models() {
-    // Registry rename: gpt-5.5 is now gpt-5.6-luna (responses protocol).
-    let endpoint = models::endpoint_for_model("gpt-5.6-luna", "");
+fn json_messages_aux_body_uses_responses_protocol_for_responses_dialect() {
+    // Wire behavior pinned on synthetic inputs: the Responses shape comes from
+    // the pre-resolved dialect, not from any registry key.
+    let inputs = RequestModelInputs {
+        request_model: "synthetic-responses-model".to_string(),
+        endpoint: "https://modelhub.example.com/v1".to_string(),
+        adapter: ApiProvider::Compatible,
+        effort_wire: None,
+        dialect: RequestProtocolDialect::Responses,
+        max_output: None,
+        encrypted_replay: false,
+        context_window: 256_000,
+    };
     let messages = vec![
         json!({"role": "system", "content": "Return JSON only."}),
         json!({"role": "user", "content": "classify this"}),
     ];
 
-    let body_bytes =
-        build_http_body_for_json_messages("gpt-5.6-luna", &endpoint, &messages, false, None, false);
+    let body_bytes = build_http_body_for_json_messages_from_parts(
+        &inputs,
+        &messages,
+        false,
+        None,
+        false,
+    );
     let body: Value = serde_json::from_slice(&body_bytes).expect("body should be valid JSON");
 
-    assert_eq!(body["model"], models::request_model_name("gpt-5.6-luna"));
+    assert_eq!(body["model"], "synthetic-responses-model");
     assert!(body.get("messages").is_none());
     assert_eq!(body["input"][0]["role"], "system");
     assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
     assert_eq!(body["input"][0]["content"][0]["text"], "Return JSON only.");
     assert_eq!(body["input"][1]["role"], "user");
     assert_eq!(body["input"][1]["content"][0]["text"], "classify this");
+
+    // Registry coverage: the Responses class the wire pin above stands for
+    // must keep existing, or the pin tests a dead path.
+    assert!(
+        crate::ai::model_names::all()
+            .iter()
+            .any(|m| m.request_protocol == Some(RequestProtocolDialect::Responses)),
+        "registry must keep at least one Responses-protocol entry"
+    );
 }
 
 #[test]
@@ -302,12 +328,22 @@ fn responses_request_body_includes_encrypted_reasoning_flag_for_capable_model() 
         tool_call_id: None,
         reasoning_content: None,
     }];
-    let request = build_request_body(
-        "gpt-5.6-luna", &messages, false, false, None, None, None, None, None, None, None,
+    let inputs = RequestModelInputs {
+        request_model: "synthetic-responses-model".to_string(),
+        endpoint: "https://modelhub.example.com/v1".to_string(),
+        adapter: ApiProvider::Compatible,
+        effort_wire: None,
+        dialect: RequestProtocolDialect::Responses,
+        max_output: None,
+        encrypted_replay: true,
+        context_window: 256_000,
+    };
+    let request = super::super::builder::build_request_body_from_parts(
+        &inputs, &messages, false, false, None, None, None, None, None, None, None,
     );
     assert!(
         request.reasoning_encrypted_replay,
-        "gpt-5.6-luna declares reasoning_encrypted_replay=true in model registry"
+        "inputs with encrypted_replay=true must set the request flag"
     );
 
     let body = super::super::build_responses_request_body(&request);
@@ -315,6 +351,15 @@ fn responses_request_body_includes_encrypted_reasoning_flag_for_capable_model() 
         body["include"],
         json!(["reasoning.encrypted_content"]),
         "capable model must request encrypted reasoning include"
+    );
+
+    // Registry coverage: at least one entry must keep declaring the flag, or
+    // the wire pin above tests a dead path.
+    assert!(
+        crate::ai::model_names::all()
+            .iter()
+            .any(|m| m.reasoning_encrypted_replay),
+        "registry must keep at least one reasoning_encrypted_replay entry"
     );
 }
 

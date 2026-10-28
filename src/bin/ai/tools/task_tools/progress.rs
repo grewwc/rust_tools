@@ -11,9 +11,7 @@ pub(super) static TASK_PROGRESS_FILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|
 pub(crate) fn task_progress_slot(
     task_id: &str,
 ) -> Option<crate::ai::driver::runtime_ctx::SubagentPhaseSlot> {
-    TASK_PROGRESS_REGISTRY
-        .lock()
-        .ok()?
+    lock_unpoisoned(&TASK_PROGRESS_REGISTRY)
         .get_ref(&task_id.to_string())
         .cloned()
 }
@@ -49,7 +47,7 @@ pub(crate) fn record_subagent_progress_update(
 ) {
     let now = Instant::now();
     let update = {
-        let mut registry = TASK_REGISTRY.lock().unwrap();
+        let mut registry = lock_task_registry();
         let Some(entry) = registry.get_mut(&task_id.to_string()) else {
             return;
         };
@@ -71,7 +69,7 @@ pub(crate) fn record_subagent_progress_update(
     };
 
     if update.0 && persist_subagent_progress_snapshot(task_id, snapshot).is_err() {
-        let mut registry = TASK_REGISTRY.lock().unwrap();
+        let mut registry = lock_task_registry();
         if let Some(entry) = registry.get_mut(&task_id.to_string())
             && entry.last_progress_persisted_at == Some(now)
         {

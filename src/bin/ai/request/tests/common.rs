@@ -85,17 +85,27 @@ pub(super) fn first_alibaba_vl_model_name() -> Option<String> {
         .map(|m| m.name.clone())
 }
 
+/// Attribute-based discovery: finds the first registry **key** whose model
+/// definition satisfies `predicate`. Returns `None` when no entry matches so
+/// each caller decides; callers in registry-coupled tests must hard-fail
+/// (panic/expect naming the missing model class) instead of skipping.
+pub(super) fn first_model_key_where(
+    predicate: impl Fn(&crate::ai::model_names::ModelDef) -> bool,
+) -> Option<String> {
+    crate::ai::model_names::all()
+        .iter()
+        .find(|m| predicate(m))
+        .map(|m| m.key.clone())
+}
+
 /// Returns the **unique key** of the adapter's first model (not the `name`).
 /// The production path locates models by key (log identifiers look like
-/// `glm-5.2-opencode`), while a `name` (e.g. `glm-5.2`) may be shared by entries
+/// `example-model-opencode`), while a `name` (e.g. `example-model`) may be shared by entries
 /// of multiple adapters/platforms; looking up by name would hit an ambiguous
 /// entry and resolve the wrong adapter dialect. Tests must use the key,
 /// consistent with production.
 pub(super) fn first_model_key_for_adapter(adapter: crate::ai::provider::ApiProvider) -> Option<String> {
-    crate::ai::model_names::all()
-        .iter()
-        .find(|m| m.adapter == adapter)
-        .map(|m| m.key.clone())
+    first_model_key_where(|m| m.adapter == adapter)
 }
 /// Finds a MiniMax ("MiMo" / "MiniMax") model key from the registry. MiniMax is
 /// not an `ApiProvider` variant — the thinking dialect dispatch keys off the
@@ -104,17 +114,14 @@ pub(super) fn first_model_key_for_adapter(adapter: crate::ai::provider::ApiProvi
 /// branch. Returning the registry key keeps the sub-case honest: it exercises
 /// the MiniMax off-switch path only when such a model is actually present.
 pub(super) fn first_minimax_model_key() -> Option<String> {
-    crate::ai::model_names::all()
-        .iter()
-        .find(|m| {
-            let name = m.name.to_ascii_lowercase();
-            let key = m.key.to_ascii_lowercase();
-            name.contains("mimo")
-                || name.contains("minimax")
-                || key.contains("mimo")
-                || key.contains("minimax")
-        })
-        .map(|m| m.key.clone())
+    first_model_key_where(|m| {
+        let name = m.name.to_ascii_lowercase();
+        let key = m.key.to_ascii_lowercase();
+        name.contains("mimo")
+            || name.contains("minimax")
+            || key.contains("mimo")
+            || key.contains("minimax")
+    })
 }
 /// Reuses the production clamping logic to build the expected `max_tokens`
 /// fragment for the wire assertion: `,"max_tokens":N` when the model declares

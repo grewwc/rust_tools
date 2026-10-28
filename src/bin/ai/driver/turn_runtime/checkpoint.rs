@@ -44,8 +44,8 @@ impl ToolRoundCheckpointPhase {
     pub(super) fn action(self) -> &'static str {
         match self {
             Self::Explore => "choose-one-next-step",
-            Self::ImplementedNeedsVerification => "verify-and-wrap-up",
-            Self::VerifiedNeedsFinalization => "finalize",
+            Self::ImplementedNeedsVerification => "verify-and-continue",
+            Self::VerifiedNeedsFinalization => "checkpoint-and-continue",
             Self::RecoveringFromError => "fix-current-failure",
         }
     }
@@ -56,10 +56,10 @@ impl ToolRoundCheckpointPhase {
                 "Still in the read-only evidence-gathering phase: summarize confirmed facts and the single remaining gap, then pick only the one next step with the highest information gain; prefer a precise search or one sufficiently large read, and stop expanding the unrelated evidence surface. Then execute that step and continue the loop; do not stop after merely naming it."
             }
             Self::ImplementedNeedsVerification => {
-                "State has recently been modified successfully: do not resume exploration or continue unrelated changes; run the narrowest check/test that covers the change, check diff/status if needed, then wrap up immediately."
+                "State has recently been modified successfully: do not resume exploration or continue unrelated changes; run the narrowest check/test that covers the change, check diff/status if needed, then continue with the next planned step. Wrap up only when the task itself is complete or you are genuinely blocked."
             }
             Self::VerifiedNeedsFinalization => {
-                "Successful verification observed: unless there is a clear gap that would change the conclusion, do not call any more tools; summarize the changes, verification results, and remaining risks, and complete the answer."
+                "Successful verification observed: record the verified work into plan notes so it survives across turns, then continue with the next planned step. Only wrap up when the task itself is complete or you are genuinely blocked; a checkpoint alone is never a reason to stop calling tools."
             }
             Self::RecoveringFromError => {
                 "A recent change or verification failed: diagnose only the current failure and make one targeted fix/retry without expanding into unrelated issues; if still blocked, clearly report the blocker and wrap up."
@@ -98,10 +98,10 @@ impl ToolRoundCheckpointLevel {
                 "This is a one-time phase checkpoint that is not an error or a tool failure; it is a pacing reminder only. Do not end the turn or write a final answer because of this checkpoint: choose the next step, execute it, and keep working until the task is complete or you are genuinely blocked."
             }
             Self::Restrict => {
-                "This is the second-level checkpoint: first list the remaining necessary work, then only complete critical fixes and minimal verification; do not expand the task scope."
+                "This is the second-level checkpoint: first list the remaining necessary work, then focus on the critical path and defer nice-to-haves; do not expand the task scope. You may keep calling tools: this checkpoint paces the turn but never ends it."
             }
             Self::Finalize => {
-                "This is the third-level checkpoint: wrap up based on existing evidence; do not call further tools unless the current verification failed and one targeted fix can resolve it directly."
+                "This is the third-level checkpoint: this turn has run long, so consolidate verified progress into plan notes or context checkpoints first so nothing is lost across turns. Then continue the critical path, or hand a clean continuation to the next turn if the remaining work fits better there. This checkpoint never forbids tool calls and never requires ending the turn: long tasks are expected to continue past it."
             }
         }
     }

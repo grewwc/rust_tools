@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::ai::config_schema::AiConfig;
 use crate::ai::history::{Message, is_runtime_synthetic_user_message};
 use crate::ai::models;
-use crate::ai::provider::ThinkingOffCapability;
+use crate::ai::provider::{ReasoningEffort, ThinkingOffCapability};
 use crate::ai::types::App;
 use crate::commonw::configw;
 use rust_tools::commonw;
@@ -41,57 +41,23 @@ use super::routing::{extract_router_content, strip_json_fence};
 /// 7. Auto-detect based on question complexity
 #[commonw::debug_measure_time("resolve_thinking")]
 pub(super) async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool {
-    // Truncation-retry fallback: after repeated truncation, thinking is forcibly
-    // disabled with priority over everything (including force_thinking), leaving
-    // the whole output budget to visible content. Restored by the orchestrator
-    // at the end of the turn.
-    if app.cli.thinking_disabled_override {
-        return false;
-    }
-
-    // Explicit user "effort off" (`/effort off`, `/model effort off`,
-    // `--reasoning-effort off`) also turns thinking off on dialects whose
-    // declared off capability is a real wire off-switch (DashScope
-    // `enable_thinking:false`, DeepSeek `thinking:{"type":"disabled"}`) — same
-    // precedence tier as the truncation fallback above: a recent explicit
-    // in-session command wins over the persistent `ai.model.thinking=true`
-    // config. Effort-only dialects (capability [`ThinkingOffCapability::EffortNone`])
-    // are not handled here: `resolve_reasoning_effort` expresses their off as
-    // `reasoning_effort: "none"` instead. Unsupported dialects keep thinking on
-    // and the `/effort off` handler reports that honestly.
-    if app.cli.reasoning_effort_override == Some(None)
-        && matches!(
-            model_thinking_off_capability(model),
-            ThinkingOffCapability::RealSwitch
-        )
-    {
-        return false;
-    }
-
     let cfg = configw::get_all_config();
     let force_thinking = config_bool_is_true(cfg.get_opt(AiConfig::MODEL_THINKING));
-
-    if force_thinking {
-        return models::enable_thinking(model);
-    }
-
-    // Model must support thinking
-    if !models::enable_thinking(model) {
-        return false;
-    }
-
     // Check config for auto-thinking override
     let auto_enabled = cfg
         .get_opt(AiConfig::MODEL_AUTO_THINKING_ENABLE)
         .map(|v| !v.trim().eq_ignore_ascii_case("false"))
         .unwrap_or(true); // Default: enabled
-
-    if !auto_enabled {
-        return false;
-    }
-
-    if models::default_reasoning_effort(model).is_some() {
-        return true;
+    if let Some(decision) = resolve_thinking_static(
+        app.cli.thinking_disabled_override,
+        app.cli.reasoning_effort_override,
+        model_thinking_off_capability(model),
+        force_thinking,
+        models::enable_thinking(model),
+        auto_enabled,
+        models::default_reasoning_effort(model),
+    ) {
+        return decision;
     }
 
     let raw_question = latest_user_message_text(messages).unwrap_or_default();
@@ -124,6 +90,64 @@ pub(super) async fn resolve_thinking(app: &App, model: &str, messages: &[Message
     decide_thinking_via_model(app, model, messages)
         .await
         .unwrap_or(false)
+}
+
+/// Registry- and config-free core of [`resolve_thinking`]: decision steps 1-6
+/// over pre-resolved inputs. Returns `Some(decision)` when the static inputs
+/// settle it, `None` when the local heuristic + model gate must run. Behavior
+/// tests pin the precedence ladder here without registry keys or ambient
+/// config; the local heuristic itself is already pure
+/// ([`local_thinking_decision`]).
+pub(super) fn resolve_thinking_static(
+    thinking_disabled_override: bool,
+    effort_override: Option<Option<ReasoningEffort>>,
+    off_capability: ThinkingOffCapability,
+    force_thinking: bool,
+    thinking_enabled: bool,
+    auto_enabled: bool,
+    default_effort: Option<ReasoningEffort>,
+) -> Option<bool> {
+    // Truncation-retry fallback: after repeated truncation, thinking is forcibly
+    // disabled with priority over everything (including force_thinking), leaving
+    // the whole output budget to visible content. Restored by the orchestrator
+    // at the end of the turn.
+    if thinking_disabled_override {
+        return Some(false);
+    }
+
+    // Explicit user "effort off" (`/effort off`, `/model effort off`,
+    // `--reasoning-effort off`) also turns thinking off on dialects whose
+    // declared off capability is a real wire off-switch (DashScope
+    // `enable_thinking:false`, DeepSeek `thinking:{"type":"disabled"}`) — same
+    // precedence tier as the truncation fallback above: a recent explicit
+    // in-session command wins over the persistent `ai.model.thinking=true`
+    // config. Effort-only dialects (capability [`ThinkingOffCapability::EffortNone`])
+    // are not handled here: `resolve_reasoning_effort` expresses their off as
+    // `reasoning_effort: "none"` instead. Unsupported dialects keep thinking on
+    // and the `/effort off` handler reports that honestly.
+    if effort_override == Some(None) && matches!(off_capability, ThinkingOffCapability::RealSwitch)
+    {
+        return Some(false);
+    }
+
+    if force_thinking {
+        return Some(thinking_enabled);
+    }
+
+    // Model must support thinking
+    if !thinking_enabled {
+        return Some(false);
+    }
+
+    if !auto_enabled {
+        return Some(false);
+    }
+
+    if default_effort.is_some() {
+        return Some(true);
+    }
+
+    None
 }
 
 pub(crate) fn latest_user_message_text(messages: &[Message]) -> Option<String> {

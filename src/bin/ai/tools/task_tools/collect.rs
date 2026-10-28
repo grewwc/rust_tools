@@ -61,51 +61,75 @@ pub(super) fn read_persisted_task_evidence_status(
     .map_err(|error| format!("failed to read task evidence for {task_id}: {error}"))
 }
 
-pub(super) fn collect_missing_task_result(
-    task_id: &str,
-    entry: &AsyncTaskEntry,
-) -> Result<String, String> {
-    let result = StoredTaskResult {
-        status: "failed".to_string(),
-        output: String::new(),
-        error: Some(format!(
-            "Subagent process pid={} terminated without publishing any output.",
-            entry.pid
-        )),
-        progress: current_task_progress(task_id),
-    };
-    let rendered = format_task_result_with_id(task_id, entry, result.clone());
-    persist_rendered_task_evidence(task_id, entry, &result.status, &rendered)?;
-    mark_task_retry_status(task_id, &result.status);
-    TASK_PROGRESS_REGISTRY
-        .lock()
-        .unwrap()
-        .take(&task_id.to_string());
-    Ok(rendered)
+/// One terminal result drained from a subagent's result channel.
+pub(super) struct DrainedTaskResult {
+    pub(super) result: StoredTaskResult,
+    pub(super) rendered: String,
 }
 
-pub(super) fn collect_ready_task_result(
+/// Drain a terminal result: persist evidence first, consume the channel, then release the IPC
+/// resources and terminate the kernel process. Returns `Ok(None)` while the task is still running.
+///
+/// The registry entry is deliberately left untouched. Callers remove it after the kernel closure
+/// returns, including on the error path, so a failure while collecting a later task in the same
+/// batch cannot strand an entry whose channel has already been destroyed.
+pub(super) fn drain_task_result(
     os: &mut dyn Kernel,
     task_id: &str,
     entry: &AsyncTaskEntry,
-) -> Result<Option<String>, String> {
+    cleanup_reason: &str,
+) -> Result<Option<DrainedTaskResult>, String> {
     let Some(result) = read_task_result(os, entry.result_channel_id, false)? else {
-        return Ok(None);
+        if is_task_pending(os, entry.pid)? {
+            return Ok(None);
+        }
+        // An earlier collection may have persisted a terminal result before consuming the
+        // channel failed. The ledger is the source of truth for delivered evidence; never
+        // replace it with a synthesized failure.
+        if let Some((status, payload)) =
+            read_persisted_task_evidence_status(&entry.session_id, task_id)?
+        {
+            mark_task_retry_status(task_id, &status);
+            lock_unpoisoned(&TASK_PROGRESS_REGISTRY).take(&task_id.to_string());
+            cleanup_collected_task(os, entry, cleanup_reason);
+            return Ok(Some(DrainedTaskResult {
+                result: StoredTaskResult {
+                    status,
+                    output: payload.clone(),
+                    error: None,
+                    progress: None,
+                },
+                rendered: payload,
+            }));
+        }
+        let result = StoredTaskResult {
+            status: TaskTerminalStatus::Failed.as_str().to_string(),
+            output: String::new(),
+            error: Some(format!(
+                "Subagent process pid={} terminated without publishing any output.",
+                entry.pid
+            )),
+            progress: current_task_progress(task_id),
+        };
+        let rendered = format_task_result_with_id(task_id, entry, result.clone());
+        persist_rendered_task_evidence(task_id, entry, &result.status, &rendered)?;
+        mark_task_retry_status(task_id, &result.status);
+        lock_unpoisoned(&TASK_PROGRESS_REGISTRY).take(&task_id.to_string());
+        cleanup_collected_task(os, entry, cleanup_reason);
+        return Ok(Some(DrainedTaskResult { result, rendered }));
     };
+
     let rendered = format_task_result_with_id(task_id, entry, result.clone());
     persist_rendered_task_evidence(task_id, entry, &result.status, &rendered)?;
-    let consumed = read_task_result(os, entry.result_channel_id, true)?;
-    if consumed.is_none() {
+    if read_task_result(os, entry.result_channel_id, true)?.is_none() {
         return Err(format!(
             "task result for {task_id} disappeared after durable persistence"
         ));
     }
     mark_task_retry_status(task_id, &result.status);
-    TASK_PROGRESS_REGISTRY
-        .lock()
-        .unwrap()
-        .take(&task_id.to_string());
-    Ok(Some(rendered))
+    lock_unpoisoned(&TASK_PROGRESS_REGISTRY).take(&task_id.to_string());
+    cleanup_collected_task(os, entry, cleanup_reason);
+    Ok(Some(DrainedTaskResult { result, rendered }))
 }
 
 pub(super) enum OwnedTaskPoll {
@@ -128,93 +152,59 @@ pub(super) fn poll_owned_task_result(task_id: &str) -> Result<OwnedTaskPoll, Str
     let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
     let current_owner_pid = current_task_owner_pid()?;
     let entry = {
-        let registry = TASK_REGISTRY.lock().unwrap();
-        let entry = match registry.get_ref(&task_id.to_string()) {
-            Some(entry) => entry,
-            None => {
-                // Entry missing: in the normal flow an entry is only removed
-                // after the task is polled to Terminal and its evidence is
-                // persisted. If this session already persisted evidence for the
-                // task (the only path for the H1 regression "polled but
-                // checkpoint not saved"), return an idempotent Terminal so the
-                // graph/team checkpoint can self-heal instead of hanging
-                // forever; without evidence this is still a genuine error.
-                if let Some((status, payload)) =
-                    read_persisted_task_evidence_status(&current_session_id, task_id)?
-                {
-                    return Ok(OwnedTaskPoll::Terminal {
-                        result: StoredTaskResult {
-                            status,
-                            output: payload.clone(),
-                            error: None,
-                            progress: None,
-                        },
-                        rendered: payload,
-                    });
-                }
-                return Err(format!("Unknown graph-managed task_id: {task_id}"));
-            }
-        };
-        if !task_entry_owned_by(entry, &current_session_id, current_owner_pid) {
-            return Err(format!(
-                "Task {task_id} is not owned by the current process/session"
-            ));
-        }
-        entry.clone()
+        let registry = lock_task_registry();
+        registry.get_ref(&task_id.to_string()).cloned()
     };
-
-    let poll = with_os_kernel(|os| {
-        if let Some(result) = read_task_result(os, entry.result_channel_id, false)? {
-            let rendered = format_task_result_with_id(task_id, &entry, result.clone());
-            persist_rendered_task_evidence(task_id, &entry, &result.status, &rendered)?;
-            if read_task_result(os, entry.result_channel_id, true)?.is_none() {
-                return Err(format!(
-                    "task result for {task_id} disappeared after durable persistence"
-                ));
-            }
-            mark_task_retry_status(task_id, &result.status);
-            TASK_PROGRESS_REGISTRY
-                .lock()
-                .unwrap()
-                .take(&task_id.to_string());
-            cleanup_collected_task(os, &entry, "subagent result collected by agent graph");
-            return Ok(OwnedTaskPoll::Terminal { result, rendered });
-        }
-
-        if is_task_pending(os, entry.pid)? {
-            return Ok(OwnedTaskPoll::Pending {
-                state: task_state_string(os, entry.result_channel_id, entry.pid)?,
+    let Some(entry) = entry else {
+        // Entry missing: in the normal flow an entry is only removed after the
+        // task is polled to Terminal and its evidence is persisted. If this
+        // session already persisted evidence for the task (the only path for the
+        // H1 regression "polled but checkpoint not saved"), return an idempotent
+        // Terminal so the graph/team checkpoint can self-heal instead of hanging
+        // forever; without evidence this is still a genuine error.
+        if let Some((status, payload)) =
+            read_persisted_task_evidence_status(&current_session_id, task_id)?
+        {
+            return Ok(OwnedTaskPoll::Terminal {
+                result: StoredTaskResult {
+                    status,
+                    output: payload.clone(),
+                    error: None,
+                    progress: None,
+                },
+                rendered: payload,
             });
         }
-
-        let result = StoredTaskResult {
-            status: "failed".to_string(),
-            output: String::new(),
-            error: Some(format!(
-                "Subagent process pid={} terminated without publishing any output.",
-                entry.pid
-            )),
-            progress: current_task_progress(task_id),
-        };
-        let rendered = format_task_result_with_id(task_id, &entry, result.clone());
-        persist_rendered_task_evidence(task_id, &entry, &result.status, &rendered)?;
-        mark_task_retry_status(task_id, &result.status);
-        TASK_PROGRESS_REGISTRY
-            .lock()
-            .unwrap()
-            .take(&task_id.to_string());
-        cleanup_collected_task(
-            os,
-            &entry,
-            "graph-managed subagent terminated without output",
-        );
-        Ok(OwnedTaskPoll::Terminal { result, rendered })
-    })?;
-
-    if matches!(poll, OwnedTaskPoll::Terminal { .. }) {
-        TASK_REGISTRY.lock().unwrap().remove(&task_id.to_string());
+        return Err(format!("Unknown graph-managed task_id: {task_id}"));
+    };
+    if !task_entry_owned_by(&entry, &current_session_id, current_owner_pid) {
+        return Err(format!(
+            "Task {task_id} is not owned by the current process/session"
+        ));
     }
-    Ok(poll)
+
+    let poll = with_os_kernel(|os| {
+        let collected = drain_task_result(
+            os,
+            task_id,
+            &entry,
+            "subagent result collected by agent graph",
+        )?;
+        Ok(match collected {
+            Some(collected) => OwnedTaskPoll::Terminal {
+                result: collected.result,
+                rendered: collected.rendered,
+            },
+            None => OwnedTaskPoll::Pending {
+                state: task_state_string(os, entry.result_channel_id, entry.pid)?,
+            },
+        })
+    });
+
+    if matches!(&poll, Ok(OwnedTaskPoll::Terminal { .. })) {
+        remove_task_entry(task_id);
+    }
+    poll
 }
 
 /// After collecting a terminal result, release all IPC and terminate and reap

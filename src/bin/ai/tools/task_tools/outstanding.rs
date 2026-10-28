@@ -4,12 +4,10 @@ pub(super) fn collect_outstanding_task_snapshots(
     session_id: &str,
     owner_pid: u64,
 ) -> Result<Vec<OutstandingTaskSnapshot>, String> {
-    let registry = TASK_REGISTRY.lock().unwrap();
+    let registry = lock_task_registry();
     let tracked = registry
         .iter()
-        .filter(|(_, entry)| {
-            task_entry_owned_by(entry, session_id, owner_pid) && !entry.result_observed
-        })
+        .filter(|(_, entry)| task_entry_owned_by(entry, session_id, owner_pid))
         .map(|(tid, entry)| {
             (
                 tid.clone(),

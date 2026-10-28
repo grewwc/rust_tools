@@ -6,13 +6,15 @@
 
 use serde_json::{Value, json};
 
+use super::builder::RequestModelInputs;
 use super::reasoning::{
     apply_prompt_cache_breakpoints, is_nonempty_text_block, mark_content_cache_breakpoint,
-    resolve_reasoning_wire_controls,
+    resolve_reasoning_wire_controls_from_parts,
 };
 use super::{RequestBody, types::extract_displayable_text};
 use crate::ai::history::Message;
 use crate::ai::models;
+use crate::ai::provider::ApiProvider;
 use crate::ai::request_protocol::RequestProtocolDialect;
 use crate::ai::types::ToolCall;
 
@@ -308,10 +310,26 @@ pub(crate) fn build_http_body_for_request(
     endpoint: &str,
     request: &mut RequestBody<'_>,
 ) -> Vec<u8> {
+    build_http_body_for_request_from_parts(
+        models::model_adapter(model),
+        models::request_protocol_dialect(model, endpoint),
+        endpoint,
+        request,
+    )
+}
+
+/// Registry-free core of [`build_http_body_for_request`] over the pre-resolved
+/// adapter and protocol dialect.
+pub(crate) fn build_http_body_for_request_from_parts(
+    adapter: ApiProvider,
+    dialect: RequestProtocolDialect,
+    endpoint: &str,
+    request: &mut RequestBody<'_>,
+) -> Vec<u8> {
     // Step 4: provider differences converge into the Adapter hook -- fired uniformly on every
     // request path before serialization.
-    crate::ai::provider::adapter_for(models::model_adapter(model), endpoint).adapt_request(request);
-    models::request_protocol_dialect(model, endpoint).build_http_body(request)
+    crate::ai::provider::adapter_for(adapter, endpoint).adapt_request(request);
+    dialect.build_http_body(request)
 }
 
 pub(crate) fn json_messages_to_request_messages(messages: &[Value]) -> Vec<Message> {
@@ -357,12 +375,39 @@ pub(crate) fn build_http_body_for_json_messages(
     reasoning_effort: Option<&str>,
     include_stream_usage: bool,
 ) -> Vec<u8> {
+    build_http_body_for_json_messages_from_parts(
+        &RequestModelInputs::resolve_with_endpoint(model, endpoint),
+        messages,
+        stream,
+        reasoning_effort,
+        include_stream_usage,
+    )
+}
+
+/// Registry-free core of [`build_http_body_for_json_messages`] over
+/// pre-resolved [`RequestModelInputs`].
+pub(crate) fn build_http_body_for_json_messages_from_parts(
+    inputs: &RequestModelInputs,
+    messages: &[Value],
+    stream: bool,
+    reasoning_effort: Option<&str>,
+    include_stream_usage: bool,
+) -> Vec<u8> {
+    let model = inputs.request_model.as_str();
+    let endpoint = inputs.endpoint.as_str();
     let request_messages = json_messages_to_request_messages(messages);
     let (thinking, reasoning_effort, reasoning) =
-        resolve_reasoning_wire_controls(model, endpoint, false, reasoning_effort);
+        resolve_reasoning_wire_controls_from_parts(
+            inputs.adapter,
+            model,
+            endpoint,
+            inputs.effort_wire,
+            false,
+            reasoning_effort,
+        );
     let stream_options = (stream && include_stream_usage).then(|| json!({ "include_usage": true }));
     let mut request = RequestBody {
-        model: models::request_model_name(model),
+        model: inputs.request_model.clone(),
         messages: &request_messages,
         stream,
         thinking,
@@ -374,14 +419,14 @@ pub(crate) fn build_http_body_for_json_messages(
         stream_options,
         max_tokens: None,
         reasoning_items: None,
-        reasoning_encrypted_replay: models::reasoning_encrypted_replay_enabled(model),
+        reasoning_encrypted_replay: inputs.encrypted_replay,
         estimated_prompt_tokens: 0,
         message_counts: Default::default(),
         prompt_cache_key: None,
         explicit_cache_breakpoints: false,
         tool_errors: None,
     };
-    build_http_body_for_request(model, endpoint, &mut request)
+    build_http_body_for_request_from_parts(inputs.adapter, inputs.dialect, endpoint, &mut request)
 }
 
 pub(crate) fn extract_response_text(v: &Value) -> Option<String> {
@@ -968,13 +1013,13 @@ mod messages_body_tests {
 
     #[test]
     fn messages_body_thinking_replay_survives_request_normalization_for_anthropic_dialect() {
-        // Real-chain proof: `normalize_reasoning_content_replay_for_model`
-        // strips `reasoning_content` for models that do not declare replay
+        // Real-chain proof: the from_parts normalization strips
+        // `reasoning_content` for models that do not declare replay
         // (reasoning.rs). The Anthropic Messages dialect opts into
         // shape-preservation via `requires_reasoning_content_echo`, so a
-        // tool-call round's thinking text survives to the wire. This runs the
-        // actual request-layer normalization instead of constructing the body
-        // directly.
+        // tool-call round's thinking text survives to the wire. Synthetic
+        // (OpenCode adapter, /v1/messages endpoint) inputs pin the dialect
+        // without depending on any registry key.
         let mut messages = json_messages_to_request_messages(&[
             json!({
                 "role": "assistant",
@@ -988,8 +1033,12 @@ mod messages_body_tests {
             }),
             json!({"role": "tool", "tool_call_id": "call_1", "content": "ok"}),
         ]);
-        crate::ai::request::normalize_reasoning_content_replay_for_model(
-            "claude-opus-5-5-opencode",
+        crate::ai::request::reasoning::normalize_reasoning_content_replay_from_parts(
+            "synthetic-test-tag",
+            false,
+            ApiProvider::OpenCode,
+            "synthetic-messages-model",
+            "https://example.com/v1/messages",
             &mut messages,
         );
         assert_eq!(
@@ -997,8 +1046,15 @@ mod messages_body_tests {
             Some("the file is at src/lib.rs"),
             "tool-call round reasoning must survive the request-layer normalization"
         );
+        // Registry coverage: the Messages-dialect class the synthetic inputs
+        // stand for must keep existing, or the pin tests a dead path.
+        assert!(
+            crate::ai::model_names::all().iter().any(|m| m.request_protocol
+                == Some(RequestProtocolDialect::Messages)),
+            "registry must keep at least one Messages-protocol entry"
+        );
         let request = RequestBody {
-            model: "claude-opus-5-5-opencode".to_string(),
+            model: "synthetic-messages-model".to_string(),
             messages: &messages,
             stream: true,
             thinking: serde_json::Map::new(),

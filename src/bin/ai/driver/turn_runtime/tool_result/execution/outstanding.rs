@@ -18,9 +18,11 @@
 //!   - work open, fresh claim    -> Reopen, naming the contradiction
 //!   - work open, no/stale claim -> Reopen, naming the open steps
 //!   - forced / retry cap / iteration cap -> Warn (the final lands, annotated with steps)
-//! The claim is single-use — consumed on every evaluation — so an assertion
-//! never leaks into a later round, and any `plan`/`plan_update` in between
-//! silently invalidates it via the `updated_at_ms` snapshot.
+//! The claim is single-use. Standalone evaluations consume it immediately;
+//! iteration execution first performs a non-consuming preflight, then consumes
+//! only when the final is accepted or outstanding work rejects the assertion.
+//! This lets another quality gate request a replacement draft without losing
+//! the completion assertion that draft still needs to validate.
 
 use super::*;
 use crate::ai::tools::plan_state::{
@@ -112,6 +114,46 @@ fn tool_assisted_completion_state(turn_messages: &[Message]) -> ToolAssistedComp
     state
 }
 
+fn completion_assertion_is_fresh(
+    claim_snapshot: Option<Option<u64>>,
+    expected_snapshot: Option<u64>,
+    state: &ToolAssistedCompletionState,
+) -> bool {
+    let receipt_covers_activity = state.last_complete_receipt.is_some_and(|receipt| {
+        state
+            .last_actionable_result
+            .is_none_or(|action| receipt > action)
+    });
+    receipt_covers_activity && claim_snapshot == Some(expected_snapshot)
+}
+
+pub(in crate::ai::driver::turn_runtime) fn has_successful_complete_receipt(
+    turn_messages: &[Message],
+) -> bool {
+    tool_assisted_completion_state(turn_messages)
+        .last_complete_receipt
+        .is_some()
+}
+
+/// Non-consuming preflight used by final-response integrity gates. The
+/// outstanding-work gate remains the sole consumer of the single-use claim.
+pub(in crate::ai::driver::turn_runtime) fn has_fresh_completion_assertion(
+    app: &App,
+    turn_messages: &[Message],
+) -> bool {
+    let Ok(plan) = load_plan_state(app) else {
+        return false;
+    };
+    let Ok(Some(claim)) = load_completion_claim(app) else {
+        return false;
+    };
+    completion_assertion_is_fresh(
+        Some(claim.plan_updated_at_ms),
+        plan.as_ref().map(|plan| plan.updated_at_ms),
+        &tool_assisted_completion_state(turn_messages),
+    )
+}
+
 #[cfg(test)]
 pub(in crate::ai::driver::turn_runtime) fn outstanding_work_gate_action(
     app: &App,
@@ -166,10 +208,50 @@ pub(in crate::ai::driver::turn_runtime) fn outstanding_work_gate_action_with_tur
     iteration: usize,
     max_iterations: usize,
 ) -> OutstandingWorkGateAction {
-    // The claim is single-use: consume it on every evaluation, even when there
-    // is no plan to check against, so an assertion never leaks into a later round.
+    outstanding_work_gate_action_impl(
+        app,
+        messages,
+        turn_messages,
+        force_final_response,
+        iteration,
+        max_iterations,
+        true,
+    )
+}
+
+pub(in crate::ai::driver::turn_runtime) fn preflight_outstanding_work_gate_action(
+    app: &App,
+    messages: &mut Vec<Message>,
+    turn_messages: &[Message],
+    force_final_response: bool,
+    iteration: usize,
+    max_iterations: usize,
+) -> OutstandingWorkGateAction {
+    outstanding_work_gate_action_impl(
+        app,
+        messages,
+        turn_messages,
+        force_final_response,
+        iteration,
+        max_iterations,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn outstanding_work_gate_action_impl(
+    app: &App,
+    messages: &mut Vec<Message>,
+    turn_messages: &[Message],
+    force_final_response: bool,
+    iteration: usize,
+    max_iterations: usize,
+    consume_claim: bool,
+) -> OutstandingWorkGateAction {
     let claim = load_completion_claim(app).ok().flatten();
-    consume_completion_claim(app);
+    if consume_claim {
+        consume_completion_claim(app);
+    }
     // An unreadable plan must not brick the turn: `plan_update` already surfaces
     // the underlying error, and failing open here keeps this gate advisory.
     let plan = match load_plan_state(app) {
@@ -181,17 +263,16 @@ pub(in crate::ai::driver::turn_runtime) fn outstanding_work_gate_action_with_tur
         .is_some_and(|plan| plan_binds_current_turn(app, plan));
     let state = tool_assisted_completion_state(turn_messages);
     if !plan_binds {
-        let Some(last_actionable_result) = state.last_actionable_result else {
+        if state.last_actionable_result.is_none() {
             return OutstandingWorkGateAction::Allow;
-        };
+        }
         let expected_snapshot = plan.as_ref().map(|plan| plan.updated_at_ms);
-        let has_current_receipt = state
-            .last_complete_receipt
-            .is_some_and(|index| index > last_actionable_result);
-        let claim_fresh = claim
-            .as_ref()
-            .is_some_and(|claim| claim.plan_updated_at_ms == expected_snapshot);
-        if has_current_receipt && claim_fresh {
+        let claim_fresh = completion_assertion_is_fresh(
+            claim.as_ref().map(|claim| claim.plan_updated_at_ms),
+            expected_snapshot,
+            &state,
+        );
+        if claim_fresh {
             return OutstandingWorkGateAction::Allow;
         }
         if force_final_response || iteration >= max_iterations {
@@ -221,14 +302,11 @@ pub(in crate::ai::driver::turn_runtime) fn outstanding_work_gate_action_with_tur
         .map(|step| (step.step, step.action.clone()))
         .collect();
 
-    let receipt_covers_activity = state.last_complete_receipt.is_some_and(|receipt| {
-        state
-            .last_actionable_result
-            .is_none_or(|action| receipt > action)
-    });
-    let claim_fresh = claim.is_some_and(|claim| {
-        claim.plan_updated_at_ms == Some(plan.updated_at_ms) && receipt_covers_activity
-    });
+    let claim_fresh = completion_assertion_is_fresh(
+        claim.as_ref().map(|claim| claim.plan_updated_at_ms),
+        Some(plan.updated_at_ms),
+        &state,
+    );
     let steps = outstanding
         .iter()
         .map(|(number, action)| format!("step {number} ({action})"))

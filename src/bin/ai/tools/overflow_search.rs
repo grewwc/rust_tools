@@ -977,7 +977,7 @@ fn run_overflow_search_inner(
 
     let parallel = force_parallel.unwrap_or_else(|| parallel_scan_enabled(candidates.len()));
     let ScanAggregate {
-        scans,
+        mut scans,
         df,
         files_seen,
         files_unreadable,
@@ -1084,6 +1084,25 @@ fn run_overflow_search_inner(
         .collect();
 
     // Pass B: score lines and files.
+    // Precision gate: within a file that already matched caller-typed text
+    // (`>>` or `>t`), drop pure-derived single-fragment lines. A lone
+    // 2-character fragment carries ~zero information next to typed evidence in
+    // the same source, while multi-fragment lines corroborate each other (the
+    // "压缩文档" recall case) and always survive. A typed hit in one file must
+    // not hide fragment-only evidence from another file: that would turn a
+    // ranking preference into a corpus-wide recall loss. Scores and idf are
+    // computed after this, keeping every reported number exact.
+    for scan in scans.iter_mut() {
+        let typed_hit_exists = scan
+            .hits
+            .iter()
+            .any(|hit| match_marker(patterns, &hit.matched) != ">b");
+        if typed_hit_exists {
+            scan.hits.retain(|hit| {
+                match_marker(patterns, &hit.matched) != ">b" || hit.matched.len() > 1
+            });
+        }
+    }
     let mut scored_files: Vec<ScoredFile> = Vec::new();
     // The path bonus matches the archive-relative path only: the absolute
     // session-directory prefix (a temp path plus a session id) is noise that
@@ -3046,6 +3065,53 @@ mod tests {
         assert!(
             literal_at < bigram_at,
             "the full run must rank above a shared fragment:\n{out}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn typed_hit_in_one_file_does_not_hide_fragment_only_evidence_in_another() {
+        let dir = make_temp_dir();
+        let tool_dir = dir.join("tool-overflow-compressed");
+        fs::create_dir_all(&tool_dir).unwrap();
+        fs::write(tool_dir.join("typed.txt"), "这里讨论压缩的文档结构\n").unwrap();
+        fs::write(tool_dir.join("fragment.txt"), "文档管理办法\n").unwrap();
+
+        let out = run_overflow_search(&dir, &params("压缩的文档")).unwrap();
+
+        assert!(
+            out.contains("typed.txt"),
+            "typed evidence is missing:\n{out}"
+        );
+        assert!(
+            out.contains("fragment.txt") && out.contains("文档管理办法"),
+            "a typed hit in another file must not suppress fragment recall:\n{out}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn single_bigram_line_is_gated_only_when_typed_hits_exist() {
+        let dir = make_temp_dir();
+        fs::write(
+            dir.join("overflow-history.md"),
+            "这里讨论压缩的文档结构\n文档管理办法\n压缩文档的完整性\n",
+        )
+        .unwrap();
+        // Typed hit present: the lone-fragment line is gated, while the
+        // corroborated multi-fragment line survives next to it.
+        let out = run_overflow_search(&dir, &params("压缩的文档")).unwrap();
+        assert!(out.contains("这里讨论压缩的文档结构"), "{out}");
+        assert!(
+            out.contains("2   文档管理办法"),
+            "single-fragment line must render as context only, not a match:\n{out}"
+        );
+        assert!(out.contains("压缩文档的完整性"), "{out}");
+        // No typed hit anywhere: the recall fallback keeps the lone fragment.
+        let out = run_overflow_search(&dir, &params("压缩掉的文档")).unwrap();
+        assert!(
+            out.contains("文档管理办法"),
+            "recall fallback must keep it:\n{out}"
         );
         fs::remove_dir_all(&dir).ok();
     }

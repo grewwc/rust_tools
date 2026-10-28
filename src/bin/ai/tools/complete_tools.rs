@@ -8,6 +8,7 @@ use crate::ai::tools::common::{
 };
 
 pub(crate) const COMPLETE_CLAIM_RECORDED_PREFIX: &str = "Completion assertion recorded:";
+pub(crate) const FINAL_RESPONSE_END_MARKER: &str = "[END]";
 
 fn execute_complete(args: &Value) -> Result<String, String> {
     let summary = args["summary"].as_str().unwrap_or("").trim();
@@ -46,9 +47,13 @@ fn execute_complete(args: &Value) -> Result<String, String> {
         ) {
             Ok(_) => Ok(format!(
                 "{COMPLETE_CLAIM_RECORDED_PREFIX} {summary}\n\
-                 Now write the final response text for this turn. The runtime verifies \
+                 Now write the complete final response for this turn. The runtime verifies \
                  the assertion against the session plan: if plan steps are still \
-                 unsettled, the turn reopens instead of ending."
+                 unsettled, the turn reopens instead of ending. End the response with \
+                 `{FINAL_RESPONSE_END_MARKER}` on its own final line. The runtime removes \
+                 this control marker before storing or displaying the response. If the \
+                 marker is missing, this draft is discarded and you will be asked once to \
+                 rewrite the full response."
             )),
             Err(e) => Ok(format!(
                 "Completion assertion noted but could not persist ({e}); the final response \

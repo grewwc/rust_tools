@@ -8,13 +8,27 @@ use crate::commonw::configw;
 fn load_config_accepts_default_model_specific_api_key_config_key() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 
+    // Discover a Volcengine entry by its endpoint/adapter properties instead of
+    // pinning a concrete key: the ark endpoint with the volcano api-key slot.
+    let model_key = crate::ai::model_names::all()
+        .iter()
+        .find(|m| {
+            m.endpoint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("volces.com")
+                && m.api_key_config_key.as_deref() == Some("volcano.api_key")
+        })
+        .map(|m| m.key.clone())
+        .expect("model registry must contain a volcano-endpoint model using volcano.api_key");
+
     let cfg_path = std::env::temp_dir().join(format!(
         "rt_volcano_model_{}.configw",
         uuid::Uuid::new_v4().simple()
     ));
     std::fs::write(
         &cfg_path,
-        "ai.model.default = deepseek-v4-flash-volcano\nvolcano.api_key = test-volcano-key\n",
+        format!("ai.model.default = {model_key}\nvolcano.api_key = test-volcano-key\n"),
     )
     .unwrap();
     let old_cfg = env::var_os("CONFIGW_PATH");
@@ -23,10 +37,7 @@ fn load_config_accepts_default_model_specific_api_key_config_key() {
 
     let loaded = load_config();
     let resolved_key = match loaded.as_ref() {
-        Ok(app) => Some(models::api_key_for_model(
-            "deepseek-v4-flash-volcano",
-            &app.api_key,
-        )),
+        Ok(app) => Some(models::api_key_for_model(&model_key, &app.api_key)),
         Err(_) => None,
     };
 

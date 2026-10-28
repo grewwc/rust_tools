@@ -12,6 +12,17 @@ pub(super) static TASK_REGISTRY: LazyLock<Mutex<SkipMap<String, AsyncTaskEntry>>
 pub(super) static TASK_RETRY_REGISTRY: LazyLock<Mutex<SkipMap<String, RetryableTaskSpec>>> =
     LazyLock::new(|| Mutex::new(SkipMap::default()));
 
+/// Lock a task-tool mutex without propagating poisoning. A panic while one task tool held a lock
+/// must not permanently disable every later `task_*` call in the session.
+pub(super) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+pub(super) fn lock_task_registry()
+-> std::sync::MutexGuard<'static, SkipMap<String, AsyncTaskEntry>> {
+    lock_unpoisoned(&TASK_REGISTRY)
+}
+
 #[derive(Clone)]
 pub(super) struct RetryableTaskSpec {
     pub(super) session_id: String,
@@ -28,7 +39,7 @@ pub(super) fn register_retry_spec(
     prepared: PreparedSubagentTask,
     retry_root: String,
 ) {
-    let mut registry = TASK_RETRY_REGISTRY.lock().unwrap();
+    let mut registry = lock_unpoisoned(&TASK_RETRY_REGISTRY);
     while registry.len() >= MAX_TASK_REGISTRY_SIZE {
         let Some(oldest) = registry
             .iter()
@@ -53,29 +64,25 @@ pub(super) fn register_retry_spec(
 }
 
 pub(super) fn mark_task_retry_status(task_id: &str, status: &str) {
-    if let Some(spec) = TASK_RETRY_REGISTRY
-        .lock()
-        .unwrap()
-        .get_mut(&task_id.to_string())
-    {
+    if let Some(spec) = lock_unpoisoned(&TASK_RETRY_REGISTRY).get_mut(&task_id.to_string()) {
         spec.terminal_status = Some(status.to_string());
     }
 }
 
 pub(super) fn is_retryable_task_status(status: &str) -> bool {
-    matches!(status, "failed" | "timeout" | "cancelled")
+    TaskTerminalStatus::parse(status).is_some_and(TaskTerminalStatus::is_retryable)
 }
 /// Look up a registered async task entry. Used by the driver-side sync `task`
 /// interception to retrieve the channel/futex/inherit info after spawning.
 pub(crate) fn with_task_entry<R>(task_id: &str, f: impl FnOnce(&AsyncTaskEntry) -> R) -> Option<R> {
-    let registry = TASK_REGISTRY.lock().unwrap();
+    let registry = lock_task_registry();
     registry.get_ref(&task_id.to_string()).map(f)
 }
 
 /// Associates the Tokio task that actually runs the subagent, so cancellation and timeout can stop
 /// the background Future instead of only terminating the logical process in the kernel.
 pub(crate) fn set_task_abort_handle(task_id: &str, abort_handle: tokio::task::AbortHandle) -> bool {
-    let mut registry = TASK_REGISTRY.lock().unwrap();
+    let mut registry = lock_task_registry();
     let Some(entry) = registry.get_mut(&task_id.to_string()) else {
         return false;
     };
@@ -87,7 +94,7 @@ pub(crate) fn with_task_entry_by_pid<R>(
     pid: u64,
     mut f: impl FnMut(&AsyncTaskEntry) -> R,
 ) -> Option<R> {
-    let registry = TASK_REGISTRY.lock().unwrap();
+    let registry = lock_task_registry();
     for (_task_id, entry) in registry.iter() {
         if entry.pid == pid {
             return Some(f(entry));
@@ -108,24 +115,61 @@ pub(crate) struct SubagentTerminalStatus {
     pub(crate) progress: Option<String>,
 }
 
+/// Registry-only half of the status-line snapshot. Kept separate from the kernel query so a caller
+/// that already holds the kernel lock cannot invert the registry -> kernel order used elsewhere.
+pub(crate) struct SubagentStatusSnapshot {
+    task_id: String,
+    owner_pid: u64,
+    pid: u64,
+    result_channel_id: u64,
+    description: String,
+    agent_name: String,
+    started_at: Instant,
+    progress: Option<String>,
+}
+
+/// Snapshot the registry under its own lock, then resolve progress after releasing it.
+pub(crate) fn subagent_status_snapshots(session_id: &str) -> Vec<SubagentStatusSnapshot> {
+    let mut snapshots = {
+        let registry = lock_task_registry();
+        registry
+            .iter()
+            .filter(|(_, entry)| entry.session_id == session_id)
+            .map(|(task_id, entry)| SubagentStatusSnapshot {
+                task_id: task_id.clone(),
+                owner_pid: entry.owner_pid,
+                pid: entry.pid,
+                result_channel_id: entry.result_channel_id,
+                description: entry.description.clone(),
+                agent_name: entry.agent_name.clone(),
+                started_at: entry.started_at,
+                progress: None,
+            })
+            .collect::<Vec<_>>()
+    };
+    for snapshot in &mut snapshots {
+        snapshot.progress = current_task_progress(&snapshot.task_id);
+    }
+    snapshots
+}
+
 pub(crate) fn subagent_terminal_statuses(
     os: &mut dyn Kernel,
-    session_id: &str,
+    snapshots: Vec<SubagentStatusSnapshot>,
 ) -> Vec<SubagentTerminalStatus> {
     let Some(owner_pid) = active_foreground_owner_pid(os) else {
         return Vec::new();
     };
-    let registry = TASK_REGISTRY.lock().unwrap();
-    let mut statuses = registry
-        .iter()
-        .filter(|(_, entry)| task_entry_owned_by(entry, session_id, owner_pid))
-        .map(|(task_id, entry)| SubagentTerminalStatus {
-            description: entry.description.clone(),
-            agent_name: entry.agent_name.clone(),
-            state: task_state_string(os, entry.result_channel_id, entry.pid)
+    let mut statuses = snapshots
+        .into_iter()
+        .filter(|snapshot| snapshot.owner_pid == owner_pid)
+        .map(|snapshot| SubagentTerminalStatus {
+            description: snapshot.description,
+            agent_name: snapshot.agent_name,
+            state: task_state_string(os, snapshot.result_channel_id, snapshot.pid)
                 .unwrap_or_else(|_| "unknown".to_string()),
-            elapsed_secs: entry.started_at.elapsed().as_secs(),
-            progress: current_task_progress(task_id),
+            elapsed_secs: snapshot.started_at.elapsed().as_secs(),
+            progress: snapshot.progress,
         })
         .collect::<Vec<_>>();
     statuses.sort_by(|a, b| a.description.cmp(&b.description));
@@ -135,13 +179,13 @@ pub(crate) fn subagent_terminal_statuses(
 /// Remove a task entry from the registry. Called by the synchronous `task`
 /// interception once it has consumed the result.
 pub(crate) fn remove_task_entry(task_id: &str) -> Option<AsyncTaskEntry> {
-    let mut registry = TASK_REGISTRY.lock().unwrap();
+    let mut registry = lock_task_registry();
     registry.take(&task_id.to_string())
 }
 
 #[cfg(test)]
 pub(crate) fn insert_task_entry_for_test(task_id: String, entry: AsyncTaskEntry) {
-    let mut registry = TASK_REGISTRY.lock().unwrap();
+    let mut registry = lock_task_registry();
     registry.insert(task_id, entry);
 }
 /// channel. Re-exported for the synchronous `task` interception so that both

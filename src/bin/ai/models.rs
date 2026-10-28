@@ -77,12 +77,29 @@ pub(super) fn reasoning_effort_wire(model: &str) -> Option<model_names::Reasonin
 /// 模型显式声明 wire 形状时，说明该字段是模型协议的一部分；否则回退到 provider
 /// thinking dialect 的默认能力判断。
 pub(super) fn reasoning_effort_reduces_thinking(model: &str) -> bool {
-    if reasoning_effort_wire(model).is_some() {
-        return true;
-    }
     let endpoint = endpoint_for_model(model, "");
     let request_model = request_model_name(model);
-    provider::reasoning_effort_reduces_thinking_for(model_adapter(model), &request_model, &endpoint)
+    reasoning_effort_reduces_thinking_from_parts(
+        reasoning_effort_wire(model),
+        model_adapter(model),
+        &request_model,
+        &endpoint,
+    )
+}
+
+/// Registry-free core of [`reasoning_effort_reduces_thinking`]: same rule over
+/// pre-resolved inputs so behavior tests can pin the wire rule without
+/// depending on registry keys (which churn on every model rename).
+pub(super) fn reasoning_effort_reduces_thinking_from_parts(
+    effort_wire: Option<model_names::ReasoningEffortWire>,
+    adapter: provider::ApiProvider,
+    request_model: &str,
+    endpoint: &str,
+) -> bool {
+    if effort_wire.is_some() {
+        return true;
+    }
+    provider::reasoning_effort_reduces_thinking_for(adapter, request_model, endpoint)
 }
 
 /// 返回该模型是否声明了 `reasoning_effort` 与 `tools` 不兼容。

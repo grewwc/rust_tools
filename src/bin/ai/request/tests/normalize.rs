@@ -732,9 +732,14 @@ fn normalize_messages_projects_only_recent_context_checkpoints_without_truncatin
         .collect::<Vec<_>>();
 
     assert_eq!(checkpoints.len(), 8);
+    // Fixture assets do not exist on disk, so every projected marker carries
+    // the fail-closed stale annotation; recency selection is unaffected.
     let expected = (2..10)
         .map(|index| {
-            format!("[context_checkpoint path=/tmp/checkpoint-{index}.md] checkpoint {index}")
+            format!(
+                "[context_checkpoint path=/tmp/checkpoint-{index}.md] checkpoint {index} \
+                 (stale: checkpoint asset missing or unreadable — content unverifiable)"
+            )
         })
         .collect::<Vec<_>>();
     assert_eq!(

@@ -606,6 +606,67 @@ fn task_integrate_closes_durable_evidence() {
 }
 
 #[test]
+fn task_integrate_batch_rolls_back_when_any_task_is_undelivered() {
+    let root = std::env::temp_dir()
+        .join(format!("task-integrate-batch-{}", uuid::Uuid::new_v4().simple()));
+    let history_file = root.join("history.sqlite");
+    let session_id = format!("task-integrate-batch-{}", uuid::Uuid::new_v4().simple());
+    crate::ai::history::record_delivered_task_evidence(
+        &history_file,
+        &session_id,
+        crate::ai::history::DeliveredTaskEvidence {
+            task_id: "task-delivered",
+            description: "review parser",
+            agent_name: "build",
+            model: "test-model",
+            status: "completed",
+            payload: "[Subagent final answer]\nconfirmed",
+        },
+    )
+    .unwrap();
+    let mut app = test_app_with_model(String::new());
+    app.config.history_file = history_file.clone();
+    app.session_id = session_id.clone();
+    let context = DriverContext::new(
+        app,
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+    );
+    let result = DRIVER_CTX.sync_scope(context, || {
+        execute_task_integrate(&serde_json::json!({
+            "tasks": [
+                {
+                    "task_id": "task-delivered",
+                    "disposition": "accepted",
+                    "summary": "first item is valid"
+                },
+                {
+                    "task_id": "task-undelivered",
+                    "disposition": "accepted",
+                    "summary": "second item has no delivered evidence"
+                }
+            ]
+        }))
+    });
+    let error = result.unwrap_err();
+    assert!(error.contains("task-undelivered"), "{error}");
+    assert!(error.contains("No integrations were applied"), "{error}");
+    assert!(
+        crate::ai::history::read_integrated_task_ids(&history_file, &session_id)
+            .unwrap()
+            .is_empty(),
+        "the valid first item must be rolled back with the invalid second item"
+    );
+
+    let sessions_root = crate::ai::history::SessionStore::new(&history_file)
+        .sessions_root()
+        .to_path_buf();
+    let _ = std::fs::remove_dir_all(sessions_root);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn capped_subagent_manifest_preserves_explicit_iteration_budget_within_hard_cap() {
     let mut agent = manifest("build", "Main build agent", AgentMode::Subagent);
     agent.max_steps = Some(128);
@@ -969,7 +1030,6 @@ fn task_wait_low_level_wait_wakes_on_task_result_even_with_cancel_source() {
 fn task_wait_formats_empty_subagent_result_explicitly() {
     let entry = AsyncTaskEntry {
         session_id: String::new(),
-        result_observed: false,
         owner_pid: 0,
         pid: 42,
         result_channel_id: 1,
@@ -1084,7 +1144,6 @@ fn task_wait_rejects_foreign_session_task_ids() {
         own_task_id.clone(),
         AsyncTaskEntry {
             session_id: "session-a".to_string(),
-            result_observed: false,
             owner_pid,
             pid: 1,
             result_channel_id: 11,
@@ -1107,7 +1166,6 @@ fn task_wait_rejects_foreign_session_task_ids() {
         foreign_task_id.clone(),
         AsyncTaskEntry {
             session_id: "session-b".to_string(),
-            result_observed: false,
             owner_pid,
             pid: 2,
             result_channel_id: 12,
@@ -1388,7 +1446,6 @@ fn task_status_and_outstanding_anchor_filter_same_session_sibling_owner_tasks() 
             task_id,
             AsyncTaskEntry {
                 session_id: app.session_id.clone(),
-                result_observed: false,
                 owner_pid,
                 pid,
                 result_channel_id: channel,
@@ -1471,7 +1528,6 @@ fn task_cancel_refuses_same_session_foreign_owner_task() {
         task_id.clone(),
         AsyncTaskEntry {
             session_id: app.session_id.clone(),
-            result_observed: false,
             owner_pid: sibling_owner_pid,
             pid: child_pid,
             result_channel_id: channel,
@@ -1540,7 +1596,6 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
         task_id.clone(),
         AsyncTaskEntry {
             session_id: app.session_id.clone(),
-            result_observed: false,
             owner_pid,
             pid: child_pid,
             result_channel_id: channel,
@@ -1649,7 +1704,6 @@ fn task_status_collects_completed_results_and_cleans_up_resources() {
         task_id.clone(),
         AsyncTaskEntry {
             session_id: app.session_id.clone(),
-            result_observed: false,
             owner_pid: pid,
             pid,
             result_channel_id,
@@ -1826,7 +1880,6 @@ fn task_wait_any_returns_ready_result_without_waiting_for_pending_task() {
             task_id,
             AsyncTaskEntry {
                 session_id: app.session_id.clone(),
-                result_observed: false,
                 owner_pid: root_pid,
                 pid,
                 result_channel_id: channel,
@@ -1909,7 +1962,6 @@ fn task_status_cleans_up_terminated_task_without_result() {
         task_id.clone(),
         AsyncTaskEntry {
             session_id: app.session_id.clone(),
-            result_observed: false,
             owner_pid: root_pid,
             pid,
             result_channel_id,
@@ -1944,6 +1996,117 @@ fn task_status_cleans_up_terminated_task_without_result() {
     assert!(os.futex_event_id(completion_futex_addr).is_none());
     assert!(os.get_process(pid).is_none());
     drop(os);
+}
+
+#[test]
+fn task_status_reuses_persisted_terminal_evidence_after_channel_loss() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let root = std::env::temp_dir().join(format!(
+        "task-status-evidence-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let history_file = root.join("history.sqlite");
+    let session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    crate::ai::history::record_delivered_task_evidence(
+        &history_file,
+        &session_id,
+        crate::ai::history::DeliveredTaskEvidence {
+            task_id: &task_id,
+            description: "terminated task",
+            agent_name: "build",
+            model: "qwen3.7-max",
+            status: "completed",
+            payload: "[Subagent final answer]\ndurable output",
+        },
+    )
+    .unwrap();
+
+    let mut app = test_app_with_model("qwen3.7-max".to_string());
+    app.config.history_file = history_file.clone();
+    app.session_id = session_id.clone();
+    let os_handle = app.os.clone();
+    let _os_guard = init_os_tools_guard(os_handle.clone());
+
+    let (root_pid, pid, result_channel_id, completion_futex_addr) = {
+        let mut os = os_handle.lock().unwrap();
+        let root_pid = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
+        let pid = os
+            .spawn(
+                Some(root_pid),
+                "terminated".to_string(),
+                "terminated goal".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let channel = os.channel_create(Some(pid), 1, "task-result".to_string());
+        let completion_futex = os.futex_create(0, "task-complete".to_string());
+        os.set_current_pid(Some(root_pid));
+        os.kill_process(pid, "subagent crashed".to_string())
+            .unwrap();
+        (root_pid, pid, channel.raw(), completion_futex)
+    };
+
+    insert_task_entry_for_test(
+        task_id.clone(),
+        AsyncTaskEntry {
+            session_id: app.session_id.clone(),
+            owner_pid: root_pid,
+            pid,
+            result_channel_id,
+            completion_futex_addr,
+            description: "terminated task".to_string(),
+            agent_name: "build".to_string(),
+            model: "qwen3.7-max".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit override".to_string(),
+            inherit: InheritOptions::default(),
+            abort_handle: None,
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            started_at: Instant::now(),
+        },
+    );
+
+    let context = DriverContext::new(
+        app,
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+    );
+    let output = DRIVER_CTX
+        .sync_scope(context, || {
+            crate::ai::driver::runtime_ctx::TURN_IDENTITY
+                .sync_scope((session_id.clone(), 0usize), || {
+                    execute_task_status(&serde_json::json!({}))
+                })
+        })
+        .expect("task_status should reuse persisted evidence");
+
+    assert!(output.contains("durable output"), "{output}");
+    assert!(
+        !output.contains("terminated without publishing any output"),
+        "{output}"
+    );
+    assert!(remove_task_entry(&task_id).is_none());
+
+    let os = os_handle.lock().unwrap();
+    assert!(os.channel_meta(ChannelId(result_channel_id)).is_none());
+    assert!(os.futex_event_id(completion_futex_addr).is_none());
+    drop(os);
+
+    let sessions_root = crate::ai::history::SessionStore::new(&history_file)
+        .sessions_root()
+        .to_path_buf();
+    let _ = std::fs::remove_dir_all(sessions_root);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2069,7 +2232,6 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
         task_id.clone(),
         AsyncTaskEntry {
             session_id: app.session_id.clone(),
-            result_observed: false,
             owner_pid: root,
             pid,
             result_channel_id,
@@ -2166,7 +2328,6 @@ async fn discarding_session_tasks_aborts_workers_and_releases_results() {
         task_id.clone(),
         AsyncTaskEntry {
             session_id: app.session_id.clone(),
-            result_observed: false,
             owner_pid: root,
             pid,
             result_channel_id,
@@ -2246,7 +2407,6 @@ async fn wall_clock_reaper_aborts_worker_and_leaves_timeout_result_collectable()
         task_id.clone(),
         AsyncTaskEntry {
             session_id: app.session_id.clone(),
-            result_observed: false,
             owner_pid: root,
             pid,
             result_channel_id,
@@ -2333,7 +2493,6 @@ async fn task_wait_wall_clock_timeout_aborts_worker_before_publishing_result() {
         task_id.clone(),
         AsyncTaskEntry {
             session_id: app.session_id.clone(),
-            result_observed: false,
             owner_pid: root,
             pid,
             result_channel_id,
@@ -2442,7 +2601,6 @@ fn task_entry_can_be_looked_up_by_pid() {
             task_id.clone(),
             AsyncTaskEntry {
                 session_id: String::new(),
-                result_observed: false,
                 owner_pid: 0,
                 pid: 4242,
                 result_channel_id: 11,
@@ -2549,7 +2707,6 @@ fn subagent_progress_update_never_wakes_parked_parent() {
         task_id.clone(),
         AsyncTaskEntry {
             session_id: app.session_id.clone(),
-            result_observed: false,
             owner_pid,
             pid: child_pid,
             result_channel_id: channel,
@@ -2658,7 +2815,6 @@ fn wake_expired_task_waits_reaps_orphaned_state_when_owner_gone() {
         task_id.clone(),
         AsyncTaskEntry {
             session_id: app.session_id.clone(),
-            result_observed: false,
             owner_pid,
             pid: child_pid,
             result_channel_id: channel,

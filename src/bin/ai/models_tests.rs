@@ -12,7 +12,7 @@ use crate::ai::cli::ParsedCli;
 use crate::ai::config_schema::AiConfig;
 use crate::ai::model_names::ModelDef;
 use crate::ai::provider::{
-    ALIBABA_DEFAULT_ENDPOINT, ApiProvider, ModelQualityTier, OPENCODE_DEFAULT_ENDPOINT,
+    ApiProvider, ModelQualityTier, OPENCODE_DEFAULT_ENDPOINT,
     OPENROUTER_ENDPOINT,
 };
 use crate::ai::request_protocol::RequestProtocolDialect;
@@ -252,11 +252,25 @@ fn model_def_defaults_request_protocol_to_none() {
 
 #[test]
 fn request_protocol_dialect_prefers_model_declared_protocol() {
-    let endpoint = endpoint_for_model("gpt-5.6-sol", "");
-    assert_eq!(
-        request_protocol_dialect("gpt-5.6-sol", &endpoint),
-        RequestProtocolDialect::Responses
+    // Every entry that declares a request protocol must resolve to it,
+    // regardless of what the endpoint shape would infer. Discovered by the
+    // declared property instead of pinning a concrete key.
+    let declared: Vec<(String, RequestProtocolDialect)> = super::model_names::all()
+        .iter()
+        .filter_map(|m| m.request_protocol.map(|proto| (m.key.clone(), proto)))
+        .collect();
+    assert!(
+        !declared.is_empty(),
+        "model registry must contain at least one entry with a declared request_protocol"
     );
+    for (key, proto) in &declared {
+        let endpoint = endpoint_for_model(key, "");
+        assert_eq!(
+            request_protocol_dialect(key, &endpoint),
+            *proto,
+            "{key}: declared protocol must win over endpoint inference"
+        );
+    }
 }
 
 #[test]
@@ -297,6 +311,17 @@ fn disabled_model_tokens_accept_names_and_keys() {
     assert!(disabled.contains(&model_def.name.to_ascii_lowercase()));
     assert!(disabled.contains(&model_def.key.to_ascii_lowercase()));
     assert!(disabled.contains(&"foo".to_string()));
+}
+
+/// Attribute-based discovery: finds the first registry **key** whose model
+/// definition satisfies `predicate`. Returns `None` when no entry matches so
+/// each caller decides; callers in registry-coupled tests must hard-fail
+/// (panic/expect naming the missing model class) instead of skipping.
+fn first_model_key_where(predicate: impl Fn(&ModelDef) -> bool) -> Option<String> {
+    super::model_names::all()
+        .iter()
+        .find(|m| predicate(m))
+        .map(|m| m.key.clone())
 }
 
 /// Picks a real model name whose adapter is Alibaba as the test input;
@@ -453,14 +478,25 @@ fn output_caps_above_the_tier_default_window_declare_an_explicit_window() {
 }
 
 #[test]
-fn gpt_5_x_routes_declare_window_consistent_with_output_cap() {
-    // The gpt-5.6 family (luna/sol/terra) shares a 256K context window (confirmed by the
-    // provider). A 256K output cap cannot coexist with a 256K window: prompt + 2048 safety
-    // margin would always exceed it, so the builder would clamp max_tokens below the
-    // declared cap on every request. The output cap is therefore 128K (the glm-5.3
-    // half-window pattern), and the window is declared explicitly so a future tier-default
-    // change cannot silently re-clamp max_tokens.
-    for key in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
+fn half_window_entries_declare_window_consistent_with_output_cap() {
+    // Entries on the half-window pattern (256K context window, 128K output cap)
+    // must declare both explicitly: a 256K output cap cannot coexist with a
+    // 256K window (prompt + 2048 safety margin would always exceed it, so the
+    // builder would clamp max_tokens below the declared cap on every request),
+    // and an explicit window keeps a future tier-default change from silently
+    // re-clamping max_tokens. Discovered by the declared values, not by key.
+    let matches: Vec<String> = super::model_names::all()
+        .iter()
+        .filter(|m| {
+            m.context_window_tokens == Some(256_000) && m.max_output_tokens == Some(128_000)
+        })
+        .map(|m| m.key.clone())
+        .collect();
+    assert!(
+        !matches.is_empty(),
+        "model registry must contain at least one 256K-window/128K-cap entry"
+    );
+    for key in &matches {
         assert_eq!(context_window_tokens(key), 256_000, "{key}");
         assert_eq!(max_output_tokens(key), Some(128_000), "{key}");
     }
@@ -491,24 +527,69 @@ fn all_models_declare_output_cap_below_context_window() {
 
 #[test]
 fn platform_changes_model_handle_but_legacy_adapter_handle_still_resolves() {
-    let volcano = "deepseek-v4-flash-volcano";
-    let def = super::model_names::find_by_identifier(volcano)
-        .expect("model registry should contain volcano deepseek-v4-flash");
-    assert_eq!(super::model_names::model_handle(def), volcano);
-    assert_eq!(determine_model("deepseek-v4-flash-compatible"), volcano);
-    assert_eq!(model_platform_label(volcano), "volcano");
-    // Volcengine Coding Plan's official config declares 1,024K context / 393,216 output.
-    // It must be configured explicitly here and must not fall back to flagship's conservative 256K default window.
-    assert_eq!(context_window_tokens(volcano), 1_024_000);
-    assert_eq!(max_output_tokens(volcano), Some(393_216));
+    // A re-platformed entry (platform slug differs from the adapter slug) gets
+    // its handle from the platform, while the legacy `name-adapter` handle
+    // still resolves to the same entry. Discovered by property, not by key.
+    let key = first_model_key_where(|m| {
+        !m.name.starts_with("enc:")
+            && super::model_names::platform_slug(m) != super::model_names::adapter_slug(m.adapter)
+            && super::model_names::legacy_adapter_handle(m).is_some_and(|legacy| {
+                super::model_names::find_by_identifier(&legacy)
+                    .map(|resolved| std::ptr::eq(resolved, m))
+                    .unwrap_or(false)
+            })
+    })
+    .expect(
+        "model registry must contain a re-platformed entry whose legacy adapter handle resolves to itself",
+    );
+    let def = super::model_names::find_by_key(&key).expect("model must exist");
+    let handle = super::model_names::model_handle(def);
+    let legacy = super::model_names::legacy_adapter_handle(def)
+        .expect("re-platformed entry must have a legacy adapter handle");
+    assert_ne!(handle, legacy, "platform must change the model handle");
+    assert_eq!(determine_model(&def.key), handle, "key must resolve to its handle");
+    assert_eq!(
+        determine_model(&legacy),
+        handle,
+        "{legacy}: legacy adapter handle must still resolve"
+    );
+    assert_eq!(
+        model_platform_label(&def.key),
+        super::model_names::platform_label(def)
+    );
+    // Declared window/cap values round-trip instead of falling back to the
+    // tier default (a large provider window must not be squeezed to 256K).
+    if let Some(window) = def.context_window_tokens {
+        assert_eq!(context_window_tokens(&def.key), window, "{}", def.key);
+    }
+    assert_eq!(
+        max_output_tokens(&def.key),
+        def.max_output_tokens,
+        "{}",
+        def.key
+    );
 }
 
 #[test]
 fn volcano_models_keep_dedicated_reasoning_channel() {
     // Volcengine GLM/DeepSeek streams return reasoning_content separately; if the content
     // demux is also armed, the body is held back until the stream ends and would be misrouted into thinking on a response event.
-    assert!(!reasoning_in_content_enabled("deepseek-v4-flash-volcano"));
-    assert!(!reasoning_in_content_enabled("glm-5.2-volcano"));
+    // Discovered by the platform property instead of pinning concrete keys.
+    let volcano: Vec<String> = super::model_names::all()
+        .iter()
+        .filter(|m| super::model_names::platform_slug(m) == "volcano")
+        .map(|m| m.key.clone())
+        .collect();
+    assert!(
+        !volcano.is_empty(),
+        "model registry must contain at least one volcano-platform model"
+    );
+    for key in &volcano {
+        assert!(
+            !reasoning_in_content_enabled(key),
+            "{key}: volcano models must not arm the content demux"
+        );
+    }
 }
 
 #[test]
@@ -637,7 +718,10 @@ fn registry_identifiers_resolve_to_their_owning_entry() {
 #[test]
 fn endpoint_for_alibaba_model_prefers_model_config() {
     // Find a model with an Alibaba adapter that has an endpoint configured, ensuring the model config is used.
-    let (name, expected) = super::model_names::all()
+    // Look up by registry key (unique): several entries share a display
+    // name (e.g. the qwen3.8-flash DashScope/token-plan twins), so a
+    // name-based lookup may resolve to a different twin than the one found.
+    let (key, expected) = super::model_names::all()
         .iter()
         .find_map(|m| {
             if m.adapter != ApiProvider::Alibaba {
@@ -647,12 +731,14 @@ fn endpoint_for_alibaba_model_prefers_model_config() {
                 .as_deref()
                 .map(str::trim)
                 .filter(|e| !e.is_empty())
-                .map(|e| (m.name.clone(), e.to_string()))
+                .map(|e| (m.key.clone(), e.to_string()))
         })
         .expect("model registry must contain at least one Alibaba entry with endpoint");
-    let endpoint = endpoint_for_model(&name, "");
+    let endpoint = endpoint_for_model(&key, "");
     assert_eq!(endpoint, expected);
-    assert_eq!(endpoint, ALIBABA_DEFAULT_ENDPOINT);
+    // No assertion on the concrete URL: the registry also carries Alibaba
+    // entries on non-default endpoints (e.g. token-plan), and whichever
+    // entry is found first, the model config must win.
 }
 
 #[test]

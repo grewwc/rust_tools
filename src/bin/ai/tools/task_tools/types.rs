@@ -171,6 +171,42 @@ impl InheritOptions {
     }
 }
 
+/// Terminal states shared by the result channel, the durable evidence ledger, and tool summaries.
+/// Keeping the wire strings in one place prevents publisher/collector drift: `is_retryable_task_status`
+/// and `format_task_result` must agree on exactly the same spellings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TaskTerminalStatus {
+    Completed,
+    Failed,
+    Timeout,
+    Cancelled,
+}
+
+impl TaskTerminalStatus {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "timeout" => Some(Self::Timeout),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    pub(super) fn is_retryable(self) -> bool {
+        matches!(self, Self::Failed | Self::Timeout | Self::Cancelled)
+    }
+}
+
 /// Registry entry maintained by the agent layer for each asynchronous subtask, used by the
 /// `task_spawn` / `task_wait` flows.
 ///
@@ -192,7 +228,6 @@ impl InheritOptions {
 #[derive(Clone)]
 pub(crate) struct AsyncTaskEntry {
     pub(crate) session_id: String,
-    pub(crate) result_observed: bool,
     /// pid of the parent process that directly owns this task. task_wait/status/cancel only allow
     /// the owner process to observe its own spawned subtasks, preventing parent/sibling tasks
     /// within the same session from interfering with each other.

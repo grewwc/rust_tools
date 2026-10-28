@@ -44,16 +44,38 @@ pub(super) fn resolve_reasoning_wire_controls<'a>(
     reasoning_effort: Option<&'a str>,
 ) -> (Map<String, Value>, Option<&'a str>, Option<Value>) {
     let adapter_kind = models::model_adapter(model);
-    let adapter = adapter_for(adapter_kind, &endpoint);
     let request_model = models::request_model_name(model);
-    let thinking_dialect = thinking_dialect_for(adapter_kind, &request_model, &endpoint);
+    resolve_reasoning_wire_controls_from_parts(
+        adapter_kind,
+        &request_model,
+        endpoint,
+        models::reasoning_effort_wire(model),
+        enable_thinking,
+        reasoning_effort,
+    )
+}
+
+/// Registry-free core of [`resolve_reasoning_wire_controls`]: identical wire
+/// rules over pre-resolved inputs (`adapter_kind`, provider-side
+/// `request_model`, declared `effort_wire`) so behavior tests pin the dialect
+/// matrix without resolving registry keys.
+pub(super) fn resolve_reasoning_wire_controls_from_parts<'a>(
+    adapter_kind: ApiProvider,
+    request_model: &str,
+    endpoint: &str,
+    effort_wire: Option<crate::ai::model_names::ReasoningEffortWire>,
+    enable_thinking: bool,
+    reasoning_effort: Option<&'a str>,
+) -> (Map<String, Value>, Option<&'a str>, Option<Value>) {
+    let adapter = adapter_for(adapter_kind, endpoint);
+    let thinking_dialect = thinking_dialect_for(adapter_kind, request_model, endpoint);
     // Per-vendor effort **value** adaptation: the dialect owns the mapping and
     // this layer never invents a wire value. A registry-declared
     // `reasoning_effort_wire` takes precedence (the model's effort is
     // vendor-verified graded and placement is explicit); only undeclared models
     // go through the dialect default, where binary-switch dialects omit the
     // tier so the placement routing below has nothing to place.
-    let reasoning_effort = if models::reasoning_effort_wire(model).is_some() {
+    let reasoning_effort = if effort_wire.is_some() {
         reasoning_effort
     } else {
         thinking_dialect.adapt_effort(reasoning_effort)
@@ -61,9 +83,7 @@ pub(super) fn resolve_reasoning_wire_controls<'a>(
     // The user's `enable_search` request is passed in by the builder; only the
     // reasoning/thinking triple matters here, so `None` is a placeholder — this
     // function does not depend on the returned enable_search.
-    let (_, top_level_reasoning_effort, nested_reasoning) = if let Some(wire) =
-        models::reasoning_effort_wire(model)
-    {
+    let (_, top_level_reasoning_effort, nested_reasoning) = if let Some(wire) = effort_wire {
         match wire {
             crate::ai::model_names::ReasoningEffortWire::TopLevel => (None, reasoning_effort, None),
             crate::ai::model_names::ReasoningEffortWire::Nested => (
@@ -107,7 +127,28 @@ pub(super) fn normalize_reasoning_content_replay_for_model(model: &str, messages
     let adapter_kind = models::model_adapter(model);
     let endpoint = models::endpoint_for_model(model, "");
     let request_model = models::request_model_name(model);
-    let dialect = thinking_dialect_for(adapter_kind, &request_model, &endpoint);
+    normalize_reasoning_content_replay_from_parts(
+        model,
+        exact_replay,
+        adapter_kind,
+        &request_model,
+        &endpoint,
+        messages,
+    )
+}
+
+/// Registry-free core of [`normalize_reasoning_content_replay_for_model`].
+/// `model_tag` is opaque: it only tags persisted replay markers for
+/// same-model decode, never looks anything up — tests pass a synthetic tag.
+pub(super) fn normalize_reasoning_content_replay_from_parts(
+    model_tag: &str,
+    exact_replay: bool,
+    adapter_kind: ApiProvider,
+    request_model: &str,
+    endpoint: &str,
+    messages: &mut [Message],
+) {
+    let dialect = thinking_dialect_for(adapter_kind, request_model, endpoint);
     let shape_only_replay = dialect.requires_reasoning_content_echo();
 
     for message in messages.iter_mut() {
@@ -132,7 +173,7 @@ pub(super) fn normalize_reasoning_content_replay_for_model(model: &str, messages
                     ) =>
                 {
                     crate::ai::history::compress::decode_reasoning_replay_for_model(
-                        model, reasoning,
+                        model_tag, reasoning,
                     )
                     .unwrap_or_default()
                 }
@@ -155,7 +196,7 @@ pub(super) fn normalize_reasoning_content_replay_for_model(model: &str, messages
                 message.reasoning_content =
                     message.reasoning_content.as_deref().and_then(|reasoning| {
                         crate::ai::history::compress::decode_reasoning_replay_for_model(
-                            model, reasoning,
+                            model_tag, reasoning,
                         )
                     });
             }
@@ -333,7 +374,17 @@ pub(super) fn is_nonempty_text_block(block: &Value) -> bool {
 pub(crate) fn model_thinking_off_capability(model: &str) -> ThinkingOffCapability {
     let endpoint = models::endpoint_for_model(model, "");
     let request_model = models::request_model_name(model);
-    thinking_off_capability_for(models::model_adapter(model), &request_model, &endpoint)
+    thinking_off_capability_from_parts(models::model_adapter(model), &request_model, &endpoint)
+}
+
+/// Registry-free core of [`model_thinking_off_capability`]: pure dialect
+/// dispatch over pre-resolved inputs.
+pub(crate) fn thinking_off_capability_from_parts(
+    adapter: ApiProvider,
+    request_model: &str,
+    endpoint: &str,
+) -> ThinkingOffCapability {
+    thinking_off_capability_for(adapter, request_model, endpoint)
 }
 
 /// Whether the current model's thinking has a wire effort gradation.
@@ -346,6 +397,21 @@ pub(crate) fn model_thinking_off_capability(model: &str) -> ThinkingOffCapabilit
 /// DashScope) treat effort as a no-op and omit it from the wire.
 pub(crate) fn model_effort_graded(model: &str) -> bool {
     models::reasoning_effort_reduces_thinking(model)
+}
+
+/// Registry-free core of [`model_effort_graded`] over pre-resolved inputs.
+pub(crate) fn model_effort_graded_from_parts(
+    effort_wire: Option<crate::ai::model_names::ReasoningEffortWire>,
+    adapter: ApiProvider,
+    request_model: &str,
+    endpoint: &str,
+) -> bool {
+    models::reasoning_effort_reduces_thinking_from_parts(
+        effort_wire,
+        adapter,
+        request_model,
+        endpoint,
+    )
 }
 
 /// Resolve the effective reasoning intensity for the current session, highest
@@ -371,19 +437,38 @@ pub(crate) fn model_effort_graded(model: &str) -> bool {
 /// - [`ThinkingOffCapability::Unsupported`] dialects omit the field; the
 ///   `/effort off` handler reports that thinking stays on.
 pub(crate) fn resolve_reasoning_effort(app: &App, model: &str) -> Option<ReasoningEffort> {
-    if let Some(Some(level)) = app.cli.reasoning_effort_override.as_ref() {
-        return Some(*level);
+    resolve_reasoning_effort_from_parts(
+        app.cli.reasoning_effort_override,
+        &app.current_agent,
+        model_thinking_off_capability(model),
+        models::enable_thinking(model),
+        models::default_reasoning_effort(model),
+    )
+}
+
+/// Registry-free core of [`resolve_reasoning_effort`]: identical priority
+/// ladder over pre-resolved inputs (`effort_override` is `Some(None)` for an
+/// explicit off, `current_agent` for the sharp-agent implied `low`).
+pub(crate) fn resolve_reasoning_effort_from_parts(
+    effort_override: Option<Option<ReasoningEffort>>,
+    current_agent: &str,
+    off_capability: ThinkingOffCapability,
+    thinking_enabled: bool,
+    default_effort: Option<ReasoningEffort>,
+) -> Option<ReasoningEffort> {
+    if let Some(Some(level)) = effort_override {
+        return Some(level);
     }
-    if app.cli.reasoning_effort_override == Some(None) {
+    if effort_override == Some(None) {
         // User explicitly typed `/effort off` (or `--reasoning-effort off`).
-        match model_thinking_off_capability(model) {
-            ThinkingOffCapability::EffortNone if models::enable_thinking(model) => {
+        match off_capability {
+            ThinkingOffCapability::EffortNone if thinking_enabled => {
                 return Some(ReasoningEffort::None);
             }
             _ => return None,
         }
     }
-    if app.current_agent == "sharp" {
+    if current_agent == "sharp" {
         // Sharp means minimal deliberation; the configured default (often
         // `max`) would defeat it. Derived here — not stored in the override
         // at CLI parse — so switching agents mid-session (`/agent sharp` /
@@ -391,7 +476,7 @@ pub(crate) fn resolve_reasoning_effort(app: &App, model: &str) -> Option<Reasoni
         // effective tier instead of leaving a stale value behind.
         return Some(ReasoningEffort::Low);
     }
-    models::default_reasoning_effort(model)
+    default_effort
 }
 
 /// Apply the truncation ladder's last-resort force-off fallback to the reasoning-effort value.
@@ -417,12 +502,25 @@ pub(crate) fn apply_thinking_force_off_effort<'a>(
     endpoint: &str,
     effort: Option<&'a str>,
 ) -> Option<&'a str> {
+    apply_thinking_force_off_effort_from_parts(
+        thinking_disabled_override,
+        reasoning_effort_reduces_thinking_for(provider, model, endpoint),
+        thinking_off_capability_for(provider, model, endpoint),
+        effort,
+    )
+}
+
+/// Registry-free core of [`apply_thinking_force_off_effort`] over the
+/// pre-resolved dialect predicates.
+pub(crate) fn apply_thinking_force_off_effort_from_parts<'a>(
+    thinking_disabled_override: bool,
+    effort_reduces_thinking: bool,
+    off_capability: ThinkingOffCapability,
+    effort: Option<&'a str>,
+) -> Option<&'a str> {
     if thinking_disabled_override
-        && reasoning_effort_reduces_thinking_for(provider, model, endpoint)
-        && matches!(
-            thinking_off_capability_for(provider, model, endpoint),
-            ThinkingOffCapability::EffortNone
-        )
+        && effort_reduces_thinking
+        && matches!(off_capability, ThinkingOffCapability::EffortNone)
     {
         Some(ReasoningEffort::None.as_str())
     } else {
@@ -435,16 +533,40 @@ pub(crate) fn apply_thinking_force_off_effort<'a>(
 /// default, so a model without a default tier is not mis-displayed as a
 /// specific effort.
 pub(crate) fn reasoning_effort_display_label(app: &App, model: &str) -> &'static str {
-    if app.cli.reasoning_effort_override == Some(None) {
+    reasoning_effort_display_label_from_parts(
+        app.cli.reasoning_effort_override,
+        &app.current_agent,
+        model_thinking_off_capability(model),
+        models::enable_thinking(model),
+        models::default_reasoning_effort(model),
+    )
+}
+
+/// Registry-free core of [`reasoning_effort_display_label`] over pre-resolved
+/// inputs; see [`resolve_reasoning_effort_from_parts`] for the semantics.
+pub(crate) fn reasoning_effort_display_label_from_parts(
+    effort_override: Option<Option<ReasoningEffort>>,
+    current_agent: &str,
+    off_capability: ThinkingOffCapability,
+    thinking_enabled: bool,
+    default_effort: Option<ReasoningEffort>,
+) -> &'static str {
+    if effort_override == Some(None) {
         // Explicit `/effort off`: show "off" (the user's intent) instead of the
         // underlying "none"/"server default" value. When the vendor has no off
         // mechanism at all, say so instead of implying thinking was turned off.
-        return match model_thinking_off_capability(model) {
+        return match off_capability {
             ThinkingOffCapability::Unsupported => "off (unsupported)",
             _ => "off",
         };
     }
-    match resolve_reasoning_effort(app, model) {
+    match resolve_reasoning_effort_from_parts(
+        effort_override,
+        current_agent,
+        off_capability,
+        thinking_enabled,
+        default_effort,
+    ) {
         Some(effort) => effort.as_str(),
         None => "server default",
     }
@@ -459,6 +581,17 @@ mod encrypted_replay_reconstruct_tests {
     use crate::ai::types::{FunctionCall, ToolCall};
     use rustc_hash::FxHashMap;
     use serde_json::{Value, json};
+
+    /// First registry key declaring `reasoning_encrypted_replay`. Hard-fails
+    /// when no such entry exists so the tests below cannot silently run
+    /// against the unknown-model fallback.
+    fn first_encrypted_replay_model_key() -> String {
+        crate::ai::model_names::all()
+            .iter()
+            .find(|m| m.reasoning_encrypted_replay)
+            .map(|m| m.key.clone())
+            .expect("registry must keep at least one reasoning_encrypted_replay entry")
+    }
 
     fn assistant_call_with_reasoning(id: &str, reasoning: Option<String>) -> Message {
         Message {
@@ -480,17 +613,17 @@ mod encrypted_replay_reconstruct_tests {
     #[test]
     fn rebuilds_items_from_encoded_history_for_encrypted_model() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Must resolve in the model registry with reasoning_encrypted_replay: true
-        // (models/muse-spark-1.3-contributor.json); an unknown identifier makes the
-        // reconstruct gate return early and the rebuild never runs.
-        let model = "muse-spark-1.3-contributor";
+        // Must resolve in the model registry with reasoning_encrypted_replay:
+        // true; an unknown identifier makes the reconstruct gate return early
+        // and the rebuild never runs.
+        let model = first_encrypted_replay_model_key();
         let items = vec![json!({"type":"reasoning","encrypted_content":"ENC"})];
         let messages = vec![assistant_call_with_reasoning(
             "call-1",
-            Some(encode_encrypted_reasoning_replay_state(model, &items)),
+            Some(encode_encrypted_reasoning_replay_state(&model, &items)),
         )];
         let rebuilt = reconstruct_encrypted_reasoning_items_for_model(
-            model,
+            &model,
             &messages,
             &FxHashMap::default(),
         );
@@ -500,16 +633,17 @@ mod encrypted_replay_reconstruct_tests {
     #[test]
     fn live_side_channel_takes_precedence_over_history() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let model = "muse-spark-1.3-contributor";
+        let model = first_encrypted_replay_model_key();
         let stale = vec![json!({"encrypted_content":"OLD"})];
         let fresh = vec![json!({"encrypted_content":"NEW"})];
         let messages = vec![assistant_call_with_reasoning(
             "call-1",
-            Some(encode_encrypted_reasoning_replay_state(model, &stale)),
+            Some(encode_encrypted_reasoning_replay_state(&model, &stale)),
         )];
         let mut live: FxHashMap<String, Vec<Value>> = FxHashMap::default();
         live.insert("call-1".to_string(), fresh.clone());
-        let rebuilt = reconstruct_encrypted_reasoning_items_for_model(model, &messages, &live);
+        let rebuilt =
+            reconstruct_encrypted_reasoning_items_for_model(&model, &messages, &live);
         // The in-memory side channel (freshest for the current turn) wins;
         // archived values must never overwrite it.
         assert_eq!(rebuilt.get("call-1"), Some(&fresh));
@@ -518,23 +652,28 @@ mod encrypted_replay_reconstruct_tests {
     #[test]
     fn non_encrypted_model_is_untouched() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let model = "glm-5.2-opencode";
         let items = vec![json!({"encrypted_content":"ENC"})];
-        // Even if history carries an encrypted marker, non encrypted-replay
-        // models never rebuild (they return the live map as-is).
-        let messages = vec![assistant_call_with_reasoning(
-            "call-1",
-            Some(encode_encrypted_reasoning_replay_state(
-                "muse-spark-1.3-contributor",
-                &items,
-            )),
-        )];
-        let rebuilt = reconstruct_encrypted_reasoning_items_for_model(
-            model,
-            &messages,
-            &FxHashMap::default(),
-        );
-        assert!(rebuilt.is_empty());
+        // Even if history carries an encrypted marker, models without the
+        // encrypted-replay flag never rebuild (they return the live map
+        // as-is). Cover both the explicitly-unregistered tag and a registered
+        // entry that does not declare the flag.
+        let registered_plain = crate::ai::model_names::all()
+            .iter()
+            .find(|m| !m.reasoning_encrypted_replay)
+            .map(|m| m.key.clone())
+            .expect("registry must keep at least one non-encrypted-replay entry");
+        for model in ["synthetic-unregistered-model".to_string(), registered_plain] {
+            let messages = vec![assistant_call_with_reasoning(
+                "call-1",
+                Some(encode_encrypted_reasoning_replay_state(&model, &items)),
+            )];
+            let rebuilt = reconstruct_encrypted_reasoning_items_for_model(
+                &model,
+                &messages,
+                &FxHashMap::default(),
+            );
+            assert!(rebuilt.is_empty(), "{model}");
+        }
     }
 
     #[test]
@@ -549,17 +688,17 @@ mod encrypted_replay_reconstruct_tests {
         // depend on this env var.
         unsafe { std::env::set_var("AIOS_DISABLE_ENCRYPTED_REPLAY", "1") };
         assert!(!encrypted_reasoning_replay_runtime_enabled());
-        let model = "muse-spark-1.3-contributor";
+        let model = first_encrypted_replay_model_key();
         let items = vec![json!({"encrypted_content":"ENC"})];
         let messages = vec![assistant_call_with_reasoning(
             "call-1",
-            Some(encode_encrypted_reasoning_replay_state(model, &items)),
+            Some(encode_encrypted_reasoning_replay_state(&model, &items)),
         )];
         // With replay disabled, no rebuild happens even if the model is capable
         // and history carries an encoded blob.
         assert!(
             reconstruct_encrypted_reasoning_items_for_model(
-                model,
+                &model,
                 &messages,
                 &FxHashMap::default()
             )

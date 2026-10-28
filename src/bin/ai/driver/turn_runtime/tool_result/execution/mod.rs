@@ -60,6 +60,7 @@ mod completion_gate;
 mod evidence_status;
 mod final_citations;
 mod final_recovery;
+mod final_terminator;
 mod followup;
 mod iteration;
 mod observer;
@@ -89,9 +90,9 @@ pub(in crate::ai) use audit_evidence::is_evidence_gated_audit_agent;
 // cluster), so the glob segments are unused outside test builds.
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(in crate::ai::driver::turn_runtime) use {
-    audit_evidence::*, completion_gate::*, final_citations::*, final_recovery::*, followup::*,
-    iteration::*, observer::*, outstanding::*, output_format::*, patch_retry::*, prepare::*,
-    rejection::*, round::*,
+    audit_evidence::*, completion_gate::*, final_citations::*, final_recovery::*,
+    final_terminator::*, followup::*, iteration::*, observer::*, outstanding::*, output_format::*,
+    patch_retry::*, prepare::*, rejection::*, round::*,
 };
 #[cfg(test)]
 mod tests;

@@ -21,9 +21,10 @@ use crate::ai::types::ToolDefinition;
 use super::aux::charge_llm_usage_to_kernel;
 use super::builder::{
     build_request_body, clamp_with_estimated_prompt, estimate_request_prompt_from_definitions,
+    estimate_request_prompt_upper, estimate_request_prompt_upper_from_definitions,
     resolve_wire_enable_search,
 };
-use super::current_budget::CurrentRequestBudget;
+use super::current_budget::{ContextLimits, CurrentRequestBudget, WaterBand, water_note};
 use super::error::{
     REQUEST_MAX_ATTEMPTS, RequestError, RequestErrorKind, RequestRetryPolicy,
     STREAM_RESPONSE_HEADER_TIMEOUT_SECS, api_key_for_request_model, apply_request_auth,
@@ -499,7 +500,7 @@ pub(crate) async fn preview_request_budget(
     // it once for the wire body, but budgets only need its token estimate and
     // settings fingerprint, both derived directly from the definitions
     // (parity-tested in builder/prompt_feedback).
-    let core = prepare_projection_core(app, model, messages, tools_enabled).await;
+    let mut core = prepare_projection_core(app, model, messages, tools_enabled).await;
     // `Some` exactly when the send path would carry tools (non-empty and
     // model-enabled, as in `agent_tools_for_request`), so effort-conflict
     // handling and fingerprints agree between preview and send.
@@ -538,39 +539,68 @@ pub(crate) async fn preview_request_budget(
         models::search_enabled(model).then_some(true),
     );
     let tool_choice = tools_defs.map(|_| Value::String("auto".to_string()));
-    let (estimated, message_counts) = estimate_request_prompt_from_definitions(
+    // Preserve the previous fixed-band prefix when possible so compatible
+    // provider usage can calibrate this request; otherwise seed from the
+    // noteless upper estimate. The send path applies the same rule.
+    let naked_upper = estimate_request_prompt_upper_from_definitions(
         &core.messages,
         tools_defs,
         Some(&core.reasoning_items),
     );
-    let feedback = PromptTokenFeedback::capture_preview(
-        &app.session_id,
-        model,
-        &core.endpoint,
-        &core.messages,
-        &thinking,
-        enable_search,
-        tools_defs,
-        tool_choice.as_ref(),
-        wire_effort,
-        reasoning.as_ref(),
-        models::reasoning_encrypted_replay_enabled(model),
-        stream,
-        estimated,
-        message_counts,
-    );
-    CurrentRequestBudget::measure(
-        model,
-        app.cli.max_tokens_override,
-        &feedback,
-        app.last_known_prompt_tokens.as_ref(),
-    )
+    let allowance =
+        ContextLimits::for_model(model, app.cli.max_tokens_override).input_allowance_tokens;
+    let provisional_band = previous_water_meter_band(app.last_known_prompt_tokens.as_ref())
+        .unwrap_or_else(|| WaterBand::for_upper(naked_upper, allowance));
+    core.messages
+        .insert(0, water_meter_message(provisional_band));
+    let measure = |messages: &[Message]| {
+        let (estimated, message_counts) = estimate_request_prompt_from_definitions(
+            messages,
+            tools_defs,
+            Some(&core.reasoning_items),
+        );
+        let estimated_upper = estimate_request_prompt_upper_from_definitions(
+            messages,
+            tools_defs,
+            Some(&core.reasoning_items),
+        );
+        let feedback = PromptTokenFeedback::capture_preview(
+            &app.session_id,
+            model,
+            &core.endpoint,
+            messages,
+            &thinking,
+            enable_search,
+            tools_defs,
+            tool_choice.as_ref(),
+            wire_effort,
+            reasoning.as_ref(),
+            models::reasoning_encrypted_replay_enabled(model),
+            stream,
+            estimated,
+            estimated_upper,
+            message_counts,
+        );
+        CurrentRequestBudget::measure(
+            model,
+            app.cli.max_tokens_override,
+            &feedback,
+            app.last_known_prompt_tokens.as_ref(),
+        )
+    };
+    let budget = measure(&core.messages);
+    // The send path derives its corrected note from this same budget. Preview
+    // returns the pre-replacement budget: changing the note is an intentional
+    // prefix transition and must not discard compatible provider usage while
+    // deciding the pressure for this request.
+    budget
 }
 
 /// Owns the wire projection so measurement can borrow it without borrowing App
 /// across the mutable transport path. Both preview and send build tools once.
 struct RequestProjection {
     messages: Vec<Message>,
+    corrected_messages: Option<Vec<Message>>,
     tools: Option<Value>,
     tool_choice: Option<Value>,
     enable_thinking: bool,
@@ -693,6 +723,7 @@ async fn prepare_request_projection(
     );
     RequestProjection {
         messages: core.messages,
+        corrected_messages: None,
         tools: tools_value,
         tool_choice,
         enable_thinking: core.enable_thinking,
@@ -703,6 +734,32 @@ async fn prepare_request_projection(
     }
 }
 
+/// Display-only water meter note as a leading system message. Fixed text per
+/// band; preview uses the provisional band while send may replace it after
+/// calibration (see `water_note` for the stability contract).
+fn water_meter_message(band: WaterBand) -> Message {
+    Message {
+        role: "system".to_string(),
+        content: Value::String(water_note(band).to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }
+}
+
+fn previous_water_meter_band(previous: Option<&PromptTokenFeedback>) -> Option<WaterBand> {
+    previous.and_then(|feedback| {
+        [
+            WaterBand::Comfortable,
+            WaterBand::Elevated,
+            WaterBand::Pressure,
+            WaterBand::Critical,
+        ]
+        .into_iter()
+        .find(|band| feedback.starts_with_message(&water_meter_message(*band)))
+    })
+}
+
 impl RequestProjection {
     fn measure<'a>(
         &'a mut self,
@@ -711,6 +768,26 @@ impl RequestProjection {
         stream: bool,
         previous: Option<&PromptTokenFeedback>,
     ) -> (RequestBody<'a>, PromptTokenFeedback, CurrentRequestBudget) {
+        // Preserve the previous fixed-band prefix long enough to apply
+        // compatible provider usage, falling back to the noteless upper
+        // estimate when no prior meter exists. Then correct the note from the
+        // calibrated budget. Text is fixed per band so the calibration prefix
+        // stays byte-stable once the corrected band is stable (see
+        // `water_note`). Preview mirrors the provisional pass.
+        let allowance =
+            ContextLimits::for_model(model, app.cli.max_tokens_override).input_allowance_tokens;
+        let provisional_band = previous_water_meter_band(previous).unwrap_or_else(|| {
+            WaterBand::for_upper(
+                estimate_request_prompt_upper(
+                    &self.messages,
+                    self.tools.as_ref(),
+                    Some(&self.reasoning_items),
+                ),
+                allowance,
+            )
+        });
+        self.messages
+            .insert(0, water_meter_message(provisional_band));
         let mut body = build_request_body(
             model,
             &self.messages,
@@ -735,8 +812,51 @@ impl RequestProjection {
             .then(|| app.session_id.clone())
             .filter(|key| !key.is_empty());
         body.explicit_cache_breakpoints = prompt_cache_enabled_for_model(model);
-        let feedback = PromptTokenFeedback::capture(&app.session_id, model, &self.endpoint, &body);
-        let budget = CurrentRequestBudget::measure(model, app.cli.max_tokens_override, &feedback, previous);
+        let mut feedback =
+            PromptTokenFeedback::capture(&app.session_id, model, &self.endpoint, &body);
+        let budget =
+            CurrentRequestBudget::measure(model, app.cli.max_tokens_override, &feedback, previous);
+        let calibrated_band = WaterBand::for_budget(budget);
+        if calibrated_band == provisional_band {
+            body.max_tokens = models::max_output_tokens(model).map(|model_max| {
+                let cap = clamp_with_estimated_prompt(model, budget.prompt_tokens, model_max);
+                app.cli
+                    .max_tokens_override
+                    .map_or(cap, |value| cap.min(value))
+            });
+            return (body, feedback, budget);
+        }
+        // Recover the owned tool values before releasing the provisional body.
+        // Only a band transition pays for a second body build.
+        self.tools = body.tools.take();
+        self.tool_choice = body.tool_choice.take();
+        drop(body);
+        let mut corrected_messages = self.messages.clone();
+        corrected_messages[0] = water_meter_message(calibrated_band);
+        self.corrected_messages = Some(corrected_messages);
+        let corrected_messages = self
+            .corrected_messages
+            .as_deref()
+            .expect("corrected messages were just populated");
+        body = build_request_body(
+            model,
+            corrected_messages,
+            stream,
+            self.enable_thinking,
+            models::search_enabled(model).then_some(true),
+            self.tools.take(),
+            self.tool_choice.take(),
+            self.reasoning_effort,
+            app.cli.max_tokens_override,
+            None,
+            Some(&self.reasoning_items),
+        );
+        body.tool_errors = Some(&self.tool_errors);
+        body.prompt_cache_key = models::prompt_cache_key_enabled(model)
+            .then(|| app.session_id.clone())
+            .filter(|key| !key.is_empty());
+        body.explicit_cache_breakpoints = prompt_cache_enabled_for_model(model);
+        feedback = PromptTokenFeedback::capture(&app.session_id, model, &self.endpoint, &body);
         // Auxiliary builders lack request-scoped usage. Only this shared main
         // request boundary calibrates the raw estimate, including tools once.
         // An adaptive output override may lower, never defeat, the context cap.
@@ -938,7 +1058,18 @@ mod budget_tests {
             });
             assert_eq!(tool_tokens > 0, tools_enabled);
             let (body, _, measured) = projection.measure(&app, &model, true, None);
-            assert_eq!(measured.prompt_tokens, message_tokens + tool_tokens);
+            // The send projection carries the fixed water meter note on top of
+            // the normalized messages; count it exactly with the same estimator.
+            let note_tokens = super::super::builder::estimate_request_prompt_tokens(
+                &[super::water_meter_message(super::WaterBand::Comfortable)],
+                None,
+                None,
+            );
+            assert!(note_tokens > 0);
+            assert_eq!(
+                measured.prompt_tokens,
+                message_tokens + tool_tokens + note_tokens
+            );
             assert_eq!(body.estimated_prompt_tokens, measured.prompt_tokens);
             assert_eq!(body.max_tokens, Some(512));
             assert_eq!(measured.limits.output_reserve_tokens, 512);
@@ -949,6 +1080,75 @@ mod budget_tests {
         }
         assert_eq!(serde_json::to_value(&messages).unwrap(), original);
         assert_eq!(app.agent_context.as_ref().unwrap().tools.len(), 1);
+    }
+
+    #[test]
+    fn water_meter_uses_the_calibrated_budget_band() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut app = app();
+        let model = model();
+        let mut messages = vec![message("user", "prefix")];
+        let mut previous = prepare_request_projection(&app, &model, &messages, true)
+            .now_or_never()
+            .unwrap();
+        let (_, feedback, baseline) = previous.measure(&app, &model, true, None);
+        app.last_known_prompt_tokens = Some(feedback);
+        let actual = baseline.limits.input_allowance_tokens * 7 / 10;
+        assert!(app.last_known_prompt_tokens.as_mut().unwrap().record_usage(
+            &app.session_id,
+            Some(&model),
+            Some(actual as u64)
+        ));
+        messages.push(message("assistant", "small calibrated growth"));
+
+        let mut current = prepare_request_projection(&app, &model, &messages, true)
+            .now_or_never()
+            .unwrap();
+        let (body, mut current_feedback, measured) =
+            current.measure(&app, &model, true, app.last_known_prompt_tokens.as_ref());
+
+        assert_eq!(
+            measured.source,
+            PromptCountSource::CompatibleActualPlusEstimatedGrowth
+        );
+        let expected_band = WaterBand::for_budget(measured);
+        assert_eq!(expected_band, WaterBand::Elevated);
+        assert_eq!(
+            body.messages[0].content,
+            water_meter_message(expected_band).content
+        );
+        let preview = preview_request_budget(&app, &model, &messages, true, true)
+            .now_or_never()
+            .unwrap();
+        assert_eq!(preview, measured);
+
+        assert!(current_feedback.record_usage(
+            &app.session_id,
+            Some(&model),
+            Some(measured.prompt_tokens as u64)
+        ));
+        app.last_known_prompt_tokens = Some(current_feedback);
+        messages.push(message("user", "next append-only request"));
+        let mut next = prepare_request_projection(&app, &model, &messages, true)
+            .now_or_never()
+            .unwrap();
+        let (next_body, _, next_budget) =
+            next.measure(&app, &model, true, app.last_known_prompt_tokens.as_ref());
+        assert_eq!(
+            next_budget.source,
+            PromptCountSource::CompatibleActualPlusEstimatedGrowth
+        );
+        assert_eq!(WaterBand::for_budget(next_budget), WaterBand::Elevated);
+        assert_eq!(
+            next_body.messages[0].content,
+            water_meter_message(WaterBand::Elevated).content
+        );
+        let next_preview = preview_request_budget(&app, &model, &messages, true, true)
+            .now_or_never()
+            .unwrap();
+        assert_eq!(next_preview, next_budget);
     }
 
     #[test]
