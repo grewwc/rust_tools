@@ -118,8 +118,7 @@ fn run_one_shot_turn(
 ) -> std::io::Result<String> {
     let exe = runtime_exe()?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--session").arg(session_id).arg(prompt);
-    push_turn_override_args(&mut cmd, overrides);
+    push_turn_args(&mut cmd, session_id, prompt, overrides);
     // The child renders the rows this client displays; its own stdout is a
     // pipe, so the client's width travels through the environment.
     apply_term_cols_env(&mut cmd, term_cols);
@@ -155,8 +154,11 @@ async fn post_turn(
     if SessionStore::validate_session_id(&id).is_err() {
         return bad_request(format!("invalid session id: {id}")).into_response();
     }
-    let prompt = req.prompt.trim().to_string();
-    if prompt.is_empty() {
+    // Hand the client's bytes through unchanged and use the trimmed view only
+    // for the blank check: leading indentation and trailing whitespace are
+    // part of the prompt (code blocks, markdown hard breaks).
+    let prompt = req.prompt.clone();
+    if prompt.trim().is_empty() {
         return bad_request("prompt is empty".to_string()).into_response();
     }
     if let Err(err) = stage_turn_images(
@@ -301,8 +303,9 @@ async fn post_turn_sse(
         .get("x-aserve-native")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value == "1");
-    let prompt = req.prompt.trim().to_string();
-    if prompt.is_empty() {
+    // Same byte-exact handoff as `post_turn`.
+    let prompt = req.prompt.clone();
+    if prompt.trim().is_empty() {
         return bad_request("prompt is empty".to_string()).into_response();
     }
     if let Err(err) = stage_turn_images(
@@ -463,13 +466,10 @@ fn stream_child_turn(
         }
     };
     let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("--session")
-        .arg(&session_id)
-        .arg(&prompt)
-        // Run in the session's virtual cwd (see `serve/session_cwd.rs`), so
-        // tools, MCP children and the prompt all see that session's directory.
-        .current_dir(&session_cwd);
-    push_turn_override_args(&mut cmd, &overrides);
+    push_turn_args(&mut cmd, &session_id, &prompt, &overrides);
+    // Run in the session's virtual cwd (see `serve/session_cwd.rs`), so
+    // tools, MCP children and the prompt all see that session's directory.
+    cmd.current_dir(&session_cwd);
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Marks the child as serve-spawned even when no FIFO is set up

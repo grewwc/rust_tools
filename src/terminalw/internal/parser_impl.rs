@@ -94,6 +94,27 @@ pub(crate) fn parse_args(p: &mut Parser, cmd: &str, bool_optionals: &[&str]) {
     parse_args_encoded(p, &encoded, &bool_opts);
 }
 
+/// Strip one pair of *matching* surrounding quotes from an argv element.
+///
+/// `argv` is produced by `execve`, where the shell already consumed its own
+/// quoting: a surviving quote character is literal content. Only a balanced
+/// outer pair can therefore be a wrapper. Peeling a lone quote would corrupt
+/// values that legitimately end with one — notably a whole command line
+/// carried as a single element (`/git commit -m "before split feature"`),
+/// whose interior the CLI joins specifically so nothing inspects it.
+fn strip_matched_outer_quotes(raw: &str) -> &str {
+    // The compared quote bytes are ASCII, so a match puts both slice bounds on
+    // char boundaries; the content between them may be arbitrary UTF-8.
+    let bytes = raw.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        if (first == b'"' || first == b'\'') && bytes[bytes.len() - 1] == first {
+            return &raw[1..raw.len() - 1];
+        }
+    }
+    raw
+}
+
 pub(crate) fn parse_argv(p: &mut Parser, argv: &[String], bool_optionals: &[&str]) {
     p.cmd = argv.join(" ");
     p.num_arg = None;
@@ -125,7 +146,7 @@ pub(crate) fn parse_argv(p: &mut Parser, argv: &[String], bool_optionals: &[&str
 
     let mut flat = Vec::with_capacity(argv.len());
     for raw in argv {
-        let trimmed = raw.trim_matches(['"', '\'']).to_string();
+        let trimmed = strip_matched_outer_quotes(raw).to_string();
         if (trimmed.starts_with('-') || trimmed.starts_with("--"))
             && trimmed.contains('=')
             && let Some((k, v)) = trimmed.split_once('=')

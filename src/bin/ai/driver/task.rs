@@ -493,6 +493,15 @@ pub(crate) fn start_task(
 /// bookkeeping on success and returns the core note; callers add their own
 /// prefix. `exe_override` is a test hook; production passes `None` to re-exec
 /// itself.
+///
+/// The brief travels behind `--` as one verbatim element, so the woken
+/// child's CLI parser never re-interprets brief bytes (leading dashes,
+/// quotes, `--key=value`) as options: the turn sees exactly this text.
+fn headless_cmd(exe: &Path, worker: &str, brief: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--session").arg(worker).arg("--").arg(brief);
+    cmd
+}
 fn spawn_headless(
     from_history_file: &Path,
     state: &mut TaskState,
@@ -517,10 +526,8 @@ fn spawn_headless(
     match (exe, log) {
         (Some(exe), Ok(log)) => {
             let std_file = log.try_clone().ok();
-            let mut cmd = std::process::Command::new(exe);
-            cmd.arg("--session")
-                .arg(worker)
-                .arg(brief)
+            let mut cmd = headless_cmd(&exe, worker, brief);
+            cmd
                 .stdin(std::process::Stdio::null())
                 .stdout(log);
             if let Some(f) = std_file {
@@ -1007,6 +1014,26 @@ pub(crate) fn format_room_status(st: &RoomStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The headless wake command carries the brief behind `--` as one
+    /// verbatim element, and the child CLI parses it back byte-identical:
+    /// hostile bytes (leading dashes, quotes, `--opt`) stay data, never
+    /// become child options.
+    #[test]
+    fn headless_cmd_keeps_brief_verbatim_behind_terminator() {
+        let brief = "--model=x \"quoted\" -m tail";
+        let cmd = headless_cmd(Path::new("a"), "worker-1", brief);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["--session", "worker-1", "--", brief]);
+        let mut argv = vec!["a".to_string()];
+        argv.extend(args);
+        let cli = crate::ai::cli::parse_cli_args(argv.into_iter());
+        assert_eq!(cli.session.as_deref(), Some("worker-1"));
+        assert_eq!(cli.args, vec![brief.to_string()]);
+    }
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir()

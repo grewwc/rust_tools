@@ -3958,8 +3958,11 @@ async function runCdCommand(text) {
 async function send() {
   if (sendBusy) return; // one send's own setup at a time
   if (typeof abortEvents === "function") abortEvents();
-  const text = $("prompt").value.trim();
-  if (!text && !pendingImages.length) return;
+  // Send the textarea bytes as typed: the server stores them unchanged, so a
+  // client-side trim would make the transcript differ from the input. The
+  // trimmed view only decides whether there is anything to send.
+  const text = $("prompt").value;
+  if (!text.trim() && !pendingImages.length) return;
   if (!validateSkillInput()) return;
 
   // A cd line belongs to the session, not to this turn (see runCdCommand).
@@ -4007,7 +4010,7 @@ async function send() {
   questionCache = null;
   document.querySelectorAll("#msgs .turn-interrupted").forEach((node) => node.remove());
   lastHistoryEndsUnanswered = false;
-  const userBubble = addLiveUserBubble(text || "(images only)", prompt, sid, rewindFloor);
+  const userBubble = addLiveUserBubble(text.trim() ? text : "(images only)", prompt, sid, rewindFloor);
   const pendingInputs = pendingUserInputs.get(sid) || [];
   // `settled` flips once the turn's POST is accepted: from then on this input
   // is in canonical history, so an exact text match anywhere in the transcript

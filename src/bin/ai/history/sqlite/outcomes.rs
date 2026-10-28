@@ -359,7 +359,7 @@ pub(in crate::ai) struct PromptResidency {
     /// Directories whose target-scoped instruction documents are loaded.
     #[serde(default)]
     pub(in crate::ai) scoped_instruction_dirs: Vec<PathBuf>,
-    /// Whether the full session-tools guidance replaces the one-line session id.
+    /// Whether the full session-tools guidance is resident for later turns.
     #[serde(default)]
     pub(in crate::ai) session_context_guidance: bool,
 }

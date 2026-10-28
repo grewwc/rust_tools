@@ -49,6 +49,131 @@ fn parse_cli_args_distill_session_slash_options_stay_with_command() {
     }
 }
 
+#[test]
+fn parse_cli_args_keeps_quoted_checkpoint_message_verbatim() {
+    // The serve checkpoint bridge spawns `a --session <id> "<command line>"`,
+    // so the command arrives as one argv element whose quotes are command
+    // syntax (`-m "..."`), not argv wrapping.
+    let command = "/git commit -m \"before split feature\"";
+    let cli = super::parse_cli_args(
+        ["a", "--session", "s1", command]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    assert_eq!(cli.session.as_deref(), Some("s1"));
+    assert_eq!(cli.args, vec![command.to_string()]);
+}
+
+/// `--` is the verbatim channel `serve-chat` uses. A client line may look like
+/// options, carry quote characters, and hold `--key=value` tokens; none of
+/// that may change on the way to the turn, including its outer whitespace.
+#[test]
+fn parse_cli_args_verbatim_tail_bypasses_option_and_quote_parsing() {
+    let prompt = "  -m \"before split feature\" --model=x  ";
+    let cli = super::parse_cli_args(
+        ["a", "--session", "s1", "--", prompt]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    assert_eq!(cli.session.as_deref(), Some("s1"));
+    assert_eq!(cli.model, None);
+    assert_eq!(cli.args, vec![prompt.to_string()]);
+}
+
+/// A slash command sent by a client keeps the quotes it typed, so the
+/// command's own splitter receives command syntax rather than argv wrapping.
+#[test]
+fn parse_cli_args_verbatim_tail_preserves_slash_command_text() {
+    let command = "/git commit -m \"before split feature\"";
+    let cli = super::parse_cli_args(
+        ["a", "--session", "s1", "--", command]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    assert_eq!(cli.args, vec![command.to_string()]);
+}
+
+/// A `--` that a local command parses itself is command syntax, not `a`'s
+/// terminator: `/ss mark -- last important` marks the current session with a
+/// message, and `/distill-session -- -x` forwards an option to the command.
+#[test]
+fn parse_cli_args_keeps_command_owned_terminators_inside_command_text() {
+    let cli = super::parse_cli_args(
+        ["a", "/ss", "mark", "--", "last", "important"]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    assert_eq!(cli.args, vec!["/ss mark -- last important".to_string()]);
+
+    let cli = super::parse_cli_args(
+        ["a", "/distill-session", "--", "-x"]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    assert_eq!(cli.args, vec!["/distill-session -- -x".to_string()]);
+}
+
+/// The terminator still works in front of a command: the client's line stays
+/// one verbatim element, and the `--` inside it is preserved.
+#[test]
+fn parse_cli_args_honors_terminator_before_command_text() {
+    let cli = super::parse_cli_args(
+        ["a", "--session", "s1", "--", "/ss mark -- last"]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    assert_eq!(cli.session.as_deref(), Some("s1"));
+    assert_eq!(cli.args, vec!["/ss mark -- last".to_string()]);
+}
+
+/// Only the first `--` terminates options. A later one is prompt text, so a
+/// client message that itself contains `--` is not truncated.
+#[test]
+fn parse_cli_args_keeps_later_terminators_as_prompt_text() {
+    let cli = super::parse_cli_args(
+        ["a", "--session", "s1", "--", "--", "-x"]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    assert_eq!(cli.session.as_deref(), Some("s1"));
+    assert_eq!(cli.args, vec!["--".to_string(), "-x".to_string()]);
+}
+
+#[test]
+fn parse_cli_args_shell_git_commit_keeps_message_flag_and_word_boundaries() {
+    // A real shell hands `a` one argv element per word, having already
+    // consumed the user's quotes: `-m` and `before split feature` arrive
+    // separately. Folding them back into command text must not let the global
+    // `-m`/`--model` alias steal the message, and must not merge the message
+    // words into separate commit arguments.
+    let cli = super::parse_cli_args(
+        ["a", "/git", "commit", "-m", "before split feature"]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    assert_eq!(cli.model, None);
+    assert_eq!(
+        cli.args,
+        vec!["/git commit -m \"before split feature\"".to_string()]
+    );
+}
+
+/// A shell turns `--message="two words"` into one argv element. Folding must
+/// quote only the value, because the checkpoint parser recognises the option by
+/// the literal `--message=` prefix.
+#[test]
+fn parse_cli_args_shell_git_commit_inline_message_keeps_flag_prefix() {
+    let cli = super::parse_cli_args(
+        ["a", "/git", "commit", "--message=before split feature"]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    assert_eq!(
+        cli.args,
+        vec!["/git commit --message=\"before split feature\"".to_string()]
+    );
+}
+
 fn make_temp_file(name: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!("ai-cli-{name}-{}.txt", uuid::Uuid::new_v4()));

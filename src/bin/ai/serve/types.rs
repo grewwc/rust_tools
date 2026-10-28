@@ -524,6 +524,27 @@ pub(crate) fn push_turn_override_args(cmd: &mut std::process::Command, overrides
     }
 }
 
+/// Append the full child argv for one turn: session, validated overrides, then
+/// the prompt behind `--`.
+///
+/// `--` is required: it ends option parsing in the child, so the client's line
+/// stays prompt text even when it starts with `-`, carries quote characters,
+/// or contains a `--key=value` token. Without it the child would re-read the
+/// prompt as argv and silently change what the model sees.
+///
+/// Keeping this in one function is what fixes the order: every option must be
+/// emitted *before* the terminator, or it would be appended to the prompt.
+pub(crate) fn push_turn_args(
+    cmd: &mut std::process::Command,
+    session_id: &str,
+    prompt: &str,
+    overrides: &TurnOverrides,
+) {
+    cmd.arg("--session").arg(session_id);
+    push_turn_override_args(cmd, overrides);
+    cmd.arg("--").arg(prompt);
+}
+
 /// One field of a `POST /sessions/{id}/config` update. `None` (field absent)
 /// keeps the stored value; `Some(None)` (field present but blank) clears it;
 /// `Some(Some(v))` sets it.

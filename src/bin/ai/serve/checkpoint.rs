@@ -69,6 +69,9 @@ fn run_checkpoint_child(
     child
         .arg("--session")
         .arg(id)
+        // `--` keeps the client's `/git` line out of option parsing, so a
+        // quoted message and any `-flag` inside it arrive verbatim.
+        .arg("--")
         .arg(command)
         // The checkpoint runs in the session's virtual cwd, exactly like
         // every turn child, so cwd-relative reads resolve per session

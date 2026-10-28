@@ -1114,6 +1114,42 @@ fn merge_session_config_fills_absent_fields_only() {
     assert_eq!(overrides, super::TurnOverrides::default());
 }
 
+/// Two contracts in one argv: every option precedes the `--` terminator (an
+/// option after it would silently become prompt text, dropping the override),
+/// and the prompt behind it keeps its bytes, including quotes and leading
+/// dashes, so the model sees exactly what the client sent.
+#[test]
+fn turn_args_keep_options_before_terminator_and_prompt_verbatim() {
+    let prompt = "-m \"before split feature\" --model=x";
+    let overrides = super::TurnOverrides {
+        model: Some("explicit".to_string()),
+        agent: Some("sharp".to_string()),
+        reasoning_effort: Some("high".to_string()),
+        skills: Vec::new(),
+    };
+    let mut cmd = std::process::Command::new("a");
+    super::push_turn_args(&mut cmd, "s1", prompt, &overrides);
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        args,
+        vec![
+            "--session",
+            "s1",
+            "--model",
+            "explicit",
+            "--agent",
+            "sharp",
+            "--reasoning-effort",
+            "high",
+            "--",
+            prompt,
+        ]
+    );
+}
+
 /// Seed helper for the rewind tests: a fixed-id session holding the
 /// given roles in order, like one built by real chat traffic.
 fn seed_rewind_session(state: &super::ServeState, id: &str, roles: &[&str]) {
@@ -2731,4 +2767,26 @@ async fn interrupt_route_reports_idle_sessions_and_guards_access() {
     .await
     .into_response();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `send()` must forward the textarea bytes unchanged. The server stores the
+/// prompt exactly as it arrives (trimming only to detect blank input), so a
+/// client-side trim would make the transcript differ from what the user typed:
+/// leading indentation in code blocks and trailing markdown hard breaks would
+/// disappear before the turn was ever created.
+#[test]
+fn chat_page_forwards_prompt_bytes_unchanged() {
+    let page = include_str!("app.html");
+    assert!(
+        page.contains(r#"const text = $("prompt").value;"#),
+        "send() must read the textarea value verbatim"
+    );
+    assert!(
+        !page.contains(r#"$("prompt").value.trim()"#),
+        "send() must not trim the prompt before posting it"
+    );
+    assert!(
+        page.contains(r#"if (!text.trim() && !pendingImages.length) return;"#),
+        "blank input is still detected on the trimmed view"
+    );
 }

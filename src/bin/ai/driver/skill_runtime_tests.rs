@@ -855,7 +855,7 @@ fn session_issue_likely_covers_debugging_intents_in_both_languages() {
             "session debugging intent missed: {question}"
         );
     }
-    // Misses: unrelated turns keep the one-line session id.
+    // Misses: unrelated requests do not activate fresh session guidance.
     for question in ["write a fizzbuzz", "explain Rust lifetimes"] {
         assert!(
             !session_issue_likely(question),
@@ -902,7 +902,8 @@ fn session_id_referenced_detects_uuid_shaped_ids_only() {
 fn session_id_reference_makes_session_tools_resident_for_the_turn() {
     let mcp_client = McpClient::new();
     let mut app = super::super::tests::test_app("build");
-    let guard = super::prepare_skill_for_turn(
+    app.session_id = "current-session-for-guidance".to_string();
+    let mut guard = super::prepare_skill_for_turn(
         &mut app,
         &mcp_client,
         &[],
@@ -939,6 +940,7 @@ fn session_id_reference_makes_session_tools_resident_for_the_turn() {
             "{session_tool} should be resident for a session-id turn, got {names:?}"
         );
     }
+    assert!(guard.system_prompt().contains("current-session-for-guidance"));
     drop(guard);
 }
 
@@ -946,7 +948,8 @@ fn session_id_reference_makes_session_tools_resident_for_the_turn() {
 fn question_without_session_id_keeps_session_tools_lazy() {
     let mcp_client = McpClient::new();
     let mut app = super::super::tests::test_app("build");
-    let guard = super::prepare_skill_for_turn(
+    app.session_id = "ordinary-turn-session-id".to_string();
+    let mut guard = super::prepare_skill_for_turn(
         &mut app,
         &mcp_client,
         &[],
@@ -983,7 +986,40 @@ fn question_without_session_id_keeps_session_tools_lazy() {
             "{session_tool} must stay lazy without a session id, got {names:?}"
         );
     }
+    let system_prompt = guard.system_prompt().to_string();
+    let context_reminder = guard.context_reminder().unwrap_or_default();
+    assert!(!system_prompt.contains("ordinary-turn-session-id"));
+    assert!(!context_reminder.contains("ordinary-turn-session-id"));
     drop(guard);
+}
+
+#[test]
+fn resident_session_guidance_keeps_exact_id_on_an_unrelated_turn() {
+    let root = temp_dir("resident_session_guidance");
+    fs::create_dir_all(&root).unwrap();
+    let history = root.join("history.sqlite");
+    let mut residency = crate::ai::history::read_prompt_residency_sqlite(&history)
+        .unwrap()
+        .unwrap_or_default();
+    residency.session_context_guidance = true;
+    crate::ai::history::write_prompt_residency_sqlite(&history, &residency).unwrap();
+
+    let mcp_client = McpClient::new();
+    let mut app = super::super::tests::test_app("build");
+    app.session_id = "resident-current-session-id".to_string();
+    app.session_history_file = history;
+    let mut guard = super::prepare_skill_for_turn(
+        &mut app,
+        &mcp_client,
+        &[],
+        "write a fizzbuzz function",
+    )
+    .unwrap();
+
+    assert!(guard.system_prompt().contains("resident-current-session-id"));
+    assert!(!guard.session_context_guidance_newly_rendered());
+    drop(guard);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

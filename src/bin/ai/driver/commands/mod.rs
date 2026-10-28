@@ -194,13 +194,7 @@ pub(crate) fn classify_serve_input(input: &str) -> ServeInputRoute {
 /// silently re-enables the steal. Tokens match without any `=value` suffix, so
 /// `--open=vscode` is covered by `--open`.
 pub fn local_command_reserved_flags(head: &str) -> &'static [&'static str] {
-    let trimmed = head.trim();
-    let word = trimmed
-        .strip_prefix('/')
-        .or_else(|| trimmed.strip_prefix(':'))
-        .and_then(|rest| rest.split_whitespace().next())
-        .unwrap_or("");
-    match word {
+    match local_command_word(head) {
         "changes" | "diff" => &[
             "-h", "--help", "--stat", "-s", "--json", "--patch", "--open",
         ],
@@ -208,6 +202,10 @@ pub fn local_command_reserved_flags(head: &str) -> &'static [&'static str] {
         // collides with the global `--files` alias, which would additionally
         // swallow the following token as a file path.
         "audit" => &["-f", "--fast"],
+        // `/git commit -m "..."` / `--message "..."`: the checkpoint parser
+        // owns both spellings, and `-m` collides with the global `--model`
+        // alias, which would swallow the message as its value.
+        "git" => &["-m", "--message"],
         "distill-session" => distill_session::FLAGS,
         // `--prefix` is not a registered global today, so this entry changes
         // no current behavior; it only guards the `sessions delete --prefix`
@@ -215,6 +213,32 @@ pub fn local_command_reserved_flags(head: &str) -> &'static [&'static str] {
         "sessions" | "session" | "ss" => &["--prefix"],
         _ => &[],
     }
+}
+
+/// Dash-flags whose value is one argv element that the command re-tokenizes
+/// from a quoted command line.
+///
+/// The one-shot CLI folds argv back into command text, and that fold splits on
+/// whitespace; a value flag's argument must therefore be rendered quoted to
+/// stay a single word. Keep each entry in sync with the command's argument
+/// parser (`checkpoint.rs::parse_save_args` for `/git`).
+pub fn local_command_value_flags(head: &str) -> &'static [&'static str] {
+    match local_command_word(head) {
+        // `/git commit -m "..."` and `--message "..."` accept a multi-word
+        // message.
+        "git" => &["-m", "--message"],
+        _ => &[],
+    }
+}
+
+/// The command word a slash-command token names, without its `/` or `:`.
+fn local_command_word(head: &str) -> &str {
+    let trimmed = head.trim();
+    trimmed
+        .strip_prefix('/')
+        .or_else(|| trimmed.strip_prefix(':'))
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or("")
 }
 
 /// Handle local slash commands that do not depend on skill/agent manifests.

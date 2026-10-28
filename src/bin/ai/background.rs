@@ -1216,6 +1216,14 @@ pub(crate) fn build_daemon_args(cli: &ParsedCli, session_id: &str) -> Vec<std::f
     if cli.generate_completions {
         args.push(OsString::from("--generate-completions"));
     }
+    if !cli.args.is_empty() {
+        // `cli.args` is the prompt, already past the child's option parser on
+        // our side. Re-declare that boundary for the child: without `--`, a
+        // prompt that starts with `-`, repeats a registered option, or carries
+        // an outer quote pair would be parsed as argv again and silently
+        // change what the turn receives.
+        args.push(OsString::from("--"));
+    }
     for a in &cli.args {
         args.push(OsString::from(a));
     }
@@ -1430,6 +1438,27 @@ mod tests {
             reparsed.reasoning_effort_override,
             Some(Some(crate::ai::provider::ReasoningEffort::High))
         );
+    }
+
+    #[test]
+    fn daemon_args_keep_dash_prompt_verbatim() {
+        // The parent already parsed this prompt; the rebuilt argv must not let
+        // the child read it as options again.
+        let prompt = "-x --model other \"quoted\"";
+        let cli = parse_cli_args(["a", "-bg", "--", prompt].into_iter().map(str::to_owned));
+        let session_id = "dash-prompt-sess".to_string();
+        let daemon_args = build_daemon_args(&cli, &session_id);
+        let child_argv: Vec<String> = std::iter::once("a".to_string())
+            .chain(
+                daemon_args
+                    .iter()
+                    .skip(2)
+                    .map(|s| s.to_string_lossy().to_string()),
+            )
+            .collect();
+        let reparsed = parse_cli_args(child_argv.into_iter());
+        assert_eq!(reparsed.args, vec![prompt.to_string()]);
+        assert_eq!(reparsed.model, None);
     }
 
     #[cfg(unix)]

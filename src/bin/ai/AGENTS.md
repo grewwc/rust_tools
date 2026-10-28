@@ -36,9 +36,9 @@ not the store (root AGENTS.md pitfall). Capability-first: a question that names
 a session id must be answered with the `session` tools — never by probing the
 filesystem or sqlite.
 `build_skill_turn_guard` injects that `session_context` guidance when the turn
-looks session-related or references a concrete session id; a top-level turn
-with a session id also auto-loads the `session` group. Other turns carry a
-one-line session id only.
+looks session-related, references a concrete session id, or prior guidance is
+already resident; a top-level turn with a session id also auto-loads the
+`session` group. Otherwise the opaque id is omitted.
 
 ## Runtime-wide invariants
 

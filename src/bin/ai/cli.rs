@@ -475,12 +475,15 @@ fn find_command_start(argv: &[String], kinds: &FastMap<String, CliOptionKind>) -
 /// a bool cluster such as `-hi` behind the command passes through as command
 /// text. Tokens the command owns itself (`commands::local_command_reserved_flags`,
 /// e.g. `-s` behind `/changes`) are never extracted even when a global alias
-/// collides.
+/// collides. Folding the region keeps each command value-flag argument
+/// (`commands::local_command_value_flags`) as one word, since the command's
+/// own parser re-tokenizes the folded text.
 fn protect_slash_command_args(argv: &mut Vec<String>, kinds: &FastMap<String, CliOptionKind>) {
     let Some(idx) = find_command_start(argv, kinds) else {
         return;
     };
     let reserved = crate::ai::driver::commands::local_command_reserved_flags(&argv[idx]);
+    let value_flags = crate::ai::driver::commands::local_command_value_flags(&argv[idx]);
     let mut command_text: Vec<&str> = Vec::new();
     let mut extracted: Vec<String> = Vec::new();
     let mut i = idx;
@@ -527,10 +530,67 @@ fn protect_slash_command_args(argv: &mut Vec<String>, kinds: &FastMap<String, Cl
             }
         }
     }
-    let joined = command_text.join(" ");
+    let joined = render_command_line(&command_text, value_flags);
     argv.truncate(idx);
     argv.push(joined);
     argv.extend(extracted);
+}
+
+/// Render command-region argv tokens as command text.
+///
+/// Tokens are folded with single spaces, so word boundaries inside an argv
+/// element survive only where the command reads a *quoted* line: the value of
+/// a `value_flags` entry is therefore emitted double-quoted (with `"` and `\`
+/// escaped) when its text would otherwise split or escape. An inline
+/// `--flag=value` token quotes only the part after `=`, because the command
+/// recognises the option by that literal prefix. Everything else
+/// stays byte-identical, preserving the free-text contract where a multi-word
+/// argv element is flattened into ordinary words. A one-element region is a
+/// caller-supplied command line already (`serve-chat` and a fully quoted
+/// shell argument both arrive this way) and is emitted verbatim.
+fn render_command_line(tokens: &[&str], value_flags: &[&str]) -> String {
+    let mut line = String::new();
+    let mut after_value_flag = false;
+    for (i, token) in tokens.iter().enumerate() {
+        if i > 0 {
+            line.push(' ');
+        }
+        // Only the value after `=` is quoted: quoting `--message=...` as a
+        // whole would hide the flag from the command's own parser.
+        let inline_value = value_flags.iter().find_map(|flag| {
+            (token.len() > flag.len()
+                && token.starts_with(flag)
+                && token.as_bytes()[flag.len()] == b'=')
+                .then(|| &token[flag.len() + 1..])
+        });
+        let (prefix, value, is_value) = match inline_value {
+            Some(value) => (&token[..token.len() - value.len()], value, true),
+            None => ("", *token, tokens.len() > 1 && after_value_flag),
+        };
+        if is_value && needs_command_line_quotes(value) {
+            line.push_str(prefix);
+            line.push('"');
+            for c in value.chars() {
+                if matches!(c, '"' | '\\') {
+                    line.push('\\');
+                }
+                line.push(c);
+            }
+            line.push('"');
+        } else {
+            line.push_str(token);
+        }
+        after_value_flag = value_flags.contains(token);
+    }
+    line
+}
+
+/// True when a bare token would not survive `split_quoted_args` unchanged.
+fn needs_command_line_quotes(token: &str) -> bool {
+    token.is_empty()
+        || token
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\'))
 }
 
 fn file_spec_exists(raw: &str) -> bool {
@@ -611,7 +671,7 @@ fn normalize_files_flags(argv: Vec<String>) -> Vec<String> {
     normalized
 }
 
-fn normalize_cli_argv(raw: &[String], parser: &TermParser) -> Vec<String> {
+fn normalize_cli_argv(raw: &[String], kinds: &FastMap<String, CliOptionKind>) -> Vec<String> {
     let mut argv = if raw.len() > 1 {
         raw[1..].to_vec()
     } else {
@@ -623,7 +683,7 @@ fn normalize_cli_argv(raw: &[String], parser: &TermParser) -> Vec<String> {
     // absorb that pair into the command text. Option-value skipping in
     // `find_command_start` keeps `/`-path flag values from being mistaken for
     // command starts.
-    protect_slash_command_args(&mut argv, &cli_option_kinds(parser));
+    protect_slash_command_args(&mut argv, kinds);
     normalize_files_flags(argv)
 }
 
@@ -682,15 +742,49 @@ impl Default for ParsedCli {
     }
 }
 
+/// Index where the verbatim tail starts: the element after the first `--` in
+/// `argv[1..]`. `argv[0]` is the program name and never terminates options.
+/// `None` means no terminator was given.
+///
+/// A local command owns its whole tail: `/ss mark -- last important` hands its
+/// `--` to the command's own parser, so a terminator at or after
+/// `command_start` (an index into `argv[1..]`, as `find_command_start`
+/// returns) is command text rather than `a`'s terminator.
+fn verbatim_tail_start(argv: &[String], command_start: Option<usize>) -> Option<usize> {
+    // `command_start` counts from `argv[1]`, so the command token itself sits
+    // at absolute index `command_start + 1`.
+    let end = command_start.map_or(argv.len(), |start| start + 1);
+    argv[1..end]
+        .iter()
+        .position(|arg| arg == "--")
+        .map(|offset| offset + 2)
+}
+
 /// Parse CLI arguments with terminalw::Parser.
+///
+/// A `--` terminator ends option parsing. Everything after it is prompt text
+/// and reaches `args` byte for byte, bypassing quote stripping, option
+/// pairing, and `--key=value` splitting. `serve-chat` relies on this so a
+/// client's line becomes the turn's input exactly as it was sent.
+///
+/// A local command (`/ss mark -- last`) owns everything from its first token
+/// onward, so a `--` inside that region is command syntax, never a terminator.
 pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     let raw: Vec<String> = args.collect();
     if raw.is_empty() {
         return ParsedCli::default();
     }
-
     let mut parser = build_cli_parser();
-    let argv = normalize_cli_argv(&raw, &parser);
+    let kinds = cli_option_kinds(&parser);
+    // `find_command_start` indexes `argv[1..]`, the space `verbatim_tail_start`
+    // reads, so a `--` inside a command region stays command text.
+    let command_start = find_command_start(&raw[1..], &kinds);
+    let (head, verbatim) = match verbatim_tail_start(&raw, command_start) {
+        Some(tail_start) => (&raw[..tail_start - 1], raw[tail_start..].to_vec()),
+        None => (&raw[..], Vec::new()),
+    };
+
+    let argv = normalize_cli_argv(head, &kinds);
 
     // Parse arguments with terminalw.
     parser.parse_argv(&argv, &[]);
@@ -900,8 +994,10 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     // build` and miss `/agent sharp` switches. An explicit
     // `--reasoning-effort` above always wins over the derivation.
 
-    // Handle positional arguments (prompt args).
+    // Handle positional arguments (prompt args). The verbatim tail keeps its
+    // argv order after any positional parsed from the option region.
     cli.args = parser.positional_args(false);
+    cli.args.extend(verbatim);
 
     cli
 }

@@ -64,3 +64,46 @@ fn test_on_execute_runs_actions() {
     p.execute();
     assert!(hit.load(std::sync::atomic::Ordering::Relaxed));
 }
+
+#[test]
+fn test_parse_argv_preserves_command_text_quotes() {
+    // `serve-chat` hands a whole `/git` line to the child as one argv element.
+    // The line's quoting is command syntax, not argv wrapping: stripping the
+    // trailing quote breaks `-m "..."` in the checkpoint dispatcher.
+    let mut p = terminalw::Parser::new();
+    p.add_string("session", "", "");
+    p.parse_argv(
+        &[
+            "--session".to_string(),
+            "s1".to_string(),
+            "/git commit -m \"before split feature\"".to_string(),
+        ],
+        &[],
+    );
+    assert_eq!(p.flag_value_or_default("session"), "s1");
+    assert_eq!(
+        p.positional_args(false),
+        vec!["/git commit -m \"before split feature\"".to_string()]
+    );
+}
+
+#[test]
+fn test_parse_argv_strips_only_matched_outer_quotes() {
+    let mut p = terminalw::Parser::new();
+    p.parse_argv(
+        &[
+            "\"quoted value\"".to_string(),
+            "\"unbalanced".to_string(),
+            "\"中文消息\"".to_string(),
+        ],
+        &[],
+    );
+    assert_eq!(
+        p.positional_args(false),
+        vec![
+            "quoted value".to_string(),
+            "\"unbalanced".to_string(),
+            "中文消息".to_string(),
+        ]
+    );
+}

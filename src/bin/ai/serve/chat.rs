@@ -3499,6 +3499,20 @@ impl Drop for RemoteTurnScope {
     }
 }
 
+/// The text a routed input sends to the server.
+///
+/// A prompt keeps the bytes the user typed: the server stores the prompt
+/// unchanged, so trimming on the way out would make the transcript differ from
+/// the input (leading indentation in a pasted block, trailing markdown hard
+/// breaks). A command line is trimmed because its grammar owns the words and
+/// the handlers expect the command word first.
+fn routed_prompt_text<'a>(route: &ServeInputRoute, typed: &'a str, trimmed: &'a str) -> &'a str {
+    match route {
+        ServeInputRoute::Prompt => typed,
+        _ => trimmed,
+    }
+}
+
 fn post_turn_stream(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -4112,7 +4126,9 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                 }
             }
             _ => {
-                match classify_serve_input(&trimmed) {
+                let route = classify_serve_input(&trimmed);
+                let prompt = routed_prompt_text(&route, &input, &trimmed);
+                match route {
                     // A local slash command is never a prompt: the local REPL
                     // would swallow it, so forwarding it as a turn only burns a
                     // model round-trip at best and hangs the session at worst
@@ -4142,7 +4158,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                             &base,
                             &token,
                             &session_id,
-                            &trimmed,
+                            prompt,
                             &app_config.history_file,
                             &mut selection,
                         ) {
@@ -5361,6 +5377,24 @@ mod tests {
         assert!(
             head.contains("authorization: bearer tk"),
             "request head: {head}"
+        );
+    }
+
+    /// The prompt the server stores must be the one the user typed. Only
+    /// command lines, whose grammar owns the words, are sent trimmed.
+    #[test]
+    fn prompt_route_sends_typed_bytes_while_commands_stay_trimmed() {
+        let typed = "  fn main() {}\n\n";
+        let trimmed = typed.trim();
+        assert_eq!(
+            routed_prompt_text(&ServeInputRoute::Prompt, typed, trimmed),
+            typed,
+            "a prompt must reach the server exactly as typed"
+        );
+        assert_eq!(
+            routed_prompt_text(&ServeInputRoute::ServerCommand, typed, trimmed),
+            "fn main() {}",
+            "a command line keeps its trimmed grammar form"
         );
     }
 }

@@ -1170,17 +1170,17 @@ fn push_project_context(builder: &mut SystemPromptBuilder) {
 /// modifying, or deleting session data. The raw storage layout (sessions
 /// root, `<id>.sqlite`, assets dirs) is deliberately not advertised so the
 /// model cannot bypass the tools with direct sqlite or filesystem reads;
-/// `session_search` surfaces asset paths at runtime. Injected only when the
-/// request looks session-related (`session_issue_likely`) or references a
-/// concrete session id (`session_id_referenced`); other turns keep a one-line
-/// session id for grounding (see `build_skill_turn_guard`).
+/// `session_search` surfaces asset paths at runtime. Injected when the request
+/// looks session-related (`session_issue_likely`), references a concrete session
+/// id (`session_id_referenced`), or prior session guidance is already resident.
+/// Otherwise the opaque id is omitted because it has no actionable meaning.
 fn session_context_prompt(session_id: &str) -> String {
     format!(include_str!("system_prompts/session_context.md"), session_id)
 }
 
 /// Relevance gate for the session-debugging walkthrough: decides whether the
 /// turn injects the session-context guidance (session id + standard session
-/// tools) or just the one-line session id. Matching is deliberately broad
+/// tools). Matching is deliberately broad
 /// substring — a missed debug session costs more than the ~500 carried
 /// characters of an occasional over-injection (a general "history of X"
 /// knowledge question also matches `history`; accepted). Chinese is matched
@@ -1776,11 +1776,10 @@ fn build_skill_turn_guard(
         .ok()
         .flatten()
         .unwrap_or_default();
-    // Session debugging guidance is low-frequency knowledge: every turn keeps
-    // a one-line session id for grounding, while the session-tools walkthrough
-    // is injected once the request looks session-related. After that it stays
-    // resident for the rest of the session, so later turns keep the guidance
-    // and the system-prompt prefix does not flip between the two forms.
+    // Session debugging guidance is low-frequency knowledge. Keep the opaque id
+    // out of unrelated turns; inject it with the session-tools walkthrough once
+    // the request looks session-related. After that the guidance stays resident
+    // for the rest of the session, so later turns keep the system-prompt prefix.
     let session_context_guidance = residency.session_context_guidance
         || session_issue_likely(question)
         || session_id_referenced(question);
@@ -1789,12 +1788,6 @@ fn build_skill_turn_guard(
             ContextKind::Behavior,
             "session_context",
             session_context_prompt(&app.session_id),
-        );
-    } else {
-        builder.push_labeled(
-            ContextKind::Fact,
-            "session_context",
-            format!("Session id: {}.", app.session_id),
         );
     }
     if let Ok(events) = history::read_skill_activation_events_sqlite(&app.session_history_file)

@@ -1583,6 +1583,19 @@ mod tests {
         assert_eq!(parsed.message.as_deref(), Some("subject"));
     }
 
+    /// The CLI folds a multi-word inline value back as `--message="..."`, so
+    /// that shape must identify the option instead of becoming the name.
+    #[test]
+    fn save_args_recognize_quoted_inline_message() {
+        let parsed = parse_save_args("--message=\"before split feature\"").unwrap();
+        assert_eq!(parsed.name, None);
+        assert_eq!(parsed.message.as_deref(), Some("before split feature"));
+
+        let parsed = parse_save_args("release --message=\"before split feature\"").unwrap();
+        assert_eq!(parsed.name.as_deref(), Some("release"));
+        assert_eq!(parsed.message.as_deref(), Some("before split feature"));
+    }
+
     #[test]
     fn save_args_reject_missing_empty_or_unterminated_messages() {
         assert!(parse_save_args("-m").is_err());
