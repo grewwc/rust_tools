@@ -1526,7 +1526,7 @@ test("the phone composer keeps an idle prompt compact beside smaller action butt
   assert.match(phoneCss, /#composer \{[\s\S]*?display:grid;[\s\S]*?grid-template-areas:"image prompt send";[\s\S]*?align-items:end;/);
   assert.match(phoneCss, /#composer\.side-note-ready \{[\s\S]*?grid-template-areas:"image prompt sidenote send";/);
   assert.match(phoneCss, /#sidenote\.show \{[\s\S]*?grid-area:sidenote;[\s\S]*?display:inline-flex;/);
-  assert.match(phoneCss, /#prompt \{[\s\S]*?grid-area:prompt;[\s\S]*?min-height:40px;[\s\S]*?max-height:38dvh;/);
+  assert.match(phoneCss, /#prompt \{[\s\S]*?grid-area:prompt;[\s\S]*?min-height:40px;[\s\S]*?max-height:calc\(var\(--app-height, 100vh\) \* \.38\);/);
   assert.match(desktopCss, /#prompt \{[\s\S]*?-webkit-user-select:text; user-select:text; -webkit-touch-callout:default;/);
   assert.doesNotMatch(phoneCss, /#prompt:focus[^\{]*\{[^}]*min-height/);
   assert.match(phoneCss, /#img, #send \{[\s\S]*?width:42px;[\s\S]*?height:42px;[\s\S]*?border-radius:50%;/);

@@ -57,3 +57,16 @@ test("the document cannot scroll and the message list fills its wrapper", () => 
 test("the header keeps clear of a status bar or notch", () => {
   assert.match(css, /header \{[^}]*padding:10px 12px; padding-top:calc\(10px \+ env\(safe-area-inset-top\)\);/);
 });
+
+test("the model sheet is capped by the measured viewport, not dvh", () => {
+  const panel = css.match(/#modelpickpanel \{[^}]*\}/)[0];
+  assert.match(panel, /max-height:calc\(var\(--app-height, 100vh\) \* \.82\);/);
+  assert.match(css, /#modelpicklist \{ flex:1; min-height:0; overflow-y:auto;/);
+  assert.match(css, /#modelpickpanel \{ max-height:calc\(var\(--app-height, 100vh\) \* \.88\); \}/);
+});
+
+test("the composer and dialogs cap by the same measured height", () => {
+  assert.match(css, /max-height:calc\(var\(--app-height, 100vh\) \* \.30\)/);
+  assert.match(css, /max-height:calc\(var\(--app-height, 100vh\) \* \.38\)/);
+  assert.match(css, /max-height:calc\(var\(--app-height, 100vh\) \* \.80\)/);
+});
