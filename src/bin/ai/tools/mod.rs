@@ -41,6 +41,16 @@ pub(crate) use registry::common::{
 };
 pub(crate) use registry::tool_groups::ToolGroup;
 pub(crate) use registry::tool_metadata::tool_first_use_guidance;
+
+/// Whether the driver injects this tool itself as part of the per-turn
+/// control protocol. Such tools carry no manifest group because their
+/// availability is runtime policy, not a manifest capability:
+/// `request_user_input` is suppressed in goal mode, background turns, and
+/// subagent turns, so a skill or agent manifest must not pin it.
+pub(crate) fn is_driver_injected_control_tool(name: &str) -> bool {
+    registry::tool_metadata::tool_groups(name).is_empty()
+}
+
 const BASELINE_TOOL_NAMES: &[&str] = &[
     "list_skills",
     "load_skill",

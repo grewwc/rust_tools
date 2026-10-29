@@ -87,6 +87,29 @@ test("skill combobox loads server names and describes next-message scope", async
   assert.equal(h.elements.ovrsummary.textContent, "model default · agent default · effort default · skill review (next)");
 });
 
+test("comma-separated skill names send every selected skill", async () => {
+  const h = harness();
+  await h.context.loadSkills();
+  h.choose("review");
+  h.choose("build");
+  assert.equal(h.elements.oskill.value, "review, build");
+  assert.equal(h.elements.ovrsummary.textContent, "model default · agent default · effort default · skill review, build (next)");
+  // Already picked names drop out of the suggestion list; the last segment
+  // still drives the query.
+  h.elements.oskill.focus();
+  h.type("review, bui");
+  assert.equal(h.elements.oskill.attrs["aria-invalid"], "true");
+  assert.deepEqual(h.options().map((o) => o.children[0].textContent), ["build", "Default"]);
+  // Picking from the menu replaces only the partial tail, not the whole field.
+  h.choose("build");
+  assert.equal(h.elements.oskill.value, "review, build");
+  h.type("review, build");
+  assert.equal(h.elements.oskill.attrs["aria-invalid"], "false");
+  await h.context.submit();
+  assert.deepEqual(h.requests[0].body.skills, ["review", "build"]);
+  assert.equal(h.elements.oskill.value, "");
+});
+
 test("override controls and summary keep model, agent, effort, skill order", async () => {
   const controls = ["omodel", "oagent", "oeffort", "oskill"];
   const positions = controls.map((id) => html.indexOf(`id="${id}"`));

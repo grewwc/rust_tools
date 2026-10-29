@@ -497,7 +497,9 @@ fn merge_with_runtime_enabled_tools(
         .into_iter()
         .collect::<Box<SkipSet<_>>>();
     if explicit_enabled.is_empty() {
-        return filter_subagent_hidden_tools(merged);
+        // Builtin and MCP inputs can overlap (a skill may name a tool the
+        // driver also injects), so the no-explicit branch still dedupes.
+        return filter_subagent_hidden_tools(dedupe_tools_by_name(merged));
     }
     let known_names: Box<SkipSet<String>> = merged
         .iter()
@@ -525,7 +527,7 @@ fn merge_with_runtime_enabled_tools(
         &missing_builtin_names,
     ));
     if runtime_extra.is_empty() {
-        return filter_subagent_hidden_tools(merged);
+        return filter_subagent_hidden_tools(dedupe_tools_by_name(merged));
     }
     merged.extend(runtime_extra);
     rust_tools::sortw::stable_sort_by(&mut merged, |a, b| a.function.name.cmp(&b.function.name));
@@ -603,6 +605,9 @@ fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option
     // Case-insensitive dedup so a tool named both via a group and by an
     // explicit `tools:` entry rides along only once.
     let mut names_seen: Vec<String> = Vec::new();
+    // Set when a manifest pinned a driver-injected control tool, which is
+    // dropped below; it still counts as a declared tool set.
+    let mut pinned_control_tool = false;
     if !tool_groups.is_empty() {
         // Manifest group names resolve against the closed ToolGroup vocabulary;
         // unknown names are skipped (matching how unknown names have always
@@ -632,6 +637,13 @@ fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option
         // group is also declared, bypassing the deferred-eager-load pruning
         // above (a manifest listing a name opts that tool in).
         for tool in super::super::tools::get_tool_definitions_by_names(tools) {
+            // Driver control tools are injected by name per turn, never
+            // granted by a manifest: pinning one would bypass the per-turn
+            // ask policy and duplicate the driver's own injection.
+            if super::super::tools::is_driver_injected_control_tool(&tool.function.name) {
+                pinned_control_tool = true;
+                continue;
+            }
             if !names_seen
                 .iter()
                 .any(|n| n.eq_ignore_ascii_case(&tool.function.name))
@@ -642,6 +654,12 @@ fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option
         }
     }
     if defs.is_empty() {
+        // Pinning only driver-injected control tools is still a declared set:
+        // returning None would make the caller fall back to the default
+        // groups, widening the manifest's narrow pin to the whole Core set.
+        if pinned_control_tool {
+            return Some(ensure_required_baseline_tools(Vec::new()));
+        }
         return None;
     }
     Some(ensure_required_baseline_tools(defs))
@@ -1695,7 +1713,7 @@ fn build_skill_turn_guard(
 
     let mut builtin_tools = builtin_tools_for_skill(skills, active_agent.as_ref());
     // Externally downloaded skills cannot pre-declare this runtime's ask/handoff
-    // protocol via manifest tool_groups; the driver injects request_user_input by
+    // protocol via manifest tool lists; the driver injects request_user_input by
     // name for every interactive turn. Skill turns need the cross-turn
     // continuation handoff; ordinary turns get the explicit ask protocol in place
     // of prose-only guidance. Goal mode, background, and subagent turns
@@ -1718,8 +1736,7 @@ fn build_skill_turn_guard(
         && session_id_referenced(question)
     {
         // Only append tools that are not already resident (a skill manifest may
-        // have declared the session group); `merge_with_runtime_enabled_tools`
-        // does not dedupe when no explicit tools are enabled.
+        // have declared the session group).
         let known: Box<SkipSet<String>> = builtin_tools
             .iter()
             .map(|tool| tool.function.name.clone())

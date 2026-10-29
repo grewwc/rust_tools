@@ -3212,3 +3212,64 @@ fn multi_skill_merges_mcp_servers_deduplicated() {
     let servers = super::resolved_mcp_servers(&[&skill_a, &skill_b], None);
     assert_eq!(servers, vec!["server_a", "server_b", "server_c"]);
 }
+
+#[test]
+fn manifest_tools_cannot_pin_driver_injected_control_tools() {
+    // The driver owns request_user_input's per-turn availability (goal mode,
+    // background, and subagent turns suppress it) and injects it by name.
+    // A skill listing it must not add a second definition.
+    let defs = manifest_tool_definitions(
+        &[],
+        &["request_user_input".to_string(), "read_file".to_string()],
+    )
+    .expect("read_file keeps the manifest set non-empty");
+    let names = defs
+        .iter()
+        .map(|tool| tool.function.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"read_file"));
+    assert!(!names.contains(&"request_user_input"));
+
+    // A manifest pinned to the control tool alone still declares its set; it
+    // must keep the baseline tools rather than fall back to the default
+    // groups (which would widen the pin to the whole Core set).
+    let control_only =
+        manifest_tool_definitions(&[], &["request_user_input".to_string()]).expect("declared set");
+    let control_only_names = control_only
+        .iter()
+        .map(|tool| tool.function.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(!control_only_names.contains(&"request_user_input"));
+    assert!(control_only_names.contains(&"read_file"));
+    assert!(!control_only_names.contains(&"execute_command"));
+}
+
+#[test]
+fn merge_dedupes_duplicate_names_without_explicit_tools() {
+    let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
+    set_explicit_enabled_tool_names(Vec::new());
+    let merged = merge_with_runtime_enabled_tools(
+        vec![
+            tool("request_user_input"),
+            tool("read_file"),
+            tool("request_user_input"),
+        ],
+        vec![],
+        &[],
+    );
+    let names = merged
+        .iter()
+        .map(|tool| tool.function.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| **name == "request_user_input")
+            .count(),
+        1
+    );
+    assert_eq!(
+        names.iter().filter(|name| **name == "read_file").count(),
+        1
+    );
+}
