@@ -637,21 +637,34 @@ impl Drop for SideNoteInputGuard {
 /// (self-managed echo so erasing by character width works), ISIG kept (Ctrl+C still
 /// raises SIGINT) and OPOST kept (output newline conversion unaffected).
 ///
-/// While cbreak is held, stdin is also switched to `O_NONBLOCK` (restored on
-/// drop): every read site polls for readability first, but a byte can vanish
-/// between poll and read (competing reader, pty quirk), and a blocking read
-/// would then stall forever holding the stdin lease while ignoring the stop
-/// flag — wedging the next input box, which waits on that lease. With a
-/// non-blocking fd the race degrades to an `EAGAIN` retry that re-checks the
-/// stop flag on the next poll.
+/// Reads are also non-blocking: every read site polls for readability first,
+/// but a byte can vanish between poll and read (competing reader, pty quirk),
+/// and a blocking read would then stall forever holding the stdin lease while
+/// ignoring the stop flag — wedging the next input box, which waits on that
+/// lease. With a non-blocking fd the race degrades to an `EAGAIN` retry that
+/// re-checks the stop flag on the next poll.
+///
+/// `O_NONBLOCK` is a file-status flag of the open file description, and a
+/// terminal usually hands the process fds 0-2 that share one description of
+/// the same tty. Setting it on stdin therefore also makes stdout non-blocking,
+/// and a filled pty output buffer then turns every render write into `EAGAIN`
+/// ("Resource temporarily unavailable (os error 35)"), which the stream path
+/// reports as a failed request. The listener therefore reads through its own
+/// open of the same terminal device — a new description, so the flag cannot
+/// leak — and leaves stdin's flags untouched. Only when no private handle can
+/// be opened does it fall back to the old stdin-based behavior.
 struct CbreakTerm {
     saved: libc::termios,
-    /// `fcntl` flags before `O_NONBLOCK` was added; `None` when the fd flags
-    /// could not be queried, in which case reads stay blocking (legacy behavior).
-    fd_flags: Option<libc::c_int>,
+    /// Handle the listener polls and reads; non-blocking on entry.
+    read_fd: libc::c_int,
+    /// True when `read_fd` is our own open and is closed on drop.
+    owns_read_fd: bool,
+    /// stdin `fcntl` flags before the fallback `O_NONBLOCK`; `None` when stdin
+    /// was left untouched or its flags could not be queried.
+    stdin_flags: Option<libc::c_int>,
 }
 
-/// Warned-once guard for the `O_NONBLOCK` best-effort setup below.
+/// Warned-once guard for the fallback `O_NONBLOCK` setup below.
 static NONBLOCK_WARNED: AtomicBool = AtomicBool::new(false);
 
 impl CbreakTerm {
@@ -670,9 +683,19 @@ impl CbreakTerm {
             if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t) != 0 {
                 return Err(io::Error::last_os_error());
             }
-            // Best-effort `O_NONBLOCK`: on failure keep blocking reads (legacy
+            if let Some(read_fd) = open_private_tty() {
+                return Ok(CbreakTerm {
+                    saved,
+                    read_fd,
+                    owns_read_fd: true,
+                    stdin_flags: None,
+                });
+            }
+            // Fallback: no private handle available. Keep reading stdin itself and
+            // make it non-blocking there; this is the one branch whose `O_NONBLOCK`
+            // is shared with stdout. On failure keep blocking reads (legacy
             // behavior) rather than disabling the listener.
-            let mut fd_flags = None;
+            let mut stdin_flags = None;
             let current = libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL);
             if current >= 0
                 && libc::fcntl(
@@ -681,26 +704,70 @@ impl CbreakTerm {
                     current | libc::O_NONBLOCK,
                 ) == 0
             {
-                fd_flags = Some(current);
+                stdin_flags = Some(current);
             } else if !NONBLOCK_WARNED.swap(true, Ordering::Relaxed) {
                 eprintln!(
-                    "[Warning] side-note listener: failed to set stdin O_NONBLOCK ({}); a poll/read race may stall the next input box.",
+                    "[Warning] side-note listener: no private tty handle and stdin O_NONBLOCK failed ({}); a poll/read race may stall the next input box.",
                     io::Error::last_os_error()
                 );
             }
-            Ok(CbreakTerm { saved, fd_flags })
+            Ok(CbreakTerm {
+                saved,
+                read_fd: libc::STDIN_FILENO,
+                owns_read_fd: false,
+                stdin_flags,
+            })
         }
     }
+
+    /// Handle the listener polls and reads; non-blocking for this listener.
+    fn read_fd(&self) -> libc::c_int {
+        self.read_fd
+    }
+}
+
+/// Open a private handle on the terminal stdin is attached to.
+///
+/// A fresh `open` creates a new open file description, so `O_NONBLOCK` set on
+/// this handle cannot leak into stdin/stdout (see [`CbreakTerm`]). `ttyname(0)`
+/// names exactly the device stdin is attached to; `/dev/tty` covers a tty that
+/// reports no usable name.
+fn open_private_tty() -> Option<libc::c_int> {
+    open_private_tty_for(libc::STDIN_FILENO)
+}
+
+/// [`open_private_tty`] for an arbitrary tty fd (tests drive it with a pty slave).
+fn open_private_tty_for(tty_fd: libc::c_int) -> Option<libc::c_int> {
+    // `O_NOCTTY`: never acquire a controlling terminal as a side effect of opening
+    // the device path.
+    const FLAGS: libc::c_int =
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY;
+    let mut buf = vec![libc::c_char::default(); 4096];
+    // SAFETY: `buf` is writable for its full length.
+    let mut fd = if unsafe { libc::ttyname_r(tty_fd, buf.as_mut_ptr(), buf.len()) } == 0 {
+        // SAFETY: success means `buf` holds a NUL-terminated path.
+        unsafe { libc::open(buf.as_ptr(), FLAGS) }
+    } else {
+        -1
+    };
+    if fd < 0 {
+        // SAFETY: static NUL-terminated path.
+        fd = unsafe { libc::open(c"/dev/tty".as_ptr(), FLAGS) };
+    }
+    (fd >= 0).then_some(fd)
 }
 
 impl Drop for CbreakTerm {
     fn drop(&mut self) {
         // SAFETY: restores the original terminal state captured on entry.
         unsafe {
-            if let Some(flags) = self.fd_flags {
+            if let Some(flags) = self.stdin_flags {
                 libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, flags);
             }
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved);
+            if self.owns_read_fd {
+                libc::close(self.read_fd);
+            }
         }
     }
 }
@@ -912,8 +979,8 @@ fn submit_draft(
 
 /// Single-byte read with timeout (only used to decide whether a post-Esc key is a
 /// submit-type function-key sequence).
-/// None means timeout, stop received, or stdin closed/errored.
-fn read_byte_timeout(timeout_ms: i32, stop: &AtomicBool) -> Option<u8> {
+/// None means timeout, stop received, or the listener handle closed/errored.
+fn read_byte_timeout(fd: libc::c_int, timeout_ms: i32, stop: &AtomicBool) -> Option<u8> {
     let deadline = std::time::Instant::now()
         + Duration::from_millis(u64::try_from(timeout_ms.max(0)).unwrap_or_default());
     loop {
@@ -921,7 +988,7 @@ fn read_byte_timeout(timeout_ms: i32, stop: &AtomicBool) -> Option<u8> {
             return None;
         }
         let mut pfd = libc::pollfd {
-            fd: libc::STDIN_FILENO,
+            fd,
             events: libc::POLLIN,
             revents: 0,
         };
@@ -950,9 +1017,9 @@ fn read_byte_timeout(timeout_ms: i32, stop: &AtomicBool) -> Option<u8> {
             return None;
         }
         let mut byte = [0u8; 1];
-        // SAFETY: one-byte stack buffer. stdin is `O_NONBLOCK` under `CbreakTerm`,
-        // so a byte that vanished after poll surfaces as `EAGAIN` instead of a stall.
-        let n = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
+        // SAFETY: one-byte stack buffer. The listener handle is non-blocking, so a
+        // byte that vanished after poll surfaces as `EAGAIN` instead of a stall.
+        let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
         if n == 1 {
             return Some(byte[0]);
         }
@@ -972,21 +1039,21 @@ fn read_byte_timeout(timeout_ms: i32, stop: &AtomicBool) -> Option<u8> {
 /// immediately available; whether or not it submits, this function consumes every
 /// follow-up byte after ESC so bytes from other sequences such as arrow keys cannot
 /// leak into the draft.
-fn is_submit_escape(stop: &AtomicBool) -> bool {
+fn is_submit_escape(fd: libc::c_int, stop: &AtomicBool) -> bool {
     const ESCAPE_FOLLOWUP_MS: i32 = 30;
     const MAX_CSI_BYTES: usize = 16;
-    match read_byte_timeout(ESCAPE_FOLLOWUP_MS, stop) {
+    match read_byte_timeout(fd, ESCAPE_FOLLOWUP_MS, stop) {
         None => !should_yield_stdin(stop), // bare Esc; never submit the draft while stopping / foreground-preempted
         Some(0x0d) | Some(0x0a) => true,   // Alt+Enter
         Some(0x4f) => {
             // SS3 form: `ESC O Q` → F2; the rest (F1/F3/F4 etc.) are swallowed and ignored.
-            read_byte_timeout(ESCAPE_FOLLOWUP_MS, stop) == Some(0x51)
+            read_byte_timeout(fd, ESCAPE_FOLLOWUP_MS, stop) == Some(0x51)
         }
         Some(0x5b) => {
             // CSI form: read until the `~` terminator; `ESC [ 1 2 ~` → F2, anything else ignored.
             let mut seq = Vec::new();
             loop {
-                match read_byte_timeout(ESCAPE_FOLLOWUP_MS, stop) {
+                match read_byte_timeout(fd, ESCAPE_FOLLOWUP_MS, stop) {
                     Some(0x7e) => return seq == b"12",
                     Some(b) if seq.len() < MAX_CSI_BYTES => seq.push(b),
                     Some(_) => return false,
@@ -1053,7 +1120,7 @@ fn scan_text_area_report(buf: &[u8]) -> ReportScan {
 
 /// Services one pending `refresh_true_width` request: the served epoch always advances so
 /// the caller's bounded wait cannot hang, even when the terminal never answers.
-fn service_pending_width_query(replay: &mut VecDeque<u8>) {
+fn service_pending_width_query(fd: libc::c_int, replay: &mut VecDeque<u8>) {
     let requested = WIDTH_QUERY_REQUEST_EPOCH.load(Ordering::Acquire);
     if WIDTH_QUERY_SERVED_EPOCH.load(Ordering::Acquire) >= requested {
         return;
@@ -1061,7 +1128,7 @@ fn service_pending_width_query(replay: &mut VecDeque<u8>) {
     let cols = if WIDTH_QUERY_UNSUPPORTED.load(Ordering::Relaxed) {
         None
     } else {
-        service_width_query(replay)
+        service_width_query(fd, replay)
     };
     if let Some(cols) = cols {
         WIDTH_QUERY_COLS.store(cols, Ordering::Relaxed);
@@ -1069,10 +1136,10 @@ fn service_pending_width_query(replay: &mut VecDeque<u8>) {
     WIDTH_QUERY_SERVED_EPOCH.store(requested, Ordering::Release);
 }
 
-/// One `CSI 18 t` round trip on the listener's own cbreak stdin lease. Bytes read while
+/// One `CSI 18 t` round trip on the listener's own tty handle. Bytes read while
 /// hunting for the reply that turn out to be ordinary input are pushed to `replay`, which
 /// the loop's byte source drains first, so a query can never eat a keystroke.
-fn service_width_query(replay: &mut VecDeque<u8>) -> Option<u16> {
+fn service_width_query(fd: libc::c_int, replay: &mut VecDeque<u8>) -> Option<u16> {
     let mut out = io::stdout();
     if out.write_all(b"\x1b[18t").is_err() || out.flush().is_err() {
         return None;
@@ -1086,7 +1153,7 @@ fn service_width_query(replay: &mut VecDeque<u8>) -> Option<u16> {
             return None;
         }
         let mut pfd = libc::pollfd {
-            fd: libc::STDIN_FILENO,
+            fd,
             events: libc::POLLIN,
             revents: 0,
         };
@@ -1111,9 +1178,9 @@ fn service_width_query(replay: &mut VecDeque<u8>) -> Option<u16> {
             continue;
         }
         let mut byte = [0u8; 1];
-        // SAFETY: one-byte stack buffer. stdin is `O_NONBLOCK` under `CbreakTerm`,
-        // so a byte that vanished after poll surfaces as `EAGAIN` instead of a stall.
-        let n = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
+        // SAFETY: one-byte stack buffer. The listener handle is non-blocking, so a
+        // byte that vanished after poll surfaces as `EAGAIN` instead of a stall.
+        let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
         if n <= 0 {
             if n < 0 {
                 let kind = io::Error::last_os_error().kind();
@@ -1140,7 +1207,7 @@ fn service_width_query(replay: &mut VecDeque<u8>) -> Option<u16> {
 fn side_note_input_loop(
     sink: &SideNoteSink,
     stop: &AtomicBool,
-    _term: CbreakTerm,
+    term: CbreakTerm,
 ) -> SideNoteLoopExit {
     // Input mode: UTF-8 byte accumulation buffer + parsed characters + echoed column count
     let mut pending: Vec<u8> = Vec::new();
@@ -1154,6 +1221,8 @@ fn side_note_input_loop(
     // turned out to be ordinary input; the byte source below drains them first so a query
     // never eats a keystroke.
     let mut replay: VecDeque<u8> = VecDeque::new();
+    // Kept alive for the whole loop: cbreak termios and the non-blocking read handle.
+    let read_fd = term.read_fd();
 
     loop {
         if should_yield_stdin(stop) {
@@ -1161,12 +1230,12 @@ fn side_note_input_loop(
         }
         // Answer a pending fold width request before blocking again: the fold's bounded
         // wait ends within one poll cadence plus this service round trip.
-        service_pending_width_query(&mut replay);
+        service_pending_width_query(read_fd, &mut replay);
         let b = if let Some(queued) = replay.pop_front() {
             queued
         } else {
             let mut pfd = libc::pollfd {
-                fd: libc::STDIN_FILENO,
+                fd: read_fd,
                 events: libc::POLLIN,
                 revents: 0,
             };
@@ -1218,10 +1287,10 @@ fn side_note_input_loop(
                 break;
             }
             let mut byte = [0u8; 1];
-            // SAFETY: one-byte stack buffer. stdin is `O_NONBLOCK` under
-            // `CbreakTerm`, so a byte that vanished after poll surfaces as
-            // `EAGAIN` (handled below) instead of stalling the lease holder.
-            let n = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
+            // SAFETY: one-byte stack buffer. The listener handle is non-blocking, so
+            // a byte that vanished after poll surfaces as `EAGAIN` (handled below)
+            // instead of stalling the lease holder.
+            let n = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), 1) };
             if n == 0 {
                 break; // EOF
             }
@@ -1288,7 +1357,7 @@ fn side_note_input_loop(
                 // the full escape sequence of F2 and other function keys so their
                 // follow-up bytes cannot leak into the draft; other sequences such as
                 // arrow keys are swallowed without submitting.
-                if is_submit_escape(stop) {
+                if is_submit_escape(read_fd, stop) {
                     let Some(active_footer) = footer.as_mut() else {
                         break;
                     };
@@ -1410,6 +1479,75 @@ mod tests {
         // cannot pollute redirected input. The query must not panic regardless of
         // whether the local stdin is a tty.
         let _ = side_note_input_enabled();
+    }
+
+    /// The listener's non-blocking read handle must be its own open file
+    /// description: `O_NONBLOCK` is a file-status flag of the description (not of
+    /// the fd number), so a handle sharing the tty's description — as `dup` or
+    /// `/dev/fd/0` would — also makes stdout non-blocking, and a filled pty buffer
+    /// then turns render writes into `EAGAIN` ("os error 35").
+    #[test]
+    fn listener_read_handle_does_not_share_tty_flags() {
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        // SAFETY: openpty initializes both fds on success.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            eprintln!("skipping: no pty available");
+            return;
+        }
+        let Some(private) = open_private_tty_for(slave) else {
+            // SAFETY: both fds are owned here and closed exactly once.
+            unsafe {
+                libc::close(master);
+                libc::close(slave);
+            }
+            eprintln!("skipping: no private tty handle");
+            return;
+        };
+        // SAFETY: plain fcntl flag query/update on fds owned here.
+        unsafe {
+            let private_flags = libc::fcntl(private, libc::F_GETFL);
+            assert!(private_flags >= 0);
+            assert_ne!(
+                private_flags & libc::O_NONBLOCK,
+                0,
+                "listener handle must be opened non-blocking"
+            );
+            assert_ne!(
+                libc::fcntl(private, libc::F_GETFD) & libc::FD_CLOEXEC,
+                0,
+                "listener handle must not leak into exec'd children"
+            );
+            // The handle must stay on the same device as the tty it reads for; the
+            // `/dev/tty` fallback could otherwise silently read another terminal.
+            let mut private_stat = std::mem::zeroed::<libc::stat>();
+            let mut tty_stat = std::mem::zeroed::<libc::stat>();
+            assert_eq!(libc::fstat(private, &mut private_stat), 0);
+            assert_eq!(libc::fstat(slave, &mut tty_stat), 0);
+            assert_eq!(
+                private_stat.st_rdev, tty_stat.st_rdev,
+                "listener handle must reference the same terminal device"
+            );
+            let tty_flags = libc::fcntl(slave, libc::F_GETFL);
+            assert!(tty_flags >= 0);
+            assert_eq!(
+                tty_flags & libc::O_NONBLOCK,
+                0,
+                "listener handle must not share the terminal's file-status flags"
+            );
+            libc::close(private);
+            libc::close(master);
+            libc::close(slave);
+        }
     }
 
     #[test]

@@ -1121,6 +1121,11 @@ pub(in crate::ai::driver) async fn run_turn(
                 // run_turn_body's happy-path tail cleanup; abort / early returns also Drop it.
                 let _enable_turn_guard =
                     crate::ai::tools::enable_tools::EnableTurnStateGuard::enter();
+                // Rendering must run against a blocking stdout: `O_NONBLOCK` is a
+                // file-status flag of the shared terminal description, so a stale flag
+                // turns render writes into `EAGAIN` as soon as the pty buffer fills,
+                // which the stream path reports as a failed request.
+                crate::ai::driver::input::ensure_stdout_blocking();
                 // Keep same-terminal side-note input listening (Ctrl+G) active for the whole turn
                 // (prepare / streaming / thinking / tool execution / finalize). The RAII guard drops when
                 // this future ends, restoring the canonical terminal so prompt_user input boxes between
@@ -1463,19 +1468,18 @@ async fn run_turn_body(
         // canonical turn_messages are untouched. Placed before the mcp-lock block: the
         // fallback request contains .await and must never hold a std::Mutex across it.
         if !image_digest_resolved && iteration >= 2 {
-            // Handle only THIS turn's user images: use rposition to find the last user
-            // message containing an image. The head of `messages` may load images from
-            // earlier turns in history (only old images without a persisted digest, e.g.
-            // legacy sessions — ones with a digest were already replaced with text
-            // during prepare). But the digests we collect/generate describe only this
-            // turn's images (instruction injection lives in the current user message,
-            // and the fallback uses app.attached_image_files = current turn), so using
-            // them to replace old images would mismatch. What we swap out here is this
-            // turn's original image — replayed every round in the request projection and
-            // exactly the digest target.
-            if let Some(idx) = messages.iter().rposition(|m| {
-                m.role == "user" && crate::ai::request::content_has_image(&m.content)
-            }) {
+            // Handle only THIS turn's user images: target the current real user message,
+            // and only when it carries an image. The head of `messages` may load images
+            // from earlier turns in history (only old images without a persisted digest,
+            // e.g. legacy sessions — ones with a digest were already replaced with text
+            // during prepare), and a `read_file` image followup is a later synthetic user
+            // message carrying a different image. The digests we collect/generate describe
+            // only this turn's attachments (instruction injection lives in the current user
+            // message, and the fallback uses app.attached_image_files = current turn), so
+            // using them on either of those would mismatch. What we swap out here is this
+            // turn's original attachment — replayed every round in the request projection
+            // and exactly the digest target.
+            if let Some(idx) = crate::ai::request::current_user_image_message_index(&messages) {
                 let image_paths = app.attached_image_files.clone();
                 let digest = match pending_digest_source
                     .as_deref()

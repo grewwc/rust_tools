@@ -735,8 +735,10 @@ fn stream_error_truncation_skips_shrink_note_and_partial_text() {
 #[test]
 fn runtime_synthetic_user_auto_image_followup_is_multimodal() {
     let mut app = test_app_with_tools(&[]);
-    let dir = std::env::temp_dir();
-    let path = dir.join(format!("tool-followup-{}.png", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!("tool-followup-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    app.config.history_file = dir.join("history.sqlite");
+    let path = dir.join("screen.png");
     std::fs::write(&path, b"fake").unwrap();
     app.current_model = crate::ai::model_names::all()
         .iter()
@@ -762,7 +764,22 @@ fn runtime_synthetic_user_auto_image_followup_is_multimodal() {
     assert!(is_runtime_synthetic_user_message(&messages[0]));
     assert!(messages[0].content.is_array());
 
-    let _ = std::fs::remove_file(&path);
+    // The session owns what the model saw: canonical history keeps a reference to an
+    // immutable session copy, never inline bytes or the caller's scratch path, so the
+    // image survives the source file being deleted.
+    assert_eq!(turn_messages.len(), 1);
+    assert!(is_runtime_synthetic_user_message(&turn_messages[0]));
+    let persisted = turn_messages[0].content.to_string();
+    assert!(persisted.contains("\"reference\"") && !persisted.contains("base64"));
+    assert!(!persisted.contains(&*path.to_string_lossy()));
+    std::fs::remove_file(&path).unwrap();
+    let assets_dir = crate::ai::history::SessionStore::new(app.config.history_file.as_path())
+        .session_assets_dir(&app.session_id);
+    let mut replayed = turn_messages[0].content.clone();
+    crate::ai::request::materialize_references(&mut replayed, Some(assets_dir.as_path()));
+    assert_eq!(replayed, messages[0].content);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -283,8 +283,8 @@ fn outstanding_work_gate_action_impl(
             messages,
             format!(
                 "{OUTSTANDING_WORK_REQUIRED_MARKER}\n\
-                 This turn has tool results, but no successful `complete` assertion was recorded after the latest tool result.\n\
-                 This is not a final answer. Inspect the user's request and the tool evidence: if work remains, continue using tools; otherwise call `complete`, then write the final response."
+                 This turn has tool results, but no successful `complete` assertion was recorded after the latest tool result. Your final response above was REJECTED and discarded; it was not delivered.\n\
+                 This is not a final answer. Do not write prose yet: your next message must be exactly one `complete` tool call with no other content (if work remains, keep using tools instead). After the runtime records the receipt, rewrite the final response. Any further prose final without a fresh `complete` receipt will be rejected again (at most {OUTSTANDING_WORK_MAX_REOPENS} reopens; then the final lands with an unverified warning)."
             ),
         );
         return OutstandingWorkGateAction::Reopen;
@@ -329,8 +329,8 @@ fn outstanding_work_gate_action_impl(
             messages,
             format!(
                 "{OUTSTANDING_WORK_REQUIRED_MARKER}\n\
-                 The session plan has no unsettled steps, but no `complete` call asserts completion for this turn.\n\
-                 This is not a final answer. If the work is done, call `complete` and write the final response; otherwise keep working with tools."
+                 The session plan has no unsettled steps, but no `complete` call asserts completion for this turn. Your final response above was REJECTED and discarded; it was not delivered.\n\
+                 This is not a final answer. Do not write prose yet: your next message must be exactly one `complete` tool call with no other content (if work remains, keep using tools instead). After the runtime records the receipt, rewrite the final response. Any further prose final without a fresh `complete` receipt will be rejected again (at most {OUTSTANDING_WORK_MAX_REOPENS} reopens; then the final lands with an unverified warning)."
             ),
         );
         return OutstandingWorkGateAction::Reopen;
@@ -344,15 +344,15 @@ fn outstanding_work_gate_action_impl(
         log_outstanding_work_reopen(app, "open_steps_with_claim", Some(&steps), iteration);
         format!(
             "{OUTSTANDING_WORK_REQUIRED_MARKER}\n\
-             You called `complete` asserting all work is done, but the session plan still has unsettled steps: {steps}.\n\
-             This is not a final answer. Finish or explicitly skip the open steps with `plan_update` (a step that cannot be done must be marked skipped, not left failed), then call `complete` again and write the final response."
+             You called `complete` asserting all work is done, but the session plan still has unsettled steps: {steps}. Your final response above was REJECTED and discarded; it was not delivered.\n\
+             This is not a final answer. Finish or explicitly skip the open steps with `plan_update` (a step that cannot be done must be marked skipped, not left failed), then reply with exactly one `complete` tool call and no prose; after the runtime records it, rewrite the final response. Any further prose final without a fresh `complete` receipt will be rejected again."
         )
     } else {
         log_outstanding_work_reopen(app, "open_steps_no_claim", Some(&steps), iteration);
         format!(
             "{OUTSTANDING_WORK_REQUIRED_MARKER}\n\
-             The session plan still has unsettled steps: {steps}.\n\
-             This is not a final answer. Finish or explicitly skip the open steps with `plan_update`, then call `complete` and write the final response."
+             The session plan still has unsettled steps: {steps}. Your final response above was REJECTED and discarded; it was not delivered.\n\
+             This is not a final answer. Finish or explicitly skip the open steps with `plan_update`, then reply with exactly one `complete` tool call and no prose; after the runtime records it, rewrite the final response. Any further prose final without a fresh `complete` receipt will be rejected again."
         )
     };
     upsert_outstanding_work_note(messages, note);

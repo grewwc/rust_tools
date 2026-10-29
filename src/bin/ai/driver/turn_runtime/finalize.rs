@@ -467,6 +467,16 @@ pub(super) async fn finalize_turn(
             final_assistant_recorded,
             turn_messages,
         );
+        // Persist before any terminal rendering. Rendering is display-only and can
+        // fail (e.g. EAGAIN on a non-blocking tty); such a failure must never drop
+        // the canonical assistant message from history.
+        persist_pending_turn_messages_for_model(
+            app,
+            response_source_model,
+            one_shot_mode,
+            turn_messages,
+            persisted_turn_messages,
+        );
         // Serve children commit the accepted body through their live FIFO below;
         // their stdout must not render a second copy.
         if crate::ai::driver::runtime_ctx::terminal_output_enabled()
@@ -492,13 +502,6 @@ pub(super) async fn finalize_turn(
                 editor.set_alternate_screen_tail(&visible_text);
             }
         }
-        persist_pending_turn_messages_for_model(
-            app,
-            response_source_model,
-            one_shot_mode,
-            turn_messages,
-            persisted_turn_messages,
-        );
         if crate::ai::background::serve_live_streaming()
             && crate::ai::driver::runtime_ctx::terminal_output_enabled()
         {

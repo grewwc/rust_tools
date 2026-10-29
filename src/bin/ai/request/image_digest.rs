@@ -211,14 +211,22 @@ pub(crate) fn image_message_fingerprint(content: &Value) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Cross-turn image digest: takes the fingerprint of the last image-bearing user
-/// message's content in `messages` (the one whose digest should be persisted).
+/// Index of the current turn's user message when it carries images — the only message
+/// the digest protocol describes (its instruction and fallback cover just the user's
+/// own attachments). Runtime-synthetic user messages are skipped: a `read_file` image
+/// followup carries a different image, so treating it as the target would pin the
+/// attachment's digest onto that image. An older turn's image is never chosen either;
+/// `None` when the current user message has no image.
+pub(crate) fn current_user_image_message_index(messages: &[Message]) -> Option<usize> {
+    crate::ai::history::last_real_user_index(messages)
+        .filter(|&index| content_has_image(&messages[index].content))
+}
+
+/// Cross-turn image digest: the fingerprint of the current turn's image-bearing user
+/// message (see [`current_user_image_message_index`]), the key its digest is persisted under.
 pub(crate) fn last_image_user_message_fingerprint(messages: &[Message]) -> Option<String> {
-    messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user" && content_has_image(&m.content))
-        .map(|m| image_message_fingerprint(&m.content))
+    current_user_image_message_index(messages)
+        .map(|index| image_message_fingerprint(&messages[index].content))
 }
 
 /// A history image message whose digest was never persisted: the carrying turn was
@@ -663,6 +671,39 @@ mod tests {
             last_image_user_message_fingerprint(&[test_msg("user", Value::String("无图".into()))]),
             None
         );
+    }
+
+    #[test]
+    fn digest_target_skips_synthetic_image_followups_and_older_turns() {
+        // The user attached an image and the first tool round read a screenshot: the
+        // followup is the last image-bearing user message, yet the digest describes the
+        // attachment, so the attachment message stays the target.
+        let attachment = image_content("data:image/png;base64,AAAA", "q");
+        let screenshot = image_content("data:image/png;base64,BBBB", "describe");
+        let msgs = vec![
+            test_msg("user", attachment.clone()),
+            test_msg("assistant", Value::String("reading".into())),
+            crate::ai::history::runtime_synthetic_user_message(screenshot),
+        ];
+        assert_eq!(current_user_image_message_index(&msgs), Some(0));
+        assert_eq!(
+            last_image_user_message_fingerprint(&msgs).as_deref(),
+            Some(image_message_fingerprint(&attachment).as_str())
+        );
+
+        // A text-only current turn has no target, even when an older turn or a
+        // followup carries an image.
+        let msgs = vec![
+            test_msg("user", attachment),
+            test_msg("assistant", Value::String("a1".into())),
+            test_msg("user", Value::String("next question".into())),
+            crate::ai::history::runtime_synthetic_user_message(image_content(
+                "data:image/png;base64,CCCC",
+                "describe",
+            )),
+        ];
+        assert_eq!(current_user_image_message_index(&msgs), None);
+        assert_eq!(last_image_user_message_fingerprint(&msgs), None);
     }
 
     #[test]

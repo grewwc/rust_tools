@@ -24,11 +24,12 @@ use crate::backend;
 const FRAME_TOKEN_VERSION: &str = "mcp-computer-frame-v1";
 const SCREENSHOT_DIR_ENV: &str = "MCP_COMPUTER_SCREENSHOT_DIR";
 const CAPTURE_FILE_PREFIX: &str = "screen-";
-/// Kept frames beyond this count (newest first) are deleted when a new one is kept.
-const MAX_KEPT_FRAMES: usize = 40;
-/// Kept frames older than this are deleted when a new one is kept: they describe a
-/// screen state that is long gone, and nothing else ever removes them.
-const MAX_KEPT_FRAME_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Kept frames are scratch: `a`'s `read_file` copies a frame into its session before
+/// showing it to the model, so the copy here only bridges the gap between the
+/// screenshot reply and that read. Frames older than this are deleted when a new one
+/// is kept. Age is the only rule because every `a` process runs its own server over
+/// this one directory: a count cap would let one process delete another's unread frame.
+const MAX_KEPT_FRAME_AGE: Duration = Duration::from_secs(30 * 60);
 /// Downscale only when the capture holds at least this many pixels per point; below
 /// it the saving does not pay for a resample that softens small text.
 const MIN_DOWNSCALE_RATIO: f64 = 1.25;
@@ -384,7 +385,7 @@ impl CapturedFrame {
         let (width, height) = self.store_for_model()?;
         self.file.keep = true;
         if let Some(directory) = self.file.path.parent() {
-            prune_kept_frames(directory, &self.file.path, MAX_KEPT_FRAMES, MAX_KEPT_FRAME_AGE);
+            prune_kept_frames(directory, &self.file.path, MAX_KEPT_FRAME_AGE);
         }
         let mut report = format!(
             "status={status}\nframe_id={}\nscreenshot saved: {}\n",
@@ -454,38 +455,29 @@ fn geometry_report(width: u32, height: u32, mapping: Option<ScreenMapping>) -> S
     text
 }
 
-/// Delete kept frames beyond the newest `max_count` or older than `max_age`. Only
-/// this server's own `screen-*.png` files are considered, and `current` always
-/// survives and counts toward `max_count`. Best effort: a pruned frame that some
-/// session still wanted is simply captured again.
-fn prune_kept_frames(directory: &Path, current: &Path, max_count: usize, max_age: Duration) {
+/// Delete kept frames older than `max_age`. Only this server's own `screen-*.png`
+/// files are considered, and `current` always survives.
+fn prune_kept_frames(directory: &Path, current: &Path, max_age: Duration) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
-    let mut frames: Vec<(SystemTime, PathBuf)> = entries
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with(CAPTURE_FILE_PREFIX) && name.ends_with(".png")
-        })
-        .filter_map(|entry| {
-            let path = entry.path();
-            if path == current {
-                return None;
-            }
-            Some((entry.metadata().ok()?.modified().ok()?, path))
-        })
-        .collect();
-    frames.sort_by(|left, right| right.0.cmp(&left.0));
     let now = SystemTime::now();
-    let keep_others = max_count.saturating_sub(1);
-    for (index, (modified, path)) in frames.iter().enumerate() {
-        let expired = now
-            .duration_since(*modified)
-            .is_ok_and(|age| age > max_age);
-        if index >= keep_others || expired {
-            let _ = std::fs::remove_file(path);
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(CAPTURE_FILE_PREFIX) || !name.ends_with(".png") {
+            continue;
+        }
+        let path = entry.path();
+        if path == current {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| now.duration_since(modified).is_ok_and(|age| age > max_age));
+        if expired {
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
@@ -665,31 +657,33 @@ mod tests {
     }
 
     #[test]
-    fn pruning_keeps_the_newest_frames_and_ignores_foreign_files() {
+    fn pruning_removes_only_expired_frames_of_this_server() {
         let directory = std::env::temp_dir().join(format!(
             "mcp_computer_prune_{}_{}",
             std::process::id(),
             NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&directory).unwrap();
-        let base = SystemTime::now() - Duration::from_secs(600);
-        let mut frames = Vec::new();
-        for index in 0..5u64 {
-            let path = directory.join(format!("{CAPTURE_FILE_PREFIX}{index}.png"));
-            let file = File::create(&path).unwrap();
-            file.set_modified(base + Duration::from_secs(index)).unwrap();
-            frames.push(path);
-        }
-        let foreign = directory.join("notes.png");
-        File::create(&foreign).unwrap();
-        // The current frame is the oldest file, yet it must survive and count toward the cap.
-        prune_kept_frames(&directory, &frames[0], 3, Duration::from_secs(3600));
-        let exists: Vec<bool> = frames.iter().map(|path| path.exists()).collect();
-        assert_eq!(exists, [true, false, false, true, true]);
-        assert!(foreign.exists());
+        let now = SystemTime::now();
+        let frame = |name: &str, age_secs: u64| {
+            let path = directory.join(name);
+            File::create(&path)
+                .unwrap()
+                .set_modified(now - Duration::from_secs(age_secs))
+                .unwrap();
+            path
+        };
+        let fresh = frame("screen-fresh.png", 60);
+        let expired = frame("screen-expired.png", 7200);
+        // The current frame survives even when its timestamp is old.
+        let current = frame("screen-current.png", 7200);
+        let foreign = frame("notes.png", 7200);
 
-        prune_kept_frames(&directory, &frames[4], 10, Duration::from_secs(60));
-        assert!(!frames[3].exists() && frames[4].exists() && foreign.exists());
+        prune_kept_frames(&directory, &current, Duration::from_secs(1800));
+        assert!(fresh.exists());
+        assert!(!expired.exists());
+        assert!(current.exists());
+        assert!(foreign.exists());
         let _ = std::fs::remove_dir_all(&directory);
     }
 

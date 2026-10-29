@@ -46,9 +46,9 @@ pub(crate) use error::{
 };
 pub(crate) use image_digest::{
     DIGEST_BEGIN, DIGEST_END, PendingImageDigest, backfill_batch, content_has_image,
-    describe_image_for_digest, digest_instruction, is_digest_only_response,
-    last_image_user_message_fingerprint, parse_digest, replace_old_images_with_persisted_digests,
-    strip_digest_blocks, swap_images_with_digest,
+    current_user_image_message_index, describe_image_for_digest, digest_instruction,
+    is_digest_only_response, last_image_user_message_fingerprint, parse_digest,
+    replace_old_images_with_persisted_digests, strip_digest_blocks, swap_images_with_digest,
 };
 pub(in crate::ai) use logging::TransientStatusLine;
 pub(in crate::ai) use logging::emit_request_diagnostic;

@@ -38,6 +38,12 @@ fn print_history_help() {
 
 /// Clear any pending input from stdin to prevent stray Enter keys
 /// from interrupting the next input prompt.
+///
+/// Uses `tcflush` instead of flipping stdin to `O_NONBLOCK` for the drain:
+/// file-status flags belong to the open file description, which a terminal
+/// shares between fds 0 and 1, so a temporary `O_NONBLOCK` here would also make
+/// concurrent render writes fail with `EAGAIN`. Flushing needs no mode change
+/// and cannot block on a partial line the way a canonical-mode read would.
 pub(crate) fn clear_stdin_buffer() {
     use std::io::IsTerminal;
     if !io::stdin().is_terminal() {
@@ -46,26 +52,43 @@ pub(crate) fn clear_stdin_buffer() {
 
     #[cfg(unix)]
     {
-        use libc::{F_GETFL, F_SETFL, O_NONBLOCK, fcntl};
         use std::os::unix::io::AsRawFd;
 
         let fd = io::stdin().as_raw_fd();
-        unsafe {
-            // Get current flags
-            let flags = fcntl(fd, F_GETFL, 0);
-            if flags >= 0 {
-                // Set non-blocking mode
-                let _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        // SAFETY: `fd` is an open tty; TCIFLUSH only discards queued input.
+        unsafe { libc::tcflush(fd, libc::TCIFLUSH) };
+    }
+}
 
-                // Read and discard any pending input
-                let mut buf = [0u8; 1024];
-                while libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) > 0 {
-                    // Discard
-                }
+/// Re-assert blocking mode on the terminal output fds before a foreground turn renders.
+///
+/// `O_NONBLOCK` lives on the open file description, and a terminal usually hands
+/// the process fds 0-2 that share one description. A component that flips stdin
+/// non-blocking for its own reads therefore also flips stdout, after which a full
+/// pty output buffer turns the next render write into `EAGAIN`
+/// ("Resource temporarily unavailable (os error 35)") and the stream path
+/// reports the whole request as failed. Rendering wants normal terminal
+/// backpressure, so each turn clears a stale flag once before writing. Only tty
+/// fds are touched: a pipe never shares the terminal's description, and its
+/// non-blocking state (if any) belongs to whoever set it.
+pub(crate) fn ensure_stdout_blocking() {
+    #[cfg(unix)]
+    for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        clear_nonblocking_if_tty(fd);
+    }
+}
 
-                // Restore blocking mode
-                let _ = fcntl(fd, F_SETFL, flags);
-            }
+/// Clear `O_NONBLOCK` on `fd` when it is a terminal; leave other fds untouched.
+#[cfg(unix)]
+fn clear_nonblocking_if_tty(fd: libc::c_int) {
+    // SAFETY: plain flag query/update on a standard fd; isatty only inspects it.
+    unsafe {
+        if libc::isatty(fd) != 1 {
+            return;
+        }
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 && flags & libc::O_NONBLOCK != 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
         }
     }
 }
@@ -1573,20 +1596,28 @@ fn resolve_inline_image_path(raw: &str, assets_dir: &Path) -> String {
 
 /// Copies images into the active session before the turn is persisted. The
 /// immutable copies, rather than a caller's mutable paths, are used for the
-/// current request and every later history replay.
+/// current request and every later history replay. A source that already is one
+/// of these immutable snapshots (e.g. a digest's original image path opened again)
+/// is reused instead of copied a second time.
 /// `pub(crate)` because the synchronous `task` tool attaches caller-provided
 /// images to a sub-agent's first turn; the sub-agent path skips
 /// `finalize_question`, so it must capture the files itself before the turn
-/// is persisted.
+/// is persisted. The `read_file` image followup captures its images here too.
 pub(crate) fn snapshot_image_attachments(
     images: Vec<String>,
     assets_dir: &Path,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let snapshots_dir = assets_dir.join("attachments");
     fs::create_dir_all(&snapshots_dir)?;
+    let snapshots_root = snapshots_dir.canonicalize()?;
     images
         .into_iter()
         .map(|source| {
+            if let Ok(existing) = Path::new(&source).canonicalize()
+                && existing.starts_with(&snapshots_root)
+            {
+                return Ok(existing.to_string_lossy().into_owned());
+            }
             let name = Path::new(&source)
                 .file_name()
                 .filter(|name| !name.is_empty())
@@ -1775,6 +1806,60 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
     use uuid::Uuid;
+
+    /// The turn-start reassert must restore terminal backpressure without touching
+    /// fds whose non-blocking state belongs to someone else (pipes).
+    #[cfg(unix)]
+    #[test]
+    fn clear_nonblocking_touches_tty_fds_only() {
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        // SAFETY: openpty initializes both fds on success.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 0 {
+            eprintln!("skipping: no pty available");
+            return;
+        }
+        // SAFETY: plain flag query/update and close on fds owned here.
+        unsafe {
+            let flags = libc::fcntl(slave, libc::F_GETFL);
+            assert!(flags >= 0);
+            assert_eq!(libc::fcntl(slave, libc::F_SETFL, flags | libc::O_NONBLOCK), 0);
+            super::clear_nonblocking_if_tty(slave);
+            assert_eq!(
+                libc::fcntl(slave, libc::F_GETFL) & libc::O_NONBLOCK,
+                0,
+                "a tty output fd must be restored to blocking mode"
+            );
+
+            let mut fds: [libc::c_int; 2] = [0; 2];
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let pipe_flags = libc::fcntl(fds[1], libc::F_GETFL);
+            assert!(pipe_flags >= 0);
+            assert_eq!(
+                libc::fcntl(fds[1], libc::F_SETFL, pipe_flags | libc::O_NONBLOCK),
+                0
+            );
+            super::clear_nonblocking_if_tty(fds[1]);
+            assert_ne!(
+                libc::fcntl(fds[1], libc::F_GETFL) & libc::O_NONBLOCK,
+                0,
+                "non-tty fds keep their flags"
+            );
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+            libc::close(master);
+            libc::close(slave);
+        }
+    }
 
     #[test]
     fn inline_image_filenames_lists_placeholders_in_order_deduped() {

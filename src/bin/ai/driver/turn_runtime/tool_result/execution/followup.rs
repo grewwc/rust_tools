@@ -321,9 +321,30 @@ pub(in crate::ai::driver::turn_runtime) fn append_auto_image_followup_message(
         question.to_string()
     };
 
-    let content = if crate::ai::models::supports_image_input(&app.current_model) {
-        crate::ai::request::build_content(&app.current_model, &question, image_paths)?
-    } else if let Some(ocr) =
+    if crate::ai::models::supports_image_input(&app.current_model) {
+        // The read file may be scratch owned by someone else (a computer-use
+        // screenshot is pruned by its MCP server), so the session takes an immutable
+        // copy, exactly like a user attachment: the request inlines the copy, history
+        // persists only a `reference` to it, and the copy lives as long as the session.
+        let assets_dir = crate::ai::history::SessionStore::new(app.config.history_file.as_path())
+            .session_assets_dir(&app.session_id);
+        let snapshots =
+            crate::ai::driver::input::snapshot_image_attachments(image_paths.to_vec(), &assets_dir)?;
+        let request_content =
+            crate::ai::request::build_content(&app.current_model, &question, &snapshots)?;
+        let persisted_content = crate::ai::request::build_reference_content(
+            &app.current_model,
+            &question,
+            &snapshots,
+            "",
+            &assets_dir,
+        )?;
+        messages.push(runtime_synthetic_user_message(request_content));
+        turn_messages.push(runtime_synthetic_user_message(persisted_content));
+        return Ok(());
+    }
+
+    let content = if let Some(ocr) =
         crate::ai::driver::model::ocr_images_for_attached_input(shared_mcp_client, image_paths)?
     {
         let prompt = if ocr.has_usable_text() {

@@ -48,9 +48,12 @@ src/backend/unsupported.rs # every call reports a clear "no backend on this OS" 
    plus `a`'s image-aware `read_file` is what shows the frame to a vision
    model. `frame.rs` binds each `frame_id` to its capture scope; unchanged
    probe files are deleted. A kept HiDPI frame is stored at one pixel per point
-   (the report's click formula always describes the stored file) and kept frames
-   are pruned by count and age; the `frame_id` digest and OCR use the native
-   pixels. `find_text`/`click_text` reuse
+   (the report's click formula always describes the stored file); the
+   `frame_id` digest and OCR use the native pixels. Kept frames are scratch:
+   `a`'s `read_file` copies an image into the session's assets before showing
+   it, so the session owns what the model saw and this server only prunes its
+   own frames by age — never by count, since every `a` process runs its own
+   server over the shared directory. `find_text`/`click_text` reuse
    `rust_tools::pdfw` OCR; `click_text` never acts unless exactly one OCR
    line matches, and for window captures it activates and verifies the exact
    window — before the fresh OCR frame and again immediately before input.
