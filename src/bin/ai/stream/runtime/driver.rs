@@ -157,7 +157,7 @@ pub(super) fn render_thinking_event(
 
     match event {
         StreamTextEvent::OpenThinking => {
-            flush_digest_filter_to_terminal(markers, state, false)?;
+            flush_terminal_filters_to_terminal(markers, state, false)?;
             if markers.subagent_preview_enabled() {
                 return Ok(());
             }
@@ -174,8 +174,9 @@ pub(super) fn render_thinking_event(
                 return Ok(());
             }
             clear_waiting_hint(state)?;
-            // digest is extra image-understanding content meant for the model; the thinking channel's terminal display strips it too
-            let terminal_text = state.render.digest_filter.push(text);
+            // The thinking channel's terminal display applies the same runtime-owned
+            // region projection as the body (image digest, audit envelope).
+            let terminal_text = state.render.push_terminal_text(text);
             if terminal_text.is_empty() {
                 return Ok(());
             }
@@ -186,7 +187,7 @@ pub(super) fn render_thinking_event(
             }
         }
         StreamTextEvent::CloseThinking => {
-            flush_digest_filter_to_terminal(markers, state, true)?;
+            flush_terminal_filters_to_terminal(markers, state, true)?;
             if markers.subagent_preview_enabled() {
                 return Ok(());
             }
@@ -208,12 +209,12 @@ pub(super) fn render_thinking_event(
     Ok(())
 }
 
-pub(super) fn flush_digest_filter_to_terminal(
+pub(super) fn flush_terminal_filters_to_terminal(
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
     dimmed: bool,
 ) -> io::Result<()> {
-    let residual = state.render.digest_filter.flush();
+    let residual = state.render.flush_terminal_text();
     if residual.is_empty() || !runtime_ctx::terminal_output_enabled() {
         return Ok(());
     }

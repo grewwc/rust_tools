@@ -40,10 +40,15 @@ use std::time::SystemTime;
 /// Global (source_path, MemoryIndex) registry: lazily loaded and reused per path.
 /// The first access to a source path opens / rebuilds the SQLite index; all later calls receive the
 /// same `Arc<MemoryIndex>`, sharing LFU counts and the FTS index across calls.
+///
+/// Every retained index owns an open SQLite connection, so entries for private
+/// memory files must be dropped when those files end their lifecycle
+/// ([`remove_memory_index_entry`]); otherwise each sub-agent task leaves a
+/// database handle open in the parent process for its entire lifetime.
+static MEMORY_INDEX_REGISTRY: OnceLock<Mutex<Vec<(PathBuf, Arc<MemoryIndex>)>>> = OnceLock::new();
+
 fn memory_index_for(source_path: &Path) -> Option<Arc<MemoryIndex>> {
-    use std::sync::Mutex;
-    static REG: OnceLock<Mutex<Vec<(PathBuf, Arc<MemoryIndex>)>>> = OnceLock::new();
-    let reg = REG.get_or_init(|| Mutex::new(Vec::new()));
+    let reg = MEMORY_INDEX_REGISTRY.get_or_init(|| Mutex::new(Vec::new()));
     let mut guard = reg.lock().ok()?;
     if let Some((_, idx)) = guard.iter().find(|(p, _)| p == source_path) {
         return Some(idx.clone());
@@ -68,6 +73,19 @@ fn memory_index_for(source_path: &Path) -> Option<Arc<MemoryIndex>> {
             );
             None
         }
+    }
+}
+
+/// Evict the cached index for a memory file whose lifecycle has ended, closing
+/// its SQLite connection. Callers that delete the jsonl/db pair must use this;
+/// a retained index would otherwise keep the deleted database (and its
+/// `-wal`/`-shm` sidecars) open until the process exits.
+pub(crate) fn remove_memory_index_entry(source_path: &Path) {
+    let Some(reg) = MEMORY_INDEX_REGISTRY.get() else {
+        return;
+    };
+    if let Ok(mut guard) = reg.lock() {
+        guard.retain(|(path, _)| path != source_path);
     }
 }
 

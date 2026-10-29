@@ -10,6 +10,28 @@ mod state;
 mod think_demux;
 mod wire_log;
 
+/// Terminal projection for text that never went through the streaming path: a
+/// machine-checked `<audit_report>` envelope is replaced by the same notice the
+/// stream projection shows, while canonical history keeps the original bytes.
+pub(crate) fn hide_audit_report(text: &str) -> String {
+    let mut filter = state::HiddenRegionTerminalFilter::replace(
+        crate::ai::types::AUDIT_REPORT_OPEN,
+        crate::ai::types::AUDIT_REPORT_CLOSE,
+        state::AUDIT_REPORT_HIDDEN_NOTICE,
+    );
+    let mut out = filter.push(text);
+    out.push_str(&filter.flush());
+    out
+}
+
+/// The body the terminal actually shows: image digests and audit envelopes are
+/// model/machine content and never reach the screen, so every "what the user just
+/// read" computation (dedup candidates, failure echoes) projects through here.
+/// Canonical history keeps the original bytes.
+pub(crate) fn project_visible_body(text: &str) -> String {
+    hide_audit_report(&crate::ai::request::strip_digest_blocks(text))
+}
+
 pub(super) use render::markdown::MarkdownStreamRenderer;
 pub(in crate::ai) use render::markdown::clamp_line_to_terminal_row_with_reserve;
 // Only the serve client reports a display width, and it exists only in the

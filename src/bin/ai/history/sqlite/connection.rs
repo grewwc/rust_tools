@@ -1,11 +1,11 @@
 use std::{
-    cell::RefCell,
     collections::VecDeque,
     fs, io,
     marker::PhantomData,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     rc::Rc,
+    sync::{LazyLock, Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -19,13 +19,15 @@ use rusqlite::{Connection, Error as RusqliteError, ErrorCode, OpenFlags};
 // commit's frames.
 pub(super) const HISTORY_WAL_SIZE_LIMIT_BYTES: i64 = 4 * 1024 * 1024;
 
-// Each worker thread caches its most recently opened history connection so that
-// every read/write avoids `Connection::open` + PRAGMA setup, and so that
-// `prepare_cached`'s statement cache is genuinely reused across calls.
+// History connections are pooled so that every read/write avoids
+// `Connection::open` + PRAGMA setup, and so that `prepare_cached`'s statement
+// cache is genuinely reused across calls.
 //
 // Safety:
-// - `thread_local` guarantees the connection is only accessed from its owning
-//   thread; `Connection` is not `Sync` and is therefore never used concurrently.
+// - The pools are shared by all threads, but a connection is removed from the
+//   pool under its mutex before use and returned only when idle, so no two
+//   callers ever use the same `Connection` concurrently. `HistoryConnection` is
+//   `!Send`, so a checked-out handle cannot migrate to another thread either.
 // - Read paths do not hold the per-session `Mutex` (concurrent writers still write
 //   through their own connections), but every read opens a fresh
 //   `conn.transaction()` and commits within the same call: WAL's per-transaction
@@ -35,8 +37,26 @@ pub(super) const HISTORY_WAL_SIZE_LIMIT_BYTES: i64 = 4 * 1024 * 1024;
 //   the underlying file was not renamed/replaced wholesale. File replacement
 //   operations (rollback/compact/reset) change the inode, in which case we drop
 //   the old connection and reopen, matching the semantics of opening a fresh one.
-thread_local! {
-    static CACHED_HISTORY_CONN: RefCell<Option<CachedHistoryConn>> = const { RefCell::new(None) };
+//
+// Both pools are bounded per process, never per thread: the runtime runs many
+// worker threads, and a per-thread bound multiplies by the thread count until
+// the process exhausts its descriptor limit. Each idle SQLite connection pins
+// its database file and, once it has touched the WAL, its `-wal`/`-shm`
+// sidecars too.
+const MAX_CACHED_WRITE_CONNS: usize = 8;
+const MAX_CACHED_READ_CONNS: usize = 4;
+
+static CACHED_WRITE_CONNS: LazyLock<Mutex<VecDeque<CachedWriteConn>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
+static CACHED_READ_CONNS: LazyLock<Mutex<VecDeque<CachedHistoryConn>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
+
+fn cache_lock<T>(cache: &'static LazyLock<Mutex<T>>) -> MutexGuard<'static, T> {
+    // A panic while holding the lock must not disable caching for the rest of
+    // the process; the cached connections themselves remain valid.
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 struct CachedHistoryConn {
@@ -45,7 +65,7 @@ struct CachedHistoryConn {
     conn: Connection,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct FileFingerprint {
     dev: u64,
     ino: u64,
@@ -69,16 +89,6 @@ fn file_fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
         ino: 0,
         len: metadata.len(),
     }
-}
-
-/// Upper bound on connections kept by the thread-local write cache. A worker
-/// normally touches one session at a time; the extra slots cover short
-/// interleavings without letting a long-lived process accumulate descriptors.
-const MAX_CACHED_WRITE_CONNS: usize = 4;
-
-thread_local! {
-    static CACHED_WRITE_CONNS: RefCell<VecDeque<CachedWriteConn>> =
-        const { RefCell::new(VecDeque::new()) };
 }
 
 struct CachedWriteConn {
@@ -121,7 +131,7 @@ fn file_identity(_metadata: &fs::Metadata) -> Option<FileIdentity> {
     None
 }
 
-/// A connection checked out from the thread-local write cache.
+/// A connection checked out from the process-wide write pool.
 ///
 /// It dereferences to [`Connection`], so call sites keep using the normal
 /// rusqlite API. Dropping it returns the connection to the cache when the file
@@ -130,8 +140,8 @@ pub(super) struct HistoryConnection {
     path: PathBuf,
     identity: Option<FileIdentity>,
     conn: Option<Connection>,
-    // The cache lives in thread-local storage, so the guard must stay on the
-    // thread that created it.
+    // The pool is shared, but the checked-out handle stays on the thread that
+    // took it so callers can never hold one across threads.
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -183,52 +193,47 @@ impl Drop for HistoryConnection {
         if current_identity != identity {
             return;
         }
-        let path = self.path.clone();
-        let _ = CACHED_WRITE_CONNS.try_with(|slot| {
-            let Ok(mut slot) = slot.try_borrow_mut() else {
-                return;
-            };
-            // Keep at most one pooled connection per path so a thread cannot
-            // pin several descriptors for the same session.
-            slot.retain(|entry| entry.path != path);
-            if slot.len() >= MAX_CACHED_WRITE_CONNS {
-                slot.pop_front();
+        let mut evicted = Vec::new();
+        {
+            let mut slot = cache_lock(&CACHED_WRITE_CONNS);
+            // Keep at most one pooled connection per path so one session
+            // cannot pin several descriptors.
+            slot.retain(|entry| entry.path != self.path);
+            while slot.len() >= MAX_CACHED_WRITE_CONNS {
+                if let Some(entry) = slot.pop_front() {
+                    evicted.push(entry);
+                }
             }
             slot.push_back(CachedWriteConn {
-                path,
+                path: std::mem::take(&mut self.path),
                 identity,
                 conn,
             });
-        });
+        }
+        // Close evicted connections after releasing the pool lock.
+        drop(evicted);
     }
 }
 
 fn take_cached_write_conn(path: &Path, identity: FileIdentity) -> Option<Connection> {
-    CACHED_WRITE_CONNS
-        .try_with(|slot| {
-            let Ok(mut slot) = slot.try_borrow_mut() else {
-                return None;
-            };
-            let mut found = None;
-            while let Some(index) = slot
-                .iter()
-                .position(|entry| entry.path == path && entry.identity == identity)
-            {
-                let entry = slot.remove(index).expect("index came from position");
-                if entry.conn.is_autocommit() {
-                    found = Some(entry.conn);
-                    break;
-                }
-            }
-            // Drop stale or unusable entries for this path.
-            slot.retain(|entry| entry.path != path);
-            found
-        })
-        .ok()
-        .flatten()
+    let mut slot = cache_lock(&CACHED_WRITE_CONNS);
+    let mut found = None;
+    while let Some(index) = slot
+        .iter()
+        .position(|entry| entry.path == path && entry.identity == identity)
+    {
+        let entry = slot.remove(index).expect("index came from position");
+        if entry.conn.is_autocommit() {
+            found = Some(entry.conn);
+            break;
+        }
+    }
+    // Drop stale or unusable entries for this path.
+    slot.retain(|entry| entry.path != path);
+    found
 }
 
-/// Close the thread's cached write connection for `path`, if one is cached.
+/// Close every pooled write connection for `path`, on every thread.
 ///
 /// Callers use this before publishing, replacing, or discarding a database file.
 /// A cached handle keeps the `-wal`/`-shm` sidecars on disk and keeps the inode
@@ -236,12 +241,8 @@ fn take_cached_write_conn(path: &Path, identity: FileIdentity) -> Option<Connect
 /// path by name, which by then can belong to a different database at the same
 /// path. Closing while the caller still controls the path keeps that harmless.
 pub(in crate::ai) fn close_cached_write_conn(path: &Path) {
-    let _ = CACHED_WRITE_CONNS.try_with(|slot| {
-        let Ok(mut slot) = slot.try_borrow_mut() else {
-            return;
-        };
-        slot.retain(|entry| entry.path != path);
-    });
+    let mut slot = cache_lock(&CACHED_WRITE_CONNS);
+    slot.retain(|entry| entry.path != path);
 }
 
 pub(super) fn open_history_db(path: &Path) -> Result<HistoryConnection, io::Error> {
@@ -311,15 +312,15 @@ fn fresh_connection(path: &Path, busy_timeout: Duration) -> Result<Connection, i
     Ok(conn)
 }
 
-/// Runs a read-only operation on a cached history connection. Connections are
-/// cached per thread and automatically reconnected when the underlying file's
-/// inode/size changes (rollback/compact/reset and other replacement operations),
-/// giving the same semantics as opening a fresh connection each time while saving
-/// the per-turn open + PRAGMA and statement recompilation costs.
+/// Runs a read-only operation on a cached history connection. Connections come
+/// from a small process-wide pool and automatically reconnect when the
+/// underlying file's inode/size changes (rollback/compact/reset and other
+/// replacement operations), giving the same semantics as opening a fresh
+/// connection each time while saving the per-turn open + PRAGMA and statement
+/// recompilation costs.
 ///
-/// Note: borrowed data must not escape the closure (`Connection` is not `Sync`
-/// and is owned by the thread_local). Intended only for hot-path read-only
-/// queries.
+/// Note: borrowed data must not escape the closure; the connection returns to
+/// the pool when the call ends. Intended only for hot-path read-only queries.
 pub(super) fn with_cached_read_conn<T>(
     path: &Path,
     busy_timeout: Duration,
@@ -333,23 +334,62 @@ pub(super) fn with_cached_read_conn<T>(
     let fingerprint = file_fingerprint(&metadata);
     let path_owned = path.to_path_buf();
 
-    CACHED_HISTORY_CONN.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let need_reconnect = match slot.as_ref() {
-            Some(cached) => cached.path != path_owned || cached.fingerprint != fingerprint,
-            None => true,
+    let conn = match take_cached_read_conn(&path_owned, fingerprint) {
+        Some(conn) => conn,
+        None => fresh_connection(&path_owned, busy_timeout)?,
+    };
+    let mut checked_out = ReadConnGuard {
+        entry: Some(CachedHistoryConn {
+            path: path_owned,
+            fingerprint,
+            conn,
+        }),
+    };
+    let cached = checked_out
+        .entry
+        .as_mut()
+        .expect("read connection just initialized");
+    op(&mut cached.conn)
+}
+
+fn take_cached_read_conn(path: &Path, fingerprint: FileFingerprint) -> Option<Connection> {
+    let mut slot = cache_lock(&CACHED_READ_CONNS);
+    let index = slot
+        .iter()
+        .position(|entry| entry.path == path && entry.fingerprint == fingerprint)?;
+    Some(slot.remove(index).expect("index came from position").conn)
+}
+
+/// Returns the checked-out connection to the read pool, including on panic, so
+/// a failed query does not throw away a usable handle.
+struct ReadConnGuard {
+    entry: Option<CachedHistoryConn>,
+}
+
+impl Drop for ReadConnGuard {
+    fn drop(&mut self) {
+        let Some(entry) = self.entry.take() else {
+            return;
         };
-        if need_reconnect {
-            let conn = fresh_connection(&path_owned, busy_timeout)?;
-            *slot = Some(CachedHistoryConn {
-                path: path_owned,
-                fingerprint,
-                conn,
-            });
+        // A transaction left open by an early return must not leak into the
+        // next user of this connection.
+        if !entry.conn.is_autocommit() && entry.conn.execute_batch("ROLLBACK").is_err() {
+            return;
         }
-        let cached = slot.as_mut().expect("cached connection just initialized");
-        op(&mut cached.conn)
-    })
+        let mut evicted = Vec::new();
+        {
+            let mut slot = cache_lock(&CACHED_READ_CONNS);
+            slot.retain(|cached| cached.path != entry.path);
+            while slot.len() >= MAX_CACHED_READ_CONNS {
+                if let Some(old) = slot.pop_front() {
+                    evicted.push(old);
+                }
+            }
+            slot.push_back(entry);
+        }
+        // Close evicted connections after releasing the pool lock.
+        drop(evicted);
+    }
 }
 
 pub(super) fn sqlite_error_kind(error: &RusqliteError) -> io::ErrorKind {

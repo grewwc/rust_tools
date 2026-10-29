@@ -86,7 +86,18 @@ impl SyncSubagentHistoryGuard {
     }
 
     fn preserve_memory(&mut self) {
+        self.release_memory_index();
         self.memory_path = None;
+    }
+
+    /// Preserving the private memory file keeps it on disk for later evidence
+    /// reads, but the derived SQLite index holds a database connection in this
+    /// process. Drop the cached index so a finished sub-agent does not pin a
+    /// handle for the rest of the parent's lifetime; a later access reopens it.
+    fn release_memory_index(&self) {
+        if let Some(memory_path) = self.memory_path.as_deref() {
+            crate::ai::tools::storage::memory_store::remove_memory_index_entry(memory_path);
+        }
     }
 }
 

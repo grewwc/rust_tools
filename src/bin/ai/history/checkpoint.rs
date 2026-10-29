@@ -1482,8 +1482,8 @@ impl CheckpointStore {
                 backup_sqlite(&self.session_file, &sqlite)?;
             }
             let cleared = clear_session_history_sqlite(&sqlite);
-            // The clear hands its connection back to the thread-local write
-            // cache. A cached handle keeps the staged DB's `-wal`/`-shm` on
+            // The clear hands its connection back to the process-wide write
+            // pool. A cached handle keeps the staged DB's `-wal`/`-shm` on
             // disk, which makes `restore_staged_sqlite_after_rollback` skip the
             // clonefile fast path, and it pins the staging inode after cleanup.
             // Close it while the staged file is still the one at this path.

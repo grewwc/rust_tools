@@ -3,6 +3,7 @@ use serde_json::Value;
 pub(crate) mod audit;
 pub(crate) mod changes;
 pub(crate) mod command;
+pub(crate) mod command_facade;
 pub(crate) mod command_session;
 pub(crate) mod discuss;
 pub(crate) mod file;

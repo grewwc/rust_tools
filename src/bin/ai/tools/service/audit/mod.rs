@@ -36,6 +36,7 @@ pub(crate) use git::command_subcommand_index;
 pub(crate) use git::git_subcommand_index;
 pub(crate) use lexer::{
     ShellJoin, effective_command_tokens, split_unquoted_command_segments, split_unquoted_segments,
+    tokenize_shell_words,
 };
 pub(crate) use substitute::{
     SafeShellSubstitutionKind, safe_shell_substitutions, validate_no_injection_surface,
@@ -50,7 +51,7 @@ pub(crate) use exec::{
     summarize_dirs, validate_kill_pids, validate_pattern_kill, validate_rm_targets,
 };
 #[cfg(test)]
-pub(crate) use lexer::{effective_chain_uses_xargs, tokenize_shell_words};
+pub(crate) use lexer::effective_chain_uses_xargs;
 
 // =========================================================================
 // Public entry point
@@ -642,6 +643,58 @@ mod tests {
     fn leading_env_assignment_only_has_shell_meaning_when_shell_is_used() {
         assert!(validate("FOO=1 rm -rf target").is_ok());
         assert!(validate("FOO=1 rm -rf *.tmp").is_err());
+    }
+
+    #[test]
+    fn scp_allows_plain_file_copies() {
+        assert!(validate("scp file.txt user@host:/tmp/").is_ok());
+        assert!(validate("scp user@host:/tmp/file.txt .").is_ok());
+        assert!(validate("scp -r dir user@host:/tmp/").is_ok());
+        assert!(validate("scp -P 2222 -i ~/.ssh/id_ed25519 file host:/tmp/").is_ok());
+        assert!(validate("scp -o StrictHostKeyChecking=no file host:/tmp/").is_ok());
+        assert!(validate("scp -oStrictHostKeyChecking=no file host:/tmp/").is_ok());
+        assert!(validate("scp -X buffer=32K file host:/tmp/").is_ok());
+        assert!(validate("scp scp://user@host/tmp/file .").is_ok());
+        assert!(validate("scp 'user@[::1]:/tmp/file' .").is_ok());
+        assert!(validate("scp ./a.txt ./b.txt").is_ok());
+        assert!(validate("scp ':file' dest").is_ok());
+        assert!(validate("scp 'host:path with space' .").is_ok());
+        assert!(validate("scp 'scp://user@host/path%20file' .").is_ok());
+        assert!(validate("scp -O 'host:path' .").is_ok());
+        assert!(validate("env scp file host:/tmp/").is_ok());
+        assert!(validate("timeout 30 scp file host:/tmp/").is_ok());
+        assert!(validate("nohup scp file host:/tmp/").is_ok());
+    }
+
+    #[test]
+    fn scp_blocks_local_program_execution_and_remote_shell_metacharacters() {
+        assert!(validate("scp -S /tmp/evil file host:/tmp/").is_err());
+        assert!(validate("scp -F /tmp/ssh_config file host:/tmp/").is_err());
+        assert!(validate("scp -D /tmp/sftp-server file host:/tmp/").is_err());
+        assert!(validate("scp -o ProxyCommand=/tmp/evil file host:/tmp/").is_err());
+        assert!(validate("scp -oProxyCommand=/tmp/evil file host:/tmp/").is_err());
+        assert!(validate("scp -o LocalCommand=/tmp/evil file host:/tmp/").is_err());
+        assert!(
+            validate("scp -o 'StrictHostKeyChecking=no\nProxyCommand=/tmp/evil' file host:/tmp/")
+                .is_err()
+        );
+        assert!(validate("scp -X nope file host:/tmp/").is_err());
+        assert!(validate("scp 'host:file;id' .").is_err());
+        assert!(validate("scp 'host:file\tid' .").is_err());
+        assert!(validate("scp 'host:$(id)' .").is_err());
+        assert!(validate("scp 'host:`id`' .").is_err());
+        assert!(validate("scp 'host:-rf' .").is_err());
+        assert!(validate("scp -- '-host:file' dest").is_err());
+        assert!(validate("scp 'h:x;touch a[1]:y' .").is_err());
+        assert!(validate("scp 'scp://host/path%3Bid' .").is_err());
+        assert!(validate("scp -O 'host:path with space' .").is_err());
+        assert!(validate("scp -O 'scp://host/path%20file' .").is_err());
+        assert!(validate("env /usr/bin/scp -S /tmp/evil file host:/tmp/").is_err());
+        assert!(validate("env -S 'scp -S /tmp/evil file host:/tmp'").is_err());
+        assert!(validate("env --split-string 'scp -S /tmp/evil file host:/tmp'").is_err());
+        assert!(validate("xargs scp").is_err());
+        assert!(validate("ssh user@host").is_err());
+        assert!(validate("rsync file host:/tmp/").is_err());
     }
 
     #[test]

@@ -188,7 +188,7 @@ pub(super) fn rebase_metadata_after_rollback(
         tx.commit().map_err(|e| io::Error::other(e.to_string()))
     })();
     // The caller renames this working DB over the live path immediately after
-    // this returns. Returning the connection to the thread-local write cache
+    // this returns. Returning the connection to the process-wide write pool
     // would keep the renamed inode's WAL index (`-shm`) alive in this process
     // after publish deletes and recreates the sidecars: later connections to
     // the live path would then attach to that stale, unlinked WAL index, so
@@ -474,10 +474,13 @@ fn reset_history_for_subagent_unlocked(child: &Path) -> io::Result<()> {
     }
     let result = (|| {
         let conn = open_history_db(&temporary)?;
-        init_history_schema(&conn)?;
+        let initialized = init_history_schema(&conn);
         // The staged file is renamed into place below, so it must be fully
-        // closed rather than returned to the connection cache.
+        // closed rather than returned to the connection cache — including when
+        // schema initialization fails, or the cached handle would keep the
+        // temp file's inode open after the cleanup below unlinks it.
         conn.close();
+        initialized?;
         backup_sqlite(&temporary, child)
     })();
     let _ = fs::remove_file(&temporary);

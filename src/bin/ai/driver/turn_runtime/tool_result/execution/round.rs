@@ -247,13 +247,13 @@ pub(in crate::ai::driver::turn_runtime) fn handle_tool_call_round(
     ))
 }
 
-/// Terminal dedup candidates must align with the actually visible body: the digest is
-/// extra image-understanding content shown only to the model, never in the terminal, so
-/// candidates strip it too before comparing or falling back to rendering.
+/// Terminal dedup candidates must align with the actually visible body: the digest and
+/// the audit envelope are model/machine content never shown in the terminal, so
+/// candidates project them out too before comparing or falling back to rendering.
 pub(in crate::ai::driver::turn_runtime) fn terminal_dedupe_candidate_from_assistant_text(
     assistant_text: &str,
 ) -> Option<String> {
-    let visible_text = crate::ai::request::strip_digest_blocks(assistant_text.trim());
+    let visible_text = crate::ai::stream::project_visible_body(assistant_text.trim());
     (!visible_text.is_empty()).then(|| visible_text.to_string())
 }
 

@@ -10,7 +10,7 @@
       },
       "content": {
         "type": "string",
-        "description": "Full file content to write (overwrites existing file)."
+        "description": "Full file content to write (overwrites existing file). Limit 262144 bytes (256 KiB) per call; split larger writes (write the first part, then extend with apply_patch pure-insert hunks)."
       },
       "temp": {
         "type": "boolean",

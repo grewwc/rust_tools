@@ -415,6 +415,12 @@ pub(crate) struct FunctionCall {
 /// also lets the existing repeated-tool-call guard converge.
 pub(crate) const INVALID_TOOL_CALL_NAME: &str = "__invalid_tool_call_name__";
 
+/// Response-envelope markers of the machine-checked audit protocol. The driver
+/// validates the payload and the terminal projection hides it, so both sides
+/// read the same markers instead of keeping private copies that can drift.
+pub(crate) const AUDIT_REPORT_OPEN: &str = "<audit_report>";
+pub(crate) const AUDIT_REPORT_CLOSE: &str = "</audit_report>";
+
 /// Function names are model-visible protocol identifiers, not arbitrary text.
 /// Keep the accepted alphabet broad enough for namespaced MCP tools while
 /// excluding whitespace, markup, quotes, and unbounded transcript fragments.

@@ -235,7 +235,7 @@ fn restored_live_db_opens_with_a_fresh_wal_index() {
 
     // The working copy used to build the replacement must be fully closed
     // before it is renamed over the live path. A connection left in the
-    // thread-local cache keeps the old, already-unlinked WAL index (shm)
+    // process-wide write pool keeps the old, already-unlinked WAL index (shm)
     // mapping alive for the new live inode; a later connection in this
     // process then reuses that ghost index instead of creating the live
     // sidecar, so commits from other processes stay invisible here.

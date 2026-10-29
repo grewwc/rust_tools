@@ -625,7 +625,7 @@ fn finalize_stream_response(
     }
 
     if render_terminal && state.content.thinking_open {
-        flush_digest_filter_to_terminal(markers, &mut state, true)?;
+        flush_terminal_filters_to_terminal(markers, &mut state, true)?;
         if state.render.thinking_fold.active {
             finalize_thinking_fold(&mut state)?;
         } else if crate::ai::background::serve_live_streaming() {
@@ -669,7 +669,7 @@ fn finalize_stream_response(
 
     if render_terminal {
         // Residue must still go through the dedup/fold/style pipeline; it cannot be written straight to the terminal.
-        flush_digest_filter_to_terminal(markers, &mut state, false)?;
+        flush_terminal_filters_to_terminal(markers, &mut state, false)?;
         flush_terminal_splitter(&mut state, markers)?;
         let suppress_duplicate = final_assistant_matches_terminal_dedupe(&state);
         disable_terminal_dedupe(&mut state, suppress_duplicate)?;
@@ -858,7 +858,9 @@ fn finalize_stream_response(
     if render_terminal && state.render.defer_assistant_body && outcome != StreamOutcome::Completed
         && !crate::ai::background::serve_live_streaming()
     {
-        let visible_text = crate::ai::request::strip_digest_blocks(&state.content.assistant_text);
+        // Failure-path echo of the whole body: apply the same runtime-owned region
+        // projection the incremental terminal writes use.
+        let visible_text = super::project_visible_body(&state.content.assistant_text);
         let duplicate = deferred_dedupe_candidate
             .as_deref()
             .is_some_and(|candidate| candidate.trim() == visible_text.trim());
@@ -1012,7 +1014,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
     let mut fold_settled = false;
     if runtime_ctx::terminal_output_enabled() {
         if state.content.thinking_open {
-            let _ = flush_digest_filter_to_terminal(markers, state, true);
+            let _ = flush_terminal_filters_to_terminal(markers, state, true);
         }
         fold_settled = finalize_live_folds_before_diagnostic(state);
         eprintln!("[Error] 响应流读取失败，返回已收集的内容");
@@ -1020,7 +1022,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
 
     if runtime_ctx::terminal_output_enabled() {
         if state.content.thinking_open {
-            let _ = flush_digest_filter_to_terminal(markers, state, true);
+            let _ = flush_terminal_filters_to_terminal(markers, state, true);
         }
         if state.content.thinking_open && !fold_settled {
             if crate::ai::background::serve_live_streaming() {
@@ -1044,7 +1046,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         if state.render.subagent_fold.active {
             let _ = finalize_subagent_preview_fold(state);
         }
-        let _ = flush_digest_filter_to_terminal(markers, state, false);
+        let _ = flush_terminal_filters_to_terminal(markers, state, false);
         let _ = flush_terminal_splitter(state, markers);
         let suppress_duplicate = final_assistant_matches_terminal_dedupe(state);
         let _ = disable_terminal_dedupe(state, suppress_duplicate);
@@ -1068,7 +1070,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         && outcome != StreamOutcome::Completed
         && !crate::ai::background::serve_live_streaming()
     {
-        let visible_text = crate::ai::request::strip_digest_blocks(&assistant_text);
+        let visible_text = super::project_visible_body(&assistant_text);
         if !visible_text.trim().is_empty() {
             let _ = super::render_markdown_block(&visible_text);
         }
@@ -1172,8 +1174,10 @@ fn commit_visible_content(
     }
 
     if render_terminal && (state.content.thinking_open || !state.render.defer_assistant_body) {
-        // digest is extra image-understanding content meant for the model; strip it for terminal display (history/assistant_text keep the original)
-        let terminal_content = state.render.digest_filter.push(&content);
+        // Runtime-owned regions (image digest, audit envelope) exist for the model or for
+        // machine validation; project them out of the terminal only (history/assistant_text
+        // keep the original bytes).
+        let terminal_content = state.render.push_terminal_text(&content);
         if markers.subagent_preview_enabled() {
             write_subagent_content_folded(terminal_content.as_str(), state)?;
         } else {
@@ -1373,7 +1377,7 @@ fn terminal_dedupe_buffer_is_complete_match(state: &StreamProcessingState) -> bo
 
 fn final_assistant_matches_terminal_dedupe(state: &StreamProcessingState) -> bool {
     state.render.terminal_dedupe.as_ref().is_some_and(|dedupe| {
-        crate::ai::request::strip_digest_blocks(&state.content.assistant_text).trim()
+        crate::ai::stream::project_visible_body(&state.content.assistant_text).trim()
             == dedupe.candidate.trim()
     })
 }

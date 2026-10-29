@@ -6,7 +6,9 @@ pub(in crate::ai) use crate::ai::request::ParsedStreamPayload;
 use crate::ai::{
     ports::stream::FilterChain,
     request::{DIGEST_BEGIN, DIGEST_END},
-    types::{FunctionCall, StreamResult, ToolCall},
+    types::{
+        AUDIT_REPORT_CLOSE, AUDIT_REPORT_OPEN, FunctionCall, StreamResult, ToolCall,
+    },
 };
 
 use super::{
@@ -152,7 +154,10 @@ pub(super) struct StreamRenderState {
     pub(super) subagent_fold: ThinkingFoldState,
     /// Terminal display only: strips `<<<IMAGE_DIGEST>>> ... <<<END_IMAGE_DIGEST>>>` ranges
     /// (model-visible text / history are unaffected), and handles sentinels split across chunks.
-    pub(super) digest_filter: DigestTerminalFilter,
+    pub(super) digest_filter: HiddenRegionTerminalFilter,
+    /// Terminal display only: replaces `<audit_report>...</audit_report>` with a short
+    /// notice so the machine-checked payload never reaches the terminal verbatim.
+    pub(super) audit_filter: HiddenRegionTerminalFilter,
 }
 
 impl StreamRenderState {
@@ -172,26 +177,82 @@ impl StreamRenderState {
             terminal_splitter: StreamSplitter::new(),
             thinking_fold: ThinkingFoldState::new(),
             subagent_fold: ThinkingFoldState::new_with_labels("subagent", "done subagent", false),
-            digest_filter: DigestTerminalFilter::new(),
+            digest_filter: HiddenRegionTerminalFilter::strip(DIGEST_BEGIN, DIGEST_END),
+            audit_filter: HiddenRegionTerminalFilter::replace(
+                AUDIT_REPORT_OPEN,
+                AUDIT_REPORT_CLOSE,
+                AUDIT_REPORT_HIDDEN_NOTICE,
+            ),
         }
+    }
+
+    /// Terminal projection of streamed text: runtime-owned regions (image digest,
+    /// audit envelope) never reach the terminal, while `current_history` /
+    /// `assistant_text` keep the original bytes.
+    pub(super) fn push_terminal_text(&mut self, content: &str) -> String {
+        let digest_stripped = self.digest_filter.push(content);
+        self.audit_filter.push(&digest_stripped)
+    }
+
+    /// Flush both terminal projections at a stream boundary.
+    pub(super) fn flush_terminal_text(&mut self) -> String {
+        let mut out = self.digest_filter.flush();
+        out.push_str(&self.audit_filter.flush());
+        out
     }
 }
 
-/// Image-digest range filter for terminal display: strips digest ranges from **terminal output**,
-/// correctly handling sentinels split across chunks; model-visible text does not go through here.
-pub(super) struct DigestTerminalFilter {
-    /// Whether the BEGIN sentinel has been passed (currently inside the digest range).
-    in_digest: bool,
+/// Terminal notice written in place of a hidden `<audit_report>` envelope.
+pub(super) const AUDIT_REPORT_HIDDEN_NOTICE: &str =
+    "[audit report · machine-checked JSON hidden from the terminal; full text stays in session history]";
+
+/// Hidden-region filter for terminal display: removes `begin ... end` ranges from
+/// **terminal output only**, correctly handling sentinels split across chunks;
+/// model-visible text and history do not go through here.
+pub(super) struct HiddenRegionTerminalFilter {
+    begin: &'static str,
+    end: &'static str,
+    /// Written to the terminal in place of a closed region; empty drops it silently.
+    replacement: &'static str,
+    /// The stream ended with the region still open: `true` restores the staged body
+    /// (narration must not vanish), `false` shows `replacement` instead (a machine
+    /// payload must never be dumped verbatim).
+    restore_unclosed: bool,
+    /// Whether the BEGIN sentinel has been passed (currently inside the region).
+    in_region: bool,
     /// Pending tail: held while confirming whether it forms a sentinel prefix (at most longest sentinel length - 1).
     pending: String,
-    /// Text staged after the digest range is confirmed entered (only flushed back out if the stream ends while still unclosed).
+    /// Text staged after the region is confirmed entered (only flushed back out if the stream ends while still unclosed).
     suppressed: String,
 }
 
-impl DigestTerminalFilter {
-    fn new() -> Self {
+impl HiddenRegionTerminalFilter {
+    /// Drops the region from the terminal; an unclosed region is restored at flush.
+    pub(super) fn strip(begin: &'static str, end: &'static str) -> Self {
         Self {
-            in_digest: false,
+            begin,
+            end,
+            replacement: "",
+            restore_unclosed: true,
+            in_region: false,
+            pending: String::new(),
+            suppressed: String::new(),
+        }
+    }
+
+    /// Replaces the region with `replacement`; an unclosed region shows the
+    /// replacement instead of the staged body.
+    pub(super) fn replace(
+        begin: &'static str,
+        end: &'static str,
+        replacement: &'static str,
+    ) -> Self {
+        Self {
+            begin,
+            end,
+            replacement,
+            restore_unclosed: false,
+            in_region: false,
             pending: String::new(),
             suppressed: String::new(),
         }
@@ -202,29 +263,26 @@ impl DigestTerminalFilter {
         let mut out = String::with_capacity(content.len());
         self.pending.push_str(content);
         loop {
-            let target = if self.in_digest {
-                DIGEST_END
-            } else {
-                DIGEST_BEGIN
-            };
+            let target = if self.in_region { self.end } else { self.begin };
             let Some(idx) = self.pending.find(target) else {
                 break;
             };
-            if self.in_digest {
-                // Drop the digest range content (including the END sentinel) and return to normal state
-                self.in_digest = false;
+            if self.in_region {
+                // Drop the region body and its END sentinel, then show the replacement notice.
+                self.in_region = false;
                 self.suppressed.clear();
                 self.pending.drain(..idx + target.len());
+                out.push_str(self.replacement);
             } else {
-                // Emit the text before BEGIN and enter the digest range
+                // Emit the text before BEGIN and enter the region
                 out.push_str(&self.pending[..idx]);
-                self.in_digest = true;
+                self.in_region = true;
                 self.pending.drain(..idx + target.len());
             }
         }
-        if self.in_digest {
-            // Inside the digest range, keep only the suffix that could genuinely form END; move the rest into suppressed.
-            let hold_len = marker_prefix_suffix_len(&self.pending, DIGEST_END);
+        if self.in_region {
+            // Inside the region, keep only the suffix that could genuinely form END; move the rest into suppressed.
+            let hold_len = marker_prefix_suffix_len(&self.pending, self.end);
             let commit_len = self.pending.len() - hold_len;
             if commit_len > 0 {
                 let committed: String = self.pending.drain(..commit_len).collect();
@@ -233,7 +291,7 @@ impl DigestTerminalFilter {
         } else {
             // Normal state keeps only the suffix that could genuinely form BEGIN. Ordinary body text must pass through immediately,
             // not be held back as a fixed tail only to bypass the dedup/style pipeline at flush time.
-            let hold_len = marker_prefix_suffix_len(&self.pending, DIGEST_BEGIN);
+            let hold_len = marker_prefix_suffix_len(&self.pending, self.begin);
             let emit_len = self.pending.len() - hold_len;
             out.push_str(&self.pending[..emit_len]);
             self.pending.drain(..emit_len);
@@ -241,13 +299,20 @@ impl DigestTerminalFilter {
         out
     }
 
-    /// Flush at stream end: if the digest range was never closed, flush the staged content back out
-    /// (prefer showing the full narration over silently dropping content); the sentinel-prefix tail is emitted too.
+    /// Flush at stream end: an unclosed region is either restored (narration must not
+    /// vanish) or replaced by the notice (a machine payload is never dumped verbatim);
+    /// the sentinel-prefix tail of ordinary text is emitted too.
     pub(super) fn flush(&mut self) -> String {
         let mut out = String::new();
-        if self.in_digest {
-            out.push_str(&std::mem::take(&mut self.suppressed));
-            self.in_digest = false;
+        if self.in_region {
+            if self.restore_unclosed {
+                out.push_str(&std::mem::take(&mut self.suppressed));
+            } else {
+                self.suppressed.clear();
+                self.pending.clear();
+                out.push_str(self.replacement);
+            }
+            self.in_region = false;
         }
         out.push_str(&std::mem::take(&mut self.pending));
         out
@@ -604,12 +669,15 @@ pub(super) struct InternalToolCall {
 
 #[cfg(test)]
 mod tests {
-    use super::{DigestTerminalFilter, response_server_text_mismatch};
+    use super::{
+        AUDIT_REPORT_HIDDEN_NOTICE, HiddenRegionTerminalFilter, response_server_text_mismatch,
+    };
     use crate::ai::request::{DIGEST_BEGIN, DIGEST_END};
+    use crate::ai::types::{AUDIT_REPORT_CLOSE, AUDIT_REPORT_OPEN};
 
     #[test]
     fn digest_filter_strips_region_across_chunk_boundaries() {
-        let mut f = DigestTerminalFilter::new();
+        let mut f = HiddenRegionTerminalFilter::strip(DIGEST_BEGIN, DIGEST_END);
         let mut out = String::new();
         // Ordinary narration passes through immediately.
         out.push_str(&f.push("我先看一下界面。"));
@@ -629,7 +697,7 @@ mod tests {
 
     #[test]
     fn digest_filter_flush_recovers_unclosed_region() {
-        let mut f = DigestTerminalFilter::new();
+        let mut f = HiddenRegionTerminalFilter::strip(DIGEST_BEGIN, DIGEST_END);
         let mut out = String::new();
         out.push_str(&f.push("叙述开始"));
         out.push_str(&f.push(DIGEST_BEGIN));
@@ -643,7 +711,7 @@ mod tests {
 
     #[test]
     fn digest_filter_multiple_regions_and_adjacent_text() {
-        let mut f = DigestTerminalFilter::new();
+        let mut f = HiddenRegionTerminalFilter::strip(DIGEST_BEGIN, DIGEST_END);
         let text = format!("a{DIGEST_BEGIN}1{DIGEST_END}b{DIGEST_BEGIN}2{DIGEST_END}c");
         let mut out = f.push(&text);
         out.push_str(&f.flush());
@@ -652,10 +720,55 @@ mod tests {
 
     #[test]
     fn digest_filter_keeps_partial_sentinel_tail_until_flush() {
-        let mut f = DigestTerminalFilter::new();
+        let mut f = HiddenRegionTerminalFilter::strip(DIGEST_BEGIN, DIGEST_END);
         // Stream ends inside ordinary text: a tail that may be part of a sentinel prefix is emitted at flush
         assert_eq!(f.push("结尾写着 <<<IMAGE_"), "结尾写着 ");
         assert_eq!(f.flush(), "<<<IMAGE_");
+    }
+
+    #[test]
+    fn audit_filter_replaces_envelope_with_notice_across_chunks() {
+        let mut f = HiddenRegionTerminalFilter::replace(
+            AUDIT_REPORT_OPEN,
+            AUDIT_REPORT_CLOSE,
+            AUDIT_REPORT_HIDDEN_NOTICE,
+        );
+        let mut out = String::new();
+        out.push_str(&f.push("审计完成。"));
+        // BEGIN and END sentinels each split across two chunks
+        out.push_str(&f.push(&AUDIT_REPORT_OPEN[..5]));
+        out.push_str(&f.push(&AUDIT_REPORT_OPEN[5..]));
+        out.push_str(&f.push("{\"findings\":[{\"severity\":\"high\"}]}"));
+        out.push_str(&f.push(&AUDIT_REPORT_CLOSE[..7]));
+        out.push_str(&f.push(&AUDIT_REPORT_CLOSE[7..]));
+        out.push_str(&f.push("以上。"));
+        out.push_str(&f.flush());
+        assert_eq!(out, format!("审计完成。{AUDIT_REPORT_HIDDEN_NOTICE}以上。"));
+    }
+
+    #[test]
+    fn audit_filter_never_dumps_an_unclosed_payload() {
+        let mut f = HiddenRegionTerminalFilter::replace(
+            AUDIT_REPORT_OPEN,
+            AUDIT_REPORT_CLOSE,
+            AUDIT_REPORT_HIDDEN_NOTICE,
+        );
+        assert_eq!(f.push("前文"), "前文");
+        assert_eq!(f.push(AUDIT_REPORT_OPEN), "");
+        assert_eq!(f.push("{\"findings\":["), "");
+        assert_eq!(f.flush(), AUDIT_REPORT_HIDDEN_NOTICE);
+    }
+
+    #[test]
+    fn terminal_projection_hides_the_audit_envelope_end_to_end() {
+        let mut render = super::StreamRenderState::new();
+        let mut out = String::new();
+        out.push_str(&render.push_terminal_text("结论。\n<audit_report>{\"a\":1}</audit_report>\n完。"));
+        out.push_str(&render.flush_terminal_text());
+        assert!(!out.contains("<audit_report>"), "{out}");
+        assert!(!out.contains("\"a\":1"), "{out}");
+        assert!(out.starts_with("结论。"), "{out}");
+        assert!(out.trim_end().ends_with("完。"), "{out}");
     }
 
     #[test]

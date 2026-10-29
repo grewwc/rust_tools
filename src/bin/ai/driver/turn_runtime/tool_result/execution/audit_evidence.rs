@@ -4,14 +4,14 @@
 use super::*;
 use serde::Deserialize;
 
+use crate::ai::types::{AUDIT_REPORT_CLOSE, AUDIT_REPORT_OPEN};
+
 pub(in crate::ai::driver::turn_runtime) const AUDIT_EVIDENCE_RETRY_MARKER: &str =
     "[audit-evidence-retry]";
 pub(in crate::ai::driver::turn_runtime) const AUDIT_EVIDENCE_UNVERIFIED_NOTE: &str = "runtime:audit_evidence_withheld\nThe audit response was not published as verified findings: either the report did not follow the structured evidence protocol, or its findings lacked a complete current-turn evidence chain.";
 pub(in crate::ai::driver::turn_runtime) const AUDIT_EVIDENCE_WARNING: &str = "[Runtime warning] Audit findings without a complete, current-turn evidence chain were withheld rather than published as verified.";
 pub(in crate::ai::driver::turn_runtime) const AUDIT_EVIDENCE_PARSE_WARNING: &str = "[Runtime warning] The audit draft did not follow the structured evidence protocol; nothing in the draft above is a verified finding.";
 
-const AUDIT_REPORT_OPEN: &str = "<audit_report>";
-const AUDIT_REPORT_CLOSE: &str = "</audit_report>";
 const MAX_AUDIT_REPORT_BYTES: usize = 64 * 1024;
 const MAX_AUDIT_FINDINGS: usize = 32;
 const MAX_AUDIT_EVIDENCE_PER_KIND: usize = 16;

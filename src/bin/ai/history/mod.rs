@@ -223,7 +223,7 @@ pub(in crate::ai) fn preserve_subagent_history(path: &Path) -> Option<PathBuf> {
     let preserved = preserved_subagent_history_path(path);
     if blob::is_sqlite_path(path) {
         // WAL-mode SQLite: the sub-agent's cached read connection
-        // (history/sqlite/connection.rs `CACHED_HISTORY_CONN`) stays open past the abort, so the
+        // (history/sqlite/connection.rs `CACHED_READ_CONNS`) stays open past the abort, so the
         // last-connection-close checkpoint never runs and recent committed messages still live in
         // the -wal file. Renaming only the main file would drop them and corrupt the preserved
         // snapshot (SQLITE_IOERR_SHMOPEN on re-open). Use the SQLite Online Backup API, which
@@ -283,6 +283,9 @@ pub(in crate::ai) fn delete_subagent_memory(memory_path: &Path) -> io::Result<()
         None => Ok(()),
     };
     crate::ai::tools::storage::memory_store::remove_knowledge_dedup_cache_entry(memory_path);
+    // Drop the derived SQLite index as well: each retained index holds an open
+    // connection to the database this function just deleted.
+    crate::ai::tools::storage::memory_store::remove_memory_index_entry(memory_path);
     jsonl_result.and(db_result)
 }
 
@@ -1669,9 +1672,9 @@ mod tests {
         )
         .unwrap();
 
-        // Simulate the running sub-agent's cached read connection: the worker-thread TLS keeps
-        // this connection open past the child's abort, which prevents the last-connection-close
-        // WAL checkpoint (history/sqlite/connection.rs `CACHED_HISTORY_CONN`).
+        // Simulate the running sub-agent's cached read connection: the process-wide read pool
+        // keeps this connection open past the child's abort, which prevents the
+        // last-connection-close WAL checkpoint (history/sqlite/connection.rs `CACHED_READ_CONNS`).
         read_context_history_sqlite(&history, "test-fingerprint").unwrap();
 
         // A later write is committed to the -wal file and is not yet checkpointed into the main

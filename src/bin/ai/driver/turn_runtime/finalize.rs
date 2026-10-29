@@ -77,7 +77,9 @@ fn terminal_final_text_to_render(
     {
         return None;
     }
-    Some(terminal_text.to_string())
+    // This fallback bypasses the streaming projection, so a machine-checked audit
+    // envelope must be hidden here as well; canonical history keeps the original.
+    Some(crate::ai::stream::hide_audit_report(terminal_text))
 }
 
 fn serve_final_text_to_commit(
@@ -984,6 +986,17 @@ mod tests {
             ),
             Some("[Runtime warning] Completion is unverified.".to_string())
         );
+        // The unstreamed fallback bypasses the streaming projection, so the machine
+        // payload must be replaced there too.
+        let unstreamed_audit = terminal_final_text_to_render(
+            "审计完成。\n\n<audit_report>{\"findings\":[]}</audit_report>",
+            false,
+            None,
+        )
+        .expect("unstreamed fallback is rendered");
+        assert!(unstreamed_audit.starts_with("审计完成。"));
+        assert!(!unstreamed_audit.contains("<audit_report>"));
+        assert!(!unstreamed_audit.contains("\"findings\""));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::cmd::run::CommandRunResult;
 
 use super::command_session::{non_empty_str_arg, resolve_session_yield};
 
-const MAX_COMMAND_OUTPUT_CHARS: usize = 16_000;
+pub(super) const MAX_COMMAND_OUTPUT_CHARS: usize = 16_000;
 /// Maximum one-shot stdin payload accepted by `execute_command`.
 const MAX_COMMAND_INPUT_BYTES: usize = 16 * 1024;
 /// Read cap when materializing `$(cat /absolute/literal/path)` into a plain
@@ -195,7 +195,7 @@ fn materialize_safe_shell_substitutions(
 /// greps (the repeated calls in history.json come from this). With counts and
 /// a paging hint, the retry motive changes from guessing with incomplete
 /// information to converging on evidence.
-fn truncate_chars(content: &str, max_chars: usize) -> String {
+pub(super) fn truncate_chars(content: &str, max_chars: usize) -> String {
     let total_chars = content.chars().count();
     if total_chars <= max_chars {
         return content.to_string();
@@ -466,7 +466,7 @@ dead time — it is expensive. Use it only when truly necessary (e.g. waiting fo
 accept connections); prefer starting the work with `yield_time_ms` and polling it with \
 `command_session`, or `task_wait` for subagent tasks.";
 
-fn execute_command_inner<F>(args: &Value, on_chunk: F) -> Result<String, String>
+fn execute_command_inner<F>(args: &Value, mut on_chunk: F) -> Result<String, String>
 where
     F: FnMut(&[u8]),
 {
@@ -510,6 +510,17 @@ where
     // Confirm-gated git subcommands (commit/stash/checkout/switch) ask the user first
     // (fail-closed in non-interactive environments).
     confirm_git_confirm_gated_if_needed(&command)?;
+
+    // `execute_command` is a facade: when a simple command names a program that
+    // is not installed, an internal implementation can satisfy it. Interactive
+    // requests keep the shell path so a missing binary fails visibly.
+    if !pseudo_terminal && input.is_none() {
+        if let Some(result) = super::command_facade::try_run(&command, cwd, timeout) {
+            let rendered = result?;
+            on_chunk(rendered.as_bytes());
+            return Ok(rendered);
+        }
+    }
 
     if let Some(wait) = yield_ms {
         let mut output = super::super::storage::command_session::start(

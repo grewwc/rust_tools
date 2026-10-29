@@ -732,6 +732,14 @@ fn delete_subagent_memory_removes_only_its_knowledge_dedup_cache_entry() {
             KnowledgeAppendOutcome::Appended
         );
     }
+    // Each cached index owns an open SQLite connection; weak handles let the
+    // test observe the registry releasing them when a file's lifecycle ends.
+    let removed_index = super::memory_index_for(&removed_path).expect("removed index");
+    let retained_index = super::memory_index_for(&retained_path).expect("retained index");
+    let removed_index_handle = std::sync::Arc::downgrade(&removed_index);
+    let retained_index_handle = std::sync::Arc::downgrade(&retained_index);
+    drop(removed_index);
+    drop(retained_index);
     {
         let cache = KNOWLEDGE_DEDUP_CACHE.lock().unwrap();
         assert!(cache.contains_key(&removed_path));
@@ -740,6 +748,14 @@ fn delete_subagent_memory_removes_only_its_knowledge_dedup_cache_entry() {
 
     crate::ai::history::delete_subagent_memory(&removed_path).unwrap();
 
+    assert!(
+        removed_index_handle.upgrade().is_none(),
+        "lifecycle end must drop the cached memory index and its connection"
+    );
+    assert!(
+        retained_index_handle.upgrade().is_some(),
+        "unrelated cached indexes must survive"
+    );
     {
         let cache = KNOWLEDGE_DEDUP_CACHE.lock().unwrap();
         assert!(!cache.contains_key(&removed_path));

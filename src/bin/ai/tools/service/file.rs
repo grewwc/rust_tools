@@ -973,9 +973,35 @@ fn strip_window_line_number_layer(
     Ok(stripped.join("\n"))
 }
 
+/// Single-write size cap for the `write_file` tool, in bytes (`content.len()`).
+///
+/// A single write may take at most a quarter of the streaming layer's per-turn total
+/// tool-argument budget (1 MiB, `MAX_TOOL_ARG_BYTES`), covers anything a model can legitimately
+/// emit in one response (32K-128K output tokens are roughly 64-256KB of text), and fails fast
+/// with an actionable error instead of stalling the response stream (45s no-progress cut plus
+/// degenerate retry loop) on multi-megabyte generations. Measured in bytes to match the stream
+/// cap and the on-disk size. The cap lives at the tool boundary only: `FileStore::write_all`
+/// stays unbounded so internal flows (patch application, mutation restore) are unaffected.
+const MAX_WRITE_FILE_BYTES: usize = 256 * 1024;
+
+/// Reject oversized `write_file` content before any filesystem side effect.
+fn check_write_file_size(content: &str) -> Result<(), String> {
+    let len = content.len();
+    if len > MAX_WRITE_FILE_BYTES {
+        return Err(format!(
+            "content too large ({} bytes; limit {}). Split into smaller writes: write the first \
+             part with `write_file`, then extend it with `apply_patch` pure-insert hunks (or write \
+             parts to temp files and concatenate via `execute_command`).",
+            len, MAX_WRITE_FILE_BYTES
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
     let file_path = resolve_file_path_arg(args)?;
     let content = args["content"].as_str().ok_or("Missing content")?;
+    check_write_file_size(content)?;
     let is_temp = args["temp"].as_bool().unwrap_or(false);
 
     let resolved_path = if is_temp {
@@ -1012,6 +1038,7 @@ pub(crate) fn execute_write_file_streaming(
 ) -> Result<String, String> {
     let file_path = resolve_file_path_arg(args)?;
     let content = args["content"].as_str().ok_or("Missing content")?;
+    check_write_file_size(content)?;
     let is_temp = args["temp"].as_bool().unwrap_or(false);
     let resolved_path = if is_temp {
         let name = temp_file_name(file_path)?;
@@ -1652,6 +1679,101 @@ mod tests {
         let read_back = fs::read_to_string(&path).unwrap();
         assert_eq!(read_back, content);
 
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_write_file_rejects_oversized_content() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let mut path = make_temp_path("oversized");
+        path.push("big.txt");
+        let base = path.parent().unwrap().to_path_buf();
+        let content = "x".repeat(MAX_WRITE_FILE_BYTES + 1);
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "content": content
+            });
+            let result = execute_write_file(&args);
+            assert!(
+                result.is_err(),
+                "oversized write must fail, got: {:?}",
+                result
+            );
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("content too large"),
+                "error must name the size violation: {err}"
+            );
+            assert!(
+                err.contains("Split into smaller writes"),
+                "error must suggest splitting: {err}"
+            );
+        });
+
+        assert!(!path.exists(), "rejected write must not create the file");
+        assert!(!base.exists(), "rejected write must not create parent dirs");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_write_file_streaming_rejects_oversized_content() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let mut path = make_temp_path("oversized_streaming");
+        path.push("big.txt");
+        let content = "x".repeat(MAX_WRITE_FILE_BYTES + 1);
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "content": content
+        });
+
+        let mut sink = |_chunk: &[u8]| {};
+        let mut emitted: Vec<u8> = Vec::new();
+        let result = {
+            let mut sink = |chunk: &[u8]| emitted.extend_from_slice(chunk);
+            execute_write_file_streaming(&args, &mut sink)
+        };
+        assert!(
+            result.is_err(),
+            "oversized streaming write must fail, got: {:?}",
+            result
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("content too large"),
+            "error must name the size violation: {err}"
+        );
+        assert!(
+            emitted.is_empty(),
+            "rejected streaming write must emit no progress output"
+        );
+        assert!(!path.exists(), "rejected write must not create the file");
+    }
+
+    #[test]
+    fn test_write_file_accepts_content_at_size_limit() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let mut path = make_temp_path("at_limit");
+        path.push("edge.txt");
+        let base = path.parent().unwrap().to_path_buf();
+        let content = "y".repeat(MAX_WRITE_FILE_BYTES);
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "content": content
+            });
+            let result = execute_write_file(&args);
+            assert!(
+                result.is_ok(),
+                "write at exactly the limit must succeed: {:?}",
+                result
+            );
+        });
+
+        let read_back = fs::read_to_string(&path).unwrap();
+        assert_eq!(read_back.len(), MAX_WRITE_FILE_BYTES);
         let _ = fs::remove_dir_all(base);
     }
 

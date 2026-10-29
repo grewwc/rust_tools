@@ -168,7 +168,6 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
         "ln",
         "truncate",
         "ssh",
-        "scp",
         "rsync",
         // Bypass vector: `eval` / `source` / `.` re-interpret the following string
         // as shell code, completely bypassing validation.
@@ -236,6 +235,16 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
         if let Some(reason) = blocked_git_destructive(raw_command_tokens) {
             return Err(reason.to_string());
         }
+    }
+
+    if is_env_program(program) && env_split_string_index(&raw_command_tokens).is_some() {
+        return Err(env_split_string_message());
+    }
+
+    // `scp` copies files and is allowed; options that can execute a local
+    // program or load arbitrary ssh configuration are rejected separately.
+    if is_scp_program(program) {
+        validate_scp(raw_command_tokens)?;
     }
 
     // "Second interpretation" like `bash -c "..."` / `sh -c` / `zsh -c` executes
@@ -320,7 +329,6 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
         "sudo",
         "su",
         "ssh",
-        "scp",
         "rsync",
         "dd",
         "shutdown",
@@ -351,6 +359,21 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
             if let Some(reason) = blocked_git_destructive(&raw_command_tokens[idx..]) {
                 return Err(reason.to_string());
             }
+        }
+        // `scp` behind a wrapper gets the same copy-only checks as the direct
+        // path. `xargs` would append stdin items as extra copy targets the
+        // audit cannot see, so that form stays blocked.
+        if is_env_program(nested) && env_split_string_index(&raw_command_tokens[idx..]).is_some() {
+            return Err(env_split_string_message());
+        }
+        if is_scp_program(nested) {
+            if program == "xargs" {
+                return Err(
+                    "scp behind 'xargs' is blocked: xargs appends stdin items as extra copy targets"
+                        .to_string(),
+                );
+            }
+            validate_scp(&raw_command_tokens[idx..])?;
         }
         // Kill tools behind wrappers (`env kill 123`, `timeout 5 pkill -f x`)
         // get the same per-target verification as the direct path, otherwise
@@ -451,6 +474,20 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
                 return Err(xargs_rm_blocked_message());
             }
             validate_rm_targets(&effective)?;
+        } else if is_env_program(eff_program)
+            && env_split_string_index(&effective).is_some()
+        {
+            return Err(env_split_string_message());
+        } else if is_scp_program(eff_program) {
+            // Layered wrappers (`nohup env scp ...`) must not bypass the
+            // copy-only checks; `xargs` adds unseen copy targets at runtime.
+            if effective_chain_uses_xargs(command) {
+                return Err(
+                    "scp behind 'xargs' is blocked: xargs appends stdin items as extra copy targets"
+                        .to_string(),
+                );
+            }
+            validate_scp(&effective)?;
         } else if osascript::is_osascript_program(eff_program) {
             // Wrappers (`env osascript ...`, `timeout 5 osascript ...`) must not
             // smuggle an AppleScript past the scanner.
@@ -461,6 +498,421 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+// =========================================================================
+// `scp` file-copy policy
+// =========================================================================
+//
+// `scp` copies files and is allowed, unlike the interactive remote shell
+// (`ssh`) and the mirroring tool (`rsync`). The sandbox still rejects options
+// that can execute a local program or load arbitrary ssh/sftp configuration,
+// and remote paths must not smuggle shell metacharacters into the remote
+// command scp constructs.
+
+/// Compare a program token by basename so wrappers cannot hide `scp` behind
+/// an absolute or relative path (`env /usr/bin/scp ...`).
+fn program_matches(program: &str, name: &str) -> bool {
+    std::path::Path::new(program)
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .is_some_and(|file_name| file_name.eq_ignore_ascii_case(name))
+}
+
+fn is_scp_program(program: &str) -> bool {
+    program_matches(program, "scp")
+}
+
+fn is_env_program(program: &str) -> bool {
+    program_matches(program, "env")
+}
+
+/// `env -S`/`--split-string` splits one argument into a command line that the
+/// audit never sees. Fail closed instead of trying to re-tokenize it.
+fn env_split_string_index(tokens: &[String]) -> Option<usize> {
+    let mut index = 1;
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        if token == "--" {
+            return None;
+        }
+        if token == "-S"
+            || token == "-s"
+            || token == "--split-string"
+            || token.starts_with("--split-string=")
+            || (token.starts_with('-')
+                && !token.starts_with("--")
+                && token != "-"
+                && token[1..].contains(['s', 'S']))
+        {
+            return Some(index);
+        }
+        if matches!(
+            token,
+            "-u" | "--unset" | "-c" | "--chdir" | "-a" | "--argv0"
+        ) {
+            index += 2;
+            continue;
+        }
+        if token.starts_with("--unset=")
+            || token.starts_with("--chdir=")
+            || token.starts_with("--argv0=")
+        {
+            index += 1;
+            continue;
+        }
+        if token.starts_with('-') && token != "-" {
+            index += 1;
+            continue;
+        }
+        // Env assignments may precede the utility; keep scanning so
+        // `env FOO=1 -S '...'` cannot hide the split-string option.
+        if token.contains('=') {
+            index += 1;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+fn env_split_string_message() -> String {
+    "env -S/--split-string re-interprets a command string and cannot be audited; \
+     run the inner command directly"
+        .to_string()
+}
+
+fn validate_scp(raw_tokens: &[String]) -> Result<(), String> {
+    if raw_tokens.is_empty() {
+        return Err("scp: missing command".to_string());
+    }
+    let mut positional = Vec::new();
+    let mut end_of_options = false;
+    let mut legacy = false;
+    let mut index = 1;
+    while index < raw_tokens.len() {
+        let token = raw_tokens[index].as_str();
+        if !end_of_options && token == "--" {
+            end_of_options = true;
+            index += 1;
+            continue;
+        }
+        if !end_of_options && token.starts_with('-') && token != "-" {
+            if token.starts_with("--") {
+                return Err(format!(
+                    "scp option '{token}' is not recognized; only short file-copy options are allowed"
+                ));
+            }
+            let mut options = token[1..].chars();
+            while let Some(option) = options.next() {
+                match option {
+                    // Options that take a value; it may be attached
+                    // (`-P2222`) or be the next token.
+                    'c' | 'i' | 'l' | 'P' | 'J' => {
+                        let _ =
+                            take_scp_option_value(raw_tokens, &mut index, &mut options, option)?;
+                        break;
+                    }
+                    'o' => {
+                        let value =
+                            take_scp_option_value(raw_tokens, &mut index, &mut options, option)?;
+                        validate_scp_ssh_option(&value)?;
+                        break;
+                    }
+                    'X' => {
+                        let value =
+                            take_scp_option_value(raw_tokens, &mut index, &mut options, option)?;
+                        validate_scp_sftp_option(&value)?;
+                        break;
+                    }
+                    // These run a local program (`-S`, `-D`) or load a config
+                    // that can (`-F`, including `ProxyCommand`).
+                    'S' | 'F' | 'D' => {
+                        return Err(format!(
+                            "scp option '-{option}' can execute a local program or load arbitrary ssh/sftp configuration and is blocked"
+                        ));
+                    }
+                    // Plain copy flags. `-A`/`-R`/`-T`/`-s` are deliberately
+                    // not listed: agent forwarding, remote-to-remote pivots,
+                    // filename-check bypass, and legacy modes are not needed
+                    // for a plain copy.
+                    '3' | '4' | '6' | 'B' | 'C' | 'p' | 'q' | 'r' | 'v' => {}
+                    // Legacy SCP protocol. Its remote path is interpolated
+                    // unquoted into a remote shell command, so whitespace is
+                    // rejected below when this mode is selected.
+                    'O' => legacy = true,
+                    other => {
+                        return Err(format!(
+                            "scp option '-{other}' is not recognized; only file-copy options are allowed"
+                        ));
+                    }
+                }
+            }
+        } else {
+            positional.push(token);
+        }
+        index += 1;
+    }
+    if positional.len() < 2 {
+        return Err("scp requires at least one source and one destination".to_string());
+    }
+    for argument in positional {
+        validate_scp_remote_path(argument, legacy)?;
+    }
+    Ok(())
+}
+
+fn take_scp_option_value(
+    raw_tokens: &[String],
+    index: &mut usize,
+    options: &mut impl Iterator<Item = char>,
+    option: char,
+) -> Result<String, String> {
+    let attached: String = options.collect();
+    if !attached.is_empty() {
+        return Ok(attached);
+    }
+    *index += 1;
+    raw_tokens
+        .get(*index)
+        .cloned()
+        .ok_or_else(|| format!("scp option '-{option}' requires a value"))
+}
+
+fn validate_scp_ssh_option(value: &str) -> Result<(), String> {
+    if value
+        .chars()
+        .any(|character| matches!(character, '\n' | '\r' | '\0'))
+    {
+        return Err(format!(
+            "scp option '-o {value}' contains a control character and is blocked"
+        ));
+    }
+    let name = value
+        .split(|character: char| character == '=' || character.is_whitespace())
+        .next()
+        .unwrap_or(value)
+        .trim();
+    // Non-executing ssh_config options commonly used for copies. Anything not
+    // listed fails closed, which keeps `ProxyCommand`, `LocalCommand`,
+    // `KnownHostsCommand`, `PKCS11Provider`, etc. out.
+    const SAFE_SSH_OPTIONS: &[&str] = &[
+        "AddressFamily",
+        "BatchMode",
+        "BindAddress",
+        "BindInterface",
+        "CanonicalDomains",
+        "CanonicalizeFallbackLocal",
+        "CanonicalizeHostname",
+        "CanonicalizeMaxDots",
+        "CanonicalizePermittedCNAMEs",
+        "CheckHostIP",
+        "Ciphers",
+        "Compression",
+        "ConnectionAttempts",
+        "ConnectTimeout",
+        "GlobalKnownHostsFile",
+        "HashKnownHosts",
+        "Host",
+        "HostKeyAlgorithms",
+        "HostKeyAlias",
+        "Hostname",
+        "IdentitiesOnly",
+        "IdentityFile",
+        "IPQoS",
+        "KbdInteractiveAuthentication",
+        "KexAlgorithms",
+        "LogLevel",
+        "MACs",
+        "NoHostAuthenticationForLocalhost",
+        "NumberOfPasswordPrompts",
+        "PasswordAuthentication",
+        "Port",
+        "PreferredAuthentications",
+        "PubkeyAcceptedAlgorithms",
+        "PubkeyAuthentication",
+        "RekeyLimit",
+        "SendEnv",
+        "ServerAliveCountMax",
+        "ServerAliveInterval",
+        "StrictHostKeyChecking",
+        "TCPKeepAlive",
+        "UpdateHostKeys",
+        "User",
+        "UserKnownHostsFile",
+        "VerifyHostKeyDNS",
+    ];
+    if SAFE_SSH_OPTIONS
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(name))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "scp option '-o {value}' is blocked: only non-executing ssh options are allowed"
+        ))
+    }
+}
+
+fn validate_scp_sftp_option(value: &str) -> Result<(), String> {
+    if value
+        .chars()
+        .any(|character| matches!(character, '\n' | '\r' | '\0'))
+    {
+        return Err(format!(
+            "scp option '-X {value}' contains a control character and is blocked"
+        ));
+    }
+    let lower = value.trim().to_ascii_lowercase();
+    if lower.starts_with("nrequests=") || lower.starts_with("buffer=") {
+        Ok(())
+    } else {
+        Err(format!(
+            "scp option '-X {value}' is blocked: only 'nrequests=' and 'buffer=' sftp options are allowed"
+        ))
+    }
+}
+
+const REMOTE_SHELL_METACHARACTERS: &[char] =
+    &[';', '&', '|', '$', '`', '<', '>', '(', ')', '\n', '\r', '\0'];
+
+fn validate_scp_remote_path(argument: &str, legacy: bool) -> Result<(), String> {
+    if let Some(rest) = argument.strip_prefix("scp://") {
+        return validate_scp_uri(rest, legacy);
+    }
+    let Some((host, path)) = split_scp_remote(argument) else {
+        return Ok(());
+    };
+    if host.is_empty() {
+        return Err(format!(
+            "scp remote target '{argument}' is missing a host"
+        ));
+    }
+    if host.starts_with('-') {
+        return Err(format!(
+            "scp remote host '{host}' starts with '-', which could be parsed as an ssh option"
+        ));
+    }
+    validate_scp_remote_path_text(path, legacy)
+}
+
+/// Validate the path part of an `scp://` URI. OpenSSH percent-decodes it
+/// before use, so both the raw text (old clients that do not understand URIs
+/// treat the whole string as `host:path`) and the decoded text are checked.
+fn validate_scp_uri(rest: &str, legacy: bool) -> Result<(), String> {
+    if let Some(character) = rest.chars().find(|character| {
+        character.is_control() || REMOTE_SHELL_METACHARACTERS.contains(character)
+    }) {
+        return Err(format!(
+            "scp URI contains control or shell metacharacter '{}', which could run commands on the remote host",
+            character.escape_default()
+        ));
+    }
+    let (authority, raw_path) = match rest.find('/') {
+        Some(index) => (&rest[..index], &rest[index + 1..]),
+        None => (rest, ""),
+    };
+    if authority.is_empty() {
+        return Err("scp URI is missing a host".to_string());
+    }
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    if host.is_empty() {
+        return Err("scp URI is missing a host".to_string());
+    }
+    if host.starts_with('-') {
+        return Err(format!(
+            "scp remote host '{host}' starts with '-', which could be parsed as an ssh option"
+        ));
+    }
+    let decoded = percent_decode(raw_path)
+        .ok_or_else(|| "scp URI path contains an invalid percent escape".to_string())?;
+    validate_scp_remote_path_text(&decoded, legacy)
+}
+
+fn validate_scp_remote_path_text(path: &str, legacy: bool) -> Result<(), String> {
+    if path.starts_with('-') {
+        return Err(format!(
+            "scp remote path '{path}' starts with '-', which the remote scp could parse as an option"
+        ));
+    }
+    if let Some(character) = path.chars().find(|character| {
+        character.is_control() || REMOTE_SHELL_METACHARACTERS.contains(character)
+    }) {
+        return Err(format!(
+            "scp remote path '{path}' contains control or shell metacharacter '{}', which could run commands on the remote host",
+            character.escape_default()
+        ));
+    }
+    // Legacy SCP interpolates the path unquoted into the remote command, so
+    // whitespace can introduce extra remote scp options. SFTP mode sends the
+    // path as a protocol field and does not have this constraint.
+    if legacy && path.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "scp legacy mode (-O) cannot safely quote whitespace in remote path '{path}'; use SFTP mode or a path without whitespace"
+        ));
+    }
+    Ok(())
+}
+
+/// Match OpenSSH's `colon()`: a leading `:` or any `/` before the split point
+/// makes the argument a local path. Brackets are honored only when they open
+/// the argument or follow `@`, so a colon before a bracket cannot hide a
+/// metacharacter in the host part.
+fn split_scp_remote(argument: &str) -> Option<(&str, &str)> {
+    let bytes = argument.as_bytes();
+    if bytes.first() == Some(&b':') {
+        return None;
+    }
+    // Windows drive letters (`C:\path`) are local paths.
+    #[cfg(windows)]
+    {
+        if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+            return None;
+        }
+    }
+    let mut bracketed = bytes.first() == Some(&b'[');
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'@' && bytes.get(index + 1) == Some(&b'[') {
+            bracketed = true;
+        } else if byte == b']' && bracketed && bytes.get(index + 1) == Some(&b':') {
+            return Some((&argument[..index + 1], &argument[index + 2..]));
+        } else if byte == b':' && !bracketed {
+            return Some((&argument[..index], &argument[index + 1..]));
+        } else if byte == b'/' {
+            return None;
+        }
+        index += 1;
+    }
+    None
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = hex_value(*bytes.get(index + 1)?)?;
+            let low = hex_value(*bytes.get(index + 2)?)?;
+            decoded.push(high * 16 + low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 // =========================================================================
