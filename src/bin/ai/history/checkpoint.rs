@@ -2148,12 +2148,31 @@ fn replace_snapshot_file(source: &Path, destination: &Path) -> io::Result<()> {
         return Ok(());
     }
     let _ = fs::remove_file(&temporary);
-    fs::copy(source, destination).map(|_| ())
+    replace_file_via_temporary(source, destination)
+}
+
+/// Replace `destination` with `source` without truncating an existing
+/// destination in place. `fs::copy` opens the destination for writing, which
+/// fails with `EACCES` when both the snapshot and the live copy are read-only
+/// (npm cache entries use mode 0444). Copy to a sibling temporary file and
+/// rename it over the destination instead; rename only requires write
+/// permission on the containing directory.
+fn replace_file_via_temporary(source: &Path, destination: &Path) -> io::Result<()> {
+    let temporary = destination.with_extension(format!("restore-{}", uuid::Uuid::new_v4()));
+    if let Err(error) = fs::copy(source, &temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
 fn replace_snapshot_file(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::copy(source, destination).map(|_| ())
+    replace_file_via_temporary(source, destination)
 }
 
 /// Normalize a checkpoint name into a safe file name (alphanumeric, `-`, `_`;
@@ -3847,6 +3866,36 @@ mod tests {
         assert_eq!(
             fs::read_to_string(live_assets.join("concurrent.md")).unwrap(),
             "concurrent output"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restoring_checkpoint_assets_replaces_read_only_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "ai-checkpoint-assets-read-only-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let checkpoint_assets = root.join("checkpoint");
+        let live_assets = root.join("live");
+        fs::create_dir_all(&checkpoint_assets).unwrap();
+        fs::create_dir_all(&live_assets).unwrap();
+        let source = checkpoint_assets.join("cache-entry");
+        let destination = live_assets.join("cache-entry");
+        fs::write(&source, "checkpoint").unwrap();
+        fs::write(&destination, "newer").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o444)).unwrap();
+
+        restore_checkpoint_assets(&checkpoint_assets, &live_assets).unwrap();
+
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "checkpoint");
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o444
         );
         let _ = fs::remove_dir_all(root);
     }
