@@ -40,6 +40,7 @@ pub(super) use lock::{
 // External call surface (unchanged from the pre-split single module): these
 // `pub(in crate::ai)` items are what history/mod.rs, sessions.rs, blob.rs and
 // checkpoint.rs reach through `super::sqlite::…`.
+pub(in crate::ai) use connection::close_cached_write_conn;
 #[cfg(test)]
 pub(in crate::ai) use context::write_context_snapshot_sqlite;
 pub(in crate::ai) use context::{

@@ -112,9 +112,10 @@ fn scoped_preflight_grace_has_separate_bounded_budget() {
         assert!(supervisor.grant_scoped_preflight_grace(&[target]));
         assert_eq!(supervisor.effective_max_iterations(1), 1 + expected_rounds);
     }
-    assert!(!supervisor.grant_scoped_preflight_grace(&[std::path::PathBuf::from(
-        "target-over-budget.rs"
-    )]));
+    assert!(
+        !supervisor
+            .grant_scoped_preflight_grace(&[std::path::PathBuf::from("target-over-budget.rs")])
+    );
     assert_eq!(
         supervisor.effective_max_iterations(1),
         1 + MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS
@@ -151,9 +152,10 @@ fn repeated_scoped_preflight_target_does_not_consume_new_budget() {
     );
 
     // ...while a new target beyond the budget is denied.
-    assert!(!supervisor.grant_scoped_preflight_grace(&[std::path::PathBuf::from(
-        "new-target-over-budget.rs"
-    )]));
+    assert!(
+        !supervisor
+            .grant_scoped_preflight_grace(&[std::path::PathBuf::from("new-target-over-budget.rs")])
+    );
 }
 
 #[test]
@@ -763,9 +765,8 @@ fn coarse_execute_command_signature_keeps_git_global_option_before_subcommand() 
 
 #[test]
 fn coarse_execute_command_signature_keeps_git_inspection_pathspecs() {
-    let first = coarse_execute_command_signature(
-        "git diff --stat -- src/conciliator/services/aeolus.py",
-    );
+    let first =
+        coarse_execute_command_signature("git diff --stat -- src/conciliator/services/aeolus.py");
     let same_target = coarse_execute_command_signature(
         "git status --short -- src/conciliator/services/aeolus.py",
     );
@@ -1128,11 +1129,7 @@ fn tool_round_checkpoint_never_forbids_tool_calls_at_any_level() {
             };
             let mut messages = Vec::new();
             inject_tool_round_checkpoint_note(&mut messages, 24, checkpoint);
-            let text = messages[0]
-                .content
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
+            let text = messages[0].content.as_str().unwrap_or_default().to_string();
             assert!(
                 text.contains("Checkpoints are advisory pacing only")
                     && text.contains("no checkpoint forbids tool calls"),
@@ -1179,7 +1176,10 @@ fn tool_round_checkpoint_record_is_a_persistable_one_line_marker() {
         "threshold=96",
         "action=checkpoint-and-continue",
     ] {
-        assert!(text.contains(part), "marker must contain {part}, got: {text}");
+        assert!(
+            text.contains(part),
+            "marker must contain {part}, got: {text}"
+        );
     }
     for instruction in ["do not", "Do not", "must", "should"] {
         assert!(

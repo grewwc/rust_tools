@@ -6,8 +6,8 @@ use crate::ai::mcp::SharedMcpClient;
 use crate::ai::{
     driver::skill_runtime,
     history::{
-        Message, ROLE_INTERNAL_NOTE, build_context_history_with_outcome, compact_session_history_with_app,
-        runtime_synthetic_user_message,
+        Message, ROLE_INTERNAL_NOTE, build_context_history_with_outcome,
+        compact_session_history_with_app, runtime_synthetic_user_message,
     },
     request,
     types::App,
@@ -111,7 +111,11 @@ const SESSION_ORIGIN_MAX_CHARS: usize = 2_000;
 /// absent from `history` byte-for-byte, project it from canonical history as a
 /// fixed Fact: exact, independent of compression and of the current question.
 /// The text never changes once the session starts, so it is prompt-cache stable.
-fn session_origin_fact(history_file: &Path, session_id: &str, history: &[Message]) -> Option<String> {
+fn session_origin_fact(
+    history_file: &Path,
+    session_id: &str,
+    history: &[Message],
+) -> Option<String> {
     let (index, prompt, reply) = crate::ai::history::read_session_origin_sqlite(history_file)
         .ok()
         .flatten()?;
@@ -425,50 +429,46 @@ pub(super) async fn prepare_turn(
     let reference_assets_dir = attachment_assets_dir.clone();
     let (history, compression_diagnostic, pending_image_digests) =
         tokio::task::spawn_blocking(move || {
-        let outcome = build_context_history_with_outcome(
-            history_count,
-            &history_file,
-            history_max_chars,
-            history_keep_last,
-            history_summary_max_chars,
-            overflow_dir,
-            cwd.as_deref(),
-        )
-        .map_err(|e| e.to_string())?;
-        // Capture compaction feedback before image substitution changes the
-        // projection size. The driver reports safe degradation without aborting
-        // turn preparation or discarding the retained source messages.
-        let compression_diagnostic = outcome.diagnostic();
-        let mut history = outcome.messages;
-        // Cross-turn image digests: replace prior turns' raw images with the
-        // digest persisted in history metadata, so a new turn does not re-send
-        // last turn's images to the model (consistent for all VL models). Images
-        // whose digest never reached metadata are reported back so the turn can
-        // retry persisting them instead of re-sending those images forever.
-        let digest_outcome = crate::ai::request::replace_old_images_with_persisted_digests(
-            &history_file,
-            &mut history,
-            Some(reference_assets_dir.as_path()),
-        )
-        .map_err(|e| e.to_string())?;
-        // Materialize immutable reference snapshots after digest substitution so
-        // digest-bearing turns stay text-only while other image references turn
-        // into inline images for the request projection.
-        for m in &mut history {
-            crate::ai::request::materialize_references(
-                &mut m.content,
+            let outcome = build_context_history_with_outcome(
+                history_count,
+                &history_file,
+                history_max_chars,
+                history_keep_last,
+                history_summary_max_chars,
+                overflow_dir,
+                cwd.as_deref(),
+            )
+            .map_err(|e| e.to_string())?;
+            // Capture compaction feedback before image substitution changes the
+            // projection size. The driver reports safe degradation without aborting
+            // turn preparation or discarding the retained source messages.
+            let compression_diagnostic = outcome.diagnostic();
+            let mut history = outcome.messages;
+            // Cross-turn image digests: replace prior turns' raw images with the
+            // digest persisted in history metadata, so a new turn does not re-send
+            // last turn's images to the model (consistent for all VL models). Images
+            // whose digest never reached metadata are reported back so the turn can
+            // retry persisting them instead of re-sending those images forever.
+            let digest_outcome = crate::ai::request::replace_old_images_with_persisted_digests(
+                &history_file,
+                &mut history,
                 Some(reference_assets_dir.as_path()),
-            );
-        }
-        Ok::<_, String>((
-            history,
-            compression_diagnostic,
-            digest_outcome.pending,
-        ))
-    })
-    .await
-    .map_err(|e| format!("context history task failed: {e}"))?
-    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            )
+            .map_err(|e| e.to_string())?;
+            // Materialize immutable reference snapshots after digest substitution so
+            // digest-bearing turns stay text-only while other image references turn
+            // into inline images for the request projection.
+            for m in &mut history {
+                crate::ai::request::materialize_references(
+                    &mut m.content,
+                    Some(reference_assets_dir.as_path()),
+                );
+            }
+            Ok::<_, String>((history, compression_diagnostic, digest_outcome.pending))
+        })
+        .await
+        .map_err(|e| format!("context history task failed: {e}"))?
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     if let Some(diagnostic) = compression_diagnostic
         && crate::ai::driver::runtime_ctx::terminal_output_enabled()
     {
@@ -488,8 +488,7 @@ pub(super) async fn prepare_turn(
             &format!("Today's date is {}.", date_str),
         );
     }
-    if let Some(origin) =
-        session_origin_fact(&app.session_history_file, &app.session_id, &history)
+    if let Some(origin) = session_origin_fact(&app.session_history_file, &app.session_id, &history)
     {
         skill_turn.push_labeled_section(
             skill_runtime::ContextKind::Fact,
@@ -777,7 +776,7 @@ pub(super) async fn prepare_turn(
         turn_messages,
         persisted_turn_messages: 0,
         max_iterations,
-       pending_image_digests,
+        pending_image_digests,
     })
 }
 
@@ -793,9 +792,8 @@ fn detect_complex_task(question: &str) -> bool {
 mod tests {
     use super::{
         QuestionShape, assemble_effective_question, build_user_redirect_reminder,
-        detect_complex_task, filter_suggested_tool_calls_for_tool_names,
-        inject_integrated_critic, persisted_user_turn_message,
-        task_evidence_handoff_messages,
+        detect_complex_task, filter_suggested_tool_calls_for_tool_names, inject_integrated_critic,
+        persisted_user_turn_message, task_evidence_handoff_messages,
     };
     use crate::ai::driver::observer::SuggestedToolCall;
     use crate::ai::history::Message;
@@ -976,14 +974,20 @@ mod tests {
         let mut guard = crate::ai::driver::skill_runtime::SkillTurnGuard::default();
         inject_integrated_critic(&mut guard, None, None);
         let system_prompt = guard.system_prompt().to_owned();
-        assert_eq!(system_prompt.matches("<integrated_critic_revise>").count(), 1);
+        assert_eq!(
+            system_prompt.matches("<integrated_critic_revise>").count(),
+            1
+        );
         assert!(system_prompt.contains(include_str!("prompts/integrated_critic_revise.md").trim()));
         assert_eq!(guard.system_prompt(), system_prompt);
         assert!(guard.context_reminder().is_none());
 
         // Preparation adds the behavior to the system prompt, not to prior turns.
         let mut request = vec![serde_json::json!({"role": "system", "content": system_prompt})];
-        let prior: Vec<_> = history.iter().map(|m| serde_json::to_value(m).unwrap()).collect();
+        let prior: Vec<_> = history
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
         request.extend(prior.iter().cloned());
         request.push(serde_json::json!({"role": "user", "content": question}));
         assert_eq!(&request[1..1 + prior.len()], prior.as_slice());
@@ -1022,7 +1026,11 @@ mod tests {
 
     #[test]
     fn integrated_critic_covers_short_plain_opening_question_without_deliberate_thinking() {
-        for question in ["今天几号", "What is the capital of France?", "一小时有多少分钟？"] {
+        for question in [
+            "今天几号",
+            "What is the capital of France?",
+            "一小时有多少分钟？",
+        ] {
             assert_default_critic(question, &[]);
             assert!(!QuestionShape::analyze(question).needs_deliberate_thinking(false));
         }
@@ -1064,21 +1072,30 @@ mod tests {
         assert_default_critic("continue", &[tool_call_only]);
         // A missing assistant body no longer disables the self-check.
         assert_default_critic("continue", &[message("assistant", Value::Null)]);
-        assert_default_critic("are you sure?", &[
-            message("user", text("hi")),
-            message("assistant", text("The cause is X.")),
-        ]);
+        assert_default_critic(
+            "are you sure?",
+            &[
+                message("user", text("hi")),
+                message("assistant", text("The cause is X.")),
+            ],
+        );
         // Once compaction replaces the answering turns, the summary is the
         // only trace of the earlier conclusion.
-        assert_default_critic("are you sure?", &[message(
-            ROLE_INTERNAL_NOTE,
-            text("[incremental-memory-v1]\n{\"source\":{}}"),
-        )]);
+        assert_default_critic(
+            "are you sure?",
+            &[message(
+                ROLE_INTERNAL_NOTE,
+                text("[incremental-memory-v1]\n{\"source\":{}}"),
+            )],
+        );
         // Redirect notes do not affect default coverage either.
-        assert_default_critic("new question", &[message(
-            ROLE_INTERNAL_NOTE,
-            text("Turn redirect: the previous turn ended in tool calls."),
-        )]);
+        assert_default_critic(
+            "new question",
+            &[message(
+                ROLE_INTERNAL_NOTE,
+                text("Turn redirect: the previous turn ended in tool calls."),
+            )],
+        );
     }
 
     #[test]
@@ -1099,7 +1116,10 @@ mod tests {
                 integrated.map(str::to_owned),
             );
             assert_eq!(
-                guard.system_prompt().matches("<integrated_critic_revise>").count(),
+                guard
+                    .system_prompt()
+                    .matches("<integrated_critic_revise>")
+                    .count(),
                 usize::from(expected),
                 "enabled={enabled:?}, integrated={integrated:?}",
             );
@@ -1116,7 +1136,13 @@ mod tests {
             let mut rebuilt = crate::ai::driver::skill_runtime::SkillTurnGuard::default();
             rebuilt.inherit_turn_state(&guard);
             assert_eq!(rebuilt.system_prompt(), expected);
-            assert_eq!(rebuilt.system_prompt().matches("<integrated_critic_revise>").count(), 1);
+            assert_eq!(
+                rebuilt
+                    .system_prompt()
+                    .matches("<integrated_critic_revise>")
+                    .count(),
+                1
+            );
             assert!(rebuilt.context_reminder().is_none());
             guard = rebuilt;
         }
@@ -1157,9 +1183,11 @@ mod tests {
         // The self-review must not impose an evidence-axis checklist, directly
         // or through a named rule.
         assert!(!prompt.contains("Match the evidence to the claim it supports"));
-        assert!(!prompt.contains(
-            "check the subject, time window, measurement scope, and artifact version"
-        ));
+        assert!(
+            !prompt.contains(
+                "check the subject, time window, measurement scope, and artifact version"
+            )
+        );
         assert!(prompt.contains("apply `A refuted premise invalidates its dependents`"));
         // Simple, already-determined answers must not turn into a confirmation loop.
         assert!(prompt.contains("no confirmation question when the answer is already determined"));

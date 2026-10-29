@@ -102,7 +102,8 @@ Do NOT retry patches in this batch — doing so will only fail again. Required r
             // "instruction documents" sends the caller looking for rules inside
             // the source file it was about to commit, so name each list for what
             // it is.
-            let docs = crate::ai::agents::load_scoped_project_instruction_docs_for_targets(&targets);
+            let docs =
+                crate::ai::agents::load_scoped_project_instruction_docs_for_targets(&targets);
             let doc_line = if docs.is_empty() {
                 String::new()
             } else {

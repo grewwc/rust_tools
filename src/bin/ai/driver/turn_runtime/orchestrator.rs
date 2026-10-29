@@ -17,8 +17,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use rustc_hash::{FxHashMap, FxHashSet};
 use rust_tools::commonw::FastSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ai::{history, mcp::SharedMcpClient, types::App};
 
@@ -30,20 +30,19 @@ use super::{
     },
     persistence::{persist_pending_turn_messages, persist_pending_turn_messages_for_model},
     prepare::prepare_turn,
-    turn_signals::{SignalKind, TurnSignalBudget},
     tool_result::{
         DEGENERATE_REPETITION_FINISH_REASON, FinalGateState, append_empty_response_retry_note,
         audit_evidence_gate_action, completion_evidence_state, completion_tool_result_succeeded,
         handle_iteration_execution_for_model, is_evidence_gated_audit_agent,
         tool_call_is_successful_mutation_candidate,
     },
+    turn_signals::{SignalKind, TurnSignalBudget},
     types::{IterationExecution, TurnLoopStep, TurnOutcome, TurnPreparation},
 };
 
 /// Final text when a sub-agent's request budget expires before either the original
 /// request or its wrap-up round produced visible output.
-const SUBAGENT_REQUEST_BUDGET_EMPTY_RESULT: &str =
-    "[subagent-request-budget] The model request exceeded its wall-clock budget before \
+const SUBAGENT_REQUEST_BUDGET_EMPTY_RESULT: &str = "[subagent-request-budget] The model request exceeded its wall-clock budget before \
      producing a final answer. No verified conclusions were returned; inspect the persisted \
      sub-agent history for partial evidence.";
 
@@ -223,8 +222,7 @@ const MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS: usize = 8;
 /// Repeats do not consume the new-target budget, and pause rounds return before the
 /// iteration-limit branch, so this total-grant cap provides the hard bound on a
 /// pause-only loop.
-const MAX_SCOPED_PREFLIGHT_TOTAL_GRACE_ROUNDS: usize =
-    MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS * 2;
+const MAX_SCOPED_PREFLIGHT_TOTAL_GRACE_ROUNDS: usize = MAX_SCOPED_PREFLIGHT_GRACE_ROUNDS * 2;
 
 #[derive(Default)]
 struct ScopedPreflightTargets {
@@ -454,9 +452,7 @@ impl ToolLoopSignal {
             Self::LowProgressLedger => Some(("low_progress_ledger", SignalKind::Advisory)),
             Self::LowProgressHard => Some(("low_progress_hard", SignalKind::HardStop)),
             Self::ReadOnlyBreadth => Some(("read_only_breadth", SignalKind::Advisory)),
-            Self::ReadOnlyBreadthHard => {
-                Some(("read_only_breadth_hard", SignalKind::HardStop))
-            }
+            Self::ReadOnlyBreadthHard => Some(("read_only_breadth_hard", SignalKind::HardStop)),
         }
     }
 }
@@ -1146,21 +1142,33 @@ pub(in crate::ai::driver) async fn run_turn(
                     } else {
                         None
                     };
-                run_turn_body(
-                    app,
-                    mcp_client,
-                    skill_manifests,
-                    history_count,
-                    turn_index,
-                    question,
-                    attachments_text,
-                    next_model,
-                    precomputed_ocr,
-                    one_shot_mode,
-                    self_generated_audit,
-                    should_quit,
-                )
-                .await
+                // Pin decision-log persistence to the session that owns this
+                // turn. `session_history_file` may point at a subagent child
+                // history, and a concurrent session switch can retarget the
+                // process-wide path; neither may reroute this turn's records.
+                let decision_log_target = crate::ai::driver::decision_log::turn_persist_target(
+                    &app.config.history_file,
+                    &app.session_id,
+                );
+                crate::ai::driver::runtime_ctx::DECISION_LOG_TARGET
+                    .scope(
+                        decision_log_target,
+                        run_turn_body(
+                            app,
+                            mcp_client,
+                            skill_manifests,
+                            history_count,
+                            turn_index,
+                            question,
+                            attachments_text,
+                            next_model,
+                            precomputed_ocr,
+                            one_shot_mode,
+                            self_generated_audit,
+                            should_quit,
+                        ),
+                    )
+                    .await
             })
             .await
     })
@@ -2593,9 +2601,7 @@ async fn run_turn_body(
                 },
             )
             .await;
-            if backfilled_digests > 0
-                && crate::ai::driver::runtime_ctx::terminal_output_enabled()
-            {
+            if backfilled_digests > 0 && crate::ai::driver::runtime_ctx::terminal_output_enabled() {
                 eprintln!(
                     "[image] backfilled {backfilled_digests} image digest(s) into history metadata"
                 );
@@ -2666,7 +2672,7 @@ async fn run_turn_body(
                             TurnOutcome::Quit
                         } else {
                             TurnOutcome::Continue
-                        })
+                        });
                     }
                 }
             }

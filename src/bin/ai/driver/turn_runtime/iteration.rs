@@ -1182,7 +1182,8 @@ async fn reclaim_tool_evidence_under_pressure(
     let mut budget =
         request::preview_request_budget(app, model, messages, true, tools_enabled).await;
     for _ in 0..MAX_RECLAIM_ROUNDS_PER_REQUEST {
-        if !under_reclaim_pressure(budget) || reclaim_tool_evidence_before_request(app, messages) == 0
+        if !under_reclaim_pressure(budget)
+            || reclaim_tool_evidence_before_request(app, messages) == 0
         {
             break;
         }
@@ -1771,9 +1772,8 @@ pub(super) async fn execute_turn_iteration(
     // Sub-agents get one absolute deadline per model request, covering the header
     // wait, transport retries, and the stream. Foreground turns get None and keep
     // their existing unbounded-per-attempt behavior.
-    let request_deadline = crate::ai::driver::runtime_ctx::subagent_model_request_deadline(
-        force_final_response,
-    );
+    let request_deadline =
+        crate::ai::driver::runtime_ctx::subagent_model_request_deadline(force_final_response);
 
     let shutdown = app.shutdown.clone();
     let cancel_stream = app.cancel_stream.clone();
@@ -2340,8 +2340,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_until_deadline_resolves_only_when_a_deadline_exists() {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(20);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             super::wait_until_deadline(Some(deadline)),

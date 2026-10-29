@@ -87,8 +87,7 @@ fn final_citation_gate_allows_a_refusal_that_names_a_missing_path() {
         uuid::Uuid::new_v4().simple()
     ));
     fs::create_dir_all(root.join("src")).unwrap();
-    let final_text =
-        "There is no `src/ghost.rs:3` to cite: `read_file src/ghost.rs` returned \"File not found\".";
+    let final_text = "There is no `src/ghost.rs:3` to cite: `read_file src/ghost.rs` returned \"File not found\".";
 
     // The path really is absent here, so an unexempted gate would reopen and then warn.
     assert!(unvalidated_final_response_citations(final_text, Some(&root)).is_empty());

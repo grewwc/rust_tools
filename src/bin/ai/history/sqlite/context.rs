@@ -1,9 +1,10 @@
 use std::{
-    io,
+    io::{self, Read, Write},
     path::Path,
     time::{Duration, Instant},
 };
 
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::super::compress;
@@ -280,8 +281,9 @@ pub(in crate::ai) fn write_context_snapshot_sqlite_with_busy_timeout(
 /// Number of replaced snapshots kept as rewind fallbacks.
 ///
 /// Each entry holds one projection: the compressed prefix plus whatever raw
-/// tail a retained rewind appended. The ring is therefore bounded in entries
-/// rather than bytes, which still keeps the fallback tables small.
+/// tail a retained rewind appended, stored as one gzip payload so a fallback
+/// keeps a single compressed copy instead of every projection row. The ring is
+/// therefore bounded in entries rather than bytes.
 const CONTEXT_SNAPSHOT_HISTORY_KEEP: usize = 8;
 
 /// Move the snapshot being replaced into the bounded rewind ring.
@@ -306,14 +308,20 @@ fn archive_context_snapshot(conn: &Connection, path: &Path) -> io::Result<()> {
     if source_generation != history_generation(conn)? {
         // A canonical rewrite already invalidated the projection; it cannot
         // prove coverage of any surviving prefix, and neither can older rows.
-        conn.execute("DELETE FROM context_messages_history", [])
-            .map_err(|error| sqlite_error(path, "clear context_messages_history", error))?;
         conn.execute("DELETE FROM context_snapshot_history", [])
             .map_err(|error| sqlite_error(path, "clear context_snapshot_history", error))?;
         return Ok(());
     }
     // History watermarks increase monotonically; an equivalent or newer range
     // is not an older fallback.
+    // A row without a payload cannot be promoted (for example one written by a
+    // build that predates payloads); drop it first so it neither blocks a new
+    // archive nor takes a ring slot.
+    conn.execute(
+        "DELETE FROM context_snapshot_history WHERE payload IS NULL",
+        [],
+    )
+    .map_err(|error| sqlite_error(path, "drop unpromotable ring entries", error))?;
     let newest = conn
         .query_row(
             "SELECT source_message_id FROM context_snapshot_history
@@ -326,36 +334,19 @@ fn archive_context_snapshot(conn: &Connection, path: &Path) -> io::Result<()> {
     if newest.is_some_and(|watermark| watermark >= source_message_id) {
         return Ok(());
     }
+    let payload = encode_context_history_payload(&read_archived_context_messages(conn, path)?)?;
     conn.execute(
-        "INSERT INTO context_snapshot_history (source_message_id, projection_fingerprint)
-         VALUES (?1, ?2)",
-        params![source_message_id, fingerprint],
+        "INSERT INTO context_snapshot_history
+            (source_message_id, projection_fingerprint, payload)
+         VALUES (?1, ?2, ?3)",
+        params![source_message_id, fingerprint, payload],
     )
     .map_err(|error| sqlite_error(path, "save context_snapshot_history", error))?;
-    let snapshot_id = conn.last_insert_rowid();
-    conn.execute(
-        "INSERT INTO context_messages_history
-            (snapshot_id, position, role, content, tool_calls, tool_call_id, reasoning_content)
-         SELECT ?1, position, role, content, tool_calls, tool_call_id, reasoning_content
-         FROM context_messages",
-        [snapshot_id],
-    )
-    .map_err(|error| sqlite_error(path, "save context_messages_history", error))?;
     Ok(())
 }
 
 /// Drop the oldest archived projections beyond the rewind ring.
 fn prune_context_snapshot_history(conn: &Connection, path: &Path) -> io::Result<()> {
-    conn.execute(
-        "DELETE FROM context_messages_history
-         WHERE snapshot_id IN (
-            SELECT snapshot_id FROM context_snapshot_history
-            ORDER BY source_message_id DESC, snapshot_id DESC
-            LIMIT -1 OFFSET ?1
-         )",
-        [CONTEXT_SNAPSHOT_HISTORY_KEEP as i64],
-    )
-    .map_err(|error| sqlite_error(path, "prune context_messages_history", error))?;
     conn.execute(
         "DELETE FROM context_snapshot_history
          WHERE snapshot_id IN (
@@ -367,6 +358,64 @@ fn prune_context_snapshot_history(conn: &Connection, path: &Path) -> io::Result<
     )
     .map_err(|error| sqlite_error(path, "prune context_snapshot_history", error))?;
     Ok(())
+}
+
+/// One row of a context projection, kept in exactly the strings
+/// `context_messages` stores so promotion never re-encodes message JSON.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ArchivedContextMessage {
+    position: i64,
+    role: String,
+    content: String,
+    tool_calls: Option<String>,
+    tool_call_id: Option<String>,
+    reasoning_content: Option<String>,
+}
+
+/// Read the current projection in the form archived into a ring entry.
+fn read_archived_context_messages(
+    conn: &Connection,
+    path: &Path,
+) -> io::Result<Vec<ArchivedContextMessage>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT position, role, content, tool_calls, tool_call_id, reasoning_content
+             FROM context_messages ORDER BY position ASC",
+        )
+        .map_err(|error| sqlite_error(path, "read context_messages for archive", error))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(ArchivedContextMessage {
+                position: row.get(0)?,
+                role: row.get(1)?,
+                content: row.get(2)?,
+                tool_calls: row.get(3)?,
+                tool_call_id: row.get(4)?,
+                reasoning_content: row.get(5)?,
+            })
+        })
+        .map_err(|error| sqlite_error(path, "read context_messages for archive", error))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| sqlite_error(path, "read context_messages for archive", error))
+}
+
+/// Serialize one ring entry into a single gzip payload.
+///
+/// A projection repeats message JSON structure and consecutive boundaries often
+/// share text, so one compressed payload is several times smaller than storing
+/// the same rows again. The ring is only read as a whole during a rewind, which
+/// makes a single payload a good fit.
+fn encode_context_history_payload(messages: &[ArchivedContextMessage]) -> io::Result<Vec<u8>> {
+    let json = serde_json::to_vec(messages).map_err(io::Error::other)?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&json)?;
+    encoder.finish()
+}
+
+fn decode_context_history_payload(payload: &[u8]) -> io::Result<Vec<ArchivedContextMessage>> {
+    let mut json = Vec::new();
+    GzDecoder::new(payload).read_to_end(&mut json)?;
+    serde_json::from_slice(&json).map_err(io::Error::other)
 }
 
 /// Restore the newest archived projection whose whole source range survives a
@@ -381,29 +430,42 @@ pub(super) fn promote_context_snapshot_from_history(
     max_kept_id: i64,
     generation: i64,
 ) -> io::Result<bool> {
-    let snapshot_id = conn
+    let entry = conn
         .query_row(
-            "SELECT snapshot_id FROM context_snapshot_history
-             WHERE source_message_id <= ?1
+            "SELECT snapshot_id, payload FROM context_snapshot_history
+             WHERE source_message_id <= ?1 AND payload IS NOT NULL
              ORDER BY source_message_id DESC LIMIT 1",
             [max_kept_id],
-            |row| row.get::<_, i64>(0),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()
         .map_err(|error| io::Error::other(error.to_string()))?;
-    let Some(snapshot_id) = snapshot_id else {
+    let Some((snapshot_id, payload)) = entry else {
         return Ok(false);
     };
+    let messages = decode_context_history_payload(&payload)?;
     conn.execute("DELETE FROM context_messages", [])
         .map_err(|error| io::Error::other(error.to_string()))?;
-    conn.execute(
-        "INSERT INTO context_messages
-            (position, role, content, tool_calls, tool_call_id, reasoning_content)
-         SELECT position, role, content, tool_calls, tool_call_id, reasoning_content
-         FROM context_messages_history WHERE snapshot_id = ?1",
-        [snapshot_id],
-    )
-    .map_err(|error| io::Error::other(error.to_string()))?;
+    {
+        let mut stmt = conn
+            .prepare(
+                "INSERT INTO context_messages
+                    (position, role, content, tool_calls, tool_call_id, reasoning_content)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        for message in &messages {
+            stmt.execute(params![
+                message.position,
+                message.role,
+                message.content,
+                message.tool_calls,
+                message.tool_call_id,
+                message.reasoning_content,
+            ])
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        }
+    }
     conn.execute(
         "INSERT INTO context_snapshot
             (singleton, source_message_id, source_generation, projection_fingerprint)
@@ -414,15 +476,6 @@ pub(super) fn promote_context_snapshot_from_history(
             source_generation = excluded.source_generation,
             projection_fingerprint = excluded.projection_fingerprint",
         params![snapshot_id, generation],
-    )
-    .map_err(|error| io::Error::other(error.to_string()))?;
-    conn.execute(
-        "DELETE FROM context_messages_history
-         WHERE snapshot_id IN (
-                SELECT snapshot_id FROM context_snapshot_history
-                WHERE source_message_id > ?1
-            )",
-        [max_kept_id],
     )
     .map_err(|error| io::Error::other(error.to_string()))?;
     conn.execute(

@@ -862,6 +862,53 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Decision logs live beside the session history file, so deleting a session
+    /// must remove them explicitly; the history sidecars alone do not cover them.
+    fn delete_decision_log_artifacts(path: &Path) -> io::Result<bool> {
+        // Clear the writer target first: even if a removal below fails, a
+        // long-lived process must not recreate logs for a session whose history
+        // is already gone.
+        crate::ai::driver::decision_log::clear_persist_path_if_matches(path);
+        let mut existed = false;
+        for artifact in
+            crate::ai::driver::decision_log::persist_artifact_paths_for_history_file(path)
+        {
+            existed |= artifact.exists();
+            remove_file_if_exists(&artifact)?;
+        }
+        Ok(existed)
+    }
+
+    /// Clear-all must also reclaim decision logs whose session history is already
+    /// gone: they are not enumerated by `list_sessions`.
+    fn delete_all_decision_log_artifacts(&self) -> io::Result<()> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(session_id) =
+                crate::ai::driver::decision_log::persist_artifact_session_id(file_name)
+            else {
+                continue;
+            };
+            if Self::validate_session_id(session_id).is_err() {
+                continue;
+            }
+            remove_file_if_exists(&entry.path())?;
+        }
+        Ok(())
+    }
+
     pub(in crate::ai) fn delete_session(&self, session_id: &str) -> io::Result<bool> {
         Self::validate_session_id(session_id)?;
         let path = self.session_history_file(session_id);
@@ -970,9 +1017,10 @@ impl SessionStore {
         let existed = path.exists();
         delete_history_artifacts(path)?;
         let derived_existed = self.delete_derived_session_history_artifacts(session_id)?;
+        let decision_logs_existed = Self::delete_decision_log_artifacts(path)?;
         delete_assets_dir(assets)?;
         remove_dir_if_exists(checkpoints)?;
-        Ok(existed || derived_existed)
+        Ok(existed || derived_existed || decision_logs_existed)
     }
 
     pub(in crate::ai) fn clear_session(&self, session_id: &str) -> io::Result<()> {
@@ -983,6 +1031,7 @@ impl SessionStore {
         super::checkpoint::with_checkpoint_lock(&checkpoints, || {
             delete_history_artifacts(&path)?;
             self.delete_derived_session_history_artifacts(session_id)?;
+            Self::delete_decision_log_artifacts(&path)?;
             delete_assets_dir(&assets)?;
             remove_dir_if_exists(&checkpoints)?;
             let _ = self.remove_session_size_cache_entry(session_id);
@@ -1038,7 +1087,9 @@ impl SessionStore {
                     deleted += 1;
                 }
             }
+            crate::ai::driver::decision_log::clear_decision_log_persist_path();
             self.delete_all_derived_session_history_artifacts()?;
+            self.delete_all_decision_log_artifacts()?;
             // Tolerate orphan checkpoint directories left by old versions:
             // they have no matching `.sqlite` and are not enumerated by
             // `list_sessions`, but clear-all must still wipe all session data.
@@ -2768,7 +2819,6 @@ mod tests {
             "context_snapshot",
             "context_messages",
             "context_snapshot_history",
-            "context_messages_history",
         ] {
             assert_eq!(
                 count_rows(&store.session_history_file(target_id), table),

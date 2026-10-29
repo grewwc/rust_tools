@@ -7,6 +7,9 @@
 //! - prompt-cache breakpoint injection (`cache_control`)
 //! - `reasoning_effort` tier resolution
 
+use std::sync::{Arc, LazyLock, Mutex};
+
+use rustc_hash::FxHashMap;
 use serde_json::{Map, Value, json};
 
 use super::super::{
@@ -17,7 +20,7 @@ use super::super::{
         compatible_wire_shapes, reasoning_effort_reduces_thinking_for, thinking_dialect_for,
         thinking_off_capability_for,
     },
-    types::App,
+    types::{App, ReasoningItemMap},
 };
 use crate::commonw::configw;
 
@@ -206,6 +209,93 @@ pub(super) fn normalize_reasoning_content_replay_from_parts(
     }
 }
 
+/// Decoded persisted encrypted-reasoning items, keyed by source model and the
+/// exact encoded blob.
+///
+/// A request projection is rebuilt for every preview and every send (several
+/// times per tool round). The persisted blob is immutable once written and the
+/// decode is a pure function of `(model, blob)`, so caching it removes repeated
+/// JSON parsing without changing which items are replayed: the full blob is
+/// the key, so a rewritten payload can never hit a stale entry.
+#[derive(Clone)]
+enum DecodedReasoning {
+    Items(Arc<Vec<Value>>),
+    Missing,
+}
+
+#[derive(Default)]
+struct DecodedReasoningCache {
+    by_model: FxHashMap<String, FxHashMap<String, DecodedReasoning>>,
+    entries: usize,
+    encoded_bytes: usize,
+}
+
+const DECODED_REASONING_CACHE_MAX_ENTRIES: usize = 64;
+const DECODED_REASONING_CACHE_MAX_ENCODED_BYTES: usize = 8 * 1024 * 1024;
+
+static DECODED_REASONING_CACHE: LazyLock<Mutex<DecodedReasoningCache>> =
+    LazyLock::new(|| Mutex::new(DecodedReasoningCache::default()));
+
+impl DecodedReasoningCache {
+    fn get(&self, model: &str, encoded: &str) -> Option<DecodedReasoning> {
+        self.by_model.get(model)?.get(encoded).cloned()
+    }
+
+    fn insert(&mut self, model: &str, encoded: &str, value: DecodedReasoning) {
+        // A single blob larger than the whole budget is decoded on demand
+        // rather than thrashing a cache it can never fit in.
+        if encoded.len() > DECODED_REASONING_CACHE_MAX_ENCODED_BYTES {
+            return;
+        }
+        if self
+            .by_model
+            .get(model)
+            .is_some_and(|bucket| bucket.contains_key(encoded))
+        {
+            return;
+        }
+        if self.entries >= DECODED_REASONING_CACHE_MAX_ENTRIES
+            || self.encoded_bytes + encoded.len() > DECODED_REASONING_CACHE_MAX_ENCODED_BYTES
+        {
+            self.by_model.clear();
+            self.entries = 0;
+            self.encoded_bytes = 0;
+        }
+        self.by_model
+            .entry(model.to_string())
+            .or_default()
+            .insert(encoded.to_string(), value);
+        self.entries += 1;
+        self.encoded_bytes += encoded.len();
+    }
+}
+
+fn decode_encrypted_reasoning_cached(model: &str, encoded: &str) -> Option<Arc<Vec<Value>>> {
+    let cached = DECODED_REASONING_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(model, encoded));
+    if let Some(value) = cached {
+        return match value {
+            DecodedReasoning::Items(items) => Some(items),
+            DecodedReasoning::Missing => None,
+        };
+    }
+    let decoded =
+        crate::ai::history::compress::decode_encrypted_reasoning_replay_for_model(model, encoded);
+    let value = match decoded {
+        Some(items) if !items.is_empty() => DecodedReasoning::Items(Arc::new(items)),
+        _ => DecodedReasoning::Missing,
+    };
+    if let Ok(mut cache) = DECODED_REASONING_CACHE.lock() {
+        cache.insert(model, encoded, value.clone());
+    }
+    match value {
+        DecodedReasoning::Items(items) => Some(items),
+        DecodedReasoning::Missing => None,
+    }
+}
+
 /// Rebuilds the side-channel map for Responses encrypted-reasoning replay from
 /// persisted messages (key = first tool_call id).
 ///
@@ -227,8 +317,8 @@ pub(super) fn normalize_reasoning_content_replay_from_parts(
 pub(super) fn reconstruct_encrypted_reasoning_items_for_model(
     model: &str,
     messages: &[Message],
-    live: &rustc_hash::FxHashMap<String, Vec<Value>>,
-) -> rustc_hash::FxHashMap<String, Vec<Value>> {
+    live: &ReasoningItemMap,
+) -> ReasoningItemMap {
     let mut merged = live.clone();
     if !models::reasoning_encrypted_replay_enabled(model)
         || !crate::ai::history::compress::encrypted_reasoning_replay_runtime_enabled()
@@ -253,14 +343,8 @@ pub(super) fn reconstruct_encrypted_reasoning_items_for_model(
         let Some(encoded) = message.reasoning_content.as_deref() else {
             continue;
         };
-        if let Some(items) =
-            crate::ai::history::compress::decode_encrypted_reasoning_replay_for_model(
-                model, encoded,
-            )
-        {
-            if !items.is_empty() {
-                merged.insert(first_call_id, items);
-            }
+        if let Some(items) = decode_encrypted_reasoning_cached(model, encoded) {
+            merged.insert(first_call_id, items);
         }
     }
     merged
@@ -574,11 +658,13 @@ pub(crate) fn reasoning_effort_display_label_from_parts(
 
 #[cfg(test)]
 mod encrypted_replay_reconstruct_tests {
+    use std::sync::Arc;
+
     use super::reconstruct_encrypted_reasoning_items_for_model;
     use crate::ai::history::Message;
     use crate::ai::history::compress::encode_encrypted_reasoning_replay_state;
     use crate::ai::test_support::ENV_LOCK;
-    use crate::ai::types::{FunctionCall, ToolCall};
+    use crate::ai::types::{FunctionCall, ReasoningItemMap, ToolCall};
     use rustc_hash::FxHashMap;
     use serde_json::{Value, json};
 
@@ -627,7 +713,7 @@ mod encrypted_replay_reconstruct_tests {
             &messages,
             &FxHashMap::default(),
         );
-        assert_eq!(rebuilt.get("call-1"), Some(&items));
+        assert_eq!(rebuilt.get("call-1").map(Arc::as_ref), Some(&items));
     }
 
     #[test]
@@ -635,18 +721,25 @@ mod encrypted_replay_reconstruct_tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let model = first_encrypted_replay_model_key();
         let stale = vec![json!({"encrypted_content":"OLD"})];
-        let fresh = vec![json!({"encrypted_content":"NEW"})];
+        let fresh = Arc::new(vec![json!({"encrypted_content":"NEW"})]);
         let messages = vec![assistant_call_with_reasoning(
             "call-1",
             Some(encode_encrypted_reasoning_replay_state(&model, &stale)),
         )];
-        let mut live: FxHashMap<String, Vec<Value>> = FxHashMap::default();
-        live.insert("call-1".to_string(), fresh.clone());
+        let mut live: ReasoningItemMap = ReasoningItemMap::default();
+        live.insert("call-1".to_string(), Arc::clone(&fresh));
         let rebuilt =
             reconstruct_encrypted_reasoning_items_for_model(&model, &messages, &live);
         // The in-memory side channel (freshest for the current turn) wins;
         // archived values must never overwrite it.
         assert_eq!(rebuilt.get("call-1"), Some(&fresh));
+        assert!(
+            Arc::ptr_eq(
+                rebuilt.get("call-1").expect("live entry survives"),
+                &fresh
+            ),
+            "live reasoning items must be shared, not deep-cloned"
+        );
     }
 
     #[test]
@@ -715,6 +808,81 @@ mod encrypted_replay_reconstruct_tests {
             Some(v) => unsafe { std::env::set_var("AIOS_DISABLE_ENCRYPTED_REPLAY", v) },
             None => unsafe { std::env::remove_var("AIOS_DISABLE_ENCRYPTED_REPLAY") },
         }
+    }
+
+    #[test]
+    fn repeated_reconstruction_reuses_cached_decoded_items() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let model = first_encrypted_replay_model_key();
+        let items = vec![json!({
+            "type": "reasoning",
+            "encrypted_content": "CACHE_REUSE_UNIQUE_ENC",
+        })];
+        let messages = vec![assistant_call_with_reasoning(
+            "call-cache-reuse",
+            Some(encode_encrypted_reasoning_replay_state(&model, &items)),
+        )];
+        let first = reconstruct_encrypted_reasoning_items_for_model(
+            &model,
+            &messages,
+            &ReasoningItemMap::default(),
+        );
+        let second = reconstruct_encrypted_reasoning_items_for_model(
+            &model,
+            &messages,
+            &ReasoningItemMap::default(),
+        );
+        assert_eq!(
+            first.get("call-cache-reuse").map(Arc::as_ref),
+            Some(&items)
+        );
+        assert!(
+            Arc::ptr_eq(
+                first.get("call-cache-reuse").expect("first decode"),
+                second.get("call-cache-reuse").expect("second decode"),
+            ),
+            "the second reconstruction must reuse the cached decode"
+        );
+    }
+
+    #[test]
+    fn changed_encoded_blob_does_not_hit_the_decode_cache() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let model = first_encrypted_replay_model_key();
+        let first_items = vec![json!({"encrypted_content": "CACHE_CHANGE_FIRST"})];
+        let second_items = vec![json!({"encrypted_content": "CACHE_CHANGE_SECOND"})];
+        let first_messages = vec![assistant_call_with_reasoning(
+            "call-cache-change",
+            Some(encode_encrypted_reasoning_replay_state(
+                &model,
+                &first_items,
+            )),
+        )];
+        let second_messages = vec![assistant_call_with_reasoning(
+            "call-cache-change",
+            Some(encode_encrypted_reasoning_replay_state(
+                &model,
+                &second_items,
+            )),
+        )];
+        let first = reconstruct_encrypted_reasoning_items_for_model(
+            &model,
+            &first_messages,
+            &ReasoningItemMap::default(),
+        );
+        let second = reconstruct_encrypted_reasoning_items_for_model(
+            &model,
+            &second_messages,
+            &ReasoningItemMap::default(),
+        );
+        assert_eq!(
+            second.get("call-cache-change").map(Arc::as_ref),
+            Some(&second_items)
+        );
+        assert!(!Arc::ptr_eq(
+            first.get("call-cache-change").expect("first decode"),
+            second.get("call-cache-change").expect("second decode"),
+        ));
     }
 }
 

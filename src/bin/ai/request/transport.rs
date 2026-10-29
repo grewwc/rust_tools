@@ -16,12 +16,12 @@ use super::super::{
     types::App,
 };
 use crate::ai::theme::{self, RESET};
-use crate::ai::types::ToolDefinition;
+use crate::ai::types::{ReasoningItemMap, ToolDefinition};
 
 use super::aux::charge_llm_usage_to_kernel;
 use super::builder::{
-    build_request_body, clamp_with_estimated_prompt, estimate_request_prompt_from_definitions,
-    estimate_request_prompt_upper, estimate_request_prompt_upper_from_definitions,
+    build_request_body, clamp_with_estimated_prompt, estimate_request_prompt_upper,
+    estimate_request_prompt_upper_from_definitions, measure_request_prompt_from_definitions,
     resolve_wire_enable_search,
 };
 use super::current_budget::{ContextLimits, CurrentRequestBudget, WaterBand, water_note};
@@ -135,7 +135,7 @@ fn maybe_emit_responses_reasoning_replay_diagnostic(
     model: &str,
     endpoint: &str,
     messages: &[Message],
-    reasoning_items: &rustc_hash::FxHashMap<String, Vec<Value>>,
+    reasoning_items: &ReasoningItemMap,
 ) {
     if !models::reasoning_encrypted_replay_enabled(model)
         || models::request_protocol_dialect(model, endpoint)
@@ -554,12 +554,7 @@ pub(crate) async fn preview_request_budget(
     core.messages
         .insert(0, water_meter_message(provisional_band));
     let measure = |messages: &[Message]| {
-        let (estimated, message_counts) = estimate_request_prompt_from_definitions(
-            messages,
-            tools_defs,
-            Some(&core.reasoning_items),
-        );
-        let estimated_upper = estimate_request_prompt_upper_from_definitions(
+        let counts = measure_request_prompt_from_definitions(
             messages,
             tools_defs,
             Some(&core.reasoning_items),
@@ -577,9 +572,9 @@ pub(crate) async fn preview_request_budget(
             reasoning.as_ref(),
             models::reasoning_encrypted_replay_enabled(model),
             stream,
-            estimated,
-            estimated_upper,
-            message_counts,
+            counts.lower_tokens(),
+            counts.upper_tokens(),
+            counts.message_counts(),
         );
         CurrentRequestBudget::measure(
             model,
@@ -605,7 +600,7 @@ struct RequestProjection {
     tool_choice: Option<Value>,
     enable_thinking: bool,
     reasoning_effort: Option<&'static str>,
-    reasoning_items: rustc_hash::FxHashMap<String, Vec<Value>>,
+    reasoning_items: ReasoningItemMap,
     tool_errors: rustc_hash::FxHashMap<String, bool>,
     endpoint: String,
 }
@@ -618,7 +613,7 @@ struct ProjectionCore {
     messages: Vec<Message>,
     enable_thinking: bool,
     reasoning_effort: Option<&'static str>,
-    reasoning_items: rustc_hash::FxHashMap<String, Vec<Value>>,
+    reasoning_items: ReasoningItemMap,
     tool_errors: rustc_hash::FxHashMap<String, bool>,
     endpoint: String,
 }
@@ -640,7 +635,7 @@ async fn prepare_projection_core(
     if let Ok(outcomes) =
         crate::ai::history::read_tool_execution_outcomes_cached(&app.session_history_file)
     {
-        fold_resolved_tool_failures(&mut normalized_messages, &outcomes);
+        fold_resolved_tool_failures(&mut normalized_messages, outcomes.as_slice());
     }
     let request_tool_names = tools_enabled
         .then(|| request_tool_names_for_model(app, model))

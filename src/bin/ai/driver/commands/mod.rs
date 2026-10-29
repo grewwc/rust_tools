@@ -127,9 +127,9 @@ pub fn is_local_command_start(token: &str) -> bool {
 
 /// Commands serve-chat forwards to the turn child even though the local REPL
 /// also recognizes them. The child executes them server-side: `/memo` after
-/// pre-turn dispatch, `/archive` in the pre-turn local-command path, `/task`,
-/// `/discuss`, and `/goal` inject a `forced_question` into the turn, and
-/// `/distill-session` runs in the turn dispatcher.
+/// pre-turn dispatch, `/archive` in the pre-turn local-command path, `/audit`
+/// and `/distill-session` in the turn dispatcher, and `/task`, `/discuss`, and
+/// `/goal` inject a `forced_question` into the turn.
 fn is_serve_forwarded_command_start(token: &str) -> bool {
     if memo::memo_command_args(token).is_some() {
         return true;
@@ -144,7 +144,7 @@ fn is_serve_forwarded_command_start(token: &str) -> bool {
     let word = rest.and_then(|r| r.split_whitespace().next()).unwrap_or("");
     matches!(
         word,
-        "task" | "discuss" | "goal" | "distill-session" | "archive"
+        "task" | "discuss" | "goal" | "distill-session" | "archive" | "audit"
     )
 }
 
@@ -616,6 +616,19 @@ mod tests {
             classify_serve_input("/archive last"),
             ServeInputRoute::ServerCommand
         );
+        for input in [
+            "/audit",
+            ":audit",
+            "/audit review the current diff",
+            "/audit -f check this change",
+            "/audit --fast check this change",
+        ] {
+            assert_eq!(
+                classify_serve_input(input),
+                ServeInputRoute::ServerCommand,
+                "{input}"
+            );
+        }
         assert_eq!(
             classify_serve_input("/memo keep this"),
             ServeInputRoute::ServerCommand
@@ -630,6 +643,10 @@ mod tests {
         );
         assert_eq!(
             classify_serve_input(":no-such-command"),
+            ServeInputRoute::UnknownCommand
+        );
+        assert_eq!(
+            classify_serve_input("/auditor review this"),
             ServeInputRoute::UnknownCommand
         );
         // Path-shaped absolute paths and ordinary prose stay prompts.

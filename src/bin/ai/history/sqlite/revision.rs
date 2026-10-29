@@ -160,8 +160,6 @@ pub(super) fn invalidate_context_snapshot(conn: &Connection) -> io::Result<()> {
         .map_err(|error| io::Error::other(error.to_string()))?;
     conn.execute("DELETE FROM context_snapshot", [])
         .map_err(|error| io::Error::other(error.to_string()))?;
-    conn.execute("DELETE FROM context_messages_history", [])
-        .map_err(|error| io::Error::other(error.to_string()))?;
     conn.execute("DELETE FROM context_snapshot_history", [])
         .map_err(|error| io::Error::other(error.to_string()))?;
     bump_history_generation(conn)?;

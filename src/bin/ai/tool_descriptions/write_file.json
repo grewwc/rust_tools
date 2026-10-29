@@ -1,6 +1,6 @@
 {
   "name": "write_file",
-  "description": "Write content to a file, replacing its entire contents (no append/merge); returns the absolute path. temp=true writes under the per-session temp dir; otherwise use an absolute or working-directory-relative path. A path outside the session's writable roots is rejected with `Write blocked` — write under the working directory, or use temp=true for scratch files.",
+  "description": "Write content to a file, replacing its entire contents (no append/merge); returns the absolute path. Writable roots include the working directory (or configured roots) and the session/system temp dirs; temp=true writes under the per-session temp dir. Paths outside them are rejected with `Write blocked`. Sensitive paths/names such as `.ssh/`, `.aws/`, `.npmrc`, and `config.json` are rejected even with temp=true.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -14,7 +14,7 @@
       },
       "temp": {
         "type": "boolean",
-        "description": "Write under the per-session temp directory for scratch/intermediate files (scripts, data dumps, fixtures); cleaned up when the session ends. (default: false)"
+        "description": "Write under the per-session temp directory for scratch/intermediate files (scripts, data dumps, fixtures); only the basename is kept; cleaned up when the session ends. (default: false)"
       }
     },
     "required": [

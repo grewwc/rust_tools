@@ -1442,19 +1442,108 @@ fn maybe_write_stream_content(
     Ok(())
 }
 
+/// A complete control envelope must close within this many bytes of its start marker;
+/// markers further away belong to unrelated text, not to a leaked control block.
 const PROVIDER_CONTROL_LEAK_MAX_SPAN: usize = 2_048;
 
-fn reasoning_contains_provider_control_leak(reasoning: &str) -> bool {
-    const START: &str = "<|end|>assistant to=";
-    const FOLLOWING_MARKERS: [&str; 3] = ["<|channel|>", "<|constrain|>", "<|message|>"];
+const PROVIDER_CONTROL_LEAK_START: &str = "<|end|>assistant to=";
+const PROVIDER_CONTROL_LEAK_FOLLOWING_MARKERS: [&str; 3] =
+    ["<|channel|>", "<|constrain|>", "<|message|>"];
 
-    let Some(start) = reasoning.rfind(START) else {
-        return false;
-    };
-    let suffix = &reasoning[start..];
-    let mut cursor = START.len();
-    for marker in FOLLOWING_MARKERS {
-        let Some(relative) = suffix[cursor..].find(marker) else {
+/// Streaming detector for a provider control envelope leaked into the reasoning channel.
+///
+/// The check runs after every reasoning fragment against the whole accumulation, so
+/// re-examining every candidate envelope on every fragment is quadratic in the reasoning
+/// length. The scanner keeps only the candidates whose verdict can still change: a start
+/// marker either completes its envelope inside the bounded span, or falls past that span
+/// and can never complete. Quoted masking is monotonic as well — spans only grow as text
+/// is appended — so a masked candidate is dropped too. In the common case, a reasoning
+/// body that never mentions the start marker, each fragment costs one search of the newly
+/// appended bytes.
+///
+/// The verdict is true when the accumulation carries a live provider control envelope:
+/// the envelope opens in live text rather than inside quoted content. A mention displays
+/// the same bytes as data (fenced block, inline code, quoted string); only an envelope
+/// the provider emits as protocol is malformed. Masked candidates are skipped while
+/// earlier occurrences are still examined, so a quotation can never shield a genuine
+/// earlier leak.
+pub(super) struct ProviderControlLeakScanner {
+    /// Bytes of the accumulation already searched for start markers.
+    scanned: usize,
+    /// Start markers whose envelope is incomplete but still inside the span window.
+    pending: Vec<usize>,
+}
+
+impl ProviderControlLeakScanner {
+    pub(super) fn new() -> Self {
+        Self {
+            scanned: 0,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Feed the current accumulation (not just the new fragment) and report whether it
+    /// carries a live, complete envelope.
+    ///
+    /// A first call with the whole text scans it once, so a non-streaming caller gets the
+    /// plain whole-text verdict.
+    pub(super) fn observe(&mut self, reasoning: &str) -> bool {
+        if reasoning.len() < self.scanned {
+            // The accumulation was replaced or truncated: offsets from the previous text
+            // no longer address this one.
+            self.scanned = 0;
+            self.pending.clear();
+        }
+        let previously_scanned = self.scanned;
+        // Re-read the tail of the scanned region so a start marker split across two
+        // fragments is recognized once its remainder arrives.
+        let mut search = floor_char_boundary(
+            reasoning,
+            previously_scanned.saturating_sub(PROVIDER_CONTROL_LEAK_START.len() - 1),
+        );
+        while let Some(relative) = reasoning[search..].find(PROVIDER_CONTROL_LEAK_START) {
+            let start = search + relative;
+            // A marker fully inside the already-searched prefix was handled by an earlier
+            // call; only markers completed by this fragment are new candidates.
+            if start + PROVIDER_CONTROL_LEAK_START.len() > previously_scanned {
+                self.pending.push(start);
+            }
+            search = start + PROVIDER_CONTROL_LEAK_START.len();
+        }
+        self.scanned = reasoning.len();
+
+        // A candidate that completed its envelope is decided below; one that is still
+        // incomplete can only complete while the accumulation stays inside its span.
+        let mut complete = Vec::new();
+        self.pending.retain(|&start| {
+            if envelope_completes(&reasoning[start..]) {
+                complete.push(start);
+                false
+            } else {
+                reasoning.len() - start <= PROVIDER_CONTROL_LEAK_MAX_SPAN
+            }
+        });
+        if complete.is_empty() {
+            return false;
+        }
+        // Quoted spans only matter once an envelope actually completed, which keeps the
+        // whole-text mask scan off the per-fragment path.
+        let quoted = quoted_content_spans(reasoning);
+        complete
+            .iter()
+            .any(|&start| !quoted.iter().any(|&(lo, hi)| start >= lo && start < hi))
+    }
+}
+
+/// Whether `suffix`, starting at a control start marker, carries the ordered following
+/// markers within `PROVIDER_CONTROL_LEAK_MAX_SPAN`.
+fn envelope_completes(suffix: &str) -> bool {
+    // A marker ending past the span is rejected below, so clamping the search window to
+    // the span cannot change the verdict while keeping the check constant-time.
+    let window = &suffix[..floor_char_boundary(suffix, PROVIDER_CONTROL_LEAK_MAX_SPAN)];
+    let mut cursor = PROVIDER_CONTROL_LEAK_START.len();
+    for marker in PROVIDER_CONTROL_LEAK_FOLLOWING_MARKERS {
+        let Some(relative) = window[cursor..].find(marker) else {
             return false;
         };
         cursor += relative + marker.len();
@@ -1463,6 +1552,85 @@ fn reasoning_contains_provider_control_leak(reasoning: &str) -> bool {
         }
     }
     true
+}
+
+/// Largest char boundary at or before `index`, so slices derived from byte spans that may
+/// land inside a multi-byte character stay valid.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Byte ranges of `reasoning` that display text as data instead of emitting
+/// it: fenced code blocks, inline code spans, and `"..."` strings. One
+/// forward scan masks every quotation form, so the envelope matcher needs no
+/// per-form rules. Inline spans end at a newline (a backslash-escaped newline
+/// continues the span, matching string-continuation semantics) and only
+/// balanced pairs mask. Residual risk: an unbalanced quote earlier on the
+/// same line can still pair with a later quote past a live envelope and mask
+/// it; observed leaks arrive as their own reasoning rather than mid-line
+/// after prose, so this stays accepted. An unclosed fence masks to the end,
+/// since the rest of a fenced paste is code by construction.
+fn quoted_content_spans(reasoning: &str) -> Vec<(usize, usize)> {
+    let bytes = reasoning.as_bytes();
+    let mut spans = Vec::new();
+    // Invariant: `i` is always a char boundary (fence/quote/span ends land
+    // past ASCII delimiters or `find` results; anything else advances one
+    // full char), so every `reasoning[i..]` slice below is safe.
+    let mut i = 0;
+    while i < bytes.len() {
+        if reasoning[i..].starts_with("```") {
+            let open = i;
+            let after_open = i + 3;
+            let close = reasoning[after_open..]
+                .find("```")
+                .map_or(reasoning.len(), |rel| after_open + rel + 3);
+            spans.push((open, close));
+            i = close;
+        } else if bytes[i] == b'"' {
+            match closing_quote_on_line(&reasoning[i + 1..]) {
+                Some(end) => {
+                    spans.push((i, i + 1 + end));
+                    i += 1 + end;
+                }
+                None => i += 1,
+            }
+        } else if bytes[i] == b'`' {
+            let rest = &reasoning[i + 1..];
+            match rest.find(|c| c == '`' || c == '\n') {
+                Some(rel) if rest[rel..].starts_with('`') => {
+                    spans.push((i, i + 1 + rel + 1));
+                    i += 1 + rel + 1;
+                }
+                _ => i += 1,
+            }
+        } else {
+            i += reasoning[i..].chars().next().map_or(1, |c| c.len_utf8());
+        }
+    }
+    spans
+}
+
+/// Byte offset (relative to `rest`, just past the opening `"`) one past the
+/// closing quote, or `None` when the line holds no balanced closing quote. A
+/// `\"` escape never closes the span.
+fn closing_quote_on_line(rest: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (idx, ch) in rest.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(idx + 1);
+        } else if ch == '\n' {
+            return None;
+        }
+}
+    None
 }
 
 #[cfg(test)]
@@ -1688,7 +1856,11 @@ fn process_stream_payload(
             .live_reasoning_tokens
             .saturating_add(estimate_stream_tokens(&emitted_reasoning));
 
-        if reasoning_contains_provider_control_leak(&state.content.reasoning_text) {
+        if state
+            .content
+            .provider_control_leak
+            .observe(&state.content.reasoning_text)
+        {
             state.content.finish_reason_seen = true;
             state.content.finish_reason_value =
                 Some(PROVIDER_CONTROL_LEAK_FINISH_REASON.to_string());

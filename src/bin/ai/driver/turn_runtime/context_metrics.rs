@@ -1,7 +1,11 @@
 //! Content-free projection measurements. Character budgets are not provider token usage.
 
 use serde::{Deserialize, Serialize};
-use std::{sync::{LazyLock, Mutex}, time::Instant};
+use std::{
+    hash::{Hash, Hasher},
+    sync::{LazyLock, Mutex},
+    time::Instant,
+};
 
 use crate::ai::{
     driver::decision_log::{DecisionLog, DecisionType, get_decision_log_store},
@@ -11,8 +15,9 @@ use crate::ai::{
 
 // Independent scheduler processes can share a session, but not a projection.
 // This counter describes replacements in this runtime, not persisted history revisions.
-static COMPACTION_CYCLES: LazyLock<Mutex<rustc_hash::FxHashMap<(String, Option<u64>), CompactionWindow>>> =
-    LazyLock::new(|| Mutex::new(rustc_hash::FxHashMap::default()));
+static COMPACTION_CYCLES: LazyLock<
+    Mutex<rustc_hash::FxHashMap<(String, Option<u64>), CompactionWindow>>,
+> = LazyLock::new(|| Mutex::new(rustc_hash::FxHashMap::default()));
 
 #[derive(Clone, Serialize)]
 struct CompactionWindow {
@@ -23,7 +28,11 @@ struct CompactionWindow {
 
 impl CompactionWindow {
     fn new(baseline: CurrentRequestBudget) -> Self {
-        Self { id: uuid::Uuid::new_v4().to_string(), cycle: 0, baseline }
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            cycle: 0,
+            baseline,
+        }
     }
 
     fn update(&mut self, after: CurrentRequestBudget, replaced: bool) {
@@ -36,8 +45,15 @@ impl CompactionWindow {
 }
 
 pub(super) fn current_compaction_cycle(session_id: &str) -> u64 {
-    let key = (session_id.to_string(), crate::ai::driver::current_task_pid());
-    COMPACTION_CYCLES.lock().unwrap_or_else(|e| e.into_inner()).get(&key).map_or(0, |window| window.cycle)
+    let key = (
+        session_id.to_string(),
+        crate::ai::driver::current_task_pid(),
+    );
+    COMPACTION_CYCLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .map_or(0, |window| window.cycle)
 }
 
 fn advance_cycle(cycle: &mut u64, replaced: bool) -> u64 {
@@ -48,26 +64,17 @@ fn advance_cycle(cycle: &mut u64, replaced: bool) -> u64 {
 }
 
 pub(super) fn projection_fingerprint(messages: &[Message]) -> u64 {
-    // Stream the serialized projection straight into the hasher instead of
-    // materializing the full JSON (a 300K-char projection is ~1MB+): this runs
-    // twice per compaction attempt (start + finish), so the Vec allocation would
-    // otherwise be repeated up to 4 times per request. The hashed stream is
-    // byte-identical to `serde_json::to_vec(messages)`.
-    use std::hash::Hasher;
-    use std::io::Write;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    struct HashWriter<'a, H: Hasher>(&'a mut H);
-    impl<H: Hasher> Write for HashWriter<'_, H> {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.write(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+    // This fingerprint only answers "did the projection change?" inside one
+    // process, and it runs up to four times per request (compaction start and
+    // finish plus the plan-prefix checks). Hash the message fields directly
+    // instead of running every value through JSON escaping first; the layout
+    // still mirrors `serde_json::to_value(messages)` shape for shape.
+    let mut hasher = rustc_hash::FxHasher::default();
+    4u8.hash(&mut hasher);
+    messages.len().hash(&mut hasher);
+    for message in messages {
+        crate::ai::request::hash_message(message, &mut hasher);
     }
-    // All Message fields serialize; no content or hash is emitted in telemetry.
-    serde_json::to_writer(HashWriter(&mut hasher), messages).expect("messages serialize");
     hasher.finish()
 }
 
@@ -107,9 +114,16 @@ pub(super) struct CompactionAttempt {
 }
 
 impl CompactionAttempt {
-    pub(super) fn start(trigger: &'static str, before: CurrentRequestBudget, messages: &[Message]) -> Self {
+    pub(super) fn start(
+        trigger: &'static str,
+        before: CurrentRequestBudget,
+        messages: &[Message],
+    ) -> Self {
         Self {
-            before, fingerprint: projection_fingerprint(messages), started: Instant::now(), trigger,
+            before,
+            fingerprint: projection_fingerprint(messages),
+            started: Instant::now(),
+            trigger,
             // Routine projection refreshes are not budget-triggered compaction attempts.
             _hooks: (trigger != "projection_maintenance")
                 .then(crate::ai::driver::hooks::CompressionHookGuard::new),
@@ -118,23 +132,40 @@ impl CompactionAttempt {
 
     /// Only a committed, different projection advances the cycle. Failed archive
     /// writes, rejected candidates and no-op summaries leave it unchanged.
-    pub(super) fn finish(self, session_id: &str, iteration: usize, model: &str,
-        after: CurrentRequestBudget, messages: &[Message], accepted: bool) {
-        // Skip the second full serialization when the candidate was rejected:
+    pub(super) fn finish(
+        self,
+        session_id: &str,
+        iteration: usize,
+        model: &str,
+        after: CurrentRequestBudget,
+        messages: &[Message],
+        accepted: bool,
+    ) {
+        // Skip the second full projection hash when the candidate was rejected:
         // `replaced` stays false regardless of the fingerprint in that case.
-        let replaced =
-            if accepted { self.fingerprint != projection_fingerprint(messages) } else { false };
+        let replaced = if accepted {
+            self.fingerprint != projection_fingerprint(messages)
+        } else {
+            false
+        };
         let window = {
-            let key = (session_id.to_string(), crate::ai::driver::current_task_pid());
+            let key = (
+                session_id.to_string(),
+                crate::ai::driver::current_task_pid(),
+            );
             let mut cycles = COMPACTION_CYCLES.lock().unwrap_or_else(|e| e.into_inner());
-            let window = cycles.entry(key).or_insert_with(|| CompactionWindow::new(self.before));
+            let window = cycles
+                .entry(key)
+                .or_insert_with(|| CompactionWindow::new(self.before));
             window.update(after, replaced);
             window.clone()
         };
         let elapsed_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let token_delta = prompt_token_delta(self.before.prompt_tokens, after.prompt_tokens);
         get_decision_log_store().log(DecisionLog {
-            timestamp: 0, session_id: session_id.to_string(), turn_id: iteration,
+            timestamp: 0,
+            session_id: session_id.to_string(),
+            turn_id: iteration,
             decision_type: DecisionType::ContextProjection,
             context: serde_json::json!({
                 "schema": "context-compaction-v2", "model": model, "cycle": window.cycle,
@@ -146,10 +177,15 @@ impl CompactionAttempt {
                 ),
                 "prompt_token_delta": token_delta,
                 "duration_ms": elapsed_ms,
-            }).to_string(),
-            alternatives_considered: Vec::new(), chosen_option: "compaction_attempt".to_string(),
-            reasoning: "Measured projection replacement; token count provenance is explicit.".to_string(),
-            confidence: None, outcome: None, execution_time_ms: Some(elapsed_ms),
+            })
+            .to_string(),
+            alternatives_considered: Vec::new(),
+            chosen_option: "compaction_attempt".to_string(),
+            reasoning: "Measured projection replacement; token count provenance is explicit."
+                .to_string(),
+            confidence: None,
+            outcome: None,
+            execution_time_ms: Some(elapsed_ms),
         });
     }
 }
@@ -301,6 +337,42 @@ mod tests {
     }
 
     #[test]
+    fn projection_fingerprint_tracks_structural_distinctions() {
+        let base = vec![
+            message("user", json!(["ab"])),
+            message("assistant", json!("c")),
+        ];
+        assert_eq!(
+            projection_fingerprint(&base),
+            projection_fingerprint(&base.clone())
+        );
+        // Message boundaries, JSON value kinds, and absent-vs-empty fields must
+        // stay distinguishable after dropping the serialization pass.
+        assert_ne!(
+            projection_fingerprint(&base),
+            projection_fingerprint(&[
+                message("user", json!(["a"])),
+                message("assistant", json!("bc")),
+            ]),
+        );
+        assert_ne!(
+            projection_fingerprint(&[message("user", json!(1))]),
+            projection_fingerprint(&[message("user", json!(1.0))]),
+        );
+        assert_ne!(
+            projection_fingerprint(&[message("user", json!(""))]),
+            projection_fingerprint(&[Message {
+                tool_calls: Some(Vec::new()),
+                ..message("user", json!(""))
+            }]),
+        );
+        assert_ne!(
+            projection_fingerprint(&[]),
+            projection_fingerprint(&[message("user", json!(null))]),
+        );
+    }
+
+    #[test]
     fn context_replay_cycle_only_advances_for_committed_different_projection() {
         let session = format!("compaction-cycle-{}", uuid::Uuid::new_v4());
         let budget: CurrentRequestBudget = serde_json::from_value(json!({
@@ -316,7 +388,10 @@ mod tests {
         CompactionAttempt::start("test", budget, &original)
             .finish(&session, 1, "model", budget, &changed, false);
         assert_eq!(current_compaction_cycle(&session), 0);
-        let after = CurrentRequestBudget { prompt_tokens: 7_000, ..budget };
+        let after = CurrentRequestBudget {
+            prompt_tokens: 7_000,
+            ..budget
+        };
         let mut window = CompactionWindow::new(budget);
         let initial_id = window.id.clone();
         window.update(after, false);
@@ -329,15 +404,23 @@ mod tests {
         CompactionAttempt::start("test", budget, &original)
             .finish(&session, 1, "model", after, &changed, true);
         assert_eq!(current_compaction_cycle(&session), 1);
-        CompactionAttempt::start("test", after, &changed)
-            .finish(&session, 2, "another model", after, &changed, true);
+        CompactionAttempt::start("test", after, &changed).finish(
+            &session,
+            2,
+            "another model",
+            after,
+            &changed,
+            true,
+        );
         assert_eq!(current_compaction_cycle(&session), 1);
         assert_eq!(current_compaction_cycle(&format!("{session}-other")), 0);
         let logs = get_decision_log_store().by_type(&DecisionType::ContextProjection);
-        let replaced: serde_json::Value = logs.iter()
+        let replaced: serde_json::Value = logs
+            .iter()
             .filter(|log| log.session_id == session)
             .map(|log| serde_json::from_str::<serde_json::Value>(&log.context).unwrap())
-            .find(|body| body["outcome"] == "replaced").unwrap();
+            .find(|body| body["outcome"] == "replaced")
+            .unwrap();
         assert_eq!(replaced["schema"], "context-compaction-v2");
         assert_eq!(replaced["prompt_token_delta"], -2_000);
         assert_eq!(replaced["cycle"], 1);
@@ -345,7 +428,10 @@ mod tests {
         assert_eq!(replaced["after"]["prompt_tokens"], 7_000);
         assert_eq!(replaced["window"]["baseline"]["prompt_tokens"], 7_000);
         assert!(replaced["window"]["id"].is_string());
-        assert_eq!(replaced["before"]["source"], "compatible_actual_plus_estimated_growth");
+        assert_eq!(
+            replaced["before"]["source"],
+            "compatible_actual_plus_estimated_growth"
+        );
         assert!(replaced["duration_ms"].is_u64());
         assert!(!replaced.to_string().contains("private"));
     }

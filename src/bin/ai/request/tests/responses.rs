@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::super::builder::RequestModelInputs;
 use super::super::protocol::build_http_body_for_json_messages_from_parts;
 use super::super::*;
@@ -157,6 +159,7 @@ fn responses_request_body_omits_assistant_reasoning_from_message_content() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        estimated_prompt_tokens_upper: 0,
         message_counts: Default::default(),
         prompt_cache_key: None,
         explicit_cache_breakpoints: false,
@@ -200,6 +203,7 @@ fn responses_request_body_emits_prompt_cache_key_only_when_set() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        estimated_prompt_tokens_upper: 0,
         message_counts: Default::default(),
         prompt_cache_key: None,
         explicit_cache_breakpoints: false,
@@ -252,6 +256,7 @@ fn responses_request_body_emits_bare_function_call_for_tool_turn() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        estimated_prompt_tokens_upper: 0,
         message_counts: Default::default(),
         prompt_cache_key: None,
         explicit_cache_breakpoints: false,
@@ -300,6 +305,7 @@ fn responses_request_body_drops_empty_text_content_items() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        estimated_prompt_tokens_upper: 0,
         message_counts: Default::default(),
         prompt_cache_key: None,
         explicit_cache_breakpoints: false,
@@ -387,6 +393,7 @@ fn responses_request_body_omits_include_without_encrypted_replay() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        estimated_prompt_tokens_upper: 0,
         message_counts: Default::default(),
         prompt_cache_key: None,
         explicit_cache_breakpoints: false,
@@ -422,12 +429,12 @@ fn responses_request_body_replays_reasoning_items_before_function_call() {
     let mut items = rustc_hash::FxHashMap::default();
     items.insert(
         "call_1".to_string(),
-        vec![json!({
+        Arc::new(vec![json!({
             "type": "reasoning",
             "id": "rs_abc",
             "encrypted_content": "ENC",
             "summary": [],
-        })],
+        })]),
     );
     let request = RequestBody {
         model: "gpt-5.5".to_string(),
@@ -444,6 +451,7 @@ fn responses_request_body_replays_reasoning_items_before_function_call() {
         reasoning_items: Some(&items),
         reasoning_encrypted_replay: true,
         estimated_prompt_tokens: 0,
+        estimated_prompt_tokens_upper: 0,
         message_counts: Default::default(),
         prompt_cache_key: None,
         explicit_cache_breakpoints: false,
@@ -499,6 +507,7 @@ fn responses_request_body_degrades_to_bare_function_call_without_reasoning_items
         reasoning_items: Some(&empty),
         reasoning_encrypted_replay: true,
         estimated_prompt_tokens: 0,
+        estimated_prompt_tokens_upper: 0,
         message_counts: Default::default(),
         prompt_cache_key: None,
         explicit_cache_breakpoints: false,
@@ -551,6 +560,7 @@ fn responses_request_body_replays_tool_round_narration_before_function_call() {
         reasoning_items: None,
         reasoning_encrypted_replay: false,
         estimated_prompt_tokens: 0,
+        estimated_prompt_tokens_upper: 0,
         message_counts: Default::default(),
         prompt_cache_key: None,
         explicit_cache_breakpoints: false,
@@ -591,12 +601,12 @@ fn responses_request_body_orders_reasoning_narration_function_call() {
     let mut items = rustc_hash::FxHashMap::default();
     items.insert(
         "call_1".to_string(),
-        vec![json!({
+        Arc::new(vec![json!({
             "type": "reasoning",
             "id": "rs_abc",
             "encrypted_content": "ENC",
             "summary": [],
-        })],
+        })]),
     );
     let request = RequestBody {
         model: "gpt-5.5".to_string(),
@@ -613,6 +623,7 @@ fn responses_request_body_orders_reasoning_narration_function_call() {
         reasoning_items: Some(&items),
         reasoning_encrypted_replay: true,
         estimated_prompt_tokens: 0,
+        estimated_prompt_tokens_upper: 0,
         message_counts: Default::default(),
         prompt_cache_key: None,
         explicit_cache_breakpoints: false,

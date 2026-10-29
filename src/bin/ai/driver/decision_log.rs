@@ -11,10 +11,51 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::ai::config_schema::AiConfig;
+use crate::commonw::configw;
+
 /// Byte cap for the on-disk decision log; exceeding it triggers one tail-retaining compaction. About 8MB.
 const DECISION_LOG_MAX_PERSIST_BYTES: u64 = 8 * 1024 * 1024;
 /// Number of recent lines retained after compaction (same order as the in-memory max_capacity, enough to replay the current session).
 const DECISION_LOG_RETAIN_LINES: usize = 2000;
+/// File-name suffixes of the persisted streams written beside a session history file.
+const DECISION_LOG_FILE_SUFFIX: &str = ".decision-log.jsonl";
+const DECISION_LOG_CONTEXT_FILE_SUFFIX: &str = ".decision-log.context.jsonl";
+/// New extensions replace the history file's `.sqlite` suffix.
+const DECISION_LOG_EXTENSION: &str = "decision-log.jsonl";
+const DECISION_LOG_CONTEXT_EXTENSION: &str = "context.jsonl";
+
+/// Persist path the writer uses for `history_file`. Session deletion derives its
+/// deletion set from the same functions so a removed session never leaves
+/// telemetry behind.
+pub(in crate::ai) fn persist_path_for_history_file(history_file: &Path) -> PathBuf {
+    history_file.with_extension(DECISION_LOG_EXTENSION)
+}
+
+/// Every file the persist writer can create for `history_file`: the decision
+/// log, its context-projection stream, and their compaction temp files.
+pub(in crate::ai) fn persist_artifact_paths_for_history_file(history_file: &Path) -> [PathBuf; 4] {
+    let decision_log = persist_path_for_history_file(history_file);
+    let context_log = context_log_path(&decision_log);
+    let decision_log_tmp = compaction_temp_path(&decision_log);
+    let context_log_tmp = compaction_temp_path(&context_log);
+    [decision_log, context_log, decision_log_tmp, context_log_tmp]
+}
+
+/// Session id encoded in a persisted decision-log artifact file name.
+pub(in crate::ai) fn persist_artifact_session_id(file_name: &str) -> Option<&str> {
+    let base = file_name.strip_suffix(".tmp").unwrap_or(file_name);
+    base.strip_suffix(DECISION_LOG_CONTEXT_FILE_SUFFIX)
+        .or_else(|| base.strip_suffix(DECISION_LOG_FILE_SUFFIX))
+}
+
+fn context_log_path(decision_log_path: &Path) -> PathBuf {
+    decision_log_path.with_extension(DECISION_LOG_CONTEXT_EXTENSION)
+}
+
+fn compaction_temp_path(log_path: &Path) -> PathBuf {
+    log_path.with_extension("jsonl.tmp")
+}
 
 /// Decision type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -94,6 +135,9 @@ pub enum UserFeedback {
 pub struct DecisionLogStore {
     logs: Arc<Mutex<Vec<DecisionLog>>>,
     // Observation must never evict decisions or consume their feedback targets.
+    // Context projections are persisted separately; only tests inspect their
+    // in-memory retention, so production does not allocate a second ring.
+    #[cfg(test)]
     context_logs: Arc<Mutex<Vec<DecisionLog>>>,
     max_capacity: usize,
     persist_path: Arc<Mutex<Option<PathBuf>>>,
@@ -103,6 +147,7 @@ impl DecisionLogStore {
     pub fn new(max_capacity: usize) -> Self {
         Self {
             logs: Arc::new(Mutex::new(Vec::with_capacity(max_capacity))),
+            #[cfg(test)]
             context_logs: Arc::new(Mutex::new(Vec::with_capacity(max_capacity))),
             max_capacity,
             persist_path: Arc::new(Mutex::new(None)),
@@ -119,30 +164,50 @@ impl DecisionLogStore {
         *guard = None;
     }
 
-    fn persist_log_if_enabled(&self, log: &DecisionLog) {
-        let path = {
-            let guard = self.persist_path.lock().unwrap();
-            guard.clone()
-        };
-        let Some(path) = path else {
-            return;
-        };
+    /// Drop the persist target only when it is `path`. Session deletion uses this
+    /// so a later log write cannot recreate the just-removed files while leaving
+    /// unrelated sessions' persistence untouched.
+    pub fn clear_persist_path_if_matches(&self, path: &Path) {
+        let mut guard = self.persist_path.lock().unwrap();
+        if guard.as_deref() == Some(path) {
+            *guard = None;
+        }
+    }
+
+    /// Resolve the persist target and serialize the record before it is moved
+    /// into an in-memory ring. Returns `None` when persistence is disabled.
+    fn prepare_persist_log(&self, log: &DecisionLog) -> Option<(PathBuf, String)> {
+        // A running turn pins its own target: its history file may be a
+        // subagent child while the process-wide target follows a session the
+        // user switched to mid-turn.
+        let path = match crate::ai::driver::runtime_ctx::decision_log_target() {
+            // A turn that outlived its session's deletion must not recreate
+            // the removed log files.
+            Some(target) if !target.session_history_file.exists() => None,
+            Some(target) => target.log_path,
+            None => {
+                let guard = self.persist_path.lock().unwrap();
+                guard.clone()
+            }
+        }?;
         // Independent disk retention prevents telemetry from compacting away decisions.
         let path = if log.decision_type == DecisionType::ContextProjection {
-            path.with_extension("context.jsonl")
+            context_log_path(&path)
         } else {
             path
         };
+        let line = serde_json::to_string(log).ok()?;
+        Some((path, line))
+    }
+
+    fn write_persist_log(&self, path: &Path, line: &str) {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
+        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
             return;
         };
-        let Ok(line) = serde_json::to_string(log) else {
-            return;
-        };
-        let _ = writeln!(file, "{}", line);
+        let _ = writeln!(file, "{line}");
         drop(file);
 
         // The decision log is append-only JSONL: the in-memory buffer is bounded by max_capacity, but the on-disk file
@@ -170,7 +235,7 @@ impl DecisionLogStore {
         let start = lines.len() - DECISION_LOG_RETAIN_LINES;
         let retained = lines.split_off(start);
 
-        let tmp_path = path.with_extension("jsonl.tmp");
+        let tmp_path = compaction_temp_path(path);
         let Ok(mut tmp) = OpenOptions::new()
             .create(true)
             .write(true)
@@ -195,27 +260,44 @@ impl DecisionLogStore {
 
     /// Record a decision
     pub fn log(&self, mut log: DecisionLog) {
-        let context_projection = log.decision_type == DecisionType::ContextProjection;
-        let buffer = if context_projection { &self.context_logs } else { &self.logs };
-        let mut logs = buffer.lock().unwrap();
-
-        // Set the timestamp
         log.timestamp = Local::now().timestamp_millis();
+        let context_projection = log.decision_type == DecisionType::ContextProjection;
+        // Serialize before moving the entry into memory: the writer only needs
+        // a shared borrow, so every record no longer costs a full clone.
+        let persist = self.prepare_persist_log(&log);
 
-        // If over capacity, drop the oldest 10%
-        if logs.len() >= self.max_capacity {
-            let remove_count = if context_projection {
-                (self.max_capacity / 10).max(1).min(logs.len())
-            } else {
-                self.max_capacity / 10
-            };
-            logs.drain(0..remove_count);
+        if context_projection {
+            // The on-disk context stream is the production retention path; the
+            // in-memory copy exists only for tests that inspect it.
+            #[cfg(test)]
+            self.push_context_observation(log);
+        } else {
+            self.push_decision(log);
         }
 
-        let persist_copy = log.clone();
+        if let Some((path, line)) = persist {
+            self.write_persist_log(&path, &line);
+        }
+    }
+
+    fn push_decision(&self, log: DecisionLog) {
+        let mut logs = self.logs.lock().unwrap();
+        // If over capacity, drop the oldest 10%.
+        if logs.len() >= self.max_capacity {
+            let remove_count = self.max_capacity / 10;
+            logs.drain(0..remove_count);
+        }
         logs.push(log);
-        drop(logs);
-        self.persist_log_if_enabled(&persist_copy);
+    }
+
+    #[cfg(test)]
+    fn push_context_observation(&self, log: DecisionLog) {
+        let mut logs = self.context_logs.lock().unwrap();
+        if logs.len() >= self.max_capacity {
+            let remove_count = (self.max_capacity / 10).max(1).min(logs.len());
+            logs.drain(0..remove_count);
+        }
+        logs.push(log);
     }
 
     /// Get the most recent N log entries
@@ -260,7 +342,8 @@ impl DecisionLogStore {
         out[start..].to_vec()
     }
 
-    /// Filter log entries by type
+    /// Filter log entries by type.
+    #[cfg(test)]
     pub fn by_type(&self, decision_type: &DecisionType) -> Vec<DecisionLog> {
         let buffer = if *decision_type == DecisionType::ContextProjection {
             &self.context_logs
@@ -393,7 +476,10 @@ impl DecisionLogStore {
     pub fn clear(&self) {
         let mut logs = self.logs.lock().unwrap();
         logs.clear();
-        self.context_logs.lock().unwrap().clear();
+        #[cfg(test)]
+        {
+            self.context_logs.lock().unwrap().clear();
+        }
     }
 }
 
@@ -706,6 +792,27 @@ mod tests {
         path
     }
 
+    /// The deletion path in `SessionStore` consumes these exact names, including
+    /// the compaction temp files, so pin the producer side to literal strings.
+    #[test]
+    fn persist_artifact_paths_match_documented_session_sidecars() {
+        let history_file = Path::new("/tmp/sessions/abc.sqlite");
+        let paths = persist_artifact_paths_for_history_file(history_file);
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("/tmp/sessions/abc.decision-log.jsonl"),
+                PathBuf::from("/tmp/sessions/abc.decision-log.context.jsonl"),
+                PathBuf::from("/tmp/sessions/abc.decision-log.jsonl.tmp"),
+                PathBuf::from("/tmp/sessions/abc.decision-log.context.jsonl.tmp"),
+            ]
+        );
+        for path in paths {
+            let file_name = path.file_name().unwrap().to_str().unwrap();
+            assert_eq!(persist_artifact_session_id(file_name), Some("abc"));
+        }
+    }
+
     #[test]
     fn test_log_store_basic() {
         let store = DecisionLogStore::new(100);
@@ -900,6 +1007,155 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_persist_path_if_matches_only_drops_matching_target() {
+        let store = DecisionLogStore::new(100);
+        let path = temp_log_path("decision_log_match");
+        store.set_persist_path(&path);
+        store.clear_persist_path_if_matches(Path::new("/tmp/unrelated.decision-log.jsonl"));
+
+        log_scheduler_dispatch(
+            &store,
+            "sess-a",
+            0,
+            "ctx",
+            vec!["a".to_string()],
+            "chosen",
+            "reason",
+            true,
+        );
+        assert!(path.exists(), "non-matching path must keep persisting");
+
+        store.clear_persist_path_if_matches(&path);
+        std::fs::remove_file(&path).unwrap();
+        log_scheduler_dispatch(
+            &store,
+            "sess-a",
+            1,
+            "ctx",
+            vec!["b".to_string()],
+            "chosen",
+            "reason",
+            true,
+        );
+        assert!(
+            !path.exists(),
+            "matching target must stop writes that would recreate deleted files"
+        );
+    }
+
+    #[test]
+    fn session_persist_path_follows_the_owning_session() {
+        let config = Path::new("/tmp/ai-config/history.sqlite");
+        assert_eq!(
+            session_persist_path(config, "sess-a"),
+            PathBuf::from("/tmp/ai-config/history.sessions/sess-a.decision-log.jsonl")
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_scope_overrides_and_restores_the_persist_target() {
+        let store = DecisionLogStore::new(100);
+        let global = temp_log_path("decision_log_global");
+        let scoped = temp_log_path("decision_log_turn");
+        let history = temp_log_path("decision_log_turn_history");
+        std::fs::write(&history, b"").unwrap();
+        store.set_persist_path(&global);
+
+        let target = crate::ai::driver::runtime_ctx::DecisionLogTarget {
+            log_path: Some(scoped.clone()),
+            session_history_file: history.clone(),
+        };
+        crate::ai::driver::runtime_ctx::DECISION_LOG_TARGET
+            .scope(target, async {
+                log_scheduler_dispatch(
+                    &store,
+                    "sess-a",
+                    0,
+                    "ctx",
+                    vec!["a".to_string()],
+                    "chosen",
+                    "reason",
+                    true,
+                );
+            })
+            .await;
+
+        assert!(scoped.exists(), "the turn target must receive the record");
+        assert!(
+            !global.exists(),
+            "the process-wide target must stay untouched during a turn"
+        );
+
+        log_scheduler_dispatch(
+            &store,
+            "sess-a",
+            1,
+            "ctx",
+            vec!["a".to_string()],
+            "chosen",
+            "reason",
+            true,
+        );
+        assert!(
+            global.exists(),
+            "outside a turn the process-wide target applies again"
+        );
+
+        std::fs::remove_file(&global).unwrap();
+        let target = crate::ai::driver::runtime_ctx::DecisionLogTarget {
+            log_path: None,
+            session_history_file: history.clone(),
+        };
+        crate::ai::driver::runtime_ctx::DECISION_LOG_TARGET
+            .scope(target, async {
+                log_scheduler_dispatch(
+                    &store,
+                    "sess-a",
+                    2,
+                    "ctx",
+                    vec!["a".to_string()],
+                    "chosen",
+                    "reason",
+                    true,
+                );
+            })
+            .await;
+        assert!(
+            !global.exists(),
+            "a turn that disables persistence must not fall back to the process-wide target"
+        );
+
+        // A session deletion clears the process-wide target; a still-running
+        // turn with a scoped target must not recreate the removed log files.
+        std::fs::remove_file(&scoped).unwrap();
+        std::fs::remove_file(&history).unwrap();
+        let target = crate::ai::driver::runtime_ctx::DecisionLogTarget {
+            log_path: Some(scoped.clone()),
+            session_history_file: history,
+        };
+        crate::ai::driver::runtime_ctx::DECISION_LOG_TARGET
+            .scope(target, async {
+                log_scheduler_dispatch(
+                    &store,
+                    "sess-a",
+                    3,
+                    "ctx",
+                    vec!["a".to_string()],
+                    "chosen",
+                    "reason",
+                    true,
+                );
+            })
+            .await;
+        assert!(
+            !scoped.exists(),
+            "a turn that outlived its session's deletion must not recreate the log"
+        );
+
+        let _ = std::fs::remove_file(scoped);
+    }
+
+    #[test]
     fn test_compact_persist_file_retains_recent_tail() {
         let store = DecisionLogStore::new(100);
         let path = temp_log_path("decision_log_compact");
@@ -1018,4 +1274,55 @@ pub fn set_decision_log_persist_path<P: AsRef<Path>>(path: P) {
 
 pub fn clear_decision_log_persist_path() {
     get_decision_log_store().clear_persist_path();
+}
+
+/// Stop persisting when `history_file` is the active persist target.
+pub(in crate::ai) fn clear_persist_path_if_matches(history_file: &Path) {
+    get_decision_log_store()
+        .clear_persist_path_if_matches(&persist_path_for_history_file(history_file));
+}
+
+/// Point persistence at `history_file`, or disable it when the feature is off.
+/// Session switches call this so logs follow the active session instead of a
+/// deleted (or previously active) one.
+pub(in crate::ai) fn sync_persist_path_for_history_file(history_file: &Path) {
+    if decision_log_persist_enabled() {
+        set_decision_log_persist_path(persist_path_for_history_file(history_file));
+    } else {
+        clear_decision_log_persist_path();
+    }
+}
+
+/// Persist target for a turn owned by `session_id` under `config_history_file`.
+///
+/// Derived from the owning session instead of `App::session_history_file`:
+/// subagent turns point that field at a child history file while their records
+/// still carry the parent `session_id`, and a concurrent session switch can
+/// move the process-wide target away from the session that produced the turn.
+pub(in crate::ai) fn turn_persist_target(
+    config_history_file: &Path,
+    session_id: &str,
+) -> crate::ai::driver::runtime_ctx::DecisionLogTarget {
+    let session_history =
+        crate::ai::history::SessionStore::new(config_history_file).session_history_file(session_id);
+    crate::ai::driver::runtime_ctx::DecisionLogTarget {
+        log_path: decision_log_persist_enabled()
+            .then(|| persist_path_for_history_file(&session_history)),
+        session_history_file: session_history,
+    }
+}
+
+#[cfg(test)]
+fn session_persist_path(config_history_file: &Path, session_id: &str) -> PathBuf {
+    let session_history =
+        crate::ai::history::SessionStore::new(config_history_file).session_history_file(session_id);
+    persist_path_for_history_file(&session_history)
+}
+
+fn decision_log_persist_enabled() -> bool {
+    configw::get_all_config()
+        .get_opt(AiConfig::DECISION_LOG_PERSIST_ENABLE)
+        .unwrap_or_else(|| "true".to_string())
+        .trim()
+        .eq_ignore_ascii_case("true")
 }

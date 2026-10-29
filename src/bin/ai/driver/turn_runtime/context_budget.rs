@@ -273,8 +273,12 @@ fn apply_pre_request_context_budget(
 /// an existing snapshot frozen (see [`ActivePlanProjection::frozen_or`]).
 pub(super) fn ensure_active_plan(app: &App, messages: &mut Vec<Message>) {
     let snapshot = ActivePlanProjection::take(messages);
-    ActivePlanProjection::frozen_or(snapshot, ActivePlanProjection::new(active_plan_text(app)), false)
-        .restore(messages);
+    ActivePlanProjection::frozen_or(
+        snapshot,
+        ActivePlanProjection::new(active_plan_text(app)),
+        false,
+    )
+    .restore(messages);
 }
 
 pub(super) fn apply_measured_context_budget(
@@ -290,7 +294,12 @@ pub(super) fn apply_measured_context_budget(
         budget.compression_target_chars(chars)
     } else {
         chars.saturating_add(
-            budget.tokens_to_chars(budget.limits.soft_target_tokens.saturating_sub(budget.prompt_tokens)),
+            budget.tokens_to_chars(
+                budget
+                    .limits
+                    .soft_target_tokens
+                    .saturating_sub(budget.prompt_tokens),
+            ),
         )
     };
     apply_context_budget_target(
@@ -409,7 +418,10 @@ fn apply_context_budget_target(
     // frozen text while it is reusable, keeping its query stable across requests.
     let reusable = !snapshot.pair.is_empty() && !fresh.pair.is_empty();
     let (reserved_chars, active_context) = if reusable {
-        (snapshot.chars().max(fresh.chars()), snapshot.text().to_string())
+        (
+            snapshot.chars().max(fresh.chars()),
+            snapshot.text().to_string(),
+        )
     } else {
         (fresh.chars(), fresh.text().to_string())
     };
@@ -553,9 +565,8 @@ fn apply_history_context_budget(
         // The spill pass already modified the projection before the lossy
         // attempt; keep its flag through the rollback so decision logs and the
         // context-budget progress line still report the change.
-        report.changed = tool_spilled > 0
-            || report.lossless_removed_messages > 0
-            || memory_projection.changed;
+        report.changed =
+            tool_spilled > 0 || report.lossless_removed_messages > 0 || memory_projection.changed;
         report.rolled_back = after_chars < scan.total_chars;
         if report.rolled_back {
             report.rollback_reason = Some(reason);
@@ -1212,13 +1223,8 @@ mod tests {
             &later_report,
         );
         let mut live = later_messages;
-        let (budget, report) = finish_pressured_projection(
-            &mut live,
-            original,
-            initial,
-            best,
-            later_report,
-        );
+        let (budget, report) =
+            finish_pressured_projection(&mut live, original, initial, best, later_report);
 
         assert_eq!(live, best_messages);
         assert_eq!(budget.prompt_tokens, 1_150);
@@ -1299,7 +1305,7 @@ mod tests {
             last_turn_interrupted: false,
             prune_marks: Default::default(),
             turn_reasoning_items: Default::default(),
-        turn_tool_errors: Default::default(),
+            turn_tool_errors: Default::default(),
             stale_patch_targets: Default::default(),
             tool_middlewares: Vec::new(),
             llm_middlewares: Vec::new(),
@@ -1346,7 +1352,10 @@ mod tests {
 
     #[test]
     fn context_budget_measured_tokens_gate_lossy_work_not_character_size_or_model_name() {
-        let history_file = std::env::temp_dir().join(format!("context-budget-measured-{}.sqlite", uuid::Uuid::new_v4()));
+        let history_file = std::env::temp_dir().join(format!(
+            "context-budget-measured-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
         let mut app = test_app(history_file);
         let canonical = vec![
             msg("system", "exact system"),
@@ -1366,7 +1375,10 @@ mod tests {
         apply_measured_context_budget(&app, budget, &mut messages);
         assert_eq!(messages, canonical);
 
-        let pressured = crate::ai::request::CurrentRequestBudget { prompt_tokens: 40_000, ..budget };
+        let pressured = crate::ai::request::CurrentRequestBudget {
+            prompt_tokens: 40_000,
+            ..budget
+        };
         let report = apply_measured_context_budget(&app, pressured, &mut messages);
         // The token gate opened: the target shrank below the current size even
         // though neither character size nor model name changed. But the
@@ -1381,7 +1393,10 @@ mod tests {
         assert!(!report.changed);
         assert_eq!(messages.first(), canonical.first());
         assert_eq!(messages.last(), canonical.last());
-        assert_eq!(canonical[1].content.as_str().unwrap().len(), "old narration ".len() * 4_000);
+        assert_eq!(
+            canonical[1].content.as_str().unwrap().len(),
+            "old narration ".len() * 4_000
+        );
     }
 
     #[test]
@@ -1817,9 +1832,7 @@ mod tests {
             msg("user", "continue"),
         ];
         let canonical = messages.clone();
-        assert!(!super::super::context_memory::has_projectable_recoverable_memory(
-            &messages
-        ));
+        assert!(!super::super::context_memory::has_projectable_recoverable_memory(&messages));
         let report = apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
         assert!(report.changed);
         assert_eq!(report.memory_projection_removed_messages, 0);
@@ -1989,7 +2002,10 @@ mod tests {
             // A complete snapshot stays frozen under an unchanged prefix; only a
             // turn without one gets the fresh rendering.
             let expected = if body.is_empty() { &fresh } else { &body };
-            assert_eq!(replacement.pair[1].content.as_str(), Some(expected.as_str()));
+            assert_eq!(
+                replacement.pair[1].content.as_str(),
+                Some(expected.as_str())
+            );
             assert!(fresh.contains("Fresh failure"));
             assert_eq!(messages, canonical, "budget={budget}");
         }
@@ -2269,10 +2285,8 @@ mod tests {
         // reflect that the projection was actually modified. Regression for the
         // rollback branch overwriting the spill flag with the lossless/memory
         // flags.
-        let history_file = std::env::temp_dir().join(format!(
-            "cb-spill-changed-{}.sqlite",
-            uuid::Uuid::new_v4()
-        ));
+        let history_file =
+            std::env::temp_dir().join(format!("cb-spill-changed-{}.sqlite", uuid::Uuid::new_v4()));
         let app = test_app(history_file);
         let mut messages = vec![
             msg("system", "system prompt"),
@@ -2313,10 +2327,8 @@ mod tests {
         // measured, not from `app.current_model` (stale during model-fallback
         // retries). A 40K result stays inline under a 1M-window model (64K
         // line) but spills under an unknown/empty model (32K line).
-        let history_file = std::env::temp_dir().join(format!(
-            "spill-cap-model-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let history_file =
+            std::env::temp_dir().join(format!("spill-cap-model-{}.json", uuid::Uuid::new_v4()));
         let app = test_app(history_file);
         let messages = vec![
             msg("system", "system prompt"),
@@ -2339,11 +2351,7 @@ mod tests {
             .map(|m| m.key.clone())
             .find(|key| crate::ai::models::context_window_tokens(key) >= 1_000_000)
             .expect("registry must keep at least one 1M-window model");
-        let wide = apply_pre_request_context_budget(
-            &app,
-            &wide_key,
-            &mut messages.clone(),
-        );
+        let wide = apply_pre_request_context_budget(&app, &wide_key, &mut messages.clone());
         assert_eq!(
             wide.tool_spill_saved_chars, 0,
             "40K result must stay inline under the 1M-window model line"

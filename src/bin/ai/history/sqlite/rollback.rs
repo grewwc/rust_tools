@@ -138,55 +138,65 @@ pub(super) fn rebase_metadata_after_rollback(
     transaction_id: Option<&str>,
 ) -> io::Result<()> {
     let mut conn = open_history_db(path)?;
-    init_history_schema(&conn)?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    // canonical has rolled back, so the old derived snapshots (possibly tagged with the generation at checkpoint time)
-    // no longer match; clear them to force the next read to recompute from canonical.
-    tx.execute("DELETE FROM context_messages", [])
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    tx.execute("DELETE FROM context_snapshot", [])
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    // The rewind ring is derived state too; a checkpoint restore must not
-    // leave a projection that a later truncation could promote.
-    tx.execute("DELETE FROM context_messages_history", [])
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    tx.execute("DELETE FROM context_snapshot_history", [])
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    // Each counter takes MAX(checkpoint value, live value) then +1 (generation/revision must strictly
-    // increase; turn_seq can simply take the live value, since it is the “next number to allocate”).
-    let bump_gen = live_generation.saturating_add(1).max(0);
-    let bump_rev = live_revision.saturating_add(1).max(0);
-    let bump_turn = live_turn_seq.max(0);
-    tx.execute(
-        "INSERT INTO meta (key, value) VALUES ('history_generation', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), CAST(?1 AS INTEGER))",
-        params![bump_gen.to_string()],
-    )
-    .map_err(|e| io::Error::other(e.to_string()))?;
-    tx.execute(
-        "INSERT INTO meta (key, value) VALUES ('turn_seq', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), CAST(?1 AS INTEGER))",
-        params![bump_turn.to_string()],
-    )
-    .map_err(|e| io::Error::other(e.to_string()))?;
-    tx.execute(
-        "INSERT INTO meta (key, value) VALUES ('history_revision', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), CAST(?1 AS INTEGER))",
-        params![bump_rev.to_string()],
-    )
-    .map_err(|e| io::Error::other(e.to_string()))?;
-    if let Some(transaction_id) = transaction_id {
+    let result = (|| {
+        init_history_schema(&conn)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        // canonical has rolled back, so the old derived snapshots (possibly tagged with the generation at checkpoint time)
+        // no longer match; clear them to force the next read to recompute from canonical.
+        tx.execute("DELETE FROM context_messages", [])
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        tx.execute("DELETE FROM context_snapshot", [])
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        // The rewind ring is derived state too; a checkpoint restore must not
+        // leave a projection that a later truncation could promote.
+        tx.execute("DELETE FROM context_snapshot_history", [])
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        // Each counter takes MAX(checkpoint value, live value) then +1 (generation/revision must strictly
+        // increase; turn_seq can simply take the live value, since it is the “next number to allocate”).
+        let bump_gen = live_generation.saturating_add(1).max(0);
+        let bump_rev = live_revision.saturating_add(1).max(0);
+        let bump_turn = live_turn_seq.max(0);
         tx.execute(
-            "INSERT INTO meta (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![CHECKPOINT_LIVE_ROLLBACK_META_KEY, transaction_id],
+            "INSERT INTO meta (key, value) VALUES ('history_generation', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), CAST(?1 AS INTEGER))",
+            params![bump_gen.to_string()],
         )
         .map_err(|e| io::Error::other(e.to_string()))?;
-    }
-    touch_session_activity(&tx)?;
-    tx.commit().map_err(|e| io::Error::other(e.to_string()))
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('turn_seq', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), CAST(?1 AS INTEGER))",
+            params![bump_turn.to_string()],
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('history_revision', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), CAST(?1 AS INTEGER))",
+            params![bump_rev.to_string()],
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+        if let Some(transaction_id) = transaction_id {
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![CHECKPOINT_LIVE_ROLLBACK_META_KEY, transaction_id],
+            )
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        }
+        touch_session_activity(&tx)?;
+        tx.commit().map_err(|e| io::Error::other(e.to_string()))
+    })();
+    // The caller renames this working DB over the live path immediately after
+    // this returns. Returning the connection to the thread-local write cache
+    // would keep the renamed inode's WAL index (`-shm`) alive in this process
+    // after publish deletes and recreates the sidecars: later connections to
+    // the live path would then attach to that stale, unlinked WAL index, so
+    // commits from other processes stay invisible here and our next write can
+    // overwrite them. Close it on every path so publication starts with no
+    // open users of the source file.
+    conn.close();
+    result
 }
 
 /// Prepare a rebased temporary DB inside the session state lock, then publish it to the live path
@@ -465,7 +475,9 @@ fn reset_history_for_subagent_unlocked(child: &Path) -> io::Result<()> {
     let result = (|| {
         let conn = open_history_db(&temporary)?;
         init_history_schema(&conn)?;
-        drop(conn);
+        // The staged file is renamed into place below, so it must be fully
+        // closed rather than returned to the connection cache.
+        conn.close();
         backup_sqlite(&temporary, child)
     })();
     let _ = fs::remove_file(&temporary);

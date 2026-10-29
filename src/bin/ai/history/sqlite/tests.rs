@@ -113,28 +113,26 @@ fn cached_outcomes_track_appends_and_prunes_without_stale_hits() {
 
     // Miss then hit: the second read serves the same rows from the cache.
     append_tool_execution_outcomes_sqlite(&path, &[outcome("call-1")]).unwrap();
-    assert_eq!(
-        read_tool_execution_outcomes_cached(&path).unwrap(),
-        vec![outcome("call-1")]
-    );
-    assert_eq!(
-        read_tool_execution_outcomes_cached(&path).unwrap(),
-        vec![outcome("call-1")]
-    );
+    let first = read_tool_execution_outcomes_cached(&path).unwrap();
+    assert_eq!(*first, vec![outcome("call-1")]);
+    let second = read_tool_execution_outcomes_cached(&path).unwrap();
+    assert_eq!(*second, vec![outcome("call-1")]);
+    // A cache hit must share the stored snapshot instead of copying the table.
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
 
     // A new append bumps the revision, so the next read re-scans instead of
     // returning the cached rows.
     append_history_sqlite(&path, vec![tool_msg("call-2", "second")]).unwrap();
     append_tool_execution_outcomes_sqlite(&path, &[outcome("call-2")]).unwrap();
     assert_eq!(
-        read_tool_execution_outcomes_cached(&path).unwrap(),
+        *read_tool_execution_outcomes_cached(&path).unwrap(),
         vec![outcome("call-1"), outcome("call-2")]
     );
 
     // History rewrites prune orphaned rows and bump the revision as well.
     replace_all_messages_sqlite(&path, &[tool_msg("call-2", "second")]).unwrap();
     assert_eq!(
-        read_tool_execution_outcomes_cached(&path).unwrap(),
+        *read_tool_execution_outcomes_cached(&path).unwrap(),
         vec![outcome("call-2")]
     );
 
@@ -216,6 +214,41 @@ fn rollback_metadata_read_error_does_not_replace_live_history() {
     let messages = read_all_messages_sqlite(&live).unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(value_to_string(&messages[0].content), "live message");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn restored_live_db_opens_with_a_fresh_wal_index() {
+    let dir = std::env::temp_dir().join(format!(
+        "rollback_fresh_wal_index_{}_{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let live = dir.join("live.sqlite");
+    let checkpoint = dir.join("checkpoint.sqlite");
+    append_history_sqlite(&live, vec![msg("user", "live")]).unwrap();
+    append_history_sqlite(&checkpoint, vec![msg("user", "restored")]).unwrap();
+
+    restore_sqlite_after_rollback(&checkpoint, &live).unwrap();
+
+    // The working copy used to build the replacement must be fully closed
+    // before it is renamed over the live path. A connection left in the
+    // thread-local cache keeps the old, already-unlinked WAL index (shm)
+    // mapping alive for the new live inode; a later connection in this
+    // process then reuses that ghost index instead of creating the live
+    // sidecar, so commits from other processes stay invisible here.
+    let restored = Connection::open(&live).unwrap();
+    let count: i64 = restored
+        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+    assert!(
+        dir.join("live.sqlite-shm").exists(),
+        "opening the published DB must create a fresh WAL index for its inode"
+    );
+    drop(restored);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -421,6 +454,66 @@ fn history_revision_cache_invalidates_on_wal_write_with_live_connection() {
     );
 
     drop(guard);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn history_connection_caps_wal_size_after_checkpoint() {
+    let dir = std::env::temp_dir().join(format!(
+        "hist_wal_limit_{}_{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    let mut conn = open_history_db(&path).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA journal_size_limit", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        super::connection::HISTORY_WAL_SIZE_LIMIT_BYTES,
+        "every history connection must cap the retained WAL"
+    );
+
+    conn.execute_batch(
+        "PRAGMA wal_autocheckpoint=0;
+         CREATE TABLE payload(data BLOB);",
+    )
+    .unwrap();
+    let tx = conn.transaction().unwrap();
+    {
+        let mut insert = tx
+            .prepare("INSERT INTO payload(data) VALUES(randomblob(4096))")
+            .unwrap();
+        for _ in 0..2000 {
+            insert.execute([]).unwrap();
+        }
+    }
+    tx.commit().unwrap();
+
+    let wal_path = dir.join("history.db-wal");
+    let wal_size = std::fs::metadata(&wal_path).unwrap().len();
+    assert!(wal_size > super::connection::HISTORY_WAL_SIZE_LIMIT_BYTES as u64);
+
+    conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    assert_eq!(
+        std::fs::metadata(&wal_path).unwrap().len(),
+        wal_size,
+        "a checkpoint resets the WAL but does not shrink the file by itself"
+    );
+
+    conn.execute("INSERT INTO payload(data) VALUES(randomblob(1))", [])
+        .unwrap();
+    assert!(
+        std::fs::metadata(&wal_path).unwrap().len()
+            <= super::connection::HISTORY_WAL_SIZE_LIMIT_BYTES as u64,
+        "the first commit after a checkpoint reset must truncate the retained WAL"
+    );
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM payload", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 2001, "truncation must not discard committed rows");
+
+    drop(conn);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1464,14 +1557,15 @@ fn rollback_clears_context_snapshot_history() {
     // must go, including the archived rewind ring.
     let conn = open_history_db(&path).unwrap();
     let generation_before = super::revision::history_generation(&conn).unwrap();
-    for table in ["context_snapshot_history", "context_messages_history"] {
-        let count: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(count, 1, "{table} should hold an archive before the rebase");
-    }
+    let archived: i64 = conn
+        .query_row("SELECT COUNT(*) FROM context_snapshot_history", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        archived, 1,
+        "context_snapshot_history should hold an archive before the rebase"
+    );
     drop(conn);
     super::rollback::rebase_metadata_after_rollback(
         &path,
@@ -1487,7 +1581,6 @@ fn rollback_clears_context_snapshot_history() {
         "context_snapshot",
         "context_messages",
         "context_snapshot_history",
-        "context_messages_history",
     ] {
         let count: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -1619,18 +1712,238 @@ fn truncate_after_clear_cannot_promote_pre_clear_ring_entry() {
     truncate_messages_sqlite(&path, 1).unwrap();
 
     let conn = open_history_db(&path).unwrap();
-    for table in ["context_snapshot_history", "context_messages_history"] {
-        let count: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(count, 0, "{table} must stay empty after a clear");
-    }
+    let archived: i64 = conn
+        .query_row("SELECT COUNT(*) FROM context_snapshot_history", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(archived, 0, "the ring must stay empty after a clear");
     drop(conn);
     let projected = read_context_history_sqlite(&path, PROJECTION).unwrap();
     assert_eq!(projected.messages, vec![surviving]);
     assert!(!projected.snapshot_is_current);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ring_entries_store_one_compressed_payload_and_promote_exactly() {
+    use crate::ai::types::{FunctionCall, ToolCall};
+
+    const PROJECTION: &str = "ring-payload";
+    let dir = std::env::temp_dir().join(format!(
+        "ring_payload_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    let first_turn = vec![msg("user", "first"), msg("assistant", "first answer")];
+    append_history_sqlite(&path, first_turn).unwrap();
+    let first_source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    let long_summary = format!("[summary] {}", "first turn detail ".repeat(200));
+    let first_summary = msg(ROLE_INTERNAL_NOTE, &long_summary);
+    let mut tool_turn = msg("assistant", "read the file");
+    tool_turn.tool_calls = Some(vec![ToolCall {
+        id: "call-1".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "read_file".to_string(),
+            arguments: "{\"path\":\"a.txt\"}".to_string(),
+        },
+    }]);
+    tool_turn.reasoning_content = Some("the file holds the answer".to_string());
+    let tool_result = tool_msg("call-1", "file body");
+    let first_projection = vec![first_summary.clone(), tool_turn.clone(), tool_result.clone()];
+    assert!(
+        write_context_snapshot_sqlite(
+            &path,
+            &first_projection,
+            first_source.source_message_id,
+            first_source.canonical_generation,
+            PROJECTION,
+        )
+        .unwrap()
+    );
+    let archived_rows: i64 = open_history_db(&path)
+        .unwrap()
+        .query_row(
+            "SELECT COALESCE(SUM(LENGTH(role) + LENGTH(content) + LENGTH(IFNULL(tool_calls, ''))
+                + LENGTH(IFNULL(tool_call_id, '')) + LENGTH(IFNULL(reasoning_content, ''))), 0)
+             FROM context_messages",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    append_history_sqlite(&path, vec![msg("user", "second")]).unwrap();
+    let second_source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert!(
+        write_context_snapshot_sqlite(
+            &path,
+            &[
+                first_summary,
+                tool_turn,
+                tool_result,
+                msg("user", "second"),
+            ],
+            second_source.source_message_id,
+            second_source.canonical_generation,
+            PROJECTION,
+        )
+        .unwrap()
+    );
+
+    // The replaced projection is one payload on its ring row, and gzip keeps it
+    // smaller than the row text it covers.
+    let conn = open_history_db(&path).unwrap();
+    let payload: Vec<u8> = conn
+        .query_row("SELECT payload FROM context_snapshot_history", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(
+        (payload.len() as i64) < archived_rows,
+        "payload {} should be smaller than {archived_rows} bytes of archived rows",
+        payload.len()
+    );
+    let legacy_table: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'context_messages_history'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_table, 0, "the per-row ring table is retired");
+    drop(conn);
+
+    // Promotion restores the archived projection exactly.
+    truncate_messages_sqlite(&path, 2).unwrap();
+    let projected = read_context_history_sqlite(&path, PROJECTION).unwrap();
+    assert_eq!(projected.messages, first_projection);
+    assert!(projected.snapshot_is_current);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v1_ring_rows_are_dropped_when_payloads_replace_the_row_table() {
+    let dir = std::env::temp_dir().join(format!(
+        "ring_payload_migration_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE context_snapshot_history (
+            snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_message_id INTEGER NOT NULL,
+            projection_fingerprint TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+        CREATE TABLE context_messages_history (
+            snapshot_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tool_calls TEXT,
+            tool_call_id TEXT,
+            reasoning_content TEXT,
+            PRIMARY KEY (snapshot_id, position)
+        );
+        INSERT INTO context_snapshot_history (source_message_id, projection_fingerprint)
+            VALUES (7, 'v1');
+        INSERT INTO context_messages_history (snapshot_id, position, role, content)
+            VALUES (1, 0, 'assistant', 'old');
+        PRAGMA user_version = 1;",
+    )
+    .unwrap();
+
+    super::migrations::init_history_schema(&conn).unwrap();
+
+    let legacy_table: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'context_messages_history'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_table, 0);
+    let ring: i64 = conn
+        .query_row("SELECT COUNT(*) FROM context_snapshot_history", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        ring, 0,
+        "an entry without a payload cannot be promoted and must not linger"
+    );
+    let payload_column: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('context_snapshot_history')
+             WHERE name = 'payload'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(payload_column, 1);
+    let version: i32 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, super::migrations::HISTORY_SCHEMA_VERSION);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ring_prune_keeps_only_the_newest_eight_payloads() {
+    const PROJECTION: &str = "ring-prune";
+    let dir = std::env::temp_dir().join(format!(
+        "ring_prune_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    append_history_sqlite(&path, vec![msg("user", "start")]).unwrap();
+    for turn in 0..10 {
+        let source = read_context_history_sqlite(&path, PROJECTION).unwrap();
+        append_history_sqlite(&path, vec![msg("user", &format!("turn {turn}"))]).unwrap();
+        assert!(
+            write_context_snapshot_sqlite(
+                &path,
+                &[msg(ROLE_INTERNAL_NOTE, &format!("[summary] turn {turn}"))],
+                source.source_message_id,
+                source.canonical_generation,
+                PROJECTION,
+            )
+            .unwrap()
+        );
+    }
+
+    let conn = open_history_db(&path).unwrap();
+    let (rows, newest, unpromotable): (i64, i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(MAX(source_message_id), 0),
+                    COALESCE(SUM(payload IS NULL), 0)
+             FROM context_snapshot_history",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(rows, 8, "the ring keeps eight fallbacks");
+    assert_eq!(newest, 9, "the live projection is not a ring entry");
+    assert_eq!(unpromotable, 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1961,5 +2274,138 @@ fn session_origin_reads_first_real_exchange_verbatim_past_synthetic_and_tool_row
     assert_eq!(index, 1);
     assert_eq!(prompt, "第一轮：帮我看下 src/main.rs");
     assert_eq!(reply.as_deref(), Some("main 只有一个空函数。"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn write_connection_is_reused_within_a_thread() {
+    let dir = std::env::temp_dir().join(format!(
+        "write_conn_reuse_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+
+    {
+        let conn = open_history_db(&path).unwrap();
+        super::migrations::init_history_schema(&conn).unwrap();
+        // TEMP tables are connection-local: observing this row after the first
+        // guard is dropped proves the same SQLite connection came back.
+        conn.execute_batch(
+            "CREATE TEMP TABLE reuse_probe(value INTEGER);
+             INSERT INTO reuse_probe VALUES (42);",
+        )
+        .unwrap();
+    }
+
+    {
+        let conn = open_history_db(&path).unwrap();
+        let value: i64 = conn
+            .query_row("SELECT value FROM reuse_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 42);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deleted_history_is_not_reused_for_a_new_database_at_the_same_path() {
+    let dir = std::env::temp_dir().join(format!(
+        "write_conn_delete_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    let wal_path = dir.join("history.db-wal");
+
+    {
+        let conn = open_history_db(&path).unwrap();
+        super::migrations::init_history_schema(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TABLE reuse_probe(value INTEGER);
+             INSERT INTO reuse_probe VALUES (42);",
+        )
+        .unwrap();
+    }
+
+    // Session deletion removes the database and its sidecars while the pooled
+    // handle still references the unlinked inode.
+    crate::ai::history::delete_history_artifacts(&path).unwrap();
+    assert!(!path.exists());
+
+    {
+        let conn = open_history_db(&path).unwrap();
+        super::migrations::init_history_schema(&conn).unwrap();
+        // TEMP state is connection-local, so its absence proves the deleted
+        // database's connection was not handed back.
+        let probes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_temp_master WHERE name = 'reuse_probe'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(probes, 0);
+        let messages: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(messages, 0);
+    }
+
+    // Closing the deleted database's connection must not unlink the new file's
+    // sidecars; the guard is pooled here, so the WAL has to survive.
+    assert!(wal_path.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_history_schema_skips_ddl_after_version_marker() {
+    let dir = std::env::temp_dir().join(format!(
+        "schema_version_fast_path_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.db");
+    let conn = Connection::open(&path).unwrap();
+
+    super::migrations::init_history_schema(&conn).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+            .unwrap(),
+        super::migrations::HISTORY_SCHEMA_VERSION
+    );
+
+    // Dropping a table created by init and observing that the next call does
+    // not recreate it proves the versioned fast path skipped the CREATE batch.
+    // The marker is only written after a complete init, so this tradeoff is
+    // what keeps the per-operation path cheap.
+    conn.execute_batch("DROP TABLE skill_activation_events;")
+        .unwrap();
+    super::migrations::init_history_schema(&conn).unwrap();
+    let table_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'skill_activation_events'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_count, 0, "second init replayed schema DDL");
+
+    drop(conn);
     let _ = std::fs::remove_dir_all(&dir);
 }

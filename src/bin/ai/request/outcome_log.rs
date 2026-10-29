@@ -277,6 +277,7 @@ mod tests {
             tool_errors: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
+            estimated_prompt_tokens_upper: 0,
             message_counts: Default::default(),
             prompt_cache_key: None,
             explicit_cache_breakpoints: false,

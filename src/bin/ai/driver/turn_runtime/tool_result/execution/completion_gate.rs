@@ -213,8 +213,7 @@ pub(in crate::ai::driver::turn_runtime) fn completion_tool_result_succeeded(
     // wrapper must not require teaching each consumer a new failure prefix.
     !matches!(
         classify_tool_result_progress(content.as_str().unwrap_or_default()),
-        ToolResultProgressStatus::Failure
-            | ToolResultProgressStatus::BlockedOutsideWorkspace(_)
+        ToolResultProgressStatus::Failure | ToolResultProgressStatus::BlockedOutsideWorkspace(_)
     )
 }
 
@@ -331,14 +330,11 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_gate_action(
 /// to do.
 pub(in crate::ai::driver::turn_runtime) const RECOVERABLE_PAUSE_RETRY_MARKER: &str =
     "[recoverable-pause-retry]";
-pub(in crate::ai::driver::turn_runtime) const RECOVERABLE_PAUSE_RETRY_NOTE: &str =
-    "[recoverable-pause-retry]\n\
+pub(in crate::ai::driver::turn_runtime) const RECOVERABLE_PAUSE_RETRY_NOTE: &str = "[recoverable-pause-retry]\n\
      A tool call was paused before execution in the current user turn and nothing ran after it.\n\
      This is not a final answer. Complete the recovery the pause reply prescribed (loading the instruction documents it named, or reading the target before retrying the patch), then re-issue the paused call in this turn; report a blocker only if that retry fails too.";
-pub(in crate::ai::driver::turn_runtime) const RECOVERABLE_PAUSE_WARNING: &str =
-    "[Runtime warning] A tool call was paused before execution and the turn ended without retrying it, so the requested action was most likely never performed.";
-pub(in crate::ai::driver::turn_runtime) const RECOVERABLE_PAUSE_UNVERIFIED_NOTE: &str =
-    "runtime:recoverable_pause_unretried\nA final response was recorded after a recoverable pre-execution pause without a retry.";
+pub(in crate::ai::driver::turn_runtime) const RECOVERABLE_PAUSE_WARNING: &str = "[Runtime warning] A tool call was paused before execution and the turn ended without retrying it, so the requested action was most likely never performed.";
+pub(in crate::ai::driver::turn_runtime) const RECOVERABLE_PAUSE_UNVERIFIED_NOTE: &str = "runtime:recoverable_pause_unretried\nA final response was recorded after a recoverable pre-execution pause without a retry.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::ai::driver::turn_runtime) enum RecoverablePauseGateAction {

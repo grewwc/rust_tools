@@ -91,18 +91,21 @@ pub(super) fn degenerate_repetition_strip_len(text: &str) -> Option<usize> {
         let repeated_len = pattern_len * REASONING_REPEAT_COUNT;
         let repeated = &chars[chars.len() - repeated_len..];
         let pattern = &repeated[..pattern_len];
+        // Compare equality first: the alphanumeric scan visits every char of every candidate
+        // pattern, while a non-repeating tail usually diverges on the first compared char.
+        if repeated[pattern_len..pattern_len * 2] != *pattern
+            || repeated[pattern_len * 2..] != *pattern
+        {
+            continue;
+        }
         if pattern.iter().filter(|ch| ch.is_alphanumeric()).count() < MIN_REASONING_REPEAT_CHARS / 2
         {
             continue;
         }
-        if repeated[pattern_len..pattern_len * 2] == *pattern
-            && repeated[pattern_len * 2..] == *pattern
-        {
-            if is_fold_placeholder_repeat_pattern(pattern) {
-                continue;
-            }
-            return Some(repeated_len);
+        if is_fold_placeholder_repeat_pattern(pattern) {
+            continue;
         }
+        return Some(repeated_len);
     }
     None
 }

@@ -25,7 +25,7 @@ use crate::ai::{
     models,
     provider::{ApiProvider, adapter_for, compatible_wire_shapes},
     request_protocol::RequestProtocolDialect,
-    types::ToolDefinition,
+    types::{ReasoningItemMap, ToolDefinition},
 };
 
 /// Builds message content: returns a string for text-only models or no images; otherwise,
@@ -274,48 +274,108 @@ fn estimate_prompt_tokens(messages: &[Message]) -> usize {
     message_prompt_counts(messages).tokens()
 }
 
+/// Everything the prompt estimate bills, gathered in one traversal.
+///
+/// The lower and pessimistic upper bounds are two projections of these counts
+/// ([`BillableCounts::tokens`] / [`BillableCounts::tokens_upper`]), so a caller
+/// that needs both — the preview budget and the send-path feedback — must not
+/// walk the same history, tool schema, and replay a second time.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct PromptCounts {
+    messages: BillableCounts,
+    tools: BillableCounts,
+    reasoning: BillableCounts,
+    /// Sum of per-item `ceil(encrypted bytes / 4)`. The per-item ceiling is
+    /// kept because rounding the sum once can differ from summing rounded
+    /// items, and the published estimate must not drift.
+    reasoning_encrypted_lower: usize,
+    /// Upper-bound twin of `reasoning_encrypted_lower`, at 2 bytes per token.
+    reasoning_encrypted_upper: usize,
+}
+
+impl PromptCounts {
+    pub(super) fn lower_tokens(self) -> usize {
+        self.messages.tokens()
+            + self.tools.tokens()
+            + self.reasoning.tokens()
+            + self.reasoning_encrypted_lower
+    }
+
+    pub(super) fn upper_tokens(self) -> usize {
+        self.messages.tokens_upper()
+            + self.tools.tokens_upper()
+            + self.reasoning.tokens_upper()
+            + self.reasoning_encrypted_upper
+    }
+
+    /// Script mix of the messages alone: budgets convert token deficits back
+    /// into message chars at the observed ratio.
+    pub(super) fn message_counts(self) -> BillableCounts {
+        self.messages
+    }
+}
+
+/// Measures a wire `tools` value exactly once; both bounds project it.
+pub(super) fn measure_request_prompt(
+    messages: &[Message],
+    tools: Option<&Value>,
+    reasoning_items: Option<&ReasoningItemMap>,
+) -> PromptCounts {
+    let (reasoning, reasoning_encrypted_lower, reasoning_encrypted_upper) =
+        reasoning_item_counts(messages, reasoning_items);
+    PromptCounts {
+        messages: message_prompt_counts(messages),
+        tools: tools.map_or(BillableCounts::default(), compact_json_counts),
+        reasoning,
+        reasoning_encrypted_lower,
+        reasoning_encrypted_upper,
+    }
+}
+
+/// Definitions-based twin of [`measure_request_prompt`]: counts the schema
+/// without serializing it to a `Value` first.
+pub(super) fn measure_request_prompt_from_definitions(
+    messages: &[Message],
+    defs: Option<&[ToolDefinition]>,
+    reasoning_items: Option<&ReasoningItemMap>,
+) -> PromptCounts {
+    let (reasoning, reasoning_encrypted_lower, reasoning_encrypted_upper) =
+        reasoning_item_counts(messages, reasoning_items);
+    PromptCounts {
+        messages: message_prompt_counts(messages),
+        tools: defs.map_or(BillableCounts::default(), tools_definitions_compact_json_counts),
+        reasoning,
+        reasoning_encrypted_lower,
+        reasoning_encrypted_upper,
+    }
+}
+
 /// Encrypted reasoning replay spliced in front of Responses function calls.
 /// Only items keyed by a projected message's first tool call reach the wire
 /// (see `protocol::responses_input`); entries for compressed-away rounds are
 /// not billed. `encrypted_content` is base64 of an opaque payload: following
 /// codex (`context_manager/history.rs`), decoded bytes ~= 3/4 of the encoded
-/// length, minus a fixed envelope, at ~4 bytes per token. Every other field
-/// (summary text, ids, type) is charged as ordinary compact JSON.
-fn estimate_reasoning_items_tokens(
+/// length, minus a fixed envelope, at ~4 bytes per token (2 for the upper
+/// bound). Every other field (summary text, ids, type) is charged as ordinary
+/// compact JSON. Returns the JSON counts plus both per-item encrypted sums.
+fn reasoning_item_counts(
     messages: &[Message],
-    items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
-) -> usize {
-    estimate_reasoning_items_projected(messages, items, 4, BillableCounts::tokens)
-}
-
-/// Pessimistic twin of [`estimate_reasoning_items_tokens`]: opaque encrypted
-/// bytes at 2 chars/token, text counts via [`BillableCounts::tokens_upper`].
-fn estimate_reasoning_items_tokens_upper(
-    messages: &[Message],
-    items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
-) -> usize {
-    estimate_reasoning_items_projected(messages, items, 2, BillableCounts::tokens_upper)
-}
-
-/// Shared replay walk behind both reasoning estimates. The lower estimate
-/// passes the historical divisor/projection, so its arithmetic is unchanged.
-fn estimate_reasoning_items_projected(
-    messages: &[Message],
-    items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
-    encrypted_divisor: usize,
-    project: fn(BillableCounts) -> usize,
-) -> usize {
+    items: Option<&ReasoningItemMap>,
+) -> (BillableCounts, usize, usize) {
     const ENCRYPTED_ENVELOPE_BYTES: usize = 650;
+    const LOWER_ENCRYPTED_DIVISOR: usize = 4;
+    const UPPER_ENCRYPTED_DIVISOR: usize = 2;
     let Some(items) = items.filter(|items| !items.is_empty()) else {
-        return 0;
+        return (BillableCounts::default(), 0, 0);
     };
     let mut counts = BillableCounts::default();
-    let mut encrypted_tokens = 0usize;
+    let mut encrypted_lower = 0usize;
+    let mut encrypted_upper = 0usize;
     let replayed = messages
         .iter()
         .filter_map(|message| message.tool_calls.as_ref()?.first())
         .filter_map(|call| items.get(&call.id))
-        .flatten();
+        .flat_map(|items| items.iter());
     for item in replayed {
         let Value::Object(map) = item else {
             counts += compact_json_counts(item);
@@ -327,17 +387,17 @@ fn estimate_reasoning_items_projected(
             match (key.as_str(), value) {
                 ("encrypted_content", Value::String(encoded)) => {
                     let decoded = encoded.len().saturating_mul(3) / 4;
-                    encrypted_tokens = encrypted_tokens.saturating_add(
-                        decoded
-                            .saturating_sub(ENCRYPTED_ENVELOPE_BYTES)
-                            .div_ceil(encrypted_divisor),
-                    );
+                    let billable = decoded.saturating_sub(ENCRYPTED_ENVELOPE_BYTES);
+                    encrypted_lower =
+                        encrypted_lower.saturating_add(billable.div_ceil(LOWER_ENCRYPTED_DIVISOR));
+                    encrypted_upper =
+                        encrypted_upper.saturating_add(billable.div_ceil(UPPER_ENCRYPTED_DIVISOR));
                 }
                 _ => counts += compact_json_counts(value),
             }
         }
     }
-    encrypted_tokens.saturating_add(project(counts))
+    (counts, encrypted_lower, encrypted_upper)
 }
 
 /// Script mix of the compact JSON text `serde_json::to_string` produces for
@@ -394,13 +454,6 @@ fn estimate_tools_tokens(tools: Option<&Value>) -> usize {
     tools.map_or(0, |tools| compact_json_counts(tools).tokens())
 }
 
-/// Pessimistic twin of [`estimate_tools_tokens`]: identical counts projected
-/// with [`BillableCounts::tokens_upper`]. Upper-bound input only; budgets and
-/// clamps keep the lower estimate.
-fn estimate_tools_tokens_upper(tools: Option<&Value>) -> usize {
-    tools.map_or(0, |tools| compact_json_counts(tools).tokens_upper())
-}
-
 /// Compact-JSON counts of `serde_json::to_value(defs)` computed directly from
 /// the definitions, without building the intermediate `Value`. Mirrors serde's
 /// struct layout field-for-field (`preserve_order` keeps declaration order):
@@ -443,54 +496,27 @@ pub(super) fn estimate_tools_tokens_from_definitions(defs: Option<&[ToolDefiniti
     defs.map_or(0, |defs| tools_definitions_compact_json_counts(defs).tokens())
 }
 
-/// Pessimistic twin of [`estimate_tools_tokens_from_definitions`] for the
-/// preview path. Same counts, [`BillableCounts::tokens_upper`] projection.
-pub(super) fn estimate_tools_tokens_upper_from_definitions(
-    defs: Option<&[ToolDefinition]>,
-) -> usize {
-    defs.map_or(0, |defs| {
-        tools_definitions_compact_json_counts(defs).tokens_upper()
-    })
-}
-
-/// Preview-path prompt estimate: messages, tool schemas, and reasoning replay,
-/// none materialized as JSON. Matches `estimate_request_prompt_tokens` on the
-/// equivalent wire body (parity-tested) while skipping the schema deep clone.
+/// Preview-path lower-bound estimate: messages, tool schemas, and reasoning
+/// replay, none materialized as JSON. Matches `estimate_request_prompt_tokens`
+/// on the equivalent wire body (parity-tested) while skipping the schema deep
+/// clone.
 #[cfg(test)]
 pub(super) fn estimate_request_prompt_tokens_from_definitions(
     messages: &[Message],
     defs: Option<&[ToolDefinition]>,
-    reasoning_items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
+    reasoning_items: Option<&ReasoningItemMap>,
 ) -> usize {
-    estimate_request_prompt_from_definitions(messages, defs, reasoning_items).0
+    measure_request_prompt_from_definitions(messages, defs, reasoning_items).lower_tokens()
 }
 
-/// [`estimate_request_prompt_tokens_from_definitions`] plus the message
-/// counts it walked, so the preview budget derives its chars-per-token ratio
-/// without a second history scan.
-pub(super) fn estimate_request_prompt_from_definitions(
-    messages: &[Message],
-    defs: Option<&[ToolDefinition]>,
-    reasoning_items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
-) -> (usize, BillableCounts) {
-    let counts = message_prompt_counts(messages);
-    let tokens = counts.tokens()
-        + estimate_tools_tokens_from_definitions(defs)
-        + estimate_reasoning_items_tokens(messages, reasoning_items);
-    (tokens, counts)
-}
-
-/// Pessimistic twin of [`estimate_request_prompt_from_definitions`] for the
-/// preview path. The counts walk is shared in spirit but projected with
-/// `tokens_upper`, so this needs its own pass over the same inputs.
+/// Pessimistic twin of [`estimate_request_prompt_tokens_from_definitions`],
+/// projected from the same counts walk.
 pub(super) fn estimate_request_prompt_upper_from_definitions(
     messages: &[Message],
     defs: Option<&[ToolDefinition]>,
-    reasoning_items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
+    reasoning_items: Option<&ReasoningItemMap>,
 ) -> usize {
-    message_prompt_counts(messages).tokens_upper()
-        + estimate_tools_tokens_upper_from_definitions(defs)
-        + estimate_reasoning_items_tokens_upper(messages, reasoning_items)
+    measure_request_prompt_from_definitions(messages, defs, reasoning_items).upper_tokens()
 }
 
 /// Estimates input tokens for this request: messages + tool schemas + any
@@ -500,35 +526,21 @@ pub(super) fn estimate_request_prompt_upper_from_definitions(
 pub(super) fn estimate_request_prompt_tokens(
     messages: &[Message],
     tools: Option<&Value>,
-    reasoning_items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
+    reasoning_items: Option<&ReasoningItemMap>,
 ) -> usize {
-    estimate_request_prompt(messages, tools, reasoning_items).0
+    measure_request_prompt(messages, tools, reasoning_items).lower_tokens()
 }
 
-fn estimate_request_prompt(
-    messages: &[Message],
-    tools: Option<&Value>,
-    reasoning_items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
-) -> (usize, BillableCounts) {
-    let counts = message_prompt_counts(messages);
-    let tokens = counts.tokens()
-        + estimate_tools_tokens(tools)
-        + estimate_reasoning_items_tokens(messages, reasoning_items);
-    (tokens, counts)
-}
-
-/// Pessimistic twin of [`estimate_request_prompt`]: same inputs, every
-/// component projected with its `_upper` variant. Stored on the wire body
-/// next to the lower estimate (via `PromptTokenFeedback`) for the water
-/// meter's display interval.
+/// Pessimistic twin of [`estimate_request_prompt_tokens`]: same inputs,
+/// projected from the same counts walk. Stored on the wire body next to the
+/// lower estimate (via `PromptTokenFeedback`) for the water meter's display
+/// interval.
 pub(super) fn estimate_request_prompt_upper(
     messages: &[Message],
     tools: Option<&Value>,
-    reasoning_items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
+    reasoning_items: Option<&ReasoningItemMap>,
 ) -> usize {
-    message_prompt_counts(messages).tokens_upper()
-        + estimate_tools_tokens_upper(tools)
-        + estimate_reasoning_items_tokens_upper(messages, reasoning_items)
+    measure_request_prompt(messages, tools, reasoning_items).upper_tokens()
 }
 
 /// Clamp the output cap to the estimated remaining context window. Any supplied
@@ -659,7 +671,7 @@ pub(super) fn build_request_body<'a>(
     reasoning_effort: Option<&'a str>,
     max_tokens_override: Option<u32>,
     current_prompt_tokens: Option<u64>,
-    reasoning_items: Option<&'a rustc_hash::FxHashMap<String, Vec<Value>>>,
+    reasoning_items: Option<&'a ReasoningItemMap>,
 ) -> RequestBody<'a> {
     build_request_body_from_parts(
         &RequestModelInputs::resolve(model),
@@ -691,7 +703,7 @@ pub(super) fn build_request_body_from_parts<'a>(
     reasoning_effort: Option<&'a str>,
     max_tokens_override: Option<u32>,
     current_prompt_tokens: Option<u64>,
-    reasoning_items: Option<&'a rustc_hash::FxHashMap<String, Vec<Value>>>,
+    reasoning_items: Option<&'a ReasoningItemMap>,
 ) -> RequestBody<'a> {
     let endpoint = &inputs.endpoint;
     let request_model = inputs.request_model.clone();
@@ -724,8 +736,12 @@ pub(super) fn build_request_body_from_parts<'a>(
     // the next response's growth calculation. Reasoning replay is included
     // whenever the side channel carries it; a cross-dialect fallback that
     // drops it on the wire only overestimates.
-    let (est_prompt, message_counts) =
-        estimate_request_prompt(messages, tools.as_ref(), reasoning_items);
+    // One traversal yields both the lower bound used by the clamp/budget and
+    // the pessimistic bound the water meter publishes; `PromptTokenFeedback`
+    // reads the upper bound off the body instead of re-walking the prompt.
+    let prompt_counts = measure_request_prompt(messages, tools.as_ref(), reasoning_items);
+    let est_prompt = prompt_counts.lower_tokens();
+    let message_counts = prompt_counts.message_counts();
     let max_tokens = inputs.max_output.map(|model_max| {
         let current = current_prompt_tokens
             .map(|tokens| usize::try_from(tokens).unwrap_or(usize::MAX))
@@ -755,6 +771,7 @@ pub(super) fn build_request_body_from_parts<'a>(
         tool_errors: None,
         reasoning_encrypted_replay: inputs.encrypted_replay,
         estimated_prompt_tokens: est_prompt,
+        estimated_prompt_tokens_upper: prompt_counts.upper_tokens(),
         message_counts,
         prompt_cache_key: None,
         explicit_cache_breakpoints: false,
@@ -958,9 +975,12 @@ mod compact_json_char_len_tests {
 
     #[test]
     fn token_estimate_weights_scripts_and_bills_only_projected_reasoning_replay() {
-        use super::{estimate_request_prompt_tokens, estimate_tools_tokens};
+        use super::{
+            estimate_request_prompt_tokens, estimate_request_prompt_upper, estimate_tools_tokens,
+        };
         use crate::ai::history::Message;
         use crate::ai::types::{FunctionCall, ToolCall};
+        use std::sync::Arc;
 
         // ASCII JSON at 3 chars/token, CJK at 1 token per scalar (+2 quotes).
         assert_eq!(estimate_tools_tokens(Some(&json!("abcd"))), 2);
@@ -986,18 +1006,35 @@ mod compact_json_char_len_tests {
         let item = json!({"type": "reasoning", "encrypted_content": encrypted});
         let mut items = rustc_hash::FxHashMap::default();
         // Keyed by a non-first call or by a compressed-away round: not on the wire.
-        items.insert("second".to_owned(), vec![item.clone()]);
-        items.insert("gone".to_owned(), vec![item.clone()]);
+        items.insert("second".to_owned(), Arc::new(vec![item.clone()]));
+        items.insert("gone".to_owned(), Arc::new(vec![item.clone()]));
         assert_eq!(
             estimate_request_prompt_tokens(&messages, None, Some(&items)),
             base
         );
-        items.insert("live".to_owned(), vec![item]);
+        items.insert("live".to_owned(), Arc::new(vec![item]));
         // 4000 base64 chars -> 3000 bytes - 650 envelope -> 588 tokens, plus
         // `{"type":"reasoning","encrypted_content":}` as ASCII JSON (14 tokens).
         assert_eq!(
             estimate_request_prompt_tokens(&messages, None, Some(&items)),
             base + 588 + 14
         );
+        // The upper bound is the other projection of the same walk: the
+        // encrypted payload alone grows by ceil(2350 / 2) = 1175 tokens, and
+        // the shared measurement must reproduce both published bounds.
+        let upper_with_encrypted = estimate_request_prompt_upper(&messages, None, Some(&items));
+        let mut empty_encrypted = rustc_hash::FxHashMap::default();
+        empty_encrypted.insert(
+            "live".to_owned(),
+            Arc::new(vec![json!({"type": "reasoning", "encrypted_content": ""})]),
+        );
+        assert_eq!(
+            upper_with_encrypted
+                - estimate_request_prompt_upper(&messages, None, Some(&empty_encrypted)),
+            1_175
+        );
+        let counts = super::measure_request_prompt(&messages, None, Some(&items));
+        assert_eq!(counts.lower_tokens(), base + 588 + 14);
+        assert_eq!(counts.upper_tokens(), upper_with_encrypted);
     }
 }

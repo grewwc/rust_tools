@@ -843,7 +843,8 @@ pub(super) fn has_archive_recall_sources(messages: &[Message]) -> bool {
                 .starts_with(crate::ai::history::compress::QUERY_MEMORY_INDEX_PREFIX)
                 || recoverable_candidate(message).is_some();
         }
-        message.role == "assistant" && message_text_view(&message.content).starts_with(RECALL_PREFIX)
+        message.role == "assistant"
+            && message_text_view(&message.content).starts_with(RECALL_PREFIX)
     })
 }
 
@@ -1343,8 +1344,9 @@ mod tests {
 
     #[test]
     fn archive_recall_source_predicate_keeps_every_detection_source() {
-        let targets =
-            BTreeSet::from([RecoveryTarget::File("/tmp/assets/checkpoints/1.md".to_string())]);
+        let targets = BTreeSet::from([RecoveryTarget::File(
+            "/tmp/assets/checkpoints/1.md".to_string(),
+        )]);
         let mut tool_call = message("assistant", "");
         tool_call.tool_calls = Some(vec![crate::ai::types::ToolCall {
             id: "call-1".to_string(),

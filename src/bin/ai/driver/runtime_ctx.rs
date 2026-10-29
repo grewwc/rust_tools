@@ -243,6 +243,16 @@ impl DriverContext {
     }
 }
 
+/// Decision-log destination fixed for one turn.
+#[derive(Clone, Debug)]
+pub(crate) struct DecisionLogTarget {
+    /// Persist path for this turn, or `None` when persistence is disabled.
+    pub(crate) log_path: Option<PathBuf>,
+    /// History file of the session that owns the turn. A turn that outlives a
+    /// session deletion must not recreate the deleted session's log files.
+    pub(crate) session_history_file: PathBuf,
+}
+
 tokio::task_local! {
     pub(crate) static DRIVER_CTX: Arc<DriverContext>;
     /// Memory file bound to the current persona. The foreground turn / one-shot note flows scope it
@@ -288,6 +298,13 @@ tokio::task_local! {
     /// turn's scheduling; DecisionLog / feedback write paths read it to attribute tool call
     /// results back to the right (session, turn). Downstream sees ("", 0) when unset.
     pub(crate) static TURN_IDENTITY: (String, usize);
+    /// Decision-log target fixed for the current turn.
+    ///
+    /// `run_turn` scopes this to the file of the session that owns the turn.
+    /// Subagent turns temporarily point `App::session_history_file` at a child
+    /// history file, and a concurrent session or persona switch moves the
+    /// process-wide target; neither may reroute a running turn's diagnostics.
+    pub(crate) static DECISION_LOG_TARGET: DecisionLogTarget;
     pub(crate) static AUTO_MODEL_FALLBACK: AutoModelFallbackSpec;
     /// When set, marks the current turn as resumed execution after a foreground process wakeup
     /// (rather than direct user input). `prepare_turn` uses this to mark the persisted question message
@@ -307,6 +324,11 @@ pub(crate) fn current_session_id_or_empty() -> String {
 /// Read the current turn's turn_id; returns 0 outside a turn.
 pub(crate) fn current_turn_id_or_zero() -> usize {
     TURN_IDENTITY.try_with(|(_, t)| *t).unwrap_or(0)
+}
+
+/// Decision-log target fixed by the current turn, if a turn scope is active.
+pub(crate) fn decision_log_target() -> Option<DecisionLogTarget> {
+    DECISION_LOG_TARGET.try_with(|target| target.clone()).ok()
 }
 
 /// Whether the current turn is resumed execution after a foreground process wakeup.

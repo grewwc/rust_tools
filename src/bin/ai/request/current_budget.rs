@@ -312,10 +312,7 @@ mod tests {
     }
 
     fn preview_budget(model: &str, messages: &[Message]) -> CurrentRequestBudget {
-        let (estimated, counts) =
-            builder::estimate_request_prompt_from_definitions(messages, None, None);
-        let estimated_upper =
-            builder::estimate_request_prompt_upper_from_definitions(messages, None, None);
+        let prompt = builder::measure_request_prompt_from_definitions(messages, None, None);
         let feedback = PromptTokenFeedback::capture_preview(
             "session",
             model,
@@ -329,9 +326,9 @@ mod tests {
             None,
             false,
             false,
-            estimated,
-            estimated_upper,
-            counts,
+            prompt.lower_tokens(),
+            prompt.upper_tokens(),
+            prompt.message_counts(),
         );
         CurrentRequestBudget::measure(model, None, &feedback, None)
     }

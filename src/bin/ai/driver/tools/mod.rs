@@ -240,6 +240,44 @@ fn builtin_arg_validator(name: &str, schema: &Value) -> Option<Arc<jsonschema::V
     compiled
 }
 
+/// Compiled argument validators for MCP tool schemas, keyed by the schema's
+/// compact JSON text. MCP schemas are server-supplied and can change on
+/// reconnect, so the key is the schema itself rather than the tool name: a
+/// changed schema compiles a fresh validator, and two tools publishing the same
+/// schema share one. The text is the key instead of a hash of it because a
+/// collision would silently validate arguments against another tool's contract.
+/// `None` marks a known-unusable schema so its fail-open is logged once.
+static MCP_ARG_VALIDATORS: LazyLock<
+    Mutex<std::collections::HashMap<String, Option<Arc<jsonschema::Validator>>>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Upper bound on cached MCP schemas. A long-lived serve process sees churn when
+/// servers reconnect with different tool sets; once the cache is full, new
+/// schemas are compiled per call instead of evicting the schemas already in use.
+const MCP_ARG_VALIDATOR_CACHE_LIMIT: usize = 256;
+
+fn mcp_arg_validator(name: &str, schema: &Value) -> Option<Arc<jsonschema::Validator>> {
+    let key = schema.to_string();
+    if let Ok(cache) = MCP_ARG_VALIDATORS.lock()
+        && let Some(hit) = cache.get(&key).cloned()
+    {
+        return hit;
+    }
+    let compiled = match jsonschema::validator_for(schema) {
+        Ok(validator) => Some(Arc::new(validator)),
+        Err(err) => {
+            eprintln!("[tools] skipping argument validation for '{name}': invalid schema: {err}");
+            None
+        }
+    };
+    if let Ok(mut cache) = MCP_ARG_VALIDATORS.lock()
+        && cache.len() < MCP_ARG_VALIDATOR_CACHE_LIMIT
+    {
+        cache.insert(key, compiled.clone());
+    }
+    compiled
+}
+
 /// Per-tool compatibility aliases: (tool name, alias key, canonical key).
 ///
 /// Services accept these historical spellings alongside the canonical key
@@ -338,8 +376,9 @@ fn unknown_builtin_arg_keys(args: &Value, schema: &Value) -> Vec<String> {
 /// validation runs on a normalized copy of the args
 /// (provider-materialized `null` optionals dropped, `BUILTIN_ARG_ALIASES`
 /// resolved); the service still receives the original args. Builtin
-/// validators are compiled once per tool name; MCP schemas are
-/// server-supplied, so only their lookup is cached (Arc snapshot, no clone).
+/// validators are compiled once per tool name; MCP validators are compiled once
+/// per distinct schema text (server schemas can change on reconnect, so a name
+/// alone would pin a stale contract).
 fn validate_tool_call_args(
     mcp_client: &McpClient,
     tool_call: &ToolCall,
@@ -397,21 +436,14 @@ fn validate_tool_call_args(
                 None => Ok(()),
             }
         }
-        // MCP schemas are server-supplied and can change on reconnect, so
-        // they are compiled per call; only the directory lookup is cached.
+        // MCP schemas are server-supplied and can change on reconnect, so the
+        // compiled validator is cached under the schema text itself: a changed
+        // schema misses and recompiles, an unchanged one is reused.
         // Validated against the raw args — no local normalization — so the
         // gate can never bless arguments the server itself would reject.
-        ToolRoute::Mcp { .. } => match jsonschema::validator_for(&schema) {
-            Ok(validator) => {
-                reject_invalid_tool_args(tool_call, &validator, args)
-            }
-            Err(err) => {
-                eprintln!(
-                    "[tools] skipping argument validation for '{}': invalid schema: {err}",
-                    tool_call.function.name
-                );
-                Ok(())
-            }
+        ToolRoute::Mcp { .. } => match mcp_arg_validator(&tool_call.function.name, &schema) {
+            Some(validator) => reject_invalid_tool_args(tool_call, &validator, args),
+            None => Ok(()),
         },
     }
 }

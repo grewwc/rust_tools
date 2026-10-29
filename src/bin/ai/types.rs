@@ -24,6 +24,13 @@ use super::{
     prompt::PromptEditor,
 };
 
+/// Reasoning side-channel map (first tool_call id -> Responses reasoning items).
+///
+/// Values are shared rather than owned because every request projection
+/// overlays the current-turn side channel with decoded history; a deep clone
+/// per preview would copy the encrypted payloads.
+pub(crate) type ReasoningItemMap = FxHashMap<String, Arc<Vec<Value>>>;
+
 /// Configuration for the AI application, including API credentials,
 /// endpoint, model settings, and conversation history parameters.
 #[derive(Clone)]
@@ -254,7 +261,7 @@ pub(super) struct App {
     /// require `#[serde(skip)]` to keep them off disk. A turn-level bypass map
     /// (same pattern as `prune_marks`) is naturally turn-aligned, purely
     /// in-memory, and physically impossible to persist.
-    pub(super) turn_reasoning_items: FxHashMap<String, Vec<Value>>,
+    pub(super) turn_reasoning_items: ReasoningItemMap,
 
     /// Per-tool-call failure flag for the current turn, keyed by `tool_call_id`.
     /// Same turn-scoped side-channel rationale as `turn_reasoning_items`: the

@@ -298,7 +298,11 @@ impl<'a> TerminalToolObserver<'a> {
     /// completed command takes one terminal row instead of two. Only safe while
     /// the command line is the last line on screen and stdout is a real TTY;
     /// `print_run_status` covers every other case with its own status line.
-    fn render_command_line_status(&mut self, tool_call: &ToolCall, run_result: &tools::RunOneResult) {
+    fn render_command_line_status(
+        &mut self,
+        tool_call: &ToolCall,
+        run_result: &tools::RunOneResult,
+    ) {
         self.command_line_pending = false;
         let Some(command) = self.pending_command_line.take() else {
             return;
@@ -541,7 +545,10 @@ impl ToolExecutor for RoundToolExecutorAdapter {
             let snapshot = self.shared_mcp_client.lock().unwrap().routing_snapshot();
             // The permission middleware has already filtered this batch. Preserve
             // its order when a model-backed tool needs to await between calls.
-            if tool_calls.iter().any(|call| call.function.name == "session_distill") {
+            if tool_calls
+                .iter()
+                .any(|call| call.function.name == "session_distill")
+            {
                 let mut output = ToolExecOutput::default();
                 for call in tool_calls {
                     if call.function.name == "session_distill"
@@ -550,8 +557,13 @@ impl ToolExecutor for RoundToolExecutorAdapter {
                         observer.on_tool_dispatched(&call);
                         observer.on_tool_started(&call);
                         let run = crate::ai::driver::tools::run_session_distill(
-                            app, &snapshot, &self.session_id, &call, &self.allowed_tool_names,
-                        ).await;
+                            app,
+                            &snapshot,
+                            &self.session_id,
+                            &call,
+                            &self.allowed_tool_names,
+                        )
+                        .await;
                         observer.on_tool_finished(&call, &run);
                         output.had_error |= !run.ok;
                         output.tool_results.push(run.tool_result);
@@ -560,14 +572,22 @@ impl ToolExecutor for RoundToolExecutorAdapter {
                         output.execution_outcomes.push(None);
                     } else {
                         let result = execute_tool_calls_with_suppressed_read_only_calls(
-                            &self.session_id, &snapshot, &self.shared_mcp_client,
-                            &[call], &self.allowed_tool_names, Some(&mut observer),
-                            self.iteration, &self.suppressed_read_only_results,
-                        ).map_err(|e| std::io::Error::other(format!("tool dispatch failed: {e}")))?;
+                            &self.session_id,
+                            &snapshot,
+                            &self.shared_mcp_client,
+                            &[call],
+                            &self.allowed_tool_names,
+                            Some(&mut observer),
+                            self.iteration,
+                            &self.suppressed_read_only_results,
+                        )
+                        .map_err(|e| std::io::Error::other(format!("tool dispatch failed: {e}")))?;
                         let result = result.into_tool_exec_output();
                         output.had_error |= result.had_error;
                         output.tool_results.extend(result.tool_results);
-                        output.executed_tool_calls.extend(result.executed_tool_calls);
+                        output
+                            .executed_tool_calls
+                            .extend(result.executed_tool_calls);
                         output.cached_hits.extend(result.cached_hits);
                         output.execution_outcomes.extend(result.execution_outcomes);
                         output.assistant_messages.extend(result.assistant_messages);

@@ -35,7 +35,6 @@ use crate::ai::{
     agents::{self, AgentManifest},
     cli::{self},
     config,
-    config_schema::AiConfig,
     history::{SessionStore, SuspendedSessionEntry, SuspendedSessionStore},
     mcp::{McpClient, SharedMcpClient},
     models,
@@ -330,14 +329,6 @@ fn restore_consumed_suspended_session(entry: Option<&SuspendedSessionEntry>, fal
     ) {
         eprintln!("[resume] failed to restore suspended session binding: {err}");
     }
-}
-
-fn decision_log_persist_enabled() -> bool {
-    configw::get_all_config()
-        .get_opt(AiConfig::DECISION_LOG_PERSIST_ENABLE)
-        .unwrap_or_else(|| "true".to_string())
-        .trim()
-        .eq_ignore_ascii_case("true")
 }
 
 /// Main entry point for AIOS.
@@ -726,14 +717,9 @@ pub(in crate::ai) async fn run_with_cli(
             .await;
     }
 
-    if decision_log_persist_enabled() {
-        let decision_log_path = app
-            .session_history_file
-            .with_extension("decision-log.jsonl");
-        crate::ai::driver::decision_log::set_decision_log_persist_path(decision_log_path);
-    } else {
-        crate::ai::driver::decision_log::clear_decision_log_persist_path();
-    }
+    crate::ai::driver::decision_log::sync_persist_path_for_history_file(
+        &app.session_history_file,
+    );
 
     let mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
 

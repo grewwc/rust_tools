@@ -2,8 +2,8 @@
 
 use super::super::*;
 use super::common::*;
-use crate::ai::request::{DERIVED_CONTEXT_HANDOFF, HISTORY_SUMMARY_CONTEXT_HEADER};
 use crate::ai::request::MODEL_SELF_NOTE_CONTEXT_HEADER;
+use crate::ai::request::{DERIVED_CONTEXT_HANDOFF, HISTORY_SUMMARY_CONTEXT_HEADER};
 
 #[test]
 fn task_evidence_reopen_marker_counts_and_survives_reopen_retain() {

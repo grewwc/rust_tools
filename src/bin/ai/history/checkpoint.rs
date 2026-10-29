@@ -40,9 +40,9 @@ use crate::ai::history::SessionStore;
 use super::sqlite::restore_sqlite_after_rollback_with_transaction;
 use super::{
     sqlite::{
-        backup_sqlite, clear_session_history_sqlite, live_rollback_transaction_is_published,
-        message_count_sqlite_read_only, read_all_messages_sqlite_read_only,
-        restore_sqlite_after_rollback,
+        backup_sqlite, clear_session_history_sqlite, close_cached_write_conn,
+        live_rollback_transaction_is_published, message_count_sqlite_read_only,
+        read_all_messages_sqlite_read_only, restore_sqlite_after_rollback,
         restore_staged_sqlite_after_rollback,
     },
     types::Message,
@@ -1481,7 +1481,14 @@ impl CheckpointStore {
             if self.session_file.is_file() {
                 backup_sqlite(&self.session_file, &sqlite)?;
             }
-            clear_session_history_sqlite(&sqlite)?;
+            let cleared = clear_session_history_sqlite(&sqlite);
+            // The clear hands its connection back to the thread-local write
+            // cache. A cached handle keeps the staged DB's `-wal`/`-shm` on
+            // disk, which makes `restore_staged_sqlite_after_rollback` skip the
+            // clonefile fast path, and it pins the staging inode after cleanup.
+            // Close it while the staged file is still the one at this path.
+            close_cached_write_conn(&sqlite);
+            cleared?;
             fs::write(
                 transaction.join(LIVE_ROLLBACK_MANIFEST),
                 b"commit\nsource: -\n",
@@ -2472,6 +2479,40 @@ mod tests {
                 .join(GENERATION_PUBLISH_READY_MARKER)
                 .exists()
         );
+        if let Some(root) = history_file.parent() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn staged_empty_rollback_keeps_the_clonefile_source_sidecar_free() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-empty-rollback");
+        append_history_messages(
+            &store.session_file,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("cleared by an empty checkout".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+
+        let transaction = store.stage_empty_live_rollback().unwrap();
+        let staged = transaction.join("new").join(GENERATION_SQLITE_FILE);
+        for suffix in SQLITE_SIDECAR_SUFFIXES {
+            let sidecar = PathBuf::from(format!("{}{}", staged.display(), suffix));
+            assert!(
+                !sidecar.exists(),
+                "staged DB kept {suffix}; a cached connection forces the restore path off clonefile"
+            );
+        }
+        // Releasing the writer must checkpoint the clear into the main file;
+        // discarding an un-checkpointed WAL would resurrect the cleared rows.
+        assert_eq!(message_count_sqlite_read_only(&staged).unwrap(), 0);
+
         if let Some(root) = history_file.parent() {
             let _ = fs::remove_dir_all(root);
         }

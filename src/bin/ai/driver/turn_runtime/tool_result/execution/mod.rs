@@ -91,7 +91,7 @@ pub(in crate::ai) use audit_evidence::is_evidence_gated_audit_agent;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(in crate::ai::driver::turn_runtime) use {
     audit_evidence::*, completion_gate::*, final_citations::*, final_recovery::*,
-    final_terminator::*, followup::*, iteration::*, observer::*, outstanding::*, output_format::*,
+    final_terminator::*, followup::*, iteration::*, observer::*, output_format::*, outstanding::*,
     patch_retry::*, prepare::*, rejection::*, round::*,
 };
 #[cfg(test)]

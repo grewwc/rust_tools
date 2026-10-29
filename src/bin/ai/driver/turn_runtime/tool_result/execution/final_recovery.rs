@@ -109,9 +109,7 @@ impl FinalGateState {
         iteration: usize,
         max_iterations: usize,
     ) -> bool {
-        !self.final_terminator_retry_consumed
-            && !force_final_response
-            && iteration < max_iterations
+        !self.final_terminator_retry_consumed && !force_final_response && iteration < max_iterations
     }
 
     pub(super) fn consume_final_terminator_retry(&mut self) {

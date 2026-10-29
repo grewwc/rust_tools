@@ -16,7 +16,7 @@ use crate::ai::history::Message;
 use crate::ai::models;
 use crate::ai::provider::ApiProvider;
 use crate::ai::request_protocol::RequestProtocolDialect;
-use crate::ai::types::ToolCall;
+use crate::ai::types::{ReasoningItemMap, ToolCall};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(in crate::ai::request) struct ResponsesReasoningReplayStats {
@@ -421,6 +421,7 @@ pub(crate) fn build_http_body_for_json_messages_from_parts(
         reasoning_items: None,
         reasoning_encrypted_replay: inputs.encrypted_replay,
         estimated_prompt_tokens: 0,
+        estimated_prompt_tokens_upper: 0,
         message_counts: Default::default(),
         prompt_cache_key: None,
         explicit_cache_breakpoints: false,
@@ -617,7 +618,7 @@ fn responses_message_input(message: &Message) -> Value {
 
 pub(in crate::ai::request) fn responses_reasoning_replay_stats(
     messages: &[Message],
-    reasoning_items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
+    reasoning_items: Option<&ReasoningItemMap>,
 ) -> ResponsesReasoningReplayStats {
     let mut stats = ResponsesReasoningReplayStats::default();
     for message in messages {
@@ -644,7 +645,7 @@ pub(in crate::ai::request) fn responses_reasoning_replay_stats(
 
 fn responses_input(
     messages: &[Message],
-    reasoning_items: Option<&rustc_hash::FxHashMap<String, Vec<Value>>>,
+    reasoning_items: Option<&ReasoningItemMap>,
 ) -> Vec<Value> {
     let mut input = Vec::new();
     for message in messages {
@@ -787,6 +788,7 @@ mod messages_body_tests {
             reasoning_items: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
+            estimated_prompt_tokens_upper: 0,
             message_counts: Default::default(),
             prompt_cache_key: None,
             explicit_cache_breakpoints: false,
@@ -816,6 +818,7 @@ mod messages_body_tests {
             reasoning_items: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
+            estimated_prompt_tokens_upper: 0,
             message_counts: Default::default(),
             prompt_cache_key: None,
             explicit_cache_breakpoints: false,
@@ -905,6 +908,7 @@ mod messages_body_tests {
             reasoning_items: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
+            estimated_prompt_tokens_upper: 0,
             message_counts: Default::default(),
             prompt_cache_key: None,
             explicit_cache_breakpoints: false,
@@ -1068,6 +1072,7 @@ mod messages_body_tests {
             reasoning_items: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
+            estimated_prompt_tokens_upper: 0,
             message_counts: Default::default(),
             prompt_cache_key: None,
             explicit_cache_breakpoints: false,
@@ -1102,6 +1107,7 @@ mod messages_body_tests {
             reasoning_items: None,
             reasoning_encrypted_replay: false,
             estimated_prompt_tokens: 0,
+            estimated_prompt_tokens_upper: 0,
             message_counts: Default::default(),
             prompt_cache_key: None,
             explicit_cache_breakpoints: false,

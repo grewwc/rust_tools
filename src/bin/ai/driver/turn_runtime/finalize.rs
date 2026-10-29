@@ -86,7 +86,9 @@ fn serve_final_text_to_commit(
 ) -> Option<String> {
     let base = terminal_final_text_to_render(final_assistant_text, false, None)?;
     let base = base.trim();
-    let suffix = user_visible_suffix.map(str::trim).filter(|text| !text.is_empty());
+    let suffix = user_visible_suffix
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
     let visible = match (base.is_empty(), suffix) {
         (true, Some(suffix)) => suffix.to_string(),
         (true, None) => return None,
@@ -790,7 +792,13 @@ pub(crate) async fn generate_session_title_outside_turn(
         // The parallel pre-turn call can race the child's first write (the
         // session file may not exist yet); the pending input alone still seeds
         // the request, mirroring `generate_session_title_if_missing`.
-        Err(_) if pending_user_input.map(str::trim).is_some_and(|s| !s.is_empty()) => Vec::new(),
+        Err(_)
+            if pending_user_input
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty()) =>
+        {
+            Vec::new()
+        }
         Err(_) => return false,
     };
     // The child may already have persisted this input by now; avoid seeding the
@@ -799,9 +807,9 @@ pub(crate) async fn generate_session_title_outside_turn(
         .map(str::trim)
         .filter(|input| !input.is_empty())
         .filter(|input| {
-            !messages.last().is_some_and(|m| {
-                m.role == "user" && value_to_string(&m.content).trim() == *input
-            })
+            !messages
+                .last()
+                .is_some_and(|m| m.role == "user" && value_to_string(&m.content).trim() == *input)
         });
     let messages = session_title_messages(messages, pending.as_deref());
     if !has_session_title_source(&messages) {

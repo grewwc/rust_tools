@@ -103,20 +103,8 @@ mod tests {
         for _ in 0..MAX_ADVISORY_SIGNALS_PER_TURN {
             assert!(budget.admit("test-session", 7, 1, "coarse", SignalKind::Advisory));
         }
-        assert!(!budget.admit(
-            "test-session",
-            7,
-            1,
-            "target_repeat",
-            SignalKind::Advisory
-        ));
+        assert!(!budget.admit("test-session", 7, 1, "target_repeat", SignalKind::Advisory));
         assert!(budget.admit("test-session", 7, 1, "hard", SignalKind::HardStop));
-        assert!(budget.admit(
-            "test-session",
-            7,
-            1,
-            "coarse_hard",
-            SignalKind::HardStop
-        ));
+        assert!(budget.admit("test-session", 7, 1, "coarse_hard", SignalKind::HardStop));
     }
 }

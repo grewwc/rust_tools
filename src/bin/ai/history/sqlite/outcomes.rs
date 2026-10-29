@@ -1,7 +1,7 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    sync::{LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -96,7 +96,7 @@ pub(in crate::ai) fn append_interrupted_stream_diagnostic_sqlite(
 /// on the happy path), so a cache hit avoids the per-preview
 /// `Connection::open` + full-table scan entirely.
 static TOOL_EXECUTION_OUTCOMES_CACHE: LazyLock<
-    Mutex<FxHashMap<PathBuf, (i64, Vec<ToolExecutionOutcome>)>>,
+    Mutex<FxHashMap<PathBuf, (i64, Arc<Vec<ToolExecutionOutcome>>)>>,
 > = LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 /// Revision-validated cached read for the request projection hot path.
@@ -109,27 +109,31 @@ static TOOL_EXECUTION_OUTCOMES_CACHE: LazyLock<
 /// is cached only when both agree. `history_revision` is monotonically
 /// increasing, so agreement proves the scan saw the latest committed state; a
 /// concurrent append racing the read merely delays caching by one preview and
-/// can never pin stale rows.
+/// can never pin stale rows. The returned `Arc` lets repeated previews share one
+/// immutable snapshot instead of copying the whole table on every cache hit.
 pub(in crate::ai) fn read_tool_execution_outcomes_cached(
     path: &Path,
-) -> io::Result<Vec<ToolExecutionOutcome>> {
+) -> io::Result<Arc<Vec<ToolExecutionOutcome>>> {
     if !blob::is_sqlite_path(path) || !path.exists() {
-        return Ok(Vec::new());
+        return Ok(Arc::new(Vec::new()));
     }
     let Some(revision_before) = super::revision::read_history_revision(path) else {
-        return read_tool_execution_outcomes_sqlite(path);
+        return read_tool_execution_outcomes_sqlite(path).map(Arc::new);
     };
     if let Ok(cache) = TOOL_EXECUTION_OUTCOMES_CACHE.lock()
         && let Some((cached_revision, outcomes)) = cache.get(path)
         && *cached_revision == revision_before
     {
-        return Ok(outcomes.clone());
+        return Ok(Arc::clone(outcomes));
     }
-    let outcomes = read_tool_execution_outcomes_sqlite(path)?;
+    let outcomes = Arc::new(read_tool_execution_outcomes_sqlite(path)?);
     if super::revision::read_history_revision(path) == Some(revision_before)
         && let Ok(mut cache) = TOOL_EXECUTION_OUTCOMES_CACHE.lock()
     {
-        cache.insert(path.to_path_buf(), (revision_before, outcomes.clone()));
+        cache.insert(
+            path.to_path_buf(),
+            (revision_before, Arc::clone(&outcomes)),
+        );
     }
     Ok(outcomes)
 }

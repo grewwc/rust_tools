@@ -158,9 +158,9 @@ fn scoped_instruction_preflight_blocks_first_mutation_until_rules_are_loaded() {
     );
     let paused_outside_project = rejected_tool_call_message(
         "execute_command",
-        ToolCallRejectionReason::ScopedInstructionsNeedReload(vec![
-            std::path::PathBuf::from("/tmp/demo/AGENTS.md"),
-        ]),
+        ToolCallRejectionReason::ScopedInstructionsNeedReload(vec![std::path::PathBuf::from(
+            "/tmp/demo/AGENTS.md",
+        )]),
     );
     assert!(
         paused_outside_project.contains("Paused target(s): /tmp/demo/AGENTS.md"),

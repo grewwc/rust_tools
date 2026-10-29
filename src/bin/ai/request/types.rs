@@ -10,6 +10,7 @@ use serde_json::{Map, Value};
 
 use crate::ai::history::Message;
 use crate::ai::history::compress::BillableCounts;
+use crate::ai::types::ReasoningItemMap;
 use rustc_hash::FxHashMap;
 
 #[derive(Debug, Serialize)]
@@ -48,7 +49,7 @@ pub(crate) struct RequestBody<'a> {
     /// 用于在对应 function_call 前原样回放 encrypted reasoning。`#[serde(skip)]`：
     /// 不参与 chat-completions 序列化，也绝不落盘。
     #[serde(skip)]
-    pub(crate) reasoning_items: Option<&'a FxHashMap<String, Vec<Value>>>,
+    pub(crate) reasoning_items: Option<&'a ReasoningItemMap>,
     /// Turn-scoped per-tool-call failure flags (`tool_call_id` -> failed) for
     /// dialects that can surface them (Anthropic `tool_result.is_error`).
     #[serde(skip)]
@@ -64,6 +65,11 @@ pub(crate) struct RequestBody<'a> {
     /// history is not re-walked. `#[serde(skip)]`: never part of any wire encoding.
     #[serde(skip)]
     pub(crate) estimated_prompt_tokens: usize,
+    /// Pessimistic twin of `estimated_prompt_tokens`, measured in the same
+    /// traversal. `PromptTokenFeedback::capture` reads it off the body instead
+    /// of walking the prompt again. `#[serde(skip)]`: never on the wire.
+    #[serde(skip)]
+    pub(crate) estimated_prompt_tokens_upper: usize,
     /// Script mix of the messages behind `estimated_prompt_tokens`, so budgets
     /// can convert token deficits back into message chars at the observed
     /// ratio instead of a flat constant. `#[serde(skip)]`: never on the wire.

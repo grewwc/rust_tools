@@ -789,6 +789,13 @@ fn text_with_done_sentinel_stays_completed() {
     );
 }
 
+// Single-shot verdict through the streaming scanner: a fresh scanner observing
+// the whole text at once must agree with the former whole-text check, so the
+// assertions below keep pinning the same behavior.
+fn reasoning_contains_provider_control_leak(reasoning: &str) -> bool {
+    ProviderControlLeakScanner::new().observe(reasoning)
+}
+
 #[test]
 fn provider_control_leak_requires_a_complete_ordered_envelope() {
     let leaked = "No reasoning available.<|end|>assistant to=read_file<|channel|>analysis \
@@ -801,4 +808,138 @@ fn provider_control_leak_requires_a_complete_ordered_envelope() {
     assert!(!reasoning_contains_provider_control_leak(
         "<|end|>assistant to=read_file<|message|>example<|channel|>analysis<|constrain|>xml"
     ));
+}
+
+#[test]
+fn provider_control_leak_ignores_rust_source_quotation() {
+    // Pasting this detector's own constants (e.g. while discussing a fix for
+    // it) must not self-trigger: the opening token is a quoted literal and
+    // the markers are quoted array elements, not a live envelope.
+    let quoted_source = "The detector is:\n\
+        const START: &str = \"<|end|>assistant to=\";\n\
+        const FOLLOWING_MARKERS: [&str; 3] = [\"<|channel|>\", \"<|constrain|>\", \"<|message|>\"];";
+    assert!(!reasoning_contains_provider_control_leak(quoted_source));
+}
+
+#[test]
+fn provider_control_leak_ignores_backtick_mentions() {
+    let mentioned = "The envelope opens with `<|end|>assistant to=` followed by \
+        `<|channel|>`, `<|constrain|>`, then `<|message|>` before the payload.";
+    assert!(!reasoning_contains_provider_control_leak(mentioned));
+}
+
+#[test]
+fn provider_control_leak_ignores_envelope_inside_string_literal() {
+    // A verbatim leak sample discussed as a test fixture stays quoted: the
+    // opening sits inside a same-line "..." literal.
+    let fixture = "let leaked = \"No reasoning available.<|end|>assistant to=read_file<|channel|>analysis \
+        <|constrain|>xml<|message|><rfl:parameter name=\\\"file_path\\\">/tmp/x</rfl:parameter>\";";
+    assert!(!reasoning_contains_provider_control_leak(fixture));
+}
+
+#[test]
+fn provider_control_leak_ignores_fenced_code_block() {
+    let fenced = "Here is the captured envelope:\n\
+        ```text\n\
+        No reasoning available.<|end|>assistant to=read_file<|channel|>analysis \
+        <|constrain|>xml<|message|><rfl:parameter name=\"file_path\">/tmp/x</rfl:parameter>\n\
+        ```\n\
+        That is what the detector must catch when emitted raw.";
+    assert!(!reasoning_contains_provider_control_leak(fenced));
+}
+
+#[test]
+fn provider_control_leak_quotation_does_not_mask_a_real_leak() {
+    // A quoted mention anywhere in the reasoning must not shield a genuine
+    // raw envelope: earlier occurrences are still examined.
+    let leaked = "No reasoning available.<|end|>assistant to=read_file<|channel|>analysis \
+        <|constrain|>xml<|message|><rfl:parameter name=\"file_path\">/tmp/x</rfl:parameter>";
+    let quoted = "The opening token is \"<|end|>assistant to=\" in the source.";
+    assert!(reasoning_contains_provider_control_leak(&format!(
+        "{leaked}\nLater I quoted the constant: {quoted}"
+    )));
+    assert!(reasoning_contains_provider_control_leak(&format!(
+        "First I quoted the constant: {quoted}\nThen the provider emitted: {leaked}"
+    )));
+    // A trailing bare opening with no envelope must not shield an earlier
+    // complete live envelope either (a last-opening-only scan misses it).
+    assert!(reasoning_contains_provider_control_leak(&format!(
+        "{leaked}\nA trailing bare token: <|end|>assistant to="
+    )));
+}
+
+#[test]
+fn provider_control_leak_unclosed_fence_masks_to_end() {
+    let pasted = "Captured output:\n```text\nNo reasoning available.<|end|>assistant to=read_file<|channel|>analysis \
+        <|constrain|>xml<|message|><rfl:parameter name=\"file_path\">/tmp/x</rfl:parameter>";
+    assert!(!reasoning_contains_provider_control_leak(pasted));
+}
+
+#[test]
+fn provider_control_leak_stray_backtick_does_not_mask_a_live_leak() {
+    // Only balanced pairs mask: a stray backtick leaves a live envelope live.
+    let leaked = "No reasoning available.<|end|>assistant to=read_file<|channel|>analysis \
+        <|constrain|>xml<|message|><rfl:parameter name=\"file_path\">/tmp/x</rfl:parameter>";
+    assert!(reasoning_contains_provider_control_leak(&format!(
+        "A stray `tick in prose\n{leaked}"
+    )));
+}
+
+#[test]
+fn provider_control_leak_handles_multibyte_empty_and_boundary_input() {
+    assert!(!reasoning_contains_provider_control_leak(""));
+    assert!(!reasoning_contains_provider_control_leak(
+        "纯中文推理，没有包络。"
+    ));
+    // Multi-byte prose around quoted mentions must neither panic nor misfire.
+    assert!(!reasoning_contains_provider_control_leak(
+        "讨论检测器：常量 \"<|end|>assistant to=\" 后跟 \"<|channel|>\"、\"<|constrain|>\"、\"<|message|>\"。"
+    ));
+    // An envelope at offset zero is live.
+    assert!(reasoning_contains_provider_control_leak(
+        "<|end|>assistant to=read_file<|channel|>analysis <|constrain|>xml<|message|>x"
+    ));
+}
+
+#[test]
+fn provider_control_leak_chunked_delivery_matches_single_shot() {
+    // Feeding the accumulation in fragments must reach the same verdict as a
+    // single whole-text observation: a live envelope may complete across a
+    // fragment boundary, a quoted one must stay masked, and a masked mention
+    // must not hide a later live envelope.
+    let leaked = "No reasoning available.<|end|>assistant to=read_file<|channel|>analysis \
+        <|constrain|>xml<|message|>done";
+    let quoted_mention = "The opening token is \"<|end|>assistant to=\" in the source.";
+    let quoted_envelope =
+        "See `<|end|>assistant to=x<|channel|>c <|constrain|>k<|message|>m` quoted.";
+    let cases = [
+        leaked.to_string(),
+        quoted_envelope.to_string(),
+        format!("First I quoted the constant: {quoted_mention}\nThen the provider emitted: {leaked}"),
+        format!("{leaked}\nLater I quoted the constant: {quoted_mention}"),
+        format!("{leaked}\nA trailing bare token: <|end|>assistant to="),
+    ];
+    for text in cases {
+        let expected = reasoning_contains_provider_control_leak(&text);
+        for cut in [text.len() / 3, text.len() / 2, 2 * text.len() / 3] {
+            let mut scanner = ProviderControlLeakScanner::new();
+            let before = scanner.observe(&text[..cut]);
+            assert_eq!(
+                before || scanner.observe(&text),
+                expected,
+                "two-chunk verdict must match single-shot"
+            );
+        }
+        // The real delivery shape: 20-byte fragments, with the verdict latched
+        // at the first report because the stream stops there.
+        let mut scanner = ProviderControlLeakScanner::new();
+        let mut verdict = false;
+        for end in (20..=text.len()).step_by(20).chain(std::iter::once(text.len())) {
+            verdict |= scanner.observe(&text[..end]);
+        }
+        assert_eq!(
+            verdict, expected,
+            "20-byte-fragment verdict must match single-shot"
+        );
+    }
 }

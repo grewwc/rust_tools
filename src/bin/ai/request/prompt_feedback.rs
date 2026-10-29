@@ -95,28 +95,68 @@ fn hash_value(value: &Value, state: &mut impl Hasher) {
     }
 }
 
-/// Hash one request message without JSON-serializing it. Field order follows
-/// the `Message` shape (`role`, `content`, `tool_calls`, `tool_call_id`,
-/// `reasoning_content`); `None` vs `Some` discriminants are hashed explicitly
-/// so absent and empty fields never collide.
+/// Hash one message exactly as `hash_value(&serde_json::to_value(message))`,
+/// without building the serialized value: `Serialize` field order, field names,
+/// object lengths and array lengths are all included. The serialized-shape
+/// parity keeps a newly added `Message` field from silently escaping the
+/// fingerprint.
+pub(in crate::ai) fn hash_message(message: &Message, state: &mut impl Hasher) {
+    5u8.hash(state);
+    let mut fields = 2usize;
+    if message.tool_calls.is_some() {
+        fields += 1;
+    }
+    if message.tool_call_id.is_some() {
+        fields += 1;
+    }
+    if message.reasoning_content.is_some() {
+        fields += 1;
+    }
+    fields.hash(state);
+    "role".hash(state);
+    3u8.hash(state);
+    message.role.hash(state);
+    "content".hash(state);
+    hash_value(&message.content, state);
+    if let Some(calls) = message.tool_calls.as_ref() {
+        "tool_calls".hash(state);
+        4u8.hash(state);
+        calls.len().hash(state);
+        for call in calls {
+            5u8.hash(state);
+            3usize.hash(state);
+            "id".hash(state);
+            3u8.hash(state);
+            call.id.hash(state);
+            "type".hash(state);
+            3u8.hash(state);
+            call.tool_type.hash(state);
+            "function".hash(state);
+            5u8.hash(state);
+            2usize.hash(state);
+            "name".hash(state);
+            3u8.hash(state);
+            call.function.name.hash(state);
+            "arguments".hash(state);
+            3u8.hash(state);
+            call.function.arguments.hash(state);
+        }
+    }
+    if let Some(tool_call_id) = message.tool_call_id.as_ref() {
+        "tool_call_id".hash(state);
+        3u8.hash(state);
+        tool_call_id.hash(state);
+    }
+    if let Some(reasoning) = message.reasoning_content.as_ref() {
+        "reasoning_content".hash(state);
+        3u8.hash(state);
+        reasoning.hash(state);
+    }
+}
+
 fn fingerprint_message(message: &Message) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
-    message.role.hash(&mut hasher);
-    hash_value(&message.content, &mut hasher);
-    if let Some(calls) = message.tool_calls.as_ref() {
-        true.hash(&mut hasher);
-        calls.len().hash(&mut hasher);
-        for call in calls {
-            call.id.hash(&mut hasher);
-            call.tool_type.hash(&mut hasher);
-            call.function.name.hash(&mut hasher);
-            call.function.arguments.hash(&mut hasher);
-        }
-    } else {
-        false.hash(&mut hasher);
-    }
-    message.tool_call_id.hash(&mut hasher);
-    message.reasoning_content.hash(&mut hasher);
+    hash_message(message, &mut hasher);
     hasher.finish()
 }
 
@@ -244,18 +284,14 @@ impl PromptTokenFeedback {
             settings: Some(fingerprint_settings(body)),
             messages: Some(body.messages.iter().map(fingerprint_message).collect()),
             estimated_prompt_tokens: body.estimated_prompt_tokens,
-            estimated_prompt_tokens_upper: super::builder::estimate_request_prompt_upper(
-                body.messages,
-                body.tools.as_ref(),
-                body.reasoning_items,
-            ),
+            estimated_prompt_tokens_upper: body.estimated_prompt_tokens_upper,
             message_counts: body.message_counts,
             actual_prompt_tokens: None,
             awaiting_usage: true,
             cache_key: None,
             // Encrypted reasoning replay is part of the estimate (see
-            // `builder::estimate_reasoning_items_tokens`), so its usage may
-            // calibrate later requests like any other prompt content.
+            // `builder::reasoning_item_counts`), so its usage may calibrate
+            // later requests like any other prompt content.
             prefix_reuse: None,
         }
     }
@@ -498,6 +534,7 @@ mod tests {
     use crate::ai::history::Message;
     use crate::ai::request::builder::{build_request_body, clamp_with_estimated_prompt};
     use serde_json::{Value, json};
+    use std::sync::Arc;
 
     fn model() -> String {
         crate::ai::model_names::all()
@@ -665,7 +702,7 @@ mod tests {
         });
         let replay = rustc_hash::FxHashMap::from_iter([(
             "call".to_owned(),
-            vec![json!({"encrypted_content": "A".repeat(8_000)})],
+            Arc::new(vec![json!({"encrypted_content": "A".repeat(8_000)})]),
         )]);
         let build = |items| {
             build_request_body(
@@ -772,6 +809,63 @@ mod tests {
                 json!([1, "two", {"three": [true, null, 1.5]}]),
             ),
         ]);
+    }
+
+    #[test]
+    fn message_hash_matches_serialized_message_shape() {
+        use crate::ai::types::{FunctionCall, ToolCall};
+
+        fn assert_hash_parity_with<H: Hasher + Default>(message: &Message) {
+            let serialized = serde_json::to_value(message).expect("message must serialize");
+            let mut direct = H::default();
+            super::hash_message(message, &mut direct);
+            let mut through_value = H::default();
+            super::hash_value(&serialized, &mut through_value);
+            assert_eq!(direct.finish(), through_value.finish());
+        }
+
+        fn assert_hash_parity(message: &Message) {
+            assert_hash_parity_with::<rustc_hash::FxHasher>(message);
+            // `hash_message` is generic over the hasher; pin that integer widths
+            // cannot make its layout diverge from `hash_value`'s.
+            assert_hash_parity_with::<std::collections::hash_map::DefaultHasher>(message);
+        }
+
+        assert_hash_parity(&message("user", "plain text"));
+        assert_hash_parity(&Message {
+            role: "assistant".to_owned(),
+            content: json!([
+                {"type": "text", "text": "quotes \" backslash \\ control \u{1} 中文 🙂"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ]),
+            tool_calls: Some(vec![
+                ToolCall {
+                    id: "call-1".to_owned(),
+                    tool_type: "function".to_owned(),
+                    function: FunctionCall {
+                        name: "read_file".to_owned(),
+                        arguments: "{\"path\":\"a\\\"b\"}".to_owned(),
+                    },
+                },
+                ToolCall {
+                    id: String::new(),
+                    tool_type: "function".to_owned(),
+                    function: FunctionCall {
+                        name: String::new(),
+                        arguments: "{}".to_owned(),
+                    },
+                },
+            ]),
+            tool_call_id: Some("call-1".to_owned()),
+            reasoning_content: Some("thinking: 1 < 2".to_owned()),
+        });
+        assert_hash_parity(&Message {
+            role: "tool".to_owned(),
+            content: json!({"nested": [1, 1.5, -2, true, null, {"k": "v"}]}),
+            tool_calls: Some(Vec::new()),
+            tool_call_id: Some(String::new()),
+            reasoning_content: None,
+        });
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! Tests for the `completion_gate` cluster.
 
-use crate::ai::tools::FINAL_RESPONSE_END_MARKER;
 use super::super::*;
 use super::common::*;
+use crate::ai::tools::FINAL_RESPONSE_END_MARKER;
 
 #[test]
 fn completion_and_outstanding_gates_each_reopen_once() {

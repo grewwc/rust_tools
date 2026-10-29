@@ -101,6 +101,22 @@ fn session_delete_removes_sqlite_sidecars() {
     std::fs::write(&derived_state_lock, b"lock").unwrap();
     let legacy_derived = store.sessions_root().join("abc.sqlite.subagent-legacy");
     std::fs::write(&legacy_derived, b"legacy").unwrap();
+    let decision_log = store.sessions_root().join("abc.decision-log.jsonl");
+    let context_log = store.sessions_root().join("abc.decision-log.context.jsonl");
+    let decision_log_tmp = store.sessions_root().join("abc.decision-log.jsonl.tmp");
+    let context_log_tmp = store
+        .sessions_root()
+        .join("abc.decision-log.context.jsonl.tmp");
+    let other_decision_log = store.sessions_root().join("other.decision-log.jsonl");
+    for path in [
+        &decision_log,
+        &context_log,
+        &decision_log_tmp,
+        &context_log_tmp,
+        &other_decision_log,
+    ] {
+        std::fs::write(path, b"log").unwrap();
+    }
     let assets = store.session_assets_dir("abc");
     let checkpoints = store.checkpoints_dir("abc");
     std::fs::create_dir_all(&assets).unwrap();
@@ -129,8 +145,60 @@ fn session_delete_removes_sqlite_sidecars() {
     assert!(!PathBuf::from(format!("{}-wal", derived.display())).exists());
     assert!(!derived_state_lock.exists());
     assert!(!legacy_derived.exists());
+    assert!(!decision_log.exists());
+    assert!(!context_log.exists());
+    assert!(!decision_log_tmp.exists());
+    assert!(!context_log_tmp.exists());
+    assert!(
+        other_decision_log.exists(),
+        "another session's decision log must survive"
+    );
     assert!(!assets.exists());
     assert!(!checkpoints.exists());
+    let _ = std::fs::remove_dir_all(store.sessions_root());
+}
+
+#[test]
+fn session_clear_removes_decision_logs() {
+    let history_file =
+        std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
+    let store = SessionStore::new(history_file.as_path());
+    store.ensure_root_dir().unwrap();
+
+    let db = store.session_history_file("abc");
+    std::fs::write(&db, b"test").unwrap();
+    let decision_log = store.sessions_root().join("abc.decision-log.jsonl");
+    let context_log = store.sessions_root().join("abc.decision-log.context.jsonl");
+    std::fs::write(&decision_log, b"log").unwrap();
+    std::fs::write(&context_log, b"log").unwrap();
+
+    store.clear_session("abc").unwrap();
+
+    assert!(!db.exists());
+    assert!(!decision_log.exists());
+    assert!(!context_log.exists());
+    let _ = std::fs::remove_dir_all(store.sessions_root());
+}
+
+/// Deletion must still reclaim decision logs when the sqlite history is already
+/// gone (the orphan shape left by older runs).
+#[test]
+fn session_delete_removes_orphan_decision_logs_without_sqlite() {
+    let history_file =
+        std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
+    let store = SessionStore::new(history_file.as_path());
+    store.ensure_root_dir().unwrap();
+
+    let decision_log = store.sessions_root().join("abc.decision-log.jsonl");
+    let context_log = store.sessions_root().join("abc.decision-log.context.jsonl");
+    std::fs::write(&decision_log, b"log").unwrap();
+    std::fs::write(&context_log, b"log").unwrap();
+
+    assert!(store.delete_session("abc").unwrap());
+
+    assert!(!decision_log.exists());
+    assert!(!context_log.exists());
+    let _ = std::fs::remove_dir_all(store.sessions_root());
 }
 
 #[test]
@@ -188,6 +256,14 @@ fn session_clear_all_removes_all_sqlite_sidecars() {
             b"derived",
         )
         .unwrap();
+        let decision_log = store
+            .sessions_root()
+            .join(format!("{id}.decision-log.jsonl"));
+        let context_log = store
+            .sessions_root()
+            .join(format!("{id}.decision-log.context.jsonl"));
+        std::fs::write(&decision_log, b"log").unwrap();
+        std::fs::write(&context_log, b"log").unwrap();
         let assets = store.session_assets_dir(id);
         std::fs::create_dir_all(&assets).unwrap();
         std::fs::write(assets.join("paste.png"), b"test").unwrap();
@@ -200,6 +276,14 @@ fn session_clear_all_removes_all_sqlite_sidecars() {
     std::fs::write(orphan_checkpoints.join("saved.sqlite"), b"test").unwrap();
     let orphan_derived = store.sessions_root().join("orphan.proc-1.sqlite");
     std::fs::write(&orphan_derived, b"orphan").unwrap();
+    let orphan_decision_log = store.sessions_root().join("orphan.decision-log.jsonl");
+    let orphan_context_log = store
+        .sessions_root()
+        .join("orphan.decision-log.context.jsonl");
+    let unrelated_jsonl = store.sessions_root().join("notes.jsonl");
+    std::fs::write(&orphan_decision_log, b"orphan").unwrap();
+    std::fs::write(&orphan_context_log, b"orphan").unwrap();
+    std::fs::write(&unrelated_jsonl, b"keep").unwrap();
 
     let deleted = store.clear_all_sessions().unwrap();
     assert_eq!(deleted, 3);
@@ -215,10 +299,28 @@ fn session_clear_all_removes_all_sqlite_sidecars() {
             .join(format!("{id}.subagent-child.sqlite"));
         assert!(!derived.exists());
         assert!(!PathBuf::from(format!("{}-shm", derived.display())).exists());
+        assert!(
+            !store
+                .sessions_root()
+                .join(format!("{id}.decision-log.jsonl"))
+                .exists()
+        );
+        assert!(
+            !store
+                .sessions_root()
+                .join(format!("{id}.decision-log.context.jsonl"))
+                .exists()
+        );
         let assets = store.session_assets_dir(id);
         assert!(!assets.exists());
         assert!(!store.checkpoints_dir(id).exists());
     }
     assert!(!orphan_checkpoints.exists());
     assert!(!orphan_derived.exists());
+    assert!(!orphan_decision_log.exists());
+    assert!(!orphan_context_log.exists());
+    assert!(
+        unrelated_jsonl.exists(),
+        "clear-all must not delete unrelated files"
+    );
 }

@@ -1321,3 +1321,38 @@ fn search_overflow_description_stays_in_sync_with_implementation() {
         "search_overflow parameter set drifted from the documented contract"
     );
 }
+
+#[test]
+fn mcp_arg_validators_are_reused_per_schema_text() {
+    // MCP tool calls arrive one per model round; compiling the server schema on
+    // every call repeats work whose result cannot differ while the schema text
+    // is unchanged. Reuse is keyed by that text, not by tool name, because a
+    // reconnect can swap the schema behind the same name.
+    let schema = json!({
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+    });
+    let first = super::mcp_arg_validator("mcp__fs__read", &schema).expect("schema is valid");
+    let second = super::mcp_arg_validator("mcp__fs__read", &schema).expect("schema is valid");
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "an unchanged schema must reuse the compiled validator"
+    );
+    // Same schema text under a different tool name is still the same contract.
+    let shared = super::mcp_arg_validator("mcp__other__read", &schema).expect("schema is valid");
+    assert!(std::sync::Arc::ptr_eq(&first, &shared));
+
+    // A changed schema for the same tool name must NOT reuse the old validator:
+    // it is a different server-side contract.
+    let changed = json!({
+        "type": "object",
+        "properties": {"path": {"type": "integer"}},
+        "required": ["path"],
+    });
+    let third = super::mcp_arg_validator("mcp__fs__read", &changed).expect("schema is valid");
+    assert!(!std::sync::Arc::ptr_eq(&first, &third));
+    assert!(first.is_valid(&json!({"path": "x"})));
+    assert!(third.is_valid(&json!({"path": 1})));
+    assert!(!third.is_valid(&json!({"path": "x"})));
+}

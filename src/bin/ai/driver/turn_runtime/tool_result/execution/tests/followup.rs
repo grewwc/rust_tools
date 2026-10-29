@@ -780,7 +780,11 @@ fn empty_response_retry_note_is_idempotent_and_clears_stale_hints() {
     }];
 
     append_empty_response_retry_note(&mut messages, 1);
-    assert_eq!(messages.len(), 1, "stale truncation note must be replaced, not stacked");
+    assert_eq!(
+        messages.len(),
+        1,
+        "stale truncation note must be replaced, not stacked"
+    );
     assert!(
         messages[0]
             .content
@@ -799,11 +803,7 @@ fn empty_response_retry_note_is_idempotent_and_clears_stale_hints() {
     // A second empty response replaces the note with the updated count (idempotent).
     append_empty_response_retry_note(&mut messages, 2);
     assert_eq!(messages.len(), 1);
-    assert!(
-        messages[0]
-            .content
-            .as_str()
-            .is_some_and(|c| c.starts_with(EMPTY_RESPONSE_RETRY_NOTE_PREFIX)
-                && c.contains("(retry #2)"))
-    );
+    assert!(messages[0].content.as_str().is_some_and(|c| {
+        c.starts_with(EMPTY_RESPONSE_RETRY_NOTE_PREFIX) && c.contains("(retry #2)")
+    }));
 }

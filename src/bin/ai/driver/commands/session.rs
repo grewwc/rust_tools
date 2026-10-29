@@ -269,6 +269,11 @@ fn switch_app_to_session(
     clear_session_local_runtime_state(app);
     app.session_id = session_id.to_string();
     app.session_history_file = history_file;
+    // Decision logs follow the active session; a stale target would either
+    // recreate a deleted session's files or mix another session's telemetry in.
+    crate::ai::driver::decision_log::sync_persist_path_for_history_file(
+        &app.session_history_file,
+    );
     app.stale_patch_targets = stale_patch_targets;
     restore_session_model_agent_effort(app, store);
     restore_prune_marks_for_history(app)?;

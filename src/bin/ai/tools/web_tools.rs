@@ -1,5 +1,6 @@
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -41,6 +42,14 @@ const SEARCH_QUERY_PLACEHOLDER: &str = "{query}";
 const MAX_SEARCH_RESULTS: usize = 10;
 const MAX_SNIPPET_CHARS: usize = 400;
 const SNIPPET_LOOKAHEAD_CHARS: usize = 1_200;
+
+static SEARCH_HEADING_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<h([1-4])\b[^>]*>(.*?)</h[1-4]>").unwrap());
+static SEARCH_ANCHOR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#).unwrap()
+});
+static SEARCH_PARAGRAPH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<p\b[^>]*>(.*?)</p>").unwrap());
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
@@ -267,15 +276,11 @@ fn char_prefix(text: &str, max_chars: usize) -> &str {
 /// heading (`h2`/`h3`) in the result block, so a heading anchor plus the
 /// first following paragraph is a workable engine-agnostic shape.
 fn extract_search_results(html: &str) -> String {
-    let heading_re = Regex::new(r"(?is)<h([1-4])\b[^>]*>(.*?)</h[1-4]>").unwrap();
-    let anchor_re =
-        Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#).unwrap();
-    let paragraph_re = Regex::new(r"(?is)<p\b[^>]*>(.*?)</p>").unwrap();
     let mut entries = String::new();
     let mut seen: Vec<String> = Vec::new();
-    for heading in heading_re.captures_iter(html) {
+    for heading in SEARCH_HEADING_RE.captures_iter(html) {
         let inner = heading.get(2).map(|m| m.as_str()).unwrap_or_default();
-        let Some(anchor) = anchor_re.captures(inner) else {
+        let Some(anchor) = SEARCH_ANCHOR_RE.captures(inner) else {
             continue;
         };
         let title = clean_text(anchor.get(2).map(|m| m.as_str()).unwrap_or_default());
@@ -291,7 +296,7 @@ fn extract_search_results(html: &str) -> String {
         let heading_end = heading.get(0).map(|m| m.end()).unwrap_or_default();
         let tail = &html[heading_end..];
         let window = char_prefix(tail, SNIPPET_LOOKAHEAD_CHARS);
-        let snippet = match paragraph_re.find(window) {
+        let snippet = match SEARCH_PARAGRAPH_RE.find(window) {
             Some(found) if !window[..found.start()].contains("<h") => {
                 let mut text = clean_text(found.as_str());
                 if text.chars().count() > MAX_SNIPPET_CHARS {

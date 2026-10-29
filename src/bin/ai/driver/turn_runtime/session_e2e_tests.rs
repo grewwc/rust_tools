@@ -339,8 +339,7 @@ struct TurnFixture {
 impl TurnFixture {
     fn new(script: Vec<ScriptedTurn>) -> Self {
         let root = TempDirGuard::new("ai-scripted-e2e");
-        std::fs::create_dir_all(root.path().join("history.sessions"))
-            .expect("create fixture root");
+        std::fs::create_dir_all(root.path().join("history.sessions")).expect("create fixture root");
         // A nonexistent path makes configw fall back to defaults; it also keeps the
         // developer's real ~/.configW (and any ai.history.max_chars override) out of
         // the test.
@@ -386,10 +385,7 @@ impl TurnFixture {
         }
     }
 
-    async fn run(
-        &mut self,
-        question: &str,
-    ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
+    async fn run(&mut self, question: &str) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
         let future = run_turn(
             &mut self.app,
             &self.mcp,
@@ -470,7 +466,9 @@ async fn scripted_turn_executes_tool_round_and_keeps_request_prefix() {
         .as_array()
         .expect("first request must carry tool definitions");
     assert!(
-        tools.iter().any(|tool| tool["function"]["name"] == "read_file"),
+        tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "read_file"),
         "read_file must be visible in the request tool schema"
     );
 
@@ -521,7 +519,9 @@ async fn loop_detector_note_reaches_next_request_without_extra_gate_reopen() {
     // the model's final answer; if the final gate spuriously reopened, the script
     // would need a sixth response and the request count/index assertions fail.
     let mut script: Vec<ScriptedTurn> = (0..4)
-        .map(|_| ScriptedTurn::tool_call("call_read_loop", "read_file", json!({"file_path": target})))
+        .map(|_| {
+            ScriptedTurn::tool_call("call_read_loop", "read_file", json!({"file_path": target}))
+        })
         .collect();
     script.push(ScriptedTurn::final_text(
         "Stopped repeating the read after the loop notice.",
@@ -651,7 +651,10 @@ async fn cross_turn_requests_extend_the_previous_request_prefix() {
 
     // Both questions name a code artifact, so the integrated critic gate is on
     // for both turns and does not mask the behavior under test.
-    for question in ["Inspect `src/driver/turn.rs`.", "Inspect `src/driver/turn.rs` once more."] {
+    for question in [
+        "Inspect `src/driver/turn.rs`.",
+        "Inspect `src/driver/turn.rs` once more.",
+    ] {
         let outcome = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
             .scope(
                 project.clone(),
@@ -664,7 +667,11 @@ async fn cross_turn_requests_extend_the_previous_request_prefix() {
     }
 
     let requests = fixture.server.requests();
-    assert_eq!(requests.len(), 4, "two turns of one tool round plus a final answer each");
+    assert_eq!(
+        requests.len(),
+        4,
+        "two turns of one tool round plus a final answer each"
+    );
     let messages: Vec<&[Value]> = requests.iter().map(|r| request_messages(r)).collect();
 
     // Every request after the first must carry the scoped rules the model already

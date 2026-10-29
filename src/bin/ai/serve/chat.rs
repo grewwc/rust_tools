@@ -2545,8 +2545,15 @@ mod serve_history_tests {
         assert!(!is_serve_local_command_start(":discuss API options"));
         assert!(!is_serve_local_command_start("/goal refactor parser"));
         assert!(!is_serve_local_command_start("/task status"));
-        // `/distill-session` and `/archive` execute in the server turn child,
-        // so serve-chat forwards them like a prompt instead of blocking them.
+        // `/audit`, `/distill-session`, and `/archive` execute in the server
+        // turn child, so serve-chat forwards them like a prompt instead of
+        // blocking them.
+        assert!(!is_serve_local_command_start("/audit"));
+        assert!(!is_serve_local_command_start(":audit -f review this"));
+        assert_eq!(
+            classify_serve_input("/audit --fast review this"),
+            ServeInputRoute::ServerCommand
+        );
         assert!(!is_serve_local_command_start("/distill-session"));
         assert!(!is_serve_local_command_start("/archive"));
         assert_eq!(
@@ -3901,7 +3908,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first, archived hidden); /sessions all - include archived; /sessions archive - list archived; /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|u<N>|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/distill-session [session-id|archive.zip] [--dry-run] [--limit N] - distill a session into knowledge on the server (paths resolve on the server)\n/archive [<id>|current|last] - toggle the server-side formal archive flag (default: current)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first, archived hidden); /sessions all - include archived; /sessions archive - list archived; /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|u<N>|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/audit [-f|--fast] [instruction] - run the audit subagent on the server, then verify and fix findings\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/distill-session [session-id|archive.zip] [--dry-run] [--limit N] - distill a session into knowledge on the server (paths resolve on the server)\n/archive [<id>|current|last] - toggle the server-side formal archive flag (default: current)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
                 );
                 continue;
             }
@@ -4137,7 +4144,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                     ServeInputRoute::Unsupported => {
                         let command = trimmed.split_whitespace().next().unwrap_or(&trimmed);
                         eprintln!(
-                            "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /cd, /pwd, /git, /history, /model, /effort, /agent, /skills, /sessions, /resume, /fork, /close, /bg, /new, /distill-session, /archive (see /help)."
+                            "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /cd, /pwd, /git, /history, /model, /effort, /agent, /skills, /sessions, /resume, /fork, /close, /bg, /new, /audit, /distill-session, /archive (see /help)."
                         );
                     }
                     // Unknown command shapes must not fall through to the
@@ -4149,7 +4156,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                             "[serve-chat] unknown command: {command}; it was not sent. Run /help to list commands supported over serve-chat."
                         );
                     }
-                    // `/memo`, `/task`, `/discuss`, `/goal`,
+                    // `/memo`, `/task`, `/discuss`, `/goal`, `/audit`,
                     // `/distill-session`, and `/archive` execute in the server
                     // turn child; everything else is ordinary prompt text.
                     ServeInputRoute::ServerCommand | ServeInputRoute::Prompt => {

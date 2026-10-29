@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fs, io::Write, path::Path, path::PathBuf};
+use std::{borrow::Cow, fs, io::Write, path::Path, path::PathBuf, sync::Arc};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
@@ -1060,7 +1060,7 @@ pub(super) fn append_tool_result_messages_for_model(
             .map(|call| call.id.clone())
         {
             app.turn_reasoning_items
-                .insert(first_call_id, stream_reasoning_items.to_vec());
+                .insert(first_call_id, Arc::new(stream_reasoning_items.to_vec()));
         }
     }
 
@@ -1109,8 +1109,12 @@ pub(super) fn append_tool_result_messages_for_model(
         // `tool_result.is_error`) via the turn-scoped side channel; alignment
         // with executed_tool_calls is guaranteed by the round runner that
         // builds both vectors.
-        let is_error = outcome.as_ref().map(|outcome| !outcome.succeeded).unwrap_or(false);
-        app.turn_tool_errors.insert(result.tool_call_id.clone(), is_error);
+        let is_error = outcome
+            .as_ref()
+            .map(|outcome| !outcome.succeeded)
+            .unwrap_or(false);
+        app.turn_tool_errors
+            .insert(result.tool_call_id.clone(), is_error);
         let projected_tool_message = Message {
             role: "tool".to_string(),
             content: Value::String(prepared.content_for_model),
@@ -1548,7 +1552,7 @@ mod tests {
             last_turn_interrupted: false,
             prune_marks: Default::default(),
             turn_reasoning_items: Default::default(),
-        turn_tool_errors: Default::default(),
+            turn_tool_errors: Default::default(),
             stale_patch_targets: Default::default(),
             tool_middlewares: Vec::new(),
             llm_middlewares: Vec::new(),

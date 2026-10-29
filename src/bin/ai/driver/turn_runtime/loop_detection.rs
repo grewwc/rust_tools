@@ -743,7 +743,8 @@ pub(super) fn round_has_mutation(messages: &[crate::ai::history::Message]) -> bo
                 // Only starting a command can change the workspace. Session
                 // control is a separate `command_session` tool and is not a
                 // mutation tool, so it never reaches this branch.
-                let Ok(args) = serde_json::from_str::<serde_json::Value>(tc.function.arguments.as_str())
+                let Ok(args) =
+                    serde_json::from_str::<serde_json::Value>(tc.function.arguments.as_str())
                 else {
                     // Malformed arguments are conservatively treated as a
                     // mutation candidate, matching the previous fail-safe.

@@ -275,8 +275,16 @@ fn open_steps_reopen_until_forced_then_warn_with_steps() {
         last_note(&messages).contains(OUTSTANDING_WORK_REQUIRED_MARKER),
         "reopen must carry the budget marker"
     );
-    assert!(last_note(&messages).contains("step 1"), "{}", last_note(&messages));
-    assert!(last_note(&messages).contains("step 2"), "{}", last_note(&messages));
+    assert!(
+        last_note(&messages).contains("step 1"),
+        "{}",
+        last_note(&messages)
+    );
+    assert!(
+        last_note(&messages).contains("step 2"),
+        "{}",
+        last_note(&messages)
+    );
     // Persistent gate: a second evaluation in the same turn still reopens.
     let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 1, 16);
     assert_eq!(action, OutstandingWorkGateAction::Reopen);
@@ -304,7 +312,11 @@ fn failed_step_blocks_completion() {
     // A failed step needs retry/redo or an explicit skip: ending here would drop it.
     let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16);
     assert_eq!(action, OutstandingWorkGateAction::Reopen);
-    assert!(last_note(&messages).contains("step 2"), "{}", last_note(&messages));
+    assert!(
+        last_note(&messages).contains("step 2"),
+        "{}",
+        last_note(&messages)
+    );
     let _ = fs::remove_dir_all(&base);
 }
 
@@ -405,7 +417,9 @@ fn reopen_is_recorded_in_the_decision_log() {
         .recent_by_session(&app.session_id, 5);
     assert!(
         recent.iter().any(|entry| {
-            entry.context.contains("reason=outstanding_work_settled_plan_no_claim")
+            entry
+                .context
+                .contains("reason=outstanding_work_settled_plan_no_claim")
         }),
         "reopen must be observable in the decision log: {recent:?}"
     );
@@ -457,7 +471,10 @@ fn plan_from_earlier_turn_does_not_bind_a_new_turn() {
         super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16)
     });
     assert_eq!(action, OutstandingWorkGateAction::Allow);
-    assert!(messages.is_empty(), "a carried plan must not inject a reopen note");
+    assert!(
+        messages.is_empty(),
+        "a carried plan must not inject a reopen note"
+    );
     // The same turn that wrote the plan stays bound.
     let action = in_turn(&app, 5, || {
         super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16)
@@ -493,7 +510,11 @@ fn updating_carried_plan_rebinds_it_to_the_current_turn() {
         super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16)
     });
     assert_eq!(action, OutstandingWorkGateAction::Reopen);
-    assert!(last_note(&messages).contains("step 2"), "{}", last_note(&messages));
+    assert!(
+        last_note(&messages).contains("step 2"),
+        "{}",
+        last_note(&messages)
+    );
     let _ = fs::remove_dir_all(&base);
 }
 

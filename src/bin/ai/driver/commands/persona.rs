@@ -196,6 +196,11 @@ fn switch_to_persona(app: &mut App, persona: PersonaProfile) {
     let session_store = SessionStore::new(app.config.history_file.as_path());
     app.session_id = session_id.clone();
     app.session_history_file = session_store.session_history_file(&session_id);
+    // Keep decision-log persistence on the new persona's session; a stale
+    // target in a deleted persona's sessions root would recreate its files.
+    crate::ai::driver::decision_log::sync_persist_path_for_history_file(
+        &app.session_history_file,
+    );
     if let Err((path, error)) = crate::ai::driver::session_pid::mark_session_pid(
         session_store.sessions_root(),
         &session_id,
