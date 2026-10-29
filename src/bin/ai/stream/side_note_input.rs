@@ -636,9 +636,23 @@ impl Drop for SideNoteInputGuard {
 /// cbreak terminal mode: ICANON off (single keys delivered immediately) and ECHO off
 /// (self-managed echo so erasing by character width works), ISIG kept (Ctrl+C still
 /// raises SIGINT) and OPOST kept (output newline conversion unaffected).
+///
+/// While cbreak is held, stdin is also switched to `O_NONBLOCK` (restored on
+/// drop): every read site polls for readability first, but a byte can vanish
+/// between poll and read (competing reader, pty quirk), and a blocking read
+/// would then stall forever holding the stdin lease while ignoring the stop
+/// flag — wedging the next input box, which waits on that lease. With a
+/// non-blocking fd the race degrades to an `EAGAIN` retry that re-checks the
+/// stop flag on the next poll.
 struct CbreakTerm {
     saved: libc::termios,
+    /// `fcntl` flags before `O_NONBLOCK` was added; `None` when the fd flags
+    /// could not be queried, in which case reads stay blocking (legacy behavior).
+    fd_flags: Option<libc::c_int>,
 }
+
+/// Warned-once guard for the `O_NONBLOCK` best-effort setup below.
+static NONBLOCK_WARNED: AtomicBool = AtomicBool::new(false);
 
 impl CbreakTerm {
     fn enter() -> io::Result<Self> {
@@ -656,7 +670,25 @@ impl CbreakTerm {
             if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &t) != 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(CbreakTerm { saved })
+            // Best-effort `O_NONBLOCK`: on failure keep blocking reads (legacy
+            // behavior) rather than disabling the listener.
+            let mut fd_flags = None;
+            let current = libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL);
+            if current >= 0
+                && libc::fcntl(
+                    libc::STDIN_FILENO,
+                    libc::F_SETFL,
+                    current | libc::O_NONBLOCK,
+                ) == 0
+            {
+                fd_flags = Some(current);
+            } else if !NONBLOCK_WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[Warning] side-note listener: failed to set stdin O_NONBLOCK ({}); a poll/read race may stall the next input box.",
+                    io::Error::last_os_error()
+                );
+            }
+            Ok(CbreakTerm { saved, fd_flags })
         }
     }
 }
@@ -665,6 +697,9 @@ impl Drop for CbreakTerm {
     fn drop(&mut self) {
         // SAFETY: restores the original terminal state captured on entry.
         unsafe {
+            if let Some(flags) = self.fd_flags {
+                libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, flags);
+            }
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved);
         }
     }
@@ -915,14 +950,17 @@ fn read_byte_timeout(timeout_ms: i32, stop: &AtomicBool) -> Option<u8> {
             return None;
         }
         let mut byte = [0u8; 1];
-        // SAFETY: one-byte stack buffer; poll confirmed readability so the blocking
-        // read returns immediately.
+        // SAFETY: one-byte stack buffer. stdin is `O_NONBLOCK` under `CbreakTerm`,
+        // so a byte that vanished after poll surfaces as `EAGAIN` instead of a stall.
         let n = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
         if n == 1 {
             return Some(byte[0]);
         }
-        if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue; // read interrupted by a signal, retry
+        if n < 0 {
+            let kind = io::Error::last_os_error().kind();
+            if kind == io::ErrorKind::Interrupted || kind == io::ErrorKind::WouldBlock {
+                continue; // signal, or the byte vanished after poll; re-poll within the deadline
+            }
         }
         return None; // EOF or error
     }
@@ -1073,11 +1111,15 @@ fn service_width_query(replay: &mut VecDeque<u8>) -> Option<u16> {
             continue;
         }
         let mut byte = [0u8; 1];
-        // SAFETY: one-byte stack buffer; poll confirmed readability.
+        // SAFETY: one-byte stack buffer. stdin is `O_NONBLOCK` under `CbreakTerm`,
+        // so a byte that vanished after poll surfaces as `EAGAIN` instead of a stall.
         let n = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
         if n <= 0 {
-            if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
+            if n < 0 {
+                let kind = io::Error::last_os_error().kind();
+                if kind == io::ErrorKind::Interrupted || kind == io::ErrorKind::WouldBlock {
+                    continue;
+                }
             }
             replay.extend(buf.drain(..));
             return None;
@@ -1176,8 +1218,9 @@ fn side_note_input_loop(
                 break;
             }
             let mut byte = [0u8; 1];
-            // SAFETY: one-byte stack buffer; poll confirmed readability so the blocking
-            // read returns immediately.
+            // SAFETY: one-byte stack buffer. stdin is `O_NONBLOCK` under
+            // `CbreakTerm`, so a byte that vanished after poll surfaces as
+            // `EAGAIN` (handled below) instead of stalling the lease holder.
             let n = unsafe { libc::read(libc::STDIN_FILENO, byte.as_mut_ptr().cast(), 1) };
             if n == 0 {
                 break; // EOF

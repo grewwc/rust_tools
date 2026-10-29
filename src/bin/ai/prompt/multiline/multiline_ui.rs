@@ -1642,7 +1642,9 @@ impl PromptEditor {
         // The streaming side-note listener (Ctrl+G composer) owns stdin in
         // cbreak mode for the whole turn. Preempt it BEFORE touching stdin or
         // termios: the foreground flag makes it stop poll/read, restore termios
-        // and release its stdin lease, and only then does this function return.
+        // and release its stdin lease. The handshake is bounded (see
+        // `acquire_foreground_stdin`): on timeout the prompt proceeds without
+        // the lease rather than wedging the UI forever.
         // Without the handshake, the cursor-position query (\x1b[6n) below races
         // the listener for stdin: a stolen response would force an unnecessary
         // timeout and a switch to the query-free editing screen.

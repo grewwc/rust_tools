@@ -40,12 +40,17 @@ src/backend/unsupported.rs # every call reports a clear "no backend on this OS" 
 2. **No silent no-ops.** A parameter a platform cannot honour (the `display`
    parameter or the `pixel` scroll unit on Linux, `include_cursor` with
    ImageMagick's `import`) is an error naming the limitation, never a dropped
-   argument.
+   argument. Placeholders models send for unused optionals (`""`, `[]`, an
+   all-zero `region`, `window_id`/`display` ≤ 0) are invalid values on every
+   backend and mean "not given"; rejecting them wasted most real screenshot calls.
 3. **Screenshots return a path, not image content.** Only `content[0].text`
    reaches the model (`crates/mcp_stdio/AGENTS.md` invariant 4), so the path
    plus `a`'s image-aware `read_file` is what shows the frame to a vision
    model. `frame.rs` binds each `frame_id` to its capture scope; unchanged
-   probe files are deleted. `find_text`/`click_text` reuse
+   probe files are deleted. A kept HiDPI frame is stored at one pixel per point
+   (the report's click formula always describes the stored file) and kept frames
+   are pruned by count and age; the `frame_id` digest and OCR use the native
+   pixels. `find_text`/`click_text` reuse
    `rust_tools::pdfw` OCR; `click_text` never acts unless exactly one OCR
    line matches, and for window captures it activates and verifies the exact
    window — before the fresh OCR frame and again immediately before input.
@@ -99,5 +104,6 @@ That check proves it compiles, not that the Linux helpers behave.
   support.
 - Pixels-per-point must be taken from the display *mode* (`CGDisplayCopyDisplayMode` +
   `CGDisplayMode::pixel_width`); `CGDisplayPixelsWide` returns the *point* size on a
-  HiDPI mode. `capture.rs` also re-measures the ratio from the PNG it wrote, so the
-  pixel→point mapping the model is given stays right for window captures too.
+  HiDPI mode. `frame.rs` also measures the ratio from the decoded capture against the
+  frame the backend reports, so the pixel→point mapping stays right for window
+  captures too.

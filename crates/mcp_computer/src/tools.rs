@@ -290,21 +290,21 @@ async fn screenshot(
     previous: Option<FrameFingerprint>,
 ) -> Result<String, JsonRpcErr> {
     let started = Instant::now();
-    let captured = call(move || CapturedFrame::capture(scope)).await?;
-    let status = if previous.is_some() {
-        "changed"
-    } else {
-        "captured"
-    };
-    if let Some(previous) = &previous
-        && captured.fingerprint() == previous
-    {
-        return Ok(frame::unchanged_report(
-            previous,
-            started.elapsed().as_millis(),
-        ));
-    }
-    Ok(captured.into_report(status))
+    // Keeping a frame resamples and re-encodes it, so it stays on the blocking thread.
+    call(move || {
+        let captured = CapturedFrame::capture(scope)?;
+        let Some(previous) = previous else {
+            return captured.into_report("captured");
+        };
+        if captured.fingerprint() == &previous {
+            return Ok(frame::unchanged_report(
+                &previous,
+                started.elapsed().as_millis(),
+            ));
+        }
+        captured.into_report("changed")
+    })
+    .await
 }
 
 async fn find_text(
@@ -387,10 +387,10 @@ fn capture_ocr(
     languages: &[String],
 ) -> Result<(CapturedFrame, OcrResult), String> {
     let captured = CapturedFrame::capture(scope)?;
-    let image = image::open(captured.path())
-        .map_err(|error| format!("could not decode captured image for OCR: {error}"))?;
+    // OCR reads the native capture pixels, which `captured.mapping()` describes; the
+    // downscaled copy kept for the model would lose small text.
     let languages = languages.iter().map(String::as_str).collect::<Vec<_>>();
-    let ocr = ocr_image_with_regions(&image, &languages)?;
+    let ocr = ocr_image_with_regions(captured.image(), &languages)?;
     Ok((captured, ocr))
 }
 
@@ -477,7 +477,7 @@ async fn wait_for_change(
                 }
             };
             if captured.fingerprint() != &previous {
-                return Ok(captured.into_report("changed"));
+                return run_blocking(move || captured.into_report("changed")).await;
             }
             let now = Instant::now();
             if now >= deadline {
@@ -707,12 +707,30 @@ fn required_string(args: &Value, key: &str) -> Result<String, JsonRpcErr> {
     optional_string(args, key)?.ok_or_else(|| invalid(&format!("missing or empty '{key}'")))
 }
 
+/// Models routinely fill unused optional fields with `""` instead of omitting them, so
+/// an empty string means "not given"; `required_string` still rejects it.
 fn optional_string(args: &Value, key: &str) -> Result<Option<String>, JsonRpcErr> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) if !text.trim().is_empty() => Ok(Some(text.clone())),
-        Some(Value::String(_)) => Err(invalid(&format!("missing or empty '{key}'"))),
+        Some(Value::String(text)) if text.trim().is_empty() => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
         Some(other) => Err(invalid(&format!("'{key}' must be a string, got {other}"))),
+    }
+}
+
+/// Read an optional capture-selector id (`window_id`, `display`). Models fill unused
+/// selectors with `0` or `-1` instead of omitting them; neither is a valid window or
+/// display id on any backend, so both mean "not selected".
+fn optional_selector_id(args: &Value, key: &str) -> Result<Option<u32>, JsonRpcErr> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => match value.as_i64() {
+            Some(id) if id <= 0 => Ok(None),
+            Some(id) => u32::try_from(id)
+                .map(Some)
+                .map_err(|_| invalid(&format!("'{key}' is out of range, got {value}"))),
+            None => Err(invalid(&format!("'{key}' must be an integer id, got {value}"))),
+        },
     }
 }
 
@@ -784,16 +802,21 @@ fn string_list(args: &Value, key: &str) -> Result<Vec<String>, JsonRpcErr> {
     }
 }
 
-/// Read `region` as `[x, y, width, height]` in points.
+/// Read `region` as `[x, y, width, height]` in points. `[]` and an all-zero region are
+/// the placeholders models send for "no region", so both mean "not selected".
 fn optional_region(args: &Value) -> Result<Option<(f64, f64, f64, f64)>, JsonRpcErr> {
     match args.get("region") {
         None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) if items.is_empty() => Ok(None),
         Some(Value::Array(items)) if items.len() == 4 => {
             let mut numbers = [0.0_f64; 4];
             for (slot, item) in numbers.iter_mut().zip(items) {
                 *slot = item
                     .as_f64()
                     .ok_or_else(|| invalid("'region' must be [x, y, width, height] in points"))?;
+            }
+            if numbers.iter().all(|number| *number == 0.0) {
+                return Ok(None);
             }
             Ok(Some((numbers[0], numbers[1], numbers[2], numbers[3])))
         }
@@ -804,8 +827,8 @@ fn optional_region(args: &Value) -> Result<Option<(f64, f64, f64, f64)>, JsonRpc
 fn capture_scope(args: &Value) -> Result<CaptureScope, JsonRpcErr> {
     CaptureScope::from_arguments(
         optional_region(args)?,
-        optional_u32(args, "window_id")?,
-        optional_u32(args, "display")?,
+        optional_selector_id(args, "window_id")?,
+        optional_selector_id(args, "display")?,
         optional_bool(args, "include_cursor")?.unwrap_or(false),
     )
     .map_err(|error| invalid(&error))
@@ -831,6 +854,29 @@ mod tests {
             Err(_) => panic!("a zero-budget wait should return without capturing"),
         };
         assert!(report.starts_with("status=unchanged\n"));
+    }
+
+    #[test]
+    fn placeholder_selectors_mean_not_given() {
+        // Argument shapes recorded from real sessions, which the server used to reject.
+        // `JsonRpcErr` has no `Debug`, so results are compared through `.ok()`.
+        let window = CaptureScope::from_arguments(None, Some(128), None, false).ok();
+        for args in [
+            json!({"display": 0, "include_cursor": false, "previous_frame_id": "", "region": [], "window_id": 128}),
+            json!({"display": -1, "region": [0, 0, 0, 0], "window_id": 128}),
+        ] {
+            assert_eq!(capture_scope(&args).ok(), window);
+            assert_eq!(optional_frame_id(&args, "previous_frame_id").ok(), Some(None));
+        }
+        assert_eq!(
+            capture_scope(&json!({"display": 0, "region": [0, 38, 1512, 851], "window_id": 0})).ok(),
+            CaptureScope::from_arguments(Some((0.0, 38.0, 1512.0, 851.0)), None, None, false).ok()
+        );
+        assert_eq!(optional_string(&json!({"app": ""}), "app").ok(), Some(None));
+
+        // Two real selectors are still ambiguous, and a required string is still required.
+        assert!(capture_scope(&json!({"display": 1, "window_id": 128})).is_err());
+        assert!(required_string(&json!({"text": ""}), "text").is_err());
     }
 
     #[test]

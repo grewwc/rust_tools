@@ -1,17 +1,29 @@
 use std::{
     io::{IsTerminal, Write},
     sync::{
-        Mutex, MutexGuard,
+        Mutex, MutexGuard, TryLockError,
         atomic::{AtomicUsize, Ordering},
     },
+    thread,
+    time::{Duration, Instant},
 };
 
 static STDIN_OWNER: Mutex<()> = Mutex::new(());
 static FOREGROUND_STDIN_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
+/// Upper bound for the foreground stdin-lease handshake. The background
+/// side-note listener normally yields within one poll interval (~50ms); if it
+/// is wedged in a blocking read, the UI must still come back instead of
+/// hanging forever before the input box is drawn.
+const FOREGROUND_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Sleep between lease polls while waiting for the background listener.
+const FOREGROUND_ACQUIRE_POLL: Duration = Duration::from_millis(20);
+
 /// stdin / termios 的进程内独占租约。前台确认先发布抢占请求，再等待后台监听器交还租约。
 #[doc(hidden)]
 pub struct StdinOwnerGuard {
+    /// `None` only on the degraded path: the handshake timed out and the
+    /// foreground proceeds without the lease so the UI stays reachable.
     owner: Option<MutexGuard<'static, ()>>,
     foreground: bool,
 }
@@ -40,14 +52,51 @@ pub fn foreground_stdin_requested() -> bool {
 
 /// Foreground interactions must call this before printing the prompt or reading
 /// stdin. Publishing the preemption flag makes the streaming side-note listener
-/// stop poll/read, restore termios, and release its stdin lease; this function
-/// returns only after that handshake completes.
+/// stop poll/read, restore termios, and release its stdin lease. The handshake
+/// is bounded by [`FOREGROUND_ACQUIRE_TIMEOUT`]: on timeout the foreground
+/// proceeds without the lease (degraded: a wedged listener may briefly race
+/// for input, but it exits on its next read and releases the lease then) so a
+/// stuck background reader can never wedge the UI forever.
 #[doc(hidden)]
 pub fn acquire_foreground_stdin() -> StdinOwnerGuard {
+    acquire_foreground_stdin_with_timeout(FOREGROUND_ACQUIRE_TIMEOUT)
+}
+
+/// Same as [`acquire_foreground_stdin`] with an explicit handshake bound.
+/// Exposed so tests can pin the degraded path without waiting out the
+/// production timeout.
+#[doc(hidden)]
+pub fn acquire_foreground_stdin_with_timeout(timeout: Duration) -> StdinOwnerGuard {
     FOREGROUND_STDIN_REQUESTS.fetch_add(1, Ordering::SeqCst);
-    StdinOwnerGuard {
-        owner: Some(lock_stdin_owner()),
-        foreground: true,
+    let deadline = Instant::now() + timeout;
+    loop {
+        match STDIN_OWNER.try_lock() {
+            Ok(owner) => {
+                return StdinOwnerGuard {
+                    owner: Some(owner),
+                    foreground: true,
+                };
+            }
+            Err(TryLockError::Poisoned(poisoned)) => {
+                return StdinOwnerGuard {
+                    owner: Some(poisoned.into_inner()),
+                    foreground: true,
+                };
+            }
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    eprintln!(
+                        "[Warning] stdin lease still held by the background listener after {:?}; proceeding without exclusive stdin. Input may interleave until the listener yields; press Enter if keys seem eaten.",
+                        timeout
+                    );
+                    return StdinOwnerGuard {
+                        owner: None,
+                        foreground: true,
+                    };
+                }
+                thread::sleep(FOREGROUND_ACQUIRE_POLL);
+            }
+        }
     }
 }
 
@@ -181,8 +230,13 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    /// Serializes the lease tests: they share the process-global stdin lease
+    /// and request counter, so parallel execution would flake on interleavings.
+    static TEST_LEASE_SERIAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn foreground_request_preempts_background_stdin_owner() {
+        let _serial = TEST_LEASE_SERIAL.lock().unwrap();
         let background = acquire_background_stdin().expect("background should acquire stdin");
         let (acquired_tx, acquired_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -211,5 +265,34 @@ mod tests {
             "foreground did not receive stdin ownership"
         );
         assert!(!foreground_stdin_requested());
+    }
+
+    /// Regression test for the turn-end UI wedge: when the background lease
+    /// holder never yields (e.g. wedged in a blocking stdin read), the
+    /// foreground handshake must time out and proceed degraded instead of
+    /// hanging forever before the input box is drawn.
+    #[test]
+    fn foreground_acquire_degrades_after_timeout_when_lease_wedged() {
+        let _serial = TEST_LEASE_SERIAL.lock().unwrap();
+        // Wedge the lease directly: hold the mutex without honoring the
+        // foreground request, like a listener stuck in `read()`.
+        let _wedged = lock_stdin_owner();
+        let started = Instant::now();
+        let guard = acquire_foreground_stdin_with_timeout(Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        assert!(
+            guard.owner.is_none(),
+            "expected a degraded guard without the lease"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "foreground acquire blocked too long: {:?}",
+            elapsed
+        );
+        drop(guard);
+        assert!(
+            !foreground_stdin_requested(),
+            "foreground request was not released"
+        );
     }
 }

@@ -1,21 +1,37 @@
 //! Shared screenshot scope, lifecycle, and visual fingerprinting.
 //!
 //! Backends only write a PNG to the path supplied here. This layer owns unique
-//! paths, removes probe frames automatically, and gives the model a stable frame
-//! token based on decoded pixels rather than PNG encoding details.
+//! paths, removes probe frames automatically, bounds the kept frames, and gives the
+//! model a stable frame token based on decoded pixels rather than PNG encoding
+//! details. A kept HiDPI frame is stored at one image pixel per screen point: the
+//! vision model gets a quarter of the pixels, and an image coordinate is directly a
+//! point offset from the capture origin. OCR reads the native pixels instead.
 
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use image::ImageReader;
+use image::codecs::png::{CompressionType, FilterType as PngFilter, PngEncoder};
+use image::imageops::FilterType;
+use image::{DynamicImage, ImageEncoder, ImageReader, RgbaImage};
 use sha2::{Digest, Sha256};
 
 use crate::backend;
 
 const FRAME_TOKEN_VERSION: &str = "mcp-computer-frame-v1";
 const SCREENSHOT_DIR_ENV: &str = "MCP_COMPUTER_SCREENSHOT_DIR";
+const CAPTURE_FILE_PREFIX: &str = "screen-";
+/// Kept frames beyond this count (newest first) are deleted when a new one is kept.
+const MAX_KEPT_FRAMES: usize = 40;
+/// Kept frames older than this are deleted when a new one is kept: they describe a
+/// screen state that is long gone, and nothing else ever removes them.
+const MAX_KEPT_FRAME_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Downscale only when the capture holds at least this many pixels per point; below
+/// it the saving does not pay for a resample that softens small text.
+const MIN_DOWNSCALE_RATIO: f64 = 1.25;
 static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -235,19 +251,7 @@ impl FrameFingerprint {
         )
     }
 
-    fn from_png(path: &Path, scope: CaptureScope) -> Result<Self, String> {
-        let image = ImageReader::open(path)
-            .map_err(|error| format!("could not open screenshot {}: {error}", path.display()))?
-            .with_guessed_format()
-            .map_err(|error| {
-                format!(
-                    "could not identify screenshot format for {}: {error}",
-                    path.display()
-                )
-            })?
-            .decode()
-            .map_err(|error| format!("could not decode screenshot {}: {error}", path.display()))?
-            .to_rgba8();
+    fn from_pixels(image: &RgbaImage, scope: CaptureScope) -> Self {
         let (width, height) = image.dimensions();
         let mut hasher = Sha256::new();
         hasher.update(width.to_be_bytes());
@@ -257,18 +261,36 @@ impl FrameFingerprint {
         for byte in hasher.finalize() {
             let _ = write!(pixel_digest, "{byte:02x}");
         }
-        Ok(Self {
+        Self {
             scope,
             width,
             height,
             pixel_digest,
-        })
+        }
     }
 }
 
+fn decode_png(path: &Path) -> Result<RgbaImage, String> {
+    Ok(ImageReader::open(path)
+        .map_err(|error| format!("could not open screenshot {}: {error}", path.display()))?
+        .with_guessed_format()
+        .map_err(|error| {
+            format!(
+                "could not identify screenshot format for {}: {error}",
+                path.display()
+            )
+        })?
+        .decode()
+        .map_err(|error| format!("could not decode screenshot {}: {error}", path.display()))?
+        .into_rgba8())
+}
+
+/// One capture, decoded once: the native pixels serve the fingerprint and OCR, and
+/// the file on disk is rewritten for the model only if the frame is kept.
 pub(crate) struct CapturedFrame {
     file: CaptureFile,
     details: String,
+    image: DynamicImage,
     fingerprint: FrameFingerprint,
     mapping: Option<ScreenMapping>,
 }
@@ -290,6 +312,18 @@ impl ScreenMapping {
             self.origin_y + y * self.point_height / f64::from(self.pixel_height),
         )
     }
+
+    /// Image size at one pixel per point, or `None` when the capture is not dense
+    /// enough (a 1x display) for downscaling to pay off.
+    fn point_sized(self) -> Option<(u32, u32)> {
+        let ratio = f64::from(self.pixel_width) / self.point_width;
+        if !(ratio >= MIN_DOWNSCALE_RATIO) {
+            return None;
+        }
+        let width = self.point_width.round();
+        let height = self.point_height.round();
+        (width >= 1.0 && height >= 1.0).then_some((width as u32, height as u32))
+    }
 }
 
 impl CapturedFrame {
@@ -303,7 +337,8 @@ impl CapturedFrame {
             scope.include_cursor(),
             file.path(),
         )?;
-        let fingerprint = FrameFingerprint::from_png(file.path(), scope)?;
+        let pixels = decode_png(file.path())?;
+        let fingerprint = FrameFingerprint::from_pixels(&pixels, scope);
         let mapping = screenshot.origin.and_then(|(origin_x, origin_y)| {
             let (point_width, point_height) = screenshot
                 .point_size
@@ -324,6 +359,7 @@ impl CapturedFrame {
         Ok(Self {
             file,
             details: screenshot.report,
+            image: DynamicImage::ImageRgba8(pixels),
             fingerprint,
             mapping,
         })
@@ -333,21 +369,29 @@ impl CapturedFrame {
         &self.fingerprint
     }
 
-    pub(crate) fn path(&self) -> &Path {
-        self.file.path()
+    /// The native capture pixels, which `mapping` describes.
+    pub(crate) fn image(&self) -> &DynamicImage {
+        &self.image
     }
 
     pub(crate) fn mapping(&self) -> Option<ScreenMapping> {
         self.mapping
     }
 
-    pub(crate) fn into_report(mut self, status: &str) -> String {
+    /// Keep the frame for the model: store it at one pixel per point when the capture
+    /// is HiDPI, prune old kept frames, and describe the stored file's geometry.
+    pub(crate) fn into_report(mut self, status: &str) -> Result<String, String> {
+        let (width, height) = self.store_for_model()?;
         self.file.keep = true;
+        if let Some(directory) = self.file.path.parent() {
+            prune_kept_frames(directory, &self.file.path, MAX_KEPT_FRAMES, MAX_KEPT_FRAME_AGE);
+        }
         let mut report = format!(
             "status={status}\nframe_id={}\nscreenshot saved: {}\n",
             self.fingerprint.to_token(),
             self.file.path.display()
         );
+        report.push_str(&geometry_report(width, height, self.mapping));
         if !self.details.is_empty() {
             report.push_str(&self.details);
             if !self.details.ends_with('\n') {
@@ -357,7 +401,92 @@ impl CapturedFrame {
         report.push_str(
             "Next: call `read_file` on exactly this path to inspect the new frame before acting.",
         );
-        report
+        Ok(report)
+    }
+
+    /// Rewrite a HiDPI capture at one pixel per point and return the stored size.
+    fn store_for_model(&self) -> Result<(u32, u32), String> {
+        let Some((width, height)) = self.mapping.and_then(ScreenMapping::point_sized) else {
+            return Ok((self.fingerprint.width, self.fingerprint.height));
+        };
+        let resized = self.image.resize_exact(width, height, FilterType::Triangle);
+        let path = &self.file.path;
+        let file = File::create(path)
+            .map_err(|error| format!("could not rewrite screenshot {}: {error}", path.display()))?;
+        PngEncoder::new_with_quality(BufWriter::new(file), CompressionType::Fast, PngFilter::Adaptive)
+            .write_image(resized.as_bytes(), width, height, resized.color().into())
+            .map_err(|error| format!("could not encode screenshot {}: {error}", path.display()))?;
+        Ok((width, height))
+    }
+}
+
+/// Geometry of the stored image: everything needed to turn a position in it back
+/// into a global screen point for `click`.
+fn geometry_report(width: u32, height: u32, mapping: Option<ScreenMapping>) -> String {
+    let mut text = format!("image size: {width}x{height} px\n");
+    let Some(mapping) = mapping else {
+        text.push_str(
+            "capture frame: unknown (the window or display bounds could not be read); \
+             take coordinates from `list_windows` and treat the image size as pixels\n",
+        );
+        return text;
+    };
+    let scale = f64::from(width) / mapping.point_width;
+    let _ = writeln!(
+        text,
+        "capture frame: x={} y={} {}x{} points, scale {scale:.2} px/point",
+        mapping.origin_x, mapping.origin_y, mapping.point_width, mapping.point_height
+    );
+    if (scale - 1.0).abs() < 0.01 {
+        let _ = writeln!(
+            text,
+            "to click a feature at pixel (px, py) in this image: x = {} + px, y = {} + py",
+            mapping.origin_x, mapping.origin_y
+        );
+    } else {
+        let _ = writeln!(
+            text,
+            "to click a feature at pixel (px, py) in this image: \
+             x = {} + px / {scale:.2}, y = {} + py / {scale:.2}",
+            mapping.origin_x, mapping.origin_y
+        );
+    }
+    text
+}
+
+/// Delete kept frames beyond the newest `max_count` or older than `max_age`. Only
+/// this server's own `screen-*.png` files are considered, and `current` always
+/// survives and counts toward `max_count`. Best effort: a pruned frame that some
+/// session still wanted is simply captured again.
+fn prune_kept_frames(directory: &Path, current: &Path, max_count: usize, max_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut frames: Vec<(SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(CAPTURE_FILE_PREFIX) && name.ends_with(".png")
+        })
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path == current {
+                return None;
+            }
+            Some((entry.metadata().ok()?.modified().ok()?, path))
+        })
+        .collect();
+    frames.sort_by(|left, right| right.0.cmp(&left.0));
+    let now = SystemTime::now();
+    let keep_others = max_count.saturating_sub(1);
+    for (index, (modified, path)) in frames.iter().enumerate() {
+        let expired = now
+            .duration_since(*modified)
+            .is_ok_and(|age| age > max_age);
+        if index >= keep_others || expired {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -383,7 +512,7 @@ impl CaptureFile {
             .unwrap_or_default();
         let sequence = NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed);
         let path = directory.join(format!(
-            "screen-{}-{stamp}-{sequence}.png",
+            "{CAPTURE_FILE_PREFIX}{}-{stamp}-{sequence}.png",
             std::process::id()
         ));
         Ok(Self { path, keep: false })
@@ -502,11 +631,66 @@ mod tests {
         );
 
         let scope = CaptureScope::from_arguments(None, None, None, false).unwrap();
-        let first = FrameFingerprint::from_png(first.path(), scope).unwrap();
-        let second = FrameFingerprint::from_png(second.path(), scope).unwrap();
-        let changed = FrameFingerprint::from_png(changed.path(), scope).unwrap();
+        let fingerprint =
+            |path: &Path| FrameFingerprint::from_pixels(&decode_png(path).unwrap(), scope);
+        let first = fingerprint(first.path());
+        let second = fingerprint(second.path());
+        let changed = fingerprint(changed.path());
         assert_eq!(first, second);
         assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn hidpi_frames_are_stored_at_one_pixel_per_point() {
+        let retina = ScreenMapping {
+            origin_x: 72.0,
+            origin_y: 38.0,
+            point_width: 1314.0,
+            point_height: 721.0,
+            pixel_width: 2628,
+            pixel_height: 1442,
+        };
+        assert_eq!(retina.point_sized(), Some((1314, 721)));
+        let report = geometry_report(1314, 721, Some(retina));
+        assert!(report.contains("image size: 1314x721 px"));
+        assert!(report.contains("scale 1.00 px/point"));
+        assert!(report.contains("x = 72 + px, y = 38 + py"));
+
+        let standard = ScreenMapping {
+            pixel_width: 1314,
+            pixel_height: 721,
+            ..retina
+        };
+        assert_eq!(standard.point_sized(), None);
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_frames_and_ignores_foreign_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "mcp_computer_prune_{}_{}",
+            std::process::id(),
+            NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let base = SystemTime::now() - Duration::from_secs(600);
+        let mut frames = Vec::new();
+        for index in 0..5u64 {
+            let path = directory.join(format!("{CAPTURE_FILE_PREFIX}{index}.png"));
+            let file = File::create(&path).unwrap();
+            file.set_modified(base + Duration::from_secs(index)).unwrap();
+            frames.push(path);
+        }
+        let foreign = directory.join("notes.png");
+        File::create(&foreign).unwrap();
+        // The current frame is the oldest file, yet it must survive and count toward the cap.
+        prune_kept_frames(&directory, &frames[0], 3, Duration::from_secs(3600));
+        let exists: Vec<bool> = frames.iter().map(|path| path.exists()).collect();
+        assert_eq!(exists, [true, false, false, true, true]);
+        assert!(foreign.exists());
+
+        prune_kept_frames(&directory, &frames[4], 10, Duration::from_secs(60));
+        assert!(!frames[3].exists() && frames[4].exists() && foreign.exists());
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
