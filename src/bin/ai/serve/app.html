@@ -1453,7 +1453,7 @@ function syncOvrSummary() {
   const t = (s) => { const o = s.options[s.selectedIndex]; return (o && s.value) ? o.textContent : "default"; };
   $("ovrsummary").textContent = "model " + t($("omodel")) + " · agent " + t($("oagent")) + " · effort " + t($("oeffort"));
   const pick = skillPicks.get(skillPickKey());
-  const skill = !$("oskill").disabled && pick ? (pick.name ? pick.name + " (next)" : "choose a match") : "default";
+  const skill = !$("oskill").disabled && pick ? (pick.names.length ? pick.names.join(", ") + " (next)" : "choose a match") : "default";
   $("ovrsummary").textContent += " · skill " + skill;
 }
 // The composer grows with its content (up to the CSS cap) instead of
@@ -2573,11 +2573,39 @@ let skillCatalog = [], skillMatches = [], skillActive = -1, skillComposing = fal
 function skillPickKey(sid = sessionId) { return JSON.stringify([store.base, sid || ""]); }
 function saveSkillPick() {
   const key = skillPickKey(), text = $("oskill").value;
-  const match = !skillComposing && skillCatalog.find((s) => s.name.toLowerCase() === text.trim().toLowerCase());
-  if (text.trim()) skillPicks.set(key, { text, name: match ? match.name : "" });
+  const names = skillComposing ? [] : skillNamesFromText(text);
+  if (text.trim()) skillPicks.set(key, { text, names: names || [] });
   else skillPicks.delete(key);
   syncSkillInput();
   syncOvrSummary();
+}
+// Parse a comma-separated selection ("review, build") into canonical catalog
+// names. Returns null when any segment does not name a skill, so a partially
+// typed segment keeps the field invalid until it resolves.
+function skillNamesFromText(text) {
+  const names = [];
+  for (const segment of text.split(",")) {
+    const trimmed = segment.trim();
+    if (!trimmed) continue;
+    const match = skillCatalog.find((s) => s.name.toLowerCase() === trimmed.toLowerCase());
+    if (!match) return null;
+    if (!names.includes(match.name)) names.push(match.name);
+  }
+  return names;
+}
+// Completed picks in the comma-separated field: every segment that exactly
+// names a catalog skill. A partial segment still being typed is ignored, so
+// choosing from the suggestion list replaces only that tail instead of
+// discarding the picks before it.
+function completedSkillNames(text) {
+  const names = [];
+  for (const segment of text.split(",")) {
+    const trimmed = segment.trim();
+    if (!trimmed) continue;
+    const match = skillCatalog.find((s) => s.name.toLowerCase() === trimmed.toLowerCase());
+    if (match && !names.includes(match.name)) names.push(match.name);
+  }
+  return names;
 }
 function skillInputChanged() {
   saveSkillPick();
@@ -2587,7 +2615,7 @@ function skillInputChanged() {
 }
 function syncSkillInput() {
   const input = $("oskill"), pick = skillPicks.get(skillPickKey());
-  const invalid = !input.disabled && !!input.value.trim() && !(pick && pick.name);
+  const invalid = !input.disabled && !!input.value.trim() && !(pick && pick.names.length);
   input.setAttribute("aria-invalid", String(invalid && !skillComposing));
   $("skillclear").hidden = input.disabled || !input.value;
   $("skillhint").hidden = !invalid || skillComposing;
@@ -2596,8 +2624,16 @@ function syncSkillInput() {
 function restoreSkillPick() {
   const sel = $("oskill"), key = skillPickKey();
   let pick = skillPicks.get(key);
-  if (pick && pick.name && !sel.disabled && !skillCatalog.some((s) => s.name === pick.name)) {
-    skillPicks.delete(key); pick = null;
+  if (pick && pick.names.length && !sel.disabled) {
+    const live = pick.names.filter((name) => skillCatalog.some((s) => s.name === name));
+    if (live.length !== pick.names.length) {
+      if (live.length) {
+        pick = { text: live.join(", "), names: live };
+        skillPicks.set(key, pick);
+      } else {
+        skillPicks.delete(key); pick = null;
+      }
+    }
   }
   const value = !sel.disabled && pick ? pick.text : "";
   if (sel.value !== value) sel.value = value;
@@ -2614,7 +2650,17 @@ function closeSkillMenu() {
 function chooseSkill(name) {
   if (skillComposing || $("oskill").disabled) return;
   if (name && !skillCatalog.some((s) => s.name === name)) return;
-  $("oskill").value = name;
+  if (!name) {
+    $("oskill").value = "";
+  } else {
+    // Append to the current selection instead of replacing it; the field
+    // holds a comma-separated list so one message can force several skills.
+    // The tail is the query being replaced by this choice, so a partial tail
+    // must not drop the completed picks before it.
+    const names = completedSkillNames($("oskill").value);
+    if (!names.includes(name)) names.push(name);
+    $("oskill").value = names.join(", ");
+  }
   saveSkillPick();
   $("oskill").focus();
   closeSkillMenu();
@@ -2623,14 +2669,23 @@ function renderSkillMenu() {
   const input = $("oskill"), menu = $("skillmenu");
   closeSkillMenu();
   if (input.disabled || skillComposing || document.activeElement !== input) return;
-  const query = input.value.trim().toLowerCase();
+  // Only the segment being typed feeds the suggestion query; earlier
+  // comma-separated segments are already chosen.
+  const segments = input.value.split(",");
+  const query = segments.pop().trim().toLowerCase();
   const tokens = query.split(/\s+/).filter(Boolean);
   // Fuzzy matching: every token must match the name or description, as a
   // substring or as an ordered subsequence (gaps allowed). Scores rank
   // name/substring hits above description/subsequence hits; the best
   // candidates come first so a short typo-tolerant query still lands on
   // the intended skill.
-  const scored = skillCatalog.map((skill) => ({ skill, score: skillMatchScore(skill, tokens) }))
+  const picked = new Set();
+  for (const segment of segments) {
+    const match = skillCatalog.find((s) => s.name.toLowerCase() === segment.trim().toLowerCase());
+    if (match) picked.add(match.name);
+  }
+  const scored = skillCatalog.filter((skill) => !picked.has(skill.name))
+    .map((skill) => ({ skill, score: skillMatchScore(skill, tokens) }))
     .filter((entry) => entry.score >= 0);
   // With a query, rank by relevance; with no query, keep catalog order.
   if (tokens.length) scored.sort((a, b) => b.score - a.score || a.skill.name.localeCompare(b.skill.name));
@@ -2707,14 +2762,14 @@ function skillKeydown(e) {
     if (!menu.hidden && skillActive >= 0) chooseSkill(skillMatches[skillActive].name);
     else {
       const pick = skillPicks.get(skillPickKey());
-      if (pick && pick.name) chooseSkill(pick.name);
+      if (pick && pick.names.length) closeSkillMenu();
       else renderSkillMenu();
     }
   }
 }
 function validateSkillInput() {
   const input = $("oskill"), pick = skillPicks.get(skillPickKey());
-  if (input.disabled || (!skillComposing && (!input.value.trim() || (pick && pick.name)))) return true;
+  if (input.disabled || (!skillComposing && (!input.value.trim() || (pick && pick.names.length)))) return true;
   $("ovrwrap").open = true;
   input.focus();
   renderSkillMenu();
@@ -2727,7 +2782,8 @@ function carrySkillPick(from, to) {
 }
 function captureSkillPick() {
   const key = skillPickKey(), pick = skillPicks.get(key);
-  return { key, pick, skills: !$("oskill").disabled && pick && pick.name ? [pick.name] : [] };
+  const names = !$("oskill").disabled && pick ? pick.names : [];
+  return { key, pick, skills: names.slice() };
 }
 function consumeSkillPick(sent) {
   if (sent.skills.length && skillPicks.get(sent.key) === sent.pick) skillPicks.delete(sent.key);
@@ -2743,8 +2799,8 @@ async function loadSkills() {
     const skills = await (await api("/skills")).json();
     if (epoch !== skillLoadEpoch || base !== store.base) return;
     skillCatalog = skills.filter((s) => typeof s.name === "string" && s.name.trim());
-    sel.placeholder = skillCatalog.length ? "skill: type to search (next message)" : "skill: none available";
-    sel.title = "Skill for the next message only; default does not force a skill";
+    sel.placeholder = skillCatalog.length ? "skill: type to search (next message; comma separates)" : "skill: none available";
+    sel.title = "Skills for the next message only, comma-separated; default does not force a skill";
     sel.disabled = !skillCatalog.length;
     if (!skillCatalog.length) skillPicks.delete(skillPickKey());
   } catch (_) {

@@ -826,6 +826,42 @@ fn split_serve_skills_inline(
     (names, question)
 }
 
+/// Split the multi-line `/skills` form: with a newline in the remainder the
+/// first line is the selection line and everything after it is the question, so
+/// every token on that line must name a server skill. Returns `None` for the
+/// single-line form (handled by `split_serve_skills_inline`) and for an explicit
+/// `use <names>` head, whose branch owns the whole line. The third element lists
+/// tokens that matched no skill: reporting them beats the implicit split
+/// silently demoting a misspelled name to the first words of the question.
+fn split_serve_skills_multiline(
+    known: &[ServeSkillEntry],
+    arg: &str,
+) -> Option<(Vec<String>, Option<String>, Vec<String>)> {
+    let (head, tail) = arg.split_once('\n')?;
+    if head
+        .split_whitespace()
+        .next()
+        .is_some_and(|token| token.eq_ignore_ascii_case("use"))
+    {
+        return None;
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    for token in head.split_whitespace() {
+        match known.iter().find(|e| e.name.eq_ignore_ascii_case(token)) {
+            Some(entry) => {
+                if !names.contains(&entry.name) {
+                    names.push(entry.name.clone());
+                }
+            }
+            None => missing.push(token.to_string()),
+        }
+    }
+    let question = tail.trim();
+    let question = (!question.is_empty()).then(|| question.to_string());
+    Some((names, question, missing))
+}
+
 /// Handle `/skills` in serve-chat. Mirrors the local `/skills` branches
 /// (`driver/commands/skills.rs`): bare/`list` prints the server skill list,
 /// `current` shows the pending next-turn selection, `use <names>` pins names
@@ -879,6 +915,25 @@ fn run_serve_skills_command(
         println!("(remote) Usage: /skills use <skill-name> [<skill-name>...]");
         print_serve_skills_list(&entries, &selection.skills);
         return None;
+    }
+    if let Some((names, question, missing)) = split_serve_skills_multiline(&entries, arg) {
+        if !missing.is_empty() {
+            println!(
+                "(remote) unknown skill(s): {}; see /skills list",
+                missing.join(", ")
+            );
+            return None;
+        }
+        if names.is_empty() {
+            println!("(remote) no skill names on the selection line; see /skills list");
+            return None;
+        }
+        selection.skills = names.clone();
+        println!(
+            "(remote) skills selected for next turn: {}",
+            names.join(", ")
+        );
+        return question;
     }
     // Explicit `use <names>`: every token must name a server skill (unknown
     // names abort without touching the pending selection, like the local
@@ -4508,6 +4563,29 @@ mod tests {
         let (names, question) = split_serve_skills_inline(&known, "hello there");
         assert!(names.is_empty());
         assert_eq!(question.as_deref(), Some("hello there"));
+    }
+
+    #[test]
+    fn serve_skills_multiline_selection_line_is_strict() {
+        let known = vec![skill_fixture("bytedcli"), skill_fixture("code-review")];
+        // Both names on the selection line, question on the following lines.
+        let (names, question, missing) =
+            split_serve_skills_multiline(&known, "bytedcli code-review\n先看看这个文档\n第二行")
+                .expect("multi-line form");
+        assert_eq!(
+            names,
+            vec!["bytedcli".to_string(), "code-review".to_string()]
+        );
+        assert_eq!(question.as_deref(), Some("先看看这个文档\n第二行"));
+        assert!(missing.is_empty());
+        // An unknown name is reported, not demoted to question text.
+        let (names, _, missing) =
+            split_serve_skills_multiline(&known, "bytedcli nope\nquestion").expect("multi-line");
+        assert_eq!(names, vec!["bytedcli".to_string()]);
+        assert_eq!(missing, vec!["nope".to_string()]);
+        // Single-line and explicit `use` heads keep their existing paths.
+        assert!(split_serve_skills_multiline(&known, "bytedcli nope").is_none());
+        assert!(split_serve_skills_multiline(&known, "use bytedcli\nquestion").is_none());
     }
 
     fn agent_fixture(
