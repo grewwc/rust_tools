@@ -44,6 +44,9 @@ fn print_history_help() {
 /// shares between fds 0 and 1, so a temporary `O_NONBLOCK` here would also make
 /// concurrent render writes fail with `EAGAIN`. Flushing needs no mode change
 /// and cannot block on a partial line the way a canonical-mode read would.
+/// Unlike the old non-blocking drain, `TCIFLUSH` also discards a partially
+/// typed canonical-mode line; that matches this function's contract of clearing
+/// pending input before the next prompt.
 pub(crate) fn clear_stdin_buffer() {
     use std::io::IsTerminal;
     if !io::stdin().is_terminal() {

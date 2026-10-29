@@ -666,6 +666,9 @@ struct CbreakTerm {
 
 /// Warned-once guard for the fallback `O_NONBLOCK` setup below.
 static NONBLOCK_WARNED: AtomicBool = AtomicBool::new(false);
+/// Warned-once guard for the degraded fallback where stdin's `O_NONBLOCK`
+/// (shared with stdout) is actually applied.
+static NONBLOCK_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 
 impl CbreakTerm {
     fn enter() -> io::Result<Self> {
@@ -705,6 +708,15 @@ impl CbreakTerm {
                 ) == 0
             {
                 stdin_flags = Some(current);
+                // Degraded mode: the flag just set is shared with stdout, so
+                // render writes can now fail with EAGAIN. Say so once, with a
+                // non-panicking write (the same EAGAIN can hit stderr too).
+                if !NONBLOCK_FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "[Warning] side-note listener: no private tty handle; stdin O_NONBLOCK is shared with stdout, so terminal writes may fail with EAGAIN (os error 35)."
+                    );
+                }
             } else if !NONBLOCK_WARNED.swap(true, Ordering::Relaxed) {
                 eprintln!(
                     "[Warning] side-note listener: no private tty handle and stdin O_NONBLOCK failed ({}); a poll/read race may stall the next input box.",
@@ -750,11 +762,42 @@ fn open_private_tty_for(tty_fd: libc::c_int) -> Option<libc::c_int> {
     } else {
         -1
     };
+    if fd >= 0 && !same_terminal_device(fd, tty_fd) {
+        // SAFETY: `fd` is an open handle owned here.
+        unsafe { libc::close(fd) };
+        fd = -1;
+    }
     if fd < 0 {
         // SAFETY: static NUL-terminated path.
         fd = unsafe { libc::open(c"/dev/tty".as_ptr(), FLAGS) };
+        // `/dev/tty` names the controlling terminal, which need not be the
+        // terminal stdin is attached to; reading a different device would steal
+        // keystrokes from it.
+        if fd >= 0 && !same_terminal_device(fd, tty_fd) {
+            // SAFETY: `fd` is an open handle owned here.
+            unsafe { libc::close(fd) };
+            fd = -1;
+        }
     }
     (fd >= 0).then_some(fd)
+}
+
+/// True when `fd` and `tty_fd` refer to the same terminal device.
+///
+/// A private handle only substitutes for stdin's terminal when the device
+/// matches: `/dev/tty` can name a different controlling terminal, and the
+/// listener must never consume input from that one.
+fn same_terminal_device(fd: libc::c_int, tty_fd: libc::c_int) -> bool {
+    // SAFETY: `fstat`/`isatty` only inspect the two open fds; a zeroed `stat`
+    // is a valid output buffer for `fstat`.
+    unsafe {
+        let mut opened = std::mem::zeroed::<libc::stat>();
+        let mut expected = std::mem::zeroed::<libc::stat>();
+        if libc::fstat(fd, &mut opened) != 0 || libc::fstat(tty_fd, &mut expected) != 0 {
+            return false;
+        }
+        opened.st_rdev == expected.st_rdev && libc::isatty(fd) == 1
+    }
 }
 
 impl Drop for CbreakTerm {
