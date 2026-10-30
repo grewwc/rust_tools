@@ -25,6 +25,10 @@ pub(super) struct ParsedCli {
     pub(super) list_skills: bool,
     pub(super) list_agents: bool,
     pub(super) no_skills: bool,
+    /// Startup opt-out of the pure agent. `--no-pure` ignores a persisted
+    /// `ai.prompt.pure_mode = true` startup default for one run; `--pure` is a
+    /// shortcut that selects the pure agent (`cli.agent`) directly.
+    pub(super) no_pure: bool,
     pub(super) mcp_config: String,
     pub(super) help: bool,
     /// --version: print the version and exit (purely local, no LLM).
@@ -203,6 +207,16 @@ fn register_cli_flags(parser: &mut TermParser) {
     parser.add_bool("list-skills", false, "list skills and exit");
     parser.add_bool("list-agents", false, "list available agents and exit");
     parser.add_bool("no-skills", false, "disable loading all skills");
+    parser.add_bool(
+        "pure",
+        false,
+        "start with the pure agent: minimal system prompt, same as --agent pure (persist with ai.prompt.pure_mode = true)",
+    );
+    parser.add_bool(
+        "no-pure",
+        false,
+        "ignore the ai.prompt.pure_mode startup default for this run",
+    );
     parser.add_bool("help", false, "print help");
     parser.add_bool("version", false, "print version and exit");
     parser.add_bool(
@@ -707,6 +721,7 @@ impl Default for ParsedCli {
             list_skills: false,
             list_agents: false,
             no_skills: false,
+            no_pure: false,
             mcp_config: String::new(),
             help: false,
             version: false,
@@ -936,6 +951,15 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 
     // Handle no-skills.
     cli.no_skills = parser.contains_flag_strict("no-skills");
+
+    // Handle pure mode. `--pure` is a shortcut for `--agent pure` unless an
+    // explicit `--agent` value already wins; `--no-pure` suppresses the
+    // `ai.prompt.pure_mode` startup default (and the `--pure` shortcut, so an
+    // explicit opt-out can never be defeated by a stale shell alias).
+    cli.no_pure = parser.contains_flag_strict("no-pure");
+    if !cli.no_pure && parser.contains_flag_strict("pure") && cli.agent.is_none() {
+        cli.agent = Some("pure".to_string());
+    }
 
     // Handle note-search.
     cli.note_search = parser.contains_flag_strict("note-search");

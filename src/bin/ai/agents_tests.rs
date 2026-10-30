@@ -156,6 +156,30 @@ fn builtin_audit_agents_opt_out_of_task_auto_selection() {
 }
 
 #[test]
+fn builtin_pure_agent_pins_minimal_rendering_contract() {
+    // The pure agent replaces the full prompt stack with its own baseline, so
+    // its manifest flags are load-bearing: `pure` switches rendering,
+    // `mode: all` keeps it switchable and subagent-nameable, and
+    // `auto_select: false` keeps the router from silently stripping the full
+    // stack. Empty tools/tool_groups fall through to the default tool set.
+    let (_, content) = BUILTIN_AGENTS
+        .iter()
+        .find(|(filename, _)| *filename == "pure.agent")
+        .expect("pure agent should be registered");
+    let agent = parse_agent_front_matter(content).unwrap();
+    assert_eq!(agent.name, "pure");
+    assert!(agent.pure);
+    assert!(agent.is_primary());
+    assert!(agent.is_subagent());
+    assert!(!agent.auto_select);
+    assert!(agent.disable_mcp_tools);
+    assert!(agent.tools.is_empty());
+    assert!(agent.tool_groups.is_empty());
+    assert!(agent.prompt.contains("<pure_mode>"));
+    assert!(agent.prompt.contains("You are a general-purpose AI assistant"));
+}
+
+#[test]
 fn builtin_sharp_agent_pins_no_task_tools_resident() {
     // Explicitly named tools ride along in every turn, and resident task_*
     // tools inject the subagent-orchestration prose ("delegate every step",

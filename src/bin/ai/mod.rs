@@ -123,7 +123,7 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
         background::detach_daemon_session()?;
     }
 
-    let cli = cli::parse_cli_args(args.clone().into_iter());
+    let mut cli = cli::parse_cli_args(args.clone().into_iter());
 
     // Attach before loading session history or creating a runtime: a live worker
     // remains the sole owner of its conversation and in-flight model request.
@@ -132,6 +132,15 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
         && let Some(code) = terminal_session::maybe_run_client(&cli, &args)?
     {
         std::process::exit(code);
+    }
+
+    // `ai.prompt.pure_mode = true` starts with the pure agent unless this run
+    // already names an agent or opts out with `--no-pure`. Applied after the
+    // terminal-session attach decision so a persisted default never changes
+    // attach eligibility, and before App construction so the agent preset,
+    // session restore, and manifest activation all see the same selection.
+    if cli.agent.is_none() && !cli.no_pure && config::pure_startup_default_enabled() {
+        cli.agent = Some("pure".to_string());
     }
 
     if let Some(session_id) = daemon_session {

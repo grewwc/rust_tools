@@ -238,6 +238,9 @@ pub(super) struct SkillTurnGuard {
     scoped_instruction_dirs_changed: bool,
     /// Whether this guard rendered the full session-tools guidance.
     session_context_guidance: bool,
+    /// Whether this guard renders the pure prompt, which carries no project
+    /// context and therefore never accepts scoped instruction documents.
+    pure_mode: bool,
     /// Whether the session had already made that guidance resident.
     session_context_guidance_was_sticky: bool,
 }
@@ -349,6 +352,12 @@ impl SkillTurnGuard {
         required_targets: &[PathBuf],
         observed_targets: &[PathBuf],
     ) -> bool {
+        // Pure mode owns its whole prompt: project instruction documents would
+        // make it larger at exactly the moment it is supposed to stay minimal.
+        // Reporting "nothing missing" also stops the preflight from pausing.
+        if self.pure_mode {
+            return true;
+        }
         if let Some((prompt, doc_dirs)) = build_scoped_project_instruction_prompt_with_priority(
             required_targets,
             observed_targets,
@@ -1140,10 +1149,21 @@ fn build_scoped_project_instruction_prompt_with_priority(
     Some((out, dirs))
 }
 
+/// Marker carried by the authored pure prompt. Scoped-instruction handling
+/// recognises pure mode from the rendered text so it needs no extra plumbing
+/// through the turn loop.
+const PURE_MODE_PROMPT_MARKER: &str = "<pure_mode>";
+
 pub(super) fn scoped_project_instructions_missing(
     system_prompt: &str,
     targets: &[PathBuf],
 ) -> bool {
+    // Pure mode renders no project context by design, so nothing can be
+    // missing. Answering "not missing" keeps the mutation preflight from
+    // pausing the turn to inject instructions the mode deliberately omits.
+    if system_prompt.contains(PURE_MODE_PROMPT_MARKER) {
+        return false;
+    }
     load_scoped_project_instruction_docs_for_targets(targets)
         .iter()
         .any(|doc| {
@@ -1691,6 +1711,40 @@ fn build_system_prompt(
     b
 }
 
+/// Pure mode renders the pure agent's authored baseline plus the runtime
+/// environment. The baseline already owns identity, non-fabrication,
+/// tool-evidence, safety, and response style, so re-adding those blocks here
+/// would duplicate contracts. Only the environment block is added because it
+/// is per-process fact that no static prompt can carry.
+fn build_pure_system_prompt(agent: &AgentManifest) -> SystemPromptBuilder {
+    let mut b = SystemPromptBuilder::new();
+    // Behavior, not Identity: the authored block is a whole behaviour contract
+    // (identity, honesty, tool evidence, safety, style), and rendering it into
+    // the identity group would leave that group carrying more than identity.
+    b.push(ContextKind::Behavior, agent.build_system_prompt());
+    b.push_labeled(
+        ContextKind::Behavior,
+        "execution_environment",
+        runtime_environment_prompt(),
+    );
+    b
+}
+
+/// Chooses the prompt builder for one turn. A pure agent renders only its own
+/// baseline: the skill and runtime context inputs are ignored because none of
+/// their guidance renders.
+fn prompt_builder_for_turn(
+    active_agent: Option<&AgentManifest>,
+    skills: &[&SkillManifest],
+    available_tools: &Box<SkipSet<String>>,
+    ctx: &PromptContext,
+) -> SystemPromptBuilder {
+    match active_agent {
+        Some(agent) if agent.pure => build_pure_system_prompt(agent),
+        _ => build_system_prompt(active_agent, skills, available_tools, ctx),
+    }
+}
+
 fn build_skill_turn_guard(
     app: &mut App,
     mcp_client: &McpClient,
@@ -1760,12 +1814,25 @@ fn build_skill_turn_guard(
         None => builtin_tools.into_iter().chain(mcp_tools).collect(),
     };
     let available_tools = available_tool_names(&loaded_tools, &[]);
+    // Pure mode is a prompt-construction decision only: tool selection, session
+    // state, and persistence are unchanged. It is driven by the active agent's
+    // `pure` flag, so switching agents (CLI, /agent, task) switches rendering.
+    let pure_mode = active_agent.as_ref().is_some_and(|agent| agent.pure);
     let ctx = PromptContext {
         goal_mode: app.goal_mode.clone(),
         is_background: app.cli.background,
     };
-    let mut builder = build_system_prompt(active_agent.as_ref(), skills, &available_tools, &ctx);
-    if has_tool(&available_tools, "enable_tools")
+    let mut builder = prompt_builder_for_turn(
+        active_agent.as_ref(),
+        skills,
+        &available_tools,
+        &ctx,
+    );
+    // Everything appended below steers a full agent: tool catalogs, project and
+    // session context, skill history, persona, and scoped instructions. Pure mode
+    // keeps the prompt to the safety/protocol core, so none of them render.
+    if !pure_mode
+        && has_tool(&available_tools, "enable_tools")
         && let Some(catalog) = build_hidden_mcp_tool_catalog(&all_mcp_tools, &loaded_tools)
     {
         builder.push(ContextKind::Capability, catalog);
@@ -1774,7 +1841,8 @@ fn build_skill_turn_guard(
     // the resident set by manifest_tool_definitions; add an on-demand enable
     // hint here so the model can still sense them (read-only agents never
     // declare the group, so nothing is injected).
-    if has_tool(&available_tools, "enable_tools")
+    if !pure_mode
+        && has_tool(&available_tools, "enable_tools")
         && hidden_group_declared
         && let Some(catalog) = build_hidden_execution_primitive_catalog(&available_tools)
     {
@@ -1783,12 +1851,15 @@ fn build_skill_turn_guard(
     // Task-family tools are lazy for every top-level turn (not just executor
     // agents); advertise them so the model loads subagent tools exactly when the
     // task warrants parallelism. Gated internally on top-level depth.
-    if has_tool(&available_tools, "enable_tools")
+    if !pure_mode
+        && has_tool(&available_tools, "enable_tools")
         && let Some(catalog) = build_hidden_task_tool_catalog(&available_tools)
     {
         builder.push(ContextKind::Capability, catalog);
     }
-    push_project_context(&mut builder);
+    if !pure_mode {
+        push_project_context(&mut builder);
+    }
     let residency = history::read_prompt_residency_sqlite(&app.session_history_file)
         .ok()
         .flatten()
@@ -1797,9 +1868,10 @@ fn build_skill_turn_guard(
     // out of unrelated turns; inject it with the session-tools walkthrough once
     // the request looks session-related. After that the guidance stays resident
     // for the rest of the session, so later turns keep the system-prompt prefix.
-    let session_context_guidance = residency.session_context_guidance
-        || session_issue_likely(question)
-        || session_id_referenced(question);
+    let session_context_guidance = !pure_mode
+        && (residency.session_context_guidance
+            || session_issue_likely(question)
+            || session_id_referenced(question));
     if session_context_guidance {
         builder.push_labeled(
             ContextKind::Behavior,
@@ -1807,7 +1879,8 @@ fn build_skill_turn_guard(
             session_context_prompt(&app.session_id),
         );
     }
-    if let Ok(events) = history::read_skill_activation_events_sqlite(&app.session_history_file)
+    if !pure_mode
+        && let Ok(events) = history::read_skill_activation_events_sqlite(&app.session_history_file)
         && let Some(reminder) = build_skill_activation_history_reminder(&events)
     {
         builder.push_labeled(
@@ -1816,7 +1889,7 @@ fn build_skill_turn_guard(
             reminder,
         );
     }
-    if !app.active_persona.is_default() {
+    if !pure_mode && !app.active_persona.is_default() {
         let mut persona_prompt = format!("- Name: {}\n", app.active_persona.name.trim());
         if !app.active_persona.avatar.trim().is_empty() {
             persona_prompt.push_str(&format!("- Avatar: {}\n", app.active_persona.avatar.trim()));
@@ -1837,13 +1910,16 @@ fn build_skill_turn_guard(
         restore_agent_context,
         builder,
         matched_skill_names,
+        pure_mode,
         session_context_guidance,
         session_context_guidance_was_sticky: residency.session_context_guidance,
         ..SkillTurnGuard::default()
     };
     // Rendered last so the section is the final policy entry, the same position
     // a mid-turn load appends it at.
-    guard.seed_scoped_instruction_dirs(residency.scoped_instruction_dirs);
+    if !pure_mode {
+        guard.seed_scoped_instruction_dirs(residency.scoped_instruction_dirs);
+    }
     guard
 }
 
@@ -2044,6 +2120,317 @@ pub(super) fn prepare_skill_for_turn(
     let mut guard = build_skill_turn_guard(app, mcp_client, skills, question);
     guard.matched_skill_names = Vec::new();
     Ok(guard)
+}
+
+#[cfg(test)]
+mod pure_prompt_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Every tool that gates a guidance section, so a mode's omissions are the
+    /// mode's own decision rather than a missing tool precondition.
+    const FULL_TOOL_SET: &[&str] = &[
+        "request_user_input",
+        "enable_tools",
+        "list_skills",
+        "activate_skill",
+        "knowledge_save",
+        "knowledge_search",
+        "knowledge_list",
+        "plan",
+        "plan_update",
+        "task_spawn",
+        "task_status",
+        "write_file",
+        "apply_patch",
+        "execute_command",
+        "search_overflow",
+    ];
+
+    fn tools(names: &[&str]) -> Box<SkipSet<String>> {
+        let mut available = SkipSet::new(names.len().max(1));
+        for name in names {
+            available.insert((*name).to_string());
+        }
+        Box::new(available)
+    }
+
+    fn skill_with_prompt(prompt: &str) -> SkillManifest {
+        SkillManifest {
+            name: "pure-sample-skill".to_string(),
+            version: "1.0.0".to_string(),
+            description: String::new(),
+            author: None,
+            tools: Vec::new(),
+            tool_groups: Vec::new(),
+            mcp_servers: Vec::new(),
+            disable_builtin_tools: false,
+            disable_mcp_tools: false,
+            prompt: prompt.to_string(),
+            system_prompt: None,
+            priority: 0,
+            excludes: Vec::new(),
+            parent: None,
+            source_path: None,
+            resource_path: None,
+        }
+    }
+
+    fn render_turn(
+        agent: Option<&AgentManifest>,
+        skills: &[&SkillManifest],
+        available: &Box<SkipSet<String>>,
+        ctx: &PromptContext,
+    ) -> String {
+        prompt_builder_for_turn(agent, skills, available, ctx).render_system_prompt()
+    }
+
+    fn pure_agent_manifest() -> AgentManifest {
+        crate::ai::agents::load_all_agents()
+            .into_iter()
+            .find(|agent| agent.name == "pure")
+            .expect("the pure agent is registered")
+    }
+
+    #[test]
+    fn pure_mode_renders_only_the_authored_baseline_and_environment() {
+        let pure_agent = pure_agent_manifest();
+        let prompt = render_turn(
+            Some(&pure_agent),
+            &[],
+            &tools(FULL_TOOL_SET),
+            &PromptContext::default(),
+        );
+
+        for kept in [
+            "You are a general-purpose AI assistant",
+            "<honesty>",
+            "<tool_evidence>",
+            "<safety>",
+            "<execution_environment>",
+        ] {
+            assert!(prompt.contains(kept), "pure mode must keep {kept}:\n{prompt}");
+        }
+
+        // Guidance that steers a general agent rather than preventing a wrong
+        // answer, so pure mode drops it.
+        for dropped in [
+            "<tool_usage>",
+            "<correctness_guardrails>",
+            "<thinking_scope>",
+            "<task_convergence>",
+            "<tool_result_evidence>",
+            "<compressed_context_recovery>",
+            "<scope_discipline>",
+            "<autonomous_execution>",
+            "<tool_discovery>",
+            "<knowledge_save>",
+            "<knowledge_retrieval>",
+            "<planning_subprocess_execution>",
+            "<async_subagent_orchestration>",
+            "<temporary_files>",
+            "<interactive_skill_handoff>",
+            "<intellectual_honesty>",
+            "<safety_redlines>",
+            "<trust_boundary>",
+        ] {
+            assert!(
+                !prompt.contains(dropped),
+                "pure mode must drop {dropped}:\n{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_mode_keeps_the_full_guidance_catalog() {
+        let prompt = render_turn(
+            None,
+            &[],
+            &tools(FULL_TOOL_SET),
+            &PromptContext::default(),
+        );
+
+        for kept in [
+            "<response_style>",
+            "<tool_usage>",
+            "<correctness_guardrails>",
+            "<task_convergence>",
+            "<scope_discipline>",
+            "<autonomous_execution>",
+            "<tool_discovery>",
+            "<planning_subprocess_execution>",
+            "<async_subagent_orchestration>",
+            "<temporary_files>",
+        ] {
+            assert!(
+                prompt.contains(kept),
+                "standard mode must keep {kept}:\n{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn pure_agent_renders_baseline_and_skips_skill_instructions() {
+        let pure_agent = pure_agent_manifest();
+        let skill = skill_with_prompt("SKILL_SCOPE_MARKER");
+        let available = tools(FULL_TOOL_SET);
+        let skills = [&skill];
+
+        let pure = render_turn(
+            Some(&pure_agent),
+            &skills,
+            &available,
+            &PromptContext::default(),
+        );
+        // The pure agent's own body is the whole baseline, so it stays.
+        assert!(
+            pure.contains("You are a general-purpose AI assistant"),
+            "pure mode must keep the authored baseline:\n{pure}"
+        );
+        for dropped in [
+            "SKILL_SCOPE_MARKER",
+            "<skill_instructions>",
+            "<agent_instructions>",
+        ] {
+            assert!(
+                !pure.contains(dropped),
+                "pure mode must skip {dropped}:\n{pure}"
+            );
+        }
+
+        // A non-pure agent keeps the standard composition: its own
+        // instructions and skill guidance both render.
+        let agent: AgentManifest = serde_json::from_value(json!({
+            "name": "pure-sample-agent",
+            "description": "",
+            "prompt": "AGENT_SCOPE_MARKER",
+        }))
+        .expect("agent manifest deserializes from its documented fields");
+        let standard = render_turn(
+            Some(&agent),
+            &skills,
+            &available,
+            &PromptContext::default(),
+        );
+        for kept in [
+            "AGENT_SCOPE_MARKER",
+            "SKILL_SCOPE_MARKER",
+            "<skill_instructions>",
+        ] {
+            assert!(
+                standard.contains(kept),
+                "standard mode must keep {kept}:\n{standard}"
+            );
+        }
+    }
+
+    #[test]
+    fn pure_mode_is_a_small_fraction_of_the_standard_prompt() {
+        let pure_agent = pure_agent_manifest();
+        let pure = build_pure_system_prompt(&pure_agent).render_system_prompt();
+        let standard = render_turn(
+            None,
+            &[],
+            &tools(FULL_TOOL_SET),
+            &PromptContext::default(),
+        );
+
+        assert!(!pure.is_empty());
+        assert!(
+            pure.len() * 3 < standard.len(),
+            "pure prompt must stay a small fraction of the standard prompt; \
+             pure={} bytes, standard={} bytes",
+            pure.len(),
+            standard.len()
+        );
+    }
+
+    #[test]
+    fn pure_mode_ignores_scoped_project_instructions() {
+        // A file under the project's scoped-instruction directory: the loader
+        // only collects documents for targets below the effective working
+        // directory, and `driver/AGENTS.md` supplies a real document here.
+        let target = std::env::current_dir()
+            .expect("test working directory")
+            .join("src/bin/ai/driver/skill_runtime.rs");
+        let targets = std::slice::from_ref(&target);
+
+        let standard = render_turn(
+            None,
+            &[],
+            &tools(&["apply_patch"]),
+            &PromptContext::default(),
+        );
+        assert!(
+            scoped_project_instructions_missing(&standard, targets),
+            "the standard prompt starts without the target's scoped documents"
+        );
+
+        let pure_agent = pure_agent_manifest();
+        let pure = build_pure_system_prompt(&pure_agent).render_system_prompt();
+        assert!(
+            !scoped_project_instructions_missing(&pure, targets),
+            "pure mode must never report scoped instructions as missing, \
+             otherwise the mutation preflight pauses the turn"
+        );
+
+        let mut guard = SkillTurnGuard {
+            pure_mode: true,
+            ..SkillTurnGuard::default()
+        };
+        assert!(
+            guard.push_scoped_project_instructions(targets, &[]),
+            "a pure guard reports the target as satisfied instead of pausing"
+        );
+        assert!(
+            !guard.system_prompt().contains("<instructions path="),
+            "pure mode must not render project instruction documents"
+        );
+    }
+
+    /// FNV-1a, so the snapshot is stable across toolchains and dependency
+    /// versions instead of depending on `Hash`'s randomised state.
+    fn stable_hash(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// Drops the environment block: it carries the host OS, shell, and working
+    /// directory, which differ per machine and are not part of the profile.
+    fn without_environment_block(prompt: &str) -> String {
+        const OPEN: &str = "<execution_environment>";
+        const CLOSE: &str = "</execution_environment>";
+        match (prompt.find(OPEN), prompt.find(CLOSE)) {
+            (Some(start), Some(close)) if close > start => {
+                let mut out = String::with_capacity(prompt.len());
+                out.push_str(&prompt[..start]);
+                out.push_str("<execution_environment/>");
+                out.push_str(&prompt[close + CLOSE.len()..]);
+                out
+            }
+            _ => prompt.to_string(),
+        }
+    }
+
+    #[test]
+    fn default_profile_prompt_bytes_are_unchanged() {
+        const DEFAULT_PROFILE_PROMPT_HASH: u64 = 7_767_455_692_574_641_592;
+        let prompt = render_turn(
+            None,
+            &[],
+            &tools(FULL_TOOL_SET),
+            &PromptContext::default(),
+        );
+        assert_eq!(
+            stable_hash(without_environment_block(&prompt).as_bytes()),
+            DEFAULT_PROFILE_PROMPT_HASH,
+            "the default profile's prompt bytes drifted"
+        );
+    }
 }
 
 #[cfg(test)]

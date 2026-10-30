@@ -522,11 +522,19 @@ pub(super) async fn prepare_turn(
     // own words apart from attachment content.
     let persisted_question_text = assemble_effective_question(question, "", ocr_pair);
     let cfg = crate::commonw::configw::get_all_config();
-    inject_integrated_critic(
-        &mut skill_turn,
-        cfg.get_opt(AiConfig::CRITIC_REVISE_ENABLE),
-        cfg.get_opt(AiConfig::CRITIC_REVISE_INTEGRATED_ENABLE),
-    );
+    // The critic block is final-review guidance layered on the standard prompt
+    // stack. A pure agent renders no stack to review against, so it stays out.
+    let pure_mode = app
+        .current_agent_manifest
+        .as_ref()
+        .is_some_and(|agent| agent.pure);
+    if !pure_mode {
+        inject_integrated_critic(
+            &mut skill_turn,
+            cfg.get_opt(AiConfig::CRITIC_REVISE_ENABLE),
+            cfg.get_opt(AiConfig::CRITIC_REVISE_INTEGRATED_ENABLE),
+        );
+    }
 
     let mut messages = Vec::with_capacity(history.len() + 2);
 

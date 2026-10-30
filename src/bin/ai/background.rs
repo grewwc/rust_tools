@@ -1167,6 +1167,12 @@ pub(crate) fn build_daemon_args(cli: &ParsedCli, session_id: &str) -> Vec<std::f
     if cli.no_skills {
         args.push(OsString::from("--no-skills"));
     }
+    // `--pure` already rides as `--agent pure` via the forward above; only the
+    // `--no-pure` opt-out needs its own flag so the child skips the
+    // `ai.prompt.pure_mode` startup default too.
+    if cli.no_pure {
+        args.push(OsString::from("--no-pure"));
+    }
     if !cli.mcp_config.trim().is_empty() {
         args.push(OsString::from("--mcp-config"));
         args.push(OsString::from(&cli.mcp_config));
@@ -1372,6 +1378,43 @@ mod tests {
         assert!(
             !args_str.iter().any(|s| s == "--background" || s == "-bg"),
             "daemon args must not contain --background/-bg, actual args={args_str:?}"
+        );
+    }
+
+    #[test]
+    fn daemon_args_forward_pure_mode_override() {
+        let base = ["a".to_string(), "-bg".to_string(), "hi".to_string()];
+        let forwarded = |flag: &str| {
+            let cli = parse_cli_args(
+                base.iter()
+                    .cloned()
+                    .chain([flag.to_string()])
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            );
+            build_daemon_args(&cli, "session-pure")
+                .iter()
+                .map(|arg| arg.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // `--pure` rides as `--agent pure` so the child selects the pure agent.
+        let args = forwarded("--pure");
+        let agent_pos = args
+            .iter()
+            .position(|arg| arg == "--agent")
+            .expect("--agent must reach the daemon child");
+        assert_eq!(
+            args.get(agent_pos + 1).map(String::as_str),
+            Some("pure"),
+            "--pure must forward as --agent pure, actual args={args:?}"
+        );
+
+        // `--no-pure` keeps its own flag so the child skips the startup default.
+        let args = forwarded("--no-pure");
+        assert!(
+            args.iter().any(|arg| arg == "--no-pure"),
+            "--no-pure must reach the daemon child, actual args={args:?}"
         );
     }
 

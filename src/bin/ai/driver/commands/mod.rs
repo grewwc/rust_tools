@@ -128,8 +128,9 @@ pub fn is_local_command_start(token: &str) -> bool {
 /// Commands serve-chat forwards to the turn child even though the local REPL
 /// also recognizes them. The child executes them server-side: `/memo` after
 /// pre-turn dispatch, `/audit` and `/distill-session` in the turn dispatcher,
-/// `/mark`, `/unmark`, and `/archive` in the pre-turn local-command path, and
-/// `/task`, `/discuss`, and `/goal` inject a `forced_question` into the turn.
+/// `/mark`, `/unmark`, `/archive`, and `/title` in the pre-turn local-command
+/// path, and `/task`, `/discuss`, and `/goal` inject a `forced_question` into
+/// the turn.
 fn is_serve_forwarded_command_start(token: &str) -> bool {
     if memo::memo_command_args(token).is_some() {
         return true;
@@ -144,7 +145,15 @@ fn is_serve_forwarded_command_start(token: &str) -> bool {
     let word = rest.and_then(|r| r.split_whitespace().next()).unwrap_or("");
     matches!(
         word,
-        "task" | "discuss" | "goal" | "distill-session" | "mark" | "unmark" | "archive" | "audit"
+        "task"
+            | "discuss"
+            | "goal"
+            | "distill-session"
+            | "mark"
+            | "unmark"
+            | "archive"
+            | "audit"
+            | "title"
     )
 }
 
@@ -616,6 +625,13 @@ mod tests {
             classify_serve_input("/archive last"),
             ServeInputRoute::ServerCommand
         );
+        for input in ["/title", ":title", "/title 排查性能问题"] {
+            assert_eq!(
+                classify_serve_input(input),
+                ServeInputRoute::ServerCommand,
+                "{input}"
+            );
+        }
         for input in ["/mark", ":mark keep this", "/unmark", ":unmark current"] {
             assert_eq!(
                 classify_serve_input(input),

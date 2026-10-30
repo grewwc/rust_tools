@@ -156,6 +156,10 @@ impl AgentReloadIdentity<'_> {
         // hashing it keeps a hot-edited `auto_select` effective without a restart.
         hasher.update([manifest.auto_select as u8]);
         hasher.update(b"|");
+        // Same for `pure`: it switches the whole prompt stack, so a hot-edited
+        // value must take effect without a restart too.
+        hasher.update([manifest.pure as u8]);
+        hasher.update(b"|");
     }
 }
 
@@ -275,6 +279,7 @@ mod tests {
             disabled: false,
             hidden: true,
             auto_select: true,
+            pure: false,
             color: Some("#123456".to_string()),
             source_path: Some("/agents/alpha.agent".to_string()),
         }
@@ -285,8 +290,8 @@ mod tests {
         assert_eq!(
             agent_manifests_fingerprint(&[manifest_fixture()]),
             [
-                94, 85, 159, 185, 74, 221, 79, 209, 157, 105, 1, 153, 21, 19, 109, 142, 61, 25,
-                142, 223, 236, 234, 163, 31, 222, 33, 22, 1, 14, 203, 51, 29,
+                110, 129, 20, 25, 90, 29, 111, 243, 9, 183, 49, 104, 167, 96, 184, 60, 167, 70,
+                98, 254, 69, 114, 114, 58, 160, 85, 74, 172, 197, 168, 88, 139,
             ]
         );
     }
@@ -336,6 +341,7 @@ mod tests {
             ("hidden", |m| m.hidden = false),
             ("color", |m| m.color = Some("#abcdef".to_string())),
             ("auto_select", |m| m.auto_select = false),
+            ("pure", |m| m.pure = true),
         ];
 
         for (field, mutate) in mutations {

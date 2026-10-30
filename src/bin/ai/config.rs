@@ -93,6 +93,31 @@ pub(super) fn history_max_chars_for_model(cfg: &configw::ConfigW, _model: &str) 
         .unwrap_or(DEFAULT_HISTORY_MAX_CHARS)
 }
 
+/// Parse an on/off configuration switch. Returns `None` for unset or
+/// unrecognized values so callers can apply their own default.
+fn parse_switch(raw: Option<&str>) -> Option<bool> {
+    match raw?.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enable" | "enabled" => Some(true),
+        "0" | "false" | "no" | "off" | "disable" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether the `ai.prompt.pure_mode` configuration key requests the pure
+/// agent as the startup default. Unset or invalid config means off, so a
+/// missing configuration can never silently strip the normal system prompt.
+/// Explicit agent selection (`--agent`, `--pure`) and `--no-pure` are applied
+/// by the caller; this function only reads the persisted default.
+pub(super) fn pure_startup_default(cfg: &configw::ConfigW) -> bool {
+    parse_switch(cfg.get_opt(AiConfig::PURE_ENABLE).as_deref()).unwrap_or(false)
+}
+
+/// Pure-agent startup default for the current process, reading the cached
+/// configuration.
+pub(super) fn pure_startup_default_enabled() -> bool {
+    pure_startup_default(&configw::get_all_config())
+}
+
 #[allow(dead_code)]
 pub(super) fn clear_history_file(path: &PathBuf) {
     let _ = fs::remove_file(path);

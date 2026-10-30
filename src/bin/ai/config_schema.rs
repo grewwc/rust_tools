@@ -83,6 +83,18 @@ impl AiConfig {
     // ── Agents ─────────────────────────────────────────────
     pub const AGENTS_DIR: &str = "ai.agents.dir";
 
+    // ── Pure mode ─────────────────────────────────────────
+    /// Startup default for the pure agent. When true, a run that names no
+    /// agent starts with the `pure` agent, which renders only its minimal
+    /// baseline (core identity, honesty, tool-evidence, safety, style) plus
+    /// the runtime environment instead of the full prompt stack. Tools and
+    /// session persistence stay available; this key controls agent selection
+    /// at startup only, and `/agent` can switch away afterwards.
+    ///
+    /// Precedence: an explicit `--agent` / `--pure` wins; `--no-pure` ignores
+    /// this key for one run. Default false.
+    pub const PURE_ENABLE: &str = "ai.prompt.pure_mode";
+
     // ── Tool descriptions ──────────────────────────────────
     /// User tool-description override directory (a `tool_descriptions/*.json`
     /// file with the same name overrides built-in metadata). Lower priority

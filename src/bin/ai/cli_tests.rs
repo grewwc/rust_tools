@@ -30,6 +30,49 @@ fn parse_cli_args_distill_session_preserves_missing_value_for_driver_error() {
 }
 
 #[test]
+fn parse_cli_args_pure_flag_selects_the_pure_agent() {
+    let pure = super::parse_cli_args(
+        ["a", "--pure", "explain this"]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    assert_eq!(pure.agent.as_deref(), Some("pure"));
+    assert!(!pure.no_pure);
+    assert_eq!(pure.args, vec!["explain this".to_string()]);
+
+    // An explicit --agent wins over the --pure shortcut.
+    let explicit = super::parse_cli_args(
+        ["a", "--pure", "--agent", "sharp"]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    assert_eq!(explicit.agent.as_deref(), Some("sharp"));
+
+    let no_pure = super::parse_cli_args(["a", "--no-pure"].into_iter().map(str::to_owned));
+    assert!(no_pure.no_pure);
+    assert_eq!(no_pure.agent, None);
+    assert!(no_pure.args.is_empty());
+
+    // Neither flag: leave the decision to `ai.prompt.pure_mode`.
+    let default = super::parse_cli_args(["a", "hello"].into_iter().map(str::to_owned));
+    assert!(!default.no_pure);
+    assert_eq!(default.agent, None);
+    assert_eq!(default.args, vec!["hello".to_string()]);
+}
+
+#[test]
+fn parse_cli_args_no_pure_wins_over_pure() {
+    let cli = super::parse_cli_args(
+        ["a", "--pure", "--no-pure"]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    assert!(cli.no_pure);
+    assert_eq!(cli.agent, None);
+    assert!(cli.args.is_empty());
+}
+
+#[test]
 fn parse_cli_args_distill_session_slash_options_stay_with_command() {
     for command in ["/distill-session", ":distill-session"] {
         let cli = super::parse_cli_args(

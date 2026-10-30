@@ -179,6 +179,7 @@ fn default_cli() -> ParsedCli {
         list_skills: false,
         list_agents: false,
         no_skills: false,
+        no_pure: false,
         mcp_config: String::new(),
         help: false,
         version: false,

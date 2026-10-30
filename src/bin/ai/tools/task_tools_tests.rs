@@ -96,6 +96,7 @@ fn manifest(name: &str, description: &str, mode: AgentMode) -> AgentManifest {
         disabled: false,
         hidden: false,
         auto_select: true,
+        pure: false,
         color: None,
         source_path: None,
     }

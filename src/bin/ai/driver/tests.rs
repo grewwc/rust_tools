@@ -250,6 +250,7 @@ fn primary_agent(name: &str, description: &str) -> AgentManifest {
         disabled: false,
         hidden: false,
         auto_select: true,
+        pure: false,
         color: None,
         source_path: None,
     }

@@ -7,6 +7,7 @@
 //! arrives instead of waiting for the whole turn.
 
 use std::{
+    io::IsTerminal,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -2600,9 +2601,9 @@ mod serve_history_tests {
         assert!(!is_serve_local_command_start(":discuss API options"));
         assert!(!is_serve_local_command_start("/goal refactor parser"));
         assert!(!is_serve_local_command_start("/task status"));
-        // `/audit`, `/distill-session`, `/mark`, `/unmark`, and `/archive`
-        // execute in the server turn child, so serve-chat forwards them like a
-        // prompt instead of blocking them.
+        // `/audit`, `/distill-session`, `/mark`, `/unmark`, `/archive`, and
+        // `/title` execute in the server turn child, so serve-chat forwards
+        // them like a prompt instead of blocking them.
         assert!(!is_serve_local_command_start("/audit"));
         assert!(!is_serve_local_command_start(":audit -f review this"));
         assert_eq!(
@@ -2620,6 +2621,14 @@ mod serve_history_tests {
             ServeInputRoute::ServerCommand
         );
         for input in ["/mark", ":mark keep this", "/unmark", ":unmark current"] {
+            assert!(!is_serve_local_command_start(input), "{input}");
+            assert_eq!(
+                classify_serve_input(input),
+                ServeInputRoute::ServerCommand,
+                "{input}"
+            );
+        }
+        for input in ["/title", ":title", "/title 排查性能问题"] {
             assert!(!is_serve_local_command_start(input), "{input}");
             assert_eq!(
                 classify_serve_input(input),
@@ -3751,20 +3760,77 @@ fn serve_connection(
     Ok((client, base, token))
 }
 
-/// Print one `GET /sessions` listing as `N. <id>  <title>` rows (newest
-/// first) on stdout, so `--serve-sessions` output stays pipeable for scripts
-/// and later mobile clients; the interactive client reuses the same format.
-fn print_remote_sessions(items: &[RemoteSession], empty_message: &str) {
+/// Highlight style for remote sessions marked important, mirroring the local
+/// `/ss` view: ANSI colors only on a terminal, piped output stays plain.
+fn marked_remote_session_style(tty: bool) -> (&'static str, &'static str) {
+    if tty {
+        (
+            crate::ai::theme::current().accent_marked,
+            crate::ai::theme::RESET,
+        )
+    } else {
+        ("", "")
+    }
+}
+
+/// One `/ss` row of a `GET /sessions` listing. With a current session (the
+/// interactive client) the row carries a `*`/` ` mark column, like the local
+/// view; without one (`None`, the non-interactive `--serve-sessions`) the row
+/// keeps the legacy `N. <id>  <title>` bytes so piped output stays stable.
+/// Marked rows carry the theme's marked highlight and archived rows render
+/// dimmed, both terminal-only like the local view. `tty` is a parameter so
+/// tests can pin both renderings without a terminal.
+fn format_remote_session_row(
+    item: &RemoteSession,
+    index: usize,
+    current_session_id: Option<&str>,
+    tty: bool,
+) -> String {
+    let archived_suffix = if item.archived { "  [archived]" } else { "" };
+    let interactive_tty = current_session_id.is_some() && tty;
+    let (style_open, style_close) = if item.marked {
+        marked_remote_session_style(interactive_tty)
+    } else if item.archived && interactive_tty {
+        (crate::ai::theme::DIM, crate::ai::theme::RESET)
+    } else {
+        ("", "")
+    };
+    match current_session_id {
+        Some(current) => {
+            let mark = if item.id == current { "*" } else { " " };
+            format!(
+                "{style_open}{mark} {}. {}  {}{archived_suffix}{style_close}",
+                index + 1,
+                item.id,
+                remote_session_title(item)
+            )
+        }
+        None => format!(
+            "{style_open}{}. {}  {}{archived_suffix}{style_close}",
+            index + 1,
+            item.id,
+            remote_session_title(item)
+        ),
+    }
+}
+
+/// Print one `GET /sessions` listing as numbered rows (newest first) on
+/// stdout, so `--serve-sessions` output stays pipeable for scripts and later
+/// mobile clients; the interactive client passes its session id so the
+/// current row is marked, like the local REPL.
+fn print_remote_sessions(
+    items: &[RemoteSession],
+    empty_message: &str,
+    current_session_id: Option<&str>,
+) {
     if items.is_empty() {
         println!("{empty_message}");
     } else {
+        let tty = std::io::stdout().is_terminal();
         for (i, item) in items.iter().enumerate() {
-            let archived = if item.archived { "  [archived]" } else { "" };
             println!(
-                "{}. {}  {}{archived}",
-                i + 1,
-                item.id,
-                remote_session_title(item)
+                "{}",
+                format_remote_session_row(item, i, current_session_id, tty)
             );
         }
     }
@@ -3776,7 +3842,7 @@ pub(in crate::ai) fn run_serve_sessions(cli: &ParsedCli) -> Result<(), Box<dyn s
     let (client, base, token) = serve_connection(cli, "serve-sessions")?;
     let items = fetch_remote_sessions(&client, &base, &token)
         .map_err(|err| format!("[serve-sessions] {err}"))?;
-    print_remote_sessions(&items, "No remote sessions.");
+    print_remote_sessions(&items, "No remote sessions.", None);
     Ok(())
 }
 
@@ -3971,7 +4037,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first, archived hidden); /sessions all - include archived; /sessions archive - list archived; /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|u<N>|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/audit [-f|--fast] [instruction] - run the audit subagent on the server, then verify and fix findings\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/distill-session [session-id|archive.zip] [--dry-run] [--limit N] - distill a session into knowledge on the server (paths resolve on the server)\n/mark [<id>|current|last] [message] - mark a server-side session as important (default: current; leading `--` makes the rest a literal message for current)\n/unmark [<id>|current|last|--] - remove a server-side important mark (default: current; `--` forces current)\n/archive [<id>|current|last] - toggle the server-side formal archive flag (default: current)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first, archived hidden); /sessions all - include archived; /sessions archive - list archived; /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|u<N>|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/audit [-f|--fast] [instruction] - run the audit subagent on the server, then verify and fix findings\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/distill-session [session-id|archive.zip] [--dry-run] [--limit N] - distill a session into knowledge on the server (paths resolve on the server)\n/title [text] - set or show the current server-side session title (bare /title shows it)\n/mark [<id>|current|last] [message] - mark a server-side session as important (default: current; leading `--` makes the rest a literal message for current)\n/unmark [<id>|current|last|--] - remove a server-side important mark (default: current; `--` forces current)\n/archive [<id>|current|last] - toggle the server-side formal archive flag (default: current)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
                 );
                 continue;
             }
@@ -4003,7 +4069,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                             } else {
                                 "No remote sessions."
                             };
-                            print_remote_sessions(&items, empty);
+                            print_remote_sessions(&items, empty, Some(session_id.as_str()));
                             // Back `/resume` Tab-completion and numbering with
                             // the rows just printed; the silent refresh before
                             // the next input re-applies this view.
@@ -4207,7 +4273,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                     ServeInputRoute::Unsupported => {
                         let command = trimmed.split_whitespace().next().unwrap_or(&trimmed);
                         eprintln!(
-                            "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /cd, /pwd, /git, /history, /model, /effort, /agent, /skills, /sessions, /resume, /fork, /close, /bg, /new, /audit, /distill-session, /mark, /unmark, /archive (see /help)."
+                            "[serve-chat] {command} is a local command and is not supported over serve-chat; it was not sent. Supported here: /cd, /pwd, /git, /history, /model, /effort, /agent, /skills, /sessions, /resume, /fork, /close, /bg, /new, /audit, /distill-session, /mark, /unmark, /archive, /title (see /help)."
                         );
                     }
                     // Unknown command shapes must not fall through to the
@@ -4220,9 +4286,9 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                         );
                     }
                     // `/memo`, `/task`, `/discuss`, `/goal`, `/audit`,
-                    // `/distill-session`, `/mark`, `/unmark`, and `/archive`
-                    // execute in the server turn child; everything else is
-                    // ordinary prompt text.
+                    // `/distill-session`, `/mark`, `/unmark`, `/archive`, and
+                    // `/title` execute in the server turn child; everything
+                    // else is ordinary prompt text.
                     ServeInputRoute::ServerCommand | ServeInputRoute::Prompt => {
                         if let Err(err) = post_turn_stream(
                             &client,
@@ -4612,6 +4678,7 @@ mod tests {
             disabled,
             hidden,
             auto_select: false,
+            pure: false,
             color: None,
             source_path: None,
         }
@@ -5106,6 +5173,55 @@ mod tests {
         let mut marked = listed_session("x", Some("T"), None);
         marked.marked = true;
         assert_eq!(remote_session_title(&marked), "T ★");
+    }
+
+    #[test]
+    fn remote_session_row_marks_current_and_highlights_marked() {
+        let current = listed_session("cur", Some("C"), None);
+        // Interactive rows carry a `*`/` ` mark column, like the local view.
+        assert_eq!(
+            format_remote_session_row(&current, 0, Some("cur"), false),
+            "* 1. cur  C"
+        );
+        assert_eq!(
+            format_remote_session_row(&current, 0, Some("other"), false),
+            "  1. cur  C"
+        );
+        // Without a current session the legacy pipeable bytes are kept.
+        assert_eq!(
+            format_remote_session_row(&current, 0, None, false),
+            "1. cur  C"
+        );
+        // On a terminal, marked rows carry the theme highlight.
+        let mut marked = listed_session("m", Some("T"), None);
+        marked.marked = true;
+        let row = format_remote_session_row(&marked, 1, Some("cur"), true);
+        assert!(
+            row.starts_with(&format!(
+                "{}  2. m  T ★",
+                crate::ai::theme::current().accent_marked
+            )),
+            "{row:?}"
+        );
+        assert!(row.ends_with(crate::ai::theme::RESET), "{row:?}");
+        // Non-interactive output keeps its legacy bytes even on a terminal.
+        assert_eq!(
+            format_remote_session_row(&marked, 1, None, true),
+            "2. m  T ★"
+        );
+        // Archived rows render dimmed and keep the explicit suffix.
+        let mut archived = listed_session("o", Some("O"), None);
+        archived.archived = true;
+        let row = format_remote_session_row(&archived, 0, Some("cur"), true);
+        assert!(row.contains(crate::ai::theme::DIM), "{row:?}");
+        assert!(row.contains("[archived]"), "{row:?}");
+        assert_eq!(
+            format_remote_session_row(&archived, 0, None, true),
+            "1. o  O  [archived]"
+        );
+        // Piped output stays plain.
+        let row = format_remote_session_row(&marked, 0, Some("cur"), false);
+        assert!(!row.contains('\u{1b}'), "{row:?}");
     }
 
     #[test]

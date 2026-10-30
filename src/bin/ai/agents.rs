@@ -17,6 +17,7 @@
 //   - audit: Evidence-driven code, configuration, prompt, and behavior reviewer
 //   - audit-fast: Bounded quick review for light/simple changes
 //   - sharp: Fast decisive answers and fixes with minimal reasoning overhead
+//   - pure: Minimal system prompt (core baseline only, no skills/catalogs/project context)
 // =============================================================================
 
 use rust_tools::cw::SkipMap;
@@ -36,6 +37,7 @@ const BUILTIN_AGENTS: &[(&str, &str)] = &[
         include_str!("builtin_agents/audit-fast.agent"),
     ),
     ("sharp.agent", include_str!("builtin_agents/sharp.agent")),
+    ("pure.agent", include_str!("builtin_agents/pure.agent")),
 ];
 const PROJECT_INSTRUCTION_FILENAMES: &[&str] = &[
     "AGENTS.md",
@@ -226,6 +228,12 @@ pub(super) struct AgentManifest {
     /// explicitly in the `agent` field.
     #[serde(default = "default_auto_select")]
     pub(super) auto_select: bool,
+    /// Whether this agent replaces the full prompt stack with its own minimal
+    /// baseline. A pure agent renders only its prompt body plus the runtime
+    /// environment: no skills, tool catalogs, project instructions, or
+    /// lifecycle guidance. The prompt body must therefore stay self-contained.
+    #[serde(default)]
+    pub(super) pure: bool,
     #[serde(default)]
     pub(super) color: Option<String>,
     #[serde(skip)]
@@ -944,6 +952,7 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
     let mut disabled = false;
     let mut hidden = false;
     let mut auto_select = true;
+    let mut pure = false;
     let mut color: Option<String> = None;
     let mut tools: Vec<String> = Vec::new();
     let mut tool_groups: Vec<String> = Vec::new();
@@ -1022,6 +1031,9 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
                 "auto_select" => {
                     auto_select = unquoted.eq_ignore_ascii_case("true");
                 }
+                "pure" => {
+                    pure = unquoted.eq_ignore_ascii_case("true");
+                }
                 "disable_mcp_tools" => {
                     disable_mcp_tools = unquoted.eq_ignore_ascii_case("true");
                 }
@@ -1095,6 +1107,7 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
         disabled,
         hidden,
         auto_select,
+        pure,
         color: color.filter(|s| !s.trim().is_empty()),
         source_path: None,
     })
