@@ -28,7 +28,7 @@ use super::super::{
     cli::ParsedCli,
     config_schema::AiConfig,
     driver::{
-        commands::{ServeInputRoute, classify_serve_input, export},
+        commands::{ServeInputRoute, classify_serve_input},
         input::inline_image_filenames,
     },
     history::{SessionStore, current_terminal_key},
@@ -1677,18 +1677,8 @@ fn render_serve_history_last(
     messages: &[RemoteHistoryMessage],
     nth_back: usize,
 ) -> Result<String, String> {
-    let text = serve_history_conclusion_text(messages, nth_back)?;
-    Ok(format!("{}\n{}", serve_history_last_header(nth_back), text))
-}
-
-/// Body of the Nth-most-recent assistant conclusion (1 = latest), without the
-/// `/history last` header. `/history replay` and `/export` use it verbatim;
-/// the missing-conclusion wording matches the local command.
-fn serve_history_conclusion_text(
-    messages: &[RemoteHistoryMessage],
-    nth_back: usize,
-) -> Result<String, String> {
     let mut seen = 0usize;
+    let mut found = None;
     for message in messages.iter().rev() {
         if message.role != "assistant" {
             continue;
@@ -1706,16 +1696,19 @@ fn serve_history_conclusion_text(
         }
         seen += 1;
         if seen == nth_back {
-            return Ok(text);
+            found = Some(text);
+            break;
         }
     }
-    if seen == 0 {
-        Err("[history] No assistant messages yet.".into())
-    } else {
-        Err(format!(
+    let Some(text) = found else {
+        if seen == 0 {
+            return Err("[history] No assistant messages yet.".into());
+        }
+        return Err(format!(
             "[history] Only {seen} assistant message(s) in history."
-        ))
-    }
+        ));
+    };
+    Ok(format!("{}\n{}", serve_history_last_header(nth_back), text))
 }
 
 /// Header for the Nth-back assistant conclusion (1 = latest).
@@ -2102,33 +2095,6 @@ fn run_serve_history_command(
     }
 }
 
-/// Remote `/export [path]`: fetch the latest assistant conclusion from the
-/// server session and write it to a file on this machine. The local `/export`
-/// reads local history and writes to the local working directory; serve-chat has no
-/// local copy of the history, so only the body travels over the history route
-/// while the destination stays local: a relative path (and the `_summary.md`
-/// default) resolves against this client's working directory, not the remote
-/// session cwd.
-fn run_serve_export_command(
-    client: &reqwest::blocking::Client,
-    base: &str,
-    token: &str,
-    session_id: &str,
-    arg: &str,
-) -> Result<(), String> {
-    let messages = fetch_serve_history_conclusion(client, base, token, session_id, 1)?;
-    let text = serve_history_conclusion_text(&messages, 1)?;
-    let target = export::export_target_path(arg)
-        .map_err(|err| format!("cannot resolve the export path: {err}"))?;
-    let (lines, chars) = export::write_export_conclusion(&target, &text)
-        .map_err(|err| format!("cannot write {}: {err}", target.display()))?;
-    println!(
-        "[export] Wrote {} ({lines} line(s), {chars} char(s)).",
-        target.display()
-    );
-    Ok(())
-}
-
 fn show_serve_history(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -2230,7 +2196,7 @@ fn check_serve_rewind_syntax(args: &[&str]) -> Result<(), String> {
 
 fn print_serve_history_help() {
     println!(
-        "/history usage (remote session):\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history u<N>          Replay the assistant reply to user message u<N>\n  /history grep <keyword>  Search messages\n  /history last [N]      Replay the Nth recent assistant conclusion (full text)\n  /history replay        Replay the last assistant conclusion (text only)\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history help          Show this help\n\n`/history copy`/`/history export` and other-session views are local-only: print the view here and save or copy it locally; `/export [path]` writes the latest conclusion to this machine. Assistant rows carry no model tag; the history route serves bare messages.",
+        "/history usage (remote session):\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history u<N>          Replay the assistant reply to user message u<N>\n  /history grep <keyword>  Search messages\n  /history last [N]      Replay the Nth recent assistant conclusion (full text)\n  /history replay        Replay the last assistant conclusion (text only)\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history help          Show this help\n\n`/history copy`/`/history export` and other-session views are local-only: print the view here and save or copy it locally; `/export [path]` runs on the server. Assistant rows carry no model tag; the history route serves bare messages.",
         SERVE_HISTORY_DEFAULT_COUNT
     );
 }
@@ -2535,20 +2501,6 @@ mod serve_history_tests {
     }
 
     #[test]
-    fn serve_history_conclusion_text_has_no_last_header() {
-        let messages = sample_history();
-        assert_eq!(
-            serve_history_conclusion_text(&messages, 1).expect("latest"),
-            "second answer"
-        );
-        assert_eq!(
-            serve_history_conclusion_text(&messages, 2).expect("second"),
-            "first answer"
-        );
-        assert!(serve_history_conclusion_text(&messages, 3).is_err());
-    }
-
-    #[test]
     fn serve_rewind_target_resolution() {
         let messages = sample_history();
         assert!(resolve_serve_rewind_target(&messages, &[]).is_err());
@@ -2649,9 +2601,9 @@ mod serve_history_tests {
         assert!(!is_serve_local_command_start(":discuss API options"));
         assert!(!is_serve_local_command_start("/goal refactor parser"));
         assert!(!is_serve_local_command_start("/task status"));
-        // `/audit`, `/distill-session`, `/mark`, `/unmark`, `/archive`, and
-        // `/title` execute in the server turn child, so serve-chat forwards
-        // them like a prompt instead of blocking them.
+        // `/audit`, `/distill-session`, `/mark`, `/unmark`, `/archive`,
+        // `/title`, and `/export` execute in the server turn child, so
+        // serve-chat forwards them like a prompt instead of blocking them.
         assert!(!is_serve_local_command_start("/audit"));
         assert!(!is_serve_local_command_start(":audit -f review this"));
         assert_eq!(
@@ -2677,6 +2629,14 @@ mod serve_history_tests {
             );
         }
         for input in ["/title", ":title", "/title 排查性能问题"] {
+            assert!(!is_serve_local_command_start(input), "{input}");
+            assert_eq!(
+                classify_serve_input(input),
+                ServeInputRoute::ServerCommand,
+                "{input}"
+            );
+        }
+        for input in ["/export", ":export", "/export notes/summary.md"] {
             assert!(!is_serve_local_command_start(input), "{input}");
             assert_eq!(
                 classify_serve_input(input),
@@ -4084,7 +4044,7 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
             "/quit" | "/exit" | ":q" => break,
             "/help" | "/h" => {
                 println!(
-                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first, archived hidden); /sessions all - include archived; /sessions archive - list archived; /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|u<N>|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/export [path] - write the latest server-side assistant conclusion to a local markdown file (default: ./_summary.md)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/audit [-f|--fast] [instruction] - run the audit subagent on the server, then verify and fix findings\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/distill-session [session-id|archive.zip] [--dry-run] [--limit N] - distill a session into knowledge on the server (paths resolve on the server)\n/title [text] - set or show the current server-side session title (bare /title shows it)\n/mark [<id>|current|last] [message] - mark a server-side session as important (default: current; leading `--` makes the rest a literal message for current)\n/unmark [<id>|current|last|--] - remove a server-side important mark (default: current; `--` forces current)\n/archive [<id>|current|last] - toggle the server-side formal archive flag (default: current)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
+                    "Enter inserts a newline, Esc or Alt+Enter submits (same as the local REPL).\n/quit - exit\n/new - start a new session\n/sessions (/ss, same as the local REPL) - list remote sessions (newest first, archived hidden); /sessions all - include archived; /sessions archive - list archived; /sessions current|cur|curr - show the current session; /sessions id - print its id\n/resume <number|id-prefix|id> - continue a listed session (Tab completes after /sessions)\n/fork - branch the current session and switch to it\n/close - delete the current remote session and exit\n/git [commit|checkout|branch|switch|tree|list|show|delete|clear|help] - operate on the remote session checkpoints and branches\n/history [N|full|user|assistant|tool|system|u<N>|grep <kw>|last [N]|replay|rewind <uN|last|grep <kw>>|help] - remote history over HTTP (never a turn)\n/export [path] - export the latest server-side assistant conclusion to a markdown file on the server (relative to the remote cwd; default: _summary.md)\n/cd [dir] - switch the remote working directory (Tab completes remote paths; `-` goes back)\n/pwd - print the remote working directory (same as bare /cd)\n/model <selector> [question] - switch remote model (/model list|current|help; question sends immediately)\n/effort <level> - switch remote reasoning effort (minimal|low|medium|high|xhigh|max|off|auto)\n/agent <name> - switch remote agent (/agent list|current|help)\n/audit [-f|--fast] [instruction] - run the audit subagent on the server, then verify and fix findings\n/task [N] <goal> - run a multi-worker task room on the server (/task status [room] shows progress; /task help for details)\n/discuss [N] <topic> - run a multi-member discussion on the server (/discuss status [room] shows progress; /discuss help for details)\n/distill-session [session-id|archive.zip] [--dry-run] [--limit N] - distill a session into knowledge on the server (paths resolve on the server)\n/title [text] - set or show the current server-side session title (bare /title shows it)\n/mark [<id>|current|last] [message] - mark a server-side session as important (default: current; leading `--` makes the rest a literal message for current)\n/unmark [<id>|current|last|--] - remove a server-side important mark (default: current; `--` forces current)\n/archive [<id>|current|last] - toggle the server-side formal archive flag (default: current)\n/bg - exit and bind this terminal to the current remote session\nCtrl+C - interrupt the running remote turn (a second Ctrl+C exits the client)"
                 );
                 continue;
             }
@@ -4287,15 +4247,6 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
                     eprintln!("[serve-chat] {err}");
                 }
             }
-            // Remote `/export [path]`: the latest conclusion lives in the
-            // server session, but the file belongs on this machine, so fetch
-            // the body over the history route and write it locally.
-            "/export" | ":export" => {
-                if let Err(err) = run_serve_export_command(&client, &base, &token, &session_id, arg)
-                {
-                    eprintln!("[serve-chat] {err}");
-                }
-            }
             "/git" | ":git" => {
                 match run_serve_checkpoint_command(&client, &base, &token, &session_id, &trimmed) {
                     Ok(checkpoint_status) => {
@@ -4454,33 +4405,6 @@ mod tests {
             let _ = stream.write_all(response.as_bytes());
         });
         (format!("http://{addr}"), captured)
-    }
-
-    #[test]
-    fn serve_export_writes_latest_conclusion_to_the_client_machine() {
-        let (base, captured) =
-            serve_capture_once(r#"[{"role":"assistant","content":"export body"}]"#);
-        let dir = std::env::temp_dir().join(format!("a-serve-export-{}", uuid::Uuid::new_v4()));
-        let target = dir.join("nested/out.md");
-        let client = reqwest::blocking::Client::new();
-        run_serve_export_command(
-            &client,
-            &base,
-            "",
-            "sess",
-            target.to_str().expect("utf8 path"),
-        )
-        .expect("export");
-        assert_eq!(
-            std::fs::read_to_string(&target).expect("read export"),
-            "export body"
-        );
-        let head = captured.lock().expect("captured head").clone();
-        assert!(
-            head.contains("GET /sessions/sess/history?conclusion=1"),
-            "unexpected request: {head}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

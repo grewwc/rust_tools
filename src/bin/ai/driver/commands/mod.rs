@@ -128,9 +128,9 @@ pub fn is_local_command_start(token: &str) -> bool {
 /// Commands serve-chat forwards to the turn child even though the local REPL
 /// also recognizes them. The child executes them server-side: `/memo` after
 /// pre-turn dispatch, `/audit` and `/distill-session` in the turn dispatcher,
-/// `/mark`, `/unmark`, `/archive`, and `/title` in the pre-turn local-command
-/// path, and `/task`, `/discuss`, and `/goal` inject a `forced_question` into
-/// the turn.
+/// `/mark`, `/unmark`, `/archive`, `/title`, and `/export` in the pre-turn
+/// local-command path, and `/task`, `/discuss`, and `/goal` inject a
+/// `forced_question` into the turn.
 fn is_serve_forwarded_command_start(token: &str) -> bool {
     if memo::memo_command_args(token).is_some() {
         return true;
@@ -149,6 +149,7 @@ fn is_serve_forwarded_command_start(token: &str) -> bool {
             | "discuss"
             | "goal"
             | "distill-session"
+            | "export"
             | "mark"
             | "unmark"
             | "archive"
