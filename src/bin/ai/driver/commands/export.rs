@@ -34,16 +34,7 @@ fn extract_export_arg(input: &str) -> &str {
 
 fn execute_export(app: &App, arg: &str) -> Result<(), Box<dyn std::error::Error>> {
     // 1) Determine the output path
-    let target_path = if arg.is_empty() {
-        default_export_path()
-    } else {
-        let p = PathBuf::from(arg);
-        if p.is_relative() {
-            std::env::current_dir()?.join(p)
-        } else {
-            p
-        }
-    };
+    let target_path = export_target_path(arg)?;
 
     // 2) Fetch the last assistant conclusion
     let text = match input::last_assistant_conclusion_text(app)? {
@@ -60,22 +51,45 @@ fn execute_export(app: &App, arg: &str) -> Result<(), Box<dyn std::error::Error>
     }
 
     // 3) Write the file
-    if let Some(parent) = target_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    std::fs::write(&target_path, &text)?;
-
+    let (line_count, char_count) = write_export_conclusion(&target_path, &text)?;
     let display_path = target_path.display();
-    let line_count = text.lines().count();
-    let char_count = text.chars().count();
     show_status(&format!(
         "[export] 已导出到 {} ({} 行, {} 字符)",
         display_path, line_count, char_count
     ));
 
     Ok(())
+}
+
+/// Resolve the destination for `/export [path]`: the argument as given
+/// (relative paths join this process's working directory), or `_summary.md`
+/// there when no path was supplied. Shared with the serve-chat client, whose
+/// export writes to the machine running the client rather than the server.
+pub(crate) fn export_target_path(arg: &str) -> std::io::Result<PathBuf> {
+    if arg.is_empty() {
+        return Ok(default_export_path());
+    }
+    let path = PathBuf::from(arg);
+    if path.is_relative() {
+        Ok(std::env::current_dir()?.join(path))
+    } else {
+        Ok(path)
+    }
+}
+
+/// Write exported conclusion text, creating missing parent directories, and
+/// return `(line_count, char_count)` for the caller's status line.
+pub(crate) fn write_export_conclusion(
+    target_path: &std::path::Path,
+    text: &str,
+) -> std::io::Result<(usize, usize)> {
+    if let Some(parent) = target_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(target_path, text)?;
+    Ok((text.lines().count(), text.chars().count()))
 }
 
 fn default_export_path() -> PathBuf {
@@ -110,6 +124,18 @@ mod tests {
         assert!(!is_export_command("/foo"));
         assert!(!is_export_command(""));
         assert!(!is_export_command("export"));
+    }
+
+    #[test]
+    fn export_target_path_keeps_absolute_and_joins_relative_to_cwd() {
+        assert_eq!(
+            export_target_path("/tmp/out.md").unwrap(),
+            PathBuf::from("/tmp/out.md")
+        );
+        let relative = export_target_path("sub/out.md").unwrap();
+        assert!(relative.is_absolute());
+        assert!(relative.ends_with("sub/out.md"));
+        assert!(export_target_path("").unwrap().ends_with("_summary.md"));
     }
 }
 
