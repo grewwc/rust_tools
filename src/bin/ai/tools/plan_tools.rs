@@ -58,6 +58,7 @@ inventory::submit!(ToolDisplayRegistration {
         print_result: true,
         emphasize_result: false,
         display: None,
+        status_target: None,
     },
 });
 

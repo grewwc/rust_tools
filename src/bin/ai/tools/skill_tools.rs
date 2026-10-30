@@ -8,8 +8,8 @@ use serde_json::Value;
 use crate::ai::config_schema::AiConfig;
 use crate::ai::skills::SkillManifest;
 use crate::ai::tools::common::{
-    ToolParallelPolicy, ToolParallelPolicyRegistration, ToolRegistration, ToolRetryPolicy,
-    ToolRetryPolicyRegistration, ToolSpec,
+    ToolDisplayConfig, ToolDisplayRegistration, ToolParallelPolicy, ToolParallelPolicyRegistration,
+    ToolRegistration, ToolRetryPolicy, ToolRetryPolicyRegistration, ToolSpec, short_path,
 };
 
 /// Skill change actions requested by the model via the `activate_skill` / `deactivate_skill` tools (to be
@@ -678,6 +678,32 @@ inventory::submit!(ToolRegistration {
 
         execute: execute_save_skill,
     }
+});
+
+fn save_skill_status_target(args: &Value) -> Option<String> {
+    let name = args
+        .get("name")
+        .or_else(|| args.get("file_name"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let short = short_path(name);
+    let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    if dry_run {
+        return Some(format!("{short} (dry run)"));
+    }
+    Some(short)
+}
+
+inventory::submit!(ToolDisplayRegistration {
+    name: "save_skill",
+    config: ToolDisplayConfig {
+        print_args: false,
+        print_result: false,
+        emphasize_result: false,
+        display: None,
+        status_target: Some(save_skill_status_target),
+    },
 });
 
 fn resolve_configured_skills_dir() -> PathBuf {

@@ -52,6 +52,12 @@ inventory::collect!(ToolStreamingRegistration);
 /// `None` echoes the full result as-is.
 pub(crate) type ToolDisplayTransform = fn(&str, &Value) -> String;
 
+/// Inline status-target extractor: derives the short target shown after the
+/// tool name on the terminal status line (file path, skill name, ...) from
+/// the call arguments. Signature `fn(call args) -> Option<target text>`;
+/// `None` means the tool carries no inline target.
+pub(crate) type ToolStatusTarget = fn(&Value) -> Option<String>;
+
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct ToolDisplayConfig {
     /// Whether to print tool call arguments to the terminal.
@@ -64,6 +70,32 @@ pub(crate) struct ToolDisplayConfig {
     pub(crate) emphasize_result: bool,
     /// Optional terminal echo transform: the model still receives the full `content`; the terminal only echoes the transformed compact text.
     pub(crate) display: Option<ToolDisplayTransform>,
+    /// Optional inline status target shown on both the running row and the
+    /// completion row. Defaults to `None` (no target printed); only tools
+    /// that register an extractor get the `· target` prompt.
+    pub(crate) status_target: Option<ToolStatusTarget>,
+}
+
+/// Keep only the last two path segments (directory + file name), truncating over-long paths.
+pub(crate) fn short_path(p: &str) -> String {
+    // Prefer the last two segments: /a/b/c/foo.rs → b/foo.rs
+    let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+    let short = if parts.len() >= 2 {
+        format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+    } else {
+        p.to_string()
+    };
+    let char_count = short.chars().count();
+    if char_count > 50 {
+        let byte_idx = short
+            .char_indices()
+            .nth(char_count - 48)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        format!("…{}", &short[byte_idx..])
+    } else {
+        short
+    }
 }
 
 /// Optional terminal-echo registration: only for builtin tools that need to

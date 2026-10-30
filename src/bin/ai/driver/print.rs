@@ -394,85 +394,15 @@ fn format_tool_output_block_with_formatter(
     content.lines().map(format_line).collect()
 }
 
-/// Extract the target file name from a file tool's arguments JSON, for the terminal prompt.
-/// - `read_file` / `write_file`: the `file_path` field
-/// - `apply_patch`: prefer `file_path` / `path`; otherwise extract from lines like `*** Update File:` in the patch text
-pub(in crate::ai) fn format_file_tool_target(tool_name: &str, args_json: &str) -> Option<String> {
+/// Resolve the inline target shown after the tool name on the terminal status line.
+/// Whether a tool carries a target is decided by the `status_target` attribute in its
+/// `ToolDisplayConfig`; unregistered tools print no target. Callers need not know
+/// specific tool names or argument shapes.
+pub(in crate::ai) fn format_tool_status_target(tool_name: &str, args_json: &str) -> Option<String> {
+    let target =
+        crate::ai::tools::registry::common::tool_display_config(tool_name).status_target?;
     let args: serde_json::Value = serde_json::from_str(args_json.trim()).ok()?;
-    match tool_name {
-        "read_file" | "write_file" => args
-            .get("file_path")
-            .or_else(|| args.get("path"))
-            .and_then(|v| v.as_str())
-            .map(|path| {
-                let short = short_path(path);
-                if tool_name == "read_file" {
-                    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1);
-                    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(0);
-                    if limit > 0 {
-                        return format!(
-                            "{}  lines {}..{}",
-                            short,
-                            offset,
-                            offset + limit.saturating_sub(1)
-                        );
-                    }
-                }
-                short
-            }),
-        "apply_patch" => {
-            // Prefer the file_path / path arguments
-            for key in &["file_path", "path"] {
-                if let Some(p) = args
-                    .get(*key)
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    return Some(short_path(p));
-                }
-            }
-            // Otherwise extract the first target file from the patch text
-            let patch = args.get("patch").and_then(|v| v.as_str())?;
-            extract_first_patch_target(patch).map(|s| short_path(&s))
-        }
-        _ => None,
-    }
-}
-
-/// Extract the target path from the first `*** Update File:` / `*** Add File:` line in the patch text.
-fn extract_first_patch_target(patch: &str) -> Option<String> {
-    for line in patch.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed
-            .strip_prefix("*** Update File:")
-            .or_else(|| trimmed.strip_prefix("*** Add File:"))
-        {
-            return Some(rest.trim().to_string());
-        }
-    }
-    None
-}
-
-/// Keep only the last two path segments (directory + file name), truncating over-long paths.
-fn short_path(p: &str) -> String {
-    // Prefer the last two segments: /a/b/c/foo.rs → b/foo.rs
-    let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
-    let short = if parts.len() >= 2 {
-        format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
-    } else {
-        p.to_string()
-    };
-    let char_count = short.chars().count();
-    if char_count > 50 {
-        let byte_idx = short
-            .char_indices()
-            .nth(char_count - 48)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        format!("…{}", &short[byte_idx..])
-    } else {
-        short
-    }
+    target(&args)
 }
 
 /// If the tool is configured with `print_args`, echo the call arguments to the terminal; otherwise no-op.
@@ -647,6 +577,7 @@ pub fn print_mcp_tools(report: &McpInitReport, mcp_client: &McpClient) {
 mod tests {
     use super::{
         format_assistant_banner, format_emphasized_tool_output_block, format_empty_state,
+        format_tool_status_target,
         format_ocr_summary_block, format_section_header, format_section_item, format_section_note,
         format_skill_activation_note, format_tool_command_line, format_tool_header,
         format_tool_output_block, format_tool_output_line, format_tool_output_prefix,
@@ -895,5 +826,67 @@ mod tests {
     fn tool_output_line_strips_control_characters() {
         let visible = strip_ansi_for_test(&format_tool_output_line("line\x03with\x04ctrl"));
         assert_eq!(visible, "  │ linewithctrl");
+    }
+
+    #[test]
+    fn tool_status_target_shows_save_skill_name() {
+        let target =
+            format_tool_status_target("save_skill", r#"{"name": "my-skill", "prompt": "..."}"#);
+        assert_eq!(target.as_deref(), Some("my-skill"));
+    }
+
+    #[test]
+    fn tool_status_target_marks_save_skill_dry_run() {
+        let target =
+            format_tool_status_target("save_skill", r#"{"name": "my-skill", "dry_run": true}"#);
+        assert_eq!(target.as_deref(), Some("my-skill (dry run)"));
+    }
+
+    #[test]
+    fn tool_status_target_falls_back_to_save_skill_file_name() {
+        let target = format_tool_status_target("save_skill", r#"{"file_name": "custom.skill"}"#);
+        assert_eq!(target.as_deref(), Some("custom.skill"));
+    }
+
+    #[test]
+    fn tool_status_target_ignores_empty_save_skill_name() {
+        assert_eq!(
+            format_tool_status_target("save_skill", r#"{"prompt": "x"}"#),
+            None
+        );
+        assert_eq!(
+            format_tool_status_target("save_skill", r#"{"name": "  "}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn tool_status_target_shows_read_file_line_range() {
+        let target = format_tool_status_target(
+            "read_file",
+            r#"{"file_path": "wwc-ai-work/SKILL.md", "offset": 41, "limit": 140}"#,
+        );
+        assert_eq!(
+            target.as_deref(),
+            Some("wwc-ai-work/SKILL.md  lines 41..180")
+        );
+    }
+
+    #[test]
+    fn tool_status_target_extracts_apply_patch_target_from_patch_text() {
+        let target = format_tool_status_target(
+            "apply_patch",
+            r#"{"patch": "*** Begin Patch\n*** Update File: a/b/foo.rs\n@@\n+hi\n*** End Patch"}"#,
+        );
+        assert_eq!(target.as_deref(), Some("b/foo.rs"));
+    }
+
+    #[test]
+    fn tool_status_target_defaults_to_none_for_unregistered_tools() {
+        assert_eq!(
+            format_tool_status_target("execute_command", r#"{"command": "ls"}"#),
+            None
+        );
+        assert_eq!(format_tool_status_target("save_skill", "not json"), None);
     }
 }

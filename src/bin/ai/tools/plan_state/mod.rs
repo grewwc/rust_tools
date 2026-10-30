@@ -120,6 +120,7 @@ inventory::submit!(ToolDisplayRegistration {
         print_result: true,
         emphasize_result: true,
         display: Some(compact_plan_update_echo),
+        status_target: None,
     },
 });
 inventory::submit!(ToolHistoryPolicyRegistration {

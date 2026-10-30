@@ -1,3 +1,5 @@
+use crate::ai::tools::common::ToolDisplayConfig;
+use crate::ai::tools::common::ToolDisplayRegistration;
 use crate::ai::tools::common::ToolHistoryPolicy;
 use crate::ai::tools::common::ToolHistoryPolicyRegistration;
 use crate::ai::tools::common::ToolLossyCompressPolicy;
@@ -6,6 +8,7 @@ use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
 use crate::ai::tools::common::ToolStreamWriter;
 use crate::ai::tools::common::ToolStreamingRegistration;
+use crate::ai::tools::common::short_path;
 use crate::ai::tools::storage::file_store::FileStore;
 use crate::ai::tools::storage::temp_registry;
 use rustc_hash::FxHashMap;
@@ -38,6 +41,47 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolStreamingRegistration {
     name: "apply_patch",
     execute_streaming: execute_apply_patch_streaming,
+});
+
+fn apply_patch_status_target(args: &Value) -> Option<String> {
+    // Prefer the file_path / path arguments
+    for key in &["file_path", "path"] {
+        if let Some(p) = args
+            .get(*key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(short_path(p));
+        }
+    }
+    // Otherwise extract the first target file from the patch text
+    let patch = args.get("patch").and_then(|v| v.as_str())?;
+    extract_first_patch_target(patch).map(|s| short_path(&s))
+}
+
+/// Extract the target path from the first `*** Update File:` / `*** Add File:` line in the patch text.
+fn extract_first_patch_target(patch: &str) -> Option<String> {
+    for line in patch.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed
+            .strip_prefix("*** Update File:")
+            .or_else(|| trimmed.strip_prefix("*** Add File:"))
+        {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+inventory::submit!(ToolDisplayRegistration {
+    name: "apply_patch",
+    config: ToolDisplayConfig {
+        print_args: false,
+        print_result: false,
+        emphasize_result: false,
+        display: None,
+        status_target: Some(apply_patch_status_target),
+    },
 });
 
 // The apply_patch result is the only precise evidence of "which file did I just modify" for the

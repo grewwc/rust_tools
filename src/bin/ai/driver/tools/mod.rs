@@ -13,7 +13,7 @@ use std::time::{Duration as StdDuration, UNIX_EPOCH};
 
 use crate::ai::{
     driver::print::{
-        echo_tool_args, echo_tool_output, format_file_tool_target, format_tool_status_cached,
+        echo_tool_args, echo_tool_output, format_tool_status_cached, format_tool_status_target,
         format_tool_status_completed, format_tool_status_deferred, format_tool_status_failed,
         format_tool_status_running, format_tool_status_skipped,
         format_tool_status_with_file_target,
@@ -899,9 +899,7 @@ fn print_run_status(
         return;
     }
     let name = &tool_call.function.name;
-    let inline_file_target = matches!(name.as_str(), "read_file" | "write_file" | "apply_patch")
-        .then(|| format_file_tool_target(name, &tool_call.function.arguments))
-        .flatten();
+    let inline_file_target = format_tool_status_target(name, &tool_call.function.arguments);
     let with_file_target = |status_line: String| {
         if let Some(target) = inline_file_target.as_deref() {
             format_tool_status_with_file_target(status_line, target)
@@ -1113,7 +1111,14 @@ fn run_one(
     crate::ai::driver::runtime_ctx::publish_subagent_phase(&progress);
 
     if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
-        let row = format_tool_status_running(&tool_call.function.name);
+        let running = format_tool_status_running(&tool_call.function.name);
+        let row = match format_tool_status_target(
+            &tool_call.function.name,
+            &tool_call.function.arguments,
+        ) {
+            Some(target) => format_tool_status_with_file_target(running, &target),
+            None => running,
+        };
         if crate::ai::driver::runtime_ctx::stdout_is_terminal() {
             // Keep the line open so completion can replace it with a carriage return.
             print!("{row}");

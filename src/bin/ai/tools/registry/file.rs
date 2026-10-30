@@ -1,7 +1,11 @@
+use serde_json::Value;
+
 use crate::ai::tools::common::{
-    ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
+    ToolDisplayConfig, ToolDisplayRegistration, ToolHistoryPolicy, ToolHistoryPolicyRegistration,
+    ToolLossyCompressPolicy, ToolPrunePolicy,
     ToolParallelPolicy, ToolParallelPolicyRegistration, ToolRegistration, ToolReplayRegistration,
     ToolRetryPolicy, ToolRetryPolicyRegistration, ToolSpec, ToolStreamingRegistration,
+    short_path,
 };
 use crate::ai::tools::service::file::{
     execute_read_file, execute_write_file, execute_write_file_streaming,
@@ -61,4 +65,52 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolStreamingRegistration {
     name: "write_file",
     execute_streaming: execute_write_file_streaming,
+});
+
+fn read_file_status_target(args: &Value) -> Option<String> {
+    let path = args
+        .get("file_path")
+        .or_else(|| args.get("path"))
+        .and_then(|v| v.as_str())?;
+    let short = short_path(path);
+    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1);
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(0);
+    if limit > 0 {
+        return Some(format!(
+            "{}  lines {}..{}",
+            short,
+            offset,
+            offset + limit.saturating_sub(1)
+        ));
+    }
+    Some(short)
+}
+
+inventory::submit!(ToolDisplayRegistration {
+    name: "read_file",
+    config: ToolDisplayConfig {
+        print_args: false,
+        print_result: false,
+        emphasize_result: false,
+        display: None,
+        status_target: Some(read_file_status_target),
+    },
+});
+
+fn write_file_status_target(args: &Value) -> Option<String> {
+    args.get("file_path")
+        .or_else(|| args.get("path"))
+        .and_then(|v| v.as_str())
+        .map(short_path)
+}
+
+inventory::submit!(ToolDisplayRegistration {
+    name: "write_file",
+    config: ToolDisplayConfig {
+        print_args: false,
+        print_result: false,
+        emphasize_result: false,
+        display: None,
+        status_target: Some(write_file_status_target),
+    },
 });
