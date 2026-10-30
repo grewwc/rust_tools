@@ -41,3 +41,10 @@ HTTP/SSE surface lives in `mod.rs`.
    certificate is configured and `http://` otherwise, and `--serve-status`
    prints that URL as `bind=`. Probe `<bind>/healthz` with the same scheme;
    plain HTTP against a TLS port fails.
+7. **The APK download is a compile-time embed.** `serve_android_apk` in
+   `info.rs` serves `include_bytes!` of `android/a-serve/dist/a-serve.apk`, and
+   the download name comes from `ANDROID_APK_VERSION`, which a test keeps equal
+   to the gradle `versionName`. Copying a new APK into `dist/` does not change
+   a built `bin/a`: bump both version strings, copy, then rebuild and restart
+   the daemon. Verify by hashing the download and `dist/a-serve.apk`; equal
+   hashes prove the served bytes, not just the filename.

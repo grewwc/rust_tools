@@ -19,7 +19,7 @@ pub(crate) async fn healthz() -> Json<Healthz> {
 /// Android shell version published by the download route. `versionName` in
 /// `android/a-serve/app/build.gradle` is its build-side twin; a test keeps the
 /// two equal so bumping one cannot leave the download advertising the other.
-pub(crate) const ANDROID_APK_VERSION: &str = "1.15.2";
+pub(crate) const ANDROID_APK_VERSION: &str = "1.16.1";
 
 /// Download filename derived from [`ANDROID_APK_VERSION`]. The route, the
 /// `Content-Disposition` header, and the page's download link all use it.

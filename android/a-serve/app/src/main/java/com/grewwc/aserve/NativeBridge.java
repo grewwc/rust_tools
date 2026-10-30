@@ -45,8 +45,9 @@ final class NativeBridge {
 
     private static final String[] ACTIONS = {"now", "calendar_read", "calendar_add", "sms",
             "alarm", "timer", "note", "note_create", "note_list", "note_update",
-            "file_import", "file_read", "file_save", "location", "screen_capture", "screen_stop",
-            "screen_overlay_settings", "camera_capture", "camera_stop", "rebind_ime"};
+            "phone_search", "file_import", "file_read", "file_save", "location",
+            "screen_capture", "screen_stop", "screen_overlay_settings", "camera_capture",
+            "camera_stop", "rebind_ime"};
     private static final int MAX_NOTE_CHARS = 3000;
     private static final int MAX_TITLE_CHARS = 200;
     private static final int MAX_PLACE_CHARS = 200;
@@ -199,6 +200,8 @@ final class NativeBridge {
             });
         } else if ("file_import".equals(action) || "file_read".equals(action) || "file_save".equals(action)) {
             activity.performDocumentAction(requestId, action, payload);
+        } else if ("phone_search".equals(action)) {
+            activity.performSearch(requestId, payload);
         } else if ("screen_capture".equals(action) || "screen_stop".equals(action)) {
             activity.performScreen(requestId, "screen_stop".equals(action));
         } else if ("camera_capture".equals(action) || "camera_stop".equals(action)) {

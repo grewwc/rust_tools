@@ -91,6 +91,7 @@ const phoneFixtures = {
   file_import: { action: "file_import" },
   file_read: { action: "file_read", file_id: "12345678-1234-1234-1234-123456789012", offset: 3000, limit: 3000 },
   file_save: { action: "file_save", filename: "summary.txt", text: "结果😀" },
+  phone_search: { action: "phone_search", query: "rust async runtime", engine: "bing", max: 5 },
   screen_capture: { action: "screen_capture" },
   screen_stop: { action: "screen_stop" },
   camera_capture: { action: "camera_capture" },
@@ -116,6 +117,9 @@ test("new phone actions validate bounds without weakening old actions", () => {
     { ...phoneFixtures.alarm, weekdays: "1,2" }, { action: "timer", seconds: "20" },
     { action: "timer", seconds: 86401 }, { action: "timer", seconds: 0 },
     { ...phoneFixtures.note_create, kind: "reminder" }, { ...phoneFixtures.note_create, text: " " },
+    { ...phoneFixtures.phone_search, engine: "arbitrary" },
+    { ...phoneFixtures.phone_search, query: " " },
+    { ...phoneFixtures.phone_search, max: 11 },
     { action: "note_update", entry_id: phoneFixtures.note_update.entry_id },
     { ...phoneFixtures.note_update, completed: "true" }, { ...phoneFixtures.note_update, entry_id: "bad" },
     { ...phoneFixtures.note_list, max: 21 }, { ...phoneFixtures.note_list, offset: -1 },
@@ -207,7 +211,7 @@ test("old APK refuses new actions and never silently drops repeat weekdays", asy
     await app.request(); await app.settle();
     assert.equal(app.calls.length, 0);
     assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
-    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1.13.0/);
+    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.16\.0/);
   }
 });
 
@@ -231,7 +235,7 @@ test("a shell without the floating bubble cannot pick the capture moment", async
   await app.request(); await app.settle();
   assert.equal(app.calls.length, 0);
   assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
-    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.13\.0/);
+    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.16\.0/);
 });
 
 test("the screen capture waits for the user tap instead of timing out early", async () => {
@@ -253,7 +257,7 @@ test("a shell without the camera preview cannot open the camera", async () => {
   await app.request(); await app.settle();
   assert.equal(app.calls.length, 0);
   assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
-  assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.13\.0/);
+  assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.16\.0/);
 });
 
 test("the camera frame reaches the conversation with the camera caption", async () => {

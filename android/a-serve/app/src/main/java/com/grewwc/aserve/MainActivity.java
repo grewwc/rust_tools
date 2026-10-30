@@ -68,6 +68,8 @@ public final class MainActivity extends Activity {
     private ScreenCapture screenCapture;
     /** The native request waiting for a frame from the camera preview. */
     private String pendingCameraRequest;
+    /** The native request waiting for the visible search activity. */
+    private String pendingSearchRequest;
     private boolean nativeResumed;
     private Runnable grantedNativeAction;
     private String pendingPermissionOrigin;
@@ -360,6 +362,57 @@ public final class MainActivity extends Activity {
         }
         String error = data == null ? null : data.getStringExtra(CameraActivity.EXTRA_ERROR);
         deliverNativeResult(requestId, false, error == null ? "camera cancelled" : error, null);
+    }
+
+    /**
+     * Opens the visible in-app search browser. The user can solve a CAPTCHA or
+     * consent page there; the activity returns extracted result entries as JSON.
+     */
+    void performSearch(String requestId, JSONObject payload) {
+        if (pendingSearchRequest != null) {
+            deliverNativeResult(requestId, false, getString(R.string.search_busy), null);
+            return;
+        }
+        String query = payload == null ? "" : payload.optString("query", "").trim();
+        String engine = SearchActivity.normalizeEngine(
+                payload == null ? null : payload.optString("engine", "bing"));
+        int max = payload == null ? 5 : payload.optInt("max", 5);
+        if (query.isEmpty() || query.codePointCount(0, query.length()) > 500
+                || engine == null) {
+            deliverNativeResult(requestId, false, getString(R.string.search_invalid_request), null);
+            return;
+        }
+        if (max < 1 || max > 10) max = 5;
+        pendingSearchRequest = requestId;
+        try {
+            startActivityForResult(new Intent(this, SearchActivity.class)
+                    .putExtra(SearchActivity.EXTRA_QUERY, query)
+                    .putExtra(SearchActivity.EXTRA_ENGINE, engine)
+                    .putExtra(SearchActivity.EXTRA_MAX, max), SearchActivity.REQUEST);
+        } catch (RuntimeException error) {
+            pendingSearchRequest = null;
+            deliverNativeResult(requestId, false, getString(R.string.search_open_failed), null);
+        }
+    }
+
+    private void deliverSearchResult(int resultCode, Intent data) {
+        String requestId = pendingSearchRequest;
+        pendingSearchRequest = null;
+        if (requestId == null) return;
+        if (resultCode == RESULT_OK && data != null) {
+            String raw = data.getStringExtra(SearchActivity.EXTRA_RESULT);
+            if (raw != null && !raw.isEmpty()) {
+                try {
+                    deliverNativeResult(requestId, true, null, new JSONObject(raw));
+                    return;
+                } catch (JSONException ignored) {
+                    // Fall through to the explicit failure below.
+                }
+            }
+        }
+        String error = data == null ? null : data.getStringExtra(SearchActivity.EXTRA_ERROR);
+        deliverNativeResult(requestId, false,
+                error == null ? getString(R.string.search_cancelled) : error, null);
     }
 
     /** Reads a file into a base64 string, the shape the page expects. */
@@ -688,6 +741,10 @@ public final class MainActivity extends Activity {
         }
         if (requestCode == CameraActivity.REQUEST) {
             deliverCameraResult(resultCode, data);
+            return;
+        }
+        if (requestCode == SearchActivity.REQUEST) {
+            deliverSearchResult(resultCode, data);
             return;
         }
         if (requestCode == PhoneDocuments.REQUEST) {

@@ -25,6 +25,13 @@ fails with `SDK location not found`.
 
 The installable APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
 
+Publishing it through `a serve` requires this order: bump `versionName` and
+`ANDROID_APK_VERSION` (in `src/bin/ai/serve/info.rs`) together, build the APK,
+copy it to `dist/a-serve.apk`, then rebuild and restart `a`. The daemon embeds
+the APK at compile time, so building `a` before the copy keeps serving the
+previous package under the old name. Confirm with `curl -sk <bind>/a-serve.apk
+| sha256sum` against `sha256sum dist/a-serve.apk`.
+
 ## Device setup
 
 The APK bundles the public `a serve` CA used by its default server, so no
@@ -57,6 +64,15 @@ This version reads UTF-8 text, Markdown, CSV, JSON, and XML up to 1 MiB, in
 3000-character pages. PDF/Office/image extraction is not implemented. Imported
 file handles expire when the app process exits; reimport to read again. File
 save uses the system create-document picker and accepts up to 3000 characters.
+
+`phone_search` (1.16.0) opens a visible in-app search page for one query and
+returns up to ten extracted result entries marked untrusted. Google, Bing,
+Baidu, and DuckDuckGo are allowlisted; the URL template is fixed on the device.
+The page loads in a dedicated WebView without the app's JavaScript bridge, and
+result links open in the system browser, so the app never drives or reads
+another app's browser. When the engine shows a consent or CAPTCHA page, the
+window stays interactive: the user solves it there and extraction resumes
+automatically. It uses the phone's network but not the user's Chrome cookies.
 
 Location requests fine and coarse permission together and prefers a fresh GPS
 fix. An existing coarse-only installation gets one upgrade prompt. If only

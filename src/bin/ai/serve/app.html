@@ -1100,6 +1100,13 @@ function parsePhoneAction(raw) {
     return seconds === null || label === null ? null : { action, seconds, label };
   }
   if (action === "file_import") return { action };
+  if (action === "phone_search") {
+    const query = textField("query", 500), engine = spec.engine === undefined ? "bing" : spec.engine;
+    const max = integerField("max", 5, 1, 10);
+    if (!["google", "bing", "baidu", "duckduckgo"].includes(engine) ||
+        query === null || !query.trim() || max === null) return null;
+    return { action, query: query.trim(), engine, max };
+  }
   if (action === "file_read") {
     const file_id = uuidField("file_id"), offset = integerField("offset", 0, 0, 1048576);
     const limit = integerField("limit", 3000, 1, 3000);
@@ -1630,11 +1637,12 @@ function nativeCall(action, payload, requestId) {
     if (!supported || (repeat && !features.includes("alarm_weekdays")) ||
         (action === "screen_capture" && !features.includes("screen_bubble")) ||
         (action === "camera_capture" && !features.includes("camera_preview"))) {
-      reject(new Error("当前 APK 不支持此操作，请升级到 v1.13.0 或更新版本")); return;
+      reject(new Error("当前 APK 不支持此操作，请升级到 v1.16.0 或更新版本")); return;
     }
     const id = requestId || ("n" + (++nativeSeq) + "-" + Date.now());
     if (!/^[A-Za-z0-9_-]{1,80}$/.test(id)) { reject(new Error("无效的手机请求编号")); return; }
-    const timeoutMs = action === "file_import" || action === "file_save" ? 180000
+    const timeoutMs = action === "file_import" || action === "file_save" ||
+      action === "phone_search" ? 180000
       : action === "screen_capture" ? 120000 : 45000;
     const timer = setTimeout(() => {
       nativePending.delete(id);
