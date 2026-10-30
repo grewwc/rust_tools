@@ -1,7 +1,7 @@
 {
   "name": "save_skill",
-  "description": "Render and save a skill into the configured skills directory. Simple skills are saved as a single .skill file; complex skills are saved as a directory package (SKILL.md + subskills/). Use proactively to persist reusable skills, including splitting a complex skill into multiple sub-skills. Saving a package for a name that already exists as a single `.skill` file deletes that old file.",
-  "first_use_guidance": "Guidance for distilling session experience into a reusable skill:\n- Gather evidence first with search_overflow (past turns) and knowledge_search (saved facts); quote behavior, not project specifics.\n- Generalize before saving: no absolute paths, hostnames, tokens, or single-project identifiers; state goal, inputs, steps, and done criteria.\n- Iterate safely: save_skill with dry_run=true previews the rendered skill without writing; validate_skill checks the exact arguments; only then save without dry_run.\n- Prefer validate_skill over re-saving to fix drafts, and delete_skill to remove a bad skill.",
+  "description": "Render and save a skill into the configured skills directory. Simple skills are saved as a single .skill file; complex skills are saved as a directory package (SKILL.md + resources + subskills/). Bundle scripts, examples, references, and archives through `resources`: use inline `content` for small UTF-8 text, `content_base64` for small binary data, or `from` to copy an existing file or directory recursively without inlining it. Use proactively to persist reusable skills. Never create or edit `.skill` or `SKILL.md` files with `write_file`/`apply_patch`; save_skill owns the package layout and reserved paths. Saving a package for a name that already exists as a single `.skill` file deletes that old file. Updating replaces the manifest fields: pass every supported field you want to keep. For an existing package, omitting both `resources` and `subskills` updates only SKILL.md and keeps its files; a manifest-only save cannot downgrade a package to a single-file skill.",
+  "first_use_guidance": "Guidance for distilling session experience into a reusable skill:\n- Gather evidence first with search_overflow (past turns) and knowledge_search (saved facts); quote behavior, not project specifics.\n- Generalize before saving: no absolute paths, hostnames, tokens, or single-project identifiers; state goal, inputs, steps, and done criteria.\n- Iterate safely: save_skill with dry_run=true previews the rendered skill without writing; validate_skill checks the exact arguments; only then save without dry_run.\n- Bundle assets through `resources`: `content` for small UTF-8 text, `content_base64` for small binary, or `from` to copy a file/directory tree byte-for-byte. Do not paste large files or archives into `content`.\n- Never create or edit `.skill`/`SKILL.md` files with `write_file` or `apply_patch`; save_skill owns the manifest and package layout.\n- Updating replaces the manifest fields, not a field-by-field merge: read the existing `source` manifest first, then pass every supported field you want to keep. For a package, omitting both `resources` and `subskills` updates only SKILL.md and keeps the existing files. `load_skill` omits `tools`, `tool_groups`, `mcp_servers`, and `priority`; `disable_*` and `excludes` are not accepted by save_skill.\n- Prefer validate_skill over re-saving to fix drafts, and delete_skill to remove a bad skill.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -68,28 +68,39 @@
       },
       "resources": {
         "type": "array",
-        "description": "Optional bundled resources to save alongside the skill. Each entry has `path` (relative, e.g. 'references/guide.md', 'examples/demo.md', 'scripts/tool.py') and `content`. When any resources or subskills are provided, the skill is saved as a directory package (SKILL.md + resource files).",
+        "description": "Optional bundled resources to save alongside the skill. Each entry has `path` plus exactly one source: `content` (UTF-8 text), `content_base64` (binary bytes), or `from` (copy an existing file or a directory tree, binary-safe). When any resources or subskills are provided, the skill is saved as a directory package (SKILL.md + resource files).",
         "items": {
           "type": "object",
           "properties": {
             "path": {
               "type": "string",
-              "description": "Relative path inside the skill package, e.g. 'references/api.md' or 'scripts/helper.py'. Must not be absolute or contain '..'."
+              "description": "Relative destination inside the package, e.g. 'references/api.md' or 'scripts/helper.py'. A directory import is copied under this prefix. Must not be absolute, contain '..', be 'SKILL.md', or start with 'subskills/'."
             },
             "content": {
               "type": "string",
-              "description": "File content to write."
+              "description": "UTF-8 text to write. Provide exactly one of content/content_base64/from."
+            },
+            "content_base64": {
+              "type": "string",
+              "description": "Base64-encoded bytes, for small binary resources. Provide exactly one of content/content_base64/from."
+            },
+            "from": {
+              "type": "string",
+              "description": "Existing file or directory to copy. Relative paths resolve against the working directory; absolute paths are allowed. Files are copied byte-for-byte. A directory is copied recursively under `path`; symlinks and VCS metadata are skipped/rejected. Provide exactly one of content/content_base64/from."
+            },
+            "executable": {
+              "type": "boolean",
+              "description": "Mark a single-file resource executable (Unix). Directory imports preserve source modes."
             }
           },
           "required": [
-            "path",
-            "content"
+            "path"
           ]
         }
       },
       "references": {
         "type": "array",
-        "description": "Convenience alias for resources under references/. Each entry has `path` (filename or relative) and `content`. Merged with `resources`.",
+        "description": "Convenience alias for resources under references/. Same entry shape as `resources` (content, content_base64, or from). Merged with `resources`.",
         "items": {
           "type": "object",
           "properties": {
@@ -98,17 +109,25 @@
             },
             "content": {
               "type": "string"
+            },
+            "content_base64": {
+              "type": "string"
+            },
+            "from": {
+              "type": "string"
+            },
+            "executable": {
+              "type": "boolean"
             }
           },
           "required": [
-            "path",
-            "content"
+            "path"
           ]
         }
       },
       "examples": {
         "type": "array",
-        "description": "Convenience alias for resources under examples/. Same shape as `references`.",
+        "description": "Convenience alias for resources under examples/. Same entry shape as `resources` (content, content_base64, or from).",
         "items": {
           "type": "object",
           "properties": {
@@ -117,17 +136,25 @@
             },
             "content": {
               "type": "string"
+            },
+            "content_base64": {
+              "type": "string"
+            },
+            "from": {
+              "type": "string"
+            },
+            "executable": {
+              "type": "boolean"
             }
           },
           "required": [
-            "path",
-            "content"
+            "path"
           ]
         }
       },
       "scripts": {
         "type": "array",
-        "description": "Convenience alias for resources under scripts/. Same shape as `references`.",
+        "description": "Convenience alias for resources under scripts/. Same entry shape as `resources` (content, content_base64, or from). Use `executable: true` for inline scripts that must be runnable.",
         "items": {
           "type": "object",
           "properties": {
@@ -136,11 +163,19 @@
             },
             "content": {
               "type": "string"
+            },
+            "content_base64": {
+              "type": "string"
+            },
+            "from": {
+              "type": "string"
+            },
+            "executable": {
+              "type": "boolean"
             }
           },
           "required": [
-            "path",
-            "content"
+            "path"
           ]
         }
       },
@@ -187,6 +222,7 @@
             },
             "resources": {
               "type": "array",
+              "description": "Resources for this sub-skill. Same entry shape as the top-level `resources` (content, content_base64, or from).",
               "items": {
                 "type": "object",
                 "properties": {
@@ -195,11 +231,19 @@
                   },
                   "content": {
                     "type": "string"
+                  },
+                  "content_base64": {
+                    "type": "string"
+                  },
+                  "from": {
+                    "type": "string"
+                  },
+                  "executable": {
+                    "type": "boolean"
                   }
                 },
                 "required": [
-                  "path",
-                  "content"
+                  "path"
                 ]
               }
             }

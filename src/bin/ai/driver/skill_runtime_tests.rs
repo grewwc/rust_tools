@@ -7,7 +7,7 @@ use super::{
     filter_mcp_tools_by_allowed_servers, has_tool, manifest_tool_definitions,
     merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
     select_mcp_tools, session_context_prompt, session_id_referenced, session_issue_likely,
-    tool_uses_mcp_server,
+    skill_authoring_referenced, tool_uses_mcp_server,
 };
 use crate::ai::agents::{AgentManifest, AgentMode};
 use crate::ai::driver::runtime_ctx::{SUBAGENT_CWD, SUBAGENT_DEPTH};
@@ -870,6 +870,35 @@ fn session_issue_likely_covers_debugging_intents_in_both_languages() {
 }
 
 #[test]
+fn skill_authoring_referenced_routes_save_and_update_intents() {
+    for question in [
+        "save this workflow as a skill",
+        "create a skill from what we just did",
+        "update the audit skill with this rule",
+        "把这个流程保存成技能",
+        "帮我新建一个技能",
+        "请更新技能里的脚本",
+        "call save_skill with a dry run",
+    ] {
+        assert!(
+            skill_authoring_referenced(question),
+            "skill-authoring intent missed: {question}"
+        );
+    }
+    for question in [
+        "write a fizzbuzz",
+        "explain Rust lifetimes",
+        "load the audit skill and follow it",
+        "这个技能怎么用",
+    ] {
+        assert!(
+            !skill_authoring_referenced(question),
+            "unrelated question over-loaded the skills group: {question}"
+        );
+    }
+}
+
+#[test]
 fn session_id_referenced_detects_uuid_shaped_ids_only() {
     // Hits: a bare UUID (with or without session keywords) is an unambiguous
     // reference to a concrete runtime session.
@@ -991,6 +1020,38 @@ fn question_without_session_id_keeps_session_tools_lazy() {
     let context_reminder = guard.context_reminder().unwrap_or_default();
     assert!(!system_prompt.contains("ordinary-turn-session-id"));
     assert!(!context_reminder.contains("ordinary-turn-session-id"));
+    drop(guard);
+}
+
+#[test]
+fn skill_authoring_question_auto_loads_save_skill() {
+    let mcp_client = McpClient::new();
+    let mut app = super::super::tests::test_app("build");
+    app.session_id = "skill-authoring-turn".to_string();
+    let mut guard = super::prepare_skill_for_turn(
+        &mut app,
+        &mcp_client,
+        &[],
+        "save this workflow as a skill",
+    )
+    .unwrap();
+    let names: Vec<String> = app
+        .agent_context
+        .as_ref()
+        .unwrap()
+        .tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect();
+    assert!(
+        names.iter().any(|name| name == "save_skill"),
+        "skill-authoring turn must expose save_skill, got {names:?}"
+    );
+    assert!(
+        guard
+            .system_prompt()
+            .contains("Create or update skills with `save_skill`")
+    );
     drop(guard);
 }
 

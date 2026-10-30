@@ -1251,6 +1251,26 @@ fn session_id_referenced(question: &str) -> bool {
     SESSION_ID_RE.is_match(question)
 }
 
+/// Deterministic skill-authoring detection: the user turn explicitly asks to
+/// save, create, or update a skill. Such turns auto-load the lazy `skills`
+/// group; without it the model sees `write_file` (core) but not `save_skill`,
+/// and the skills directory is writable, so it can hand-write the manifest.
+fn skill_authoring_referenced(question: &str) -> bool {
+    let lowered = question.to_lowercase();
+    if lowered.contains("save_skill") || lowered.contains("validate_skill") {
+        return true;
+    }
+    if !(lowered.contains("skill") || lowered.contains("技能")) {
+        return false;
+    }
+    const ACTIONS: &[&str] = &[
+        "save", "create", "update", "edit", "write", "add", "persist", "package", "author",
+        "revise", "modify", "保存", "创建", "新建", "更新", "修改", "编辑", "写成", "做成",
+        "存成", "存为", "生成", "打包",
+    ];
+    ACTIONS.iter().any(|keyword| lowered.contains(keyword))
+}
+
 const MAX_SKILL_ACTIVATION_HISTORY_ENTRIES: usize = 6;
 
 /// Project a successful explicit skill selection into a bounded runtime fact. The raw side-channel record does not enter
@@ -1527,6 +1547,11 @@ fn build_system_prompt(
                 "Additional capabilities are available via `enable_tools`; list and enable only what the current task needs.".to_string(),
             );
         }
+        if !has_tool(available_tools, "save_skill") && has_tool(available_tools, "enable_tools") {
+            discovery_lines.push(
+                "To save, create, or update a skill, enable the `skills` group and use `save_skill`; never hand-write `.skill` or `SKILL.md` files with `write_file`.".to_string(),
+            );
+        }
         if skills.is_empty()
             && has_tool(available_tools, "list_skills")
             && has_tool(available_tools, "activate_skill")
@@ -1545,6 +1570,15 @@ fn build_system_prompt(
             "tool_discovery",
             discovery_lines,
         );
+    }
+
+    if has_tool(available_tools, "save_skill") {
+        let lines = vec![
+            "Create or update skills with `save_skill` (use `dry_run` for a preview), not `write_file` or another direct file editor: save_skill renders the manifest, owns the package layout, and rejects reserved paths.".to_string(),
+            "Bundle scripts, examples, references, and archives through `resources`; use `from` to copy existing files or whole directories (binary-safe) instead of inlining large or non-UTF-8 content.".to_string(),
+            "Set `executable: true` on inline scripts that must be runnable.".to_string(),
+        ];
+        push_tool_guidance_section(&mut b, ContextKind::Policy, "skill_authoring", lines);
     }
 
     if has_tool(available_tools, "knowledge_save") {
@@ -1802,6 +1836,28 @@ fn build_skill_turn_guard(
             .collect();
         if !missing.is_empty() {
             builtin_tools.extend(crate::ai::tools::get_tool_definitions_by_names(&missing));
+        }
+    }
+    // Deterministic skill-authoring routing: `save_skill` and the rest of the
+    // `skills` group are lazy, while `write_file` is resident and the skills
+    // directory is writable. When the user explicitly asks to save/create/
+    // update a skill, make the group visible so the model can call
+    // `save_skill` instead of hand-writing `.skill`/`SKILL.md` files.
+    if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0
+        && !builtin_tools.is_empty()
+        && skill_authoring_referenced(question)
+    {
+        let known: Box<SkipSet<String>> = builtin_tools
+            .iter()
+            .map(|tool| tool.function.name.clone())
+            .collect();
+        let missing: Vec<ToolDef> =
+            crate::ai::tools::tool_definitions_for_groups(&[ToolGroup::Skills])
+                .into_iter()
+                .filter(|tool| !known.contains_str(&tool.function.name))
+                .collect();
+        if !missing.is_empty() {
+            builtin_tools.extend(missing);
         }
     }
     let mcp_tools = select_mcp_tools(all_mcp_tools.clone(), skills, active_agent.as_ref());
@@ -2418,7 +2474,7 @@ mod pure_prompt_tests {
 
     #[test]
     fn default_profile_prompt_bytes_are_unchanged() {
-        const DEFAULT_PROFILE_PROMPT_HASH: u64 = 7_767_455_692_574_641_592;
+        const DEFAULT_PROFILE_PROMPT_HASH: u64 = 4_005_824_832_458_205_908;
         let prompt = render_turn(
             None,
             &[],

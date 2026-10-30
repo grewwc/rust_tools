@@ -1,6 +1,6 @@
 {
   "name": "validate_skill",
-  "description": "Statically validate a skill definition without saving anything. Pass the exact arguments you intend to give save_skill; returns valid plus warnings, or an error listing every problem. Static check only — filesystem conflicts (an existing file or package at the target, `overwrite=false`) are reported by `save_skill` itself.",
+  "description": "Validate a skill definition without saving anything. Pass the exact arguments you intend to give save_skill; returns valid plus warnings, or an error listing every problem. Checks package paths and `from` import sources, but not target conflicts (an existing file or package at the target, `overwrite=false`), which `save_skill` reports itself.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -43,7 +43,7 @@
       },
       "resources": {
         "type": "array",
-        "description": "Optional bundled resources, each with relative `path` and `content`.",
+        "description": "Optional bundled resources. Each entry has `path` and exactly one of `content`, `content_base64`, or `from` (same shape as save_skill).",
         "items": {
           "type": "object",
           "properties": {
@@ -52,17 +52,25 @@
             },
             "content": {
               "type": "string"
+            },
+            "content_base64": {
+              "type": "string"
+            },
+            "from": {
+              "type": "string"
+            },
+            "executable": {
+              "type": "boolean"
             }
           },
           "required": [
-            "path",
-            "content"
+            "path"
           ]
         }
       },
       "subskills": {
         "type": "array",
-        "description": "Optional nested sub-skills, each with `name` and `prompt`.",
+        "description": "Optional nested sub-skills, each with `name` and `prompt`; may also include `resources` with the same shape as the top-level field.",
         "items": {
           "type": "object"
         }

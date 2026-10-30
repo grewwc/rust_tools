@@ -1029,7 +1029,11 @@ pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
         super::super::storage::temp_registry::register(&abs_path)?;
     }
 
-    Ok(format!("Successfully wrote to {}", store.path().display()))
+    let mut message = format!("Successfully wrote to {}", store.path().display());
+    if let Some(hint) = skill_manifest_write_hint(store.path()) {
+        message.push_str(&hint);
+    }
+    Ok(message)
 }
 
 pub(crate) fn execute_write_file_streaming(
@@ -1069,9 +1073,31 @@ pub(crate) fn execute_write_file_streaming(
         super::super::storage::temp_registry::register(&abs_path)?;
     }
 
-    let result = format!("Successfully wrote to {}", store.path().display());
+    let mut result = format!("Successfully wrote to {}", store.path().display());
+    if let Some(hint) = skill_manifest_write_hint(store.path()) {
+        result.push_str(&hint);
+    }
     emit_stream_line(on_chunk, &result);
     Ok(result)
+}
+
+/// A direct manifest write bypasses `save_skill`'s package layout and
+/// validation. Keep the write working (an in-place edit is legitimate), but
+/// point the model at the supported skill-authoring path.
+fn skill_manifest_write_hint(path: &std::path::Path) -> Option<String> {
+    let skills = crate::ai::skills::skills_dir();
+    if !path.starts_with(&skills) {
+        return None;
+    }
+    let name = path.file_name()?.to_string_lossy();
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".skill") || lower == "skill.md" {
+        Some(format!(
+            "\nNote: `{name}` is a skill manifest. Use `save_skill` to create or update skills so the package layout and validation stay consistent."
+        ))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1085,6 +1111,18 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("ai_tools_test_{}_{}", name, uuid::Uuid::new_v4()));
         path
+    }
+
+    #[test]
+    fn skill_manifest_write_hint_targets_manifest_files_only() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let skills = crate::ai::skills::skills_dir();
+        assert!(skill_manifest_write_hint(&skills.join("demo.skill")).is_some());
+        assert!(skill_manifest_write_hint(&skills.join("demo/SKILL.md")).is_some());
+        assert!(
+            skill_manifest_write_hint(&skills.join("demo/references/guide.md")).is_none()
+        );
+        assert!(skill_manifest_write_hint(&std::env::temp_dir().join("demo.skill")).is_none());
     }
 
     #[test]

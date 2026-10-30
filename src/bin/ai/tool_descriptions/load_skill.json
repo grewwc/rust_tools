@@ -1,6 +1,6 @@
 {
   "name": "load_skill",
-  "description": "Read a skill's full contents (prompt body, system prompt, bundled resource directory if any) by name, without changing the current turn. Use to inspect, learn from, or modify an existing skill (e.g. authoring or debugging). Returns text only; it does NOT activate the skill or alter your tool set. The returned text omits the manifest's `tools`, `tool_groups`, `mcp_servers` and `priority` — re-saving from it drops them, so a skill that restricted its tools is saved with the default turn groups instead.",
+  "description": "Read a skill's full contents (prompt body, system prompt, bundled resource directory if any, and source path) by name, without changing the current turn. Use to inspect, learn from, or modify an existing skill (e.g. authoring or debugging). Returns text only; it does NOT activate the skill or alter your tool set. The returned text omits the manifest's `tools`, `tool_groups`, `mcp_servers` and `priority` — re-saving from it drops them, so read the `source` manifest path first and pass every field you intend to keep. `save_skill` does not currently write `disable_builtin_tools`, `disable_mcp_tools`, or `excludes`.",
   "parameters": {
     "type": "object",
     "properties": {
