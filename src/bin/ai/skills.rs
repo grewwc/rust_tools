@@ -264,7 +264,7 @@ fn parse_bool_value(s: &str) -> Option<bool> {
     }
 }
 
-fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
+pub(crate) fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
     let mut lines = content.lines();
     let Some(first) = lines.next() else {
         return Err("empty skill file".to_string());

@@ -1,7 +1,7 @@
 {
   "name": "save_skill",
-  "description": "Render and save a skill into the configured skills directory. Simple skills are saved as a single .skill file; complex skills are saved as a directory package (SKILL.md + resources + subskills/). Bundle scripts, examples, references, and archives through `resources`: use inline `content` for small UTF-8 text, `content_base64` for small binary data, or `from` to copy an existing file or directory recursively without inlining it. Use proactively to persist reusable skills. Never create or edit `.skill` or `SKILL.md` files with `write_file`/`apply_patch`; save_skill owns the package layout and reserved paths. Saving a package for a name that already exists as a single `.skill` file deletes that old file. Updating replaces the manifest fields: pass every supported field you want to keep. For an existing package, omitting both `resources` and `subskills` updates only SKILL.md and keeps its files; a manifest-only save cannot downgrade a package to a single-file skill.",
-  "first_use_guidance": "Guidance for distilling session experience into a reusable skill:\n- Gather evidence first with search_overflow (past turns) and knowledge_search (saved facts); quote behavior, not project specifics.\n- Generalize before saving: no absolute paths, hostnames, tokens, or single-project identifiers; state goal, inputs, steps, and done criteria.\n- Iterate safely: save_skill with dry_run=true previews the rendered skill without writing; validate_skill checks the exact arguments; only then save without dry_run.\n- Bundle assets through `resources`: `content` for small UTF-8 text, `content_base64` for small binary, or `from` to copy a file/directory tree byte-for-byte. Do not paste large files or archives into `content`.\n- Never create or edit `.skill`/`SKILL.md` files with `write_file` or `apply_patch`; save_skill owns the manifest and package layout.\n- Updating replaces the manifest fields, not a field-by-field merge: read the existing `source` manifest first, then pass every supported field you want to keep. For a package, omitting both `resources` and `subskills` updates only SKILL.md and keeps the existing files. `load_skill` omits `tools`, `tool_groups`, `mcp_servers`, and `priority`; `disable_*` and `excludes` are not accepted by save_skill.\n- Prefer validate_skill over re-saving to fix drafts, and delete_skill to remove a bad skill.",
+  "description": "Render and save a skill into the configured skills directory. Simple skills are saved as a single .skill file; complex skills are saved as a directory package (SKILL.md + resources + subskills/). Bundle scripts, examples, references, and archives through `resources`: use inline `content` for small UTF-8 text, `content_base64` for small binary data, or `from` to copy an existing file or directory recursively without inlining it. Use proactively to persist reusable skills. Never create or edit `.skill` or `SKILL.md` files with `write_file`/`apply_patch`; save_skill owns the package layout and reserved paths. Saving a package for a name that already exists as a single `.skill` file deletes that old file. Updating is incremental: omitted manifest fields keep their stored values, so pass only what changes (`prompt` is required only when creating a new skill). For an existing package, `resources`/`subskills` merge by default (upsert listed entries, keep unlisted files); pass `rebuild:true` to replace the whole package, or `remove_paths`/`remove_subskills` to delete entries. A manifest-only save cannot downgrade a package to a single-file skill.",
+  "first_use_guidance": "Guidance for distilling session experience into a reusable skill:\n- Gather evidence first with search_overflow (past turns) and knowledge_search (saved facts); quote behavior, not project specifics.\n- Generalize before saving: no absolute paths, hostnames, tokens, or single-project identifiers; state goal, inputs, steps, and done criteria.\n- Iterate safely: save_skill with dry_run=true previews the rendered skill without writing; validate_skill checks a full definition; only then save without dry_run.\n- Bundle assets through `resources`: `content` for small UTF-8 text, `content_base64` for small binary, or `from` to copy a file/directory tree byte-for-byte. Do not paste large files or archives into `content`.\n- Never create or edit `.skill`/`SKILL.md` files with `write_file` or `apply_patch` for routine authoring; save_skill owns the manifest and package layout. Small in-place `apply_patch` edits to an existing SKILL.md still work but bypass validation, so prefer save_skill for anything structural.\n- Updating is incremental: omitted manifest fields keep their stored values, so pass only what changes. For a package, `resources`/`subskills` merge (upsert) by default; use `remove_paths`/`remove_subskills` to delete and `rebuild:true` only to replace the whole package. `disable_*` and `excludes` are not accepted by save_skill.\n- Prefer validate_skill over re-saving to fix drafts, and delete_skill to remove a bad skill.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -15,7 +15,7 @@
       },
       "prompt": {
         "type": "string",
-        "description": "Full skill prompt body (Markdown). Saved after the YAML front matter."
+        "description": "Full skill prompt body (Markdown). Saved after the YAML front matter. Required when creating a new skill; omitted on update keeps the existing prompt."
       },
       "system_prompt": {
         "type": "string",
@@ -66,9 +66,27 @@
         "type": "boolean",
         "description": "When true, validate and render the skill without writing anything; returns the preview plus warnings."
       },
+      "rebuild": {
+        "type": "boolean",
+        "description": "Package updates merge by default (upsert listed resources/subskills, keep unlisted files). Set true to replace the whole package instead. Manifest-only saves ignore this flag."
+      },
+      "remove_paths": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Resource paths to delete from an existing package, e.g. ['references/old.md', 'scripts/legacy']. Same path rules as resources. Missing paths are ignored."
+      },
+      "remove_subskills": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Sub-skill names to delete from an existing package. Missing names are ignored."
+      },
       "resources": {
         "type": "array",
-        "description": "Optional bundled resources to save alongside the skill. Each entry has `path` plus exactly one source: `content` (UTF-8 text), `content_base64` (binary bytes), or `from` (copy an existing file or a directory tree, binary-safe). When any resources or subskills are provided, the skill is saved as a directory package (SKILL.md + resource files).",
+        "description": "Optional bundled resources to save alongside the skill. Each entry has `path` plus exactly one source: `content` (UTF-8 text), `content_base64` (binary bytes), or `from` (copy an existing file or a directory tree, binary-safe). When any resources or subskills are provided, the skill is saved as a directory package (SKILL.md + resource files). On update, listed resources are upserted and unlisted files are kept unless `rebuild:true`.",
         "items": {
           "type": "object",
           "properties": {
@@ -256,8 +274,7 @@
       }
     },
     "required": [
-      "name",
-      "prompt"
+      "name"
     ]
   },
   "groups": [

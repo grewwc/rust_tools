@@ -1288,8 +1288,15 @@ fn write_planned_resource_files(
                 }
             }
         }
-        if target.exists() {
-            return Err(format!("Resource already exists: {}", target.display()));
+        // Overlay is allowed so incremental updates can replace one file
+        // without resending the whole package; fresh rebuilds use an empty
+        // temp dir so this does not hide intra-plan duplicates (already
+        // rejected case-insensitively by `ResourcePlan::push`).
+        if target.is_dir() {
+            return Err(format!(
+                "Resource path collides with an existing directory: {}",
+                file.path
+            ));
         }
         match &file.source {
             PlannedSource::Text(text) => {
@@ -1333,6 +1340,436 @@ fn write_planned_resource_files(
     Ok(())
 }
 
+/// Load the existing manifest for an incremental update, if any. Package
+/// layouts win over the legacy single file when both exist.
+fn load_existing_skill_manifest(
+    package_dir: &std::path::Path,
+    legacy_file: &std::path::Path,
+) -> Option<SkillManifest> {
+    let manifest_path = if package_dir.join("SKILL.md").is_file() {
+        package_dir.join("SKILL.md")
+    } else if legacy_file.is_file() {
+        legacy_file.to_path_buf()
+    } else {
+        return None;
+    };
+    let content = fs::read_to_string(&manifest_path).ok()?;
+    crate::ai::skills::parse_skill_front_matter(&content).ok()
+}
+
+fn merged_string_field(args: &Value, key: &str, existing: &str) -> String {
+    match args.get(key) {
+        None => existing.to_string(),
+        Some(Value::Null) => existing.to_string(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
+fn merged_optional_string_field(
+    args: &Value,
+    key: &str,
+    existing: Option<&str>,
+) -> Option<String> {
+    match args.get(key) {
+        None | Some(Value::Null) => existing.map(|s| s.to_string()),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
+        }
+        Some(other) => Some(other.to_string()),
+    }
+}
+
+fn merged_string_list_field(args: &Value, key: &str, existing: &[String]) -> Vec<Value> {
+    match args.get(key) {
+        None | Some(Value::Null) => existing
+            .iter()
+            .map(|s| Value::String(s.clone()))
+            .collect(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(Value::String)
+            .collect(),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                vec![Value::String(trimmed.to_string())]
+            }
+        }
+        Some(_) => Vec::new(),
+    }
+}
+
+/// Merge update args over the stored manifest: omitted fields keep their old
+/// values so callers can patch one field without resending the whole skill.
+fn merge_skill_args_for_update(existing: &SkillManifest, args: &Value) -> Value {
+    let mut merged = serde_json::Map::new();
+    merged.insert(
+        "name".to_string(),
+        Value::String(
+            args.get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&existing.name)
+                .to_string(),
+        ),
+    );
+    let prompt = match args.get("prompt") {
+        None | Some(Value::Null) => existing.prompt.clone(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+    };
+    merged.insert("prompt".to_string(), Value::String(prompt));
+    merged.insert(
+        "description".to_string(),
+        Value::String(merged_string_field(args, "description", &existing.description)),
+    );
+    merged.insert(
+        "author".to_string(),
+        Value::String(merged_string_field(
+            args,
+            "author",
+            existing.author.as_deref().unwrap_or("agent"),
+        )),
+    );
+    merged.insert(
+        "version".to_string(),
+        Value::String(merged_string_field(args, "version", &existing.version)),
+    );
+    if let Some(system_prompt) =
+        merged_optional_string_field(args, "system_prompt", existing.system_prompt.as_deref())
+    {
+        merged.insert("system_prompt".to_string(), Value::String(system_prompt));
+    }
+    if let Some(parent) = merged_optional_string_field(args, "parent", existing.parent.as_deref())
+    {
+        merged.insert("parent".to_string(), Value::String(parent));
+    }
+    let priority = match args.get("priority") {
+        None | Some(Value::Null) => existing.priority as i64,
+        Some(v) => v.as_i64().unwrap_or(existing.priority as i64),
+    };
+    merged.insert("priority".to_string(), Value::Number(priority.into()));
+    merged.insert(
+        "tools".to_string(),
+        Value::Array(merged_string_list_field(args, "tools", &existing.tools)),
+    );
+    merged.insert(
+        "tool_groups".to_string(),
+        Value::Array(merged_string_list_field(
+            args,
+            "tool_groups",
+            &existing.tool_groups,
+        )),
+    );
+    merged.insert(
+        "mcp_servers".to_string(),
+        Value::Array(merged_string_list_field(
+            args,
+            "mcp_servers",
+            &existing.mcp_servers,
+        )),
+    );
+    for key in [
+        "file_name",
+        "overwrite",
+        "dry_run",
+        "rebuild",
+        "resources",
+        "references",
+        "examples",
+        "scripts",
+        "subskills",
+        "remove_paths",
+        "remove_subskills",
+    ] {
+        if let Some(value) = args.get(key) {
+            merged.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(merged)
+}
+
+fn parse_remove_paths_arg(args: &Value) -> Result<Vec<String>, String> {
+    let Some(arr) = args.get("remove_paths").and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (idx, item) in arr.iter().enumerate() {
+        let raw = item
+            .as_str()
+            .ok_or_else(|| format!("remove_paths[{idx}] must be a string"))?;
+        out.push(validate_resource_path(raw).map_err(|e| format!("remove_paths[{idx}]: {e}"))?);
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+fn parse_remove_subskills_arg(args: &Value) -> Result<Vec<String>, String> {
+    let Some(arr) = args.get("remove_subskills").and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (idx, item) in arr.iter().enumerate() {
+        let raw = item
+            .as_str()
+            .ok_or_else(|| format!("remove_subskills[{idx}] must be a string"))?
+            .trim();
+        if raw.is_empty() {
+            return Err(format!("remove_subskills[{idx}] is empty"));
+        }
+        out.push(raw.to_string());
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    fs::create_dir_all(dst)
+        .map_err(|e| format!("Failed to create dir {}: {e}", dst.display()))?;
+    let entries =
+        fs::read_dir(src).map_err(|e| format!("Failed to read dir {}: {e}", src.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| format!("Failed to read dir {}: {e}", src.display()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to inspect {}: {e}", entry.path().display()))?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "Skill package contains a symlink, which is not supported: {}",
+                entry.path().display()
+            ));
+        }
+        let dst_path = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), &dst_path)
+                .map_err(|e| format!("Failed to copy {}: {e}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_package_paths(
+    package_dir: &std::path::Path,
+    remove_paths: &[String],
+    remove_subskills: &[String],
+) -> Result<(), String> {
+    let canonical_base =
+        fs::canonicalize(package_dir).unwrap_or_else(|_| package_dir.to_path_buf());
+    for rel in remove_paths {
+        let target = package_dir.join(rel);
+        if fs::symlink_metadata(&target).is_err() {
+            continue;
+        }
+        if let Ok(canonical) = fs::canonicalize(
+            target
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| package_dir.to_path_buf()),
+        ) {
+            if !canonical.starts_with(&canonical_base) {
+                return Err(format!("remove_paths escapes package directory: {rel}"));
+            }
+        }
+        if target.is_dir() {
+            fs::remove_dir_all(&target)
+                .map_err(|e| format!("Failed to remove resource dir {rel}: {e}"))?;
+        } else {
+            let _ = fs::remove_file(&target);
+        }
+    }
+    for name in remove_subskills {
+        let sub_dir = package_dir
+            .join("subskills")
+            .join(safe_skill_dir_name(name));
+        if sub_dir.exists() {
+            fs::remove_dir_all(&sub_dir)
+                .map_err(|e| format!("Failed to remove subskill {name}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Incremental package update: copy the existing package to a temp dir, apply
+/// removals, overlay new resources, upsert listed subskills, then atomically
+/// publish. Unlisted files and subskills are preserved.
+#[allow(clippy::too_many_arguments)]
+fn execute_save_skill_package_merge(
+    dir: &std::path::Path,
+    name: &str,
+    effective_args: &Value,
+    package_dir: &std::path::Path,
+    legacy_file: &std::path::Path,
+    _resources: &[SkillResource],
+    resource_plan: &[PlannedResourceFile],
+    subskills: &[Value],
+    remove_paths: &[String],
+    remove_subskills: &[String],
+) -> Result<String, String> {
+    {
+        use rustc_hash::FxHashSet;
+        let mut seen_names: FxHashSet<String> = FxHashSet::default();
+        let mut seen_dirs: FxHashSet<String> = FxHashSet::default();
+        for sub in subskills {
+            let sub_name = sub["name"].as_str().unwrap_or("").trim().to_string();
+            if sub_name.is_empty() {
+                continue;
+            }
+            if sub_name == name {
+                return Err(format!(
+                    "Subskill name must not equal parent skill name: '{sub_name}'"
+                ));
+            }
+            if let Some(ep) = sub.get("parent").and_then(|v| v.as_str()) {
+                let ep = ep.trim();
+                if !ep.is_empty() && ep == sub_name {
+                    return Err(format!("Subskill '{sub_name}' parent must not be itself"));
+                }
+            }
+            if !seen_names.insert(sub_name.clone()) {
+                return Err(format!("Duplicate subskill name: '{sub_name}'"));
+            }
+            let dir_name = safe_skill_dir_name(&sub_name);
+            if !seen_dirs.insert(dir_name) {
+                return Err(format!(
+                    "Duplicate subskill directory name (sanitized collision): '{sub_name}'"
+                ));
+            }
+        }
+    }
+    let mut sub_resource_plans: Vec<Vec<PlannedResourceFile>> =
+        Vec::with_capacity(subskills.len());
+    for (idx, sub) in subskills.iter().enumerate() {
+        let sub_resources = parse_resources_arg(sub, &format!("subskills[{idx}]."))?;
+        sub_resource_plans.push(plan_resource_files(&sub_resources)?);
+    }
+    let package_dir_name = safe_skill_dir_name(name);
+    let tmp_dir = dir.join(format!(".tmp-{}-{}", package_dir_name, std::process::id()));
+    if tmp_dir.exists() {
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+    let main_content = build_skill_file_content(effective_args)?;
+    let write_result: Result<Vec<String>, String> = (|| {
+        copy_dir_recursive(package_dir, &tmp_dir)?;
+        remove_package_paths(&tmp_dir, remove_paths, remove_subskills)?;
+        fs::write(tmp_dir.join("SKILL.md"), &main_content)
+            .map_err(|e| format!("Failed to write skill manifest: {e}"))?;
+        if !resource_plan.is_empty() {
+            write_planned_resource_files(&tmp_dir, resource_plan)?;
+        }
+        let mut updated_subskills: Vec<String> = Vec::new();
+        for (idx, sub) in subskills.iter().enumerate() {
+            let sub_name = sub["name"].as_str().unwrap_or("").trim().to_string();
+            let mut sub_args = sub.clone();
+            let parent_missing = sub
+                .get("parent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .is_empty();
+            if parent_missing {
+                if let Some(map) = sub_args.as_object_mut() {
+                    map.insert("parent".to_string(), Value::String(name.to_string()));
+                }
+            }
+            let sub_content = build_skill_file_content(&sub_args)?;
+            let sub_dir = tmp_dir
+                .join("subskills")
+                .join(safe_skill_dir_name(&sub_name));
+            if sub_dir.is_file() {
+                return Err(format!(
+                    "Subskill path collides with an existing file: '{sub_name}'"
+                ));
+            }
+            fs::create_dir_all(&sub_dir).map_err(|e| {
+                format!("Failed to create subskill dir {}: {e}", sub_dir.display())
+            })?;
+            fs::write(sub_dir.join("SKILL.md"), sub_content)
+                .map_err(|e| format!("Failed to write subskill {sub_name}: {e}"))?;
+            if let Some(plan) = sub_resource_plans.get(idx) {
+                if !plan.is_empty() {
+                    write_planned_resource_files(&sub_dir, plan)?;
+                }
+            }
+            updated_subskills.push(sub_name);
+        }
+        Ok(updated_subskills)
+    })();
+    let updated_subskills = match write_result {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
+    };
+    let backup = dir.join(format!(".bak-{}-{}", package_dir_name, std::process::id()));
+    if backup.exists() {
+        let _ = fs::remove_dir_all(&backup);
+    }
+    fs::rename(package_dir, &backup).map_err(|e| {
+        format!(
+            "Failed to backup existing skill package {}: {e}",
+            package_dir.display()
+        )
+    })?;
+    match fs::rename(&tmp_dir, package_dir) {
+        Ok(()) => {
+            let _ = fs::remove_dir_all(&backup);
+        }
+        Err(e) => {
+            let _ = fs::rename(&backup, package_dir);
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Err(format!(
+                "Failed to publish skill package {}: {e}",
+                package_dir.display()
+            ));
+        }
+    }
+    if legacy_file.exists() {
+        let _ = fs::remove_file(legacy_file);
+    }
+    let mut msg = format!(
+        "Skill package updated: {}\nSkill name: {name}\nManifest: SKILL.md (merged)",
+        package_dir.display(),
+    );
+    if !resource_plan.is_empty() {
+        msg.push_str(&format!(
+            "\nResources upserted: {} file(s)",
+            resource_plan.len()
+        ));
+    }
+    if !updated_subskills.is_empty() {
+        msg.push_str(&format!(
+            "\nSub-skills upserted: {}",
+            updated_subskills.join(", ")
+        ));
+    }
+    if !remove_paths.is_empty() {
+        msg.push_str(&format!("\nRemoved paths: {}", remove_paths.join(", ")));
+    }
+    if !remove_subskills.is_empty() {
+        msg.push_str(&format!(
+            "\nRemoved sub-skills: {}",
+            remove_subskills.join(", ")
+        ));
+    }
+    Ok(msg)
+}
+
 pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
     let name = args["name"]
         .as_str()
@@ -1342,56 +1779,117 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
     if name.is_empty() {
         return Err("name is empty".to_string());
     }
-    // Resolve the optional complex-package capabilities up front
-    let resources = parse_resources_arg(args, "")?;
-    let subskills = parse_subskills_arg(args)?;
-    let has_package_features = !resources.is_empty() || !subskills.is_empty();
-    let resource_plan = plan_resource_files(&resources)?;
-
     let dir = resolve_configured_skills_dir();
-    let overwrite = args["overwrite"].as_bool().unwrap_or(true);
-    // Preview mode: validate and render without writing, so a session-distilled
-    // draft can be iterated into a generic skill before saving.
-    if args["dry_run"].as_bool().unwrap_or(false) {
-        return render_skill_dry_run_preview(args, &name, &resources, &subskills);
-    }
-    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create skills dir: {e}"))?;
-
     let package_dir_name = safe_skill_dir_name(&name);
     let package_dir = dir.join(&package_dir_name);
     let legacy_file = dir.join(safe_skill_file_name(&name));
-    if !has_package_features {
-        if package_dir.exists() {
-            if !overwrite {
-                return Err(format!(
-                    "Skill package already exists and overwrite=false: {}",
-                    package_dir.display()
-                ));
-            }
-            // A manifest-only save is the common update path for a package:
-            // replace SKILL.md in place and keep its resources/subskills.
-            if args.get("resources").is_none() && args.get("subskills").is_none() {
-                let content = build_skill_file_content(args)?;
-                let manifest = package_dir.join("SKILL.md");
-                fs::write(&manifest, content).map_err(|e| {
-                    format!(
-                        "Failed to update skill manifest {}: {e}",
-                        manifest.display()
-                    )
-                })?;
-                return Ok(format!(
-                    "Skill package manifest updated: {}\nSkill name: {name}",
-                    package_dir.display()
-                ));
-            }
+    // Resolve the optional complex-package capabilities up front
+    let resources = parse_resources_arg(args, "")?;
+    let subskills = parse_subskills_arg(args)?;
+    let remove_paths = parse_remove_paths_arg(args)?;
+    let remove_subskills = parse_remove_subskills_arg(args)?;
+    let rebuild = args.get("rebuild").and_then(|v| v.as_bool()).unwrap_or(false);
+    let has_package_features = !resources.is_empty() || !subskills.is_empty();
+    let resource_plan = plan_resource_files(&resources)?;
+    let overwrite = args["overwrite"].as_bool().unwrap_or(true);
+    // Incremental update: when the skill already exists, omitted manifest
+    // fields keep their stored values so a caller can patch one field
+    // without resending the whole skill.
+    let existing = load_existing_skill_manifest(&package_dir, &legacy_file);
+    let effective_args: Value = match &existing {
+        Some(stored) => merge_skill_args_for_update(stored, args),
+        None => args.clone(),
+    };
+    if existing.is_none() {
+        let prompt = effective_args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if prompt.is_empty() {
+            return Err("prompt is required when creating a new skill".to_string());
+        }
+    }
+    // Preview mode: validate and render without writing, so a session-distilled
+    // draft can be iterated into a generic skill before saving.
+    if args["dry_run"].as_bool().unwrap_or(false) {
+        return render_skill_dry_run_preview(
+            &effective_args,
+            &name,
+            &resources,
+            &subskills,
+            &remove_paths,
+            &remove_subskills,
+            existing.is_some(),
+        );
+    }
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create skills dir: {e}"))?;
+    if package_dir.exists() {
+        if !overwrite {
             return Err(format!(
-                "Skill package already exists for '{name}'; pass non-empty `resources`/`subskills` to rebuild it, or omit both fields to update only SKILL.md: {}",
+                "Skill package already exists and overwrite=false: {}",
                 package_dir.display()
             ));
         }
+        let no_content_change =
+            !has_package_features && remove_paths.is_empty() && remove_subskills.is_empty();
+        if no_content_change {
+            // Manifest-only update: omitted fields were already merged over
+            // the stored manifest, so this patches one field at a time.
+            let content = build_skill_file_content(&effective_args)?;
+            let manifest = package_dir.join("SKILL.md");
+            fs::write(&manifest, content).map_err(|e| {
+                format!(
+                    "Failed to update skill manifest {}: {e}",
+                    manifest.display()
+                )
+            })?;
+            return Ok(format!(
+                "Skill package manifest updated: {}\nSkill name: {name}",
+                package_dir.display()
+            ));
+        }
+        if !rebuild {
+            return execute_save_skill_package_merge(
+                &dir,
+                &name,
+                &effective_args,
+                &package_dir,
+                &legacy_file,
+                &resources,
+                &resource_plan,
+                &subskills,
+                &remove_paths,
+                &remove_subskills,
+            );
+        }
+        if !has_package_features {
+            // Rebuild was requested but no replacement content was given:
+            // apply removals as a merge instead of deleting everything.
+            return execute_save_skill_package_merge(
+                &dir,
+                &name,
+                &effective_args,
+                &package_dir,
+                &legacy_file,
+                &resources,
+                &resource_plan,
+                &subskills,
+                &remove_paths,
+                &remove_subskills,
+            );
+        }
+        // Fall through to the full-rebuild path below.
+    }
+    if !has_package_features {
+        if !remove_paths.is_empty() || !remove_subskills.is_empty() {
+            return Err(
+                "remove_paths/remove_subskills require an existing skill package".to_string(),
+            );
+        }
         // Legacy behavior compatibility: single-file `*.skill`
-        let content = build_skill_file_content(args)?;
-        let file_name = args["file_name"]
+        let content = build_skill_file_content(&effective_args)?;
+        let file_name = effective_args["file_name"]
             .as_str()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -1464,7 +1962,7 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
             legacy_file.display()
         ));
     }
-    let main_content = build_skill_file_content(args)?;
+    let main_content = build_skill_file_content(&effective_args)?;
     let tmp_dir = dir.join(format!(".tmp-{}-{}", package_dir_name, std::process::id()));
     if tmp_dir.exists() {
         let _ = fs::remove_dir_all(&tmp_dir);
@@ -1691,14 +2189,25 @@ fn render_skill_dry_run_preview(
     name: &str,
     resources: &[SkillResource],
     subskills: &[Value],
+    remove_paths: &[String],
+    remove_subskills: &[String],
+    is_update: bool,
 ) -> Result<String, String> {
     let content = build_skill_file_content(args)?;
     let (errors, warnings) = validate_skill_args(args);
     if !errors.is_empty() {
         return Err(format!("Skill draft invalid:\n- {}", errors.join("\n- ")));
     }
-    let mut out = String::from("Skill dry-run preview (nothing written):\n");
-    if subskills.is_empty() && resources.is_empty() {
+    let mut out = if is_update {
+        String::from("Skill dry-run preview for update (nothing written):\n")
+    } else {
+        String::from("Skill dry-run preview (nothing written):\n")
+    };
+    if subskills.is_empty()
+        && resources.is_empty()
+        && remove_paths.is_empty()
+        && remove_subskills.is_empty()
+    {
         out.push_str(&format!(
             "Target: {}\n---\n{content}\n---",
             safe_skill_file_name(name)
@@ -1738,6 +2247,21 @@ fn render_skill_dry_run_preview(
                     "\n  - {}",
                     sub["name"].as_str().unwrap_or("").trim()
                 ));
+            }
+        }
+        if !remove_paths.is_empty() {
+            out.push_str(&format!("\nRemove paths: {} entr(y/ies)", remove_paths.len()));
+            for rel in remove_paths {
+                out.push_str(&format!("\n  - {rel}"));
+            }
+        }
+        if !remove_subskills.is_empty() {
+            out.push_str(&format!(
+                "\nRemove sub-skills: {} skill(s)",
+                remove_subskills.len()
+            ));
+            for sub_name in remove_subskills {
+                out.push_str(&format!("\n  - {sub_name}"));
             }
         }
     }
@@ -2131,7 +2655,7 @@ mod tests {
             "dry_run": true,
         }))
         .unwrap_err();
-        assert!(err.contains("prompt is empty"));
+        assert!(err.contains("prompt"), "{err}");
     }
 
     #[test]
@@ -2197,6 +2721,138 @@ mod tests {
         }
         crate::commonw::configw::refresh();
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn with_temp_skills_dir(label: &str, run: impl FnOnce(&std::path::Path)) {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let base = std::env::temp_dir().join(format!(
+            "skill-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let skills = base.join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let cfg_path = base.join("test.configw");
+        std::fs::write(
+            &cfg_path,
+            format!("ai.skills.dir = \"{}\"\n", skills.display()),
+        )
+        .unwrap();
+        let old_cfg = std::env::var_os("CONFIGW_PATH");
+        unsafe { std::env::set_var("CONFIGW_PATH", &cfg_path) };
+        crate::commonw::configw::refresh();
+        run(&skills);
+        match old_cfg {
+            Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+            None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+        }
+        crate::commonw::configw::refresh();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn save_skill_update_inherits_omitted_fields_and_prompt() {
+        with_temp_skills_dir("merge-manifest", |skills| {
+            execute_save_skill(&serde_json::json!({
+                "name": "merge-demo",
+                "description": "original description",
+                "prompt": "original prompt",
+                "tools": ["read_file"],
+                "tool_groups": ["skills"],
+            }))
+            .unwrap();
+            // Update one field only: description changes, prompt/tools stay.
+            let out = execute_save_skill(&serde_json::json!({
+                "name": "merge-demo",
+                "description": "patched description",
+            }))
+            .unwrap();
+            assert!(out.contains("merge-demo"), "{out}");
+            let manifest =
+                std::fs::read_to_string(skills.join("merge-demo.skill")).unwrap();
+            assert!(manifest.contains("patched description"), "{manifest}");
+            assert!(manifest.contains("original prompt"), "{manifest}");
+            assert!(manifest.contains("read_file"), "{manifest}");
+            assert!(manifest.contains("skills"), "{manifest}");
+            // Explicit empty list clears the field instead of inheriting it.
+            execute_save_skill(&serde_json::json!({
+                "name": "merge-demo",
+                "tools": [],
+            }))
+            .unwrap();
+            let manifest =
+                std::fs::read_to_string(skills.join("merge-demo.skill")).unwrap();
+            assert!(!manifest.contains("read_file"), "{manifest}");
+            assert!(manifest.contains("original prompt"), "{manifest}");
+        });
+    }
+
+    #[test]
+    fn save_skill_package_merge_keeps_unlisted_files_and_removes() {
+        with_temp_skills_dir("merge-package", |skills| {
+            execute_save_skill(&serde_json::json!({
+                "name": "pkg-demo",
+                "description": "package",
+                "prompt": "package prompt",
+                "resources": [
+                    {"path": "references/keep.md", "content": "keep"},
+                    {"path": "references/drop.md", "content": "drop"},
+                ],
+            }))
+            .unwrap();
+            let out = execute_save_skill(&serde_json::json!({
+                "name": "pkg-demo",
+                "resources": [
+                    {"path": "references/new.md", "content": "new"},
+                ],
+                "remove_paths": ["references/drop.md"],
+            }))
+            .unwrap();
+            assert!(out.contains("updated"), "{out}");
+            assert_eq!(
+                std::fs::read_to_string(skills.join("pkg-demo/references/keep.md")).unwrap(),
+                "keep"
+            );
+            assert_eq!(
+                std::fs::read_to_string(skills.join("pkg-demo/references/new.md")).unwrap(),
+                "new"
+            );
+            assert!(!skills.join("pkg-demo/references/drop.md").exists());
+            let manifest =
+                std::fs::read_to_string(skills.join("pkg-demo/SKILL.md")).unwrap();
+            assert!(manifest.contains("package prompt"), "{manifest}");
+        });
+    }
+
+    #[test]
+    fn save_skill_rebuild_replaces_package_contents() {
+        with_temp_skills_dir("rebuild-package", |skills| {
+            execute_save_skill(&serde_json::json!({
+                "name": "rebuild-demo",
+                "description": "package",
+                "prompt": "package prompt",
+                "resources": [
+                    {"path": "references/old.md", "content": "old"},
+                ],
+            }))
+            .unwrap();
+            execute_save_skill(&serde_json::json!({
+                "name": "rebuild-demo",
+                "resources": [
+                    {"path": "references/fresh.md", "content": "fresh"},
+                ],
+                "rebuild": true,
+            }))
+            .unwrap();
+            assert!(!skills.join("rebuild-demo/references/old.md").exists());
+            assert_eq!(
+                std::fs::read_to_string(skills.join("rebuild-demo/references/fresh.md"))
+                    .unwrap(),
+                "fresh"
+            );
+        });
     }
 
     #[test]
