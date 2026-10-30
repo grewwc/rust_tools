@@ -70,9 +70,6 @@ mod test_support {
 /// `background::spawn_daemon_child`), avoiding fork carrying the parent's
 /// half-initialized CF/os_log/objc state into the child.
 pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
-    // reqwest is built with rustls-no-provider (no built-in crypto provider);
-    // install ring so any code path in this process can build TLS clients.
-    rust_tools::ensure_rustls_provider();
     // Serve-mode chunk streaming handoff: no-op unless this process was
     // spawned by the serve SSE endpoint with `A_SERVE_LIVE_FIFO` set.
     background::open_serve_live_fifo_from_env();

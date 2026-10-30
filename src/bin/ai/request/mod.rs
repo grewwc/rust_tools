@@ -60,8 +60,6 @@ pub(crate) use current_budget::CurrentRequestBudget;
 pub(crate) use protocol::extract_response_text;
 #[cfg(test)]
 use protocol::responses_reasoning_replay_stats;
-#[cfg(test)]
-pub(crate) use reasoning::apply_aux_thinking_fields;
 pub(crate) use reasoning::model_effort_graded;
 pub(crate) use reasoning::model_thinking_off_capability;
 pub(crate) use reasoning::reasoning_effort_display_label;

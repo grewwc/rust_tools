@@ -84,7 +84,9 @@ fn no_plan_still_consumes_claim() {
 }
 
 #[test]
-fn tool_assisted_turn_without_complete_reopens() {
+fn tool_assisted_turn_without_plan_allows_final() {
+    // The `complete` assertion is plan-scoped: tool activity alone no longer
+    // forces it, so a turn without a binding plan lands its final directly.
     let (app, base) = test_app_with_session();
     let turn_messages = tool_exchange("work", "execute_command", "[command exited: exit code 0]");
     let mut messages = Vec::new();
@@ -96,14 +98,19 @@ fn tool_assisted_turn_without_complete_reopens() {
         0,
         16,
     );
-    assert_eq!(action, OutstandingWorkGateAction::Reopen);
-    assert!(last_note(&messages).contains("no successful `complete` assertion"));
+    assert_eq!(action, OutstandingWorkGateAction::Allow);
+    assert!(messages.is_empty(), "no plan must not inject a reopen note");
     let _ = fs::remove_dir_all(&base);
 }
 
 #[test]
 fn outstanding_reopens_three_times_then_warns_without_duplicate_marker() {
     let (app, base) = test_app_with_session();
+    // Reopen budget applies to plan-bound turns: a settled plan without a
+    // completion assertion keeps reopening until the forced final warns.
+    two_step_plan(&app);
+    update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
+    update_plan_step(&app, 2, StepStatus::Skipped, None).unwrap();
     let turn_messages = tool_exchange("work", "execute_command", "ok");
     let mut messages = Vec::new();
     let mut gate_state = FinalGateState::default();
@@ -148,9 +155,16 @@ fn outstanding_reopens_three_times_then_warns_without_duplicate_marker() {
 }
 
 #[test]
-fn tool_assisted_turn_allows_complete_after_latest_result() {
+fn plan_bound_turn_allows_complete_after_latest_result() {
     let (app, base) = test_app_with_session();
-    record_completion_claim(&app, "done", None).unwrap();
+    two_step_plan(&app);
+    update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
+    update_plan_step(&app, 2, StepStatus::Skipped, None).unwrap();
+    let plan_updated = crate::ai::tools::plan_state::load_plan_state(&app)
+        .unwrap()
+        .unwrap()
+        .updated_at_ms;
+    record_completion_claim(&app, "done", Some(plan_updated)).unwrap();
     let mut turn_messages = tool_exchange("work", "execute_command", "ok");
     turn_messages.extend(tool_exchange(
         "done",
@@ -237,7 +251,24 @@ fn recoverable_pre_execution_pause_uses_its_own_gate() {
 #[test]
 fn recoverable_pause_supersedes_earlier_actionable_result() {
     let (app, base) = test_app_with_session();
+    two_step_plan(&app);
+    update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
+    update_plan_step(&app, 2, StepStatus::Skipped, None).unwrap();
+    let plan_updated = crate::ai::tools::plan_state::load_plan_state(&app)
+        .unwrap()
+        .unwrap()
+        .updated_at_ms;
+    record_completion_claim(&app, "done", Some(plan_updated)).unwrap();
+
+    // The receipt covers the earlier activity; the later activity would stale
+    // it, but the trailing pause resets the latest actionable result.
     let mut turn_messages = tool_exchange("work", "execute_command", "ok");
+    turn_messages.extend(tool_exchange(
+        "done",
+        "complete",
+        "Completion assertion recorded: done",
+    ));
+    turn_messages.extend(tool_exchange("retry", "apply_patch", "ok"));
     let pause = format!("Error: {SCOPED_INSTRUCTIONS_PAUSE_PREFIX}");
     turn_messages.extend(tool_exchange("patch", "apply_patch", &pause));
     let mut messages = Vec::new();
@@ -251,6 +282,8 @@ fn recoverable_pause_supersedes_earlier_actionable_result() {
     );
     assert_eq!(action, OutstandingWorkGateAction::Allow);
 
+    // A successful retry after the pause is the latest actionable result, so
+    // the earlier receipt no longer covers it.
     turn_messages.extend(tool_exchange("retry", "apply_patch", "ok"));
     let action = super::super::outstanding_work_gate_action_with_turn_messages(
         &app,
@@ -261,6 +294,7 @@ fn recoverable_pause_supersedes_earlier_actionable_result() {
         16,
     );
     assert_eq!(action, OutstandingWorkGateAction::Reopen);
+    assert!(last_note(&messages).contains("no `complete` call asserts completion"));
     let _ = fs::remove_dir_all(&base);
 }
 

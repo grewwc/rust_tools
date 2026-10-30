@@ -22,12 +22,12 @@ fn execute_complete(args: &Value) -> Result<String, String> {
     // Record the assertion as session state so the outstanding-work gate can check
     // it against the plan when the final response arrives. Recording failures do
     // not suppress the ack, but must remain visible as a warning: without the
-    // persisted claim the gate treats the turn as an unasserted final.
+    // persisted claim a plan-bound turn is treated as an unasserted final.
     if let Some(ctx) = crate::ai::driver::runtime_ctx::try_current() {
         // Snapshot the plan's `updated_at_ms` so the gate can verify the
         // assertion later. A claim recorded without the snapshot is permanently
         // stale (the gate demands `claim.plan_updated_at_ms == plan.updated_at_ms`),
-        // yet its ack would look identical to a healthy recording and every later
+        // yet its ack would look identical to a healthy recording and a plan-bound
         // final would be reopened as unasserted. Surface the failure instead.
         let plan_updated_at_ms =
             match crate::ai::tools::plan_state::load_plan_state(&ctx.app_proto) {
@@ -35,7 +35,8 @@ fn execute_complete(args: &Value) -> Result<String, String> {
                 Err(err) => {
                     return Ok(format!(
                         "Completion assertion noted but could not snapshot the plan state ({err}); \
-                         the final response will be treated as an unasserted final.\n\
+                         if a plan binds this turn, the final response will be treated as an \
+                         unasserted final.\n\
                          Now write the final response text for this turn."
                     ));
                 }
@@ -47,18 +48,18 @@ fn execute_complete(args: &Value) -> Result<String, String> {
         ) {
             Ok(_) => Ok(format!(
                 "{COMPLETE_CLAIM_RECORDED_PREFIX} {summary}\n\
-                 Now write the complete final response for this turn. The runtime verifies \
-                 the assertion against the session plan: if plan steps are still \
-                 unsettled, the turn reopens instead of ending. End the response with \
+                 Now write the complete final response for this turn. If a plan binds this \
+                 turn, the runtime verifies the assertion against it: unsettled steps reopen \
+                 the turn instead of ending. End the response with \
                  `{FINAL_RESPONSE_END_MARKER}` on its own final line. The runtime removes \
                  this control marker before storing or displaying the response. If the \
                  marker is missing, this draft is discarded and you will be asked once to \
                  rewrite the full response."
             )),
             Err(e) => Ok(format!(
-                "Completion assertion noted but could not persist ({e}); the final response \
-                 will be treated as an unasserted final.\nNow write the final response text \
-                 for this turn."
+                "Completion assertion noted but could not persist ({e}); if a plan binds this \
+                 turn, the final response will be treated as an unasserted final.\nNow write \
+                 the final response text for this turn."
             )),
         }
     } else {

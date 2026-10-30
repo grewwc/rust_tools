@@ -1198,7 +1198,7 @@ mod tests {
 
     #[test]
     fn start_keeps_snapshot_on_failure_and_clears_it_on_success() {
-        let (dir, store, host_hist, w1_hist, w2_hist) = fixture();
+        let (dir, store, host_hist, _w1_hist, _w2_hist) = fixture();
         // Failed start (invalid input) must leave the payload for a retry.
         assert!(talk::write_pending_room_skills(&host_hist, &["s1".to_string()]).is_ok());
         assert!(start(&store, &host_hist, "   ", &workers(), None, None).is_err());

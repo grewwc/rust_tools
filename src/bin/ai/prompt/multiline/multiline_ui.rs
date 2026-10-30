@@ -25,7 +25,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
 };
 use tui_textarea::TextArea;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
     MultilineHistoryState,
@@ -1603,30 +1603,99 @@ fn take_standalone_resize_rebuild(
     needs_rebuild
 }
 
-fn submitted_input_preview_lines(content: &str) -> Vec<String> {
-    let mut rendered = Vec::new();
-    let mut lines = content.lines();
-    let marker = crate::ai::theme::current().accent_prompt;
-    let bar = crate::ai::theme::current().accent_submitted_bar;
-    // The post-submit preview body uses the theme's `accent.submitted`, a bright
-    // signature warm hue (amber/yellow on dark themes, deep purple on light).
-    // It is deliberately NOT a white/gray: assistant output is full of near-white
-    // body/strong text, so the echoed user input must carry its own hue to stay
-    // visible and recognizable as the user's own text. The theme-aware left
-    // bar and the `accent.prompt` marker keep the submit boundary distinct;
-    // the marker uses the prompt slot rather than `accent.success` so green
-    // keeps meaning "done" everywhere in the transcript.
-    let body = crate::ai::theme::current().accent_submitted;
-    if let Some(first) = lines.next() {
-        // The left bar makes a user turn scannable in long output; continuation
-        // lines keep their body aligned with the first line.
-        rendered.push(format!(
-            "\x1b[1m{bar}▎\x1b[0m \x1b[1m{marker}❯\x1b[0m {body}{first}\x1b[0m"
-        ));
-        for line in lines {
-            rendered.push(format!("\x1b[1m{bar}▎\x1b[0m   {body}{line}\x1b[0m"));
+/// Greedy display-cell wrap for one echo line. Empty input yields one empty row
+/// so blank input lines keep their (empty) box row instead of vanishing.
+fn wrap_echo_line(line: &str, max_width: usize) -> Vec<String> {
+    let mut rows = vec![String::new()];
+    let mut row_width = 0;
+    for ch in line.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if row_width + ch_width > max_width && row_width > 0 {
+            rows.push(String::new());
+            row_width = 0;
         }
+        rows.last_mut().expect("wrap rows are never empty").push(ch);
+        row_width += ch_width;
     }
+    rows
+}
+
+fn submitted_input_preview_lines(content: &str) -> Vec<String> {
+    // The echo prints synchronously to the live terminal (submit path only),
+    // so a direct winsize query is the right width source, matching the other
+    // geometry reads in this module; the streaming renderer's override chain
+    // targets serve children that never reach the interactive submit path.
+    let cols = crossterm::terminal::size()
+        .map(|(cols, _)| cols as usize)
+        .unwrap_or(80);
+    submitted_input_preview_lines_with_width(content, cols)
+}
+
+/// Post-submit echo of the user input, framed in a rounded box so a user turn
+/// stands out in a long transcript at a glance:
+///
+/// ```text
+/// ╭─ ❯ ───────╮
+/// │ /history  │
+/// ╰───────────╯
+/// ```
+///
+/// The box hugs the content (one padding cell per side) and never exceeds the
+/// terminal width: overlong lines wrap inside the box instead of being cut.
+/// Widths are display cells (`unicode_width`, ambiguous counted as one like
+/// the box-drawing characters themselves), so CJK input keeps the borders
+/// aligned; tabs are expanded because a raw tab would break the padding math.
+/// The echo body uses the theme's `accent.submitted`, a bright signature warm
+/// hue (amber/orange on dark themes, deep purple on light). It is deliberately
+/// NOT a white/gray: assistant output is full of near-white body/strong text,
+/// so the echoed user input must carry its own hue to stay recognizable as
+/// the user's own text. The `❯` title on the top border reuses `accent.prompt`
+/// rather than `accent.success` so green keeps meaning "done" everywhere.
+fn submitted_input_preview_lines_with_width(
+    content: &str,
+    term_cols: usize,
+) -> Vec<String> {
+    // Two borders plus one padding cell per side.
+    const OVERHEAD: usize = 4;
+    // Keeps at least one dash after the `❯` title on the top border. The floor
+    // applies even on absurdly narrow terminals so the box stays aligned (it
+    // may overflow the visible width there, where everything is broken anyway).
+    const MIN_INNER: usize = 3;
+    let max_inner = term_cols.saturating_sub(OVERHEAD).max(MIN_INNER);
+    let mut rows: Vec<String> = Vec::new();
+    for line in content.lines() {
+        rows.extend(wrap_echo_line(&line.replace('\t', "    "), max_inner));
+    }
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let inner = rows
+        .iter()
+        .map(|row| UnicodeWidthStr::width(row.as_str()))
+        .max()
+        .unwrap_or(0)
+        .clamp(MIN_INNER, max_inner);
+    let theme = crate::ai::theme::current();
+    let marker = theme.accent_prompt;
+    let bar = theme.accent_submitted_bar;
+    let body = theme.accent_submitted;
+    let total = inner + OVERHEAD;
+    let mut rendered = Vec::with_capacity(rows.len() + 2);
+    rendered.push(format!(
+        "\x1b[1m{bar}╭─\x1b[0m \x1b[1m{marker}❯\x1b[0m \x1b[1m{bar}{}╮\x1b[0m",
+        "─".repeat(total - 6)
+    ));
+    for row in &rows {
+        let pad = inner - UnicodeWidthStr::width(row.as_str());
+        rendered.push(format!(
+            "\x1b[1m{bar}│\x1b[0m \x1b[1m{body}{row}{}\x1b[0m \x1b[1m{bar}│\x1b[0m",
+            " ".repeat(pad)
+        ));
+    }
+    rendered.push(format!(
+        "\x1b[1m{bar}╰{}╯\x1b[0m",
+        "─".repeat(total - 2)
+    ));
     rendered
 }
 
@@ -2221,7 +2290,8 @@ mod tests {
         VERIFIED_ANCHOR_ATTEMPTS, ViewportRebuildMode, bottom_glued_area, clear_fixed_viewport,
         clear_row_range, fixed_viewport_area, force_frame_repaint, multiline_viewport_height,
         park_reflow_anchor, parked_anchor_offset, prepare_fixed_viewport,
-        reflow_pins_box_to_bottom, submitted_input_preview_lines, take_redraw_request,
+        reflow_pins_box_to_bottom, submitted_input_preview_lines,
+        submitted_input_preview_lines_with_width, take_redraw_request,
         take_standalone_resize_rebuild, terminal_with_fixed_viewport, update_pending_resize_rebuild,
         verified_cursor_row, viewport_height_with_completion,
     };
@@ -3628,23 +3698,95 @@ mod tests {
     }
 
     #[test]
-    fn submitted_input_preview_formats_single_and_multi_line_content() {
+    fn submitted_input_preview_draws_box_around_single_line() {
         let marker = crate::ai::theme::current().accent_prompt;
         let bar = crate::ai::theme::current().accent_submitted_bar;
         let body = crate::ai::theme::current().accent_submitted;
+        let bold = "\x1b[1m";
         let reset = "\x1b[0m";
+        // "hello" is 5 cells wide: inner 5, total 9, 3 top dashes, 7 bottom.
         assert_eq!(
-            submitted_input_preview_lines("hello"),
-            vec![format!(
-                "\x1b[1m{bar}▎{reset} \x1b[1m{marker}❯{reset} {body}hello{reset}"
-            )]
-        );
-        assert_eq!(
-            submitted_input_preview_lines("hello\nworld"),
+            submitted_input_preview_lines_with_width("hello", 80),
             vec![
-                format!("\x1b[1m{bar}▎{reset} \x1b[1m{marker}❯{reset} {body}hello{reset}"),
-                format!("\x1b[1m{bar}▎{reset}   {body}world{reset}"),
+                format!("{bold}{bar}╭─{reset} {bold}{marker}❯{reset} {bold}{bar}───╮{reset}"),
+                format!("{bold}{bar}│{reset} {bold}{body}hello{reset} {bold}{bar}│{reset}"),
+                format!("{bold}{bar}╰───────╯{reset}"),
             ]
+        );
+    }
+
+    #[test]
+    fn submitted_input_preview_pads_short_rows_to_content_width() {
+        let marker = crate::ai::theme::current().accent_prompt;
+        let bar = crate::ai::theme::current().accent_submitted_bar;
+        let body = crate::ai::theme::current().accent_submitted;
+        let bold = "\x1b[1m";
+        let reset = "\x1b[0m";
+        // Inner width follows the longest row ("world", 5); "hi" gets 3 pads.
+        assert_eq!(
+            submitted_input_preview_lines_with_width("hi\nworld", 80),
+            vec![
+                format!("{bold}{bar}╭─{reset} {bold}{marker}❯{reset} {bold}{bar}───╮{reset}"),
+                format!("{bold}{bar}│{reset} {bold}{body}hi   {reset} {bold}{bar}│{reset}"),
+                format!("{bold}{bar}│{reset} {bold}{body}world{reset} {bold}{bar}│{reset}"),
+                format!("{bold}{bar}╰───────╯{reset}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn submitted_input_preview_aligns_cjk_borders() {
+        let marker = crate::ai::theme::current().accent_prompt;
+        let bar = crate::ai::theme::current().accent_submitted_bar;
+        let body = crate::ai::theme::current().accent_submitted;
+        let bold = "\x1b[1m";
+        let reset = "\x1b[0m";
+        // "你好" spans 4 cells, so inner is 4 and "hi" pads with 2 spaces.
+        assert_eq!(
+            submitted_input_preview_lines_with_width("hi\n你好", 80),
+            vec![
+                format!("{bold}{bar}╭─{reset} {bold}{marker}❯{reset} {bold}{bar}──╮{reset}"),
+                format!("{bold}{bar}│{reset} {bold}{body}hi  {reset} {bold}{bar}│{reset}"),
+                format!("{bold}{bar}│{reset} {bold}{body}你好{reset} {bold}{bar}│{reset}"),
+                format!("{bold}{bar}╰──────╯{reset}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn submitted_input_preview_wraps_overlong_lines_inside_box() {
+        let marker = crate::ai::theme::current().accent_prompt;
+        let bar = crate::ai::theme::current().accent_submitted_bar;
+        let body = crate::ai::theme::current().accent_submitted;
+        let bold = "\x1b[1m";
+        let reset = "\x1b[0m";
+        // 10 columns leave 6 inner cells, so 10 ASCII cells wrap into 6 + 4.
+        assert_eq!(
+            submitted_input_preview_lines_with_width("abcdefghij", 10),
+            vec![
+                format!("{bold}{bar}╭─{reset} {bold}{marker}❯{reset} {bold}{bar}────╮{reset}"),
+                format!("{bold}{bar}│{reset} {bold}{body}abcdef{reset} {bold}{bar}│{reset}"),
+                format!("{bold}{bar}│{reset} {bold}{body}ghij  {reset} {bold}{bar}│{reset}"),
+                format!("{bold}{bar}╰────────╯{reset}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn submitted_input_preview_renders_nothing_for_empty_content() {
+        assert!(submitted_input_preview_lines_with_width("", 80).is_empty());
+        assert!(submitted_input_preview_lines("").is_empty());
+    }
+
+    #[test]
+    fn submitted_input_preview_expands_tabs_before_measuring() {
+        // "a\tb" becomes "a    b" (7 cells) so the borders stay aligned.
+        let out = submitted_input_preview_lines_with_width("a\tb", 80);
+        assert_eq!(out.len(), 3);
+        assert!(
+            out[1].contains("a    b"),
+            "tab must expand to spaces: {}",
+            out[1]
         );
     }
 

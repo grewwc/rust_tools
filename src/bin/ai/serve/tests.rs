@@ -419,7 +419,6 @@ async fn session_events_stream_ends_with_the_terminal_marker() {
     use super::EventsQuery;
     use axum::body::to_bytes;
     use axum::extract::{Path, Query, State};
-    use axum::response::IntoResponse;
 
     let state = lifecycle_test_state();
     // A session whose turn already finished: the backlog replays, then the
@@ -587,7 +586,7 @@ async fn confirm_answer_reaches_the_child_stdin_once() {
 #[tokio::test]
 async fn input_answer_reaches_the_child_stdin_once() {
     use axum::{
-        body::Body, extract::Path, http::HeaderMap, http::Request, http::StatusCode,
+        extract::Path, http::HeaderMap, http::StatusCode,
         response::IntoResponse,
     };
     // Stand-in turn child: consumes one stdin line and echoes it, which is

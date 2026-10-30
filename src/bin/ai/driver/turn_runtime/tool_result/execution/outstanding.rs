@@ -5,14 +5,14 @@
 //! not `done`/`skipped` as outstanding — including `failed`, which needs a
 //! retry/redo or an explicit `skipped` before the turn can end; silently landing
 //! on a failure would drop it. Tool-assisted turns without a binding plan use
-//! the same `complete` handshake, while plain no-tool Q&A passes untouched.
+//! no `complete` handshake at all: the assertion is only required for planned
+//! work, so turns without a binding plan land freely.
 //!
 //! Deliberately no wording classification lives here (same rule as the other
 //! final-response gates): whether the final answer claims completion is never
 //! inferred from prose. The model asserts completion structurally with the
 //! `complete` tool; the gate checks that assertion against the plan:
-//!   - no binding plan, no tools -> Allow (plain Q&A rounds pass through untouched)
-//!   - no binding plan + tools   -> Require `complete` after the last tool result
+//!   - no binding plan           -> Allow (the `complete` assertion is optional)
 //!   - plan settled, fresh claim -> Allow (assertion verified, consumed as spent)
 //!   - plan settled, no claim    -> Reopen, demanding a `complete` call
 //!   - work open, fresh claim    -> Reopen, naming the contradiction
@@ -261,34 +261,14 @@ fn outstanding_work_gate_action_impl(
     let plan_binds = plan
         .as_ref()
         .is_some_and(|plan| plan_binds_current_turn(app, plan));
-    let state = tool_assisted_completion_state(turn_messages);
+    // Without a binding plan there is no machine-verifiable work contract to
+    // check, so the final lands freely; the `complete` assertion is optional.
+    // A plan carried from an earlier turn stays visible context only until this
+    // turn writes it.
     if !plan_binds {
-        if state.last_actionable_result.is_none() {
-            return OutstandingWorkGateAction::Allow;
-        }
-        let expected_snapshot = plan.as_ref().map(|plan| plan.updated_at_ms);
-        let claim_fresh = completion_assertion_is_fresh(
-            claim.as_ref().map(|claim| claim.plan_updated_at_ms),
-            expected_snapshot,
-            &state,
-        );
-        if claim_fresh {
-            return OutstandingWorkGateAction::Allow;
-        }
-        if force_final_response || iteration >= max_iterations {
-            return OutstandingWorkGateAction::WarnUnasserted;
-        }
-        log_outstanding_work_reopen(app, "tool_assisted_turn_no_claim", None, iteration);
-        upsert_outstanding_work_note(
-            messages,
-            format!(
-                "{OUTSTANDING_WORK_REQUIRED_MARKER}\n\
-                 This turn has tool results, but no successful `complete` assertion was recorded after the latest tool result. Your final response above was REJECTED and discarded; it was not delivered.\n\
-                 This is not a final answer. Do not write prose yet: your next message must be exactly one `complete` tool call with no other content (if work remains, keep using tools instead). After the runtime records the receipt, rewrite the final response. Any further prose final without a fresh `complete` receipt will be rejected again (at most {OUTSTANDING_WORK_MAX_REOPENS} reopens; then the final lands with an unverified warning)."
-            ),
-        );
-        return OutstandingWorkGateAction::Reopen;
+        return OutstandingWorkGateAction::Allow;
     }
+    let state = tool_assisted_completion_state(turn_messages);
     let plan = plan.expect("binding plan must exist");
     let outstanding: Vec<(u64, String)> = plan
         .steps

@@ -1728,7 +1728,6 @@ mod tests {
             "content": content
         });
 
-        let mut sink = |_chunk: &[u8]| {};
         let mut emitted: Vec<u8> = Vec::new();
         let result = {
             let mut sink = |chunk: &[u8]| emitted.extend_from_slice(chunk);

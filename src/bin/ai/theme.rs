@@ -6,27 +6,38 @@
 //! model loaded from a VSCode-style JSON theme file (hot-reloaded at each
 //! turn boundary), so styling changes are a config edit, not a recompile.
 //!
-//! # Theme JSON format (VSCode-like)
+//! # Theme JSON format (VSCode-like keys, opencode-style values)
 //!
 //! ```json
 //! {
 //!   "name": "my-theme",
 //!   "type": "dark",
+//!   "defs": {
+//!     "brand": "#7C9CF5",
+//!     "panel": "#242832"
+//!   },
 //!   "colors": {
-//!     "accent.primary": "#7C9CF5",
-//!     "accent.submittedBar": "#7C9CF5",
-//!     "code.background": "#242832",
+//!     "accent.primary": "brand",
+//!     "accent.submittedBar": "brand",
+//!     "code.background": "panel",
 //!     "markdown.math": "\u001b[95m"
 //!   }
 //! }
 //! ```
 //!
-//! `colors` maps flat dotted keys (like VSCode's `editor.foreground`) to
-//! either `#RRGGBB` (optionally `#RRGGBBAA`, alpha ignored) or a raw ANSI
-//! escape sequence (a string starting with ESC, e.g. `"\u001b[95m"` or a
-//! 256-color code). Unknown keys and unparsable values are ignored; every key
-//! falls back to the built-in default, so a custom theme only needs to list
-//! what it changes.
+//! `colors` maps flat dotted keys (like VSCode's `editor.foreground`) to a
+//! color value; every key falls back to the built-in default, so a custom
+//! theme only needs to list what it changes. Each value accepts:
+//!
+//! - `#RRGGBB` (optionally `#RRGGBBAA`, alpha ignored) — truecolor.
+//! - `0`-`255` (a JSON number) — 256-color palette index.
+//! - `"none"` — emits no SGR sequence, so the terminal's own color shows.
+//! - a `defs` key — a reusable definition holding any of the above (or a raw
+//!   escape); chains resolve up to 8 deep, cycles fall back to the default.
+//! - a raw ANSI escape sequence (a string starting with ESC, e.g.
+//!   `"\u001b[95m"`).
+//!
+//! Unknown keys and unparsable values are ignored.
 //!
 //! `name` and `type` (`"dark"` / `"light"`) describe the terminal a theme was
 //! designed for; the renderer reads the `colors` map alone, so they are
@@ -176,7 +187,8 @@ impl Theme {
     }
 
     /// Parse a VSCode-style theme JSON, merging over the built-in default.
-    /// Returns `None` only when the document is not valid JSON.
+    /// Returns `None` only when the document is not valid JSON (or `colors`
+    /// is present but not an object). A non-object `defs` is ignored.
     pub(crate) fn from_json(json: &str) -> Option<Theme> {
         let root: Value = serde_json::from_str(json).ok()?;
         let colors = match root.get("colors") {
@@ -184,54 +196,62 @@ impl Theme {
             Some(_) => return None,
             None => return Some(Theme::default_theme()),
         };
+        let empty_defs = serde_json::Map::new();
+        let defs = match root.get("defs") {
+            Some(Value::Object(map)) => map,
+            _ => &empty_defs,
+        };
         let mut t = Theme::default_theme();
         let mut submitted_bar_overridden = false;
         let mut prompt_overridden = false;
         for (key, value) in colors {
-            let Some(raw) = value.as_str() else { continue };
             match key.as_str() {
-                "accent.primary" => set_fg(&mut t.accent_primary, raw),
-                "accent.toolName" => set_fg(&mut t.accent_tool_name, raw),
-                "accent.secondary" => set_fg(&mut t.accent_secondary, raw),
-                "accent.command" => set_fg(&mut t.accent_command, raw),
-                "accent.muted" => set_fg(&mut t.accent_muted, raw),
+                "accent.primary" => set_color(&mut t.accent_primary, value, defs, false),
+                "accent.toolName" => set_color(&mut t.accent_tool_name, value, defs, false),
+                "accent.secondary" => set_color(&mut t.accent_secondary, value, defs, false),
+                "accent.command" => set_color(&mut t.accent_command, value, defs, false),
+                "accent.muted" => set_color(&mut t.accent_muted, value, defs, false),
                 "accent.input" => {
-                    set_fg(&mut t.accent_input, raw);
-                    if let Some(rgb) = hex_rgb(raw) {
+                    set_color(&mut t.accent_input, value, defs, false);
+                    if let Some(rgb) = resolve_rgb(value, defs, 0) {
                         t.accent_input_rgb = rgb;
                     }
                 }
-                "accent.success" => set_fg(&mut t.accent_success, raw),
-                "accent.emphasizedOutput" => set_fg(&mut t.accent_emphasized_output, raw),
-                "accent.warn" => set_fg(&mut t.accent_warn, raw),
-                "accent.danger" => set_fg(&mut t.accent_danger, raw),
-                "accent.marked" => set_fg(&mut t.accent_marked, raw),
-                "accent.rule" => set_fg(&mut t.accent_rule, raw),
-                "accent.submitted" => set_fg(&mut t.accent_submitted, raw),
+                "accent.success" => set_color(&mut t.accent_success, value, defs, false),
+                "accent.emphasizedOutput" => {
+                    set_color(&mut t.accent_emphasized_output, value, defs, false)
+                }
+                "accent.warn" => set_color(&mut t.accent_warn, value, defs, false),
+                "accent.danger" => set_color(&mut t.accent_danger, value, defs, false),
+                "accent.marked" => set_color(&mut t.accent_marked, value, defs, false),
+                "accent.rule" => set_color(&mut t.accent_rule, value, defs, false),
+                "accent.submitted" => set_color(&mut t.accent_submitted, value, defs, false),
                 "accent.submittedBar" => {
-                    if let Some(ansi) = color_to_ansi(raw, false) {
+                    if let Some(ansi) = resolve_color(value, defs, false, 0) {
                         t.accent_submitted_bar = leak(ansi);
                         submitted_bar_overridden = true;
                     }
                 }
                 "accent.prompt" => {
-                    set_fg(&mut t.accent_prompt, raw);
-                    prompt_overridden = true;
+                    if let Some(ansi) = resolve_color(value, defs, false, 0) {
+                        t.accent_prompt = leak(ansi);
+                        prompt_overridden = true;
+                    }
                 }
-                "markdown.body" => set_fg(&mut t.markdown_body, raw),
-                "markdown.strong" => set_fg(&mut t.markdown_strong, raw),
-                "markdown.heading" => set_fg(&mut t.markdown_heading, raw),
-                "markdown.accent" => set_fg(&mut t.markdown_accent, raw),
-                "markdown.codeFg" => set_fg(&mut t.markdown_code_fg, raw),
-                "markdown.math" => set_fg(&mut t.markdown_math, raw),
-                "code.background" => set_bg(&mut t.code_background, raw),
-                "code.foreground" => set_fg(&mut t.code_foreground, raw),
-                "code.comment" => set_fg(&mut t.code_comment, raw),
-                "code.keyword" => set_fg(&mut t.code_keyword, raw),
-                "code.string" => set_fg(&mut t.code_string, raw),
-                "code.number" => set_fg(&mut t.code_number, raw),
-                "code.type" => set_fg(&mut t.code_type, raw),
-                "code.dim" => set_fg(&mut t.code_dim, raw),
+                "markdown.body" => set_color(&mut t.markdown_body, value, defs, false),
+                "markdown.strong" => set_color(&mut t.markdown_strong, value, defs, false),
+                "markdown.heading" => set_color(&mut t.markdown_heading, value, defs, false),
+                "markdown.accent" => set_color(&mut t.markdown_accent, value, defs, false),
+                "markdown.codeFg" => set_color(&mut t.markdown_code_fg, value, defs, false),
+                "markdown.math" => set_color(&mut t.markdown_math, value, defs, false),
+                "code.background" => set_color(&mut t.code_background, value, defs, true),
+                "code.foreground" => set_color(&mut t.code_foreground, value, defs, false),
+                "code.comment" => set_color(&mut t.code_comment, value, defs, false),
+                "code.keyword" => set_color(&mut t.code_keyword, value, defs, false),
+                "code.string" => set_color(&mut t.code_string, value, defs, false),
+                "code.number" => set_color(&mut t.code_number, value, defs, false),
+                "code.type" => set_color(&mut t.code_type, value, defs, false),
+                "code.dim" => set_color(&mut t.code_dim, value, defs, false),
                 _ => {} // unknown keys are ignored so themes stay forward-compatible
             }
         }
@@ -367,14 +387,35 @@ impl Theme {
                 BOLD, self.accent_prompt, RESET, self.accent_input, RESET
             ),
             format!(
-                "{}{}▎{} {}{}{}❯{} your submitted input{}",
+                "{}{}╭─{} {}{}❯{} {}{}{}╮{}",
                 BOLD,
                 self.accent_submitted_bar,
                 RESET,
                 BOLD,
                 self.accent_prompt,
                 RESET,
+                BOLD,
+                self.accent_submitted_bar,
+                "─".repeat(18),
+                RESET
+            ),
+            format!(
+                "{}{}│{} {}{}your submitted input{} {}{}│{}",
+                BOLD,
+                self.accent_submitted_bar,
+                RESET,
+                BOLD,
                 self.accent_submitted,
+                RESET,
+                BOLD,
+                self.accent_submitted_bar,
+                RESET
+            ),
+            format!(
+                "{}{}╰{}╯{}",
+                BOLD,
+                self.accent_submitted_bar,
+                "─".repeat(22),
                 RESET
             ),
         ]
@@ -456,6 +497,11 @@ pub(crate) const BUILTIN_THEME_NAMES: &[&str] = &[
     "tokyo-night",
     "nord",
     "catppuccin",
+    "everforest",
+    "ayu",
+    "gruvbox",
+    "kanagawa",
+    "matrix",
 ];
 
 fn builtin_theme_json(name: &str) -> Option<&'static str> {
@@ -468,6 +514,11 @@ fn builtin_theme_json(name: &str) -> Option<&'static str> {
         "tokyo-night" => Some(include_str!("builtin_themes/tokyo-night.json")),
         "nord" => Some(include_str!("builtin_themes/nord.json")),
         "catppuccin" => Some(include_str!("builtin_themes/catppuccin.json")),
+        "everforest" => Some(include_str!("builtin_themes/everforest.json")),
+        "ayu" => Some(include_str!("builtin_themes/ayu.json")),
+        "gruvbox" => Some(include_str!("builtin_themes/gruvbox.json")),
+        "kanagawa" => Some(include_str!("builtin_themes/kanagawa.json")),
+        "matrix" => Some(include_str!("builtin_themes/matrix.json")),
         _ => None,
     }
 }
@@ -497,15 +548,118 @@ pub(crate) fn available_theme_names() -> Vec<String> {
     names
 }
 
-fn set_fg(field: &mut &'static str, raw: &str) {
-    if let Some(ansi) = color_to_ansi(raw, false) {
+/// Assign a resolved color to a palette slot; unparsable values keep the default.
+fn set_color(
+    field: &mut &'static str,
+    value: &Value,
+    defs: &serde_json::Map<String, Value>,
+    is_bg: bool,
+) {
+    if let Some(ansi) = resolve_color(value, defs, is_bg, 0) {
         *field = leak(ansi);
     }
 }
 
-fn set_bg(field: &mut &'static str, raw: &str) {
-    if let Some(ansi) = color_to_ansi(raw, true) {
-        *field = leak(ansi);
+/// Resolve a theme color value to an ANSI SGR sequence (opencode-style):
+/// `#RRGGBB`/`#RRGGBBAA` truecolor, a `0`-`255` palette index, `"none"` for
+/// the terminal default (empty string), a `defs` reference, or a raw ESC
+/// sequence. Returns `None` for anything else, including reference chains
+/// deeper than 8 (cycles fall back to the default instead of hanging).
+fn resolve_color(
+    value: &Value,
+    defs: &serde_json::Map<String, Value>,
+    is_bg: bool,
+    depth: u8,
+) -> Option<String> {
+    if depth > 8 {
+        return None;
+    }
+    match value {
+        Value::Number(n) => {
+            let idx = n.as_u64()?;
+            if idx > 255 {
+                return None;
+            }
+            let code = if is_bg { 48 } else { 38 };
+            Some(format!("\x1b[{code};5;{idx}m"))
+        }
+        Value::String(s) => {
+            if s == "none" {
+                return Some(String::new());
+            }
+            if let Some(target) = defs.get(s) {
+                return resolve_color(target, defs, is_bg, depth + 1);
+            }
+            color_to_ansi(s, is_bg)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a theme color value to an RGB tuple for numeric blending
+/// (`accent.input`): hex directly or through `defs`, else the standard
+/// 256-palette RGB for indices. `"none"` and unparsable values keep the
+/// default blend base.
+fn resolve_rgb(
+    value: &Value,
+    defs: &serde_json::Map<String, Value>,
+    depth: u8,
+) -> Option<(u8, u8, u8)> {
+    if depth > 8 {
+        return None;
+    }
+    match value {
+        Value::Number(n) => {
+            let idx = n.as_u64()?;
+            if idx > 255 {
+                return None;
+            }
+            Some(ansi256_rgb(idx as u8))
+        }
+        Value::String(s) => {
+            if let Some(target) = defs.get(s) {
+                return resolve_rgb(target, defs, depth + 1);
+            }
+            hex_rgb(s)
+        }
+        _ => None,
+    }
+}
+
+/// RGB of a 256-color palette index (standard xterm palette: 0-15 system
+/// colors, 16-231 a 6x6x6 cube, 232-255 a grayscale ramp).
+fn ansi256_rgb(idx: u8) -> (u8, u8, u8) {
+    const SYSTEM: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (128, 0, 0),
+        (0, 128, 0),
+        (128, 128, 0),
+        (0, 0, 128),
+        (128, 0, 128),
+        (0, 128, 128),
+        (192, 192, 192),
+        (128, 128, 128),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    if idx < 16 {
+        SYSTEM[idx as usize]
+    } else if idx < 232 {
+        let i = idx - 16;
+        (
+            LEVELS[(i / 36) as usize],
+            LEVELS[((i / 6) % 6) as usize],
+            LEVELS[(i % 6) as usize],
+        )
+    } else {
+        let v = 8 + 10 * (idx - 232);
+        (v, v, v)
     }
 }
 
@@ -517,10 +671,11 @@ fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
-/// Convert a theme value to an ANSI color sequence. `#RRGGBB` (optionally
+/// Convert a theme string to an ANSI color sequence: `#RRGGBB` (optionally
 /// `#RRGGBBAA`, alpha ignored) becomes an RGB SGR code; a string starting
 /// with ESC is passed through verbatim (raw ANSI, e.g. 256-color or style
-/// sequences).
+/// sequences). Numbers, `"none"` and `defs` references are resolved by
+/// `resolve_color` before reaching here.
 fn color_to_ansi(value: &str, is_bg: bool) -> Option<String> {
     if value.starts_with('\u{1b}') {
         return Some(value.to_string());
@@ -645,6 +800,75 @@ mod tests {
     #[test]
     fn from_json_missing_colors_is_default() {
         assert_eq!(Theme::from_json(r#"{"name": "x"}"#).unwrap(), Theme::default_theme());
+    }
+
+    #[test]
+    fn from_json_defs_reference_resolves() {
+        let json = r##"{"defs": {"brand": "#112233", "panel": 235},
+            "colors": {"accent.primary": "brand", "code.background": "panel"}}"##;
+        let t = Theme::from_json(json).unwrap();
+        assert_eq!(t.accent_primary, "\x1b[38;2;17;34;51m");
+        assert_eq!(t.code_background, "\x1b[48;5;235m");
+    }
+
+    #[test]
+    fn from_json_defs_chain_resolves_and_cycle_falls_back() {
+        let json = r##"{"defs": {"a": "b", "b": "#AABBCC"},
+            "colors": {"accent.primary": "a"}}"##;
+        let t = Theme::from_json(json).unwrap();
+        assert_eq!(t.accent_primary, "\x1b[38;2;170;187;204m");
+        // cycles terminate and fall back to the default palette
+        let json = r##"{"defs": {"a": "b", "b": "a"},
+            "colors": {"accent.primary": "a"}}"##;
+        let t = Theme::from_json(json).unwrap();
+        assert_eq!(t.accent_primary, Theme::default_theme().accent_primary);
+    }
+
+    #[test]
+    fn from_json_none_is_transparent_and_number_is_256color() {
+        let json = r##"{"colors": {"accent.primary": "none", "accent.warn": 214,
+            "code.background": 235}}"##;
+        let t = Theme::from_json(json).unwrap();
+        assert_eq!(t.accent_primary, "");
+        assert_eq!(t.accent_warn, "\x1b[38;5;214m");
+        assert_eq!(t.code_background, "\x1b[48;5;235m");
+    }
+
+    #[test]
+    fn from_json_bad_numbers_and_non_object_defs_ignored() {
+        let json = r##"{"defs": 42, "colors": {"accent.primary": 999,
+            "accent.warn": -1, "accent.danger": 1.5}}"##;
+        let t = Theme::from_json(json).unwrap();
+        assert_eq!(t.accent_primary, Theme::default_theme().accent_primary);
+        assert_eq!(t.accent_warn, Theme::default_theme().accent_warn);
+        assert_eq!(t.accent_danger, Theme::default_theme().accent_danger);
+    }
+
+    #[test]
+    fn from_json_input_rgb_follows_defs_and_numbers() {
+        let json = r##"{"defs": {"ink": "#112233"}, "colors": {"accent.input": "ink"}}"##;
+        let t = Theme::from_json(json).unwrap();
+        assert_eq!(t.accent_input, "\x1b[38;2;17;34;51m");
+        assert_eq!(t.accent_input_rgb, (17, 34, 51));
+        let json = r##"{"colors": {"accent.input": 196}}"##;
+        let t = Theme::from_json(json).unwrap();
+        assert_eq!(t.accent_input, "\x1b[38;5;196m");
+        assert_eq!(t.accent_input_rgb, (255, 0, 0));
+        // "none" keeps the default blend base (nothing to blend toward)
+        let json = r##"{"colors": {"accent.input": "none"}}"##;
+        let t = Theme::from_json(json).unwrap();
+        assert_eq!(t.accent_input, "");
+        assert_eq!(t.accent_input_rgb, Theme::default_theme().accent_input_rgb);
+    }
+
+    #[test]
+    fn ansi256_rgb_spot_checks() {
+        assert_eq!(ansi256_rgb(0), (0, 0, 0));
+        assert_eq!(ansi256_rgb(9), (255, 0, 0));
+        assert_eq!(ansi256_rgb(15), (255, 255, 255));
+        assert_eq!(ansi256_rgb(196), (255, 0, 0));
+        assert_eq!(ansi256_rgb(232), (8, 8, 8));
+        assert_eq!(ansi256_rgb(255), (238, 238, 238));
     }
 
     #[test]

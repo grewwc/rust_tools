@@ -2400,7 +2400,7 @@ mod serve_history_tests {
     }
 
     #[test]
-    fn serve_rewind_target_from_roles_resolves_uN_and_last() {
+    fn serve_rewind_target_from_roles_resolves_u_n_and_last() {
         let roles: Vec<String> = sample_history().iter().map(|m| m.role.clone()).collect();
         assert_eq!(
             resolve_serve_rewind_target_from_roles(&roles, &["u2"]).expect("u2"),
@@ -3727,7 +3727,6 @@ fn serve_connection(
     cli: &ParsedCli,
     tool: &str,
 ) -> Result<(reqwest::blocking::Client, String, String), Box<dyn std::error::Error>> {
-    rust_tools::ensure_rustls_provider();
     let cfg = configw::get_all_config();
     // Same precedence as the server and the management commands: explicit
     // `--serve-bind` wins, then `ai.serve.bind`, then the default.
@@ -5455,7 +5454,6 @@ mod tests {
     /// instead of an error.
     #[test]
     fn interrupt_request_targets_the_session_route() {
-        rust_tools::ensure_rustls_provider();
         let (base, captured) = serve_capture_once("{\"session_id\":\"s1\",\"interrupted\":true}");
         let client = reqwest::blocking::Client::new();
         let interrupted = interrupt_remote_turn(&client, &base, "tk", "s1").expect("request");
@@ -5479,7 +5477,6 @@ mod tests {
         let _guard = crate::ai::test_support::ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        rust_tools::ensure_rustls_provider();
         let (base, captured) = serve_capture_once(
             r#"{"output":"switched\n","confirmation":null,"checkpoints":["latest","before"],"branches":["main","feature"],"checkpoint_status":"feature@latest"}"#,
         );
@@ -5526,7 +5523,6 @@ mod tests {
 
     #[test]
     fn cd_command_posts_to_the_remote_cd_route_and_renders_the_result() {
-        rust_tools::ensure_rustls_provider();
         let (base, captured) = serve_capture_once(
             r#"{"stdout":"Working directory: /srv/work (was /srv)\n","stderr":""}"#,
         );
@@ -5573,7 +5569,6 @@ mod tests {
 
     #[test]
     fn cd_completion_fetches_remote_candidates_from_the_candidates_route() {
-        rust_tools::ensure_rustls_provider();
         let (base, captured) = serve_capture_once(r#"{"candidates":["src/","docs/"]}"#);
         let client = reqwest::blocking::Client::new();
         let candidates =

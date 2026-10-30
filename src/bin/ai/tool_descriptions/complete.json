@@ -1,6 +1,6 @@
 {
   "name": "complete",
-  "description": "Assert that current tool-assisted or planned work is done. Call once with a short summary, after the last tool action and after every plan step is done or skipped. Tool-assisted turns and turns that create or update a plan (including resume / goal-mode turns) require this call; plain no-tool Q&A does not. The runtime reopens the turn if current plan steps remain pending, running, or failed. A plan carried from an earlier turn binds only after this turn updates it. Any later tool action, including `plan` or `plan_update`, invalidates the assertion, so call `complete` last.",
+  "description": "Required only when the session plan binds this turn (created or updated this turn, or a resume / goal-mode turn); without a binding plan the call is optional. When it applies, call once with a short summary after the last tool action, once every plan step is done or skipped. The runtime reopens the turn if plan steps remain pending, running, or failed. A plan carried from an earlier turn binds only after this turn updates it. Any later tool action, including `plan` or `plan_update`, invalidates the assertion, so call `complete` last.",
   "parameters": {
     "type": "object",
     "properties": {
