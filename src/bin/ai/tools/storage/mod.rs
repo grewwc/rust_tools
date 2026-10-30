@@ -18,6 +18,7 @@ pub(crate) mod process_registry;
 pub(crate) mod rag_store;
 pub(crate) mod read_registry;
 pub(crate) mod temp_registry;
+pub(crate) mod text_utils;
 pub(crate) mod token_usage_store;
 
 /// 文件锁，用于并发访问 memory 文件

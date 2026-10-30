@@ -6,6 +6,10 @@ use regex::{Regex, RegexBuilder};
 #[cfg(test)]
 use serde_json::Value;
 
+use crate::ai::tools::storage::text_utils::{
+    glob_match_simple, truncate_tool_output as truncate_output,
+};
+
 const MAX_OUTPUT_CHARS: usize = 32_000;
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
 const MAX_MATCHES: usize = 200;
@@ -584,41 +588,6 @@ fn glob_match_path(pattern: &str, path: &str) -> bool {
     false
 }
 
-fn glob_match_simple(pattern: &str, name: &str) -> bool {
-    let pat = pattern.trim_start_matches("**/");
-    // Classic two-pointer glob matching with backtracking, correctly supporting
-    // `*` (matches any length, including empty) and `?` (matches exactly one
-    // character). Patterns without wildcards degrade to exact matching, avoiding
-    // the old implementation's bug where `name.ends_with(pat)` made `Cargo.toml`
-    // match `my_cargo.toml`.
-    let p: Vec<char> = pat.chars().collect();
-    let n: Vec<char> = name.chars().collect();
-    let mut pi = 0usize;
-    let mut ni = 0usize;
-    let mut star_pi: Option<usize> = None;
-    let mut star_ni = 0usize;
-    while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star_pi = Some(pi);
-            star_ni = ni;
-            pi += 1;
-        } else if let Some(sp) = star_pi {
-            pi = sp + 1;
-            star_ni += 1;
-            ni = star_ni;
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
-}
-
 /// Recursively collect candidate files via BFS, skipping hidden directories and
 /// dependency/build directories.
 /// - `glob_matcher`: file-name or relative-path glob filter (None = no filter).
@@ -700,21 +669,6 @@ fn collect_content_files(
 
     files.sort();
     Ok(files)
-}
-
-fn truncate_output(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(max_chars + 32);
-    for (i, ch) in s.chars().enumerate() {
-        if i >= max_chars {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push_str("\n... (output truncated)");
-    out
 }
 
 // execute_text_grep is kept as a test-only entry point: the text_grep tool is

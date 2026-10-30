@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
+use crate::ai::tools::storage::text_utils::{
+    glob_match_simple, truncate_tool_output as truncate_output,
+};
 
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -235,36 +238,6 @@ impl GlobFilter {
     }
 }
 
-fn glob_match_simple(pattern: &str, name: &str) -> bool {
-    let pat = pattern.trim_start_matches("**/");
-    if pat.starts_with("*.") {
-        let ext = &pat[1..];
-        return name.ends_with(ext);
-    }
-    if pat.contains('*') || pat.contains('?') {
-        let parts: Vec<&str> = pat.split('*').collect();
-        if parts.len() == 2 {
-            return name.starts_with(parts[0]) && name.ends_with(parts[1]);
-        }
-    }
-    name == pat || name.ends_with(pat)
-}
-
-fn truncate_output(s: &str, max_chars: usize) -> String {
-    if s.len() <= max_chars {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(max_chars + 32);
-    for (i, ch) in s.chars().enumerate() {
-        if i >= max_chars {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push_str("\n... (output truncated)");
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,5 +361,42 @@ mod tests {
         assert!(output.contains("src/"), "dirs always shown");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tree_literal_file_pattern_matches_exactly() {
+        let dir = make_temp_dir("literal_filefilter");
+        fs::write(dir.join("main.rs"), "").unwrap();
+        fs::write(dir.join("domain.rs"), "").unwrap();
+
+        let args = serde_json::json!({
+            "path": dir.to_string_lossy().to_string(),
+            "file_pattern": "main.rs"
+        });
+        let output = execute_tree(&args).unwrap();
+        assert!(output.contains("main.rs"));
+        assert!(!output.contains("domain.rs"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tree_question_mark_matches_one_character() {
+        assert!(glob_match_simple("file?.rs", "file1.rs"));
+        assert!(!glob_match_simple("file?.rs", "file.rs"));
+        assert!(!glob_match_simple("file?.rs", "file10.rs"));
+    }
+
+    #[test]
+    fn test_tree_truncate_output_counts_characters() {
+        let content = "你".repeat(MAX_OUTPUT_CHARS);
+        assert_eq!(truncate_output(&content, MAX_OUTPUT_CHARS), content);
+
+        let over_budget = format!("{content}界");
+        let truncated = truncate_output(&over_budget, MAX_OUTPUT_CHARS);
+        assert_eq!(
+            truncated.strip_suffix("\n... (output truncated)"),
+            Some(content.as_str())
+        );
     }
 }
