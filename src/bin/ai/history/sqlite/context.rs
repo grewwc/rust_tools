@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Read, Write},
+    io::{self, Read},
     path::Path,
     time::{Duration, Instant},
 };
@@ -406,9 +406,11 @@ fn read_archived_context_messages(
 /// the same rows again. The ring is only read as a whole during a rewind, which
 /// makes a single payload a good fit.
 fn encode_context_history_payload(messages: &[ArchivedContextMessage]) -> io::Result<Vec<u8>> {
-    let json = serde_json::to_vec(messages).map_err(io::Error::other)?;
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&json)?;
+    // Stream serialization straight into the gzip encoder instead of
+    // materializing the full uncompressed JSON first; `to_writer` emits
+    // byte-identical JSON to `to_vec` for the same value.
+    serde_json::to_writer(&mut encoder, messages).map_err(io::Error::other)?;
     encoder.finish()
 }
 

@@ -857,6 +857,80 @@ fn cap_reuses_execute_command_cat_archive_instead_of_rearchiving() {
 }
 
 #[test]
+fn cap_does_not_reuse_input_archive_for_transformed_command_output() {
+    // A command that merely *mentions* an archive (awk/diff/pipes/multi-input
+    // cat) must not reuse that input file for its transformed output: the
+    // stub would otherwise mislabel input bytes as the full historical
+    // result. Only byte-identical read-backs (plain `cat`, see the test
+    // above) may reuse.
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-cap-transform-no-reuse-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut messages = vec![
+        assistant_call("run", "execute_command"),
+        tool_result("run", &"log line\n".repeat(30_000)),
+    ];
+    let capped =
+        cap_oversized_tool_results_for_context(&mut messages, 64_000, 0, Some(&overflow_dir), None);
+    assert!(capped > 0);
+    let archive_dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
+    let input_path = std::fs::read_dir(&archive_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let input_name = input_path.file_name().unwrap().to_string_lossy().into_owned();
+
+    // `awk '{print "DIFF:" $0}' <archive>`: every output line differs from the
+    // input, so no existing archive may be reused.
+    let transformed = "log line\n"
+        .repeat(30_000)
+        .lines()
+        .map(|line| format!("DIFF:{line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let run_args = serde_json::json!({
+        "command": format!("awk '{{print \"DIFF:\" $0}}' {}", input_path.to_string_lossy()),
+        "pty": false,
+    });
+    let mut messages = vec![
+        assistant_call_args("awk-run", "execute_command", &run_args.to_string()),
+        tool_result("awk-run", &transformed),
+    ];
+    let capped =
+        cap_oversized_tool_results_for_context(&mut messages, 64_000, 0, Some(&overflow_dir), None);
+    assert_eq!(capped, 1);
+    assert_eq!(
+        std::fs::read_dir(&archive_dir).unwrap().count(),
+        2,
+        "transformed output must be archived as its own bytes"
+    );
+    let stub_text = value_to_string(&messages[1].content);
+    assert!(is_preserved_tool_overflow_stub(&stub_text), "{stub_text}");
+    // The stub must point its `file_path` at a fresh archive holding the
+    // transformed bytes. (The input path still appears in the recall lines
+    // via `original_command`, which is correct provenance, not reuse.)
+    let file_line = stub_text
+        .lines()
+        .find(|line| line.trim_start().starts_with("- file_path: "))
+        .expect("stub must carry a file_path line");
+    assert!(
+        !file_line.contains(&input_name),
+        "stub file_path must not point at the transform input: {stub_text}"
+    );
+    // The fresh archive holds exactly the transformed output.
+    let fresh_path = std::fs::read_dir(&archive_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.file_name().unwrap().to_string_lossy() != input_name)
+        .expect("a second archive file must exist");
+    assert_eq!(std::fs::read_to_string(&fresh_path).unwrap(), transformed);
+    let _ = std::fs::remove_dir_all(&overflow_dir);
+}
+
+#[test]
 fn path_c_spills_all_protected_precision_groups_without_recent_group_cap() {
     let overflow_dir = std::env::temp_dir().join(format!(
         "ai-global-precision-budget-{}",
@@ -1484,4 +1558,50 @@ fn archived_asset_reuse_accepts_typed_aliases_and_legacy_paths_safely() {
         None
     );
     let _ = std::fs::remove_dir_all(&overflow_dir);
+}
+
+fn plain_message(role: &str, content: String) -> Message {
+    Message {
+        role: role.to_string(),
+        content: Value::String(content),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }
+}
+
+#[test]
+fn persisted_summary_reserves_budget_for_latest_correction_and_pending() {
+    // Twenty fat old turns must not crowd the fragment's latest correction
+    // and unanswered task out of the draft: newest intent claims budget
+    // before older history.
+    let mut messages: Vec<Message> = Vec::new();
+    for turn in 0..20 {
+        messages.push(plain_message(
+            "user",
+            format!("work on topic_{turn}.rs {}", "u".repeat(300)),
+        ));
+        messages.push(plain_message(
+            "assistant",
+            format!("old_answer_{turn} {}", "a".repeat(400)),
+        ));
+    }
+    messages.push(plain_message(
+        "user",
+        "LATEST_CORRECTION switch the plan to tabs".to_string(),
+    ));
+    let draft = build_persisted_summary_text(&messages, 2_800);
+    assert!(
+        draft.contains("LATEST_CORRECTION"),
+        "newest correction must survive old-turn pressure: {draft}"
+    );
+    assert!(
+        draft.contains("Pending tasks:"),
+        "unanswered latest turn must stay listed: {draft}"
+    );
+    assert!(
+        draft.chars().count() <= 2_800,
+        "draft exceeds budget: {}",
+        draft.chars().count()
+    );
 }

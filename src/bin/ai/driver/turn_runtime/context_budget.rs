@@ -502,11 +502,18 @@ fn apply_history_context_budget(
         }
     }
 
+    // Representative/index omission only runs under real token pressure.
+    // Without pressure the projection keeps its existing recoverable body
+    // text and only gains additive archive recall; recall excerpts are
+    // bounded and cannot push a fitting request over budget by themselves.
+    // Measure the live projection (the entry scan predates the spill pass).
+    let live_chars = crate::ai::history::messages_total_chars_pub(messages);
     let memory_projection = super::context_memory::apply_query_aware_memory_projection_with_context(
         messages,
         target_chars,
         &overflow_dir,
         active_context,
+        allow_lossy && live_chars > target_chars,
     );
     report.memory_projection_removed_messages = memory_projection.removed_messages;
     report.memory_projection_selected_messages = memory_projection.selected_messages;

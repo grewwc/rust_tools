@@ -673,12 +673,16 @@ pub(super) fn is_task_pending(os: &mut dyn Kernel, pid: u64) -> Result<bool, Str
     let Some(proc) = os.get_process(pid) else {
         return Ok(false);
     };
+    // Stopped is pending, not finished: SIGSTOP pauses the process and SIGCONT
+    // resumes it, so a stopped subagent can still consume queued side-notes and
+    // must not be collected/cancelled as if it had terminated.
     Ok(matches!(
         proc.state,
         ProcessState::Ready
             | ProcessState::Running
             | ProcessState::Waiting { .. }
             | ProcessState::Sleeping { .. }
+            | ProcessState::Stopped
     ))
 }
 

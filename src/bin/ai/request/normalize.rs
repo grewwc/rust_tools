@@ -1209,7 +1209,11 @@ pub(super) fn normalize_messages_for_model(model: &str, messages: &[Message]) ->
     }
 
     for message in &mut normalized {
-        message.content = normalize_message_content_for_text_only_model(&message.content);
+        // Only multimodal arrays need conversion; every other content shape
+        // would just be cloned back onto itself, so keep it in place.
+        if message.content.is_array() {
+            message.content = normalize_message_content_for_text_only_model(&message.content);
+        }
     }
     normalized
 }

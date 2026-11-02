@@ -155,7 +155,7 @@ pub(super) fn prepare_tool_messages_structured(
                         .as_deref()
                         .and_then(|id| id_to_tool_args.get(id))
                         .and_then(|args| {
-                            preserved_tool_overflow_path_in_arguments(name, args, dir, cwd)
+                            preserved_tool_overflow_path_in_arguments(name, args, dir, cwd, &text)
                         })
                 });
                 let reused_existing = existing_asset_path.is_some();
@@ -293,7 +293,7 @@ pub(in crate::ai) fn cap_oversized_tool_results_for_context(
             tool_call_id
                 .and_then(|id| id_to_tool_args.get(id))
                 .and_then(|args| {
-                    preserved_tool_overflow_path_in_arguments(tool_name, args, dir, cwd)
+                    preserved_tool_overflow_path_in_arguments(tool_name, args, dir, cwd, &text)
                 })
         });
         let replacement = existing_asset_path
@@ -407,7 +407,13 @@ pub(super) fn enforce_protected_precision_group_budget(
             let existing_asset_path = tool_call_id
                 .and_then(|id| id_to_tool_args.get(id))
                 .and_then(|args| {
-                    preserved_tool_overflow_path_in_arguments(&tool_name, args, overflow_dir, cwd)
+                    preserved_tool_overflow_path_in_arguments(
+                        &tool_name,
+                        args,
+                        overflow_dir,
+                        cwd,
+                        &text,
+                    )
                 });
             let (path, wrote_new) = if let Some(path) = existing_asset_path {
                 (path, false)
@@ -490,7 +496,13 @@ pub(super) fn spill_protected_precision_to_fit(
             // pointer both preserves the hard target and avoids the "spill →
             // read-back → spill again" cycle.
             let existing_asset_path = id_to_tool_args.get(id).and_then(|args| {
-                preserved_tool_overflow_path_in_arguments(&tool_name, args, overflow_dir, cwd)
+                preserved_tool_overflow_path_in_arguments(
+                    &tool_name,
+                    args,
+                    overflow_dir,
+                    cwd,
+                    &text,
+                )
             });
             (!text.trim().is_empty()
                 && !is_preserved_tool_overflow_stub(&text)
@@ -646,8 +658,14 @@ fn preserved_tool_overflow_read_file_path(arguments: &str, overflow_dir: &Path) 
 /// re-read endlessly along new pointers.
 ///
 /// - `read_file`: the `file_path` / `path` / `filePath` fields;
-/// - `execute_command`: archive paths embedded in the `command` string
-///   (`cat`/`head`/`grep` etc.).
+/// - `execute_command`: archive paths embedded in the `command` string, gated
+///   on the archived bytes actually equaling this result's text. A bare
+///   filename match cannot distinguish `cat <archive>` from a transforming
+///   pipeline (`awk`/`diff`/multi-input `cat`/pipes): reusing an input file
+///   for transformed output would point the stub's "full historical result"
+///   at bytes that never contained it. `read_file` needs no such gate: it
+///   can only window or re-render the file itself, so its output stays
+///   recoverable from the reused file (and the stub records the range).
 /// Other tools return no paths (reuse semantics do not apply; behavior matches
 /// the old `read_file` guard).
 fn preserved_tool_overflow_path_in_arguments(
@@ -655,13 +673,14 @@ fn preserved_tool_overflow_path_in_arguments(
     arguments: &str,
     overflow_dir: &Path,
     cwd: Option<&Path>,
+    result_text: &str,
 ) -> Option<PathBuf> {
     let args = serde_json::from_str::<Value>(arguments).ok()?;
     match tool_name {
         "read_file" => preserved_tool_overflow_read_file_path(arguments, overflow_dir),
         "execute_command" => {
             let command = value_string_from_keys(&args, &["command"])?;
-            archived_asset_path_in_command(&command, overflow_dir, cwd)
+            archived_asset_path_in_command(&command, overflow_dir, cwd, result_text)
         }
         _ => None,
     }
@@ -745,12 +764,23 @@ fn archived_asset_bare_name_from_raw(raw_path: &str, preserved_dir: &Path) -> Op
 /// Recognizes paths that "read this session's archived asset" inside the
 /// `command` string of execute_command. Matches absolute paths of archive
 /// direct children, paths relative to effective_cwd, or bare file names (the
-/// name contains a uuid and is essentially unique). The archive count is
-/// small, so the per-compaction scan cost is acceptable.
+/// name contains a uuid and is essentially unique).
+///
+/// A filename match alone only proves the command *mentioned* the archive,
+/// not that the result *is* the archive: `awk`/`diff`/multi-input `cat` and
+/// pipes transform their inputs, and pointing such a result at one input
+/// file mislabels it as the full historical output. Reuse therefore also
+/// requires the archived bytes to equal `expected_output` (edge-whitespace
+/// insensitive: command results are stored trimmed, so a pure `cat` matches
+/// while any transformed or multi-input result falls through to a fresh
+/// content-addressed archive). The archive count is small and candidates are
+/// already bounded by the filename pre-filter, so the extra read cost stays
+/// acceptable.
 fn archived_asset_path_in_command(
     command: &str,
     overflow_dir: &Path,
     cwd: Option<&Path>,
+    expected_output: &str,
 ) -> Option<PathBuf> {
     let preserved_dir = overflow_dir
         .join(PRESERVED_TOOL_OVERFLOW_DIR)
@@ -771,18 +801,22 @@ fn archived_asset_path_in_command(
             continue;
         }
         let abs = canonical.to_string_lossy().into_owned();
-        if command.contains(&abs) {
-            return Some(canonical);
-        }
-        if let Some(cwd) = &cwd
-            && let Ok(rel) = canonical.strip_prefix(cwd)
-            && let Some(rel_str) = rel.to_str()
-            && command.contains(rel_str)
-        {
-            return Some(canonical);
-        }
-        if let Some(name) = canonical.file_name().and_then(|n| n.to_str())
-            && command.contains(name)
+        let mentioned = command.contains(&abs)
+            || cwd
+                .as_ref()
+                .and_then(|cwd| canonical.strip_prefix(cwd).ok())
+                .and_then(|rel| rel.to_str())
+                .is_some_and(|rel_str| command.contains(rel_str))
+            || canonical
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| command.contains(name));
+        // Mentioned but not byte-identical: a transformed or multi-input
+        // result. Keep scanning (another archive may match) instead of
+        // mislabeling this input as the full historical output.
+        if mentioned
+            && std::fs::read_to_string(&canonical)
+                .is_ok_and(|archived| archived.trim() == expected_output.trim())
         {
             return Some(canonical);
         }
@@ -2562,47 +2596,37 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
         );
         tool_blob.chars().count().min(max_chars / 3)
     };
-    let body_budget = max_chars
-        .saturating_sub(reserved_tool_chars)
-        .max(max_chars / 2);
-    let mut lines: Vec<String> = Vec::new();
-    if !initial_goal.is_empty()
-        && !push_line_with_budget(
-            &mut lines,
-            format!("Main request: {initial_goal}"),
-            body_budget,
-        )
+    // Newest-first budget reservation: the tail (current work + pending
+    // tasks) carries this fragment's latest correction and unanswered work,
+    // so it claims budget before older history and tool lines — previously
+    // old turns filled the budget first and the newest intent could miss the
+    // draft entirely. Build order follows survival priority (tail, head,
+    // tools) while emit order stays readable (head, tools, tail). Each
+    // section owns its vector and cap, and 2 chars cover the inter-section
+    // separators, so the total fits max_chars by construction; the trailing
+    // summarize_text is only a safety net.
+    let tail_cap = max_chars / 2;
+    let tool_reserve = reserved_tool_chars.min(max_chars.saturating_sub(tail_cap + 2));
+    // Pending tasks first (unanswered turns are the most critical), then the
+    // current-work window; both filled newest-first so a binding cap drops
+    // the oldest-of-recent instead of the latest correction, and both
+    // emitted in chronological order.
+    let mut tail: Vec<String> = Vec::new();
     {
-        return summarize_text(&lines.join("\n"), max_chars);
-    }
-    for s in pre_summary_lines.into_iter().take(3) {
-        if !push_line_with_budget(&mut lines, s, body_budget) {
-            return summarize_text(&lines.join("\n"), max_chars);
-        }
-    }
-    for t in &merged {
-        if !push_line_with_budget(&mut lines, format!("- {}", render_line(t)), body_budget) {
-            break;
-        }
-    }
-
-    if !known_tool_lines.is_empty() {
-        let _ = push_line_with_budget(
-            &mut lines,
-            "Verified facts and sources:".to_string(),
-            max_chars,
-        );
-        for line in known_tool_lines {
-            if !push_line_with_budget(&mut lines, line, max_chars) {
+        let mut pending: Vec<String> = Vec::new();
+        for task in pending_tasks.iter().rev() {
+            if !push_line_with_budget(
+                &mut pending,
+                format!("- {}", summarize_text(task, 300)),
+                tail_cap,
+            ) {
                 break;
             }
         }
-    }
-
-    if !recent_turns.is_empty() {
-        let _ = push_line_with_budget(&mut lines, String::new(), max_chars);
-        let _ = push_line_with_budget(&mut lines, "Current work:".to_string(), max_chars);
-        for t in &recent_turns {
+        pending.reverse();
+        let current_cap = tail_cap.saturating_sub(pending.join("\n").chars().count() + 1);
+        let mut current: Vec<String> = Vec::new();
+        for t in recent_turns.iter().rev() {
             let mut parts = Vec::new();
             if !t.topic_label.is_empty() {
                 parts.push(format!("Topic: {}", t.topic_label));
@@ -2623,25 +2647,66 @@ pub(super) fn build_persisted_summary_text(messages: &[Message], max_chars: usiz
                 parts.push(format!("Key: {}", t.tool_highlights.join(", ")));
             }
             let line = format!("- {}", parts.join(" | "));
-            if !push_line_with_budget(&mut lines, summarize_text(&line, 600), max_chars) {
+            if !push_line_with_budget(&mut current, summarize_text(&line, 600), current_cap) {
+                break;
+            }
+        }
+        current.reverse();
+        if !current.is_empty() {
+            tail.push(String::new());
+            tail.push("Current work:".to_string());
+            tail.extend(current);
+        }
+        if !pending.is_empty() {
+            tail.push(String::new());
+            tail.push("Pending tasks:".to_string());
+            tail.extend(pending);
+        }
+    }
+    let tail_used = tail.join("\n").chars().count();
+    let head_cap = max_chars.saturating_sub(tail_used + tool_reserve + 2);
+    let mut head: Vec<String> = Vec::new();
+    if !initial_goal.is_empty() {
+        let _ = push_line_with_budget(
+            &mut head,
+            format!("Main request: {initial_goal}"),
+            head_cap,
+        );
+    }
+    for s in pre_summary_lines.into_iter().take(3) {
+        if !push_line_with_budget(&mut head, s, head_cap) {
+            break;
+        }
+    }
+    for t in &merged {
+        if !push_line_with_budget(&mut head, format!("- {}", render_line(t)), head_cap) {
+            break;
+        }
+    }
+    let head_used = head.join("\n").chars().count();
+    let tool_cap = max_chars.saturating_sub(tail_used + head_used + 2);
+    let mut tools: Vec<String> = Vec::new();
+    if !known_tool_lines.is_empty() {
+        let _ = push_line_with_budget(
+            &mut tools,
+            "Verified facts and sources:".to_string(),
+            tool_cap,
+        );
+        for line in known_tool_lines {
+            if !push_line_with_budget(&mut tools, line, tool_cap) {
                 break;
             }
         }
     }
-
-    if !pending_tasks.is_empty() {
-        let _ = push_line_with_budget(&mut lines, String::new(), max_chars);
-        let _ = push_line_with_budget(&mut lines, "Pending tasks:".to_string(), max_chars);
-        for task in &pending_tasks {
-            if !push_line_with_budget(
-                &mut lines,
-                format!("- {}", summarize_text(task, 300)),
-                max_chars,
-            ) {
-                break;
-            }
-        }
+    let mut sections: Vec<String> = Vec::new();
+    if !head.is_empty() {
+        sections.push(head.join("\n"));
     }
-
-    summarize_text(&lines.join("\n"), max_chars)
+    if !tools.is_empty() {
+        sections.push(tools.join("\n"));
+    }
+    if !tail.is_empty() {
+        sections.push(tail.join("\n"));
+    }
+    summarize_text(&sections.join("\n"), max_chars)
 }

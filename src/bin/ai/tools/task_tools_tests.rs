@@ -2870,3 +2870,103 @@ fn wake_expired_task_waits_reaps_orphaned_state_when_owner_gone() {
 
     let _ = remove_task_entry(&task_id);
 }
+
+#[test]
+fn side_note_target_validation_accepts_stopped_subagent() {
+    // Regression: SIGSTOP pauses a subagent (Stopped) but does not finish it; a
+    // side-note sent during the pause must queue normally and become visible
+    // after SIGCONT instead of being rejected as "already finished".
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut app = test_app_with_model("qwen3.7-max".to_string());
+    app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    let _os_guard = init_os_tools_guard(app.os.clone());
+
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let (owner_pid, child_pid, channel, futex) = {
+        let mut os = app.os.lock().unwrap();
+        let owner_pid =
+            os.begin_foreground("owner".to_string(), "goal".to_string(), 10, 8, None);
+        let child_pid = os
+            .spawn(
+                Some(owner_pid),
+                "stopped-child".to_string(),
+                "stopped goal".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let channel = os.channel_create(Some(child_pid), 1, "stopped-result".to_string());
+        let futex = os.futex_create(0, "stopped-complete".to_string());
+        os.set_current_pid(Some(owner_pid));
+        (owner_pid, child_pid, channel.raw(), futex)
+    };
+    insert_task_entry_for_test(
+        task_id.clone(),
+        AsyncTaskEntry {
+            session_id: app.session_id.clone(),
+            owner_pid,
+            pid: child_pid,
+            result_channel_id: channel,
+            completion_futex_addr: futex,
+            description: "stopped task".to_string(),
+            agent_name: "explore".to_string(),
+            model: "qwen3.7-max".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit override".to_string(),
+            inherit: InheritOptions::default(),
+            abort_handle: None,
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            started_at: Instant::now(),
+        },
+    );
+
+    let validate = || {
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+            (app.session_id.clone(), 0usize),
+            || super::validate_side_note_target(&task_id),
+        )
+    };
+
+    // SIGSTOP: still pending, side-notes must queue.
+    {
+        let mut os = app.os.lock().unwrap();
+        os.set_current_pid(Some(owner_pid));
+        os.signal_process(child_pid, aios_kernel::kernel::Signal::SigStop)
+            .unwrap();
+        assert!(super::is_task_pending(os.as_mut(), child_pid).unwrap());
+        os.set_current_pid(Some(owner_pid));
+    }
+    assert!(validate().is_ok());
+
+    // SIGCONT: resumed, still accepted.
+    {
+        let mut os = app.os.lock().unwrap();
+        os.set_current_pid(Some(owner_pid));
+        os.signal_process(child_pid, aios_kernel::kernel::Signal::SigCont)
+            .unwrap();
+        assert!(super::is_task_pending(os.as_mut(), child_pid).unwrap());
+        os.set_current_pid(Some(owner_pid));
+    }
+    assert!(validate().is_ok());
+
+    // Terminated: genuinely finished, side-notes must be refused.
+    {
+        let mut os = app.os.lock().unwrap();
+        os.set_current_pid(Some(owner_pid));
+        os.kill_process(child_pid, "test cleanup".to_string())
+            .unwrap();
+        assert!(!super::is_task_pending(os.as_mut(), child_pid).unwrap());
+        os.set_current_pid(Some(owner_pid));
+    }
+    let err = validate().expect_err("terminated task must reject side-notes");
+    assert!(err.contains("already finished"), "unexpected error: {err}");
+
+    assert!(remove_task_entry(&task_id).is_some());
+}

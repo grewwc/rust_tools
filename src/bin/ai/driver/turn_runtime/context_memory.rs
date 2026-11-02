@@ -101,16 +101,29 @@ pub(super) fn apply_query_aware_memory_projection(
 
 /// The runtime passes session authority and live task state explicitly. Archive
 /// reads never use a root supplied by an index or by model-authored content.
+///
+/// `omit_metadata` gates the lossy half: representative selection and index
+/// replacement only run when the request is actually over budget. Archive
+/// recall is additive and always runs, so an unpressured request keeps its
+/// existing recoverable body text while still gaining relevant excerpts.
 pub(super) fn apply_query_aware_memory_projection_with_context(
     messages: &mut Vec<Message>,
     target_chars: usize,
     assets_dir: &Path,
     active_context: &str,
+    omit_metadata: bool,
 ) -> MemoryProjectionStats {
     let before_chars = total_chars(messages);
     let removed =
         crate::ai::history::compress::dedupe_context_checkpoint_markers_for_projection(messages);
-    let mut stats = project_memory_metadata(messages, target_chars, active_context);
+    let mut stats = if omit_metadata {
+        project_memory_metadata(messages, target_chars, active_context)
+    } else {
+        MemoryProjectionStats {
+            before_chars: total_chars(messages),
+            ..MemoryProjectionStats::default()
+        }
+    };
     stats.changed |= refresh_archive_recall(messages, target_chars, assets_dir, active_context);
     if removed > 0 {
         stats.changed = true;
@@ -923,6 +936,12 @@ fn refresh_archive_recall(
     } else {
         Vec::new()
     };
+    // Steady state (deterministic recall under a quantized budget) usually
+    // reproduces the list unchanged; detect that without cloning every
+    // message first, and only pay for the rebuild when it differs.
+    if projection_matches(messages, user, &obsolete, &recalled) {
+        return false;
+    }
     let mut projected = Vec::with_capacity(messages.len() + recalled.len());
     for (index, message) in messages.iter().enumerate() {
         if index == user {
@@ -934,11 +953,45 @@ fn refresh_archive_recall(
     }
     // Only runtime-owned recall pairs can be replaced. All source indexes and
     // the entire current user/tool tail survive byte-for-byte and in order.
-    if projected == *messages {
-        return false;
-    }
     *messages = projected;
     true
+}
+
+/// Whether the recall rebuild below would reproduce `messages` unchanged,
+/// decided without cloning the message list.
+///
+/// The rebuilt projection is `messages[..user]` minus `obsolete`, plus
+/// `recalled` spliced before `user`, plus the untouched `messages[user..]`
+/// tail. `user` always names a live message here (the caller returns early
+/// when there is none) and `recall_pairs` only reports indices before it,
+/// so every position before the first obsolete index survives untouched and
+/// in place; comparing the suffix from there lazily is exactly equivalent
+/// to building the full projection and comparing.
+fn projection_matches(
+    messages: &[Message],
+    user: usize,
+    obsolete: &FxHashSet<usize>,
+    recalled: &[Message],
+) -> bool {
+    debug_assert!(user < messages.len());
+    debug_assert!(obsolete.iter().all(|index| *index < user));
+    // Removals must balance insertions or the lengths already differ.
+    if obsolete.len() != recalled.len() {
+        return false;
+    }
+    if obsolete.is_empty() {
+        // Nothing removed or inserted: the projection is `messages` itself.
+        return true;
+    }
+    let start = obsolete.iter().copied().min().unwrap_or(user).min(user);
+    let rebuilt_suffix = messages[start..user]
+        .iter()
+        .enumerate()
+        .filter(|(offset, _)| !obsolete.contains(&(start + offset)))
+        .map(|(_, message)| message)
+        .chain(recalled.iter())
+        .chain(messages[user..].iter());
+    rebuilt_suffix.eq(messages[start..].iter())
 }
 
 fn recall_archive_pair(
@@ -1204,6 +1257,7 @@ mod tests {
                 100_000,
                 &fixture.0,
                 "",
+                true
             );
             assert!(stats.changed);
             let recalled = recalled_text(&projected);
@@ -1228,6 +1282,7 @@ mod tests {
                 100_000,
                 &fixture.0,
                 "",
+                true
             );
             assert!(!again.changed);
             assert_eq!(projected, once);
@@ -1262,6 +1317,7 @@ mod tests {
             100_000,
             &fixture.0,
             "rare_plan_dependency",
+            true
         );
         assert!(recalled_text(&projected).contains("rare_plan_dependency fact"));
         assert_eq!(
@@ -1287,9 +1343,9 @@ mod tests {
         let mut projected = vec![index_note(&targets), message("user", "rare_keyword")];
         let original = projected.clone();
         let tight = total_chars(&projected);
-        apply_query_aware_memory_projection_with_context(&mut projected, tight, &fixture.0, "");
+        apply_query_aware_memory_projection_with_context(&mut projected, tight, &fixture.0, "", true);
         assert_eq!(projected, original);
-        apply_query_aware_memory_projection_with_context(&mut projected, 100_000, &fixture.0, "");
+        apply_query_aware_memory_projection_with_context(&mut projected, 100_000, &fixture.0, "", true);
         assert!(recalled_text(&projected).contains("rare_keyword at the end"));
         assert!(recalled_text(&projected).contains("partial line"));
     }
@@ -1312,7 +1368,7 @@ mod tests {
         ]);
         let mut projected = vec![index_note(&targets), message("user", "secret_keyword")];
         let original = projected.clone();
-        apply_query_aware_memory_projection_with_context(&mut projected, 100_000, &fixture.0, "");
+        apply_query_aware_memory_projection_with_context(&mut projected, 100_000, &fixture.0, "", true);
         assert_eq!(projected, original);
         assert_eq!(parsed_targets(single_index_note(&projected)), targets);
     }
@@ -1338,7 +1394,7 @@ mod tests {
         ]);
         let mut projected = vec![index_note(&targets), message("user", "secret_keyword")];
         let original = projected.clone();
-        apply_query_aware_memory_projection_with_context(&mut projected, 100_000, &fixture.0, "");
+        apply_query_aware_memory_projection_with_context(&mut projected, 100_000, &fixture.0, "", true);
         assert_eq!(projected, original);
     }
 
@@ -1421,6 +1477,97 @@ mod tests {
                 "x".repeat(padding)
             ),
         )
+    }
+
+    /// Mirror of the rebuild loop in [`refresh_archive_recall`]: the pair of
+    /// helpers below pins [`projection_matches`] against it scenario by
+    /// scenario, so the clone-skipping fast path can never disagree with the
+    /// rebuild it replaces.
+    fn rebuild_like_refresh(
+        messages: &[Message],
+        user: usize,
+        obsolete: &FxHashSet<usize>,
+        recalled: &[Message],
+    ) -> Vec<Message> {
+        let mut projected = Vec::with_capacity(messages.len() + recalled.len());
+        for (index, message) in messages.iter().enumerate() {
+            if index == user {
+                projected.extend(recalled.iter().cloned());
+            }
+            if !obsolete.contains(&index) {
+                projected.push(message.clone());
+            }
+        }
+        projected
+    }
+
+    fn assert_projection_match_parity(
+        messages: &[Message],
+        user: usize,
+        obsolete: &FxHashSet<usize>,
+        recalled: &[Message],
+    ) {
+        assert_eq!(
+            projection_matches(messages, user, obsolete, recalled),
+            rebuild_like_refresh(messages, user, obsolete, recalled) == messages,
+        );
+    }
+
+    #[test]
+    fn projection_matches_agrees_with_rebuild_on_recall_shapes() {
+        let handoff = message("user", RECALL_HANDOFF);
+        let body = message("assistant", "recalled excerpt");
+        let fresh_body = message("assistant", "new excerpt");
+
+        // No removal or insertion: the projection is the list itself.
+        let idle = vec![message("user", "hello")];
+        assert!(projection_matches(&idle, 0, &FxHashSet::default(), &[]));
+        assert_projection_match_parity(&idle, 0, &FxHashSet::default(), &[]);
+
+        // Steady state: the identical pair sits right before the live user
+        // message, so removing and re-splicing it is a no-op.
+        let steady = vec![
+            message("system", "rules"),
+            handoff.clone(),
+            body.clone(),
+            message("user", "continue"),
+        ];
+        let obsolete = FxHashSet::from_iter([1usize, 2]);
+        let recalled = vec![handoff.clone(), body.clone()];
+        assert!(projection_matches(&steady, 3, &obsolete, &recalled));
+        assert_projection_match_parity(&steady, 3, &obsolete, &recalled);
+
+        // Reselected excerpts differ from the installed pair: rebuild.
+        let changed = vec![handoff.clone(), fresh_body.clone()];
+        assert!(!projection_matches(&steady, 3, &obsolete, &changed));
+        assert_projection_match_parity(&steady, 3, &obsolete, &changed);
+
+        // Identical pair content, but a live message arrived between the old
+        // pair and the user message: the re-spliced pair lands elsewhere.
+        let gapped = vec![
+            message("system", "rules"),
+            handoff.clone(),
+            body.clone(),
+            message("assistant", "working"),
+            message("user", "continue"),
+        ];
+        let gapped_obsolete = FxHashSet::from_iter([1usize, 2]);
+        assert!(!projection_matches(&gapped, 4, &gapped_obsolete, &recalled));
+        assert_projection_match_parity(&gapped, 4, &gapped_obsolete, &recalled);
+
+        // First recall: nothing installed yet, pair spliced before the user.
+        let first = vec![message("system", "rules"), message("user", "continue")];
+        assert!(!projection_matches(
+            &first,
+            1,
+            &FxHashSet::default(),
+            &recalled
+        ));
+        assert_projection_match_parity(&first, 1, &FxHashSet::default(), &recalled);
+
+        // Recall dropped (budget starved): the installed pair is removed.
+        assert!(!projection_matches(&steady, 3, &obsolete, &[]));
+        assert_projection_match_parity(&steady, 3, &obsolete, &[]);
     }
 
     #[test]
@@ -1696,11 +1843,65 @@ mod tests {
             100_000,
             &fixture.0,
             "",
+            true
         );
         assert!(stats.changed);
         let recalled = recalled_text(&projected);
         assert!(recalled.contains("ledger_router"), "{recalled}");
         assert!(recalled.contains("Archive lines: 1-3"), "{recalled}");
+    }
+
+    #[test]
+    fn unpressured_projection_recalls_without_omitting_recoverable_metadata() {
+        // Without token pressure the projection must keep its existing
+        // recoverable body text and only gain additive archive recall:
+        // omission (representative selection + index replacement) is the
+        // pressured path.
+        let fixture = RecallFixture::new();
+        let archive_dir = fixture.0.join("folded-tool-groups");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(
+            archive_dir.join("recall-topic.md"),
+            "folded evidence\nledger_router gamma decision\nsource C",
+        )
+        .unwrap();
+        let mut projected = vec![message("system", "system stays exact")];
+        for index in 0..16 {
+            projected.push(checkpoint(index, "unrelated archived topic", 1_200));
+        }
+        projected.push(message(
+            ROLE_INTERNAL_NOTE,
+            "compressed_tool_round: 1 tool calls (folded for context budget)\n\
+             [compressed-tool-evidence]\n\
+             - archive_file_path: session-asset:folded-tool-groups/recall-topic.md\n\
+             assistant_checkpoint: folded evidence",
+        ));
+        projected.push(message("user", "ledger_router continue"));
+        let before = projected.clone();
+
+        let stats = apply_query_aware_memory_projection_with_context(
+            &mut projected,
+            100_000,
+            &fixture.0,
+            "",
+            false,
+        );
+
+        assert_eq!(stats.removed_messages, 0);
+        for original in &before {
+            let text = value_to_string(&original.content);
+            assert!(
+                projected
+                    .iter()
+                    .any(|message| value_to_string(&message.content) == text),
+                "unpressured projection must keep recoverable body text: {text:.80}"
+            );
+        }
+        let recalled = recalled_text(&projected);
+        assert!(
+            recalled.contains("ledger_router"),
+            "additive recall must still run without pressure: {recalled}"
+        );
     }
 
     #[test]

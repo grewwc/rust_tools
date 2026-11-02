@@ -176,6 +176,55 @@ pub(crate) fn subagent_terminal_statuses(
     statuses
 }
 
+/// Validate a `send_side_note` target before queueing the note.
+/// Foreground targets need no validation and always pass. A concrete task id
+/// must name an active subagent owned by the current session/process, and the
+/// subagent must not have published its final result yet.
+pub(crate) fn validate_side_note_target(task_id: &str) -> Result<(), String> {
+    let trimmed = task_id.trim();
+    if trimmed.is_empty() || trimmed == "foreground" {
+        return Ok(());
+    }
+    let session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
+    let owner_pid_opt = current_task_owner_pid_opt();
+    let entry = with_task_entry(trimmed, |entry| entry.clone()).ok_or_else(|| {
+        format!(
+            "Unknown task_id `{trimmed}`: no active subagent with this id in the current session."
+        )
+    })?;
+    if entry.session_id != session_id {
+        return Err(format!(
+            "Refusing side-note to task_id `{trimmed}` owned by another session."
+        ));
+    }
+    if let Some(owner_pid) = owner_pid_opt
+        && entry.owner_pid != owner_pid
+    {
+        return Err(format!(
+            "Refusing side-note to task_id `{trimmed}` not owned by current process pid={owner_pid}."
+        ));
+    }
+    let finished_status = match with_os_kernel(|os| {
+        if let Some(result) = read_task_result(os, entry.result_channel_id, false)? {
+            return Ok(Some(result.status));
+        }
+        if is_task_pending(os, entry.pid)? {
+            Ok(None)
+        } else {
+            Ok(Some(task_state_string(os, entry.result_channel_id, entry.pid)?))
+        }
+    }) {
+        Ok(status) => status,
+        Err(_) => return Ok(()),
+    };
+    if let Some(status) = finished_status {
+        return Err(format!(
+            "Task `{trimmed}` already finished (status={status}); a side-note would never be seen. Spawn a follow-up task or use `task_retry` for a new linked attempt instead."
+        ));
+    }
+    Ok(())
+}
+
 /// Remove a task entry from the registry. Called by the synchronous `task`
 /// interception once it has consumed the result.
 pub(crate) fn remove_task_entry(task_id: &str) -> Option<AsyncTaskEntry> {

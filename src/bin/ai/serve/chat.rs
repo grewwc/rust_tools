@@ -2702,8 +2702,10 @@ mod serve_history_tests {
 /// arrive, `delta` events (live body chunks) print without a trailing
 /// newline, thinking frames collapse into one live status line while the
 /// block is open and print only the `✓ thinking (N lines)` summary on close
-/// (local-fold parity: the body is discarded), error events abort with
-/// the server detail, the done event (or the end of the body) ends the turn.
+/// (local-fold parity: the body is discarded), subagent progress redraws one
+/// clamped live row in place instead of appending scrollback, error events
+/// abort with the server detail, and the done event (or the end of the body)
+/// ends the turn.
 fn render_turn_stream(resp: reqwest::blocking::Response) -> Result<(), Box<dyn std::error::Error>> {
     render_turn_stream_with_confirm(resp, None)
 }
@@ -2758,6 +2760,10 @@ fn render_turn_stream_to_with_confirm(
     let mut thinking_body = String::new();
     let mut answer_pending = false;
     let mut answer_pending_drawn = false;
+    // Whether the subagent progress row is the one currently painted on the
+    // terminal's active row. Like the thinking/answer-pending lines it is a
+    // transient live row, never scrollback: each frame redraws it in place.
+    let mut subagent_status_drawn = false;
     // Whether the cursor sits mid-line (answer delta without a trailing
     // newline, or a live thinking status). Footer/message lines must start
     // on a fresh row instead of gluing onto the answer's last line.
@@ -2798,6 +2804,17 @@ fn render_turn_stream_to_with_confirm(
             continue;
         };
         let payload = data.strip_prefix(' ').unwrap_or(data);
+        // The subagent status occupies the active row, so any event that
+        // renders output or ends the turn supersedes it. Clear it first so
+        // answer/footer bytes never land on top of a stale progress row.
+        // `tool` frames are display-only and `confirm_done` renders nothing,
+        // so keeping the row through them avoids needless flicker.
+        if !matches!(
+            event_kind.as_str(),
+            "subagent_progress" | "tool" | "confirm_done"
+        ) {
+            hide_subagent_status(&mut subagent_status_drawn, &mut line_open, tty, out);
+        }
         match event_kind.as_str() {
             "error" => {
                 // Best effort: surface the partial answer before failing.
@@ -3095,6 +3112,23 @@ fn render_turn_stream_to_with_confirm(
                 }
                 streamed_body = text;
             }
+            "subagent_progress" => {
+                // Serve frames carry the whole parent-observed status line
+                // (several subagents, plans, elapsed counters). Painting each
+                // frame as an observer row leaves one wrapped copy per
+                // scheduler tick in the scrollback, so render it as a single
+                // in-place live row instead, exactly like the local TTY
+                // status line.
+                show_subagent_status(
+                    payload,
+                    &mut subagent_status_drawn,
+                    answer_pending_drawn,
+                    thinking_active,
+                    &mut line_open,
+                    tty,
+                    out,
+                );
+            }
             _ => {
                 // Same ordering guarantee as the `delta` arm: observer footers
                 // arriving while a fold is still open must not slip between the
@@ -3155,6 +3189,7 @@ fn render_turn_stream_to_with_confirm(
         }
     }
     // Stream ended without a `done` event: same end-of-turn flush.
+    hide_subagent_status(&mut subagent_status_drawn, &mut line_open, tty, out);
     hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
     if tty {
         let _ = markdown.flush_pending_to(out);
@@ -3295,6 +3330,57 @@ fn show_answer_pending_status(
 }
 
 fn hide_answer_pending_status(
+    drawn: &mut bool,
+    line_open: &mut bool,
+    tty: bool,
+    out: &mut dyn std::io::Write,
+) {
+    if !*drawn {
+        return;
+    }
+    if tty {
+        let _ = write!(out, "\r\x1b[K");
+        let _ = out.flush();
+    }
+    *drawn = false;
+    *line_open = false;
+}
+
+/// Paint the parent-observed subagent status as one transient terminal row.
+///
+/// The payload is the whole scheduler status line: several subagent details,
+/// plans, elapsed counters, and a `+N more` tail. It easily exceeds the
+/// terminal width, and the elapsed counters change on every scheduler tick.
+/// Writing it as an observer footer therefore stacks one wrapped copy per tick
+/// in the scrollback. Clamp it to a single physical row and redraw it in place
+/// instead, matching the local TTY status line. Piped output stays clean: the
+/// progress row is terminal-only and is never part of the captured transcript.
+///
+/// The row must not overwrite real output or another live status:
+/// - `thinking_active` / `answer_pending_drawn` own the active row;
+/// - `line_open` without our own row means a body delta is mid-line.
+fn show_subagent_status(
+    text: &str,
+    drawn: &mut bool,
+    answer_pending_drawn: bool,
+    thinking_active: bool,
+    line_open: &mut bool,
+    tty: bool,
+    out: &mut dyn std::io::Write,
+) {
+    if !tty || thinking_active || answer_pending_drawn || (*line_open && !*drawn) {
+        return;
+    }
+    let row = crate::ai::stream::clamp_line_to_terminal_row_with_reserve(&format!("◌ {text}"), 0);
+    let _ = write!(out, "\r\x1b[K{}", dim(&row, true));
+    let _ = out.flush();
+    *drawn = true;
+    *line_open = true;
+}
+
+/// Clear the in-place subagent status row before other output claims the
+/// active line. No-op when the row was never painted.
+fn hide_subagent_status(
     drawn: &mut bool,
     line_open: &mut bool,
     tty: bool,
@@ -4787,6 +4873,39 @@ mod tests {
         assert!(tty.contains("finalizing response…"));
         assert!(tty.contains("\r\x1b[K"));
         assert!(tty.contains("accepted answer"));
+    }
+
+    #[test]
+    fn sse_subagent_progress_is_an_in_place_live_row() {
+        // The scheduler republishes the whole status line whenever the elapsed
+        // counters change, so appending frames as footer rows stacks one
+        // wrapped copy per tick in the scrollback. The client must redraw a
+        // single live row instead, and piped captures must stay clean.
+        let body = "event: subagent_progress\ndata: subagents · 1 active · worker 5s running (sharp)\n\nevent: subagent_progress\ndata: subagents · 1 active · worker 6s running (sharp)\n\nevent: delta\ndata: {\"delta\": \"answer\"}\n\nevent: done\ndata: \n\n";
+
+        let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+        let mut piped = Vec::new();
+        render_turn_stream_to(resp, &mut piped, false).expect("render piped");
+        assert_eq!(
+            String::from_utf8(piped).expect("utf8"),
+            "answer\n",
+            "live progress must not enter piped scrollback"
+        );
+
+        let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+        let mut tty = Vec::new();
+        render_turn_stream_to(resp, &mut tty, true).expect("render tty");
+        let tty = String::from_utf8(tty).expect("utf8");
+        assert_eq!(
+            tty.matches("\r\x1b[K\x1b[2m◌ subagents · 1 active").count(),
+            2,
+            "each frame redraws the live row: {tty:?}"
+        );
+        assert!(
+            !tty.contains("(sharp)\n"),
+            "status must never become a scrollback row: {tty:?}"
+        );
+        assert!(tty.contains("answer"), "missing body: {tty:?}");
     }
 
     #[test]

@@ -654,7 +654,13 @@ fn context_projection_fingerprint(
     // `scope=tool_outputs` search with a directory-level `file_pattern` instead
     // of a full `scope=all` scan; old projection snapshots keep serving the stale
     // broad guidance, so they must be invalidated and rebuilt.
-    const PROJECTION_VERSION: u8 = 17;
+    // v18: execute_command archive reuse requires the archived bytes to equal
+    // the result text (a transformed/multi-input command no longer reuses one
+    // input file as its full output), and persisted summary drafts reserve
+    // budget for the newest correction/pending tasks before older history.
+    // Snapshots built under v17 may carry a mislabeled archive pointer or a
+    // draft that dropped the latest intent, so they must be rebuilt.
+    const PROJECTION_VERSION: u8 = 18;
     projection_cache_key(
         PROJECTION_VERSION,
         history_max_chars,
@@ -1066,31 +1072,32 @@ mod tests {
     }
 
     #[test]
-    fn projection_cache_key_is_versioned_and_v17_never_reuses_v16_snapshots() {
+    fn projection_cache_key_is_versioned_and_v18_never_reuses_v17_snapshots() {
         let params = (
             8_000usize,
             2usize,
             4_000usize,
             Some(Path::new("/sessions/example/archives")),
         );
-        let v16_key = projection_cache_key(16, params.0, params.1, params.2, params.3);
         let v17_key = projection_cache_key(17, params.0, params.1, params.2, params.3);
+        let v18_key = projection_cache_key(18, params.0, params.1, params.2, params.3);
         assert_ne!(
-            v16_key,
             v17_key,
+            v18_key,
             "identical projection parameters must not collide across projection versions"
         );
-        assert!(v16_key.starts_with("v16|"));
         assert!(v17_key.starts_with("v17|"));
+        assert!(v18_key.starts_with("v18|"));
         // The live fingerprint must carry the current version, so a snapshot
-        // materialized under v16 (which served the broad scope=all recovery
-        // guidance for archived internal notes) can no longer be looked up after
-        // the v17 narrow-search prompt change. Updating the v17 literal is a
+        // materialized under v17 (which could mislabel a transformed command
+        // result with its input archive, or drop the latest correction from
+        // the persisted summary draft) can no longer be looked up after the
+        // v18 reuse-gate and newest-first budget change. Updating the v18 literal is a
         // deliberate tripwire for the next projection-strategy change.
         let live = context_projection_fingerprint(params.0, params.1, params.2, params.3);
         assert_eq!(
             live,
-            projection_cache_key(17, params.0, params.1, params.2, params.3)
+            projection_cache_key(18, params.0, params.1, params.2, params.3)
         );
     }
 

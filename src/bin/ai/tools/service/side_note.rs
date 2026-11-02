@@ -1,4 +1,4 @@
-// lead-agent -> subagent 实时 side-note 工具服务
+// Lead-agent to subagent real-time side-note tool service.
 use serde_json::Value;
 
 use crate::ai::{
@@ -6,8 +6,9 @@ use crate::ai::{
     types::ToolResult,
 };
 
-/// ToolSpec 适配：`ToolSpec.execute` 签名是 `fn(&Value) -> Result<String, String>`，
-/// 直接返回模型可见的成功文案，`ToolResult` 的包装由 registry 通用路径完成。
+/// ToolSpec adapter: `ToolSpec.execute` returns `Result<String, String>` with
+/// model-visible text directly; the `ToolResult` wrapper is added by the
+/// shared registry path.
 pub(crate) fn execute_send_side_note(args: &Value) -> Result<String, String> {
     let note = args
         .get("note")
@@ -30,6 +31,13 @@ pub(crate) fn execute_send_side_note(args: &Value) -> Result<String, String> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+
+    // Fail fast for unknown, foreign, or already-finished task targets so the
+    // caller does not mistake an unconsumed queue file for a delivered note.
+    // Foreground targets pass through without registry validation.
+    if let Some(target_id) = target.as_deref() {
+        crate::ai::tools::task_tools::validate_side_note_target(target_id)?;
+    }
 
     let history_file = runtime_ctx::try_current()
         .map(|ctx| ctx.app_proto.session_history_file.clone())

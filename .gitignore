@@ -28,3 +28,4 @@ history.sqlite-*
 /android/**/local.properties
 /android/**/dist/*
 !/android/a-serve/dist/a-serve.apk
+context-effect-audit-*
