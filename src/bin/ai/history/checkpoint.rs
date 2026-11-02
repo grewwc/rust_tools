@@ -2387,6 +2387,7 @@ fn copy_directory_snapshot_impl(
     _parent: Option<&SnapshotBase>,
     _scope: SnapshotScope,
 ) -> io::Result<SnapshotCopy> {
+    let destination_path = destination;
     let source = CString::new(source.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "asset path contains NUL"))?;
     let destination = CString::new(destination.as_os_str().as_bytes())
@@ -2429,7 +2430,7 @@ fn copy_directory_snapshot_impl(
     }
     Ok(SnapshotCopy {
         copied: u64::try_from(copied).unwrap_or(0),
-        logical: directory_storage_size(destination)?,
+        logical: directory_storage_size(destination_path)?,
         index_bytes: 0,
     })
 }
