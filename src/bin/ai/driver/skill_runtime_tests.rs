@@ -742,6 +742,45 @@ fn system_prompt_pins_impact_surface_workflow() {
 }
 
 #[test]
+fn system_prompt_pins_invariant_discharge_workflow() {
+    // Static derivation is a first-class verification method, but only when the
+    // invariant is stated and discharged by a named rule. Pin the rule names, the
+    // proof-scope limit (one branch proves nothing about unread branches), the
+    // anti-patterns that stand in for a derivation, and the proportionality rule
+    // that keeps local edits from paying for a full enumeration.
+    for ctx in [
+        PromptContext::default(),
+        PromptContext {
+            goal_mode: Some("finish the goal".to_string()),
+            is_background: false,
+        },
+    ] {
+        let prompt = build_system_prompt(None, &[], &Box::new(SkipSet::new(16)), &ctx)
+            .render_system_prompt();
+        for phrase in [
+            "**Invariants with discharge.**",
+            "state — at whatever depth the risk warrants — what must remain true afterwards in falsifiable form",
+            "`binding`",
+            "`enumeration`",
+            "`substitution`",
+            "`induction`",
+            "`case`",
+            "A proof is only as wide as what was actually read",
+            "\"By construction\"",
+            "an unrun \"the compiler/tests will catch it\" is not a discharge",
+            "**Depth follows coupling, not diff size.**",
+            "Every change still gets the invariant question",
+            "never inspected",
+        ] {
+            assert!(
+                prompt.contains(phrase),
+                "invariant-discharge contract missing phrase: {phrase}"
+            );
+        }
+    }
+}
+
+#[test]
 fn system_prompt_bridges_compressed_context_recovery_via_search_overflow() {
     // search_overflow is a core resident tool but must be explicitly bridged to the compression pipeline:
     // Historical absence claims need the archive; current-state claims need current evidence.
