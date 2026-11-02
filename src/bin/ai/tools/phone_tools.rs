@@ -20,13 +20,16 @@ const MAX_DESCRIPTION_CHARS: usize = 1_000;
 const MAX_SMS_CHARS: usize = 1_000;
 const MAX_CONTACT_CHARS: usize = 120;
 const MAX_NUMBER_CHARS: usize = 40;
+const MAX_PHONE_QUERY_CHARS: usize = 200;
+const MAX_PHONE_ROWS: i64 = 20;
 const MAX_SEARCH_QUERY_CHARS: usize = 500;
 const MAX_SEARCH_RESULTS: i64 = 10;
 // A full page of 20 notes, including JSON escaping, fits without losing bodies.
 const MAX_RESULT_BYTES: usize = 512 * 1024;
 const MAX_FILE_CHARS: i64 = 1_048_576;
 const PHONE_ACTIONS: &str = "now, calendar_read, calendar_add, sms, alarm, timer, note, \
-    location, note_create, note_list, note_update, file_import, file_read, file_save, phone_search, \
+    location, note_create, note_list, note_update, contacts_read, contact_add, call_history, call, \
+    file_import, file_read, file_save, phone_search, \
     screen_capture, screen_stop, camera_capture, camera_stop";
 
 /// Camera budget for one response.
@@ -183,6 +186,14 @@ fn is_dialable(value: &str) -> bool {
             .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | ' ' | '(' | ')' | '.'))
 }
 
+fn is_blocked_emergency(value: &str) -> bool {
+    let digits: String = value.chars().filter(char::is_ascii_digit).collect();
+    matches!(
+        digits.as_str(),
+        "000" | "110" | "112" | "119" | "120" | "122" | "911" | "999"
+    )
+}
+
 /// Validate and normalize one phone action. Only the fields the Android bridge
 /// understands survive, so a model cannot smuggle an arbitrary intent through
 /// the action name.
@@ -294,18 +305,12 @@ fn build_phone_spec(args: &Value) -> Result<Value, String> {
                 .map(str::trim)
                 .filter(|query| !query.is_empty())
                 .ok_or("'query' must contain the search text")?;
-            let engine = string_arg(args, "engine", 20)?
-                .unwrap_or("bing")
-                .to_ascii_lowercase();
-            if !matches!(engine.as_str(), "google" | "bing" | "baidu" | "duckduckgo") {
-                return Err(
-                    "'engine' must be google, bing, baidu, or duckduckgo".to_string()
-                );
-            }
+            // Search-engine selection is runtime policy, not model input. Keep
+            // stale schemas and unsolicited extra arguments from overriding it.
             Ok(json!({
                 "action": "phone_search",
                 "query": query,
-                "engine": engine,
+                "engine": "quark",
                 "max": integer_arg(args, "max", Some(5), 1, MAX_SEARCH_RESULTS)?,
             }))
         }
@@ -416,6 +421,71 @@ fn build_phone_spec(args: &Value) -> Result<Value, String> {
                 "number": number,
                 "text": text,
             }))
+        }
+        "contacts_read" => Ok(json!({
+            "action": "contacts_read",
+            "query": string_arg(args, "query", MAX_PHONE_QUERY_CHARS)?.unwrap_or(""),
+            "max": integer_arg(args, "max", Some(10), 1, MAX_PHONE_ROWS)?,
+            "offset": integer_arg(args, "offset", Some(0), 0, 100_000)?,
+        })),
+        "contact_add" => {
+            let name = bounded_string(args, "name", MAX_CONTACT_CHARS)
+                .trim()
+                .to_string();
+            let number = bounded_string(args, "number", MAX_NUMBER_CHARS)
+                .trim()
+                .to_string();
+            let digits = number.chars().filter(|c| c.is_ascii_digit()).count();
+            if name.is_empty() {
+                return Err("contact_add requires a nonblank 'name'".to_string());
+            }
+            if !is_dialable(&number) || digits < 3 {
+                return Err("'number' must contain at least three digits and only + - ( ) . spaces".to_string());
+            }
+            Ok(json!({"action": "contact_add", "name": name, "number": number}))
+        }
+        "call_history" => {
+            let call_type = string_arg(args, "call_type", 32)?.unwrap_or("all");
+            if !matches!(
+                call_type,
+                "all"
+                    | "incoming"
+                    | "outgoing"
+                    | "missed"
+                    | "voicemail"
+                    | "rejected"
+                    | "blocked"
+                    | "answered_externally"
+            ) {
+                return Err("'call_type' must be all, incoming, outgoing, missed, voicemail, rejected, blocked, or answered_externally".to_string());
+            }
+            Ok(json!({
+                "action": "call_history",
+                "call_type": call_type,
+                "max": integer_arg(args, "max", Some(10), 1, MAX_PHONE_ROWS)?,
+                "offset": integer_arg(args, "offset", Some(0), 0, 100_000)?,
+            }))
+        }
+        "call" => {
+            let contact = bounded_string(args, "contact", MAX_CONTACT_CHARS)
+                .trim()
+                .to_string();
+            let number = bounded_string(args, "number", MAX_NUMBER_CHARS)
+                .trim()
+                .to_string();
+            if contact.is_empty() == number.is_empty() {
+                return Err("call requires exactly one of 'contact' or 'number'".to_string());
+            }
+            if !number.is_empty() {
+                let digits = number.chars().filter(|c| c.is_ascii_digit()).count();
+                if !is_dialable(&number) || digits < 3 {
+                    return Err("'number' must contain at least three digits and only + - ( ) . spaces".to_string());
+                }
+                if is_blocked_emergency(&number) {
+                    return Err("emergency numbers cannot be called by the agent".to_string());
+                }
+            }
+            Ok(json!({"action": "call", "contact": contact, "number": number}))
         }
         "" => Err(format!("'action' is required: {PHONE_ACTIONS}")),
         other => Err(format!(
@@ -539,7 +609,8 @@ fn format_phone_result(spec: &Value, answer: &str) -> Result<String, String> {
         };
         return Ok(format!("Phone image saved to {}. Use read_file on this path to inspect the image before answering. {moment} {closing}", path.display()));
     }
-    if matches!(action, "note_create" | "note_list" | "note_update" | "file_import" | "file_read" | "file_save") && !data.is_object() {
+    if matches!(action, "note_create" | "note_list" | "note_update" | "file_import" |
+        "file_read" | "file_save" | "contacts_read" | "call_history" | "call") && !data.is_object() {
         return Err("the phone returned no result data; the action outcome is unknown".to_string());
     }
     let summary: Result<String, String> = match action {
@@ -652,6 +723,29 @@ fn format_phone_result(spec: &Value, answer: &str) -> Result<String, String> {
             Ok(format!(
                 "Created calendar event \"{title}\" at {begin} on the phone's {calendar} \
                  calendar."
+            ))
+        }
+        "contacts_read" => Ok(
+            "Phone contacts page. It contains only display names, phone numbers, and number types; use next_offset only when has_more is true."
+                .to_string(),
+        ),
+        "contact_add" => {
+            let name = data.get("name").and_then(Value::as_str).unwrap_or("");
+            let number = data.get("number").and_then(Value::as_str).unwrap_or("");
+            Ok(format!(
+                "The user confirmed and Android inserted contact {name} ({number}) into the phone contacts provider."
+            ))
+        }
+        "call_history" => Ok(
+            "Phone call-history page. Times and durations are Android call-log values; use next_offset only when has_more is true."
+                .to_string(),
+        ),
+        "call" => {
+            let name = data.get("contact").and_then(Value::as_str).unwrap_or("");
+            let number = data.get("number").and_then(Value::as_str).unwrap_or("");
+            let target = if name.is_empty() { number.to_string() } else { format!("{name} ({number})") };
+            Ok(format!(
+                "The user confirmed and Android dispatched a direct call to {target}. Dispatch does not prove that the call connected."
             ))
         }
         "phone_search" => {
@@ -821,7 +915,61 @@ mod tests {
     }
 
     #[test]
-    fn phone_search_accepts_only_allowlisted_engines_and_bounds() {
+    fn phone_records_and_calls_are_bounded_and_safe() {
+        assert_eq!(
+            build_phone_spec(&json!({"action": "contacts_read", "query": "张", "max": 20, "offset": 100_000})).unwrap(),
+            json!({"action": "contacts_read", "query": "张", "max": 20, "offset": 100_000})
+        );
+        assert_eq!(
+            build_phone_spec(&json!({"action": "contact_add", "name": " 张三 ", "number": "+86 (138) 0013-8000"})).unwrap(),
+            json!({"action": "contact_add", "name": "张三", "number": "+86 (138) 0013-8000"})
+        );
+        assert_eq!(
+            build_phone_spec(&json!({"action": "call_history", "call_type": "missed"})).unwrap(),
+            json!({"action": "call_history", "call_type": "missed", "max": 10, "offset": 0})
+        );
+        assert_eq!(
+            build_phone_spec(&json!({"action": "call", "contact": "张三"})).unwrap(),
+            json!({"action": "call", "contact": "张三", "number": ""})
+        );
+        assert_eq!(
+            build_phone_spec(&json!({"action": "call", "number": "+86 (138) 0013-8000"})).unwrap(),
+            json!({"action": "call", "contact": "", "number": "+86 (138) 0013-8000"})
+        );
+        for args in [
+            json!({"action": "contacts_read", "max": 21}),
+            json!({"action": "contacts_read", "query": "x".repeat(201)}),
+            json!({"action": "contact_add", "name": "", "number": "10086"}),
+            json!({"action": "contact_add", "name": "张三", "number": "12"}),
+            json!({"action": "contact_add", "name": "张三", "number": "123;456"}),
+            json!({"action": "call_history", "call_type": "other"}),
+            json!({"action": "call_history", "offset": 100_001}),
+            json!({"action": "call"}),
+            json!({"action": "call", "contact": "张三", "number": "10086"}),
+            json!({"action": "call", "number": "12"}),
+            json!({"action": "call", "number": "110"}),
+            json!({"action": "call", "number": "123;456"}),
+        ] {
+            assert!(build_phone_spec(&args).is_err(), "{args}");
+        }
+
+        let answer = json!({"ok": true, "data": {
+            "offset": 0, "next_offset": 1, "has_more": false,
+            "contacts": [{"contact_id": 7, "name": "张三", "number": "10086", "type": "mobile"}]
+        }}).to_string();
+        let text = format_phone_result(&json!({"action": "contacts_read"}), &answer).unwrap();
+        assert!(text.contains("张三"));
+        assert!(text.contains("next_offset"));
+        let added = format_phone_result(
+            &json!({"action": "contact_add"}),
+            &json!({"ok": true, "data": {"name": "张三", "number": "10086"}}).to_string(),
+        ).unwrap();
+        assert!(added.contains("confirmed"));
+        assert!(added.contains("张三 (10086)"));
+    }
+
+    #[test]
+    fn phone_search_forces_quark_and_bounds() {
         assert_eq!(
             build_phone_spec(&json!({
                 "action": "phone_search",
@@ -832,16 +980,31 @@ mod tests {
             json!({
                 "action": "phone_search",
                 "query": "rust async",
-                "engine": "bing",
+                "engine": "quark",
                 "max": 5
             })
         );
+        for engine in [json!("baidu"), json!("arbitrary"), json!(1), Value::Null] {
+            assert_eq!(
+                build_phone_spec(&json!({
+                    "action": "phone_search",
+                    "query": "rust",
+                    "engine": engine,
+                })).unwrap(),
+                json!({
+                    "action": "phone_search",
+                    "query": "rust",
+                    "engine": "quark",
+                    "max": 5
+                })
+            );
+        }
         assert_eq!(
             build_phone_spec(&json!({"action": "phone_search", "query": "中文"})).unwrap(),
             json!({
                 "action": "phone_search",
                 "query": "中文",
-                "engine": "bing",
+                "engine": "quark",
                 "max": 5
             })
         );
@@ -849,8 +1012,6 @@ mod tests {
             json!({"action": "phone_search"}),
             json!({"action": "phone_search", "query": " "}),
             json!({"action": "phone_search", "query": "x".repeat(501)}),
-            json!({"action": "phone_search", "query": "x", "engine": "arbitrary"}),
-            json!({"action": "phone_search", "query": "x", "engine": 1}),
             json!({"action": "phone_search", "query": "x", "max": 0}),
             json!({"action": "phone_search", "query": "x", "max": 11}),
             json!({"action": "phone_search", "query": "x", "max": "5"}),
@@ -984,6 +1145,11 @@ mod tests {
     fn phone_description_and_backend_actions_stay_in_sync() {
         let description: Value = serde_json::from_str(include_str!("../tool_descriptions/phone_action.json")).unwrap();
         assert_eq!(description["groups"], json!(["phone"]));
+        assert!(description["parameters"]["properties"]["engine"].is_null());
+        assert!(description["description"]
+            .as_str()
+            .unwrap()
+            .contains("use phone_search before server-side web_search"));
         let fixtures = [
             json!({"action": "now"}),
             json!({"action": "calendar_read"}),
@@ -996,6 +1162,10 @@ mod tests {
             json!({"action": "note_create", "text": "body"}),
             json!({"action": "note_list"}),
             json!({"action": "note_update", "entry_id": ID, "completed": false}),
+            json!({"action": "contacts_read"}),
+            json!({"action": "contact_add", "name": "张三", "number": "10086"}),
+            json!({"action": "call_history"}),
+            json!({"action": "call", "number": "10086"}),
             json!({"action": "file_import"}),
             json!({"action": "file_read", "file_id": ID}),
             json!({"action": "file_save", "filename": "a.txt", "text": "body"}),

@@ -65,9 +65,16 @@ This version reads UTF-8 text, Markdown, CSV, JSON, and XML up to 1 MiB, in
 file handles expire when the app process exits; reimport to read again. File
 save uses the system create-document picker and accepts up to 3000 characters.
 
-`phone_search` (1.16.0) opens a visible in-app search page for one query and
-returns up to ten extracted result entries marked untrusted. Google, Bing,
-Baidu, and DuckDuckGo are allowlisted; the URL template is fixed on the device.
+Phone contacts and call history use Android's runtime permissions and bounded
+pages. Adding a contact accepts one display name and one phone number, shows a
+native confirmation, and inserts the raw contact, name, and number in one
+ContactsProvider batch. Direct calls likewise require a native confirmation;
+successful dispatch does not prove that the call connected.
+
+`phone_search` (1.16.2) opens a visible in-app search page for one query and
+returns up to ten extracted result entries marked untrusted. Agent-triggered
+searches are pinned to Quark; the server discards any stale or unsolicited
+engine override before invoking the fixed on-device URL template.
 The page loads in a dedicated WebView without the app's JavaScript bridge, and
 result links open in the system browser, so the app never drives or reads
 another app's browser. When the engine shows a consent or CAPTCHA page, the

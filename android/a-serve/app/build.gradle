@@ -16,8 +16,8 @@ android {
         applicationId "com.grewwc.aserve"
         minSdk 26
         targetSdk 33
-        versionCode 22
-        versionName "1.16.1"
+        versionCode 25
+        versionName "1.16.4"
         buildConfigField "String", "DEFAULT_SERVER_URL", "\"${escapedServeUrl}\""
     }
 

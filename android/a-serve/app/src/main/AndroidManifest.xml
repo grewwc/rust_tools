@@ -16,9 +16,13 @@
     <!-- Calendar events the user asks the agent to read or create. -->
     <uses-permission android:name="android.permission.READ_CALENDAR" />
     <uses-permission android:name="android.permission.WRITE_CALENDAR" />
-    <!-- Contact lookup only resolves a display name to a number; the message
-         is composed by the user's messaging app, never sent from here. -->
+    <!-- Contact reads and confirmed inserts run only through bounded foreground phone actions. -->
     <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-permission android:name="android.permission.WRITE_CONTACTS" />
+    <!-- Call history is read-only and paged; direct calls still require a
+         visible native confirmation after this runtime permission is granted. -->
+    <uses-permission android:name="android.permission.READ_CALL_LOG" />
+    <uses-permission android:name="android.permission.CALL_PHONE" />
     <!-- The camera preview stays in this app: the frame is handed to the
          assistant in memory and never written to the gallery. -->
     <uses-permission android:name="android.permission.CAMERA" />

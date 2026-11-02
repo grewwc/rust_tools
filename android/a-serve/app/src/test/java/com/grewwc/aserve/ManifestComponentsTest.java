@@ -12,6 +12,8 @@ import org.w3c.dom.NodeList;
 
 /** Manifest components are constructed by Android, outside the app's package. */
 public final class ManifestComponentsTest {
+    private static final String ANDROID_NS = "http://schemas.android.com/apk/res/android";
+
     @Test
     public void frameworkComponentsArePublicWithPublicNoArgConstructors() throws Exception {
         DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
@@ -23,7 +25,7 @@ public final class ManifestComponentsTest {
             NodeList components = manifest.getElementsByTagName(tag);
             for (int i = 0; i < components.getLength(); i++) {
                 String name = ((Element) components.item(i)).getAttributeNS(
-                        "http://schemas.android.com/apk/res/android", "name");
+                        ANDROID_NS, "name");
                 if (name.isEmpty()) continue;
                 if (name.startsWith(".")) name = BuildConfig.APPLICATION_ID + name;
                 else if (!name.contains(".")) name = BuildConfig.APPLICATION_ID + "." + name;
@@ -37,5 +39,29 @@ public final class ManifestComponentsTest {
             }
         }
         assertTrue("the manifest component list must not be empty", checked > 0);
+    }
+
+    @Test
+    public void phoneDataAndCallPermissionsAreDeclared() throws Exception {
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        factory.setNamespaceAware(true);
+        Element manifest = factory.newDocumentBuilder().parse(
+                Paths.get("src", "main", "AndroidManifest.xml").toFile()).getDocumentElement();
+        NodeList permissions = manifest.getElementsByTagName("uses-permission");
+        for (String required : new String[] {
+                "android.permission.READ_CONTACTS",
+                "android.permission.WRITE_CONTACTS",
+                "android.permission.READ_CALL_LOG",
+                "android.permission.CALL_PHONE"
+        }) {
+            boolean found = false;
+            for (int i = 0; i < permissions.getLength(); i++) {
+                if (required.equals(((Element) permissions.item(i)).getAttributeNS(ANDROID_NS, "name"))) {
+                    found = true;
+                    break;
+                }
+            }
+            assertTrue("missing manifest permission " + required, found);
+        }
     }
 }

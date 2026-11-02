@@ -375,7 +375,7 @@ public final class MainActivity extends Activity {
         }
         String query = payload == null ? "" : payload.optString("query", "").trim();
         String engine = SearchActivity.normalizeEngine(
-                payload == null ? null : payload.optString("engine", "bing"));
+                payload == null ? null : payload.optString("engine", "quark"));
         int max = payload == null ? 5 : payload.optInt("max", 5);
         if (query.isEmpty() || query.codePointCount(0, query.length()) > 500
                 || engine == null) {

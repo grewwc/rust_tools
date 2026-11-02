@@ -14,6 +14,7 @@ import android.net.Uri;
 import android.provider.AlarmClock;
 import android.provider.CalendarContract;
 import android.provider.ContactsContract;
+import android.telephony.PhoneNumberUtils;
 import android.webkit.JavascriptInterface;
 import android.widget.Toast;
 
@@ -37,7 +38,8 @@ import java.util.TimeZone;
  *
  * <p>Only allowlisted actions exist. The page never gets a generic
  * {@code startActivity}. Manual actions use native confirmation; chat-initiated
- * actions may skip it. Calls are rejected unless the loaded page
+ * actions may skip it, except direct calls, which always require confirmation.
+ * Calls are rejected unless the loaded page
  * still belongs to the configured server origin.</p>
  */
 final class NativeBridge {
@@ -45,7 +47,8 @@ final class NativeBridge {
 
     private static final String[] ACTIONS = {"now", "calendar_read", "calendar_add", "sms",
             "alarm", "timer", "note", "note_create", "note_list", "note_update",
-            "phone_search", "file_import", "file_read", "file_save", "location",
+            "contacts_read", "contact_add", "call_history", "call", "phone_search",
+            "file_import", "file_read", "file_save", "location",
             "screen_capture", "screen_stop", "screen_overlay_settings", "camera_capture",
             "camera_stop", "rebind_ime"};
     private static final int MAX_NOTE_CHARS = 3000;
@@ -60,6 +63,7 @@ final class NativeBridge {
     private boolean foreground;
     private ForegroundLocation locationRequest;
     private final java.util.concurrent.ExecutorService notebookWorker = java.util.concurrent.Executors.newSingleThreadExecutor();
+    private final java.util.concurrent.ExecutorService phoneWorker = java.util.concurrent.Executors.newSingleThreadExecutor();
     private LocalNotebook notebook;
 
     NativeBridge(MainActivity activity) {
@@ -79,6 +83,7 @@ final class NativeBridge {
         onHostPause();
         notebookWorker.execute(() -> { if (notebook != null) notebook.close(); });
         notebookWorker.shutdown();
+        phoneWorker.shutdown();
     }
 
     /** Feature detection for the page; returns a JSON string. */
@@ -179,6 +184,12 @@ final class NativeBridge {
             addCalendarEvent(requestId, payload, auto);
         } else if ("sms".equals(action)) {
             composeSms(requestId, payload, auto);
+        } else if ("contacts_read".equals(action) || "call_history".equals(action)) {
+            readPhoneRecords(requestId, action, payload);
+        } else if ("contact_add".equals(action)) {
+            requestContactAdd(requestId, payload);
+        } else if ("call".equals(action)) {
+            requestCall(requestId, payload);
         } else if ("note_create".equals(action) || "note_list".equals(action) || "note_update".equals(action)) {
             String origin = activity.nativeOrigin();
             payload.remove("action");
@@ -247,6 +258,17 @@ final class NativeBridge {
             needed.add(Manifest.permission.WRITE_CALENDAR);
         } else if ("sms".equals(action) && payload.optString("contact", "").trim().length() > 0) {
             needed.add(Manifest.permission.READ_CONTACTS);
+        } else if ("contacts_read".equals(action)) {
+            needed.add(Manifest.permission.READ_CONTACTS);
+        } else if ("contact_add".equals(action)) {
+            needed.add(Manifest.permission.WRITE_CONTACTS);
+        } else if ("call_history".equals(action)) {
+            needed.add(Manifest.permission.READ_CALL_LOG);
+        } else if ("call".equals(action)) {
+            needed.add(Manifest.permission.CALL_PHONE);
+            if (payload.optString("contact", "").trim().length() > 0) {
+                needed.add(Manifest.permission.READ_CONTACTS);
+            }
         }
         List<String> missing = new ArrayList<>();
         for (String permission : needed) {
@@ -621,6 +643,135 @@ final class NativeBridge {
             return;
         }
         Toast.makeText(activity, "已加入日历：" + title, Toast.LENGTH_SHORT).show();
+        activity.deliverNativeResult(requestId, true, null, data);
+    }
+
+    private void readPhoneRecords(String requestId, String action, JSONObject payload) {
+        String origin = activity.nativeOrigin();
+        phoneWorker.execute(() -> {
+            try {
+                JSONObject data = "contacts_read".equals(action)
+                        ? PhoneRecords.readContacts(activity.getContentResolver(), payload)
+                        : PhoneRecords.readCallHistory(activity.getContentResolver(), payload);
+                activity.runOnUiThread(() -> {
+                    if (origin.equals(activity.nativeOrigin()) && activity.isTrustedPage())
+                        activity.deliverNativeResult(requestId, true, null, data);
+                });
+            } catch (SecurityException error) {
+                activity.runOnUiThread(() -> activity.deliverNativeResult(
+                        requestId, false, "phone data permission denied", null));
+            } catch (Exception error) {
+                activity.runOnUiThread(() -> activity.deliverNativeResult(
+                        requestId, false, "phone data unavailable", null));
+            }
+        });
+    }
+
+    private void requestContactAdd(String requestId, JSONObject payload) {
+        String name = payload.optString("name", "").trim();
+        String number = PhoneDataRules.normalizeDialable(payload.optString("number", "").trim());
+        if (name.isEmpty() || name.length() > MAX_CONTACT_CHARS || number == null) {
+            activity.deliverNativeResult(requestId, false, "invalid contact name or number", null);
+            return;
+        }
+        confirm(requestId, "添加联系人", "姓名：" + name + "\n号码：" + number
+                + "\n\n确认后会写入手机通讯录。", () -> insertContact(requestId, name, number));
+    }
+
+    private void insertContact(String requestId, String name, String number) {
+        String origin = activity.nativeOrigin();
+        phoneWorker.execute(() -> {
+            try {
+                JSONObject data = PhoneRecords.addContact(
+                        activity.getContentResolver(), name, number);
+                activity.runOnUiThread(() -> {
+                    if (!origin.equals(activity.nativeOrigin()) || !activity.isTrustedPage()) return;
+                    Toast.makeText(activity, "已添加联系人：" + name, Toast.LENGTH_SHORT).show();
+                    activity.deliverNativeResult(requestId, true, null, data);
+                });
+            } catch (SecurityException error) {
+                activity.runOnUiThread(() -> {
+                    if (origin.equals(activity.nativeOrigin()) && activity.isTrustedPage())
+                        activity.deliverNativeResult(
+                                requestId, false, "contacts permission denied", null);
+                });
+            } catch (Exception error) {
+                activity.runOnUiThread(() -> {
+                    if (origin.equals(activity.nativeOrigin()) && activity.isTrustedPage())
+                        activity.deliverNativeResult(
+                                requestId, false, "unable to add contact", null);
+                });
+            }
+        });
+    }
+
+    private void requestCall(String requestId, JSONObject payload) {
+        String contact = clamp(payload.optString("contact", ""), MAX_CONTACT_CHARS).trim();
+        String number = clamp(payload.optString("number", ""), MAX_NUMBER_CHARS).trim();
+        String name = "";
+        if (number.isEmpty()) {
+            if (contact.isEmpty()) {
+                activity.deliverNativeResult(requestId, false, "no contact or number", null);
+                return;
+            }
+            List<String[]> matches = findContactNumbers(contact);
+            if (matches.isEmpty()) {
+                activity.deliverNativeResult(requestId, false, "no contact matched", null);
+                return;
+            }
+            Set<String> distinct = new LinkedHashSet<>();
+            for (String[] match : matches) distinct.add(match[1]);
+            if (distinct.size() > 1) {
+                StringBuilder choices = new StringBuilder();
+                for (String[] match : matches) {
+                    if (choices.length() > 0) choices.append("; ");
+                    choices.append(match[0]).append(" ").append(match[1]);
+                }
+                activity.deliverNativeResult(requestId, false,
+                        "contact is ambiguous, pass 'number' explicitly: " + choices, null);
+                return;
+            }
+            name = matches.get(0)[0];
+            number = matches.get(0)[1];
+        }
+        String dialable = PhoneDataRules.normalizeDialable(number);
+        if (dialable == null) {
+            activity.deliverNativeResult(requestId, false, "invalid number", null);
+            return;
+        }
+        if (PhoneDataRules.isBlockedEmergency(dialable)
+                || PhoneNumberUtils.isEmergencyNumber(dialable)) {
+            activity.deliverNativeResult(requestId, false,
+                    "emergency numbers cannot be called by the agent", null);
+            return;
+        }
+        String finalName = name;
+        String finalNumber = dialable;
+        String target = name.isEmpty() ? dialable : name + "（" + dialable + "）";
+        confirm(requestId, "拨打电话", "即将直接拨打 " + target
+                        + "。通话可能产生费用。\n\n只有点击确认后才会呼出。",
+                () -> placeCall(requestId, finalName, finalNumber));
+    }
+
+    private void placeCall(String requestId, String name, String number) {
+        try {
+            Intent intent = new Intent(Intent.ACTION_CALL, Uri.fromParts("tel", number, null));
+            activity.startActivity(intent);
+        } catch (SecurityException error) {
+            activity.deliverNativeResult(requestId, false, "call permission denied", null);
+            return;
+        } catch (ActivityNotFoundException error) {
+            activity.deliverNativeResult(requestId, false, "no phone app available", null);
+            return;
+        }
+        JSONObject data = new JSONObject();
+        try {
+            data.put("dispatched", true);
+            data.put("contact", name);
+            data.put("number", number);
+        } catch (JSONException ignored) {
+            data = null;
+        }
         activity.deliverNativeResult(requestId, true, null, data);
     }
 

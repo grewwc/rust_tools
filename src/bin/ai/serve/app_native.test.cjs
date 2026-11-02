@@ -88,10 +88,14 @@ const phoneFixtures = {
   note_create: { action: "note_create", kind: "todo", title: "Shopping", text: "Buy milk" },
   note_list: { action: "note_list", query: "milk", kind: "todo", max: 10, offset: 0 },
   note_update: { action: "note_update", entry_id: "12345678-1234-1234-1234-123456789012", completed: true },
+  contacts_read: { action: "contacts_read", query: "张", max: 10, offset: 0 },
+  contact_add: { action: "contact_add", name: "张三", number: "+86 (138) 0013-8000" },
+  call_history: { action: "call_history", call_type: "all", max: 10, offset: 0 },
+  call: { action: "call", contact: "", number: "10086" },
   file_import: { action: "file_import" },
   file_read: { action: "file_read", file_id: "12345678-1234-1234-1234-123456789012", offset: 3000, limit: 3000 },
   file_save: { action: "file_save", filename: "summary.txt", text: "结果😀" },
-  phone_search: { action: "phone_search", query: "rust async runtime", engine: "bing", max: 5 },
+  phone_search: { action: "phone_search", query: "rust async runtime", engine: "quark", max: 5 },
   screen_capture: { action: "screen_capture" },
   screen_stop: { action: "screen_stop" },
   camera_capture: { action: "camera_capture" },
@@ -110,6 +114,11 @@ test("every advertised phone action has a valid browser payload", () => {
 
 test("new phone actions validate bounds without weakening old actions", () => {
   const app = load(), parse = spec => app.parsePhoneAction(JSON.stringify(spec));
+  assert.deepEqual(JSON.parse(JSON.stringify(parse({ action: "phone_search", query: "rust" }))),
+    { action: "phone_search", query: "rust", engine: "quark", max: 5 });
+  assert.deepEqual(JSON.parse(JSON.stringify(parse({
+    ...phoneFixtures.phone_search, engine: "baidu",
+  }))), phoneFixtures.phone_search);
   assert.deepEqual(Array.from(parse({ ...phoneFixtures.alarm, weekdays: [1, 2, 3, 4, 5] }).weekdays), [1, 2, 3, 4, 5]);
   assert.equal(parse({ action: "file_save", filename: "测试.txt", text: "😀".repeat(3000) }).text.length, 6000);
   for (const spec of [
@@ -117,7 +126,6 @@ test("new phone actions validate bounds without weakening old actions", () => {
     { ...phoneFixtures.alarm, weekdays: "1,2" }, { action: "timer", seconds: "20" },
     { action: "timer", seconds: 86401 }, { action: "timer", seconds: 0 },
     { ...phoneFixtures.note_create, kind: "reminder" }, { ...phoneFixtures.note_create, text: " " },
-    { ...phoneFixtures.phone_search, engine: "arbitrary" },
     { ...phoneFixtures.phone_search, query: " " },
     { ...phoneFixtures.phone_search, max: 11 },
     { action: "note_update", entry_id: phoneFixtures.note_update.entry_id },
@@ -141,6 +149,29 @@ test("SMS accepts contact lookup but rejects missing content and unsafe numbers"
     { number: "10086", text: "x".repeat(1001) }, { contact: "x".repeat(121), text: "hi" },
     { number: "1".repeat(41), text: "hi" }, { contact: {}, text: "hi" },
   ]) assert.equal(parse({ action: "sms", ...spec }), null);
+});
+
+test("phone records paginate and direct calls require one safe target", () => {
+  const app = load(), parse = (spec) => app.parsePhoneAction(JSON.stringify(spec));
+  assert.deepEqual(JSON.parse(JSON.stringify(parse({ action: "contacts_read" }))),
+    { action: "contacts_read", query: "", max: 10, offset: 0 });
+  assert.deepEqual(JSON.parse(JSON.stringify(parse({ action: "contact_add", name: " 张三 ", number: " 10086 " }))),
+    { action: "contact_add", name: "张三", number: "10086" });
+  assert.deepEqual(JSON.parse(JSON.stringify(parse({ action: "call_history", call_type: "missed" }))),
+    { action: "call_history", call_type: "missed", max: 10, offset: 0 });
+  assert.deepEqual(JSON.parse(JSON.stringify(parse({ action: "call", contact: " 妈妈 " }))),
+    { action: "call", contact: "妈妈", number: "" });
+  for (const spec of [
+    { action: "contacts_read", max: 21 }, { action: "contacts_read", offset: 100001 },
+    { action: "contacts_read", query: "x".repeat(201) },
+    { action: "contact_add", name: "", number: "10086" },
+    { action: "contact_add", name: "张三", number: "12" },
+    { action: "contact_add", name: "张三", number: "123;456" },
+    { action: "call_history", call_type: "unknown" }, { action: "call_history", offset: -1 },
+    { action: "call" }, { action: "call", contact: "A", number: "10086" },
+    { action: "call", number: "12" }, { action: "call", number: "110" },
+    { action: "call", number: "123;456" },
+  ]) assert.equal(parse(spec), null, JSON.stringify(spec));
 });
 
 test("calendar payloads retain local dates, defaults, and strict bounds", () => {
@@ -211,7 +242,7 @@ test("old APK refuses new actions and never silently drops repeat weekdays", asy
     await app.request(); await app.settle();
     assert.equal(app.calls.length, 0);
     assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
-    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.16\.0/);
+    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.16\.4/);
   }
 });
 
@@ -235,7 +266,7 @@ test("a shell without the floating bubble cannot pick the capture moment", async
   await app.request(); await app.settle();
   assert.equal(app.calls.length, 0);
   assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
-    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.16\.0/);
+  assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.16\.4/);
 });
 
 test("the screen capture waits for the user tap instead of timing out early", async () => {
@@ -257,7 +288,7 @@ test("a shell without the camera preview cannot open the camera", async () => {
   await app.request(); await app.settle();
   assert.equal(app.calls.length, 0);
   assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
-  assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.16\.0/);
+  assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.16\.4/);
 });
 
 test("the camera frame reaches the conversation with the camera caption", async () => {

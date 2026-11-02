@@ -83,7 +83,7 @@ public final class SearchActivity extends Activity {
     private WebView webView;
     private TextView status;
     private String query = "";
-    private String engine = "bing";
+    private String engine = "quark";
     private int max = 5;
     private boolean extracting;
     private boolean finished;
@@ -423,8 +423,9 @@ public final class SearchActivity extends Activity {
 
     static String normalizeEngine(String value) {
         String engine = value == null ? "" : value.trim().toLowerCase(Locale.US);
-        if (engine.isEmpty()) return "bing";
+        if (engine.isEmpty()) return "quark";
         switch (engine) {
+            case "quark":
             case "google":
             case "bing":
             case "baidu":
@@ -445,6 +446,8 @@ public final class SearchActivity extends Activity {
             throw new AssertionError(impossible);
         }
         switch (normalized) {
+            case "quark":
+                return "https://quark.sm.cn/s?q=" + encoded;
             case "google":
                 return "https://www.google.com/search?q=" + encoded;
             case "bing":
@@ -463,6 +466,8 @@ public final class SearchActivity extends Activity {
         if (normalized == null || host == null) return false;
         String value = host.toLowerCase(Locale.US);
         switch (normalized) {
+            case "quark":
+                return value.equals("quark.sm.cn") || value.endsWith(".quark.sm.cn");
             case "google":
                 // Google serves consent and accounts from google.com, and
                 // country domains such as google.co.jp. Match those exact

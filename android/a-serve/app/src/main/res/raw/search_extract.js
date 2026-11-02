@@ -17,6 +17,7 @@
   const seen = new Set();
   const seenTitles = new Set();
   const results = [];
+  const quarkBlockSelector = 'article, div.sc, div.sc-item, div[class*="search-result"], div[class*="result-item"], div[data-log*="result"]';
   const add = (title, href, snippet) => {
     const url = unwrap(href);
     const name = clean(title);
@@ -43,14 +44,22 @@
     return best;
   };
   const pickSnippet = (block, title) => {
-    const el = block.querySelector('.c-abstract, .c-span-last, [class*="abstract"], [class*="summary"]');
+    const el = block.querySelector('.c-abstract, .c-span-last, .sc-desc, .sc-content, [class*="abstract"], [class*="summary"], [class*="desc"]');
     let text = clean(el ? el.innerText : block.innerText);
     if (title && text.indexOf(title) === 0) {
       text = text.slice(title.length).trim();
     }
     return text;
   };
-  if (engine === 'google') {
+  if (engine === 'quark') {
+    document.querySelectorAll(quarkBlockSelector).forEach((block) => {
+      const link = pickLink(block);
+      if (!link) return;
+      const title = clean(link.innerText);
+      const direct = clean(block.getAttribute('data-url') || block.getAttribute('url'));
+      add(title, /^https?:\/\//i.test(direct) ? direct : link.href, pickSnippet(block, title));
+    });
+  } else if (engine === 'google') {
     document.querySelectorAll('div.g, div.MjjYud, div[data-hveid]').forEach((block) => {
       const link = block.querySelector('a[href]');
       const heading = block.querySelector('h3');
@@ -94,7 +103,7 @@
       if (link.closest(nav)) return;
       const title = clean(link.innerText);
       if (title.length < 8 || title.length > 250 || junk.test(title)) return;
-      const block = link.closest('div[mu], div.c-result, div.result, div.c-container, li, article') || link.parentElement;
+      const block = link.closest('div[mu], div.c-result, div.result, div.c-container, div.sc, div.sc-item, div[class*="search-result"], div[class*="result-item"], li, article') || link.parentElement;
       if (!block) return;
       const blockText = clean(block.innerText);
       if (blockText.length < title.length + 12) return;
@@ -106,7 +115,9 @@
     || !!document.querySelector('iframe[src*="recaptcha"], iframe[src*="captcha"], #captcha, .g-recaptcha, [class*="captcha"]');
   const consent = /^consent\./.test(location.hostname) || /before you continue|接受所有|同意并继续/i.test(body);
   const state = results.length ? 'results' : (verification || consent ? 'verify' : 'empty');
-  const blocks = document.querySelectorAll('div[mu], div.c-result, div.result, div.result-op, div.c-container').length;
+  const blocks = document.querySelectorAll(engine === 'quark'
+    ? quarkBlockSelector
+    : 'div[mu], div.c-result, div.result, div.result-op, div.c-container').length;
   const anchors = document.querySelectorAll('a[href]').length;
   return JSON.stringify({
     state: state,
