@@ -184,8 +184,16 @@ pub fn try_handle_checkpoint_command(
                 .name
                 .unwrap_or_else(|| Local::now().format("commit-%Y%m%d-%H%M%S-%3f").to_string());
             match store.save_with_message(&name, parsed.message.as_deref()) {
-                Ok(_) => {
+                Ok(path) => {
                     println!("Saved checkpoint '{name}'.");
+                    if path
+                        .parent()
+                        .is_some_and(|generation| store.checkpoint_omitted_scratch(generation))
+                    {
+                        println!(
+                            "  (assets/tmp scratch was omitted because the full snapshot exceeded the storage quota)"
+                        );
+                    }
                     publish_checkpoint_names(&store);
                 }
                 Err(err) => println!("Failed to save checkpoint: {err}"),

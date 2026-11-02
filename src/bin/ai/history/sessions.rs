@@ -94,7 +94,7 @@ pub(super) fn copy_dir_recursively(src: &Path, dst: &Path) -> io::Result<()> {
 /// A clone has exact copy semantics (later appends never affect the source),
 /// unlike a hard link, so it is safe for append-in-place archives; any failure
 /// falls back to a regular byte copy.
-fn copy_file_fast(from: &Path, to: &Path) -> io::Result<()> {
+pub(super) fn copy_file_fast(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     if clonefile_fast(from, to) {
         return Ok(());

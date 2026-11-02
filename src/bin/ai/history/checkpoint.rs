@@ -56,6 +56,19 @@ const GENERATION_MANIFEST_FILE: &str = "checkpoint.manifest";
 const GENERATION_STAGE_MARKER: &str = ".stage-";
 const GENERATION_PREVIOUS_MARKER: &str = ".previous-";
 const GENERATION_PUBLISH_READY_MARKER: &str = ".publish-ready";
+/// Present when the generation omitted disposable `assets/tmp` scratch to
+/// stay within the storage quota.
+const GENERATION_SCRATCH_OMITTED_MARKER: &str = ".scratch-omitted";
+/// Per-generation metadata fingerprints for asset files. It lives beside the
+/// manifest (not inside `assets/`) so a restore never materializes it into the
+/// live session directory. A missing or unreadable index only disables the
+/// incremental and restore-skip fast paths; the snapshot itself stays valid.
+const GENERATION_ASSET_INDEX_FILE: &str = "asset-index";
+const ASSET_INDEX_MAGIC: &[u8; 8] = b"CKPTAIDX";
+const ASSET_INDEX_VERSION: u32 = 1;
+const ASSET_INDEX_HEADER_BYTES: u64 = 20;
+const ASSET_INDEX_ENTRY_FIXED_BYTES: u64 = 44;
+const ASSET_INDEX_MAX_PATH_BYTES: usize = 1 << 20;
 /// Git-style pointer to the most recently preserved checkpoint. It is a plain
 /// file (not a checkpoint directory), so it never shows up in listings; it
 /// only records a name for the `HEAD` (`@`) alias to resolve. `-` is the
@@ -210,6 +223,14 @@ impl CheckpointStore {
         self.generation_dir(name).join(GENERATION_ASSETS_DIR)
     }
 
+    /// Whether a saved generation omitted disposable `assets/tmp` scratch to
+    /// stay within the storage quota.
+    pub(in crate::ai) fn checkpoint_omitted_scratch(&self, generation: &Path) -> bool {
+        generation
+            .join(GENERATION_SCRATCH_OMITTED_MARKER)
+            .is_file()
+    }
+
     fn generation_dir(&self, name: &str) -> PathBuf {
         self.dir.join(sanitize_name(name))
     }
@@ -320,21 +341,46 @@ impl CheckpointStore {
                     total.saturating_add(checkpoint.storage_bytes)
                 })
                 .saturating_add(store.branch_storage_size_unlocked(&branches)?);
-            let staged =
-                store.stage_generation(&normalized_name, parent.as_deref(), message)?;
-            let sqlite = staged.path.join(GENERATION_SQLITE_FILE);
-            let logical_base = checkpoint_storage_size(
-                &sqlite,
-                &staged.path.join(GENERATION_ASSETS_DIR),
+            validate_checkpoint_count(checkpoints.len(), MAX_CHECKPOINTS_PER_SESSION)?;
+            let parent_base = parent
+                .as_deref()
+                .and_then(|name| store.snapshot_base(name));
+            // Non-APFS filesystems have no COW clone. Estimate the bytes a
+            // snapshot would materialize before staging so an oversized live
+            // asset tree fails immediately instead of being copied first.
+            // When the full tree does not fit but the durable assets do, leave
+            // the disposable scratch directory out instead of failing.
+            #[cfg(not(target_os = "macos"))]
+            let scope = preflight_checkpoint_storage(
+                store,
+                current_size,
+                branch_growth,
+                parent.as_deref(),
+                parent_base.as_ref(),
+                message,
+                MAX_CHECKPOINT_STORAGE_BYTES,
             )?;
-            let storage_base = sqlite_storage_size(&sqlite)?
-                .saturating_add(staged.copied_asset_bytes);
+            #[cfg(target_os = "macos")]
+            let scope = SnapshotScope::All;
+            let staged = store.stage_generation(
+                &normalized_name,
+                parent.as_deref(),
+                message,
+                parent_base.as_ref(),
+                scope,
+            )?;
+            let sqlite = staged.path.join(GENERATION_SQLITE_FILE);
+            // Reading the count can create SQLite sidecars. Do it before sizing
+            // so the cached storage includes every byte the generation keeps.
+            let staged_messages = message_count_sqlite_read_only(&sqlite).ok();
+            let sqlite_bytes = sqlite_storage_size(&sqlite)?;
+            let logical_base = sqlite_bytes.saturating_add(staged.logical_asset_bytes);
+            let storage_base = sqlite_bytes.saturating_add(staged.copied_asset_bytes);
             // Cache the size and message count in the staged manifest so later
             // `list` skips the recursive walk and the dirty check can skip
             // opening the snapshot SQLite on a count mismatch. Logical size is
             // displayed; storage size charges only bytes materialized instead
             // of COW-cloned from the live assets.
-            let staged_messages = message_count_sqlite_read_only(&sqlite).ok();
             let saved_at = read_generation_manifest(&staged.path)
                 .and_then(|manifest| manifest.saved_at)
                 .unwrap_or_else(unix_now_secs);
@@ -1378,11 +1424,25 @@ impl CheckpointStore {
         Ok(size)
     }
 
+    fn snapshot_base(&self, name: &str) -> Option<SnapshotBase> {
+        let generation = self.generation_dir(name);
+        if !generation_is_ready(&generation) {
+            return None;
+        }
+        Some(SnapshotBase {
+            assets: generation.join(GENERATION_ASSETS_DIR),
+            index: read_asset_index(&generation.join(GENERATION_ASSET_INDEX_FILE))
+                .unwrap_or_default(),
+        })
+    }
+
     fn stage_generation(
         &self,
         name: &str,
         parent: Option<&str>,
         message: Option<&str>,
+        parent_assets: Option<&SnapshotBase>,
+        scope: SnapshotScope,
     ) -> io::Result<StagedGeneration> {
         fs::create_dir_all(&self.dir)?;
         let staged = self.dir.join(format!(
@@ -1392,20 +1452,29 @@ impl CheckpointStore {
         let result = (|| {
             fs::create_dir_all(&staged)?;
             backup_sqlite(&self.session_file, &staged.join(GENERATION_SQLITE_FILE))?;
-            let copied_asset_bytes =
-                copy_directory_snapshot(&self.session_assets, &staged.join(GENERATION_ASSETS_DIR))?;
+            let copy = copy_directory_snapshot(
+                &self.session_assets,
+                &staged.join(GENERATION_ASSETS_DIR),
+                &staged.join(GENERATION_ASSET_INDEX_FILE),
+                parent_assets,
+                scope,
+            )?;
+            if scope == SnapshotScope::DurableOnly {
+                fs::write(staged.join(GENERATION_SCRATCH_OMITTED_MARKER), b"")?;
+            }
             fs::write(
                 staged.join(GENERATION_MANIFEST_FILE),
                 generation_manifest_body(parent, unix_now_secs(), None, None, None, message),
             )?;
-            Ok(copied_asset_bytes)
+            Ok(copy)
         })();
         if result.is_err() {
             let _ = fs::remove_dir_all(&staged);
         }
-        result.map(|copied_asset_bytes| StagedGeneration {
+        result.map(|copy| StagedGeneration {
             path: staged,
-            copied_asset_bytes,
+            copied_asset_bytes: copy.copied,
+            logical_asset_bytes: copy.logical,
         })
     }
 
@@ -1558,11 +1627,17 @@ impl CheckpointStore {
         // and skips the restore (same no-op as restoring an empty dir).
         match live_rollback_source_name(transaction)? {
             Some(name) => {
-                let source_assets = self.generation_dir(&name).join(GENERATION_ASSETS_DIR);
-                if generation_is_ready(&self.generation_dir(&name)) {
-                    restore_checkpoint_assets(&source_assets, &self.session_assets)?;
+                let generation = self.generation_dir(&name);
+                let source_assets = generation.join(GENERATION_ASSETS_DIR);
+                if generation_is_ready(&generation) {
+                    let index = read_asset_index(&generation.join(GENERATION_ASSET_INDEX_FILE));
+                    restore_checkpoint_assets(
+                        &source_assets,
+                        &self.session_assets,
+                        index.as_ref(),
+                    )?;
                 } else if staged_assets.is_dir() {
-                    restore_checkpoint_assets(&staged_assets, &self.session_assets)?;
+                    restore_checkpoint_assets(&staged_assets, &self.session_assets, None)?;
                 } else {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
@@ -1571,7 +1646,7 @@ impl CheckpointStore {
                 }
             }
             None if staged_assets.is_dir() => {
-                restore_checkpoint_assets(&staged_assets, &self.session_assets)?;
+                restore_checkpoint_assets(&staged_assets, &self.session_assets, None)?;
             }
             None => {}
         }
@@ -1893,7 +1968,18 @@ fn validate_checkpoint_budget(
     max_count: usize,
     max_size: u64,
 ) -> io::Result<()> {
-    if !replacing_existing && current_count >= max_count {
+    if !replacing_existing {
+        validate_checkpoint_count(current_count, max_count)?;
+    }
+
+    let projected_size = current_size
+        .saturating_sub(replaced_size)
+        .saturating_add(snapshot_size);
+    validate_checkpoint_storage(projected_size, max_size)
+}
+
+fn validate_checkpoint_count(current_count: usize, max_count: usize) -> io::Result<()> {
+    if current_count >= max_count {
         return Err(io::Error::new(
             io::ErrorKind::StorageFull,
             format!(
@@ -1901,10 +1987,10 @@ fn validate_checkpoint_budget(
             ),
         ));
     }
+    Ok(())
+}
 
-    let projected_size = current_size
-        .saturating_sub(replaced_size)
-        .saturating_add(snapshot_size);
+fn validate_checkpoint_storage(projected_size: u64, max_size: u64) -> io::Result<()> {
     if projected_size > max_size {
         return Err(io::Error::new(
             io::ErrorKind::StorageFull,
@@ -2044,21 +2130,263 @@ fn staged_generation_base<'a>(name: &'a str, marker: &str) -> Option<&'a str> {
 struct StagedGeneration {
     path: PathBuf,
     copied_asset_bytes: u64,
+    logical_asset_bytes: u64,
 }
 
-fn copy_directory_snapshot(source: &Path, destination: &Path) -> io::Result<u64> {
+/// Bytes produced by one asset snapshot. `logical` is what the checkpoint
+/// displays; `copied` is the newly allocated data charged to the quota.
+/// `index_bytes` is the sidecar's own materialized size; callers add it to both
+/// totals because it is stored inside the generation, not inside `assets/`.
+#[derive(Debug, Default, Clone, Copy)]
+struct SnapshotCopy {
+    copied: u64,
+    logical: u64,
+    index_bytes: u64,
+}
+
+/// Which live asset subtrees a generation captures. `DurableOnly` drops the
+/// disposable session scratch directory (`assets/tmp`) when including it would
+/// exceed the quota; the durable evidence assets still restore normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotScope {
+    All,
+    DurableOnly,
+}
+
+/// Immutable asset tree and metadata index of the generation a new checkpoint
+/// is based on. Hard links always come from this generation, never from the
+/// live assets, so later in-place writes to the live tree cannot mutate an
+/// already-published checkpoint.
+#[derive(Debug)]
+struct SnapshotBase {
+    assets: PathBuf,
+    index: AssetIndex,
+}
+
+/// Metadata identity of one regular asset file. `mtime` and `ctime` are both
+/// recorded because a writer can restore an mtime but cannot normally restore
+/// ctime; the pair makes an in-place rewrite distinguishable from an untouched
+/// file without reading the content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AssetFingerprint {
+    len: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    ctime_sec: i64,
+    ctime_nsec: i64,
+}
+
+/// Relative asset path -> fingerprint observed when the generation was saved.
+#[derive(Debug, Default)]
+struct AssetIndex {
+    entries: FastMap<PathBuf, AssetFingerprint>,
+}
+
+fn copy_directory_snapshot(
+    source: &Path,
+    destination: &Path,
+    index_path: &Path,
+    parent: Option<&SnapshotBase>,
+    scope: SnapshotScope,
+) -> io::Result<SnapshotCopy> {
     if destination.exists() {
         fs::remove_dir_all(destination)?;
     }
     if !source.is_dir() {
         fs::create_dir_all(destination)?;
-        return Ok(0);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let index_bytes = write_asset_index(index_path, &AssetIndex::default())?;
+            return Ok(SnapshotCopy {
+                copied: index_bytes,
+                logical: index_bytes,
+                index_bytes,
+            });
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = index_path;
+            return Ok(SnapshotCopy::default());
+        }
     }
-    copy_directory_snapshot_impl(source, destination)
+    copy_directory_snapshot_impl(source, destination, index_path, parent, scope)
+}
+
+fn asset_fingerprint(metadata: &fs::Metadata) -> AssetFingerprint {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        AssetFingerprint {
+            len: metadata.len(),
+            mtime_sec: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec() as i64,
+            ctime_sec: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec() as i64,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let (mtime_sec, mtime_nsec) = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| (duration.as_secs() as i64, duration.subsec_nanos() as i64))
+            .unwrap_or((0, 0));
+        AssetFingerprint {
+            len: metadata.len(),
+            mtime_sec,
+            mtime_nsec,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+        }
+    }
+}
+
+fn is_safe_index_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+fn path_from_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes).ok().map(PathBuf::from)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_asset_index(path: &Path, index: &AssetIndex) -> io::Result<u64> {
+    let mut bytes = Vec::with_capacity(16 + index.entries.len().saturating_mul(48));
+    bytes.extend_from_slice(ASSET_INDEX_MAGIC);
+    bytes.extend_from_slice(&ASSET_INDEX_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(index.entries.len() as u64).to_le_bytes());
+    for (relative, fingerprint) in &index.entries {
+        let path = path_bytes(relative);
+        let path_len = u32::try_from(path.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "asset index path too long")
+        })?;
+        bytes.extend_from_slice(&path_len.to_le_bytes());
+        bytes.extend_from_slice(&path);
+        bytes.extend_from_slice(&fingerprint.len.to_le_bytes());
+        bytes.extend_from_slice(&fingerprint.mtime_sec.to_le_bytes());
+        bytes.extend_from_slice(&fingerprint.mtime_nsec.to_le_bytes());
+        bytes.extend_from_slice(&fingerprint.ctime_sec.to_le_bytes());
+        bytes.extend_from_slice(&fingerprint.ctime_nsec.to_le_bytes());
+    }
+    fs::write(path, &bytes)?;
+    Ok(bytes.len() as u64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn asset_index_entry_bytes(relative: &Path) -> u64 {
+    (path_bytes(relative).len() as u64)
+        .saturating_add(ASSET_INDEX_ENTRY_FIXED_BYTES)
+}
+
+fn read_asset_index(path: &Path) -> Option<AssetIndex> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() < 20 || &bytes[..8] != ASSET_INDEX_MAGIC {
+        return None;
+    }
+    let version = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    if version != ASSET_INDEX_VERSION {
+        return None;
+    }
+    let count = u64::from_le_bytes(bytes[12..20].try_into().ok()?);
+    // Each entry is at least 45 bytes, so a larger count cannot be genuine and
+    // would otherwise make the parser loop over attacker-controlled input.
+    if count > bytes.len() as u64 {
+        return None;
+    }
+    let mut cursor = 20usize;
+    let mut index = AssetIndex::default();
+    for _ in 0..count {
+        let path_len = read_index_u32(&bytes, &mut cursor)? as usize;
+        if path_len == 0 || path_len > ASSET_INDEX_MAX_PATH_BYTES {
+            return None;
+        }
+        let end = cursor.checked_add(path_len)?;
+        let path_bytes = bytes.get(cursor..end)?.to_vec();
+        cursor = end;
+        let len = read_index_u64(&bytes, &mut cursor)?;
+        let mtime_sec = read_index_i64(&bytes, &mut cursor)?;
+        let mtime_nsec = read_index_i64(&bytes, &mut cursor)?;
+        let ctime_sec = read_index_i64(&bytes, &mut cursor)?;
+        let ctime_nsec = read_index_i64(&bytes, &mut cursor)?;
+        let relative = path_from_bytes(path_bytes)?;
+        if !is_safe_index_path(&relative) {
+            return None;
+        }
+        index.entries.insert(
+            relative,
+            AssetFingerprint {
+                len,
+                mtime_sec,
+                mtime_nsec,
+                ctime_sec,
+                ctime_nsec,
+            },
+        );
+    }
+    (cursor == bytes.len()).then_some(index)
+}
+
+fn read_index_u32(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
+    let end = cursor.checked_add(4)?;
+    let value = u32::from_le_bytes(bytes.get(*cursor..end)?.try_into().ok()?);
+    *cursor = end;
+    Some(value)
+}
+
+fn read_index_u64(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
+    let end = cursor.checked_add(8)?;
+    let value = u64::from_le_bytes(bytes.get(*cursor..end)?.try_into().ok()?);
+    *cursor = end;
+    Some(value)
+}
+
+fn read_index_i64(bytes: &[u8], cursor: &mut usize) -> Option<i64> {
+    let end = cursor.checked_add(8)?;
+    let value = i64::from_le_bytes(bytes.get(*cursor..end)?.try_into().ok()?);
+    *cursor = end;
+    Some(value)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_checkpoint_asset_debris(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with('.') && name.ends_with(".tmp")
 }
 
 #[cfg(target_os = "macos")]
-fn copy_directory_snapshot_impl(source: &Path, destination: &Path) -> io::Result<u64> {
+fn copy_directory_snapshot_impl(
+    source: &Path,
+    destination: &Path,
+    _index_path: &Path,
+    _parent: Option<&SnapshotBase>,
+    _scope: SnapshotScope,
+) -> io::Result<SnapshotCopy> {
     let source = CString::new(source.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "asset path contains NUL"))?;
     let destination = CString::new(destination.as_os_str().as_bytes())
@@ -2099,13 +2427,252 @@ fn copy_directory_snapshot_impl(source: &Path, destination: &Path) -> io::Result
     if state_result != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(u64::try_from(copied).unwrap_or(0))
+    Ok(SnapshotCopy {
+        copied: u64::try_from(copied).unwrap_or(0),
+        logical: directory_storage_size(destination)?,
+        index_bytes: 0,
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
-fn copy_directory_snapshot_impl(source: &Path, destination: &Path) -> io::Result<u64> {
-    super::sessions::copy_dir_recursively(source, destination)?;
-    directory_storage_size(destination)
+fn copy_directory_snapshot_impl(
+    source: &Path,
+    destination: &Path,
+    index_path: &Path,
+    parent: Option<&SnapshotBase>,
+    scope: SnapshotScope,
+) -> io::Result<SnapshotCopy> {
+    fs::create_dir_all(destination)?;
+    let mut copy = SnapshotCopy::default();
+    let mut index = AssetIndex::default();
+    copy_directory_incremental(
+        source,
+        Path::new(""),
+        destination,
+        parent,
+        scope,
+        &mut copy,
+        &mut index,
+    )?;
+    let index_bytes = write_asset_index(index_path, &index)?;
+    copy.index_bytes = index_bytes;
+    copy.copied = copy.copied.saturating_add(index_bytes);
+    copy.logical = copy.logical.saturating_add(index_bytes);
+    Ok(copy)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_session_scratch_dir(relative: &Path, name: &std::ffi::OsStr) -> bool {
+    relative.as_os_str().is_empty() && name == std::ffi::OsStr::new("tmp")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn copy_directory_incremental(
+    directory: &Path,
+    relative: &Path,
+    destination: &Path,
+    parent: Option<&SnapshotBase>,
+    scope: SnapshotScope,
+    copy: &mut SnapshotCopy,
+    index: &mut AssetIndex,
+) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let path = entry.path();
+        let destination_path = destination.join(&name);
+        let relative_path = relative.join(&name);
+        let file_type = entry.file_type()?;
+        if scope == SnapshotScope::DurableOnly && is_session_scratch_dir(relative, &name) {
+            continue;
+        }
+        if file_type.is_dir() {
+            fs::create_dir_all(&destination_path)?;
+            copy_directory_incremental(
+                &path,
+                &relative_path,
+                &destination_path,
+                parent,
+                scope,
+                copy,
+                index,
+            )?;
+            continue;
+        }
+        if is_checkpoint_asset_debris(&name) {
+            continue;
+        }
+        // `fs::metadata` follows symlinks because `copy_file_fast` copies the
+        // target bytes; only a real regular file can be represented by an
+        // index entry and reused through a hard link.
+        let metadata = fs::metadata(&path)?;
+        let len = metadata.len();
+        copy.logical = copy.logical.saturating_add(len);
+        let fingerprint = file_type.is_file().then(|| asset_fingerprint(&metadata));
+        let mut linked = false;
+        if let (Some(fingerprint), Some(parent)) = (fingerprint, parent)
+            && parent.index.entries.get(&relative_path) == Some(&fingerprint)
+        {
+            // Link from the immutable parent generation, never from the live
+            // tree: a later in-place write to a live file must not change an
+            // older checkpoint's content. Timestamps can collide for a
+            // same-length rewrite, so compare the bytes before reusing.
+            let parent_path = parent.assets.join(&relative_path);
+            if files_equal(&path, &parent_path).unwrap_or(false) {
+                linked = fs::hard_link(&parent_path, &destination_path).is_ok();
+            }
+        }
+        if !linked {
+            super::sessions::copy_file_fast(&path, &destination_path)?;
+            copy.copied = copy.copied.saturating_add(len);
+        }
+        if let Some(fingerprint) = fingerprint {
+            index.entries.insert(relative_path, fingerprint);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn estimate_snapshot_bytes(
+    source: &Path,
+    parent: Option<&SnapshotBase>,
+    scope: SnapshotScope,
+) -> io::Result<SnapshotCopy> {
+    if !source.is_dir() {
+        return Ok(SnapshotCopy {
+            copied: ASSET_INDEX_HEADER_BYTES,
+            logical: ASSET_INDEX_HEADER_BYTES,
+            index_bytes: ASSET_INDEX_HEADER_BYTES,
+        });
+    }
+    let mut copy = SnapshotCopy {
+        index_bytes: ASSET_INDEX_HEADER_BYTES,
+        ..SnapshotCopy::default()
+    };
+    estimate_snapshot_dir(source, Path::new(""), parent, scope, &mut copy)?;
+    copy.copied = copy.copied.saturating_add(copy.index_bytes);
+    copy.logical = copy.logical.saturating_add(copy.index_bytes);
+    Ok(copy)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn preflight_checkpoint_storage(
+    store: &CheckpointStore,
+    current_size: u64,
+    branch_growth: u64,
+    parent: Option<&str>,
+    parent_assets: Option<&SnapshotBase>,
+    message: Option<&str>,
+    max_size: u64,
+) -> io::Result<SnapshotScope> {
+    let sqlite_upper = sqlite_storage_size(&store.session_file)?;
+    let all = projected_checkpoint_storage(
+        store,
+        current_size,
+        branch_growth,
+        parent,
+        parent_assets,
+        message,
+        sqlite_upper,
+        SnapshotScope::All,
+    )?;
+    if validate_checkpoint_storage(all, max_size).is_ok() {
+        return Ok(SnapshotScope::All);
+    }
+    let durable = projected_checkpoint_storage(
+        store,
+        current_size,
+        branch_growth,
+        parent,
+        parent_assets,
+        message,
+        sqlite_upper,
+        SnapshotScope::DurableOnly,
+    )?;
+    validate_checkpoint_storage(durable, max_size)?;
+    Ok(SnapshotScope::DurableOnly)
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn projected_checkpoint_storage(
+    store: &CheckpointStore,
+    current_size: u64,
+    branch_growth: u64,
+    parent: Option<&str>,
+    parent_assets: Option<&SnapshotBase>,
+    message: Option<&str>,
+    sqlite_upper: u64,
+    scope: SnapshotScope,
+) -> io::Result<u64> {
+    let estimate = estimate_snapshot_bytes(&store.session_assets, parent_assets, scope)?;
+    let logical_base = sqlite_upper.saturating_add(estimate.logical);
+    let storage_base = sqlite_upper.saturating_add(estimate.copied);
+    let (_, _, storage_with_manifest) = generation_manifest_with_sizes(
+        parent,
+        unix_now_secs(),
+        logical_base,
+        storage_base,
+        None,
+        message,
+    );
+    // The real message count is known only after staging. Reserve a short line
+    // so a save cannot pass preflight just below the cap and then fail only
+    // after the live asset tree has already been materialized.
+    const MESSAGE_COUNT_LINE_RESERVE: u64 = 64;
+    let projected_size = current_size
+        .saturating_add(storage_with_manifest)
+        .saturating_add(branch_growth)
+        .saturating_add(MESSAGE_COUNT_LINE_RESERVE);
+    Ok(projected_size)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn estimate_snapshot_dir(
+    directory: &Path,
+    relative: &Path,
+    parent: Option<&SnapshotBase>,
+    scope: SnapshotScope,
+    copy: &mut SnapshotCopy,
+) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let path = entry.path();
+        let relative_path = relative.join(&name);
+        let file_type = entry.file_type()?;
+        if scope == SnapshotScope::DurableOnly && is_session_scratch_dir(relative, &name) {
+            continue;
+        }
+        if file_type.is_dir() {
+            estimate_snapshot_dir(&path, &relative_path, parent, scope, copy)?;
+            continue;
+        }
+        if is_checkpoint_asset_debris(&name) {
+            continue;
+        }
+        let metadata = fs::metadata(&path)?;
+        let len = metadata.len();
+        copy.logical = copy.logical.saturating_add(len);
+        if file_type.is_file() {
+            copy.index_bytes = copy
+                .index_bytes
+                .saturating_add(asset_index_entry_bytes(&relative_path));
+        }
+        let reusable = file_type.is_file()
+            && parent.is_some_and(|parent| {
+                parent
+                    .index
+                    .entries
+                    .get(&relative_path)
+                    .is_some_and(|expected| *expected == asset_fingerprint(&metadata))
+            });
+        if !reusable {
+            copy.copied = copy.copied.saturating_add(len);
+        }
+    }
+    Ok(())
 }
 
 /// Overflow assets are UUID-named and immutable after writing. Rollback only
@@ -2113,30 +2680,92 @@ fn copy_directory_snapshot_impl(source: &Path, destination: &Path) -> io::Result
 /// directory wholesale: a concurrent writer may have created a new asset and
 /// committed its stub to the canonical DB after the rollback, and deleting
 /// that file would leave a `file_path` that can never be read back.
-fn restore_checkpoint_assets(source: &Path, destination: &Path) -> io::Result<()> {
+fn restore_checkpoint_assets(
+    source: &Path,
+    destination: &Path,
+    index: Option<&AssetIndex>,
+) -> io::Result<()> {
     fs::create_dir_all(destination)?;
     if source.is_dir() {
-        copy_dir_skip_identical(source, destination)?;
+        copy_dir_skip_identical(source, destination, Path::new(""), index)?;
     }
     Ok(())
 }
 
-/// Restore every snapshotted path. Session scratch files are mutable, so equal
-/// length does not imply equal content. On APFS each replacement is another
+/// Restore every snapshotted path that changed since the snapshot. The
+/// generation index records the live metadata at save time, so a matching
+/// fingerprint is a cheap prefilter. The bytes are compared before a live file
+/// is left alone because a same-length rewrite can share every timestamp tick
+/// with the save. Files without an index entry (legacy generations, symlinks,
+/// scratch paths) are replaced as before. On APFS each replacement is another
 /// COW clone rather than a full byte copy.
-fn copy_dir_skip_identical(source: &Path, destination: &Path) -> io::Result<()> {
+fn copy_dir_skip_identical(
+    source: &Path,
+    destination: &Path,
+    relative: &Path,
+    index: Option<&AssetIndex>,
+) -> io::Result<()> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
+        let name = entry.file_name();
         let from = entry.path();
-        let to = destination.join(entry.file_name());
+        let to = destination.join(&name);
+        let relative_path = relative.join(&name);
         if entry.file_type()?.is_dir() {
             fs::create_dir_all(&to)?;
-            copy_dir_skip_identical(&from, &to)?;
+            copy_dir_skip_identical(&from, &to, &relative_path, index)?;
         } else {
-            replace_snapshot_file(&from, &to)?;
+            let unchanged = index
+                .and_then(|index| index.entries.get(&relative_path))
+                .is_some_and(|expected| {
+                    fs::symlink_metadata(&to).is_ok_and(|metadata| {
+                        metadata.file_type().is_file()
+                            && asset_fingerprint(&metadata) == *expected
+                            && files_equal(&from, &to).unwrap_or(false)
+                    })
+                });
+            if !unchanged {
+                replace_snapshot_file(&from, &to)?;
+            }
         }
     }
     Ok(())
+}
+
+/// Compare two regular files without holding either body in memory. Metadata
+/// timestamps can collide for a same-length in-place rewrite, so a matching
+/// fingerprint is only a fast-path hint; the bytes decide whether a restore can
+/// leave the live file untouched.
+fn files_equal(left: &Path, right: &Path) -> io::Result<bool> {
+    const CHUNK_BYTES: usize = 64 * 1024;
+    let mut left = fs::File::open(left)?;
+    let mut right = fs::File::open(right)?;
+    let mut left_chunk = [0u8; CHUNK_BYTES];
+    let mut right_chunk = [0u8; CHUNK_BYTES];
+    loop {
+        let left_read = read_file_chunk(&mut left, &mut left_chunk)?;
+        let right_read = read_file_chunk(&mut right, &mut right_chunk)?;
+        if left_read != right_read || left_chunk[..left_read] != right_chunk[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn read_file_chunk(file: &mut fs::File, buffer: &mut [u8]) -> io::Result<usize> {
+    use std::io::Read;
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
 }
 
 #[cfg(target_os = "macos")]
@@ -2533,7 +3162,9 @@ mod tests {
             }],
         )
         .unwrap();
-        let staged = store.stage_generation("unvalidated", None, None).unwrap();
+        let staged = store
+            .stage_generation("unvalidated", None, None, None, SnapshotScope::All)
+            .unwrap();
         assert!(generation_is_ready(&staged.path));
 
         assert!(store.list().unwrap().is_empty());
@@ -3760,8 +4391,12 @@ mod tests {
             .stage_live_rollback(&store.checkpoint_path("stable"), Some("stable"))
             .unwrap();
         let transaction_id = live_rollback_transaction_id(&transaction).unwrap();
-        restore_checkpoint_assets(&store.checkpoint_assets_path("stable"), &store.session_assets)
-            .unwrap();
+        restore_checkpoint_assets(
+            &store.checkpoint_assets_path("stable"),
+            &store.session_assets,
+            None,
+        )
+        .unwrap();
         restore_sqlite_after_rollback_with_transaction(
             &transaction.join("new").join(GENERATION_SQLITE_FILE),
             &store.session_file,
@@ -3898,7 +4533,7 @@ mod tests {
         fs::write(live_assets.join("existing.md"), "newer").unwrap();
         fs::write(live_assets.join("concurrent.md"), "concurrent output").unwrap();
 
-        restore_checkpoint_assets(&checkpoint_assets, &live_assets).unwrap();
+        restore_checkpoint_assets(&checkpoint_assets, &live_assets, None).unwrap();
 
         assert_eq!(
             fs::read_to_string(live_assets.join("existing.md")).unwrap(),
@@ -3931,12 +4566,482 @@ mod tests {
         fs::set_permissions(&source, fs::Permissions::from_mode(0o444)).unwrap();
         fs::set_permissions(&destination, fs::Permissions::from_mode(0o444)).unwrap();
 
-        restore_checkpoint_assets(&checkpoint_assets, &live_assets).unwrap();
+        restore_checkpoint_assets(&checkpoint_assets, &live_assets, None).unwrap();
 
         assert_eq!(fs::read_to_string(&destination).unwrap(), "checkpoint");
         assert_eq!(
             fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
             0o444
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn asset_index_round_trips_and_rejects_corruption() {
+        let root =
+            std::env::temp_dir().join(format!("ai-checkpoint-index-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(GENERATION_ASSET_INDEX_FILE);
+        let key = PathBuf::from("nested").join("asset.bin");
+        let mut index = AssetIndex::default();
+        index.entries.insert(
+            key.clone(),
+            AssetFingerprint {
+                len: 7,
+                mtime_sec: 1,
+                mtime_nsec: 2,
+                ctime_sec: 3,
+                ctime_nsec: 4,
+            },
+        );
+        write_asset_index(&path, &index).unwrap();
+        let read = read_asset_index(&path).unwrap();
+        assert_eq!(read.entries.len(), 1);
+        assert_eq!(read.entries.get(&key), index.entries.get(&key));
+
+        fs::write(&path, b"corrupt").unwrap();
+        assert!(read_asset_index(&path).is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn snapshot_estimate_charges_only_changed_files() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-checkpoint-estimate-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = root.join("assets");
+        let parent = root.join("parent-assets");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(source.join("stable.bin"), vec![1u8; 64]).unwrap();
+        fs::write(source.join("changed.bin"), vec![2u8; 8]).unwrap();
+        fs::write(parent.join("stable.bin"), vec![1u8; 64]).unwrap();
+
+        let mut parent_index = AssetIndex::default();
+        parent_index.entries.insert(
+            PathBuf::from("stable.bin"),
+            asset_fingerprint(&fs::metadata(source.join("stable.bin")).unwrap()),
+        );
+        let base = SnapshotBase {
+            assets: parent,
+            index: parent_index,
+        };
+        let estimate =
+            estimate_snapshot_bytes(&source, Some(&base), SnapshotScope::All).unwrap();
+        let index_bytes = ASSET_INDEX_HEADER_BYTES
+            .saturating_add(asset_index_entry_bytes(Path::new("stable.bin")))
+            .saturating_add(asset_index_entry_bytes(Path::new("changed.bin")));
+        assert_eq!(estimate.logical, 72 + index_bytes);
+        assert_eq!(estimate.copied, 8 + index_bytes);
+
+        let error = validate_checkpoint_storage(estimate.copied, 4).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn preflight_rejects_oversized_assets_before_staging() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-preflight");
+        fs::create_dir_all(&store.session_assets).unwrap();
+        fs::write(store.session_assets.join("big.bin"), vec![0u8; 64]).unwrap();
+
+        let error =
+            preflight_checkpoint_storage(&store, 0, 0, None, None, None, 32).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        let staged = store.dir.exists() && fs::read_dir(&store.dir).unwrap().next().is_some();
+        assert!(!staged, "preflight must fail before staging");
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn preflight_charges_manifest_message_before_staging() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-preflight-message");
+        fs::create_dir_all(&store.session_assets).unwrap();
+        fs::write(store.session_assets.join("small.bin"), vec![0u8; 8]).unwrap();
+        let message = "x".repeat(4096);
+
+        let estimate =
+            estimate_snapshot_bytes(&store.session_assets, None, SnapshotScope::All).unwrap();
+        assert!(
+            estimate.copied < 128,
+            "the asset estimate alone must fit under the cap"
+        );
+        let error =
+            preflight_checkpoint_storage(&store, 0, 0, None, None, Some(&message), 128)
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn preflight_omits_disposable_scratch_when_the_full_snapshot_is_too_large() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-preflight-scratch");
+        append_history_messages(
+            &store.session_file,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("scratch quota".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        fs::create_dir_all(store.session_assets.join("tmp")).unwrap();
+        fs::write(store.session_assets.join("durable.bin"), vec![0u8; 8]).unwrap();
+        fs::write(
+            store.session_assets.join("tmp").join("huge.bin"),
+            vec![0u8; 1024],
+        )
+        .unwrap();
+
+        let sqlite_upper = sqlite_storage_size(&store.session_file).unwrap();
+        let durable = projected_checkpoint_storage(
+            &store,
+            0,
+            0,
+            None,
+            None,
+            None,
+            sqlite_upper,
+            SnapshotScope::DurableOnly,
+        )
+        .unwrap();
+        let all = projected_checkpoint_storage(
+            &store,
+            0,
+            0,
+            None,
+            None,
+            None,
+            sqlite_upper,
+            SnapshotScope::All,
+        )
+        .unwrap();
+        assert!(durable < all);
+        let max = durable + (all - durable) / 2;
+        let scope =
+            preflight_checkpoint_storage(&store, 0, 0, None, None, None, max).unwrap();
+        assert_eq!(scope, SnapshotScope::DurableOnly);
+
+        let staged = store
+            .stage_generation("scratch", None, None, None, scope)
+            .unwrap();
+        let assets = staged.path.join(GENERATION_ASSETS_DIR);
+        assert!(assets.join("durable.bin").is_file());
+        assert!(!assets.join("tmp").exists());
+        assert!(store.checkpoint_omitted_scratch(&staged.path));
+        let index = read_asset_index(&staged.path.join(GENERATION_ASSET_INDEX_FILE)).unwrap();
+        assert!(index.entries.contains_key(Path::new("durable.bin")));
+        assert!(!index.entries.contains_key(Path::new("tmp/huge.bin")));
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn checkpoint_storage_cache_charges_asset_index() {
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-index-quota");
+        append_history_messages(
+            &store.session_file,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("index-quota".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        fs::create_dir_all(&store.session_assets).unwrap();
+        fs::write(store.session_assets.join("asset.bin"), vec![0u8; 8]).unwrap();
+        store.save("one").unwrap();
+
+        let generation = store.generation_dir("one");
+        let actual = directory_storage_size(&generation).unwrap();
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].storage_bytes, actual,
+            "cached storage must include the asset index and manifest"
+        );
+        assert!(
+            fs::metadata(generation.join(GENERATION_ASSET_INDEX_FILE))
+                .unwrap()
+                .len()
+                > 0
+        );
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn incremental_snapshot_hardlinks_unchanged_assets_and_charges_only_copies() {
+        use std::os::unix::fs::MetadataExt;
+
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-incremental");
+        append_history_messages(
+            &store.session_file,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("incremental".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        fs::create_dir_all(&store.session_assets).unwrap();
+        fs::write(
+            store.session_assets.join("stable.bin"),
+            vec![7u8; 1024 * 1024],
+        )
+        .unwrap();
+        store.save("one").unwrap();
+
+        fs::write(store.session_assets.join("changed.bin"), b"new").unwrap();
+        store.save("two").unwrap();
+
+        let one_assets = store.checkpoint_assets_path("one");
+        let two_assets = store.checkpoint_assets_path("two");
+        assert_eq!(
+            fs::metadata(one_assets.join("stable.bin")).unwrap().ino(),
+            fs::metadata(two_assets.join("stable.bin")).unwrap().ino(),
+            "unchanged asset must be hard-linked from the parent generation"
+        );
+        assert_eq!(
+            fs::read(two_assets.join("changed.bin")).unwrap(),
+            b"new".to_vec()
+        );
+        assert!(
+            store
+                .generation_dir("two")
+                .join(GENERATION_ASSET_INDEX_FILE)
+                .is_file()
+        );
+
+        let listed = store.list().unwrap();
+        let two = listed
+            .iter()
+            .find(|checkpoint| checkpoint.name == "two")
+            .unwrap();
+        assert!(
+            two.storage_bytes < two.size_bytes,
+            "hard-linked bytes must not be charged again"
+        );
+        store.delete("one").unwrap();
+        assert_eq!(
+            fs::read(two_assets.join("stable.bin")).unwrap().len(),
+            1024 * 1024,
+            "a child hardlink must survive deleting its parent generation"
+        );
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn incremental_snapshot_compares_content_before_reusing_parent() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "ai-checkpoint-link-collision-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = root.join("source");
+        let parent_assets = root.join("parent");
+        let destination = root.join("destination");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&parent_assets).unwrap();
+        fs::write(source.join("same.md"), "tampered").unwrap();
+        fs::write(parent_assets.join("same.md"), "snapshot").unwrap();
+
+        let mut parent_index = AssetIndex::default();
+        parent_index.entries.insert(
+            PathBuf::from("same.md"),
+            asset_fingerprint(&fs::metadata(source.join("same.md")).unwrap()),
+        );
+        let parent = SnapshotBase {
+            assets: parent_assets.clone(),
+            index: parent_index,
+        };
+        copy_directory_snapshot(
+            &source,
+            &destination,
+            &root.join(GENERATION_ASSET_INDEX_FILE),
+            Some(&parent),
+            SnapshotScope::All,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("same.md")).unwrap(),
+            "tampered",
+            "a fingerprint match must not reuse different bytes"
+        );
+        assert_ne!(
+            fs::metadata(destination.join("same.md")).unwrap().ino(),
+            fs::metadata(parent_assets.join("same.md")).unwrap().ino(),
+            "different content must be copied, not hard-linked"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_skips_unchanged_assets_when_the_index_matches() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "ai-checkpoint-restore-skip-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = root.join("checkpoint");
+        let live = root.join("live");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&live).unwrap();
+        fs::write(source.join("same.md"), "same").unwrap();
+        fs::write(source.join("changed.md"), "snapshot").unwrap();
+        fs::write(live.join("same.md"), "same").unwrap();
+        fs::write(live.join("changed.md"), "old").unwrap();
+
+        let mut index = AssetIndex::default();
+        index.entries.insert(
+            PathBuf::from("same.md"),
+            asset_fingerprint(&fs::symlink_metadata(live.join("same.md")).unwrap()),
+        );
+        index.entries.insert(
+            PathBuf::from("changed.md"),
+            asset_fingerprint(&fs::symlink_metadata(live.join("changed.md")).unwrap()),
+        );
+        let same_inode = fs::symlink_metadata(live.join("same.md")).unwrap().ino();
+        let changed_inode = fs::symlink_metadata(live.join("changed.md"))
+            .unwrap()
+            .ino();
+
+        fs::write(live.join("changed.md"), "modified").unwrap();
+        restore_checkpoint_assets(&source, &live, Some(&index)).unwrap();
+
+        assert_eq!(fs::read_to_string(live.join("same.md")).unwrap(), "same");
+        assert_eq!(
+            fs::symlink_metadata(live.join("same.md")).unwrap().ino(),
+            same_inode,
+            "an unchanged asset must not be rewritten"
+        );
+        assert_eq!(
+            fs::read_to_string(live.join("changed.md")).unwrap(),
+            "snapshot"
+        );
+        assert_ne!(
+            fs::symlink_metadata(live.join("changed.md"))
+                .unwrap()
+                .ino(),
+            changed_inode,
+            "a changed asset must be replaced"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn rollback_skips_unchanged_assets_end_to_end() {
+        use std::os::unix::fs::MetadataExt;
+
+        let history_file = temp_history_file();
+        let store = CheckpointStore::new(&history_file, "sess-restore-skip");
+        append_history_messages(
+            &store.session_file,
+            &[Message {
+                role: "user".to_string(),
+                content: Value::String("restore-skip".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+        )
+        .unwrap();
+        fs::create_dir_all(&store.session_assets).unwrap();
+        fs::write(store.session_assets.join("same.bin"), vec![9u8; 4096]).unwrap();
+        fs::write(store.session_assets.join("changed.bin"), "snapshot").unwrap();
+        store.save("one").unwrap();
+
+        let same_inode = fs::metadata(store.session_assets.join("same.bin"))
+            .unwrap()
+            .ino();
+        let changed_inode = fs::metadata(store.session_assets.join("changed.bin"))
+            .unwrap()
+            .ino();
+        fs::write(
+            store.session_assets.join("changed.bin"),
+            "modified-after-save",
+        )
+        .unwrap();
+        fs::write(store.session_assets.join("concurrent.bin"), "keep").unwrap();
+
+        store.rollback("one").unwrap();
+
+        assert_eq!(
+            fs::read(store.session_assets.join("same.bin")).unwrap(),
+            vec![9u8; 4096]
+        );
+        assert_eq!(
+            fs::metadata(store.session_assets.join("same.bin"))
+                .unwrap()
+                .ino(),
+            same_inode,
+            "unchanged assets must not be rewritten during rollback"
+        );
+        assert_eq!(
+            fs::read_to_string(store.session_assets.join("changed.bin")).unwrap(),
+            "snapshot"
+        );
+        assert_ne!(
+            fs::metadata(store.session_assets.join("changed.bin"))
+                .unwrap()
+                .ino(),
+            changed_inode,
+            "changed assets must be restored"
+        );
+        assert_eq!(
+            fs::read_to_string(store.session_assets.join("concurrent.bin")).unwrap(),
+            "keep"
+        );
+        let _ = fs::remove_dir_all(history_file.parent().unwrap());
+    }
+
+    #[test]
+    fn restore_replaces_same_length_content_when_fingerprint_matches() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-checkpoint-restore-collision-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = root.join("checkpoint");
+        let live = root.join("live");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&live).unwrap();
+        fs::write(source.join("same.md"), "snapshot").unwrap();
+        fs::write(live.join("same.md"), "tampered").unwrap();
+        let mut index = AssetIndex::default();
+        index.entries.insert(
+            PathBuf::from("same.md"),
+            asset_fingerprint(&fs::symlink_metadata(live.join("same.md")).unwrap()),
+        );
+
+        restore_checkpoint_assets(&source, &live, Some(&index)).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(live.join("same.md")).unwrap(),
+            "snapshot",
+            "matching metadata must not suppress the byte comparison"
         );
         let _ = fs::remove_dir_all(root);
     }
