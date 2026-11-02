@@ -2782,6 +2782,10 @@ fn render_turn_stream_to_with_confirm(
     // usually repeats them; a terminal cannot rewind the rows, so only the
     // not-yet-rendered suffix is printed.
     let mut streamed_body = String::new();
+    // Whether a `replace` has committed a turn on this stream. The turn header
+    // is also printed on stream retries, so only a header after a committed
+    // turn starts a new one.
+    let mut turn_committed = false;
     loop {
         raw.clear();
         if reader.read_line(&mut raw)? == 0 {
@@ -3085,7 +3089,23 @@ fn render_turn_stream_to_with_confirm(
                     .ok()
                     .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
                     .unwrap_or_default();
-                if let Some(suffix) = text.strip_prefix(streamed_body.as_str()) {
+                if text.is_empty() {
+                    // An empty accepted body means the turn produced no
+                    // user-visible answer (or the final gate rejected it).
+                    // The provisional deltas are not authoritative, and
+                    // `/history last` can show an older turn's answer, so say
+                    // plainly that this turn has no final answer instead of
+                    // pointing at history.
+                    if line_open {
+                        let _ = writeln!(out);
+                    }
+                    let _ = writeln!(
+                        out,
+                        "[serve-chat] this turn ended without a final answer; the provisional draft was not authoritative."
+                    );
+                    line_open = false;
+                    let _ = out.flush();
+                } else if let Some(suffix) = text.strip_prefix(streamed_body.as_str()) {
                     if !suffix.is_empty() {
                         if tty {
                             let _ = markdown.write_chunk_to(out, suffix, false);
@@ -3097,20 +3117,29 @@ fn render_turn_stream_to_with_confirm(
                     }
                 } else {
                     // The accepted body is not an extension of the streamed
-                    // text (a gate rewrote or rejected it). Printing the
-                    // payload would expose raw JSON and duplicating the whole
-                    // body would leave two conflicting answers; point at the
-                    // canonical answer instead.
+                    // text (a gate rewrote it). The provisional draft may
+                    // never have reached the screen (or may have been
+                    // overwritten), so hiding the accepted body would leave
+                    // the turn with no visible answer. Print it under a
+                    // separator; a duplicate is preferable to a missing
+                    // answer.
                     if line_open {
                         let _ = writeln!(out);
-                        line_open = false;
                     }
                     let _ = writeln!(
                         out,
-                        "[serve-chat] final answer was revised; run /history last to view it."
+                        "[serve-chat] final answer was revised; showing the accepted answer:"
                     );
+                    if tty {
+                        let _ = markdown.write_chunk_to(out, &text, false);
+                    } else {
+                        let _ = write!(out, "{text}");
+                    }
+                    line_open = !text.ends_with('\n');
+                    let _ = out.flush();
                 }
                 streamed_body = text;
+                turn_committed = true;
             }
             "subagent_progress" => {
                 // Serve frames carry the whole parent-observed status line
@@ -3167,6 +3196,17 @@ fn render_turn_stream_to_with_confirm(
                     // local run. Annotate only that row; every other observer
                     // row stays byte-identical.
                     let row = if is_turn_header_row(payload) {
+                        // A serve child can run several turns on one SSE
+                        // stream (a pending side-note is flushed as the next
+                        // user input). Only a header after a committed turn
+                        // starts a new one: `print_info` also runs inside the
+                        // stream retry loop, and clearing the buffer there
+                        // would duplicate the answer already painted for the
+                        // same turn.
+                        if turn_committed {
+                            streamed_body.clear();
+                            turn_committed = false;
+                        }
                         annotate_remote_turn_header(payload, tty)
                     } else {
                         payload.to_string()
@@ -4641,6 +4681,87 @@ mod tests {
         let mut buf = Vec::new();
         render_turn_stream_to(resp, &mut buf, false).expect("render");
         assert_eq!(String::from_utf8(buf).expect("utf8"), "full answer\n");
+    }
+
+    #[test]
+    fn sse_replace_event_with_rewritten_body_prints_the_accepted_answer() {
+        // A final gate can rewrite the streamed draft. The client must render
+        // the accepted body; a notice alone hides the only authoritative copy.
+        let body = "event: delta\ndata: {\"delta\": \"draft\"}\n\nevent: replace\ndata: {\"text\": \"accepted answer\"}\n\nevent: done\ndata: \n\n";
+        let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(out.contains("accepted answer"), "missing final body: {out}");
+        assert!(
+            out.contains("final answer was revised"),
+            "missing revision notice: {out}"
+        );
+    }
+
+    #[test]
+    fn sse_empty_replace_reports_missing_final_answer() {
+        // An empty accepted body clears rejected prose, but the user must not
+        // be pointed at `/history last`: that can show an older turn's answer.
+        let body = "event: delta\ndata: {\"delta\": \"draft\"}\n\nevent: replace\ndata: {\"text\": \"\"}\n\nevent: done\ndata: \n\n";
+        let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(
+            out.contains("without a final answer"),
+            "missing status: {out}"
+        );
+        assert!(!out.contains("/history last"), "misleading pointer: {out}");
+    }
+
+    #[test]
+    fn sse_turn_header_resets_the_streamed_body_buffer() {
+        // A serve child can flush pending side-notes as a second turn on the
+        // same SSE stream. Each turn's `replace` must be compared only with
+        // that turn's deltas, not the previous turn's answer.
+        let body = concat!(
+            "event: delta\ndata: {\"delta\": \"first\"}\n\n",
+            "event: replace\ndata: {\"text\": \"first\"}\n\n",
+            "data: [test (effort: max) - topic]\n\n",
+            "event: delta\ndata: {\"delta\": \"second\"}\n\n",
+            "event: replace\ndata: {\"text\": \"second\"}\n\n",
+            "event: done\ndata: \n\n",
+        );
+        let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(
+            !out.contains("final answer was revised"),
+            "spurious revision notice: {out}"
+        );
+        assert!(out.contains("first"), "missing first turn body: {out}");
+        assert!(out.contains("second"), "missing second turn body: {out}");
+    }
+
+    #[test]
+    fn sse_stream_retry_header_does_not_duplicate_the_streamed_answer() {
+        // `print_info` runs inside the stream retry loop, so a retry prints
+        // the turn header mid-turn. That header must not clear the body
+        // already painted for the same turn.
+        let body = concat!(
+            "event: delta\ndata: {\"delta\": \"part1\"}\n\n",
+            "data: [test (effort: max) - retry]\n\n",
+            "event: delta\ndata: {\"delta\": \"part2\"}\n\n",
+            "event: replace\ndata: {\"text\": \"part1part2\"}\n\n",
+            "event: done\ndata: \n\n",
+        );
+        let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+        let mut buf = Vec::new();
+        render_turn_stream_to(resp, &mut buf, false).expect("render");
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(
+            !out.contains("final answer was revised"),
+            "retry header caused a spurious rewrite: {out}"
+        );
+        assert_eq!(out.matches("part1").count(), 1, "duplicated first half: {out}");
+        assert_eq!(out.matches("part2").count(), 1, "duplicated second half: {out}");
     }
 
     #[test]
