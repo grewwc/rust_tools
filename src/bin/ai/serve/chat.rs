@@ -771,6 +771,40 @@ fn fetch_serve_skills(
         .collect())
 }
 
+/// Push the server skill list into Tab completion so `/skills` and `@skills`
+/// suggest remote names. Must run on every successful fetch: completion reads
+/// only this cache in serve-chat and never falls back to local disk.
+fn apply_serve_skills_to_completion(entries: &[ServeSkillEntry]) {
+    CommandCompleter::set_skill_name_descriptions(
+        entries
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.description.clone()))
+            .collect(),
+    );
+}
+
+/// Best-effort skill refresh before each input box (short timeout, errors
+/// swallowed): keeps `/skills` completion fresh when server manifests change.
+/// Failures keep the previous cache; the prompt is never blocked by this.
+fn refresh_serve_skills_quiet(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    token: &str,
+) -> Option<Vec<ServeSkillEntry>> {
+    let resp = auth(client.get(format!("{base}/skills")), token)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .ok()
+        .filter(|resp| resp.status().is_success())?;
+    let entries: Vec<ServeSkillEntry> = resp.json().ok()?;
+    Some(
+        entries
+            .into_iter()
+            .filter(|entry| !entry.name.trim().is_empty())
+            .collect(),
+    )
+}
+
 /// Print the server skill list, marking the pending next-turn selection.
 fn print_serve_skills_list(entries: &[ServeSkillEntry], selected: &[String]) {
     if entries.is_empty() {
@@ -908,6 +942,7 @@ fn run_serve_skills_command(
             return None;
         }
     };
+    apply_serve_skills_to_completion(&entries);
     if arg.is_empty() || arg.eq_ignore_ascii_case("list") || arg.eq_ignore_ascii_case("ls") {
         print_serve_skills_list(&entries, &selection.skills);
         return None;
@@ -3970,6 +4005,13 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
     let current_session: Arc<std::sync::Mutex<String>> =
         Arc::new(std::sync::Mutex::new(session_id.clone()));
     install_serve_cd_completion(&client, &base, &token, current_session.clone());
+    // Skill Tab-completion must list the remote server's skills: the shared
+    // cache starts empty (Some) so completion never falls back to this
+    // client's local disk, then the quiet refresh below fills it.
+    CommandCompleter::set_skill_name_descriptions(Vec::new());
+    if let Some(entries) = refresh_serve_skills_quiet(&client, &base, &token) {
+        apply_serve_skills_to_completion(&entries);
+    }
     // Last `/sessions` view and its rows: backs `/resume <number|id-prefix>`.
     // The silent refresh below re-applies the view, so a filtered listing keeps
     // the row numbers the user just saw.
@@ -4015,6 +4057,9 @@ pub(in crate::ai) fn run_serve_chat(cli: ParsedCli) -> Result<(), Box<dyn std::e
             CommandCompleter::set_checkpoint_name_candidates(checkpoint_state.checkpoints);
             CommandCompleter::set_checkpoint_branch_candidates(checkpoint_state.branches);
             editor.set_remote_checkpoint_status_label(checkpoint_state.checkpoint_status);
+        }
+        if let Some(entries) = refresh_serve_skills_quiet(&client, &base, &token) {
+            apply_serve_skills_to_completion(&entries);
         }
         let input = match editor.read_multi_line() {
             Ok(Some(text)) => text,

@@ -223,6 +223,40 @@ impl CommandCompleter {
         }
     }
 
+    /// Update the skill completion cache from remote name/description pairs.
+    /// Serve-chat owns this path: the server skill list backs Tab completion
+    /// so `/skills` and `@skills` suggest what a remote turn can force.
+    /// Empty descriptions render as the bare name, matching local manifests.
+    pub(in crate::ai) fn set_skill_name_descriptions(entries: Vec<(String, String)>) {
+        if let Ok(mut guard) = SKILL_NAME_CANDIDATES.write() {
+            *guard = Some(Self::skill_candidates_from_name_descriptions(entries));
+        }
+    }
+
+    /// Build skill candidates from remote name/description pairs. Pure helper
+    /// behind [`Self::set_skill_name_descriptions`]; kept separate so tests
+    /// cover the display shape without touching the global cache.
+    fn skill_candidates_from_name_descriptions(
+        entries: Vec<(String, String)>,
+    ) -> Vec<CompletionCandidate> {
+        entries
+            .into_iter()
+            .filter(|(name, _)| !name.trim().is_empty())
+            .map(|(name, description)| {
+                let trimmed = description.trim();
+                let display = if trimmed.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{name} · {trimmed}")
+                };
+                CompletionCandidate {
+                    display,
+                    replacement: name,
+                }
+            })
+            .collect()
+    }
+
     /// Update the switchable-agent completion cache from the runtime manifest snapshot.
     pub(in crate::ai) fn set_agent_manifests(manifests: &[crate::ai::agents::AgentManifest]) {
         if let Ok(mut guard) = AGENT_NAME_CANDIDATES.write() {
@@ -3650,6 +3684,22 @@ mod tests {
                 c.replacement
             );
         }
+    }
+
+    #[test]
+    fn remote_skill_candidates_render_name_and_description() {
+        // Pure shape behind serve-chat remote completion: empty names drop,
+        // empty descriptions render as the bare name, otherwise `name · desc`.
+        let candidates = CommandCompleter::skill_candidates_from_name_descriptions(vec![
+            ("remote-b".to_string(), "  does things  ".to_string()),
+            ("remote-a".to_string(), String::new()),
+            ("   ".to_string(), "ignored".to_string()),
+        ]);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].replacement, "remote-b");
+        assert_eq!(candidates[0].display, "remote-b · does things");
+        assert_eq!(candidates[1].replacement, "remote-a");
+        assert_eq!(candidates[1].display, "remote-a");
     }
 
     #[test]
