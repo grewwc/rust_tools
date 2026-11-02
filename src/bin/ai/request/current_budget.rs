@@ -94,12 +94,23 @@ impl WaterBand {
     }
 }
 
-/// Fixed water meter note per band. Byte-stable within a band by
-/// construction (only fixed edge labels, no measured numbers): the
-/// calibration prefix fingerprint covers all messages, so a
-/// per-round-changing note would break usage calibration on every send. A
-/// band transition costs exactly one prefix break, then the chain
-/// re-stabilizes; transitions are rare (see [`WaterBand::for_upper`]).
+/// Prefix of the request-only water-meter note.
+///
+/// The note travels as a synthetic user message at the request tail, so a band
+/// change never moves the cached system/tool prefix. Cache breakpoint selection
+/// identifies it by this prefix.
+pub(crate) const WATER_METER_PREFIX: &str = "[context-water-meter:";
+
+/// Whether `text` is a water-meter note.
+pub(crate) fn is_water_meter_text(text: &str) -> bool {
+    text.trim_start().starts_with(WATER_METER_PREFIX)
+}
+
+/// Fixed water meter note per band. The note is request-only tail context and
+/// is trimmed from calibration/prefix-reuse comparisons, so changing bands only
+/// changes the tail message; it never moves the cached system/tool prefix.
+/// Fixed edge labels (no measured numbers) also keep the note byte-stable
+/// within a band, so repeated requests reuse the same tail bytes.
 pub(crate) fn water_note(band: WaterBand) -> &'static str {
     match band {
         WaterBand::Comfortable => "[context-water-meter: comfortable] Conservative context occupancy is below 60% of the input allowance. No action needed.",

@@ -3,7 +3,8 @@
 use std::hash::{Hash, Hasher};
 
 use super::RequestBody;
-use crate::ai::history::Message;
+use super::current_budget::WATER_METER_PREFIX;
+use crate::ai::history::{Message, is_code_inspection_memory_text};
 use crate::ai::history::compress::BillableCounts;
 use crate::ai::models;
 use crate::ai::types::ToolDefinition;
@@ -37,6 +38,10 @@ pub(crate) struct PromptTokenFeedback {
     context_window: usize,
     settings: Option<u64>,
     messages: Option<Vec<u64>>,
+    /// Length of the stable conversation prefix in `messages`; request-only
+    /// tail notes are excluded so their per-request content cannot break
+    /// calibration or prefix-reuse accounting.
+    stable_message_count: usize,
     estimated_prompt_tokens: usize,
     /// Pessimistic twin of `estimated_prompt_tokens`: identical inputs, every
     /// component projected with its `_upper` variant. Upper-bound input for
@@ -48,6 +53,23 @@ pub(crate) struct PromptTokenFeedback {
     awaiting_usage: bool,
     cache_key: Option<u64>,
     prefix_reuse: Option<PrefixReuse>,
+}
+
+fn is_request_only_note(message: &Message) -> bool {
+    message.role == "user"
+        && matches!(
+            &message.content,
+            Value::String(text)
+                if is_code_inspection_memory_text(text)
+                    || text.trim_start().starts_with(WATER_METER_PREFIX)
+        )
+}
+
+fn stable_message_count(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .rposition(|message| !is_request_only_note(message))
+        .map_or(0, |index| index + 1)
 }
 
 /// Fallback ratio when a request carries no message text to observe.
@@ -283,6 +305,7 @@ impl PromptTokenFeedback {
             context_window: models::context_window_tokens(model),
             settings: Some(fingerprint_settings(body)),
             messages: Some(body.messages.iter().map(fingerprint_message).collect()),
+            stable_message_count: stable_message_count(body.messages),
             estimated_prompt_tokens: body.estimated_prompt_tokens,
             estimated_prompt_tokens_upper: body.estimated_prompt_tokens_upper,
             message_counts: body.message_counts,
@@ -347,6 +370,7 @@ impl PromptTokenFeedback {
             context_window: models::context_window_tokens(model),
             settings: Some(hasher.finish()),
             messages: Some(messages.iter().map(fingerprint_message).collect()),
+            stable_message_count: stable_message_count(messages),
             estimated_prompt_tokens,
             estimated_prompt_tokens_upper,
             message_counts,
@@ -375,6 +399,8 @@ impl PromptTokenFeedback {
         let (Some(current), Some(prior)) = (&self.messages, &previous.messages) else {
             return None;
         };
+        let current = &current[..self.stable_message_count.min(current.len())];
+        let prior = &prior[..previous.stable_message_count.min(prior.len())];
         Some(PrefixReuse {
             previous_messages: prior.len(),
             current_messages: current.len(),
@@ -393,14 +419,14 @@ impl PromptTokenFeedback {
         self.prefix_reuse
     }
 
-    /// Whether the captured request begins with this exact message. The water
-    /// meter uses this to preserve its prior fixed-band prefix long enough to
-    /// apply compatible provider usage before deciding whether to change bands.
-    pub(super) fn starts_with_message(&self, message: &Message) -> bool {
+    /// Whether the captured request contains this exact message. The water
+    /// meter uses this to recover its prior band from the request tail, where
+    /// the note lives so band changes cannot move the cached system prefix.
+    pub(super) fn contains_message(&self, message: &Message) -> bool {
+        let fingerprint = fingerprint_message(message);
         self.messages
             .as_ref()
-            .and_then(|messages| messages.first())
-            .is_some_and(|fingerprint| *fingerprint == fingerprint_message(message))
+            .is_some_and(|messages| messages.contains(&fingerprint))
     }
 
     /// Consume the pending observation even when usage is missing or mismatched.
@@ -440,6 +466,8 @@ impl PromptTokenFeedback {
         let (Some(messages), Some(prefix)) = (&self.messages, &previous.messages) else {
             return None;
         };
+        let messages = &messages[..self.stable_message_count.min(messages.len())];
+        let prefix = &prefix[..previous.stable_message_count.min(prefix.len())];
         // Compression, replacement, and reordering invalidate feedback even if
         // the resulting prompt is larger. Only an unchanged prefix may grow.
         if prefix.is_empty() || !messages.starts_with(prefix) {
@@ -572,6 +600,34 @@ mod tests {
         feedback.mark_sent_with_key("key-a");
         feedback.record_usage("session", Some(&model), Some(actual));
         feedback
+    }
+
+    #[test]
+    fn request_only_tail_notes_do_not_break_prefix_reuse() {
+        let model = model();
+        let previous_messages = vec![
+            message("user", "stable request"),
+            message(
+                "user",
+                "[context-water-meter: elevated] Conservative context occupancy is at 60-80%.",
+            ),
+        ];
+        let current_messages = vec![
+            message("user", "stable request"),
+            message("user", "next append-only request"),
+            message(
+                "user",
+                "[context-water-meter: pressure] Conservative context occupancy is at 80-100%.",
+            ),
+        ];
+        let previous = capture(&model, &previous_messages, None);
+        let mut current = capture(&model, &current_messages, None);
+        current.record_prefix_reuse(Some(&previous));
+
+        let reuse = current.prefix_reuse().expect("prefix reuse");
+        assert_eq!(reuse.previous_messages, 1);
+        assert_eq!(reuse.current_messages, 2);
+        assert_eq!(reuse.common_prefix_messages, 1);
     }
 
     #[test]

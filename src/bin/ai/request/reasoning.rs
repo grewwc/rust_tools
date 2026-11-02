@@ -13,7 +13,7 @@ use rustc_hash::FxHashMap;
 use serde_json::{Map, Value, json};
 
 use super::super::{
-    history::{Message, is_system_like_role},
+    history::{Message, is_code_inspection_memory_text, is_system_like_role},
     models,
     provider::{
         ApiProvider, ReasoningEffort, ThinkingOffCapability, adapter_for,
@@ -22,6 +22,8 @@ use super::super::{
     },
     types::{App, ReasoningItemMap},
 };
+use super::types::extract_displayable_text;
+use super::current_budget::is_water_meter_text;
 use crate::commonw::configw;
 
 /// Resolve the thinking/reasoning field shapes for each provider adapter.
@@ -409,11 +411,34 @@ pub(super) fn apply_prompt_cache_breakpoints(messages: &mut [Value]) {
     if let Some(content) = messages
         .iter_mut()
         .rev()
-        .find(|message| matches!(role_of(message).as_deref(), Some("user" | "tool")))
+        .find(|message| {
+            matches!(role_of(message).as_deref(), Some("user" | "tool"))
+                && !is_code_inspection_memory_message(message)
+                && !is_water_meter_message(message)
+        })
         .and_then(|message| message.get_mut("content"))
     {
         mark_content_cache_breakpoint(content, is_nonempty_text_block);
     }
+}
+
+/// The code-inspection working-memory note is request-only tail context. Leaving a rolling
+/// breakpoint on it would make every round's edited note re-bill the conversation prefix.
+pub(super) fn is_code_inspection_memory_message(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("user")
+        && message
+            .get("content")
+            .is_some_and(|content| is_code_inspection_memory_text(&extract_displayable_text(content)))
+}
+
+/// The water-meter note is request-only tail context. It changes with the
+/// context band, so leaving a rolling breakpoint on it would re-bill the
+/// conversation prefix whenever the band changes.
+pub(super) fn is_water_meter_message(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("user")
+        && message
+            .get("content")
+            .is_some_and(|content| is_water_meter_text(&extract_displayable_text(content)))
 }
 
 /// Marks `content` as a cache breakpoint: a non-empty plain string becomes a

@@ -152,9 +152,7 @@ impl SystemPromptBuilder {
         if facts.is_empty() {
             return None;
         }
-        let mut out = String::from(
-            "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n",
-        );
+        let mut out = String::from("<system-reminder>\n");
         for (label, content) in &facts {
             if let Some(key) = label {
                 out.push_str(&format!("## {}\n{}\n\n", key, content.trim()));
@@ -162,11 +160,9 @@ impl SystemPromptBuilder {
                 out.push_str(&format!("{}\n\n", content.trim()));
             }
         }
-        out.push_str("IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\n</system-reminder>");
-        // Keep a constant near-end pointer to the base behavior contracts,
-        // outside the optional fact context. Do not define a second acceptance
-        // standard here; recorded reminders still replay byte-identically.
-        out.push_str("\n<system-reminder>\nBehavior check (mandatory, every turn): apply the base evidence and outcome-reporting rules. Resolve only gaps that materially affect delivery; otherwise reuse sufficient evidence and keep conclusions within its support.\n</system-reminder>");
+        out.push_str(
+            "Use this context only when relevant.\n\nBehavior check (mandatory, every turn): apply the base evidence and outcome-reporting rules. Resolve only gaps that materially affect delivery; otherwise reuse sufficient evidence and keep conclusions within its support.\n</system-reminder>",
+        );
         Some(out)
     }
 }
@@ -1728,8 +1724,7 @@ fn build_system_prompt(
                 "Do NOT use `write_file(temp=true)` on existing project files; reserve `write_file` without `temp` for genuine full rewrites (localized edits go through `apply_patch`).".to_string(),
             );
             lines.push(
-                "When one file needs several localized edits, read the span once. Make ONE `apply_patch` call with multiple `@@` hunks only when every hunk has a unique anchor (distinct context); for structurally similar blocks, patch one at a time with a distinctive anchor line such as a function name or comment."
-                    .to_string(),
+                "Batch hunks into one `apply_patch` call only when every anchor is unique; otherwise patch one at a time with a distinctive anchor.".to_string(),
             );
             lines.push(
                 "To remove an existing project/source/config file, including a git-tracked file, use `apply_patch` with a `*** Delete File: <path>` section.".to_string(),
@@ -2474,7 +2469,7 @@ mod pure_prompt_tests {
 
     #[test]
     fn default_profile_prompt_bytes_are_unchanged() {
-        const DEFAULT_PROFILE_PROMPT_HASH: u64 = 4_005_824_832_458_205_908;
+        const DEFAULT_PROFILE_PROMPT_HASH: u64 = 4_947_217_246_557_299_139;
         let prompt = render_turn(
             None,
             &[],

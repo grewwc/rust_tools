@@ -24,7 +24,9 @@ use super::builder::{
     estimate_request_prompt_upper_from_definitions, measure_request_prompt_from_definitions,
     resolve_wire_enable_search,
 };
-use super::current_budget::{ContextLimits, CurrentRequestBudget, WaterBand, water_note};
+use super::current_budget::{
+    ContextLimits, CurrentRequestBudget, WaterBand, is_water_meter_text, water_note,
+};
 use super::error::{
     REQUEST_MAX_ATTEMPTS, RequestError, RequestErrorKind, RequestRetryPolicy,
     STREAM_RESPONSE_HEADER_TIMEOUT_SECS, api_key_for_request_model, apply_request_auth,
@@ -551,8 +553,9 @@ pub(crate) async fn preview_request_budget(
         ContextLimits::for_model(model, app.cli.max_tokens_override).input_allowance_tokens;
     let provisional_band = previous_water_meter_band(app.last_known_prompt_tokens.as_ref())
         .unwrap_or_else(|| WaterBand::for_upper(naked_upper, allowance));
-    core.messages
-        .insert(0, water_meter_message(provisional_band));
+    if provisional_band != WaterBand::Comfortable {
+        core.messages.push(water_meter_message(provisional_band));
+    }
     let measure = |messages: &[Message]| {
         let counts = measure_request_prompt_from_definitions(
             messages,
@@ -595,6 +598,8 @@ pub(crate) async fn preview_request_budget(
 /// across the mutable transport path. Both preview and send build tools once.
 struct RequestProjection {
     messages: Vec<Message>,
+    /// Index of the request-tail water-meter note, when one is present.
+    water_meter_index: Option<usize>,
     corrected_messages: Option<Vec<Message>>,
     tools: Option<Value>,
     tool_choice: Option<Value>,
@@ -718,6 +723,7 @@ async fn prepare_request_projection(
     );
     RequestProjection {
         messages: core.messages,
+        water_meter_index: None,
         corrected_messages: None,
         tools: tools_value,
         tool_choice,
@@ -729,17 +735,24 @@ async fn prepare_request_projection(
     }
 }
 
-/// Display-only water meter note as a leading system message. Fixed text per
-/// band; preview uses the provisional band while send may replace it after
-/// calibration (see `water_note` for the stability contract).
+/// Display-only water meter note as a request-tail user message. Fixed text per
+/// band; a band change replaces only this tail message, so the cached
+/// system/tool prefix stays byte-stable. Preview uses the provisional band while
+/// send may replace it after calibration (see `water_note` for the stability
+/// contract).
 fn water_meter_message(band: WaterBand) -> Message {
     Message {
-        role: "system".to_string(),
+        role: "user".to_string(),
         content: Value::String(water_note(band).to_string()),
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
     }
+}
+
+fn is_water_meter_message(message: &Message) -> bool {
+    message.role == "user"
+        && matches!(&message.content, Value::String(text) if is_water_meter_text(text))
 }
 
 fn previous_water_meter_band(previous: Option<&PromptTokenFeedback>) -> Option<WaterBand> {
@@ -751,11 +764,19 @@ fn previous_water_meter_band(previous: Option<&PromptTokenFeedback>) -> Option<W
             WaterBand::Critical,
         ]
         .into_iter()
-        .find(|band| feedback.starts_with_message(&water_meter_message(*band)))
+        .find(|band| feedback.contains_message(&water_meter_message(*band)))
     })
 }
 
 impl RequestProjection {
+    fn remove_water_meter_note(&mut self) {
+        if let Some(index) = self.water_meter_index.take()
+            && self.messages.get(index).is_some_and(is_water_meter_message)
+        {
+            self.messages.remove(index);
+        }
+    }
+
     fn measure<'a>(
         &'a mut self,
         app: &App,
@@ -763,12 +784,13 @@ impl RequestProjection {
         stream: bool,
         previous: Option<&PromptTokenFeedback>,
     ) -> (RequestBody<'a>, PromptTokenFeedback, CurrentRequestBudget) {
-        // Preserve the previous fixed-band prefix long enough to apply
+        // Recover the prior band from the tail note long enough to apply
         // compatible provider usage, falling back to the noteless upper
         // estimate when no prior meter exists. Then correct the note from the
-        // calibrated budget. Text is fixed per band so the calibration prefix
-        // stays byte-stable once the corrected band is stable (see
-        // `water_note`). Preview mirrors the provisional pass.
+        // calibrated budget. The note is trimmed from prefix comparison, so a
+        // band change only rewrites the tail message (see `water_note`).
+        // Preview mirrors the provisional pass.
+        self.remove_water_meter_note();
         let allowance =
             ContextLimits::for_model(model, app.cli.max_tokens_override).input_allowance_tokens;
         let provisional_band = previous_water_meter_band(previous).unwrap_or_else(|| {
@@ -781,8 +803,10 @@ impl RequestProjection {
                 allowance,
             )
         });
-        self.messages
-            .insert(0, water_meter_message(provisional_band));
+        if provisional_band != WaterBand::Comfortable {
+            self.water_meter_index = Some(self.messages.len());
+            self.messages.push(water_meter_message(provisional_band));
+        }
         let mut body = build_request_body(
             model,
             &self.messages,
@@ -827,7 +851,19 @@ impl RequestProjection {
         self.tool_choice = body.tool_choice.take();
         drop(body);
         let mut corrected_messages = self.messages.clone();
-        corrected_messages[0] = water_meter_message(calibrated_band);
+        if calibrated_band == WaterBand::Comfortable {
+            if let Some(index) = self.water_meter_index
+                && corrected_messages
+                    .get(index)
+                    .is_some_and(is_water_meter_message)
+            {
+                corrected_messages.remove(index);
+            }
+        } else if let Some(index) = self.water_meter_index {
+            corrected_messages[index] = water_meter_message(calibrated_band);
+        } else {
+            corrected_messages.push(water_meter_message(calibrated_band));
+        }
         self.corrected_messages = Some(corrected_messages);
         let corrected_messages = self
             .corrected_messages
@@ -1053,14 +1089,17 @@ mod budget_tests {
             });
             assert_eq!(tool_tokens > 0, tools_enabled);
             let (body, _, measured) = projection.measure(&app, &model, true, None);
-            // The send projection carries the fixed water meter note on top of
-            // the normalized messages; count it exactly with the same estimator.
-            let note_tokens = super::super::builder::estimate_request_prompt_tokens(
-                &[super::water_meter_message(super::WaterBand::Comfortable)],
-                None,
-                None,
-            );
-            assert!(note_tokens > 0);
+            // The comfortable band adds no water-meter note; higher bands do.
+            let band = super::WaterBand::for_budget(measured);
+            let note_tokens = if band == super::WaterBand::Comfortable {
+                0
+            } else {
+                super::super::builder::estimate_request_prompt_tokens(
+                    &[super::water_meter_message(band)],
+                    None,
+                    None,
+                )
+            };
             assert_eq!(
                 measured.prompt_tokens,
                 message_tokens + tool_tokens + note_tokens
@@ -1110,10 +1149,13 @@ mod budget_tests {
         );
         let expected_band = WaterBand::for_budget(measured);
         assert_eq!(expected_band, WaterBand::Elevated);
-        assert_eq!(
-            body.messages[0].content,
-            water_meter_message(expected_band).content
-        );
+        let note = body
+            .messages
+            .last()
+            .expect("water meter note must trail the request");
+        assert_eq!(note.role, "user");
+        assert_eq!(note.content, water_meter_message(expected_band).content);
+        assert_eq!(body.messages[0].content, Value::String("prefix".to_string()));
         let preview = preview_request_budget(&app, &model, &messages, true, true)
             .now_or_never()
             .unwrap();
@@ -1136,14 +1178,51 @@ mod budget_tests {
             PromptCountSource::CompatibleActualPlusEstimatedGrowth
         );
         assert_eq!(WaterBand::for_budget(next_budget), WaterBand::Elevated);
+        let next_note = next_body
+            .messages
+            .last()
+            .expect("water meter note must trail the request");
+        assert_eq!(next_note.role, "user");
+        assert_eq!(
+            next_note.content,
+            water_meter_message(WaterBand::Elevated).content
+        );
         assert_eq!(
             next_body.messages[0].content,
-            water_meter_message(WaterBand::Elevated).content
+            Value::String("prefix".to_string())
         );
         let next_preview = preview_request_budget(&app, &model, &messages, true, true)
             .now_or_never()
             .unwrap();
         assert_eq!(next_preview, next_budget);
+    }
+
+    #[test]
+    fn previous_water_meter_band_finds_the_request_tail_note() {
+        let app = app();
+        let model = model();
+        let messages = vec![
+            message("user", "stable prefix"),
+            water_meter_message(WaterBand::Pressure),
+        ];
+        let body = build_request_body(
+            &model,
+            &messages,
+            true,
+            false,
+            None,
+            None,
+            None,
+            None,
+            app.cli.max_tokens_override,
+            None,
+            None,
+        );
+        let feedback = PromptTokenFeedback::capture(&app.session_id, &model, "", &body);
+        assert_eq!(
+            previous_water_meter_band(Some(&feedback)),
+            Some(WaterBand::Pressure)
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@
     "properties": {
       "command": {
         "type": "string",
-        "description": "Shell command to start. Servers, REPLs, multi-step interactive work, and any command that may outlive the blocking `timeout` should use `yield_time_ms`; short finite commands should rely on the blocking timeout. Do not pipe through `tail` or `grep`: they buffer output until the process exits, so every poll reports no new output. `head` ends the pipeline early instead."
+        "description": "Shell command to start. Servers, REPLs, multi-step interactive work, and any command that may outlive the blocking `timeout` should use `yield_time_ms`; short finite commands should rely on the blocking timeout. When polling a persistent session, avoid `tail`/`grep`: `tail` waits for EOF and `grep` may block-buffer when stdout is a pipe, so polls can report no new output; `head` ends the pipeline early instead. Ordinary blocking commands may pipe output through filters."
       },
       "cwd": {
         "type": "string",

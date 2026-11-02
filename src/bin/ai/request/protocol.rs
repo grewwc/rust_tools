@@ -8,7 +8,8 @@ use serde_json::{Value, json};
 
 use super::builder::RequestModelInputs;
 use super::reasoning::{
-    apply_prompt_cache_breakpoints, is_nonempty_text_block, mark_content_cache_breakpoint,
+    apply_prompt_cache_breakpoints, is_code_inspection_memory_message, is_nonempty_text_block,
+    is_water_meter_message, mark_content_cache_breakpoint,
     resolve_reasoning_wire_controls_from_parts,
 };
 use super::{RequestBody, types::extract_displayable_text};
@@ -153,7 +154,11 @@ fn mark_messages_cache_breakpoint(messages: &mut [Value]) {
     if let Some(content) = messages
         .iter_mut()
         .rev()
-        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .find(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && !is_code_inspection_memory_message(message)
+                && !is_water_meter_message(message)
+        })
         .and_then(|message| message.get_mut("content"))
     {
         mark_content_cache_breakpoint(content, |block| {
@@ -945,6 +950,143 @@ mod messages_body_tests {
         let mut empty = vec![json!({ "role": "user", "content": "" })];
         mark_messages_cache_breakpoint(&mut empty);
         assert_eq!(empty[0]["content"], "");
+    }
+
+    #[test]
+    fn messages_cache_breakpoint_skips_the_working_memory_tail_note() {
+        let mut messages = vec![
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": "calling tool"}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "ok"},
+            ]}),
+            json!({"role": "user", "content":
+                "Current code-inspection working memory:\n- read_file(file=src/lib.rs) => ok"}),
+        ];
+        mark_messages_cache_breakpoint(&mut messages);
+
+        // The editable note must not own the rolling breakpoint; the last stable tool result
+        // keeps it so the next round can reuse the whole previous prefix.
+        assert!(messages[3].get("cache_control").is_none());
+        assert!(messages[3]["content"].get("cache_control").is_none());
+        let blocks = messages[2]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn messages_cache_breakpoint_skips_the_water_meter_tail_note() {
+        let mut messages = vec![
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": "calling tool"}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "ok"},
+            ]}),
+            json!({"role": "user", "content":
+                "[context-water-meter: pressure] Context occupancy is at 80-100%."}),
+        ];
+        mark_messages_cache_breakpoint(&mut messages);
+
+        assert!(messages[3]["content"].get("cache_control").is_none());
+        let blocks = messages[2]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn messages_body_keeps_the_working_memory_note_out_of_the_system_prefix() {
+        let note = "Current code-inspection working memory:\n- read_file(file=src/lib.rs) => ok";
+        let messages = json_messages_to_request_messages(&[
+            json!({"role": "system", "content": "stable system"}),
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": "calling tool"}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "ok"},
+            ]}),
+            json!({"role": "user", "content": note}),
+        ]);
+        let request = RequestBody {
+            model: "claude-opus-5-5".to_string(),
+            messages: &messages,
+            stream: true,
+            thinking: serde_json::Map::new(),
+            enable_search: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            reasoning: None,
+            stream_options: None,
+            max_tokens: None,
+            reasoning_items: None,
+            reasoning_encrypted_replay: false,
+            estimated_prompt_tokens: 0,
+            estimated_prompt_tokens_upper: 0,
+            message_counts: Default::default(),
+            prompt_cache_key: None,
+            explicit_cache_breakpoints: false,
+            tool_errors: None,
+        };
+
+        let body = build_messages_request_body(&request);
+        assert_eq!(body["system"].as_str(), Some("stable system"));
+        let wire = body["messages"].as_array().expect("messages array");
+        assert_eq!(wire.last().unwrap()["role"], "user");
+        assert_eq!(wire.last().unwrap()["content"], note);
+    }
+
+    #[test]
+    fn messages_body_keeps_the_water_meter_note_out_of_the_system_prefix() {
+        let note = "[context-water-meter: pressure] Context occupancy is at 80-100%.";
+        let messages = json_messages_to_request_messages(&[
+            json!({"role": "system", "content": "stable system"}),
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": "calling tool"}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "ok"},
+            ]}),
+            json!({"role": "user", "content": note}),
+        ]);
+        let request = RequestBody {
+            model: "claude-opus-5-5".to_string(),
+            messages: &messages,
+            stream: true,
+            thinking: serde_json::Map::new(),
+            enable_search: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            reasoning: None,
+            stream_options: None,
+            max_tokens: None,
+            reasoning_items: None,
+            reasoning_encrypted_replay: false,
+            estimated_prompt_tokens: 0,
+            estimated_prompt_tokens_upper: 0,
+            message_counts: Default::default(),
+            prompt_cache_key: None,
+            explicit_cache_breakpoints: false,
+            tool_errors: None,
+        };
+
+        let body = build_messages_request_body(&request);
+        assert_eq!(body["system"].as_str(), Some("stable system"));
+        let wire = body["messages"].as_array().expect("messages array");
+        assert_eq!(wire.last().unwrap()["role"], "user");
+        assert_eq!(wire.last().unwrap()["content"], note);
+    }
+
+    #[test]
+    fn chat_cache_breakpoint_skips_the_water_meter_tail_note() {
+        let mut messages = vec![
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": "calling tool"}),
+            json!({"role": "user", "content": "tool result text"}),
+            json!({"role": "user", "content":
+                "[context-water-meter: pressure] Context occupancy is at 80-100%."}),
+        ];
+        apply_prompt_cache_breakpoints(&mut messages);
+
+        assert!(messages[3]["content"].get("cache_control").is_none());
+        let blocks = messages[2]["content"].as_array().expect("text block");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]

@@ -319,10 +319,12 @@ pub(in crate::ai) use task_evidence::{
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use types::{
-    COLON, MAX_HISTORY_TURNS, Message, NEWLINE, SkillActivationEvent, ToolExecutionOutcome,
-    attach_request_reminder, clear_runtime_message_metadata, has_runtime_message_metadata,
-    is_runtime_synthetic_user_message, last_real_user_index, prepend_request_reminder,
-    redact_inline_image_data, request_reminder, runtime_synthetic_user_message,
+    CODE_INSPECTION_MEMORY_PREFIX, COLON, MAX_HISTORY_TURNS, Message, NEWLINE,
+    SkillActivationEvent, ToolExecutionOutcome, attach_request_reminder,
+    clear_runtime_message_metadata, has_runtime_message_metadata,
+    is_code_inspection_memory_text, is_runtime_synthetic_user_message, last_real_user_index,
+    prepend_request_reminder, redact_inline_image_data, request_reminder,
+    runtime_synthetic_user_message,
 };
 
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;

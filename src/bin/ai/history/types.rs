@@ -9,6 +9,19 @@ pub(in crate::ai) const NEWLINE: char = '\x01';
 pub(crate) const ROLE_SYSTEM: &str = "system";
 pub(crate) const ROLE_INTERNAL_NOTE: &str = "internal_note";
 
+/// Prefix of the request-only note that summarizes the current turn's file inspections.
+///
+/// The note is regenerated after every tool round and is never persisted. It travels as a
+/// runtime-synthetic user message at the request tail so its changes cannot invalidate the
+/// cached system/tool prefix.
+pub(in crate::ai) const CODE_INSPECTION_MEMORY_PREFIX: &str =
+    "Current code-inspection working memory:";
+
+/// Whether `text` is a code-inspection working-memory note.
+pub(in crate::ai) fn is_code_inspection_memory_text(text: &str) -> bool {
+    text.trim_start().starts_with(CODE_INSPECTION_MEMORY_PREFIX)
+}
+
 /// Structured side record of tool execution outcomes. The body text remains stored
 /// verbatim in `messages`; this record is only used when building model requests to
 /// decide whether an earlier failure was already resolved by a later success with

@@ -69,6 +69,10 @@ impl AiConfig {
     pub const HISTORY_SUMMARY_PROMPT: &str = "ai.history.summary_prompt";
 
     // ── Intent ─────────────────────────────────────────────
+    /// Model for auxiliary control tasks (session titles, intent routing, and
+    /// similar one-shot helpers). Unset reuses the turn's current model; point
+    /// it at a cheap model to cut auxiliary request cost without changing the
+    /// main turn model.
     pub const INTENT_MODEL: &str = "ai.intent_model";
 
     // ── MCP ────────────────────────────────────────────────

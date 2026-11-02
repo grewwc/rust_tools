@@ -1098,9 +1098,10 @@ fn system_prompt_routes_project_file_deletes_to_apply_patch() {
     assert!(prompt.contains("Reserve the destination with `write_file(temp=true)`"));
     assert!(prompt.contains("git-tracked file"));
     assert!(prompt.contains("`apply_patch`"));
-    assert!(prompt.contains("ONE `apply_patch` call with multiple `@@` hunks"));
-    assert!(prompt.contains("unique anchor"));
-    assert!(prompt.contains("structurally similar blocks"));
+    assert!(prompt.contains(
+        "Batch hunks into one `apply_patch` call only when every anchor is unique"
+    ));
+    assert!(prompt.contains("distinctive anchor"));
     assert!(prompt.contains("`*** Delete File: <path>`"));
     // Patch-size limits are owned by the apply_patch schema and first-use
     // guidance; the system prompt must not restate them.
@@ -2380,8 +2381,8 @@ fn render_keeps_capabilities_in_system_prompt_out_of_fact_reminder() {
         .find("Behavior check (mandatory, every turn)")
         .expect("fact reminder must carry the near-end behavior check");
     let hedge = reminder
-        .find("IMPORTANT: this context")
-        .expect("fact reminder must keep its hedge for facts");
+        .find("Use this context only when relevant.")
+        .expect("fact reminder must keep a hedge for facts");
     assert!(
         check > hedge,
         "the behavior check must sit after the fact hedge instead of under it"

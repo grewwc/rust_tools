@@ -349,6 +349,39 @@ fn prompt_cache_breakpoints_mark_first_system_and_last_user_or_tool() {
 }
 
 #[test]
+fn prompt_cache_breakpoints_skip_the_working_memory_tail_note() {
+    let mut messages = vec![
+        serde_json::json!({ "role": "system", "content": "you are helpful" }),
+        serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": { "name": "read_file", "arguments": "{}" }
+            }]
+        }),
+        serde_json::json!({ "role": "tool", "tool_call_id": "c1", "content": "tool output" }),
+        serde_json::json!({
+            "role": "user",
+            "content": "Current code-inspection working memory:\n- read_file(file=src/lib.rs) => ok"
+        }),
+    ];
+    apply_prompt_cache_breakpoints(&mut messages);
+
+    // The rolling breakpoint stays on the stable tool result, not on the editable tail note.
+    assert_eq!(messages[2]["content"][0]["text"], "tool output");
+    assert_eq!(
+        messages[2]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert_eq!(
+        messages[3]["content"],
+        "Current code-inspection working memory:\n- read_file(file=src/lib.rs) => ok"
+    );
+}
+
+#[test]
 fn prompt_cache_breakpoints_mark_last_text_block_of_multimodal_user() {
     let mut messages = vec![serde_json::json!({
         "role": "user",

@@ -8,8 +8,9 @@ use crate::ai::{
     driver::tools::ExecuteToolCallsResult,
     files::{diff_line_tags, preview_anchor},
     history::{
-        Message, ROLE_INTERNAL_NOTE, SessionStore, compress::TOOL_RESULT_RAW_HARD_CAP_CHARS,
-        is_system_like_role,
+        CODE_INSPECTION_MEMORY_PREFIX, Message, ROLE_INTERNAL_NOTE, SessionStore,
+        compress::TOOL_RESULT_RAW_HARD_CAP_CHARS, is_code_inspection_memory_text,
+        is_runtime_synthetic_user_message, runtime_synthetic_user_message,
     },
     tools::plan_state::{PlanState, load_plan_state, plan_state_path},
     types::App,
@@ -22,7 +23,6 @@ use super::execution::prepare_recent_tool_result;
 
 const TOOL_RESULT_PREVIEW_SCAN_MAX_BYTES: usize = 64_000;
 
-const CODE_INSPECTION_MEMORY_PREFIX: &str = "Current code-inspection working memory:";
 const CONTEXT_CHECKPOINT_OPEN: &str = "<context_checkpoint>";
 const CONTEXT_CHECKPOINT_CLOSE: &str = "</context_checkpoint>";
 const CONTEXT_CHECKPOINT_SUMMARY_MAX_CHARS: usize = 240;
@@ -1178,37 +1178,31 @@ fn append_code_inspection_working_memory(
         return;
     };
 
-    // Replace in place: the working memory summarizes the current turn and is regenerated
-    // every round, so rewriting the existing note with the same prefix keeps N
-    // near-identical copies from piling up as persisted internal notes.
-    let mut found_prior = false;
-    for message in messages.iter_mut() {
-        if !is_system_like_role(&message.role) {
-            continue;
-        }
-        if let Value::String(content) = &message.content {
-            if content.starts_with(CODE_INSPECTION_MEMORY_PREFIX) {
-                // An identical note is left untouched so the prompt cache keeps hitting.
-                if content == &note {
-                    return;
-                }
-                message.content = Value::String(note.clone());
-                found_prior = true;
-                break;
-            }
-        }
-    }
-    if found_prior {
+    // The note summarizes the current turn and is regenerated every round. Keep it at the
+    // request tail as a runtime-synthetic user message instead of rewriting it in place:
+    // prompt caches match a byte prefix, so editing a note in the middle of the projection
+    // invalidates every later tool result. Removing the previous note and appending the new
+    // one leaves the prefix before that point reusable, and the synthetic origin keeps it
+    // from becoming a real user-turn boundary.
+    // Identify the note by its runtime origin marker as well as its content: a real user
+    // message, assistant narration, or tool result may legitimately start with the same
+    // prefix, and must never be deleted from the request.
+    let is_working_memory_note = |message: &Message| {
+        is_runtime_synthetic_user_message(message)
+            && matches!(
+                &message.content,
+                Value::String(content) if is_code_inspection_memory_text(content)
+            )
+    };
+    let unchanged = messages.iter().any(|message| {
+        is_working_memory_note(message)
+            && matches!(&message.content, Value::String(content) if content == &note)
+    });
+    if unchanged {
         return;
     }
-
-    messages.push(Message {
-        role: ROLE_INTERNAL_NOTE.to_string(),
-        content: Value::String(note),
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    });
+    messages.retain(|message| !is_working_memory_note(message));
+    messages.push(runtime_synthetic_user_message(Value::String(note)));
 }
 
 pub(super) fn record_final_stream_response(
@@ -1472,9 +1466,11 @@ fn truncate_note(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        TOOL_RESULT_RAW_HARD_CAP_CHARS, append_tool_result_messages,
+        CODE_INSPECTION_MEMORY_PREFIX, TOOL_RESULT_RAW_HARD_CAP_CHARS,
+        append_code_inspection_working_memory, append_tool_result_messages,
         append_tool_result_messages_for_model, build_code_inspection_working_memory,
-        collect_repo_inspection_findings, describe_tool_call, is_repo_inspection_tool,
+        collect_repo_inspection_findings, describe_tool_call, is_code_inspection_memory_text,
+        is_repo_inspection_tool, is_runtime_synthetic_user_message,
         prepare_tool_results_for_history, strip_legacy_prune_directives,
     };
     use super::{
@@ -2381,6 +2377,162 @@ mod tests {
         assert_eq!(note.matches("Already inspected in this turn").count(), 1);
         assert!(!note.contains("Completed exact tool calls in this turn"));
         assert!(!note.contains("\"file_path\""));
+    }
+
+    #[test]
+    fn working_memory_note_moves_to_tail_without_rewriting_the_cached_prefix() {
+        let system = Message {
+            role: "system".to_string(),
+            content: Value::String("stable system".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let user = Message {
+            role: "user".to_string(),
+            content: Value::String("inspect the repo".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let assistant1 = Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![tool_call(
+                "1",
+                "read_file",
+                serde_json::json!({"file_path":"src/lib.rs","offset":1,"limit":20}),
+            )]),
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let tool1 = Message {
+            role: "tool".to_string(),
+            content: Value::String("     1\tpub fn a() {}".to_string()),
+            tool_calls: None,
+            tool_call_id: Some("1".to_string()),
+            reasoning_content: None,
+        };
+        let mut messages = vec![
+            system.clone(),
+            user.clone(),
+            assistant1.clone(),
+            tool1.clone(),
+        ];
+        let turn_messages1 = vec![assistant1.clone(), tool1.clone()];
+        append_code_inspection_working_memory(
+            &mut messages,
+            &collect_repo_inspection_findings(&turn_messages1),
+        );
+        let note1 = messages
+            .last()
+            .and_then(|message| message.content.as_str())
+            .expect("first note")
+            .to_string();
+        assert!(is_code_inspection_memory_text(&note1));
+        assert_eq!(messages.last().unwrap().role, "user");
+        assert!(crate::ai::history::is_runtime_synthetic_user_message(
+            messages.last().unwrap()
+        ));
+        let first_request_prefix = messages[..messages.len() - 1].to_vec();
+
+        let assistant2 = Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![tool_call(
+                "2",
+                "read_file",
+                serde_json::json!({"file_path":"src/main.rs","offset":1,"limit":20}),
+            )]),
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let tool2 = Message {
+            role: "tool".to_string(),
+            content: Value::String("     1\tmod main;".to_string()),
+            tool_calls: None,
+            tool_call_id: Some("2".to_string()),
+            reasoning_content: None,
+        };
+        messages.push(assistant2.clone());
+        messages.push(tool2.clone());
+        let turn_messages2 = vec![assistant1, tool1.clone(), assistant2, tool2.clone()];
+        append_code_inspection_working_memory(
+            &mut messages,
+            &collect_repo_inspection_findings(&turn_messages2),
+        );
+
+        // Everything before the old note is untouched; the old note is gone and the new note
+        // sits at the tail, so the next request can reuse the whole previous prefix.
+        assert_eq!(
+            messages[..first_request_prefix.len()],
+            first_request_prefix[..]
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| is_code_inspection_memory_text(
+                    message.content.as_str().unwrap_or_default()
+                ))
+                .count(),
+            1
+        );
+        let note2 = messages.last().unwrap();
+        assert_eq!(note2.role, "user");
+        let note2 = note2.content.as_str().expect("second note");
+        assert!(note2.contains("read_file(file=src/lib.rs"));
+        assert!(note2.contains("read_file(file=src/main.rs"));
+        assert_ne!(note1, note2);
+    }
+
+    #[test]
+    fn working_memory_note_removal_keeps_messages_that_share_its_prefix() {
+        let user = Message {
+            role: "user".to_string(),
+            content: Value::String(format!(
+                "{} this is the real question",
+                CODE_INSPECTION_MEMORY_PREFIX
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let assistant = Message {
+            role: "assistant".to_string(),
+            content: Value::String(format!(
+                "{} quoted in narration",
+                CODE_INSPECTION_MEMORY_PREFIX
+            )),
+            tool_calls: Some(vec![tool_call(
+                "1",
+                "read_file",
+                serde_json::json!({"file_path":"src/lib.rs","offset":1,"limit":20}),
+            )]),
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let tool = Message {
+            role: "tool".to_string(),
+            content: Value::String(format!(
+                "{} echoed by a tool",
+                CODE_INSPECTION_MEMORY_PREFIX
+            )),
+            tool_calls: None,
+            tool_call_id: Some("1".to_string()),
+            reasoning_content: None,
+        };
+        let mut messages = vec![user.clone(), assistant.clone(), tool.clone()];
+
+        append_code_inspection_working_memory(
+            &mut messages,
+            &collect_repo_inspection_findings(&[assistant.clone(), tool.clone()]),
+        );
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0], user);
+        assert_eq!(messages[1], assistant);
+        assert_eq!(messages[2], tool);
+        assert!(is_runtime_synthetic_user_message(messages.last().unwrap()));
     }
 
     #[test]

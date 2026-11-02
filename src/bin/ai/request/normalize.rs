@@ -11,8 +11,8 @@ use serde_json::Value;
 
 use crate::ai::history::compress::QUERY_MEMORY_INDEX_PREFIX;
 use crate::ai::history::{
-    Message, ROLE_SYSTEM, clear_runtime_message_metadata, is_internal_note_role,
-    is_summary_note_text, is_system_like_role,
+    Message, ROLE_SYSTEM, clear_runtime_message_metadata, is_code_inspection_memory_text,
+    is_internal_note_role, is_summary_note_text, is_system_like_role,
 };
 use crate::ai::models;
 use crate::ai::tools::storage::mutation_log;
@@ -479,10 +479,10 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
 
     fn detect_note_kind(text: &str) -> InternalNoteKind {
         let trimmed = text.trim();
-        if trimmed.starts_with("Current code-inspection working memory:") {
+        if is_code_inspection_memory_text(trimmed) {
             return InternalNoteKind::WorkingMemory;
         }
-        if trimmed.starts_with("Context note: reused cached tool results") {
+        if trimmed.starts_with("Context note: reused prior tool results") {
             return InternalNoteKind::CachedTools;
         }
         if is_summary_note_text(trimmed) {

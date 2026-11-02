@@ -80,6 +80,35 @@ fn normalize_messages_keeps_model_derived_notes_out_of_system_role() {
 }
 
 #[test]
+fn normalize_messages_keeps_the_working_memory_tail_note_as_user_context() {
+    let note = "Current code-inspection working memory:\n- read_file(file=src/lib.rs) => ok";
+    let messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String("base system".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("question".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        crate::ai::history::runtime_synthetic_user_message(Value::String(note.to_string())),
+    ];
+
+    let normalized = normalize_messages_for_request(&messages);
+    let last = normalized.last().expect("normalized messages");
+    assert_eq!(last.role, "user");
+    assert_eq!(last.content.as_str(), Some(note));
+    assert_eq!(normalized[0].role, "system");
+    assert_eq!(normalized[0].content.as_str(), Some("base system"));
+}
+
+#[test]
 fn normalize_messages_prioritizes_working_memory_before_summary_and_self_note() {
     let messages = vec![
         Message {
