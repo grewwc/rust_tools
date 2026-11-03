@@ -1609,12 +1609,18 @@ async fn request_model_response(
                     .min(u128::from(u64::MAX)) as u64,
             },
         );
-        return request_result.map(|response| {
-            if auto_model_fallback_spec.is_some() {
-                crate::ai::models::mark_subagent_model_verified(&actual_model);
+        return match request_result {
+            Ok(response) => {
+                if auto_model_fallback_spec.is_some() {
+                    crate::ai::models::mark_subagent_model_verified(&actual_model);
+                }
+                Ok((response, actual_model))
             }
-            (response, actual_model)
-        });
+            Err(error) => {
+                request::append_request_failure(&app.session_id, &actual_model, &error);
+                Err(error)
+            }
+        };
     }
 }
 
@@ -1965,6 +1971,11 @@ pub(super) async fn execute_turn_iteration(
                             response = new_response;
                         }
                         Err(retry_err) => {
+                            request::append_request_failure(
+                                &app.session_id,
+                                &actual_model,
+                                &retry_err,
+                            );
                             let err_text = retry_err.to_string();
                             if crate::ai::driver::runtime_ctx::has_subagent_result_slot() {
                                 return Err(err_text.into());
