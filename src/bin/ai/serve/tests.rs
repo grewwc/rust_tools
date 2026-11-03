@@ -1088,6 +1088,7 @@ fn merge_session_config_fills_absent_fields_only() {
         model: Some("stored-model".to_string()),
         agent: Some("stored-agent".to_string()),
         reasoning_effort: Some("low".to_string()),
+        ..Default::default()
     };
     let mut overrides = super::TurnOverrides {
         model: Some("explicit".to_string()),

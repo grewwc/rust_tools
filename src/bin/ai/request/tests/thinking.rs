@@ -195,8 +195,25 @@ fn reasoning_effort_display_label_reflects_explicit_off() {
     // stays — it tests the registry-miss fallback itself.
     let app2 = test_app();
     assert_eq!(
-        super::super::reasoning::reasoning_effort_display_label(&app2, "unregistered-model-no-default"),
+        super::super::reasoning::reasoning_effort_display_label(
+            &app2,
+            "unregistered-model-no-default"
+        ),
         "server default"
+    );
+    assert_eq!(
+        super::super::reasoning::reasoning_effort_display_label_for_subagent(
+            "build",
+            "unregistered-model-no-default",
+        ),
+        "server default"
+    );
+    assert_eq!(
+        super::super::reasoning::reasoning_effort_display_label_for_subagent(
+            "sharp",
+            "unregistered-model-no-default",
+        ),
+        "low"
     );
 }
 

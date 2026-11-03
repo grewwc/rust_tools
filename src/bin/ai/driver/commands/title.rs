@@ -86,6 +86,9 @@ mod tests {
             client: reqwest::Client::builder().build().unwrap(),
             current_model: "test".to_string(),
             current_agent: "build".to_string(),
+            session_default_subagent_backend: Default::default(),
+            session_default_subagent_model: None,
+            session_default_skills: Vec::new(),
             current_agent_manifest: None,
             pending_files: None,
             forced_skills: Vec::new(),
@@ -110,7 +113,7 @@ mod tests {
             last_turn_interrupted: false,
             prune_marks: Default::default(),
             turn_reasoning_items: Default::default(),
-        turn_tool_errors: Default::default(),
+            turn_tool_errors: Default::default(),
             stale_patch_targets: Default::default(),
             tool_middlewares: Vec::new(),
             llm_middlewares: Vec::new(),
@@ -163,7 +166,11 @@ mod tests {
         // A later `/title` overwrites the previous one.
         assert!(try_handle_title_command(&mut app, "/title 排查性能问题").unwrap());
         assert_eq!(
-            store.read_session_title_with_origin(&id).unwrap().unwrap().text,
+            store
+                .read_session_title_with_origin(&id)
+                .unwrap()
+                .unwrap()
+                .text,
             "排查性能问题"
         );
 
@@ -181,7 +188,10 @@ mod tests {
         let id = app.session_id.clone();
 
         assert!(try_handle_title_command(&mut app, ":title   总结   本周  工作").unwrap());
-        assert_eq!(store.read_session_title(&id).unwrap().unwrap(), "总结 本周 工作");
+        assert_eq!(
+            store.read_session_title(&id).unwrap().unwrap(),
+            "总结 本周 工作"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

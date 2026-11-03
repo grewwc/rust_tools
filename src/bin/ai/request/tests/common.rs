@@ -25,6 +25,9 @@ pub(crate) fn test_app() -> App {
         client: reqwest::Client::builder().build().unwrap(),
         current_model: String::new(),
         current_agent: String::new(),
+        session_default_subagent_backend: Default::default(),
+        session_default_subagent_model: None,
+        session_default_skills: Vec::new(),
         current_agent_manifest: None,
         pending_files: None,
         forced_skills: Vec::new(),
@@ -100,7 +103,9 @@ pub(super) fn first_model_key_where(
 /// of multiple adapters/platforms; looking up by name would hit an ambiguous
 /// entry and resolve the wrong adapter dialect. Tests must use the key,
 /// consistent with production.
-pub(super) fn first_model_key_for_adapter(adapter: crate::ai::provider::ApiProvider) -> Option<String> {
+pub(super) fn first_model_key_for_adapter(
+    adapter: crate::ai::provider::ApiProvider,
+) -> Option<String> {
     first_model_key_where(|m| m.adapter == adapter)
 }
 /// Finds a MiniMax ("MiMo" / "MiniMax") model key from the registry. MiniMax is
@@ -137,7 +142,11 @@ pub(super) fn test_attachment_assets_dir() -> PathBuf {
     dir
 }
 
-pub(super) fn write_image_snapshot(assets_dir: &std::path::Path, name: &str, bytes: &[u8]) -> String {
+pub(super) fn write_image_snapshot(
+    assets_dir: &std::path::Path,
+    name: &str,
+    bytes: &[u8],
+) -> String {
     let dir = assets_dir
         .join("attachments")
         .join(uuid::Uuid::new_v4().to_string());

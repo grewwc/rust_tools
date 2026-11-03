@@ -1,9 +1,7 @@
 use crate::ai::{
     model_names, models,
     provider::{ReasoningEffort, ThinkingOffCapability},
-    request::{
-        model_effort_graded, model_thinking_off_capability, reasoning_effort_display_label,
-    },
+    request::{model_effort_graded, model_thinking_off_capability, reasoning_effort_display_label},
     types::App,
 };
 
@@ -380,6 +378,9 @@ mod tests {
                 .map(|m| crate::ai::model_names::model_handle(m))
                 .expect("model registry is empty"),
             current_agent: "build".to_string(),
+            session_default_subagent_backend: Default::default(),
+            session_default_subagent_model: None,
+            session_default_skills: Vec::new(),
             current_agent_manifest: None,
             pending_files: None,
             forced_skills: Vec::new(),
@@ -406,7 +407,7 @@ mod tests {
             last_turn_interrupted: false,
             prune_marks: Default::default(),
             turn_reasoning_items: Default::default(),
-        turn_tool_errors: Default::default(),
+            turn_tool_errors: Default::default(),
             stale_patch_targets: Default::default(),
             tool_middlewares: Vec::new(),
             llm_middlewares: Vec::new(),

@@ -47,6 +47,15 @@ cargo test -p aios_kernel test_name  # run one targeted test in a crate
 4. **Runtime behavior changed, no focused test**: narrowest `cargo check`; note no test found.
 5. **Bug fix with regression/new test**: run that named test; on failure fix and re-run.
 
+**Formatting scope.** Never run `cargo fmt` (any form): at workspace root it
+rewrites every member, and `cargo fmt -- <file>` is not scoped. Format only a
+file you touched with
+`rustfmt --edition 2024 --config skip_children=true <file>`.
+
+**Flag verification.** A CLI/config flag is wired only when its effect is
+observable (effective config, argv, or output); a clean exit does not prove the
+key was accepted, because unknown keys may be ignored.
+
 To deploy changes to the server-capable `a`, build and install all release
 features, then restart the managed server:
 

@@ -51,7 +51,16 @@ fn cargo_subcommand_index(command_tokens: &[String]) -> Option<usize> {
         "-C",
         "-Z",
     ];
-    let mut index = 1usize;
+    // Rustup's `+toolchain` prefix (`cargo +nightly fmt`) precedes the
+    // subcommand; it names a toolchain, never a subcommand, so skip it.
+    let mut index = if command_tokens
+        .get(1)
+        .is_some_and(|token| token.len() > 1 && token.starts_with('+'))
+    {
+        2
+    } else {
+        1
+    };
     while index < command_tokens.len() {
         let token = command_tokens[index].as_str();
         if token == "--" {
@@ -92,6 +101,34 @@ pub(crate) fn command_subcommand_index(command_tokens: &[String]) -> Option<usiz
             .find(|(_, token)| !token.starts_with('-') && !token.contains('='))
             .map(|(index, _)| index),
     }
+}
+
+/// Rejection reason for workspace-wide formatting through cargo.
+pub(crate) const CARGO_FMT_BLOCKED: &str = "`cargo fmt` is blocked by sandbox policy: it rewrites every workspace member and creates \
+     hundreds of unrelated diffs; format only a touched file with \
+     `rustfmt --edition 2024 --config skip_children=true <file>`";
+
+/// If a `cargo` invocation resolves to the `fmt` subcommand, return its
+/// rejection reason.
+///
+/// Covers the plain form, a trailing `-- <file>` argument list (cargo still
+/// formats the whole workspace before handing the paths to rustfmt), rustup's
+/// `cargo +nightly fmt`, and global options placed before the subcommand.
+/// `rustfmt` itself is unaffected.
+pub(crate) fn blocked_cargo_subcommand(command_tokens: &[String]) -> Option<&'static str> {
+    let idx = cargo_subcommand_index(command_tokens)?;
+    command_tokens[idx]
+        .eq_ignore_ascii_case("fmt")
+        .then_some(CARGO_FMT_BLOCKED)
+}
+
+/// True when `program` (possibly a path) is cargo's `fmt` subcommand binary,
+/// which performs the same workspace-wide rewrite as `cargo fmt`.
+pub(crate) fn is_cargo_fmt_program(program: &str) -> bool {
+    std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("cargo-fmt"))
 }
 
 /// `git` subcommands hard-blocked by the safety policy and their rejection

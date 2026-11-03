@@ -1353,8 +1353,10 @@ pub(crate) fn print_info(app: &App, model: &str) {
         .map(|s| format!("{} · {}{}{RESET}", theme::current().accent_muted, theme::current().accent_warn, s))
         .unwrap_or_default();
 
-    // Use println! to avoid manual-flush permission issues; model and session are merged into one line.
-    println!(
+    // The side-note composer may own the bottom row; write through the locked,
+    // footer-aware path so a header printed onto that row cannot leave a partially
+    // overwritten composer line behind. Model and session stay merged into one line.
+    let header = format!(
         "{}[{}{}{} (effort: {}{effort_label}{}){session_part}{}]{RESET}",
         theme::current().accent_muted,
         theme::current().accent_success,
@@ -1364,6 +1366,9 @@ pub(crate) fn print_info(app: &App, model: &str) {
         theme::current().accent_muted,
         theme::current().accent_muted,
     );
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let _ = crate::ai::stream::side_note_input::write_output_line(&mut out, &header);
 }
 
 /// Make an LLM request expecting a JSON response (used for intent recognition, knowledge-base Q&A, etc.).

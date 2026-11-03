@@ -92,7 +92,7 @@ pub(super) struct SkillManifest {
     pub(super) name: String,
     #[serde(default = "default_skill_version")]
     pub(super) version: String,
-    /// 技能描述：用于模型路由选择的核心字段
+    /// Skill description used as the primary model-routing signal.
     #[serde(default)]
     pub(super) description: String,
     #[serde(default)]
@@ -101,6 +101,8 @@ pub(super) struct SkillManifest {
     pub(super) tools: Vec<String>,
     #[serde(default)]
     pub(super) tool_groups: Vec<String>,
+    #[serde(default)]
+    pub(super) delegation: Option<String>,
     #[serde(default)]
     pub(super) mcp_servers: Vec<String>,
     #[serde(default)]
@@ -111,12 +113,12 @@ pub(super) struct SkillManifest {
     pub(super) prompt: String,
     #[serde(default)]
     pub(super) system_prompt: Option<String>,
-    /// 优先级：仅在多个技能匹配度相近时使用
+    /// Priority used only when multiple skills have similar match scores.
     #[serde(default)]
     pub(super) priority: i32,
     #[serde(default)]
     pub(super) excludes: Vec<String>,
-    /// 若为子 skill，指向父 skill 的 name。
+    /// Parent skill name when this is a subskill.
     #[serde(default)]
     pub(super) parent: Option<String>,
     #[serde(skip)]
@@ -149,6 +151,7 @@ impl SkillManifest {
             "author": self.author,
             "tools": self.tools,
             "tool_groups": self.tool_groups,
+            "delegation": self.delegation,
             "mcp_servers": self.mcp_servers,
             "disable_builtin_tools": self.disable_builtin_tools,
             "disable_mcp_tools": self.disable_mcp_tools,
@@ -165,6 +168,60 @@ impl SkillManifest {
     pub(super) fn is_subskill(&self) -> bool {
         self.parent.is_some()
     }
+}
+
+pub(super) fn delegation_required(active_names: &[String], manifests: &[SkillManifest]) -> bool {
+    manifests.iter().any(|manifest| {
+        active_names.iter().any(|name| name == &manifest.name)
+            && manifest.delegation.as_deref() == Some("required")
+    })
+}
+
+/// Render active parent skills as plain instructions for an external headless
+/// runner (e.g. TraeCLI). Only the model-visible text travels: name,
+/// description, and the combined system/prompt body. Parent-only routing
+/// fields (tools, tool groups, MCP servers) are meaningless outside this
+/// runtime and stay behind; the header tells the runner to use its own tools.
+/// Only skills in `active_names` are rendered: external backends must receive
+/// the instructions the parent actually runs with, not the whole catalog.
+/// Returns `None` when no active skill carries body text, so callers omit the
+/// block.
+pub(super) fn render_external_skill_context(
+    skills: &[SkillManifest],
+    active_names: &[String],
+) -> Option<String> {
+    let mut out = String::new();
+    for skill in skills {
+        if !active_names.iter().any(|name| name == &skill.name) {
+            continue;
+        }
+        // Team orchestration belongs to the parent. A leaf worker cannot spawn
+        // further subagents, so forwarding this skill would tell it to do
+        // something its tool set does not support.
+        if skill.name == "agent-team" {
+            continue;
+        }
+        let body = skill.build_system_prompt();
+        if body.trim().is_empty() && skill.description.trim().is_empty() {
+            continue;
+        }
+        out.push_str(&format!("## Skill: {}\n", skill.name));
+        if !skill.description.trim().is_empty() {
+            out.push_str(skill.description.trim());
+            out.push('\n');
+        }
+        if !body.trim().is_empty() {
+            out.push_str(body.trim());
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    if out.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "<parent_skills>\nThe parent agent runs with these skills active. Follow their instructions using your own tools; parent-only tool names mentioned below do not exist in your environment.\n\n{out}</parent_skills>"
+    ))
 }
 
 pub(super) fn load_all_skills() -> Vec<SkillManifest> {
@@ -279,6 +336,7 @@ pub(crate) fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, S
     let mut author: Option<String> = None;
     let mut tools: Vec<String> = Vec::new();
     let mut tool_groups: Vec<String> = Vec::new();
+    let mut delegation: Option<String> = None;
     let mut mcp_servers: Vec<String> = Vec::new();
     let mut excludes: Vec<String> = Vec::new();
     let mut disable_builtin_tools = false;
@@ -353,6 +411,9 @@ pub(crate) fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, S
                 }
                 "tools" => tools = parse_list_value(unquoted),
                 "tool_groups" => tool_groups = parse_list_value(unquoted),
+                "delegation" => {
+                    delegation = Some(unquoted.to_string()).filter(|s| !s.trim().is_empty())
+                }
                 "mcp_servers" => mcp_servers = parse_list_value(unquoted),
                 "excludes" => excludes = parse_list_value(unquoted),
                 "parent" => parent = Some(unquoted.to_string()).filter(|s| !s.trim().is_empty()),
@@ -391,6 +452,7 @@ pub(crate) fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, S
         author: author.filter(|s| !s.trim().is_empty()),
         tools,
         tool_groups,
+        delegation,
         mcp_servers,
         disable_builtin_tools,
         disable_mcp_tools,

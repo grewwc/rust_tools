@@ -298,7 +298,10 @@ pub(crate) fn parse_embedded_skills_line(line: &str) -> Option<Vec<String>> {
     }
     let mut words = words.peekable();
     if matches!(
-        words.peek().map(|word| word.to_ascii_lowercase()).as_deref(),
+        words
+            .peek()
+            .map(|word| word.to_ascii_lowercase())
+            .as_deref(),
         Some("use" | "select" | "switch")
     ) {
         words.next();
@@ -314,13 +317,7 @@ pub(crate) fn parse_embedded_skills_line(line: &str) -> Option<Vec<String>> {
     let first_is_reserved = names.first().is_some_and(|name| {
         matches!(
             name.to_ascii_lowercase().as_str(),
-            "list"
-                | "ls"
-                | "current"
-                | "cur"
-                | "help"
-                | "h"
-                | "--help"
+            "list" | "ls" | "current" | "cur" | "help" | "h" | "--help"
         )
     });
     if names.is_empty() || first_is_reserved {
@@ -341,6 +338,7 @@ mod tests {
             author: None,
             tools: Vec::new(),
             tool_groups: Vec::new(),
+            delegation: None,
             mcp_servers: Vec::new(),
             disable_builtin_tools: false,
             disable_mcp_tools: false,

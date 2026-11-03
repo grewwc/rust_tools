@@ -84,6 +84,9 @@ pub(super) struct PromptEditor {
     /// Reasoning effort active for the current request, shown on the same line
     /// as the model hint above the input box.
     current_reasoning_effort_label: String,
+    /// Session default subagent backend, shown on the same line as the model
+    /// hint when it is not the built-in default. Empty hides it.
+    current_backend_label: String,
     /// Current session topic, shown on the same line as the model hint above the input box.
     session_topic: Option<String>,
     /// Open task/discuss room badge, shown after the topic above the input
@@ -169,6 +172,7 @@ impl PromptEditor {
             model_remote: false,
             current_agent_label: String::new(),
             current_reasoning_effort_label: String::new(),
+            current_backend_label: String::new(),
             session_topic: None,
             room_badge: None,
             remote_checkpoint_status_label: None,
@@ -224,6 +228,13 @@ impl PromptEditor {
     /// `read_multi_line` shows it on the same line as the model hint.
     pub(super) fn set_current_reasoning_effort_label(&mut self, label: impl Into<String>) {
         self.current_reasoning_effort_label = label.into();
+    }
+
+    /// Set the session default subagent backend label; the next
+    /// `read_multi_line` shows it on the same line as the model hint. Empty
+    /// hides it.
+    pub(super) fn set_current_backend_label(&mut self, label: impl Into<String>) {
+        self.current_backend_label = label.into();
     }
 
     /// Update the bound session. `PromptEditor` outlives `/session` switches,

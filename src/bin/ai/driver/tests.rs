@@ -106,6 +106,11 @@ fn encoded_background_task_goal_rejects_corrupt_payload() {
         selection_explanation: "explicit override".to_string(),
         spawn_depth: 0,
         response_schema: None,
+        backend: None,
+        backend_model: None,
+        backend_continue_from: None,
+        active_skill_names: Vec::new(),
+        image_files: Vec::new(),
     })
     .unwrap();
     assert!(
@@ -150,6 +155,11 @@ fn background_task_wakeup_prompt_prefers_mailbox_and_decoded_goal() {
         selection_explanation: "explicit override".to_string(),
         spawn_depth: 0,
         response_schema: None,
+        backend: None,
+        backend_model: None,
+        backend_continue_from: None,
+        active_skill_names: Vec::new(),
+        image_files: Vec::new(),
     })
     .unwrap();
     let mailbox = vec![
@@ -277,6 +287,9 @@ pub(super) fn test_app(current_agent: &str) -> App {
         client: reqwest::Client::new(),
         current_model: "test-model".to_string(),
         current_agent: current_agent.to_string(),
+        session_default_subagent_backend: Default::default(),
+        session_default_subagent_model: None,
+        session_default_skills: Vec::new(),
         current_agent_manifest: None,
         pending_files: None,
         forced_skills: Vec::new(),
@@ -676,7 +689,10 @@ fn startup_choice_explicit_resume_skips_selector_for_single_entry() {
     )
     .unwrap();
 
-    assert_eq!(selector_calls, 0, "explicit --resume auto-picks the lone entry");
+    assert_eq!(
+        selector_calls, 0,
+        "explicit --resume auto-picks the lone entry"
+    );
     assert_eq!(choice.session_id, "sess-single");
 
     unsafe {

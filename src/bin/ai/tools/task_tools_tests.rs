@@ -1,19 +1,20 @@
 use super::{
     AsyncTaskEntry, InheritOptions, OsTaskGoal, OutstandingTaskSnapshot, PreparedSubagentTask,
     SUBAGENT_PARENT_SUMMARY_REMINDER, SUBAGENT_WALL_CLOCK_TIMEOUT, SelectedSubagent,
-    StoredTaskResult, TASK_REGISTRY, TASK_RETRY_REGISTRY, TASK_WAIT_NOOP_COUNTS, WaitManySource,
-    append_current_process_cancel_source, build_outstanding_task_anchor,
+    StoredTaskResult, SubagentBackend, TASK_REGISTRY, TASK_RETRY_REGISTRY, TASK_WAIT_NOOP_COUNTS,
+    WaitManySource, append_current_process_cancel_source, build_outstanding_task_anchor,
     build_selection_explanation, bump_task_wait_noop_count, capped_subagent_manifest,
     discard_tasks_for_session, encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels,
     execute_task_cancel, execute_task_integrate, execute_task_retry, execute_task_spawn,
-    execute_task_status, execute_task_wait,
-    expire_task_wait_states_for_test, format_task_result_with_id, insert_task_entry_for_test,
-    is_encoded_task_goal, is_retryable_task_status, parse_task_wait_options, prepare_subagent_task,
+    execute_task_status, execute_task_wait, expire_task_wait_states_for_test,
+    format_task_result_with_id, insert_task_entry_for_test, is_encoded_task_goal,
+    is_retryable_task_status, parse_task_wait_options, prepare_subagent_task,
     reap_timed_out_subagents, record_subagent_progress_update, register_retry_spec,
     remove_task_entry, render_outstanding_task_anchor, reset_task_wait_noop_counts_for_test,
-    select_subagent, task_wait_key, task_wait_state_count_for_test, validate_subagent_response,
-    wait_sources_for_channel_and_futex, wake_expired_task_waits, with_task_entry_by_pid,
-    wrap_subagent_prompt,
+    resolve_side_note_history_file, select_subagent, set_task_reasoning_effort,
+    task_reasoning_effort, task_wait_key, task_wait_state_count_for_test,
+    validate_subagent_response, wait_sources_for_channel_and_futex, wake_expired_task_waits,
+    with_task_entry_by_pid, wrap_subagent_prompt,
 };
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
 
@@ -109,10 +110,16 @@ fn prepared_retry_task() -> PreparedSubagentTask {
         response_schema: None,
         agent_name: "build".to_string(),
         model: "qwen3.7-max".to_string(),
+        reasoning_effort: None,
         is_model_auto_selected: false,
         auto_model_fallback: None,
         selection_explanation: "test fixture".to_string(),
         inherit: InheritOptions::default(),
+        backend: SubagentBackend::Kernel,
+        show_backend_launch_tag: false,
+        backend_model: None,
+        backend_continue_from: None,
+        image_files: Vec::new(),
     }
 }
 
@@ -195,6 +202,12 @@ fn subagent_prompt_preserves_the_evidence_bar() {
     assert!(prompt.contains("check likely counter-evidence"));
     assert!(prompt.contains("return a concise partial result"));
     assert!(prompt.contains("unresolved hypotheses, missing evidence"));
+    // Without an explicit schema the default contract still asks for an
+    // auditable shape, guidance-only (no JSON enforcement).
+    assert!(prompt.contains("Default response contract"));
+    assert!(prompt.contains("**Evidence**"));
+    assert!(prompt.contains("**Unresolved**"));
+    assert!(!prompt.contains("Return exactly one JSON value"));
     assert!(!prompt.contains("Do not wait for perfect certainty"));
 }
 
@@ -212,6 +225,7 @@ fn subagent_response_schema_is_prompted_and_validated() {
 
     assert!(prompt.contains("Return exactly one JSON value"));
     assert!(prompt.contains("<response_schema>"));
+    assert!(!prompt.contains("Default response contract"));
     assert!(validate_subagent_response(Some(&schema), r#"{"summary":"done"}"#).is_ok());
     assert!(
         validate_subagent_response(Some(&schema), r#"{"other":"done"}"#)
@@ -346,6 +360,9 @@ fn test_app_with_model(current_model: String) -> App {
         client: reqwest::Client::new(),
         current_model,
         current_agent: "build".to_string(),
+        session_default_subagent_backend: Default::default(),
+        session_default_subagent_model: None,
+        session_default_skills: Vec::new(),
         current_agent_manifest: None,
         pending_files: None,
         forced_skills: Vec::new(),
@@ -523,8 +540,11 @@ fn prepare_subagent_task_inherits_parent_model_by_default() {
         "Read-only codebase navigation agent",
         AgentMode::Subagent,
     );
+    let mut app = test_app_with_model(current_model.clone());
+    app.current_agent = "sharp".to_string();
+    app.cli.reasoning_effort_override = Some(None);
     let ctx = DriverContext::new(
-        test_app_with_model(current_model.clone()),
+        app,
         Arc::new(std::sync::Mutex::new(McpClient::new())),
         Arc::new(Vec::new()),
         Arc::new(vec![navigator]),
@@ -546,6 +566,10 @@ fn prepare_subagent_task_inherits_parent_model_by_default() {
 
     let prepared = prepared.unwrap();
     assert_eq!(prepared.model, current_model);
+    let expected_effort = crate::ai::models::default_reasoning_effort(&current_model)
+        .map(|effort| effort.as_str())
+        .unwrap_or("server default");
+    assert_eq!(prepared.reasoning_effort.as_deref(), Some(expected_effort));
     assert!(!prepared.is_model_auto_selected);
     assert!(prepared.auto_model_fallback.is_none());
     assert!(
@@ -553,6 +577,256 @@ fn prepare_subagent_task_inherits_parent_model_by_default() {
             .selection_explanation
             .contains("model_reason=inherited parent agent current model")
     );
+}
+
+#[test]
+fn prepare_subagent_task_uses_session_default_backend() {
+    let current_model = crate::ai::model_names::all()
+        .first()
+        .map(|model| crate::ai::model_names::model_handle(model))
+        .expect("model registry must contain at least one model");
+    let navigator = manifest(
+        "navigator",
+        "Read-only codebase navigation agent",
+        AgentMode::Subagent,
+    );
+    let mut app = test_app_with_model(current_model);
+    app.session_default_subagent_backend = SubagentBackend::TraeCli;
+    app.session_default_subagent_model = Some("GPT-6.1-Sol".to_string());
+    let ctx = DriverContext::new(
+        app,
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(vec![navigator]),
+    );
+    let args = serde_json::json!({
+        "description": "Locate task tool",
+        "prompt": "Find where task spawning is implemented.",
+        "agent": "navigator"
+    });
+
+    let prepared = DRIVER_CTX
+        .sync_scope(ctx, || prepare_subagent_task(&args))
+        .unwrap();
+
+    assert_eq!(prepared.backend, SubagentBackend::TraeCli);
+    assert_eq!(prepared.backend_model.as_deref(), Some("GPT-6.1-Sol"));
+    assert!(prepared.reasoning_effort.is_none());
+    assert!(prepared.show_backend_launch_tag);
+}
+
+#[test]
+fn use_command_task_preparation_prefers_explicit_worker_model_over_session() {
+    let current_model = crate::ai::model_names::all()
+        .first()
+        .map(|model| crate::ai::model_names::model_handle(model))
+        .expect("model registry must contain at least one model");
+    let navigator = manifest(
+        "navigator",
+        "Read-only codebase navigation agent",
+        AgentMode::Subagent,
+    );
+    let mut app = test_app_with_model(current_model.clone());
+    app.session_default_subagent_backend = SubagentBackend::TraeCli;
+    app.session_default_subagent_model = Some("session-worker-model".to_string());
+    let ctx = DriverContext::new(
+        app,
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(vec![navigator]),
+    );
+    DRIVER_CTX.sync_scope(ctx, || {
+        for (backend, per_call, expected_backend, expected_model) in [
+            (None, None, SubagentBackend::TraeCli, Some("session-worker-model")),
+            (Some("traecli"), None, SubagentBackend::TraeCli, Some("session-worker-model")),
+            (None, Some("per-call-model"), SubagentBackend::TraeCli, Some("per-call-model")),
+            (Some("kernel"), None, SubagentBackend::Kernel, None),
+        ] {
+            let args = serde_json::json!({
+                "description": "Locate task tool", "prompt": "Find task spawning.", "agent": "navigator",
+                "backend": backend, "backend_model": per_call
+            });
+            let prepared = prepare_subagent_task(&args).unwrap();
+            assert_eq!(prepared.backend, expected_backend);
+            assert_eq!(prepared.backend_model.as_deref(), expected_model);
+            assert_eq!(crate::ai::driver::runtime_ctx::try_current().unwrap().app_proto.current_model, current_model);
+        }
+    });
+}
+
+#[test]
+fn use_command_task_preparation_applies_worker_model_with_kernel_session() {
+    let current_model = crate::ai::model_names::all()
+        .first()
+        .map(|model| crate::ai::model_names::model_handle(model))
+        .expect("model registry must contain at least one model");
+    let navigator = manifest(
+        "navigator",
+        "Read-only codebase navigation agent",
+        AgentMode::Subagent,
+    );
+    let mut app = test_app_with_model(current_model);
+    app.session_default_subagent_model = Some("session-worker-model".to_string());
+    let ctx = DriverContext::new(
+        app,
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(vec![navigator]),
+    );
+    DRIVER_CTX.sync_scope(ctx, || {
+        for backend_args in [serde_json::json!({"backend": "traecli"}), serde_json::json!({"backend_continue_from": "session-id"})] {
+            let mut args = serde_json::json!({"description": "Locate task tool", "prompt": "Find task spawning.", "agent": "navigator"});
+            args.as_object_mut().unwrap().extend(backend_args.as_object().unwrap().clone());
+            let prepared = prepare_subagent_task(&args).unwrap();
+            assert_eq!(prepared.backend, SubagentBackend::TraeCli);
+            assert_eq!(prepared.backend_model.as_deref(), Some("session-worker-model"));
+        }
+    });
+}
+
+#[test]
+fn prepare_subagent_task_carries_parent_images_to_traecli_prompt() {
+    let current_model = crate::ai::model_names::all()
+        .first()
+        .map(|model| crate::ai::model_names::model_handle(model))
+        .expect("model registry must contain at least one model");
+    let navigator = manifest(
+        "navigator",
+        "Read-only codebase navigation agent",
+        AgentMode::Subagent,
+    );
+    let mut app = test_app_with_model(current_model);
+    app.session_default_subagent_backend = SubagentBackend::TraeCli;
+    app.attached_image_files = vec![
+        "/tmp/original-a.png".to_string(),
+        "/tmp/original-b.png".to_string(),
+    ];
+    let ctx = DriverContext::new(
+        app,
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(vec![navigator]),
+    );
+    let args = serde_json::json!({
+        "description": "Inspect the screenshot",
+        "prompt": "Read the attached image and report what it shows.",
+        "agent": "navigator"
+    });
+
+    let prepared = DRIVER_CTX
+        .sync_scope(ctx, || prepare_subagent_task(&args))
+        .unwrap();
+
+    assert_eq!(
+        prepared.image_files,
+        vec![
+            "/tmp/original-a.png".to_string(),
+            "/tmp/original-b.png".to_string()
+        ]
+    );
+    assert!(prepared.prompt.contains("## Original images"));
+    assert!(prepared.prompt.contains("/tmp/original-a.png"));
+    assert!(prepared.prompt.contains("/tmp/original-b.png"));
+}
+
+#[test]
+fn prepare_subagent_task_explicit_backend_overrides_session_default() {
+    let current_model = crate::ai::model_names::all()
+        .first()
+        .map(|model| crate::ai::model_names::model_handle(model))
+        .expect("model registry must contain at least one model");
+    let navigator = manifest(
+        "navigator",
+        "Read-only codebase navigation agent",
+        AgentMode::Subagent,
+    );
+    let mut app = test_app_with_model(current_model);
+    app.session_default_subagent_backend = SubagentBackend::TraeCli;
+    let ctx = DriverContext::new(
+        app,
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(vec![navigator]),
+    );
+    let args = serde_json::json!({
+        "description": "Locate task tool",
+        "prompt": "Find where task spawning is implemented.",
+        "agent": "navigator",
+        "backend": "kernel"
+    });
+
+    let prepared = DRIVER_CTX
+        .sync_scope(ctx, || prepare_subagent_task(&args))
+        .unwrap();
+
+    assert_eq!(prepared.backend, SubagentBackend::Kernel);
+    assert!(prepared.show_backend_launch_tag);
+}
+
+#[test]
+fn prepare_subagent_task_continue_from_omitted_backend_infers_traecli() {
+    let current_model = crate::ai::model_names::all()
+        .first()
+        .map(|model| crate::ai::model_names::model_handle(model))
+        .expect("model registry must contain at least one model");
+    let navigator = manifest(
+        "navigator",
+        "Read-only codebase navigation agent",
+        AgentMode::Subagent,
+    );
+    let ctx = DriverContext::new(
+        test_app_with_model(current_model),
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(vec![navigator]),
+    );
+    let args = serde_json::json!({
+        "description": "Continue task",
+        "prompt": "Continue the earlier investigation.",
+        "agent": "navigator",
+        "backend_continue_from": "task_previous"
+    });
+
+    let prepared = DRIVER_CTX
+        .sync_scope(ctx, || prepare_subagent_task(&args))
+        .unwrap();
+
+    assert_eq!(prepared.backend, SubagentBackend::TraeCli);
+    assert!(prepared.show_backend_launch_tag);
+}
+
+#[test]
+fn prepare_subagent_task_continue_from_rejects_explicit_kernel() {
+    let current_model = crate::ai::model_names::all()
+        .first()
+        .map(|model| crate::ai::model_names::model_handle(model))
+        .expect("model registry must contain at least one model");
+    let navigator = manifest(
+        "navigator",
+        "Read-only codebase navigation agent",
+        AgentMode::Subagent,
+    );
+    let ctx = DriverContext::new(
+        test_app_with_model(current_model),
+        Arc::new(std::sync::Mutex::new(McpClient::new())),
+        Arc::new(Vec::new()),
+        Arc::new(vec![navigator]),
+    );
+    let args = serde_json::json!({
+        "description": "Continue task",
+        "prompt": "Continue the earlier investigation.",
+        "agent": "navigator",
+        "backend": "kernel",
+        "backend_continue_from": "task_previous"
+    });
+
+    let error = match DRIVER_CTX.sync_scope(ctx, || prepare_subagent_task(&args)) {
+        Ok(_) => panic!("explicit kernel backend with backend_continue_from should fail"),
+        Err(error) => error,
+    };
+
+    assert!(error.contains("backend_continue_from"), "{error}");
+    assert!(error.contains("traecli"), "{error}");
 }
 
 #[test]
@@ -608,8 +882,10 @@ fn task_integrate_closes_durable_evidence() {
 
 #[test]
 fn task_integrate_batch_rolls_back_when_any_task_is_undelivered() {
-    let root = std::env::temp_dir()
-        .join(format!("task-integrate-batch-{}", uuid::Uuid::new_v4().simple()));
+    let root = std::env::temp_dir().join(format!(
+        "task-integrate-batch-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
     let history_file = root.join("history.sqlite");
     let session_id = format!("task-integrate-batch-{}", uuid::Uuid::new_v4().simple());
     crate::ai::history::record_delivered_task_evidence(
@@ -1029,6 +1305,9 @@ fn task_wait_low_level_wait_wakes_on_task_result_even_with_cancel_source() {
 
 #[test]
 fn task_wait_formats_empty_subagent_result_explicitly() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let entry = AsyncTaskEntry {
         session_id: String::new(),
         owner_pid: 0,
@@ -1037,6 +1316,7 @@ fn task_wait_formats_empty_subagent_result_explicitly() {
         completion_futex_addr: FutexAddr(1),
         description: "verify behavior".to_string(),
         agent_name: "explore".to_string(),
+        backend: None,
         model: "qwen3.7-max".to_string(),
         is_model_auto_selected: true,
         auto_model_fallback: None,
@@ -1053,16 +1333,30 @@ fn task_wait_formats_empty_subagent_result_explicitly() {
         output: String::new(),
         error: Some("request timed out waiting for response headers".to_string()),
         progress: Some("calling model".to_string()),
+        backend_session: None,
     };
 
-    let output = format_task_result_with_id("task-failed", &entry, result);
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let without_effort = format_task_result_with_id(&task_id, &entry, result.clone());
+    assert!(without_effort.starts_with(&format!(
+        "[task_id={task_id}]\n[Task: verify behavior via explore @ qwen3.7-max]"
+    )));
+    assert!(!without_effort.contains("(effort:"));
+
+    set_task_reasoning_effort(&task_id, Some("high".to_string()));
+    let output = format_task_result_with_id(&task_id, &entry, result);
+    assert!(output.starts_with(&format!(
+        "[task_id={task_id}]\n[Task: verify behavior via explore @ qwen3.7-max (effort: high)]"
+    )));
+    let _ = remove_task_entry(&task_id);
+    assert!(task_reasoning_effort(&task_id).is_none());
 
     assert!(output.contains("FAILED"));
     assert!(output.contains("Failure reason: request timed out waiting for response headers"));
     assert!(output.contains("Last known progress: calling model"));
     assert!(output.contains("(subagent did not produce any final assistant text)"));
     assert!(output.contains("task_retry"));
-    assert!(output.contains("task-failed"));
+    assert!(output.contains(&task_id));
     assert!(output.contains(SUBAGENT_PARENT_SUMMARY_REMINDER));
 }
 
@@ -1151,6 +1445,7 @@ fn task_wait_rejects_foreign_session_task_ids() {
             completion_futex_addr: FutexAddr(21),
             description: "own task".to_string(),
             agent_name: "explore".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -1173,6 +1468,7 @@ fn task_wait_rejects_foreign_session_task_ids() {
             completion_futex_addr: FutexAddr(22),
             description: "foreign task".to_string(),
             agent_name: "build".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -1453,6 +1749,7 @@ fn task_status_and_outstanding_anchor_filter_same_session_sibling_owner_tasks() 
                 completion_futex_addr: futex,
                 description: description.to_string(),
                 agent_name: "explore".to_string(),
+                backend: None,
                 model: "qwen3.7-max".to_string(),
                 is_model_auto_selected: false,
                 auto_model_fallback: None,
@@ -1481,6 +1778,11 @@ fn task_status_and_outstanding_anchor_filter_same_session_sibling_owner_tasks() 
 
     assert!(status.contains("own visible task"));
     assert!(!status.contains("sibling hidden task"));
+    let row = status
+        .lines()
+        .find(|line| line.starts_with(&own_task_id))
+        .expect("owned task must have a status row");
+    assert_eq!(row.split_whitespace().nth(4), Some("-"));
     assert!(anchor.contains(&own_task_id));
     assert!(!anchor.contains(&sibling_task_id));
 
@@ -1535,6 +1837,7 @@ fn task_cancel_refuses_same_session_foreign_owner_task() {
             completion_futex_addr: futex,
             description: "sibling task".to_string(),
             agent_name: "explore".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -1603,6 +1906,7 @@ fn task_wait_wall_clock_budget_waker_returns_budget_elapsed_without_tick_timeout
             completion_futex_addr: futex,
             description: "pending task".to_string(),
             agent_name: "explore".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -1711,6 +2015,7 @@ fn task_status_collects_completed_results_and_cleans_up_resources() {
             completion_futex_addr,
             description: "inspect parser".to_string(),
             agent_name: "explore".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -1723,6 +2028,7 @@ fn task_status_collects_completed_results_and_cleans_up_resources() {
             started_at: Instant::now(),
         },
     );
+    set_task_reasoning_effort(&task_id, Some("high".to_string()));
 
     let context = DriverContext::new(
         app.clone(),
@@ -1736,9 +2042,17 @@ fn task_status_collects_completed_results_and_cleans_up_resources() {
         })
         .expect("task_status should succeed");
 
+    assert!(output.lines().next().unwrap().contains("Effort"));
+    let row = output
+        .lines()
+        .find(|line| line.starts_with(&task_id))
+        .expect("completed task must have a status row");
+    assert_eq!(row.split_whitespace().nth(4), Some("high"));
+    assert!(output.contains("[Task: inspect parser via explore @ qwen3.7-max (effort: high)]"));
     assert!(output.contains("Completed task results below (already collected"));
     assert!(output.contains("subagent final answer"));
     assert!(output.contains("COMPLETED"));
+    assert!(task_reasoning_effort(&task_id).is_none());
     assert!(remove_task_entry(&task_id).is_none());
 
     let os = app.os.lock().unwrap();
@@ -1887,6 +2201,7 @@ fn task_wait_any_returns_ready_result_without_waiting_for_pending_task() {
                 completion_futex_addr: futex,
                 description: description.to_string(),
                 agent_name: "explore".to_string(),
+                backend: None,
                 model: "qwen3.7-max".to_string(),
                 is_model_auto_selected: false,
                 auto_model_fallback: None,
@@ -1969,6 +2284,7 @@ fn task_status_cleans_up_terminated_task_without_result() {
             completion_futex_addr,
             description: "terminated task".to_string(),
             agent_name: "build".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -2063,6 +2379,7 @@ fn task_status_reuses_persisted_terminal_evidence_after_channel_loss() {
             completion_futex_addr,
             description: "terminated task".to_string(),
             agent_name: "build".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -2239,6 +2556,7 @@ async fn task_cancel_aborts_worker_and_leaves_result_collectable_via_task_wait()
             completion_futex_addr,
             description: "cancel branch".to_string(),
             agent_name: "explore".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -2335,6 +2653,7 @@ async fn discarding_session_tasks_aborts_workers_and_releases_results() {
             completion_futex_addr,
             description: "deleted session branch".to_string(),
             agent_name: "explore".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -2414,6 +2733,7 @@ async fn wall_clock_reaper_aborts_worker_and_leaves_timeout_result_collectable()
             completion_futex_addr,
             description: "timeout branch".to_string(),
             agent_name: "explore".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -2500,6 +2820,7 @@ async fn task_wait_wall_clock_timeout_aborts_worker_before_publishing_result() {
             completion_futex_addr,
             description: "timeout in task_wait".to_string(),
             agent_name: "explore".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -2586,6 +2907,11 @@ fn encoded_task_goal_prefix_is_detectable_without_decoding() {
         selection_explanation: "explicit agent/model override".to_string(),
         spawn_depth: 0,
         response_schema: None,
+        backend: None,
+        backend_model: None,
+        backend_continue_from: None,
+        active_skill_names: Vec::new(),
+        image_files: Vec::new(),
     })
     .unwrap();
 
@@ -2608,6 +2934,7 @@ fn task_entry_can_be_looked_up_by_pid() {
                 completion_futex_addr: FutexAddr(13),
                 description: "inspect".to_string(),
                 agent_name: "explore".to_string(),
+                backend: None,
                 model: "qwen3.7-max-alibaba".to_string(),
                 is_model_auto_selected: false,
                 auto_model_fallback: None,
@@ -2646,6 +2973,7 @@ fn outstanding_task_anchor_lists_ids_and_required_follow_up() {
             status: "running".to_string(),
             agent_name: "explore".to_string(),
             model: "qwen3.7-max".to_string(),
+            reasoning_effort: Some("high".to_string()),
             description: "inspect parser".to_string(),
             progress: Some("running command · plan: inspect parser".to_string()),
         },
@@ -2654,6 +2982,7 @@ fn outstanding_task_anchor_lists_ids_and_required_follow_up() {
             status: "completed".to_string(),
             agent_name: "build".to_string(),
             model: "gpt-5.5".to_string(),
+            reasoning_effort: None,
             description: "verify fix".to_string(),
             progress: None,
         },
@@ -2662,8 +2991,10 @@ fn outstanding_task_anchor_lists_ids_and_required_follow_up() {
     assert!(note.contains("[pending-subagent-tasks]"));
     assert!(note.contains("Outstanding task_ids: [task_alpha, task_beta]"));
     assert!(note.contains("task_id=task_alpha status=running"));
+    assert!(note.contains("model=qwen3.7-max effort=high desc=inspect parser"));
     assert!(note.contains("progress: running command · plan: inspect parser"));
     assert!(note.contains("task_id=task_beta status=completed"));
+    assert!(note.contains("model=gpt-5.5 desc=verify fix"));
     assert!(note.contains("use `task_wait` with the same task_ids"));
 }
 
@@ -2714,6 +3045,7 @@ fn subagent_progress_update_never_wakes_parked_parent() {
             completion_futex_addr: futex,
             description: "pending task".to_string(),
             agent_name: "explore".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -2822,6 +3154,7 @@ fn wake_expired_task_waits_reaps_orphaned_state_when_owner_gone() {
             completion_futex_addr: futex,
             description: "pending task".to_string(),
             agent_name: "explore".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -2886,8 +3219,7 @@ fn side_note_target_validation_accepts_stopped_subagent() {
     let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
     let (owner_pid, child_pid, channel, futex) = {
         let mut os = app.os.lock().unwrap();
-        let owner_pid =
-            os.begin_foreground("owner".to_string(), "goal".to_string(), 10, 8, None);
+        let owner_pid = os.begin_foreground("owner".to_string(), "goal".to_string(), 10, 8, None);
         let child_pid = os
             .spawn(
                 Some(owner_pid),
@@ -2914,6 +3246,7 @@ fn side_note_target_validation_accepts_stopped_subagent() {
             completion_futex_addr: futex,
             description: "stopped task".to_string(),
             agent_name: "explore".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -2928,10 +3261,10 @@ fn side_note_target_validation_accepts_stopped_subagent() {
     );
 
     let validate = || {
-        crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
-            (app.session_id.clone(), 0usize),
-            || super::validate_side_note_target(&task_id),
-        )
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY
+            .sync_scope((app.session_id.clone(), 0usize), || {
+                super::validate_side_note_target(&task_id)
+            })
     };
 
     // SIGSTOP: still pending, side-notes must queue.
@@ -2969,4 +3302,290 @@ fn side_note_target_validation_accepts_stopped_subagent() {
     assert!(err.contains("already finished"), "unexpected error: {err}");
 
     assert!(remove_task_entry(&task_id).is_some());
+}
+
+/// A targeted side-note must land in the queue the subagent drains, which is
+/// the child's own history file, not the lead's.
+#[test]
+fn side_note_target_resolves_child_history_file() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut app = test_app_with_model("qwen3.7-max".to_string());
+    app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    let _os_guard = init_os_tools_guard(app.os.clone());
+
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let (owner_pid, child_pid, channel, futex) = {
+        let mut os = app.os.lock().unwrap();
+        let owner_pid = os.begin_foreground("owner".to_string(), "goal".to_string(), 10, 8, None);
+        let child_pid = os
+            .spawn(
+                Some(owner_pid),
+                "child".to_string(),
+                "child goal".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let channel = os.channel_create(Some(child_pid), 1, "child-result".to_string());
+        let futex = os.futex_create(0, "child-complete".to_string());
+        os.set_current_pid(Some(owner_pid));
+        (owner_pid, child_pid, channel.raw(), futex)
+    };
+    insert_task_entry_for_test(
+        task_id.clone(),
+        AsyncTaskEntry {
+            session_id: app.session_id.clone(),
+            owner_pid,
+            pid: child_pid,
+            result_channel_id: channel,
+            completion_futex_addr: futex,
+            description: "child task".to_string(),
+            agent_name: "explore".to_string(),
+            backend: None,
+            model: "qwen3.7-max".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit override".to_string(),
+            inherit: InheritOptions::default(),
+            abort_handle: None,
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            started_at: Instant::now(),
+        },
+    );
+
+    let parent_history = std::path::Path::new("/sessions/lead.sqlite");
+    let (targeted, foreground) = crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope(
+        (app.session_id.clone(), 0usize),
+        || {
+            (
+                resolve_side_note_history_file(&task_id, parent_history),
+                resolve_side_note_history_file("foreground", parent_history),
+            )
+        },
+    );
+    assert_eq!(
+        targeted.unwrap(),
+        Some(std::path::PathBuf::from(format!(
+            "/sessions/lead.proc-{child_pid}.sqlite"
+        )))
+    );
+    assert_eq!(foreground.unwrap(), None);
+
+    assert!(remove_task_entry(&task_id).is_some());
+}
+
+/// External backends run outside the in-process turn loop and never drain the
+/// side-note queue, so the tool must refuse instead of reporting a delivery
+/// that can never happen.
+#[test]
+fn side_note_target_rejects_external_backend() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut app = test_app_with_model("qwen3.7-max".to_string());
+    app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    let _os_guard = init_os_tools_guard(app.os.clone());
+
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let (owner_pid, child_pid, channel, futex) = {
+        let mut os = app.os.lock().unwrap();
+        let owner_pid = os.begin_foreground("owner".to_string(), "goal".to_string(), 10, 8, None);
+        let child_pid = os
+            .spawn(
+                Some(owner_pid),
+                "external-child".to_string(),
+                "external goal".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let channel = os.channel_create(Some(child_pid), 1, "external-result".to_string());
+        let futex = os.futex_create(0, "external-complete".to_string());
+        os.set_current_pid(Some(owner_pid));
+        (owner_pid, child_pid, channel.raw(), futex)
+    };
+    insert_task_entry_for_test(
+        task_id.clone(),
+        AsyncTaskEntry {
+            session_id: app.session_id.clone(),
+            owner_pid,
+            pid: child_pid,
+            result_channel_id: channel,
+            completion_futex_addr: futex,
+            description: "external task".to_string(),
+            agent_name: "build".to_string(),
+            backend: Some(SubagentBackend::TraeCli),
+            model: "qwen3.7-max".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit override".to_string(),
+            inherit: InheritOptions::default(),
+            abort_handle: None,
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            started_at: Instant::now(),
+        },
+    );
+
+    let parent_history = std::path::Path::new("/sessions/lead.sqlite");
+    let err = crate::ai::driver::runtime_ctx::TURN_IDENTITY
+        .sync_scope((app.session_id.clone(), 0usize), || {
+            resolve_side_note_history_file(&task_id, parent_history)
+        })
+        .expect_err("external backend must reject side-notes");
+    assert!(
+        err.contains("no in-turn side-note channel"),
+        "unexpected error: {err}"
+    );
+
+    assert!(remove_task_entry(&task_id).is_some());
+}
+
+/// After the wait budget expires, `wait_policy=any` must not hide tasks that
+/// are still running: the caller was woken for the timeout, so the reply has to
+/// carry both the ready results and the pending ids.
+#[test]
+fn task_wait_any_after_budget_reports_ready_and_pending() {
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut app = test_app_with_model("qwen3.7-max".to_string());
+    app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    let _os_guard = init_os_tools_guard(app.os.clone());
+
+    let task_done = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let task_pending = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let (owner_pid, done_pid, done_channel, pending_pid) = {
+        let mut os = app.os.lock().unwrap();
+        let owner_pid = os.begin_foreground("owner".to_string(), "goal".to_string(), 10, 8, None);
+        let mut spawn_child = |name: &str| {
+            let pid = os
+                .spawn(
+                    Some(owner_pid),
+                    name.to_string(),
+                    format!("{name} goal"),
+                    20,
+                    4,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let channel = os.channel_create(Some(pid), 1, format!("{name}-result"));
+            let futex = os.futex_create(0, format!("{name}-complete"));
+            (pid, channel.raw(), futex)
+        };
+        let (done_pid, done_channel, done_futex) = spawn_child("done-child");
+        let (pending_pid, pending_channel, pending_futex) = spawn_child("pending-child");
+        os.set_current_pid(Some(owner_pid));
+        for (task_id, pid, channel, futex, name) in [
+            (
+                task_done.clone(),
+                done_pid,
+                done_channel,
+                done_futex,
+                "done",
+            ),
+            (
+                task_pending.clone(),
+                pending_pid,
+                pending_channel,
+                pending_futex,
+                "pending",
+            ),
+        ] {
+            insert_task_entry_for_test(
+                task_id,
+                AsyncTaskEntry {
+                    session_id: app.session_id.clone(),
+                    owner_pid,
+                    pid,
+                    result_channel_id: channel,
+                    completion_futex_addr: futex,
+                    description: format!("{name} task"),
+                    agent_name: "explore".to_string(),
+                    backend: None,
+                    model: "qwen3.7-max".to_string(),
+                    is_model_auto_selected: false,
+                    auto_model_fallback: None,
+                    selection_explanation: "explicit override".to_string(),
+                    inherit: InheritOptions::default(),
+                    abort_handle: None,
+                    last_progress_notification_at: None,
+                    last_progress_persisted_at: None,
+                    cancel_stream: Arc::new(AtomicBool::new(false)),
+                    started_at: Instant::now(),
+                },
+            );
+        }
+        (owner_pid, done_pid, done_channel, pending_pid)
+    };
+
+    let task_ids = [task_done.clone(), task_pending.clone()];
+    let parked = crate::ai::driver::runtime_ctx::TURN_IDENTITY
+        .sync_scope((app.session_id.clone(), 0usize), || {
+            execute_task_wait(&serde_json::json!({
+                "task_ids": task_ids.clone(),
+                "timeout_secs": 1,
+                "wait_policy": "any",
+            }))
+        })
+        .expect("first wait should park");
+    assert!(parked.contains("[task_wait PARKED]"));
+
+    expire_task_wait_states_for_test();
+    {
+        let mut os = app.os.lock().unwrap();
+        // The parked wait leaves the owner suspended; restore the active pid the
+        // tool layer reads before the follow-up call.
+        os.set_current_pid(Some(owner_pid));
+        os.channel_send(
+            Some(done_pid),
+            aios_kernel::primitives::ChannelId(done_channel),
+            serde_json::json!({
+                "status": "completed",
+                "output": "done child answer",
+                "error": null,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    let elapsed = crate::ai::driver::runtime_ctx::TURN_IDENTITY
+        .sync_scope((app.session_id.clone(), 0usize), || {
+            execute_task_wait(&serde_json::json!({
+                "task_ids": task_ids.clone(),
+                "timeout_secs": 1,
+                "wait_policy": "any",
+            }))
+        })
+        .expect("expired wait should report ready plus pending");
+    assert!(
+        elapsed.contains("done child answer"),
+        "ready result must not be dropped: {elapsed}"
+    );
+    assert!(
+        elapsed.contains("[task_wait BUDGET ELAPSED]"),
+        "pending task must stay visible: {elapsed}"
+    );
+    assert!(
+        elapsed.contains(&task_pending),
+        "pending id must be reported: {elapsed}"
+    );
+
+    assert!(remove_task_entry(&task_done).is_none());
+    assert!(remove_task_entry(&task_pending).is_some());
+    let mut os = app.os.lock().unwrap();
+    os.set_current_pid(Some(owner_pid));
+    let _ = os.kill_process(done_pid, "test cleanup".to_string());
+    let _ = os.kill_process(pending_pid, "test cleanup".to_string());
 }

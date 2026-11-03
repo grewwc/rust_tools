@@ -13,7 +13,6 @@
 //   4. Return TurnOutcome (Quit, Success, or Error)
 // =============================================================================
 
-use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -142,9 +141,9 @@ const TASK_ANCHOR_MAX_QUESTION_CHARS: usize = 220;
 const VOLATILE_ARG_KEYS: &[&str] = &["offset", "limit", "page", "cursor", "max_results"];
 
 /// First fixed threshold for tool-round checkpoints. The default turn hard budget is 4096; the
-/// 24 / 48 / 96 checkpoint tiers only schedule convergence, never disable tools, and the
+/// 16 / 32 / 64 checkpoint tiers only schedule convergence, never disable tools, and the
 /// accumulated round count is not reset by mutation.
-const TOOL_ROUND_CHECKPOINT: usize = 24;
+const TOOL_ROUND_CHECKPOINT: usize = 16;
 const TOOL_ROUND_CHECKPOINT_MULTIPLIERS: [usize; 3] = [1, 2, 4];
 /// Retry cap for consecutive "stream-read interrupted" truncations (stream_error). Past this we
 /// give up on the turn to avoid retrying forever while the server keeps dropping the stream
@@ -189,6 +188,11 @@ const REASONING_BUDGET_DOMINANCE_RATIO: f64 = 0.5;
 /// Free-exploration rounds: before this many rounds, even continuous no-progress never prompts
 /// (locating code before deleting it, or exploring an unfamiliar codebase first, is normal).
 const PROGRESS_FREE_EXPLORE_ROUNDS: usize = 20;
+/// A delegation-required skill governs the whole turn, so the first undelegated tool-work
+/// round is already a divergence. The old six-round/six-target threshold only caught broad sweeps;
+/// the scheduling advisory must not wait for the generic exploration grace.
+const REQUIRED_DELEGATION_WORK_ROUNDS: usize = 1;
+const REQUIRED_DELEGATION_READ_ONLY_TARGETS: usize = 6;
 /// Touching many distinct targets without converging suggests the task may be sliding from
 /// "gathering key evidence" into "endlessly expanding branches". This threshold injects a single
 /// non-blocking breadth check only; it never counts new targets as no-progress, so legitimate
@@ -267,7 +271,9 @@ fn persist_prompt_residency(
     }
     residency.session_context_guidance |= guidance_added;
     if let Err(error) = crate::ai::history::write_prompt_residency_sqlite(path, &residency) {
-        eprintln!("[Warning] failed to persist prompt residency: {error}");
+        crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
+            "[Warning] failed to persist prompt residency: {error}"
+        ));
     }
 }
 
@@ -421,6 +427,8 @@ enum ToolLoopSignal {
     /// Progress Budget level three: still no consecutive progress after the soft prompt and ledger,
     /// switch to no-tool handoff mode.
     LowProgressHard,
+    /// A required-delegation parent has kept exploring without making its first delegation call.
+    DelegationRequired,
     /// Many distinct targets have been covered; remind the model to first summarize current evidence
     /// and the single critical gap.
     ReadOnlyBreadth,
@@ -451,6 +459,7 @@ impl ToolLoopSignal {
             Self::LowProgressSoft => Some(("low_progress_soft", SignalKind::Advisory)),
             Self::LowProgressLedger => Some(("low_progress_ledger", SignalKind::Advisory)),
             Self::LowProgressHard => Some(("low_progress_hard", SignalKind::HardStop)),
+            Self::DelegationRequired => Some(("delegation_required", SignalKind::Advisory)),
             Self::ReadOnlyBreadth => Some(("read_only_breadth", SignalKind::Advisory)),
             Self::ReadOnlyBreadthHard => Some(("read_only_breadth_hard", SignalKind::HardStop)),
         }
@@ -484,6 +493,12 @@ struct ProgressLedger {
     ledger_injected: bool,
     hard_injected: bool,
     read_only_breadth_injected: bool,
+    delegation_required: bool,
+    mutation_calls_this_turn: usize,
+    delegation_calls_this_turn: usize,
+    delegation_advisory_injected: bool,
+    /// Tool-work rounds before the first delegation; progress and truncation resets preserve it.
+    work_rounds_before_delegation: usize,
     /// Whether any project mutation happened this turn. Once true, the pure read-only divergence hard
     /// stop permanently yields (read+modify tasks are not bound by that brake). plan / task lifecycle
     /// counts only as progress and does not set this. Set monotonically, never cleared by reset.
@@ -507,6 +522,73 @@ struct ProgressLedger {
 }
 
 impl ProgressLedger {
+    fn observe_delegation_calls(&mut self, tool_calls: &[crate::ai::types::ToolCall]) -> bool {
+        if !self.delegation_required {
+            return false;
+        }
+        let mut inject_advisory = false;
+        for tool_call in tool_calls {
+            match tool_call.function.name.as_str() {
+                "task" | "task_spawn" => {
+                    self.delegation_calls_this_turn =
+                        self.delegation_calls_this_turn.saturating_add(1);
+                }
+                "apply_patch" | "patch_file" | "write_file" => {
+                    self.mutation_calls_this_turn = self.mutation_calls_this_turn.saturating_add(1);
+                    if self.delegation_calls_this_turn == 0 && !self.delegation_advisory_injected {
+                        self.delegation_advisory_injected = true;
+                        inject_advisory = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        inject_advisory
+    }
+
+    /// A pure Q&A or decision turn executes no tools, leaving both work counters at zero and
+    /// bypassing the final-response gate. Even one undelegated tool-work round must
+    /// prompt once before the final response, just like an undelegated mutation.
+    fn delegation_requirement_violated(&self) -> bool {
+        self.delegation_required
+            && self.delegation_calls_this_turn == 0
+            && (self.mutation_calls_this_turn > 0 || self.work_rounds_before_delegation > 0)
+    }
+
+    fn observe_delegation_exploration(
+        &mut self,
+        tool_calls: &[crate::ai::types::ToolCall],
+    ) -> ToolLoopSignal {
+        if !self.delegation_required
+            || self.delegation_calls_this_turn > 0
+            || self.delegation_advisory_injected
+        {
+            return ToolLoopSignal::None;
+        }
+        // Direct mutations already have their own delegation advisory. Shell commands must
+        // still count as parent work when the loop detector cannot classify them as read-only.
+        let has_direct_mutation = tool_calls.iter().any(|tool_call| {
+            let name = tool_call.function.name.as_str();
+            is_direct_file_mutation_tool(name) || name == "patch_file"
+        });
+        let has_tool_work = tool_calls.iter().any(|tool_call| {
+            let name = tool_call.function.name.as_str();
+            !crate::ai::tools::is_subagent_orchestration_tool_name(name)
+                && !matches!(name, "plan" | "plan_update")
+        });
+        if has_direct_mutation || !has_tool_work {
+            return ToolLoopSignal::None;
+        }
+        self.work_rounds_before_delegation = self.work_rounds_before_delegation.saturating_add(1);
+        if self.work_rounds_before_delegation < REQUIRED_DELEGATION_WORK_ROUNDS
+            && self.seen_targets.len() < REQUIRED_DELEGATION_READ_ONLY_TARGETS
+        {
+            return ToolLoopSignal::None;
+        }
+        self.delegation_advisory_injected = true;
+        ToolLoopSignal::DelegationRequired
+    }
+
     /// Reset the escalation ladder: clear the no-progress counter and the one-shot soft/ledger/hard/grace
     /// state so billing restarts from zero. Shared by two scenarios:
     /// 1. Truncation retry (mark_truncation_skip): after a truncation clears history, re-reading is
@@ -823,6 +905,15 @@ impl TurnSupervisor {
             }
         }
         let made_progress = round_had_mutation || added_new_target || added_new_evidence;
+        let round_tool_calls = progress_messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "assistant")
+            .and_then(|message| message.tool_calls.as_deref())
+            .unwrap_or_default();
+        let delegation_signal = self
+            .progress
+            .observe_delegation_exploration(round_tool_calls);
 
         let reasoning_fp = extract_round_reasoning_fingerprint(progress_messages)
             .or_else(|| extract_round_reasoning_fingerprint(messages));
@@ -889,7 +980,11 @@ impl TurnSupervisor {
                 self.progress.read_only_breadth_injected = true;
                 return ToolLoopSignal::ReadOnlyBreadth;
             }
-            return ToolLoopSignal::None;
+            return delegation_signal;
+        }
+
+        if delegation_signal != ToolLoopSignal::None {
+            return delegation_signal;
         }
 
         // Free-exploration zone: exploration is completely free — no charging, no escalation
@@ -950,7 +1045,7 @@ impl TurnSupervisor {
     }
 
     /// Tiered tool-round checkpoints: keep the cumulative round count and inject different
-    /// scheduling prompts at 24 / 48 / 96 (scaled by the first tier for small budgets) depending on
+    /// scheduling prompts at 16 / 32 / 64 (scaled by the first tier for small budgets) depending on
     /// the current work phase.
     fn maybe_inject_tool_round_checkpoint(
         &mut self,
@@ -1030,6 +1125,7 @@ pub(in crate::ai::driver) async fn run_turn(
     attachments_text: String,
     next_model: String,
     precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
+    parked_foreground_wait_guard: Option<crate::ai::driver::signal::ParkedForegroundWaitGuard>,
     one_shot_mode: bool,
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
@@ -1109,6 +1205,14 @@ pub(in crate::ai::driver) async fn run_turn(
         // automatically when this future drops.
         let _foreground_turn_guard = (!crate::ai::driver::runtime_ctx::has_subagent_result_slot())
             .then(crate::ai::driver::signal::ForegroundTurnGuard::enter);
+        if parked_foreground_wait_guard
+            .is_some_and(crate::ai::driver::signal::ParkedForegroundWaitGuard::finish)
+        {
+            question.push_str("\n\n");
+            question.push_str(
+                crate::ai::driver::agent_routing::PARKED_FOREGROUND_INTERRUPT_MESSAGE,
+            );
+        }
         crate::ai::driver::runtime_ctx::TURN_IDENTITY
             .scope((session_id, turn_id), async {
                 if crate::ai::driver::runtime_ctx::current_subagent_depth() == 0
@@ -1235,16 +1339,18 @@ fn run_audit_subagent(app: &App, instruction: &str, fast: bool) -> Option<String
         wrap_up_lead_time,
     ) {
         Ok(result) => {
-            println!(
+            crate::ai::driver::print::print_line(&format!(
                 "\n{}",
                 crate::ai::driver::commands::audit::terminal_audit_result(&result.content)
-            );
+            ));
             Some(crate::ai::driver::commands::audit::audit_report_for_fix(
                 &result.content,
             ))
         }
         Err(error) => {
-            println!("\n[audit] Unable to start audit subagent: {error}");
+            crate::ai::driver::print::print_line(&format!(
+                "\n[audit] Unable to start audit subagent: {error}"
+            ));
             None
         }
     }
@@ -1402,6 +1508,12 @@ async fn run_turn_body(
     // explicitly per stage when needed.
 
     let mut supervisor = TurnSupervisor::default();
+    supervisor.progress.delegation_required =
+        crate::ai::driver::runtime_ctx::current_subagent_depth() == 0
+            && crate::ai::skills::delegation_required(
+                skill_turn.matched_skill_names(),
+                skill_manifests,
+            );
     let mut force_final_response = false;
     let mut pre_timeout_wrap_up_requested = false;
     let mut output = TurnOutputState::default();
@@ -1727,11 +1839,10 @@ async fn run_turn_body(
             if matches!(execution, IterationExecution::EmptyResponse) {
                 retry.consecutive_empty_responses += 1;
                 if retry.consecutive_empty_responses > 5 {
-                    let _ = writeln!(
-                        std::io::stderr(),
+                    crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
                         "  ✗ {} consecutive empty responses; giving up retry",
                         retry.consecutive_empty_responses
-                    );
+                    ));
                     output.assistant_text = "[Model returned empty responses repeatedly; please retry or switch models]".to_string();
                     break 'turn Ok(None);
                 }
@@ -1753,12 +1864,11 @@ async fn run_turn_body(
                         .saturating_mul(1u64 << shift)
                         .min(EMPTY_RESPONSE_RETRY_BACKOFF_MAX_SECS),
                 );
-                let _ = writeln!(
-                    std::io::stderr(),
+                crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
                     "  ▲ empty response #{}, backing off {}s before retrying",
                     retry.consecutive_empty_responses,
                     backoff.as_secs()
-                );
+                ));
                 if crate::ai::request::sleep_with_cancel(app, backoff).await {
                     // User interrupted (Ctrl+C) or shut down during the backoff: end the turn
                     // through the same path as a mid-stream cancel (finish_interrupted_turn).
@@ -1857,8 +1967,10 @@ async fn run_turn_body(
                                     &stream_result.reasoning_text,
                                 )
                             {
-                                eprintln!(
-                                    "[Warning] Failed to save degenerate-repetition diagnostics: {error}"
+                                crate::ai::stream::side_note_input::print_output_stderr_line(
+                                    &format!(
+                                        "[Warning] Failed to save degenerate-repetition diagnostics: {error}"
+                                    ),
                                 );
                             }
                         }
@@ -1866,22 +1978,20 @@ async fn run_turn_body(
                             // The model produced real content and only its tail looped (the stream
                             // layer already stripped the repeated junk); accept the partial answer
                             // instead of discarding it.
-                            let _ = writeln!(
-                                std::io::stderr(),
+                            crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
                                 "  ▲ {} degenerate-repetition stops; keeping the visible content produced so far",
                                 retry.consecutive_degenerate_repetitions
-                            );
+                            ));
                             output.assistant_text = partial_text.to_string();
                         } else {
                             // No visible content at all: the loop consumed the whole generation in
                             // reasoning. Give an honest, actionable message plus the reasoning tail
                             // the detector saw, instead of the generic placeholder that misattributes
                             // the cause to output length.
-                            let _ = writeln!(
-                                std::io::stderr(),
+                            crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
                                 "  ✗ {} degenerate-repetition stops; ending the turn with an explanation",
                                 retry.consecutive_degenerate_repetitions
-                            );
+                            ));
                             let mut degraded = String::from(
                                 "[Model output was stopped: the response stream repeated itself and the runtime \
                                  terminated the generation to avoid burning tokens and persisting junk. One corrective \
@@ -1986,12 +2096,10 @@ async fn run_turn_body(
                             .or_else(|| crate::ai::models::max_output_tokens(&app.current_model))
                             .unwrap_or(32768);
                         let halved = (current_max / 2).max(4096);
-                        let _ = writeln!(
-                            std::io::stderr(),
+                        crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
                             "  ⚠ Zero-output truncation (completion=0); auto-downgrading max_tokens {} → {} and retrying",
-                            current_max,
-                            halved
-                        );
+                            current_max, halved
+                        ));
                         app.cli.max_tokens_override = Some(halved);
                         retry.max_tokens_downgraded = true;
                     } else if retry.max_tokens_downgraded {
@@ -2097,11 +2205,10 @@ async fn run_turn_body(
                         // the injected shrink prompt for the next attempt, and once MAX_MODEL_TRUNCATION_RETRIES
                         // is reached the partial text (or the explicit "truncated repeatedly" placeholder) below.
                         // Record the condition so a retry that ends in truncated output stays auditable.
-                        let _ = writeln!(
-                            std::io::stderr(),
+                        crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
                             "  ⚠ Truncated output #{}: this model has no effort gradient to trade for budget; keeping thinking as configured",
                             retry.consecutive_truncations
-                        );
+                        ));
                         crate::ai::driver::decision_log::log_truncation_downgrade(
                             crate::ai::driver::decision_log::get_decision_log_store(),
                             &crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
@@ -2128,11 +2235,10 @@ async fn run_turn_body(
                     && retry.consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES
                     && !stream_result.stream_error
                 {
-                    let _ = writeln!(
-                        std::io::stderr(),
+                    crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
                         "  ▲ {} consecutive truncated outputs; keeping the partial text produced so far",
                         retry.consecutive_truncations
-                    );
+                    ));
                     output.assistant_text = partial_text.to_string();
                     // A truncation finalizes outside the normal FinalResponse gate path. Audit
                     // reports must still be parsed or withheld here so a partial protocol payload
@@ -2158,11 +2264,10 @@ async fn run_turn_body(
                 if retry.consecutive_truncations >= MAX_MODEL_TRUNCATION_RETRIES
                     && !stream_result.stream_error
                 {
-                    let _ = writeln!(
-                        std::io::stderr(),
+                    crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
                         "  ✗ {} consecutive truncated responses; giving up retry",
                         retry.consecutive_truncations
-                    );
+                    ));
                     // Keep whatever partial text the model already produced (if any) — it is more valuable
                     // than discarding it outright.
                     output.assistant_text = if has_visible_text {
@@ -2185,6 +2290,14 @@ async fn run_turn_body(
             if crate::ai::background::live_background_active() {
                 app.cli.background = true;
             }
+            let inject_delegation_advisory = match &execution {
+                IterationExecution::ToolCall(tool_call_execution) => supervisor
+                    .progress
+                    .observe_delegation_calls(&tool_call_execution.stream_result.tool_calls),
+                _ => false,
+            };
+            let delegation_requirement_violated =
+                supervisor.progress.delegation_requirement_violated();
             let step = match handle_iteration_execution_for_model(
                 app,
                 response_model.as_deref().unwrap_or(&next_model),
@@ -2202,6 +2315,7 @@ async fn run_turn_body(
                 &mut output.terminal_dedupe_candidate,
                 &mut output.validation_status,
                 &mut output.gate,
+                delegation_requirement_violated,
                 skill_turn.matched_skill_names().is_empty(),
                 iteration,
                 effective_max_iterations,
@@ -2211,6 +2325,9 @@ async fn run_turn_body(
                 Ok(s) => s,
                 Err(err) => break 'turn Err(err),
             };
+            if inject_delegation_advisory {
+                inject_delegation_required_advisory(&mut messages);
+            }
             if matches!(step, TurnLoopStep::Continue) {
                 drop(output.validation_status.take());
             }
@@ -2434,11 +2551,18 @@ async fn run_turn_body(
                     "agent-health",
                     "read-only analysis breadth is high: requesting evidence summary before expanding further",
                 );
-                let agent_team_active = skill_turn
-                    .matched_skill_names()
-                    .iter()
-                    .any(|name| name == "agent-team");
-                inject_read_only_breadth_note(&mut messages, agent_team_active);
+                let delegation_required = crate::ai::skills::delegation_required(
+                    skill_turn.matched_skill_names(),
+                    skill_manifests,
+                );
+                inject_read_only_breadth_note(&mut messages, delegation_required);
+            }
+            ToolLoopSignal::DelegationRequired => {
+                crate::ai::driver::print::print_tool_note_line(
+                    "agent-health",
+                    "required delegation is overdue: delegate discovery before continuing exploration",
+                );
+                inject_delegation_exploration_advisory(&mut messages);
             }
             ToolLoopSignal::LowProgressHard => {
                 crate::ai::driver::print::print_tool_note_line(
@@ -2606,9 +2730,9 @@ async fn run_turn_body(
             )
             .await;
             if backfilled_digests > 0 && crate::ai::driver::runtime_ctx::terminal_output_enabled() {
-                eprintln!(
+                crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
                     "[image] backfilled {backfilled_digests} image digest(s) into history metadata"
-                );
+                ));
             }
             // `?` (not `match`) so the boxed error never lives across the
             // forced-audit fix `await` below (`Box<dyn Error>` is not `Send`).
@@ -2639,11 +2763,11 @@ async fn run_turn_body(
                     turn_messages.as_slice(),
                 )
             {
-                println!(
+                crate::ai::driver::print::print_line(&format!(
                     "\n[audit] The lead agent did not start an audit subagent this turn; \
                      forcing `/audit{}` with this turn's output as the audit instruction.",
                     if fast { " --fast" } else { "" }
-                );
+                ));
                 // Forced audit also auto-fixes by default: run the audit
                 // subagent, then continue the same turn with the report
                 // as the fix prompt.

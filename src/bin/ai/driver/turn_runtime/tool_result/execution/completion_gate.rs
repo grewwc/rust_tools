@@ -80,12 +80,6 @@ pub(in crate::ai::driver::turn_runtime) fn completion_evidence_state(
         };
 
         let tool_succeeded = completion_tool_result_succeeded(&message.content);
-        // `complete` is only a structured assertion. Treating its receipt as
-        // post-mutation activity would let the required handshake erase the
-        // separate evidence gate's missing-verification warning.
-        if tool_call.function.name == "complete" {
-            continue;
-        }
         if tool_call.function.name == "execute_command" {
             let effects = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
                 .ok()

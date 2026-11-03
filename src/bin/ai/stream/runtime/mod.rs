@@ -364,14 +364,14 @@ pub(super) async fn stream_response(
             let stdout = io::stdout();
             let mut out = stdout.lock();
             if tool_args_stalled {
-                let _ = writeln!(
-                    out,
-                    "  ⚠ 工具调用参数流超过 {timeout_secs} 秒未完成，按流中断处理…"
+                let _ = crate::ai::stream::side_note_input::write_output_line(
+                    &mut out,
+                    &format!("  ⚠ 工具调用参数流超过 {timeout_secs} 秒未完成，按流中断处理…"),
                 );
             } else {
-                let _ = writeln!(
-                    out,
-                    "  ⚠ 响应流连续 {timeout_secs} 秒无有效进展，按流中断处理…"
+                let _ = crate::ai::stream::side_note_input::write_output_line(
+                    &mut out,
+                    &format!("  ⚠ 响应流连续 {timeout_secs} 秒无有效进展，按流中断处理…"),
                 );
             }
             let _ = out.flush();
@@ -986,10 +986,10 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
     state.framing.decode_error_count += 1;
     if runtime_ctx::terminal_output_enabled() {
         let _ = suspend_live_terminal_regions(state);
-        eprintln!(
+        side_note_input::print_output_stderr_line(&format!(
             "[Warning] 读取响应流时出错：{} (错误次数：{}/{})",
             err, state.framing.decode_error_count, MAX_DECODE_ERRORS
-        );
+        ));
     }
 
     if take_stream_cancelled(app) {
@@ -998,7 +998,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
 
     if state.framing.decode_error_count <= MAX_DECODE_ERRORS {
         if runtime_ctx::terminal_output_enabled() {
-            eprintln!("[Warning] 尝试继续读取...");
+            side_note_input::print_output_stderr_line("[Warning] 尝试继续读取...");
         }
         if wait_for_interrupt_or_timeout(
             app,
@@ -1017,7 +1017,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
             let _ = flush_terminal_filters_to_terminal(markers, state, true);
         }
         fold_settled = finalize_live_folds_before_diagnostic(state);
-        eprintln!("[Error] 响应流读取失败，返回已收集的内容");
+        side_note_input::print_output_stderr_line("[Error] 响应流读取失败，返回已收集的内容");
     }
 
     if runtime_ctx::terminal_output_enabled() {
@@ -1887,7 +1887,9 @@ fn process_stream_payload(
                 Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
             if runtime_ctx::terminal_output_enabled() {
                 let _ = finalize_live_folds_before_diagnostic(state);
-                eprintln!("\n  ⚠ 检测到模型推理重复循环，停止当前响应并自动重试…");
+                side_note_input::print_output_stderr_line(
+                    "\n  ⚠ 检测到模型推理重复循环，停止当前响应并自动重试…",
+                );
             }
             return Ok(StreamPayloadOutcome::stop_with_progress());
         }
@@ -1933,7 +1935,9 @@ fn process_stream_payload(
         state.content.finish_reason_value = Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
         if runtime_ctx::terminal_output_enabled() {
             let _ = finalize_live_folds_before_diagnostic(state);
-            eprintln!("\n  ⚠ 检测到模型伪造工具结果标记（输出退化），停止当前响应并自动重试…");
+            side_note_input::print_output_stderr_line(
+                "\n  ⚠ 检测到模型伪造工具结果标记（输出退化），停止当前响应并自动重试…",
+            );
         }
         return Ok(StreamPayloadOutcome::stop_with_progress());
     }
@@ -1957,9 +1961,9 @@ fn process_stream_payload(
         state.content.tool_args_cap_exceeded = true;
         if runtime_ctx::terminal_output_enabled() {
             let _ = finalize_live_folds_before_diagnostic(state);
-            eprintln!(
+            side_note_input::print_output_stderr_line(&format!(
                 "\n  ⚠ 工具调用参数累积超过上限（{tool_arg_bytes} 字节 > {MAX_TOOL_ARG_BYTES}），判定输出退化，停止当前响应并自动重试…"
-            );
+            ));
         }
         return Ok(StreamPayloadOutcome::stop_with_progress());
     }
@@ -2025,7 +2029,9 @@ fn process_stream_payload(
                         Some(DEGENERATE_REPETITION_FINISH_REASON.to_string());
                     if runtime_ctx::terminal_output_enabled() {
                         let _ = finalize_live_folds_before_diagnostic(state);
-                        eprintln!("\n  ⚠ 检测到模型输出重复循环，停止当前响应并自动重试…");
+                        side_note_input::print_output_stderr_line(
+                            "\n  ⚠ 检测到模型输出重复循环，停止当前响应并自动重试…",
+                        );
                     }
                     return Ok(StreamPayloadOutcome::stop_with_progress());
                 }

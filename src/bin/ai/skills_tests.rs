@@ -118,6 +118,24 @@ test prompt"#;
 }
 
 #[test]
+fn parse_skill_front_matter_supports_required_delegation() {
+    let content = r#"---
+name: team-skill
+delegation: required
+---
+
+Delegate implementation."#;
+
+    let skill = parse_skill_front_matter(content).unwrap();
+    assert_eq!(skill.delegation.as_deref(), Some("required"));
+    assert!(delegation_required(
+        &["team-skill".to_string()],
+        std::slice::from_ref(&skill)
+    ));
+    assert!(!delegation_required(&["other".to_string()], &[skill]));
+}
+
+#[test]
 fn parse_skill_front_matter_ignores_legacy_triggers_field() {
     let content = r#"---
 name: test-skill
@@ -391,4 +409,62 @@ fn load_skills_from_dir_supports_multi_package_collection_zip() {
     let resource_path = PathBuf::from(base.resource_path.as_deref().unwrap());
     assert!(resource_path.join("references").join("guide.md").is_file());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn test_external_skill(name: &str, body: &str) -> SkillManifest {
+    SkillManifest {
+        name: name.to_string(),
+        version: default_skill_version(),
+        description: format!("{name} description"),
+        author: None,
+        tools: Vec::new(),
+        tool_groups: Vec::new(),
+        delegation: None,
+        mcp_servers: Vec::new(),
+        disable_builtin_tools: false,
+        disable_mcp_tools: false,
+        prompt: body.to_string(),
+        system_prompt: None,
+        priority: 0,
+        excludes: Vec::new(),
+        parent: None,
+        source_path: None,
+        resource_path: None,
+    }
+}
+
+#[test]
+fn external_skill_context_renders_only_active_skills() {
+    let skills = vec![
+        test_external_skill("alpha", "ALPHA_BODY"),
+        test_external_skill("beta", "BETA_BODY"),
+        test_external_skill("gamma", "GAMMA_BODY"),
+    ];
+    let rendered =
+        render_external_skill_context(&skills, &["beta".to_string(), "gamma".to_string()]).unwrap();
+    assert!(rendered.contains("BETA_BODY"));
+    assert!(rendered.contains("GAMMA_BODY"));
+    assert!(!rendered.contains("ALPHA_BODY"));
+    assert!(!rendered.contains("## Skill: alpha"));
+}
+
+#[test]
+fn external_skill_context_is_none_without_active_skills() {
+    let skills = vec![test_external_skill("alpha", "ALPHA_BODY")];
+    assert!(render_external_skill_context(&skills, &[]).is_none());
+    assert!(render_external_skill_context(&skills, &["missing".to_string()]).is_none());
+}
+
+#[test]
+fn external_skill_context_skips_parent_only_orchestration_skill() {
+    let skills = vec![
+        test_external_skill("agent-team", "TEAM_ORCHESTRATION_BODY"),
+        test_external_skill("alpha", "ALPHA_BODY"),
+    ];
+    let rendered =
+        render_external_skill_context(&skills, &["agent-team".to_string(), "alpha".to_string()])
+            .unwrap();
+    assert!(rendered.contains("ALPHA_BODY"));
+    assert!(!rendered.contains("TEAM_ORCHESTRATION_BODY"));
+    assert!(!rendered.contains("## Skill: agent-team"));
 }

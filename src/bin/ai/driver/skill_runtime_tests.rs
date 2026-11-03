@@ -11,7 +11,7 @@ use super::{
     skill_authoring_referenced, tool_uses_mcp_server,
 };
 use crate::ai::agents::{AgentManifest, AgentMode};
-use crate::ai::driver::runtime_ctx::{SUBAGENT_CWD, SUBAGENT_DEPTH};
+use crate::ai::driver::runtime_ctx::{RESUME_SKILL_NAMES, SUBAGENT_CWD, SUBAGENT_DEPTH};
 use crate::ai::history::SkillActivationEvent;
 use crate::ai::mcp::McpClient;
 use crate::ai::skills::SkillManifest;
@@ -239,6 +239,162 @@ fn explicit_user_input_continuation_restores_only_the_next_turn() {
     .unwrap();
     assert_eq!(forced_guard.primary_skill_name(), Some("replacement"));
     assert!(app.pending_skill_continuation.is_none());
+}
+
+#[test]
+fn use_command_sticky_skill_survives_turns_and_explicit_selection_adds_to_it() {
+    use crate::ai::types::ForcedSkillSource;
+
+    let _env = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let root = std::env::temp_dir().join(format!("use-sticky-skills-{}", uuid::Uuid::new_v4()));
+    let mut app = super::super::tests::test_app("build");
+    app.config.history_file = root.join("history.sqlite");
+    app.session_id = "use-sticky".to_string();
+    let store = crate::ai::history::SessionStore::new(&app.config.history_file);
+    store.ensure_root_dir().unwrap();
+    app.session_history_file = store.session_history_file(&app.session_id);
+    let mut team = skill("agent-team", "delegate work");
+    team.tool_groups = vec!["task".to_string()];
+    let replacement = skill("replacement", "explicit workflow");
+    let manifests = [team, replacement];
+    let mcp_client = McpClient::new();
+
+    super::super::commands::try_handle_use_command(&mut app, "/use traecli GPT-5.5").unwrap();
+    for question in ["first ordinary request", "second unrelated request"] {
+        let guard =
+            super::prepare_skill_for_turn(&mut app, &mcp_client, &manifests, question).unwrap();
+        assert_eq!(guard.matched_skill_names(), ["agent-team"]);
+        assert_eq!(app.session_default_skills, ["agent-team"]);
+        assert!(app.forced_skills.is_empty());
+        assert!(
+            app.agent_context
+                .as_ref()
+                .unwrap()
+                .tools
+                .iter()
+                .any(|tool| tool.function.name == "task_spawn")
+        );
+    }
+    for source in [
+        ForcedSkillSource::SkillsCommandInline,
+        ForcedSkillSource::SkillsCommandNextTurn,
+        ForcedSkillSource::InlineReference,
+    ] {
+        app.forced_skills = vec!["replacement".to_string()];
+        app.forced_skill_source = Some(source);
+        let guard =
+            super::prepare_skill_for_turn(&mut app, &mcp_client, &manifests, "explicit turn")
+                .unwrap();
+        // The `/use` mode skill is a floor: loading another skill adds it for the turn
+        // instead of replacing `agent-team`, and the explicit pick stays primary.
+        assert_eq!(guard.matched_skill_names(), ["replacement", "agent-team"]);
+        assert!(app.forced_skills.is_empty());
+        assert!(app.forced_skill_source.is_none());
+        let guard =
+            super::prepare_skill_for_turn(&mut app, &mcp_client, &manifests, "next ordinary turn")
+                .unwrap();
+        assert_eq!(guard.matched_skill_names(), ["agent-team"]);
+    }
+    app.forced_skills = vec!["missing-skill".to_string()];
+    app.forced_skill_source = Some(ForcedSkillSource::InlineReference);
+    let guard =
+        super::prepare_skill_for_turn(&mut app, &mcp_client, &manifests, "explicit missing skill")
+            .unwrap();
+    // An unresolved explicit name does not switch the `/use` mode off either.
+    assert_eq!(guard.matched_skill_names(), ["agent-team"]);
+
+    let events =
+        crate::ai::history::read_skill_activation_events_sqlite(&app.session_history_file).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.source == "session-default")
+            .count(),
+        5
+    );
+    assert!(
+        events
+            .iter()
+            .filter(|event| event.source == "session-default")
+            .all(|event| event.injected_skill.as_deref() == Some("agent-team"))
+    );
+    assert!(events.iter().any(|event| event.source == "@skills"
+        && event.requested_skill == "missing-skill"
+        && event.outcome == "not-found"));
+
+    super::super::commands::try_handle_use_command(&mut app, "/use kernel").unwrap();
+    let guard =
+        super::prepare_skill_for_turn(&mut app, &mcp_client, &manifests, "kernel turn").unwrap();
+    assert_eq!(guard.matched_skill_names(), ["agent-team"]);
+    assert_eq!(app.session_default_skills, ["agent-team"]);
+
+    super::super::commands::try_handle_reset_command(&mut app, "/reset").unwrap();
+    let guard =
+        super::prepare_skill_for_turn(&mut app, &mcp_client, &manifests, "reset turn").unwrap();
+    assert!(guard.matched_skill_names().is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn use_command_sticky_defaults_preserve_resumed_explicit_skill() {
+    let manifests = [
+        skill("agent-team", "delegate work"),
+        skill("replacement", "explicit workflow"),
+    ];
+    let mcp_client = McpClient::new();
+    let mut app = super::super::tests::test_app("build");
+    app.session_default_skills = vec!["agent-team".to_string()];
+    RESUME_SKILL_NAMES
+        .scope(vec!["replacement".to_string()], async {
+            let guard = super::prepare_skill_for_turn(
+                &mut app,
+                &mcp_client,
+                &manifests,
+                "resume this turn",
+            )
+            .unwrap();
+            assert_eq!(guard.matched_skill_names(), ["replacement"]);
+            assert_eq!(app.session_default_skills, ["agent-team"]);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn resumed_turn_restores_skill_and_its_task_tools() {
+    let mut agent_team = skill("agent-team", "delegate work to subagents");
+    agent_team.tool_groups = vec!["task".to_string()];
+    let expected_name = agent_team.name.clone();
+    let mcp_client = McpClient::new();
+    let mut app = super::super::tests::test_app("build");
+
+    RESUME_SKILL_NAMES
+        .scope(vec![expected_name.clone()], async {
+            let guard = super::prepare_skill_for_turn(
+                &mut app,
+                &mcp_client,
+                std::slice::from_ref(&agent_team),
+                "[Process 1 Resumed] Continue execution.",
+            )
+            .unwrap();
+            let loaded_tools = app
+                .agent_context
+                .as_ref()
+                .map(|context| {
+                    context
+                        .tools
+                        .iter()
+                        .map(|tool| tool.function.name.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            assert_eq!(guard.matched_skill_names(), &[expected_name]);
+            assert!(loaded_tools.contains(&"task_wait"));
+            assert!(loaded_tools.contains(&"task_integrate"));
+        })
+        .await;
 }
 
 #[test]
@@ -658,9 +814,8 @@ fn system_prompt_keeps_subagent_orchestration_lazy_without_task_tools() {
     ] {
         with_tasks.insert(name.to_string());
     }
-    let heavy =
-        build_system_prompt(None, &[], &Box::new(with_tasks), &PromptContext::default())
-            .render_system_prompt();
+    let heavy = build_system_prompt(None, &[], &Box::new(with_tasks), &PromptContext::default())
+        .render_system_prompt();
     assert!(heavy.contains("<async_subagent_orchestration>"));
     let saved = heavy.len().saturating_sub(lean.len());
     assert!(
@@ -760,7 +915,7 @@ fn system_prompt_pins_invariant_discharge_workflow() {
             .render_system_prompt();
         for phrase in [
             "**Invariants with discharge.**",
-            "state — at whatever depth the risk warrants — what must remain true afterwards in falsifiable form",
+            "state a falsifiable postcondition at the needed depth",
             "`binding`",
             "`enumeration`",
             "`substitution`",
@@ -770,8 +925,8 @@ fn system_prompt_pins_invariant_discharge_workflow() {
             "\"By construction\"",
             "an unrun \"the compiler/tests will catch it\" is not a discharge",
             "**Depth follows coupling, not diff size.**",
-            "Every change still gets the invariant question",
-            "never inspected",
+            "Before choosing an implementation, compare changed preconditions and preserved guarantees",
+            "never claim uninspected branches are covered",
         ] {
             assert!(
                 prompt.contains(phrase),
@@ -793,7 +948,9 @@ fn system_prompt_bridges_compressed_context_recovery_via_search_overflow() {
 
     assert!(prompt.contains("<compressed_context_recovery>"));
     assert!(prompt.contains("search the relevant session archive with `search_overflow`"));
-    assert!(prompt.contains("absence claim about past conversation or tool evidence that may have been compressed"));
+    assert!(prompt.contains(
+        "absence claim about past conversation or tool evidence that may have been compressed"
+    ));
     assert!(prompt.contains("the visible context window alone cannot establish that absence"));
     assert!(prompt.contains("Claims about current source or external state should be checked against that object, not the session archive"));
     assert!(prompt.contains("verbatim excerpts"));
@@ -1010,7 +1167,11 @@ fn session_id_reference_makes_session_tools_resident_for_the_turn() {
             "{session_tool} should be resident for a session-id turn, got {names:?}"
         );
     }
-    assert!(guard.system_prompt().contains("current-session-for-guidance"));
+    assert!(
+        guard
+            .system_prompt()
+            .contains("current-session-for-guidance")
+    );
     drop(guard);
 }
 
@@ -1019,13 +1180,8 @@ fn question_without_session_id_keeps_session_tools_lazy() {
     let mcp_client = McpClient::new();
     let mut app = super::super::tests::test_app("build");
     app.session_id = "ordinary-turn-session-id".to_string();
-    let mut guard = super::prepare_skill_for_turn(
-        &mut app,
-        &mcp_client,
-        &[],
-        "write a fizzbuzz",
-    )
-    .unwrap();
+    let mut guard =
+        super::prepare_skill_for_turn(&mut app, &mcp_client, &[], "write a fizzbuzz").unwrap();
     let names: Vec<String> = app
         .agent_context
         .as_ref()
@@ -1068,13 +1224,9 @@ fn skill_authoring_question_auto_loads_save_skill() {
     let mcp_client = McpClient::new();
     let mut app = super::super::tests::test_app("build");
     app.session_id = "skill-authoring-turn".to_string();
-    let mut guard = super::prepare_skill_for_turn(
-        &mut app,
-        &mcp_client,
-        &[],
-        "save this workflow as a skill",
-    )
-    .unwrap();
+    let mut guard =
+        super::prepare_skill_for_turn(&mut app, &mcp_client, &[], "save this workflow as a skill")
+            .unwrap();
     let names: Vec<String> = app
         .agent_context
         .as_ref()
@@ -1110,15 +1262,15 @@ fn resident_session_guidance_keeps_exact_id_on_an_unrelated_turn() {
     let mut app = super::super::tests::test_app("build");
     app.session_id = "resident-current-session-id".to_string();
     app.session_history_file = history;
-    let mut guard = super::prepare_skill_for_turn(
-        &mut app,
-        &mcp_client,
-        &[],
-        "write a fizzbuzz function",
-    )
-    .unwrap();
+    let mut guard =
+        super::prepare_skill_for_turn(&mut app, &mcp_client, &[], "write a fizzbuzz function")
+            .unwrap();
 
-    assert!(guard.system_prompt().contains("resident-current-session-id"));
+    assert!(
+        guard
+            .system_prompt()
+            .contains("resident-current-session-id")
+    );
     assert!(!guard.session_context_guidance_newly_rendered());
     drop(guard);
     let _ = fs::remove_dir_all(root);
@@ -1134,13 +1286,15 @@ fn system_prompt_routes_project_file_deletes_to_apply_patch() {
         .render_system_prompt();
 
     assert!(prompt.contains("<temporary_files>"));
-    assert!(prompt.contains("Save content downloaded from the network in the session temp directory"));
+    assert!(
+        prompt.contains("Save content downloaded from the network in the session temp directory")
+    );
     assert!(prompt.contains("Reserve the destination with `write_file(temp=true)`"));
     assert!(prompt.contains("git-tracked file"));
     assert!(prompt.contains("`apply_patch`"));
-    assert!(prompt.contains(
-        "Batch hunks into one `apply_patch` call only when every anchor is unique"
-    ));
+    assert!(
+        prompt.contains("Batch hunks into one `apply_patch` call only when every anchor is unique")
+    );
     assert!(prompt.contains("distinctive anchor"));
     assert!(prompt.contains("`*** Delete File: <path>`"));
     // Patch-size limits are owned by the apply_patch schema and first-use
@@ -1228,7 +1382,9 @@ fn system_prompt_uses_criterion_based_parallel_delegation() {
     assert!(prompt.contains("net benefit is marginal or uncertain"));
     // The parent keeps final decisions, tightly coupled edits, and end-to-end
     // synthesis.
-    assert!(prompt.contains("Keep final decisions, tightly coupled overlapping edits"));
+    assert!(prompt.contains(
+        "Keep final decisions and end-to-end synthesis in the parent; when an active skill requires delegation, hand a tightly coupled edit to exactly one worker instead of doing it in the parent."
+    ));
     assert!(prompt.contains("broad read-only discovery"));
     assert!(prompt.contains("explicit result contract"));
     // Serial steps may also be delegated for context isolation (parallel
@@ -1251,21 +1407,30 @@ fn system_prompt_uses_criterion_based_parallel_delegation() {
 
 #[test]
 fn system_prompt_does_not_require_status_as_a_finishing_ritual() {
-    for tools in [vec![], vec!["task_status"], vec!["task_spawn", "task_status"]] {
+    for tools in [
+        vec![],
+        vec!["task_status"],
+        vec!["task_spawn", "task_status"],
+    ] {
         let mut available = SkipSet::new(16);
         for tool in &tools {
             available.insert((*tool).to_string());
         }
-        let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
-            .render_system_prompt();
+        let prompt =
+            build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
+                .render_system_prompt();
         assert!(!prompt.contains("Before finishing your answer, call `task_status`"));
         assert_eq!(
-            prompt.contains("Use `task_status` when unresolved task state matters to the next decision"),
+            prompt.contains(
+                "Use `task_status` when unresolved task state matters to the next decision"
+            ),
             tools.contains(&"task_status")
         );
         if tools.contains(&"task_status") {
             assert!(prompt.contains("Never silently drop a spawned task"));
-            assert!(prompt.contains("never substitute a status query for reviewing and explicitly integrating evidence"));
+            assert!(prompt.contains(
+                "never substitute a status query for reviewing and explicitly integrating evidence"
+            ));
             assert!(prompt.contains("runtime final-response gates provide bounded recovery"));
         }
     }
@@ -1297,7 +1462,7 @@ fn system_prompt_routes_single_delegation_to_sync_task_when_available() {
     assert!(!prompt.contains("is just a slower `task`"));
     // ...but still keeps its own unique plan/delegate guidance.
     assert!(prompt.contains(
-        "Simple tasks: act directly. Complex ones: call `plan` first — before the first tool call"
+        "Simple tasks: act directly (unless an active skill requires delegation). Complex ones: call `plan` first — before the first tool call"
     ));
     assert!(prompt.contains("decide delegation per the async_subagent_orchestration guidance"));
 }
@@ -1337,10 +1502,12 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
     assert!(prompt.contains("<correctness_guardrails>"));
-    assert!(prompt.contains("Ground facts about a particular workspace, execution, session, or current external state"));
+    assert!(prompt.contains(
+        "Ground facts about a particular workspace, execution, session, or current external state"
+    ));
     assert!(prompt.contains("state what is verified, what is unknown"));
     assert!(prompt.contains("limit absence claims to the scope actually searched"));
-    assert!(prompt.contains("plus its callers and dependents anywhere in the workspace"));
+    assert!(prompt.contains("its callers and dependents anywhere in the workspace"));
     assert!(prompt.contains("compilation and tests prove only covered behavior"));
     assert!(prompt.contains("reset, checkout, restore, stash drop"));
     assert!(prompt.contains("temporary branch/worktree or stash push then pop"));
@@ -1349,7 +1516,11 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     // unfinished actions.
     assert!(prompt.contains("navigation aids rather than independent proof"));
     assert!(prompt.contains("in evidence observed in this session"));
-    assert!(prompt.contains("Investigate an unresolved fact only when it can materially change the answer"));
+    assert!(
+        prompt.contains(
+            "Investigate an unresolved fact only when it can materially change the answer"
+        )
+    );
     assert!(prompt.contains("claims of success require successful results"));
     assert!(prompt.contains("An attempt or a plan is not a completed action"));
     // Subject-scope bullet: set-level aggregates never describe a single
@@ -1389,7 +1560,9 @@ fn system_prompt_answers_stable_general_knowledge_without_a_probe() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
     assert!(prompt.contains("Answer stable general knowledge directly"));
-    assert!(prompt.contains("Where the conclusion follows deductively from inspected code or math"));
+    assert!(
+        prompt.contains("Where the conclusion follows deductively from inspected code or math")
+    );
     assert!(prompt.contains("instead of adding executed tests to re-prove it"));
     assert!(prompt.contains(
         "This check does not apply to stable general knowledge or to valid deductions from explicit, supported premises"
@@ -1399,14 +1572,16 @@ fn system_prompt_answers_stable_general_knowledge_without_a_probe() {
     assert!(!prompt.contains("deductions from explicit premises"));
     assert!(!prompt.contains("deductions from supported premises"));
     assert!(prompt.contains("Confidence does not replace evidence"));
-    assert!(prompt.contains(
-        "a script that merely restates an assumption adds no independent support"
-    ));
+    assert!(
+        prompt.contains("a script that merely restates an assumption adds no independent support")
+    );
     assert!(prompt.contains("current external state in evidence observed in this session"));
     assert!(prompt.contains(
         "inspect source for code structure, compile for compilation claims, and observe the running system for runtime state"
     ));
-    assert!(prompt.contains("Where execution settles a material claim that deduction cannot close"));
+    assert!(
+        prompt.contains("Where execution settles a material claim that deduction cannot close")
+    );
     assert!(prompt.contains("An explicit request to check a fact makes it part of delivery"));
 }
 
@@ -1517,6 +1692,10 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "violating it invalidates the answer",
                     "Lack of emphasis does not weaken a requirement",
                     "**Change authorization.**",
+                    "compare changed preconditions and preserved guarantees",
+                    "Absence of an in-repo producer does not exclude an accepted input or existing state",
+                    "This applies with or without an audit",
+                    "a source/contract derivation proves only what follows from its established premises",
                     "Do not implement refactors or optimizations unrelated to the task",
                     "Report an adjacent critical correctness, data-loss, or security risk",
                     "but do not fix it without user approval",
@@ -1600,7 +1779,8 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     assert_eq!(prompt.matches(rule).count(), 1);
                 }
                 let (_, tool_evidence) = prompt.split_once("<tool_result_evidence>").unwrap();
-                let (tool_evidence, _) = tool_evidence.split_once("</tool_result_evidence>").unwrap();
+                let (tool_evidence, _) =
+                    tool_evidence.split_once("</tool_result_evidence>").unwrap();
                 for rule in [
                     "If capability availability is unknown and the operation is safe and authorized",
                     "Reuse an existing failure unless relevant conditions changed",
@@ -1617,10 +1797,15 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                 assert!(!prompt.contains("<compressed_context_recovery>"));
                 let mut recovery_tools = SkipSet::new(16);
                 recovery_tools.insert("search_overflow".to_string());
-                let recovery_prompt = build_system_prompt(active_agent, skills, &Box::new(recovery_tools), &ctx)
-                    .render_system_prompt();
-                let (_, recovery) = recovery_prompt.split_once("<compressed_context_recovery>").unwrap();
-                let (recovery, _) = recovery.split_once("</compressed_context_recovery>").unwrap();
+                let recovery_prompt =
+                    build_system_prompt(active_agent, skills, &Box::new(recovery_tools), &ctx)
+                        .render_system_prompt();
+                let (_, recovery) = recovery_prompt
+                    .split_once("<compressed_context_recovery>")
+                    .unwrap();
+                let (recovery, _) = recovery
+                    .split_once("</compressed_context_recovery>")
+                    .unwrap();
                 assert!(recovery.contains("absence claim about past conversation or tool evidence that may have been compressed"));
                 assert!(recovery.contains("Claims about current source or external state should be checked against that object, not the session archive"));
                 for obsolete in [
@@ -1648,13 +1833,17 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                 } else {
                     let (_, scope) = prompt.split_once("<scope_discipline>").unwrap();
                     let (scope, _) = scope.split_once("</scope_discipline>").unwrap();
-                    assert!(scope.contains("Investigate only the request plus its direct dependencies"));
+                    assert!(
+                        scope.contains("Investigate only the request plus its direct dependencies")
+                    );
                     assert!(!scope.contains("Do not implement refactors"));
                     let (_, execution) = prompt.split_once("<autonomous_execution>").unwrap();
                     let (execution, _) = execution.split_once("</autonomous_execution>").unwrap();
                     assert!(execution.contains("**Deliver the requested outcome.**"));
                     assert!(execution.contains("Answer questions with supported conclusions"));
-                    assert!(execution.contains("carry out authorized actions rather than merely proposing them"));
+                    assert!(execution.contains(
+                        "carry out authorized actions rather than merely proposing them"
+                    ));
                     assert!(execution.contains("Use tools when needed for evidence or execution, not as a substitute for answering"));
                 }
                 if !skills.is_empty() {
@@ -1666,7 +1855,10 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                 assert!(prompt.contains(
                     "Where the conclusion follows deductively from inspected code or math, state the derivation instead of adding executed tests to re-prove it"
                 ));
-                assert_eq!(prompt.matches("Omit optional unsupported claims").count(), 1);
+                assert_eq!(
+                    prompt.matches("Omit optional unsupported claims").count(),
+                    1
+                );
                 assert!(
                     prompt.contains(
                         "When the user is right, say so plainly and accept the correction"
@@ -1735,11 +1927,7 @@ fn system_prompt_scope_discipline_bullets_have_no_leaked_indentation() {
     assert!(prompt.contains("<scope_discipline>"));
     // Investigation bullets and the separate change-authorization rule must
     // start at column 0, without leaked source indentation.
-    assert!(
-        prompt.contains(
-            "\n- Investigate only the request plus its direct dependencies"
-        )
-    );
+    assert!(prompt.contains("\n- Investigate only the request plus its direct dependencies"));
     assert!(
         prompt.contains("\n- **Change authorization.** Edit only files the current task requires")
     );
@@ -1776,6 +1964,10 @@ fn system_prompt_links_task_convergence_criteria_to_plan_when_available() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
     assert!(prompt.contains("For multi-step tasks, encode these criteria into the `plan`"));
+    assert!(prompt.contains("Carry material unresolved concerns in the affected step"));
+    assert!(prompt.contains("recording closure evidence before marking it done"));
+    assert!(prompt.contains("skipping a blocked step does not verify its outcome"));
+    assert!(prompt.contains("No extra plan is needed for a locally resolved concern"));
     assert!(!prompt.contains("Track step progress with `plan_update`"));
     assert!(prompt.contains("Treat the plan as a living roadmap"));
     assert!(prompt.contains("before the first tool call, so the plan is the roadmap"));
@@ -1790,6 +1982,7 @@ fn system_prompt_links_task_convergence_criteria_to_plan_when_available() {
     .render_system_prompt();
     assert!(empty.contains("<task_convergence>"));
     assert!(!empty.contains("encode these criteria into the `plan`"));
+    assert!(!empty.contains("Carry material unresolved concerns in the affected step"));
 }
 
 #[test]
@@ -1950,16 +2143,16 @@ fn ask_protocol_lives_in_tool_description_not_prose() {
 
     // The merged ask protocol lives in the tool metadata, visible to every turn
     // that carries the tool.
-    let tool = crate::ai::tools::get_tool_definitions_by_names(&[
-        "request_user_input".to_string(),
-    ]);
+    let tool = crate::ai::tools::get_tool_definitions_by_names(&["request_user_input".to_string()]);
     assert_eq!(tool.len(), 1);
     let desc = &tool[0].function.description;
     assert!(desc.contains("genuinely blocked"));
     assert!(desc.contains("one focused question"));
     assert!(desc.contains("exhaust what tools and verification can establish"));
     assert!(
-        desc.contains("restores that skill only for the user's immediately following normal message")
+        desc.contains(
+            "restores that skill only for the user's immediately following normal message"
+        )
     );
 }
 
@@ -1969,7 +2162,9 @@ fn request_user_input_injection_matrix() {
     let skills: &[&SkillManifest] = &[&humanizer];
 
     // Skill turns always inject (cross-turn handoff), even under goal mode.
-    assert!(super::should_inject_request_user_input(skills, &None, false));
+    assert!(super::should_inject_request_user_input(
+        skills, &None, false
+    ));
     assert!(super::should_inject_request_user_input(
         skills,
         &Some("g".to_string()),
@@ -1992,7 +2187,9 @@ fn request_user_input_injection_matrix() {
     // Subagent turns have no attached user: asking is always disabled, even with
     // skills active (the cross-turn handoff cannot reach a human from a leaf task).
     SUBAGENT_DEPTH.sync_scope(1, || {
-        assert!(!super::should_inject_request_user_input(skills, &None, false));
+        assert!(!super::should_inject_request_user_input(
+            skills, &None, false
+        ));
         assert!(!super::should_inject_request_user_input(&[], &None, false));
     });
 }
@@ -2014,7 +2211,9 @@ fn system_prompt_keeps_code_grounding_calls_serial() {
     let prompt = build_system_prompt(None, &[], &Box::new(available), &PromptContext::default())
         .render_system_prompt();
     assert!(prompt.contains("Navigate code serially"));
-    assert!(prompt.contains("read one sufficiently broad needed region, then take the task-appropriate action"));
+    assert!(prompt.contains(
+        "read one sufficiently broad needed region, then take the task-appropriate action"
+    ));
     assert!(prompt.contains("Do not batch code reads"));
     assert!(
         !prompt.contains("Work in batches: when several independent read-only lookups are needed")
@@ -2224,7 +2423,9 @@ fn system_prompt_guides_optional_skill_discovery_when_available() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(descriptions.contains("technical keywords"));
-    assert!(descriptions.contains("routine source-code, repository, file, or terminal investigation"));
+    assert!(
+        descriptions.contains("routine source-code, repository, file, or terminal investigation")
+    );
     let activation_description = &list_skills
         .iter()
         .find(|tool| tool.function.name == "activate_skill")
@@ -2687,7 +2888,9 @@ fn scoped_instructions_stay_resident_and_keep_their_position_across_guards() {
         let grown = turn_two.system_prompt().to_string();
         assert!(grown.contains("Driver rules.") && grown.contains("Tool rules."));
         assert_eq!(
-            grown.matches("<target_scoped_project_instructions>").count(),
+            grown
+                .matches("<target_scoped_project_instructions>")
+                .count(),
             1,
             "scoped instructions must stay one section, replaced in place: {grown}"
         );
@@ -2969,6 +3172,7 @@ fn skill(name: &str, description: &str) -> SkillManifest {
         author: None,
         tools: Vec::new(),
         tool_groups: Vec::new(),
+        delegation: None,
         mcp_servers: Vec::new(),
         disable_builtin_tools: false,
         disable_mcp_tools: false,
@@ -3414,8 +3618,5 @@ fn merge_dedupes_duplicate_names_without_explicit_tools() {
             .count(),
         1
     );
-    assert_eq!(
-        names.iter().filter(|name| **name == "read_file").count(),
-        1
-    );
+    assert_eq!(names.iter().filter(|name| **name == "read_file").count(), 1);
 }

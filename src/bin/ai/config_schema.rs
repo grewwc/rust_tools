@@ -87,6 +87,12 @@ impl AiConfig {
     // ── Agents ─────────────────────────────────────────────
     pub const AGENTS_DIR: &str = "ai.agents.dir";
 
+    // ── TraeCLI subagent backend ─────────────────────────────
+    /// Default model for `backend: "traecli"` subagent runs (a TraeCLI model
+    /// slug, see `traecli models`). A per-call `backend_model` wins over this
+    /// key. Unset falls back to `gpt-5.5`.
+    pub const TRAECLI_DEFAULT_MODEL: &str = "ai.traecli.default_model";
+
     // ── Pure mode ─────────────────────────────────────────
     /// Startup default for the pure agent. When true, a run that names no
     /// agent starts with the `pure` agent, which renders only its minimal

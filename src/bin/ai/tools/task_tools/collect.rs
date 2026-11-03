@@ -19,6 +19,26 @@ pub(super) fn record_subagent_spawn_audit(task_id: &str, prepared: &PreparedSuba
     );
 }
 
+/// Persist a terminal status for a task whose result is not collected.
+///
+/// Cancellation, wall-clock reaping, and turn wrap-up know the terminal state before
+/// `task_wait` runs. Recording it keeps `task_audit` accurate when the turn ends first;
+/// the ledger row remains undelivered, so it is not treated as pending evidence.
+pub(super) fn record_uncollected_terminal_status(session_id: &str, task_id: &str, status: &str) {
+    if session_id.is_empty() {
+        return;
+    }
+    let Some(context) = crate::ai::driver::runtime_ctx::try_current() else {
+        return;
+    };
+    let _ = crate::ai::history::record_uncollected_task_terminal_status(
+        context.app_proto.config.history_file.as_path(),
+        session_id,
+        task_id,
+        status,
+    );
+}
+
 pub(super) fn persist_rendered_task_evidence(
     task_id: &str,
     entry: &AsyncTaskEntry,
@@ -98,6 +118,7 @@ pub(super) fn drain_task_result(
                     output: payload.clone(),
                     error: None,
                     progress: None,
+                    backend_session: None,
                 },
                 rendered: payload,
             }));
@@ -110,6 +131,7 @@ pub(super) fn drain_task_result(
                 entry.pid
             )),
             progress: current_task_progress(task_id),
+            backend_session: record_traecli_session(task_id, None),
         };
         let rendered = format_task_result_with_id(task_id, entry, result.clone());
         persist_rendered_task_evidence(task_id, entry, &result.status, &rendered)?;
@@ -171,6 +193,7 @@ pub(super) fn poll_owned_task_result(task_id: &str) -> Result<OwnedTaskPoll, Str
                     output: payload.clone(),
                     error: None,
                     progress: None,
+                    backend_session: None,
                 },
                 rendered: payload,
             });

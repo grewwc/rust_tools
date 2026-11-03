@@ -760,11 +760,11 @@ pub(super) fn collect_valid_tool_calls(
                     raw.to_string()
                 };
                 if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
-                    eprintln!(
+                    crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
                         "[Warning] dropping malformed tool call '{}' due to incomplete JSON arguments\n\
                          └─ 截断的 arguments 片段:\n{}",
                         builder.function_name, snippet
-                    );
+                    ));
                 }
                 return None;
             };

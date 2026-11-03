@@ -1,13 +1,12 @@
 pub(crate) mod command_tools;
 mod common;
-mod complete_tools;
 pub(crate) mod enable_tools;
 mod knowledge_tools;
 pub mod os_tools;
 mod overflow_search;
 mod patch_tools;
-mod phone_tools;
 pub(crate) mod permissions;
+mod phone_tools;
 // `App` is `pub(in crate::ai)`, so the plan-state API stays at the same visibility; the
 // driver reaches it through this path instead of duplicating plan persistence.
 pub(in crate::ai) mod plan_state;
@@ -27,7 +26,6 @@ mod web_tools;
 #[cfg(test)]
 pub use command_tools::validate_execute_command;
 
-pub(crate) use complete_tools::{COMPLETE_CLAIM_RECORDED_PREFIX, FINAL_RESPONSE_END_MARKER};
 pub(crate) use patch_tools::{PATCH_TEXT_BLOCK_START, apply_patch_target_paths_from_patch};
 #[cfg(test)]
 pub(crate) use registry::common::ToolReplayRegistration;

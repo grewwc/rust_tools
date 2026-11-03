@@ -3,9 +3,9 @@ pub(crate) mod audit;
 pub(crate) mod changes;
 pub mod checkpoint;
 pub(crate) mod compact;
-pub(crate) mod distill_session;
 pub mod cwd;
 pub mod discuss;
+pub(crate) mod distill_session;
 pub mod export;
 pub mod goal;
 pub mod help;
@@ -21,17 +21,22 @@ pub mod task;
 pub mod theme;
 pub mod title;
 pub mod usage;
+pub(crate) mod use_backend;
 
 use std::sync::Arc;
 
-use crate::ai::{agents::AgentManifest, skills::SkillManifest, types::{App, ForcedSkillSource}};
+use crate::ai::{
+    agents::AgentManifest,
+    skills::SkillManifest,
+    types::{App, ForcedSkillSource},
+};
 
 pub use agent::try_handle_agent_command;
 pub use checkpoint::try_handle_checkpoint_command;
 #[cfg(feature = "serve")]
 pub(crate) use checkpoint::{
-    SERVE_CHECKPOINT_CONFIRM_ENV, SERVE_CHECKPOINT_CONFIRM_MARKER,
-    SERVE_CHECKPOINT_CONFIRM_PROBE, SERVE_CHECKPOINT_CONFIRM_YES,
+    SERVE_CHECKPOINT_CONFIRM_ENV, SERVE_CHECKPOINT_CONFIRM_MARKER, SERVE_CHECKPOINT_CONFIRM_PROBE,
+    SERVE_CHECKPOINT_CONFIRM_YES,
 };
 pub use cwd::try_handle_cwd_command;
 pub use discuss::try_handle_discuss_command;
@@ -49,6 +54,7 @@ pub use task::try_handle_task_command;
 pub use theme::try_handle_theme_command;
 pub use title::try_handle_title_command;
 pub use usage::try_handle_usage_command;
+pub(crate) use use_backend::{try_handle_reset_command, try_handle_use_command};
 
 pub(super) fn publish_checkpoint_names(store: &crate::ai::history::CheckpointStore) {
     checkpoint::publish_checkpoint_names(store);
@@ -80,6 +86,8 @@ pub fn is_local_command_start(token: &str) -> bool {
             | "agents"
             | "archive"
             | "audit"
+            | "use"
+            | "reset"
             | "bg"
             | "cd"
             | "changes"
@@ -128,8 +136,8 @@ pub fn is_local_command_start(token: &str) -> bool {
 /// Commands serve-chat forwards to the turn child even though the local REPL
 /// also recognizes them. The child executes them server-side: `/memo` after
 /// pre-turn dispatch, `/audit` and `/distill-session` in the turn dispatcher,
-/// `/mark`, `/unmark`, `/archive`, `/title`, and `/export` in the pre-turn
-/// local-command path, and `/task`, `/discuss`, and `/goal` inject a
+/// `/mark`, `/unmark`, `/archive`, `/title`, `/export`, `/use`, and `/reset` in
+/// the pre-turn local-command path, and `/task`, `/discuss`, and `/goal` inject a
 /// `forced_question` into the turn.
 fn is_serve_forwarded_command_start(token: &str) -> bool {
     if memo::memo_command_args(token).is_some() {
@@ -155,6 +163,8 @@ fn is_serve_forwarded_command_start(token: &str) -> bool {
             | "archive"
             | "audit"
             | "title"
+            | "use"
+            | "reset"
     )
 }
 
@@ -306,6 +316,12 @@ pub fn try_handle_local_command(
     if try_handle_task_command(app, input)? {
         return Ok(true);
     }
+    if try_handle_use_command(app, input)? {
+        return Ok(true);
+    }
+    if try_handle_reset_command(app, input)? {
+        return Ok(true);
+    }
     if try_handle_model_command(app, input)? {
         return Ok(true);
     }
@@ -376,7 +392,11 @@ pub fn try_handle_interactive_command(
     // A slash-looking invocation no handler claimed is a usage error, not a
     // model question: report it locally instead of sending it to the model.
     if looks_like_slash_command(input) {
-        let head = input.trim_start().split_whitespace().next().unwrap_or(input);
+        let head = input
+            .trim_start()
+            .split_whitespace()
+            .next()
+            .unwrap_or(input);
         println!("Unknown command: '{head}'. Run /help to list available commands.");
         return Ok(true);
     }
@@ -495,9 +515,7 @@ fn conflicting_main_commands(input: &str) -> Vec<&'static str> {
     if !(first.starts_with('/') || first.starts_with(':')) {
         return Vec::new();
     }
-    if main_command_kind(first).is_none()
-        && skills::parse_embedded_skills_line(first).is_none()
-    {
+    if main_command_kind(first).is_none() && skills::parse_embedded_skills_line(first).is_none() {
         return Vec::new();
     }
     let mut open: Option<(char, usize)> = None;
@@ -552,7 +570,10 @@ pub(crate) fn split_combined_command(
         }
         if let Some(picked) = skills::parse_embedded_skills_line(trimmed) {
             for name in picked {
-                if !names.iter().any(|known: &String| known.eq_ignore_ascii_case(&name)) {
+                if !names
+                    .iter()
+                    .any(|known: &String| known.eq_ignore_ascii_case(&name))
+                {
                     names.push(name);
                 }
             }
@@ -608,7 +629,7 @@ mod tests {
 
     #[test]
     fn serve_input_routing_separates_local_server_unknown_and_prompt() {
-        use super::{ServeInputRoute, classify_serve_input};
+        use super::{ServeInputRoute, classify_serve_input, is_serve_local_command_start};
 
         assert_eq!(
             classify_serve_input("/history rewind u4"),
@@ -653,6 +674,25 @@ mod tests {
                 "{input}"
             );
         }
+        for input in [
+            "/use",
+            ":use",
+            "/use traecli",
+            "/use traecli GPT-5.5",
+            "/use kernel",
+            "/use\nfix login",
+            "/use traecli\nfix login",
+            "/use traecli GPT-5.5\nfix login",
+            "/reset",
+            ":reset",
+        ] {
+            assert!(!is_serve_local_command_start(input), "{input}");
+            assert_eq!(
+                classify_serve_input(input),
+                ServeInputRoute::ServerCommand,
+                "{input}"
+            );
+        }
         assert_eq!(
             classify_serve_input("/memo keep this"),
             ServeInputRoute::ServerCommand
@@ -674,10 +714,7 @@ mod tests {
             ServeInputRoute::UnknownCommand
         );
         // Path-shaped absolute paths and ordinary prose stay prompts.
-        assert_eq!(
-            classify_serve_input("/tmp/foo"),
-            ServeInputRoute::Prompt
-        );
+        assert_eq!(classify_serve_input("/tmp/foo"), ServeInputRoute::Prompt);
         assert_eq!(
             classify_serve_input("plain prompt"),
             ServeInputRoute::Prompt
@@ -712,21 +749,21 @@ mod tests {
         assert_eq!(main, "/task fix login");
         assert_eq!(names, vec!["s1", "s2"]);
         // Reverse order: the main line moves first so single-line parsers apply.
-        let (main, names) =
-            split_combined_command("/skills use s1\n/discuss topic here", &["/discuss", ":discuss"])
-                .expect("reverse order must engage");
+        let (main, names) = split_combined_command(
+            "/skills use s1\n/discuss topic here",
+            &["/discuss", ":discuss"],
+        )
+        .expect("reverse order must engage");
         assert_eq!(main, "/discuss topic here");
         assert_eq!(names, vec!["s1"]);
         // No skills lines: still engages with an empty selection.
-        let (main, names) =
-            split_combined_command("/task fix login", &["/task", ":task"])
-                .expect("plain command must engage");
+        let (main, names) = split_combined_command("/task fix login", &["/task", ":task"])
+            .expect("plain command must engage");
         assert_eq!(main, "/task fix login");
         assert!(names.is_empty());
         // Other-command lines and prose are preserved, never claimed.
-        let (main, names) =
-            split_combined_command("/task x\n/discuss y", &["/task", ":task"])
-                .expect("main command must engage");
+        let (main, names) = split_combined_command("/task x\n/discuss y", &["/task", ":task"])
+            .expect("main command must engage");
         assert_eq!(main, "/task x\n/discuss y");
         assert!(names.is_empty());
         assert!(split_combined_command("hello\n/task x", &["/task", ":task"]).is_none());
@@ -783,35 +820,24 @@ mod tests {
         assert!(conflicting_main_commands("how do I use /task?\n/discuss this").is_empty());
         assert!(conflicting_main_commands("").is_empty());
         // Fenced code examples are body text, never conflicting commands.
-        assert!(conflicting_main_commands(
-            "/task fix login\n```\n/discuss API options\n```"
-        )
-        .len()
-            < 2);
-        assert!(conflicting_main_commands(
-            "/task fix login\n~~~\n/task second\n~~~"
-        )
-        .len()
-            < 2);
+        assert!(
+            conflicting_main_commands("/task fix login\n```\n/discuss API options\n```").len() < 2
+        );
+        assert!(conflicting_main_commands("/task fix login\n~~~\n/task second\n~~~").len() < 2);
         // Nested fences: the inner ``` run is shorter than the ```` opener,
         // so it cannot close the block and the /discuss line stays fenced.
         assert!(
-            conflicting_main_commands(
-                "/task fix login\n````\n```\n/discuss API options\n````"
-            )
-            .len()
+            conflicting_main_commands("/task fix login\n````\n```\n/discuss API options\n````")
+                .len()
                 < 2
         );
         // Cross-character runs never close: ~~~ inside a ``` block is content.
         assert!(
-            conflicting_main_commands("/task fix login\n```\n~~~\n/discuss API options\n```")
-                .len()
+            conflicting_main_commands("/task fix login\n```\n~~~\n/discuss API options\n```").len()
                 < 2
         );
         // A shorter backtick run cannot close a longer opener: the second
         // /task line is still fenced, so no conflict is reported.
-        assert!(
-            conflicting_main_commands("/task a\n````\n```\n/task b\n````").len() < 2
-        );
+        assert!(conflicting_main_commands("/task a\n````\n```\n/task b\n````").len() < 2);
     }
 }

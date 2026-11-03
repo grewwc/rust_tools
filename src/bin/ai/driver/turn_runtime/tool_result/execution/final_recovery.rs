@@ -22,16 +22,18 @@ pub(in crate::ai::driver::turn_runtime) const INJECTED_CONTEXT_ECHO_STOP: &str =
 /// Turn-local state for final-response recovery. Prompt markers remain useful context for
 /// the model, but runtime control flow must not infer retry budgets from persisted text:
 /// old markers can survive into later turns. General quality gates share one retry, while
-/// the structural outstanding-work assertion has its own bounded retry budget so another
-/// gate cannot suppress the required `complete` prompt or make it spin to the iteration cap.
+/// unsettled plan steps have their own bounded retry budget so another gate cannot
+/// suppress the plan reminder or make it spin to the iteration cap.
 pub(in crate::ai::driver::turn_runtime) const OUTSTANDING_WORK_MAX_REOPENS: usize = 3;
+pub(in crate::ai::driver::turn_runtime) const DELEGATION_REQUIRED_RETRY_MARKER: &str =
+    "[delegation-required-final]";
 
 #[derive(Debug, Default)]
 pub(in crate::ai::driver::turn_runtime) struct FinalGateState {
     retry_consumed: bool,
     no_tool_retry_consumed: bool,
-    final_terminator_retry_consumed: bool,
     outstanding_work_reopens: usize,
+    delegation_retry_consumed: bool,
 }
 
 impl FinalGateState {
@@ -51,14 +53,14 @@ impl FinalGateState {
                 messages,
                 NO_TOOL_SYNTHESIS_RETRY_MARKER,
             ),
-            final_terminator_retry_consumed: current_turn_has_internal_marker(
-                messages,
-                FINAL_TERMINATOR_RETRY_MARKER,
-            ),
             outstanding_work_reopens: usize::from(current_turn_has_internal_marker(
                 messages,
                 OUTSTANDING_WORK_REQUIRED_MARKER,
             )),
+            delegation_retry_consumed: current_turn_has_internal_marker(
+                messages,
+                DELEGATION_REQUIRED_RETRY_MARKER,
+            ),
         }
     }
 
@@ -95,25 +97,27 @@ impl FinalGateState {
         self.outstanding_work_reopens
     }
 
+    pub(super) fn can_reopen_delegation(
+        &self,
+        force_final_response: bool,
+        iteration: usize,
+        max_iterations: usize,
+    ) -> bool {
+        !self.delegation_retry_consumed
+            && self.can_reopen_outstanding_work(force_final_response, iteration, max_iterations)
+    }
+
+    pub(super) fn consume_delegation_retry(&mut self) -> usize {
+        self.delegation_retry_consumed = true;
+        self.consume_outstanding_work_retry()
+    }
+
     pub(super) fn no_tool_retry_consumed(&self) -> bool {
         self.no_tool_retry_consumed
     }
 
     pub(super) fn consume_no_tool_retry(&mut self) {
         self.no_tool_retry_consumed = true;
-    }
-
-    pub(super) fn can_reopen_final_terminator(
-        &self,
-        force_final_response: bool,
-        iteration: usize,
-        max_iterations: usize,
-    ) -> bool {
-        !self.final_terminator_retry_consumed && !force_final_response && iteration < max_iterations
-    }
-
-    pub(super) fn consume_final_terminator_retry(&mut self) {
-        self.final_terminator_retry_consumed = true;
     }
 }
 

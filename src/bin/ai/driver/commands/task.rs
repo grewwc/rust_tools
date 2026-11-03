@@ -1,6 +1,10 @@
 use colored::Colorize;
 
-use crate::ai::{driver::{task, talk}, history::SessionStore, types::App};
+use crate::ai::{
+    driver::{talk, task},
+    history::SessionStore,
+    types::App,
+};
 
 use super::{apply_embedded_skills, split_combined_command};
 
@@ -10,9 +14,9 @@ use super::{apply_embedded_skills, split_combined_command};
 /// goal first, then passes its chosen count to `task_start`.
 pub(crate) fn build_task_host_prompt(goal: &str, worker_count: Option<usize>) -> String {
     let team_size = match worker_count {
-        Some(n) => format!(
-            "{n} workers (fixed on the command line — pass worker_count={n} to task_start)"
-        ),
+        Some(n) => {
+            format!("{n} workers (fixed on the command line — pass worker_count={n} to task_start)")
+        }
         None => "undecided — decompose the goal and choose 1-8 workers yourself, \
              then pass your count to task_start"
             .to_string(),
@@ -27,8 +31,13 @@ pub(crate) fn build_task_host_prompt(goal: &str, worker_count: Option<usize>) ->
 /// Parsed `/task` invocation.
 #[derive(Debug, PartialEq, Eq)]
 enum TaskCommand {
-    Start { goal: String, worker_count: Option<usize> },
-    Status { room: Option<String> },
+    Start {
+        goal: String,
+        worker_count: Option<usize>,
+    },
+    Status {
+        room: Option<String>,
+    },
     Help,
 }
 
@@ -62,7 +71,7 @@ fn parse_task_command(input: &str) -> Option<Result<TaskCommand, String>> {
     };
     if rest.is_empty() {
         return Some(Err(
-            "Usage: /task [workers] <goal> | /task status [room]".to_string(),
+            "Usage: /task [workers] <goal> | /task status [room]".to_string()
         ));
     }
     if matches!(rest.as_str(), "help" | "h" | "--help") {
@@ -93,7 +102,7 @@ fn parse_task_command(input: &str) -> Option<Result<TaskCommand, String>> {
         let goal: String = words.collect::<Vec<_>>().join(" ");
         if goal.is_empty() {
             return Some(Err(
-                "Usage: /task [workers] <goal> — a goal is required.".to_string(),
+                "Usage: /task [workers] <goal> — a goal is required.".to_string()
             ));
         }
         if count == 0 || count > task::MAX_TASK_WORKERS {
@@ -123,8 +132,7 @@ pub fn try_handle_task_command(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     // Combined send: `/task <goal>` plus `/skills <name>...` lines in either
     // order. Task stays the main command; the picked skills ride the host turn.
-    let Some((main_input, embedded)) = split_combined_command(input, &["/task", ":task"])
-    else {
+    let Some((main_input, embedded)) = split_combined_command(input, &["/task", ":task"]) else {
         return Ok(false);
     };
     let Some(parsed) = parse_task_command(&main_input) else {
@@ -138,10 +146,7 @@ pub fn try_handle_task_command(
         }
     };
     match cmd {
-        TaskCommand::Start {
-            goal,
-            worker_count,
-        } => {
+        TaskCommand::Start { goal, worker_count } => {
             let store = SessionStore::new(app.config.history_file.as_path());
             // Per-session history file: the room-start consumer resolves the
             // snapshot from this same path, so both sides agree on
@@ -237,7 +242,9 @@ mod tests {
     #[test]
     fn bare_goal_leaves_team_size_to_host() {
         assert_eq!(
-            parse_task_command("/task fix login retry").unwrap().unwrap(),
+            parse_task_command("/task fix login retry")
+                .unwrap()
+                .unwrap(),
             TaskCommand::Start {
                 goal: "fix login retry".to_string(),
                 worker_count: None,
@@ -329,6 +336,9 @@ mod tests {
             client: reqwest::Client::builder().build().unwrap(),
             current_model: "test".to_string(),
             current_agent: "build".to_string(),
+            session_default_subagent_backend: Default::default(),
+            session_default_subagent_model: None,
+            session_default_skills: Vec::new(),
             current_agent_manifest: None,
             pending_files: None,
             forced_skills: Vec::new(),

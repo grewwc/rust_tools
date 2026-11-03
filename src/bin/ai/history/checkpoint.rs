@@ -1576,7 +1576,7 @@ impl CheckpointStore {
         source_name: Option<&str>,
     ) -> io::Result<PathBuf> {
         // Only the SQLite snapshot is staged: generation assets are immutable,
-        // so `complete` restores them directly from the source generation
+        // so `complete_live_rollback` restores them from the source generation
         // (recorded in the manifest) instead of paying a second full-tree copy
         // checkpoint -> txn. This halves the assets I/O on every checkout.
         fs::create_dir_all(&self.dir)?;

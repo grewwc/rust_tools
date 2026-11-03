@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, params, params_from_iter};
 use serde_json::Value;
 
 use super::super::types::ROLE_INTERNAL_NOTE;
@@ -19,6 +19,11 @@ use super::revision::{
     invalidate_context_snapshot_unless_covered_by,
 };
 use super::store::decode_message_content;
+use super::{
+    SESSION_DEFAULT_SKILLS_META_KEY, SESSION_SERVE_AGENT_META_KEY, SESSION_SERVE_EFFORT_META_KEY,
+    SESSION_SERVE_MODEL_META_KEY, SESSION_SUBAGENT_BACKEND_META_KEY,
+    SESSION_SUBAGENT_MODEL_META_KEY,
+};
 
 /// Relocate the asset paths recorded in the history to a new session.
 /// On fork, the source assets directory is passed in for an exact prefix replacement; on archive import the source path is unknown, so only
@@ -208,10 +213,24 @@ fn clear_session_history_sqlite_unlocked(path: &Path) -> io::Result<()> {
     // turn_seq is likewise session-scoped identity; clearing the context must not let old numbers be reused.
     // If they were deleted along with the rest, the bump would restart at 1; after the version regresses it could collide with
     // the revision of early cache entries, and already-invalidated old history would be wrongly hit.
+    // Session runtime defaults must also survive clears so reopened sessions retain their config.
+    let preserved_meta_keys = [
+        "history_revision",
+        "history_generation",
+        "turn_seq",
+        SESSION_SERVE_MODEL_META_KEY,
+        SESSION_SERVE_AGENT_META_KEY,
+        SESSION_SERVE_EFFORT_META_KEY,
+        SESSION_SUBAGENT_BACKEND_META_KEY,
+        SESSION_SUBAGENT_MODEL_META_KEY,
+        SESSION_DEFAULT_SKILLS_META_KEY,
+    ];
+    let placeholders = std::iter::repeat_n("?", preserved_meta_keys.len())
+        .collect::<Vec<_>>()
+        .join(", ");
     tx.execute(
-        "DELETE FROM meta
-         WHERE key NOT IN ('history_revision', 'history_generation', 'turn_seq')",
-        [],
+        &format!("DELETE FROM meta WHERE key NOT IN ({placeholders})"),
+        params_from_iter(preserved_meta_keys),
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
     bump_history_revision(&tx)?;

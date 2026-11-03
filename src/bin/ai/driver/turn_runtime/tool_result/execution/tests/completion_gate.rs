@@ -2,10 +2,9 @@
 
 use super::super::*;
 use super::common::*;
-use crate::ai::tools::FINAL_RESPONSE_END_MARKER;
 
 #[test]
-fn completion_and_outstanding_gates_each_reopen_once() {
+fn completion_and_outstanding_gates_keep_independent_reopens() {
     let mutation = test_tool_call(
         "call_patch",
         "apply_patch",
@@ -20,15 +19,6 @@ fn completion_and_outstanding_gates_each_reopen_once() {
     let (mut app, base) =
         super::outstanding::test_app_with_session_and_tools(&["apply_patch", "execute_command"]);
     super::outstanding::two_step_plan(&app);
-    for step in 1..=2 {
-        crate::ai::tools::plan_state::update_plan_step(
-            &app,
-            step,
-            crate::ai::tools::plan_state::StepStatus::Done,
-            None,
-        )
-        .unwrap();
-    }
     let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
     let mut messages = evidence_messages.clone();
     let mut turn_messages = evidence_messages;
@@ -37,13 +27,13 @@ fn completion_and_outstanding_gates_each_reopen_once() {
     let mut final_assistant_recorded = false;
     let mut force_final_response = false;
     let mut terminal_dedupe_candidate = None;
-    const TERMINATED_FINAL_RESPONSE: &str = "已修复。\n[END]";
+    const FINAL_RESPONSE: &str = "已修复。";
     let mut turn_had_tool_error = false;
 
     let final_response = || {
         IterationExecution::FinalResponse(crate::ai::types::StreamResult {
             outcome: crate::ai::types::StreamOutcome::Completed,
-            assistant_text: TERMINATED_FINAL_RESPONSE.to_string(),
+            assistant_text: FINAL_RESPONSE.to_string(),
             skip_response_drain: true,
             ..Default::default()
         })
@@ -115,22 +105,15 @@ fn completion_and_outstanding_gates_each_reopen_once() {
     assert!(!final_assistant_recorded);
     assert_eq!(terminal_dedupe_candidate, None);
 
-    let plan_updated = crate::ai::tools::plan_state::load_plan_state(&app)
-        .unwrap()
-        .unwrap()
-        .updated_at_ms;
-    crate::ai::tools::plan_state::record_completion_claim(&app, "Done", Some(plan_updated))
+    for step in 1..=2 {
+        crate::ai::tools::plan_state::update_plan_step(
+            &app,
+            step,
+            crate::ai::tools::plan_state::StepStatus::Done,
+            None,
+        )
         .unwrap();
-    let complete_pair = vec![
-        assistant_tool_call_message(test_tool_call(
-            "call_complete",
-            "complete",
-            serde_json::json!({ "summary": "Done" }),
-        )),
-        tool_result_message("call_complete", "Completion assertion recorded: Done"),
-    ];
-    messages.extend(complete_pair.clone());
-    turn_messages.extend(complete_pair);
+    }
     let third_step = handle_iteration_execution(
         &mut app,
         "fix the bug",
@@ -156,7 +139,6 @@ fn completion_and_outstanding_gates_each_reopen_once() {
     assert!(matches!(third_step, TurnLoopStep::Break));
     assert!(final_assistant_recorded);
     assert!(final_assistant_text.starts_with("已修复。"));
-    assert!(!final_assistant_text.contains(FINAL_RESPONSE_END_MARKER));
     assert!(final_assistant_text.contains(COMPLETION_EVIDENCE_WARNING));
     assert_eq!(
         terminal_dedupe_candidate.as_deref(),
@@ -359,19 +341,8 @@ fn completion_evidence_gate_allows_unrecognized_post_mutation_activity_silently(
 
     let (mut app, base) =
         super::outstanding::test_app_with_session_and_tools(&["apply_patch", "execute_command"]);
-    crate::ai::tools::plan_state::record_completion_claim(&app, "done", None).unwrap();
     let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
-    let complete = test_tool_call(
-        "call_complete",
-        "complete",
-        serde_json::json!({ "summary": "done" }),
-    );
     let mut turn_messages = evidence_messages;
-    turn_messages.push(assistant_tool_call_message(complete));
-    turn_messages.push(tool_result_message(
-        "call_complete",
-        "Completion assertion recorded: done",
-    ));
     let mut messages = turn_messages.clone();
     let mut persisted_turn_messages = 0usize;
     let mut final_assistant_text = String::new();
@@ -383,7 +354,7 @@ fn completion_evidence_gate_allows_unrecognized_post_mutation_activity_silently(
     let final_response = || {
         IterationExecution::FinalResponse(crate::ai::types::StreamResult {
             outcome: crate::ai::types::StreamOutcome::Completed,
-            assistant_text: "已修复。\n[END]".to_string(),
+            assistant_text: "已修复。".to_string(),
             skip_response_drain: true,
             ..Default::default()
         })
@@ -414,8 +385,7 @@ fn completion_evidence_gate_allows_unrecognized_post_mutation_activity_silently(
     // warning appended, so the model never restates its conclusion.
     assert!(matches!(step, TurnLoopStep::Break));
     assert!(final_assistant_recorded);
-    assert!(final_assistant_text.starts_with("已修复。"));
-    assert!(!final_assistant_text.contains(FINAL_RESPONSE_END_MARKER));
+    assert_eq!(final_assistant_text, "已修复。");
     assert!(
         !final_assistant_text.contains(COMPLETION_EVIDENCE_WARNING),
         "变更后活动静默 Allow，不应追加'未观察到检查'的虚假警告"

@@ -1,4 +1,5 @@
 use super::*;
+use crate::ai::stream::side_note_input::print_output_line;
 /// Maximum number of decode errors before giving up and returning partial content
 pub(super) const MAX_DECODE_ERRORS: usize = 3;
 /// Delay in milliseconds between retry attempts on transient errors
@@ -101,7 +102,7 @@ pub(super) fn maybe_print_prompt_cache_metrics(usage: &crate::ai::request::Strea
         .map(|d| d.cached_tokens)
         .unwrap_or(0);
     if let Some(line) = format_prompt_cache_metrics(usage.prompt_tokens, cached) {
-        println!("  {}{line}{RESET}", theme::current().accent_muted);
+        print_output_line(&format!("  {}{line}{RESET}", theme::current().accent_muted));
     }
 }
 
@@ -143,7 +144,7 @@ pub(super) fn maybe_print_token_throughput_metrics(
     ) else {
         return;
     };
-    println!("  {}{line}{RESET}", theme::current().accent_muted);
+    print_output_line(&format!("  {}{line}{RESET}", theme::current().accent_muted));
 }
 
 /// Live reasoning-rate text for the in-progress thinking-fold header. It is

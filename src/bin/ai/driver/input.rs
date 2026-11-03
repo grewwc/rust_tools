@@ -1793,7 +1793,10 @@ mod tests {
         unsafe {
             let flags = libc::fcntl(slave, libc::F_GETFL);
             assert!(flags >= 0);
-            assert_eq!(libc::fcntl(slave, libc::F_SETFL, flags | libc::O_NONBLOCK), 0);
+            assert_eq!(
+                libc::fcntl(slave, libc::F_SETFL, flags | libc::O_NONBLOCK),
+                0
+            );
             super::clear_nonblocking_if_tty(slave);
             assert_eq!(
                 libc::fcntl(slave, libc::F_GETFL) & libc::O_NONBLOCK,
@@ -1934,6 +1937,9 @@ mod tests {
             client,
             current_model: any_model_name(),
             current_agent: "build".to_string(),
+            session_default_subagent_backend: Default::default(),
+            session_default_subagent_model: None,
+            session_default_skills: Vec::new(),
             current_agent_manifest: None,
             pending_files: None,
             forced_skills: Vec::new(),
@@ -3417,6 +3423,10 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
     let model_label = crate::ai::models::model_display_label(&app.current_model);
     let reasoning_effort_label =
         crate::ai::request::reasoning_effort_display_label(app, &app.current_model);
+    let backend_label = match app.session_default_subagent_backend {
+        crate::ai::tools::task_tools::SubagentBackend::Kernel => String::new(),
+        backend => format!("sub:{}", backend.as_str()),
+    };
     if let Some(editor) = app.prompt_editor.as_mut() {
         let checkpoint_store = crate::ai::history::CheckpointStore::new(
             app.config.history_file.as_path(),
@@ -3427,6 +3437,7 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
         editor.set_current_model_label(&model_label);
         editor.set_current_agent_label(&app.current_agent);
         editor.set_current_reasoning_effort_label(reasoning_effort_label);
+        editor.set_current_backend_label(backend_label);
         editor.set_session_id(app.session_id.clone());
         // Derive the session topic from the first user message. A session with
         // no user messages is displayed as "new session".

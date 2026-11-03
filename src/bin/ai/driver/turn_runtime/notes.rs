@@ -250,7 +250,7 @@ pub(super) fn inject_low_progress_soft_note(messages: &mut Vec<crate::ai::histor
         "[low-progress-review] The runtime recently observed no new target, success-state change, or new tool-result content.\n\
         This is a heuristic check; it does not mean the work on the same target is necessarily ineffective, and do not drop necessary steps just because of this note.\n\
         Before calling a tool, confirm which missing piece of evidence the next call would add, and what result would end this branch.\n\
-        If existing evidence is enough, run the narrowest verification and answer; if not, you may continue along the clearly stated gap.\
+        If existing evidence already settles the request, answer now without further verification; otherwise make the one call that closes the clearly stated gap.\
         {SELF_NOTE_REFLECTION_CHANNEL_HINT}"
     );
     messages.push(Message {
@@ -267,12 +267,12 @@ pub(super) fn inject_low_progress_soft_note(messages: &mut Vec<crate::ai::histor
 /// large investigations are not misjudged as low progress.
 pub(super) fn inject_read_only_breadth_note(
     messages: &mut Vec<crate::ai::history::Message>,
-    agent_team_active: bool,
+    delegation_required: bool,
 ) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let team_guidance = if agent_team_active {
-        "\nBecause `agent-team` is active, do not continue a broad serial sweep: delegate any remaining branches now (serial ones one at a time via the synchronous `task`, passing prior results), or state the concrete dependency that makes delegation unsafe."
+    let team_guidance = if delegation_required {
+        "\nBecause an active skill requires delegation, do not continue a broad serial sweep: delegate any remaining branches now, or state the concrete dependency that makes delegation unsafe."
     } else {
         ""
     };
@@ -287,6 +287,37 @@ pub(super) fn inject_read_only_breadth_note(
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
+pub(super) fn inject_delegation_required_advisory(messages: &mut Vec<crate::ai::history::Message>) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+
+    messages.push(Message {
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(
+            "[delegation-required-advisory] This turn requires delegation, but the parent just made a mutating tool call before using `task` or `task_spawn`. Hand the edit to a subagent now, or state the concrete reason delegation is unsafe."
+                .to_string(),
+        ),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
+pub(super) fn inject_delegation_exploration_advisory(
+    messages: &mut Vec<crate::ai::history::Message>,
+) {
+    messages.push(crate::ai::history::Message {
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+        content: serde_json::Value::String(
+            "[delegation-required-exploration-advisory] This turn requires delegation, but the parent has continued read-only exploration without using `task` or `task_spawn`. Delegate a bounded discovery task now using the known objective, candidate paths, and missing evidence; the worker can do the remaining exploration. A self-contained prompt does not require the parent to finish discovery first. Tools remain available; if delegation is unsafe, state the concrete dependency before continuing."
+                .to_string(),
+        ),
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,

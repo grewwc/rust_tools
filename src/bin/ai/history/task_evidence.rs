@@ -270,6 +270,35 @@ pub(in crate::ai) fn record_task_spawn_audit(
     })
 }
 
+/// Records the terminal status of a spawned task whose result was never collected.
+///
+/// Cancellation, wall-clock reaping, and turn wrap-up can know a task's terminal status
+/// before `task_wait` collects it. Persisting that status keeps `task_audit` truthful when
+/// the parent turn ends first, while leaving `delivered_at_unix_ms` at 0: the row stays an
+/// audit entry, not pending integration evidence, and a later delivery still replaces it
+/// with the full status and payload. Delivered evidence is never overwritten.
+pub(in crate::ai) fn record_uncollected_task_terminal_status(
+    history_file: &Path,
+    session_id: &str,
+    task_id: &str,
+    status: &str,
+) -> io::Result<()> {
+    with_store_lock(history_file, session_id, || {
+        let connection = open_store(history_file, session_id)?;
+        let updated = connection
+            .execute(
+                "UPDATE task_evidence SET status = ?2
+                 WHERE task_id = ?1 AND delivered_at_unix_ms = 0",
+                params![task_id, status],
+            )
+            .map_err(|error| sqlite_error("record uncollected task terminal status", error))?;
+        if updated == 0 {
+            return Ok(());
+        }
+        refresh_task_evidence_checkpoint(&connection, history_file, session_id)
+    })
+}
+
 fn read_records_from_connection(
     connection: &Connection,
     only_unintegrated: bool,
@@ -935,6 +964,71 @@ mod tests {
         assert_eq!(pending[0].disposition, None);
         assert_eq!(fs::read(database).unwrap(), before_db);
         assert_eq!(fs::read(checkpoint).unwrap(), before_checkpoint);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uncollected_terminal_status_updates_audit_without_delivering_evidence() {
+        let root = std::env::temp_dir()
+            .join(format!("task-uncollected-{}", uuid::Uuid::new_v4().simple()));
+        let history_file = root.join("history.sqlite");
+        let session_id = "uncollected-terminal-status";
+        record_task_spawn_audit(
+            &history_file,
+            session_id,
+            "task-uncollected",
+            "review parser",
+            "build",
+            "test-model",
+        )
+        .unwrap();
+
+        record_uncollected_task_terminal_status(
+            &history_file,
+            session_id,
+            "task-uncollected",
+            "failed",
+        )
+        .unwrap();
+        let records = read_task_spawn_audit(&history_file, session_id).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, "failed");
+        assert_eq!(records[0].delivered_at_unix_ms, 0);
+        assert!(
+            read_task_evidence_status_payload(&history_file, session_id, "task-uncollected")
+                .unwrap()
+                .is_none()
+        );
+        let (_, checkpoint) = task_evidence_paths(&history_file, session_id);
+        let mirrored = fs::read_to_string(&checkpoint).unwrap();
+        assert!(
+            mirrored.contains("- status: failed"),
+            "status-only writes must refresh the Markdown mirror: {mirrored}"
+        );
+
+        record_delivered_task_evidence(
+            &history_file,
+            session_id,
+            DeliveredTaskEvidence {
+                task_id: "task-uncollected",
+                description: "review parser",
+                agent_name: "build",
+                model: "test-model",
+                status: "completed",
+                payload: "[Subagent final answer]\ncomplete",
+            },
+        )
+        .unwrap();
+        record_uncollected_task_terminal_status(
+            &history_file,
+            session_id,
+            "task-uncollected",
+            "timeout",
+        )
+        .unwrap();
+        let records = read_task_spawn_audit(&history_file, session_id).unwrap();
+        assert_eq!(records[0].status, "completed");
+        assert!(records[0].delivered_at_unix_ms > 0);
         let _ = fs::remove_dir_all(root);
     }
 

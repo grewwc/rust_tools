@@ -688,7 +688,10 @@ fn save_skill_status_target(args: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())?;
     let short = short_path(name);
-    let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let dry_run = args
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if dry_run {
         return Some(format!("{short} (dry run)"));
     }
@@ -1036,8 +1039,7 @@ fn validate_resource_layout(resources: &[SkillResource]) -> Result<(), String> {
             if *existing == key {
                 return Err(format!("Duplicate resource path: '{}'", resource.path));
             }
-            if key.starts_with(&format!("{existing}/"))
-                || existing.starts_with(&format!("{key}/"))
+            if key.starts_with(&format!("{existing}/")) || existing.starts_with(&format!("{key}/"))
             {
                 return Err(format!(
                     "Resource destination '{}' overlaps '{}'",
@@ -1366,11 +1368,7 @@ fn merged_string_field(args: &Value, key: &str, existing: &str) -> String {
     }
 }
 
-fn merged_optional_string_field(
-    args: &Value,
-    key: &str,
-    existing: Option<&str>,
-) -> Option<String> {
+fn merged_optional_string_field(args: &Value, key: &str, existing: Option<&str>) -> Option<String> {
     match args.get(key) {
         None | Some(Value::Null) => existing.map(|s| s.to_string()),
         Some(Value::String(s)) => {
@@ -1387,10 +1385,7 @@ fn merged_optional_string_field(
 
 fn merged_string_list_field(args: &Value, key: &str, existing: &[String]) -> Vec<Value> {
     match args.get(key) {
-        None | Some(Value::Null) => existing
-            .iter()
-            .map(|s| Value::String(s.clone()))
-            .collect(),
+        None | Some(Value::Null) => existing.iter().map(|s| Value::String(s.clone())).collect(),
         Some(Value::Array(arr)) => arr
             .iter()
             .filter_map(|v| v.as_str())
@@ -1431,7 +1426,11 @@ fn merge_skill_args_for_update(existing: &SkillManifest, args: &Value) -> Value 
     merged.insert("prompt".to_string(), Value::String(prompt));
     merged.insert(
         "description".to_string(),
-        Value::String(merged_string_field(args, "description", &existing.description)),
+        Value::String(merged_string_field(
+            args,
+            "description",
+            &existing.description,
+        )),
     );
     merged.insert(
         "author".to_string(),
@@ -1450,8 +1449,7 @@ fn merge_skill_args_for_update(existing: &SkillManifest, args: &Value) -> Value 
     {
         merged.insert("system_prompt".to_string(), Value::String(system_prompt));
     }
-    if let Some(parent) = merged_optional_string_field(args, "parent", existing.parent.as_deref())
-    {
+    if let Some(parent) = merged_optional_string_field(args, "parent", existing.parent.as_deref()) {
         merged.insert("parent".to_string(), Value::String(parent));
     }
     let priority = match args.get("priority") {
@@ -1536,13 +1534,11 @@ fn parse_remove_subskills_arg(args: &Value) -> Result<Vec<String>, String> {
 }
 
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
-    fs::create_dir_all(dst)
-        .map_err(|e| format!("Failed to create dir {}: {e}", dst.display()))?;
+    fs::create_dir_all(dst).map_err(|e| format!("Failed to create dir {}: {e}", dst.display()))?;
     let entries =
         fs::read_dir(src).map_err(|e| format!("Failed to read dir {}: {e}", src.display()))?;
     for entry in entries {
-        let entry =
-            entry.map_err(|e| format!("Failed to read dir {}: {e}", src.display()))?;
+        let entry = entry.map_err(|e| format!("Failed to read dir {}: {e}", src.display()))?;
         let file_type = entry
             .file_type()
             .map_err(|e| format!("Failed to inspect {}: {e}", entry.path().display()))?;
@@ -1651,8 +1647,7 @@ fn execute_save_skill_package_merge(
             }
         }
     }
-    let mut sub_resource_plans: Vec<Vec<PlannedResourceFile>> =
-        Vec::with_capacity(subskills.len());
+    let mut sub_resource_plans: Vec<Vec<PlannedResourceFile>> = Vec::with_capacity(subskills.len());
     for (idx, sub) in subskills.iter().enumerate() {
         let sub_resources = parse_resources_arg(sub, &format!("subskills[{idx}]."))?;
         sub_resource_plans.push(plan_resource_files(&sub_resources)?);
@@ -1695,9 +1690,8 @@ fn execute_save_skill_package_merge(
                     "Subskill path collides with an existing file: '{sub_name}'"
                 ));
             }
-            fs::create_dir_all(&sub_dir).map_err(|e| {
-                format!("Failed to create subskill dir {}: {e}", sub_dir.display())
-            })?;
+            fs::create_dir_all(&sub_dir)
+                .map_err(|e| format!("Failed to create subskill dir {}: {e}", sub_dir.display()))?;
             fs::write(sub_dir.join("SKILL.md"), sub_content)
                 .map_err(|e| format!("Failed to write subskill {sub_name}: {e}"))?;
             if let Some(plan) = sub_resource_plans.get(idx) {
@@ -1788,7 +1782,10 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
     let subskills = parse_subskills_arg(args)?;
     let remove_paths = parse_remove_paths_arg(args)?;
     let remove_subskills = parse_remove_subskills_arg(args)?;
-    let rebuild = args.get("rebuild").and_then(|v| v.as_bool()).unwrap_or(false);
+    let rebuild = args
+        .get("rebuild")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let has_package_features = !resources.is_empty() || !subskills.is_empty();
     let resource_plan = plan_resource_files(&resources)?;
     let overwrite = args["overwrite"].as_bool().unwrap_or(true);
@@ -2250,7 +2247,10 @@ fn render_skill_dry_run_preview(
             }
         }
         if !remove_paths.is_empty() {
-            out.push_str(&format!("\nRemove paths: {} entr(y/ies)", remove_paths.len()));
+            out.push_str(&format!(
+                "\nRemove paths: {} entr(y/ies)",
+                remove_paths.len()
+            ));
             for rel in remove_paths {
                 out.push_str(&format!("\n  - {rel}"));
             }
@@ -2339,7 +2339,10 @@ pub(crate) fn execute_delete_skill(args: &Value) -> Result<String, String> {
     let name = args["name"].as_str().unwrap_or("").trim().to_string();
     let dir = resolve_configured_skills_dir();
     match delete_skill_entries(&dir, &name) {
-        Ok(removed) => Ok(format!("Deleted skill '{name}':\n- {}", removed.join("\n- "))),
+        Ok(removed) => Ok(format!(
+            "Deleted skill '{name}':\n- {}",
+            removed.join("\n- ")
+        )),
         Err(e) => Err(e),
     }
 }
@@ -2770,8 +2773,7 @@ mod tests {
             }))
             .unwrap();
             assert!(out.contains("merge-demo"), "{out}");
-            let manifest =
-                std::fs::read_to_string(skills.join("merge-demo.skill")).unwrap();
+            let manifest = std::fs::read_to_string(skills.join("merge-demo.skill")).unwrap();
             assert!(manifest.contains("patched description"), "{manifest}");
             assert!(manifest.contains("original prompt"), "{manifest}");
             assert!(manifest.contains("read_file"), "{manifest}");
@@ -2782,8 +2784,7 @@ mod tests {
                 "tools": [],
             }))
             .unwrap();
-            let manifest =
-                std::fs::read_to_string(skills.join("merge-demo.skill")).unwrap();
+            let manifest = std::fs::read_to_string(skills.join("merge-demo.skill")).unwrap();
             assert!(!manifest.contains("read_file"), "{manifest}");
             assert!(manifest.contains("original prompt"), "{manifest}");
         });
@@ -2820,8 +2821,7 @@ mod tests {
                 "new"
             );
             assert!(!skills.join("pkg-demo/references/drop.md").exists());
-            let manifest =
-                std::fs::read_to_string(skills.join("pkg-demo/SKILL.md")).unwrap();
+            let manifest = std::fs::read_to_string(skills.join("pkg-demo/SKILL.md")).unwrap();
             assert!(manifest.contains("package prompt"), "{manifest}");
         });
     }
@@ -2848,8 +2848,7 @@ mod tests {
             .unwrap();
             assert!(!skills.join("rebuild-demo/references/old.md").exists());
             assert_eq!(
-                std::fs::read_to_string(skills.join("rebuild-demo/references/fresh.md"))
-                    .unwrap(),
+                std::fs::read_to_string(skills.join("rebuild-demo/references/fresh.md")).unwrap(),
                 "fresh"
             );
         });
@@ -2857,10 +2856,7 @@ mod tests {
 
     #[test]
     fn delete_skill_entries_removes_file_and_package() {
-        let base = std::env::temp_dir().join(format!(
-            "skill-delete-test-{}",
-            std::process::id()
-        ));
+        let base = std::env::temp_dir().join(format!("skill-delete-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let file_skill = base.join("demo.skill");
@@ -3061,6 +3057,7 @@ mod tests {
             author: None,
             tools: Vec::new(),
             tool_groups: Vec::new(),
+            delegation: None,
             mcp_servers: Vec::new(),
             disable_builtin_tools: false,
             disable_mcp_tools: false,

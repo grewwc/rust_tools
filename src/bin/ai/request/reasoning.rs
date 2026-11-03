@@ -651,6 +651,20 @@ pub(crate) fn reasoning_effort_display_label(app: &App, model: &str) -> &'static
     )
 }
 
+/// Resolve the display effort for a fresh child, whose fork clears parent overrides.
+pub(crate) fn reasoning_effort_display_label_for_subagent(
+    agent: &str,
+    model: &str,
+) -> &'static str {
+    reasoning_effort_display_label_from_parts(
+        None,
+        agent,
+        model_thinking_off_capability(model),
+        models::enable_thinking(model),
+        models::default_reasoning_effort(model),
+    )
+}
+
 /// Registry-free core of [`reasoning_effort_display_label`] over pre-resolved
 /// inputs; see [`resolve_reasoning_effort_from_parts`] for the semantics.
 pub(crate) fn reasoning_effort_display_label_from_parts(

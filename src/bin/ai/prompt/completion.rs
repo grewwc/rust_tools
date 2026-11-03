@@ -96,6 +96,10 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":effort",
         "/audit",
         ":audit",
+        "/use",
+        ":use",
+        "/reset",
+        ":reset",
         "/changes",
         ":changes",
         "/diff",
@@ -354,6 +358,10 @@ impl CommandCompleter {
             ":effort",
             "/audit",
             ":audit",
+            "/use",
+            ":use",
+            "/reset",
+            ":reset",
             "/changes",
             ":changes",
             "/diff",
@@ -764,6 +772,19 @@ impl CommandCompleter {
         ]
     }
 
+    fn use_backends() -> &'static [&'static str] {
+        &["traecli", "kernel"]
+    }
+
+    fn traecli_model_candidates(token: &str) -> Vec<CompletionCandidate> {
+        let mut matched: Vec<(u8, String)> = crate::ai::tools::task_tools::traecli_model_names()
+            .into_iter()
+            .filter_map(|name| Self::name_token_match_rank(token, &name).map(|rank| (rank, name)))
+            .collect();
+        matched.sort_by_key(|(rank, _)| *rank);
+        Self::plain_candidates(matched.into_iter().map(|(_, name)| name))
+    }
+
     fn session_subcommands() -> &'static [&'static str] {
         crate::ai::driver::commands::session::CANONICAL_SESSION_SUBCOMMANDS
     }
@@ -803,14 +824,8 @@ impl CommandCompleter {
             // to offer; every other subcommand keeps the pre-existing
             // subcommand list.
             (
-                "export"
-                | "markdown"
-                | "md"
-                | "export-current"
-                | "export-cur"
-                | "export-last"
-                | "export-latest"
-                | "import",
+                "export" | "markdown" | "md" | "export-current" | "export-cur" | "export-last"
+                | "export-latest" | "import",
                 _,
             ) => Vec::new(),
             _ => Self::session_subcommand_candidates(token),
@@ -1334,6 +1349,19 @@ impl CommandCompleter {
                     }
                     _ => Vec::new(),
                 }
+            } else if matches!(first, "/use" | ":use") {
+                match words.next() {
+                    None => Self::plain_candidates(
+                        Self::use_backends()
+                            .iter()
+                            .filter(|backend| backend.starts_with(token))
+                            .map(|backend| (*backend).to_string()),
+                    ),
+                    Some("traecli") if words.next().is_none() => {
+                        Self::traecli_model_candidates(token)
+                    }
+                    _ => Vec::new(),
+                }
             } else if matches!(first, "/agent" | ":agent" | "/agents" | ":agents") {
                 match words.next() {
                     None => {
@@ -1491,16 +1519,14 @@ impl CommandCompleter {
                             )
                         }
                     }
-                    Some(sub) if matches!(sub, "checkout" | "co") => {
-                        Self::navigation_candidates(
-                            Self::args_after_subcommand(&before[line_start..token_start], sub),
-                            token,
-                            "-b",
-                            "create and checkout a new branch",
-                            Self::checkpoint_revision_candidates(token),
-                            false,
-                        )
-                    }
+                    Some(sub) if matches!(sub, "checkout" | "co") => Self::navigation_candidates(
+                        Self::args_after_subcommand(&before[line_start..token_start], sub),
+                        token,
+                        "-b",
+                        "create and checkout a new branch",
+                        Self::checkpoint_revision_candidates(token),
+                        false,
+                    ),
                     Some("switch") => Self::navigation_candidates(
                         Self::args_after_subcommand(&before[line_start..token_start], "switch"),
                         token,
@@ -1516,9 +1542,7 @@ impl CommandCompleter {
                                 .filter(|candidate| candidate.starts_with(token))
                                 .map(str::to_string),
                         ),
-                        Some("-b" | "-c" | "--create") if words.next().is_none() => {
-                            Vec::new()
-                        }
+                        Some("-b" | "-c" | "--create") if words.next().is_none() => Vec::new(),
                         Some("-b" | "-c" | "--create") => {
                             Self::checkpoint_revision_candidates(token)
                         }
@@ -1562,8 +1586,10 @@ impl CommandCompleter {
                     "/skills" | ":skills" | "/skill" | ":skill" => {
                         // Argument tokens already typed (before the cursor, excluding the command itself) — for multi-skill
                         // completion exclude already-picked names so `/skills a <TAB>` can pick the next one.
-                        let consumed: Vec<&str> =
-                            before[line_start..token_start].split_whitespace().skip(1).collect();
+                        let consumed: Vec<&str> = before[line_start..token_start]
+                            .split_whitespace()
+                            .skip(1)
+                            .collect();
                         let mut matched: Vec<(u8, CompletionCandidate)> = Vec::new();
                         if consumed.is_empty() {
                             // First argument position: subcommand literals join the hints too (`/skills us<TAB>` → use)
@@ -1606,9 +1632,7 @@ impl CommandCompleter {
                     "/model" | ":model" => Self::model_subcommands(),
                     // `/effort <TAB>` -> reasoning-effort levels (same set as `/model effort <level>`).
                     "/effort" | ":effort" => Self::model_effort_levels(),
-                    "/discuss" | ":discuss" | "/task" | ":task" => {
-                        Self::discuss_task_subcommands()
-                    }
+                    "/discuss" | ":discuss" | "/task" | ":task" => Self::discuss_task_subcommands(),
                     _ => &[],
                 };
                 Self::plain_candidates(
@@ -2052,8 +2076,7 @@ pub(crate) fn cd_fragment_candidates_from(fragment: &str, cwd: &std::path::Path)
     // `.`/`..` navigation entries, offered only while the fragment is empty or
     // a dot-prefix — the same trigger as `relative_navigation_candidates`.
     for nav in ["./", "../"] {
-        if fragment.is_empty() || fragment == "." || fragment == ".." || nav.starts_with(fragment)
-        {
+        if fragment.is_empty() || fragment == "." || fragment == ".." || nav.starts_with(fragment) {
             candidates.push(nav.to_string());
         }
     }
@@ -2110,9 +2133,7 @@ pub(crate) fn cd_fragment_candidates_from(fragment: &str, cwd: &std::path::Path)
     candidates.sort_by(|left, right| {
         rank(left)
             .cmp(&rank(right))
-            .then_with(|| {
-                left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
-            })
+            .then_with(|| left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase()))
             .then_with(|| left.cmp(right))
     });
     candidates.dedup();
@@ -2359,7 +2380,10 @@ mod tests {
         let (start, candidates) = CommandCompleter::complete_for_line(&line, line.len());
         assert_eq!(&line[start..], frag);
         assert_eq!(candidates.len(), 1, "only the matching directory");
-        assert_eq!(candidates[0].replacement, format!("{}/alpha/", tmp.to_str().unwrap()));
+        assert_eq!(
+            candidates[0].replacement,
+            format!("{}/alpha/", tmp.to_str().unwrap())
+        );
 
         // A file name must never be offered as a `/cd` target.
         let frag = format!("{}/f", tmp.to_str().unwrap());
@@ -2371,9 +2395,18 @@ mod tests {
         let line = format!("/cd {}/", tmp.to_str().unwrap());
         let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
         let values: Vec<_> = candidates.iter().map(|c| c.replacement.as_str()).collect();
-        assert!(values.iter().any(|v| v.ends_with("alpha/")), "alpha dir listed");
-        assert!(values.iter().any(|v| v.ends_with("beta/")), "beta dir listed");
-        assert!(values.iter().all(|v| !v.contains("file.txt")), "no files offered");
+        assert!(
+            values.iter().any(|v| v.ends_with("alpha/")),
+            "alpha dir listed"
+        );
+        assert!(
+            values.iter().any(|v| v.ends_with("beta/")),
+            "beta dir listed"
+        );
+        assert!(
+            values.iter().all(|v| !v.contains("file.txt")),
+            "no files offered"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -2393,7 +2426,10 @@ mod tests {
     fn cd_completion_rejects_dash_and_extra_args() {
         for line in ["/cd -", ":cd -"] {
             let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
-            assert!(candidates.is_empty(), "{line} (dash is a literal, not a path)");
+            assert!(
+                candidates.is_empty(),
+                "{line} (dash is a literal, not a path)"
+            );
         }
         let line = "/cd a b";
         let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
@@ -2654,8 +2690,7 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.replacement == "-c")
         );
-        let (_, branch_delete) =
-            CommandCompleter::complete_for_line("/git branch --delete fe", 23);
+        let (_, branch_delete) = CommandCompleter::complete_for_line("/git branch --delete fe", 23);
         assert!(
             branch_delete
                 .iter()
@@ -2846,9 +2881,11 @@ mod tests {
         // Quoteless input must behave exactly like the old whitespace split.
         for plain in ["", "  ", "main", "  main   --discard  ", "-b feature main"] {
             let words = CommandCompleter::split_quoted_words(plain);
-            let expected: Vec<String> =
-                plain.split_whitespace().map(str::to_string).collect();
-            assert_eq!(words, expected, "plain input must split like before: {plain:?}");
+            let expected: Vec<String> = plain.split_whitespace().map(str::to_string).collect();
+            assert_eq!(
+                words, expected,
+                "plain input must split like before: {plain:?}"
+            );
         }
     }
 
@@ -2931,13 +2968,13 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         // Serve-chat mode: the provider answers with remote candidates.
-        CommandCompleter::set_remote_cd_candidates_provider(Some(Box::new(|fragment| {
-            match fragment {
+        CommandCompleter::set_remote_cd_candidates_provider(Some(Box::new(
+            |fragment| match fragment {
                 "" => vec!["./".to_string(), "../".to_string(), "src/".to_string()],
                 "src/" => vec!["src/bin/".to_string()],
                 _ => Vec::new(),
-            }
-        })));
+            },
+        )));
         let (_, candidates) = CommandCompleter::complete_for_line("/cd ", 4);
         let replacements: Vec<&str> = candidates.iter().map(|c| c.replacement.as_str()).collect();
         assert_eq!(replacements, vec!["./", "../", "src/"]);
@@ -2948,8 +2985,7 @@ mod tests {
         // Local REPL (no provider): the disk path runs again and finds nothing
         // for a nonexistent directory.
         CommandCompleter::set_remote_cd_candidates_provider(None);
-        let (_, disk) =
-            CommandCompleter::complete_for_line("/cd ./definitely-not-a-dir-xyz/", 31);
+        let (_, disk) = CommandCompleter::complete_for_line("/cd ./definitely-not-a-dir-xyz/", 31);
         assert!(disk.is_empty());
     }
 
@@ -3255,7 +3291,11 @@ mod tests {
         assert!(pairs.iter().any(|pair| pair.replacement == "markdown"));
 
         let (_, pairs) = completer
-            .complete("/sessions ar", "/sessions ar".len(), &Context::new(&history))
+            .complete(
+                "/sessions ar",
+                "/sessions ar".len(),
+                &Context::new(&history),
+            )
             .unwrap();
         assert!(pairs.iter().any(|pair| pair.replacement == "archive"));
 
@@ -3738,7 +3778,10 @@ mod tests {
         // Single characters behave as plain containment (keeps `@skills:{letter}` filters working).
         assert!(CommandCompleter::fuzzy_match_score("e", "beam-free").is_some());
         // Mid-word start plus scattered rest does not match (the random-bytes noise class).
-        assert_eq!(CommandCompleter::fuzzy_match_score("fre", "xxfxxrxxe"), None);
+        assert_eq!(
+            CommandCompleter::fuzzy_match_score("fre", "xxfxxrxxe"),
+            None
+        );
         // ... but the same query hits a genuine contiguous occurrence.
         assert!(CommandCompleter::fuzzy_match_score("fre", "beam-free").is_some());
     }
@@ -3750,9 +3793,11 @@ mod tests {
         let Some(terra) = crate::ai::model_names::find_by_identifier("gpt-5.6-terra") else {
             return; // skip when the model registry (models/) lacks this model
         };
-        assert!(CommandCompleter::model_search_fields(terra)
-            .iter()
-            .all(|field| !field.starts_with("enc:")));
+        assert!(
+            CommandCompleter::model_search_fields(terra)
+                .iter()
+                .all(|field| !field.starts_with("enc:"))
+        );
         assert_eq!(CommandCompleter::model_token_match_rank("fre", terra), None);
         // ... while the same model is still reachable by its real key text.
         assert!(CommandCompleter::model_token_match_rank("terra", terra).is_some());
@@ -4000,6 +4045,86 @@ mod tests {
         assert!(labels.iter().any(|x| x == "high"));
         assert!(!labels.iter().any(|x| x == "low"));
         assert!(!labels.iter().any(|x| x == "auto"));
+    }
+
+    #[test]
+    fn use_command_completion_expands_command_and_removes_backend() {
+        for prefix in ["/us", ":us"] {
+            let (_, candidates) = CommandCompleter::complete_for_line(prefix, prefix.len());
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.replacement == format!("{}use", &prefix[..1]))
+            );
+        }
+        for prefix in ["/back", ":back", "/backend ", ":backend "] {
+            let (_, candidates) = CommandCompleter::complete_for_line(prefix, prefix.len());
+            assert!(candidates.is_empty());
+        }
+    }
+
+    #[test]
+    fn use_command_completion_lists_backends_and_filters_prefix() {
+        for line in ["/use ", ":use "] {
+            let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
+            assert_eq!(start, line.len());
+            let labels: Vec<_> = candidates
+                .iter()
+                .map(|candidate| candidate.replacement.as_str())
+                .collect();
+            assert_eq!(labels, ["traecli", "kernel"]);
+        }
+        for line in ["/use t", ":use t"] {
+            let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].replacement, "traecli");
+        }
+    }
+
+    #[test]
+    fn use_command_completion_lists_live_traecli_models() {
+        crate::ai::tools::task_tools::with_traecli_model_names_for_test(
+            vec![
+                "GPT-5.5".to_string(),
+                "GPT-6.1-Sol".to_string(),
+                "Seed-Evolving".to_string(),
+            ],
+            || {
+                for line in ["/use traecli ", ":use traecli "] {
+                    let (start, candidates) = CommandCompleter::complete_for_line(line, line.len());
+                    assert_eq!(start, line.len());
+                    let labels: Vec<_> = candidates
+                        .iter()
+                        .map(|candidate| candidate.replacement.as_str())
+                        .collect();
+                    assert_eq!(labels, ["GPT-5.5", "GPT-6.1-Sol", "Seed-Evolving"]);
+                }
+                let line = "/use traecli gpt-6";
+                let (_, candidates) = CommandCompleter::complete_for_line(line, line.len());
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].replacement, "GPT-6.1-Sol");
+                for line in ["/use kernel ", ":use kernel ", "/use traecli GPT-5.5 "] {
+                    assert!(
+                        CommandCompleter::complete_for_line(line, line.len())
+                            .1
+                            .is_empty()
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn use_command_completion_failed_model_listing_has_no_candidates() {
+        crate::ai::tools::task_tools::with_traecli_model_names_for_test(Vec::new(), || {
+            for line in ["/use traecli ", ":use traecli "] {
+                assert!(
+                    CommandCompleter::complete_for_line(line, line.len())
+                        .1
+                        .is_empty()
+                );
+            }
+        });
     }
 
     #[test]

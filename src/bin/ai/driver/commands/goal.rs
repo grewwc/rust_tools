@@ -5,19 +5,13 @@ use crate::ai::types::App;
 /// Builds the initial goal-mode prompt: wraps the user's goal into an explicit
 /// user message with instructions to keep executing.
 pub(crate) fn build_goal_prompt(goal: &str) -> String {
-    format!(
-        include_str!("prompts/goal_mode_initial.md"),
-        goal = goal
-    )
+    format!(include_str!("prompts/goal_mode_initial.md"), goal = goal)
 }
 
 /// Builds the goal-mode continuation prompt, injected automatically after the
 /// previous turn to drive the agent forward.
 pub(crate) fn build_goal_continuation_prompt(goal: &str) -> String {
-    format!(
-        include_str!("prompts/goal_continuation.md"),
-        goal = goal
-    )
+    format!(include_str!("prompts/goal_continuation.md"), goal = goal)
 }
 
 /// End-of-turn decision for goal mode when no continuation was triggered this turn.
@@ -140,6 +134,9 @@ mod tests {
             client: reqwest::Client::builder().build().unwrap(),
             current_model: "test".to_string(),
             current_agent: "build".to_string(),
+            session_default_subagent_backend: Default::default(),
+            session_default_subagent_model: None,
+            session_default_skills: Vec::new(),
             current_agent_manifest: None,
             pending_files: None,
             forced_skills: Vec::new(),

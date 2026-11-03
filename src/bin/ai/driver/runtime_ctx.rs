@@ -72,6 +72,7 @@ const SUBAGENT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubagentProgressEventKind {
     Phase,
+    Activity,
     Checkpoint,
 }
 
@@ -79,6 +80,7 @@ impl SubagentProgressEventKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Phase => "phase",
+            Self::Activity => "activity",
             Self::Checkpoint => "checkpoint",
         }
     }
@@ -107,16 +109,50 @@ pub(crate) struct SubagentProgressSnapshot {
 
 impl SubagentProgressSnapshot {
     pub(crate) fn display(&self) -> String {
-        let mut display = match self.checkpoint_summary.as_deref() {
-            Some(summary) if !summary.is_empty() => {
-                format!("{} · plan: {summary}", self.phase)
+        let activity = self
+            .timeline
+            .iter()
+            .rev()
+            .find(|event| event.kind == SubagentProgressEventKind::Activity)
+            .map(|event| event.summary.as_str())
+            .filter(|summary| !summary.is_empty() && *summary != self.phase);
+        let Some(activity) = activity else {
+            let mut display = match self.checkpoint_summary.as_deref() {
+                Some(summary) if !summary.is_empty() => {
+                    format!("{} · plan: {summary}", self.phase)
+                }
+                _ => self.phase.clone(),
+            };
+            display.push_str(&format!(
+                " · elapsed {} · last activity {} ago",
+                format_progress_duration(self.elapsed),
+                format_progress_duration(self.stale_for)
+            ));
+            if self.checkpoint_due {
+                display.push_str(" · checkpoint due");
             }
-            _ => self.phase.clone(),
+            return display;
         };
+        // The status line is clamped to the terminal width from the right, so
+        // the current action and its age lead: static phase text and counters
+        // are what may be truncated, not the live signal.
+        let mut display = compact_progress_text(activity, 100);
         display.push_str(&format!(
-            " · elapsed {} · last activity {} ago",
-            format_progress_duration(self.elapsed),
-            format_progress_duration(self.stale_for)
+            " · last activity {} ago · {}",
+            format_progress_duration(self.stale_for),
+            self.phase
+        ));
+        if self.sequence > 1 {
+            display.push_str(&format!(" · updates {}", self.sequence));
+        }
+        if let Some(summary) = self.checkpoint_summary.as_deref() {
+            if !summary.is_empty() {
+                display.push_str(&format!(" · plan: {summary}"));
+            }
+        }
+        display.push_str(&format!(
+            " · elapsed {}",
+            format_progress_duration(self.elapsed)
         ));
         if self.checkpoint_due {
             display.push_str(" · checkpoint due");
@@ -210,6 +246,10 @@ pub(crate) struct DriverContext {
     pub(crate) mcp_client: SharedMcpClient,
     pub(crate) skill_manifests: Arc<Vec<SkillManifest>>,
     pub(crate) agent_manifests: Arc<Vec<AgentManifest>>,
+    /// Names of the skills active in the current turn, refreshed whenever the
+    /// turn guard is (re)built. External subagents scope their skill overlay
+    /// to this set instead of inheriting the whole manifest catalog.
+    pub(crate) active_skill_names: Arc<std::sync::RwLock<Vec<String>>>,
 }
 
 impl DriverContext {
@@ -224,6 +264,7 @@ impl DriverContext {
             mcp_client,
             skill_manifests,
             agent_manifests,
+            active_skill_names: Arc::new(std::sync::RwLock::new(Vec::new())),
         })
     }
 
@@ -239,8 +280,31 @@ impl DriverContext {
             mcp_client,
             skill_manifests,
             agent_manifests,
+            active_skill_names: Arc::new(std::sync::RwLock::new(Vec::new())),
         })
     }
+}
+
+/// Record the skills active for the current turn. No-op outside a driver turn
+/// (tests and one-shot calls), where no subagent dispatch can happen anyway.
+pub(crate) fn set_active_skill_names(names: Vec<String>) {
+    let _ = DRIVER_CTX.try_with(|ctx| {
+        if let Ok(mut active) = ctx.active_skill_names.write() {
+            *active = names;
+        }
+    });
+}
+
+/// Skills active for the current turn; empty when no driver turn is active.
+pub(crate) fn active_skill_names() -> Vec<String> {
+    DRIVER_CTX
+        .try_with(|ctx| {
+            ctx.active_skill_names
+                .read()
+                .map(|active| active.clone())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
 }
 
 /// Decision-log destination fixed for one turn.
@@ -312,6 +376,9 @@ tokio::task_local! {
     /// `/history user`, history compression's user-turn counts, or misread by the model as
     /// the user asking again.
     pub(crate) static IS_RESUME_TURN: bool;
+    /// Exact skill set active when the foreground process suspended. Resume
+    /// turns restore it instead of rebuilding with only the default core tools.
+    pub(crate) static RESUME_SKILL_NAMES: Vec<String>;
 }
 
 /// Read the current turn's session_id; returns an empty string outside a turn.
@@ -334,6 +401,12 @@ pub(crate) fn decision_log_target() -> Option<DecisionLogTarget> {
 /// Whether the current turn is resumed execution after a foreground process wakeup.
 pub(crate) fn is_resume_turn() -> bool {
     IS_RESUME_TURN.try_with(|v| *v).unwrap_or(false)
+}
+
+pub(crate) fn resume_skill_names() -> Vec<String> {
+    RESUME_SKILL_NAMES
+        .try_with(|names| names.clone())
+        .unwrap_or_default()
 }
 
 /// Publish the parent-side payload together with the original final body into the active result slot. A top-level
@@ -382,6 +455,13 @@ pub(crate) fn publish_subagent_phase(phase: &str) {
     let Ok(slot) = SUBAGENT_PHASE.try_with(|slot| slot.clone()) else {
         return;
     };
+    publish_subagent_phase_to_slot(&slot, phase);
+}
+
+/// Update a specific phase slot. External subagent runners execute on blocking
+/// threads where the task-local [`SUBAGENT_PHASE`] is unavailable, so the
+/// spawning tool passes its slot explicitly.
+pub(crate) fn publish_subagent_phase_to_slot(slot: &SubagentPhaseSlot, phase: &str) {
     let phase = compact_progress_text(phase, 80);
     let snapshot = match slot.lock() {
         Ok(mut guard) if guard.phase != phase => {
@@ -393,6 +473,47 @@ pub(crate) fn publish_subagent_phase(phase: &str) {
     };
     if let Some(snapshot) = snapshot {
         publish_progress_update(&snapshot, SubagentProgressEventKind::Phase);
+    }
+}
+
+/// Publish a human-readable activity line (tool, command, message, error) in
+/// addition to the coarse phase. The two are separate events so the status
+/// line can keep a stable phase summary while still showing what just happened.
+pub(crate) fn publish_subagent_activity_to_slot(
+    slot: &SubagentPhaseSlot,
+    phase: &str,
+    activity: &str,
+) {
+    let phase = compact_progress_text(phase, 80);
+    let activity = compact_progress_text(activity, 100);
+    if activity.is_empty() {
+        publish_subagent_phase_to_slot(slot, &phase);
+        return;
+    }
+    let snapshot = match slot.lock() {
+        Ok(mut guard) => {
+            let now = Instant::now();
+            let phase_changed = guard.phase != phase;
+            if phase_changed {
+                guard.phase = phase.clone();
+                guard.push_event(SubagentProgressEventKind::Phase, phase, now);
+            }
+            let duplicate = guard
+                .timeline
+                .back()
+                .is_some_and(|event| {
+                    event.kind == SubagentProgressEventKind::Activity
+                        && event.summary == activity
+                });
+            if !duplicate {
+                guard.push_event(SubagentProgressEventKind::Activity, activity, now);
+            }
+            (phase_changed || !duplicate).then(|| guard.snapshot(now))
+        }
+        Err(_) => None,
+    };
+    if let Some(snapshot) = snapshot {
+        publish_progress_update(&snapshot, SubagentProgressEventKind::Activity);
     }
 }
 

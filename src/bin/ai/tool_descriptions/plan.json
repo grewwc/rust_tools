@@ -33,7 +33,7 @@
             },
             "delegate": {
               "type": "boolean",
-              "description": "Whether a subagent should do this step. true for substantive bounded work; keep trivial or tightly coupled work and final review in the parent."
+              "description": "Whether a subagent should do this step. true for substantive bounded work; keep trivial work and final review in the parent unless an active skill requires delegation."
             }
           },
           "required": [

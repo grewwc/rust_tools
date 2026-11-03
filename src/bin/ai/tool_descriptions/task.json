@@ -19,7 +19,7 @@
       },
       "model": {
         "type": "string",
-        "description": "Optional model override. Default: reuse parent model; override only when the subtask is clearly lighter or heavier."
+        "description": "Optional model override. Default: reuse parent model; override only when the subtask is clearly lighter or heavier. Ignored when backend is 'traecli' (use `backend_model` there)."
       },
       "inherit": {
         "type": "string",
@@ -28,6 +28,19 @@
       "response_schema": {
         "type": "object",
         "description": "Optional JSON Schema object the subagent's single returned value must match, e.g. {\"type\": \"string\"} — not a bare type name. Evidence-gated audit agents reject `response_schema`; call them without one and read the `<audit_report>` envelope from the result."
+      },
+      "backend": {
+        "type": "string",
+        "enum": ["kernel", "traecli"],
+        "description": "Omit to use the session default chosen by /use ('kernel' or 'traecli'); pass an explicit value only to override it for this call."
+      },
+      "backend_model": {
+        "type": "string",
+        "description": "Model for backend 'traecli' (see `traecli models`); ignored otherwise. An explicit value overrides the /use session worker model, then TRAECLI_MODEL, ai.traecli.default_model, and built-in 'gpt-5.5' defaults."
+      },
+      "backend_continue_from": {
+        "type": "string",
+        "description": "Continue a previous traecli run: pass the earlier task's `task_id` to resume its traecli session, or a raw traecli session UUID. Only for backend 'traecli'; the referenced run must have completed."
       }
     },
     "required": [

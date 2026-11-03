@@ -27,7 +27,7 @@ use std::{
     io::{self, IsTerminal, Write},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
@@ -89,6 +89,97 @@ pub(crate) fn side_note_composer_active() -> bool {
 fn set_composer_active(active: bool) {
     COMPOSER_ACTIVE.store(active, Ordering::Relaxed);
 }
+
+/// The composer line the listener last painted.
+///
+/// Every footer-aware output write erases the reserved row before writing (a line
+/// that starts on it would otherwise scroll half a composer line into scrollback).
+/// The listener repaints the composer at poll cadence, so without this snapshot an
+/// in-progress draft would stay invisible for up to one poll interval per output
+/// line — and look lost while the model streams.
+struct ComposerPaint {
+    rows: u16,
+    cols: u16,
+    input: Vec<char>,
+}
+
+static COMPOSER_PAINT: Mutex<Option<ComposerPaint>> = Mutex::new(None);
+
+/// An unsubmitted draft carried across listener-loop instances of one session.
+///
+/// The draft buffer belongs to the loop, while the driver drops the wait-window
+/// listener right before a parked turn resumes (and a foreground stdin handoff
+/// restarts the same loop). Keeping the draft only in the loop frame therefore
+/// loses a note typed while subagents were still running as soon as new model
+/// output arrives. The store is keyed by session so a draft can never leak into
+/// another session's composer.
+struct StoredDraft {
+    session_key: String,
+    input: Vec<char>,
+    in_input: bool,
+}
+
+static DRAFT: Mutex<Option<StoredDraft>> = Mutex::new(None);
+
+fn composer_paint() -> Option<(u16, u16, Vec<char>)> {
+    let guard = COMPOSER_PAINT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    guard
+        .as_ref()
+        .map(|paint| (paint.rows, paint.cols, paint.input.clone()))
+}
+
+fn set_composer_paint(rows: u16, cols: u16, input: &[char]) {
+    let mut guard = COMPOSER_PAINT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *guard = Some(ComposerPaint {
+        rows,
+        cols,
+        input: input.to_vec(),
+    });
+}
+
+fn clear_composer_paint() {
+    let mut guard = COMPOSER_PAINT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *guard = None;
+}
+
+fn restore_draft(session_key: &str) -> Option<StoredDraft> {
+    let mut slot = DRAFT.lock().unwrap_or_else(|error| error.into_inner());
+    match slot.as_ref() {
+        Some(stored) if stored.session_key == session_key => slot.take(),
+        Some(_) => {
+            // The previous session's listener is gone for good; never queue its
+            // text for a later session.
+            *slot = None;
+            None
+        }
+        None => None,
+    }
+}
+
+fn store_draft(session_key: &str, input: &[char], in_input: bool) {
+    let mut slot = DRAFT.lock().unwrap_or_else(|error| error.into_inner());
+    if input.is_empty() {
+        if slot
+            .as_ref()
+            .is_some_and(|stored| stored.session_key == session_key)
+        {
+            *slot = None;
+        }
+        return;
+    }
+    *slot = Some(StoredDraft {
+        session_key: session_key.to_owned(),
+        input: input.to_vec(),
+        in_input,
+    });
+}
+
 #[cfg(not(test))]
 static WIDTH_REFRESH_CONSECUTIVE_TIMEOUTS: AtomicU8 = AtomicU8::new(0);
 
@@ -264,15 +355,11 @@ impl FooterReservation {
         self.rows = rows;
         let stdout = io::stdout();
         let mut out = stdout.lock();
-        // Clear the old footer before re-establishing the scroll region; the
-        // save/restore keeps the model-output cursor from being moved by the resize
-        // redraw.
-        write!(
-            out,
-            "\x1b7\x1b[{};1H\x1b[2K\x1b[r\x1b[1;{}r\x1b8",
-            old_rows,
-            self.output_bottom()
-        )?;
+        // Clear the old footer, then re-assert the reservation with the output
+        // cursor clamped inside it: a resize can leave the saved cursor on the
+        // new footer row, where the next line write would scroll the composer
+        // into the transcript.
+        clear_footer_and_reserve(&mut out, old_rows, self.output_bottom())?;
         out.flush()
     }
 
@@ -289,22 +376,7 @@ impl FooterReservation {
     /// stdout lock for the whole write: the lock is shared with the stream renderer,
     /// and interleaving would split the save/draw/restore sequence into model text.
     pub(super) fn draw_to(&mut self, out: &mut impl io::Write, input: &[char]) -> io::Result<()> {
-        let (prefix, visible, caret) = composer_line_parts(input, self.cols as usize);
-        // The stdout lock is shared with the stream renderer: the whole control
-        // sequence cannot be interleaved into model text. Do not leave the real
-        // cursor in the footer, so the next model/token output does not start from
-        // the input row; the tail uses a visible block caret to mark the edit point.
-        // Argument order is load-bearing: the first positional `{}` is the absolute
-        // CUP row; an SGR string in that slot would terminate the CSI early and draw
-        // the composer at the model-output cursor instead of the footer row.
-        write!(
-            out,
-            "\x1b7\x1b[?25l\x1b[{};1H\x1b[2K{}{prefix}{RESET}{visible}{}{caret}{RESET}\x1b8\x1b[?25h",
-            self.rows,
-            theme::current().accent_muted,
-            theme::current().accent_muted
-        )?;
-        Ok(())
+        out.write_all(composer_line_bytes(self.rows, self.cols, input).as_bytes())
     }
 
     fn clear(&mut self) -> io::Result<()> {
@@ -326,6 +398,13 @@ impl FooterReservation {
     fn leave(&mut self) -> io::Result<()> {
         let stdout = io::stdout();
         let mut out = stdout.lock();
+        // Release ownership while the lock is still held: a writer blocked on
+        // stdout must observe the released footer, otherwise it could re-assert
+        // the scroll region after `leave_to` reset it.
+        set_composer_active(false);
+        // Same reasoning for the paint snapshot: no writer that acquires the lock
+        // after this point may repaint a composer the listener just closed.
+        clear_composer_paint();
         self.leave_to(&mut out)?;
         out.flush()
     }
@@ -346,6 +425,151 @@ fn terminal_size() -> io::Result<(u16, u16)> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+/// Write one complete ordinary output line while the composer footer may be reserved.
+///
+/// The composer owns the last physical row and repaints it at poll cadence. Ordinary
+/// output shares the same TTY cursor: when that cursor rests on the footer row, a
+/// plain line write replaces only the leading part of the composer line, and the
+/// following line feed pushes the hybrid row into scrollback, where the composer's
+/// own `clear`/`leave` can never erase it. The erase below turns such a write into
+/// one complete line; the cursor clamp repairs a cursor that a resize or a region
+/// reset pushed onto the footer row, so later fragments also stay inside the
+/// scrollable area. The next redraw restores the draft.
+///
+/// The caller passes an already-locked stdout handle so no composer redraw can run
+/// between the erase and the line.
+pub(crate) fn write_output_line(out: &mut impl Write, line: &str) -> io::Result<()> {
+    write_output_line_to(out, line, active_footer_row())?;
+    // Restore the draft in the same locked write: the erase above removed the
+    // composer row, and waiting for the listener's poll redraw would leave the
+    // draft invisible for up to one interval per output line.
+    repaint_composer(out)?;
+    out.flush()
+}
+
+/// Print one ordinary stdout line through the footer-aware path.
+pub(crate) fn print_output_line(line: &str) {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let _ = write_output_line(&mut out, line);
+}
+
+/// Print one stderr diagnostic line through the same footer-aware path.
+///
+/// Both streams share the terminal's current row, so a diagnostic written while
+/// the cursor rests on the footer row has the same hybrid-line failure mode as a
+/// stdout line. The stdout lock serializes the erase/clamp with the composer
+/// redraw; a failed erase must not drop the diagnostic.
+pub(crate) fn print_output_stderr_line(line: &str) {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let stderr = io::stderr();
+    let mut err = stderr.lock();
+    let _ = write_stderr_line_to(&mut out, &mut err, line, active_footer_row());
+    let _ = repaint_composer(&mut out);
+    let _ = out.flush();
+}
+
+/// Print one ordinary output fragment without a trailing newline.
+///
+/// Used for in-place status rows that a later `\r` overwrite completes; the
+/// footer erase/clamp keeps the fragment out of the composer row in the same
+/// way as a complete line.
+pub(crate) fn print_output_fragment(text: &str) {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let _ = write_output_fragment_to(&mut out, text, active_footer_row());
+    let _ = repaint_composer(&mut out);
+    let _ = out.flush();
+}
+
+fn active_footer_row() -> Option<u16> {
+    if side_note_composer_active() {
+        terminal_size().ok().map(|(_, rows)| rows)
+    } else {
+        None
+    }
+}
+
+/// Repaint the composer line the listener last drew, if any.
+///
+/// No-op in listening mode and after the composer closed: the paint snapshot is
+/// cleared under the stdout lock by `clear_input`/`leave`, so a writer that runs
+/// after the composer is gone cannot resurrect its row.
+pub(super) fn repaint_composer(out: &mut impl Write) -> io::Result<()> {
+    let Some((rows, cols, input)) = composer_paint() else {
+        return Ok(());
+    };
+    out.write_all(composer_line_bytes(rows, cols, &input).as_bytes())
+}
+
+/// Repaint the active composer after a live writer that bypasses the footer-aware
+/// helpers (the markdown streaming renderer rewrites its preview with `CSI 0J`,
+/// which erases past the DECSTBM margin into the footer row).
+///
+/// No-op without a painted composer; the stdout lock serializes the repaint with
+/// the listener's own draw.
+pub(crate) fn repaint_stdout_composer() -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    repaint_composer(&mut out)?;
+    out.flush()
+}
+
+fn write_output_fragment_to(
+    out: &mut impl Write,
+    text: &str,
+    footer_row: Option<u16>,
+) -> io::Result<()> {
+    if let Some(row) = footer_row.filter(|row| *row > FOOTER_ROWS) {
+        clear_footer_and_reserve(out, row, row - FOOTER_ROWS)?;
+    }
+    write!(out, "{text}")
+}
+
+fn write_output_line_to(
+    out: &mut impl Write,
+    line: &str,
+    footer_row: Option<u16>,
+) -> io::Result<()> {
+    if let Some(row) = footer_row.filter(|row| *row > FOOTER_ROWS) {
+        clear_footer_and_reserve(out, row, row - FOOTER_ROWS)?;
+    }
+    writeln!(out, "{line}")
+}
+
+fn write_stderr_line_to(
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    line: &str,
+    footer_row: Option<u16>,
+) -> io::Result<()> {
+    if let Some(row) = footer_row.filter(|row| *row > FOOTER_ROWS) {
+        // stdout is line-buffered and the erase carries no newline: flush it
+        // before the diagnostic, or it would reach the terminal afterwards and
+        // could clear the line it was meant to protect. A failed erase must not
+        // drop the diagnostic.
+        let _ = clear_footer_and_reserve(stdout, row, row - FOOTER_ROWS);
+        let _ = stdout.flush();
+    }
+    writeln!(stderr, "{line}")
+}
+
+/// Erase the composer row, then re-assert the footer reservation on `bottom`
+/// with the output cursor clamped inside it.
+///
+/// Resetting DECSTBM homes the cursor, so every region change is bracketed by
+/// DECSC/DECRC. `IND`/`RI` under the full-screen region is a no-op unless the
+/// cursor is on the last physical row: there it scrolls the already-cleared
+/// footer row out and leaves the cursor one row above, inside the region.
+fn clear_footer_and_reserve(out: &mut impl Write, row: u16, bottom: u16) -> io::Result<()> {
+    debug_assert!(row > FOOTER_ROWS);
+    write!(
+        out,
+        "\x1b7\x1b[{row};1H\x1b[2K\x1b8\x1b[r\x1b8\x1bD\x1bM\x1b7\x1b[1;{bottom}r\x1b8"
+    )
 }
 
 /// Whether same-terminal side-note input listening is enabled: foreground main agent
@@ -400,6 +624,18 @@ pub(crate) enum SideNoteSink {
 impl SideNoteSink {
     fn is_local(&self) -> bool {
         matches!(self, Self::Local(_))
+    }
+
+    /// Stable identity of the session whose draft the composer edits.
+    ///
+    /// The serve client keeps one listener for its whole session, so remote sinks
+    /// never carry a draft across instances: restoring one there could inject a
+    /// previous connection's text into another session.
+    fn draft_key(&self) -> Option<String> {
+        match self {
+            Self::Local(history_file) => Some(format!("local:{}", history_file.to_string_lossy())),
+            Self::Remote(_) => None,
+        }
     }
 }
 
@@ -905,18 +1141,44 @@ fn composer_line_parts(input: &[char], cols: usize) -> (&'static str, String, St
     (prefix, visible, caret.map(String::from).unwrap_or_default())
 }
 
+/// The exact bytes of one composer paint. Shared by the listener's own redraw and
+/// by output writers that repaint the draft after erasing the footer row.
+///
+/// The whole control sequence must land in one locked write: interleaving it with
+/// model text would split the save/draw/restore. Do not leave the real cursor in
+/// the footer, so the next model/token output does not start from the input row;
+/// the tail uses a visible block caret to mark the edit point.
+///
+/// Argument order is load-bearing: the first positional `{}` is the absolute CUP
+/// row; an SGR string in that slot would terminate the CSI early and draw the
+/// composer at the model-output cursor instead of the footer row.
+fn composer_line_bytes(rows: u16, cols: u16, input: &[char]) -> String {
+    let (prefix, visible, caret) = composer_line_parts(input, cols as usize);
+    format!(
+        "\x1b7\x1b[?25l\x1b[{rows};1H\x1b[2K{}{prefix}{RESET}{visible}{}{caret}{RESET}\x1b8\x1b[?25h",
+        theme::current().accent_muted,
+        theme::current().accent_muted
+    )
+}
+
 fn redraw_input(footer: &mut FooterReservation, input: &[char]) -> io::Result<()> {
-    footer.draw(input)
+    footer.draw(input)?;
+    set_composer_paint(footer.rows, footer.cols, input);
+    Ok(())
 }
 
 fn clear_input(footer: &mut FooterReservation) -> io::Result<()> {
+    // Drop the snapshot before the erase: a writer that runs between the two must
+    // not repaint a draft the composer is already closing.
+    clear_composer_paint();
     footer.clear()
 }
 
 fn refresh_footer(footer: &mut FooterReservation, input: Option<&[char]>) -> io::Result<()> {
     footer.refresh()?;
     if let Some(input) = input {
-        footer.draw(input)?;
+        // Route through `redraw_input` so the snapshot follows a resize.
+        redraw_input(footer, input)?;
     }
     Ok(())
 }
@@ -981,8 +1243,9 @@ fn submit_draft(
     if content.is_empty() {
         input.clear();
         *in_input = false;
+        let cleared = clear_input(footer);
         set_composer_active(false);
-        clear_input(footer)?;
+        cleared?;
         return Ok(false);
     }
     // Remote sinks have no local attach view to detach, so `/bg`-family
@@ -992,8 +1255,9 @@ fn submit_draft(
     {
         input.clear();
         *in_input = false;
+        let cleared = clear_input(footer);
         set_composer_active(false);
-        clear_input(footer)?;
+        cleared?;
         return Ok(true);
     }
     // Do not insert a confirmation line into the transcript: the model may be mid-way
@@ -1003,8 +1267,9 @@ fn submit_draft(
         Some(true) => {
             input.clear();
             *in_input = false;
+            let cleared = clear_input(footer);
             set_composer_active(false);
-            clear_input(footer)?;
+            cleared?;
             Ok(false)
         }
         Some(false) => {
@@ -1254,11 +1519,43 @@ fn side_note_input_loop(
 ) -> SideNoteLoopExit {
     // Input mode: UTF-8 byte accumulation buffer + parsed characters + echoed column count
     let mut pending: Vec<u8> = Vec::new();
-    let mut input: Vec<char> = Vec::new();
-    let mut in_input = false;
+    // A draft typed in an earlier listener of this session survives the driver's
+    // guard swap (wait window -> turn) and the stdin handoff to a foreground
+    // prompt; without the store it would vanish at the next model output.
+    let draft_key = sink.draft_key();
+    let restored = draft_key.as_deref().and_then(restore_draft);
+    let mut input: Vec<char> = restored
+        .as_ref()
+        .map(|draft| draft.input.clone())
+        .unwrap_or_default();
+    let mut in_input = restored.as_ref().is_some_and(|draft| draft.in_input);
     // Created lazily on the first Ctrl+G: a turn that never enters input mode must not
     // touch the scroll region or the cursor position.
     let mut footer: Option<FooterReservation> = None;
+    if in_input && !should_yield_stdin(stop) {
+        // The draft was visible when the previous listener stopped: reopen the
+        // composer so it does not look lost while the model resumes.
+        match FooterReservation::enter(stop) {
+            Ok(active_footer) => {
+                footer = Some(active_footer);
+                set_composer_active(true);
+                let redrawn = match footer.as_mut() {
+                    Some(active_footer) => redraw_input(active_footer, &input),
+                    None => Ok(()),
+                };
+                if redrawn.is_err() {
+                    // Keep the draft in `input` (and in the store on exit); only
+                    // the visible composer failed, and Ctrl+G reopens it.
+                    set_composer_active(false);
+                    if let Some(mut active_footer) = footer.take() {
+                        let _ = active_footer.leave();
+                    }
+                    in_input = false;
+                }
+            }
+            Err(_) => in_input = false,
+        }
+    }
     let mut background_requested = false;
     // Bytes the width-query service read while hunting for its `CSI 18 t` reply but that
     // turned out to be ordinary input; the byte source below drains them first so a query
@@ -1353,7 +1650,9 @@ fn side_note_input_loop(
             // Listening state: only Ctrl+G enters input mode; Ctrl+C is handled by the
             // SIGINT path (exit as soon as it is read)
             if b == CTRL_G {
-                input.clear();
+                // Do not clear `input`: a draft restored from a previous listener of
+                // this session waits here until the composer is opened again. Submit
+                // and cancel already empty it.
                 pending.clear();
                 if footer.is_none() {
                     match FooterReservation::enter(stop) {
@@ -1362,11 +1661,13 @@ fn side_note_input_loop(
                     }
                 }
                 if let Some(active_footer) = footer.as_mut() {
+                    // Claim ownership before the first draw: a concurrent line write
+                    // must erase the composer row as soon as the composer is visible.
+                    set_composer_active(true);
                     if redraw_input(active_footer, &input).is_err() {
                         break;
                     }
                     in_input = true;
-                    set_composer_active(true);
                 }
             } else if b == 0x03 {
                 break; // Ctrl+C during streaming: main loop handles the interrupt, listener task exits
@@ -1426,11 +1727,13 @@ fn side_note_input_loop(
                 input.clear();
                 pending.clear();
                 in_input = false;
+                let cleared = match footer.as_mut() {
+                    Some(active_footer) => clear_input(active_footer),
+                    None => Ok(()),
+                };
                 set_composer_active(false);
-                if let Some(active_footer) = footer.as_mut() {
-                    if clear_input(active_footer).is_err() {
-                        break;
-                    }
+                if cleared.is_err() {
+                    break;
                 }
             }
             0x03 => {
@@ -1473,15 +1776,20 @@ fn side_note_input_loop(
     // Loop exit (stop / EOF / error / Ctrl+C): the listener thread alone performs
     // the terminal cleanup, avoiding the guard resetting the scroll region first
     // while a blocking poll has not yet returned.
-    // The composer no longer owns the footer row from here on, so deferred status
-    // writers may resume touching the TTY.
-    set_composer_active(false);
+    // Persist an unsubmitted draft for the next listener of this session. Submit
+    // and cancel already emptied `input`, which clears the slot instead.
+    if let Some(session_key) = draft_key.as_deref() {
+        store_draft(session_key, &input, in_input);
+    }
     if let Some(mut active_footer) = footer {
         if in_input {
             let _ = clear_input(&mut active_footer);
         }
         let _ = active_footer.leave();
     }
+    // Ownership is released inside `leave` while it still holds the stdout lock,
+    // so a writer blocked there observes the released footer and cannot re-assert
+    // the scroll region after the reset.
     if background_requested {
         SideNoteLoopExit::BackgroundRequested
     } else if foreground_stdin_requested() && !stop.load(Ordering::Relaxed) {
@@ -1752,6 +2060,172 @@ mod tests {
         let _ = submit_draft(&sink, &stop, &mut footer, &mut input, &mut pending, &mut in_input);
         assert!(!in_input);
         assert!(!side_note_composer_active());
+    }
+
+    #[test]
+    fn output_line_clears_reserved_footer_before_writing() {
+        // A plain line written while the output cursor rests on the footer row must
+        // not leave half of the composer line behind: the row is cleared first, the
+        // cursor is clamped back into the reserved region, and the write becomes one
+        // complete line. Without a reserved footer the sequence is unchanged.
+        let mut out = Vec::new();
+        write_output_line_to(&mut out, "  │ side-note: injected 1 note(s)", Some(24)).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b7\x1b[24;1H\x1b[2K\x1b8\x1b[r\x1b8\x1bD\x1bM\x1b7\x1b[1;23r\x1b8  │ side-note: injected 1 note(s)\n"
+        );
+
+        let mut out = Vec::new();
+        write_output_line_to(&mut out, "plain", None).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "plain\n");
+    }
+
+    #[test]
+    fn stderr_line_flushes_footer_erase_before_diagnostic() {
+        // stderr shares the terminal row with stdout: a diagnostic while the
+        // composer owns the footer must apply the same erase/clamp, but the
+        // diagnostic text is written even when the erase fails. stdout is
+        // line-buffered and the erase has no newline, so it must be flushed
+        // before the diagnostic instead of trailing it.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct Log(Rc<RefCell<Vec<&'static str>>>);
+        struct Out<'a> {
+            log: &'a Log,
+            bytes: Vec<u8>,
+        }
+        impl std::io::Write for Out<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.log.0.borrow_mut().push("stdout-write");
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.log.0.borrow_mut().push("stdout-flush");
+                Ok(())
+            }
+        }
+        struct ErrOut<'a> {
+            log: &'a Log,
+            bytes: Vec<u8>,
+        }
+        impl std::io::Write for ErrOut<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.log.0.borrow_mut().push("stderr-write");
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let log = Log(Rc::new(RefCell::new(Vec::new())));
+        let mut out = Out { log: &log, bytes: Vec::new() };
+        let mut err = ErrOut { log: &log, bytes: Vec::new() };
+        write_stderr_line_to(&mut out, &mut err, "[Warning] retry", Some(24)).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out.bytes).unwrap(),
+            "\x1b7\x1b[24;1H\x1b[2K\x1b8\x1b[r\x1b8\x1bD\x1bM\x1b7\x1b[1;23r\x1b8"
+        );
+        assert_eq!(String::from_utf8(err.bytes).unwrap(), "[Warning] retry\n");
+        let events = log.0.borrow();
+        let flush_at = events.iter().position(|e| *e == "stdout-flush").unwrap();
+        let stderr_at = events.iter().position(|e| *e == "stderr-write").unwrap();
+        assert!(flush_at < stderr_at, "erase must be flushed first: {events:?}");
+        assert!(events[..flush_at].iter().all(|e| *e == "stdout-write"));
+    }
+
+    #[test]
+    fn leave_releases_composer_ownership() {
+        // The listener clears the flag inside `leave` while it still holds the
+        // stdout lock; clearing it only after `leave` returned left a window
+        // where a blocked writer could re-assert the released scroll region.
+        set_composer_active(true);
+        let mut footer = FooterReservation { cols: 80, rows: 24 };
+        let _ = footer.leave();
+        assert!(!side_note_composer_active());
+    }
+
+    #[test]
+    fn fragment_clears_reserved_footer_before_writing() {
+        let mut out = Vec::new();
+        write_output_fragment_to(&mut out, "running", Some(24)).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b7\x1b[24;1H\x1b[2K\x1b8\x1b[r\x1b8\x1bD\x1bM\x1b7\x1b[1;23r\x1b8running"
+        );
+
+        let mut out = Vec::new();
+        write_output_fragment_to(&mut out, "running", None).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "running");
+    }
+
+    /// The draft and paint stores are process-wide; serialize the tests that use them.
+    static STORE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn store_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        STORE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    #[test]
+    fn draft_survives_listener_reentry_for_the_same_session() {
+        let _serial = store_test_guard();
+        let key = "local:/tmp/a-side-note-draft-reentry.sqlite";
+        let draft: Vec<char> = "waiting for the subagent".chars().collect();
+        store_draft(key, &draft, true);
+        let restored = restore_draft(key).expect("same session must restore the draft");
+        assert_eq!(restored.input, draft);
+        assert!(restored.in_input, "the composer must reopen with the draft");
+        assert!(
+            restore_draft(key).is_none(),
+            "a restored draft is consumed once"
+        );
+    }
+
+    #[test]
+    fn draft_is_never_carried_into_another_session() {
+        let _serial = store_test_guard();
+        let old = "local:/tmp/a-side-note-old.sqlite";
+        let new = "local:/tmp/a-side-note-new.sqlite";
+        store_draft(old, &"secret".chars().collect::<Vec<_>>(), true);
+        assert!(restore_draft(new).is_none());
+        assert!(
+            restore_draft(old).is_none(),
+            "the stale draft is dropped, not queued"
+        );
+    }
+
+    #[test]
+    fn empty_draft_clears_the_store() {
+        let _serial = store_test_guard();
+        let key = "local:/tmp/a-side-note-empty.sqlite";
+        store_draft(key, &"typed then submitted".chars().collect::<Vec<_>>(), true);
+        store_draft(key, &[], false);
+        assert!(restore_draft(key).is_none());
+    }
+
+    #[test]
+    fn output_line_repaints_the_draft_after_erasing_the_footer() {
+        let _serial = store_test_guard();
+        set_composer_paint(24, 80, &"keep me".chars().collect::<Vec<_>>());
+        let mut out = Vec::new();
+        write_output_line_to(&mut out, "  │ note", Some(24)).unwrap();
+        repaint_composer(&mut out).unwrap();
+        clear_composer_paint();
+
+        let bytes = String::from_utf8(out).unwrap();
+        let line_at = bytes.find("  │ note\n").expect("line written");
+        let repaint_at = line_at
+            + bytes[line_at..]
+                .find("\x1b[24;1H\x1b[2K")
+                .expect("composer repainted after the line");
+        assert!(line_at < repaint_at, "repaint must follow the line: {bytes:?}");
+        assert!(bytes.contains("keep me"), "draft text repainted: {bytes:?}");
     }
 
     #[test]

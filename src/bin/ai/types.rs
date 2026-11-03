@@ -68,6 +68,9 @@ impl App {
             client: self.client.clone(),
             current_model: self.current_model.clone(),
             current_agent: self.current_agent.clone(),
+            session_default_subagent_backend: self.session_default_subagent_backend,
+            session_default_subagent_model: self.session_default_subagent_model.clone(),
+            session_default_skills: self.session_default_skills.clone(),
             current_agent_manifest: self.current_agent_manifest.clone(),
             pending_files: self.pending_files.clone(),
             forced_skills: self.forced_skills.clone(),
@@ -127,6 +130,10 @@ impl App {
     pub(super) fn fork_for_subagent(&self) -> Self {
         let mut app = self.fork_baseline();
         Self::reset_child_reasoning_controls(&mut app);
+        // Team orchestration belongs to the parent turn; worker turns keep
+        // their own manifest instead of activating the session's team default.
+        app.session_default_skills
+            .retain(|name| !name.eq_ignore_ascii_case("agent-team"));
         app
     }
 
@@ -173,6 +180,11 @@ pub(super) struct App {
     pub(super) client: Client,
     pub(super) current_model: String,
     pub(super) current_agent: String,
+    pub(super) session_default_subagent_backend: crate::ai::tools::task_tools::SubagentBackend,
+    /// TraeCLI worker model selected for this session; independent of `current_model`.
+    pub(super) session_default_subagent_model: Option<String>,
+    /// Skills activated on ordinary turns unless the user explicitly selects skills.
+    pub(super) session_default_skills: Vec<String>,
     pub(super) current_agent_manifest: Option<AgentManifest>,
     pub(super) pending_files: Option<String>,
     /// Forced skill list explicitly selected by the user via `@skills:<name>` or
@@ -351,8 +363,8 @@ pub(super) struct PendingSkillContinuation {
     pub(super) skill_names: Vec<String>,
 }
 
-/// Entry point where the user explicitly specifies forced skills. Keeping the
-/// source distinguishes command-parsing issues from injection issues.
+/// Origin of a skill selection. Session defaults remain distinct from explicit
+/// per-turn selections in activation history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ForcedSkillSource {
     SkillsCommandInline,
@@ -361,6 +373,8 @@ pub(super) enum ForcedSkillSource {
     /// Skills assigned by a host-rendered task/discuss room card delivered
     /// through the talk inbox (see `driver/task.rs` and `driver/discuss.rs`).
     RoomCard,
+    /// Sticky skills selected by a session-default command such as `/use`.
+    SessionDefault,
 }
 
 impl ForcedSkillSource {
@@ -370,6 +384,7 @@ impl ForcedSkillSource {
             Self::SkillsCommandNextTurn => "/skills-next-turn",
             Self::InlineReference => "@skills",
             Self::RoomCard => "room-card",
+            Self::SessionDefault => "session-default",
         }
     }
 }

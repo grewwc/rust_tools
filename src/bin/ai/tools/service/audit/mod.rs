@@ -25,6 +25,7 @@ mod git;
 mod lexer;
 mod osascript;
 mod substitute;
+mod traecli;
 mod wrapper;
 
 // Re-export names that sibling modules, the inline tests, and external callers
@@ -595,6 +596,78 @@ mod tests {
         assert!(validate("command git stash").is_ok());
         assert!(validate("echo git stash").is_ok());
         assert!(validate("printf '%s' stash").is_ok());
+    }
+
+    // ---- direct TraeCLI execution ----
+
+    #[test]
+    fn blocks_direct_traecli_programs_and_paths() {
+        for command in [
+            "traecli exec --json",
+            "/Users/bytedance/.local/bin/traecli exec --json",
+            "./traecli exec --json",
+            "env VAR=1 traecli exec --json",
+            "timeout 30 /usr/local/bin/traecli exec --json",
+            "nohup env traecli exec --json",
+            "coco run",
+            "trae-agent run",
+            "/Users/bytedance/.local/bin/ta run",
+            "echo ok && traecli exec --json",
+        ] {
+            let err = validate(command).unwrap_err();
+            assert!(
+                err.contains("task_spawn"),
+                "expected task/task_spawn hint for {command}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_task_payloads_and_literal_text_mentioning_traecli() {
+        assert!(
+            validate(r#"echo '{"tool":"task_spawn","arguments":{"backend":"traecli"}}'"#).is_ok()
+        );
+        assert!(validate("printf '%s' traecli").is_ok());
+        assert!(validate("grep -rn traecli src/bin/ai/tools/task_tools").is_ok());
+    }
+
+    // ---- workspace-wide formatting ----
+
+    #[test]
+    fn blocks_cargo_fmt_in_every_form() {
+        for command in [
+            "cargo fmt",
+            "cargo fmt -- src/bin/ai/tools/service/audit/mod.rs",
+            "cargo +nightly fmt",
+            "cargo --manifest-path Cargo.toml fmt",
+            "cargo --color never fmt --check",
+            "env CARGO_TERM_COLOR=never cargo fmt",
+            "timeout 60 cargo fmt",
+            "/Users/bytedance/.cargo/bin/cargo fmt",
+            "cargo-fmt",
+        ] {
+            let err = validate(command).unwrap_err();
+            assert!(
+                err.contains("rustfmt"),
+                "expected per-file rustfmt hint for {command}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_rustfmt_and_other_cargo_subcommands() {
+        assert!(
+            validate(
+                "rustfmt --edition 2024 --config skip_children=true \
+                 src/bin/ai/tools/service/audit/mod.rs"
+            )
+            .is_ok()
+        );
+        assert!(validate("cargo check --bin a").is_ok());
+        assert!(validate("cargo test --bin a audit::tests").is_ok());
+        assert!(validate("cargo clippy --bin a").is_ok());
+        assert!(validate("cargo build --bin a").is_ok());
+        assert!(validate("echo 'cargo fmt is blocked'").is_ok());
     }
 
     #[test]

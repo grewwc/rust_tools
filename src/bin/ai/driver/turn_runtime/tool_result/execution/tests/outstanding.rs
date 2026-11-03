@@ -3,11 +3,9 @@
 
 use super::super::*;
 use super::common::*;
-use crate::ai::tools::plan_state::{
-    StepStatus, load_completion_claim, record_completion_claim, record_plan, update_plan_step,
-};
+use crate::ai::tools::plan_state::{StepStatus, record_plan, update_plan_step};
 
-/// Test app whose plan/claim files land in a fresh temp dir (mirrors the
+/// Test app whose plan files land in a fresh temp dir (mirrors the
 /// plan-state store test setup; pid + sequence + timestamp keeps parallel
 /// test threads from sharing a dir).
 pub(super) fn test_app_with_session_and_tools(tools: &[&str]) -> (App, PathBuf) {
@@ -51,13 +49,6 @@ fn last_note(messages: &[Message]) -> &str {
         .expect("gate note must be a string message")
 }
 
-fn tool_exchange(id: &str, name: &str, content: &str) -> Vec<Message> {
-    vec![
-        assistant_tool_call_message(test_tool_call(id, name, serde_json::json!({}))),
-        tool_result_message(id, content),
-    ]
-}
-
 #[test]
 fn no_plan_file_allows_final() {
     let (app, base) = test_app_with_session();
@@ -68,76 +59,68 @@ fn no_plan_file_allows_final() {
     let _ = fs::remove_dir_all(&base);
 }
 
-#[test]
-fn no_plan_still_consumes_claim() {
-    // A stale assertion must not leak into the next round that does have a plan.
-    let (app, base) = test_app_with_session();
-    record_completion_claim(&app, "all done", None).unwrap();
-    let mut messages = Vec::new();
-    let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16);
-    assert_eq!(action, OutstandingWorkGateAction::Allow);
-    assert!(
-        load_completion_claim(&app).unwrap().is_none(),
-        "no-plan evaluation must still consume the single-use claim"
-    );
-    let _ = fs::remove_dir_all(&base);
+fn tool_exchange(id: &str, name: &str, content: &str) -> Vec<Message> {
+    vec![
+        assistant_tool_call_message(test_tool_call(id, name, serde_json::json!({}))),
+        tool_result_message(id, content),
+    ]
 }
 
 #[test]
 fn tool_assisted_turn_without_plan_allows_final() {
-    // The `complete` assertion is plan-scoped: tool activity alone no longer
-    // forces it, so a turn without a binding plan lands its final directly.
     let (app, base) = test_app_with_session();
-    let turn_messages = tool_exchange("work", "execute_command", "[command exited: exit code 0]");
-    let mut messages = Vec::new();
-    let action = super::super::outstanding_work_gate_action_with_turn_messages(
-        &app,
-        &mut messages,
-        &turn_messages,
-        false,
-        0,
-        16,
-    );
+    let mut messages = tool_exchange("work", "execute_command", "[command exited: exit code 0]");
+    let before = messages.clone();
+    let action = outstanding_work_gate_action(&app, &mut messages, false, 0, 16);
     assert_eq!(action, OutstandingWorkGateAction::Allow);
-    assert!(messages.is_empty(), "no plan must not inject a reopen note");
+    assert_eq!(messages, before, "no plan must not inject a reopen note");
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn request_user_input_allows_final_without_plan() {
+    let (app, base) = test_app_with_session();
+    let mut messages = tool_exchange("ask", "request_user_input", "Input requested.");
+    let action = outstanding_work_gate_action(&app, &mut messages, false, 0, 16);
+    assert_eq!(action, OutstandingWorkGateAction::Allow);
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn recoverable_pre_execution_pause_uses_its_own_gate() {
+    let (app, base) = test_app_with_session();
+    let pause = format!("Error: {SCOPED_INSTRUCTIONS_PAUSE_PREFIX}");
+    let turn_messages = tool_exchange("patch", "apply_patch", &pause);
+    let mut messages = turn_messages.clone();
+    let action = outstanding_work_gate_action(&app, &mut messages, false, 0, 16);
+    assert_eq!(action, OutstandingWorkGateAction::Allow);
+    assert_eq!(
+        recoverable_pause_gate_action(&mut messages, &turn_messages, false, 0, 16),
+        RecoverablePauseGateAction::Reopen
+    );
     let _ = fs::remove_dir_all(&base);
 }
 
 #[test]
 fn outstanding_reopens_three_times_then_warns_without_duplicate_marker() {
     let (app, base) = test_app_with_session();
-    // Reopen budget applies to plan-bound turns: a settled plan without a
-    // completion assertion keeps reopening until the forced final warns.
+    // Unsettled plan steps keep reopening until the bounded budget is spent.
     two_step_plan(&app);
-    update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
-    update_plan_step(&app, 2, StepStatus::Skipped, None).unwrap();
-    let turn_messages = tool_exchange("work", "execute_command", "ok");
     let mut messages = Vec::new();
     let mut gate_state = FinalGateState::default();
 
     for attempt in 1..=OUTSTANDING_WORK_MAX_REOPENS {
         assert!(gate_state.can_reopen_outstanding_work(false, attempt, 16));
-        let action = super::super::outstanding_work_gate_action_with_turn_messages(
-            &app,
-            &mut messages,
-            &turn_messages,
-            false,
-            attempt,
-            16,
-        );
+        let action =
+            super::super::outstanding_work_gate_action(&app, &mut messages, false, attempt, 16);
         assert_eq!(action, OutstandingWorkGateAction::Reopen);
         assert_eq!(gate_state.consume_outstanding_work_retry(), attempt);
     }
     assert!(!gate_state.can_reopen_outstanding_work(false, 4, 16));
-    let final_action = super::super::outstanding_work_gate_action_with_turn_messages(
-        &app,
-        &mut messages,
-        &turn_messages,
-        true,
-        4,
-        16,
+    let final_action = super::super::outstanding_work_gate_action(&app, &mut messages, true, 4, 16);
+    assert!(
+        matches!(final_action, OutstandingWorkGateAction::Warn(steps) if steps.contains("step 1") && steps.contains("step 2"))
     );
-    assert_eq!(final_action, OutstandingWorkGateAction::WarnUnasserted);
 
     assert_eq!(
         messages
@@ -151,150 +134,6 @@ fn outstanding_reopens_three_times_then_warns_without_duplicate_marker() {
             .count(),
         1
     );
-    let _ = fs::remove_dir_all(&base);
-}
-
-#[test]
-fn plan_bound_turn_allows_complete_after_latest_result() {
-    let (app, base) = test_app_with_session();
-    two_step_plan(&app);
-    update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
-    update_plan_step(&app, 2, StepStatus::Skipped, None).unwrap();
-    let plan_updated = crate::ai::tools::plan_state::load_plan_state(&app)
-        .unwrap()
-        .unwrap()
-        .updated_at_ms;
-    record_completion_claim(&app, "done", Some(plan_updated)).unwrap();
-    let mut turn_messages = tool_exchange("work", "execute_command", "ok");
-    turn_messages.extend(tool_exchange(
-        "done",
-        "complete",
-        "Completion assertion recorded: done",
-    ));
-    let mut messages = Vec::new();
-    let action = super::super::outstanding_work_gate_action_with_turn_messages(
-        &app,
-        &mut messages,
-        &turn_messages,
-        false,
-        0,
-        16,
-    );
-    assert_eq!(action, OutstandingWorkGateAction::Allow);
-    assert!(load_completion_claim(&app).unwrap().is_none());
-    let _ = fs::remove_dir_all(&base);
-}
-
-#[test]
-fn binding_plan_complete_before_later_tool_result_does_not_cover_it() {
-    let (app, base) = test_app_with_session();
-    two_step_plan(&app);
-    for step in 1..=2 {
-        update_plan_step(&app, step, StepStatus::Done, None).unwrap();
-    }
-    let updated_at_ms = crate::ai::tools::plan_state::load_plan_state(&app)
-        .unwrap()
-        .unwrap()
-        .updated_at_ms;
-    record_completion_claim(&app, "done", Some(updated_at_ms)).unwrap();
-    let mut turn_messages =
-        tool_exchange("done", "complete", "Completion assertion recorded: done");
-    turn_messages.extend(tool_exchange("work", "execute_command", "ok"));
-    let mut messages = Vec::new();
-    let action = super::super::outstanding_work_gate_action_with_turn_messages(
-        &app,
-        &mut messages,
-        &turn_messages,
-        false,
-        0,
-        16,
-    );
-    assert_eq!(action, OutstandingWorkGateAction::Reopen);
-    let _ = fs::remove_dir_all(&base);
-}
-
-#[test]
-fn request_user_input_does_not_require_complete() {
-    let (app, base) = test_app_with_session();
-    let turn_messages = tool_exchange("ask", "request_user_input", "Input requested.");
-    let mut messages = Vec::new();
-    let action = super::super::outstanding_work_gate_action_with_turn_messages(
-        &app,
-        &mut messages,
-        &turn_messages,
-        false,
-        0,
-        16,
-    );
-    assert_eq!(action, OutstandingWorkGateAction::Allow);
-    let _ = fs::remove_dir_all(&base);
-}
-
-#[test]
-fn recoverable_pre_execution_pause_uses_its_own_gate() {
-    let (app, base) = test_app_with_session();
-    let pause = format!("Error: {SCOPED_INSTRUCTIONS_PAUSE_PREFIX}");
-    let turn_messages = tool_exchange("patch", "apply_patch", &pause);
-    let mut messages = Vec::new();
-    let action = super::super::outstanding_work_gate_action_with_turn_messages(
-        &app,
-        &mut messages,
-        &turn_messages,
-        false,
-        0,
-        16,
-    );
-    assert_eq!(action, OutstandingWorkGateAction::Allow);
-    let _ = fs::remove_dir_all(&base);
-}
-
-#[test]
-fn recoverable_pause_supersedes_earlier_actionable_result() {
-    let (app, base) = test_app_with_session();
-    two_step_plan(&app);
-    update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
-    update_plan_step(&app, 2, StepStatus::Skipped, None).unwrap();
-    let plan_updated = crate::ai::tools::plan_state::load_plan_state(&app)
-        .unwrap()
-        .unwrap()
-        .updated_at_ms;
-    record_completion_claim(&app, "done", Some(plan_updated)).unwrap();
-
-    // The receipt covers the earlier activity; the later activity would stale
-    // it, but the trailing pause resets the latest actionable result.
-    let mut turn_messages = tool_exchange("work", "execute_command", "ok");
-    turn_messages.extend(tool_exchange(
-        "done",
-        "complete",
-        "Completion assertion recorded: done",
-    ));
-    turn_messages.extend(tool_exchange("retry", "apply_patch", "ok"));
-    let pause = format!("Error: {SCOPED_INSTRUCTIONS_PAUSE_PREFIX}");
-    turn_messages.extend(tool_exchange("patch", "apply_patch", &pause));
-    let mut messages = Vec::new();
-    let action = super::super::outstanding_work_gate_action_with_turn_messages(
-        &app,
-        &mut messages,
-        &turn_messages,
-        false,
-        0,
-        16,
-    );
-    assert_eq!(action, OutstandingWorkGateAction::Allow);
-
-    // A successful retry after the pause is the latest actionable result, so
-    // the earlier receipt no longer covers it.
-    turn_messages.extend(tool_exchange("retry", "apply_patch", "ok"));
-    let action = super::super::outstanding_work_gate_action_with_turn_messages(
-        &app,
-        &mut messages,
-        &turn_messages,
-        false,
-        0,
-        16,
-    );
-    assert_eq!(action, OutstandingWorkGateAction::Reopen);
-    assert!(last_note(&messages).contains("no `complete` call asserts completion"));
     let _ = fs::remove_dir_all(&base);
 }
 
@@ -355,36 +194,11 @@ fn failed_step_blocks_completion() {
 }
 
 #[test]
-fn settled_plan_without_claim_reopens_until_forced_then_warns() {
+fn settled_plan_allows_final_directly() {
     let (app, base) = test_app_with_session();
     two_step_plan(&app);
     update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
     update_plan_step(&app, 2, StepStatus::Skipped, None).unwrap();
-    // A settled plan is not a completion assertion: landing without `complete`
-    // must keep reopening, guiding the model to
-    // assert completion structurally instead of silently ending the turn.
-    let mut messages = Vec::new();
-    let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16);
-    assert_eq!(action, OutstandingWorkGateAction::Reopen);
-    assert!(last_note(&messages).contains("no `complete` call asserts completion"));
-    let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 1, 16);
-    assert_eq!(action, OutstandingWorkGateAction::Reopen);
-    let action = super::super::outstanding_work_gate_action(&app, &mut messages, true, 1, 16);
-    assert_eq!(action, OutstandingWorkGateAction::WarnUnasserted);
-    let _ = fs::remove_dir_all(&base);
-}
-
-#[test]
-fn settled_plan_with_fresh_claim_allows_final() {
-    let (app, base) = test_app_with_session();
-    two_step_plan(&app);
-    update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
-    update_plan_step(&app, 2, StepStatus::Skipped, None).unwrap();
-    let plan_updated = crate::ai::tools::plan_state::load_plan_state(&app)
-        .unwrap()
-        .unwrap()
-        .updated_at_ms;
-    record_completion_claim(&app, "Done", Some(plan_updated)).unwrap();
     let mut messages = Vec::new();
     let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16);
     assert_eq!(action, OutstandingWorkGateAction::Allow);
@@ -393,68 +207,19 @@ fn settled_plan_with_fresh_claim_allows_final() {
 }
 
 #[test]
-fn fresh_claim_is_consumed_but_still_reopens_on_open_work() {
-    let (app, base) = test_app_with_session();
-    two_step_plan(&app);
-    let plan_updated = crate::ai::tools::plan_state::load_plan_state(&app)
-        .unwrap()
-        .unwrap()
-        .updated_at_ms;
-    record_completion_claim(&app, "all done", Some(plan_updated)).unwrap();
-    let mut messages = Vec::new();
-    let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16);
-    assert_eq!(action, OutstandingWorkGateAction::Reopen);
-    assert!(
-        last_note(&messages).contains("called `complete`"),
-        "a fresh claim contradicting open work must be named: {}",
-        last_note(&messages)
-    );
-    // Single-use: the claim file is gone, so the next round cannot reuse it.
-    assert!(load_completion_claim(&app).unwrap().is_none());
-    let _ = fs::remove_dir_all(&base);
-}
-
-#[test]
-fn stale_claim_after_plan_update_is_treated_as_unasserted() {
-    let (app, base) = test_app_with_session();
-    two_step_plan(&app);
-    let plan_updated = crate::ai::tools::plan_state::load_plan_state(&app)
-        .unwrap()
-        .unwrap()
-        .updated_at_ms;
-    record_completion_claim(&app, "all done", Some(plan_updated)).unwrap();
-    // Any plan change bumps updated_at_ms and silently invalidates the claim.
-    update_plan_step(&app, 1, StepStatus::Running, None).unwrap();
-    let mut messages = Vec::new();
-    let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 0, 16);
-    assert_eq!(action, OutstandingWorkGateAction::Reopen);
-    assert!(
-        !last_note(&messages).contains("called `complete`"),
-        "a stale claim must not be presented as a live assertion: {}",
-        last_note(&messages)
-    );
-    let _ = fs::remove_dir_all(&base);
-}
-
-#[test]
 fn reopen_is_recorded_in_the_decision_log() {
     let (app, base) = test_app_with_session();
     two_step_plan(&app);
-    update_plan_step(&app, 1, StepStatus::Done, None).unwrap();
-    update_plan_step(&app, 2, StepStatus::Skipped, None).unwrap();
     let mut messages = Vec::new();
-    // Settled plan, no claim: the gate reopens and must leave an observable
-    // decision-log trail (the model-visible note is projection-only).
+    // Open steps must leave a decision-log trail; the note is projection-only.
     let action = super::super::outstanding_work_gate_action(&app, &mut messages, false, 3, 16);
     assert_eq!(action, OutstandingWorkGateAction::Reopen);
     let recent = crate::ai::driver::decision_log::get_decision_log_store()
         .recent_by_session(&app.session_id, 5);
     assert!(
-        recent.iter().any(|entry| {
-            entry
-                .context
-                .contains("reason=outstanding_work_settled_plan_no_claim")
-        }),
+        recent
+            .iter()
+            .any(|entry| { entry.context.contains("reason=outstanding_work_open_steps") }),
         "reopen must be observable in the decision log: {recent:?}"
     );
     let _ = fs::remove_dir_all(&base);
@@ -484,10 +249,60 @@ fn final_gate_state_keeps_outstanding_reopen_independent() {
     assert!(state.can_reopen_outstanding_work(false, 1, 16));
 
     state.consume_outstanding_work_retry();
-    // Persistent gate: consuming is a no-op; only force/cap stop the reminder.
+    // One consumed retry leaves room in the independent bounded budget.
     assert!(state.can_reopen_outstanding_work(false, 1, 16));
     assert!(!FinalGateState::default().can_reopen_outstanding_work(true, 1, 16));
     assert!(!FinalGateState::default().can_reopen_outstanding_work(false, 16, 16));
+}
+
+#[test]
+fn required_delegation_reopens_once_then_passes() {
+    let mut messages = Vec::new();
+    let mut state = FinalGateState::default();
+
+    assert_eq!(
+        preflight_delegation_requirement_gate_action(
+            &mut messages,
+            true,
+            !state.can_reopen_delegation(false, 1, 16),
+        ),
+        OutstandingWorkGateAction::Reopen
+    );
+    assert!(last_note(&messages).contains("the parent performed the work itself"));
+    assert!(last_note(&messages).contains("without using `task` or `task_spawn`"));
+    assert!(last_note(&messages).contains("Delegate the remaining work now"));
+    assert!(last_note(&messages).contains("state the concrete reason delegation is unsafe"));
+    state.consume_delegation_retry();
+    assert_eq!(
+        preflight_delegation_requirement_gate_action(
+            &mut messages,
+            true,
+            !state.can_reopen_delegation(false, 2, 16),
+        ),
+        OutstandingWorkGateAction::Allow
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message
+                .content
+                .as_str()
+                .is_some_and(|text| text.starts_with(DELEGATION_REQUIRED_RETRY_MARKER)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn delegation_without_divergence_allows_final_without_note() {
+    for retry_consumed in [false, true] {
+        let mut messages = Vec::new();
+        assert_eq!(
+            preflight_delegation_requirement_gate_action(&mut messages, false, retry_consumed),
+            OutstandingWorkGateAction::Allow
+        );
+        assert!(messages.is_empty());
+    }
 }
 
 /// Run `f` as if inside session turn `turn_id` (the scope `run_turn` installs).
@@ -518,7 +333,7 @@ fn plan_from_earlier_turn_does_not_bind_a_new_turn() {
 }
 
 #[test]
-fn settled_plan_from_earlier_turn_does_not_demand_complete() {
+fn settled_plan_from_earlier_turn_allows_final() {
     let (app, base) = test_app_with_session();
     in_turn(&app, 5, || {
         two_step_plan(&app);

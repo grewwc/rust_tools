@@ -315,7 +315,8 @@ pub(in crate::ai) use task_evidence::{
     DeliveredTaskEvidence, integrate_task_evidence, integrate_task_evidence_batch,
     read_integrated_task_ids,
     read_task_evidence_status_payload, read_task_spawn_audit, record_delivered_task_evidence,
-    record_task_spawn_audit, render_unintegrated_task_evidence_resilient, task_evidence_exists,
+    record_task_spawn_audit, record_uncollected_task_terminal_status,
+    render_unintegrated_task_evidence_resilient, task_evidence_exists,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use types::{

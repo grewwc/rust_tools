@@ -7,6 +7,15 @@ use crate::ai::{
     types::App,
 };
 
+/// Write one complete terminal line through the footer-aware stdout path.
+///
+/// Every driver and stream status line goes through this entry: the side-note
+/// composer reserves the bottom row, and a bare `println!` that starts on it would
+/// scroll a partially overwritten composer line into scrollback.
+pub(crate) fn print_line(line: &str) {
+    crate::ai::stream::side_note_input::print_output_line(line);
+}
+
 pub fn print_assistant_banner() {
     print_assistant_banner_with_app(None);
 }
@@ -23,10 +32,10 @@ pub fn print_assistant_banner_with_app_and_skill(app: Option<&App>, skill_name: 
     if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
         return;
     }
-    println!(
-        "{}",
-        format_assistant_banner(app.map(|a| a.current_agent.as_str()), Some(skill_name))
-    );
+    print_line(&format_assistant_banner(
+        app.map(|a| a.current_agent.as_str()),
+        Some(skill_name),
+    ));
 }
 
 /// The terminal no longer prints tool output content, only tool call status lines.
@@ -37,14 +46,14 @@ pub fn print_tool_output_line(line: &str) {
     if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
         return;
     }
-    println!("{}", format_tool_output_line(line));
+    print_line(&format_tool_output_line(line));
 }
 
 pub fn print_tool_note_line(label: &str, value: &str) {
     if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
         return;
     }
-    println!("{}", format_tool_note_line(label, value));
+    print_line(&format_tool_note_line(label, value));
 }
 
 /// Forced skill-activation diagnostics must be emitted as plain terminal lines.
@@ -58,17 +67,19 @@ pub(in crate::ai) fn print_skill_activation_note(
     if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
         return;
     }
-    println!(
-        "{}",
-        format_skill_activation_note(requested_skill, injected_skill, source, outcome)
-    );
+    print_line(&format_skill_activation_note(
+        requested_skill,
+        injected_skill,
+        source,
+        outcome,
+    ));
 }
 
 pub fn print_tool_command_line(command: &str) {
     if !crate::ai::driver::runtime_ctx::terminal_output_enabled() {
         return;
     }
-    println!("{}", format_tool_command_line(command));
+    print_line(&format_tool_command_line(command));
 }
 
 pub fn print_ocr_summary(extraction: &OcrExtraction) {
@@ -76,7 +87,7 @@ pub fn print_ocr_summary(extraction: &OcrExtraction) {
         return;
     }
     for line in format_ocr_summary_block(extraction) {
-        println!("{line}");
+        print_line(&line);
     }
 }
 
@@ -422,7 +433,7 @@ pub(in crate::ai) fn echo_tool_args(tool_name: &str, args_json: &str) {
         .and_then(|v| serde_json::to_string_pretty(&v).ok())
         .unwrap_or_else(|| trimmed.to_string());
     for line in format_tool_output_block(&pretty) {
-        println!("{line}");
+        print_line(&line);
     }
 }
 
@@ -451,7 +462,7 @@ pub(in crate::ai) fn echo_tool_output(tool_name: &str, content: &str, args_json:
         format_tool_output_block(&shown)
     };
     for line in lines {
-        println!("{line}");
+        print_line(&line);
     }
 }
 

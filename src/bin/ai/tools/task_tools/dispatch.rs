@@ -127,6 +127,7 @@ pub(crate) fn reap_timed_out_subagents() {
             .map(|(task_id, e)| {
                 (
                     task_id.clone(),
+                    e.session_id.clone(),
                     e.pid,
                     e.result_channel_id,
                     e.completion_futex_addr,
@@ -141,7 +142,7 @@ pub(crate) fn reap_timed_out_subagents() {
     }
     // Step 2: holding no lock, stop the real Tokio Future first so it cannot write a result
     // concurrently with the timeout terminal state.
-    for (_, _, _, _, abort_handle, cancel_stream) in &candidates {
+    for (_, _, _, _, _, abort_handle, cancel_stream) in &candidates {
         cancel_stream.store(true, Ordering::Release);
         if let Some(handle) = abort_handle {
             handle.abort();
@@ -150,7 +151,7 @@ pub(crate) fn reap_timed_out_subagents() {
     // Step 3: hold only the kernel lock and check each process; if still running, kill it + write
     // the timeout terminal state.
     let _ = with_os_kernel(|os| {
-        for (task_id, pid, result_channel_id, completion_futex_addr, _, _) in candidates {
+        for (task_id, session_id, pid, result_channel_id, completion_futex_addr, _, _) in candidates {
             if !is_task_pending(os, pid)? {
                 // The process already ended (completed normally / failed / killed by someone
                 // else); skip it — result and resource cleanup are handled by the collector.
@@ -167,6 +168,11 @@ pub(crate) fn reap_timed_out_subagents() {
                     "Subagent exceeded wall-clock lifetime of {}s (reaped by scheduler; likely stuck in a non-returning tool execution)",
                     SUBAGENT_WALL_CLOCK_TIMEOUT.as_secs()
                 ),
+            );
+            record_uncollected_terminal_status(
+                &session_id,
+                &task_id,
+                TaskTerminalStatus::Timeout.as_str(),
             );
         }
         Ok(())
@@ -555,11 +561,9 @@ pub(crate) fn discard_tasks_for_session(session_id: &str) {
         .into_iter()
         .map(|(task_id, _, _, _, _, _)| task_id)
         .collect::<Vec<_>>();
-    {
-        let mut registry = lock_task_registry();
-        for task_id in &task_ids {
-            registry.remove(task_id);
-        }
+    for task_id in &task_ids {
+        remove_task_entry(task_id);
+        super::traecli::forget_traecli_session(task_id);
     }
     {
         let mut progress_registry = lock_unpoisoned(&TASK_PROGRESS_REGISTRY);
@@ -626,6 +630,7 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
                 {
                     Some((
                         tid.clone(),
+                        entry.session_id.clone(),
                         entry.pid,
                         entry.result_channel_id,
                         entry.completion_futex_addr,
@@ -644,14 +649,14 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
     // The real Tokio Future must be stopped before entering the kernel to write the cancelled
     // terminal state; otherwise, after the logical process is terminated, network requests or
     // tool calls can still run in the background and race with the terminal write.
-    for (_, _, _, _, abort_handle, cancel_stream) in &candidates {
+    for (_, _, _, _, _, abort_handle, cancel_stream) in &candidates {
         cancel_stream.store(true, Ordering::Release);
         if let Some(handle) = abort_handle {
             handle.abort();
         }
     }
 
-    for (tid, pid, result_channel_id, completion_futex_addr, _, _) in candidates {
+    for (tid, session_id, pid, result_channel_id, completion_futex_addr, _, _) in candidates {
         // Only cancel subagents that are still running. Tasks that already ended (completed
         // normally / failed / process terminated) are neither killed nor given a terminal result —
         // otherwise a "cancelled" message would be appended to the channel and the channel
@@ -675,6 +680,11 @@ pub(crate) fn execute_task_cancel(args: &Value) -> Result<String, String> {
             Ok(true)
         })?;
         if was_pending {
+            record_uncollected_terminal_status(
+                &session_id,
+                &tid,
+                TaskTerminalStatus::Cancelled.as_str(),
+            );
             cancelled.push(tid);
         } else {
             already_finished.push(tid);
@@ -733,10 +743,16 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
         return Ok("No async tasks currently tracked.".to_string());
     }
 
-    let mut lines = vec![
-        "TaskID                               PID      Agent          Model          State       Description"
-            .to_string(),
-    ];
+    let model_width = tracked
+        .iter()
+        .map(|(_, entry)| entry.model.len())
+        .max()
+        .unwrap_or(0)
+        .max(14);
+    let mut lines = vec![format!(
+        "{:<37} {:<8} {:<14} {:<model_width$} {:<17} {:<11} {}",
+        "TaskID", "PID", "Agent", "Model", "Effort", "State", "Description"
+    )];
     // For subtasks that already wrote their result back to the channel, **consume and clean up**
     // the body directly and append it after the table. Otherwise, even if the model sees
     // state=completed, it can only get the output by calling task_wait again; worse, if it treats
@@ -745,15 +761,24 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
     // to the model here, treat it as collected.
     let mut completed_outputs: Vec<String> = Vec::new();
     let mut finished_ids: Vec<String> = Vec::new();
+    let mut printed_progress = false;
     let kernel_result = with_os_kernel(|os| {
         for (tid, entry) in &tracked {
             let state_str = task_state_string(os, entry.result_channel_id, entry.pid)?;
+            let reasoning_effort = task_reasoning_effort(tid);
             lines.push(format!(
-                "{:<37} {:<8} {:<14} {:<14} {:<11} {}",
-                tid, entry.pid, entry.agent_name, entry.model, state_str, entry.description
+                "{:<37} {:<8} {:<14} {:<model_width$} {:<17} {:<11} {}",
+                tid,
+                entry.pid,
+                entry.agent_name,
+                entry.model,
+                reasoning_effort.as_deref().unwrap_or("-"),
+                state_str,
+                entry.description
             ));
             if let Some(progress) = current_task_progress(tid) {
                 lines.push(format!("  progress[{tid}]: {progress}"));
+                printed_progress = true;
             }
             if let Some(collected) =
                 drain_task_result(os, tid, entry, "subagent result collected by task_status")?
@@ -767,13 +792,17 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
     // Remove collected entries even when a later task failed mid-batch. Their channels and
     // futexes are already destroyed, so a stranded entry would make every later task_status /
     // task_wait call fail on a missing channel.
-    if !finished_ids.is_empty() {
-        let mut registry = lock_task_registry();
-        for task_id in &finished_ids {
-            registry.remove(task_id);
-        }
+    for task_id in &finished_ids {
+        remove_task_entry(task_id);
     }
     kernel_result?;
+
+    if printed_progress {
+        lines.push(
+            "Progress notes: recent last activity means the task is still working; a terminal state or a long-stale snapshot means it is stalled. Use task_wait only when blocked on a result."
+                .to_string(),
+        );
+    }
 
     if !completed_outputs.is_empty() {
         lines.push(String::new());

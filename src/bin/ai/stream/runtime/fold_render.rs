@@ -167,9 +167,19 @@ pub(super) fn thinking_fold_redraw(
     rate: Option<&str>,
     fold: &mut super::state::ThinkingFoldState,
 ) -> io::Result<()> {
+    // Ask for the reflowed width before taking the stdout lock: the listener answers with
+    // `CSI 18 t` through that same lock, so waiting while holding it would stall both for
+    // the whole budget and keep the composer row from repainting.
+    super::side_note_input::refresh_true_width();
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    thinking_fold_redraw_to(&mut out, rate, fold)
+    thinking_fold_redraw_to(&mut out, rate, fold)?;
+    // The fold erases and rewrites a window with relative cursor moves. If its cursor has
+    // drifted onto the reserved footer row, that erase crosses into the composer; repaint
+    // the draft in the same locked write so it is never left hidden until the listener's
+    // next poll redraw.
+    let _ = super::side_note_input::repaint_composer(&mut out);
+    out.flush()
 }
 
 pub(super) fn thinking_fold_redraw_to(
@@ -177,11 +187,10 @@ pub(super) fn thinking_fold_redraw_to(
     rate: Option<&str>,
     fold: &mut super::state::ThinkingFoldState,
 ) -> io::Result<()> {
-    // Measure against the emulator's reflowed width before any counting: inside the
-    // window where xterm.js has already rewrapped the drawn rows but the PTY winsize
-    // has not arrived, ioctl reports the old width and every span below would land
-    // short, stranding the previous header. A no-op when no listener can answer.
-    super::side_note_input::refresh_true_width();
+    // Callers measure against the emulator's reflowed width first (`thinking_fold_redraw`
+    // does so before taking the lock): inside the window where xterm.js has already
+    // rewrapped the drawn rows but the PTY winsize has not arrived, ioctl reports the old
+    // width and every span below would land short, stranding the previous header.
     // Erase the region currently on screen — header rows plus body rows — and redraw the header on the
     // region's first row on every redraw, so the window stays anchored where the fold started.
     //
@@ -344,9 +353,17 @@ pub(super) fn finalize_fold(
     fold: &mut super::state::ThinkingFoldState,
     collapse_body: bool,
 ) -> io::Result<()> {
+    // Same lock discipline as `thinking_fold_redraw`: the width round-trip needs the
+    // listener, and the listener needs the stdout lock to answer. An inactive fold
+    // writes nothing, so skip the round trip entirely.
+    if fold.active {
+        super::side_note_input::refresh_true_width();
+    }
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    finalize_fold_to(&mut out, fold, collapse_body)
+    finalize_fold_to(&mut out, fold, collapse_body)?;
+    let _ = super::side_note_input::repaint_composer(&mut out);
+    out.flush()
 }
 
 /// Fold-finalize writer implementation; extracted behind a writer so regression tests can verify terminal cursor sequences precisely.
@@ -355,9 +372,8 @@ pub(super) fn finalize_fold_to(
     fold: &mut super::state::ThinkingFoldState,
     collapse_body: bool,
 ) -> io::Result<()> {
-    // Same reflowed-width discipline as `thinking_fold_redraw_to`: the header rewrite
-    // below moves the cursor up by rows recomputed at the width in force now.
-    super::side_note_input::refresh_true_width();
+    // The header rewrite below moves the cursor up by rows recomputed at the width in
+    // force now; callers refresh that width before taking the lock.
     if !fold.active {
         return Ok(());
     }

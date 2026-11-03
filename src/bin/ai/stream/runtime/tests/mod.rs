@@ -31,7 +31,6 @@ impl StreamFilter for PrefixStreamFilter {
     }
 }
 
-
 fn test_app() -> App {
     App {
         cli: ParsedCli::default(),
@@ -54,6 +53,9 @@ fn test_app() -> App {
         client: reqwest::Client::builder().build().unwrap(),
         current_model: String::new(),
         current_agent: String::new(),
+        session_default_subagent_backend: Default::default(),
+        session_default_subagent_model: None,
+        session_default_skills: Vec::new(),
         current_agent_manifest: None,
         pending_files: None,
         forced_skills: Vec::new(),
@@ -106,17 +108,17 @@ impl Drop for SavedColumns {
     }
 }
 
-mod metrics;
-mod terminal_dedupe;
-mod degenerate;
-mod interrupt;
-mod closing_marker;
-mod inline_recovery;
-mod payload_processing;
-mod thinking_fold;
-mod fold_display;
 mod cancelled_stream;
+mod closing_marker;
+mod degenerate;
+mod demuxer;
+mod fold_display;
+mod golden_wire;
+mod inline_recovery;
+mod interrupt;
+mod metrics;
+mod payload_processing;
 mod snapshot_done;
 mod stream_response;
-mod demuxer;
-mod golden_wire;
+mod terminal_dedupe;
+mod thinking_fold;

@@ -69,8 +69,10 @@ pub(super) fn lone_spawn_hint_note(waited_task_ids: &[String]) -> Option<String>
     Some(
         "[tool_followup:lone_spawn]\n\
          This task_wait collects the only task spawned by the most recent task_spawn call. \
-         Spawning a single task and waiting on it adds no concurrency: for one-task handoffs use \
-         the synchronous `task` tool instead of task_spawn + task_wait. \
+         Without parent-side work in between, task_spawn + task_wait adds no concurrency over the \
+         synchronous `task` tool. Keep the asynchronous form when an orchestration policy requires \
+         it or its immediate spawn status matters; otherwise prefer synchronous `task` for \
+         one-shot handoffs. \
          (If you intentionally ran parent-side work between spawn and wait, ignore this hint.)"
             .to_string(),
     )
@@ -291,10 +293,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         .map(|tid| {
             (
                 tid.clone(),
-                registry
-                    .get_ref(tid)
-                    .expect("validated task id")
-                    .clone(),
+                registry.get_ref(tid).expect("validated task id").clone(),
             )
         })
         .collect::<FxHashMap<_, _>>();
@@ -485,12 +484,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             pending.clear();
             for tid in &pending_ids {
                 let entry = entries.get(tid).expect("validated after wait");
-                match drain_task_result(
-                    os,
-                    tid,
-                    entry,
-                    "subagent result collected after wait",
-                )? {
+                match drain_task_result(os, tid, entry, "subagent result collected after wait")? {
                     Some(collected) => {
                         ready.push(collected.rendered);
                         finished.push(tid.clone());
@@ -555,7 +549,11 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     if let Some(message) = wait_message {
         return Ok(append_lone_spawn_hint(message, lone_spawn_hint.as_deref()));
     }
-    if wait_policy == WaitPolicy::Any && !ready.is_empty() {
+    // `any` exists to return the first finisher without blocking on the rest. Once the wait
+    // budget has already elapsed, the owner was woken for the timeout, so returning ready
+    // results alone would hide the still-pending tasks and clear the elapsed wait state.
+    // Fall through to the elapsed branch, which reports both ready output and pending ids.
+    if wait_policy == WaitPolicy::Any && !ready.is_empty() && !wait_budget_elapsed {
         clear_task_wait_state(&wait_key);
         return Ok(append_lone_spawn_hint(
             ready.join("\n\n---\n\n"),
@@ -630,6 +628,7 @@ pub(super) fn write_terminal_subagent_result(
     // state alone does not stop the Future inside the hosting process. Only then terminate the
     // kernel process and publish the terminal result.
     let _ = os.kill_process(pid, format!("{}: {}", status, error));
+    let backend_session = record_traecli_session(task_id, None);
     // Then write the terminal result as the subagent and release the producer side (the result
     // channel's producer ownership check requires current == pid). Although the process is already
     // terminated, the channel/futex resources are not reclaimed yet (that happens in
@@ -641,6 +640,7 @@ pub(super) fn write_terminal_subagent_result(
         "output": "",
         "error": error,
         "progress": current_task_progress(task_id),
+        "backend_session": backend_session,
     })
     .to_string();
     let _ = os.channel_send(Some(pid), ChannelId(result_channel_id), payload);
@@ -708,13 +708,24 @@ pub(super) fn task_state_string(
     Ok(state.to_string())
 }
 
-pub(super) fn format_task_result(entry: &AsyncTaskEntry, result: StoredTaskResult) -> String {
+pub(crate) fn format_subagent_model_label(model: &str, reasoning_effort: Option<&str>) -> String {
+    match reasoning_effort {
+        Some(effort) => format!("{model} (effort: {effort})"),
+        None => model.to_string(),
+    }
+}
+
+pub(super) fn format_task_result(
+    entry: &AsyncTaskEntry,
+    result: StoredTaskResult,
+    reasoning_effort: Option<&str>,
+) -> String {
     let duration_secs = entry.started_at.elapsed().as_secs_f64();
     let mut parts = vec![format!(
         "[Task: {} via {} @ {}] {} after {:.1}s",
         entry.description,
         entry.agent_name,
-        entry.model,
+        format_subagent_model_label(&entry.model, reasoning_effort),
         result.status.to_uppercase(),
         duration_secs
     )];
@@ -738,6 +749,11 @@ pub(super) fn format_task_result(entry: &AsyncTaskEntry, result: StoredTaskResul
     } else {
         parts.push("(subagent did not produce any final assistant text)".to_string());
     }
+    if let Some(session) = result.backend_session
+        && !session.trim().is_empty()
+    {
+        parts.push(backend_session_footer(&session));
+    }
     parts.push(SUBAGENT_PARENT_SUMMARY_REMINDER.to_string());
     parts.join("\n")
 }
@@ -748,11 +764,132 @@ pub(super) fn format_task_result_with_id(
     result: StoredTaskResult,
 ) -> String {
     let retryable = is_retryable_task_status(&result.status);
-    let mut rendered = format!("[task_id={task_id}]\n{}", format_task_result(entry, result));
+    let reasoning_effort = task_reasoning_effort(task_id);
+    let mut rendered = format!(
+        "[task_id={task_id}]\n{}",
+        format_task_result(entry, result, reasoning_effort.as_deref())
+    );
     if retryable {
         rendered.push_str(&format!(
             "\nRetry available: call `task_retry` with `task_id=\"{task_id}\"` to rerun the same subagent configuration as a new linked attempt."
         ));
     }
     rendered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aios_kernel::kernel::{KernelInternal, Syscall};
+    use aios_kernel::local::LocalOS;
+    use aios_kernel::primitives::{FutexOps, IpcOps};
+
+    #[test]
+    fn traecli_terminal_results_surface_session_after_collection() {
+        let _env_guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let session = "cccccccc-1111-2222-3333-444444444444";
+        for status in [
+            TaskTerminalStatus::Failed,
+            TaskTerminalStatus::Cancelled,
+            TaskTerminalStatus::Timeout,
+        ] {
+            for known_session in [true, false] {
+                let task_id = format!("task_{}", Uuid::new_v4().simple());
+                let slot = super::super::traecli::track_traecli_session(&task_id);
+                if known_session {
+                    *lock_unpoisoned(&slot) = Some(session.to_string());
+                }
+                assert!(resolve_continue_target(&task_id).is_err());
+
+                let mut os = LocalOS::new();
+                let owner_pid =
+                    os.begin_foreground("parent".to_string(), "goal".to_string(), 10, 8, None);
+                let pid = os
+                    .spawn(
+                        Some(owner_pid),
+                        "child".to_string(),
+                        "goal".to_string(),
+                        20,
+                        8,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                let channel = os.channel_create_tagged_with_holders(
+                    Some(owner_pid),
+                    1,
+                    "task-result".to_string(),
+                    ChannelOwnerTag::TaskResult,
+                    vec![
+                        "task_result.producer".to_string(),
+                        "task_result.consumer".to_string(),
+                    ],
+                );
+                let completion_futex = os.futex_create(0, "task-complete".to_string());
+                let entry = AsyncTaskEntry {
+                    session_id: String::new(),
+                    owner_pid,
+                    pid,
+                    result_channel_id: channel.raw(),
+                    completion_futex_addr: completion_futex,
+                    description: "resume terminal run".to_string(),
+                    agent_name: "explore".to_string(),
+                    backend: Some(SubagentBackend::TraeCli),
+                    model: "backend-test-model".to_string(),
+                    is_model_auto_selected: false,
+                    auto_model_fallback: None,
+                    selection_explanation: "explicit override".to_string(),
+                    inherit: InheritOptions::default(),
+                    abort_handle: None,
+                    cancel_stream: Arc::new(AtomicBool::new(false)),
+                    started_at: Instant::now(),
+                    last_progress_notification_at: None,
+                    last_progress_persisted_at: None,
+                };
+                insert_task_entry_for_test(task_id.clone(), entry.clone());
+                let error = "original terminal reason";
+                write_terminal_subagent_result(
+                    &mut os,
+                    &task_id,
+                    pid,
+                    channel.raw(),
+                    completion_futex,
+                    status.as_str(),
+                    error,
+                );
+                let collected = drain_task_result(&mut os, &task_id, &entry, "test collection")
+                    .unwrap()
+                    .expect("collectable terminal result");
+                let result = collected.result;
+                assert_eq!(result.status, status.as_str());
+                assert_eq!(result.error.as_deref(), Some(error));
+                assert_eq!(
+                    result.backend_session.as_deref(),
+                    known_session.then_some(session)
+                );
+                let output = collected.rendered;
+                assert!(output.contains(&format!("Failure reason: {error}")));
+                if known_session {
+                    assert!(
+                        output.contains(&backend_session_footer(session)),
+                        "{output}"
+                    );
+                } else {
+                    assert!(!output.contains("Backend session:"), "{output}");
+                }
+
+                remove_task_entry(&task_id).expect("collected task entry");
+                assert!(os.channel_meta(channel).is_none());
+                assert!(os.futex_event_id(completion_futex).is_none());
+                assert!(os.get_process(pid).is_none());
+                if known_session {
+                    assert_eq!(resolve_continue_target(&task_id).unwrap(), session);
+                } else {
+                    assert!(resolve_continue_target(&task_id).is_err());
+                }
+            }
+        }
+    }
 }

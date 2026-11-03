@@ -56,6 +56,31 @@ pub(super) fn has_pending_foreground_process(app: &App) -> bool {
     })
 }
 
+pub(super) const PARKED_FOREGROUND_INTERRUPT_MESSAGE: &str = "The user pressed Ctrl+C while this foreground process was waiting for subagents. \
+     Treat the wait as interrupted and do not re-enter task_wait automatically. \
+     Return control to the interactive session; subagents may still be running.";
+
+/// Wake the foreground process that was parked by cooperative scheduling.
+///
+/// `wake_process` also appends the message when completion won the race and the
+/// process is already ready, so the resumed turn still observes the interrupt.
+pub(super) fn interrupt_pending_foreground_process(app: &App) -> bool {
+    let mut os = app.os.lock().unwrap();
+    let Some(pid) = os
+        .list_processes()
+        .into_iter()
+        .find(|proc| {
+            proc.is_foreground
+                && !matches!(proc.state, aios_kernel::kernel::ProcessState::Terminated)
+        })
+        .map(|proc| proc.pid)
+    else {
+        return false;
+    };
+    let _ = os.wake_process(pid, PARKED_FOREGROUND_INTERRUPT_MESSAGE.to_string());
+    true
+}
+
 /// Loads all agents fresh from disk, enabling hot-reload of newly added/modified agents.
 /// Returns a message to show when something changed; the foreground driver
 /// prints it after clearing the dynamic status line.
@@ -225,7 +250,7 @@ pub(super) fn install_runtime_manifests(
         if let Some(agent) = agents::find_agent_by_name(agent_manifests, agent_name) {
             if agent.is_primary() && !agent.disabled {
                 activate_primary_agent(app, agent);
-                println!("[agent] using: {}", agent.name);
+                crate::ai::driver::print::print_line(&format!("[agent] using: {}", agent.name));
             } else {
                 eprintln!(
                     "[Warning] Agent '{}' is not available, using default",
@@ -290,8 +315,8 @@ mod tests {
         assert_eq!(
             agent_manifests_fingerprint(&[manifest_fixture()]),
             [
-                110, 129, 20, 25, 90, 29, 111, 243, 9, 183, 49, 104, 167, 96, 184, 60, 167, 70,
-                98, 254, 69, 114, 114, 58, 160, 85, 74, 172, 197, 168, 88, 139,
+                110, 129, 20, 25, 90, 29, 111, 243, 9, 183, 49, 104, 167, 96, 184, 60, 167, 70, 98,
+                254, 69, 114, 114, 58, 160, 85, 74, 172, 197, 168, 88, 139,
             ]
         );
     }

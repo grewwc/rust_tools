@@ -33,6 +33,7 @@ pub(super) fn collect_outstanding_task_snapshots(
                 status: task_state_string(os, *result_channel_id, *pid)?,
                 agent_name: agent_name.clone(),
                 model: model.clone(),
+                reasoning_effort: task_reasoning_effort(task_id),
                 description: description.clone(),
                 progress: current_task_progress(task_id),
             });
@@ -58,12 +59,18 @@ pub(super) fn render_outstanding_task_anchor(snapshots: &[OutstandingTaskSnapsho
         ),
     ];
     for snapshot in snapshots {
+        let effort = snapshot
+            .reasoning_effort
+            .as_deref()
+            .map(|effort| format!(" effort={effort}"))
+            .unwrap_or_default();
         lines.push(format!(
-            "- task_id={} status={} agent={} model={} desc={}",
+            "- task_id={} status={} agent={} model={}{} desc={}",
             snapshot.task_id,
             snapshot.status,
             snapshot.agent_name,
             snapshot.model,
+            effort,
             snapshot.description
         ));
         if let Some(progress) = &snapshot.progress {
@@ -98,6 +105,22 @@ pub(crate) fn build_abandoned_tasks_notice(
     session_id: &str,
     iteration_limit: usize,
 ) -> Result<Option<String>, String> {
+    build_uncollected_tasks_notice(
+        session_id,
+        &format!("the tool iteration limit ({iteration_limit}) was reached"),
+    )
+}
+
+/// Same snapshot fold as [`build_abandoned_tasks_notice`], but with a caller
+/// supplied reason instead of the iteration-limit wording. Used when the turn
+/// finalizes early for a reason other than the hard cap (e.g. no-tool
+/// wrap-up): the model gets no further tool rounds, so still-running subtasks
+/// are reported in the final answer rather than silently dropped or
+/// re-demanded via a reopen that would fight the wrap-up brake.
+pub(crate) fn build_uncollected_tasks_notice(
+    session_id: &str,
+    reason: &str,
+) -> Result<Option<String>, String> {
     let Some(owner_pid) = current_task_owner_pid_opt() else {
         return Ok(None);
     };
@@ -105,18 +128,33 @@ pub(crate) fn build_abandoned_tasks_notice(
     if snapshots.is_empty() {
         return Ok(None);
     }
+    for snapshot in &snapshots {
+        if TaskTerminalStatus::parse(&snapshot.status).is_some() {
+            record_uncollected_terminal_status(
+                session_id,
+                &snapshot.task_id,
+                &snapshot.status,
+            );
+        }
+    }
     let mut lines = vec![format!(
-        "The following {} spawned subagent task(s) were still outstanding when the tool iteration limit ({}) was reached; their results were NOT collected and are not reflected in this answer:",
+        "The following {} spawned subagent task(s) were still outstanding when {}; their results were NOT collected and are not reflected in this answer:",
         snapshots.len(),
-        iteration_limit
+        reason
     )];
     for snapshot in &snapshots {
+        let effort = snapshot
+            .reasoning_effort
+            .as_deref()
+            .map(|effort| format!(" effort={effort}"))
+            .unwrap_or_default();
         lines.push(format!(
-            "- task_id={} status={} agent={} model={} desc={}",
+            "- task_id={} status={} agent={} model={}{} desc={}",
             snapshot.task_id,
             snapshot.status,
             snapshot.agent_name,
             snapshot.model,
+            effort,
             snapshot.description
         ));
         if let Some(progress) = &snapshot.progress {
@@ -141,6 +179,8 @@ pub(crate) struct StoredTaskResult {
     pub(crate) error: Option<String>,
     #[serde(default)]
     pub(crate) progress: Option<String>,
+    #[serde(default)]
+    pub(crate) backend_session: Option<String>,
 }
 
 pub(super) fn read_task_result(

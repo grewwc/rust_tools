@@ -187,16 +187,18 @@ pub(in crate::ai) struct SessionTitle {
     pub(in crate::ai) origin: SessionTitleOrigin,
 }
 
-/// Per-session serve-mode defaults (model / agent / reasoning effort) for the
-/// mobile serve client. Stored in the session's meta table, so they belong to
-/// the session itself: changing the model in one session never leaks into
-/// another, and reopening a session restores its picks. `None` means "server
-/// default".
+/// Per-session runtime defaults stored in the session's meta table, so they
+/// belong to the session itself: changing one session never leaks into another,
+/// and reopening a session restores its picks. `None` means the built-in
+/// default for that field; an empty skill set means no sticky skills.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(in crate::ai) struct SessionServeConfig {
     pub model: Option<String>,
     pub agent: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub subagent_backend: Option<String>,
+    pub subagent_model: Option<String>,
+    pub default_skills: Vec<String>,
 }
 
 impl SessionStore {
@@ -1238,9 +1240,9 @@ impl SessionStore {
         write_session_archived_sqlite(&self.session_history_file(session_id), archived)
     }
 
-    /// Read the session's persisted serve-mode config. A missing session (or
-    /// one without stored picks) yields all-defaults, matching how titles and
-    /// marks read as absent for a session that does not exist yet.
+    /// Read the session's persisted runtime config. A missing session (or one
+    /// without stored picks) yields all-defaults, matching how titles and marks
+    /// read as absent for a session that does not exist yet.
     pub(in crate::ai) fn read_session_serve_config(
         &self,
         session_id: &str,
@@ -1253,7 +1255,7 @@ impl SessionStore {
         read_session_serve_config_sqlite(&path)
     }
 
-    /// Atomically persist the session's serve-mode config (see
+    /// Atomically persist the session's runtime config (see
     /// `write_session_serve_config_sqlite`).
     pub(in crate::ai) fn write_session_serve_config(
         &self,
@@ -2203,8 +2205,8 @@ fn strip_filler_prefixes(text: &str) -> String {
 mod tests {
     use super::{
         SESSION_SIZE_CACHE_FILE, SessionStore, SessionTitleOrigin, generate_session_summary,
-        is_low_quality_session_title, normalize_generated_session_title, strip_think_tags,
-        strip_terminal_prompt_echo,
+        is_low_quality_session_title, normalize_generated_session_title,
+        strip_terminal_prompt_echo, strip_think_tags,
     };
     use crate::ai::history::{Message, append_history_messages};
     use serde_json::Value;

@@ -155,10 +155,22 @@ pub(crate) struct PreparedSubagentTask {
     pub(crate) response_schema: Option<Value>,
     pub(crate) agent_name: String,
     pub(crate) model: String,
+    pub(crate) reasoning_effort: Option<String>,
     pub(crate) is_model_auto_selected: bool,
     pub(crate) auto_model_fallback: Option<models::AutoModelFallbackSpec>,
     pub(crate) selection_explanation: String,
     pub(crate) inherit: InheritOptions,
+    pub(crate) backend: SubagentBackend,
+    pub(crate) show_backend_launch_tag: bool,
+    /// Optional model override for external backends; ignored by the kernel runner.
+    pub(crate) backend_model: Option<String>,
+    /// Optional resume target for external backends (a previous task_id or a
+    /// raw backend session id); resolved at dispatch time. Ignored by kernel.
+    pub(crate) backend_continue_from: Option<String>,
+    /// Original images attached to the parent turn. The kernel path attaches
+    /// them to the child's first message; external backends receive them as
+    /// image arguments and absolute paths in the prompt.
+    pub(crate) image_files: Vec<String>,
 }
 
 pub(in crate::ai) fn capped_subagent_manifest(agent: &AgentManifest) -> AgentManifest {
@@ -177,22 +189,48 @@ pub(super) fn wrap_subagent_prompt(
     prompt: &str,
     response_schema: Option<&Value>,
 ) -> String {
-    let response_contract = response_schema
-        .map(|schema| {
+    let response_contract = match response_schema {
+        Some(schema) => {
             let schema =
                 serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string());
             format!(
                 include_str!("prompts/subagent_response_schema.md"),
                 schema = schema
             )
-        })
-        .unwrap_or_default();
+        }
+        // Without an explicit schema the parent still needs a stable, auditable
+        // shape (evidence + unresolved gaps), not free prose. This is guidance
+        // only: no default JSON enforcement, which would break agents that
+        // legitimately answer in prose or with an envelope.
+        None => include_str!("prompts/subagent_default_response_contract.md").to_string(),
+    };
     format!(
         include_str!("prompts/subagent_wrap.md"),
         task_description = description.trim(),
         response_contract = response_contract,
         parent_prompt = prompt.trim()
     )
+}
+
+/// External backends cannot see the parent's message content. Carry the
+/// original image paths in the task prompt so the child can attach them on the
+/// first request (TraeCLI `-i`) and re-open them on any later turn.
+fn append_image_files_hint(mut prompt: String, image_files: &[String]) -> String {
+    if image_files.is_empty() {
+        return prompt;
+    }
+    prompt.push_str("\n\n## Original images\n");
+    prompt.push_str("The parent turn attached these original image files:\n");
+    for path in image_files {
+        prompt.push_str("- ");
+        prompt.push_str(path);
+        prompt.push('\n');
+    }
+    prompt.push_str(
+        "The first request includes these images. Use your image viewer on a path \
+         (`read_file` / `view_image`) whenever you need the original again.",
+    );
+    prompt
 }
 
 pub(super) fn parse_response_schema(args: &Value) -> Result<Option<Value>, String> {
@@ -255,11 +293,50 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
 
     let inherit = InheritOptions::from_value(&args["inherit"])?;
     let response_schema = parse_response_schema(args)?;
+    let backend_model = parse_backend_model(args.get("backend_model"))?;
+    let backend_continue_from = parse_backend_continue_from(args.get("backend_continue_from"))?;
+    let explicit_backend = SubagentBackend::parse_optional(args.get("backend"))?;
+    let cached = crate::ai::driver::runtime_ctx::try_current();
+    let session_backend = cached
+        .as_ref()
+        .map(|ctx| ctx.app_proto.session_default_subagent_backend)
+        .unwrap_or_default();
+    let backend = explicit_backend.unwrap_or_else(|| {
+        if backend_continue_from.is_some() {
+            SubagentBackend::TraeCli
+        } else {
+            session_backend
+        }
+    });
+    // The worker model belongs to the external backend, never to the main
+    // agent's model registry. Per-call choices override the session pick.
+    let backend_model = backend_model.or_else(|| {
+        if backend.is_traecli() {
+            cached
+                .as_ref()
+                .and_then(|ctx| ctx.app_proto.session_default_subagent_model.clone())
+        } else {
+            None
+        }
+    });
+    let show_backend_launch_tag = explicit_backend.is_some()
+        || backend.is_traecli()
+        || matches!(session_backend, SubagentBackend::TraeCli);
+    if backend_continue_from.is_some() && matches!(explicit_backend, Some(SubagentBackend::Kernel))
+    {
+        return Err("'backend_continue_from' needs backend 'traecli'".to_string());
+    }
 
     // Prefer the agent_manifests cached in DRIVER_CTX, so each task_spawn does not re-read the
     // disk. When not inside a DRIVER_CTX scope (rare, e.g. unit tests), fall back to
     // load_all_agents().
-    let cached = crate::ai::driver::runtime_ctx::try_current();
+    // Original images belong to the parent turn, not to the agent manifest.
+    // Snapshot them here so the background dispatch loop and external backend
+    // keep using this task's images after the foreground turn has moved on.
+    let image_files = cached
+        .as_ref()
+        .map(|ctx| ctx.app_proto.attached_image_files.clone())
+        .unwrap_or_default();
     let owned_fallback;
     let all_agents: &[AgentManifest] = if let Some(ref ctx) = cached {
         ctx.agent_manifests.as_slice()
@@ -303,17 +380,41 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
         model_override,
         inherited_parent_model,
     );
+    let reasoning_effort = if backend.is_traecli() {
+        None
+    } else {
+        Some(
+            crate::ai::request::reasoning_effort_display_label_for_subagent(
+                &selected.agent.name,
+                &selected_model,
+            )
+            .to_string(),
+        )
+    };
+
+    let prompt = wrap_subagent_prompt(description, prompt, response_schema.as_ref());
+    let prompt = if backend.is_traecli() {
+        append_image_files_hint(prompt, &image_files)
+    } else {
+        prompt
+    };
 
     Ok(PreparedSubagentTask {
         description: description.to_string(),
-        prompt: wrap_subagent_prompt(description, prompt, response_schema.as_ref()),
+        prompt,
         response_schema,
         agent_name: selected.agent.name.clone(),
         model: selected_model,
+        reasoning_effort,
         is_model_auto_selected,
         auto_model_fallback,
         selection_explanation,
         inherit,
+        backend,
+        show_backend_launch_tag,
+        backend_model,
+        backend_continue_from,
+        image_files,
     })
 }
 
@@ -382,6 +483,12 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
             ));
         }
     }
+    if prepared.backend.is_traecli() && !traecli_binary_available() {
+        return Err(format!(
+            "traecli backend requested but binary '{}' was not found; install traecli or set TRAECLI_BIN",
+            traecli_binary()
+        ));
+    }
     let task_id = next_task_id();
     let mut pending_ipc = None;
     let spawned = with_os_kernel(|os| {
@@ -417,6 +524,20 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
             selection_explanation: prepared.selection_explanation.clone(),
             spawn_depth: child_depth,
             response_schema: prepared.response_schema.clone(),
+            backend: prepared
+                .show_backend_launch_tag
+                .then(|| prepared.backend.as_str().to_string()),
+            backend_model: prepared.backend_model.clone(),
+            backend_continue_from: prepared.backend_continue_from.clone(),
+            // Snapshot now: background dispatch may run after this turn ends,
+            // when the live driver context no longer carries the guard state.
+            // Kernel tasks never read it, so their payload keeps the old shape.
+            active_skill_names: if prepared.backend.is_traecli() {
+                crate::ai::driver::runtime_ctx::active_skill_names()
+            } else {
+                Vec::new()
+            },
+            image_files: prepared.image_files.clone(),
         })?;
         let pid = os.spawn(
             Some(parent_pid),
@@ -446,7 +567,17 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
                 completion_futex_addr,
                 description: prepared.description.clone(),
                 agent_name: prepared.agent_name.clone(),
-                model: prepared.model.clone(),
+                backend: prepared.backend.is_traecli().then_some(prepared.backend),
+                // External backends run on their own model, so records and the
+                // status line report that instead of the unused kernel-side
+                // selection. Kernel entries keep the provider model.
+                model: if prepared.backend.is_traecli() {
+                    crate::ai::tools::task_tools::traecli_model_for(
+                        prepared.backend_model.as_deref(),
+                    )
+                } else {
+                    prepared.model.clone()
+                },
                 is_model_auto_selected: prepared.is_model_auto_selected,
                 auto_model_fallback: prepared.auto_model_fallback,
                 selection_explanation: prepared.selection_explanation.clone(),
@@ -458,6 +589,9 @@ pub(super) fn spawn_subagent_kernel_task_attempt(
                 cancel_stream: Arc::new(AtomicBool::new(false)),
             },
         );
+    }
+    if !prepared.backend.is_traecli() {
+        set_task_reasoning_effort(&task_id, prepared.reasoning_effort.clone());
     }
     lock_unpoisoned(&TASK_PROGRESS_REGISTRY).insert(
         task_id.clone(),
@@ -514,7 +648,7 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
                 spawned_count += 1;
                 spawned_ids.push(spawned.task_id.clone());
                 record_subagent_spawn_audit(&spawned.task_id, task);
-                entries.push(serde_json::json!({
+                let mut entry = serde_json::json!({
                     "index": index,
                     "status": "spawned",
                     "task_id": spawned.task_id,
@@ -522,16 +656,35 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
                     "agent": task.agent_name,
                     "model": task.model,
                     "inherit": task.inherit.describe(),
-                }));
+                });
+                if let Some(effort) = &task.reasoning_effort {
+                    entry["reasoning_effort"] = serde_json::json!(effort);
+                }
+                if task.show_backend_launch_tag {
+                    entry["backend"] = serde_json::json!(task.backend.as_str());
+                }
+                if let Some(progress) = current_task_progress(&spawned.task_id) {
+                    entry["progress"] = serde_json::json!(progress);
+                }
+                entries.push(entry);
             }
-            Err(error) => entries.push(serde_json::json!({
-                "index": index,
-                "status": "failed",
-                "error": error,
-                "agent": task.agent_name,
-                "model": task.model,
-                "inherit": task.inherit.describe(),
-            })),
+            Err(error) => {
+                let mut entry = serde_json::json!({
+                    "index": index,
+                    "status": "failed",
+                    "error": error,
+                    "agent": task.agent_name,
+                    "model": task.model,
+                    "inherit": task.inherit.describe(),
+                });
+                if let Some(effort) = &task.reasoning_effort {
+                    entry["reasoning_effort"] = serde_json::json!(effort);
+                }
+                if task.show_backend_launch_tag {
+                    entry["backend"] = serde_json::json!(task.backend.as_str());
+                }
+                entries.push(entry);
+            }
         }
     }
     if !spawned_ids.is_empty() {
@@ -553,7 +706,7 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
         "spawned": spawned_count,
         "failed": entries.len() - spawned_count,
         "tasks": entries,
-        "next": "Continue independent parent-side work; use task_status for snapshots and task_wait only when blocked on results."
+        "next": "Use task_status for non-blocking progress (phase, updates, last activity). Do not duplicate a running branch; use task_wait only when blocked on a result, then task_integrate."
     }))
     .expect("serializing task_spawn result cannot fail"))
 }

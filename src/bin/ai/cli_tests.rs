@@ -2,6 +2,27 @@ use std::fs;
 use std::path::PathBuf;
 
 #[test]
+fn use_command_cli_keeps_worker_model_separate_and_recognizes_command() {
+    for command in ["/use", ":use"] {
+        let cli = super::parse_cli_args(
+            ["a", command, "traecli", "GPT-6.1-Sol"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert_eq!(cli.args, [format!("{command} traecli GPT-6.1-Sol")]);
+        assert!(cli.model.is_none());
+        assert!(crate::ai::driver::commands::is_local_command_start(command));
+        assert!(super::INTERNAL_COMMANDS.contains(&command));
+    }
+    for command in ["/backend", ":backend"] {
+        assert!(!crate::ai::driver::commands::is_local_command_start(
+            command
+        ));
+        assert!(!super::INTERNAL_COMMANDS.contains(&command));
+    }
+}
+
+#[test]
 fn parse_cli_args_distill_session_accepts_zip_and_session_id() {
     for input in ["./archive.zip", "6e969353-01f4-40c2-bddb-59fae9970ad3"] {
         let cli = super::parse_cli_args(
@@ -62,11 +83,7 @@ fn parse_cli_args_pure_flag_selects_the_pure_agent() {
 
 #[test]
 fn parse_cli_args_no_pure_wins_over_pure() {
-    let cli = super::parse_cli_args(
-        ["a", "--pure", "--no-pure"]
-            .into_iter()
-            .map(str::to_owned),
-    );
+    let cli = super::parse_cli_args(["a", "--pure", "--no-pure"].into_iter().map(str::to_owned));
     assert!(cli.no_pure);
     assert_eq!(cli.agent, None);
     assert!(cli.args.is_empty());

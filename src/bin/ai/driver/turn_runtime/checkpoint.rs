@@ -53,10 +53,10 @@ impl ToolRoundCheckpointPhase {
     pub(super) fn guidance(self) -> &'static str {
         match self {
             Self::Explore => {
-                "Still in the read-only evidence-gathering phase: summarize confirmed facts and the single remaining gap, then pick only the one next step with the highest information gain; prefer a precise search or one sufficiently large read, and stop expanding the unrelated evidence surface. Then execute that step and continue the loop; do not stop after merely naming it."
+                "Still in the read-only evidence-gathering phase: summarize confirmed facts. If they already settle the request, write the final answer now, because the evidence suffices rather than because of this checkpoint. Otherwise name the single remaining gap and pick only the one next step with the highest information gain; prefer a precise search or one sufficiently large read, and stop expanding the unrelated evidence surface. Then execute that step and continue the loop; do not stop after merely naming it."
             }
             Self::ImplementedNeedsVerification => {
-                "State has recently been modified successfully: do not resume exploration or continue unrelated changes; run the narrowest check/test that covers the change, check diff/status if needed, then continue with the next planned step. Wrap up only when the task itself is complete or you are genuinely blocked."
+                "State has recently been modified successfully: do not resume exploration or continue unrelated changes. If the change affects compilation or runtime behavior and no check covers it yet, run the narrowest check/test that covers it; otherwise (for example docs-only or comment-only edits) review the diff/status instead of running a build or test. Then continue with the next planned step. Wrap up only when the task itself is complete or you are genuinely blocked."
             }
             Self::VerifiedNeedsFinalization => {
                 "Successful verification observed: record the verified work into plan notes so it survives across turns, then continue with the next planned step. Only wrap up when the task itself is complete or you are genuinely blocked; a checkpoint alone is never a reason to stop calling tools."

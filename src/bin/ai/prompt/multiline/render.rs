@@ -336,6 +336,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_width(
         session_topic,
         None,
         live_width,
+        "",
     )
 }
 
@@ -351,6 +352,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
     session_topic: Option<&str>,
     checkpoint_label: Option<&str>,
     live_width: u16,
+    backend_label: &str,
 ) -> Option<Position> {
     let frame_area = f.area();
     let area = Rect::new(
@@ -411,7 +413,10 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
         }
         // Parenthesized agent/reasoning suffix. Parentheses and the separator
         // stay dim so the two values keep their own colors.
-        if !agent_label.is_empty() || !reasoning_effort_label.is_empty() {
+        if !agent_label.is_empty()
+            || !reasoning_effort_label.is_empty()
+            || !backend_label.is_empty()
+        {
             spans.push(Span::styled(
                 " (",
                 Style::default().fg(Color::Rgb(100, 116, 139)),
@@ -424,7 +429,9 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
                         .add_modifier(Modifier::BOLD),
                 ));
             }
-            if !agent_label.is_empty() && !reasoning_effort_label.is_empty() {
+            if !agent_label.is_empty()
+                && (!reasoning_effort_label.is_empty() || !backend_label.is_empty())
+            {
                 spans.push(Span::styled(
                     "; ",
                     Style::default().fg(Color::Rgb(100, 116, 139)),
@@ -435,6 +442,20 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup_with_checkpoint(
                     reasoning_effort_label,
                     Style::default()
                         .fg(Color::Rgb(96, 165, 250))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if !reasoning_effort_label.is_empty() && !backend_label.is_empty() {
+                spans.push(Span::styled(
+                    "; ",
+                    Style::default().fg(Color::Rgb(100, 116, 139)),
+                ));
+            }
+            if !backend_label.is_empty() {
+                spans.push(Span::styled(
+                    backend_label,
+                    Style::default()
+                        .fg(Color::Rgb(251, 191, 36))
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -1292,17 +1313,18 @@ mod tests {
                     Some("LeetCode第一题"),
                     Some("main@next_1"),
                     160,
+                    "sub:traecli",
                 );
             })
             .unwrap();
 
-        // The identity row keeps agent/reasoning/checkpoint; the topic moved
-        // to its own row below.
+        // The identity row keeps agent/reasoning/backend/checkpoint; the topic
+        // moved to its own row below.
         let model_row_y = viewport_area.bottom() - 3;
         let row = buffer_row(terminal.backend(), model_row_y, 0, viewport_area.width);
         let dense: String = row.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert!(
-            dense.contains("(Sharp;Low)|main@next_1"),
+            dense.contains("(Sharp;Low;sub:traecli)|main@next_1"),
             "{row:?}"
         );
         assert!(

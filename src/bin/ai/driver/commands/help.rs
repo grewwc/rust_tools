@@ -13,6 +13,12 @@ fn print_commands_help() {
     println!(
         "    /effort [level]           show or set reasoning effort (shortcut for /model effort)"
     );
+    println!(
+        "    /use [traecli [model]|kernel] [\\n<task>]  set backend and sticky agent-team; optionally start <task>; bare /use shows state"
+    );
+    println!(
+        "    /reset                    return to kernel; clear worker model override and sticky agent-team (no arguments)"
+    );
     println!("    /theme [name]             list or switch terminal themes live (session-only)");
     println!(
         "    /cd [dir]                 show or change the session working directory (\"-\" goes back)"

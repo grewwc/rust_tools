@@ -1,7 +1,7 @@
 {
   "name": "task_spawn",
-  "description": "Spawn one or more independent subagent tasks (1-8) asynchronously in one deterministic batch. Every item is preflight-validated before any child starts; spawn attempts run in input order and returned task entries preserve that order. Each spawned subagent is hard-terminated after 60 minutes of wall-clock lifetime (32 iterations by default), so a long-running subtask ends with a timeout result instead of a late answer. Collect with `task_wait` or `task_status`, then acknowledge with `task_integrate`. For one result needed immediately, use the synchronous `task` tool. Top-level agents only.",
-  "first_use_guidance": "Guidance for later task_spawn calls in this turn:\n- A per-item runtime spawn failure is reported as status 'failed' with no task_id and does not fail the whole call, so only wait on the task_ids that were returned.",
+  "description": "Spawn 1-8 independent tasks asynchronously. Use `task_status` for a non-blocking progress snapshot (phase, updates, last activity), `task_wait` only when blocked on a result, and `task_integrate` after delivery. Do not duplicate a branch still reporting recent activity; if genuinely stalled, take a `task_status` snapshot before taking over. Use synchronous `task` only for one result needed immediately. Top-level agents only.",
+  "first_use_guidance": "Guidance for later task_spawn calls in this turn:\n- A per-item spawn failure has status 'failed' with no task_id; only wait on returned task_ids.\n- After spawn, call `task_status` for non-blocking progress; recent `last activity` means the branch is still working.\n- Do not start overlapping work on a delegated branch; if taking over after a stalled snapshot, leave the branch running and stay non-overlapping unless it failed or its scope changed.\n- `task_wait` is blocking and returns progress snapshots on timeout/PARKED; call it only when the next step depends on a result.\n- Call `task_integrate` for every delivered result.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -27,7 +27,7 @@
             },
             "model": {
               "type": "string",
-              "description": "Optional model override. Default: reuse parent model; override only when the subtask is clearly lighter or heavier."
+              "description": "Optional model override. Default: reuse parent model; override only when the subtask is clearly lighter or heavier. Ignored when backend is 'traecli' (use `backend_model` there)."
             },
             "inherit": {
               "type": "string",
@@ -36,6 +36,19 @@
             "response_schema": {
               "type": "object",
               "description": "Optional JSON Schema object the subagent's single returned value must match, e.g. {\"type\": \"string\"} — not a bare type name. Evidence-gated audit agents reject `response_schema`; call them without one and read the `<audit_report>` envelope from the result."
+            },
+            "backend": {
+              "type": "string",
+              "enum": ["kernel", "traecli"],
+              "description": "Omit to use the session default chosen by /use ('kernel' or 'traecli'); pass an explicit value only to override it for this call."
+            },
+            "backend_model": {
+              "type": "string",
+              "description": "Model for backend 'traecli' (see `traecli models`); ignored otherwise. An explicit value overrides the /use session worker model, then TRAECLI_MODEL, ai.traecli.default_model, and built-in 'gpt-5.5' defaults."
+            },
+            "backend_continue_from": {
+              "type": "string",
+              "description": "Continue a previous traecli run: pass the earlier task's `task_id` to resume its traecli session, or a raw traecli session UUID. Only for backend 'traecli'; the referenced run must have completed."
             }
           },
           "required": [

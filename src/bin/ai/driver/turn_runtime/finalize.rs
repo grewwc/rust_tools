@@ -184,6 +184,17 @@ fn format_subagent_result_for_parent(
     evidence_block.push_str(&evidence.join("\n"));
 
     let mut output = truncate_chars(&evidence_block, SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS);
+    if evidence_block.chars().count() > SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS {
+        // Never truncate silently: the parent must be able to tell a complete
+        // evidence set from a bounded one, and the durable ledger keeps the full
+        // delivered payload for one-call recovery.
+        output.push_str(&format!(
+            "\n[evidence truncated: showing {} of {} characters. Recover the full delivered \
+             payload with `task_evidence_read` (source=\"delivered\") using this task's id.]",
+            output.chars().count(),
+            evidence_block.chars().count()
+        ));
+    }
     if final_assistant_text.is_empty() {
         return output;
     }

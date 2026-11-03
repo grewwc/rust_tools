@@ -4,8 +4,8 @@ use uuid::Uuid;
 
 use crate::ai::{
     history::{
-        MarkMessageUpdate, PruneSessionDeleteResult, SessionInfo, SessionStore, SessionTitleOrigin,
-        SessionServeConfig, SuspendedSessionEntry, SuspendedSessionStore,
+        MarkMessageUpdate, PruneSessionDeleteResult, SessionInfo, SessionServeConfig, SessionStore,
+        SessionTitleOrigin, SuspendedSessionEntry, SuspendedSessionStore,
         format_suspended_timestamp_label, generate_session_summary,
     },
     provider::ReasoningEffort,
@@ -125,12 +125,11 @@ pub(in crate::ai) fn restore_session_local_runtime_state(app: &mut App) -> std::
     restore_prune_marks_for_history(app)
 }
 
-/// Best-effort persist of the session's current model/agent/effort picks into
-/// the session's own meta table (the same `serve_*` keys the serve mode
-/// reads), so reopening the session with `a -ss <id>` — or a remote serve
-/// turn against it — resumes the last picks instead of defaults. Called after
-/// every `/model`/`/effort`/`/agent` change; a write failure is logged and
-/// never fails the command.
+/// Best-effort persist of the session's current runtime picks into the
+/// session's own meta table, so reopening the session with `a -ss <id>` — or a
+/// remote serve turn against it — resumes the last picks instead of defaults.
+/// Called after every runtime-default command change; a write failure is logged
+/// and never fails the command.
 pub(in crate::ai) fn persist_session_runtime_state(app: &App) {
     let store = SessionStore::new(app.config.history_file.as_path());
     let config = SessionServeConfig {
@@ -141,15 +140,20 @@ pub(in crate::ai) fn persist_session_runtime_state(app: &App) {
             Some(None) => Some("off".to_string()),
             Some(Some(level)) => Some(level.as_str().to_string()),
         },
+        subagent_backend: match app.session_default_subagent_backend {
+            crate::ai::tools::task_tools::SubagentBackend::Kernel => None,
+            crate::ai::tools::task_tools::SubagentBackend::TraeCli => Some("traecli".to_string()),
+        },
+        subagent_model: app.session_default_subagent_model.clone(),
+        default_skills: app.session_default_skills.clone(),
     };
     if let Err(error) = store.write_session_serve_config(&app.session_id, &config) {
-        eprintln!("[session] failed to persist model/agent/effort picks: {error}");
+        eprintln!("[session] failed to persist session runtime picks: {error}");
     }
 }
 
-/// Restore the session's own model/agent/effort picks (persisted on every
-/// `/model`/`/effort`/`/agent` change). Explicit CLI flags win over the
-/// stored picks, mirroring serve's per-turn override precedence, so
+/// Restore the session's own runtime picks. Explicit CLI flags win over stored
+/// model/agent/effort picks, mirroring serve's per-turn override precedence, so
 /// `a -ss <id> --model X` still starts with X.
 fn restore_session_model_agent_effort(app: &mut App, store: &SessionStore) {
     let Ok(stored) = store.read_session_serve_config(&app.session_id) else {
@@ -174,6 +178,12 @@ fn restore_session_model_agent_effort(app: &mut App, store: &SessionStore) {
             };
         }
     }
+    app.session_default_subagent_backend =
+        crate::ai::tools::task_tools::SubagentBackend::from_stored(
+            stored.subagent_backend.as_deref(),
+        );
+    app.session_default_subagent_model = stored.subagent_model;
+    app.session_default_skills = stored.default_skills;
 }
 
 /// Session-derived prune authorization for the current request projection.
@@ -271,9 +281,7 @@ fn switch_app_to_session(
     app.session_history_file = history_file;
     // Decision logs follow the active session; a stale target would either
     // recreate a deleted session's files or mix another session's telemetry in.
-    crate::ai::driver::decision_log::sync_persist_path_for_history_file(
-        &app.session_history_file,
-    );
+    crate::ai::driver::decision_log::sync_persist_path_for_history_file(&app.session_history_file);
     app.stale_patch_targets = stale_patch_targets;
     restore_session_model_agent_effort(app, store);
     restore_prune_marks_for_history(app)?;
@@ -474,17 +482,8 @@ fn worker_session_room(id: &str) -> Option<(&'static str, String)> {
 /// `all`, `workers` and `archive` views so they stay byte-aligned.
 /// Archived sessions carry an explicit ` [archived]` suffix (visible in
 /// piped output too) and render dimmed on a terminal.
-fn print_session_row(
-    s: &SessionInfo,
-    current_session_id: &str,
-    max_id_len: usize,
-    verbose: bool,
-) {
-    let mark = if s.id == current_session_id {
-        "*"
-    } else {
-        " "
-    };
+fn print_session_row(s: &SessionInfo, current_session_id: &str, max_id_len: usize, verbose: bool) {
+    let mark = if s.id == current_session_id { "*" } else { " " };
     let time = s
         .modified_local
         .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
@@ -513,7 +512,11 @@ fn print_session_row(
     };
     println!(
         "{style_open}{} {:<width$}  {}  {:>8}  {}{style_close}",
-        mark, s.id, time, size, summary,
+        mark,
+        s.id,
+        time,
+        size,
+        summary,
         width = max_id_len
     );
 }
@@ -675,11 +678,19 @@ pub fn try_handle_session_command(
         "help" | "h" => {
             println!("Session management commands:");
             println!();
-            println!("  /sessions [list]          list sessions (default, no sizes; workers and archived sessions hidden, current always shown)");
-            println!("  /sessions workers         list discuss/task worker sessions grouped by room");
+            println!(
+                "  /sessions [list]          list sessions (default, no sizes; workers and archived sessions hidden, current always shown)"
+            );
+            println!(
+                "  /sessions workers         list discuss/task worker sessions grouped by room"
+            );
             println!("  /sessions archive         list formally archived sessions");
-            println!("  /sessions all             list all sessions including workers and archived");
-            println!("  /sessions verbose         list sessions with per-session sizes (combines with workers/archive/all)");
+            println!(
+                "  /sessions all             list all sessions including workers and archived"
+            );
+            println!(
+                "  /sessions verbose         list sessions with per-session sizes (combines with workers/archive/all)"
+            );
             println!("  /sessions current         show current session info");
             println!("  /session [id]             show current session id (bare /session too)");
             println!("  /sessions new             create and switch to new session");
@@ -732,9 +743,7 @@ pub fn try_handle_session_command(
             println!(
                 "  /sessions import <file.zip> [as=<id>]           import a session export zip"
             );
-            println!(
-                "  /sessions fork [<src>|src=<id>] [as=<id>]  copy session to a new branch"
-            );
+            println!("  /sessions fork [<src>|src=<id>] [as=<id>]  copy session to a new branch");
             println!("  /sessions branch <keep_turns> [src=<id>] [as=<id>]");
             println!(
                 "                                          fork then retain the first N complete user turns"
@@ -826,7 +835,9 @@ pub fn try_handle_session_command(
                 println!("size: {}", format_size(size));
                 let marked = store.read_session_marked(&app.session_id).unwrap_or(false);
                 println!("marked: {}", if marked { "yes" } else { "no" });
-                let archived = store.read_session_archived(&app.session_id).unwrap_or(false);
+                let archived = store
+                    .read_session_archived(&app.session_id)
+                    .unwrap_or(false);
                 println!("archived: {}", if archived { "yes" } else { "no" });
                 if marked {
                     match store.read_session_mark_message(&app.session_id) {
@@ -860,7 +871,10 @@ pub fn try_handle_session_command(
             // becomes the literal message for the current session.
             let words: Vec<&str> = parts.collect();
             let (target, message) = if words.first() == Some(&"--") {
-                (app.session_id.clone(), words[1..].join(" ").trim().to_string())
+                (
+                    app.session_id.clone(),
+                    words[1..].join(" ").trim().to_string(),
+                )
             } else {
                 match words.first() {
                     Some(first) if *first == "current" => (
@@ -868,13 +882,9 @@ pub fn try_handle_session_command(
                         words[1..].join(" ").trim().to_string(),
                     ),
                     Some(first) => {
-                        match resolve_existing_session_selector(&store, &app.session_id, first)
-                        {
+                        match resolve_existing_session_selector(&store, &app.session_id, first) {
                             Ok(id) => (id, words[1..].join(" ").trim().to_string()),
-                            Err(_) => (
-                                app.session_id.clone(),
-                                words.join(" ").trim().to_string(),
-                            ),
+                            Err(_) => (app.session_id.clone(), words.join(" ").trim().to_string()),
                         }
                     }
                     None => (app.session_id.clone(), String::new()),
@@ -893,10 +903,7 @@ pub fn try_handle_session_command(
                 Ok(()) if message.is_empty() => {
                     println!("Marked session as important: {target}");
                 }
-                Ok(()) => println!(
-                    "Marked session as important: {} ({})",
-                    target, message
-                ),
+                Ok(()) => println!("Marked session as important: {} ({})", target, message),
                 Err(err) => eprintln!("[mark] failed to mark session: {err}"),
             }
         }
@@ -910,8 +917,7 @@ pub fn try_handle_session_command(
                 Some(first) if *first == "--" => app.session_id.clone(),
                 Some(first) if *first == "current" => app.session_id.clone(),
                 Some(first) => {
-                    match resolve_existing_session_selector(&store, &app.session_id, first)
-                    {
+                    match resolve_existing_session_selector(&store, &app.session_id, first) {
                         Ok(id) => id,
                         Err(_) => app.session_id.clone(),
                     }
@@ -991,8 +997,7 @@ pub fn try_handle_session_command(
                     return Ok(true);
                 }
             }
-            let archived: Vec<&SessionInfo> =
-                sessions.iter().filter(|s| s.archived).collect();
+            let archived: Vec<&SessionInfo> = sessions.iter().filter(|s| s.archived).collect();
             if archived.is_empty() {
                 println!("No archived sessions.");
                 return Ok(true);
@@ -1007,8 +1012,7 @@ pub fn try_handle_session_command(
         }
         "message" | "mark-message" | "mark_message" => {
             let selector = parts.next().unwrap_or("current");
-            let id = match resolve_existing_session_selector(&store, &app.session_id, selector)
-            {
+            let id = match resolve_existing_session_selector(&store, &app.session_id, selector) {
                 Ok(id) => id,
                 Err(error) => {
                     eprintln!("Failed to read mark message: {error}");
@@ -1464,7 +1468,10 @@ pub fn try_handle_session_command(
             // Every session is gone, so every suspended binding dangles: drop
             // them all so no terminal key silently resumes a deleted session.
             if let Err(err) = SuspendedSessionStore::new().clear_all() {
-                eprintln!("[sessions clear-all] failed to clear suspended bindings: {}", err);
+                eprintln!(
+                    "[sessions clear-all] failed to clear suspended bindings: {}",
+                    err
+                );
             }
             let new_id = Uuid::new_v4().to_string();
             switch_app_to_session(app, &store, &new_id, false)?;
@@ -1497,8 +1504,7 @@ pub fn try_handle_session_command(
             }
             let cutoff = chrono::Local::now() - chrono::Duration::days(days);
             let sessions = store.list_sessions()?;
-            let stale =
-                select_stale_sessions(&sessions, &app.session_id, cutoff, include_archived);
+            let stale = select_stale_sessions(&sessions, &app.session_id, cutoff, include_archived);
             // Marked sessions are excluded above; report how many were spared so
             // the "nothing deleted" case does not look like missing data.
             let marked_kept = sessions
@@ -1530,7 +1536,9 @@ pub fn try_handle_session_command(
                     println!("({marked_kept} marked session(s) kept)");
                 }
                 if archived_kept > 0 {
-                    println!("({archived_kept} archived session(s) kept; pass --include-archived to prune them too)");
+                    println!(
+                        "({archived_kept} archived session(s) kept; pass --include-archived to prune them too)"
+                    );
                 }
                 return Ok(true);
             }
@@ -1591,15 +1599,13 @@ pub fn try_handle_session_command(
                 }) {
                     Ok(PruneSessionDeleteResult::Deleted) => {
                         crate::ai::history::invalidate_context_history_cache_for(&deleted_path);
-                        let _ = SuspendedSessionStore::new()
-                            .remove_for_session(&session_id, None);
+                        let _ = SuspendedSessionStore::new().remove_for_session(&session_id, None);
                         deleted_count += 1;
                     }
                     Ok(PruneSessionDeleteResult::Missing) => {
                         // Session record already gone: its bindings are dangling,
                         // so drop them too.
-                        let _ = SuspendedSessionStore::new()
-                            .remove_for_session(&session_id, None);
+                        let _ = SuspendedSessionStore::new().remove_for_session(&session_id, None);
                         skipped_count += 1;
                         println!("[prune] skipped {}: session no longer exists", s.id);
                     }
@@ -1815,7 +1821,11 @@ fn session_title_base(store: &SessionStore, session_id: &str) -> String {
 
 /// Rewrites the dst session's title to the fork-marked version, with depth
 /// incremented from the source session's title.
-pub(in crate::ai) fn apply_fork_title(store: &SessionStore, src_id: &str, dst_id: &str) -> std::io::Result<()> {
+pub(in crate::ai) fn apply_fork_title(
+    store: &SessionStore,
+    src_id: &str,
+    dst_id: &str,
+) -> std::io::Result<()> {
     let base = session_title_base(store, src_id);
     let (depth, inner) = parse_fork_marker(&base);
     let new_title = format_fork_title(depth + 1, inner);
@@ -1916,6 +1926,9 @@ mod tests {
                 .map(|model| crate::ai::model_names::model_handle(model))
                 .expect("model registry is empty"),
             current_agent: "build".to_string(),
+            session_default_subagent_backend: Default::default(),
+            session_default_subagent_model: None,
+            session_default_skills: Vec::new(),
             current_agent_manifest: None,
             pending_files: None,
             forced_skills: vec!["example-upload-md".to_string()],
@@ -1945,7 +1958,7 @@ mod tests {
             last_turn_interrupted: false,
             prune_marks: Default::default(),
             turn_reasoning_items: Default::default(),
-        turn_tool_errors: Default::default(),
+            turn_tool_errors: Default::default(),
             stale_patch_targets: Default::default(),
             tool_middlewares: Vec::new(),
             llm_middlewares: Vec::new(),
@@ -2171,12 +2184,19 @@ mod tests {
         app.current_model = "deepseek-v3".to_string();
         app.current_agent = "helper".to_string();
         app.cli.reasoning_effort_override = Some(Some(ReasoningEffort::High));
+        app.session_default_subagent_backend =
+            crate::ai::tools::task_tools::SubagentBackend::TraeCli;
+        app.session_default_subagent_model = Some("GPT-6.1-Sol".to_string());
+        app.session_default_skills = vec!["agent-team".to_string()];
         super::persist_session_runtime_state(&app);
 
         let stored = store.read_session_serve_config(&session_id).unwrap();
         assert_eq!(stored.model.as_deref(), Some("deepseek-v3"));
         assert_eq!(stored.agent.as_deref(), Some("helper"));
         assert_eq!(stored.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(stored.subagent_backend.as_deref(), Some("traecli"));
+        assert_eq!(stored.subagent_model.as_deref(), Some("GPT-6.1-Sol"));
+        assert_eq!(stored.default_skills, ["agent-team"]);
 
         // Reopening the session (`a -ss <id>`) restores the picks.
         let mut reopened = test_app(&root);
@@ -2187,6 +2207,75 @@ mod tests {
             reopened.cli.reasoning_effort_override,
             Some(Some(ReasoningEffort::High))
         );
+        assert_eq!(
+            reopened.session_default_subagent_backend,
+            crate::ai::tools::task_tools::SubagentBackend::TraeCli
+        );
+        assert_eq!(
+            reopened.session_default_subagent_model.as_deref(),
+            Some("GPT-6.1-Sol")
+        );
+        assert_eq!(reopened.session_default_skills, ["agent-team"]);
+
+        super::super::use_backend::try_handle_use_command(&mut reopened, "/use kernel").unwrap();
+        let stored = store.read_session_serve_config(&session_id).unwrap();
+        assert!(stored.subagent_backend.is_none());
+        assert_eq!(stored.default_skills, ["agent-team"]);
+        assert_eq!(stored.subagent_model.as_deref(), Some("GPT-6.1-Sol"));
+        restore_session_local_runtime_state(&mut reopened).unwrap();
+        assert_eq!(
+            reopened.session_default_subagent_backend,
+            crate::ai::tools::task_tools::SubagentBackend::Kernel
+        );
+        assert_eq!(reopened.session_default_skills, ["agent-team"]);
+        super::super::use_backend::try_handle_reset_command(&mut reopened, "/reset").unwrap();
+        let stored = store.read_session_serve_config(&session_id).unwrap();
+        assert!(stored.subagent_backend.is_none());
+        assert!(stored.subagent_model.is_none());
+        assert!(stored.default_skills.is_empty());
+        restore_session_local_runtime_state(&mut reopened).unwrap();
+        assert_eq!(
+            reopened.session_default_subagent_backend,
+            crate::ai::tools::task_tools::SubagentBackend::Kernel
+        );
+        assert!(reopened.session_default_subagent_model.is_none());
+        assert!(reopened.session_default_skills.is_empty());
+        assert_eq!(reopened.current_model, "deepseek-v3");
+        assert_eq!(reopened.current_agent, "helper");
+        assert_eq!(
+            reopened.cli.reasoning_effort_override,
+            Some(Some(ReasoningEffort::High))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_session_runtime_state_without_use_keys_loads_defaults() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        // Simulate a legacy session containing only the older backend key.
+        store
+            .write_session_serve_config(
+                &app.session_id,
+                &SessionServeConfig {
+                    subagent_backend: Some("traecli".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        app.session_default_subagent_model = Some("stale-model".to_string());
+        app.session_default_skills = vec!["agent-team".to_string()];
+        restore_session_local_runtime_state(&mut app).unwrap();
+        assert_eq!(
+            app.session_default_subagent_backend,
+            crate::ai::tools::task_tools::SubagentBackend::TraeCli
+        );
+        assert!(app.session_default_subagent_model.is_none());
+        assert!(app.session_default_skills.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2550,16 +2639,17 @@ mod tests {
             .unwrap()
         );
         let zip_bytes = fs::read(&zip_path).expect("export must write the zip");
-        assert_eq!(&zip_bytes[..2], b"PK", "export must produce a zip container");
+        assert_eq!(
+            &zip_bytes[..2],
+            b"PK",
+            "export must produce a zip container"
+        );
 
         let markdown_path = root.join("session-roundtrip.md");
         assert!(
             try_handle_session_command(
                 &mut app,
-                &format!(
-                    "/sessions markdown {src_id} {}",
-                    markdown_path.display()
-                )
+                &format!("/sessions markdown {src_id} {}", markdown_path.display())
             )
             .unwrap()
         );
@@ -2574,7 +2664,10 @@ mod tests {
             )
             .unwrap()
         );
-        assert_eq!(app.session_id, dst_id, "import switches to the restored session");
+        assert_eq!(
+            app.session_id, dst_id,
+            "import switches to the restored session"
+        );
         let restored = store.read_all_messages(dst_id).unwrap();
         assert_eq!(restored.len(), 1);
         assert_eq!(
@@ -2793,7 +2886,10 @@ mod tests {
                 .collect();
         assert_eq!(
             matched,
-            vec!["prompt-eval-20260924-154942-a", "prompt-eval-20260924-154942-b"]
+            vec![
+                "prompt-eval-20260924-154942-a",
+                "prompt-eval-20260924-154942-b"
+            ]
         );
         // A shorter prefix matches every id sharing that start, including the
         // prefix itself.
@@ -3065,10 +3161,7 @@ mod tests {
             "fix login bug"
         );
         assert!(try_handle_session_command(&mut app, "/sessions mark second note").unwrap());
-        assert_eq!(
-            store.read_session_mark_message(&id).unwrap(),
-            "second note"
-        );
+        assert_eq!(store.read_session_mark_message(&id).unwrap(), "second note");
         // The `message` arm resolves selectors and prints without failing:
         // current (marked), unknown id, and unmarked sessions.
         assert!(try_handle_session_command(&mut app, "/sessions message").unwrap());
@@ -3107,9 +3200,7 @@ mod tests {
         // `/ss mark <id> <message>` marks the target, not the current
         // session: this is the one-shot `a /ss mark <id> ...` path, where
         // the current auto session is deleted on exit.
-        assert!(
-            try_handle_session_command(&mut app, "/ss mark sess-target target note").unwrap()
-        );
+        assert!(try_handle_session_command(&mut app, "/ss mark sess-target target note").unwrap());
         assert!(store.read_session_marked(target).unwrap());
         assert_eq!(
             store.read_session_mark_message(target).unwrap(),
@@ -3119,9 +3210,7 @@ mod tests {
 
         // An explicit `current` selector targets the current session, while
         // an unknown first word stays a message for it (backward compat).
-        assert!(
-            try_handle_session_command(&mut app, "/mark current explicit note").unwrap()
-        );
+        assert!(try_handle_session_command(&mut app, "/mark current explicit note").unwrap());
         assert_eq!(
             store.read_session_mark_message(&current).unwrap(),
             "explicit note"
@@ -3240,9 +3329,9 @@ mod tests {
         );
         let stale_ids: Vec<String> =
             select_stale_sessions(&sessions, &app.session_id, cutoff, false)
-            .iter()
-            .map(|s| s.id.clone())
-            .collect();
+                .iter()
+                .map(|s| s.id.clone())
+                .collect();
         assert_eq!(stale_ids, vec!["sess-plain-old".to_string()]);
 
         let _ = fs::remove_dir_all(root);
@@ -3471,7 +3560,10 @@ mod tests {
         let destination = app.session_id.clone();
         assert_ne!(destination, original_session);
         assert_ne!(destination, foreign_source);
-        assert_eq!(app.session_history_file, store.session_history_file(&destination));
+        assert_eq!(
+            app.session_history_file,
+            store.session_history_file(&destination)
+        );
         let forked = store.read_all_messages(&destination).unwrap();
         assert_eq!(forked.len(), 1);
         assert_eq!(
@@ -3480,9 +3572,7 @@ mod tests {
         );
 
         let session_count = store.list_sessions().unwrap().len();
-        assert!(
-            try_handle_session_command(&mut app, "/ss fork sess-foreign unexpected").unwrap()
-        );
+        assert!(try_handle_session_command(&mut app, "/ss fork sess-foreign unexpected").unwrap());
         assert_eq!(app.session_id, destination);
         assert_eq!(store.list_sessions().unwrap().len(), session_count);
         assert!(try_handle_session_command(&mut app, "/ss fork unexpected=value").unwrap());

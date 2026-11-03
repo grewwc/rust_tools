@@ -56,6 +56,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
         terminal_dedupe_candidate,
         &mut final_validation_status,
         &mut final_gate_state,
+        false,
         _no_active_skill,
         iteration,
         max_iterations,
@@ -82,6 +83,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
     terminal_dedupe_candidate: &mut Option<String>,
     final_validation_status: &mut Option<crate::ai::request::TransientStatusLine>,
     final_gate_state: &mut FinalGateState,
+    delegation_requirement_violated: bool,
     _no_active_skill: bool,
     iteration: usize,
     max_iterations: usize,
@@ -124,7 +126,14 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             // the model refuses task_wait, this would livelock forever, and resetting
             // force_final_response every round would keep knocking out the
             // orchestrator's safety brakes (tool-loop / progress-budget /
-            // iteration-limit hard-stop). Past the hard cap, finalization is allowed so
+            // iteration-limit hard-stop). The same applies once any brake has fired:
+            // when force_final_response is already set, the turn is in no-tool
+            // wrap-up and must synthesize from evidence on hand instead of
+            // demanding more tool calls — reopening here would contradict the
+            // no-tool directive in the same prompt and ping-pong with the brake
+            // (observed as repeated task_integrate/plan_update rounds that clear
+            // the flag, re-trigger the hard-stop, and spin through the reopen
+            // budgets). Past the hard cap, finalization is allowed so
             // max_iterations stays the authoritative ceiling.
             //
             // On top of the hard cap, a **separate reopen quota** is added: once the
@@ -134,12 +143,12 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             // forever and spin to 4096.
             let reopen_count = task_evidence_reopen_count(messages);
             let reopen_budget_exhausted = reopen_count >= TASK_EVIDENCE_REOPEN_MAX;
-            if iteration < max_iterations
+            if !*force_final_response
+                && iteration < max_iterations
                 && !reopen_budget_exhausted
                 && reopen_turn_for_outstanding_subagent_tasks(messages, &app.session_id)
             {
                 push_task_evidence_reopen_marker(messages, reopen_count + 1);
-                *force_final_response = false;
                 return Ok(TurnLoopStep::Continue);
             }
             let (task_evidence_ledger, task_evidence_warning) =
@@ -153,15 +162,16 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     .push_str(&format!("\n\n[Runtime warning] {warning}"));
             }
             if let Some(ledger) = task_evidence_ledger {
-                if iteration < max_iterations && !reopen_budget_exhausted {
+                if !*force_final_response && iteration < max_iterations && !reopen_budget_exhausted
+                {
                     reopen_turn_for_unintegrated_task_evidence(messages, &ledger);
                     push_task_evidence_reopen_marker(messages, reopen_count + 1);
-                    *force_final_response = false;
                     return Ok(TurnLoopStep::Continue);
                 }
-                // Hard cap or reopen quota exhausted: allow finalization, attaching the
-                // unintegrated evidence as warning + ledger to the visible answer for the
-                // user/later rounds to handle, instead of spinning on endless reopens.
+                // Hard cap, reopen quota exhausted, or no-tool wrap-up: allow
+                // finalization, attaching the unintegrated evidence as warning +
+                // ledger to the visible answer for the user/later rounds to
+                // handle, instead of spinning on endless reopens.
                 stream_result.assistant_text.push_str(
                     "\n\n[Runtime warning] Subagent results remain unintegrated after repeated reopen attempts.\n",
                 );
@@ -276,7 +286,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 iteration,
                 max_iterations,
             );
-            let final_terminator_reopen_allowed = final_gate_state.can_reopen_final_terminator(
+            let delegation_reopen_allowed = final_gate_state.can_reopen_delegation(
                 *force_final_response,
                 iteration,
                 max_iterations,
@@ -297,7 +307,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                     return Ok(TurnLoopStep::Continue);
                 }
                 FinalRecoveryAction::Warn => {
-                    crate::ai::tools::plan_state::consume_completion_claim(app);
                     *final_assistant_text = INJECTED_CONTEXT_ECHO_STOP.to_string();
                     return Ok(TurnLoopStep::Break);
                 }
@@ -372,23 +381,36 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 }
                 FinalCitationGateAction::Warn => true,
             };
-            let warn_outstanding_work = match preflight_outstanding_work_gate_action(
+            if preflight_delegation_requirement_gate_action(
+                messages,
+                delegation_requirement_violated,
+                !delegation_reopen_allowed,
+            ) == OutstandingWorkGateAction::Reopen
+            {
+                final_gate_state.consume_delegation_retry();
+                drop(final_validation_status.take());
+                print_tool_note_line(
+                    "final-gate",
+                    "required delegation missing; reopening final response (1/1)",
+                );
+                *terminal_dedupe_candidate = None;
+                return Ok(TurnLoopStep::Continue);
+            }
+            let warn_outstanding_work = match outstanding_work_gate_action(
                 app,
                 messages,
-                turn_messages,
                 !outstanding_work_reopen_allowed,
                 iteration,
                 max_iterations,
             ) {
                 OutstandingWorkGateAction::Allow => None,
                 OutstandingWorkGateAction::Reopen => {
-                    crate::ai::tools::plan_state::consume_completion_claim(app);
                     let attempt = final_gate_state.consume_outstanding_work_retry();
                     drop(final_validation_status.take());
                     print_tool_note_line(
                         "final-gate",
                         &format!(
-                            "missing `complete` or unsettled plan; reopening final response \
+                            "unsettled plan; reopening final response \
                              ({attempt}/{OUTSTANDING_WORK_MAX_REOPENS})"
                         ),
                     );
@@ -400,34 +422,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 OutstandingWorkGateAction::Warn(steps) => Some(format!(
                     "{OUTSTANDING_WORK_WARNING} Unsettled steps: {steps}."
                 )),
-                OutstandingWorkGateAction::WarnUnasserted => {
-                    Some(OUTSTANDING_WORK_UNASSERTED_WARNING.to_string())
-                }
             };
-            let warn_missing_final_terminator = match final_terminator_gate_action(
-                app,
-                messages,
-                turn_messages,
-                &mut stream_result.assistant_text,
-                final_terminator_reopen_allowed,
-            ) {
-                FinalTerminatorGateAction::Allow => false,
-                FinalTerminatorGateAction::Reopen => {
-                    final_gate_state.consume_final_terminator_retry();
-                    drop(final_validation_status.take());
-                    print_tool_note_line(
-                        "final-gate",
-                        "missing final terminator; rewriting final response (1/1)",
-                    );
-                    // Keep the completion claim for the replacement draft. It
-                    // is consumed only after a final is accepted or the
-                    // outstanding-work gate rejects it.
-                    *terminal_dedupe_candidate = None;
-                    return Ok(TurnLoopStep::Continue);
-                }
-                FinalTerminatorGateAction::Warn => true,
-            };
-            crate::ai::tools::plan_state::consume_completion_claim(app);
             let previously_rendered_body_matches = terminal_dedupe_candidate
                 .as_deref()
                 .is_some_and(|candidate| {
@@ -438,16 +433,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
             // complete accepted answer below so finalize renders it exactly once; if an
             // identical tool-round narration was already visible, only new warnings remain.
             *terminal_dedupe_candidate = None;
-            if warn_missing_final_terminator {
-                append_runtime_warning_once(
-                    &mut stream_result.assistant_text,
-                    FINAL_TERMINATOR_WARNING,
-                );
-                append_user_visible_final_notice(
-                    terminal_dedupe_candidate,
-                    FINAL_TERMINATOR_WARNING,
-                );
-            }
             if warn_unverified_completion {
                 append_runtime_warning_once(
                     &mut stream_result.assistant_text,
@@ -497,6 +482,17 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution_for_model(
                 if let Ok(Some(notice)) =
                     task_tools::build_abandoned_tasks_notice(&app.session_id, max_iterations)
                 {
+                    append_runtime_warning_once(&mut stream_result.assistant_text, &notice);
+                    append_user_visible_final_notice(terminal_dedupe_candidate, &notice);
+                }
+            } else if *force_final_response {
+                // No-tool wrap-up also finalizes without reopening, so running
+                // subtasks need the same visibility fallback — with wording
+                // that names the real trigger instead of the iteration limit.
+                if let Ok(Some(notice)) = task_tools::build_uncollected_tasks_notice(
+                    &app.session_id,
+                    "the turn entered no-tool wrap-up",
+                ) {
                     append_runtime_warning_once(&mut stream_result.assistant_text, &notice);
                     append_user_visible_final_notice(terminal_dedupe_candidate, &notice);
                 }

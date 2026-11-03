@@ -52,7 +52,7 @@ pub(in crate::ai::driver::turn_runtime) fn reopen_turn_for_outstanding_subagent_
     );
     note.push_str("This is not a final answer. Continue the current turn now.\n");
     note.push_str(
-        "Temporarily lift no-tool handoff if it was active, but only so you can collect or inspect the outstanding subagent results.\n",
+        "No-tool wrap-up is not active in this continuation, so tool calls are available: collect or inspect the outstanding subagent results now.\n",
     );
     note.push_str(
         "Immediate next step: call `task_wait` or `task_status` for the outstanding task_ids below. Do not answer the user until every listed task has been handled.\n\n",
@@ -328,8 +328,10 @@ pub(in crate::ai::driver::turn_runtime) fn append_auto_image_followup_message(
         // persists only a `reference` to it, and the copy lives as long as the session.
         let assets_dir = crate::ai::history::SessionStore::new(app.config.history_file.as_path())
             .session_assets_dir(&app.session_id);
-        let snapshots =
-            crate::ai::driver::input::snapshot_image_attachments(image_paths.to_vec(), &assets_dir)?;
+        let snapshots = crate::ai::driver::input::snapshot_image_attachments(
+            image_paths.to_vec(),
+            &assets_dir,
+        )?;
         let request_content =
             crate::ai::request::build_content(&app.current_model, &question, &snapshots)?;
         let persisted_content = crate::ai::request::build_reference_content(

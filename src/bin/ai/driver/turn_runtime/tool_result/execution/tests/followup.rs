@@ -172,7 +172,7 @@ fn final_response_reopens_until_delivered_task_is_integrated() {
 }
 
 #[test]
-fn final_response_with_outstanding_subagent_task_reopens_turn_and_clears_no_tool_handoff() {
+fn final_response_under_no_tool_wrap_up_finishes_despite_outstanding_task() {
     let _env_guard = crate::ai::test_support::ENV_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -205,6 +205,7 @@ fn final_response_with_outstanding_subagent_task_reopens_turn_and_clears_no_tool
             completion_futex_addr: aios_kernel::primitives::FutexAddr(1),
             description: "inspect parser".to_string(),
             agent_name: "build".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -229,6 +230,136 @@ fn final_response_with_outstanding_subagent_task_reopens_turn_and_clears_no_tool
     let mut final_assistant_text = String::new();
     let mut final_assistant_recorded = false;
     let mut force_final_response = true;
+    let mut terminal_dedupe_candidate = None;
+
+    let step = handle_iteration_execution(
+        &mut app,
+        "wrap up",
+        &mcp_snapshot(&shared_mcp),
+        &shared_mcp,
+        IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+            outcome: crate::ai::types::StreamOutcome::Completed,
+            tool_calls: Vec::new(),
+            assistant_text: "done".to_string(),
+            hidden_meta: String::new(),
+            reasoning_text: String::new(),
+            reasoning_items: Vec::new(),
+            skip_response_drain: true,
+            truncated_by_length: false,
+            stream_error: false,
+            response_reconciled: false,
+            response_server_mismatch: false,
+            finish_reason_value: None,
+            usage_prompt_tokens: 0,
+            usage_cached_prompt_tokens: 0,
+            usage_completion_tokens: 0,
+            usage_reasoning_tokens: 0,
+        }),
+        &mut messages,
+        &mut turn_messages,
+        false,
+        &mut persisted_turn_messages,
+        &mut final_assistant_text,
+        &mut final_assistant_recorded,
+        &mut force_final_response,
+        &mut terminal_dedupe_candidate,
+        true,
+        2,
+        16,
+        0,
+        &mut false,
+    )
+    .unwrap();
+
+    // No-tool wrap-up wins over the completion veto: no reopen, no flag
+    // clearing. The final lands with the running subtask reported in the
+    // answer instead of re-demanded via another tool round.
+    assert!(matches!(step, TurnLoopStep::Break));
+    assert!(force_final_response);
+    assert!(final_assistant_recorded);
+    assert!(final_assistant_text.starts_with("done\n\n"));
+    assert!(
+        final_assistant_text
+            .contains("were still outstanding when the turn entered no-tool wrap-up")
+    );
+    assert!(final_assistant_text.contains(&task_id));
+    assert!(final_assistant_text.contains("Required follow-up: re-run this turn"));
+    let joined = messages
+        .iter()
+        .map(|message| message.content.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!joined.contains(PENDING_SUBAGENT_TASKS_FOLLOWUP_PREFIX.trim_end()));
+    assert_eq!(task_evidence_reopen_count(&messages), 0);
+
+    let _ = crate::ai::tools::task_tools::remove_task_entry(&task_id);
+    if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+        *guard = None;
+    }
+}
+
+#[test]
+fn final_response_with_outstanding_task_reopens_when_tools_available() {
+    // Non-wrap-up counterpart of the test above: with force_final_response
+    // unset, the completion veto still bounces the round so running subtasks
+    // get collected instead of dropped.
+    let _env_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut app = test_app_with_tools(&["task_wait", "task_status"]);
+    app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+    crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+
+    let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let (pid, result_channel_id) = {
+        let mut os = app.os.lock().unwrap();
+        let pid = os.begin_foreground(
+            "child".to_string(),
+            "goal".to_string(),
+            10,
+            usize::MAX,
+            None,
+        );
+        let channel = os.channel_create(Some(pid), 1, "task-result".to_string());
+        (pid, channel.raw())
+    };
+    crate::ai::tools::task_tools::insert_task_entry_for_test(
+        task_id.clone(),
+        crate::ai::tools::task_tools::AsyncTaskEntry {
+            session_id: app.session_id.clone(),
+            last_progress_notification_at: None,
+            last_progress_persisted_at: None,
+            owner_pid: pid,
+            pid,
+            result_channel_id,
+            completion_futex_addr: aios_kernel::primitives::FutexAddr(1),
+            description: "inspect parser".to_string(),
+            agent_name: "build".to_string(),
+            backend: None,
+            model: "qwen3.7-max".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit override".to_string(),
+            inherit: crate::ai::tools::task_tools::InheritOptions::default(),
+            abort_handle: None,
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            started_at: Instant::now(),
+        },
+    );
+
+    let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+    let mut messages = vec![Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(no_tool_handoff_note().to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let mut turn_messages = Vec::new();
+    let mut persisted_turn_messages = 0usize;
+    let mut final_assistant_text = String::new();
+    let mut final_assistant_recorded = false;
+    let mut force_final_response = false;
     let mut terminal_dedupe_candidate = None;
 
     let step = handle_iteration_execution(
@@ -329,6 +460,7 @@ fn final_response_at_iteration_ceiling_finishes_despite_outstanding_task() {
             completion_futex_addr: aios_kernel::primitives::FutexAddr(1),
             description: "inspect parser".to_string(),
             agent_name: "build".to_string(),
+            backend: None,
             model: "qwen3.7-max".to_string(),
             is_model_auto_selected: false,
             auto_model_fallback: None,
@@ -406,6 +538,99 @@ fn final_response_at_iteration_ceiling_finishes_despite_outstanding_task() {
     if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
         *guard = None;
     }
+}
+
+#[test]
+fn final_response_under_no_tool_wrap_up_attaches_unintegrated_ledger_without_reopen() {
+    // Delivered-but-unintegrated counterpart: no-tool wrap-up must finalize
+    // with the ledger attached, not bounce back demanding `task_integrate`
+    // (that contradiction deadlocked the turn against the wrap-up brake).
+    let root = std::env::temp_dir().join(format!(
+        "task-evidence-wrap-up-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let history_file = root.join("history.sqlite");
+    let session_id = format!("task-evidence-{}", uuid::Uuid::new_v4().simple());
+    let mut app = test_app_with_tools(&["task_integrate"]);
+    app.config.history_file = history_file.clone();
+    app.session_id = session_id.clone();
+    crate::ai::history::record_delivered_task_evidence(
+        &history_file,
+        &session_id,
+        crate::ai::history::DeliveredTaskEvidence {
+            task_id: "task-1",
+            description: "review parser",
+            agent_name: "build",
+            model: "test-model",
+            status: "completed",
+            payload: "[Subagent final answer]\nconfirmed conclusion",
+        },
+    )
+    .unwrap();
+
+    let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+    let mut messages = vec![Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(no_tool_handoff_note().to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let mut turn_messages = Vec::new();
+    let mut persisted_turn_messages = 0usize;
+    let mut final_assistant_text = String::new();
+    let mut final_assistant_recorded = false;
+    let mut force_final_response = true;
+    let mut terminal_dedupe_candidate = None;
+    let mut turn_had_tool_error = false;
+
+    let step = handle_iteration_execution(
+        &mut app,
+        "finish",
+        &mcp_snapshot(&shared_mcp),
+        &shared_mcp,
+        IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+            outcome: crate::ai::types::StreamOutcome::Completed,
+            assistant_text: "done".to_string(),
+            skip_response_drain: true,
+            ..Default::default()
+        }),
+        &mut messages,
+        &mut turn_messages,
+        false,
+        &mut persisted_turn_messages,
+        &mut final_assistant_text,
+        &mut final_assistant_recorded,
+        &mut force_final_response,
+        &mut terminal_dedupe_candidate,
+        true,
+        2,
+        16,
+        0,
+        &mut turn_had_tool_error,
+    )
+    .unwrap();
+
+    assert!(matches!(step, TurnLoopStep::Break));
+    assert!(force_final_response);
+    assert!(final_assistant_recorded);
+    assert!(
+        final_assistant_text.contains("[Runtime warning] Subagent results remain unintegrated")
+    );
+    assert!(final_assistant_text.contains("confirmed conclusion"));
+    assert_eq!(task_evidence_reopen_count(&messages), 0);
+    let joined = messages
+        .iter()
+        .map(|message| message.content.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!joined.contains(UNINTEGRATED_TASK_EVIDENCE_PREFIX));
+
+    let sessions_root = crate::ai::history::SessionStore::new(&history_file)
+        .sessions_root()
+        .to_path_buf();
+    let _ = std::fs::remove_dir_all(sessions_root);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

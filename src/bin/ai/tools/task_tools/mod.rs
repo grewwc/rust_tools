@@ -31,6 +31,7 @@ use uuid::Uuid;
 
 mod agent_team;
 
+mod backend;
 mod collect;
 mod dispatch;
 mod epoll;
@@ -38,12 +39,15 @@ mod outstanding;
 mod progress;
 mod registry;
 mod spawn;
+mod traecli;
+mod traecli_models;
 mod types;
 mod wait;
 
 // `collect` items are `pub(super)` (task_tools-tree visible), so the re-export
 // visibility must match exactly: broader would not re-export (warning), and it
 // would leak `AgentManifest` (private to the tree) into a public interface.
+pub(crate) use backend::*;
 pub(in crate::ai::tools::task_tools) use collect::*;
 pub(crate) use dispatch::*;
 pub(crate) use epoll::*;
@@ -51,6 +55,13 @@ pub(crate) use outstanding::*;
 pub(crate) use progress::*;
 pub(crate) use registry::*;
 pub(crate) use spawn::*;
+pub(crate) use traecli::{
+    normalize_traecli_reasoning_effort, record_traecli_session, resolve_continue_target,
+    traecli_binary, traecli_binary_available, traecli_model_for,
+};
+pub(crate) use traecli_models::traecli_model_names;
+#[cfg(test)]
+pub(crate) use traecli_models::with_traecli_model_names_for_test;
 pub(crate) use types::*;
 pub(crate) use wait::*;
 

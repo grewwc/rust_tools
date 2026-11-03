@@ -79,12 +79,12 @@ impl SystemPromptBuilder {
             return;
         }
         let label = label.trim();
-        if let Some(section) = self
-            .sections
-            .iter_mut()
-            .find(|(existing_kind, existing_label, _)| {
-                *existing_kind == kind && existing_label.as_deref() == Some(label)
-            })
+        if let Some(section) =
+            self.sections
+                .iter_mut()
+                .find(|(existing_kind, existing_label, _)| {
+                    *existing_kind == kind && existing_label.as_deref() == Some(label)
+                })
         {
             section.2 = content;
             return;
@@ -604,7 +604,10 @@ fn set_native_tools(mut tools: Vec<ToolDef>, include_native: bool) -> Vec<ToolDe
         return tools;
     }
     for def in phone_tools {
-        if !tools.iter().any(|tool| tool.function.name == def.function.name) {
+        if !tools
+            .iter()
+            .any(|tool| tool.function.name == def.function.name)
+        {
             tools.push(def);
         }
     }
@@ -1119,7 +1122,8 @@ fn build_project_instruction_prompt() -> Option<String> {
 
 #[cfg(test)]
 fn build_scoped_project_instruction_prompt(targets: &[PathBuf]) -> Option<String> {
-    build_scoped_project_instruction_prompt_with_priority(targets, &[], &[]).map(|(prompt, _)| prompt)
+    build_scoped_project_instruction_prompt_with_priority(targets, &[], &[])
+        .map(|(prompt, _)| prompt)
 }
 
 /// Renders the target-scoped instruction section. Also returns the directories
@@ -1222,7 +1226,10 @@ fn push_project_context(builder: &mut SystemPromptBuilder) {
 /// id (`session_id_referenced`), or prior session guidance is already resident.
 /// Otherwise the opaque id is omitted because it has no actionable meaning.
 fn session_context_prompt(session_id: &str) -> String {
-    format!(include_str!("system_prompts/session_context.md"), session_id)
+    format!(
+        include_str!("system_prompts/session_context.md"),
+        session_id
+    )
 }
 
 /// Relevance gate for the session-debugging walkthrough: decides whether the
@@ -1237,8 +1244,15 @@ fn session_issue_likely(question: &str) -> bool {
     let lowered = question.to_lowercase();
     [
         // "session" also covers sessionid, session_id and /sessions paths.
-        "session", "history", "resume", "attach", "background", "会话", "历史",
-        "恢复", "重连",
+        "session",
+        "history",
+        "resume",
+        "attach",
+        "background",
+        "会话",
+        "历史",
+        "恢复",
+        "重连",
     ]
     .iter()
     .any(|kw| lowered.contains(kw))
@@ -1274,8 +1288,8 @@ fn skill_authoring_referenced(question: &str) -> bool {
     }
     const ACTIONS: &[&str] = &[
         "save", "create", "update", "edit", "write", "add", "persist", "package", "author",
-        "revise", "modify", "保存", "创建", "新建", "更新", "修改", "编辑", "写成", "做成",
-        "存成", "存为", "生成", "打包",
+        "revise", "modify", "保存", "创建", "新建", "更新", "修改", "编辑", "写成", "做成", "存成",
+        "存为", "生成", "打包",
     ];
     ACTIONS.iter().any(|keyword| lowered.contains(keyword))
 }
@@ -1389,11 +1403,7 @@ fn build_system_prompt(
         }
         s
     } else {
-        agent_extra.unwrap_or_else(|| {
-            String::from(
-                include_str!("prompts/default_identity.md"),
-            )
-        })
+        agent_extra.unwrap_or_else(|| String::from(include_str!("prompts/default_identity.md")))
     };
     b.push(ContextKind::Identity, identity);
     if !skills.is_empty() && has_tool(available_tools, "request_user_input") {
@@ -1489,7 +1499,7 @@ fn build_system_prompt(
     // skill whitelist). Acceptance criteria go straight into the roadmap, tracked
     // by plan_update — no more "criteria defined but never reflected in the plan".
     let plan_criteria_bridge = if has_tool(available_tools, "plan") {
-        "- For multi-step tasks, encode these criteria into the `plan` (each step states what/why/tool; the final step verifies the outcome).\n"
+        "- For multi-step tasks, encode these criteria into the `plan` (each step states what/why/tool; the final step checks the outcome against the criteria). Carry material unresolved concerns in the affected step, recording closure evidence before marking it done; skipping a blocked step does not verify its outcome. No extra plan is needed for a locally resolved concern.\n"
     } else {
         ""
     };
@@ -1614,7 +1624,7 @@ fn build_system_prompt(
     {
         let mut lines = Vec::new();
         if has_tool(available_tools, "plan") {
-            lines.push("Simple tasks: act directly. Complex ones: call `plan` first — before the first tool call, so the plan is the roadmap for the whole task.".to_string());
+            lines.push("Simple tasks: act directly (unless an active skill requires delegation). Complex ones: call `plan` first — before the first tool call, so the plan is the roadmap for the whole task.".to_string());
             // Step-status cadence and semantics are owned by the `plan_update`
             // description and the plan tool's first-use guidance.
             lines.push("Treat the plan as a living roadmap: when findings, changed requirements, or a dead end reshape the task, call `plan` again instead of drifting; the latest plan is preserved in full as the task anchor while older versions may be summarized.".to_string());
@@ -1672,9 +1682,9 @@ fn build_system_prompt(
             } else {
                 lines.push("Use `task_spawn` to fan out MULTIPLE focused, independent subtasks concurrently. For a single delegated subtask, one spawned task immediately joined by `task_wait` gains no concurrency and just adds overhead.".to_string());
             }
-            lines.push("Qualify a subtask when it has a distinct, bounded goal and its expected latency or context-isolation benefit outweighs handoff overhead — a serial step qualifies too when it keeps substantial intermediate reads, searches, logs, or experiments out of the parent context while returning a concise result; parallel branches are not required.".to_string());
-            lines.push("Keep pre-division shared discovery sequential; never run dependent steps concurrently, do not delegate merely to create parallelism, and keep work in the parent when net benefit is marginal or uncertain.".to_string());
-            lines.push("Prefer delegating broad read-only discovery, cross-module caller or consumer mapping, noisy log or dependency research, and independent adversarial verification. Keep final decisions, tightly coupled overlapping edits, unresolved coupled work, and end-to-end synthesis in the parent; iteration limits, tool failures, and recovery steps are not delegation benefits.".to_string());
+            lines.push("When no active skill requires delegation, qualify a subtask when it has a distinct, bounded goal and its expected latency or context-isolation benefit outweighs handoff overhead — a serial step qualifies too when it keeps substantial intermediate reads, searches, logs, or experiments out of the parent context while returning a concise result; parallel branches are not required.".to_string());
+            lines.push("Keep pre-division shared discovery sequential; never run dependent steps concurrently, do not delegate merely to create parallelism, and keep work in the parent when net benefit is marginal or uncertain — unless an active skill requires delegation.".to_string());
+            lines.push("Prefer delegating broad read-only discovery, cross-module caller or consumer mapping, noisy log or dependency research, and independent adversarial verification. Keep final decisions and end-to-end synthesis in the parent; when an active skill requires delegation, hand a tightly coupled edit to exactly one worker instead of doing it in the parent. Iteration limits, tool failures, and recovery steps are not delegation benefits.".to_string());
             lines.push("Give each subagent an explicit result contract: return a concise conclusion, the key evidence paths/lines or commands, remaining uncertainty, and suggested verification; do not return raw logs, exhaustive search output, or large source excerpts unless requested.".to_string());
             lines.push("Once you identify multiple qualifying subtasks with no data dependency, spawn ALL of them in one `task_spawn` call (1-8 tasks) so preflight, dispatch, and returned task ids preserve input order; continue every independent parent-side step while they run — never spawn-wait-spawn-wait serially.".to_string());
         }
@@ -1796,6 +1806,10 @@ fn build_skill_turn_guard(
     let all_mcp_tools = mcp_client.get_all_tools();
     super::super::tools::enable_tools::set_available_mcp_tools(all_mcp_tools.clone());
     let matched_skill_names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
+    // Subagent dispatch reads this snapshot to decide which skill instructions
+    // an external backend should receive. It must follow every guard rebuild,
+    // including mid-turn activate/deactivate changes.
+    super::runtime_ctx::set_active_skill_names(matched_skill_names.clone());
     let active_agent = app.current_agent_manifest.clone();
     let executor_active =
         is_executor_skill(skills) || active_agent.as_ref().is_some_and(is_executor_agent);
@@ -1837,11 +1851,27 @@ fn build_skill_turn_guard(
             .iter()
             .map(|tool| tool.function.name.clone())
             .collect();
-        let missing: Vec<String> = ["session_list", "session_read", "session_search", "talk_send", "talk_read", "discuss_start", "discuss_collect", "discuss_broadcast", "discuss_end", "discuss_status", "task_start", "task_assign", "task_collect", "task_close", "task_room_status"]
-            .iter()
-            .filter(|name| !known.contains_str(*name))
-            .map(|s| s.to_string())
-            .collect();
+        let missing: Vec<String> = [
+            "session_list",
+            "session_read",
+            "session_search",
+            "talk_send",
+            "talk_read",
+            "discuss_start",
+            "discuss_collect",
+            "discuss_broadcast",
+            "discuss_end",
+            "discuss_status",
+            "task_start",
+            "task_assign",
+            "task_collect",
+            "task_close",
+            "task_room_status",
+        ]
+        .iter()
+        .filter(|name| !known.contains_str(*name))
+        .map(|s| s.to_string())
+        .collect();
         if !missing.is_empty() {
             builtin_tools.extend(crate::ai::tools::get_tool_definitions_by_names(&missing));
         }
@@ -1886,12 +1916,15 @@ fn build_skill_turn_guard(
         goal_mode: app.goal_mode.clone(),
         is_background: app.cli.background,
     };
-    let mut builder = prompt_builder_for_turn(
-        active_agent.as_ref(),
-        skills,
-        &available_tools,
-        &ctx,
-    );
+    let mut builder =
+        prompt_builder_for_turn(active_agent.as_ref(), skills, &available_tools, &ctx);
+    if !pure_mode
+        && super::runtime_ctx::is_resume_turn()
+        && let Some(guidance) =
+            super::process_context::wakeup_task_guidance(|name| has_tool(&available_tools, name))
+    {
+        builder.push_labeled(ContextKind::Behavior, "scheduler_wakeup", guidance);
+    }
     // Everything appended below steers a full agent: tool catalogs, project and
     // session context, skill history, persona, and scoped instructions. Pure mode
     // keeps the prompt to the safety/protocol core, so none of them render.
@@ -2069,10 +2102,32 @@ pub(super) fn prepare_skill_for_turn(
 
     // Skills explicitly forced by the user via `@skills:<name>` or `/skills <name>...` in the input box have the
     // highest priority.
-    // This is per-turn semantics: cleared immediately after consumption; not force-injected next turn.
+    // Explicit selections are consumed once; session defaults apply on later turns.
     // It is also the user's signal of explicitly leaving a waiting skill; an old continuation must not grab the turn back.
-    let forced_skills = std::mem::take(&mut app.forced_skills);
-    let forced_source = app.forced_skill_source.take();
+    let mut forced_skills = std::mem::take(&mut app.forced_skills);
+    let mut forced_source = app.forced_skill_source.take();
+    // Scheduler wakeups belong to the original turn, whose explicit skill set
+    // must survive even when the session has a different default.
+    let resume_names = super::runtime_ctx::resume_skill_names();
+    let explicit_selection = !forced_skills.is_empty();
+    if forced_skills.is_empty() && resume_names.is_empty() && !app.session_default_skills.is_empty()
+    {
+        forced_skills = app.session_default_skills.clone();
+        forced_source = Some(ForcedSkillSource::SessionDefault);
+    } else if explicit_selection {
+        // Session defaults carry the `/use` mode skill (e.g. `agent-team`), which is a floor rather than a
+        // turn-scoped pick: loading another skill adds to the mode instead of replacing it. `/reset` is the
+        // only explicit way out of the mode; both `/use` backends keep it. Explicit names stay first so the
+        // turn still reports the user's own pick as primary.
+        for name in &app.session_default_skills {
+            if !forced_skills
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(name))
+            {
+                forced_skills.push(name.clone());
+            }
+        }
+    }
     if !forced_skills.is_empty() {
         app.pending_skill_continuation = None;
     }
@@ -2130,6 +2185,28 @@ pub(super) fn prepare_skill_for_turn(
         }
     }
 
+    // A scheduler wake-up continues the same logical turn. Restore the exact
+    // pre-suspension skill set so its prompt and tools remain available.
+    if !resume_names.is_empty() {
+        let valid_names: Vec<String> = resume_names
+            .iter()
+            .filter(|name| skill_manifests.iter().any(|skill| &skill.name == *name))
+            .cloned()
+            .collect();
+        if !valid_names.is_empty()
+            && let Some(guard) =
+                force_activate_named_skill(app, mcp_client, skill_manifests, question, &valid_names)
+        {
+            if debug {
+                eprintln!(
+                    "[skills] restored resumed skills: {}",
+                    valid_names.join(", ")
+                );
+            }
+            return Ok(guard);
+        }
+    }
+
     // Consume the explicit continuation created by `request_user_input` exactly once. Re-resolving manifests by name here both
     // avoids treating deleted/renamed external skills as valid state and does not fall back to
     // the old text-similarity-based cross-turn sticky routing.
@@ -2173,9 +2250,8 @@ pub(super) fn prepare_skill_for_turn(
         }
     }
 
-    // No automatic skill activation: leave it to the LLM to explicitly choose via activate_skill when needed,
-    // or complete the task with existing tools. Cross-turn sticky is also gone — shallow Jaccard
-    // matching cannot tell "follow-up on the same skill" from "a different topic that happens to share tokens".
+    // Without a selection or session default, leave skill activation to the LLM.
+    // Text similarity never implies a cross-turn skill preference.
     let skills: &[&SkillManifest] = &[];
 
     if debug {
@@ -2227,6 +2303,7 @@ mod pure_prompt_tests {
             author: None,
             tools: Vec::new(),
             tool_groups: Vec::new(),
+            delegation: None,
             mcp_servers: Vec::new(),
             disable_builtin_tools: false,
             disable_mcp_tools: false,
@@ -2273,7 +2350,10 @@ mod pure_prompt_tests {
             "<safety>",
             "<execution_environment>",
         ] {
-            assert!(prompt.contains(kept), "pure mode must keep {kept}:\n{prompt}");
+            assert!(
+                prompt.contains(kept),
+                "pure mode must keep {kept}:\n{prompt}"
+            );
         }
 
         // Guidance that steers a general agent rather than preventing a wrong
@@ -2307,12 +2387,7 @@ mod pure_prompt_tests {
 
     #[test]
     fn standard_mode_keeps_the_full_guidance_catalog() {
-        let prompt = render_turn(
-            None,
-            &[],
-            &tools(FULL_TOOL_SET),
-            &PromptContext::default(),
-        );
+        let prompt = render_turn(None, &[], &tools(FULL_TOOL_SET), &PromptContext::default());
 
         for kept in [
             "<response_style>",
@@ -2370,12 +2445,7 @@ mod pure_prompt_tests {
             "prompt": "AGENT_SCOPE_MARKER",
         }))
         .expect("agent manifest deserializes from its documented fields");
-        let standard = render_turn(
-            Some(&agent),
-            &skills,
-            &available,
-            &PromptContext::default(),
-        );
+        let standard = render_turn(Some(&agent), &skills, &available, &PromptContext::default());
         for kept in [
             "AGENT_SCOPE_MARKER",
             "SKILL_SCOPE_MARKER",
@@ -2392,12 +2462,7 @@ mod pure_prompt_tests {
     fn pure_mode_is_a_small_fraction_of_the_standard_prompt() {
         let pure_agent = pure_agent_manifest();
         let pure = build_pure_system_prompt(&pure_agent).render_system_prompt();
-        let standard = render_turn(
-            None,
-            &[],
-            &tools(FULL_TOOL_SET),
-            &PromptContext::default(),
-        );
+        let standard = render_turn(None, &[], &tools(FULL_TOOL_SET), &PromptContext::default());
 
         assert!(!pure.is_empty());
         assert!(
@@ -2482,13 +2547,8 @@ mod pure_prompt_tests {
 
     #[test]
     fn default_profile_prompt_bytes_are_unchanged() {
-        const DEFAULT_PROFILE_PROMPT_HASH: u64 = 4_947_217_246_557_299_139;
-        let prompt = render_turn(
-            None,
-            &[],
-            &tools(FULL_TOOL_SET),
-            &PromptContext::default(),
-        );
+        const DEFAULT_PROFILE_PROMPT_HASH: u64 = 5_520_967_184_060_508_820;
+        let prompt = render_turn(None, &[], &tools(FULL_TOOL_SET), &PromptContext::default());
         assert_eq!(
             stable_hash(without_environment_block(&prompt).as_bytes()),
             DEFAULT_PROFILE_PROMPT_HASH,

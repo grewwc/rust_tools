@@ -34,6 +34,9 @@ use super::turn_runtime;
 use super::{BgSubagentGuard, TASK_PID, terminate_and_cleanup};
 
 const MAX_SUBAGENT_STATUS_DETAILS: usize = 3;
+const MAX_SUBAGENT_DESCRIPTION_CHARS: usize = 32;
+const MAX_SUBAGENT_PROGRESS_CHARS: usize = 140;
+const MIN_STATUS_FIELD_WIDTH: usize = 4;
 
 /// Background subagent history is kept only while the process can still be
 /// scheduled. Normal termination, failure, panic, or a `task_cancel` that aborts
@@ -107,8 +110,8 @@ impl Drop for BackgroundSubagentHistoryGuard {
 }
 
 /// The only foreground-facing subagent status display. Background tasks stay
-/// silent, refreshing one compact status line only at scheduler safe points, so
-/// concurrent prose or multi-line ANSI redraws never disturb the terminal.
+/// silent, refreshing one compact status block only at scheduler safe points,
+/// so it cannot interleave with foreground output.
 pub(super) struct SubagentStatusLine {
     last_line: Option<String>,
     last_serve_line: Option<String>,
@@ -244,7 +247,7 @@ impl SubagentStatusLine {
     /// its bare `\r\x1b[2K` would displace the output cursor and erase the
     /// composer draft, and the deferred line is not recorded.
     fn redraw_status_line(&mut self, status_line: &str, composer_active: bool) {
-        let line = crate::ai::stream::clamp_line_to_terminal_row_with_reserve(status_line, 0);
+        let line = clamp_status_block(status_line);
         if status_line_redraw_deferred(
             composer_active,
             self.last_line.as_deref(),
@@ -253,8 +256,13 @@ impl SubagentStatusLine {
         ) {
             return;
         }
-        print!("\r\x1b[2K{line}");
-        let _ = std::io::stdout().flush();
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        if crate::ai::stream::side_note_input::side_note_composer_active() {
+            return;
+        }
+        let _ = redraw_status_block(&mut out, self.last_line.as_deref(), &line);
+        let _ = out.flush();
         self.last_line = Some(line);
     }
 
@@ -279,13 +287,236 @@ impl SubagentStatusLine {
             return;
         };
         if self.is_tty {
-            print!("\r\x1b[2K{line}\n");
-            let _ = std::io::stdout().flush();
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            if crate::ai::stream::side_note_input::side_note_composer_active() {
+                self.last_line = Some(line);
+                return;
+            }
+            let _ = writeln!(out);
+            let _ = out.flush();
         }
     }
 }
 
 fn render_subagent_status_line(
+    statuses: &[crate::ai::tools::task_tools::SubagentTerminalStatus],
+) -> String {
+    render_subagent_status_line_at_width(statuses, crate::ai::stream::raw_terminal_cols())
+}
+
+fn render_subagent_status_line_at_width(
+    statuses: &[crate::ai::tools::task_tools::SubagentTerminalStatus],
+    width: usize,
+) -> String {
+    if statuses
+        .iter()
+        .all(|status| status.backend.is_none() && parse_activity_progress(status).is_none())
+    {
+        return render_legacy_subagent_status_line(statuses);
+    }
+
+    let total = statuses.len();
+    let active = statuses
+        .iter()
+        .filter(|status| !is_terminal_subagent_state(&status.state))
+        .count();
+    let count = if active == total {
+        format!("subagents · {total} active")
+    } else {
+        format!("subagents · {active}/{total} active")
+    };
+    let Some((status, activity)) = statuses
+        .iter()
+        .find_map(|status| parse_activity_progress(status).map(|activity| (status, activity)))
+    else {
+        let line = render_compact_subagent_status_line(statuses);
+        if display_width(&line) <= width {
+            return line;
+        }
+        let status = statuses
+            .iter()
+            .find(|status| status.backend.is_some() && status.reasoning_effort.is_some())
+            .unwrap_or(&statuses[0]);
+        return render_narrow_subagent_status_header(status, &count, width);
+    };
+
+    let backend = status
+        .backend
+        .as_deref()
+        .map(sanitize_status_field)
+        .filter(|backend| !backend.is_empty());
+    let line_one_suffix = format!(
+        " · {} {}",
+        sanitize_status_field(&status.state),
+        format_subagent_elapsed(status.elapsed_secs)
+    );
+    let backend_prefix = format!("{count} · [backend=");
+    let backend_suffix = "] ";
+    // The model is what the user cannot otherwise see, so it gets a stable
+    // budget before the backend tag and agent name compete for the remainder.
+    let model_suffix = status
+        .model
+        .as_deref()
+        .map(sanitize_status_field)
+        .filter(|model| !model.is_empty())
+        .map(|model| {
+            let budget = (width / 5).clamp(MIN_STATUS_FIELD_WIDTH, 24);
+            format!(" ({})", truncate_status_field_to_width(&model, budget))
+        })
+        .unwrap_or_default();
+    let effort_suffix = status
+        .reasoning_effort
+        .as_deref()
+        .map(sanitize_status_field)
+        .filter(|effort| !effort.is_empty())
+        .map(|effort| format!(" (effort: {effort})"))
+        .unwrap_or_default();
+    let backend = backend.map(|backend| {
+        let budget = width
+            .saturating_sub(display_width(&backend_prefix))
+            .saturating_sub(display_width(backend_suffix))
+            .saturating_sub(display_width(&line_one_suffix))
+            .saturating_sub(display_width(&model_suffix))
+            .saturating_sub(display_width(&effort_suffix))
+            .saturating_sub(MIN_STATUS_FIELD_WIDTH)
+            .max(MIN_STATUS_FIELD_WIDTH);
+        truncate_status_field_to_width(&backend, budget)
+    });
+    let line_one_prefix = match backend {
+        Some(backend) => format!("{backend_prefix}{backend}{backend_suffix}"),
+        None => format!("{count} · "),
+    };
+    let line_one_suffix_with_model = format!("{model_suffix}{effort_suffix}{line_one_suffix}");
+    let agent_width = available_field_width(width, &line_one_prefix, &line_one_suffix_with_model);
+    let agent = truncate_status_field_to_width(&status.agent_name, agent_width);
+    let line_one = format!("{line_one_prefix}{agent}{line_one_suffix_with_model}");
+    let line_one = if display_width(&line_one) <= width {
+        line_one
+    } else {
+        render_narrow_subagent_status_header(status, &count, width)
+    };
+
+    let latest_prefix = "↳ latest: ";
+    // `age` already carries its unit phrase ("2s ago") from the progress slot.
+    let latest_suffix = if activity.age.ends_with("ago") {
+        format!(" · {}", activity.age)
+    } else {
+        format!(" · {} ago", activity.age)
+    };
+    let latest_width = available_field_width(width, latest_prefix, &latest_suffix);
+    let latest = truncate_status_field_to_width(&activity.latest, latest_width);
+    let line_two = format!("{latest_prefix}{latest}{latest_suffix}");
+
+    let phase_prefix = "↳ phase: ";
+    let updates = activity
+        .updates
+        .map(|updates| format!(" · updates {updates}"))
+        .unwrap_or_default();
+    let task_prefix = format!("{updates} · task: ");
+    let content_width = width.saturating_sub(display_width(phase_prefix));
+    let task_budget = content_width
+        .saturating_sub(display_width(&task_prefix))
+        .saturating_div(2);
+    let phase_budget = content_width
+        .saturating_sub(display_width(&task_prefix))
+        .saturating_sub(task_budget);
+    let phase = truncate_status_field_to_width(&activity.phase, phase_budget);
+    let task = truncate_status_field_to_width(&status.description, task_budget);
+    let line_three = format!("{phase_prefix}{phase}{task_prefix}{task}");
+
+    [line_one, line_two, line_three]
+        .map(|line| truncate_status_field_to_width(&line, width))
+        .join("\n")
+}
+
+fn render_narrow_subagent_status_header(
+    status: &crate::ai::tools::task_tools::SubagentTerminalStatus,
+    count: &str,
+    width: usize,
+) -> String {
+    let effort = status
+        .reasoning_effort
+        .as_deref()
+        .map(sanitize_status_field)
+        .filter(|effort| !effort.is_empty())
+        .map(|effort| {
+            // Compact `e=<tier>` keeps effort ahead of lower-priority fields.
+            // When even that prefix cannot fit, reserve space for the value alone.
+            let label = format!("e={effort}");
+            if display_width(&label) <= width {
+                label
+            } else {
+                effort
+            }
+        })
+        .unwrap_or_default();
+    let model = status
+        .model
+        .as_deref()
+        .map(sanitize_status_field)
+        .filter(|model| !model.is_empty())
+        .map(|model| truncate_status_field_to_width(&model, (width / 5).min(24)))
+        .unwrap_or_default();
+    let fields = [
+        (count.to_string(), "", ""),
+        (
+            status
+                .backend
+                .as_deref()
+                .map(sanitize_status_field)
+                .unwrap_or_default(),
+            "[backend=",
+            "]",
+        ),
+        (status.agent_name.clone(), "", ""),
+        (model, "(", ")"),
+        (effort, "", ""),
+        (
+            format!(
+                "{} {}",
+                sanitize_status_field(&status.state),
+                format_subagent_elapsed(status.elapsed_secs)
+            ),
+            "",
+            "",
+        ),
+    ];
+    let mut parts: [String; 6] = std::array::from_fn(|_| String::new());
+    let mut remaining = width;
+    let mut kept = 0;
+    // Allocate effort, model, activity, and count before agent/backend details,
+    // then restore the usual display order without imposing a minimum width.
+    for index in [4, 3, 5, 0, 2, 1] {
+        let (value, prefix, suffix) = &fields[index];
+        if value.is_empty() {
+            continue;
+        }
+        let separator_width = if kept == 0 { 0 } else { display_width(" · ") };
+        if remaining <= separator_width {
+            break;
+        }
+        let value_width = remaining
+            .saturating_sub(separator_width)
+            .saturating_sub(display_width(prefix) + display_width(suffix));
+        let value = truncate_status_field_to_width(value, value_width);
+        if !value.is_empty() {
+            let part = format!("{prefix}{value}{suffix}");
+            remaining -= display_width(&part) + separator_width;
+            parts[index] = part;
+            kept += 1;
+        }
+    }
+    let line = parts
+        .iter()
+        .filter(|part| !part.is_empty())
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    truncate_status_field_to_width(&line, width)
+}
+
+fn render_legacy_subagent_status_line(
     statuses: &[crate::ai::tools::task_tools::SubagentTerminalStatus],
 ) -> String {
     let total = statuses.len();
@@ -298,7 +529,6 @@ fn render_subagent_status_line(
     } else {
         format!("subagents · {active}/{total} active")
     }];
-
     parts.extend(
         statuses
             .iter()
@@ -318,12 +548,169 @@ fn render_subagent_status_line(
                 detail
             }),
     );
-
     if total > MAX_SUBAGENT_STATUS_DETAILS {
         parts.push(format!("+{} more", total - MAX_SUBAGENT_STATUS_DETAILS));
     }
-
     parts.join(" · ")
+}
+
+fn render_compact_subagent_status_line(
+    statuses: &[crate::ai::tools::task_tools::SubagentTerminalStatus],
+) -> String {
+    let total = statuses.len();
+    let active = statuses
+        .iter()
+        .filter(|status| !is_terminal_subagent_state(&status.state))
+        .count();
+    let mut parts = vec![if active == total {
+        format!("subagents · {total} active")
+    } else {
+        format!("subagents · {active}/{total} active")
+    }];
+    parts.extend(
+        statuses
+            .iter()
+            .take(MAX_SUBAGENT_STATUS_DETAILS)
+            .map(|status| {
+                let mut detail = String::new();
+                if let Some(backend) = status.backend.as_deref() {
+                    detail.push_str(&format!("[backend={}] ", sanitize_status_field(backend)));
+                }
+                detail.push_str(&sanitize_status_field(&status.agent_name));
+                if let Some(model) = status.model.as_deref() {
+                    detail.push_str(&format!(" ({})", sanitize_status_field(model)));
+                }
+                if let Some(effort) = status.reasoning_effort.as_deref() {
+                    detail.push_str(&format!(" (effort: {})", sanitize_status_field(effort)));
+                }
+                detail.push(' ');
+                detail.push_str(&format_subagent_elapsed(status.elapsed_secs));
+                detail.push(' ');
+                detail.push_str(&sanitize_status_field(&status.state));
+                if let Some(progress) = status.progress.as_deref() {
+                    detail.push_str(" · ");
+                    detail.push_str(&compact_status_field(
+                        &status_progress_text(progress),
+                        MAX_SUBAGENT_PROGRESS_CHARS,
+                    ));
+                }
+                detail.push_str(" · ");
+                detail.push_str(&compact_status_field(
+                    &status.description,
+                    MAX_SUBAGENT_DESCRIPTION_CHARS,
+                ));
+                detail
+            }),
+    );
+    if total > MAX_SUBAGENT_STATUS_DETAILS {
+        parts.push(format!("+{} more", total - MAX_SUBAGENT_STATUS_DETAILS));
+    }
+    parts.join(" · ")
+}
+
+struct ActivityProgress {
+    latest: String,
+    age: String,
+    phase: String,
+    updates: Option<u64>,
+}
+
+fn parse_activity_progress(
+    status: &crate::ai::tools::task_tools::SubagentTerminalStatus,
+) -> Option<ActivityProgress> {
+    let progress = status.progress.as_deref()?;
+    let fields = progress.split(" · ").collect::<Vec<_>>();
+    let last_index = fields
+        .iter()
+        .position(|field| field.starts_with("last activity "))?;
+    let elapsed_index = fields
+        .iter()
+        .position(|field| field.starts_with("elapsed "))?;
+    if last_index == 0 || last_index >= elapsed_index {
+        return None;
+    }
+    let phase = fields.get(last_index + 1)?.trim();
+    if phase.starts_with("updates ") || phase.starts_with("plan: ") || phase.starts_with("elapsed ")
+    {
+        return None;
+    }
+    Some(ActivityProgress {
+        latest: fields[..last_index].join(" · "),
+        age: fields[last_index]
+            .trim_start_matches("last activity ")
+            .to_string(),
+        phase: phase.to_string(),
+        updates: fields[last_index + 2..elapsed_index]
+            .iter()
+            .find_map(|field| field.strip_prefix("updates ")?.parse().ok()),
+    })
+}
+
+fn display_width(value: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(value)
+}
+
+fn available_field_width(width: usize, prefix: &str, suffix: &str) -> usize {
+    width
+        .saturating_sub(display_width(prefix))
+        .saturating_sub(display_width(suffix))
+}
+
+fn truncate_status_field_to_width(value: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let value = sanitize_status_field(value);
+    if display_width(&value) <= max_width {
+        return value;
+    }
+    let budget = max_width.saturating_sub(1);
+    let mut width = 0;
+    let mut truncated = String::new();
+    for ch in value.chars() {
+        let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + char_width > budget {
+            break;
+        }
+        truncated.push(ch);
+        width += char_width;
+    }
+    truncated.push('…');
+    // Presentation selectors can widen a character beyond its individual width.
+    while display_width(&truncated) > max_width {
+        truncated.pop();
+        truncated.pop();
+        truncated.push('…');
+    }
+    truncated
+}
+
+fn clamp_status_block(status: &str) -> String {
+    status
+        .lines()
+        .take(3)
+        .map(|line| crate::ai::stream::clamp_line_to_terminal_row_with_reserve(line, 0))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn redraw_status_block(
+    out: &mut impl Write,
+    previous: Option<&str>,
+    status: &str,
+) -> std::io::Result<()> {
+    write!(out, "\r\x1b[2K")?;
+    for _ in 1..previous.map_or(1, |line| line.lines().count()) {
+        write!(out, "\x1b[1A\r\x1b[2K")?;
+    }
+    let mut lines = status.lines();
+    if let Some(first) = lines.next() {
+        write!(out, "{first}")?;
+    }
+    for line in lines {
+        write!(out, "\r\n{line}")?;
+    }
+    Ok(())
 }
 
 fn is_terminal_subagent_state(state: &str) -> bool {
@@ -331,6 +718,35 @@ fn is_terminal_subagent_state(state: &str) -> bool {
         state,
         "completed" | "failed" | "cancelled" | "canceled" | "timeout" | "terminated"
     )
+}
+
+/// Keep one status detail compact enough that several active subagents still
+/// fit on a terminal row. Truncation is char-boundary safe and only applies
+/// when the field exceeds the budget, so short kernel details are unchanged.
+fn compact_status_field(value: &str, max_chars: usize) -> String {
+    let value = sanitize_status_field(value);
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+    let mut compact = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    compact.push('…');
+    compact
+}
+
+/// The outer status line already prints the task's elapsed time, so drop the
+/// duplicate `elapsed` segment from the progress snapshot while keeping the
+/// more useful last-activity age.
+fn status_progress_text(progress: &str) -> String {
+    let Some((head, tail)) = progress.split_once(" · elapsed ") else {
+        return progress.to_string();
+    };
+    match tail.split_once(" · last activity ") {
+        Some((_, last)) => format!("{head} · last {last}"),
+        None => head.to_string(),
+    }
 }
 
 /// Coexistence rule with the side-note composer (Ctrl+G): while the composer
@@ -374,7 +790,8 @@ impl Drop for SubagentStatusLine {
 mod tests {
     use super::{
         BackgroundSubagentHistoryGuard, SubagentStatusLine, format_subagent_elapsed,
-        render_subagent_status_line, sanitize_status_field, status_line_redraw_deferred,
+        redraw_status_block, render_subagent_status_line, render_subagent_status_line_at_width,
+        sanitize_status_field, status_line_redraw_deferred,
     };
     use crate::ai::tools::task_tools::SubagentTerminalStatus;
 
@@ -392,6 +809,9 @@ mod tests {
             SubagentTerminalStatus {
                 description: "review stream".to_string(),
                 agent_name: "explorer".to_string(),
+                backend: None,
+                model: None,
+                reasoning_effort: None,
                 state: "running".to_string(),
                 elapsed_secs: 38,
                 progress: Some("using read_file · src/bin/ai/driver.rs".to_string()),
@@ -399,6 +819,9 @@ mod tests {
             SubagentTerminalStatus {
                 description: "review driver".to_string(),
                 agent_name: "explorer".to_string(),
+                backend: None,
+                model: None,
+                reasoning_effort: None,
                 state: "waiting".to_string(),
                 elapsed_secs: 61,
                 progress: None,
@@ -406,6 +829,9 @@ mod tests {
             SubagentTerminalStatus {
                 description: "compile check".to_string(),
                 agent_name: "executor".to_string(),
+                backend: None,
+                model: None,
+                reasoning_effort: None,
                 state: "completed".to_string(),
                 elapsed_secs: 3661,
                 progress: None,
@@ -413,6 +839,9 @@ mod tests {
             SubagentTerminalStatus {
                 description: "extra task".to_string(),
                 agent_name: "executor".to_string(),
+                backend: None,
+                model: None,
+                reasoning_effort: None,
                 state: "running".to_string(),
                 elapsed_secs: 5,
                 progress: None,
@@ -428,12 +857,183 @@ mod tests {
     }
 
     #[test]
+    fn subagent_status_line_labels_external_backends_only() {
+        let kernel = SubagentTerminalStatus {
+            description: "inspect".to_string(),
+            agent_name: "explorer".to_string(),
+            backend: None,
+            model: None,
+            reasoning_effort: None,
+            state: "running".to_string(),
+            elapsed_secs: 5,
+            progress: None,
+        };
+        assert_eq!(
+            render_subagent_status_line(&[kernel]),
+            "subagents · 1 active · inspect 5s running (explorer)"
+        );
+
+        let mut external = SubagentTerminalStatus {
+            description: "inspect".to_string(),
+            agent_name: "explorer".to_string(),
+            backend: Some("traecli".to_string()),
+            model: Some("gpt-5.5".to_string()),
+            reasoning_effort: None,
+            state: "running".to_string(),
+            elapsed_secs: 5,
+            progress: Some("thinking".to_string()),
+        };
+        // Full external details retain their exact format when the row can fit.
+        assert_eq!(
+            render_subagent_status_line_at_width(&[external.clone()], 120),
+            "subagents · 1 active · [backend=traecli] explorer (gpt-5.5) 5s running · thinking · inspect"
+        );
+        external.reasoning_effort = Some("xhigh".to_string());
+        assert_eq!(
+            render_subagent_status_line_at_width(&[external], 120),
+            "subagents · 1 active · [backend=traecli] explorer (gpt-5.5) (effort: xhigh) 5s running · thinking · inspect"
+        );
+    }
+
+    #[test]
+    fn subagent_status_block_is_three_width_bounded_lines_with_live_activity() {
+        let status = SubagentTerminalStatus {
+            description:
+                "更新任务派发说明，同时保留每一个已有的内核兼容行为".to_string(),
+            agent_name: "build-and-validation-worker".to_string(),
+            backend: Some("traecli-with-a-very-long-backend-name".to_string()),
+            model: Some("gpt-5.5".to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            state: "running".to_string(),
+            elapsed_secs: 598,
+            progress: Some(
+                "completed: rg -n \"backend\" src/bin/ai/driver/background_dispatch.rs · last activity 2s ago · running command · updates 60 · plan: preserve compatibility · elapsed 9m58s"
+                    .to_string(),
+            ),
+        };
+        let block = render_subagent_status_line_at_width(&[status.clone()], 120);
+        let lines = block.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 3, "{block}");
+        assert!(
+            lines[0].starts_with("subagents · 1 active · [backend="),
+            "{block}"
+        );
+        assert!(lines[0].contains("running 9m58s"), "{block}");
+        assert!(lines[0].contains("(gpt-5.5)"), "{block}");
+        assert!(lines[0].contains("(effort: xhigh)"), "{block}");
+        assert!(lines[1].starts_with("↳ latest: completed:"), "{block}");
+        assert!(lines[1].ends_with(" · 2s ago"), "{block}");
+        assert!(lines[2].starts_with("↳ phase: running command"), "{block}");
+        assert!(lines[2].contains("updates 60"), "{block}");
+        assert!(lines[2].contains("task: "), "{block}");
+        assert!(block.contains('…'), "{block}");
+        for line in lines {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(line) <= 120,
+                "line exceeds width: {line:?}"
+            );
+        }
+
+        let narrow = render_subagent_status_line_at_width(&[status.clone()], 72);
+        assert_eq!(narrow.lines().count(), 3, "{narrow}");
+        assert!(
+            narrow.lines().next().unwrap().contains("e=xhigh"),
+            "{narrow}"
+        );
+        assert!(
+            narrow.lines().next().unwrap().contains("(gpt-5.5)"),
+            "{narrow}"
+        );
+        for line in narrow.lines() {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(line) <= 72,
+                "line exceeds width: {line:?}"
+            );
+        }
+
+        let mut long_fields = status.clone();
+        long_fields.backend = Some("backend❤\u{fe0f}".repeat(24));
+        long_fields.model = Some("model❤\u{fe0f}".repeat(24));
+        long_fields.reasoning_effort = Some("effort❤\u{fe0f}".repeat(24));
+        long_fields.agent_name = "worker❤\u{fe0f}".repeat(24);
+        long_fields.state = "running❤\u{fe0f}".repeat(24);
+        long_fields.description = "任务❤\u{fe0f}".repeat(24);
+        long_fields.progress = Some(format!(
+            "{} · last activity {} ago · {} · updates {} · elapsed 9m58s",
+            "activity❤\u{fe0f}".repeat(24),
+            "age❤\u{fe0f}".repeat(24),
+            "phase❤\u{fe0f}".repeat(24),
+            u64::MAX,
+        ));
+        let mut no_activity = long_fields.clone();
+        no_activity.progress = None;
+        let mut kernel_activity = status.clone();
+        kernel_activity.backend = None;
+        kernel_activity.model = None;
+        for sample in [status, long_fields, no_activity, kernel_activity] {
+            for width in 0..=128 {
+                let block = render_subagent_status_line_at_width(&[sample.clone()], width);
+                for line in block.split('\n') {
+                    assert!(
+                        unicode_width::UnicodeWidthStr::width(line) <= width,
+                        "line exceeds width {width}: {line:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kernel_status_without_activity_is_byte_identical_to_legacy_format() {
+        let status = SubagentTerminalStatus {
+            description: "inspect scheduler".to_string(),
+            agent_name: "explorer".to_string(),
+            backend: None,
+            model: None,
+            reasoning_effort: None,
+            state: "running".to_string(),
+            elapsed_secs: 65,
+            progress: Some(
+                "calling model · plan: inspect task path · elapsed 1m5s · last activity 3s ago"
+                    .to_string(),
+            ),
+        };
+
+        assert_eq!(
+            render_subagent_status_line_at_width(&[status], 20),
+            "subagents · 1 active · inspect scheduler 1m5s running (explorer): calling model · plan: inspect task path · elapsed 1m5s · last activity 3s ago"
+        );
+    }
+
+    #[test]
+    fn status_block_redraw_clears_every_previous_row() {
+        let mut output = Vec::new();
+        redraw_status_block(
+            &mut output,
+            Some("old one\nold two\nold three"),
+            "new one\nnew two",
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\r\x1b[2K\x1b[1A\r\x1b[2K\x1b[1A\r\x1b[2Knew one\r\nnew two"
+        );
+    }
+
+    #[test]
     fn status_line_redraw_defers_while_side_note_composer_is_open() {
         // The coexistence rule: an OPEN Ctrl+G side-note composer owns the
         // footer row / DECSTBM scroll region, so the in-place redraw must be
         // deferred (and the line not recorded) on every scheduler tick — both
         // in the task_wait PARKED wait window and during a turn.
-        assert!(status_line_redraw_deferred(true, None, "subagents · 1 active", true));
+        assert!(status_line_redraw_deferred(
+            true,
+            None,
+            "subagents · 1 active",
+            true
+        ));
         assert!(status_line_redraw_deferred(
             true,
             Some("subagents · 1 active"),
@@ -441,10 +1041,20 @@ mod tests {
             true
         ));
         // Same-line dedup and non-TTY streams also defer the redraw.
-        assert!(status_line_redraw_deferred(false, Some("line"), "line", true));
+        assert!(status_line_redraw_deferred(
+            false,
+            Some("line"),
+            "line",
+            true
+        ));
         assert!(status_line_redraw_deferred(false, None, "line", false));
         // Live path: a new line on a TTY with no composer open is drawn.
-        assert!(!status_line_redraw_deferred(false, None, "subagents · 1 active", true));
+        assert!(!status_line_redraw_deferred(
+            false,
+            None,
+            "subagents · 1 active",
+            true
+        ));
     }
 
     #[test]
@@ -648,7 +1258,19 @@ pub(super) fn dispatch_background_batch(
         usize,
         bool,
         bool,
+        bool,
+        Option<String>,
+        Option<String>,
+        Vec<String>,
+        Option<String>,
+        Vec<String>,
     )> = Vec::new();
+    let backend_reasoning_effort =
+        crate::ai::request::resolve_reasoning_effort(app, &app.current_model)
+            .and_then(|effort| {
+                crate::ai::tools::task_tools::normalize_traecli_reasoning_effort(effort.as_str())
+            })
+            .map(str::to_string);
     for proc in &background_procs {
         let pid = proc.pid;
         let task_goal = match decode_background_process_task_goal(&proc.goal) {
@@ -724,6 +1346,25 @@ pub(super) fn dispatch_background_batch(
             task_goal.as_ref().map(|goal| goal.spawn_depth).unwrap_or(0),
             is_resume_wakeup,
             initialize_history,
+            task_goal.as_ref().is_some_and(|goal| {
+                crate::ai::tools::task_tools::SubagentBackend::from_stored(goal.backend.as_deref())
+                    .is_traecli()
+            }),
+            task_goal
+                .as_ref()
+                .and_then(|goal| goal.backend_model.clone()),
+            task_goal
+                .as_ref()
+                .and_then(|goal| goal.backend_continue_from.clone()),
+            task_goal
+                .as_ref()
+                .map(|goal| goal.active_skill_names.clone())
+                .unwrap_or_default(),
+            backend_reasoning_effort.clone(),
+            task_goal
+                .as_ref()
+                .map(|goal| goal.image_files.clone())
+                .unwrap_or_default(),
         ));
     }
 
@@ -741,9 +1382,30 @@ pub(super) fn dispatch_background_batch(
         spawn_depth,
         is_resume_wakeup,
         initialize_history,
+        is_traecli_backend,
+        backend_model,
+        backend_continue_from,
+        active_skill_names,
+        backend_reasoning_effort,
+        image_files,
     ) in task_specs
     {
+        if is_traecli_backend && let Some(task_id) = task_id.as_deref() {
+            crate::ai::tools::task_tools::set_task_reasoning_effort(
+                task_id,
+                backend_reasoning_effort.clone(),
+            );
+        }
         let mut task_app = app.fork_for_subagent();
+        // A resumed task keeps its original images in its first message; the
+        // foreground may have moved on to a different image. Only the initial
+        // dispatch attaches this task's own files, so a later wakeup cannot
+        // silently swap in the live turn's attachments.
+        task_app.attached_image_files = if initialize_history {
+            image_files.clone()
+        } else {
+            Vec::new()
+        };
         // Background tasks need their own streaming/cancel_stream flags:
         // `App::clone` by default shares the same Arc set with the parent App, so
         // concurrent background run_turns would overwrite each other's streaming
@@ -827,6 +1489,7 @@ pub(super) fn dispatch_background_batch(
         let phase_slot = crate::ai::tools::task_tools::task_progress_slot(&scope_task_id)
             .unwrap_or_else(runtime_ctx::new_subagent_progress_slot);
         let phase_slot_for_payload = phase_slot.clone();
+        let phase_slot_for_backend = phase_slot.clone();
         let parent_history_for_scopes = original_history_file.clone();
 
         // Private memory files and the exclusive cwd scratch directory are
@@ -877,48 +1540,154 @@ pub(super) fn dispatch_background_batch(
         );
         let result_slot_for_scope = result_slot_for_payload.clone();
 
+        // TraeCLI backend inputs, cloned before `inner_fut` moves the owners.
+        // Kernel path ignores these; the branch below selects the runner.
+        let traecli_cwd = if inherit.cwd {
+            inherited_cwd_dir
+                .clone()
+                .or_else(|| runtime_ctx::effective_cwd().ok())
+                .unwrap_or_else(|| PathBuf::from("."))
+        } else {
+            scoped_cwd_dir.clone().unwrap_or_else(std::env::temp_dir)
+        };
+        let traecli_cancel = task_app.cancel_stream.clone();
+        let traecli_workspace_allowed = inherit.cwd;
+
         let inner_fut = TASK_PID.scope(Some(pid), async move {
             crate::ai::tools::registry::common::clear_tool_cancel();
-            let run = runtime_ctx::IS_RESUME_TURN.scope(
-                is_resume_wakeup,
-                turn_runtime::run_turn(
-                    &mut task_app,
-                    &task_mcp,
-                    &task_skills,
-                    usize::MAX,
-                    proc_question,
-                    String::new(),
-                    next_model,
-                    None,
-                    false,
-                    false,
-                ),
-            );
-            let result = if let Some(spec) = auto_model_fallback {
-                runtime_ctx::AUTO_MODEL_FALLBACK.scope(spec, run).await
+            // Resolve `backend_continue_from` before branching: kernel goals can
+            // never carry one (spawn rejects that combination), so this only
+            // runs a map lookup for TraeCLI tasks and fails the task closed on
+            // unknown references.
+            let traecli_resume_session: Result<Option<String>, String> = if is_traecli_backend {
+                backend_continue_from
+                    .as_deref()
+                    .map(crate::ai::tools::task_tools::resolve_continue_target)
+                    .transpose()
             } else {
-                run.await
-            }
-            .map_err(|e| format!("{}", e));
-            let captured_result = if result_channel_id.is_some() {
-                result_slot_for_payload.lock().await.clone()
-            } else {
-                runtime_ctx::SubagentResult::default()
+                Ok(None)
             };
-            let captured_output = captured_result.parent_payload;
-            let response_for_validation = captured_result.final_assistant_text;
-            let progress = runtime_ctx::subagent_progress_snapshot(&phase_slot_for_payload)
-                .unwrap_or_else(|| "working".to_string());
-            let memory_merge_error = private_memory_for_merge.and_then(|private_memory| {
-                crate::ai::tools::service::memory::merge_subagent_whitelist(
-                    &private_memory,
-                    &main_memory_for_merge,
+            // Subagent backend branch: TraeCLI runs a headless subprocess while
+            // the kernel path below keeps the exact in-process `run_turn` flow.
+            // Both branches publish through the same channel/futex/validation
+            // logic after this block, so `task_wait` / `task_status` stay uniform.
+            let (
+                result,
+                captured_output,
+                response_for_validation,
+                progress,
+                memory_merge_error,
+                backend_session,
+            ): (
+                Result<(), String>,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+            ) = if is_traecli_backend {
+                match traecli_resume_session {
+                    Err(err) => (
+                        Err(err),
+                        String::new(),
+                        String::new(),
+                        "traecli".to_string(),
+                        None,
+                        None,
+                    ),
+                    Ok(resume_session) => {
+                        let spec = crate::ai::tools::task_tools::ExternalSubagentSpec {
+                            prompt: proc_question,
+                            cwd: traecli_cwd,
+                            workspace_allowed: traecli_workspace_allowed,
+                            model: backend_model,
+                            skills: crate::ai::skills::render_external_skill_context(
+                                task_skills.as_slice(),
+                                &active_skill_names,
+                            ),
+                            resume_session,
+                            reasoning_effort: backend_reasoning_effort,
+                            image_files: image_files.clone(),
+                            phase_slot: Some(phase_slot_for_backend),
+                        };
+                        match crate::ai::tools::task_tools::run_external_subagent(
+                            crate::ai::tools::task_tools::SubagentBackend::TraeCli,
+                            &spec,
+                            traecli_cancel,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => (
+                                Ok(()),
+                                outcome.output.clone(),
+                                outcome.output,
+                                outcome.progress,
+                                None,
+                                outcome.session_id,
+                            ),
+                            Err(err) => (
+                                Err(err),
+                                String::new(),
+                                String::new(),
+                                "traecli".to_string(),
+                                None,
+                                None,
+                            ),
+                        }
+                    }
+                }
+            } else {
+                let run = runtime_ctx::IS_RESUME_TURN.scope(
+                    is_resume_wakeup,
+                    turn_runtime::run_turn(
+                        &mut task_app,
+                        &task_mcp,
+                        &task_skills,
+                        usize::MAX,
+                        proc_question,
+                        String::new(),
+                        next_model,
+                        None,
+                        None,
+                        false,
+                        false,
+                    ),
+                );
+                let result = if let Some(spec) = auto_model_fallback {
+                    runtime_ctx::AUTO_MODEL_FALLBACK.scope(spec, run).await
+                } else {
+                    run.await
+                }
+                .map(|_| ())
+                .map_err(|e| format!("{}", e));
+                let captured_result = if result_channel_id.is_some() {
+                    result_slot_for_payload.lock().await.clone()
+                } else {
+                    runtime_ctx::SubagentResult::default()
+                };
+                let captured_output = captured_result.parent_payload;
+                let response_for_validation = captured_result.final_assistant_text;
+                let progress = runtime_ctx::subagent_progress_snapshot(&phase_slot_for_payload)
+                    .unwrap_or_else(|| "working".to_string());
+                let memory_merge_error = private_memory_for_merge.and_then(|private_memory| {
+                    crate::ai::tools::service::memory::merge_subagent_whitelist(
+                        &private_memory,
+                        &main_memory_for_merge,
+                    )
+                    .err()
+                });
+                if memory_merge_error.is_some() {
+                    memory_merge_failed_for_inner.store(true, Ordering::Release);
+                }
+                (
+                    result,
+                    captured_output,
+                    response_for_validation,
+                    progress,
+                    memory_merge_error,
+                    None,
                 )
-                .err()
-            });
-            if memory_merge_error.is_some() {
-                memory_merge_failed_for_inner.store(true, Ordering::Release);
-            }
+            };
             let response_validation_error = if result.is_ok() && memory_merge_error.is_none() {
                 crate::ai::tools::task_tools::validate_subagent_response(
                     response_schema.as_ref(),
@@ -939,6 +1708,13 @@ pub(super) fn dispatch_background_batch(
                 os.get_process(pid).map(|proc| &proc.state),
             );
             if publish_task_result && let Some(result_channel_id) = result_channel_id {
+                let backend_session = match (is_traecli_backend, task_id.as_deref()) {
+                    (true, Some(task_id)) => crate::ai::tools::task_tools::record_traecli_session(
+                        task_id,
+                        backend_session,
+                    ),
+                    _ => backend_session,
+                };
                 let payload = serde_json::json!({
                     "status": if task_succeeded { "completed" } else { "failed" },
                     "output": captured_output,
@@ -949,6 +1725,7 @@ pub(super) fn dispatch_background_batch(
                         .or(memory_merge_error)
                         .or(response_validation_error),
                     "progress": progress,
+                    "backend_session": backend_session,
                 })
                 .to_string();
                 let _ = os.channel_send(

@@ -6,7 +6,7 @@ mod common;
 mod completion_gate;
 mod final_citations;
 mod final_recovery;
-mod final_terminator;
+mod final_response;
 mod followup;
 mod iteration;
 mod observer;

@@ -583,6 +583,60 @@ fn prompt_residency_clears_when_truncation_removes_turns() {
 }
 
 #[test]
+fn clear_session_history_preserves_session_runtime_config() {
+    use crate::ai::history::SessionServeConfig;
+
+    let dir = std::env::temp_dir().join(format!(
+        "clear_session_runtime_config_test_{}_{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("history.sqlite");
+    let config = SessionServeConfig {
+        model: Some("test-model".to_string()),
+        agent: Some("test-agent".to_string()),
+        reasoning_effort: Some("high".to_string()),
+        subagent_backend: Some("traecli".to_string()),
+        subagent_model: Some("test-subagent-model".to_string()),
+        default_skills: vec!["agent-team".to_string(), "test-skill".to_string()],
+    };
+    write_session_serve_config_sqlite(&path, &config).unwrap();
+    append_history_sqlite(&path, vec![msg("user", "before clear")]).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO meta (key, value, created_at) VALUES (?1, ?2, unixepoch())",
+        rusqlite::params!["test_transient_meta", "before clear"],
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(read_session_serve_config_sqlite(&path).unwrap(), config);
+    let revision_before = read_history_revision(&path).unwrap();
+
+    clear_session_history_sqlite(&path).unwrap();
+
+    assert_eq!(read_session_serve_config_sqlite(&path).unwrap(), config);
+    assert!(read_all_messages_sqlite(&path).unwrap().is_empty());
+    let conn = Connection::open(&path).unwrap();
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM meta WHERE key = ?1",
+            rusqlite::params!["test_transient_meta"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0, "ordinary meta must be cleared");
+    drop(conn);
+    let revision_after = read_history_revision(&path).unwrap();
+    assert!(
+        revision_after > revision_before,
+        "clear should bump revision: {revision_before} -> {revision_after}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn stale_patch_targets_survive_history_replacement_and_clear_with_session() {
     let dir = std::env::temp_dir().join(format!(
         "stale_patch_meta_test_{}_{}",

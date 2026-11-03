@@ -395,6 +395,7 @@ impl TurnFixture {
             String::new(),
             self.model.clone(),
             None,
+            None,
             true,
             false,
         );

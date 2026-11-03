@@ -230,7 +230,9 @@ fn builtin_arg_validator(name: &str, schema: &Value) -> Option<Arc<jsonschema::V
     let compiled = match jsonschema::validator_for(schema) {
         Ok(validator) => Some(Arc::new(validator)),
         Err(err) => {
-            eprintln!("[tools] skipping argument validation for '{name}': invalid schema: {err}");
+            crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
+                "[tools] skipping argument validation for '{name}': invalid schema: {err}"
+            ));
             None
         }
     };
@@ -266,7 +268,9 @@ fn mcp_arg_validator(name: &str, schema: &Value) -> Option<Arc<jsonschema::Valid
     let compiled = match jsonschema::validator_for(schema) {
         Ok(validator) => Some(Arc::new(validator)),
         Err(err) => {
-            eprintln!("[tools] skipping argument validation for '{name}': invalid schema: {err}");
+            crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
+                "[tools] skipping argument validation for '{name}': invalid schema: {err}"
+            ));
             None
         }
     };
@@ -548,7 +552,7 @@ fn confirm_tool_execution(tool_call: &ToolCall, args: &Value) -> Result<(), RunO
         return Ok(());
     }
 
-    println!("canceled by user.");
+    crate::ai::driver::print::print_line("canceled by user.");
     Err(RunOneResult {
         tool_result: ToolResult {
             tool_call_id: tool_call.id.clone(),
@@ -827,14 +831,14 @@ where
     let mut result = exec();
     if let Err(err) = result.as_ref() {
         if should_retry_once(route, tool_name, err) {
-            print!(
-                "\r\x1b[2K{} (transient error; one safe retry)\n",
+            crate::ai::driver::print::print_line(&format!(
+                "\r\x1b[2K{} (transient error; one safe retry)",
                 crate::ai::driver::print::format_tool_status(
                     "Retry",
                     tool_name,
                     crate::ai::theme::current().accent_warn
                 )
-            );
+            ));
             result = exec();
         }
     }
@@ -909,20 +913,20 @@ fn print_run_status(
     };
 
     if run_result.cached {
-        println!("{}", with_file_target(format_tool_status_cached(name)));
+        crate::ai::driver::print::print_line(&with_file_target(format_tool_status_cached(name)));
     } else if !run_result.executed {
-        println!("{}", with_file_target(format_tool_status_skipped(name)));
+        crate::ai::driver::print::print_line(&with_file_target(format_tool_status_skipped(name)));
     } else if run_result.ok {
-        // 已执行的工具：用 \r 回到行首覆盖 running 状态，保持同一行
-        print!(
-            "\r\x1b[2K{}\n",
+        // Executed tools overwrite the running status in place with `\r`, keeping one line.
+        crate::ai::driver::print::print_line(&format!(
+            "\r\x1b[2K{}",
             with_file_target(format_tool_status_completed(name))
-        );
+        ));
     } else {
-        print!(
-            "\r\x1b[2K{}\n",
+        crate::ai::driver::print::print_line(&format!(
+            "\r\x1b[2K{}",
             with_file_target(format_tool_status_failed(name))
-        );
+        ));
     }
 
     // 部分工具的输出对用户有较高可见性价值，额外把其内容回显到终端。
@@ -1121,13 +1125,13 @@ fn run_one(
         };
         if crate::ai::driver::runtime_ctx::stdout_is_terminal() {
             // Keep the line open so completion can replace it with a carriage return.
-            print!("{row}");
+            crate::ai::stream::side_note_input::print_output_fragment(&row);
         } else {
             // A pipe consumer reads whole lines. Without the newline the running
             // marker only surfaces when the completion row arrives, so a remote
             // client learns about a tool after it finished instead of when it
             // started, and a long tool looks like a dead stream.
-            println!("{row}");
+            crate::ai::driver::print::print_line(&row);
         }
         let _ = std::io::stdout().flush();
     }
@@ -1208,7 +1212,9 @@ fn execute_tool_calls_inner(
         if crate::ai::tools::registry::common::is_tool_cancel_requested() {
             if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
                 for deferred in &tool_calls[idx..] {
-                    println!("{}", format_tool_status_deferred(&deferred.function.name));
+                    crate::ai::driver::print::print_line(&format_tool_status_deferred(
+                        &deferred.function.name,
+                    ));
                 }
             }
             break;
@@ -1308,7 +1314,9 @@ fn execute_tool_calls_inner(
         if should_barrier && !is_last {
             if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
                 for deferred in &tool_calls[idx + 1..] {
-                    println!("{}", format_tool_status_deferred(&deferred.function.name));
+                    crate::ai::driver::print::print_line(&format_tool_status_deferred(
+                        &deferred.function.name,
+                    ));
                 }
             }
             break;
@@ -1317,7 +1325,9 @@ fn execute_tool_calls_inner(
         if crate::ai::tools::registry::common::is_tool_cancel_requested() {
             if crate::ai::driver::runtime_ctx::terminal_output_enabled() {
                 for deferred in &tool_calls[idx + 1..] {
-                    println!("{}", format_tool_status_deferred(&deferred.function.name));
+                    crate::ai::driver::print::print_line(&format_tool_status_deferred(
+                        &deferred.function.name,
+                    ));
                 }
             }
             break;

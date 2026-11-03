@@ -2060,6 +2060,7 @@ impl PromptEditor {
                                 topic_with_badge.as_deref(),
                                 checkpoint_label.as_deref(),
                                 live_paint_width,
+                                &self.current_backend_label,
                             );
                             drawn_row_widths = if force_repaint {
                                 force_frame_repaint(f, &screen.box_row_widths)
@@ -2364,6 +2365,7 @@ mod tests {
             model_remote: false,
             current_agent_label: "fixture-agent".to_string(),
             current_reasoning_effort_label: "high".to_string(),
+            current_backend_label: String::new(),
             session_topic: Some("fixture-topic".to_string()),
             room_badge: None,
             remote_checkpoint_status_label: None,

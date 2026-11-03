@@ -438,14 +438,17 @@ pub(super) fn write_stream_content_to_terminal(
 ) -> io::Result<()> {
     if markdown.should_render(content) {
         markdown.write_chunk(content, dimmed)?;
-        io::stdout().flush()?;
     } else {
         if dimmed {
             print!("{}{content}{RESET}", theme::current().accent_muted);
         } else {
             print!("{content}");
         }
-        io::stdout().flush()?;
     }
+    io::stdout().flush()?;
+    // The markdown renderer rewrites its preview with `CSI 0J`, which erases past the
+    // DECSTBM margin into the reserved composer row. Restore the draft right away so a
+    // side-note is never invisible between two stream chunks.
+    let _ = super::side_note_input::repaint_stdout_composer();
     Ok(())
 }

@@ -1,6 +1,10 @@
 use colored::Colorize;
 
-use crate::ai::{driver::{discuss, talk}, history::SessionStore, types::App};
+use crate::ai::{
+    driver::{discuss, talk},
+    history::SessionStore,
+    types::App,
+};
 
 use super::{apply_embedded_skills, split_combined_command};
 
@@ -222,7 +226,9 @@ mod tests {
     #[test]
     fn bare_topic_uses_default_member_count() {
         assert_eq!(
-            parse_discuss_command("/discuss tabs vs spaces").unwrap().unwrap(),
+            parse_discuss_command("/discuss tabs vs spaces")
+                .unwrap()
+                .unwrap(),
             DiscussCommand::Start {
                 topic: "tabs vs spaces".to_string(),
                 member_count: DEFAULT_DISCUSS_MEMBERS,
@@ -324,6 +330,9 @@ mod tests {
             client: reqwest::Client::builder().build().unwrap(),
             current_model: "test".to_string(),
             current_agent: "build".to_string(),
+            session_default_subagent_backend: Default::default(),
+            session_default_subagent_model: None,
+            session_default_skills: Vec::new(),
             current_agent_manifest: None,
             pending_files: None,
             forced_skills: Vec::new(),
@@ -366,7 +375,10 @@ mod tests {
             let mut app = test_app();
             assert!(try_handle_discuss_command(&mut app, input).unwrap());
             let question = app.forced_question.expect("start must set a host prompt");
-            assert!(question.contains("tabs vs spaces"), "topic lost: {question}");
+            assert!(
+                question.contains("tabs vs spaces"),
+                "topic lost: {question}"
+            );
             assert!(!question.contains("s1"), "skills line leaked: {question}");
             assert_eq!(app.forced_skills, vec!["s1", "s2"]);
             assert_eq!(

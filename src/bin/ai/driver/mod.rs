@@ -44,17 +44,16 @@ use crate::ai::{
 };
 use crate::commonw::configw;
 
-mod auto_talk;
 mod agent_routing;
+mod auto_talk;
 mod background_dispatch;
-mod distilled_recall;
 pub mod commands;
 pub mod decision_log;
 pub(crate) mod discuss;
-pub(crate) mod task;
+mod distilled_recall;
+pub(crate) mod history_rewind;
 pub mod hook_registry;
 pub mod hooks;
-pub(crate) mod history_rewind;
 pub mod input;
 pub mod mcp_init;
 mod mcp_lifecycle;
@@ -69,10 +68,11 @@ mod scheduler;
 mod session;
 pub mod session_pid;
 pub mod side_note;
-pub mod talk;
 pub mod signal;
 pub mod skill_runtime;
 mod skill_watcher;
+pub mod talk;
+pub(crate) mod task;
 pub mod thinking;
 pub mod tools;
 pub mod turn_runtime;
@@ -84,6 +84,7 @@ pub use commands::try_handle_local_command;
 pub use mcp_init::*;
 use mcp_lifecycle::*;
 pub use model::*;
+pub(crate) use process_context::process_history_path;
 use process_context::*;
 use scheduler::*;
 use session::*;
@@ -161,6 +162,16 @@ impl SchedulerClock {
             (Some(kernel), Some(task_wait)) => Some(kernel.min(task_wait)),
             (Some(delay), None) | (None, Some(delay)) => Some(delay),
             (None, None) => None,
+        };
+        // Subagent backends can stay quiet for minutes between events. Wake once
+        // a second while any are in flight so the status line recomputes elapsed
+        // and last-activity time instead of freezing on the last event.
+        let wake_after = if bg_subagents_inflight() {
+            Some(wake_after.map_or(Duration::from_secs(1), |delay| {
+                delay.min(Duration::from_secs(1))
+            }))
+        } else {
+            wake_after
         };
         let started_at = tokio::time::Instant::now();
         if let Some(delay) = wake_after {
@@ -608,10 +619,10 @@ pub(in crate::ai) async fn run_with_cli(
         // manifests load in the background and `install_runtime_manifests` only
         // applies `cli.agent` after that scan, which previously left the status
         // bar on "build" for `a -s` / `--agent` launches.
-        current_agent: cli
-            .agent
-            .clone()
-            .unwrap_or_else(|| "build".to_string()),
+        current_agent: cli.agent.clone().unwrap_or_else(|| "build".to_string()),
+        session_default_subagent_backend: Default::default(),
+        session_default_subagent_model: None,
+        session_default_skills: Vec::new(),
         current_agent_manifest: None,
         session_id: session_id.clone(),
         session_history_file: session_store.session_history_file(&session_id),
@@ -718,9 +729,7 @@ pub(in crate::ai) async fn run_with_cli(
             .await;
     }
 
-    crate::ai::driver::decision_log::sync_persist_path_for_history_file(
-        &app.session_history_file,
-    );
+    crate::ai::driver::decision_log::sync_persist_path_for_history_file(&app.session_history_file);
 
     let mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
 
@@ -776,8 +785,10 @@ async fn run_foreground_resume(
     skill_manifests: &Arc<Vec<SkillManifest>>,
     agent_manifests: &Arc<Vec<AgentManifest>>,
     proc: aios_kernel::kernel::Process,
+    parked_foreground_wait_guard: Option<signal::ParkedForegroundWaitGuard>,
 ) {
     let pid = proc.pid;
+    let restored_skill_names = resume_skill_names(&proc);
     let proc_question = if !proc.mailbox.is_empty() {
         let messages: Vec<String> = proc.mailbox.iter().cloned().collect();
         {
@@ -819,25 +830,39 @@ async fn run_foreground_resume(
                 persona_memory_path,
                 TASK_PID.scope(
                     Some(pid),
-                    runtime_ctx::IS_RESUME_TURN.scope(
-                        true,
-                        turn_runtime::run_turn(
-                            app,
-                            mcp_client,
-                            skill_manifests,
-                            usize::MAX,
-                            proc_question,
-                            String::new(),
-                            next_model,
-                            None,
-                            false,
-                            false,
-                        ),
-                    ),
+                    runtime_ctx::IS_RESUME_TURN.scope(true, async {
+                        runtime_ctx::RESUME_SKILL_NAMES
+                            .scope(restored_skill_names, async {
+                                let outcome = turn_runtime::run_turn(
+                                    app,
+                                    mcp_client,
+                                    skill_manifests,
+                                    usize::MAX,
+                                    proc_question,
+                                    String::new(),
+                                    next_model,
+                                    None,
+                                    parked_foreground_wait_guard,
+                                    false,
+                                    false,
+                                )
+                                .await;
+                                (outcome, runtime_ctx::active_skill_names())
+                            })
+                            .await
+                    }),
                 ),
             ),
         )
         .await;
+
+    let (turn_outcome, active_skill_names) = turn_outcome;
+    if turn_outcome.is_ok() {
+        let mut os = app.os.lock().unwrap();
+        if let Some(process) = os.get_process_mut(pid) {
+            store_resume_skill_names(process, &active_skill_names);
+        }
+    }
 
     match turn_outcome {
         Ok(_outcome) => {
@@ -878,12 +903,14 @@ fn spawn_wait_window_side_note_input(
     app: &App,
 ) -> Option<crate::ai::stream::side_note_input::SideNoteInputGuard> {
     if crate::ai::stream::side_note_input::side_note_input_enabled() {
-        Some(crate::ai::stream::side_note_input::SideNoteInputGuard::spawn(
-            app.session_history_file.clone(),
-            app.session_id.clone(),
-            app.active_persona.id.clone(),
-            app.current_model.clone(),
-        ))
+        Some(
+            crate::ai::stream::side_note_input::SideNoteInputGuard::spawn(
+                app.session_history_file.clone(),
+                app.session_id.clone(),
+                app.active_persona.id.clone(),
+                app.current_model.clone(),
+            ),
+        )
     } else {
         None
     }
@@ -938,8 +965,8 @@ async fn run_loop(
     // switch `app.session_id` to another session, and cleanup must never delete
     // that user-visible target — otherwise `a /ss fork src=X as=Y` prints
     // "Forked ... switched to new branch" and then immediately deletes Y.
-    let one_shot_auto_session = (one_shot_mode && app.cli.session.is_none())
-        .then(|| app.session_id.clone());
+    let one_shot_auto_session =
+        (one_shot_mode && app.cli.session.is_none()).then(|| app.session_id.clone());
     // ── --auto-talk startup ──
     // Headless bot loop over the talk inbox. Requires a named `--session` (a
     // throwaway one-shot session would be deleted on exit) and refuses to
@@ -1050,7 +1077,10 @@ async fn run_loop(
     // It is created lazily when a wait window starts and dropped explicitly
     // before every path that starts a turn or opens the input box (the `fg_proc`
     // pop below and the fall-through drop after the wait branch).
-    let mut wait_window_side_note_input: Option<crate::ai::stream::side_note_input::SideNoteInputGuard> = None;
+    let mut wait_window_side_note_input: Option<
+        crate::ai::stream::side_note_input::SideNoteInputGuard,
+    > = None;
+    let mut parked_foreground_wait_guard: Option<signal::ParkedForegroundWaitGuard> = None;
     loop {
         let epoch = next_scheduler_epoch();
 
@@ -1074,7 +1104,7 @@ async fn run_loop(
             if manifests_loaded && *counter % 5 == 0 {
                 if let Some(message) = reload_agent_manifests(agent_manifests) {
                     subagent_status_line.finish();
-                    println!("{message}");
+                    crate::ai::driver::print::print_line(&message);
                 }
             }
         } else {
@@ -1111,16 +1141,29 @@ async fn run_loop(
         );
         subagent_status_line.refresh(app);
 
+        if signal::take_parked_foreground_interrupt() {
+            agent_routing::interrupt_pending_foreground_process(app);
+        }
+
         let fg_proc = {
             let mut os = app.os.lock().unwrap();
             os.pop_foreground_ready()
         };
         if let Some(proc) = fg_proc {
-            // A turn is about to start: release the wait-window listener (if any)
-            // before `run_foreground_resume` takes foreground stdin. Drop point 1.
+            // A turn is about to start: release the wait-window listener before
+            // `run_foreground_resume` takes foreground stdin. Move the parked-wait
+            // guard into the turn so its interrupt state is handed off atomically.
             drop(wait_window_side_note_input.take());
             subagent_status_line.finish();
-            run_foreground_resume(app, mcp_client, skill_manifests, agent_manifests, proc).await;
+            run_foreground_resume(
+                app,
+                mcp_client,
+                skill_manifests,
+                agent_manifests,
+                proc,
+                parked_foreground_wait_guard.take(),
+            )
+            .await;
             continue;
         }
 
@@ -1134,8 +1177,14 @@ async fn run_loop(
         // when the window starts, keep it across every `scheduler_clock.wait`
         // wakeup, and let the two explicit drops (the `fg_proc` pop above and the
         // fall-through below) release it before a turn or the input box.
+        let pending_foreground = has_pending_foreground_process(app);
+        if pending_foreground && parked_foreground_wait_guard.is_none() {
+            parked_foreground_wait_guard = Some(signal::ParkedForegroundWaitGuard::enter());
+        } else if !pending_foreground {
+            drop(parked_foreground_wait_guard.take());
+        }
         if wait_window_needs_side_note_listener(
-            has_pending_foreground_process(app),
+            pending_foreground,
             one_shot_mode,
             bg_subagents_inflight(),
         ) {
@@ -1150,6 +1199,7 @@ async fn run_loop(
         // any turn/input path below (pending side-note flush, auto-talk poll, the
         // interactive input box). Drop point 2.
         drop(wait_window_side_note_input.take());
+        drop(parked_foreground_wait_guard.take());
 
         subagent_status_line.finish();
 
@@ -1231,8 +1281,9 @@ async fn run_loop(
                     // skill activation and every delivery path shows the same
                     // card text.
                     for msg in &mut pending {
-                        card_skills
-                            .extend(crate::ai::driver::talk::take_room_card_skills(&mut msg.body));
+                        card_skills.extend(crate::ai::driver::talk::take_room_card_skills(
+                            &mut msg.body,
+                        ));
                     }
                     // Single canonical framing shared with headless
                     // `--auto-talk`: bot and human operator see byte-identical
@@ -1306,8 +1357,7 @@ async fn run_loop(
                 }
                 if !card_skills.is_empty() {
                     app.forced_skills = card_skills;
-                    app.forced_skill_source =
-                        Some(crate::ai::types::ForcedSkillSource::RoomCard);
+                    app.forced_skill_source = Some(crate::ai::types::ForcedSkillSource::RoomCard);
                 }
                 question = pending_talk_input;
                 attachments_text = String::new();
@@ -1432,12 +1482,7 @@ async fn run_loop(
             *skill_manifests = updated;
         }
 
-        if try_handle_interactive_command(
-            app,
-            &question,
-            agent_manifests,
-            skill_manifests,
-        )? {
+        if try_handle_interactive_command(app, &question, agent_manifests, skill_manifests)? {
             // For /skills <name> <rest>, the parsed rest replaces the question and the
             // conversation continues.
             if let Some(rest) = app.forced_question.take() {
@@ -1483,8 +1528,12 @@ async fn run_loop(
             {
                 Ok(()) => {}
                 Err(err) => {
-                    eprintln!("[Error] 当前轮 notebook 检索失败：{}", err);
-                    eprintln!("[Info] 会话保持运行，请继续输入下一条消息。\n");
+                    crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
+                        "[Error] 当前轮 notebook 检索失败：{err}"
+                    ));
+                    crate::ai::stream::side_note_input::print_output_stderr_line(
+                        "[Info] 会话保持运行，请继续输入下一条消息。",
+                    );
                 }
             }
             should_quit = false;
@@ -1589,9 +1638,8 @@ async fn run_loop(
                 driver_ctx,
                 runtime_ctx::PERSONA_MEMORY_PATH.scope(
                     persona_memory_path,
-                    TASK_PID.scope(
-                        fg_pid,
-                        turn_runtime::run_turn(
+                    TASK_PID.scope(fg_pid, async {
+                        let outcome = turn_runtime::run_turn(
                             app,
                             mcp_client,
                             &*skill_manifests,
@@ -1600,13 +1648,26 @@ async fn run_loop(
                             attachments_text,
                             next_model,
                             precomputed_ocr,
+                            None,
                             one_shot_mode,
                             should_quit,
-                        ),
-                    ),
+                        )
+                        .await;
+                        (outcome, runtime_ctx::active_skill_names())
+                    }),
                 ),
             )
             .await;
+
+        let (turn_outcome, active_skill_names) = turn_outcome;
+        if turn_outcome.is_ok()
+            && let Some(pid) = fg_pid
+        {
+            let mut os = app.os.lock().unwrap();
+            if let Some(process) = os.get_process_mut(pid) {
+                store_resume_skill_names(process, &active_skill_names);
+            }
+        }
 
         hooks::run_lifecycle_hook(hooks::HookEvent::TurnEnd, None, None);
 
@@ -1632,11 +1693,11 @@ async fn run_loop(
                 if !restarted.is_empty() {
                     use colored::Colorize;
                     for pid in &restarted {
-                        println!(
+                        crate::ai::driver::print::print_line(&format!(
                             "{} Daemon process {} restarted.",
                             "[OS]".bright_blue().bold(),
                             pid
-                        );
+                        ));
                     }
                 }
 
@@ -1655,12 +1716,17 @@ async fn run_loop(
                     os.terminate_current(format!("Failed: {}", err));
                 }
                 app.session_history_file = original_history_file;
-                eprintln!("[Error] 当前轮请求失败：{}", err);
+                crate::ai::stream::side_note_input::print_output_stderr_line(&format!(
+                    "[Error] 当前轮请求失败：{}",
+                    err
+                ));
                 if one_shot_mode || should_quit {
                     cleanup_one_shot(app);
                     return Err(err);
                 }
-                eprintln!("[Info] 会话保持运行，请继续输入下一条消息。\n");
+                crate::ai::stream::side_note_input::print_output_stderr_line(
+                    "[Info] 会话保持运行，请继续输入下一条消息。\n",
+                );
                 should_quit = false;
                 continue;
             }

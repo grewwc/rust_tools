@@ -9,6 +9,8 @@ use super::*;
 /// / `take_task_entry` rather than holding a lock guard directly.
 pub(super) static TASK_REGISTRY: LazyLock<Mutex<SkipMap<String, AsyncTaskEntry>>> =
     LazyLock::new(|| Mutex::new(SkipMap::default()));
+static TASK_REASONING_EFFORT_REGISTRY: LazyLock<Mutex<SkipMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(SkipMap::default()));
 pub(super) static TASK_RETRY_REGISTRY: LazyLock<Mutex<SkipMap<String, RetryableTaskSpec>>> =
     LazyLock::new(|| Mutex::new(SkipMap::default()));
 
@@ -18,8 +20,8 @@ pub(super) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, 
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
-pub(super) fn lock_task_registry()
--> std::sync::MutexGuard<'static, SkipMap<String, AsyncTaskEntry>> {
+pub(super) fn lock_task_registry() -> std::sync::MutexGuard<'static, SkipMap<String, AsyncTaskEntry>>
+{
     lock_unpoisoned(&TASK_REGISTRY)
 }
 
@@ -90,6 +92,25 @@ pub(crate) fn set_task_abort_handle(task_id: &str, abort_handle: tokio::task::Ab
     true
 }
 
+/// Record a subagent's effective effort display label. Kernel children resolve
+/// it at preparation; external backends record their dispatched effort. `None`
+/// leaves an external backend's default unknown.
+pub(crate) fn set_task_reasoning_effort(task_id: &str, reasoning_effort: Option<String>) {
+    let mut registry = lock_unpoisoned(&TASK_REASONING_EFFORT_REGISTRY);
+    match reasoning_effort.filter(|effort| !effort.trim().is_empty()) {
+        Some(effort) => {
+            registry.insert(task_id.to_string(), effort);
+        }
+        None => {
+            registry.remove(&task_id.to_string());
+        }
+    }
+}
+
+pub(crate) fn task_reasoning_effort(task_id: &str) -> Option<String> {
+    lock_unpoisoned(&TASK_REASONING_EFFORT_REGISTRY).get(&task_id.to_string())
+}
+
 pub(crate) fn with_task_entry_by_pid<R>(
     pid: u64,
     mut f: impl FnMut(&AsyncTaskEntry) -> R,
@@ -110,6 +131,13 @@ pub(crate) fn with_task_entry_by_pid<R>(
 pub(crate) struct SubagentTerminalStatus {
     pub(crate) description: String,
     pub(crate) agent_name: String,
+    pub(crate) backend: Option<String>,
+    /// Model actually serving an external backend. `None` for the kernel
+    /// runner so its status line keeps the established format.
+    pub(crate) model: Option<String>,
+    /// Effective effort display label. `None` preserves an external backend's
+    /// unknown/default behavior.
+    pub(crate) reasoning_effort: Option<String>,
     pub(crate) state: String,
     pub(crate) elapsed_secs: u64,
     pub(crate) progress: Option<String>,
@@ -124,6 +152,9 @@ pub(crate) struct SubagentStatusSnapshot {
     result_channel_id: u64,
     description: String,
     agent_name: String,
+    backend: Option<String>,
+    display_model: Option<String>,
+    reasoning_effort: Option<String>,
     started_at: Instant,
     progress: Option<String>,
 }
@@ -142,11 +173,22 @@ pub(crate) fn subagent_status_snapshots(session_id: &str) -> Vec<SubagentStatusS
                 result_channel_id: entry.result_channel_id,
                 description: entry.description.clone(),
                 agent_name: entry.agent_name.clone(),
+                backend: entry.backend.map(|backend| backend.as_str().to_string()),
+                // Only external backends disclose their model in the status
+                // line; the kernel format stays unchanged.
+                display_model: entry.backend.map(|_| entry.model.clone()),
+                reasoning_effort: None,
                 started_at: entry.started_at,
                 progress: None,
             })
             .collect::<Vec<_>>()
     };
+    {
+        let effort_registry = lock_unpoisoned(&TASK_REASONING_EFFORT_REGISTRY);
+        for snapshot in &mut snapshots {
+            snapshot.reasoning_effort = effort_registry.get(&snapshot.task_id);
+        }
+    }
     for snapshot in &mut snapshots {
         snapshot.progress = current_task_progress(&snapshot.task_id);
     }
@@ -166,6 +208,9 @@ pub(crate) fn subagent_terminal_statuses(
         .map(|snapshot| SubagentTerminalStatus {
             description: snapshot.description,
             agent_name: snapshot.agent_name,
+            backend: snapshot.backend,
+            model: snapshot.display_model,
+            reasoning_effort: snapshot.reasoning_effort,
             state: task_state_string(os, snapshot.result_channel_id, snapshot.pid)
                 .unwrap_or_else(|_| "unknown".to_string()),
             elapsed_secs: snapshot.started_at.elapsed().as_secs(),
@@ -211,7 +256,11 @@ pub(crate) fn validate_side_note_target(task_id: &str) -> Result<(), String> {
         if is_task_pending(os, entry.pid)? {
             Ok(None)
         } else {
-            Ok(Some(task_state_string(os, entry.result_channel_id, entry.pid)?))
+            Ok(Some(task_state_string(
+                os,
+                entry.result_channel_id,
+                entry.pid,
+            )?))
         }
     }) {
         Ok(status) => status,
@@ -225,9 +274,49 @@ pub(crate) fn validate_side_note_target(task_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve which history file owns the queue a side-note must be written to.
+///
+/// `Ok(None)` keeps the note in `foreground_history`: the foreground turn and
+/// empty targets drain that queue. A concrete task id resolves to the child's
+/// own history file (`<stem>.proc-<pid>.<ext>`), because a background subagent
+/// drains the queue under its own history file; writing to the lead's file
+/// would leave the note unread while still reporting success.
+///
+/// External backends run outside the in-process turn loop and never drain this
+/// queue, so they are rejected instead of silently dropping the note.
+pub(crate) fn resolve_side_note_history_file(
+    task_id: &str,
+    foreground_history: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let trimmed = task_id.trim();
+    if trimmed.is_empty() || trimmed == "foreground" {
+        return Ok(None);
+    }
+    validate_side_note_target(trimmed)?;
+    let (pid, backend) = with_task_entry(trimmed, |entry| (entry.pid, entry.backend))
+        .ok_or_else(|| {
+            format!(
+                "Unknown task_id `{trimmed}`: no active subagent with this id in the current session."
+            )
+        })?;
+    if let Some(backend) = backend {
+        return Err(format!(
+            "Task `{trimmed}` runs on the `{}` backend, which has no in-turn side-note channel; \
+             the note would never be seen. Put the guidance in a follow-up `task`/`task_spawn` \
+             prompt, or wait for the current result.",
+            backend.as_str()
+        ));
+    }
+    Ok(Some(crate::ai::driver::process_history_path(
+        foreground_history,
+        pid,
+    )))
+}
+
 /// Remove a task entry from the registry. Called by the synchronous `task`
 /// interception once it has consumed the result.
 pub(crate) fn remove_task_entry(task_id: &str) -> Option<AsyncTaskEntry> {
+    lock_unpoisoned(&TASK_REASONING_EFFORT_REGISTRY).remove(&task_id.to_string());
     let mut registry = lock_task_registry();
     registry.take(&task_id.to_string())
 }
@@ -240,5 +329,5 @@ pub(crate) fn insert_task_entry_for_test(task_id: String, entry: AsyncTaskEntry)
 /// channel. Re-exported for the synchronous `task` interception so that both
 /// paths produce identical output.
 pub(crate) fn format_finished_task(entry: &AsyncTaskEntry, result: StoredTaskResult) -> String {
-    format_task_result(entry, result)
+    format_task_result(entry, result, None)
 }

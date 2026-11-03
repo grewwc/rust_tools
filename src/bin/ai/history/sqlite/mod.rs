@@ -32,6 +32,9 @@ const SESSION_MARK_MESSAGE_META_KEY: &str = "session_mark_message";
 const SESSION_SERVE_MODEL_META_KEY: &str = "serve_model";
 const SESSION_SERVE_AGENT_META_KEY: &str = "serve_agent";
 const SESSION_SERVE_EFFORT_META_KEY: &str = "serve_reasoning_effort";
+const SESSION_SUBAGENT_BACKEND_META_KEY: &str = "session_subagent_backend";
+const SESSION_SUBAGENT_MODEL_META_KEY: &str = "session_subagent_model";
+const SESSION_DEFAULT_SKILLS_META_KEY: &str = "session_default_skills";
 
 pub(super) use lock::{
     delete_session_state_lock, remove_session_state_lock_entry, with_session_state_lock,
@@ -48,17 +51,17 @@ pub(in crate::ai) use context::{
     read_recent_turn_window_sqlite, write_context_snapshot_sqlite_with_busy_timeout,
 };
 pub(in crate::ai) use metadata::{
-    read_first_user_prompt_sqlite, read_session_archived_sqlite, read_session_list_metadata_sqlite,
-    read_session_mark_message_sqlite, read_session_marked_sqlite, read_session_origin_sqlite,
-    read_session_serve_config_sqlite, read_session_title_origin_sqlite, read_session_title_sqlite,
-    write_session_archived_sqlite, write_session_mark_sqlite, write_session_serve_config_sqlite,
-    write_session_title_sqlite, MarkMessageUpdate,
+    MarkMessageUpdate, read_first_user_prompt_sqlite, read_session_archived_sqlite,
+    read_session_list_metadata_sqlite, read_session_mark_message_sqlite,
+    read_session_marked_sqlite, read_session_origin_sqlite, read_session_serve_config_sqlite,
+    read_session_title_origin_sqlite, read_session_title_sqlite, write_session_archived_sqlite,
+    write_session_mark_sqlite, write_session_serve_config_sqlite, write_session_title_sqlite,
 };
 pub(in crate::ai) use outcomes::{
-    append_interrupted_stream_diagnostic_sqlite,
-    append_skill_activation_event_sqlite, append_tool_execution_outcomes_sqlite,
-    read_image_digest_sqlite, read_llm_prune_marks_sqlite, read_prompt_residency_sqlite,
-    read_skill_activation_events_sqlite, read_stale_patch_targets_sqlite, read_tool_execution_outcomes_cached,
+    append_interrupted_stream_diagnostic_sqlite, append_skill_activation_event_sqlite,
+    append_tool_execution_outcomes_sqlite, read_image_digest_sqlite, read_llm_prune_marks_sqlite,
+    read_prompt_residency_sqlite, read_skill_activation_events_sqlite,
+    read_stale_patch_targets_sqlite, read_tool_execution_outcomes_cached,
     read_tool_execution_outcomes_sqlite, read_tool_message_ids_sqlite, upsert_image_digest_sqlite,
     write_llm_prune_marks_sqlite, write_prompt_residency_sqlite, write_stale_patch_targets_sqlite,
 };

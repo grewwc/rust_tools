@@ -1,11 +1,15 @@
 use super::config_blocked_commands;
-use super::git::{blocked_git_destructive, blocked_git_subcommand};
+use super::git::{
+    CARGO_FMT_BLOCKED, blocked_cargo_subcommand, blocked_git_destructive, blocked_git_subcommand,
+    is_cargo_fmt_program,
+};
 use super::lexer::{
     command_word_index, effective_chain_uses_xargs, effective_command_tokens,
     indirect_command_index, tokenize_shell_words,
 };
 use super::osascript;
 use super::substitute::{expand_tilde_and_home, normalize_path, validate_substitution_positions};
+use super::traecli::blocked_direct_traecli;
 use super::wrapper::{
     find_has_blocked_exec_semantics, is_interpreter_program, is_python_program, is_shell_program,
     python_c_argument, shell_c_option_present, validate_python_code,
@@ -193,6 +197,19 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
         ));
     }
 
+    // Direct TraeCLI execution is a task-tool concern: only the `task` /
+    // `task_spawn` tools own the task control block, cancellation, evidence
+    // ledger, and result validation. See `audit::traecli`.
+    if let Some(reason) = blocked_direct_traecli(program) {
+        return Err(reason.to_string());
+    }
+
+    // Workspace-wide `cargo fmt` rewrites every member; per-file `rustfmt`
+    // remains allowed.
+    if let Some(reason) = blocked_cargo_formatting(program, command_tokens) {
+        return Err(reason.to_string());
+    }
+
     // `osascript` runs AppleScript that the program blacklist never sees:
     // System Events GUI injection, `quit` on another app and `do shell script`
     // all reach outside this session. See `audit::osascript` for the rules.
@@ -360,6 +377,15 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
                 return Err(reason.to_string());
             }
         }
+        // Direct TraeCLI execution and workspace-wide `cargo fmt` behind a
+        // wrapper (`env traecli ...`, `xargs cargo fmt`) get the same block as
+        // the direct path.
+        if let Some(reason) = blocked_direct_traecli(nested) {
+            return Err(reason.to_string());
+        }
+        if let Some(reason) = blocked_cargo_formatting(nested, &command_tokens[idx..]) {
+            return Err(reason.to_string());
+        }
         // `scp` behind a wrapper gets the same copy-only checks as the direct
         // path. `xargs` would append stdin items as extra copy targets the
         // audit cannot see, so that form stays blocked.
@@ -492,6 +518,10 @@ pub(crate) fn validate_single_segment(command: &str) -> Result<(), String> {
             // Wrappers (`env osascript ...`, `timeout 5 osascript ...`) must not
             // smuggle an AppleScript past the scanner.
             osascript::validate_osascript(&effective)?;
+        } else if let Some(reason) = blocked_direct_traecli(eff_program) {
+            return Err(reason.to_string());
+        } else if let Some(reason) = blocked_cargo_formatting(eff_program, &effective) {
+            return Err(reason.to_string());
         } else if eff_program == "open" {
             validate_open_launch(eff_program, &effective)?;
         }
@@ -525,6 +555,19 @@ fn is_scp_program(program: &str) -> bool {
 
 fn is_env_program(program: &str) -> bool {
     program_matches(program, "env")
+}
+
+/// Workspace-wide formatting gate shared by the direct path, wrapper peeling,
+/// and deep unwrapping: `cargo fmt` (any toolchain/option form) and the
+/// `cargo-fmt` binary are rejected, while per-file `rustfmt` stays allowed.
+fn blocked_cargo_formatting(program: &str, command_tokens: &[String]) -> Option<&'static str> {
+    if is_cargo_fmt_program(program) {
+        return Some(CARGO_FMT_BLOCKED);
+    }
+    if program_matches(program, "cargo") {
+        return blocked_cargo_subcommand(command_tokens);
+    }
+    None
 }
 
 /// `env -S`/`--split-string` splits one argument into a command line that the

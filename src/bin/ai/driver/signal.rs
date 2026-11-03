@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -82,6 +82,15 @@ static FOREGROUND_SUBAGENT_SEQ: AtomicU64 = AtomicU64::new(1);
 /// "foreground main turn".
 static FOREGROUND_TURN_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Whether the foreground process is parked between turns waiting for scheduler
+/// input, such as an asynchronous `task_wait` result. This is separate from
+/// `FOREGROUND_TURN_ACTIVE`: no model turn is running, but Ctrl+C must interrupt
+/// the wait rather than shut down the interactive session.
+const PARKED_FOREGROUND_WAIT_INACTIVE: u8 = 0;
+const PARKED_FOREGROUND_WAIT_ACTIVE: u8 = 1;
+const PARKED_FOREGROUND_WAIT_INTERRUPTED: u8 = 2;
+static PARKED_FOREGROUND_WAIT_STATE: AtomicU8 = AtomicU8::new(PARKED_FOREGROUND_WAIT_INACTIVE);
+
 /// RAII guard: raises `FOREGROUND_TURN_ACTIVE` when the foreground `run_turn`
 /// enters, and lowers it on drop (normal return / early return / panic) so the
 /// flag never leaks stale state.
@@ -102,6 +111,46 @@ impl Drop for ForegroundTurnGuard {
 
 fn foreground_turn_active() -> bool {
     FOREGROUND_TURN_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// RAII guard for the scheduler window where a foreground process is parked.
+pub(in crate::ai) struct ParkedForegroundWaitGuard {
+    finished: bool,
+}
+
+impl ParkedForegroundWaitGuard {
+    pub(in crate::ai) fn enter() -> Self {
+        PARKED_FOREGROUND_WAIT_STATE.store(PARKED_FOREGROUND_WAIT_ACTIVE, Ordering::Release);
+        Self { finished: false }
+    }
+
+    /// End the parked phase and report an interrupt linearized before this handoff.
+    pub(in crate::ai) fn finish(mut self) -> bool {
+        let interrupted = PARKED_FOREGROUND_WAIT_STATE
+            .swap(PARKED_FOREGROUND_WAIT_INACTIVE, Ordering::AcqRel)
+            == PARKED_FOREGROUND_WAIT_INTERRUPTED;
+        self.finished = true;
+        interrupted
+    }
+}
+
+impl Drop for ParkedForegroundWaitGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            PARKED_FOREGROUND_WAIT_STATE.store(PARKED_FOREGROUND_WAIT_INACTIVE, Ordering::Release);
+        }
+    }
+}
+
+pub(in crate::ai) fn take_parked_foreground_interrupt() -> bool {
+    PARKED_FOREGROUND_WAIT_STATE
+        .compare_exchange(
+            PARKED_FOREGROUND_WAIT_INTERRUPTED,
+            PARKED_FOREGROUND_WAIT_ACTIVE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
 }
 
 /// RAII guard: registers a foreground sub-agent's cancel flag when
@@ -238,6 +287,19 @@ pub(in crate::ai) fn handle_sigint(
                 return;
             }
             ForegroundSubagentProbe::None => {}
+        }
+
+        match PARKED_FOREGROUND_WAIT_STATE.compare_exchange(
+            PARKED_FOREGROUND_WAIT_ACTIVE,
+            PARKED_FOREGROUND_WAIT_INTERRUPTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(PARKED_FOREGROUND_WAIT_INTERRUPTED) => {
+                super::notify_scheduler();
+                return;
+            }
+            Err(_) => {}
         }
     }
     match sigint_action(shutdown, streaming, cancel_stream, foreground_turn_active()) {
@@ -476,9 +538,10 @@ pub(in crate::ai) fn sigint_action(
 #[cfg(test)]
 mod tests {
     use super::{
-        ForegroundSubagentGuard, ForegroundSubagentProbe, ForegroundTurnGuard, SigintAction,
-        foreground_turn_active, handle_sigint, probe_foreground_subagent, request_shutdown,
-        request_sigint_shutdown, sigint_action, take_sigint_shutdown_request,
+        ForegroundSubagentGuard, ForegroundSubagentProbe, ForegroundTurnGuard,
+        ParkedForegroundWaitGuard, SigintAction, foreground_turn_active, handle_sigint,
+        probe_foreground_subagent, request_shutdown, request_sigint_shutdown, sigint_action,
+        take_parked_foreground_interrupt, take_sigint_shutdown_request,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -577,6 +640,46 @@ mod tests {
             assert!(foreground_turn_active());
         }
         assert!(!foreground_turn_active());
+    }
+
+    #[test]
+    fn sigint_interrupts_parked_foreground_wait_without_shutdown() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let shutdown = AtomicBool::new(false);
+        let streaming = AtomicBool::new(false);
+        let cancel_stream = AtomicBool::new(false);
+        let _ = take_parked_foreground_interrupt();
+
+        {
+            let _wait = ParkedForegroundWaitGuard::enter();
+            handle_sigint(&shutdown, &streaming, &cancel_stream);
+            assert!(!shutdown.load(Ordering::Relaxed));
+            assert!(!cancel_stream.load(Ordering::Relaxed));
+            assert!(take_parked_foreground_interrupt());
+        }
+        assert!(!take_parked_foreground_interrupt());
+    }
+
+    #[test]
+    fn parked_wait_handoff_preserves_interrupt_classification() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let shutdown = AtomicBool::new(false);
+        let streaming = AtomicBool::new(false);
+        let cancel_stream = AtomicBool::new(false);
+
+        let wait = ParkedForegroundWaitGuard::enter();
+        handle_sigint(&shutdown, &streaming, &cancel_stream);
+        let _turn = ForegroundTurnGuard::enter();
+        assert!(wait.finish());
+        assert!(!shutdown.load(Ordering::Relaxed));
+
+        handle_sigint(&shutdown, &streaming, &cancel_stream);
+        assert!(cancel_stream.load(Ordering::Relaxed));
+        assert!(!shutdown.load(Ordering::Relaxed));
     }
 
     #[test]

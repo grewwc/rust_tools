@@ -3,6 +3,7 @@ use std::{io, path::Path};
 use rusqlite::{Connection, OptionalExtension};
 
 use super::super::compress::value_to_string;
+use super::super::sessions::SessionServeConfig;
 use super::super::sessions::is_preserved_content_message;
 use super::connection::{open_history_db, open_history_db_read_only};
 use super::lock::with_session_state_lock;
@@ -10,11 +11,11 @@ use super::migrations::init_history_schema;
 use super::revision::{read_i64_meta_from_conn, touch_session_activity};
 use super::store::{SessionListMetadata, decode_message_content, decode_tool_calls};
 use super::{
-    LAST_ACTIVITY_META_KEY, SESSION_ARCHIVED_META_KEY, SESSION_MARKED_META_KEY,
-    SESSION_MARK_MESSAGE_META_KEY, SESSION_SERVE_AGENT_META_KEY, SESSION_SERVE_EFFORT_META_KEY,
-    SESSION_SERVE_MODEL_META_KEY,
+    LAST_ACTIVITY_META_KEY, SESSION_ARCHIVED_META_KEY, SESSION_DEFAULT_SKILLS_META_KEY,
+    SESSION_MARK_MESSAGE_META_KEY, SESSION_MARKED_META_KEY, SESSION_SERVE_AGENT_META_KEY,
+    SESSION_SERVE_EFFORT_META_KEY, SESSION_SERVE_MODEL_META_KEY, SESSION_SUBAGENT_BACKEND_META_KEY,
+    SESSION_SUBAGENT_MODEL_META_KEY,
 };
-use super::super::sessions::SessionServeConfig;
 
 pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Option<String>> {
     let conn = open_history_db(path)?;
@@ -75,7 +76,9 @@ pub(in crate::ai) fn read_session_origin_sqlite(
             "SELECT role, content, tool_calls, reasoning_content FROM messages ORDER BY id ASC",
         )
         .map_err(|e| io::Error::other(e.to_string()))?;
-    let mut rows = stmt.query([]).map_err(|e| io::Error::other(e.to_string()))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| io::Error::other(e.to_string()))?;
     let mut origin: Option<(usize, String)> = None;
     let mut index = 0usize;
     while let Some(row) = rows.next().map_err(|e| io::Error::other(e.to_string()))? {
@@ -108,7 +111,8 @@ pub(in crate::ai) fn read_session_origin_sqlite(
                 return Ok(Some((position, prompt, None)));
             }
             (Some(_), "assistant")
-                if decode_tool_calls(tool_calls.as_deref()).is_none_or(|calls| calls.is_empty())
+                if decode_tool_calls(tool_calls.as_deref())
+                    .is_none_or(|calls| calls.is_empty())
                     && !text.trim().is_empty() =>
             {
                 let (position, prompt) = origin.take().expect("origin is set");
@@ -355,28 +359,44 @@ fn read_meta_optional(conn: &Connection, key: &str) -> Option<String> {
     .filter(|value| !value.trim().is_empty())
 }
 
-/// Read the session's persisted serve-mode config (model / agent / reasoning
-/// effort) from the meta table. Missing keys mean "server default".
+/// Read the session's persisted runtime config from the meta table. Missing
+/// keys mean the built-in default for that field.
 pub(in crate::ai) fn read_session_serve_config_sqlite(
     path: &Path,
 ) -> io::Result<SessionServeConfig> {
-    let conn = open_history_db_read_only(path)?;
-    Ok(SessionServeConfig {
-        model: read_meta_optional(&conn, SESSION_SERVE_MODEL_META_KEY),
-        agent: read_meta_optional(&conn, SESSION_SERVE_AGENT_META_KEY),
-        reasoning_effort: read_meta_optional(&conn, SESSION_SERVE_EFFORT_META_KEY),
-    })
+    let mut conn = open_history_db_read_only(path)?;
+    let tx = conn
+        .transaction()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let config = SessionServeConfig {
+        model: read_meta_optional(&tx, SESSION_SERVE_MODEL_META_KEY),
+        agent: read_meta_optional(&tx, SESSION_SERVE_AGENT_META_KEY),
+        reasoning_effort: read_meta_optional(&tx, SESSION_SERVE_EFFORT_META_KEY),
+        subagent_backend: read_meta_optional(&tx, SESSION_SUBAGENT_BACKEND_META_KEY),
+        subagent_model: read_meta_optional(&tx, SESSION_SUBAGENT_MODEL_META_KEY),
+        default_skills: read_meta_optional(&tx, SESSION_DEFAULT_SKILLS_META_KEY)
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default(),
+    };
+    tx.commit()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(config)
 }
 
-/// Atomically persist the session's serve-mode config in one lock + one
-/// transaction: the three keys are one logical value, so a crash mid-write
-/// must not leave a half-updated config (e.g. a new model with the old agent).
+/// Atomically persist the session's runtime config in one lock + one
+/// transaction: these keys are one logical value, so a crash mid-write must
+/// not leave a half-updated config (e.g. a new model with the old agent).
 /// The keys live in the meta table, so they survive clear-history and are
 /// copied by fork / import (which copy the whole SQLite file).
 pub(in crate::ai) fn write_session_serve_config_sqlite(
     path: &Path,
     config: &SessionServeConfig,
 ) -> io::Result<()> {
+    let default_skills = if config.default_skills.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&config.default_skills).map_err(io::Error::other)?)
+    };
     with_session_state_lock(path, || {
         let mut conn = open_history_db(path)?;
         init_history_schema(&conn)?;
@@ -386,7 +406,19 @@ pub(in crate::ai) fn write_session_serve_config_sqlite(
         for (key, value) in [
             (SESSION_SERVE_MODEL_META_KEY, config.model.as_deref()),
             (SESSION_SERVE_AGENT_META_KEY, config.agent.as_deref()),
-            (SESSION_SERVE_EFFORT_META_KEY, config.reasoning_effort.as_deref()),
+            (
+                SESSION_SERVE_EFFORT_META_KEY,
+                config.reasoning_effort.as_deref(),
+            ),
+            (
+                SESSION_SUBAGENT_BACKEND_META_KEY,
+                config.subagent_backend.as_deref(),
+            ),
+            (
+                SESSION_SUBAGENT_MODEL_META_KEY,
+                config.subagent_model.as_deref(),
+            ),
+            (SESSION_DEFAULT_SKILLS_META_KEY, default_skills.as_deref()),
         ] {
             match value {
                 Some(value) => {

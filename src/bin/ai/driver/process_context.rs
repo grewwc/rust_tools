@@ -10,6 +10,35 @@ use aios_kernel::primitives::{ResourceUsageDelta, RlimitVerdict};
 
 use crate::ai::skills::SkillManifest;
 
+const RESUME_SKILL_NAMES_ENV: &str = "__AIOS_INTERNAL_RESUME_SKILL_NAMES";
+
+/// Store the skill set that belongs to a suspended process. A resumed turn is
+/// still the same logical turn, so rebuilding it with the default core tools
+/// would remove tools supplied by the active skill (for example `task_wait`).
+pub(super) fn store_resume_skill_names(
+    process: &mut aios_kernel::kernel::Process,
+    skill_names: &[String],
+) {
+    if skill_names.is_empty() {
+        process.env.remove(RESUME_SKILL_NAMES_ENV);
+        return;
+    }
+    if let Ok(encoded) = serde_json::to_string(skill_names) {
+        process
+            .env
+            .insert(RESUME_SKILL_NAMES_ENV.to_string(), encoded);
+    }
+}
+
+/// Recover the skill set saved immediately before this process suspended.
+pub(super) fn resume_skill_names(process: &aios_kernel::kernel::Process) -> Vec<String> {
+    process
+        .env
+        .get(RESUME_SKILL_NAMES_ENV)
+        .and_then(|encoded| serde_json::from_str(encoded).ok())
+        .unwrap_or_default()
+}
+
 pub(in crate::ai::driver) fn history_path_with_suffix(base: &Path, suffix: &str) -> PathBuf {
     let file_name = match base.file_stem() {
         Some(stem) => {
@@ -33,7 +62,7 @@ pub(in crate::ai::driver) fn history_path_with_suffix(base: &Path, suffix: &str)
 /// Generate history file path for a background process.
 /// Inserts `.proc-{pid}` before the final extension so SQLite history files
 /// stay recognizable as SQLite by extension-based dispatch.
-pub(super) fn process_history_path(base: &Path, pid: u64) -> PathBuf {
+pub(crate) fn process_history_path(base: &Path, pid: u64) -> PathBuf {
     history_path_with_suffix(base, &format!(".proc-{pid}"))
 }
 
@@ -83,15 +112,38 @@ pub(super) fn build_background_process_question(
     )
 }
 
-/// 构造进程被唤醒（mailbox 非空）时的 wake-up prompt。
-/// foreground / background 路径共享同一段 prompt，避免双份硬编码漂移。
+/// Build the shared foreground/background wake-up prompt. Tool-specific
+/// handling rules are added after the resumed turn's schema is resolved.
 pub(super) fn format_wakeup_prompt(pid: u64, goal: &str, messages: &[String]) -> String {
     format!(
-        "[Process {} Woke Up] Original goal: {}\nNew mailbox messages:\n{}\n\nWake-up handling rules:\n- Async subagent tasks use `task_spawn` / `task_wait` / `task_status` / `task_integrate` / `task_cancel` (long-lived task_id; `task_wait.timeout_secs` is a per-call wait budget, NOT a stall signal; `task_cancel` terminates the subagent but you still need `task_wait` or `task_status` to collect the terminal cancelled result)\n- If the mailbox indicates event wake-up after `task_wait PARKED`, immediately re-call `task_wait` with the same task_ids and wait_policy to collect results from task result channels. Use `task_status` only if you need a non-blocking snapshot.\n- After a task result is delivered, call `task_integrate` with the task_id, disposition, and parent conclusion; delivery alone does not close the evidence lifecycle.\n- If you used `task_cancel`, still collect the cancelled terminal result with `task_wait` or `task_status`; cancellation is not the same thing as collection.\n- Do not abandon parked subagent tasks as stuck merely because the previous `task_wait` returned PARKED.\n- Prefer continuing reasoning immediately when the wake-up messages already identify the relevant finished tasks.\n\nResume execution based on the goal and these messages.",
+        "[Process {} Woke Up] Original goal: {}\nNew mailbox messages:\n{}\n\nWake-up handling rules:\n- Call only tools present in the current schema. Mailbox tool recommendations are conditional on those tools being available.\n- If a required tool is missing, use an available tool-loading facility to restore access; if none is available, report the missing capability.\n- A cooperative scheduler yield is normal waiting, not a stall. Preserve unfinished subagent tasks.\n- Prefer continuing reasoning immediately when the wake-up messages already identify the relevant finished tasks.\n\nResume execution based on the goal and these messages.",
         pid,
         goal,
         messages.join("\n---\n")
     )
+}
+
+/// Render task wake-up instructions from the schema actually sent to the model.
+pub(super) fn wakeup_task_guidance(has_tool: impl Fn(&str) -> bool) -> Option<String> {
+    let mut lines = Vec::new();
+    if has_tool("task_wait") {
+        lines.push(
+            "- If the mailbox indicates event wake-up after a parked task wait, immediately re-call `task_wait` with the same task_ids and wait_policy to collect results from task result channels. Its timeout_secs is a per-call wait budget, not a stall signal.",
+        );
+    }
+    if has_tool("task_status") {
+        lines.push("- Use `task_status` for a non-blocking snapshot and to collect ready results.");
+    }
+    if has_tool("task_integrate") {
+        lines.push(
+            "- After a task result is delivered, call `task_integrate` with the task_id, disposition, and parent conclusion; delivery alone does not close the evidence lifecycle.",
+        );
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    lines.push("- Cancellation alone does not collect a terminal result.");
+    Some(lines.join("\n"))
 }
 
 /// 一轮 turn 执行成功后对目标进程的 quota 收尾逻辑。
@@ -137,6 +189,7 @@ pub(super) fn finalize_turn_quota(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aios_kernel::kernel::{KernelInternal, Syscall};
 
     #[test]
     fn process_history_path_preserves_sqlite_extension() {
@@ -150,5 +203,51 @@ mod tests {
         let got = history_path_with_suffix(Path::new("/tmp/session.db"), ".proc-7");
 
         assert_eq!(got, PathBuf::from("/tmp/session.proc-7.db"));
+    }
+
+    #[test]
+    fn suspended_process_skill_names_round_trip() {
+        let mut os = aios_kernel::local::LocalOS::new();
+        let pid = os.begin_foreground("foreground".to_string(), "goal".to_string(), 2, 8, None);
+        let expected = vec!["agent-team".to_string(), "audit".to_string()];
+
+        store_resume_skill_names(os.get_process_mut(pid).unwrap(), &expected);
+        assert_eq!(resume_skill_names(os.get_process(pid).unwrap()), expected);
+
+        store_resume_skill_names(os.get_process_mut(pid).unwrap(), &[]);
+        assert!(resume_skill_names(os.get_process(pid).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn wakeup_task_guidance_only_names_available_tools() {
+        let tool_names = ["task_wait", "task_status", "task_integrate"];
+        for mask in 0..8 {
+            let has_tool = |name: &str| {
+                tool_names
+                    .iter()
+                    .enumerate()
+                    .any(|(index, tool)| *tool == name && mask & (1 << index) != 0)
+            };
+            let guidance = wakeup_task_guidance(has_tool);
+            assert_eq!(guidance.is_none(), mask == 0);
+            let guidance = guidance.unwrap_or_default();
+            for tool in tool_names {
+                assert_eq!(guidance.contains(&format!("`{tool}`")), has_tool(tool));
+            }
+            assert!(!guidance.contains("`task_spawn`"));
+            assert!(!guidance.contains("`task_cancel`"));
+        }
+    }
+
+    #[test]
+    fn wakeup_prompt_preserves_mailbox_without_unconditional_tool_demands() {
+        let mailbox = "[EVENT_WAKE] Recommended next action: re-call task_wait.";
+        let prompt = format_wakeup_prompt(42, "collect the result", &[mailbox.to_string()]);
+
+        assert!(prompt.contains("[Process 42 Woke Up] Original goal: collect the result"));
+        assert!(prompt.contains(mailbox));
+        assert_eq!(prompt.matches("task_wait").count(), 1);
+        assert!(prompt.contains("Call only tools present in the current schema."));
+        assert!(!prompt.contains("`task_integrate`"));
     }
 }

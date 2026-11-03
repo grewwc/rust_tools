@@ -1,4 +1,5 @@
 use super::*;
+use crate::ai::stream::side_note_input::write_output_line;
 /// Whether to show a compact "waiting for model output" status hint in the terminal.
 /// Applies to all TTY sessions. Written and flushed on its own line so it appears
 /// immediately; once the first visible chunk arrives it is erased by moving the cursor back up over
@@ -27,7 +28,10 @@ pub(super) fn write_waiting_hint_line(state: &mut StreamProcessingState, label: 
     let row = clamp_line_to_terminal_row(&format!("  ⠋ {label}"));
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    writeln!(out, "{}{row}{RESET}", theme::current().accent_muted)?;
+    write_output_line(
+        &mut out,
+        &format!("{}{row}{RESET}", theme::current().accent_muted),
+    )?;
     out.flush()?;
     state.render.waiting_hint_line = row;
     Ok(())

@@ -246,6 +246,10 @@ pub(crate) struct AsyncTaskEntry {
     /// registered in this repo), so `agent_name` must not be set to `"plan"` — that would point the
     /// dispatch at a manifest that does not exist.
     pub(crate) agent_name: String,
+    /// Execution backend for this task. `None` is the in-process kernel
+    /// runner; external backends carry their enum value so the status line can
+    /// distinguish them without parsing the agent name or model.
+    pub(crate) backend: Option<SubagentBackend>,
     pub(crate) model: String,
     pub(crate) is_model_auto_selected: bool,
     pub(crate) auto_model_fallback: Option<models::AutoModelFallbackSpec>,
@@ -300,6 +304,7 @@ pub(super) struct OutstandingTaskSnapshot {
     pub(super) status: String,
     pub(super) agent_name: String,
     pub(super) model: String,
+    pub(super) reasoning_effort: Option<String>,
     pub(super) description: String,
     pub(super) progress: Option<String>,
 }
@@ -326,4 +331,30 @@ pub(crate) struct OsTaskGoal {
     /// payloads where it is missing.
     #[serde(default)]
     pub(crate) response_schema: Option<Value>,
+    /// Optional subagent backend (`None` is the in-process kernel runner).
+    /// `Some("traecli")` routes execution to the headless TraeCLI subprocess.
+    /// Old task goals without this field decode to `None` and keep the kernel path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) backend: Option<String>,
+    /// Optional model override for external backends (a TraeCLI slug when
+    /// `backend` is `"traecli"`). Ignored by the kernel path. Old payloads
+    /// without this field decode to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) backend_model: Option<String>,
+    /// Optional resume target for external backends (a previous task_id or a
+    /// raw backend session id); resolved at dispatch time. Old payloads
+    /// without this field decode to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) backend_continue_from: Option<String>,
+    /// Skill names active in the parent turn when this task was spawned.
+    /// External backends render only these; old payloads decode to an empty
+    /// list and therefore receive no skill overlay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) active_skill_names: Vec<String>,
+    /// Original image files attached to the parent turn that spawned this
+    /// task. Persisted so every later dispatch (including a resume wakeup on a
+    /// different foreground turn) reuses this task's images instead of the
+    /// foreground's current attachments. Old payloads decode to an empty list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) image_files: Vec<String>,
 }

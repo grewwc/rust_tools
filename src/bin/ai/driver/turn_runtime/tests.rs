@@ -1056,14 +1056,14 @@ fn coarse_loop_note_allows_distinct_sub_questions() {
 
 #[test]
 fn tool_round_checkpoints_scale_and_stop_before_hard_limit() {
-    assert_eq!(TOOL_ROUND_CHECKPOINT, 24);
+    assert_eq!(TOOL_ROUND_CHECKPOINT, 16);
     assert_eq!(initial_tool_round_checkpoint(0), 1);
     assert_eq!(initial_tool_round_checkpoint(1), 1);
     assert_eq!(initial_tool_round_checkpoint(10), 5);
     assert_eq!(initial_tool_round_checkpoint(4096), TOOL_ROUND_CHECKPOINT);
-    assert_eq!(tool_round_checkpoint_threshold(4096, 0), Some(24));
-    assert_eq!(tool_round_checkpoint_threshold(4096, 1), Some(48));
-    assert_eq!(tool_round_checkpoint_threshold(4096, 2), Some(96));
+    assert_eq!(tool_round_checkpoint_threshold(4096, 0), Some(16));
+    assert_eq!(tool_round_checkpoint_threshold(4096, 1), Some(32));
+    assert_eq!(tool_round_checkpoint_threshold(4096, 2), Some(64));
     assert_eq!(tool_round_checkpoint_threshold(10, 0), Some(5));
     assert_eq!(tool_round_checkpoint_threshold(10, 1), None);
 }
@@ -1072,7 +1072,7 @@ fn tool_round_checkpoints_scale_and_stop_before_hard_limit() {
 fn tool_round_checkpoints_are_staged() {
     let mut supervisor = TurnSupervisor::default();
     let mut messages = Vec::new();
-    supervisor.iteration = 23;
+    supervisor.iteration = 15;
     assert!(
         supervisor
             .maybe_inject_tool_round_checkpoint(
@@ -1082,7 +1082,7 @@ fn tool_round_checkpoints_are_staged() {
             )
             .is_none()
     );
-    for (iteration, expected_level) in [(24, "review"), (48, "restrict"), (96, "finalize")] {
+    for (iteration, expected_level) in [(16, "review"), (32, "restrict"), (64, "finalize")] {
         supervisor.iteration = iteration;
         let checkpoint = supervisor
             .maybe_inject_tool_round_checkpoint(
@@ -1099,7 +1099,7 @@ fn tool_round_checkpoints_are_staged() {
                 .is_some_and(|text| text.contains(&format!("level={expected_level}")))
         );
     }
-    supervisor.iteration = 97;
+    supervisor.iteration = 65;
     assert!(
         supervisor
             .maybe_inject_tool_round_checkpoint(
@@ -1125,10 +1125,10 @@ fn tool_round_checkpoint_never_forbids_tool_calls_at_any_level() {
             let checkpoint = ToolRoundCheckpoint {
                 level: ToolRoundCheckpointLevel::from_index(level_index),
                 phase,
-                threshold: 24,
+                threshold: 16,
             };
             let mut messages = Vec::new();
-            inject_tool_round_checkpoint_note(&mut messages, 24, checkpoint);
+            inject_tool_round_checkpoint_note(&mut messages, 16, checkpoint);
             let text = messages[0].content.as_str().unwrap_or_default().to_string();
             assert!(
                 text.contains("Checkpoints are advisory pacing only")
@@ -1159,9 +1159,9 @@ fn tool_round_checkpoint_record_is_a_persistable_one_line_marker() {
     let checkpoint = ToolRoundCheckpoint {
         level: ToolRoundCheckpointLevel::from_index(2),
         phase: ToolRoundCheckpointPhase::VerifiedNeedsFinalization,
-        threshold: 96,
+        threshold: 64,
     };
-    let record = tool_round_checkpoint_record(96, checkpoint);
+    let record = tool_round_checkpoint_record(64, checkpoint);
     assert_eq!(record.role, crate::ai::history::ROLE_INTERNAL_NOTE);
     let text = record.content.as_str().unwrap_or_default().to_string();
     assert!(
@@ -1172,8 +1172,8 @@ fn tool_round_checkpoint_record_is_a_persistable_one_line_marker() {
     for part in [
         "level=finalize",
         "phase=verification-success",
-        "round=96",
-        "threshold=96",
+        "round=64",
+        "threshold=64",
         "action=checkpoint-and-continue",
     ] {
         assert!(
@@ -1413,7 +1413,7 @@ fn agent_team_read_only_breadth_note_redirects_to_delegation() {
         .content
         .as_str()
         .expect("breadth note should be text");
-    assert!(team_note.contains("`agent-team` is active"));
+    assert!(team_note.contains("an active skill requires delegation"));
     assert!(team_note.contains("delegate any remaining branches now"));
 
     let mut ordinary_messages = Vec::new();
@@ -1422,7 +1422,387 @@ fn agent_team_read_only_breadth_note_redirects_to_delegation() {
         .content
         .as_str()
         .expect("breadth note should be text");
-    assert!(!ordinary_note.contains("`agent-team` is active"));
+    assert!(!ordinary_note.contains("an active skill requires delegation"));
+}
+
+#[test]
+fn required_delegation_advisory_fires_once_on_first_parent_mutation() {
+    let mut progress = ProgressLedger {
+        delegation_required: true,
+        ..ProgressLedger::default()
+    };
+    let read = crate::ai::types::ToolCall {
+        id: "read".to_string(),
+        tool_type: "function".to_string(),
+        function: crate::ai::types::FunctionCall {
+            name: "read_file".to_string(),
+            arguments: "{}".to_string(),
+        },
+    };
+    let mutation = crate::ai::types::ToolCall {
+        id: "patch".to_string(),
+        tool_type: "function".to_string(),
+        function: crate::ai::types::FunctionCall {
+            name: "apply_patch".to_string(),
+            arguments: "{}".to_string(),
+        },
+    };
+
+    let mut messages = Vec::new();
+    assert!(!progress.observe_delegation_calls(&[read]));
+    if progress.observe_delegation_calls(std::slice::from_ref(&mutation)) {
+        inject_delegation_required_advisory(&mut messages);
+    }
+    if progress.observe_delegation_calls(&[mutation]) {
+        inject_delegation_required_advisory(&mut messages);
+    }
+    assert_eq!(messages.len(), 1);
+    assert!(
+        messages[0]
+            .content
+            .as_str()
+            .is_some_and(|text| text.contains("Hand the edit to a subagent"))
+    );
+    assert!(progress.delegation_requirement_violated());
+}
+
+#[test]
+fn delegation_tracking_is_noop_without_required_declaration() {
+    let mut progress = ProgressLedger::default();
+    let mutation = crate::ai::types::ToolCall {
+        id: "write".to_string(),
+        tool_type: "function".to_string(),
+        function: crate::ai::types::FunctionCall {
+            name: "write_file".to_string(),
+            arguments: "{}".to_string(),
+        },
+    };
+
+    assert!(!progress.observe_delegation_calls(&[mutation]));
+    assert_eq!(progress.mutation_calls_this_turn, 0);
+    assert!(!progress.delegation_requirement_violated());
+}
+
+#[test]
+fn required_delegation_without_tool_calls_is_not_violated() {
+    let progress = ProgressLedger {
+        delegation_required: true,
+        ..ProgressLedger::default()
+    };
+
+    assert_eq!(progress.mutation_calls_this_turn, 0);
+    assert_eq!(progress.work_rounds_before_delegation, 0);
+    assert!(!progress.delegation_requirement_violated());
+}
+
+#[test]
+fn required_delegation_advisory_fires_on_first_read_only_round() {
+    for required in [true, false] {
+        let mut supervisor = TurnSupervisor::default();
+        supervisor.progress.delegation_required = required;
+        let mut messages = Vec::new();
+        let mut advisory_count = 0;
+        for round in 1..=(REQUIRED_DELEGATION_READ_ONLY_TARGETS + 2) {
+            supervisor.next_iteration();
+            pb_successful_read_round(
+                &mut messages,
+                &format!("src/discovery_{round}.rs"),
+                0,
+                &format!("read-{round}"),
+                &format!("new evidence {round}"),
+            );
+            let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+            let expected = if required && round == 1 {
+                ToolLoopSignal::DelegationRequired
+            } else {
+                ToolLoopSignal::None
+            };
+            assert_eq!(signal, expected, "required={required}, round={round}");
+            if signal == ToolLoopSignal::DelegationRequired {
+                advisory_count += 1;
+                assert_eq!(
+                    signal.intervention(),
+                    Some(("delegation_required", SignalKind::Advisory))
+                );
+                inject_delegation_exploration_advisory(&mut messages);
+            }
+            assert_eq!(supervisor.progress.consecutive_no_progress, 0);
+            assert_eq!(
+                supervisor.progress.delegation_requirement_violated(),
+                required,
+                "required={required}, round={round}"
+            );
+        }
+        assert_eq!(advisory_count, usize::from(required));
+        assert_eq!(supervisor.progress.delegation_advisory_injected, required);
+        assert_eq!(
+            supervisor.progress.work_rounds_before_delegation,
+            usize::from(required)
+        );
+        assert_eq!(
+            supervisor.progress.delegation_requirement_violated(),
+            required
+        );
+        if required {
+            let note = messages
+                .iter()
+                .find(|message| message.role == crate::ai::history::ROLE_INTERNAL_NOTE)
+                .and_then(|message| message.content.as_str())
+                .expect("the scheduling advisory should be injected");
+            assert!(note.contains("Delegate a bounded discovery task now"));
+            assert!(note.contains("does not require the parent to finish discovery first"));
+            assert!(note.contains("Tools remain available"));
+            supervisor.progress.reset_after_truncation();
+            assert!(supervisor.progress.delegation_advisory_injected);
+            let mutation = pb_apply_patch_msg("later-patch");
+            assert!(
+                !supervisor
+                    .progress
+                    .observe_delegation_calls(mutation.tool_calls.as_deref().unwrap())
+            );
+        }
+    }
+}
+
+#[test]
+fn required_delegation_advisory_fires_on_unclassified_command_round() {
+    let mut supervisor = TurnSupervisor::default();
+    supervisor.progress.delegation_required = true;
+    let command = "bytedcli --json insearch get https://example.com";
+    let mut messages = Vec::new();
+    pb_execute_command_round(&mut messages, command, "insearch");
+
+    assert!(!execute_command_is_read_only(command));
+    assert!(round_has_mutation(&messages));
+    assert!(
+        !supervisor
+            .progress
+            .observe_delegation_calls(messages[0].tool_calls.as_deref().unwrap())
+    );
+    assert_eq!(supervisor.progress.delegation_calls_this_turn, 0);
+    assert_eq!(supervisor.progress.mutation_calls_this_turn, 0);
+
+    supervisor.next_iteration();
+    let signal = supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+    assert_eq!(signal, ToolLoopSignal::DelegationRequired);
+    assert_eq!(
+        signal.intervention(),
+        Some(("delegation_required", SignalKind::Advisory))
+    );
+    assert!(supervisor.progress.delegation_requirement_violated());
+    assert_eq!(supervisor.progress.work_rounds_before_delegation, 1);
+    assert_eq!(supervisor.progress.consecutive_no_progress, 0);
+
+    inject_delegation_exploration_advisory(&mut messages);
+    assert!(
+        messages
+            .last()
+            .and_then(|message| message.content.as_str())
+            .is_some_and(|text| text.contains("Delegate a bounded discovery task now"))
+    );
+}
+
+#[test]
+fn required_delegation_advisory_skips_coordination_only_rounds() {
+    for name in [
+        "task_spawn",
+        "task",
+        "task_wait",
+        "task_status",
+        "task_cancel",
+        "task_audit",
+        "task_evidence_read",
+        "task_integrate",
+        "plan",
+        "plan_update",
+    ] {
+        let mut supervisor = TurnSupervisor::default();
+        supervisor.progress.delegation_required = true;
+        let mut messages = Vec::new();
+        pb_task_round(
+            &mut messages,
+            name,
+            serde_json::json!({}),
+            "coordination",
+            "No tasks running.",
+        );
+
+        // Do not let prior delegation-call tracking mask the round classifier's exemption.
+        supervisor.next_iteration();
+        assert_eq!(
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::None,
+            "coordination tool: {name}"
+        );
+        assert!(!supervisor.progress.delegation_advisory_injected, "{name}");
+        assert_eq!(supervisor.progress.work_rounds_before_delegation, 0);
+        assert!(
+            !supervisor.progress.delegation_requirement_violated(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn required_delegation_read_only_violation_clears_after_delegation() {
+    for name in ["task", "task_spawn"] {
+        let mut supervisor = TurnSupervisor::default();
+        supervisor.progress.delegation_required = true;
+        let mut messages = Vec::new();
+        supervisor.next_iteration();
+        pb_successful_read_round(&mut messages, "src/discovery.rs", 0, "read", "new evidence");
+        assert_eq!(
+            supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+            ToolLoopSignal::DelegationRequired,
+        );
+        assert_eq!(supervisor.progress.mutation_calls_this_turn, 0);
+        assert!(supervisor.progress.delegation_requirement_violated());
+
+        let mut delegation = pb_read_msg("unused", "delegate");
+        let calls = delegation.tool_calls.as_mut().unwrap();
+        calls[0].function.name = name.to_string();
+        assert!(!supervisor.progress.observe_delegation_calls(calls));
+        assert_eq!(supervisor.progress.delegation_calls_this_turn, 1);
+        assert_eq!(supervisor.progress.work_rounds_before_delegation, 1);
+        assert!(!supervisor.progress.delegation_requirement_violated());
+    }
+}
+
+#[test]
+fn required_delegation_advisory_checks_broad_batches_and_repeated_targets() {
+    let mut batch_supervisor = TurnSupervisor::default();
+    batch_supervisor.progress.delegation_required = true;
+    let calls = (0..REQUIRED_DELEGATION_READ_ONLY_TARGETS)
+        .flat_map(|target| {
+            pb_read_msg(&format!("src/batch_{target}.rs"), &format!("read-{target}"))
+                .tool_calls
+                .unwrap()
+        })
+        .collect();
+    let mut batch = pb_read_msg("unused", "unused");
+    batch.tool_calls = Some(calls);
+    batch_supervisor.next_iteration();
+    assert_eq!(
+        batch_supervisor.record_tool_signatures(&[batch], PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::DelegationRequired,
+    );
+    assert_eq!(batch_supervisor.progress.work_rounds_before_delegation, 1);
+    assert!(batch_supervisor.progress.delegation_requirement_violated());
+
+    let mut supervisor = TurnSupervisor::default();
+    supervisor.progress.delegation_required = true;
+    let mut messages = Vec::new();
+    for round in 1..=REQUIRED_DELEGATION_READ_ONLY_TARGETS {
+        supervisor.next_iteration();
+        pb_successful_read_round(
+            &mut messages,
+            "src/one_target.rs",
+            round,
+            &format!("read-{round}"),
+            &format!("new page {round}"),
+        );
+        // Isolate progress sampling from the separate same-target loop detectors.
+        let signal = supervisor.assess_progress(&messages, &messages, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert_eq!(
+            signal,
+            if round == 1 {
+                ToolLoopSignal::DelegationRequired
+            } else {
+                ToolLoopSignal::None
+            }
+        );
+        if round == 2 {
+            supervisor.progress.reset_after_truncation();
+            assert!(supervisor.progress.delegation_advisory_injected);
+        }
+    }
+    assert_eq!(supervisor.progress.seen_targets.len(), 1);
+    assert_eq!(supervisor.progress.work_rounds_before_delegation, 1);
+    assert!(supervisor.progress.delegation_requirement_violated());
+}
+
+#[test]
+fn required_delegation_exploration_advisory_skips_mutation_round() {
+    let mut supervisor = TurnSupervisor::default();
+    supervisor.progress.delegation_required = true;
+    let mut mutation = pb_apply_patch_msg("patch");
+    mutation.tool_calls.as_mut().unwrap().extend(
+        pb_read_msg("src/discovery.rs", "mixed-read")
+            .tool_calls
+            .unwrap(),
+    );
+    supervisor.next_iteration();
+    // Keep the separate mutation advisory out of this test so its one-shot flag cannot mask the guard.
+    assert_eq!(
+        supervisor.record_tool_signatures(&[mutation], PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::None,
+    );
+    assert!(!supervisor.progress.delegation_advisory_injected);
+    assert_eq!(supervisor.progress.work_rounds_before_delegation, 0);
+
+    let mut messages = Vec::new();
+    supervisor.next_iteration();
+    pb_successful_read_round(
+        &mut messages,
+        "src/after_patch_discovery.rs",
+        0,
+        "read-after-patch",
+        "new evidence",
+    );
+    assert_eq!(
+        supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+        ToolLoopSignal::DelegationRequired,
+    );
+    assert_eq!(supervisor.progress.work_rounds_before_delegation, 1);
+}
+
+#[test]
+fn required_delegation_advisory_stands_down_after_delegation() {
+    for name in ["task", "task_spawn"] {
+        for read_first in [None, Some(false), Some(true)] {
+            let mut supervisor = TurnSupervisor::default();
+            supervisor.progress.delegation_required = true;
+            let mut spawn = pb_read_msg("unused", "spawn");
+            let calls = spawn.tool_calls.as_mut().unwrap();
+            calls[0].function.name = name.to_string();
+            if let Some(read_first) = read_first {
+                calls.extend(
+                    pb_read_msg("src/parent_discovery.rs", "mixed-read")
+                        .tool_calls
+                        .unwrap(),
+                );
+                if read_first {
+                    calls.reverse();
+                }
+            }
+            assert!(!supervisor.progress.observe_delegation_calls(calls));
+            supervisor.next_iteration();
+            assert_eq!(
+                supervisor.record_tool_signatures(&[spawn], PROGRESS_FREE_EXPLORE_ROUNDS),
+                ToolLoopSignal::None,
+            );
+
+            let mut messages = Vec::new();
+            for round in 1..=(REQUIRED_DELEGATION_READ_ONLY_TARGETS + 2) {
+                supervisor.next_iteration();
+                pb_successful_read_round(
+                    &mut messages,
+                    &format!("src/worker_owned_{round}.rs"),
+                    0,
+                    &format!("read-{round}"),
+                    &format!("evidence {round}"),
+                );
+                assert_eq!(
+                    supervisor.record_tool_signatures(&messages, PROGRESS_FREE_EXPLORE_ROUNDS),
+                    ToolLoopSignal::None,
+                );
+            }
+            assert!(!supervisor.progress.delegation_advisory_injected);
+            assert_eq!(supervisor.progress.work_rounds_before_delegation, 0);
+            assert_eq!(supervisor.progress.delegation_calls_this_turn, 1);
+            assert!(!supervisor.progress.delegation_requirement_violated());
+        }
+    }
 }
 
 // ===== Progress Budget (behavioral-signal progress budget) tests =====

@@ -23,12 +23,13 @@ mod transport;
 mod types;
 mod wire_parse;
 
-#[cfg(test)]
-use aux::{SESSION_TITLE_BODY_TIMEOUT_SECS, SESSION_TITLE_REQUEST_TIMEOUT_SECS};
 pub(crate) use aux::{
     AuxRequestContext, charge_llm_usage_to_kernel, generate_session_title_via_model,
     generate_session_title_with_context,
 };
+#[cfg(test)]
+use aux::{SESSION_TITLE_BODY_TIMEOUT_SECS, SESSION_TITLE_REQUEST_TIMEOUT_SECS};
+pub(crate) use current_budget::CurrentRequestBudget;
 #[allow(unused_imports)]
 pub(crate) use error::{
     AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS, AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS,
@@ -36,13 +37,12 @@ pub(crate) use error::{
     RequestErrorKind, RequestRetryPolicy, STREAM_RESPONSE_HEADER_TIMEOUT_SECS,
     api_key_for_request_model, apply_request_auth, clear_stale_request_interrupt_before_request,
     config_bool_is_true, config_forces_thinking, control_model_for_aux_tasks,
-    control_model_for_aux_tasks_from,
-    endpoint_for_request_model, is_context_overflow_error, is_retryable_reqwest_error,
-    is_retryable_status_with_body, is_retryable_stream_error, is_transient_error,
-    parse_retry_after, request_retry_policy, request_retry_policy_for_current_context, retry_delay,
-    should_abort_retry_wait, should_retry_status, should_rotate_key,
-    should_temporarily_disable_auto_selected_model, should_temporarily_disable_model,
-    should_try_model_fallback, sleep_with_cancel,
+    control_model_for_aux_tasks_from, endpoint_for_request_model, is_context_overflow_error,
+    is_retryable_reqwest_error, is_retryable_status_with_body, is_retryable_stream_error,
+    is_transient_error, parse_retry_after, request_retry_policy,
+    request_retry_policy_for_current_context, retry_delay, should_abort_retry_wait,
+    should_retry_status, should_rotate_key, should_temporarily_disable_auto_selected_model,
+    should_temporarily_disable_model, should_try_model_fallback, sleep_with_cancel,
 };
 pub(crate) use image_digest::{
     DIGEST_BEGIN, DIGEST_END, PendingImageDigest, backfill_batch, content_has_image,
@@ -55,15 +55,16 @@ pub(in crate::ai) use logging::emit_request_diagnostic;
 #[cfg(test)]
 pub(in crate::ai) use logging::request_diagnostics_enabled;
 pub(in crate::ai) use outcome_log::append_request_failure;
-pub(crate) use prompt_feedback::{PrefixReuse, PromptTokenFeedback};
 pub(in crate::ai) use prompt_feedback::hash_message;
-pub(crate) use current_budget::CurrentRequestBudget;
+pub(crate) use prompt_feedback::{PrefixReuse, PromptTokenFeedback};
 pub(crate) use protocol::extract_response_text;
 #[cfg(test)]
 use protocol::responses_reasoning_replay_stats;
 pub(crate) use reasoning::model_effort_graded;
 pub(crate) use reasoning::model_thinking_off_capability;
 pub(crate) use reasoning::reasoning_effort_display_label;
+pub(crate) use reasoning::reasoning_effort_display_label_for_subagent;
+pub(crate) use reasoning::resolve_reasoning_effort;
 #[allow(unused_imports)]
 pub(crate) use routing::{extract_router_content, strip_json_fence};
 pub(crate) use thinking::strip_system_reminders;
@@ -87,9 +88,9 @@ pub(crate) use builder::{
 };
 
 // Transport layer: HTTP request sending, retry, timeout, auth
+pub(crate) use transport::preview_request_budget;
 pub use transport::{do_request_json, do_request_text_streaming};
 pub(super) use transport::{do_request_messages, do_request_messages_without_tools, print_info};
-pub(crate) use transport::preview_request_budget;
 
 // The private use statements below exist only for the `tests` submodule to
 // access via `use super::*;`. The function bodies have moved to `transport.rs`;
@@ -124,7 +125,6 @@ use super::{
 
 #[cfg(test)]
 #[allow(unused_imports)]
-
 #[cfg(test)]
 #[allow(unused_imports)]
 use normalize::{
