@@ -54,6 +54,7 @@ pub(in crate::ai) use logging::TransientStatusLine;
 pub(in crate::ai) use logging::emit_request_diagnostic;
 #[cfg(test)]
 pub(in crate::ai) use logging::request_diagnostics_enabled;
+pub(in crate::ai) use outcome_log::append_request_failure;
 pub(crate) use prompt_feedback::{PrefixReuse, PromptTokenFeedback};
 pub(in crate::ai) use prompt_feedback::hash_message;
 pub(crate) use current_budget::CurrentRequestBudget;

@@ -1060,7 +1060,7 @@ function parsePhoneAction(raw) {
   try { spec = JSON.parse(String(raw)); } catch (_) { return null; }
   if (!spec || typeof spec !== "object" || Array.isArray(spec)) return null;
   const action = typeof spec.action === "string" ? spec.action : "";
-  if (action === "screen_capture" || action === "screen_stop" ||
+  if (action === "alarm_list" || action === "screen_capture" || action === "screen_stop" ||
       action === "camera_capture" || action === "camera_stop") return { action };
   if (action === "alarm") {
     if (typeof spec.hour !== "number" || typeof spec.minute !== "number") return null;
@@ -1173,6 +1173,39 @@ function parsePhoneAction(raw) {
     if (!contact && !number) return null;
     if (number && (!/^[0-9+() .-]+$/.test(number) || !/[0-9]/.test(number))) return null;
     return { action, contact, number, text };
+  }
+  if (action === "app_list") {
+    const query = textField("query", 200), max = integerField("max", 10, 1, 20);
+    const offset = integerField("offset", 0, 0, 100000);
+    return query === null || max === null || offset === null ? null : { action, query, max, offset };
+  }
+  if (action === "app_open") {
+    const packageName = textField("package", 255);
+    if (packageName === null || !/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/.test(packageName)) return null;
+    return { action, package: packageName };
+  }
+  if (action === "photo_index") {
+    const max = integerField("max", 50, 1, 500);
+    if (max === null ||
+        (spec.retry_failed !== undefined && typeof spec.retry_failed !== "boolean") ||
+        (spec.reindex_existing !== undefined && typeof spec.reindex_existing !== "boolean")) return null;
+    return {
+      action, max,
+      retry_failed: spec.retry_failed === true,
+      reindex_existing: spec.reindex_existing === true
+    };
+  }
+  if (action === "photo_search") {
+    const query = textField("query", 200), max = integerField("max", 10, 1, 20);
+    const offset = integerField("offset", 0, 0, 100000);
+    const min_score = spec.min_score === undefined ? 0.18 : spec.min_score;
+    if (query === null || !query.trim() || max === null || offset === null ||
+        typeof min_score !== "number" || !Number.isFinite(min_score) || min_score < -1 || min_score > 2) return null;
+    return { action, query: query.trim(), max, offset, min_score };
+  }
+  if (action === "photo_open") {
+    if (typeof spec.media_id !== "number" || !Number.isSafeInteger(spec.media_id) || spec.media_id <= 0) return null;
+    return { action, media_id: spec.media_id };
   }
   if (action === "contacts_read") {
     const query = textField("query", 200), max = integerField("max", 10, 1, 20);
@@ -1666,12 +1699,12 @@ function nativeCall(action, payload, requestId) {
     if (!supported || (repeat && !features.includes("alarm_weekdays")) ||
         (action === "screen_capture" && !features.includes("screen_bubble")) ||
         (action === "camera_capture" && !features.includes("camera_preview"))) {
-      reject(new Error("当前 APK 不支持此操作，请升级到 v1.16.4 或更新版本")); return;
+      reject(new Error("当前 APK 不支持此操作，请升级到 v1.16.7 或更新版本")); return;
     }
     const id = requestId || ("n" + (++nativeSeq) + "-" + Date.now());
     if (!/^[A-Za-z0-9_-]{1,80}$/.test(id)) { reject(new Error("无效的手机请求编号")); return; }
     const timeoutMs = action === "file_import" || action === "file_save" ||
-      action === "phone_search" ? 180000
+      action === "phone_search" ? 180000 : action === "photo_index" || action === "photo_search" ? 1800000
       : action === "screen_capture" ? 120000 : 45000;
     const timer = setTimeout(() => {
       nativePending.delete(id);

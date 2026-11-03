@@ -585,10 +585,7 @@ async fn confirm_answer_reaches_the_child_stdin_once() {
 #[cfg(unix)]
 #[tokio::test]
 async fn input_answer_reaches_the_child_stdin_once() {
-    use axum::{
-        extract::Path, http::HeaderMap, http::StatusCode,
-        response::IntoResponse,
-    };
+    use axum::{extract::Path, http::HeaderMap, http::StatusCode, response::IntoResponse};
     // Stand-in turn child: consumes one stdin line and echoes it, which is
     // what the real child's input reader does.
     let mut child = std::process::Command::new("/bin/sh")
@@ -1370,13 +1367,11 @@ async fn serve_android_apk_returns_installable_attachment() {
             .and_then(|v| v.to_str().ok()),
         Some("no-store")
     );
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+    let expected = include_bytes!("../../../../android/a-serve/dist/a-serve.apk");
+    let body = axum::body::to_bytes(response.into_body(), expected.len())
         .await
         .expect("APK body");
-    assert!(
-        body.len() > 10_000,
-        "APK should not be an empty placeholder"
-    );
+    assert_eq!(body.as_ref(), expected, "route must serve the embedded APK");
     assert!(body.starts_with(b"PK\x03\x04"), "APK must be a ZIP archive");
 }
 

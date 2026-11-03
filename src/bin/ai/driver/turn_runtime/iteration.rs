@@ -1179,23 +1179,6 @@ async fn reclaim_tool_evidence_under_pressure(
     budget
 }
 
-#[crate::ai::agent_hang_span(
-    "pre-fix",
-    "B",
-    "turn_runtime::run_turn:do_request_messages",
-    "[DEBUG] sending model request",
-    "[DEBUG] model request finished",
-    {
-        "iteration": _iteration,
-        "message_count": messages.len(),
-        "model": next_model,
-    },
-    {
-        "iteration": _iteration,
-        "ok": __agent_hang_result.is_ok(),
-        "elapsed_ms": __agent_hang_elapsed_ms,
-    }
-)]
 /// Build the LLM client chain used for real requests: an empty chain by default = go straight to `DefaultLlmClient` (zero behavior change);
 /// with `RequestMiddleware` registered, wrap in registration order (retries/short-circuits/auditing take effect on production requests).
 fn build_llm_request_client(app: &App) -> Box<dyn LlmClient> {
@@ -1344,6 +1327,23 @@ async fn apply_request_budget(
     budget
 }
 
+#[crate::ai::agent_hang_span(
+    "pre-fix",
+    "B",
+    "turn_runtime::run_turn:do_request_messages",
+    "[DEBUG] sending model request",
+    "[DEBUG] model request finished",
+    {
+        "iteration": _iteration,
+        "message_count": messages.len(),
+        "model": next_model,
+    },
+    {
+        "iteration": _iteration,
+        "ok": __agent_hang_result.is_ok(),
+        "elapsed_ms": __agent_hang_elapsed_ms,
+    }
+)]
 async fn request_model_response(
     app: &mut App,
     next_model: &str,
@@ -1596,12 +1596,18 @@ async fn request_model_response(
                     .min(u128::from(u64::MAX)) as u64,
             },
         );
-        return request_result.map(|response| {
-            if auto_model_fallback_spec.is_some() {
-                crate::ai::models::mark_subagent_model_verified(&actual_model);
+        return match request_result {
+            Ok(response) => {
+                if auto_model_fallback_spec.is_some() {
+                    crate::ai::models::mark_subagent_model_verified(&actual_model);
+                }
+                Ok((response, actual_model))
             }
-            (response, actual_model)
-        });
+            Err(error) => {
+                request::append_request_failure(&app.session_id, &actual_model, &error);
+                Err(error)
+            }
+        };
     }
 }
 
@@ -1617,10 +1623,9 @@ async fn request_model_response(
     {
         "iteration": _iteration,
         "ok": __agent_hang_result.is_ok(),
-        "outcome": format!("{:?}", __agent_hang_result.as_ref().ok().map(|r| r.outcome)),
+        "outcome": format!("{:?}", __agent_hang_result.as_ref().ok().map(|r| &r.outcome)),
         "assistant_chars": __agent_hang_result.as_ref().map(|r| r.assistant_text.chars().count()).unwrap_or(0),
         "tool_calls": __agent_hang_result.as_ref().map(|r| r.tool_calls.len()).unwrap_or(0),
-        "history_chars": current_history.chars().count(),
         "elapsed_ms": __agent_hang_elapsed_ms,
     }
 )]
@@ -1953,6 +1958,11 @@ pub(super) async fn execute_turn_iteration(
                             response = new_response;
                         }
                         Err(retry_err) => {
+                            request::append_request_failure(
+                                &app.session_id,
+                                &actual_model,
+                                &retry_err,
+                            );
                             let err_text = retry_err.to_string();
                             if crate::ai::driver::runtime_ctx::has_subagent_result_slot() {
                                 return Err(err_text.into());

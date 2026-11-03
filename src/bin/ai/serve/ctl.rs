@@ -126,7 +126,7 @@ pub(in crate::ai) fn run_serve_ctl(cli: &ParsedCli) -> Result<(), Box<dyn std::e
 }
 
 /// Fixed state directory: the user config dir, unless overridden for tests.
-fn state_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub(super) fn state_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(dir) = std::env::var_os(STATE_DIR_ENV) {
         if dir.is_empty() {
             return Err("A_SERVE_STATE_DIR is set but empty".into());

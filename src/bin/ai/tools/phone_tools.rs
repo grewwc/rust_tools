@@ -22,14 +22,16 @@ const MAX_CONTACT_CHARS: usize = 120;
 const MAX_NUMBER_CHARS: usize = 40;
 const MAX_PHONE_QUERY_CHARS: usize = 200;
 const MAX_PHONE_ROWS: i64 = 20;
+const MAX_APP_PACKAGE_CHARS: usize = 255;
 const MAX_SEARCH_QUERY_CHARS: usize = 500;
 const MAX_SEARCH_RESULTS: i64 = 10;
+const MAX_SAFE_MEDIA_ID: i64 = 9_007_199_254_740_991;
 // A full page of 20 notes, including JSON escaping, fits without losing bodies.
 const MAX_RESULT_BYTES: usize = 512 * 1024;
 const MAX_FILE_CHARS: i64 = 1_048_576;
-const PHONE_ACTIONS: &str = "now, calendar_read, calendar_add, sms, alarm, timer, note, \
+const PHONE_ACTIONS: &str = "now, calendar_read, calendar_add, sms, alarm, alarm_list, timer, note, \
     location, note_create, note_list, note_update, contacts_read, contact_add, call_history, call, \
-    file_import, file_read, file_save, phone_search, \
+    app_list, app_open, photo_index, photo_search, photo_open, file_import, file_read, file_save, phone_search, \
     screen_capture, screen_stop, camera_capture, camera_stop";
 
 /// Camera budget for one response.
@@ -194,6 +196,17 @@ fn is_blocked_emergency(value: &str) -> bool {
     )
 }
 
+fn is_android_package(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= MAX_APP_PACKAGE_CHARS
+        && value.split('.').count() >= 2
+        && value.split('.').all(|segment| {
+            let mut chars = segment.chars();
+            chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
+                && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+}
+
 /// Validate and normalize one phone action. Only the fields the Android bridge
 /// understands survive, so a model cannot smuggle an arbitrary intent through
 /// the action name.
@@ -239,6 +252,7 @@ fn build_phone_spec(args: &Value) -> Result<Value, String> {
             }
             Ok(spec)
         }
+        "alarm_list" => Ok(json!({"action": "alarm_list"})),
         "timer" => Ok(json!({
             "action": "timer",
             "seconds": integer_arg(args, "seconds", None, 1, 86_400)?,
@@ -422,6 +436,54 @@ fn build_phone_spec(args: &Value) -> Result<Value, String> {
                 "text": text,
             }))
         }
+        "app_list" => Ok(json!({
+            "action": "app_list",
+            "query": string_arg(args, "query", MAX_PHONE_QUERY_CHARS)?.unwrap_or(""),
+            "max": integer_arg(args, "max", Some(10), 1, MAX_PHONE_ROWS)?,
+            "offset": integer_arg(args, "offset", Some(0), 0, 100_000)?,
+        })),
+        "app_open" => {
+            let package = string_arg(args, "package", MAX_APP_PACKAGE_CHARS)?
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or("app_open requires the exact 'package' returned by app_list")?;
+            if !is_android_package(package) {
+                return Err("'package' must be a valid dotted Android package name returned by app_list".to_string());
+            }
+            Ok(json!({"action": "app_open", "package": package}))
+        }
+        "photo_index" => Ok(json!({
+            "action": "photo_index",
+            "max": integer_arg(args, "max", Some(50), 1, 500)?,
+            "retry_failed": args.get("retry_failed").map_or(Ok(false), |value| {
+                value.as_bool().ok_or("'retry_failed' must be a boolean")
+            })?,
+            "reindex_existing": args.get("reindex_existing").map_or(Ok(false), |value| {
+                value.as_bool().ok_or("'reindex_existing' must be a boolean")
+            })?,
+        })),
+        "photo_search" => {
+            let query = string_arg(args, "query", MAX_PHONE_QUERY_CHARS)?
+                .map(str::trim)
+                .filter(|query| !query.is_empty())
+                .ok_or("'query' must contain the photo search text")?;
+            let min_score = match args.get("min_score") {
+                None => 0.18,
+                Some(value) => value.as_f64().filter(|score| score.is_finite() && (-1.0..=2.0).contains(score))
+                    .ok_or("'min_score' must be a finite number from -1 to 2")?,
+            };
+            Ok(json!({
+                "action": "photo_search",
+                "query": query,
+                "max": integer_arg(args, "max", Some(10), 1, MAX_PHONE_ROWS)?,
+                "offset": integer_arg(args, "offset", Some(0), 0, 100_000)?,
+                "min_score": min_score,
+            }))
+        }
+        "photo_open" => Ok(json!({
+            "action": "photo_open",
+            "media_id": integer_arg(args, "media_id", None, 1, MAX_SAFE_MEDIA_ID)?,
+        })),
         "contacts_read" => Ok(json!({
             "action": "contacts_read",
             "query": string_arg(args, "query", MAX_PHONE_QUERY_CHARS)?.unwrap_or(""),
@@ -610,7 +672,8 @@ fn format_phone_result(spec: &Value, answer: &str) -> Result<String, String> {
         return Ok(format!("Phone image saved to {}. Use read_file on this path to inspect the image before answering. {moment} {closing}", path.display()));
     }
     if matches!(action, "note_create" | "note_list" | "note_update" | "file_import" |
-        "file_read" | "file_save" | "contacts_read" | "call_history" | "call") && !data.is_object() {
+        "file_read" | "file_save" | "contacts_read" | "call_history" | "call" |
+        "alarm_list" | "app_list" | "app_open") && !data.is_object() {
         return Err("the phone returned no result data; the action outcome is unknown".to_string());
     }
     let summary: Result<String, String> = match action {
@@ -629,6 +692,10 @@ fn format_phone_result(spec: &Value, answer: &str) -> Result<String, String> {
                 "Dispatched the alarm request for {hour:02}:{minute:02}{suffix} to the phone's clock app. Creation is not verified; check the clock app. Without weekdays (or with []), this requests only the next occurrence, not a date."
             ))
         }
+        "alarm_list" => Ok(
+            "Opened the phone's system alarm list. Android does not expose another clock app's alarm database, so no alarm entries were read or returned."
+                .to_string(),
+        ),
         "timer" => Ok(format!(
             "Dispatched the {}-second timer request to the phone's clock app. Creation is not verified; check the clock app.",
             spec["seconds"]
@@ -729,6 +796,23 @@ fn format_phone_result(spec: &Value, answer: &str) -> Result<String, String> {
             "Phone contacts page. It contains only display names, phone numbers, and number types; use next_offset only when has_more is true."
                 .to_string(),
         ),
+        "app_list" => Ok(
+            "Launchable phone apps page. It contains only user-visible launcher labels and exact package names; use next_offset only when has_more is true."
+                .to_string(),
+        ),
+        "app_open" => {
+            let label = data.get("label").and_then(Value::as_str).unwrap_or("");
+            let package = data.get("package").and_then(Value::as_str).unwrap_or("");
+            Ok(format!(
+                "Android opened the launchable app {label} ({package}). This only confirms dispatch of its main launcher activity."
+            ))
+        }
+        "photo_open" => {
+            let media_id = data.get("media_id").and_then(Value::as_i64).unwrap_or(0);
+            Ok(format!(
+                "Android dispatched the system image viewer for photo media_id {media_id}. Dispatch does not prove that the viewer displayed it."
+            ))
+        }
         "contact_add" => {
             let name = data.get("name").and_then(Value::as_str).unwrap_or("");
             let number = data.get("number").and_then(Value::as_str).unwrap_or("");
@@ -969,6 +1053,44 @@ mod tests {
     }
 
     #[test]
+    fn alarm_list_and_launchable_apps_are_narrow_and_bounded() {
+        assert_eq!(
+            build_phone_spec(&json!({"action": "alarm_list", "package": "ignored"})).unwrap(),
+            json!({"action": "alarm_list"})
+        );
+        assert_eq!(
+            build_phone_spec(&json!({"action": "app_list", "query": "时钟", "max": 20, "offset": 100_000})).unwrap(),
+            json!({"action": "app_list", "query": "时钟", "max": 20, "offset": 100_000})
+        );
+        assert_eq!(
+            build_phone_spec(&json!({"action": "app_open", "package": " com.android.deskclock ", "url": "https://example.com"})).unwrap(),
+            json!({"action": "app_open", "package": "com.android.deskclock"})
+        );
+        for args in [
+            json!({"action": "app_list", "query": "x".repeat(201)}),
+            json!({"action": "app_list", "max": 21}),
+            json!({"action": "app_list", "offset": 100_001}),
+            json!({"action": "app_open"}),
+            json!({"action": "app_open", "package": "deskclock"}),
+            json!({"action": "app_open", "package": "com.android..deskclock"}),
+            json!({"action": "app_open", "package": "com.android.desk-clock"}),
+        ] {
+            assert!(build_phone_spec(&args).is_err(), "{args}");
+        }
+
+        let listed = format_phone_result(
+            &json!({"action": "app_list"}),
+            &json!({"ok": true, "data": {"apps": [{"label": "时钟", "package": "com.android.deskclock"}], "offset": 0, "next_offset": 1, "has_more": false, "total": 1}}).to_string(),
+        ).unwrap();
+        assert!(listed.contains("com.android.deskclock"));
+        let opened = format_phone_result(
+            &json!({"action": "app_open"}),
+            &json!({"ok": true, "data": {"label": "时钟", "package": "com.android.deskclock", "dispatched": true}}).to_string(),
+        ).unwrap();
+        assert!(opened.contains("only confirms dispatch"));
+    }
+
+    #[test]
     fn phone_search_forces_quark_and_bounds() {
         assert_eq!(
             build_phone_spec(&json!({
@@ -1156,6 +1278,7 @@ mod tests {
             json!({"action": "calendar_add", "title": "x", "begin_local": "2026-10-21T15:00"}),
             json!({"action": "sms", "number": "123", "text": "hi"}),
             json!({"action": "alarm", "hour": 9, "minute": 0}),
+            json!({"action": "alarm_list"}),
             json!({"action": "timer", "seconds": 1}),
             json!({"action": "note", "text": "body"}),
             json!({"action": "location"}),
@@ -1166,6 +1289,11 @@ mod tests {
             json!({"action": "contact_add", "name": "张三", "number": "10086"}),
             json!({"action": "call_history"}),
             json!({"action": "call", "number": "10086"}),
+            json!({"action": "app_list"}),
+            json!({"action": "app_open", "package": "com.android.deskclock"}),
+            json!({"action": "photo_index"}),
+            json!({"action": "photo_search", "query": "证件"}),
+            json!({"action": "photo_open", "media_id": 123}),
             json!({"action": "file_import"}),
             json!({"action": "file_read", "file_id": ID}),
             json!({"action": "file_save", "filename": "a.txt", "text": "body"}),
@@ -1183,6 +1311,27 @@ mod tests {
         implemented.sort_unstable();
         advertised.sort_unstable();
         assert_eq!(implemented, advertised);
+    }
+
+    #[test]
+    fn photo_index_and_search_specs_are_bounded() {
+        assert_eq!(build_phone_spec(&json!({"action": "photo_index"})).unwrap(),
+            json!({"action": "photo_index", "max": 50, "retry_failed": false,
+                "reindex_existing": false}));
+        assert_eq!(build_phone_spec(&json!({"action": "photo_index", "reindex_existing": true})).unwrap(),
+            json!({"action": "photo_index", "max": 50, "retry_failed": false,
+                "reindex_existing": true}));
+        assert_eq!(build_phone_spec(&json!({"action": "photo_search", "query": " 证件 "})).unwrap(),
+            json!({"action": "photo_search", "query": "证件", "max": 10, "offset": 0, "min_score": 0.18}));
+        assert_eq!(build_phone_spec(&json!({"action": "photo_open", "media_id": 123})).unwrap(),
+            json!({"action": "photo_open", "media_id": 123}));
+        assert!(build_phone_spec(&json!({"action": "photo_index", "max": 501})).is_err());
+        assert!(build_phone_spec(&json!({"action": "photo_index", "reindex_existing": 1})).is_err());
+        assert!(build_phone_spec(&json!({"action": "photo_search", "query": " ", "min_score": 0.18})).is_err());
+        assert!(build_phone_spec(&json!({"action": "photo_search", "query": "证件", "min_score": 3})).is_err());
+        assert!(build_phone_spec(&json!({"action": "photo_open", "media_id": 0})).is_err());
+        assert!(build_phone_spec(&json!({"action": "photo_open", "media_id": "123"})).is_err());
+        assert!(build_phone_spec(&json!({"action": "photo_open", "media_id": MAX_SAFE_MEDIA_ID + 1})).is_err());
     }
 
     #[test]

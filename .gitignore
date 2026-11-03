@@ -28,4 +28,8 @@ history.sqlite-*
 /android/**/local.properties
 /android/**/dist/*
 !/android/a-serve/dist/a-serve.apk
+# Photo-search model payloads are downloaded and verified by the Android app.
+*.onnx
+*.safetensors
+**/clip_vocab.txt
 context-effect-audit-*

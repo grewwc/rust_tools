@@ -7,6 +7,7 @@ use super::{
     filter_mcp_tools_by_allowed_servers, has_tool, manifest_tool_definitions,
     merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
     select_mcp_tools, session_context_prompt, session_id_referenced, session_issue_likely,
+    set_native_tools,
     skill_authoring_referenced, tool_uses_mcp_server,
 };
 use crate::ai::agents::{AgentManifest, AgentMode};
@@ -3345,6 +3346,48 @@ fn manifest_tools_cannot_pin_driver_injected_control_tools() {
     assert!(!control_only_names.contains(&"request_user_input"));
     assert!(control_only_names.contains(&"read_file"));
     assert!(!control_only_names.contains(&"execute_command"));
+}
+
+#[test]
+fn manifests_cannot_expose_phone_tools_to_non_native_turns() {
+    let declared = manifest_tool_definitions(&["phone".to_string()], &[])
+        .expect("phone group should resolve");
+    assert!(declared.iter().any(|tool| tool.function.name == "phone_action"));
+
+    let filtered = set_native_tools(declared, false);
+    assert!(!filtered.iter().any(|tool| tool.function.name == "phone_action"));
+
+    let native = set_native_tools(Vec::new(), true);
+    assert!(native.iter().any(|tool| tool.function.name == "phone_action"));
+}
+
+#[tokio::test]
+async fn default_native_tools_are_hidden_from_subagents() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let key = crate::ai::background::SERVE_NATIVE_ENV;
+    let previous = std::env::var_os(key);
+    // SAFETY: ENV_LOCK serializes environment mutation across this test suite.
+    unsafe { std::env::set_var(key, "1") };
+
+    let top_level_has_phone = builtin_tools_for_skill(&[], None)
+        .iter()
+        .any(|tool| tool.function.name == "phone_action");
+    let subagent_has_phone = SUBAGENT_DEPTH
+        .scope(1, async {
+            builtin_tools_for_skill(&[], None)
+                .iter()
+                .any(|tool| tool.function.name == "phone_action")
+        })
+        .await;
+
+    match previous {
+        Some(value) => unsafe { std::env::set_var(key, value) },
+        None => unsafe { std::env::remove_var(key) },
+    }
+    assert!(top_level_has_phone);
+    assert!(!subagent_has_phone);
 }
 
 #[test]

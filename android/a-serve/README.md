@@ -32,6 +32,13 @@ the APK at compile time, so building `a` before the copy keeps serving the
 previous package under the old name. Confirm with `curl -sk <bind>/a-serve.apk
 | sha256sum` against `sha256sum dist/a-serve.apk`.
 
+Photo-search model binaries are not stored in this repository, embedded in the
+APK, or packaged by `a serve`. The Android app downloads the four pinned model
+files directly from their HTTPS upstream on the first `photo_index` request,
+verifies their exact size and SHA-256 digest, and atomically installs them in
+app-private storage. Normal Rust builds and non-Android clients therefore do
+not download or carry photo models.
+
 ## Device setup
 
 The APK bundles the public `a serve` CA used by its default server, so no
@@ -53,6 +60,14 @@ Ask in the normal composer; no extra action buttons or skill selection are
 needed. Android-only `phone_action` supports timers, ISO-weekday repeating
 alarms, and the existing calendar/SMS/share actions. Clock requests report
 dispatch, not verified creation: the selected clock app controls the result.
+`alarm_list` opens the system clock's alarm-list screen; Android does not expose
+another clock app's stored alarm database, so it returns no alarm entries.
+
+App discovery is limited to activities shown by the Android launcher and
+returns only display labels plus exact package names. `app_open` accepts only a
+package returned by that discovery path and starts its main launcher activity;
+it cannot pass arbitrary intents, components, URLs, or read another app's data.
+The manifest declares launcher visibility rather than `QUERY_ALL_PACKAGES`.
 
 Notes and todos are stored in the app's private SQLite database. Create,
 search, and update entries by their returned IDs; completing a todo does not

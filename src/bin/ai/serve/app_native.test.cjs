@@ -77,6 +77,12 @@ test("does not turn a fenced aserve block into a tappable button", () => {
 });
 
 const phoneFixtures = {
+  alarm_list: { action: "alarm_list" },
+  app_list: { action: "app_list", query: "时钟", max: 20, offset: 100000 },
+  app_open: { action: "app_open", package: "com.android.deskclock" },
+  photo_index: { action: "photo_index", max: 50, retry_failed: false, reindex_existing: false },
+  photo_search: { action: "photo_search", query: "证件", max: 10, offset: 0, min_score: 0.18 },
+  photo_open: { action: "photo_open", media_id: 123456789 },
   now: { action: "now" },
   calendar_read: { action: "calendar_read", days: 7, max: 10 },
   calendar_add: { action: "calendar_add", title: "Meeting", begin_local: "2026-10-21T15:00", duration_min: 60, location: "Room 1", description: "Agenda" },
@@ -107,7 +113,7 @@ test("every advertised phone action has a valid browser payload", () => {
   assert.deepEqual(Object.keys(phoneFixtures).sort(), [...tool.parameters.properties.action.enum].sort());
   const app = load();
   for (const spec of Object.values(phoneFixtures)) {
-    const parsed = app.parsePhoneAction(JSON.stringify({ ...spec, auto: false, package: "untrusted" }));
+    const parsed = app.parsePhoneAction(JSON.stringify({ ...spec, auto: false, component: "untrusted" }));
     assert.deepEqual(JSON.parse(JSON.stringify(parsed)), spec, spec.action);
   }
 });
@@ -128,6 +134,13 @@ test("new phone actions validate bounds without weakening old actions", () => {
     { ...phoneFixtures.note_create, kind: "reminder" }, { ...phoneFixtures.note_create, text: " " },
     { ...phoneFixtures.phone_search, query: " " },
     { ...phoneFixtures.phone_search, max: 11 },
+    { ...phoneFixtures.photo_index, max: 501 }, { ...phoneFixtures.photo_index, retry_failed: "yes" },
+    { ...phoneFixtures.photo_index, reindex_existing: "yes" },
+    { ...phoneFixtures.photo_search, query: " " }, { ...phoneFixtures.photo_search, max: 21 },
+    { ...phoneFixtures.photo_search, min_score: 3 },
+    { action: "photo_open" }, { action: "photo_open", media_id: 0 },
+    { action: "photo_open", media_id: 1.5 }, { action: "photo_open", media_id: "123" },
+    { action: "photo_open", media_id: Number.MAX_SAFE_INTEGER + 1 },
     { action: "note_update", entry_id: phoneFixtures.note_update.entry_id },
     { ...phoneFixtures.note_update, completed: "true" }, { ...phoneFixtures.note_update, entry_id: "bad" },
     { ...phoneFixtures.note_list, max: 21 }, { ...phoneFixtures.note_list, offset: -1 },
@@ -172,6 +185,23 @@ test("phone records paginate and direct calls require one safe target", () => {
     { action: "call", number: "12" }, { action: "call", number: "110" },
     { action: "call", number: "123;456" },
   ]) assert.equal(parse(spec), null, JSON.stringify(spec));
+});
+
+test("alarm and app actions expose only launcher-safe fields", () => {
+  const app = load();
+  assert.deepEqual(JSON.parse(JSON.stringify(app.parsePhoneAction(JSON.stringify({ action: "alarm_list", package: "ignored" })))),
+    { action: "alarm_list" });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.parsePhoneAction(JSON.stringify({ action: "app_list", query: "时钟", max: 20, offset: 100000, intent: "ignored" })))),
+    { action: "app_list", query: "时钟", max: 20, offset: 100000 });
+  assert.deepEqual(JSON.parse(JSON.stringify(app.parsePhoneAction(JSON.stringify({ action: "app_open", package: "com.android.deskclock", url: "https://example.com" })))),
+    { action: "app_open", package: "com.android.deskclock" });
+  for (const spec of [
+    { action: "app_list", query: "x".repeat(201) },
+    { action: "app_list", max: 21 },
+    { action: "app_open", package: "deskclock" },
+    { action: "app_open", package: "com.android..deskclock" },
+    { action: "app_open", package: "com.android.desk-clock" },
+  ]) assert.equal(app.parsePhoneAction(JSON.stringify(spec)), null);
 });
 
 test("calendar payloads retain local dates, defaults, and strict bounds", () => {
@@ -242,7 +272,7 @@ test("old APK refuses new actions and never silently drops repeat weekdays", asy
     await app.request(); await app.settle();
     assert.equal(app.calls.length, 0);
     assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
-    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.16\.4/);
+    assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.16\.7/);
   }
 });
 
@@ -258,6 +288,17 @@ test("file picker has a bounded user-interaction timeout", async () => {
   assert.match(JSON.parse(app.posts[0].body.text).error, /已取消/);
 });
 
+test("photo model download allows a long bounded interaction", async () => {
+  const app = nativeHarness(new Map(), phoneFixtures.photo_index);
+  const delays = [];
+  app.context.setTimeout = (fn, delay) => { delays.push(delay); return 1; };
+  const request = app.request(); await app.settle();
+  assert.ok(delays.includes(1800000));
+  app.result({ ok: false, error: "cancelled" });
+  await request;
+  assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
+});
+
 test("a shell without the floating bubble cannot pick the capture moment", async () => {
   const app = nativeHarness(new Map(), phoneFixtures.screen_capture);
   app.context.window.AServeNative.capabilities = () => JSON.stringify({
@@ -266,7 +307,7 @@ test("a shell without the floating bubble cannot pick the capture moment", async
   await app.request(); await app.settle();
   assert.equal(app.calls.length, 0);
   assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
-  assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.16\.4/);
+  assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.16\.7/);
 });
 
 test("the screen capture waits for the user tap instead of timing out early", async () => {
@@ -288,7 +329,7 @@ test("a shell without the camera preview cannot open the camera", async () => {
   await app.request(); await app.settle();
   assert.equal(app.calls.length, 0);
   assert.equal(JSON.parse(app.posts[0].body.text).ok, false);
-  assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.16\.4/);
+  assert.match(JSON.parse(app.posts[0].body.text).error, /升级到 v1\.16\.7/);
 });
 
 test("the camera frame reaches the conversation with the camera caption", async () => {

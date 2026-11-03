@@ -4,7 +4,7 @@
 //! request rejected by the gateway (e.g. HTTP 400) never produces a stream,
 //! so without this module neither the request controls nor the gateway error
 //! body are persisted anywhere. Each record is one small JSONL line,
-//! discriminated by `kind` (`request` / `request_error`).
+//! discriminated by `kind` (`request` / `request_error` / `request_failure`).
 //!
 //! Design constraints (mirroring the stream-side writer):
 //! - Best-effort: recording never influences the request; failures are dropped.
@@ -30,6 +30,7 @@ use crate::ai::driver::runtime_ctx::{current_subagent_depth, current_turn_id_or_
 use crate::ai::history::Message;
 use crate::ai::tools::storage::file_store::current_session_assets_dir;
 
+use super::error::{RequestError, RequestErrorKind};
 use super::types::RequestBody;
 
 /// Outcome file shared with the stream-side writer.
@@ -86,6 +87,37 @@ pub(in crate::ai) fn append_request_error(
         "status": status,
         "body": truncate_chars(body, MAX_ERROR_BODY_CHARS),
     }));
+}
+
+/// Append the final structured error returned to the turn runtime. Unlike
+/// `request_error`, which records a raw non-2xx provider response, this also
+/// covers network errors and errors produced by request middleware.
+pub(in crate::ai) fn append_request_failure(session_id: &str, model: &str, error: &RequestError) {
+    append_line(&request_failure_record_json(session_id, model, error));
+}
+
+fn request_failure_record_json(session_id: &str, model: &str, error: &RequestError) -> Value {
+    let (error_kind, status) = match error.kind {
+        RequestErrorKind::Network => ("network", None),
+        RequestErrorKind::Status(status) => ("status", Some(status.as_u16())),
+    };
+    let retry_after_ms = error
+        .retry_after
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+    json!({
+        "kind": "request_failure",
+        "ts": Utc::now().to_rfc3339(),
+        "session": session_id,
+        "turn": current_turn_id_or_zero(),
+        "depth": current_subagent_depth(),
+        "model": model,
+        "error": {
+            "kind": error_kind,
+            "status": status,
+            "message": truncate_chars(&error.message, MAX_ERROR_BODY_CHARS),
+            "retry_after_ms": retry_after_ms,
+        },
+    })
 }
 
 fn request_record_json(
@@ -253,6 +285,35 @@ mod tests {
         assert_eq!(truncate_chars("abc", 8), "abc");
         // Multibyte cut must not split a character.
         assert_eq!(truncate_chars("a好b", 2), "a好…[truncated]");
+    }
+
+    #[test]
+    fn request_failure_record_preserves_structured_request_error() {
+        let mut error = RequestError::status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "限流".repeat(MAX_ERROR_BODY_CHARS),
+        );
+        error.retry_after = Some(std::time::Duration::from_millis(1_250));
+
+        let record = request_failure_record_json("sess", "model", &error);
+
+        assert_eq!(record["kind"], "request_failure");
+        assert_eq!(record["session"], "sess");
+        assert_eq!(record["model"], "model");
+        assert_eq!(record["error"]["kind"], "status");
+        assert_eq!(record["error"]["status"], 429);
+        assert_eq!(record["error"]["retry_after_ms"], 1_250);
+        assert!(
+            record["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.ends_with("…[truncated]"))
+        );
+
+        let network = RequestError::cancelled("request canceled");
+        let network_record = request_failure_record_json("sess", "model", &network);
+        assert_eq!(network_record["error"]["kind"], "network");
+        assert!(network_record["error"]["status"].is_null());
+        assert!(network_record["error"]["retry_after_ms"].is_null());
     }
 
     #[test]
