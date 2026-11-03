@@ -2,8 +2,6 @@ plugins {
     id "com.android.application"
 }
 
-apply from: "photo-models.gradle"
-
 def configuredServeUrl = providers.gradleProperty("serveUrl")
         .getOrElse("https://10.37.110.250:8080")
 def escapedServeUrl = configuredServeUrl
@@ -18,8 +16,8 @@ android {
         applicationId "com.grewwc.aserve"
         minSdk 26
         targetSdk 33
-        versionCode 29
-        versionName "1.16.8"
+        versionCode 30
+        versionName "1.16.9"
         buildConfigField "String", "DEFAULT_SERVER_URL", "\"${escapedServeUrl}\""
     }
 
@@ -48,10 +46,5 @@ android {
 dependencies {
     implementation "com.microsoft.onnxruntime:onnxruntime-android:1.20.0"
     implementation "com.google.mlkit:text-recognition-chinese:16.0.1"
-    testImplementation "com.microsoft.onnxruntime:onnxruntime:1.20.0"
     testImplementation "junit:junit:4.13.2"
-}
-
-tasks.withType(org.gradle.api.tasks.testing.Test).configureEach {
-    dependsOn tasks.named("preparePhotoModels")
 }

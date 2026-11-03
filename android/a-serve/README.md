@@ -32,6 +32,13 @@ the APK at compile time, so building `a` before the copy keeps serving the
 previous package under the old name. Confirm with `curl -sk <bind>/a-serve.apk
 | sha256sum` against `sha256sum dist/a-serve.apk`.
 
+Photo-search model binaries are not stored in this repository, embedded in the
+APK, or packaged by `a serve`. The Android app downloads the four pinned model
+files directly from their HTTPS upstream on the first `photo_index` request,
+verifies their exact size and SHA-256 digest, and atomically installs them in
+app-private storage. Normal Rust builds and non-Android clients therefore do
+not download or carry photo models.
+
 ## Device setup
 
 The APK bundles the public `a serve` CA used by its default server, so no

@@ -12,71 +12,46 @@ import java.security.NoSuchAlgorithmException;
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.Set;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
 
-/** Bounded archive verification and extraction with no Android dependencies. */
+/** File and installed-directory verification with no Android dependencies. */
 final class PhotoModelArchive {
     private PhotoModelArchive() {}
 
-    static void verifyArchive(File archive, PhotoModelContract.Manifest manifest) throws IOException {
-        if (!archive.isFile() || archive.length() != manifest.archiveSize) {
-            throw new IOException("photo model archive size mismatch");
+    static void verifyFile(File file, PhotoModelContract.FileSpec expected) throws IOException {
+        if (!file.isFile() || file.length() != expected.size) {
+            throw new IOException("photo model size mismatch for " + expected.name);
         }
-        if (!sha256(archive).equals(manifest.archiveSha256)) {
-            throw new IOException("photo model archive checksum mismatch");
+        if (!sha256(file).equals(expected.sha256)) {
+            throw new IOException("photo model checksum mismatch for " + expected.name);
         }
     }
 
-    static void extract(File archive, File destination, PhotoModelContract.Manifest manifest,
-                        Cancellation cancellation) throws IOException {
-        if (!destination.isDirectory() && !destination.mkdirs()) {
-            throw new IOException("cannot create photo model staging directory");
+    static void copyVerified(File source, File destination, PhotoModelContract.FileSpec expected,
+                             Cancellation cancellation) throws IOException {
+        if (!source.isFile() || source.length() != expected.size) {
+            throw new IOException("downloaded photo model size mismatch for " + expected.name);
         }
-        Set<String> seen = new HashSet<>();
-        long total = 0;
-        try (ZipInputStream zip = new ZipInputStream(new BufferedInputStream(new FileInputStream(archive)))) {
-            ZipEntry entry;
-            while ((entry = zip.getNextEntry()) != null) {
+        MessageDigest digest = digest();
+        long written = 0;
+        try (InputStream input = new BufferedInputStream(new FileInputStream(source));
+             FileOutputStream file = new FileOutputStream(destination);
+             BufferedOutputStream output = new BufferedOutputStream(file)) {
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = input.read(buffer)) != -1) {
                 cancellation.check();
-                String name = entry.getName();
-                if (entry.isDirectory() || name == null || name.indexOf('/') >= 0
-                        || name.indexOf('\\') >= 0 || !PhotoModelContract.FILE_NAMES.contains(name)) {
-                    throw new IOException("unexpected photo model archive entry");
+                written += read;
+                if (written > expected.size || written > expected.maxBytes) {
+                    throw new IOException("photo model exceeds declared size for " + expected.name);
                 }
-                if (!seen.add(name)) throw new IOException("duplicate photo model archive entry " + name);
-                PhotoModelContract.FileSpec expected = manifest.file(name);
-                if (entry.getSize() > expected.size) throw new IOException("oversized photo model entry " + name);
-                File output = new File(destination, name);
-                MessageDigest digest = digest();
-                long written = 0;
-                try (FileOutputStream file = new FileOutputStream(output);
-                     BufferedOutputStream stream = new BufferedOutputStream(file)) {
-                    byte[] buffer = new byte[64 * 1024];
-                    int read;
-                    while ((read = zip.read(buffer)) != -1) {
-                        cancellation.check();
-                        written += read;
-                        total += read;
-                        if (written > expected.size || total > manifest.totalFileSize) {
-                            throw new IOException("photo model archive exceeds declared size");
-                        }
-                        stream.write(buffer, 0, read);
-                        digest.update(buffer, 0, read);
-                    }
-                    stream.flush();
-                    file.getFD().sync();
-                }
-                if (written != expected.size || !hex(digest.digest()).equals(expected.sha256)) {
-                    throw new IOException("photo model entry verification failed for " + name);
-                }
-                zip.closeEntry();
+                output.write(buffer, 0, read);
+                digest.update(buffer, 0, read);
             }
+            output.flush();
+            file.getFD().sync();
         }
-        if (seen.size() != PhotoModelContract.FILE_NAMES.size()
-                || !seen.containsAll(PhotoModelContract.FILE_NAMES)
-                || total != manifest.totalFileSize) {
-            throw new IOException("photo model archive file set is incomplete");
+        if (written != expected.size || !hex(digest.digest()).equals(expected.sha256)) {
+            throw new IOException("downloaded photo model verification failed for " + expected.name);
         }
     }
 
@@ -93,11 +68,7 @@ final class PhotoModelArchive {
             if (!allowed.contains(name)) throw new IOException("unexpected installed model file " + name);
         }
         for (PhotoModelContract.FileSpec expected : manifest.files) {
-            File file = new File(directory, expected.name);
-            if (!file.isFile() || file.length() != expected.size
-                    || !sha256(file).equals(expected.sha256)) {
-                throw new IOException("installed photo model verification failed for " + expected.name);
-            }
+            verifyFile(new File(directory, expected.name), expected);
         }
     }
 

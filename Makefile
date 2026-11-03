@@ -18,9 +18,6 @@ DEBUG_DIR := target/debug
 INSTALLW := $(DEBUG_DIR)/installw
 CargoLock := $(wildcard Cargo.lock)
 INSTALLW_DEPS := $(shell find src -type f -name '*.rs') Cargo.toml $(CargoLock)
-PHOTO_MODELS_BUILD_DIR := android/a-serve/app/build/distributions/photo-models
-PHOTO_MODELS_ARCHIVE := a-serve-photo-models-v1.zip
-PHOTO_MODELS_MANIFEST := a-serve-photo-models-v1.json
 
 $(RELEASE_DIR)/%: src/bin/%.rs
 	cargo build --release --bin $*
@@ -147,37 +144,8 @@ install-completions:
 # It builds unconditionally instead of asking installw which bins are stale:
 # a feature change does not touch source mtimes, so installw would wrongly
 # report a previously installed bin as up-to-date and skip the rebuild.
-.PHONY: install-photo-models
-install-photo-models:
-	cd android/a-serve && ./gradlew :app:packagePhotoModels
-	@set -eu; \
-	if [ "$${A_SERVE_STATE_DIR+x}" = x ]; then \
-		if [ -z "$$A_SERVE_STATE_DIR" ]; then \
-			echo "A_SERVE_STATE_DIR is set but empty" >&2; \
-			exit 1; \
-		fi; \
-		state_dir="$$A_SERVE_STATE_DIR"; \
-	elif [ -n "$${HOME:-}" ]; then \
-		state_dir="$$HOME/.config/rust_tools"; \
-	else \
-		echo "cannot resolve user config dir: HOME is unset" >&2; \
-		exit 1; \
-	fi; \
-	destination="$$state_dir/photo-models"; \
-	mkdir -p "$$destination"; \
-	suffix=".$$$$.tmp"; \
-	archive_tmp="$$destination/$(PHOTO_MODELS_ARCHIVE)$$suffix"; \
-	manifest_tmp="$$destination/$(PHOTO_MODELS_MANIFEST)$$suffix"; \
-	trap 'rm -f "$$archive_tmp" "$$manifest_tmp"' EXIT HUP INT TERM; \
-	install -m 0644 "$(PHOTO_MODELS_BUILD_DIR)/$(PHOTO_MODELS_ARCHIVE)" "$$archive_tmp"; \
-	install -m 0644 "$(PHOTO_MODELS_BUILD_DIR)/$(PHOTO_MODELS_MANIFEST)" "$$manifest_tmp"; \
-	mv -f "$$archive_tmp" "$$destination/$(PHOTO_MODELS_ARCHIVE)"; \
-	mv -f "$$manifest_tmp" "$$destination/$(PHOTO_MODELS_MANIFEST)"; \
-	trap - EXIT HUP INT TERM; \
-	echo "photo models -> $$destination"
-
 .PHONY: install-all
-install-all: $(addprefix $(RELEASE_DIR)/,$(MCP_BINS)) install-photo-models
+install-all: $(addprefix $(RELEASE_DIR)/,$(MCP_BINS))
 	cargo build --release --features $(RELEASE_FEATURES) $(addprefix --bin ,$(filter-out $(MCP_BINS),$(INSTALL_BINS)))
 	cargo build --release -p re
 	sh ./move_executable.sh --force $(INSTALL_BINS)

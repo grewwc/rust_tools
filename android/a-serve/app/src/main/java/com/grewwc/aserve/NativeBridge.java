@@ -386,7 +386,7 @@ final class NativeBridge {
             AlertDialog dialog = new AlertDialog.Builder(activity)
                     .setTitle(operation + "照片搜索模型")
                     .setMessage("版本 " + manifest.version + "，下载 "
-                            + formatModelBytes(manifest.archiveSize)
+                            + formatModelBytes(manifest.totalFileSize)
                             + "。模型仅用于设备上的照片索引和搜索。")
                     .setNegativeButton("取消", (ignored, which) -> {
                         cancelled.set(true);
