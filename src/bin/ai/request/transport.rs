@@ -768,6 +768,26 @@ fn previous_water_meter_band(previous: Option<&PromptTokenFeedback>) -> Option<W
     })
 }
 
+/// Session-scoped `prompt_cache_key` for a main Responses request.
+///
+/// Besides prompt-cache sharding, the key carries the session's routing hint
+/// for encrypted reasoning replay: replayed item ids belong to one backing
+/// resource, so every request in the session must keep reaching that resource.
+fn main_request_prompt_cache_key(model: &str, session_id: &str, endpoint: &str) -> Option<String> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    // Encrypted reasoning replay persists server-generated item ids scoped to
+    // one backing resource; a gateway that spreads a session across resources
+    // rejects them. OpenCode already receives `x-opencode-session`, its
+    // gateway's affinity header, so `prompt_cache_key` stays off there.
+    let needs_session_affinity = models::prompt_cache_key_enabled(model)
+        || (models::reasoning_encrypted_replay_enabled(model)
+            && !super::error::is_opencode_gateway_endpoint(endpoint));
+    needs_session_affinity.then(|| session_id.to_string())
+}
+
 impl RequestProjection {
     fn remove_water_meter_note(&mut self) {
         if let Some(index) = self.water_meter_index.take()
@@ -824,12 +844,12 @@ impl RequestProjection {
         // auxiliary builders construct their own bodies without the side
         // channel (nothing failed in their tool-less flows).
         body.tool_errors = Some(&self.tool_errors);
-        // Session-scoped cache routing rides on the main request boundary only,
-        // like `tool_errors`: auxiliary calls (summaries, titles) have their own
-        // prefixes and must not share or evict this session's cache shard.
-        body.prompt_cache_key = models::prompt_cache_key_enabled(model)
-            .then(|| app.session_id.clone())
-            .filter(|key| !key.is_empty());
+        // Session-scoped cache and affinity routing rides on the main request
+        // boundary only, like `tool_errors`: auxiliary calls (summaries, titles)
+        // have their own prefixes and must not share or evict this session's
+        // cache shard.
+        body.prompt_cache_key =
+            main_request_prompt_cache_key(model, &app.session_id, &self.endpoint);
         body.explicit_cache_breakpoints = prompt_cache_enabled_for_model(model);
         let mut feedback =
             PromptTokenFeedback::capture(&app.session_id, model, &self.endpoint, &body);
@@ -883,9 +903,8 @@ impl RequestProjection {
             Some(&self.reasoning_items),
         );
         body.tool_errors = Some(&self.tool_errors);
-        body.prompt_cache_key = models::prompt_cache_key_enabled(model)
-            .then(|| app.session_id.clone())
-            .filter(|key| !key.is_empty());
+        body.prompt_cache_key =
+            main_request_prompt_cache_key(model, &app.session_id, &self.endpoint);
         body.explicit_cache_breakpoints = prompt_cache_enabled_for_model(model);
         feedback = PromptTokenFeedback::capture(&app.session_id, model, &self.endpoint, &body);
         // Auxiliary builders lack request-scoped usage. Only this shared main
@@ -1990,5 +2009,60 @@ mod retry_ladder_tests {
             1,
             12
         ));
+    }
+}
+
+#[cfg(test)]
+mod session_prompt_cache_key_tests {
+    use super::main_request_prompt_cache_key;
+
+    #[test]
+    fn encrypted_replay_models_route_every_request_by_session() {
+        // Every modelhub GPT model enables encrypted reasoning replay, whose
+        // persisted item ids are scoped to one backing resource. The session id
+        // must reach the wire as the routing key even though these models do not
+        // opt into prompt-cache keying for its own sake.
+        let modelhub = "https://dataagent-dev-llm.bytedance.net/v1/responses";
+        for key in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6.1-sol",
+            "gpt-5.6-luna",
+            "gpt-6-astra",
+        ] {
+            assert_eq!(
+                main_request_prompt_cache_key(key, "session-1", modelhub),
+                Some("session-1".to_string()),
+                "{key} must route every request by session"
+            );
+        }
+        assert_eq!(
+            main_request_prompt_cache_key(
+                "gpt-5.6-sol",
+                "",
+                "https://dataagent-dev-llm.bytedance.net/v1/responses"
+            ),
+            None
+        );
+        // OpenCode already carries the session in `x-opencode-session`; do not
+        // send it a second routing field its gateway may reject.
+        assert_eq!(
+            main_request_prompt_cache_key(
+                "claude-sonnet-5-5",
+                "session-1",
+                "https://opencode.ai/inference/go/v1/responses"
+            ),
+            None
+        );
+        // A model without encrypted replay and without the prompt-cache opt-in
+        // keeps the prior behavior: no routing key on the request.
+        assert_eq!(
+            main_request_prompt_cache_key(
+                "deepseek-v4.1-flash-opencode",
+                "session-1",
+                "https://opencode.ai/inference/go/v1/responses"
+            ),
+            None
+        );
     }
 }

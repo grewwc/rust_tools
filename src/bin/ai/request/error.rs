@@ -247,7 +247,7 @@ pub(crate) fn apply_opencode_session_header(
 /// `https://opencode.ai.evil.example/v1`, whose hosts are not controlled by the
 /// OpenCode gateway. Endpoints that fail to parse as a URL with a host (empty string,
 /// no scheme, no host) are treated as non-OpenCode rather than guessed from the text.
-fn is_opencode_gateway_endpoint(endpoint: &str) -> bool {
+pub(super) fn is_opencode_gateway_endpoint(endpoint: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(endpoint.trim()) else {
         return false;
     };

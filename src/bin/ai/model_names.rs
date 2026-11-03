@@ -157,8 +157,12 @@ pub struct ModelDef {
     /// Optional: only effective for the `responses` protocol. When enabled, main requests carry
     /// `prompt_cache_key: <session id>` so the provider routes every request of one session to the
     /// same prompt-cache shard instead of hashing the shared system-prompt prefix, which collides
-    /// across concurrent sessions and lowers hit rates. Off by default: declare it only for
-    /// gateways that accept the field (unknown fields are a 400 on strict relays).
+    /// across concurrent sessions and lowers hit rates. Encrypted-replay models on non-OpenCode
+    /// gateways also get the key automatically for resource affinity: replayed reasoning item ids
+    /// belong to one backing resource, so a gateway that spreads a session across resources rejects
+    /// them. OpenCode uses its `x-opencode-session` header instead. Off by default otherwise:
+    /// declare it only for gateways that accept the field (unknown fields are a 400 on strict
+    /// relays).
     #[serde(default)]
     pub prompt_cache_key: bool,
     #[serde(default)]
