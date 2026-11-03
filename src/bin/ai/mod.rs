@@ -15,6 +15,7 @@ mod mcp;
 mod middleware;
 mod model_names;
 mod models;
+mod path_utils;
 mod persona;
 mod pipeline;
 mod ports;
@@ -25,6 +26,7 @@ mod request_protocol;
 #[cfg(any(feature = "serve", feature = "serve-client"))]
 pub(in crate::ai) mod serve;
 mod serve_confirm;
+mod shell_quote;
 mod skills;
 mod stream;
 mod theme;

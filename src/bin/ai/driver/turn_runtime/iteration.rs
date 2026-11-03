@@ -1,7 +1,7 @@
 use colored::Colorize;
 use rust_tools::commonw::FastSet;
 use serde_json::Value;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant};
 
@@ -10,6 +10,7 @@ use crate::ai::{
     history::{Message, ROLE_INTERNAL_NOTE, compress::llm_prune, last_real_user_index},
     mcp::McpClient,
     middleware::request::build_llm_client_chain,
+    path_utils::normalize_lexical,
     ports::{DefaultLlmClient, LlmClient, LlmRequest},
     request, stream,
     tools::task_tools,
@@ -403,20 +404,6 @@ fn mutation_target_tokens(tokens: &[String]) -> (Vec<String>, bool) {
             token.starts_with("-pi") || token.starts_with("-ip") || token.starts_with("-i")
         }));
     (targets, known_mutator)
-}
-
-fn normalize_lexical(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
 }
 
 fn resolve_command_path(base: &Path, raw: &str) -> Option<PathBuf> {

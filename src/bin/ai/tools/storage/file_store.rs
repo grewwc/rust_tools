@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ai::errors::AiError;
 use crate::ai::history::compress::SESSION_ASSET_ALIAS_DIRS;
+use crate::ai::path_utils::normalize_lexical;
 use crate::ai::tools::storage::temp_registry;
 use aios_kernel::primitives::{VfsError, VfsReadRange, VfsStat};
 
@@ -755,23 +756,6 @@ fn is_session_overflow_asset_path(path: &Path) -> bool {
     session_overflow_dir_component(path).is_some()
 }
 
-/// Lexically normalize the path: resolve `.`/`..` without touching the disk (the path may not exist yet, e.g. when writing a new file).
-fn normalize_lexical(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            std::path::Component::RootDir => normalized.push(component.as_os_str()),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            std::path::Component::Normal(part) => normalized.push(part),
-        }
-    }
-    normalized
-}
-
 fn resolve_effective_path(path: PathBuf) -> PathBuf {
     // Expand a leading `~` first: models often follow shell habit and pass `~/.config/...`, but `~` is only
     // expanded by shells; in Rust it is not absolute and would be wrongly joined after effective_cwd.
@@ -959,10 +943,11 @@ mod tests {
     use super::{
         FileStore, blocked_overflow_read_reason_for_assets, is_bare_file_name,
         is_read_file_overflow_artifact, is_sensitive_fs_path, is_session_overflow_asset_path,
-        normalize_lexical, overflow_artifact_tool_name, path_within_allowed_roots,
-        path_within_roots, remove_partial_create_file, session_asset_for_alias,
-        session_overflow_asset_for_bare_name, temp_registry,
+        overflow_artifact_tool_name, path_within_allowed_roots, path_within_roots,
+        remove_partial_create_file, session_asset_for_alias, session_overflow_asset_for_bare_name,
+        temp_registry,
     };
+    use crate::ai::path_utils::normalize_lexical;
     use crate::ai::test_support::ENV_LOCK;
     use std::path::{Path, PathBuf};
 

@@ -15,11 +15,9 @@ use crate::ai::history::Message;
 use crate::ai::types::App;
 use crate::commonw::configw;
 
+use super::aux::{AuxRequestContext, send_aux_chat_request_with_key_rotation};
 use super::builder::build_request_body;
-use super::error::{
-    api_key_for_request_model, apply_request_auth, control_model_for_aux_tasks,
-    endpoint_for_request_model,
-};
+use super::error::{control_model_for_aux_tasks, endpoint_for_request_model};
 use crate::ai::skills::SkillManifest;
 
 pub(crate) fn strip_json_fence(s: &str) -> &str {
@@ -134,27 +132,26 @@ async fn select_skill_candidate_via_model(
     );
 
     let endpoint = endpoint_for_request_model(app, &control_model);
-    let api_key = api_key_for_request_model(app, &control_model);
     let http_body =
         super::protocol::build_http_body_for_request(&control_model, &endpoint, &mut request_body);
-    // Auxiliary request (skill routing); 15-second timeout fallback, same rationale as above.
-    let send_future =
-        apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key, &app.session_id)
-            .header("Content-Type", "application/json")
-            .body(http_body)
-            .send();
-    let response = match tokio::time::timeout(Duration::from_secs(15), send_future).await {
-        Ok(r) => r.ok()?,
-        Err(_) => return None,
+    // Auxiliary request (skill routing): rotate through the same configured key
+    // candidates as other auxiliary tasks, bounded to a single 30s budget.
+    let ctx = AuxRequestContext {
+        config: &app.config,
+        client: &app.client,
+        session_id: &app.session_id,
     };
-    if !response.status().is_success() {
-        return None;
-    }
-
-    let text = match tokio::time::timeout(Duration::from_secs(15), response.text()).await {
-        Ok(r) => r.ok()?,
-        Err(_) => return None,
-    };
+    let text = send_aux_chat_request_with_key_rotation(
+        &ctx,
+        &control_model,
+        &endpoint,
+        http_body,
+        Duration::from_secs(15),
+        Duration::from_secs(15),
+        Some(Instant::now() + Duration::from_secs(30)),
+    )
+    .await
+    .ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     let content = extract_router_content(&v).unwrap_or_default();
     let (name, confidence) = parse_router_output(&content);

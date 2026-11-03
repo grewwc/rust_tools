@@ -18,6 +18,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ai::config_schema::AiConfig;
+use crate::ai::shell_quote::shell_single_quote;
 
 /// Timeout for the post-processing command (mirrors the lifecycle-hook
 /// default; post-processing must never stall the turn end).
@@ -103,7 +104,7 @@ fn temp_file_path(kind: &str) -> std::path::PathBuf {
 /// Wrap a path in single quotes for safe use in a shell command line.
 fn shell_quote(path: &std::path::Path) -> String {
     let raw = path.to_string_lossy();
-    format!("'{}'", raw.replace('\'', "'\\''"))
+    shell_single_quote(&raw)
 }
 
 #[cfg(test)]

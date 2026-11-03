@@ -253,7 +253,7 @@ fn hunk_line_budget(header: &str) -> (usize, usize) {
 /// Structural key-line predicate, applied to the marker-stripped body. Matching the
 /// raw line never sees an added line (`+    /// x` does not start with `///`), so the
 /// index filled up with unchanged context and hid what the change actually did.
-fn is_key_line(body: &str) -> bool {
+pub(crate) fn is_key_line(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.starts_with("fn ")
         || lower.starts_with("pub fn ")

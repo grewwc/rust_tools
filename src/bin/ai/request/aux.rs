@@ -3,7 +3,7 @@
 //! 这些函数共享主链路的 `build_request_body` / auth 基础设施，但不参与主 turn
 //! 流式，因此独立为子模块，降低 `mod.rs` 的认知负担。
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -52,21 +52,31 @@ fn aux_request_key_candidates(model: &str, endpoint: &str, global_fallback: &str
 /// Send an auxiliary LLM request (POST chat/completions) with key rotation until one succeeds.
 ///
 /// Each key gets its own timeout so one hung key cannot stall a background
-/// auxiliary task. Returns the 2xx response body; when every key fails it
-/// returns the last error as (kind, message), with the same kind classification
-/// as [`record_title_failure`].
-async fn send_aux_chat_request_with_key_rotation(
+/// auxiliary task. `overall_deadline` optionally bounds the whole rotation so
+/// callers cannot multiply their latency budget by the number of keys. Returns
+/// the 2xx response body; when every key fails it returns the last error as
+/// (kind, message), with the same kind classification as
+/// [`record_title_failure`].
+pub(super) async fn send_aux_chat_request_with_key_rotation(
     ctx: &AuxRequestContext<'_>,
     model: &str,
     endpoint: &str,
     http_body: Vec<u8>,
     header_timeout: Duration,
     body_timeout: Duration,
+    overall_deadline: Option<Instant>,
 ) -> Result<String, (String, String)> {
     let keys = aux_request_key_candidates(model, endpoint, &ctx.config.api_key);
     let mut last_err: (String, String) = ("http_error".to_string(), "unknown".to_string());
 
     for (idx, api_key) in keys.iter().enumerate() {
+        if overall_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            last_err = (
+                "request_timeout".to_string(),
+                "auxiliary request deadline exceeded".to_string(),
+            );
+            break;
+        }
         if idx > 0 {
             super::emit_request_diagnostic(format_args!(
                 "[aux] key #{} failed, trying next key #{} ({} remaining)",
@@ -76,17 +86,20 @@ async fn send_aux_chat_request_with_key_rotation(
             ));
         }
 
-        let send_future = apply_request_auth(
-            ctx.client.post(endpoint),
-            endpoint,
-            api_key,
-            ctx.session_id,
-        )
-        .header("Content-Type", "application/json")
-        .body(http_body.clone())
-        .send();
+        let send_future =
+            apply_request_auth(ctx.client.post(endpoint), endpoint, api_key, ctx.session_id)
+                .header("Content-Type", "application/json")
+                .body(http_body.clone())
+                .send();
 
-        let response = match tokio::time::timeout(header_timeout, send_future).await {
+        let Some(header_limit) = phase_timeout(header_timeout, overall_deadline) else {
+            last_err = (
+                "request_timeout".to_string(),
+                "auxiliary request deadline exceeded".to_string(),
+            );
+            break;
+        };
+        let response = match tokio::time::timeout(header_limit, send_future).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 last_err = ("request_error".to_string(), e.to_string());
@@ -95,7 +108,7 @@ async fn send_aux_chat_request_with_key_rotation(
             Err(_) => {
                 last_err = (
                     "request_timeout".to_string(),
-                    format!("{}s", header_timeout.as_secs()),
+                    format!("{}s", header_limit.as_secs()),
                 );
                 continue;
             }
@@ -107,7 +120,14 @@ async fn send_aux_chat_request_with_key_rotation(
             continue;
         }
 
-        let text = match tokio::time::timeout(body_timeout, response.text()).await {
+        let Some(body_limit) = phase_timeout(body_timeout, overall_deadline) else {
+            last_err = (
+                "request_timeout".to_string(),
+                "auxiliary request deadline exceeded".to_string(),
+            );
+            break;
+        };
+        let text = match tokio::time::timeout(body_limit, response.text()).await {
             Ok(Ok(t)) => t,
             Ok(Err(e)) => {
                 last_err = ("body_read_error".to_string(), e.to_string());
@@ -116,7 +136,7 @@ async fn send_aux_chat_request_with_key_rotation(
             Err(_) => {
                 last_err = (
                     "body_timeout".to_string(),
-                    format!("{}s", body_timeout.as_secs()),
+                    format!("{}s", body_limit.as_secs()),
                 );
                 continue;
             }
@@ -124,6 +144,16 @@ async fn send_aux_chat_request_with_key_rotation(
         return Ok(text);
     }
     Err(last_err)
+}
+
+fn phase_timeout(phase: Duration, overall_deadline: Option<Instant>) -> Option<Duration> {
+    match overall_deadline {
+        None => Some(phase),
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            (!remaining.is_zero()).then(|| phase.min(remaining))
+        }
+    }
 }
 
 fn is_exported_message_heading(line: &str) -> bool {
@@ -426,6 +456,18 @@ mod summary_prompt_tests {
         assert!(configured.ends_with("Keep {file:line} citations."));
         assert!(configured.contains("subject to the provenance, uncertainty, and output-limit rules above"));
     }
+
+    #[test]
+    fn phase_timeout_clamps_to_deadline() {
+        assert_eq!(
+            phase_timeout(Duration::from_secs(15), None),
+            Some(Duration::from_secs(15))
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let limit = phase_timeout(Duration::from_secs(15), Some(deadline)).expect("time remains");
+        assert!(limit <= Duration::from_secs(10));
+        assert!(limit > Duration::ZERO);
+    }
 }
 
 fn history_summary_prompt(max_chars: usize, additional: &str) -> String {
@@ -507,6 +549,7 @@ pub(crate) async fn summarize_history_via_model(
         http_body,
         Duration::from_secs(60),
         Duration::from_secs(30),
+        None,
     )
     .await
     {
@@ -1002,6 +1045,7 @@ pub(crate) async fn generate_session_title_with_context(
         http_body,
         Duration::from_secs(SESSION_TITLE_REQUEST_TIMEOUT_SECS),
         Duration::from_secs(SESSION_TITLE_BODY_TIMEOUT_SECS),
+        None,
     )
     .await
     {

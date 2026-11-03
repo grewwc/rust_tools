@@ -12,6 +12,7 @@
 //! prepended to the user command as a safely escaped `export VAR='...'` prefix.
 
 use crate::ai::config_schema::AiConfig;
+use crate::ai::shell_quote::shell_single_quote;
 
 /// Default hook timeout (seconds).
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
@@ -147,22 +148,6 @@ fn build_hook_command(
     }
     prelude.push_str(user_command);
     prelude
-}
-
-/// Safely wrap a string in single quotes so it is a single shell literal.
-/// A single quote itself is escaped with the `'\''` sequence.
-fn shell_single_quote(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('\'');
-    for ch in value.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
 }
 
 #[cfg(test)]

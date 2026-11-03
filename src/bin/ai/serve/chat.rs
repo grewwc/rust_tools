@@ -29,6 +29,10 @@ use super::super::{
     config_schema::AiConfig,
     driver::{
         commands::{ServeInputRoute, classify_serve_input},
+        history_rewind::{
+            HistoryRewindTarget, count_real_users, parse_history_rewind_target, real_user_index,
+            real_user_ordinal_entries,
+        },
         input::inline_image_filenames,
     },
     history::{SessionStore, current_terminal_key},
@@ -1458,27 +1462,11 @@ fn is_remote_real_user_message(message: &RemoteHistoryMessage) -> bool {
 
 /// Canonical (0-based) index of the Nth stored real user message.
 fn serve_user_message_index(messages: &[RemoteHistoryMessage], ordinal: usize) -> Option<usize> {
-    if ordinal == 0 {
-        return None;
-    }
-    let mut seen = 0usize;
-    for (idx, message) in messages.iter().enumerate() {
-        if !is_remote_real_user_message(message) {
-            continue;
-        }
-        seen += 1;
-        if seen == ordinal {
-            return Some(idx);
-        }
-    }
-    None
+    real_user_index(messages, ordinal, is_remote_real_user_message)
 }
 
 fn serve_user_message_count(messages: &[RemoteHistoryMessage]) -> usize {
-    messages
-        .iter()
-        .filter(|message| is_remote_real_user_message(message))
-        .count()
+    count_real_users(messages, is_remote_real_user_message)
 }
 
 /// Role-array counterparts of the message-based helpers above: the
@@ -1486,24 +1474,11 @@ fn serve_user_message_count(messages: &[RemoteHistoryMessage]) -> usize {
 /// per canonical row. Runtime-synthetic users carry a distinct role sentinel,
 /// so only literal `user` rows participate in ordinals.
 fn serve_role_user_message_index(roles: &[String], ordinal: usize) -> Option<usize> {
-    if ordinal == 0 {
-        return None;
-    }
-    let mut seen = 0usize;
-    for (idx, role) in roles.iter().enumerate() {
-        if role != "user" {
-            continue;
-        }
-        seen += 1;
-        if seen == ordinal {
-            return Some(idx);
-        }
-    }
-    None
+    real_user_index(roles, ordinal, |role| role == "user")
 }
 
 fn serve_role_user_message_count(roles: &[String]) -> usize {
-    roles.iter().filter(|role| role.as_str() == "user").count()
+    count_real_users(roles, |role| role == "user")
 }
 
 /// Wire value for a view's role filter, mirroring `parse_serve_history_view`
@@ -1799,76 +1774,55 @@ fn resolve_serve_rewind_target(
     messages: &[RemoteHistoryMessage],
     args: &[&str],
 ) -> Result<(usize, usize), String> {
-    let Some(first) = args.first().copied() else {
-        return Err("missing rewind target. try: /history rewind u3".into());
-    };
-    if first == "last" || first == "latest" {
-        let count = serve_user_message_count(messages);
-        if count == 0 {
-            return Err("no user input found in history".into());
-        }
-        let index =
-            serve_user_message_index(messages, count).expect("counted user message resolves");
-        return Ok((count, index));
-    }
-    if first == "grep" {
-        let keyword = args[1..].join(" ");
-        if keyword.trim().is_empty() {
-            return Err("`/history rewind grep` requires a keyword".into());
-        }
-        let mut ordinal = 0usize;
-        let mut matches = Vec::new();
-        for message in messages {
-            if message.role != "user" {
-                continue;
+    match parse_history_rewind_target(args)? {
+        HistoryRewindTarget::LatestUser => {
+            let count = serve_user_message_count(messages);
+            if count == 0 {
+                return Err("no user input found in history".into());
             }
-            ordinal += 1;
-            let text = serve_history_searchable_text(&message.content);
-            if text
-                .to_ascii_lowercase()
-                .contains(&keyword.to_ascii_lowercase())
+            let index =
+                serve_user_message_index(messages, count).expect("counted user message resolves");
+            Ok((count, index))
+        }
+        HistoryRewindTarget::Grep(keyword) => {
+            let needle = keyword.to_ascii_lowercase();
+            let mut matches = Vec::new();
+            for (ordinal, index, message) in
+                real_user_ordinal_entries(messages, is_remote_real_user_message)
             {
-                matches.push((ordinal, message));
+                let text = serve_history_searchable_text(&message.content);
+                if text.to_ascii_lowercase().contains(&needle) {
+                    matches.push((ordinal, index, message));
+                }
             }
-        }
-        if matches.is_empty() {
-            return Err(format!("no user input matching {keyword:?}"));
-        }
-        if matches.len() > 1 {
-            // Same disambiguation shape as local: up to 8 `u<N>` candidates.
-            let mut out = format!(
-                "{} user inputs match {keyword:?}; use /history rewind u<N>:",
-                matches.len()
-            );
-            for (ord, message) in matches.iter().take(8) {
-                let preview = serve_truncate_for_terminal(
-                    &serve_history_searchable_text(&message.content)
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    120,
+            if matches.is_empty() {
+                return Err(format!("no user input matching {keyword:?}"));
+            }
+            if matches.len() > 1 {
+                // Same disambiguation shape as local: up to 8 `u<N>` candidates.
+                let mut out = format!(
+                    "{} user inputs match {keyword:?}; use /history rewind u<N>:",
+                    matches.len()
                 );
-                out.push_str(&format!("\n  u{ord} {preview}"));
+                for (ord, _, message) in matches.iter().take(8) {
+                    let preview = serve_truncate_for_terminal(
+                        &serve_history_searchable_text(&message.content)
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        120,
+                    );
+                    out.push_str(&format!("\n  u{ord} {preview}"));
+                }
+                return Err(out);
             }
-            return Err(out);
+            let (ord, index, _) = matches[0];
+            Ok((ord, index))
         }
-        let (ord, _) = matches[0];
-        let index = serve_user_message_index(messages, ord).expect("matched user message resolves");
-        return Ok((ord, index));
+        HistoryRewindTarget::UserOrdinal(ordinal) => serve_user_message_index(messages, ordinal)
+            .map(|index| (ordinal, index))
+            .ok_or_else(|| format!("user input u{ordinal} not found")),
     }
-    let raw = first
-        .strip_prefix('u')
-        .or_else(|| first.strip_prefix('U'))
-        .unwrap_or(first);
-    let ordinal = raw
-        .parse::<usize>()
-        .map_err(|_| format!("invalid rewind target: {first}. try: /history rewind u3"))?;
-    if ordinal == 0 {
-        return Err("user ordinal must be >= 1".into());
-    }
-    serve_user_message_index(messages, ordinal)
-        .map(|index| (ordinal, index))
-        .ok_or_else(|| format!("user input u{ordinal} not found"))
 }
 
 /// Same resolution grammar as `resolve_serve_rewind_target`, but over the
@@ -1880,37 +1834,30 @@ fn resolve_serve_rewind_target_from_roles(
     roles: &[String],
     args: &[&str],
 ) -> Result<(usize, usize), String> {
-    let Some(first) = args.first().copied() else {
-        return Err("missing rewind target. try: /history rewind u3".into());
-    };
-    if first == "last" || first == "latest" {
-        let count = serve_role_user_message_count(roles);
-        if count == 0 {
-            return Err("no user input found in history".into());
-        }
-        let index =
-            serve_role_user_message_index(roles, count).expect("counted user message resolves");
-        return Ok((count, index));
-    }
-    if first == "grep" {
+    if args.first().copied() == Some("grep") {
         return Err(
             "`/history rewind grep` needs message content; the full-history path resolves it"
                 .into(),
         );
     }
-    let raw = first
-        .strip_prefix('u')
-        .or_else(|| first.strip_prefix('U'))
-        .unwrap_or(first);
-    let ordinal = raw
-        .parse::<usize>()
-        .map_err(|_| format!("invalid rewind target: {first}. try: /history rewind u3"))?;
-    if ordinal == 0 {
-        return Err("user ordinal must be >= 1".into());
+    match parse_history_rewind_target(args)? {
+        HistoryRewindTarget::LatestUser => {
+            let count = serve_role_user_message_count(roles);
+            if count == 0 {
+                return Err("no user input found in history".into());
+            }
+            let index =
+                serve_role_user_message_index(roles, count).expect("counted user message resolves");
+            Ok((count, index))
+        }
+        HistoryRewindTarget::Grep(_) => Err(
+            "`/history rewind grep` needs message content; the full-history path resolves it"
+                .into(),
+        ),
+        HistoryRewindTarget::UserOrdinal(ordinal) => serve_role_user_message_index(roles, ordinal)
+            .map(|index| (ordinal, index))
+            .ok_or_else(|| format!("user input u{ordinal} not found")),
     }
-    serve_role_user_message_index(roles, ordinal)
-        .map(|index| (ordinal, index))
-        .ok_or_else(|| format!("user input u{ordinal} not found"))
 }
 
 /// `POST /sessions/{id}/rewind` result: `{"removed": N, "kept": M}`.
@@ -2204,29 +2151,7 @@ fn rewind_serve_history(
 /// Syntax-only validation of `/history rewind` args: no message list needed,
 /// so callers run this before fetching remote history.
 fn check_serve_rewind_syntax(args: &[&str]) -> Result<(), String> {
-    let Some(first) = args.first().copied() else {
-        return Err("missing rewind target. try: /history rewind u3".into());
-    };
-    if first == "last" || first == "latest" {
-        return Ok(());
-    }
-    if first == "grep" {
-        if args[1..].join(" ").trim().is_empty() {
-            return Err("`/history rewind grep` requires a keyword".into());
-        }
-        return Ok(());
-    }
-    let raw = first
-        .strip_prefix('u')
-        .or_else(|| first.strip_prefix('U'))
-        .unwrap_or(first);
-    let ordinal = raw
-        .parse::<usize>()
-        .map_err(|_| format!("invalid rewind target: {first}. try: /history rewind u3"))?;
-    if ordinal == 0 {
-        return Err("user ordinal must be >= 1".into());
-    }
-    Ok(())
+    parse_history_rewind_target(args).map(|_| ())
 }
 
 fn print_serve_history_help() {
@@ -2367,6 +2292,27 @@ mod serve_history_tests {
         ];
         assert_eq!(serve_role_user_message_count(&roles), 2);
         assert_eq!(serve_role_user_message_index(&roles, 2), Some(3));
+    }
+
+    #[test]
+    fn serve_rewind_grep_uses_real_user_ordinals() {
+        let synthetic =
+            crate::ai::history::runtime_synthetic_user_message(json!("synthetic cache note"));
+        let messages = vec![
+            test_message("user", "first"),
+            RemoteHistoryMessage {
+                role: synthetic.role,
+                content: synthetic.content,
+                tool_calls: None,
+                reasoning_content: synthetic.reasoning_content,
+                user_ordinal: None,
+            },
+            test_message("user", "second cache target"),
+        ];
+
+        let (ordinal, index) =
+            resolve_serve_rewind_target(&messages, &["grep", "target"]).expect("real user match");
+        assert_eq!((ordinal, index), (2, 2));
     }
 
     #[test]

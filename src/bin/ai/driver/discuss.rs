@@ -143,7 +143,8 @@ pub(crate) fn save_state(history_file: &Path, state: &DiscussState) -> Result<()
     }
     let content =
         serde_json::to_string_pretty(state).map_err(|e| format!("encode discuss state: {e}"))?;
-    fs::write(&file, content).map_err(|e| format!("write discuss state: {e}"))?;
+    talk::write_state_file_atomic(&file, content.as_bytes())
+        .map_err(|e| format!("write discuss state: {e}"))?;
     Ok(())
 }
 

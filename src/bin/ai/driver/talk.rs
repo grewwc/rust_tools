@@ -12,6 +12,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -22,6 +23,7 @@ use crate::ai::history::{Message, SessionStore, runtime_synthetic_user_message};
 const TALK_DIR: &str = "talk";
 const INBOX_FILE: &str = "inbox.jsonl";
 const ROOMS_DIR: &str = "rooms";
+static ROOM_STATE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// File that carries skills selected with a `/task`/`/discuss` command to the
 /// room's start call: `<host>.assets/pending-room-skills.json`. Written by the
 /// command layer before the host turn consumes `app.forced_skills`, read and
@@ -127,6 +129,55 @@ pub(crate) fn write_pending_room_skills(
     let content =
         serde_json::to_string(names).map_err(|e| format!("encode pending skills: {e}"))?;
     fs::write(&file, content).map_err(|e| format!("write pending skills: {e}"))
+}
+
+/// Atomically replace a room-state file: write a unique temp file in the same
+/// directory, then rename over the target. A process crash before the rename
+/// leaves the previous complete state instead of a truncated JSON document;
+/// power-loss durability still follows the filesystem's write/rename semantics.
+pub(crate) fn write_state_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("room-state");
+    let seq = ROOM_STATE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp = parent.join(format!(
+        ".{}.tmp.{}.{}.{}",
+        file_name,
+        std::process::id(),
+        nanos,
+        seq
+    ));
+    if let Err(error) = fs::write(&temp, contents) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    // The temp file carries the process umask, while the state file may have
+    // been narrowed after creation (room state is private). Replacing an
+    // existing file must not widen its permissions.
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            if let Err(error) = fs::set_permissions(&temp, metadata.permissions()) {
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+    }
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Read this session's pending room skills without consuming them; empty when
@@ -468,6 +519,66 @@ mod tests {
             std::fs::write(hist, b"stub").unwrap();
         }
         (dir, store, from_hist, peer_hist)
+    }
+
+    #[test]
+    fn atomic_state_write_replaces_target_without_temp_files() {
+        let dir = temp_dir();
+        let path = dir.join("room.json");
+        std::fs::write(&path, br#"{"old":true}"#).unwrap();
+
+        write_state_file_atomic(&path, br#"{"new":true}"#).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"new":true}"#);
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".room.json.tmp.")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_state_write_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir();
+        let path = dir.join("room.json");
+        std::fs::write(&path, br#"{"old":true}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_state_file_atomic(&path, br#"{"new":true}"#).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn atomic_state_write_cleans_temp_file_on_rename_failure() {
+        let dir = temp_dir();
+        let path = dir.join("room.json");
+        std::fs::create_dir(&path).unwrap();
+
+        let error = write_state_file_atomic(&path, b"state").expect_err("rename over dir fails");
+
+        assert!(!error.to_string().is_empty());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".room.json.tmp.")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
     }
 
     #[test]

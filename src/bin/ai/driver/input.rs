@@ -11,6 +11,10 @@ use crate::ai::theme::{self, BOLD, RESET};
 use crate::ai::types::{App, QuestionContext};
 use crate::clipboardw::string_content;
 
+use super::history_rewind::{
+    HistoryRewindTarget, count_real_users, parse_history_rewind_target, real_user_ordinal_entries,
+};
+
 use crate::ai::{files, prompt::trim_trailing_newline};
 use crate::pdfw::{PdfParseError, PdfParseOptions, parse_pdf};
 
@@ -208,13 +212,6 @@ struct HistoryPreviewOptions {
     grep: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum HistoryRewindTarget {
-    UserOrdinal(usize),
-    LatestUser,
-    Grep(String),
-}
-
 #[derive(Debug, Clone)]
 struct HistoryPreviewItem {
     message: history::Message,
@@ -361,8 +358,9 @@ fn parse_local_command(input: &str) -> Result<Option<LocalCommand>, Box<dyn Erro
 
 fn parse_history_local_command(args: &[&str]) -> Result<Option<LocalCommand>, Box<dyn Error>> {
     if args.first().copied() == Some("rewind") {
-        return parse_history_rewind_command(&args[1..])
-            .map(|target| Some(LocalCommand::RewindHistory(target)));
+        return parse_history_rewind_target(&args[1..])
+            .map(|target| Some(LocalCommand::RewindHistory(target)))
+            .map_err(|error| error.into());
     }
     if let Some(&first) = args.first()
         && let Some(session_id) = first.strip_prefix('@')
@@ -577,33 +575,6 @@ fn default_other_session_export_path(session_id: &str) -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(format!("history-{session_id}.txt"))
-}
-
-fn parse_history_rewind_command(args: &[&str]) -> Result<HistoryRewindTarget, Box<dyn Error>> {
-    let Some(first) = args.first().copied() else {
-        return Err("missing rewind target. try: /history rewind u3".into());
-    };
-    if first == "last" || first == "latest" {
-        return Ok(HistoryRewindTarget::LatestUser);
-    }
-    if first == "grep" {
-        let keyword = args[1..].join(" ");
-        if keyword.trim().is_empty() {
-            return Err("`/history rewind grep` requires a keyword".into());
-        }
-        return Ok(HistoryRewindTarget::Grep(keyword));
-    }
-    let raw = first
-        .strip_prefix('u')
-        .or_else(|| first.strip_prefix('U'))
-        .unwrap_or(first);
-    let ordinal = raw
-        .parse::<usize>()
-        .map_err(|_| format!("invalid rewind target: {first}. try: /history rewind u3"))?;
-    if ordinal == 0 {
-        return Err("user ordinal must be >= 1".into());
-    }
-    Ok(HistoryRewindTarget::UserOrdinal(ordinal))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1216,10 +1187,7 @@ fn resolve_rewind_target(
     match target {
         HistoryRewindTarget::UserOrdinal(ordinal) => Ok(ordinal),
         HistoryRewindTarget::LatestUser => {
-            let count = messages
-                .iter()
-                .filter(|message| is_real_history_user(message))
-                .count();
+            let count = count_real_users(messages, is_real_history_user);
             if count == 0 {
                 Err("no user input found in history".into())
             } else {
@@ -1229,12 +1197,7 @@ fn resolve_rewind_target(
         HistoryRewindTarget::Grep(keyword) => {
             let needle = keyword.to_ascii_lowercase();
             let mut matches = Vec::new();
-            let mut ordinal = 0usize;
-            for message in messages {
-                if !is_real_history_user(message) {
-                    continue;
-                }
-                ordinal += 1;
+            for (ordinal, _, message) in real_user_ordinal_entries(messages, is_real_history_user) {
                 let text = searchable_history_content(&message.content);
                 if text.to_ascii_lowercase().contains(&needle) {
                     matches.push((ordinal, text));
@@ -1270,12 +1233,7 @@ fn find_user_message_by_ordinal(
     messages: &[history::Message],
     target_ordinal: usize,
 ) -> Option<(usize, String)> {
-    let mut ordinal = 0usize;
-    for (idx, message) in messages.iter().enumerate() {
-        if !is_real_history_user(message) {
-            continue;
-        }
-        ordinal += 1;
+    for (ordinal, idx, message) in real_user_ordinal_entries(messages, is_real_history_user) {
         if ordinal == target_ordinal {
             let preview = truncate_for_terminal(
                 &searchable_history_content(&message.content)

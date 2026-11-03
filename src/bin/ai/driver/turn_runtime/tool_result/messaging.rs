@@ -775,31 +775,7 @@ fn extract_tool_result_key_lines(content: &str, max: usize) -> Vec<String> {
             }
             continue;
         }
-        let lower = trimmed.to_ascii_lowercase();
-        let is_key = lower.starts_with("fn ")
-            || lower.starts_with("pub fn ")
-            || lower.starts_with("impl ")
-            || lower.starts_with("struct ")
-            || lower.starts_with("pub struct ")
-            || lower.starts_with("trait ")
-            || lower.starts_with("enum ")
-            || lower.starts_with("pub enum ")
-            || lower.starts_with("mod ")
-            || lower.starts_with("#[")
-            || lower.starts_with("//!")
-            || lower.starts_with("///")
-            || lower.starts_with("class ")
-            || lower.starts_with("def ")
-            || lower.starts_with("func ")
-            || lower.contains("error")
-            || lower.contains("failed")
-            || lower.contains("panic")
-            || lower.contains("exception")
-            || lower.contains("timeout")
-            || lower.contains("warning")
-            || lower.contains("todo")
-            || lower.contains("fixme");
-        if is_key {
+        if crate::ai::files::is_key_line(&trimmed) {
             out.push(format!(
                 "{}{}",
                 anchor.prefix,
@@ -1469,8 +1445,8 @@ mod tests {
         CODE_INSPECTION_MEMORY_PREFIX, TOOL_RESULT_RAW_HARD_CAP_CHARS,
         append_code_inspection_working_memory, append_tool_result_messages,
         append_tool_result_messages_for_model, build_code_inspection_working_memory,
-        collect_repo_inspection_findings, describe_tool_call, is_code_inspection_memory_text,
-        is_repo_inspection_tool, is_runtime_synthetic_user_message,
+        collect_repo_inspection_findings, describe_tool_call, extract_tool_result_key_lines,
+        is_code_inspection_memory_text, is_repo_inspection_tool, is_runtime_synthetic_user_message,
         prepare_tool_results_for_history, strip_legacy_prune_directives,
     };
     use super::{
@@ -1489,6 +1465,16 @@ mod tests {
     };
     use serde_json::Value;
     use std::path::PathBuf;
+
+    #[test]
+    fn extract_tool_result_key_lines_uses_shared_classifier() {
+        let content = "use std::fmt;\nfn main() {}\nlet value = 1;\n";
+        let lines = extract_tool_result_key_lines(content, 10);
+
+        assert!(lines.iter().any(|line| line.contains("use std::fmt")));
+        assert!(lines.iter().any(|line| line.contains("fn main")));
+        assert!(!lines.iter().any(|line| line.contains("let value")));
+    }
 
     fn tool_call(id: &str, name: &str, arguments: Value) -> ToolCall {
         ToolCall {

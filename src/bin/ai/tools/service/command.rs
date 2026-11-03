@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::ai::config_schema::AiConfig;
+use crate::ai::shell_quote::shell_single_quote;
 use crate::ai::tools::storage::command_runner;
 use crate::cmd::run::CommandRunResult;
 
@@ -52,24 +53,6 @@ fn config_command_timeout_bounds() -> (u64, u64) {
 /// `default` when unset.
 fn resolve_command_timeout(requested: Option<u64>, default: u64, max: u64) -> u64 {
     requested.unwrap_or(default).clamp(1, max)
-}
-
-/// Encode UTF-8 data as a complete POSIX shell word. Inside single quotes no
-/// expansion happens; embedded single quotes are bridged with
-/// `'<backslash><quote>'` into the next single-quoted literal, so file contents
-/// can never become shell code.
-fn shell_single_quote(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len() + 2);
-    quoted.push('\'');
-    for ch in value.chars() {
-        if ch == '\'' {
-            quoted.push_str("'\\''");
-        } else {
-            quoted.push(ch);
-        }
-    }
-    quoted.push('\'');
-    quoted
 }
 
 fn read_literal_file_substitution(path: &str) -> Result<String, String> {

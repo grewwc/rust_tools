@@ -3,6 +3,7 @@ use super::lexer::{
     validate_and_skip_heredoc_bodies,
 };
 use super::validate_execute_command;
+pub(crate) use crate::ai::path_utils::normalize_lexical as normalize_path;
 
 // ---------------------------------------------------------------------------
 // Shell injection-surface checks
@@ -482,22 +483,6 @@ pub(crate) fn validate_no_injection_surface(command: &str) -> Result<(), String>
 // ---------------------------------------------------------------------------
 // Segment-level validation entry
 // ---------------------------------------------------------------------------
-
-pub(crate) fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
-    let mut normalized = std::path::PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            std::path::Component::RootDir => normalized.push(component.as_os_str()),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            std::path::Component::Normal(part) => normalized.push(part),
-        }
-    }
-    normalized
-}
 
 /// Expand a leading `~` / `$HOME` in the argument. The home directory itself and
 /// its subpaths are normal development access; only escaping outward from home

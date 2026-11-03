@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::hash::Hash;
 
 use crate::commonw::types::{FastMap, FastSet};
+use crate::cw::uf::UF;
 
 const INF: f64 = f64::INFINITY;
 
@@ -1066,11 +1067,20 @@ where
                 .then_with(|| a.v2().cmp(b.v2()))
         });
 
-        let mut uf = SimpleUf::new(self.graph.nodes());
+        // `UF` keys are borrowed, so keep one owned copy of every edge
+        // endpoint for the duration of the union loop. Clones of the same node
+        // compare and hash equal, preserving the previous node identity.
+        let mut endpoints = Vec::with_capacity(edges.len() * 2);
+        for edge in &edges {
+            endpoints.push(edge.v1().clone());
+            endpoints.push(edge.v2().clone());
+        }
+
+        let mut uf = UF::new();
         let mut picked = Vec::new();
 
-        for edge in edges {
-            if uf.union(edge.v1().clone(), edge.v2().clone()) {
+        for (index, edge) in edges.into_iter().enumerate() {
+            if uf.union(&endpoints[index * 2], &endpoints[index * 2 + 1]) {
                 picked.push(edge);
                 if self.num_nodes() > 0 && picked.len() >= self.num_nodes() - 1 {
                     break;
@@ -1256,96 +1266,6 @@ where
 {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-struct SimpleUf<T>
-where
-    T: Eq + Hash + Clone,
-{
-    parent: FastMap<T, T>,
-    size: FastMap<T, usize>,
-}
-
-impl<T> SimpleUf<T>
-where
-    T: Eq + Hash + Clone,
-{
-    fn new<I>(nodes: I) -> Self
-    where
-        I: IntoIterator<Item = T>,
-    {
-        let mut uf = Self {
-            parent: FastMap::default(),
-            size: FastMap::default(),
-        };
-        for node in nodes {
-            uf.parent.insert(node.clone(), node.clone());
-            uf.size.insert(node, 1);
-        }
-        uf
-    }
-
-    fn ensure(&mut self, node: &T) {
-        if !self.parent.contains_key(node) {
-            self.parent.insert(node.clone(), node.clone());
-            self.size.insert(node.clone(), 1);
-        }
-    }
-
-    fn find(&mut self, node: T) -> T {
-        self.ensure(&node);
-
-        let mut root = node.clone();
-        loop {
-            let parent = self
-                .parent
-                .get(&root)
-                .cloned()
-                .unwrap_or_else(|| root.clone());
-            if parent == root {
-                break;
-            }
-            root = parent;
-        }
-
-        let mut curr = node;
-        loop {
-            let parent = self
-                .parent
-                .get(&curr)
-                .cloned()
-                .unwrap_or_else(|| curr.clone());
-            if parent == root {
-                self.parent.insert(curr, root.clone());
-                break;
-            }
-            self.parent.insert(curr.clone(), root.clone());
-            curr = parent;
-        }
-
-        root
-    }
-
-    fn union(&mut self, a: T, b: T) -> bool {
-        let ra = self.find(a);
-        let rb = self.find(b);
-        if ra == rb {
-            return false;
-        }
-
-        let sa = self.size.get(&ra).copied().unwrap_or(1);
-        let sb = self.size.get(&rb).copied().unwrap_or(1);
-
-        if sa < sb {
-            self.parent.insert(ra.clone(), rb.clone());
-            self.size.insert(rb, sa + sb);
-        } else {
-            self.parent.insert(rb.clone(), ra.clone());
-            self.size.insert(ra, sa + sb);
-        }
-
-        true
     }
 }
 

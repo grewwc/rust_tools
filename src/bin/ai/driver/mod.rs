@@ -54,6 +54,7 @@ pub(crate) mod discuss;
 pub(crate) mod task;
 pub mod hook_registry;
 pub mod hooks;
+pub(crate) mod history_rewind;
 pub mod input;
 pub mod mcp_init;
 mod mcp_lifecycle;

@@ -12,6 +12,7 @@ use crate::ai::tools::registry::common::{
     ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
     ToolRegistration, ToolSpec,
 };
+use rust_tools::cw::graph::DirectedGraph;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -472,8 +473,7 @@ fn build_static_run(
             },
         );
     }
-    validate_static_edges(&nodes, &input.edges)?;
-    validate_acyclic(nodes.keys().cloned().collect(), &input.edges)?;
+    validate_static_graph(&nodes, &input.edges)?;
     Ok((
         GraphRun::Static(StaticGraphRun {
             nodes,
@@ -1853,11 +1853,14 @@ fn cancel_active_runtime_tasks(graph: &mut AgentGraphCheckpoint, reason: &str) {
     }
 }
 
-fn validate_static_edges(
+fn validate_static_graph(
     nodes: &FxHashMap<String, StaticNodeRuntime>,
     edges: &[StaticEdgeSpec],
 ) -> Result<(), String> {
-    let mut seen = FxHashSet::default();
+    let mut graph = DirectedGraph::new();
+    for id in nodes.keys() {
+        graph.add_node(id.clone());
+    }
     for edge in edges {
         if edge.from == edge.to {
             return Err(format!("self edge is not allowed: {}", edge.from));
@@ -1868,41 +1871,11 @@ fn validate_static_edges(
                 edge.from, edge.to
             ));
         }
-        if !seen.insert((edge.from.clone(), edge.to.clone())) {
+        if !graph.add_edge(edge.from.clone(), edge.to.clone()) {
             return Err(format!("duplicate edge: {} -> {}", edge.from, edge.to));
         }
     }
-    Ok(())
-}
-
-fn validate_acyclic(nodes: Vec<String>, edges: &[StaticEdgeSpec]) -> Result<(), String> {
-    let mut indegree: FxHashMap<String, usize> = nodes.iter().map(|id| (id.clone(), 0)).collect();
-    let mut outgoing: FxHashMap<String, Vec<String>> = FxHashMap::default();
-    for edge in edges {
-        *indegree.get_mut(&edge.to).expect("edge validated") += 1;
-        outgoing
-            .entry(edge.from.clone())
-            .or_default()
-            .push(edge.to.clone());
-    }
-    let mut queue: Vec<String> = indegree
-        .iter()
-        .filter_map(|(id, degree)| (*degree == 0).then(|| id.clone()))
-        .collect();
-    let mut visited = 0;
-    while let Some(id) = queue.pop() {
-        visited += 1;
-        if let Some(children) = outgoing.get(&id) {
-            for child in children {
-                let degree = indegree.get_mut(child).unwrap();
-                *degree -= 1;
-                if *degree == 0 {
-                    queue.push(child.clone());
-                }
-            }
-        }
-    }
-    if visited != nodes.len() {
+    if graph.has_cycle() {
         return Err("static graph contains a cycle".to_string());
     }
     Ok(())
@@ -2083,9 +2056,28 @@ mod tests {
         }
     }
 
+    fn runtime_nodes(ids: &[&str]) -> FxHashMap<String, StaticNodeRuntime> {
+        ids.iter()
+            .map(|id| {
+                (
+                    (*id).to_string(),
+                    StaticNodeRuntime {
+                        spec: node(id),
+                        status: NodeStatus::Pending,
+                        runtime_task_id: None,
+                        team_task_id: None,
+                        attempts: 0,
+                        output: None,
+                        error: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn static_graph_rejects_cycle() {
-        let nodes = vec!["a".to_string(), "b".to_string()];
+        let nodes = runtime_nodes(&["a", "b"]);
         let edges = vec![
             StaticEdgeSpec {
                 from: "a".to_string(),
@@ -2098,7 +2090,25 @@ mod tests {
                 condition: EdgeCondition::Always,
             },
         ];
-        assert!(validate_acyclic(nodes, &edges).is_err());
+        assert_eq!(
+            validate_static_graph(&nodes, &edges).unwrap_err(),
+            "static graph contains a cycle"
+        );
+    }
+
+    #[test]
+    fn static_graph_rejects_duplicate_edges() {
+        let nodes = runtime_nodes(&["a", "b"]);
+        let edge = StaticEdgeSpec {
+            from: "a".to_string(),
+            to: "b".to_string(),
+            condition: EdgeCondition::Always,
+        };
+        let edges = vec![edge.clone(), edge];
+        assert_eq!(
+            validate_static_graph(&nodes, &edges).unwrap_err(),
+            "duplicate edge: a -> b"
+        );
     }
 
     #[test]

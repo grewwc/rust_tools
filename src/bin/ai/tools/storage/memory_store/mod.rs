@@ -156,13 +156,20 @@ fn atomic_write_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         .unwrap_or(0);
     let tmp = parent.join(format!(".{}.tmp.{}.{}", file_name, pid, nanos));
     {
-        let mut f = std::fs::OpenOptions::new()
+        let mut f = match std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&tmp)?;
-        f.write_all(contents)?;
-        f.flush()?;
+            .open(&tmp)
+        {
+            Ok(file) => file,
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = f.write_all(contents).and_then(|()| f.flush()) {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
         let _ = f.sync_all();
     }
     if let Err(e) = std::fs::rename(&tmp, path) {

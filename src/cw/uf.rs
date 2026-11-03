@@ -6,7 +6,9 @@ pub struct UF<'a, T>
 where
     T: Eq + Hash,
 {
+    /// Parent pointer keyed by node; roots point to themselves.
     id: FastMap<&'a T, &'a T>,
+    /// Component size keyed by root. Non-root entries are removed when linked.
     size: FastMap<&'a T, usize>,
 
     n_groups: usize,
@@ -52,13 +54,18 @@ impl<'a, T: Eq + Hash> UF<'a, T> {
         if r1 == r2 {
             return false;
         }
-        let s1 = self.size.get(v1).unwrap();
-        let s2 = self.size.get(v2).unwrap();
+
+        // `size` is authoritative for roots only; a non-root entry is removed
+        // when its component is linked under another root.
+        let s1 = *self.size.get(r1).unwrap();
+        let s2 = *self.size.get(r2).unwrap();
         if s1 < s2 {
             self.id.insert(r1, r2);
+            self.size.remove(r1);
             self.size.insert(r2, s1 + s2);
         } else {
             self.id.insert(r2, r1);
+            self.size.remove(r2);
             self.size.insert(r1, s1 + s2);
         }
         self.n_groups -= 1;
@@ -75,14 +82,13 @@ impl<'a, T: Eq + Hash> UF<'a, T> {
             root = parent;
         }
 
+        // Compress every node on the path. Read the parent before rewriting
+        // the link so the walk cannot stop after the first node.
         let mut id = v;
         while id != root {
+            let parent = self.id.get(id).copied().unwrap();
             self.id.insert(id, root);
-            self.size.insert(
-                root,
-                self.size.get(root).unwrap() + self.size.get(id).unwrap(),
-            );
-            id = self.id.get(id).copied().unwrap();
+            id = parent;
         }
 
         root
@@ -117,5 +123,31 @@ mod tests {
         assert!(uf.union(&v1, &v3));
         assert!(uf.is_connected(&v2, &v3));
         assert_eq!(1, uf.n_groups());
+    }
+
+    #[test]
+    fn test_component_size_tracks_union() {
+        let mut uf: UF<i32> = UF::new();
+        let (a, b, c) = (1, 2, 3);
+
+        assert!(uf.union(&a, &b));
+        assert!(uf.union(&b, &c));
+
+        let root = uf.find_root(&a);
+        assert_eq!(uf.size.get(root).copied(), Some(3));
+    }
+
+    #[test]
+    fn test_path_compression_preserves_component_size() {
+        let mut uf: UF<i32> = UF::new();
+        let (a, b, c, d) = (1, 2, 3, 4);
+
+        assert!(uf.union(&a, &b));
+        assert!(uf.union(&c, &d));
+        assert!(uf.union(&a, &c));
+
+        let size_before = *uf.size.get(&a).unwrap();
+        assert_eq!(uf.find_root(&d), &a);
+        assert_eq!(*uf.size.get(&a).unwrap(), size_before);
     }
 }

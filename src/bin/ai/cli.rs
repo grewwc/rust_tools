@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::ai::provider::ReasoningEffort;
+use crate::ai::shell_quote::shell_single_quote;
 use crate::commonw::utils::expanduser;
 use crate::terminalw::parser::Parser as TermParser;
 use rust_tools::commonw::FastMap;
@@ -1079,10 +1080,6 @@ pub fn generate_completion_script(shell: &str) {
             std::process::exit(1);
         }
     }
-}
-
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn model_selector_words() -> String {

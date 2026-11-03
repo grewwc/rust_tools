@@ -173,7 +173,8 @@ pub(crate) fn save_state(history_file: &Path, state: &TaskState) -> Result<(), S
     }
     let content =
         serde_json::to_string_pretty(state).map_err(|e| format!("encode task state: {e}"))?;
-    fs::write(&file, content).map_err(|e| format!("write task state: {e}"))?;
+    talk::write_state_file_atomic(&file, content.as_bytes())
+        .map_err(|e| format!("write task state: {e}"))?;
     Ok(())
 }
 
