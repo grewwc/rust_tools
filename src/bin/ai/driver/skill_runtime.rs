@@ -593,16 +593,29 @@ fn filter_subagent_hidden_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
 /// Native phone actions are injected only for a top-level turn whose serve
 /// client declared the Android bridge; manifests cannot grant them to desktop
 /// or subagent turns.
-fn append_native_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
-    if !crate::ai::background::native_client() || should_hide_task_tools_for_subagent() {
+fn set_native_tools(mut tools: Vec<ToolDef>, include_native: bool) -> Vec<ToolDef> {
+    let phone_tools = super::super::tools::tool_definitions_for_groups(&[ToolGroup::Phone]);
+    tools.retain(|tool| {
+        !phone_tools
+            .iter()
+            .any(|phone| phone.function.name == tool.function.name)
+    });
+    if !include_native {
         return tools;
     }
-    for def in super::super::tools::tool_definitions_for_groups(&[ToolGroup::Phone]) {
+    for def in phone_tools {
         if !tools.iter().any(|tool| tool.function.name == def.function.name) {
             tools.push(def);
         }
     }
     tools
+}
+
+fn append_native_tools(tools: Vec<ToolDef>) -> Vec<ToolDef> {
+    set_native_tools(
+        tools,
+        crate::ai::background::native_client() && !should_hide_task_tools_for_subagent(),
+    )
 }
 
 fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option<Vec<ToolDef>> {
@@ -751,8 +764,8 @@ fn builtin_tools_for_skill(
     {
         return append_native_tools(filter_subagent_hidden_tools(tool_defs));
     }
-    filter_subagent_hidden_tools(super::super::tools::tool_definitions_for_groups(
-        &default_turn_tool_groups(),
+    append_native_tools(filter_subagent_hidden_tools(
+        super::super::tools::tool_definitions_for_groups(&default_turn_tool_groups()),
     ))
 }
 

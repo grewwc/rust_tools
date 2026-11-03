@@ -53,6 +53,14 @@ Ask in the normal composer; no extra action buttons or skill selection are
 needed. Android-only `phone_action` supports timers, ISO-weekday repeating
 alarms, and the existing calendar/SMS/share actions. Clock requests report
 dispatch, not verified creation: the selected clock app controls the result.
+`alarm_list` opens the system clock's alarm-list screen; Android does not expose
+another clock app's stored alarm database, so it returns no alarm entries.
+
+App discovery is limited to activities shown by the Android launcher and
+returns only display labels plus exact package names. `app_open` accepts only a
+package returned by that discovery path and starts its main launcher activity;
+it cannot pass arbitrary intents, components, URLs, or read another app's data.
+The manifest declares launcher visibility rather than `QUERY_ALL_PACKAGES`.
 
 Notes and todos are stored in the app's private SQLite database. Create,
 search, and update entries by their returned IDs; completing a todo does not

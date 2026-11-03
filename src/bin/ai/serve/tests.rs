@@ -585,10 +585,7 @@ async fn confirm_answer_reaches_the_child_stdin_once() {
 #[cfg(unix)]
 #[tokio::test]
 async fn input_answer_reaches_the_child_stdin_once() {
-    use axum::{
-        extract::Path, http::HeaderMap, http::StatusCode,
-        response::IntoResponse,
-    };
+    use axum::{extract::Path, http::HeaderMap, http::StatusCode, response::IntoResponse};
     // Stand-in turn child: consumes one stdin line and echoes it, which is
     // what the real child's input reader does.
     let mut child = std::process::Command::new("/bin/sh")
@@ -1370,14 +1367,168 @@ async fn serve_android_apk_returns_installable_attachment() {
             .and_then(|v| v.to_str().ok()),
         Some("no-store")
     );
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+    let expected = include_bytes!("../../../../android/a-serve/dist/a-serve.apk");
+    let body = axum::body::to_bytes(response.into_body(), expected.len())
         .await
         .expect("APK body");
-    assert!(
-        body.len() > 10_000,
-        "APK should not be an empty placeholder"
-    );
+    assert_eq!(body.as_ref(), expected, "route must serve the embedded APK");
     assert!(body.starts_with(b"PK\x03\x04"), "APK must be a ZIP archive");
+}
+
+fn photo_models_test_package() -> (std::path::PathBuf, Vec<u8>, Vec<u8>) {
+    let state_dir = std::env::temp_dir().join(format!(
+        "a-serve-photo-models-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let package_dir = state_dir.join("photo-models");
+    std::fs::create_dir_all(&package_dir).expect("photo model package directory");
+    let manifest = br#"{"version":"1","archive":{"path":"/a-serve-photo-models.zip","size":150000,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"files":[]}"#.to_vec();
+    let archive: Vec<u8> = (0..150_000).map(|index| (index % 251) as u8).collect();
+    std::fs::write(package_dir.join("a-serve-photo-models-v1.json"), &manifest).expect("manifest");
+    std::fs::write(package_dir.join("a-serve-photo-models-v1.zip"), &archive).expect("archive");
+    (state_dir, manifest, archive)
+}
+
+#[tokio::test]
+async fn photo_model_package_handlers_serve_manifest_and_streamed_archive() {
+    let (state_dir, manifest, archive) = photo_models_test_package();
+
+    let response = super::serve_photo_models_manifest_from(&state_dir);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[axum::http::header::CONTENT_TYPE],
+        "application/json; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers()[axum::http::header::CONTENT_LENGTH],
+        manifest.len().to_string()
+    );
+    let body = axum::body::to_bytes(response.into_body(), manifest.len())
+        .await
+        .expect("manifest body");
+    assert_eq!(body.as_ref(), manifest);
+
+    let response = super::serve_photo_models_archive_from(&state_dir, &HeaderMap::new());
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[axum::http::header::ACCEPT_RANGES],
+        "bytes"
+    );
+    assert_eq!(
+        response.headers()[axum::http::header::CONTENT_LENGTH],
+        archive.len().to_string()
+    );
+    assert!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_RANGE)
+            .is_none()
+    );
+    let body = axum::body::to_bytes(response.into_body(), archive.len())
+        .await
+        .expect("archive body");
+    assert_eq!(body.as_ref(), archive);
+
+    let _ = std::fs::remove_dir_all(state_dir);
+}
+
+#[tokio::test]
+async fn photo_model_archive_supports_single_ranges_and_rejects_invalid_ones() {
+    let (state_dir, _, archive) = photo_models_test_package();
+
+    for (range, expected_start, expected_end) in [
+        ("bytes=65534-65540", 65_534, 65_540),
+        ("bytes=149995-", 149_995, 149_999),
+        ("bytes=-7", 149_993, 149_999),
+        ("bytes=149999-999999", 149_999, 149_999),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::RANGE,
+            HeaderValue::from_str(range).expect("range header"),
+        );
+        let response = super::serve_photo_models_archive_from(&state_dir, &headers);
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT, "{range}");
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_RANGE],
+            format!("bytes {expected_start}-{expected_end}/{}", archive.len()),
+            "{range}"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_LENGTH],
+            (expected_end - expected_start + 1).to_string(),
+            "{range}"
+        );
+        let expected = &archive[expected_start..=expected_end];
+        let body = axum::body::to_bytes(response.into_body(), expected.len())
+            .await
+            .expect("range body");
+        assert_eq!(body.as_ref(), expected, "{range}");
+    }
+
+    for range in [
+        "items=0-1",
+        "bytes=0-1,3-4",
+        "bytes=150000-",
+        "bytes=8-3",
+        "bytes=-0",
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::RANGE,
+            HeaderValue::from_str(range).expect("range header"),
+        );
+        let response = super::serve_photo_models_archive_from(&state_dir, &headers);
+        assert_eq!(
+            response.status(),
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "{range}"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_RANGE],
+            format!("bytes */{}", archive.len()),
+            "{range}"
+        );
+        assert_eq!(response.headers()[axum::http::header::CONTENT_LENGTH], "0");
+    }
+
+    let mut duplicate = HeaderMap::new();
+    duplicate.append(
+        axum::http::header::RANGE,
+        HeaderValue::from_static("bytes=0-1"),
+    );
+    duplicate.append(
+        axum::http::header::RANGE,
+        HeaderValue::from_static("bytes=2-3"),
+    );
+    assert_eq!(
+        super::serve_photo_models_archive_from(&state_dir, &duplicate).status(),
+        StatusCode::RANGE_NOT_SATISFIABLE
+    );
+
+    let _ = std::fs::remove_dir_all(state_dir);
+}
+
+#[test]
+fn photo_model_routes_match_the_android_contract_and_missing_files_are_404() {
+    assert_eq!(
+        super::ANDROID_PHOTO_MODELS_MANIFEST_ROUTE,
+        "/a-serve-photo-models.json"
+    );
+    assert_eq!(
+        super::ANDROID_PHOTO_MODELS_ARCHIVE_ROUTE,
+        "/a-serve-photo-models.zip"
+    );
+    let missing = std::env::temp_dir().join(format!("missing-photo-models-{}", Uuid::new_v4()));
+    assert_eq!(
+        super::serve_photo_models_manifest_from(&missing).status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        super::serve_photo_models_archive_from(&missing, &HeaderMap::new()).status(),
+        StatusCode::NOT_FOUND
+    );
 }
 
 #[test]

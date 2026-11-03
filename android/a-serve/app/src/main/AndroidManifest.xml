@@ -23,9 +23,22 @@
          visible native confirmation after this runtime permission is granted. -->
     <uses-permission android:name="android.permission.READ_CALL_LOG" />
     <uses-permission android:name="android.permission.CALL_PHONE" />
+    <!-- Photo bytes are read only to build an app-private local OCR/CLIP index. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
     <!-- The camera preview stays in this app: the frame is handed to the
          assistant in memory and never written to the gallery. -->
     <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- Android 11+ limits package discovery. This query exposes only apps
+         with a user-visible launcher entry, not every installed package. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
 
     <application
         android:allowBackup="false"

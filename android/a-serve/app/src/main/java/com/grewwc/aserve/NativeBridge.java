@@ -9,11 +9,13 @@ import android.content.ContentUris;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.database.Cursor;
 import android.net.Uri;
 import android.provider.AlarmClock;
 import android.provider.CalendarContract;
 import android.provider.ContactsContract;
+import android.provider.MediaStore;
 import android.telephony.PhoneNumberUtils;
 import android.webkit.JavascriptInterface;
 import android.widget.Toast;
@@ -22,6 +24,7 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.IOException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -32,6 +35,10 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.TimeZone;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Narrow native surface for the server-owned page.
@@ -46,8 +53,9 @@ final class NativeBridge {
     static final String NAME = "AServeNative";
 
     private static final String[] ACTIONS = {"now", "calendar_read", "calendar_add", "sms",
-            "alarm", "timer", "note", "note_create", "note_list", "note_update",
+            "alarm", "alarm_list", "timer", "note", "note_create", "note_list", "note_update",
             "contacts_read", "contact_add", "call_history", "call", "phone_search",
+            "app_list", "app_open", "photo_index", "photo_search", "photo_open",
             "file_import", "file_read", "file_save", "location",
             "screen_capture", "screen_stop", "screen_overlay_settings", "camera_capture",
             "camera_stop", "rebind_ime"};
@@ -58,16 +66,24 @@ final class NativeBridge {
     private static final int MAX_SMS_CHARS = 1000;
     private static final int MAX_CONTACT_CHARS = 120;
     private static final int MAX_NUMBER_CHARS = 40;
+    private static final int MAX_APP_PACKAGE_CHARS = 255;
+    private static final long MAX_SAFE_MEDIA_ID = 9_007_199_254_740_991L;
     private static final String LOCAL_DATE_TIME = "yyyy-MM-dd'T'HH:mm";
     private final MainActivity activity;
     private boolean foreground;
     private ForegroundLocation locationRequest;
     private final java.util.concurrent.ExecutorService notebookWorker = java.util.concurrent.Executors.newSingleThreadExecutor();
     private final java.util.concurrent.ExecutorService phoneWorker = java.util.concurrent.Executors.newSingleThreadExecutor();
+    private final PhotoModelManager photoModels;
     private LocalNotebook notebook;
+    private PhotoSemanticIndex photoIndex;
+    private volatile AtomicBoolean photoCancellation;
+    private volatile CountDownLatch photoConfirmation;
+    private volatile AlertDialog photoDialog;
 
     NativeBridge(MainActivity activity) {
         this.activity = activity;
+        photoModels = new PhotoModelManager(activity.getApplicationContext());
     }
 
     void onHostResume() {
@@ -81,8 +97,19 @@ final class NativeBridge {
 
     void close() {
         onHostPause();
+        AtomicBoolean cancellation = photoCancellation;
+        if (cancellation != null) cancellation.set(true);
+        CountDownLatch confirmation = photoConfirmation;
+        if (confirmation != null) confirmation.countDown();
+        AlertDialog dialog = photoDialog;
+        if (dialog != null) activity.runOnUiThread(dialog::dismiss);
         notebookWorker.execute(() -> { if (notebook != null) notebook.close(); });
         notebookWorker.shutdown();
+        phoneWorker.execute(() -> {
+            if (photoIndex != null) {
+                try { photoIndex.close(); } catch (java.io.IOException ignored) { }
+            }
+        });
         phoneWorker.shutdown();
     }
 
@@ -170,6 +197,8 @@ final class NativeBridge {
         boolean auto = payload.optBoolean("auto", false);
         if ("alarm".equals(action)) {
             requestAlarm(requestId, payload, auto);
+        } else if ("alarm_list".equals(action)) {
+            showAlarmList(requestId);
         } else if ("timer".equals(action)) {
             requestTimer(requestId, payload, auto);
         } else if ("note".equals(action)) {
@@ -190,6 +219,14 @@ final class NativeBridge {
             requestContactAdd(requestId, payload);
         } else if ("call".equals(action)) {
             requestCall(requestId, payload);
+        } else if ("app_list".equals(action)) {
+            listLaunchableApps(requestId, payload);
+        } else if ("app_open".equals(action)) {
+            openLaunchableApp(requestId, payload);
+        } else if ("photo_open".equals(action)) {
+            openPhoto(requestId, payload);
+        } else if ("photo_index".equals(action) || "photo_search".equals(action)) {
+            performPhotoAction(requestId, action, payload);
         } else if ("note_create".equals(action) || "note_list".equals(action) || "note_update".equals(action)) {
             String origin = activity.nativeOrigin();
             payload.remove("action");
@@ -269,6 +306,10 @@ final class NativeBridge {
             if (payload.optString("contact", "").trim().length() > 0) {
                 needed.add(Manifest.permission.READ_CONTACTS);
             }
+        } else if ("photo_index".equals(action) || "photo_open".equals(action)) {
+            needed.add(android.os.Build.VERSION.SDK_INT >= 33
+                    ? Manifest.permission.READ_MEDIA_IMAGES
+                    : Manifest.permission.READ_EXTERNAL_STORAGE);
         }
         List<String> missing = new ArrayList<>();
         for (String permission : needed) {
@@ -277,6 +318,379 @@ final class NativeBridge {
             }
         }
         return missing.toArray(new String[0]);
+    }
+
+    private void performPhotoAction(String requestId, String action, JSONObject payload) {
+        String origin = activity.nativeOrigin();
+        payload.remove("action");
+        payload.remove("auto");
+        phoneWorker.execute(() -> {
+            try {
+                PhotoModelManager.Prepared prepared = photoModels.prepare(origin);
+                PhotoModelManager.Active active;
+                if (prepared.needsDownload) {
+                    AtomicBoolean cancelled = new AtomicBoolean(false);
+                    photoCancellation = cancelled;
+                    try {
+                        if (!awaitPhotoDownloadConfirmation(origin, prepared, cancelled)) {
+                            throw new PhotoModelManager.CancelledException();
+                        }
+                        AlertDialog progress = showPhotoDownloadProgress(origin, cancelled);
+                        try {
+                            active = photoModels.install(origin, prepared, cancelled,
+                                    (stage, completed, total) -> updatePhotoProgress(
+                                            progress, cancelled, stage, completed, total),
+                                    PhotoSemanticIndex::validateModel);
+                        } finally {
+                            dismissPhotoDialog(progress);
+                        }
+                    } finally {
+                        if (photoCancellation == cancelled) photoCancellation = null;
+                    }
+                } else {
+                    if (prepared.active == null) {
+                        throw new IOException("no verified photo model is installed");
+                    }
+                    active = prepared.active.withPrepared(prepared);
+                }
+                ensurePhotoIndex(active);
+                JSONObject result = "photo_index".equals(action)
+                        ? photoIndex.refresh(payload) : photoIndex.search(payload);
+                putPhotoModelState(result, active, prepared);
+                deliverPhoneWorkerResult(origin, requestId, true, null, result);
+            } catch (Exception error) {
+                String message = error.getMessage() == null
+                        ? error.getClass().getSimpleName() : error.getMessage();
+                deliverPhoneWorkerResult(origin, requestId, false, message, null);
+            }
+        });
+    }
+
+    private boolean awaitPhotoDownloadConfirmation(String origin,
+                                                    PhotoModelManager.Prepared prepared,
+                                                    AtomicBoolean cancelled)
+            throws InterruptedException {
+        CountDownLatch answered = new CountDownLatch(1);
+        AtomicBoolean approved = new AtomicBoolean(false);
+        AtomicReference<AlertDialog> shown = new AtomicReference<>();
+        photoConfirmation = answered;
+        activity.runOnUiThread(() -> {
+            if (cancelled.get() || activity.isFinishing() || activity.isDestroyed()
+                    || !origin.equals(activity.nativeOrigin()) || !activity.isTrustedPage()) {
+                cancelled.set(true);
+                answered.countDown();
+                return;
+            }
+            PhotoModelContract.Manifest manifest = prepared.fetched.manifest;
+            String operation = prepared.active == null ? "安装" : "更新";
+            AlertDialog dialog = new AlertDialog.Builder(activity)
+                    .setTitle(operation + "照片搜索模型")
+                    .setMessage("版本 " + manifest.version + "，下载 "
+                            + formatModelBytes(manifest.archiveSize)
+                            + "。模型仅用于设备上的照片索引和搜索。")
+                    .setNegativeButton("取消", (ignored, which) -> {
+                        cancelled.set(true);
+                        answered.countDown();
+                    })
+                    .setPositiveButton("下载", (ignored, which) -> {
+                        if (origin.equals(activity.nativeOrigin()) && activity.isTrustedPage()) {
+                            approved.set(true);
+                        } else {
+                            cancelled.set(true);
+                        }
+                        answered.countDown();
+                    })
+                    .setOnCancelListener(ignored -> {
+                        cancelled.set(true);
+                        answered.countDown();
+                    })
+                    .create();
+            shown.set(dialog);
+            photoDialog = dialog;
+            dialog.show();
+        });
+        boolean responded = answered.await(5, TimeUnit.MINUTES);
+        if (!responded) cancelled.set(true);
+        AlertDialog dialog = shown.get();
+        if (!responded) dismissPhotoDialog(dialog);
+        if (photoConfirmation == answered) photoConfirmation = null;
+        if (photoDialog == dialog) photoDialog = null;
+        return responded && approved.get() && !cancelled.get();
+    }
+
+    private AlertDialog showPhotoDownloadProgress(String origin, AtomicBoolean cancelled)
+            throws InterruptedException, IOException {
+        CountDownLatch shown = new CountDownLatch(1);
+        AtomicReference<AlertDialog> result = new AtomicReference<>();
+        photoConfirmation = shown;
+        activity.runOnUiThread(() -> {
+            if (cancelled.get() || activity.isFinishing() || activity.isDestroyed()
+                    || !origin.equals(activity.nativeOrigin()) || !activity.isTrustedPage()) {
+                cancelled.set(true);
+                shown.countDown();
+                return;
+            }
+            AlertDialog dialog = new AlertDialog.Builder(activity)
+                    .setTitle("照片搜索模型")
+                    .setMessage("准备下载…")
+                    .setNegativeButton("取消", (ignored, which) -> cancelled.set(true))
+                    .setOnCancelListener(ignored -> cancelled.set(true))
+                    .create();
+            result.set(dialog);
+            photoDialog = dialog;
+            dialog.show();
+            shown.countDown();
+        });
+        if (!shown.await(10, TimeUnit.SECONDS) || result.get() == null) {
+            cancelled.set(true);
+            throw new IOException("cannot show photo model download progress");
+        }
+        if (photoConfirmation == shown) photoConfirmation = null;
+        return result.get();
+    }
+
+    private void updatePhotoProgress(AlertDialog dialog, AtomicBoolean cancelled,
+                                     String stage, long completed, long total) {
+        String message = stage;
+        if (total > 0) {
+            long percent = Math.min(100, Math.max(0, completed * 100 / total));
+            message += "\n" + percent + "% (" + formatModelBytes(completed)
+                    + " / " + formatModelBytes(total) + ")";
+        }
+        String display = message;
+        activity.runOnUiThread(() -> {
+            if (!cancelled.get() && photoDialog == dialog && dialog.isShowing()) {
+                dialog.setMessage(display);
+            }
+        });
+    }
+
+    private void dismissPhotoDialog(AlertDialog dialog) {
+        if (dialog == null) return;
+        activity.runOnUiThread(dialog::dismiss);
+        if (photoDialog == dialog) photoDialog = null;
+    }
+
+    private void ensurePhotoIndex(PhotoModelManager.Active active) throws IOException {
+        if (photoIndex != null && active.version.equals(photoIndex.modelVersion())) return;
+        if (photoIndex != null) {
+            photoIndex.close();
+            photoIndex = null;
+        }
+        photoIndex = new PhotoSemanticIndex(activity, active.directory, active.version);
+    }
+
+    private static void putPhotoModelState(JSONObject result, PhotoModelManager.Active active,
+                                           PhotoModelManager.Prepared prepared) throws JSONException {
+        result.put("model_version", active.version);
+        result.put("model_state", active.state);
+        result.put("model_downloaded", active.downloaded);
+        result.put("model_updated", "updated".equals(active.state));
+        result.put("model_fallback", "installed_fallback".equals(active.state));
+        result.put("model_manifest_checked", prepared.manifestChecked);
+        if (active.manifestError != null) result.put("model_manifest_error", active.manifestError);
+    }
+
+    private static String formatModelBytes(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return String.format(Locale.ROOT, "%.1f KiB", bytes / 1024.0);
+        return String.format(Locale.ROOT, "%.1f MiB", bytes / (1024.0 * 1024.0));
+    }
+
+    private void showAlarmList(String requestId) {
+        activity.runOnUiThread(() -> {
+            try {
+                activity.startActivity(new Intent(AlarmClock.ACTION_SHOW_ALARMS));
+                JSONObject data = new JSONObject();
+                data.put("action", "alarm_list");
+                data.put("dispatched", true);
+                activity.deliverNativeResult(requestId, true, null, data);
+            } catch (ActivityNotFoundException error) {
+                activity.deliverNativeResult(requestId, false, "no alarm app", null);
+            } catch (JSONException error) {
+                activity.deliverNativeResult(requestId, false, "cannot encode alarm result", null);
+            }
+        });
+    }
+
+    private void listLaunchableApps(String requestId, JSONObject payload) {
+        String origin = activity.nativeOrigin();
+        phoneWorker.execute(() -> {
+            try {
+                String query = strictString(payload, "query", "", 200).trim().toLowerCase(Locale.ROOT);
+                int max = strictInt(payload, "max", 10, 1, 20);
+                int offset = strictInt(payload, "offset", 0, 0, 100000);
+                List<JSONObject> matching = new ArrayList<>();
+                for (JSONObject entry : launchableApps()) {
+                    String label = entry.getString("label");
+                    String packageName = entry.getString("package");
+                    if (query.isEmpty() || label.toLowerCase(Locale.ROOT).contains(query)
+                            || packageName.toLowerCase(Locale.ROOT).contains(query)) {
+                        matching.add(entry);
+                    }
+                }
+                JSONArray apps = new JSONArray();
+                int end = Math.min(matching.size(), offset + max);
+                for (int index = Math.min(offset, matching.size()); index < end; index++) {
+                    apps.put(matching.get(index));
+                }
+                JSONObject data = new JSONObject();
+                data.put("apps", apps);
+                data.put("offset", offset);
+                data.put("next_offset", end);
+                data.put("has_more", end < matching.size());
+                data.put("total", matching.size());
+                deliverPhoneWorkerResult(origin, requestId, true, null, data);
+            } catch (Exception error) {
+                deliverPhoneWorkerResult(origin, requestId, false, error.getMessage(), null);
+            }
+        });
+    }
+
+    private void openLaunchableApp(String requestId, JSONObject payload) {
+        try {
+            String packageName = strictString(payload, "package", null, MAX_APP_PACKAGE_CHARS);
+            if (!isAndroidPackage(packageName)) {
+                activity.deliverNativeResult(requestId, false, "invalid Android package name", null);
+                return;
+            }
+            JSONObject selected = null;
+            for (JSONObject entry : launchableApps()) {
+                if (packageName.equals(entry.getString("package"))) {
+                    selected = entry;
+                    break;
+                }
+            }
+            if (selected == null) {
+                activity.deliverNativeResult(requestId, false, "app is not installed or has no launcher activity", null);
+                return;
+            }
+            Intent launch = activity.getPackageManager().getLaunchIntentForPackage(packageName);
+            if (launch == null) {
+                activity.deliverNativeResult(requestId, false, "app has no launcher activity", null);
+                return;
+            }
+            JSONObject result = selected;
+            activity.runOnUiThread(() -> {
+                try {
+                    activity.startActivity(launch);
+                    result.remove("activity");
+                    result.put("dispatched", true);
+                    activity.deliverNativeResult(requestId, true, null, result);
+                } catch (ActivityNotFoundException | SecurityException | JSONException error) {
+                    activity.deliverNativeResult(requestId, false, "cannot open app", null);
+                }
+            });
+        } catch (Exception error) {
+            activity.deliverNativeResult(requestId, false, error.getMessage(), null);
+        }
+    }
+
+    private void openPhoto(String requestId, JSONObject payload) {
+        Object rawMediaId = payload.opt("media_id");
+        if (!(rawMediaId instanceof Number)) {
+            activity.deliverNativeResult(requestId, false, "media_id must be a positive integer", null);
+            return;
+        }
+        double numericMediaId = ((Number) rawMediaId).doubleValue();
+        long mediaId = ((Number) rawMediaId).longValue();
+        if (!Double.isFinite(numericMediaId) || numericMediaId != mediaId
+                || mediaId <= 0 || mediaId > MAX_SAFE_MEDIA_ID) {
+            activity.deliverNativeResult(requestId, false, "media_id must be a positive integer", null);
+            return;
+        }
+
+        Uri uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, mediaId);
+        try {
+            String mimeType = activity.getContentResolver().getType(uri);
+            if (mimeType == null || !mimeType.startsWith("image/")) {
+                activity.deliverNativeResult(requestId, false,
+                        "photo is unavailable or no longer exists", null);
+                return;
+            }
+            Intent view = new Intent(Intent.ACTION_VIEW)
+                    .setDataAndType(uri, mimeType)
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            if (view.resolveActivity(activity.getPackageManager()) == null) {
+                activity.deliverNativeResult(requestId, false,
+                        "no app can open this photo", null);
+                return;
+            }
+            activity.startActivity(view);
+            JSONObject result = new JSONObject();
+            result.put("media_id", mediaId);
+            result.put("content_uri", uri.toString());
+            result.put("dispatched", true);
+            activity.deliverNativeResult(requestId, true, null, result);
+        } catch (ActivityNotFoundException | SecurityException | JSONException error) {
+            activity.deliverNativeResult(requestId, false, "cannot open photo", null);
+        }
+    }
+
+    private List<JSONObject> launchableApps() throws JSONException {
+        Intent launcher = new Intent(Intent.ACTION_MAIN);
+        launcher.addCategory(Intent.CATEGORY_LAUNCHER);
+        PackageManager manager = activity.getPackageManager();
+        List<ResolveInfo> resolved = manager.queryIntentActivities(launcher, PackageManager.MATCH_ALL);
+        List<JSONObject> entries = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        for (ResolveInfo info : resolved) {
+            if (info.activityInfo == null || info.activityInfo.packageName == null
+                    || !isAndroidPackage(info.activityInfo.packageName)
+                    || !seen.add(info.activityInfo.packageName)) continue;
+            String packageName = info.activityInfo.packageName;
+            CharSequence loaded = info.loadLabel(manager);
+            String label = loaded == null ? packageName : loaded.toString().trim();
+            if (label.isEmpty()) label = packageName;
+            JSONObject entry = new JSONObject();
+            entry.put("label", label);
+            entry.put("package", packageName);
+            entries.add(entry);
+        }
+        entries.sort((left, right) -> {
+            int byLabel = left.optString("label").compareToIgnoreCase(right.optString("label"));
+            return byLabel != 0 ? byLabel
+                    : left.optString("package").compareTo(right.optString("package"));
+        });
+        return entries;
+    }
+
+    private static String strictString(JSONObject payload, String key, String fallback, int maxChars)
+            throws JSONException {
+        if (!payload.has(key) || payload.isNull(key)) return fallback;
+        Object raw = payload.get(key);
+        if (!(raw instanceof String) || ((String) raw).length() > maxChars)
+            throw new JSONException("invalid '" + key + "'");
+        return (String) raw;
+    }
+
+    private static int strictInt(JSONObject payload, String key, int fallback, int min, int max)
+            throws JSONException {
+        if (!payload.has(key) || payload.isNull(key)) return fallback;
+        Object raw = payload.get(key);
+        if (!(raw instanceof Number)) throw new JSONException("invalid '" + key + "'");
+        double value = ((Number) raw).doubleValue();
+        if (!Double.isFinite(value) || value != Math.rint(value) || value < min || value > max)
+            throw new JSONException("invalid '" + key + "'");
+        return (int) value;
+    }
+
+    static boolean isAndroidPackage(String value) {
+        if (value == null || value.isEmpty() || value.length() > MAX_APP_PACKAGE_CHARS) return false;
+        String[] segments = value.split("\\.", -1);
+        if (segments.length < 2) return false;
+        for (String segment : segments) {
+            if (segment.isEmpty() || !isAsciiLetter(segment.charAt(0))) return false;
+            for (int index = 1; index < segment.length(); index++) {
+                char ch = segment.charAt(index);
+                if (!isAsciiLetter(ch) && (ch < '0' || ch > '9') && ch != '_') return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean isAsciiLetter(char ch) {
+        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
     }
 
     private void requestAlarm(String requestId, JSONObject payload, boolean auto) {
@@ -644,6 +1058,14 @@ final class NativeBridge {
         }
         Toast.makeText(activity, "已加入日历：" + title, Toast.LENGTH_SHORT).show();
         activity.deliverNativeResult(requestId, true, null, data);
+    }
+
+    private void deliverPhoneWorkerResult(String origin, String requestId, boolean ok,
+                                          String error, JSONObject data) {
+        activity.runOnUiThread(() -> {
+            if (origin.equals(activity.nativeOrigin()) && activity.isTrustedPage())
+                activity.deliverNativeResult(requestId, ok, error, data);
+        });
     }
 
     private void readPhoneRecords(String requestId, String action, JSONObject payload) {
