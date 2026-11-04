@@ -28,14 +28,12 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-#[cfg(not(test))]
-use std::sync::atomic::AtomicU8;
 
 use crate::ai::{
     driver::{runtime_ctx, side_note::push_side_note},
@@ -51,23 +49,79 @@ const POLL_MS: i32 = 50;
 
 /// Upper bound for one `CSI 18 t` round trip inside the listener loop.
 const WIDTH_SERVICE_WAIT_MS: u64 = 60;
-#[cfg(not(test))]
-/// Fold-frame wait for one epoch answer (one 50ms poll cadence + service round trip + slack).
-const WIDTH_REFRESH_WAIT_MS: u64 = 150;
-#[cfg(not(test))]
 /// Freshness window of the cached emulator answer before ioctl becomes authoritative again.
 const WIDTH_REFRESH_TTL_MS: u64 = 250;
-#[cfg(not(test))]
-/// Consecutive refresh timeouts that latch `WIDTH_QUERY_UNSUPPORTED` for the process.
+/// Consecutive failed terminal queries that disable probing for this stdin lease.
 const WIDTH_REFRESH_TIMEOUT_BUDGET: u8 = 2;
 
-static WIDTH_QUERY_REQUEST_EPOCH: AtomicU64 = AtomicU64::new(0);
-static WIDTH_QUERY_SERVED_EPOCH: AtomicU64 = AtomicU64::new(0);
-static WIDTH_QUERY_COLS: AtomicU16 = AtomicU16::new(0);
-/// Process-wide "terminal never answers `CSI 18 t`" latch: two consecutive timeouts stop the
-/// per-frame wait, mirroring `queries_disabled` in the prompt's DSR handling.
-static WIDTH_QUERY_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
-/// Set while the listener thread owns stdin and services fold width requests.
+struct WidthSample {
+    cols: u16,
+    measured_at: Instant,
+    kernel_cols: Option<u16>,
+}
+
+/// Shared across the listener and render threads. Never hold this lock during
+/// terminal I/O: rendering queues a coalesced request and consumes answers later.
+struct WidthQueryState {
+    pending: bool,
+    sample: Option<WidthSample>,
+    consecutive_failures: u8,
+}
+
+impl WidthQueryState {
+    const fn new() -> Self {
+        Self {
+            pending: false,
+            sample: None,
+            consecutive_failures: 0,
+        }
+    }
+
+    fn fresh_cols(&self, now: Instant, kernel_cols: Option<u16>) -> Option<u16> {
+        let sample = self.sample.as_ref()?;
+        // A kernel resize supersedes the cached answer immediately. Before the
+        // kernel catches up, an emulator answer may legitimately differ from it.
+        (now.saturating_duration_since(sample.measured_at)
+            < Duration::from_millis(WIDTH_REFRESH_TTL_MS)
+            && kernel_cols == sample.kernel_cols)
+            .then_some(sample.cols)
+    }
+
+    fn request_refresh(&mut self, now: Instant, kernel_cols: Option<u16>) {
+        if self.pending
+            || self.consecutive_failures >= WIDTH_REFRESH_TIMEOUT_BUDGET
+            || self.fresh_cols(now, kernel_cols).is_some()
+        {
+            return;
+        }
+        self.sample = None;
+        self.pending = true;
+    }
+
+    fn complete(&mut self, cols: Option<u16>, now: Instant, kernel_cols: Option<u16>) {
+        self.pending = false;
+        self.sample = cols.filter(|&cols| cols > 0).map(|cols| WidthSample {
+            cols,
+            measured_at: now,
+            kernel_cols,
+        });
+        if self.sample.is_some() {
+            self.consecutive_failures = 0;
+        } else {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        }
+    }
+}
+
+static WIDTH_QUERY: Mutex<WidthQueryState> = Mutex::new(WidthQueryState::new());
+
+fn width_query_state() -> std::sync::MutexGuard<'static, WidthQueryState> {
+    WIDTH_QUERY
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// Set while the listener thread owns stdin and services asynchronous width requests.
 static LISTENER_ALIVE: AtomicBool = AtomicBool::new(false);
 /// Number of listener worker threads currently alive (0 or 1 in normal
 /// operation). Incremented when the worker thread starts and decremented when
@@ -180,14 +234,6 @@ fn store_draft(session_key: &str, input: &[char], in_input: bool) {
     });
 }
 
-#[cfg(not(test))]
-static WIDTH_REFRESH_CONSECUTIVE_TIMEOUTS: AtomicU8 = AtomicU8::new(0);
-
-#[cfg(not(test))]
-thread_local! {
-    static TRUTH_CACHE: std::cell::Cell<Option<(u16, Instant)>> = const { std::cell::Cell::new(None) };
-}
-
 #[cfg(test)]
 thread_local! {
     static SCRIPTED_TRUE_COLS: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
@@ -199,18 +245,15 @@ pub(crate) fn set_scripted_true_width(cols: Option<u16>) {
     SCRIPTED_TRUE_COLS.with(|cell| cell.set(cols.filter(|&c| c > 0)));
 }
 
-/// The cached `CSI 18 t` answer while fresh. Absent (test without a script, refresh timed
-/// out, latch tripped) means `raw_terminal_cols` keeps its ioctl/COLUMNS behavior.
+/// Read the listener's last valid answer without waiting for a terminal query.
+/// A miss leaves `raw_terminal_cols` on its live ioctl/COLUMNS path.
 #[cfg(not(test))]
 pub(crate) fn fresh_true_width_cols() -> Option<u16> {
-    if WIDTH_QUERY_UNSUPPORTED.load(Ordering::Relaxed) {
+    if !LISTENER_ALIVE.load(Ordering::Acquire) {
         return None;
     }
-    TRUTH_CACHE.with(|cache| {
-        cache.get().and_then(|(cols, at)| {
-            (cols > 0 && at.elapsed() < Duration::from_millis(WIDTH_REFRESH_TTL_MS)).then_some(cols)
-        })
-    })
+    let kernel_cols = terminal_size().ok().map(|(cols, _)| cols);
+    width_query_state().fresh_cols(Instant::now(), kernel_cols)
 }
 
 #[cfg(test)]
@@ -218,43 +261,15 @@ pub(crate) fn fresh_true_width_cols() -> Option<u16> {
     SCRIPTED_TRUE_COLS.with(|cell| cell.get())
 }
 
-/// Asked at every fold redraw/finalize: bump the request epoch and wait (bounded) for the
-/// listener's `CSI 18 t` answer so the reflowed width lands in the cache before the erase
-/// measures anything. No listener (tests, listener-less contexts) is a silent no-op.
-#[cfg(not(test))]
+/// Queue at most one asynchronous query when the cached answer is no longer usable.
+/// This render-path call never waits for the listener, even under the stdout lock.
 pub(crate) fn refresh_true_width() {
-    if WIDTH_QUERY_UNSUPPORTED.load(Ordering::Relaxed) || !LISTENER_ALIVE.load(Ordering::Relaxed) {
+    if !LISTENER_ALIVE.load(Ordering::Acquire) {
         return;
     }
-    let request = WIDTH_QUERY_REQUEST_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
-    let deadline = Instant::now() + Duration::from_millis(WIDTH_REFRESH_WAIT_MS);
-    loop {
-        if WIDTH_QUERY_SERVED_EPOCH.load(Ordering::Acquire) >= request {
-            let cols = WIDTH_QUERY_COLS.load(Ordering::Relaxed);
-            if cols > 0 {
-                WIDTH_REFRESH_CONSECUTIVE_TIMEOUTS.store(0, Ordering::Relaxed);
-                TRUTH_CACHE.with(|cache| cache.set(Some((cols, Instant::now()))));
-            }
-            return;
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    // No answer: expire the cache so this frame falls back to the live ioctl width, and stop
-    // waiting for good after the budget — a terminal that never answers would otherwise tax
-    // every frame of every later turn.
-    TRUTH_CACHE.with(|cache| cache.set(None));
-    if WIDTH_REFRESH_CONSECUTIVE_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1
-        >= WIDTH_REFRESH_TIMEOUT_BUDGET
-    {
-        WIDTH_QUERY_UNSUPPORTED.store(true, Ordering::Relaxed);
-    }
+    let kernel_cols = terminal_size().ok().map(|(cols, _)| cols);
+    width_query_state().request_refresh(Instant::now(), kernel_cols);
 }
-
-#[cfg(test)]
-pub(crate) fn refresh_true_width() {}
 /// Upper bound for how long Drop waits for the listener thread to confirm stdin /
 /// cbreak release.
 const SHUTDOWN_WAIT_MS: u64 = 250;
@@ -754,8 +769,11 @@ impl SideNoteInputGuard {
                     if let Some(ready_tx) = ready_tx.take() {
                         let _ = ready_tx.send(true);
                     }
+                    *width_query_state() = WidthQueryState::new();
                     LISTENER_ALIVE.store(true, Ordering::Release);
                     let exit = side_note_input_loop(&sink, &task_stop, term);
+                    LISTENER_ALIVE.store(false, Ordering::Release);
+                    *width_query_state() = WidthQueryState::new();
                     drop(stdin_owner);
                     match exit {
                         SideNoteLoopExit::ResumeAfterForeground => continue,
@@ -1426,22 +1444,15 @@ fn scan_text_area_report(buf: &[u8]) -> ReportScan {
     }
 }
 
-/// Services one pending `refresh_true_width` request: the served epoch always advances so
-/// the caller's bounded wait cannot hang, even when the terminal never answers.
+/// Service one coalesced request on the stdin owner. The shared state remains
+/// unlocked during I/O, so a slow or unsupported terminal cannot stall rendering.
 fn service_pending_width_query(fd: libc::c_int, replay: &mut VecDeque<u8>) {
-    let requested = WIDTH_QUERY_REQUEST_EPOCH.load(Ordering::Acquire);
-    if WIDTH_QUERY_SERVED_EPOCH.load(Ordering::Acquire) >= requested {
+    if !width_query_state().pending {
         return;
     }
-    let cols = if WIDTH_QUERY_UNSUPPORTED.load(Ordering::Relaxed) {
-        None
-    } else {
-        service_width_query(fd, replay)
-    };
-    if let Some(cols) = cols {
-        WIDTH_QUERY_COLS.store(cols, Ordering::Relaxed);
-    }
-    WIDTH_QUERY_SERVED_EPOCH.store(requested, Ordering::Release);
+    let kernel_cols = terminal_size().ok().map(|(cols, _)| cols);
+    let cols = service_width_query(fd, replay);
+    width_query_state().complete(cols, Instant::now(), kernel_cols);
 }
 
 /// One `CSI 18 t` round trip on the listener's own tty handle. Bytes read while
@@ -1568,8 +1579,8 @@ fn side_note_input_loop(
         if should_yield_stdin(stop) {
             break;
         }
-        // Answer a pending fold width request before blocking again: the fold's bounded
-        // wait ends within one poll cadence plus this service round trip.
+        // Publish a pending width answer before polling again. Fold rendering
+        // continues independently while this thread waits for the terminal.
         service_pending_width_query(read_fd, &mut replay);
         let b = if let Some(queued) = replay.pop_front() {
             queued
@@ -1802,6 +1813,91 @@ fn side_note_input_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn width_query_refresh_does_not_wait_for_a_listener_answer() {
+        let _serial = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::mem::replace(&mut *width_query_state(), WidthQueryState::new());
+        let was_alive = LISTENER_ALIVE.swap(true, Ordering::AcqRel);
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            // No listener services the request. Even while stdout is locked,
+            // a burst of render frames must return instead of waiting on it.
+            let stdout = io::stdout();
+            let _out = stdout.lock();
+            for _ in 0..80 {
+                refresh_true_width();
+            }
+            let _ = done_tx.send(());
+        });
+        let completed = done_rx.recv_timeout(Duration::from_millis(100));
+        let pending = width_query_state().pending;
+        LISTENER_ALIVE.store(was_alive, Ordering::Release);
+        let joined = worker.join();
+        *width_query_state() = previous;
+        assert!(joined.is_ok());
+        assert!(completed.is_ok(), "render frames waited for a width answer");
+        assert!(
+            pending,
+            "the frames must queue a query without a listener answer"
+        );
+    }
+
+    #[test]
+    fn width_query_coalesces_frames_and_expires_answers() {
+        let now = Instant::now();
+        let mut query = WidthQueryState::new();
+        for _ in 0..80 {
+            query.request_refresh(now, Some(120));
+        }
+        assert!(query.pending);
+        query.complete(Some(60), now, Some(120));
+        // The emulator may reflow before the kernel reports its new width.
+        assert_eq!(query.fresh_cols(now, Some(120)), Some(60));
+        query.request_refresh(now, Some(120));
+        assert!(!query.pending, "a fresh answer must be reused");
+
+        let expired = now + Duration::from_millis(WIDTH_REFRESH_TTL_MS);
+        assert_eq!(query.fresh_cols(expired, Some(120)), None);
+        query.request_refresh(expired, Some(120));
+        assert!(query.pending, "an expired answer needs a new query");
+    }
+
+    #[test]
+    fn width_query_failed_answers_clear_cache_and_disable_probing() {
+        let now = Instant::now();
+        let mut query = WidthQueryState::new();
+        query.complete(Some(120), now, Some(120));
+        query.complete(None, now, Some(120));
+        assert_eq!(query.fresh_cols(now, Some(120)), None);
+        assert_eq!(query.consecutive_failures, 1);
+        query.request_refresh(now, Some(120));
+        assert!(query.pending);
+        query.complete(Some(0), now, Some(120));
+        assert_eq!(query.fresh_cols(now, Some(120)), None);
+        query.request_refresh(now, Some(120));
+        assert!(
+            !query.pending,
+            "unsupported terminals must stop being probed"
+        );
+    }
+
+    #[test]
+    fn width_query_kernel_resize_supersedes_cached_emulator_width() {
+        let now = Instant::now();
+        let mut query = WidthQueryState::new();
+        query.complete(Some(60), now, Some(120));
+        assert_eq!(query.fresh_cols(now, Some(120)), Some(60));
+        // A later kernel resize is authoritative even inside the cache TTL.
+        assert_eq!(query.fresh_cols(now, Some(80)), None);
+        query.request_refresh(now, Some(80));
+        assert!(query.pending);
+        query.complete(Some(80), now, Some(80));
+        assert_eq!(query.fresh_cols(now, Some(80)), Some(80));
+        assert_eq!(query.consecutive_failures, 0);
+    }
 
     #[test]
     fn scan_text_area_report_accepts_reports_and_rejects_input() {

@@ -167,9 +167,8 @@ pub(super) fn thinking_fold_redraw(
     rate: Option<&str>,
     fold: &mut super::state::ThinkingFoldState,
 ) -> io::Result<()> {
-    // Ask for the reflowed width before taking the stdout lock: the listener answers with
-    // `CSI 18 t` through that same lock, so waiting while holding it would stall both for
-    // the whole budget and keep the composer row from repainting.
+    // Queue a width refresh without waiting; rendering uses the last valid
+    // listener answer or live ioctl width while the terminal query is in flight.
     super::side_note_input::refresh_true_width();
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -187,10 +186,8 @@ pub(super) fn thinking_fold_redraw_to(
     rate: Option<&str>,
     fold: &mut super::state::ThinkingFoldState,
 ) -> io::Result<()> {
-    // Callers measure against the emulator's reflowed width first (`thinking_fold_redraw`
-    // does so before taking the lock): inside the window where xterm.js has already
-    // rewrapped the drawn rows but the PTY winsize has not arrived, ioctl reports the old
-    // width and every span below would land short, stranding the previous header.
+    // The listener's cached emulator width covers reflow before the PTY winsize
+    // catches up. An expired answer or a changed winsize falls back to live ioctl.
     // Erase the region currently on screen — header rows plus body rows — and redraw the header on the
     // region's first row on every redraw, so the window stays anchored where the fold started.
     //
@@ -353,9 +350,8 @@ pub(super) fn finalize_fold(
     fold: &mut super::state::ThinkingFoldState,
     collapse_body: bool,
 ) -> io::Result<()> {
-    // Same lock discipline as `thinking_fold_redraw`: the width round-trip needs the
-    // listener, and the listener needs the stdout lock to answer. An inactive fold
-    // writes nothing, so skip the round trip entirely.
+    // Match `thinking_fold_redraw`'s asynchronous refresh. An inactive fold
+    // writes nothing and needs no query.
     if fold.active {
         super::side_note_input::refresh_true_width();
     }
@@ -372,8 +368,8 @@ pub(super) fn finalize_fold_to(
     fold: &mut super::state::ThinkingFoldState,
     collapse_body: bool,
 ) -> io::Result<()> {
-    // The header rewrite below moves the cursor up by rows recomputed at the width in
-    // force now; callers refresh that width before taking the lock.
+    // The header rewrite below moves the cursor up by rows recomputed from the
+    // latest available width; callers queue a refresh without waiting.
     if !fold.active {
         return Ok(());
     }

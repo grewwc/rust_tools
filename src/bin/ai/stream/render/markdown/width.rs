@@ -172,12 +172,9 @@ pub(super) fn raw_terminal_cols_with(override_cols: Option<usize>) -> usize {
     if let Some(cols) = override_cols {
         return cols;
     }
-    // Emulator-truth width cached by the fold's `CSI 18 t` refresh (see
-    // `side_note_input::refresh_true_width`): while xterm.js has rewrapped the rows it
-    // already drew but the PTY winsize has not reached this process, the kernel width
-    // below is stale, and every cursor-up span measured from it stops short, stacking
-    // the previous `○ thinking` header under the redraw. A cache miss keeps this
-    // function's ioctl/COLUMNS behavior unchanged.
+    // The listener publishes emulator widths asynchronously. A fresh answer can
+    // cover reflow before the PTY winsize catches up; a changed kernel width or
+    // an expired/failed query leaves this function on its live ioctl/COLUMNS path.
     if let Some(cols) = crate::ai::stream::side_note_input::fresh_true_width_cols() {
         return cols as usize;
     }
