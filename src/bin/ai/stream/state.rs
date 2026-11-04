@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, time::Instant};
+use std::{cell::RefCell, collections::VecDeque, time::Instant};
 
 use rust_tools::cw::SkipMap;
 
@@ -366,6 +366,24 @@ pub(super) struct ThinkingFoldState {
     pub(super) footer_label: String,
     /// Whether to skip blank lines inside the fold window. Thinking suits compact display; subagent body text stays as-is.
     pub(super) skip_blank_lines: bool,
+    /// Append-only line layouts, rebuilt when terminal geometry or the row budget changes.
+    pub(super) wrap_cache: RefCell<ThinkingFoldWrapCache>,
+}
+
+#[derive(Default)]
+pub(super) struct ThinkingFoldWrapCache {
+    pub(super) cols: usize,
+    pub(super) max_rows: usize,
+    pub(super) lines: VecDeque<ThinkingFoldWrappedLine>,
+}
+
+#[derive(Default)]
+pub(super) struct ThinkingFoldWrappedLine {
+    pub(super) index: usize,
+    pub(super) source_bytes: usize,
+    pub(super) completed_rows: usize,
+    pub(super) recent_rows: VecDeque<String>,
+    pub(super) current_row: String,
 }
 
 impl ThinkingFoldState {
@@ -394,6 +412,7 @@ impl ThinkingFoldState {
             header_label: header_label.into(),
             footer_label: footer_label.into(),
             skip_blank_lines,
+            wrap_cache: RefCell::new(ThinkingFoldWrapCache::default()),
         }
     }
 
@@ -415,6 +434,7 @@ impl ThinkingFoldState {
         self.active = false;
         self.header_drawn = false;
         self.header_rendered_line.clear();
+        self.wrap_cache.get_mut().lines.clear();
     }
 }
 

@@ -1497,7 +1497,7 @@ mod tests;
 // `markdown` module root so `render::markdown::X` paths (stream runtime) and the
 // inline `tests` module (via `use super::*`) keep their pre-split names.
 pub(in crate::ai) use width::{
-    clamp_line_to_terminal_row, clamp_line_to_terminal_row_with_reserve,
+    TerminalWidthSnapshot, clamp_line_to_terminal_row, clamp_line_to_terminal_row_with_reserve,
     live_preview_cursor_rows, raw_terminal_rows, wrap_line_to_terminal_rows_with_reserve,
 };
 // The serve client is the only caller that reports a display width, and it

@@ -313,10 +313,7 @@ impl FooterReservation {
                 "terminal is too short for side-note footer",
             ));
         }
-        let footer = Self {
-            cols,
-            rows,
-        };
+        let footer = Self { cols, rows };
         footer.apply_reservation(stop)?;
         Ok(footer)
     }
@@ -347,11 +344,7 @@ impl FooterReservation {
         // Save after this adjustment because DECSTBM itself homes the cursor.
         // As with footer redraws, the stream's live regions reserve a right margin
         // and must not leave the cursor in a pending-wrap state.
-        write!(
-            out,
-            "\x1bD\x1bM\x1b7\x1b[1;{}r\x1b8",
-            self.output_bottom()
-        )?;
+        write!(out, "\x1bD\x1bM\x1b7\x1b[1;{}r\x1b8", self.output_bottom())?;
         Ok(())
     }
 
@@ -705,9 +698,7 @@ impl SideNoteInputGuard {
     /// the same footer composer, but drafts are POSTed to the serve session.
     /// `/bg`-family drafts stay ordinary note text here: there is no local
     /// attach view to detach, and the draft must never be silently dropped.
-    pub(crate) fn spawn_remote(
-        post: Arc<dyn Fn(String) -> bool + Send + Sync>,
-    ) -> Self {
+    pub(crate) fn spawn_remote(post: Arc<dyn Fn(String) -> bool + Send + Sync>) -> Self {
         // The action never fires: the loop only reports BackgroundRequested
         // for local sinks (see `submit_draft`).
         Self::spawn_with_background_action(
@@ -1006,8 +997,7 @@ fn open_private_tty() -> Option<libc::c_int> {
 fn open_private_tty_for(tty_fd: libc::c_int) -> Option<libc::c_int> {
     // `O_NOCTTY`: never acquire a controlling terminal as a side effect of opening
     // the device path.
-    const FLAGS: libc::c_int =
-        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY;
+    const FLAGS: libc::c_int = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY;
     let mut buf = vec![libc::c_char::default(); 4096];
     // SAFETY: `buf` is writable for its full length.
     let mut fd = if unsafe { libc::ttyname_r(tty_fd, buf.as_mut_ptr(), buf.len()) } == 0 {
@@ -1303,6 +1293,34 @@ fn submit_draft(
     }
 }
 
+/// Result of trying to submit the draft from the listener loop.
+enum SubmitFlow {
+    /// The draft was handled (or the composer closed); keep looping.
+    Continue,
+    /// A `/bg`-family draft was accepted; the caller exits the listener.
+    Background,
+    /// The footer is gone or the write failed; the caller exits the listener.
+    Stop,
+}
+
+fn try_submit(
+    sink: &SideNoteSink,
+    stop: &AtomicBool,
+    footer: &mut Option<FooterReservation>,
+    input: &mut Vec<char>,
+    pending: &mut Vec<u8>,
+    in_input: &mut bool,
+) -> SubmitFlow {
+    let Some(active_footer) = footer.as_mut() else {
+        return SubmitFlow::Stop;
+    };
+    match submit_draft(sink, stop, active_footer, input, pending, in_input) {
+        Ok(true) => SubmitFlow::Background,
+        Ok(false) => SubmitFlow::Continue,
+        Err(_) => SubmitFlow::Stop,
+    }
+}
+
 /// Single-byte read with timeout (only used to decide whether a post-Esc key is a
 /// submit-type function-key sequence).
 /// None means timeout, stop received, or the listener handle closed/errored.
@@ -1359,31 +1377,88 @@ fn read_byte_timeout(fd: libc::c_int, timeout_ms: i32, stop: &AtomicBool) -> Opt
     }
 }
 
+/// One follow-up byte of a CSI sequence after `ESC [`.
+enum CsiStep {
+    /// The sequence is incomplete; keep accumulating.
+    Pending,
+    /// The sequence is complete and is F2 (`ESC [ 1 2 ~`).
+    Submit,
+    /// The sequence is complete but is not a submit key; swallow it.
+    Ignore,
+}
+
+/// Feed one byte into a CSI sequence. The first byte in `0x40..=0x7e` is final;
+/// only `ESC [ 1 2 ~` submits, while terminal replies such as
+/// `CSI 8 ; rows ; cols t` are consumed and ignored.
+fn csi_step(seq: &mut Vec<u8>, byte: u8) -> CsiStep {
+    const MAX_CSI_BYTES: usize = 64;
+    if (0x40..=0x7e).contains(&byte) {
+        if byte == b'~' && seq == b"12" {
+            CsiStep::Submit
+        } else {
+            CsiStep::Ignore
+        }
+    } else if seq.len() < MAX_CSI_BYTES {
+        seq.push(byte);
+        CsiStep::Pending
+    } else {
+        // A malformed sequence longer than any real key/report: abandon it.
+        CsiStep::Ignore
+    }
+}
+
+/// Read one byte of an escape sequence. Bytes replayed by the width-query service
+/// belong to the same input stream, so they are consumed before the tty; otherwise
+/// an Esc at the replay boundary would parse the wrong byte as its follow-up.
+fn read_escape_byte(
+    fd: libc::c_int,
+    replay: &mut VecDeque<u8>,
+    timeout_ms: i32,
+    stop: &AtomicBool,
+) -> Option<u8> {
+    replay
+        .pop_front()
+        .or_else(|| read_byte_timeout(fd, timeout_ms, stop))
+}
+
 /// Decide whether the keys following ESC (0x1b) form a submit key: bare Esc, F2
 /// (`ESC O Q` / `ESC [ 1 2 ~`), Alt+Enter (`ESC \r` / `ESC \n`). Terminals emit the
 /// full function-key sequence in a single write burst, so follow-up bytes are almost
 /// immediately available; whether or not it submits, this function consumes every
-/// follow-up byte after ESC so bytes from other sequences such as arrow keys cannot
-/// leak into the draft.
-fn is_submit_escape(fd: libc::c_int, stop: &AtomicBool) -> bool {
+/// follow-up byte after ESC so bytes from other sequences such as arrow keys or
+/// terminal replies cannot leak into the draft. A CSI sequence that straddles the
+/// follow-up timeout is stored in `pending_csi` and resumed on later bytes instead
+/// of letting its tail become draft text.
+fn is_submit_escape(
+    fd: libc::c_int,
+    replay: &mut VecDeque<u8>,
+    pending_csi: &mut Option<Vec<u8>>,
+    stop: &AtomicBool,
+) -> bool {
     const ESCAPE_FOLLOWUP_MS: i32 = 30;
-    const MAX_CSI_BYTES: usize = 16;
-    match read_byte_timeout(fd, ESCAPE_FOLLOWUP_MS, stop) {
+    match read_escape_byte(fd, replay, ESCAPE_FOLLOWUP_MS, stop) {
         None => !should_yield_stdin(stop), // bare Esc; never submit the draft while stopping / foreground-preempted
         Some(0x0d) | Some(0x0a) => true,   // Alt+Enter
         Some(0x4f) => {
             // SS3 form: `ESC O Q` → F2; the rest (F1/F3/F4 etc.) are swallowed and ignored.
-            read_byte_timeout(fd, ESCAPE_FOLLOWUP_MS, stop) == Some(0x51)
+            read_escape_byte(fd, replay, ESCAPE_FOLLOWUP_MS, stop) == Some(0x51)
         }
         Some(0x5b) => {
-            // CSI form: read until the `~` terminator; `ESC [ 1 2 ~` → F2, anything else ignored.
             let mut seq = Vec::new();
             loop {
-                match read_byte_timeout(fd, ESCAPE_FOLLOWUP_MS, stop) {
-                    Some(0x7e) => return seq == b"12",
-                    Some(b) if seq.len() < MAX_CSI_BYTES => seq.push(b),
-                    Some(_) => return false,
-                    None => return false,
+                match read_escape_byte(fd, replay, ESCAPE_FOLLOWUP_MS, stop) {
+                    None => {
+                        // Keep even an empty prefix: the query service can replay
+                        // just `ESC [` before the rest of a width report reaches
+                        // the tty, and the next byte must continue that sequence.
+                        *pending_csi = Some(seq);
+                        return false;
+                    }
+                    Some(b) => match csi_step(&mut seq, b) {
+                        CsiStep::Pending => {}
+                        CsiStep::Submit => return true,
+                        CsiStep::Ignore => return false,
+                    },
                 }
             }
         }
@@ -1530,6 +1605,10 @@ fn side_note_input_loop(
 ) -> SideNoteLoopExit {
     // Input mode: UTF-8 byte accumulation buffer + parsed characters + echoed column count
     let mut pending: Vec<u8> = Vec::new();
+    // Partial CSI sequence that straddled a follow-up timeout (for example a
+    // terminal width report replayed by the query service); later bytes continue
+    // it so its tail cannot be decoded as draft text.
+    let mut pending_csi: Option<Vec<u8>> = None;
     // A draft typed in an earlier listener of this session survives the driver's
     // guard swap (wait window -> turn) and the stdin handoff to a foreground
     // prompt; without the store it would vanish at the next model output.
@@ -1658,6 +1737,9 @@ fn side_note_input_loop(
         };
 
         if !in_input {
+            // A partial terminal reply has no draft to corrupt while listening;
+            // drop it so reopening the composer cannot consume a typed character.
+            pending_csi = None;
             // Listening state: only Ctrl+G enters input mode; Ctrl+C is handled by the
             // SIGINT path (exit as soon as it is read)
             if b == CTRL_G {
@@ -1686,6 +1768,40 @@ fn side_note_input_loop(
             continue;
         }
 
+        // A partial CSI sequence is still in flight: feed this byte into it instead
+        // of decoding it as text. Control bytes and non-ASCII input abandon the
+        // partial sequence so Esc, Ctrl+C, Ctrl+G, backspace and normal text keep
+        // working even if a terminal reply was truncated.
+        if let Some(mut seq) = pending_csi.take() {
+            if b >= 0x20 && b != 0x7f && b < 0x80 {
+                match csi_step(&mut seq, b) {
+                    CsiStep::Pending => {
+                        pending_csi = Some(seq);
+                        continue;
+                    }
+                    CsiStep::Submit => {
+                        match try_submit(
+                            sink,
+                            stop,
+                            &mut footer,
+                            &mut input,
+                            &mut pending,
+                            &mut in_input,
+                        ) {
+                            SubmitFlow::Continue => {}
+                            SubmitFlow::Background => {
+                                background_requested = true;
+                                break;
+                            }
+                            SubmitFlow::Stop => break,
+                        }
+                        continue;
+                    }
+                    CsiStep::Ignore => continue,
+                }
+            }
+        }
+
         // Input mode: control bytes handled directly, everything else decoded as
         // accumulated UTF-8
         match b {
@@ -1711,25 +1827,23 @@ fn side_note_input_loop(
                 // Esc / F2 / Alt+Enter: submit the draft. is_submit_escape consumes
                 // the full escape sequence of F2 and other function keys so their
                 // follow-up bytes cannot leak into the draft; other sequences such as
-                // arrow keys are swallowed without submitting.
-                if is_submit_escape(read_fd, stop) {
-                    let Some(active_footer) = footer.as_mut() else {
-                        break;
-                    };
-                    match submit_draft(
+                // arrow keys are swallowed without submitting. It reads replayed
+                // bytes first and keeps a split CSI sequence pending.
+                if is_submit_escape(read_fd, &mut replay, &mut pending_csi, stop) {
+                    match try_submit(
                         sink,
                         stop,
-                        active_footer,
+                        &mut footer,
                         &mut input,
                         &mut pending,
                         &mut in_input,
                     ) {
-                        Ok(true) => {
+                        SubmitFlow::Continue => {}
+                        SubmitFlow::Background => {
                             background_requested = true;
                             break;
                         }
-                        Ok(false) => {}
-                        Err(_) => break,
+                        SubmitFlow::Stop => break,
                     }
                 }
             }
@@ -1901,14 +2015,164 @@ mod tests {
 
     #[test]
     fn scan_text_area_report_accepts_reports_and_rejects_input() {
-        assert_eq!(scan_text_area_report(b"\x1b[8;24;120t"), ReportScan::Complete(120));
+        assert_eq!(
+            scan_text_area_report(b"\x1b[8;24;120t"),
+            ReportScan::Complete(120)
+        );
         assert_eq!(scan_text_area_report(b"\x1b[8;24;12"), ReportScan::Partial);
         assert_eq!(scan_text_area_report(b"\x1b[8;"), ReportScan::Partial);
         assert_eq!(scan_text_area_report(b""), ReportScan::Partial);
         assert_eq!(scan_text_area_report(b"\x1b[24;120R"), ReportScan::Invalid);
         assert_eq!(scan_text_area_report(b"abc"), ReportScan::Invalid);
         assert_eq!(scan_text_area_report(b"\x1b[8;;120t"), ReportScan::Invalid);
-        assert_eq!(scan_text_area_report(b"\x1b[8;24;120X"), ReportScan::Invalid);
+        assert_eq!(
+            scan_text_area_report(b"\x1b[8;24;120X"),
+            ReportScan::Invalid
+        );
+    }
+
+    /// Feed the bytes after the ESC that the caller already consumed and return a
+    /// reader positioned at the parser's follow-up stream. The writer is dropped so
+    /// `read_to_end` sees EOF.
+    fn escape_input(bytes: &[u8]) -> std::fs::File {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+
+        let mut fds = [0; 2];
+        // SAFETY: `pipe` initializes both fds on success; each fd is adopted once.
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "pipe: {}", io::Error::last_os_error());
+        let mut writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        writer.write_all(bytes).unwrap();
+        drop(writer);
+        reader
+    }
+
+    #[test]
+    fn escape_parser_swallows_terminal_width_reports() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+
+        // The caller consumed the first ESC. Two reports arrive back-to-back, as
+        // they do when the width-query service times out and the answers queue up.
+        let mut reader = escape_input(b"[8;24;163t\x1b[8;24;163tZ");
+        let stop = AtomicBool::new(false);
+
+        assert!(!is_submit_escape(
+            reader.as_raw_fd(),
+            &mut VecDeque::new(),
+            &mut None,
+            &stop
+        ));
+        let mut next = [0u8; 1];
+        reader.read_exact(&mut next).unwrap();
+        assert_eq!(
+            next[0], 0x1b,
+            "the parser must stop at the report's `t`, not leak `63t`"
+        );
+
+        // The second report is consumed the same way; only the sentinel remains.
+        assert!(!is_submit_escape(
+            reader.as_raw_fd(),
+            &mut VecDeque::new(),
+            &mut None,
+            &stop
+        ));
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"Z");
+    }
+
+    #[test]
+    fn escape_parser_still_recognizes_f2_and_swallows_other_final_bytes() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+
+        let f2 = escape_input(b"[12~");
+        assert!(is_submit_escape(
+            f2.as_raw_fd(),
+            &mut VecDeque::new(),
+            &mut None,
+            &AtomicBool::new(false)
+        ));
+
+        // `CSI A` (arrow up) is a complete sequence with a non-`~` final byte.
+        let mut arrow = escape_input(b"[AZ");
+        assert!(!is_submit_escape(
+            arrow.as_raw_fd(),
+            &mut VecDeque::new(),
+            &mut None,
+            &AtomicBool::new(false)
+        ));
+        let mut rest = Vec::new();
+        arrow.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"Z");
+    }
+
+    #[test]
+    fn escape_parser_reads_replayed_prefix_before_stdin() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+
+        // The width-query service timed out after buffering a report prefix and
+        // replayed it; the tail is still in the tty. Both parts must form one
+        // sequence, not "tail as follow-up + replayed prefix as text".
+        let mut reader = escape_input(b"163tZ");
+        let mut replay: VecDeque<u8> = VecDeque::from(b"[8;24;".to_vec());
+        let mut pending_csi = None;
+        assert!(!is_submit_escape(
+            reader.as_raw_fd(),
+            &mut replay,
+            &mut pending_csi,
+            &AtomicBool::new(false)
+        ));
+        assert!(replay.is_empty(), "the replayed prefix must be consumed");
+        assert!(pending_csi.is_none(), "the report is complete, not pending");
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"Z");
+    }
+
+    #[test]
+    fn escape_parser_keeps_a_split_report_pending() {
+        use std::os::fd::AsRawFd;
+
+        // The prefix is replayed but the tail has not arrived yet: remember the
+        // sequence and consume the tail on later bytes instead of as text.
+        let reader = escape_input(b"");
+        let mut replay: VecDeque<u8> = VecDeque::from(b"[8;24;".to_vec());
+        let mut pending_csi = None;
+        assert!(!is_submit_escape(
+            reader.as_raw_fd(),
+            &mut replay,
+            &mut pending_csi,
+            &AtomicBool::new(false)
+        ));
+        assert!(replay.is_empty());
+        let mut seq = pending_csi.expect("a split CSI sequence must stay pending");
+        for byte in b"163" {
+            assert!(matches!(csi_step(&mut seq, *byte), CsiStep::Pending));
+        }
+        assert!(matches!(csi_step(&mut seq, b't'), CsiStep::Ignore));
+    }
+
+    #[test]
+    fn escape_parser_keeps_an_empty_csi_prefix_pending() {
+        use std::os::fd::AsRawFd;
+
+        // The width-query service may replay only `ESC [`. Keep the prefix so a
+        // later `8;rows;cols t` is consumed as a sequence, not as draft text.
+        let reader = escape_input(b"");
+        let mut replay: VecDeque<u8> = VecDeque::from(b"[".to_vec());
+        let mut pending_csi = None;
+        assert!(!is_submit_escape(
+            reader.as_raw_fd(),
+            &mut replay,
+            &mut pending_csi,
+            &AtomicBool::new(false)
+        ));
+        assert_eq!(pending_csi.as_deref(), Some(&b""[..]));
     }
 
     #[test]
@@ -2117,10 +2381,7 @@ mod tests {
 
     #[test]
     fn composer_draw_targets_footer_row_before_any_color() {
-        let mut footer = FooterReservation {
-            cols: 80,
-            rows: 24,
-        };
+        let mut footer = FooterReservation { cols: 80, rows: 24 };
         let mut out = Vec::new();
         footer.draw_to(&mut out, &[]).unwrap();
         let seq = String::from_utf8(out).unwrap();
@@ -2153,7 +2414,14 @@ mod tests {
         let mut input: Vec<char> = vec![' ', ' '];
         let mut pending = Vec::new();
         let mut in_input = true;
-        let _ = submit_draft(&sink, &stop, &mut footer, &mut input, &mut pending, &mut in_input);
+        let _ = submit_draft(
+            &sink,
+            &stop,
+            &mut footer,
+            &mut input,
+            &mut pending,
+            &mut in_input,
+        );
         assert!(!in_input);
         assert!(!side_note_composer_active());
     }
@@ -2218,8 +2486,14 @@ mod tests {
         }
 
         let log = Log(Rc::new(RefCell::new(Vec::new())));
-        let mut out = Out { log: &log, bytes: Vec::new() };
-        let mut err = ErrOut { log: &log, bytes: Vec::new() };
+        let mut out = Out {
+            log: &log,
+            bytes: Vec::new(),
+        };
+        let mut err = ErrOut {
+            log: &log,
+            bytes: Vec::new(),
+        };
         write_stderr_line_to(&mut out, &mut err, "[Warning] retry", Some(24)).unwrap();
 
         assert_eq!(
@@ -2230,7 +2504,10 @@ mod tests {
         let events = log.0.borrow();
         let flush_at = events.iter().position(|e| *e == "stdout-flush").unwrap();
         let stderr_at = events.iter().position(|e| *e == "stderr-write").unwrap();
-        assert!(flush_at < stderr_at, "erase must be flushed first: {events:?}");
+        assert!(
+            flush_at < stderr_at,
+            "erase must be flushed first: {events:?}"
+        );
         assert!(events[..flush_at].iter().all(|e| *e == "stdout-write"));
     }
 
@@ -2300,7 +2577,11 @@ mod tests {
     fn empty_draft_clears_the_store() {
         let _serial = store_test_guard();
         let key = "local:/tmp/a-side-note-empty.sqlite";
-        store_draft(key, &"typed then submitted".chars().collect::<Vec<_>>(), true);
+        store_draft(
+            key,
+            &"typed then submitted".chars().collect::<Vec<_>>(),
+            true,
+        );
         store_draft(key, &[], false);
         assert!(restore_draft(key).is_none());
     }
@@ -2320,7 +2601,10 @@ mod tests {
             + bytes[line_at..]
                 .find("\x1b[24;1H\x1b[2K")
                 .expect("composer repainted after the line");
-        assert!(line_at < repaint_at, "repaint must follow the line: {bytes:?}");
+        assert!(
+            line_at < repaint_at,
+            "repaint must follow the line: {bytes:?}"
+        );
         assert!(bytes.contains("keep me"), "draft text repainted: {bytes:?}");
     }
 
@@ -2342,7 +2626,14 @@ mod tests {
         // The draft must be persisted before the footer redraw; in tests stdout is
         // not a tty, so the footer clear can legitimately fail with ENOTTY. Any
         // other error would mean the persist step itself failed.
-        match submit_draft(&sink, &stop, &mut footer, &mut input, &mut pending, &mut in_input) {
+        match submit_draft(
+            &sink,
+            &stop,
+            &mut footer,
+            &mut input,
+            &mut pending,
+            &mut in_input,
+        ) {
             Ok(_) => {}
             Err(err) => assert_eq!(
                 err.raw_os_error(),
@@ -2354,7 +2645,11 @@ mod tests {
         assert!(!side_note_composer_active());
 
         let notes = crate::ai::driver::side_note::drain_side_notes(&history_file, None);
-        assert_eq!(notes.len(), 1, "exactly one note must land in the foreground queue");
+        assert_eq!(
+            notes.len(),
+            1,
+            "exactly one note must land in the foreground queue"
+        );
         assert_eq!(notes[0].content, "deliver this note");
         assert_eq!(notes[0].from, "user");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2399,6 +2694,10 @@ mod tests {
         while live_listener_threads() != 0 && Instant::now() < drop_deadline {
             thread::sleep(Duration::from_millis(25));
         }
-        assert_eq!(live_listener_threads(), 0, "listener thread outlived its guard");
+        assert_eq!(
+            live_listener_threads(),
+            0,
+            "listener thread outlived its guard"
+        );
     }
 }

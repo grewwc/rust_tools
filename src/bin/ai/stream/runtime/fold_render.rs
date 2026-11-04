@@ -1,4 +1,5 @@
 use super::*;
+use crate::ai::stream::render::markdown::{TerminalWidthSnapshot, raw_terminal_cols};
 /// Physical-row budget the live fold body may occupy so the whole window (header + body) stays inside the visible
 /// viewport. Returning `usize::MAX` disables clamping (non-tty / unknown height), preserving the previous behavior
 /// exactly. On a real terminal this is `viewport_rows - FOLD_VIEWPORT_RESERVED_ROWS`, floored at 1 so an extremely
@@ -110,7 +111,10 @@ pub(super) fn split_serve_thinking_chunk<'a>(
 /// Serve-mode thinking sink: publish the classified frames for the chat
 /// client to fold remotely. Everything returns here, so nothing thinking
 /// related reaches child stdout.
-pub(super) fn write_thinking_content_serve(content: &str, markers: &StreamMarkers) -> io::Result<()> {
+pub(super) fn write_thinking_content_serve(
+    content: &str,
+    markers: &StreamMarkers,
+) -> io::Result<()> {
     use crate::ai::background::publish_serve_frame;
     for (kind, text) in
         split_serve_thinking_chunk(content, &markers.thinking_tag, &markers.end_thinking_tag)
@@ -145,10 +149,13 @@ pub(super) fn write_subagent_content_folded(
 }
 
 pub(super) fn append_fold_content(fold: &mut super::state::ThinkingFoldState, content: &str) {
-    for ch in content.chars() {
-        if ch == '\n' {
+    for part in content.split_inclusive('\n') {
+        if let Some(line) = part.strip_suffix('\n') {
+            fold.current_line.push_str(line);
             let completed_line = std::mem::take(&mut fold.current_line);
             if fold.skip_blank_lines && completed_line.trim().is_empty() {
+                // A discarded blank reuses the same logical line index.
+                fold.wrap_cache.get_mut().lines.clear();
                 continue;
             }
             fold.total_lines += 1;
@@ -157,7 +164,7 @@ pub(super) fn append_fold_content(fold: &mut super::state::ThinkingFoldState, co
                 fold.recent_lines.pop_front();
             }
         } else {
-            fold.current_line.push(ch);
+            fold.current_line.push_str(part);
         }
     }
 }
@@ -182,6 +189,31 @@ pub(super) fn thinking_fold_redraw(
 }
 
 pub(super) fn thinking_fold_redraw_to(
+    out: &mut impl Write,
+    rate: Option<&str>,
+    fold: &mut super::state::ThinkingFoldState,
+) -> io::Result<()> {
+    write_fold_frame_to(out, |frame| {
+        render_thinking_fold_frame_to(frame, rate, fold)
+    })
+}
+
+/// Compose relative cursor moves and text before touching the line-buffered
+/// terminal, so CRLFs cannot split one redraw into many terminal writes.
+fn write_fold_frame_to(
+    out: &mut impl Write,
+    render: impl FnOnce(&mut Vec<u8>) -> io::Result<()>,
+) -> io::Result<()> {
+    let _width = TerminalWidthSnapshot::capture();
+    THINKING_FOLD_FRAME_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        buf.clear();
+        render(&mut buf)?;
+        out.write_all(&buf)
+    })
+}
+
+fn render_thinking_fold_frame_to(
     out: &mut impl Write,
     rate: Option<&str>,
     fold: &mut super::state::ThinkingFoldState,
@@ -220,17 +252,10 @@ pub(super) fn thinking_fold_redraw_to(
     // the configured `max_visible_lines` (and the model-facing reasoning buffer) is untouched.
     let saved_max_visible_lines = fold.max_visible_lines;
     fold.max_visible_lines = fold.max_visible_lines.min(fold_body_viewport_row_budget());
-    let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
-    let clamped_max_visible_lines = fold.max_visible_lines;
     THINKING_FOLD_BODY_BUF.with(|buf| -> io::Result<()> {
         let mut buf = buf.borrow_mut();
-        let (body_rows, rendered_body_lines) = render_thinking_fold_window_lines(
-            &body_lines,
-            marker_lines,
-            fold.rewrite_right_margin_cols,
-            clamped_max_visible_lines,
-            &mut buf,
-        );
+        let (body_rows, rendered_body_lines) = render_thinking_fold_body(fold, &mut buf);
+        fold.max_visible_lines = saved_max_visible_lines;
         if !buf.is_empty() {
             out.write_all(buf.as_bytes())?;
         }
@@ -239,7 +264,6 @@ pub(super) fn thinking_fold_redraw_to(
         Ok(())
     })?;
     fold.max_visible_lines = saved_max_visible_lines;
-    out.flush()?;
     Ok(())
 }
 
@@ -364,6 +388,21 @@ pub(super) fn finalize_fold(
 
 /// Fold-finalize writer implementation; extracted behind a writer so regression tests can verify terminal cursor sequences precisely.
 pub(super) fn finalize_fold_to(
+    out: &mut impl Write,
+    fold: &mut super::state::ThinkingFoldState,
+    collapse_body: bool,
+) -> io::Result<()> {
+    if !fold.active {
+        return Ok(());
+    }
+    write_fold_frame_to(out, |frame| {
+        render_final_fold_frame_to(frame, fold, collapse_body)
+    })?;
+    fold.reset();
+    Ok(())
+}
+
+fn render_final_fold_frame_to(
     mut out: &mut impl Write,
     fold: &mut super::state::ThinkingFoldState,
     collapse_body: bool,
@@ -401,18 +440,10 @@ pub(super) fn finalize_fold_to(
     if collapse_body {
         fold.max_visible_lines = 0;
     }
-    let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
-    let max_visible_rows = fold.max_visible_lines;
     let mut final_body_rows = 0usize;
     THINKING_FOLD_BODY_BUF.with(|buf| -> io::Result<()> {
         let mut buf = buf.borrow_mut();
-        let (body_rows, rendered_body_lines) = render_thinking_fold_window_lines(
-            &body_lines,
-            marker_lines,
-            fold.rewrite_right_margin_cols,
-            max_visible_rows,
-            &mut buf,
-        );
+        let (body_rows, rendered_body_lines) = render_thinking_fold_body(fold, &mut buf);
         fold.max_visible_lines = saved_max_visible_lines;
         if !buf.is_empty() {
             out.write_all(buf.as_bytes())?;
@@ -444,10 +475,6 @@ pub(super) fn finalize_fold_to(
         // completion header already ends with CRLF, so no extra blank line.
         out.write_all(b"\r\n")?;
     }
-    out.flush()?;
-
-    // Reset fold state
-    fold.reset();
     Ok(())
 }
 
@@ -583,41 +610,15 @@ pub(super) fn finalize_live_folds_before_diagnostic(state: &mut StreamProcessing
     settled
 }
 
-pub(super) fn thinking_fold_window_lines(fold: &super::state::ThinkingFoldState) -> (Vec<String>, usize) {
-    let hidden_count = thinking_fold_hidden_count(fold);
-    let visible_lines = thinking_fold_visible_lines(fold);
-    // Nothing to show below the header: a `… N earlier lines` marker alone would
-    // repeat the header's own `· N lines` count and point at lines that are
-    // nowhere on screen, so the fold renders header-only in that state.
-    if visible_lines.is_empty() {
-        return (Vec::new(), 0);
-    }
-
-    let mut lines = Vec::with_capacity(visible_lines.len() + usize::from(hidden_count > 0));
-    let marker_lines = usize::from(hidden_count > 0);
-    if hidden_count > 0 {
-        lines.push(format!("… {hidden_count} earlier lines"));
-    }
-    for line in visible_lines {
-        lines.push(line.to_string());
-    }
-    (lines, marker_lines)
-}
-
 /// Render the **body** of the fold window (fold summary + recent visible lines), without the header.
 /// The header is anchored and printed separately by `write_fold_header`. Returns the number of physical body lines; the body does not
 /// end with a newline and the cursor always stays on the last line, so xterm.js does not interpret a trailing LF as extra scrolling.
-pub(super) fn render_thinking_fold_window(fold: &super::state::ThinkingFoldState) -> (String, usize) {
-    let (lines, marker_lines) = thinking_fold_window_lines(fold);
+pub(super) fn render_thinking_fold_window(
+    fold: &super::state::ThinkingFoldState,
+) -> (String, usize) {
     THINKING_FOLD_BODY_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
-        let (rows, _) = render_thinking_fold_window_lines(
-            &lines,
-            marker_lines,
-            fold.rewrite_right_margin_cols,
-            fold.max_visible_lines,
-            &mut buf,
-        );
+        let (rows, _) = render_thinking_fold_body(fold, &mut buf);
         (buf.clone(), rows)
     })
 }
@@ -628,6 +629,7 @@ pub(super) fn render_thinking_fold_window(fold: &super::state::ThinkingFoldState
 // terminal are identical to building a fresh String each time.
 thread_local! {
     static THINKING_FOLD_BODY_BUF: RefCell<String> = const { RefCell::new(String::new()) };
+    static THINKING_FOLD_FRAME_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Make control characters literal before wrapping a rewritable fold row. Raw tabs
@@ -652,41 +654,72 @@ pub(super) fn fold_display_line(line: &str) -> String {
 /// `out` (cleared first) and returns the number of physical body lines plus the plain-text rows
 /// kept for later width recomputation; the body does not end with a newline and the cursor always
 /// stays on the last line, so xterm.js does not interpret a trailing LF as extra scrolling.
-pub(super) fn render_thinking_fold_window_lines(
-    lines: &[String],
-    marker_lines: usize,
-    rewrite_right_margin_cols: usize,
-    max_visible_rows: usize,
+fn render_thinking_fold_body(
+    fold: &super::state::ThinkingFoldState,
     out: &mut String,
 ) -> (usize, Vec<String>) {
+    let _width = TerminalWidthSnapshot::capture();
     out.clear();
+    let lines = thinking_fold_visible_lines(fold);
+    // Header-only folds must not show a redundant count marker below the header.
     if lines.is_empty() {
         return (0, Vec::new());
     }
 
-    let reserve_cols = THINKING_FOLD_BODY_INDENT_WIDTH + rewrite_right_margin_cols;
-    let marker_lines = marker_lines.min(lines.len());
-    let mut wrapped_content_rows = Vec::new();
-    for line in lines.iter().skip(marker_lines) {
-        wrapped_content_rows.extend(wrap_line_to_terminal_rows_with_reserve(
-            &fold_display_line(line),
-            reserve_cols,
-        ));
+    let reserve_cols = THINKING_FOLD_BODY_INDENT_WIDTH + fold.rewrite_right_margin_cols;
+    let cols = raw_terminal_cols().saturating_sub(reserve_cols).max(1);
+    let max_visible_rows = fold.max_visible_lines;
+    let mut cache = fold.wrap_cache.borrow_mut();
+    if cache.cols != cols || cache.max_rows != max_visible_rows {
+        cache.lines.clear();
+        cache.cols = cols;
+        cache.max_rows = max_visible_rows;
     }
-    let hidden_wrapped_rows = wrapped_content_rows.len().saturating_sub(max_visible_rows);
+    let completed_lines = lines.len() - usize::from(!fold.current_line.is_empty());
+    let first_index = fold.total_lines.saturating_sub(completed_lines);
+    let end_index = first_index + lines.len();
+    cache
+        .lines
+        .retain(|line| (first_index..end_index).contains(&line.index));
+    let mut wrapped_content_rows = std::collections::VecDeque::new();
+    let mut total_wrapped_rows = 0usize;
+    for (offset, line) in lines.iter().enumerate() {
+        if cache.lines.len() <= offset {
+            cache
+                .lines
+                .push_back(super::state::ThinkingFoldWrappedLine {
+                    index: first_index + offset,
+                    ..Default::default()
+                });
+        }
+        let layout = &mut cache.lines[offset];
+        extend_fold_line_layout(layout, line, reserve_cols, max_visible_rows);
+        total_wrapped_rows += layout.completed_rows + 1;
+        for row in layout
+            .recent_rows
+            .iter()
+            .chain(std::iter::once(&layout.current_row))
+        {
+            wrapped_content_rows.push_back(row.clone());
+            while wrapped_content_rows.len() > max_visible_rows {
+                wrapped_content_rows.pop_front();
+            }
+        }
+    }
+    let hidden_wrapped_rows = total_wrapped_rows.saturating_sub(max_visible_rows);
+    let hidden_count = thinking_fold_hidden_count(fold);
     let marker = if hidden_wrapped_rows > 0 {
         // When truncated at a physical line, the first hidden content may come from a still-streaming logical line, so the
         // imprecise "earlier lines" count can no longer be reported.
         Some("… more".to_string())
-    } else if marker_lines > 0 {
-        Some(lines[0].clone())
+    } else if hidden_count > 0 {
+        Some(format!("… {hidden_count} earlier lines"))
     } else {
         None
     };
     let mut rows_to_render = Vec::with_capacity(
         wrapped_content_rows
             .len()
-            .saturating_sub(hidden_wrapped_rows)
             .saturating_add(usize::from(marker.is_some())),
     );
     if let Some(marker) = marker {
@@ -696,12 +729,7 @@ pub(super) fn render_thinking_fold_window_lines(
             true,
         ));
     }
-    rows_to_render.extend(
-        wrapped_content_rows
-            .into_iter()
-            .skip(hidden_wrapped_rows)
-            .map(|line| (line, false)),
-    );
+    rows_to_render.extend(wrapped_content_rows.into_iter().map(|line| (line, false)));
 
     let mut rendered_lines = Vec::with_capacity(rows_to_render.len());
     // Folded body has fixed indentation. The body keeps at most max_visible_rows wrapped physical lines; if more
@@ -733,4 +761,33 @@ pub(super) fn render_thinking_fold_window_lines(
     }
 
     (rows, rendered_lines)
+}
+
+/// Only the last physical row can change when an append-only logical line grows.
+/// Keep a bounded tail of completed rows and wrap that last row plus the new bytes.
+fn extend_fold_line_layout(
+    layout: &mut super::state::ThinkingFoldWrappedLine,
+    line: &str,
+    reserve_cols: usize,
+    max_rows: usize,
+) {
+    if line.len() < layout.source_bytes {
+        *layout = super::state::ThinkingFoldWrappedLine {
+            index: layout.index,
+            ..Default::default()
+        };
+    }
+    if line.len() == layout.source_bytes {
+        return;
+    }
+    let mut tail = std::mem::take(&mut layout.current_row);
+    tail.push_str(&fold_display_line(&line[layout.source_bytes..]));
+    let mut rows = wrap_line_to_terminal_rows_with_reserve(&tail, reserve_cols);
+    layout.current_row = rows.pop().unwrap_or_default();
+    layout.completed_rows += rows.len();
+    layout.recent_rows.extend(rows);
+    while layout.recent_rows.len() > max_rows {
+        layout.recent_rows.pop_front();
+    }
+    layout.source_bytes = line.len();
 }

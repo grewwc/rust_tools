@@ -5,6 +5,38 @@
 use crate::ai::stream::extract::strip_ansi_codes;
 use crate::ai::stream::render::inline::terminal_cell_width;
 use crate::ai::theme;
+use std::cell::Cell;
+
+thread_local! {
+    static FRAME_TERMINAL_COLS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Keep erase measurements and newly wrapped rows on one width for this frame.
+/// The outermost scope probes live geometry; the next frame probes it again.
+pub(in crate::ai) struct TerminalWidthSnapshot {
+    previous: Option<usize>,
+    _thread_bound: std::marker::PhantomData<*mut ()>,
+}
+
+impl TerminalWidthSnapshot {
+    pub(in crate::ai) fn capture() -> Self {
+        let previous = FRAME_TERMINAL_COLS.with(Cell::get);
+        if previous.is_none() {
+            let cols = raw_terminal_cols();
+            FRAME_TERMINAL_COLS.with(|cell| cell.set(Some(cols)));
+        }
+        Self {
+            previous,
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for TerminalWidthSnapshot {
+    fn drop(&mut self) {
+        FRAME_TERMINAL_COLS.with(|cell| cell.set(self.previous));
+    }
+}
 
 /// Wrapped width for **live regions**: the live terminal width. Live regions are the rows the renderer
 /// redraws in place with relative cursor moves (thinking/subagent fold body and markers, fold status
@@ -158,7 +190,9 @@ pub(super) fn preview_terminal_width() -> usize {
 }
 
 pub(in crate::ai) fn raw_terminal_cols() -> usize {
-    raw_terminal_cols_with(super::super::term_cols_override())
+    FRAME_TERMINAL_COLS
+        .with(Cell::get)
+        .unwrap_or_else(|| raw_terminal_cols_with(super::super::term_cols_override()))
 }
 
 /// Width chain with the explicit override factored out, so the override's

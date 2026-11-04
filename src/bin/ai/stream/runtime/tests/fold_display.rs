@@ -1,6 +1,83 @@
 use super::*;
 
 #[test]
+fn thinking_fold_incremental_layout_matches_fresh_projection() {
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    struct ClearWidth;
+    impl Drop for ClearWidth {
+        fn drop(&mut self) {
+            super::super::super::side_note_input::set_scripted_true_width(None);
+        }
+    }
+    let _clear_width = ClearWidth;
+    let chunks = [
+        "reasoning 中文 with a growing unterminated line ",
+        "\u{301}⚠",
+        "\u{fe0f}\t",
+        "\x1b",
+        "[2J\r\x08",
+        "\n",
+        "  ",
+        "\n\n",
+        "first\nsecond\nthird",
+        "",
+    ];
+    for skip_blank_lines in [true, false] {
+        let mut fold = super::super::super::state::ThinkingFoldState::new_with_labels(
+            "working",
+            "done",
+            skip_blank_lines,
+        );
+        fold.rewrite_right_margin_cols = FOLD_REWRITE_RIGHT_MARGIN_COLS;
+        let mut source = String::new();
+        for frame in 0..160 {
+            // Reuse layouts for several chunks, then force both width and
+            // window changes, including zero-line and one-column bodies.
+            let cols = [120, 32, 7, 80][(frame / 40) % 4];
+            super::super::super::side_note_input::set_scripted_true_width(Some(cols));
+            fold.max_visible_lines = [2, 8, 0, 1][(frame / 20) % 4];
+            let chunk = if frame < 40 {
+                chunks[0]
+            } else {
+                chunks[frame % chunks.len()]
+            };
+            append_fold_content(&mut fold, chunk);
+            source.push_str(chunk);
+
+            let mut fresh = super::super::super::state::ThinkingFoldState::new_with_labels(
+                "working",
+                "done",
+                skip_blank_lines,
+            );
+            fresh.max_visible_lines = fold.max_visible_lines;
+            fresh.rewrite_right_margin_cols = fold.rewrite_right_margin_cols;
+            append_fold_content(&mut fresh, &source);
+            assert_eq!(
+                render_thinking_fold_window(&fold),
+                render_thinking_fold_window(&fresh),
+                "frame={frame} cols={cols} skip_blank_lines={skip_blank_lines}",
+            );
+            let cache = fold.wrap_cache.borrow();
+            assert!(cache.lines.len() <= cache.max_rows);
+            assert!(
+                cache
+                    .lines
+                    .iter()
+                    .all(|line| line.recent_rows.len() <= cache.max_rows)
+            );
+        }
+        fold.reset();
+        fold.max_visible_lines = 2;
+        append_fold_content(&mut fold, "new thinking");
+        let (body, rows) = render_thinking_fold_window(&fold);
+        assert!(body.contains("new thinking"));
+        assert_eq!(rows, 1);
+    }
+}
+
+#[test]
 fn thinking_fold_display_controls_preserve_source_and_row_footprint() {
     let _guard = crate::ai::test_support::ENV_LOCK
         .lock()
