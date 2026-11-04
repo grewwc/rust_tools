@@ -2715,6 +2715,12 @@ fn render_turn_stream_to_with_confirm(
     // printed) as soon as the server flushes them, not after the whole turn.
     let mut reader = std::io::BufReader::new(resp);
     let mut event_kind = String::new();
+    // SSE allows one event to carry several `data:` lines; the server emits
+    // the multi-line subagent status block that way. Join them with `\n` and
+    // dispatch only when the blank line terminates the event, instead of
+    // treating every `data:` line as a complete event.
+    let mut event_data = String::new();
+    let mut event_has_data = false;
     let mut raw = String::new();
     // Folded-thinking state: the body text stays buffered in the status
     // buffer until the block closes, so it never mixes with the answer.
@@ -2726,10 +2732,10 @@ fn render_turn_stream_to_with_confirm(
     let mut thinking_body = String::new();
     let mut answer_pending = false;
     let mut answer_pending_drawn = false;
-    // Whether the subagent progress row is the one currently painted on the
-    // terminal's active row. Like the thinking/answer-pending lines it is a
-    // transient live row, never scrollback: each frame redraws it in place.
-    let mut subagent_status_drawn = false;
+    // How many terminal rows the subagent progress block currently occupies.
+    // Like the thinking/answer-pending lines it is transient live output,
+    // never scrollback: each frame redraws the block in place.
+    let mut subagent_status_rows = 0usize;
     // Whether the cursor sits mid-line (answer delta without a trailing
     // newline, or a live thinking status). Footer/message lines must start
     // on a fresh row instead of gluing onto the answer's last line.
@@ -2753,30 +2759,51 @@ fn render_turn_stream_to_with_confirm(
     // is also printed on stream retries, so only a header after a committed
     // turn starts a new one.
     let mut turn_committed = false;
-    let stream_result = loop {
-        raw.clear();
-        match reader.read_line(&mut raw) {
-            Ok(0) => break Ok(()),
-            Ok(_) => {}
-            Err(err) => break Err(Box::<dyn std::error::Error>::from(err)),
-        }
-        let line = raw.strip_suffix('\n').unwrap_or(raw.as_str());
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if line.is_empty() {
-            event_kind.clear();
-            continue;
-        }
-        if line.starts_with(':') {
-            continue; // SSE comment / keep-alive ping.
-        }
-        if let Some(kind) = line.strip_prefix("event:") {
-            event_kind = kind.trim().to_string();
-            continue;
-        }
-        let Some(data) = line.strip_prefix("data:") else {
-            continue;
+    let stream_result = 'events: loop {
+        // Collect one complete event before dispatching it. The server always
+        // terminates an event with a blank line; a final event at EOF is still
+        // dispatched so a truncated trailing frame is not silently dropped.
+        let payload = loop {
+            raw.clear();
+            match reader.read_line(&mut raw) {
+                Ok(0) => {
+                    if event_has_data {
+                        event_has_data = false;
+                        break std::mem::take(&mut event_data);
+                    }
+                    break 'events Ok(());
+                }
+                Ok(_) => {}
+                Err(err) => break 'events Err(Box::<dyn std::error::Error>::from(err)),
+            }
+            let line = raw.strip_suffix('\n').unwrap_or(raw.as_str());
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.is_empty() {
+                if event_has_data {
+                    event_has_data = false;
+                    break std::mem::take(&mut event_data);
+                }
+                event_kind.clear();
+                continue;
+            }
+            if line.starts_with(':') {
+                continue; // SSE comment / keep-alive ping.
+            }
+            if let Some(kind) = line.strip_prefix("event:") {
+                event_kind = kind.trim().to_string();
+                continue;
+            }
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.strip_prefix(' ').unwrap_or(data);
+            if event_has_data {
+                event_data.push('\n');
+            }
+            event_data.push_str(data);
+            event_has_data = true;
         };
-        let payload = data.strip_prefix(' ').unwrap_or(data);
+        let payload = payload.as_str();
         if matches!(
             event_kind.as_str(),
             "error"
@@ -2806,7 +2833,7 @@ fn render_turn_stream_to_with_confirm(
             event_kind.as_str(),
             "subagent_progress" | "tool" | "confirm_done"
         ) {
-            hide_subagent_status(&mut subagent_status_drawn, &mut line_open, tty, out);
+            hide_subagent_status(&mut subagent_status_rows, &mut line_open, tty, out);
         }
         match event_kind.as_str() {
             "error" => {
@@ -3121,7 +3148,7 @@ fn render_turn_stream_to_with_confirm(
                 // status line.
                 show_subagent_status(
                     payload,
-                    &mut subagent_status_drawn,
+                    &mut subagent_status_rows,
                     answer_pending_drawn,
                     thinking_active,
                     &mut line_open,
@@ -3258,11 +3285,12 @@ fn render_turn_stream_to_with_confirm(
                 );
             }
         }
+        event_kind.clear();
     };
     // Done, EOF and read/server errors all share cleanup, including open tools.
     observer_rows.close_tool_row(&mut line_open, out);
     observer_rows.hide_context_budget_row(&mut line_open, tty, out);
-    hide_subagent_status(&mut subagent_status_drawn, &mut line_open, tty, out);
+    hide_subagent_status(&mut subagent_status_rows, &mut line_open, tty, out);
     hide_answer_pending_status(&mut answer_pending_drawn, &mut line_open, tty, out);
     if tty {
         let _ = markdown.flush_pending_to(out);
@@ -3305,7 +3333,15 @@ impl ObserverRowState {
         out: &mut dyn std::io::Write,
     ) {
         // Budget notes use the same transient-row lifecycle as live progress.
-        hide_subagent_status(&mut self.context_budget_drawn, line_open, tty, out);
+        if !self.context_budget_drawn {
+            return;
+        }
+        if tty {
+            erase_status_rows(1, out);
+            let _ = out.flush();
+        }
+        self.context_budget_drawn = false;
+        *line_open = false;
     }
 
     fn finish_context_budget_row(&mut self, line_open: &mut bool, out: &mut dyn std::io::Write) {
@@ -3582,55 +3618,86 @@ fn hide_answer_pending_status(
     *line_open = false;
 }
 
-/// Paint the parent-observed subagent status as one transient terminal row.
+/// Paint the parent-observed subagent status block as transient terminal rows.
 ///
-/// The payload is the whole scheduler status line: several subagent details,
-/// plans, elapsed counters, and a `+N more` tail. It easily exceeds the
-/// terminal width, and the elapsed counters change on every scheduler tick.
-/// Writing it as an observer footer therefore stacks one wrapped copy per tick
-/// in the scrollback. Clamp it to a single physical row and redraw it in place
-/// instead, matching the local TTY status line. Piped output stays clean: the
-/// progress row is terminal-only and is never part of the captured transcript.
+/// The payload is the whole scheduler status line: a header, the latest
+/// activity, and the phase/updates/task row. The server sends all three lines
+/// in one SSE event; treating each `data:` line as a separate event used to
+/// leave only the last one visible. Clamp every line to one physical row and
+/// redraw the block in place, matching the local TTY status line. Piped output
+/// stays clean: the progress block is terminal-only and is never part of the
+/// captured transcript.
 ///
-/// The row must not overwrite real output or another live status:
+/// The block must not overwrite real output or another live status:
 /// - `thinking_active` / `answer_pending_drawn` own the active row;
-/// - `line_open` without our own row means a body delta is mid-line.
+/// - `line_open` without our own rows means a body delta is mid-line.
 fn show_subagent_status(
     text: &str,
-    drawn: &mut bool,
+    drawn_rows: &mut usize,
     answer_pending_drawn: bool,
     thinking_active: bool,
     line_open: &mut bool,
     tty: bool,
     out: &mut dyn std::io::Write,
 ) {
-    if !tty || thinking_active || answer_pending_drawn || (*line_open && !*drawn) {
+    if !tty || thinking_active || answer_pending_drawn || (*line_open && *drawn_rows == 0) {
         return;
     }
-    let row = crate::ai::stream::clamp_line_to_terminal_row_with_reserve(&format!("◌ {text}"), 0);
-    let _ = write!(out, "\r\x1b[K{}", dim(&row, true));
+    let rows: Vec<String> = text
+        .lines()
+        .take(3)
+        .enumerate()
+        .map(|(index, line)| {
+            let line = if index == 0 {
+                format!("◌ {line}")
+            } else {
+                line.to_string()
+            };
+            crate::ai::stream::clamp_line_to_terminal_row_with_reserve(&line, 0)
+        })
+        .collect();
+    if rows.is_empty() {
+        hide_subagent_status(drawn_rows, line_open, tty, out);
+        return;
+    }
+    erase_status_rows(*drawn_rows, out);
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 {
+            let _ = write!(out, "\r\n");
+        }
+        let _ = write!(out, "{}", dim(row, true));
+    }
     let _ = out.flush();
-    *drawn = true;
+    *drawn_rows = rows.len();
     *line_open = true;
 }
 
-/// Clear the in-place subagent status row before other output claims the
-/// active line. No-op when the row was never painted.
+/// Clear the in-place subagent status block before other output claims the
+/// active line. No-op when the block was never painted.
 fn hide_subagent_status(
-    drawn: &mut bool,
+    drawn_rows: &mut usize,
     line_open: &mut bool,
     tty: bool,
     out: &mut dyn std::io::Write,
 ) {
-    if !*drawn {
+    if *drawn_rows == 0 {
         return;
     }
     if tty {
-        let _ = write!(out, "\r\x1b[K");
+        erase_status_rows(*drawn_rows, out);
         let _ = out.flush();
     }
-    *drawn = false;
+    *drawn_rows = 0;
     *line_open = false;
+}
+
+/// Erase the transient rows ending at the cursor, leaving the cursor at the
+/// first erased row. Callers keep the cursor at the end of the last row.
+fn erase_status_rows(rows: usize, out: &mut dyn std::io::Write) {
+    let _ = write!(out, "\r\x1b[K");
+    for _ in 1..rows {
+        let _ = write!(out, "\x1b[1A\r\x1b[K");
+    }
 }
 
 /// Close the live thinking status line (if open) and print only the folded
@@ -5229,6 +5296,46 @@ mod tests {
             "status must never become a scrollback row: {tty:?}"
         );
         assert!(tty.contains("answer"), "missing body: {tty:?}");
+    }
+
+    #[test]
+    fn sse_multiline_subagent_progress_keeps_the_whole_block() {
+        // axum splits embedded newlines into one `data:` line per status row.
+        // The client must join them back into one event and paint all three
+        // rows in place; dispatching each line separately left only the last.
+        let body = "event: subagent_progress\ndata: subagents · 1 active · [backend=traecli] worker 5s running\ndata: ↳ latest: editing file · 2s ago\ndata: ↳ phase: processing output · updates 115 · task: audit\n\nevent: subagent_progress\ndata: subagents · 1 active · [backend=traecli] worker 6s running\ndata: ↳ latest: editing file · 3s ago\ndata: ↳ phase: processing output · updates 116 · task: audit\n\nevent: done\ndata: \n\n";
+
+        let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+        let mut piped = Vec::new();
+        render_turn_stream_to(resp, &mut piped, false).expect("render piped");
+        assert_eq!(
+            String::from_utf8(piped).expect("utf8"),
+            "",
+            "live progress must not enter piped scrollback"
+        );
+
+        let resp = reqwest::blocking::get(serve_body_once(body)).expect("get canned SSE");
+        let mut tty = Vec::new();
+        render_turn_stream_to(resp, &mut tty, true).expect("render tty");
+        let tty = String::from_utf8(tty).expect("utf8");
+        assert_eq!(
+            tty.matches("\x1b[2m◌ subagents · 1 active · [backend=traecli]")
+                .count(),
+            2,
+            "each complete event paints one header row: {tty:?}"
+        );
+        assert!(
+            tty.contains(
+                "\r\n\x1b[2m↳ latest: editing file · 2s ago\x1b[0m\r\n\x1b[2m↳ phase: processing output · updates 115 · task: audit\x1b[0m"
+            ),
+            "all status rows must be painted: {tty:?}"
+        );
+        assert!(
+            tty.contains(
+                "\x1b[1A\r\x1b[K\x1b[1A\r\x1b[K\x1b[2m◌ subagents · 1 active · [backend=traecli] worker 6s running"
+            ),
+            "the previous three-row block must be erased before the next frame: {tty:?}"
+        );
     }
 
     #[test]
