@@ -22,32 +22,61 @@ struct ModelCache {
     binary: String,
     refreshed_at: Option<Instant>,
     names: Vec<String>,
+    last_attempt_failed: bool,
 }
 
 impl ModelCache {
-    fn get_or_refresh(
-        &mut self,
-        binary: &str,
-        now: Instant,
-        discover: impl FnOnce() -> Vec<String>,
-    ) -> Vec<String> {
-        // Empty results are failures (spawn error, timeout, unparsable output):
-        // re-probe after a short TTL instead of the full success TTL.
-        let expired = match self.refreshed_at {
+    fn needs_refresh(&self, binary: &str, now: Instant) -> bool {
+        if self.binary != binary {
+            return true;
+        }
+        match self.refreshed_at {
             None => true,
             Some(at) => {
-                let ttl = if self.names.is_empty() {
+                let ttl = if self.names.is_empty() || self.last_attempt_failed {
                     FAILURE_CACHE_TTL
                 } else {
                     CACHE_TTL
                 };
                 now.duration_since(at) >= ttl
             }
-        };
-        if self.binary != binary || expired {
-            self.names = discover();
-            self.binary = binary.to_string();
-            self.refreshed_at = Some(now);
+        }
+    }
+
+    fn apply_refresh(
+        &mut self,
+        binary: &str,
+        now: Instant,
+        discovered: Vec<String>,
+    ) -> Vec<String> {
+        let binary_changed = self.binary != binary;
+        let failed = discovered.is_empty();
+        if failed {
+            // A failed refresh must not turn a working completion list into an
+            // empty one. Keep the last known-good names unless the binary
+            // itself changed, in which case the old names no longer apply.
+            if binary_changed {
+                self.names.clear();
+            }
+        } else {
+            self.names = discovered;
+        }
+        self.binary = binary.to_string();
+        self.refreshed_at = Some(now);
+        self.last_attempt_failed = failed;
+        self.names.clone()
+    }
+
+    #[cfg(test)]
+    fn get_or_refresh(
+        &mut self,
+        binary: &str,
+        now: Instant,
+        discover: impl FnOnce() -> Vec<String>,
+    ) -> Vec<String> {
+        if self.needs_refresh(binary, now) {
+            let discovered = discover();
+            self.apply_refresh(binary, now, discovered);
         }
         self.names.clone()
     }
@@ -62,12 +91,31 @@ pub(crate) fn traecli_model_names() -> Vec<String> {
         return names;
     }
 
-    // A concurrent lookup must never wait for another completion's subprocess.
-    let Ok(mut cache) = MODEL_CACHE.try_lock() else {
-        return Vec::new();
-    };
     let binary = super::traecli::traecli_binary();
-    cache.get_or_refresh(&binary, Instant::now(), || discover_model_names(&binary))
+    let now = Instant::now();
+    let (cached, needs_refresh) = {
+        let cache = lock_model_cache();
+        (cache.names.clone(), cache.needs_refresh(&binary, now))
+    };
+    if !needs_refresh {
+        return cached;
+    }
+
+    // Discover outside the cache lock: a slow or stuck `traecli models` must
+    // not make every later completion return an empty list.
+    let discovered = discover_model_names(&binary);
+    let mut cache = lock_model_cache();
+    cache.apply_refresh(&binary, Instant::now(), discovered)
+}
+
+fn lock_model_cache() -> std::sync::MutexGuard<'static, ModelCache> {
+    match MODEL_CACHE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            MODEL_CACHE.clear_poison();
+            poisoned.into_inner()
+        }
+    }
 }
 
 /// The installed `traecli models` prints one case-sensitive identifier per
@@ -139,7 +187,13 @@ fn discover_model_names(binary: &str) -> Vec<String> {
     })();
     if result.is_none() {
         let _ = child.kill();
-        let _ = child.wait();
+        // Reap in the background: a child that ignores the timeout must not
+        // block the editor or hold up the next completion attempt.
+        let _ = std::thread::Builder::new()
+            .name("traecli-models-reaper".to_string())
+            .spawn(move || {
+                let _ = child.wait();
+            });
     }
     result.unwrap_or_default()
 }
@@ -240,6 +294,28 @@ mod tests {
             ["M-recovered"]
         );
         assert!(discover_model_names("/definitely/not/a/traecli-binary").is_empty());
+    }
+
+    #[test]
+    fn traecli_model_list_preserves_last_good_after_failed_refresh() {
+        let now = Instant::now();
+        let mut cache = ModelCache::default();
+        assert_eq!(
+            cache.get_or_refresh("traecli", now, || vec!["M1".to_string()]),
+            ["M1"]
+        );
+        // A failed refresh must keep the previous list instead of blanking it.
+        assert_eq!(
+            cache.get_or_refresh("traecli", now + CACHE_TTL, Vec::new),
+            ["M1"]
+        );
+        // The failed attempt uses the short retry TTL, not the success TTL.
+        assert_eq!(
+            cache.get_or_refresh("traecli", now + CACHE_TTL + FAILURE_CACHE_TTL, || vec![
+                "M2".to_string()
+            ]),
+            ["M2"]
+        );
     }
 
     #[cfg(unix)]

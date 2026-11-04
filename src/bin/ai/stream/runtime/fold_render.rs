@@ -637,7 +637,10 @@ thread_local! {
 /// of cell widths; either invalidates the erase footprint and leaks previous frames.
 /// Use fixed four-space tab indentation and visible escapes for other controls.
 /// This is display-only: the fold buffers and canonical model content stay unchanged.
-pub(super) fn fold_display_line(line: &str) -> String {
+pub(super) fn fold_display_line(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(line);
+    }
     let mut display = String::with_capacity(line.len());
     for ch in line.chars() {
         match ch {
@@ -646,7 +649,7 @@ pub(super) fn fold_display_line(line: &str) -> String {
             ch => display.push(ch),
         }
     }
-    display
+    std::borrow::Cow::Owned(display)
 }
 
 /// Render the **body** of the fold window (fold summary + recent visible lines), without the header.
@@ -681,7 +684,6 @@ fn render_thinking_fold_body(
     cache
         .lines
         .retain(|line| (first_index..end_index).contains(&line.index));
-    let mut wrapped_content_rows = std::collections::VecDeque::new();
     let mut total_wrapped_rows = 0usize;
     for (offset, line) in lines.iter().enumerate() {
         if cache.lines.len() <= offset {
@@ -695,16 +697,6 @@ fn render_thinking_fold_body(
         let layout = &mut cache.lines[offset];
         extend_fold_line_layout(layout, line, reserve_cols, max_visible_rows);
         total_wrapped_rows += layout.completed_rows + 1;
-        for row in layout
-            .recent_rows
-            .iter()
-            .chain(std::iter::once(&layout.current_row))
-        {
-            wrapped_content_rows.push_back(row.clone());
-            while wrapped_content_rows.len() > max_visible_rows {
-                wrapped_content_rows.pop_front();
-            }
-        }
     }
     let hidden_wrapped_rows = total_wrapped_rows.saturating_sub(max_visible_rows);
     let hidden_count = thinking_fold_hidden_count(fold);
@@ -717,46 +709,42 @@ fn render_thinking_fold_body(
     } else {
         None
     };
-    let mut rows_to_render = Vec::with_capacity(
-        wrapped_content_rows
-            .len()
-            .saturating_add(usize::from(marker.is_some())),
-    );
-    if let Some(marker) = marker {
-        // The fold hint must always occupy exactly one physical line; only the body is allowed to wrap.
-        rows_to_render.push((
-            clamp_line_to_terminal_row_with_reserve(&marker, reserve_cols),
-            true,
-        ));
-    }
-    rows_to_render.extend(wrapped_content_rows.into_iter().map(|line| (line, false)));
-
-    let mut rendered_lines = Vec::with_capacity(rows_to_render.len());
+    // Borrow only the visible tail after updating every layout. Hidden cached
+    // rows need neither a clone nor an intermediate row collection.
+    let retained_rows: usize = cache
+        .lines
+        .iter()
+        .map(|line| line.recent_rows.len() + 1)
+        .sum();
+    let content_rows = cache.lines.iter().flat_map(|line| {
+        line.recent_rows
+            .iter()
+            .chain(std::iter::once(&line.current_row))
+    });
+    let content_rows = content_rows
+        .skip(retained_rows.saturating_sub(max_visible_rows))
+        .map(String::as_str);
+    // The fold hint must always occupy exactly one physical line.
+    let marker = marker.map(|line| clamp_line_to_terminal_row_with_reserve(&line, reserve_cols));
+    let mut rendered_lines =
+        Vec::with_capacity(retained_rows.min(max_visible_rows) + usize::from(marker.is_some()));
     // Folded body has fixed indentation. The body keeps at most max_visible_rows wrapped physical lines; if more
     // content must be hidden, the single-line fold hint does not count against the body budget. Each wrapped segment
     // occupies exactly one physical line; extra right margin for the xterm.js integrated terminal.
     let mut rows = 0usize;
     let mut first_rendered_row = true;
+    let accent_muted = theme::current().accent_muted;
 
-    for (wrapped_row, is_marker) in rows_to_render {
+    for wrapped_row in marker.as_deref().into_iter().chain(content_rows) {
         if !first_rendered_row {
             out.push_str("\r\n");
         }
         first_rendered_row = false;
         let rendered_line = format!("{THINKING_FOLD_BODY_INDENT}{wrapped_row}");
         rows += 1;
-        if is_marker {
-            out.push_str(theme::current().accent_muted);
-            out.push_str(&rendered_line);
-            out.push_str("\x1b[0m");
-        } else {
-            // Thinking body uses the theme's muted color (same family as the marker) instead of
-            // SGR-dim on the terminal default foreground: dim support varies by terminal, and the
-            // result was nearly indistinguishable from the answer body text on some setups.
-            out.push_str(&theme::current().accent_muted);
-            out.push_str(&rendered_line);
-            out.push_str(RESET);
-        }
+        out.push_str(accent_muted);
+        out.push_str(&rendered_line);
+        out.push_str(RESET);
         rendered_lines.push(rendered_line);
     }
 

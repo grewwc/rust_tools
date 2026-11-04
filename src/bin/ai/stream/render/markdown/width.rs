@@ -159,7 +159,11 @@ pub(in crate::ai) fn live_preview_cursor_rows(line: &str) -> usize {
 /// Match DECAWM wrapping: wide characters wrap early when col + w > cols.
 pub(in crate::ai) fn live_preview_cursor_rows_at(line: &str, cols: usize) -> usize {
     let cols = cols.max(1);
-    let visible = strip_ansi_codes(line);
+    let visible = if line.contains('\x1b') {
+        std::borrow::Cow::Owned(strip_ansi_codes(line))
+    } else {
+        std::borrow::Cow::Borrowed(line)
+    };
     let mut lines = 1usize;
     let mut col = 0usize;
     for ch in visible.chars() {
