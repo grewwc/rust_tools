@@ -225,6 +225,42 @@ pub(super) fn wrap_subagent_prompt(
     )
 }
 
+const SUBAGENT_HANDOFF_PREFIX: &str = "<subagent_handoff>";
+const SUBAGENT_HANDOFF_SUFFIX: &str = "</subagent_handoff>";
+
+pub(crate) fn parse_subagent_handoff(output: &str) -> Result<Option<SubagentHandoff>, String> {
+    let trimmed = output.trim();
+    if !trimmed.starts_with(SUBAGENT_HANDOFF_PREFIX) {
+        return Ok(None);
+    }
+    if !trimmed.ends_with(SUBAGENT_HANDOFF_SUFFIX) {
+        return Err("subagent handoff is missing its closing tag".to_string());
+    }
+    let body =
+        &trimmed[SUBAGENT_HANDOFF_PREFIX.len()..trimmed.len() - SUBAGENT_HANDOFF_SUFFIX.len()];
+    let mut handoff: SubagentHandoff = serde_json::from_str(body)
+        .map_err(|error| format!("subagent handoff is not valid JSON: {error}"))?;
+    handoff.reason = handoff.reason.trim().to_string();
+    if handoff.reason.is_empty() {
+        return Err("subagent handoff reason must not be empty".to_string());
+    }
+    if handoff.reason.chars().count() > 2_000 {
+        return Err("subagent handoff reason exceeds 2000 characters".to_string());
+    }
+    handoff.suggested_action = handoff
+        .suggested_action
+        .map(|action| action.trim().to_string())
+        .filter(|action| !action.is_empty());
+    if handoff
+        .suggested_action
+        .as_ref()
+        .is_some_and(|action| action.chars().count() > 2_000)
+    {
+        return Err("subagent handoff suggested_action exceeds 2000 characters".to_string());
+    }
+    Ok(Some(handoff))
+}
+
 /// External backends cannot see the parent's message content. Carry the
 /// original image paths in the task prompt so the child can attach them on the
 /// first request (TraeCLI `-i`) and re-open them on any later turn.

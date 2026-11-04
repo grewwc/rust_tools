@@ -733,7 +733,7 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
         .ok()
         .map(|guard| guard.clone())
         .unwrap_or_default();
-    let captured_output = captured_result.parent_payload;
+    let mut captured_output = captured_result.parent_payload;
     let response_for_validation = captured_result.final_assistant_text;
     let backend_session = traecli_session_slot
         .lock()
@@ -750,6 +750,20 @@ pub(super) fn execute_sync_task_with_pre_timeout_wrap_up(
         (Ok(Err(err)), _) => ("FAILED", Some(err)),
         (Err(err), _) => (subagent_wait_error_status(&err), Some(err)),
     };
+    if status == "COMPLETED" {
+        match task_tools::parse_subagent_handoff(&response_for_validation) {
+            Ok(Some(handoff)) => {
+                status = "BLOCKED";
+                error = Some(format!("{}: {}", handoff.kind.as_str(), handoff.reason));
+                captured_output = handoff.suggested_action.unwrap_or_default();
+            }
+            Ok(None) => {}
+            Err(parse_error) => {
+                status = "FAILED";
+                error = Some(parse_error);
+            }
+        }
+    }
     if status == "COMPLETED"
         && let Err(validation_error) = task_tools::validate_subagent_response(
             response_schema.as_ref(),
@@ -1163,6 +1177,9 @@ fn format_subagent_output(
         && !session.trim().is_empty()
     {
         parts.push(task_tools::backend_session_footer(session));
+    }
+    if status == "BLOCKED" {
+        parts.push(task_tools::SUBAGENT_BLOCKED_PARENT_GUIDANCE.to_string());
     }
     parts.push(task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER.to_string());
     parts.join("\n")

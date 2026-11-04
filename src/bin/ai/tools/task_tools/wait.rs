@@ -835,6 +835,7 @@ pub(super) fn format_task_result(
     reasoning_effort: Option<&str>,
 ) -> String {
     let duration_secs = entry.started_at.elapsed().as_secs_f64();
+    let task_blocked = result.status == TaskTerminalStatus::Blocked.as_str();
     let mut parts = vec![format!(
         "[Task: {} via {} @ {}] {} after {:.1}s",
         entry.description,
@@ -880,6 +881,9 @@ pub(super) fn format_task_result(
         && !session.trim().is_empty()
     {
         parts.push(backend_session_footer(&session));
+    }
+    if task_blocked {
+        parts.push(SUBAGENT_BLOCKED_PARENT_GUIDANCE.to_string());
     }
     parts.push(SUBAGENT_PARENT_SUMMARY_REMINDER.to_string());
     parts.join("\n")

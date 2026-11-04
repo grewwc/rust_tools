@@ -5,6 +5,7 @@ author: "rust_tools"
 version: "1.0.7"
 priority: 20
 delegation: required
+model_invocable: false
 tool_groups:
   - "core"
   - "task"

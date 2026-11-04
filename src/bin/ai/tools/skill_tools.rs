@@ -89,6 +89,7 @@ pub(crate) fn execute_activate_skill(args: &Value) -> Result<String, String> {
     let Some(skill) = matched else {
         let available = skills
             .iter()
+            .filter(|skill| skill.model_invocable)
             .map(|s| s.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
@@ -96,6 +97,13 @@ pub(crate) fn execute_activate_skill(args: &Value) -> Result<String, String> {
             "No skill named '{name}'. Available skills: {available}"
         ));
     };
+
+    if !skill.model_invocable {
+        return Err(format!(
+            "Skill '{}' can only be activated by an explicit user command.",
+            skill.name
+        ));
+    }
 
     set_pending_skill_action(PendingSkillAction::Add(skill.name.clone()));
     Ok(format!(
@@ -254,7 +262,16 @@ fn render_skill_catalog(skills: &[SkillManifest], query: &str, limit: usize) -> 
 pub(crate) fn execute_list_skills(args: &Value) -> Result<String, String> {
     let query = args["query"].as_str().unwrap_or("");
     let skills = crate::ai::skills::load_all_skills();
-    Ok(render_skill_catalog(&skills, query, skill_list_limit(args)))
+    let model_invocable = skills
+        .iter()
+        .filter(|skill| skill.model_invocable)
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(render_skill_catalog(
+        &model_invocable,
+        query,
+        skill_list_limit(args),
+    ))
 }
 
 inventory::submit!(ToolRegistration {
@@ -2370,7 +2387,7 @@ mod tests {
     use super::PendingSkillAction;
     use super::{
         build_skill_file_content, clear_pending_user_input_request, delete_skill_entries,
-        execute_activate_skill, execute_deactivate_skill, execute_load_skill,
+        execute_activate_skill, execute_deactivate_skill, execute_list_skills, execute_load_skill,
         execute_request_user_input, execute_save_skill, execute_validate_skill,
         parse_resources_arg, plan_resource_files, render_loaded_skill, render_skill_catalog,
         skill_resource_read_limit, take_pending_skill_action, take_pending_user_input_request,
@@ -3049,6 +3066,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn manual_only_agent_team_is_not_model_activatable_or_listed() {
+        let _g = ACTIVATION_TEST_GUARD.lock().unwrap();
+        let error = execute_activate_skill(&serde_json::json!({"name": "agent-team"}))
+            .expect_err("agent-team must require an explicit user command");
+        assert!(error.contains("explicit user command"), "{error}");
+
+        let catalog = execute_list_skills(&serde_json::json!({})).expect("list skills");
+        assert!(!catalog.contains("- `agent-team` —"), "{catalog}");
+    }
+
     fn test_skill(name: &str, description: &str) -> SkillManifest {
         SkillManifest {
             name: name.to_string(),
@@ -3058,6 +3086,7 @@ mod tests {
             tools: Vec::new(),
             tool_groups: Vec::new(),
             delegation: None,
+            model_invocable: true,
             mcp_servers: Vec::new(),
             disable_builtin_tools: false,
             disable_mcp_tools: false,

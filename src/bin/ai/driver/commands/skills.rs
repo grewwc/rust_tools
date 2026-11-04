@@ -339,6 +339,7 @@ mod tests {
             tools: Vec::new(),
             tool_groups: Vec::new(),
             delegation: None,
+            model_invocable: true,
             mcp_servers: Vec::new(),
             disable_builtin_tools: false,
             disable_mcp_tools: false,

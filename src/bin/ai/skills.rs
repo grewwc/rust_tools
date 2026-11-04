@@ -80,6 +80,10 @@ fn default_skill_version() -> String {
     "1.0.0".to_string()
 }
 
+const fn default_model_invocable() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SkillDiscoveryLevel {
     Builtin = 0,
@@ -103,6 +107,10 @@ pub(super) struct SkillManifest {
     pub(super) tool_groups: Vec<String>,
     #[serde(default)]
     pub(super) delegation: Option<String>,
+    /// Whether model-facing skill tools may discover and activate this skill.
+    /// Explicit user command paths resolve manifests independently of this flag.
+    #[serde(default = "default_model_invocable")]
+    pub(super) model_invocable: bool,
     #[serde(default)]
     pub(super) mcp_servers: Vec<String>,
     #[serde(default)]
@@ -152,6 +160,7 @@ impl SkillManifest {
             "tools": self.tools,
             "tool_groups": self.tool_groups,
             "delegation": self.delegation,
+            "model_invocable": self.model_invocable,
             "mcp_servers": self.mcp_servers,
             "disable_builtin_tools": self.disable_builtin_tools,
             "disable_mcp_tools": self.disable_mcp_tools,
@@ -337,6 +346,7 @@ pub(crate) fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, S
     let mut tools: Vec<String> = Vec::new();
     let mut tool_groups: Vec<String> = Vec::new();
     let mut delegation: Option<String> = None;
+    let mut model_invocable = true;
     let mut mcp_servers: Vec<String> = Vec::new();
     let mut excludes: Vec<String> = Vec::new();
     let mut disable_builtin_tools = false;
@@ -414,6 +424,7 @@ pub(crate) fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, S
                 "delegation" => {
                     delegation = Some(unquoted.to_string()).filter(|s| !s.trim().is_empty())
                 }
+                "model_invocable" => model_invocable = parse_bool_value(unquoted).unwrap_or(true),
                 "mcp_servers" => mcp_servers = parse_list_value(unquoted),
                 "excludes" => excludes = parse_list_value(unquoted),
                 "parent" => parent = Some(unquoted.to_string()).filter(|s| !s.trim().is_empty()),
@@ -453,6 +464,7 @@ pub(crate) fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, S
         tools,
         tool_groups,
         delegation,
+        model_invocable,
         mcp_servers,
         disable_builtin_tools,
         disable_mcp_tools,

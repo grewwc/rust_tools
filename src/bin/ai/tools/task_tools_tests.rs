@@ -1,20 +1,21 @@
 use super::{
     AsyncTaskEntry, InheritOptions, OsTaskGoal, OutstandingTaskSnapshot, PreparedSubagentTask,
-    SUBAGENT_PARENT_SUMMARY_REMINDER, SUBAGENT_WALL_CLOCK_TIMEOUT, SelectedSubagent,
-    StoredTaskResult, SubagentBackend, TASK_REGISTRY, TASK_RETRY_REGISTRY, TASK_WAIT_NOOP_COUNTS,
-    WaitManySource, append_current_process_cancel_source, build_outstanding_task_anchor,
+    SUBAGENT_BLOCKED_PARENT_GUIDANCE, SUBAGENT_PARENT_SUMMARY_REMINDER,
+    SUBAGENT_WALL_CLOCK_TIMEOUT, SelectedSubagent, StoredTaskResult, SubagentBackend,
+    TASK_REGISTRY, TASK_RETRY_REGISTRY, TASK_WAIT_NOOP_COUNTS, WaitManySource,
+    append_current_process_cancel_source, build_outstanding_task_anchor,
     build_selection_explanation, bump_task_wait_noop_count, capped_subagent_manifest,
     discard_tasks_for_session, encode_os_task_goal, epoll_wait_many, epoll_wait_many_channels,
     execute_task_cancel, execute_task_integrate, execute_task_retry, execute_task_spawn,
     execute_task_status, execute_task_wait, expire_task_wait_states_for_test,
     format_task_result_with_id, insert_task_entry_for_test, is_encoded_task_goal,
-    is_retryable_task_status, parse_task_wait_options, prepare_subagent_task,
-    reap_timed_out_subagents, record_subagent_progress_update, register_retry_spec,
-    remove_task_entry, render_outstanding_task_anchor, reset_task_wait_noop_counts_for_test,
-    resolve_side_note_history_file, select_subagent, set_task_reasoning_effort,
-    task_reasoning_effort, task_wait_key, task_wait_state_count_for_test,
-    validate_subagent_response, wait_sources_for_channel_and_futex, wake_expired_task_waits,
-    with_task_entry_by_pid, wrap_subagent_prompt,
+    is_retryable_task_status, parse_subagent_handoff, parse_task_wait_options,
+    prepare_subagent_task, reap_timed_out_subagents, record_subagent_progress_update,
+    register_retry_spec, remove_task_entry, render_outstanding_task_anchor,
+    reset_task_wait_noop_counts_for_test, resolve_side_note_history_file, select_subagent,
+    set_task_reasoning_effort, task_reasoning_effort, task_wait_key,
+    task_wait_state_count_for_test, validate_subagent_response, wait_sources_for_channel_and_futex,
+    wake_expired_task_waits, with_task_entry_by_pid, wrap_subagent_prompt,
 };
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
 
@@ -204,6 +205,8 @@ fn subagent_prompt_preserves_the_evidence_bar() {
     assert!(prompt.contains("check likely counter-evidence"));
     assert!(prompt.contains("return a concise partial result"));
     assert!(prompt.contains("unresolved hypotheses, missing evidence"));
+    assert!(prompt.contains("<subagent_handoff>"));
+    assert!(prompt.contains("authorization_required|permission_required|user_input_required"));
     // Without an explicit schema the default contract still asks for an
     // auditable shape, guidance-only (no JSON enforcement).
     assert!(prompt.contains("Default response contract"));
@@ -227,6 +230,7 @@ fn subagent_response_schema_is_prompted_and_validated() {
 
     assert!(prompt.contains("Return exactly one JSON value"));
     assert!(prompt.contains("<response_schema>"));
+    assert!(prompt.contains("This exceptional control response overrides"));
     assert!(!prompt.contains("Default response contract"));
     assert!(validate_subagent_response(Some(&schema), r#"{"summary":"done"}"#).is_ok());
     assert!(
@@ -238,6 +242,42 @@ fn subagent_response_schema_is_prompted_and_validated() {
         validate_subagent_response(Some(&schema), "not json")
             .unwrap_err()
             .contains("not valid JSON")
+    );
+}
+
+#[test]
+fn subagent_handoff_is_strict_and_carries_parent_action() {
+    let handoff = parse_subagent_handoff(
+        r#"<subagent_handoff>{"kind":"authorization_required","reason":"token expired","suggested_action":"authenticate in the foreground"}</subagent_handoff>"#,
+    )
+    .unwrap()
+    .expect("handoff should parse");
+
+    assert_eq!(handoff.kind.as_str(), "authorization_required");
+    assert_eq!(handoff.reason, "token expired");
+    assert_eq!(
+        handoff.suggested_action.as_deref(),
+        Some("authenticate in the foreground")
+    );
+    assert!(is_retryable_task_status("blocked"));
+    assert!(
+        parse_subagent_handoff(
+            r#"<subagent_handoff>{"kind":"permission_required","reason":""}</subagent_handoff>"#
+        )
+        .unwrap_err()
+        .contains("must not be empty")
+    );
+    assert!(
+        parse_subagent_handoff(
+            r#"<subagent_handoff>{"kind":"permission_required","reason":"denied"}"#
+        )
+        .unwrap_err()
+        .contains("closing tag")
+    );
+    assert!(
+        parse_subagent_handoff("ordinary final response")
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -1561,10 +1601,26 @@ fn task_wait_formats_empty_subagent_result_explicitly() {
     assert!(output.contains("task_retry"));
     assert!(output.contains(&task_id));
     assert!(output.contains(SUBAGENT_PARENT_SUMMARY_REMINDER));
+
+    let blocked = format_task_result_with_id(
+        &task_id,
+        &entry,
+        StoredTaskResult {
+            status: "blocked".to_string(),
+            output: "authenticate in the foreground".to_string(),
+            error: Some("authorization_required: token expired".to_string()),
+            progress: None,
+            backend_session: None,
+        },
+    );
+    assert!(blocked.contains("BLOCKED"));
+    assert!(blocked.contains(SUBAGENT_BLOCKED_PARENT_GUIDANCE));
+    assert!(blocked.contains("task_retry"));
 }
 
 #[test]
 fn task_retry_status_matches_the_runtime_timeout_value() {
+    assert!(is_retryable_task_status("blocked"));
     assert!(is_retryable_task_status("failed"));
     assert!(is_retryable_task_status("timeout"));
     assert!(is_retryable_task_status("cancelled"));

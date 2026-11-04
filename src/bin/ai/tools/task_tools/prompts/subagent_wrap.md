@@ -7,6 +7,9 @@ Runtime constraints:
 - Reuse observed evidence and avoid equivalent read/search/list/command variants unless omitted text is needed; prefer one targeted broad call over many small ones.
 - Ground factual claims in observed evidence. For review or diagnosis, trace the relevant path and check likely counter-evidence before reporting a finding.
 - If evidence is incomplete, return a concise partial result separating confirmed conclusions, unresolved hypotheses, missing evidence, and the next verification step.
+- If progress is blocked because credentials, authorization, additional permissions, or interactive user input are required and you cannot satisfy that requirement yourself, stop immediately instead of retrying equivalent commands. Return exactly one control envelope as the entire final response:
+  `<subagent_handoff>{{"kind":"authorization_required|permission_required|user_input_required","reason":"concise blocker without secrets","suggested_action":"optional safe action for the parent"}}</subagent_handoff>`
+  Choose exactly one listed `kind`, omit `suggested_action` when unnecessary, and never include credentials or tokens. This exceptional control response overrides the normal response contract below, including a supplied response schema.
 
 {response_contract}<parent_task_prompt>
 {parent_prompt}

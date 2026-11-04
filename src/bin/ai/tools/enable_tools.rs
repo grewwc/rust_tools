@@ -82,11 +82,12 @@ fn subagent_may_enable_tool(name: &str) -> bool {
 }
 
 /// On-demand enablement only exposes generic `builtin` tools. Skill-specific
-/// driver control tools are injected by the driver during an active-skill turn
-/// and cannot be obtained through `enable_tools` in a normal turn.
+/// driver control tools and manually activated agent-team tools are injected by
+/// the driver during an active-skill turn and cannot be obtained through
+/// `enable_tools` in a normal turn.
 fn registration_may_be_dynamically_enabled(reg: &ToolRegistration) -> bool {
-    crate::ai::tools::registry::tool_metadata::tool_groups(reg.spec.name)
-        .contains(&ToolGroup::Builtin)
+    let groups = crate::ai::tools::registry::tool_metadata::tool_groups(reg.spec.name);
+    groups.contains(&ToolGroup::Builtin) && !groups.contains(&ToolGroup::AgentTeam)
 }
 
 /// Record whether the current turn's active agent/skills declare a group that
@@ -128,7 +129,8 @@ fn agent_may_enable_tool(name: &str) -> bool {
 /// core members — so the catalog never advertises a system-level family the
 /// agent cannot meaningfully load.
 fn group_visible_to_agent(group: ToolGroup) -> bool {
-    !super::group_gates_hidden_tools(group) || hidden_group_declared()
+    group != ToolGroup::AgentTeam
+        && (!super::group_gates_hidden_tools(group) || hidden_group_declared())
 }
 
 fn current_turn_identity() -> TurnIdentity {
@@ -1116,6 +1118,27 @@ mod tests {
         let s = STATE.read().unwrap_or_else(|poison| poison.into_inner());
         assert!(!s.turns.contains_key(&turn));
         assert!(!s.explicit.contains_key(&owner));
+    }
+
+    #[test]
+    fn agent_team_tools_cannot_be_enabled_dynamically() {
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_state_for_tests();
+        set_active_tool_names(vec!["enable_tools".to_string()]);
+
+        let output = execute_enable_tools(&json!({
+            "operation": "enable",
+            "tools": ["agent_team", "manage_team", "run_agent_graph"]
+        }))
+        .expect("manual-only tools should be rejected without failing the call");
+
+        for name in ["agent_team", "manage_team", "run_agent_graph"] {
+            assert!(output.contains(name), "{output}");
+        }
+        assert!(drain_pending_enable().is_empty());
+        assert!(explicit_enabled_tool_names().is_empty());
     }
 
     #[test]

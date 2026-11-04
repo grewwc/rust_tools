@@ -1847,7 +1847,20 @@ pub(super) fn dispatch_background_batch(
                     None,
                 )
             };
-            let response_validation_error = if result.is_ok() && memory_merge_error.is_none() {
+            let (handoff, handoff_parse_error) = if result.is_ok() && memory_merge_error.is_none() {
+                match crate::ai::tools::task_tools::parse_subagent_handoff(&response_for_validation)
+                {
+                    Ok(handoff) => (handoff, None),
+                    Err(error) => (None, Some(error)),
+                }
+            } else {
+                (None, None)
+            };
+            let response_validation_error = if result.is_ok()
+                && memory_merge_error.is_none()
+                && handoff.is_none()
+                && handoff_parse_error.is_none()
+            {
                 crate::ai::tools::task_tools::validate_subagent_response(
                     response_schema.as_ref(),
                     &response_for_validation,
@@ -1858,9 +1871,14 @@ pub(super) fn dispatch_background_batch(
             };
             let mut os = task_os.lock().unwrap();
             os.set_current_pid(Some(pid));
+            let task_blocked = result.is_ok()
+                && memory_merge_error.is_none()
+                && handoff_parse_error.is_none()
+                && handoff.is_some();
             let task_succeeded = result.is_ok()
                 && memory_merge_error.is_none()
-                && response_validation_error.is_none();
+                && response_validation_error.is_none()
+                && !task_blocked;
             let publish_task_result = should_publish_subagent_task_result(
                 task_succeeded,
                 &captured_output,
@@ -1874,15 +1892,30 @@ pub(super) fn dispatch_background_batch(
                     ),
                     _ => backend_session,
                 };
+                let handoff_error = handoff
+                    .as_ref()
+                    .map(|handoff| format!("{}: {}", handoff.kind.as_str(), handoff.reason));
+                let published_output = handoff
+                    .as_ref()
+                    .and_then(|handoff| handoff.suggested_action.as_deref())
+                    .unwrap_or(&captured_output);
                 let payload = serde_json::json!({
-                    "status": if task_succeeded { "completed" } else { "failed" },
-                    "output": captured_output,
+                    "status": if task_blocked {
+                        "blocked"
+                    } else if task_succeeded {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
+                    "output": published_output,
                     "error": result
                         .as_ref()
                         .err()
                         .cloned()
                         .or(memory_merge_error)
-                        .or(response_validation_error),
+                        .or(handoff_parse_error)
+                        .or(response_validation_error)
+                        .or(handoff_error),
                     "progress": progress,
                     "backend_session": backend_session,
                 })
