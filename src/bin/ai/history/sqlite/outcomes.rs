@@ -13,7 +13,10 @@ use super::connection::{open_history_db, open_history_db_read_only};
 use super::lock::with_session_state_lock;
 use super::migrations::init_history_schema;
 use super::revision::bump_history_revision;
-use super::{LLM_PRUNE_MARKS_META_KEY, PROMPT_RESIDENCY_META_KEY, STALE_PATCH_TARGETS_META_KEY};
+use super::{
+    ENCRYPTED_REASONING_REPLAY_REJECTIONS_META_KEY, LLM_PRUNE_MARKS_META_KEY,
+    PROMPT_RESIDENCY_META_KEY, STALE_PATCH_TARGETS_META_KEY,
+};
 
 /// Persist a structured success/failure and execution signature for every real tool call. The tool result body still lives only in
 /// `messages`, so the request projection can fold resolved errors while the human history keeps the original diagnostics.
@@ -348,6 +351,111 @@ pub(in crate::ai) fn write_stale_patch_targets_sqlite(
             params![STALE_PATCH_TARGETS_META_KEY, encoded],
         )
         .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(())
+    })
+}
+
+/// Upper bound on the rejected encrypted-reasoning replay owners retained for
+/// one session. Only owners of tiers the cross-resource repair had to drop are
+/// recorded, so reaching the cap takes several resource changes in one session;
+/// the oldest entries are evicted first, keeping the newest rejections.
+pub(in crate::ai) const ENCRYPTED_REASONING_REPLAY_REJECTIONS_MAX_ENTRIES: usize = 512;
+
+/// Read the session's rejected encrypted-reasoning replay owners.
+///
+/// Each entry is the opaque `endpoint identity \x1f model \x1f first tool_call
+/// id` triple the request layer derives; the session itself is the enclosing
+/// database file. Unknown or older databases safely read as empty. Only the
+/// newest [`ENCRYPTED_REASONING_REPLAY_REJECTIONS_MAX_ENTRIES`] entries are
+/// returned so a corrupted or oversized row cannot grow the caller's ledger
+/// without bound.
+pub(in crate::ai) fn read_encrypted_reasoning_replay_rejections_sqlite(
+    path: &Path,
+) -> io::Result<Vec<String>> {
+    if !blob::is_sqlite_path(path) || !path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = open_history_db_read_only(path)?;
+    let table_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(Vec::new());
+    }
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1 LIMIT 1",
+            params![ENCRYPTED_REASONING_REPLAY_REJECTIONS_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let entries = serde_json::from_str::<Vec<String>>(&raw).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid encrypted reasoning replay rejection metadata: {error}"),
+        )
+    })?;
+    let skip = entries
+        .len()
+        .saturating_sub(ENCRYPTED_REASONING_REPLAY_REJECTIONS_MAX_ENTRIES);
+    Ok(entries
+        .into_iter()
+        .skip(skip)
+        .filter(|entry| !entry.trim().is_empty())
+        .collect())
+}
+
+/// Atomically replace the session's rejected encrypted-reasoning replay
+/// owners. Duplicate and blank entries are dropped, and only the newest
+/// [`ENCRYPTED_REASONING_REPLAY_REJECTIONS_MAX_ENTRIES`] survive. This side
+/// state never changes canonical messages, so `history_revision` is not
+/// incremented; an empty ledger deletes the meta row instead of leaving empty
+/// state behind.
+pub(in crate::ai) fn write_encrypted_reasoning_replay_rejections_sqlite(
+    path: &Path,
+    entries: &[String],
+) -> io::Result<()> {
+    if !blob::is_sqlite_path(path) {
+        return Ok(());
+    }
+    let mut seen = FxHashSet::default();
+    let mut retained = entries
+        .iter()
+        .filter(|entry| !entry.trim().is_empty() && seen.insert((*entry).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if retained.len() > ENCRYPTED_REASONING_REPLAY_REJECTIONS_MAX_ENTRIES {
+        retained.drain(..retained.len() - ENCRYPTED_REASONING_REPLAY_REJECTIONS_MAX_ENTRIES);
+    }
+    let encoded =
+        serde_json::to_string(&retained).map_err(|error| io::Error::other(error.to_string()))?;
+    with_session_state_lock(path, || {
+        let conn = open_history_db(path)?;
+        init_history_schema(&conn)?;
+        if retained.is_empty() {
+            conn.execute(
+                "DELETE FROM meta WHERE key=?1",
+                params![ENCRYPTED_REASONING_REPLAY_REJECTIONS_META_KEY],
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        } else {
+            conn.execute(
+                "INSERT INTO meta (key, value, created_at) VALUES (?1, ?2, unixepoch())
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, created_at=excluded.created_at",
+                params![ENCRYPTED_REASONING_REPLAY_REJECTIONS_META_KEY, encoded],
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        }
         Ok(())
     })
 }

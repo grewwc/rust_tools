@@ -12,7 +12,7 @@ use serde_json::Value;
 use super::super::{
     history::{Message, SessionStore, generate_session_summary},
     models,
-    provider::{ThinkingOffCapability, adapter_for},
+    provider::{ProviderAdapter, ThinkingOffCapability, adapter_for},
     types::App,
 };
 use crate::ai::theme::{self, RESET};
@@ -31,9 +31,10 @@ use super::error::{
     REQUEST_MAX_ATTEMPTS, RequestError, RequestErrorKind, RequestRetryPolicy,
     STREAM_RESPONSE_HEADER_TIMEOUT_SECS, api_key_for_request_model, apply_request_auth,
     clear_stale_request_interrupt_before_request, config_forces_thinking,
-    endpoint_for_request_model, is_deterministic_status_error, is_retryable_reqwest_error,
-    is_retryable_status_with_body, parse_retry_after, request_retry_policy_for_current_context,
-    retry_delay, retry_delay_429, should_retry_status, should_rotate_key, sleep_with_cancel,
+    endpoint_for_request_model, is_cross_resource_replay_rejection, is_deterministic_status_error,
+    is_retryable_reqwest_error, is_retryable_status_with_body, parse_retry_after,
+    request_retry_policy_for_current_context, retry_delay, retry_delay_429, should_retry_status,
+    should_rotate_key, sleep_with_cancel,
 };
 use super::normalize::{
     agent_tools_for_request, fold_resolved_tool_failures, normalize_messages_for_model,
@@ -41,10 +42,11 @@ use super::normalize::{
 };
 use super::prompt_feedback::PromptTokenFeedback;
 use super::reasoning::{
-    apply_thinking_force_off_effort, model_effort_graded,
-    model_thinking_off_capability, normalize_reasoning_content_replay_for_model,
-    prompt_cache_enabled_for_model, reconstruct_encrypted_reasoning_items_for_model,
-    resolve_reasoning_effort, resolve_reasoning_wire_controls,
+    SplicedReplayKeys, apply_thinking_force_off_effort, commit_dropped_replay_tiers,
+    drop_next_rejected_replay_tier, model_effort_graded, model_thinking_off_capability,
+    normalize_reasoning_content_replay_for_model, prompt_cache_enabled_for_model,
+    reconstruct_encrypted_reasoning_items_for_model_recorded, resolve_reasoning_effort,
+    resolve_reasoning_wire_controls,
 };
 use super::thinking::resolve_thinking;
 use super::token_budget;
@@ -606,6 +608,10 @@ struct RequestProjection {
     enable_thinking: bool,
     reasoning_effort: Option<&'static str>,
     reasoning_items: ReasoningItemMap,
+    /// Replay owners this projection splices into a Responses body, by tier.
+    /// The send path consumes them tier by tier in the cross-resource repair;
+    /// previews ignore them.
+    spliced_replay_keys: SplicedReplayKeys,
     tool_errors: rustc_hash::FxHashMap<String, bool>,
     endpoint: String,
 }
@@ -619,6 +625,7 @@ struct ProjectionCore {
     enable_thinking: bool,
     reasoning_effort: Option<&'static str>,
     reasoning_items: ReasoningItemMap,
+    spliced_replay_keys: SplicedReplayKeys,
     tool_errors: rustc_hash::FxHashMap<String, bool>,
     endpoint: String,
 }
@@ -658,25 +665,34 @@ async fn prepare_projection_core(
             "elapsed_ms": thinking_start.elapsed().as_secs_f64() * 1000.0,
         },
     );
+    // Resolved before the rebuild below: the encoded replay marker is bound to
+    // the backing resource that produced it, so decoding must compare against
+    // the endpoint that will actually serve this request.
+    let endpoint = endpoint_for_request_model(app, model);
     // Encrypted reasoning side-channel rebuild: must run before `normalize_reasoning_content_replay_for_model`,
     // because the latter strips the `reasoning_content` (our persisted encoded blob) for encrypted-replay models.
     // The in-memory side channel (freshest for the current turn) wins; the persisted blob only fills historical gaps. The field is then stripped from the wire projection as usual.
-    let turn_reasoning_items = reconstruct_encrypted_reasoning_items_for_model(
+    let mut spliced_replay_keys = SplicedReplayKeys::default();
+    let turn_reasoning_items = reconstruct_encrypted_reasoning_items_for_model_recorded(
         model,
+        &endpoint,
+        &app.session_id,
+        &app.session_history_file,
         &normalized_messages,
         &app.turn_reasoning_items,
+        &mut spliced_replay_keys,
     );
     // The final wire projection decides reasoning_content replay semantics by model capability: GLM keeps the
     // tool-call assistant's original text, DeepSeek only fills the empty field shape, and all other models strip it.
     // Unlike this turn's enable_thinking gate, this must be unified before every request.
     normalize_reasoning_content_replay_for_model(model, &mut normalized_messages);
     let reasoning_effort = resolve_reasoning_effort(app, model).map(|e| e.as_str());
-    let endpoint = endpoint_for_request_model(app, model);
     ProjectionCore {
         messages: normalized_messages,
         enable_thinking,
         reasoning_effort,
         reasoning_items: turn_reasoning_items,
+        spliced_replay_keys,
         tool_errors: app.turn_tool_errors.clone(),
         endpoint,
     }
@@ -730,6 +746,7 @@ async fn prepare_request_projection(
         enable_thinking: core.enable_thinking,
         reasoning_effort,
         reasoning_items: core.reasoning_items,
+        spliced_replay_keys: core.spliced_replay_keys,
         tool_errors: core.tool_errors,
         endpoint: core.endpoint,
     }
@@ -930,7 +947,6 @@ async fn do_request_messages_with_tool_mode(
     // an older pending request available for an unrelated response to fill.
     let previous_prompt = app.last_known_prompt_tokens.take();
     let previous_cached = app.last_known_cached_prompt_tokens.take();
-    let mut projection = prepare_request_projection(app, model, messages, tools_enabled).await;
     // Explicit off decisions are not evidence that the model lacks thinking.
     if config_forces_thinking() && !models::enable_thinking(model) {
         super::emit_request_diagnostic(format_args!(
@@ -938,6 +954,10 @@ async fn do_request_messages_with_tool_mode(
             model
         ));
     }
+    // Thinking, tools and endpoint are resolved once per request: the
+    // cross-resource repair below only changes which replay items ride along,
+    // so it must not re-run the thinking gate or rebuild the tool schema.
+    let mut projection = prepare_request_projection(app, model, messages, tools_enabled).await;
     let endpoint = projection.endpoint.clone();
     maybe_emit_responses_reasoning_replay_diagnostic(
         model,
@@ -945,46 +965,140 @@ async fn do_request_messages_with_tool_mode(
         &projection.messages,
         &projection.reasoning_items,
     );
-    let (mut request_body, mut prompt_feedback, budget) =
-        projection.measure(app, model, stream, previous_prompt.as_ref());
-    prompt_feedback.record_prefix_reuse(previous_prompt.as_ref());
-    let context_prompt_tokens = budget.prompt_tokens;
     let retry_policy = request_retry_policy_for_current_context();
-
-    // --- Key rotation + 429 backoff ---
-    // Each round first tries all keys in rotation; only when every key failed with 429 (quota/rate limit)
-    // does the whole round retry with backoff (up to max_attempts_429 rounds). Other rotatable errors (401/403)
-    // return directly if they still fail after key rotation; retrying is pointless.
     let primary_key = api_key_for_request_model(app, model);
     let adapter = adapter_for(models::model_adapter(model), &endpoint);
     let keys_to_try = adapter.collect_api_keys(&primary_key);
-    let total_keys = keys_to_try.len();
+    let mut first_key_idx = 0;
+    // Cross-resource replay repair: the rejection is deterministic for a fixed
+    // payload, but dropping replayed items changes it. The provider does not
+    // name the offending item, so each rejection drops one more replay tier
+    // (persisted, then live) and resends the same projection. The tier count
+    // bounds a request to three sends; the last result is what the caller sees.
+    // Dropped owners are recorded in the rejected-replay ledger only when a
+    // resend without them is accepted, so a repair that never gets through
+    // leaves innocent groups of the dropped tiers replayable.
+    //
+    // The persisted marker's endpoint identity already filters items whose
+    // endpoint URL changed, but it hashes only the URL, so it cannot tell two
+    // backing resources behind one gateway URL apart. That same-URL,
+    // different-resource case is only caught here, by the provider's rejection.
+    loop {
+        let (mut request_body, mut prompt_feedback, budget) =
+            projection.measure(app, model, stream, previous_prompt.as_ref());
+        prompt_feedback.record_prefix_reuse(previous_prompt.as_ref());
+        let (result, failed_key_idx) = send_with_key_rotation(
+            app,
+            model,
+            &mut request_body,
+            prompt_feedback,
+            budget.prompt_tokens,
+            previous_prompt.as_ref(),
+            previous_cached,
+            &retry_policy,
+            &endpoint,
+            adapter,
+            &keys_to_try,
+            first_key_idx,
+        )
+        .await;
+        let err = match result {
+            Ok(response) => {
+                commit_dropped_replay_tiers(
+                    &app.session_id,
+                    model,
+                    &endpoint,
+                    &app.session_history_file,
+                    &projection.spliced_replay_keys,
+                );
+                return Ok(response);
+            }
+            Err(err) if is_cross_resource_replay_rejection(&err) => err,
+            Err(err) => return Err(err),
+        };
+        // `measure` moved the tool schema into the body; reclaim it so the
+        // retry can measure the same projection again.
+        let tools = request_body.tools.take();
+        let tool_choice = request_body.tool_choice.take();
+        drop(request_body);
+        projection.tools = tools;
+        projection.tool_choice = tool_choice;
+        let Some((tier, dropped)) = drop_next_rejected_replay_tier(
+            &mut projection.reasoning_items,
+            &mut projection.spliced_replay_keys,
+        ) else {
+            return Err(err);
+        };
+        // Keys before the one that answered already failed with a rotatable
+        // error for this request, so the retry resumes from the answering key.
+        first_key_idx = failed_key_idx;
+        super::emit_request_diagnostic(format_args!(
+            "[Info] {}replayed encrypted reasoning was created by a different Azure OpenAI resource; dropped {} {} group(s) and retrying",
+            retry_scope_tag(),
+            dropped,
+            tier.label()
+        ));
+    }
+}
 
+/// Key rotation + 429 backoff for one measured wire body.
+///
+/// Each round tries every key in rotation order starting at `first_key_idx`;
+/// only when every key failed with 429 (quota/rate limit) does the whole round
+/// retry with backoff (up to max_attempts_429 rounds). Other rotatable errors
+/// (401/403) return directly if they still fail after key rotation; retrying is
+/// pointless. Returns the outcome with the index of the key that produced it,
+/// so a payload repair can resume from that key.
+#[allow(clippy::too_many_arguments)]
+async fn send_with_key_rotation(
+    app: &mut App,
+    model: &str,
+    request_body: &mut RequestBody<'_>,
+    mut prompt_feedback: PromptTokenFeedback,
+    context_prompt_tokens: usize,
+    previous_prompt: Option<&PromptTokenFeedback>,
+    previous_cached: Option<u64>,
+    retry_policy: &RequestRetryPolicy,
+    endpoint: &str,
+    adapter: &dyn ProviderAdapter,
+    keys_to_try: &[String],
+    first_key_idx: usize,
+) -> (Result<Response, RequestError>, usize) {
+    let total_keys = keys_to_try.len();
+    let first_key_idx = if first_key_idx < total_keys {
+        first_key_idx
+    } else {
+        0
+    };
     let mut last_key_err: Option<RequestError> = None;
     for attempt in 1..=retry_policy.max_attempts_429 {
         let mut all_rate_limited = true;
         let mut round_retry_after: Option<Duration> = None;
-        for (key_idx, api_key) in keys_to_try.iter().enumerate() {
-            if key_idx > 0 {
+        let mut previous_key_idx = first_key_idx;
+        for position in 0..total_keys {
+            let key_idx = (first_key_idx + position) % total_keys;
+            let api_key = &keys_to_try[key_idx];
+            if position > 0 {
                 super::emit_request_diagnostic(format_args!(
                     "[{}] key #{} failed, trying next key #{} ({} remaining)",
                     adapter.label(),
-                    key_idx - 1,
+                    previous_key_idx,
                     key_idx,
-                    total_keys - key_idx
+                    total_keys - position
                 ));
             }
+            previous_key_idx = key_idx;
             match request_messages_with_key(
                 app,
                 model,
                 api_key,
-                &mut request_body,
-                &retry_policy,
-                &endpoint,
+                request_body,
+                retry_policy,
+                endpoint,
                 token_budget::tpm_prompt_tokens(
                     context_prompt_tokens,
                     prompt_feedback.reusable_cached_tokens(
-                        previous_prompt.as_ref(),
+                        previous_prompt,
                         previous_cached,
                         api_key,
                     ),
@@ -995,7 +1109,7 @@ async fn do_request_messages_with_tool_mode(
                 Ok(response) => {
                     prompt_feedback.mark_sent_with_key(api_key);
                     app.last_known_prompt_tokens = Some(prompt_feedback);
-                    return Ok(response);
+                    return (Ok(response), key_idx);
                 }
                 Err(err) if should_rotate_key(&err) => {
                     if err.is_rate_limited() {
@@ -1005,7 +1119,7 @@ async fn do_request_messages_with_tool_mode(
                     }
                     last_key_err = Some(err);
                 }
-                Err(err) => return Err(err),
+                Err(err) => return (Err(err), key_idx),
             }
         }
 
@@ -1027,16 +1141,22 @@ async fn do_request_messages_with_tool_mode(
             retry_policy.max_attempts_429
         ));
         if sleep_with_cancel(app, delay).await {
-            return Err(RequestError::cancelled(
-                "request canceled by user during retry wait",
-            ));
+            return (
+                Err(RequestError::cancelled(
+                    "request canceled by user during retry wait",
+                )),
+                first_key_idx,
+            );
         }
     }
-    Err(last_key_err.unwrap_or_else(|| RequestError {
-        kind: RequestErrorKind::Network,
-        message: adapter.keys_exhausted_message().to_string(),
-        retry_after: None,
-    }))
+    (
+        Err(last_key_err.unwrap_or_else(|| RequestError {
+            kind: RequestErrorKind::Network,
+            message: adapter.keys_exhausted_message().to_string(),
+            retry_after: None,
+        })),
+        first_key_idx,
+    )
 }
 
 #[cfg(test)]

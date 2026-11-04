@@ -579,30 +579,61 @@ pub(in crate::ai) fn encrypted_reasoning_replay_runtime_enabled() -> bool {
 }
 
 /// Encode the encrypted reasoning items captured this turn, together with the
-/// originating model, into a single string for persisting into
-/// `reasoning_content`. Carries a model marker: when switching/falling back to
-/// another model, request-side decoding drops it on model mismatch, avoiding
-/// feeding model A's encrypted state to model B (the provider would 400).
+/// originating model and backing-resource identity, into a single string for
+/// persisting into `reasoning_content`. Carries a model marker: when
+/// switching/falling back to another model, request-side decoding drops it on
+/// model mismatch, avoiding feeding model A's encrypted state to model B (the
+/// provider would 400). `endpoint_identity` is the non-secret identity of the
+/// endpoint that served the request (see `models::endpoint_resource_identity`);
+/// it is omitted when it cannot be derived, which emits the v1 marker shape that
+/// predates endpoint binding, so such a payload keeps the model-only replay rule.
 pub(in crate::ai) fn encode_encrypted_reasoning_replay_state(
     model: &str,
+    endpoint_identity: Option<&str>,
     items: &[Value],
 ) -> String {
-    format!(
-        "{PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX}{}",
-        serde_json::json!({ "model": model, "items": items })
-    )
+    let mut payload = serde_json::json!({ "model": model, "items": items });
+    if let Some(identity) = endpoint_identity
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert("endpoint".to_string(), Value::String(identity.to_string()));
+    }
+    format!("{PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX}{payload}")
 }
 
 /// Decode encrypted reasoning items from the persisted `reasoning_content`.
 /// Returns them only when the originating model inside the marker matches the
 /// current request model; otherwise returns `None` (no cross-model replay).
+///
+/// The marker also records the backing-resource identity of the endpoint that
+/// produced the items. When both the marker and `endpoint_identity` carry one
+/// and they differ, the items were created by another resource and the
+/// provider rejects them (400 `modelhub_err_code_-4003` "created under a
+/// different Azure OpenAI resource"), so decoding returns `None`. Markers
+/// written before the field existed (v1) carry no identity and keep replaying;
+/// an unknown current identity likewise keeps replaying rather than silently
+/// dropping continuation state.
+///
+/// The identity hashes only the endpoint URL (scheme, host, port, path), so
+/// this check catches endpoint changes and nothing more: several backing
+/// resources served behind one gateway URL share one identity, and their items
+/// still decode here. That case is covered by the request-side repair, which
+/// drops replay tiers when the provider rejects them as cross-resource.
 pub(in crate::ai) fn decode_encrypted_reasoning_replay_for_model(
     model: &str,
+    endpoint_identity: Option<&str>,
     encoded: &str,
 ) -> Option<Vec<Value>> {
     let payload = encoded.strip_prefix(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX)?;
     let payload: Value = serde_json::from_str(payload).ok()?;
     if payload.get("model")?.as_str()? != model {
+        return None;
+    }
+    if let (Some(stored), Some(current)) = (
+        payload.get("endpoint").and_then(Value::as_str),
+        endpoint_identity,
+    ) && stored != current
+    {
         return None;
     }
     let mut items: Vec<Value> = payload.get("items")?.as_array()?.to_vec();

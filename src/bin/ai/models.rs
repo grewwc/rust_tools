@@ -2,6 +2,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
+use sha2::{Digest, Sha256};
 
 use super::agents::{AgentManifest, AgentModelTier};
 use super::cli::ParsedCli;
@@ -224,6 +225,46 @@ fn maybe_decrypt(value: &str) -> String {
             value.to_string()
         }
     }
+}
+
+/// Stable, non-secret identity of the resource behind a resolved endpoint.
+///
+/// Responses encrypted reasoning items are created by one backing resource and
+/// are only accepted by that same resource. Replay therefore has to be bound to
+/// the endpoint that actually served the request, not just to the model key;
+/// persisting the plaintext endpoint (which is resolved from an `enc:` value)
+/// would write deployment URLs into session history, so only a SHA-256 digest
+/// of its identifying parts is stored. The digest covers scheme, host,
+/// non-default port and path: a gateway can route different backing resources
+/// under different paths on one host, so the host alone is not enough. Query
+/// and fragment never identify a resource and are ignored.
+///
+/// Returns `None` when `endpoint` is not an absolute URL with a host; callers
+/// must then keep the identity-less behaviour (nothing to compare against, so
+/// replay stays enabled).
+pub(super) fn endpoint_resource_identity(endpoint: &str) -> Option<String> {
+    let url = reqwest::Url::parse(endpoint.trim()).ok()?;
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    // `Url` drops an explicit port equal to the scheme's default while
+    // parsing, so `port()` is already the non-default port (if any).
+    let mut identity = String::with_capacity(64);
+    identity.push_str(&url.scheme().to_ascii_lowercase());
+    identity.push_str("://");
+    identity.push_str(&host);
+    if let Some(port) = url.port() {
+        identity.push(':');
+        identity.push_str(&port.to_string());
+    }
+    identity.push_str(url.path().trim_end_matches('/'));
+    let mut hasher = Sha256::new();
+    hasher.update(identity.as_bytes());
+    let digest = hasher.finalize();
+    let mut fingerprint = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(fingerprint, "{byte:02x}");
+    }
+    Some(fingerprint)
 }
 
 pub(super) fn api_key_for_model(model: &str, global_fallback: &str) -> String {

@@ -449,7 +449,10 @@ fn context_overflow_body_markers(lower_text: &str) -> bool {
 ///   reaches it instead of after a full backoff ladder;
 /// - provider validation rejections: `invalid_request_error` is the standard
 ///   OpenAI-compatible error type for malformed requests and is deterministic
-///   for a fixed payload.
+///   for a fixed payload;
+/// - cross-resource replay rejections ([`is_cross_resource_replay_rejection`]),
+///   whose gateway body may carry neither marker above; only the transport's
+///   replay repair, which changes the payload, can cure them.
 ///
 /// Restricted to 400 so 429/5xx stay on the existing transient/backoff paths.
 pub(crate) fn is_deterministic_status_error(status: StatusCode, body: &str) -> bool {
@@ -457,7 +460,37 @@ pub(crate) fn is_deterministic_status_error(status: StatusCode, body: &str) -> b
         return false;
     }
     let lower = body.to_ascii_lowercase();
-    context_overflow_body_markers(&lower) || lower.contains("invalid_request_error")
+    context_overflow_body_markers(&lower)
+        || lower.contains("invalid_request_error")
+        || cross_resource_replay_body_markers(&lower)
+}
+
+/// Whether a failure is the Azure "item created under a different resource"
+/// rejection of a replayed Responses item.
+///
+/// The gateway answers HTTP 400 with code `modelhub_err_code_-4003` and the
+/// message "The requested item was created under a different Azure OpenAI
+/// resource. Use the same resource that created the item to access it.".
+/// Resending the identical payload can never succeed, but dropping replayed
+/// items does, so the transport drops replay tiers and retries. `-4003` alone
+/// is not enough: the same code also covers deterministic "Duplicate item
+/// found" rejections, which this repair cannot cure.
+pub(crate) fn is_cross_resource_replay_rejection(err: &RequestError) -> bool {
+    match err.kind {
+        RequestErrorKind::Status(status) if status.as_u16() == 400 => {
+            cross_resource_replay_body_markers(&err.message.to_ascii_lowercase())
+        }
+        _ => false,
+    }
+}
+
+/// Body markers of [`is_cross_resource_replay_rejection`] over lowercased
+/// text; shared with [`is_deterministic_status_error`] so the retry ladder and
+/// the replay repair cannot drift.
+fn cross_resource_replay_body_markers(lower_text: &str) -> bool {
+    let compact: String = lower_text.split_whitespace().collect();
+    let code = lower_text.contains("modelhub_err_code_-4003") || compact.contains("\"code\":-4003");
+    code && lower_text.contains("different azure openai resource")
 }
 
 /// Returns `true` if the error indicates an auth or quota issue with the API key
@@ -658,6 +691,53 @@ mod tests {
         assert!(!is_deterministic_status_error(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             "maximum context length exceeded"
+        ));
+    }
+
+    #[test]
+    fn is_cross_resource_replay_rejection_requires_400_code_and_resource_text() {
+        // Real incident shape: Azure rejects a replayed Responses item that was
+        // created under another resource behind the same gateway.
+        let cross_resource = r#"{"error":{"code":"modelhub_err_code_-4003","message":"The requested item was created under a different Azure OpenAI resource. Use the same resource that created the item to access it."}}"#;
+        assert!(is_cross_resource_replay_rejection(&RequestError::status(
+            StatusCode::BAD_REQUEST,
+            cross_resource.to_string(),
+        )));
+
+        // Same code, different cause: dropping replayed items cannot cure it.
+        let duplicate =
+            r#"{"error":{"code":"modelhub_err_code_-4003","message":"Duplicate item found"}}"#;
+        assert!(!is_cross_resource_replay_rejection(&RequestError::status(
+            StatusCode::BAD_REQUEST,
+            duplicate.to_string(),
+        )));
+
+        // Only 400 qualifies; 5xx stays on the transient/backoff paths.
+        assert!(!is_cross_resource_replay_rejection(&RequestError::status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            cross_resource.to_string(),
+        )));
+
+        // The rejection skips the per-key retry ladder even without an
+        // `invalid_request_error` type and with relay "upstream" wording, so
+        // the replay repair runs on the first answer instead of after
+        // `max_attempts` identical resends.
+        let relayed = r#"{"error":{"message":"upstream error: modelhub_err_code_-4003 The requested item was created under a different Azure OpenAI resource."}}"#;
+        assert!(is_deterministic_status_error(
+            StatusCode::BAD_REQUEST,
+            cross_resource
+        ));
+        assert!(is_deterministic_status_error(
+            StatusCode::BAD_REQUEST,
+            relayed
+        ));
+        assert!(is_cross_resource_replay_rejection(&RequestError::status(
+            StatusCode::BAD_REQUEST,
+            relayed.to_string(),
+        )));
+        assert!(!is_deterministic_status_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            cross_resource
         ));
     }
 

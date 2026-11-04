@@ -304,6 +304,11 @@ pub(in crate::ai) use sqlite::{
 };
 pub(in crate::ai) use sqlite::{read_image_digest_sqlite, upsert_image_digest_sqlite};
 pub(in crate::ai) use sqlite::{read_prompt_residency_sqlite, write_prompt_residency_sqlite};
+pub(in crate::ai) use sqlite::{
+    ENCRYPTED_REASONING_REPLAY_REJECTIONS_MAX_ENTRIES,
+    read_encrypted_reasoning_replay_rejections_sqlite,
+    write_encrypted_reasoning_replay_rejections_sqlite,
+};
 #[allow(unused_imports)]
 pub(in crate::ai) use suspended::{
     SuspendedSessionEntry, SuspendedSessionStore, current_terminal_key,

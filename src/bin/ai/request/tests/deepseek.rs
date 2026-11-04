@@ -540,6 +540,7 @@ fn encrypted_replay_blob_cleared_when_switching_to_shape_only_model() {
     let items = vec![json!({"id": "rs_1"})];
     let blob = crate::ai::history::compress::encode_encrypted_reasoning_replay_state(
         ORIGIN_TAG,
+        None,
         &items,
     );
     assert!(blob.starts_with(

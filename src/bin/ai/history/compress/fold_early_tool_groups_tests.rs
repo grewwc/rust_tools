@@ -733,6 +733,7 @@ fn encrypted_replay_reasoning_survives_recent_reasoning_window() {
         let mut assistant = assistant_call(&format!("spark-call-{i}"), "read_file");
         assistant.reasoning_content = Some(encode_encrypted_reasoning_replay_state(
             model,
+            None,
             &[serde_json::json!({
                 "type": "reasoning",
                 "encrypted_content": format!("ENC-{i}-{}", "x".repeat(64)),
@@ -832,7 +833,8 @@ fn path_c_preserves_encrypted_replay_reasoning_verbatim() {
         "summary": []
     })];
     let mut assistant = assistant_call("spark-call", "read_file");
-    assistant.reasoning_content = Some(encode_encrypted_reasoning_replay_state(model, &raw_items));
+    assistant.reasoning_content =
+        Some(encode_encrypted_reasoning_replay_state(model, None, &raw_items));
     let encoded = assistant
         .reasoning_content
         .clone()
@@ -880,7 +882,7 @@ fn path_c_preserves_encrypted_replay_reasoning_verbatim() {
         Some(encoded.as_str())
     );
     assert_eq!(
-        decode_encrypted_reasoning_replay_for_model(model, encoded.as_str()),
+        decode_encrypted_reasoning_replay_for_model(model, None, encoded.as_str()),
         Some(raw_items)
     );
 }
@@ -892,12 +894,12 @@ fn encrypted_reasoning_replay_roundtrip_same_model() {
         serde_json::json!({"type":"reasoning","encrypted_content":"AAA","summary":[]}),
         serde_json::json!({"type":"reasoning","encrypted_content":"BBB","summary":[]}),
     ];
-    let encoded = encode_encrypted_reasoning_replay_state(model, &items);
+    let encoded = encode_encrypted_reasoning_replay_state(model, None, &items);
     assert!(encoded.starts_with(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX));
     // The encrypted and exact-replay prefixes must remain distinguishable.
     assert!(!encoded.starts_with(PERSISTED_REASONING_REPLAY_PREFIX));
 
-    let decoded = decode_encrypted_reasoning_replay_for_model(model, &encoded)
+    let decoded = decode_encrypted_reasoning_replay_for_model(model, None, &encoded)
         .expect("same-model decode should succeed");
     assert_eq!(decoded, items);
 }
@@ -923,8 +925,8 @@ fn encrypted_reasoning_replay_dedups_same_id_duplicate() {
             "summary": []
         }),
     ];
-    let encoded = encode_encrypted_reasoning_replay_state(model, &items);
-    let decoded = decode_encrypted_reasoning_replay_for_model(model, &encoded)
+    let encoded = encode_encrypted_reasoning_replay_state(model, None, &items);
+    let decoded = decode_encrypted_reasoning_replay_for_model(model, None, &encoded)
         .expect("same-model decode should succeed");
     assert_eq!(decoded.len(), 1, "同 id 的两项必须收敛为一项");
     assert_eq!(
@@ -940,8 +942,8 @@ fn encrypted_reasoning_replay_dedups_same_id_duplicate() {
         serde_json::json!({"type":"reasoning","id":"rs_a","encrypted_content":"A"}),
         serde_json::json!({"type":"reasoning","id":"rs_b","encrypted_content":"B"}),
     ];
-    let encoded_mixed = encode_encrypted_reasoning_replay_state(model, &mixed);
-    let decoded_mixed = decode_encrypted_reasoning_replay_for_model(model, &encoded_mixed)
+    let encoded_mixed = encode_encrypted_reasoning_replay_state(model, None, &mixed);
+    let decoded_mixed = decode_encrypted_reasoning_replay_for_model(model, None, &encoded_mixed)
         .expect("same-model decode should succeed");
     assert_eq!(decoded_mixed.len(), 2);
 }
@@ -949,9 +951,12 @@ fn encrypted_reasoning_replay_dedups_same_id_duplicate() {
 #[test]
 fn encrypted_reasoning_replay_rejects_cross_model() {
     let items = vec![serde_json::json!({"type":"reasoning","encrypted_content":"X"})];
-    let encoded = encode_encrypted_reasoning_replay_state("muse-spark-1.2-contributor", &items);
+    let encoded =
+        encode_encrypted_reasoning_replay_state("muse-spark-1.2-contributor", None, &items);
     // Switching/falling back to another model must decode to None, never passing model A's encrypted state to B.
-    assert!(decode_encrypted_reasoning_replay_for_model("gpt-5.6-terra", &encoded).is_none());
+    assert!(
+        decode_encrypted_reasoning_replay_for_model("gpt-5.6-terra", None, &encoded).is_none()
+    );
     // The exact-replay decoder must also reject payloads with the encrypted prefix.
     assert!(decode_reasoning_replay_for_model("muse-spark-1.2-contributor", &encoded).is_none());
 }
@@ -962,7 +967,8 @@ fn encrypted_reasoning_marker_survives_persist_sanitize() {
     let items =
         vec![serde_json::json!({"type":"reasoning","encrypted_content":"ENC","summary":[]})];
     let mut assistant = assistant_call("spark-call", "read_file");
-    assistant.reasoning_content = Some(encode_encrypted_reasoning_replay_state(model, &items));
+    assistant.reasoning_content =
+        Some(encode_encrypted_reasoning_replay_state(model, None, &items));
 
     // Persistence sanitization must preserve marked encrypted continuation state idempotently.
     let sanitized = sanitize_message_for_persisted_history_for_model(model, &assistant);
@@ -972,7 +978,7 @@ fn encrypted_reasoning_marker_survives_persist_sanitize() {
         .expect("encrypted replay marker must survive persist sanitize");
     assert!(encoded.starts_with(PERSISTED_ENCRYPTED_REASONING_REPLAY_PREFIX));
     assert_eq!(
-        decode_encrypted_reasoning_replay_for_model(model, encoded),
+        decode_encrypted_reasoning_replay_for_model(model, None, encoded),
         Some(items)
     );
 }

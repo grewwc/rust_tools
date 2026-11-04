@@ -25,6 +25,8 @@ mod trim;
 const STALE_PATCH_TARGETS_META_KEY: &str = "stale_patch_targets_v1";
 const PROMPT_RESIDENCY_META_KEY: &str = "prompt_residency_v1";
 const LLM_PRUNE_MARKS_META_KEY: &str = "llm_prune_marks_v1";
+const ENCRYPTED_REASONING_REPLAY_REJECTIONS_META_KEY: &str =
+    "encrypted_reasoning_replay_rejections_v1";
 const LAST_ACTIVITY_META_KEY: &str = "last_activity_unix_ms";
 const SESSION_MARKED_META_KEY: &str = "session_marked";
 const SESSION_ARCHIVED_META_KEY: &str = "session_archived";
@@ -58,12 +60,15 @@ pub(in crate::ai) use metadata::{
     write_session_mark_sqlite, write_session_serve_config_sqlite, write_session_title_sqlite,
 };
 pub(in crate::ai) use outcomes::{
+    ENCRYPTED_REASONING_REPLAY_REJECTIONS_MAX_ENTRIES,
     append_interrupted_stream_diagnostic_sqlite, append_skill_activation_event_sqlite,
-    append_tool_execution_outcomes_sqlite, read_image_digest_sqlite, read_llm_prune_marks_sqlite,
-    read_prompt_residency_sqlite, read_skill_activation_events_sqlite,
-    read_stale_patch_targets_sqlite, read_tool_execution_outcomes_cached,
-    read_tool_execution_outcomes_sqlite, read_tool_message_ids_sqlite, upsert_image_digest_sqlite,
-    write_llm_prune_marks_sqlite, write_prompt_residency_sqlite, write_stale_patch_targets_sqlite,
+    append_tool_execution_outcomes_sqlite, read_encrypted_reasoning_replay_rejections_sqlite,
+    read_image_digest_sqlite, read_llm_prune_marks_sqlite, read_prompt_residency_sqlite,
+    read_skill_activation_events_sqlite, read_stale_patch_targets_sqlite,
+    read_tool_execution_outcomes_cached, read_tool_execution_outcomes_sqlite,
+    read_tool_message_ids_sqlite, upsert_image_digest_sqlite, write_llm_prune_marks_sqlite,
+    write_prompt_residency_sqlite, write_stale_patch_targets_sqlite,
+    write_encrypted_reasoning_replay_rejections_sqlite,
 };
 #[cfg(test)]
 pub(in crate::ai) use revision::history_revision_cache_contains;

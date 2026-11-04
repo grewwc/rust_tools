@@ -988,10 +988,17 @@ pub(super) fn append_tool_result_messages_for_model(
         && crate::ai::models::reasoning_encrypted_replay_enabled(source_model)
         && crate::ai::history::compress::encrypted_reasoning_replay_runtime_enabled()
     {
+        // Bind the marker to the endpoint that served this turn: encrypted
+        // items are only accepted by the backing resource that created them,
+        // so a later request routed elsewhere must drop them instead of
+        // replaying another resource's server-side ids.
+        let endpoint = crate::ai::request::endpoint_for_request_model(app, source_model);
+        let endpoint_identity = crate::ai::models::endpoint_resource_identity(&endpoint);
         Message {
             reasoning_content: Some(
                 crate::ai::history::compress::encode_encrypted_reasoning_replay_state(
                     source_model,
+                    endpoint_identity.as_deref(),
                     stream_reasoning_items,
                 ),
             ),
