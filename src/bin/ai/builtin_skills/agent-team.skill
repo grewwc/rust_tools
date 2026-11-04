@@ -2,7 +2,7 @@
 name: "agent-team"
 description: "Opt-in aggressive orchestration mode. Delegates all feasible, safe execution — breakdown, implementation design, discovery, edits, verification, and documentation — to subagents, keeping only the final cross-worker split, scope and product decisions, consequential-risk decisions, scheduling, acceptance, final review, integration, and synthesis in the parent."
 author: "rust_tools"
-version: "1.0.6"
+version: "1.0.7"
 priority: 20
 delegation: required
 tool_groups:
@@ -29,7 +29,7 @@ trivial atomic action (see Delegation threshold), declared with the skip line.
 
 **Worked counter-example: single URL read**
 
-BAD: "This is just one `bytedcli --json insearch get <url>` call, I'll do it directly."
+BAD: "This is just one `curl -s <url>` call, I'll do it directly."
 CORRECT: Spawn one read-only worker with the URL, that command, and the required
 summary shape, then review the worker's evidence.
 
@@ -132,6 +132,8 @@ Every delegated prompt must be self-contained and include:
 - the expected result format: concise conclusion, key evidence paths/lines or commands, changes made if any, remaining uncertainty, and recommended verification.
 
 `inherit: cwd,skills` already supplies the workspace and the parent's active skills, so do not paste AGENTS.md or skill bodies into the prompt. Use `inherit: history` only when the worker genuinely needs the full prior conversation; otherwise a background brief is cheaper and more focused.
+
+Network and workspace access follow `inherit` for fresh traecli runs: without `cwd`, the worker gets a `read-only` sandbox that blocks both writes and network. Set `inherit: "cwd,skills"` for a worker that must run a command that needs network access or writes outside the session temp directory; this selects `workspace-write` with network access. `task_spawn`, `manage_team`, and `run_agent_graph` nodes and candidates all default to `inherit: "cwd,skills"`, but defaults add nothing beyond what `inherit` names: an explicit narrower value such as `inherit: "none"` still blocks commands that need network access or writes. A resumed session (`backend_continue_from`) keeps the working root and sandbox recorded when it originally started; no `-C`/`-s` is passed, so changing `inherit` does not re-sandbox it. If the original session was `read-only`, resuming it does not gain network or write access; start a fresh run with `inherit: "cwd,skills"` instead.
 
 ## Parent responsibilities
 

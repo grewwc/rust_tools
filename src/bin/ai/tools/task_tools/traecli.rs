@@ -399,6 +399,12 @@ fn run_traecli_blocking_with(
     startup_timeout: Duration,
     session_slot: Option<TraeCliSessionSlot>,
 ) -> Result<TraeCliOutcome, String> {
+    let with_sandbox_hint = |mut error: String, stderr: &str| {
+        if let Some(hint) = read_only_sandbox_hint(spec, true, &[error.as_str(), stderr]) {
+            error.push_str(hint);
+        }
+        error
+    };
     let cwd = normalize_cwd(&spec.cwd);
     publish_traecli_activity(spec, "starting traecli", "launching traecli");
     let mut child = std::process::Command::new(binary)
@@ -489,7 +495,7 @@ fn run_traecli_blocking_with(
                 }
                 let stderr_text = take_stderr_snapshot(stderr_handle, &stderr_shared);
                 let detail = truncate_head(stderr_text.trim(), 1_000);
-                return Err(if detail.is_empty() {
+                let error = if detail.is_empty() {
                     format!(
                         "traecli did not emit a startup event within {}s",
                         startup_timeout.as_secs()
@@ -499,7 +505,8 @@ fn run_traecli_blocking_with(
                         "traecli did not emit a startup event within {}s: {detail}",
                         startup_timeout.as_secs()
                     )
-                });
+                };
+                return Err(with_sandbox_hint(error, &stderr_text));
             }
             None => std::thread::sleep(TRAECLI_POLL_INTERVAL),
         }
@@ -513,12 +520,15 @@ fn run_traecli_blocking_with(
     let stderr_text = take_stderr_snapshot(stderr_handle, &stderr_shared);
     if let Some(outcome) = parse_stream_json_output(&stdout_text) {
         if outcome.result.trim().is_empty() {
-            return Err("traecli produced an empty result".to_string());
+            return Err(with_sandbox_hint(
+                "traecli produced an empty result".to_string(),
+                &stderr_text,
+            ));
         }
         if outcome.is_error {
-            return Err(format!(
-                "traecli subagent failed: {}",
-                outcome.result.trim()
+            return Err(with_sandbox_hint(
+                format!("traecli subagent failed: {}", outcome.result.trim()),
+                &stderr_text,
             ));
         }
         return Ok(outcome);
@@ -529,7 +539,7 @@ fn run_traecli_blocking_with(
     // non-JSON stdout line as a hint in case the shape changes.
     let stderr_tail = truncate_head(stderr_text.trim(), 2000);
     let hint = stdout_hint(&stdout_text);
-    if status.success() {
+    let result = if status.success() {
         match hint {
             Some(hint) => Err(format!("traecli produced no result event: {hint}")),
             None => Err("traecli produced no result event".to_string()),
@@ -545,7 +555,86 @@ fn run_traecli_blocking_with(
         Err(format!(
             "traecli exited with status {status}: {stderr_tail}"
         ))
+    };
+    result.map_err(|error| with_sandbox_hint(error, &stderr_text))
+}
+
+const TRAECLI_READ_ONLY_SANDBOX_HINT: &str = "\n\nSandbox hint: This task ran read-only (no network; no writes outside temp). \
+     Respawn with inherit: \"cwd,skills\" to grant workspace-write.";
+
+const TRAECLI_POSSIBLE_READ_ONLY_SANDBOX_HINT: &str = "\n\nSandbox hint: If this failure is due to the read-only sandbox \
+     (no network; no writes outside temp), respawn with inherit: \"cwd,skills\" to grant workspace-write.";
+
+/// Select advice according to the strength of the failure evidence.
+/// Permission denials must identify an operation, rather than a word in a path.
+/// Generic connectivity failures cannot establish that the sandbox caused them.
+/// Resume inherits its recorded sandbox, so the spec cannot prove its mode.
+fn read_only_sandbox_hint(
+    spec: &ExternalSubagentSpec,
+    failed: bool,
+    evidence: &[&str],
+) -> Option<&'static str> {
+    if !failed
+        || spec.workspace_allowed
+        || spec
+            .resume_session
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|session| !session.is_empty())
+    {
+        return None;
     }
+
+    static DENIED_OPERATION: LazyLock<regex::Regex> = LazyLock::new(|| {
+        let operation = "(?:socket|connect|bind|send|sendto|write|writing|create|creating|mkdir|touch|save|saving|append|open|openat|rename|renameat|unlink|unlinkat)";
+        regex::Regex::new(&format!(
+            r#"(?x)
+            (?:^|:\s*)\s*
+            (?:
+                (?:(?:error|failed|unable|cannot|could\s+not)(?:\s+to)?\s+)?
+                {operation}
+                (?:
+                    \s*\([^\r\n)]*\)\s*=\s*-1\s+
+                    | \s*\([^\r\n)]*\)\s+(?:creation\s+)?failed\s*:\s*
+                    | \s*:\s*
+                    | \s+(?:creation\s+)?failed\s*:\s*
+                    | \s+(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s:]+)\s*:\s*
+                )
+                (?:eperm\b|eacces\b|operation\s+not\s+permitted\b|permission\s+denied\b)
+                |
+                (?:eperm|eacces)\s*:\s*(?:operation\s+not\s+permitted|permission\s+denied)\s*,\s*
+                {operation}\s+(?:"[^"\r\n]+"|'[^'\r\n]+'|[^\s:]+)
+            )"#
+        ))
+        .expect("valid sandbox operation diagnostic regex")
+    });
+
+    let mut connectivity_failure = false;
+    for text in evidence {
+        let text = text.to_ascii_lowercase();
+        for line in text.lines() {
+            if line.contains("read-only file system")
+                || line.contains("read-only filesystem")
+                || DENIED_OPERATION.is_match(line)
+            {
+                return Some(TRAECLI_READ_ONLY_SANDBOX_HINT);
+            }
+            connectivity_failure |= [
+                "network is unreachable",
+                "could not resolve host",
+                "could not resolve proxy",
+                "temporary failure in name resolution",
+                "name or service not known",
+                "dns lookup failed",
+                "dns resolution failed",
+                "connection refused",
+                "failed to connect",
+            ]
+            .iter()
+            .any(|signal| line.contains(*signal));
+        }
+    }
+    connectivity_failure.then_some(TRAECLI_POSSIBLE_READ_ONLY_SANDBOX_HINT)
 }
 
 fn publish_traecli_activity(spec: &ExternalSubagentSpec, phase: &str, activity: &str) {
@@ -1182,6 +1271,158 @@ mod tests {
             image_files: Vec::new(),
             phase_slot: None,
         }
+    }
+
+    #[test]
+    fn read_only_sandbox_hint_requires_failed_run_and_specific_evidence() {
+        let mut spec = test_spec();
+        spec.workspace_allowed = false;
+        for evidence in [
+            "socket: Operation not permitted (os error 1)",
+            "connect: EACCES",
+            "Network is unreachable",
+            "curl: (6) Could not resolve host: api.example.test",
+            "DNS lookup failed",
+            "error creating /workspace/output.txt: Permission denied",
+            "write /workspace/output.txt: EACCES",
+            "mkdir /workspace/cache: EPERM",
+            "Read-only file system (os error 30)",
+        ] {
+            assert!(read_only_sandbox_hint(&spec, true, &[evidence]).is_some());
+            assert!(read_only_sandbox_hint(&spec, false, &[evidence]).is_none());
+            assert!(read_only_sandbox_hint(&test_spec(), true, &[evidence]).is_none());
+        }
+        for evidence in [
+            "",
+            "traecli exited with status 1 and no result event",
+            "compiler failed: unknown type",
+            "permission denied reading /private/config",
+            "read /private/config: EACCES",
+            "socket command has invalid arguments",
+            "invalid network configuration",
+            "network\npermission denied",
+        ] {
+            assert!(read_only_sandbox_hint(&spec, true, &[evidence]).is_none());
+        }
+        assert!(
+            read_only_sandbox_hint(
+                &spec,
+                true,
+                &["generic failure", "write output.txt: Permission denied"]
+            )
+            .is_some()
+        );
+        assert!(read_only_sandbox_hint(&spec, true, &["network", "permission denied"]).is_none());
+        spec.resume_session = Some("recorded-session".to_string());
+        assert!(
+            read_only_sandbox_hint(&spec, true, &["write output.txt: Permission denied"]).is_none()
+        );
+        for evidence in [
+            "Read-only file system (os error 30)",
+            "socket: Operation not permitted (os error 1)",
+            "error sending request: connection refused",
+        ] {
+            assert!(read_only_sandbox_hint(&spec, true, &[evidence]).is_none());
+        }
+    }
+
+    #[test]
+    fn read_only_sandbox_hint_ignores_permission_denied_paths() {
+        let mut spec = test_spec();
+        spec.workspace_allowed = false;
+        for evidence in [
+            "permission denied reading /private/network.conf",
+            "permission denied reading /private/socket.conf",
+            "read /private/write: EACCES",
+            "read /private/connect: EPERM",
+            "cannot read socket: permission denied",
+            "Error: EACCES: permission denied, read '/private/network.conf'",
+        ] {
+            assert_eq!(read_only_sandbox_hint(&spec, true, &[evidence]), None);
+        }
+    }
+
+    #[test]
+    fn read_only_sandbox_hint_makes_connectivity_advice_conditional() {
+        let mut spec = test_spec();
+        spec.workspace_allowed = false;
+        for evidence in [
+            "error sending request: connection refused",
+            "failed to connect to backend endpoint",
+            "Network is unreachable",
+            "curl: (6) Could not resolve host: api.example.test",
+            "Could not resolve proxy: proxy.example.test",
+            "Temporary failure in name resolution",
+            "Name or service not known",
+            "DNS lookup failed",
+            "DNS resolution failed",
+        ] {
+            let hint = read_only_sandbox_hint(&spec, true, &[evidence]).unwrap();
+            assert_eq!(hint, TRAECLI_POSSIBLE_READ_ONLY_SANDBOX_HINT);
+            assert!(hint.contains("If this failure is due to the read-only sandbox"));
+            assert!(!hint.contains("Respawn with inherit:"));
+        }
+    }
+
+    #[test]
+    fn read_only_sandbox_hint_keeps_imperative_operation_advice() {
+        let mut spec = test_spec();
+        spec.workspace_allowed = false;
+        for evidence in [
+            "Read-only file system (os error 30)",
+            "Read-only filesystem",
+            "socket: Operation not permitted (os error 1)",
+            "socket creation failed: EPERM",
+            "socket(AF_INET, SOCK_STREAM, 0) = -1 EPERM (Operation not permitted)",
+            "failed to create socket: EPERM",
+            "traecli subagent failed: socket: Operation not permitted (os error 1)",
+            "connect: EACCES",
+            "error creating /workspace/output.txt: Permission denied",
+            "write /workspace/output.txt: EACCES",
+            "mkdir /workspace/cache: EPERM",
+            "open '/workspace/output.txt': EACCES",
+            "Error: EACCES: permission denied, open '/workspace/output.txt'",
+            "rename /workspace/output.txt: EACCES",
+            "unlink /workspace/output.txt: EPERM",
+        ] {
+            assert_eq!(
+                read_only_sandbox_hint(&spec, true, &[evidence]),
+                Some(TRAECLI_READ_ONLY_SANDBOX_HINT),
+                "{evidence}"
+            );
+            for evidence in [
+                ["error sending request: connection refused", evidence],
+                [evidence, "error sending request: connection refused"],
+            ] {
+                assert_eq!(
+                    read_only_sandbox_hint(&spec, true, &evidence),
+                    Some(TRAECLI_READ_ONLY_SANDBOX_HINT)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_sandbox_hint_matches_parenthesized_failed_operations() {
+        let mut spec = test_spec();
+        spec.workspace_allowed = false;
+        for evidence in [
+            "socket() failed: EPERM",
+            "socket() creation failed: EPERM",
+            "sendto(fd, buf, len, 0) failed: EACCES",
+            "socket(...) = -1 EPERM",
+            "openat(AT_FDCWD, \"/x\", O_WRONLY) = -1 EACCES",
+        ] {
+            assert_eq!(
+                read_only_sandbox_hint(&spec, true, &[evidence]),
+                Some(TRAECLI_READ_ONLY_SANDBOX_HINT),
+                "{evidence}"
+            );
+        }
+        assert_eq!(
+            read_only_sandbox_hint(&spec, true, &["socket() failed: ECONNRESET"]),
+            None
+        );
     }
 
     #[cfg(unix)]

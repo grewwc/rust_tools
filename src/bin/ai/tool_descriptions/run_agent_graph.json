@@ -88,7 +88,7 @@
                 },
                 "inherit": {
                   "type": "string",
-                  "description": "Context inherited by the node task: none, all, cwd, memory, history, skills, or a comma-separated combination."
+                  "description": "Context inherited by the node task: none, all, cwd, memory, history, skills, or a comma-separated combination. Default cwd,skills."
                 },
                 "response_schema": {
                   "type": "object",
@@ -212,7 +212,7 @@
                 },
                 "inherit": {
                   "type": "string",
-                  "description": "Context inherited by candidate tasks: none, all, cwd, memory, history, skills, or a comma-separated combination."
+                  "description": "Context inherited by candidate tasks: none, all, cwd, memory, history, skills, or a comma-separated combination. Default cwd,skills."
                 }
               }
             }

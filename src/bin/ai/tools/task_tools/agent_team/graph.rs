@@ -311,7 +311,7 @@ struct DynamicGraphInput {
 }
 
 fn default_inherit() -> String {
-    "none".to_string()
+    "cwd,skills".to_string()
 }
 
 fn default_min_selected() -> usize {
@@ -2040,6 +2040,7 @@ fn render_json(value: &Value) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::tools::task_tools::InheritOptions;
 
     fn node(id: &str) -> StaticNodeSpec {
         StaticNodeSpec {
@@ -2048,7 +2049,7 @@ mod tests {
             prompt: id.to_string(),
             agent: None,
             model: None,
-            inherit: "none".to_string(),
+            inherit: default_inherit(),
             response_schema: None,
             output_key: None,
             reducer: Reducer::Replace,
@@ -2073,6 +2074,55 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn graph_inherit_defaults_to_cwd_and_skills() {
+        let node: StaticNodeSpec = serde_json::from_value(json!({
+            "id": "node",
+            "description": "worker",
+            "prompt": "complete the task",
+        }))
+        .unwrap();
+        let candidate: DynamicCandidateSpec = serde_json::from_value(json!({
+            "id": "candidate",
+            "role": "worker",
+        }))
+        .unwrap();
+
+        for inherit in [node.inherit, candidate.inherit] {
+            assert_eq!(inherit, "cwd,skills");
+            assert_eq!(
+                InheritOptions::from_value(&json!(inherit)).unwrap(),
+                InheritOptions {
+                    cwd: true,
+                    skills: true,
+                    history: false,
+                    memory: false,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn graph_inherit_preserves_explicit_values() {
+        for inherit in ["none", "all", "history", "cwd", "skills", "cwd,history"] {
+            let node: StaticNodeSpec = serde_json::from_value(json!({
+                "id": "node",
+                "description": "worker",
+                "prompt": "complete the task",
+                "inherit": inherit,
+            }))
+            .unwrap();
+            let candidate: DynamicCandidateSpec = serde_json::from_value(json!({
+                "id": "candidate",
+                "role": "worker",
+                "inherit": inherit,
+            }))
+            .unwrap();
+            assert_eq!(node.inherit, inherit);
+            assert_eq!(candidate.inherit, inherit);
+        }
     }
 
     #[test]
@@ -2187,7 +2237,7 @@ mod tests {
                         prompt: String::new(),
                         agent: None,
                         model: None,
-                        inherit: "none".to_string(),
+                        inherit: default_inherit(),
                     },
                     task_id: None,
                     team_task_id: None,
