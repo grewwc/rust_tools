@@ -7,6 +7,27 @@ const CHECKPOINT_SUMMARY_MAX_CHARS: usize = 160;
 const TASK_WAIT_DEADLINE_PREFIX: &str = "[task-wait] still running:";
 type StatusCursor = FastMap<String, (String, String, u64, u64)>;
 
+#[derive(Clone, Copy)]
+pub(super) enum TaskWaitReturnReason {
+    Parked,
+    ResultsReady,
+    BudgetElapsed,
+    Interrupted,
+    Woke,
+}
+
+impl TaskWaitReturnReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Parked => "parked",
+            Self::ResultsReady => "results_ready",
+            Self::BudgetElapsed => "budget_elapsed",
+            Self::Interrupted => "interrupted",
+            Self::Woke => "woke",
+        }
+    }
+}
+
 /// Consult the current agent's active skills, never the manifest catalog or session history.
 pub(crate) fn is_agent_team_mode() -> bool {
     runtime_ctx::try_current().is_some_and(|context| {
@@ -195,7 +216,16 @@ pub(super) fn execute_agent_team_task_status(
     Ok(output)
 }
 
-fn format_wait_digest(tasks: &[TaskDigest]) -> String {
+fn format_wait_digest(
+    tasks: &[TaskDigest],
+    reason: TaskWaitReturnReason,
+    waited: Duration,
+) -> String {
+    let header = format!(
+        "{TASK_WAIT_DEADLINE_PREFIX} reason={} waited={}s",
+        reason.as_str(),
+        waited.as_secs()
+    );
     let pending = tasks
         .iter()
         .map(|task| {
@@ -205,7 +235,7 @@ fn format_wait_digest(tasks: &[TaskDigest]) -> String {
             )
         })
         .collect::<Vec<_>>();
-    let full = format!("{TASK_WAIT_DEADLINE_PREFIX} {}", pending.join(" "));
+    let full = format!("{header} {}", pending.join(" "));
     if full.chars().count() <= TASK_WAIT_LINE_MAX_CHARS {
         return full;
     }
@@ -213,7 +243,8 @@ fn format_wait_digest(tasks: &[TaskDigest]) -> String {
     let omission_hint = |omitted| {
         format!(" (+{omitted} omitted; task_status for IDs, task_evidence_read for detail)")
     };
-    let mut output = TASK_WAIT_DEADLINE_PREFIX.to_string();
+    // Reserve the return metadata and recovery hint before adding any whole task rows.
+    let mut output = header;
     let mut shown = 0;
     for task in &pending {
         let remaining = pending.len() - shown - 1;
@@ -235,7 +266,11 @@ fn format_wait_digest(tasks: &[TaskDigest]) -> String {
     output
 }
 
-pub(super) fn format_agent_team_task_wait(task_ids: &[String]) -> String {
+pub(super) fn format_agent_team_task_wait(
+    task_ids: &[String],
+    reason: TaskWaitReturnReason,
+    waited: Duration,
+) -> String {
     let tasks = task_ids
         .iter()
         .filter_map(|task_id| {
@@ -255,7 +290,7 @@ pub(super) fn format_agent_team_task_wait(task_ids: &[String]) -> String {
             })
         })
         .collect::<Vec<_>>();
-    format_wait_digest(&tasks)
+    format_wait_digest(&tasks, reason, waited)
 }
 
 #[cfg(test)]
@@ -271,6 +306,38 @@ mod tests {
             revision,
             sequence: revision,
             checkpoint_summary: Some("saved finding".to_string()),
+        }
+    }
+
+    fn waited_secs(output: &str) -> u64 {
+        output
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix("waited="))
+            .and_then(|value| value.strip_suffix('s'))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("missing wait duration: {output}"))
+    }
+
+    #[test]
+    fn agent_team_quiet_wait_reason_and_elapsed_preserve_task_idle() {
+        for (reason, token) in [
+            (TaskWaitReturnReason::Parked, "parked"),
+            (TaskWaitReturnReason::BudgetElapsed, "budget_elapsed"),
+            (TaskWaitReturnReason::ResultsReady, "results_ready"),
+            (TaskWaitReturnReason::Interrupted, "interrupted"),
+            (TaskWaitReturnReason::Woke, "woke"),
+        ] {
+            let output = format_wait_digest(
+                &[task("task-a", "running", 0)],
+                reason,
+                Duration::from_secs(17),
+            );
+            assert_eq!(
+                output,
+                format!(
+                    "[task-wait] still running: reason={token} waited=17s task-a(idle=12s,phase=read)"
+                )
+            );
         }
     }
 
@@ -342,19 +409,21 @@ mod tests {
         assert!(row.checkpoint_summary.as_ref().unwrap().ends_with('…'));
         assert_eq!(row.status_line().lines().count(), 1);
         assert!(!row.status_line().contains("full checkpoint"));
-        let timeout = format_wait_digest(&vec![row; 20]);
+        let timeout = format_wait_digest(
+            &vec![row; 20],
+            TaskWaitReturnReason::BudgetElapsed,
+            Duration::from_secs(30),
+        );
         assert!(timeout.chars().count() <= TASK_WAIT_LINE_MAX_CHARS);
         assert_eq!(timeout.lines().count(), 1);
         assert!(timeout.contains("omitted"));
         assert!(timeout.contains("task_status"));
         assert!(timeout.contains("task_evidence_read"));
+        assert!(timeout.contains("reason=budget_elapsed waited=30s"));
+        assert!(timeout.contains("idle=12s,phase=read files"));
         assert!(!timeout.contains("TASK_WAIT_TIMEOUT"));
         assert!(!timeout.contains("goal"));
         assert!(!timeout.contains("task_wait"));
-        assert_eq!(
-            format_wait_digest(&[task("task-a", "running", 0)]),
-            "[task-wait] still running: task-a(idle=12s,phase=read)"
-        );
     }
 
     #[test]
@@ -362,32 +431,47 @@ mod tests {
         let tasks = (0..8)
             .map(|index| task(&format!("task-{index}-{}", "x".repeat(48)), "running", 0))
             .collect::<Vec<_>>();
-        let output = format_wait_digest(&tasks);
-        assert!(output.chars().count() <= TASK_WAIT_LINE_MAX_CHARS);
-        assert_eq!(output.lines().count(), 1);
-        let (shown, hint) = output
-            .strip_prefix(TASK_WAIT_DEADLINE_PREFIX)
-            .unwrap()
-            .split_once(" (+")
-            .unwrap();
-        let shown_ids = shown
-            .split_whitespace()
-            .map(|row| row.split_once("(idle=").unwrap().0)
-            .collect::<Vec<_>>();
-        assert!(!shown_ids.is_empty());
-        assert!(shown_ids.len() < tasks.len());
-        for (id, task) in shown_ids.iter().zip(&tasks) {
-            assert_eq!(*id, task.task_id);
-        }
-        assert!(hint.starts_with(&format!("{} omitted;", tasks.len() - shown_ids.len())));
-        assert!(hint.contains("task_status"));
-        assert!(hint.contains("task_evidence_read"));
+        for (reason, token) in [
+            (TaskWaitReturnReason::Parked, "parked"),
+            (TaskWaitReturnReason::BudgetElapsed, "budget_elapsed"),
+            (TaskWaitReturnReason::ResultsReady, "results_ready"),
+            (TaskWaitReturnReason::Interrupted, "interrupted"),
+            (TaskWaitReturnReason::Woke, "woke"),
+        ] {
+            let waited = Duration::MAX;
+            let header = format!(
+                "{TASK_WAIT_DEADLINE_PREFIX} reason={token} waited={}s",
+                waited.as_secs()
+            );
+            let output = format_wait_digest(&tasks, reason, waited);
+            assert!(output.chars().count() <= TASK_WAIT_LINE_MAX_CHARS);
+            assert_eq!(output.lines().count(), 1);
+            let (shown, hint) = output
+                .strip_prefix(&header)
+                .unwrap()
+                .split_once(" (+")
+                .unwrap();
+            let shown_ids = shown
+                .split_whitespace()
+                .map(|row| row.split_once("(idle=").unwrap().0)
+                .collect::<Vec<_>>();
+            assert!(!shown_ids.is_empty());
+            assert!(shown_ids.len() < tasks.len());
+            for (id, task) in shown_ids.iter().zip(&tasks) {
+                assert_eq!(*id, task.task_id);
+            }
+            assert!(hint.starts_with(&format!("{} omitted;", tasks.len() - shown_ids.len())));
+            assert!(hint.contains("task_status"));
+            assert!(hint.contains("task_evidence_read"));
 
-        let oversized = task(&format!("task-{}", "x".repeat(300)), "running", 0);
-        let output = format_wait_digest(&[oversized]);
-        assert!(output.chars().count() <= TASK_WAIT_LINE_MAX_CHARS);
-        assert!(output.starts_with(&format!("{TASK_WAIT_DEADLINE_PREFIX} (+1 omitted;")));
-        assert!(!output.contains("task-xxx"));
+            let oversized = task(&format!("task-{}", "x".repeat(300)), "running", 0);
+            let output = format_wait_digest(&[oversized], reason, waited);
+            assert!(output.chars().count() <= TASK_WAIT_LINE_MAX_CHARS);
+            assert!(output.starts_with(&format!("{header} (+1 omitted;")));
+            assert!(output.contains("task_status"));
+            assert!(output.contains("task_evidence_read"));
+            assert!(!output.contains("task-xxx"));
+        }
     }
 
     #[test]
@@ -517,6 +601,21 @@ mod tests {
                 })
         }
 
+        fn scope_with_global_os<T>(&self, action: impl FnOnce() -> T) -> T {
+            struct RestoreGlobalOs(Option<SharedKernel>);
+
+            impl Drop for RestoreGlobalOs {
+                fn drop(&mut self) {
+                    *lock_unpoisoned(&GLOBAL_OS) = self.0.take();
+                }
+            }
+
+            let _restore = RestoreGlobalOs(
+                lock_unpoisoned(&GLOBAL_OS).replace(self.context.app_proto.os.clone()),
+            );
+            self.scope(action)
+        }
+
         fn publish(&self, task_id: &str, status: &str, output: &str, error: Option<&str>) {
             let entry = with_task_entry(task_id, Clone::clone).unwrap();
             self.context
@@ -567,8 +666,16 @@ mod tests {
         )
         .unwrap();
 
-        let output = fixture.scope(|| format_agent_team_task_wait(&[task_id.clone()]));
-        assert!(output.starts_with(&format!("{TASK_WAIT_DEADLINE_PREFIX} {task_id}(idle=")));
+        let output = fixture.scope(|| {
+            format_agent_team_task_wait(
+                &[task_id.clone()],
+                TaskWaitReturnReason::Parked,
+                Duration::ZERO,
+            )
+        });
+        assert!(output.starts_with(&format!(
+            "{TASK_WAIT_DEADLINE_PREFIX} reason=parked waited=0s {task_id}(idle="
+        )));
         assert!(
             output.contains(
                 "phase=starting · pending side-notes: 1 (queued for backend_continue_from)"
@@ -584,6 +691,91 @@ mod tests {
     }
 
     #[test]
+    fn agent_team_quiet_wait_non_suspending_return_reports_interrupted_or_woke() {
+        use crate::ai::tools::registry::common;
+
+        let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
+        for (agent_team_mode, cancelled, reason, label) in [
+            (true, true, "interrupted", "INTERRUPTED"),
+            (false, true, "interrupted", "INTERRUPTED"),
+            (true, false, "woke", "WOKE"),
+            (false, false, "woke", "WOKE"),
+        ] {
+            let mut fixture = RuntimeFixture::new();
+            if !agent_team_mode {
+                fixture.context.active_skill_names.write().unwrap().clear();
+            }
+            let task_id = fixture.spawn();
+            let entry = with_task_entry(&task_id, Clone::clone).unwrap();
+            let args = serde_json::json!({
+                "task_ids": [task_id.clone()], "timeout_secs": 60, "wait_policy": "all"
+            });
+            let key = task_wait_key(
+                &fixture.context.app_proto.session_id,
+                fixture.owner_pid,
+                &WaitPolicy::All,
+                &[task_id.clone()],
+            );
+            let before_wait = Instant::now();
+            let output = fixture
+                .scope_with_global_os(|| {
+                    common::clear_tool_cancel();
+                    let state = load_or_create_task_wait_state(&key, 60, agent_team_mode);
+                    assert!(!state.expired);
+                    if cancelled {
+                        assert!(common::try_request_tool_cancel());
+                        assert!(common::is_tool_cancel_requested());
+                    } else {
+                        // A completion source may be ready before its terminal payload is available.
+                        with_os_kernel(|os| {
+                            let _ = os.futex_store(entry.completion_futex_addr, 1);
+                            Ok(())
+                        })
+                        .unwrap();
+                        assert!(!common::is_tool_cancel_requested());
+                    }
+                    let result = execute_task_wait(&args);
+                    assert!(Instant::now() < state.deadline);
+                    with_os_kernel(|os| {
+                        assert_eq!(os.current_process_id(), Some(fixture.owner_pid));
+                        assert!(is_task_pending(os, entry.pid)?);
+                        assert!(
+                            os.channel_meta(ChannelId(entry.result_channel_id))
+                                .is_some()
+                        );
+                        Ok(())
+                    })
+                    .unwrap();
+                    common::clear_tool_cancel();
+                    result
+                })
+                .unwrap();
+            let after_wait = Instant::now();
+            assert!(!output.contains("reason=budget_elapsed"), "{output}");
+            assert!(!output.contains("[task_wait BUDGET ELAPSED]"), "{output}");
+            assert!(output.contains(&task_id));
+            assert!(with_task_entry(&task_id, |_| ()).is_some());
+            if agent_team_mode {
+                assert!(output.starts_with(TASK_WAIT_DEADLINE_PREFIX));
+                assert!(output.contains(&format!("reason={reason}")), "{output}");
+                assert!(
+                    waited_secs(&output)
+                        <= after_wait.saturating_duration_since(before_wait).as_secs()
+                );
+                assert!(output.contains("(idle="));
+                assert!(output.contains("phase=starting"));
+                assert!(output.chars().count() <= TASK_WAIT_LINE_MAX_CHARS);
+            } else {
+                assert!(
+                    output.starts_with(&format!("[task_wait {label}]")),
+                    "{output}"
+                );
+                assert!(output.contains("wait budget has not elapsed"), "{output}");
+            }
+        }
+    }
+
+    #[test]
     fn agent_team_quiet_wait_honors_requested_timeout_and_wakes_with_one_line() {
         let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
         let mut fixture = RuntimeFixture::new();
@@ -596,6 +788,11 @@ mod tests {
         let parked = fixture.scope(|| execute_task_wait(&args)).unwrap();
         let after_wait = Instant::now();
         assert!(is_agent_team_wait_deadline_message(&parked));
+        assert!(parked.contains("reason=parked"));
+        assert!(
+            waited_secs(&parked) <= after_wait.saturating_duration_since(before_wait).as_secs()
+        );
+        assert!(parked.contains("(idle="));
         assert_eq!(parked.lines().count(), 1);
         assert!(parked.chars().count() <= TASK_WAIT_LINE_MAX_CHARS);
         let key = task_wait_key(
@@ -620,14 +817,26 @@ mod tests {
             assert!(matches!(owner.state, ProcessState::Ready));
             assert_eq!(owner.mailbox.len(), 1);
             let notice = owner.mailbox.front().unwrap();
+            assert!(notice.contains("reason=budget_elapsed"));
+            assert!(waited_secs(notice) >= 60);
             assert_eq!(notice.lines().count(), 1);
             assert!(notice.chars().count() <= TASK_WAIT_LINE_MAX_CHARS);
             assert!(!notice.contains("TASK_WAIT_TIMEOUT"));
             assert!(!notice.contains("goal"));
             assert!(!notice.contains("task_wait"));
         }
+        let before_elapsed = Instant::now();
         let elapsed = fixture.scope(|| execute_task_wait(&args)).unwrap();
+        let after_elapsed = Instant::now();
         assert!(is_agent_team_wait_deadline_message(&elapsed));
+        assert!(elapsed.contains("reason=budget_elapsed"));
+        assert!(
+            waited_secs(&elapsed)
+                <= after_elapsed
+                    .saturating_duration_since(before_elapsed)
+                    .as_secs()
+        );
+        assert!(elapsed.contains("(idle="));
         assert_eq!(elapsed.lines().count(), 1);
         assert!(with_task_entry(&task_id, |_| ()).is_some());
         reset_last_spawn_batch_for_test();
@@ -709,33 +918,60 @@ mod tests {
     #[test]
     fn agent_team_quiet_wait_all_returns_partial_terminal_results_without_parking() {
         let _env_guard = lock_unpoisoned(&crate::ai::test_support::ENV_LOCK);
-        let mut fixture = RuntimeFixture::new();
-        let done = fixture.spawn();
-        let pending = fixture.spawn();
-        let args = serde_json::json!({ "task_ids": [done.clone(), pending.clone()], "wait_policy": "all" });
-        fixture.scope(|| execute_task_wait(&args)).unwrap();
-        let output = format!("complete output\n{}", "界".repeat(1000));
-        fixture.publish(&done, "completed", &output, None);
-        let collected = fixture.scope(|| execute_task_wait(&args)).unwrap();
-        assert_eq!(collected.matches(&output).count(), 1);
-        assert!(collected.contains("COMPLETED"));
-        let (_, notice) = collected.rsplit_once("\n\n---\n\n").unwrap();
-        assert!(notice.contains(&pending));
-        assert!(is_agent_team_wait_deadline_message(notice));
-        assert_eq!(notice.lines().count(), 1);
-        assert!(notice.chars().count() <= TASK_WAIT_LINE_MAX_CHARS);
-        assert!(matches!(
-            fixture
-                .context
-                .app_proto
-                .os
-                .lock()
-                .unwrap()
-                .get_process(fixture.owner_pid)
-                .unwrap()
-                .state,
-            ProcessState::Ready
-        ));
+        for (budget_elapsed, reason) in [(false, "results_ready"), (true, "budget_elapsed")] {
+            let mut fixture = RuntimeFixture::new();
+            let done = fixture.spawn();
+            let pending = fixture.spawn();
+            let args = serde_json::json!({ "task_ids": [done.clone(), pending.clone()], "wait_policy": "all" });
+            fixture.scope(|| execute_task_wait(&args)).unwrap();
+            if budget_elapsed {
+                let key = task_wait_key(
+                    &fixture.context.app_proto.session_id,
+                    fixture.owner_pid,
+                    &WaitPolicy::All,
+                    &[done.clone(), pending.clone()],
+                );
+                lock_unpoisoned(&TASK_WAIT_STATES)
+                    .get_mut(&key)
+                    .unwrap()
+                    .deadline = Instant::now() - Duration::from_secs(1);
+            }
+            let output = format!("complete output\n{}", "界".repeat(1000));
+            fixture.publish(&done, "completed", &output, None);
+            let before_wait = Instant::now();
+            let collected = fixture.scope(|| execute_task_wait(&args)).unwrap();
+            let after_wait = Instant::now();
+            assert_eq!(collected.matches(&output).count(), 1);
+            assert!(collected.contains("COMPLETED"));
+            let (result, notice) = collected.rsplit_once("\n\n---\n\n").unwrap();
+            assert!(result.contains(&output));
+            assert!(
+                collected.find(&output).unwrap()
+                    < collected.find(TASK_WAIT_DEADLINE_PREFIX).unwrap()
+            );
+            assert!(notice.contains(&pending));
+            assert!(is_agent_team_wait_deadline_message(notice));
+            assert!(notice.contains(&format!("reason={reason}")));
+            assert!(
+                waited_secs(notice) <= after_wait.saturating_duration_since(before_wait).as_secs()
+            );
+            assert!(notice.contains("(idle="));
+            assert!(notice.contains("phase=starting"));
+            assert_eq!(notice.lines().count(), 1);
+            assert!(notice.chars().count() <= TASK_WAIT_LINE_MAX_CHARS);
+            assert!(matches!(
+                fixture
+                    .context
+                    .app_proto
+                    .os
+                    .lock()
+                    .unwrap()
+                    .get_process(fixture.owner_pid)
+                    .unwrap()
+                    .state,
+                ProcessState::Ready
+            ));
+        }
     }
 
     #[test]

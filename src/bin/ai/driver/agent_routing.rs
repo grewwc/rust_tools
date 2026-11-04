@@ -81,6 +81,33 @@ pub(super) fn interrupt_pending_foreground_process(app: &App) -> bool {
     true
 }
 
+pub(super) const PARKED_SIDE_NOTE_MESSAGE: &str = "[SIDE_NOTE_WAKE] A side note is pending for this foreground process. \
+     Subagents are still running. Incorporate the pending side note; you may continue waiting for subagent results.";
+
+/// Wake only a parked foreground process; active turns drain guidance at their
+/// existing model-iteration boundary. Task channels and subagents are untouched.
+pub(super) fn wake_pending_foreground_side_note(app: &App) -> bool {
+    super::side_note::wake_foreground_for_pending_notes(&app.session_history_file, || {
+        let mut os = app.os.lock().unwrap();
+        let Some(pid) = os
+            .list_processes()
+            .into_iter()
+            .find(|proc| {
+                proc.is_foreground
+                    && matches!(
+                        proc.state,
+                        aios_kernel::kernel::ProcessState::Waiting { .. }
+                            | aios_kernel::kernel::ProcessState::Sleeping { .. }
+                    )
+            })
+            .map(|proc| proc.pid)
+        else {
+            return false;
+        };
+        os.wake_process(pid, PARKED_SIDE_NOTE_MESSAGE.to_string())
+    })
+}
+
 /// Loads all agents fresh from disk, enabling hot-reload of newly added/modified agents.
 /// Returns a message to show when something changed; the foreground driver
 /// prints it after clearing the dynamic status line.

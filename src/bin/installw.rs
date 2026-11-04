@@ -299,6 +299,201 @@ fn extract_mod_decl(line: &str) -> Option<String> {
     }
 }
 
+fn parse_include_paths(content: &str, current_file: &Path) -> Vec<PathBuf> {
+    let current_dir = current_file.parent().unwrap_or_else(|| Path::new("."));
+    let bytes = content.as_bytes();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < content.len() {
+        pos = skip_include_trivia(content, pos);
+        let rest = &content[pos..];
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        let literal = if matches!(ch, 'b' | 'c') {
+            &rest[1..]
+        } else {
+            rest
+        };
+        if let Some(len) = string_literal_len(literal) {
+            pos += rest.len() - literal.len() + len;
+            continue;
+        }
+        // Skip character literals without consuming lifetime annotations.
+        if ch == '\'' {
+            let mut end = pos + 1;
+            if bytes.get(end) == Some(&b'\\') {
+                end += 2;
+            } else if let Some(ch) = content[end..].chars().next() {
+                end += ch.len_utf8();
+            }
+            if bytes.get(end) == Some(&b'\'') {
+                pos = end + 1;
+                continue;
+            }
+        }
+        if !ch.is_alphabetic() && ch != '_' {
+            pos += ch.len_utf8();
+            continue;
+        }
+        let start = pos;
+        pos += ch.len_utf8();
+        while let Some(ch) = content[pos..].chars().next() {
+            if !ch.is_alphanumeric() && ch != '_' {
+                break;
+            }
+            pos += ch.len_utf8();
+        }
+        if !matches!(
+            &content[start..pos],
+            "include_str" | "include_bytes" | "include"
+        ) {
+            continue;
+        }
+        let mut arg = skip_include_trivia(content, pos);
+        if bytes.get(arg) != Some(&b'!') {
+            continue;
+        }
+        arg = skip_include_trivia(content, arg + 1);
+        let closing = match bytes.get(arg) {
+            Some(b'(') => b')',
+            Some(b'[') => b']',
+            Some(b'{') => b'}',
+            _ => continue,
+        };
+        arg = skip_include_trivia(content, arg + 1);
+        let Some((path, len)) = parse_include_literal(&content[arg..]) else {
+            continue;
+        };
+        let mut end = skip_include_trivia(content, arg + len);
+        if bytes.get(end) == Some(&b',') {
+            end = skip_include_trivia(content, end + 1);
+        }
+        if bytes.get(end) == Some(&closing) {
+            out.push(current_dir.join(path));
+            pos = end + 1;
+        }
+    }
+    out
+}
+
+fn skip_include_trivia(content: &str, mut pos: usize) -> usize {
+    let bytes = content.as_bytes();
+    loop {
+        while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        if bytes.get(pos..pos + 2) == Some(b"//") {
+            pos = content[pos..]
+                .find('\n')
+                .map_or(content.len(), |len| pos + len + 1);
+        } else if bytes.get(pos..pos + 2) == Some(b"/*") {
+            pos += 2;
+            let mut depth = 1;
+            while pos < bytes.len() && depth > 0 {
+                match bytes.get(pos..pos + 2) {
+                    Some(b"/*") => {
+                        depth += 1;
+                        pos += 2;
+                    }
+                    Some(b"*/") => {
+                        depth -= 1;
+                        pos += 2;
+                    }
+                    _ => pos += 1,
+                }
+            }
+        } else {
+            return pos;
+        }
+    }
+}
+
+// Find string boundaries without decoding or validating byte string escapes.
+fn string_literal_len(source: &str) -> Option<usize> {
+    if let Some(raw) = source.strip_prefix('r') {
+        let hashes = raw.bytes().take_while(|b| *b == b'#').count();
+        let body = raw[hashes..].strip_prefix('"')?;
+        let closing = format!("\"{}", "#".repeat(hashes));
+        return Some(
+            body.find(&closing)
+                .map_or(source.len(), |end| hashes + 2 + end + closing.len()),
+        );
+    }
+    let mut chars = source.strip_prefix('"')?.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '"' => return Some(index + 2),
+            '\\' => {
+                chars.next();
+            }
+            _ => {}
+        }
+    }
+    Some(source.len())
+}
+
+fn parse_include_literal(source: &str) -> Option<(String, usize)> {
+    if let Some(raw) = source.strip_prefix('r') {
+        let hashes = raw.bytes().take_while(|b| *b == b'#').count();
+        let body = raw[hashes..].strip_prefix('"')?;
+        let closing = format!("\"{}", "#".repeat(hashes));
+        let end = body.find(&closing)?;
+        return Some((body[..end].to_string(), hashes + 2 + end + closing.len()));
+    }
+    let mut chars = source.strip_prefix('"')?.char_indices();
+    let mut path = String::new();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '"' => return Some((path, index + 2)),
+            '\\' => match chars.next()?.1 {
+                '"' => path.push('"'),
+                '\'' => path.push('\''),
+                '\\' => path.push('\\'),
+                'n' => path.push('\n'),
+                'r' => path.push('\r'),
+                't' => path.push('\t'),
+                '0' => path.push('\0'),
+                'x' => {
+                    let hi = chars.next()?.1.to_digit(16)?;
+                    let lo = chars.next()?.1.to_digit(16)?;
+                    let value = hi * 16 + lo;
+                    if value > 0x7f {
+                        return None;
+                    }
+                    path.push(char::from_u32(value)?);
+                }
+                'u' => {
+                    if chars.next()?.1 != '{' {
+                        return None;
+                    }
+                    let mut digits = String::new();
+                    loop {
+                        match chars.next()?.1 {
+                            '}' => break,
+                            '_' => {}
+                            digit => digits.push(digit),
+                        }
+                    }
+                    path.push(char::from_u32(u32::from_str_radix(&digits, 16).ok()?)?);
+                }
+                '\n' => {
+                    while chars
+                        .clone()
+                        .next()
+                        .is_some_and(|(_, ch)| ch.is_whitespace())
+                    {
+                        chars.next();
+                    }
+                }
+                _ => return None,
+            },
+            _ => path.push(ch),
+        }
+    }
+    None
+}
+
 fn deps_for_bin(
     bin_name: &str,
     bin_rs: &Path,
@@ -322,6 +517,13 @@ fn deps_for_bin(
         let default_root = default_lib_root_for_bin(bin_name);
         if let Some(root_file) = resolve_lib_root_file(&default_root, repo_root) {
             collect_reachable(graph, interner, &root_file, &mut deps);
+        }
+    }
+
+    for file in deps.to_vec() {
+        let content = fs::read_to_string(&file).map_err(|e| format!("read {file:?}: {e}"))?;
+        for included in parse_include_paths(&content, &file) {
+            deps.insert(included);
         }
     }
 
@@ -457,6 +659,120 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_include_paths_resolves_literal_inputs() {
+        let source = r#"
+            const PROMPT: &str = include_str!("system_prompts/correctness_guardrails.md");
+            const DATA: &[u8] = include_bytes!("data/blob.bin");
+            include!("generated.rs");
+        "#;
+        let current_file = Path::new("src/bin/ai/driver/skill_runtime.rs");
+        let current_dir = current_file.parent().unwrap();
+        assert_eq!(
+            parse_include_paths(source, current_file),
+            vec![
+                current_dir.join("system_prompts/correctness_guardrails.md"),
+                current_dir.join("data/blob.bin"),
+                current_dir.join("generated.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_include_paths_handles_raw_strings() {
+        let source = r####"
+            include_str!(r"plain.md");
+            include_bytes!(r#"one.bin"#);
+            include!(r###"dir/a"b#c.rs"###);
+        "####;
+        assert_eq!(
+            parse_include_paths(source, Path::new("src/main.rs")),
+            vec![
+                PathBuf::from("src/plain.md"),
+                PathBuf::from("src/one.bin"),
+                PathBuf::from("src/dir/a\"b#c.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_include_paths_decodes_escaped_strings() {
+        let source = r#"include_str!("dir\\quoted\"file\u{2e}\x6d\x64");
+            include_str!("line\
+                joined.md");"#;
+        assert_eq!(
+            parse_include_paths(source, Path::new("src/main.rs")),
+            vec![
+                PathBuf::from("src/dir\\quoted\"file.md"),
+                PathBuf::from("src/linejoined.md")
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_include_paths_skips_comments_and_string_contents() {
+        let source = r###"
+            // include_str!("comment.md");
+            /* outer /* include!("nested.rs"); */ include_bytes!("comment.bin"); */
+            let text = "include_str!(\"quoted.md\")";
+            let raw = r#"" include!("raw.rs"); "#;
+            let bytes = br#"" include_bytes!("raw.bin"); "#;
+            let quote = '"';
+            let lifetime: &'static str = "text";
+            other_include_str!("other.md");
+            include_dir!("directory");
+            include_str /* name */ ! // delimiter
+                ( /* argument */ "real.md", /* trailing */ );
+            include_bytes!["real.bin"];
+            include! { "real.rs" }
+        "###;
+        assert_eq!(
+            parse_include_paths(source, Path::new("src/main.rs")),
+            vec![
+                PathBuf::from("src/real.md"),
+                PathBuf::from("src/real.bin"),
+                PathBuf::from("src/real.rs")
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_include_paths_skips_non_ascii_byte_strings() {
+        let source = r#"let _ = b"\xff";
+include_str!("real.md");"#;
+        assert_eq!(
+            parse_include_paths(source, Path::new("src/main.rs")),
+            vec![PathBuf::from("src/real.md")]
+        );
+    }
+
+    #[test]
+    fn parse_include_paths_handles_unclosed_literals_and_comments() {
+        for source in [
+            r#"let _ = "unterminated;"#,
+            r#"let _ = b"\xff;"#,
+            r###"let _ = br##"include_str!("fake.md");"#"###,
+            "/* outer /* inner */",
+        ] {
+            assert!(parse_include_paths(source, Path::new("src/main.rs")).is_empty());
+        }
+    }
+
+    #[test]
+    fn parse_include_paths_skips_non_literal_arguments() {
+        let source = r#"
+            include_str!(concat!("prompts/", "dynamic.md"));
+            include_bytes!(env!("ASSET_PATH"));
+            include!(GENERATED_PATH);
+            include_str!("prefix.md" + SUFFIX);
+            include_str!("literal.md");
+        "#;
+        assert_eq!(
+            parse_include_paths(source, Path::new("src/main.rs")),
+            vec![PathBuf::from("src/literal.md")]
+        );
+    }
+
+    #[test]
     fn deps_for_re_includes_bin_modules() {
         let cwd = env::current_dir().unwrap();
         let repo_root = find_repo_root(&cwd).unwrap();
@@ -504,6 +820,9 @@ mod tests {
                     .join("multiline")
                     .join("render.rs")
             )
+        );
+        assert!(
+            deps_set.contains(&bin_dir.join("ai/driver/system_prompts/correctness_guardrails.md"))
         );
     }
 }

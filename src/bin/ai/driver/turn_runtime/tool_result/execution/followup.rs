@@ -328,10 +328,16 @@ pub(in crate::ai::driver::turn_runtime) fn append_auto_image_followup_message(
         // persists only a `reference` to it, and the copy lives as long as the session.
         let assets_dir = crate::ai::history::SessionStore::new(app.config.history_file.as_path())
             .session_assets_dir(&app.session_id);
-        let snapshots = crate::ai::driver::input::snapshot_image_attachments(
+        // Image paths come from the tool-call arguments without checking whether the
+        // read succeeded, so a failed read must not kill the turn here: the tool
+        // error result already reports it to the model. Skip the followup instead.
+        let snapshots = match crate::ai::driver::input::snapshot_image_attachments(
             image_paths.to_vec(),
             &assets_dir,
-        )?;
+        ) {
+            Ok(snapshots) => snapshots,
+            Err(_) => return Ok(()),
+        };
         let request_content =
             crate::ai::request::build_content(&app.current_model, &question, &snapshots)?;
         let persisted_content = crate::ai::request::build_reference_content(

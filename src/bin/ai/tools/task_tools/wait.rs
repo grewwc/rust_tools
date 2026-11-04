@@ -1,3 +1,4 @@
+use super::quiet::TaskWaitReturnReason;
 use super::*;
 
 pub(super) static TASK_WAIT_STATES: LazyLock<Mutex<FxHashMap<TaskWaitKey, TaskWaitState>>> =
@@ -200,7 +201,15 @@ pub(crate) fn wake_expired_task_waits() {
                 continue;
             }
             let message = if state.agent_team_mode {
-                super::quiet::format_agent_team_task_wait(&key.task_ids)
+                // The deadline is the original wait instant plus its budget. Include any
+                // scheduler delay in this wake notice, using only monotonic durations.
+                let waited = Duration::from_secs(state.timeout_secs)
+                    .saturating_add(Instant::now().saturating_duration_since(state.deadline));
+                super::quiet::format_agent_team_task_wait(
+                    &key.task_ids,
+                    TaskWaitReturnReason::BudgetElapsed,
+                    waited,
+                )
             } else {
                 let task_ids = key.task_ids.join(", ");
                 let mut message = format!(
@@ -403,6 +412,8 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     // A real wait (still-pending tasks) proves the model is not stuck polling delivered ids, so
     // reset the no-op escalation counter for this key.
     reset_task_wait_noop_count(&wait_key);
+    // Measure this invocation separately from the budget retained across cooperative parks.
+    let wait_started_at = Instant::now();
     let wait_state = load_or_create_task_wait_state(&wait_key, timeout_secs, agent_team_mode);
     let wait_budget_elapsed = wait_state.expired;
 
@@ -533,7 +544,11 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                     .map(|(tid, _)| tid.clone())
                     .collect::<Vec<_>>();
                 let parked_message = if agent_team_mode {
-                    super::quiet::format_agent_team_task_wait(&still_pending)
+                    super::quiet::format_agent_team_task_wait(
+                        &still_pending,
+                        TaskWaitReturnReason::Parked,
+                        Instant::now().saturating_duration_since(wait_started_at),
+                    )
                 } else {
                     let mut parked_message = format!(
                         "[task_wait PARKED] Yielded CPU so {} pending subagent task(s) can run. \
@@ -581,7 +596,16 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 .iter()
                 .map(|(tid, _)| tid.clone())
                 .collect::<Vec<_>>();
-            parts.push(super::quiet::format_agent_team_task_wait(&pending_ids));
+            let reason = if wait_budget_elapsed {
+                TaskWaitReturnReason::BudgetElapsed
+            } else {
+                TaskWaitReturnReason::ResultsReady
+            };
+            parts.push(super::quiet::format_agent_team_task_wait(
+                &pending_ids,
+                reason,
+                Instant::now().saturating_duration_since(wait_started_at),
+            ));
         }
         clear_task_wait_state(&wait_key);
         return Ok(parts.join("\n\n---\n\n"));
@@ -589,7 +613,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     // `any` exists to return the first finisher without blocking on the rest. Once the wait
     // budget has already elapsed, the owner was woken for the timeout, so returning ready
     // results alone would hide the still-pending tasks and clear the elapsed wait state.
-    // Fall through to the elapsed branch, which reports both ready output and pending ids.
+    // Fall through to the pending status branch, which reports ready output and pending ids.
     if wait_policy == WaitPolicy::Any && !ready.is_empty() && !wait_budget_elapsed {
         clear_task_wait_state(&wait_key);
         return Ok(append_lone_spawn_hint(
@@ -611,27 +635,55 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             WaitPolicy::Any => "any",
             WaitPolicy::All => "all",
         };
-        let elapsed_message = if agent_team_mode {
-            super::quiet::format_agent_team_task_wait(&pending_ids)
+        // A ready cancel/completion source can return without suspension or a terminal result.
+        let reason = if wait_budget_elapsed {
+            TaskWaitReturnReason::BudgetElapsed
+        } else if crate::ai::tools::registry::common::is_tool_cancel_requested() {
+            TaskWaitReturnReason::Interrupted
         } else {
-            let mut elapsed_message = format!(
-                "[task_wait BUDGET ELAPSED] {} pending subagent task(s) still running in the background. \
+            TaskWaitReturnReason::Woke
+        };
+        let pending_message = if agent_team_mode {
+            super::quiet::format_agent_team_task_wait(
+                &pending_ids,
+                reason,
+                Instant::now().saturating_duration_since(wait_started_at),
+            )
+        } else {
+            let mut pending_message = if wait_budget_elapsed {
+                format!(
+                    "[task_wait BUDGET ELAPSED] {} pending subagent task(s) still running in the background. \
             wait_policy={policy_label}, timeout_secs={timeout_secs}. The subagent(s) are NOT stalled and NOT cancelled; \
             their result channels and completion futexes remain alive. \
             Pending task_ids: [{}]. \
             Next steps: call `task_status` for a snapshot, or call `task_wait` again with the same task_ids to keep waiting \
             (consider `wait_policy=\"any\"` if you only need the first finisher).",
-                pending.len(),
-                pending_ids.join(", ")
-            );
+                    pending.len(),
+                    pending_ids.join(", ")
+                )
+            } else {
+                let (label, cause) = if matches!(reason, TaskWaitReturnReason::Interrupted) {
+                    ("INTERRUPTED", "Tool cancellation interrupted this wait")
+                } else {
+                    ("WOKE", "A wait source became ready")
+                };
+                format!(
+                    "[task_wait {label}] {cause}. {} pending subagent task(s) still running in the background. \
+                     wait_policy={policy_label}, timeout_secs={timeout_secs}. The wait budget has not elapsed; \
+                     subagent result channels and completion futexes remain alive. Pending task_ids: [{}]. \
+                     Call `task_status` for a snapshot, or re-call `task_wait` with the same task_ids to keep waiting.",
+                    pending.len(),
+                    pending_ids.join(", ")
+                )
+            };
             with_os_kernel(|os| {
-                append_task_progress_snapshots(os, &mut elapsed_message, &pending_ids);
+                append_task_progress_snapshots(os, &mut pending_message, &pending_ids);
                 Ok(())
             })?;
-            append_pending_task_side_note_summaries(&mut elapsed_message, &pending_ids);
-            elapsed_message
+            append_pending_task_side_note_summaries(&mut pending_message, &pending_ids);
+            pending_message
         };
-        parts.push(elapsed_message);
+        parts.push(pending_message);
         clear_task_wait_state(&wait_key);
         return Ok(append_lone_spawn_hint(
             parts.join("\n\n---\n\n"),

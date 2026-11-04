@@ -1144,6 +1144,7 @@ async fn run_loop(
         if signal::take_parked_foreground_interrupt() {
             agent_routing::interrupt_pending_foreground_process(app);
         }
+        agent_routing::wake_pending_foreground_side_note(app);
 
         let fg_proc = {
             let mut os = app.os.lock().unwrap();

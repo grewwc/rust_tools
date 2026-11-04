@@ -40,6 +40,9 @@ parent must keep. Delegate every piece of execution that can be specified in a
 self-contained prompt, including breakdown and implementation design, and keep
 the parent focused on scope, scheduling, acceptance, and synthesis of the
 user-facing answer.
+Keep pre-spawn parent reasoning at the checkpoint level; do not compare
+solutions or draft the answer before spawning. Being answerable from general
+knowledge is never a reason to keep analysis in the parent.
 
 This is a requirement, not a quota: do not invent work, but the bar for keeping
 work in the parent is "delegation is impossible or unsafe", not "it looks
@@ -94,8 +97,11 @@ also cannot waive delegation; these heuristics only shape a worker's assignment.
 
 The parent may execute directly only when one of these holds:
 
-- the turn requires no execution tools (a decision, explanation, or status
-  answer);
+- the turn requires no execution tools: no delegated evidence, verification,
+  or artifact could materially improve the answer. A decision, explanation, or
+  status answer that any inspectable source (files, code, commands, documents,
+  network sources, prior artifacts) or worker check could ground or verify
+  does not qualify;
 - the action is the user-facing acceptance decision, or the review of evidence a
   worker already returned;
 - delegation is impossible (no backend or task tools) or unsafe;
@@ -151,8 +157,9 @@ This workflow takes precedence over routine startup checks, status polling, and
 post-wait status rechecks described elsewhere in this skill.
 
 - When blocked on results, prefer one `task_wait` with `wait_policy=all`. The
-  runtime uses a 240s quiet deadline and delivers terminal results as they arrive;
-  deadline expiry is normal scheduling and does not prove a stall.
+  runtime uses a 30s default budget per call (60s maximum) and delivers terminal
+  results as they arrive; budget expiry is normal scheduling and does not prove
+  a stall.
 - Avoid `task_status` polling. Request a targeted status snapshot only when a
   scheduling or cancellation decision needs the current state.
 - Use `task_evidence_read` for detail, including `source=delivered` for claims
@@ -182,7 +189,7 @@ Network and workspace access follow `inherit` for fresh traecli runs: without `c
 - Do not let scheduling expand into execution: outside the trivial atomic exception, do not run a read or command that gathers or verifies evidence; if a worker could do it from a self-contained prompt, delegate it.
 - Treat subagent output as evidence to review, not authority. Double-check decision-bearing claims and inspect the edits workers report before accepting them.
 - A folded, truncated, or checkpointed task result is a locator, not evidence. Before repeating numbers, quoted output, or absence claims, read the delivered payload with `task_evidence_read(source=delivered)` or the named archive; the inline preview is only a recall anchor. Do not mark a task integrated until that read is done and the claims you will reuse are checked.
-- Follow the runtime task-tool guidance for integration, evidence recovery, and retries. Wait only when blocked on results, with the full 240s `task_wait` budget; `PARKED` or `TIMEOUT` is normal scheduling, not a stall signal, and is never a reason to cancel. While `task_status` shows recent `last activity` or advancing progress, keep waiting. Cancel a branch when its scope changed, it failed, a fresh `task_status` snapshot confirms sustained zero progress, or its result is no longer needed; once the task's acceptance criteria are met, cancel remaining low-value or superseded branches instead of awaiting them.
+- Follow the runtime task-tool guidance for integration, evidence recovery, and retries. Wait only when blocked on results, with a `task_wait` budget of 30s by default (60s maximum per call); `PARKED` or budget expiry is normal scheduling, not a stall signal, and is never a reason to cancel. While `task_status` shows recent `last activity` or advancing progress, keep waiting. Cancel a branch when its scope changed, it failed, a fresh `task_status` snapshot confirms sustained zero progress, or its result is no longer needed; once the task's acceptance criteria are met, cancel remaining low-value or superseded branches instead of awaiting them.
 - Synthesize one coherent final answer. Do not dump raw subagent transcripts or make the user coordinate the team.
 
 ## Backend selection and rework loop

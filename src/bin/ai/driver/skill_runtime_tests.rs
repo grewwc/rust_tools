@@ -1560,7 +1560,7 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     assert!(prompt.contains("in evidence observed in this session"));
     assert!(
         prompt.contains(
-            "Investigate an unresolved fact only when it can materially change the answer"
+            "Continue only to close the request's unresolved conditions with evidence or a valid derivation"
         )
     );
     assert!(prompt.contains("claims of success require successful results"));
@@ -1571,7 +1571,7 @@ fn system_prompt_forbids_guessing_without_sufficient_evidence() {
     assert!(prompt.contains("Evidence stays with the subject it was measured on"));
     // The stop-investigation boundary is single-sourced in guardrails; the
     // convergence block states only task-completion reporting.
-    assert_eq!(prompt.matches("Omit optional unsupported claims rather than researching them merely to strengthen the answer").count(), 1);
+    assert_eq!(prompt.matches("Continue only to close the request's unresolved conditions with evidence or a valid derivation").count(), 1);
 }
 
 #[test]
@@ -1624,7 +1624,9 @@ fn system_prompt_answers_stable_general_knowledge_without_a_probe() {
     assert!(
         prompt.contains("Where execution settles a material claim that deduction cannot close")
     );
-    assert!(prompt.contains("An explicit request to check a fact makes it part of delivery"));
+    assert!(prompt.contains(
+        "Before acting, identify the request's acceptance conditions; omissions waive no requirements."
+    ));
 }
 
 #[test]
@@ -1743,15 +1745,15 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "but do not fix it without user approval",
                     "**Preserve existing changes.**",
                     "**Evidence provenance.**",
-                    "Once evidence or a valid derivation settles the question at the task's required scope",
-                    "reopen only for a material change, contradiction, or untested dependency",
-                    "Investigate an unresolved fact only when it can materially change the answer, the requested action, or a necessary safety judgment",
-                    "An explicit request to check a fact makes it part of delivery",
-                    "Complete requested actions and necessary verification, then answer with what the evidence supports",
-                    "Omit optional unsupported claims rather than researching them merely to strengthen the answer",
+                    "Stopping with any required condition unverified is failure; deliver only when all are closed and NEVER recheck closed conditions for confidence or reassurance.",
+                    "Reopen only for a material change, contradiction, or untested dependency.",
+                    "Continue only to close the request's unresolved conditions with evidence or a valid derivation, including checks needed to establish closure and required compilation or focused tests after code changes.",
+                    "Before acting, identify the request's acceptance conditions; omissions waive no requirements.",
+                    "Stopping with any required condition unverified is failure",
+                    "Continue only to close the request's unresolved conditions with evidence or a valid derivation",
                     "If an important gap cannot be resolved, state what is verified, what is unknown, and what would settle it",
-                    "do not repeat settled reasoning",
-                    "a verification rule or checklist is not a reason to keep checking",
+                    "NEVER recheck closed conditions for confidence or reassurance",
+                    "Continue only to close the request's unresolved conditions with evidence or a valid derivation, including checks needed to establish closure and required compilation or focused tests after code changes. Stopping with any required condition unverified is failure; deliver only when all are closed and NEVER recheck closed conditions for confidence or reassurance.",
                     "Use the fewest checks sufficient to cover the acceptance conditions, not a fixed check count",
                     "Complete required authorization, safety checks, impact mapping, and edit-target inspection before acting",
                     "If an action is deferred beyond this turn, report it as scheduled, not completed",
@@ -1898,7 +1900,7 @@ fn system_prompt_evidence_decisions_survive_modes_and_overrides() {
                     "Where the conclusion follows deductively from inspected code or math, state the derivation instead of adding executed tests to re-prove it"
                 ));
                 assert_eq!(
-                    prompt.matches("Omit optional unsupported claims").count(),
+                    prompt.matches("Continue only to close the request's unresolved conditions with evidence or a valid derivation").count(),
                     1
                 );
                 assert!(
@@ -2092,8 +2094,10 @@ fn system_prompt_bounds_tool_exploration() {
         .render_system_prompt();
     assert!(prompt.contains("Give every call a concrete decision goal"));
     assert!(prompt.contains("how the result could change the answer or next action"));
-    assert!(prompt.contains("Reuse adequate evidence"));
-    assert!(prompt.contains("reopen only for a material change, contradiction, or untested dependency that matters to this request"));
+    assert!(prompt.contains("NEVER recheck closed conditions for confidence or reassurance"));
+    assert!(prompt.contains(
+        "Reopen only for a material change, contradiction, or untested dependency."
+    ));
     assert!(prompt.contains("before exploring, decide which question it answers"));
     assert!(prompt.contains("Do not batch code reads or reread visible content"));
 }
@@ -2111,7 +2115,7 @@ fn system_prompt_uses_success_criteria_for_normal_and_goal_convergence() {
     assert!(normal.contains("<task_convergence>"));
     assert!(normal.contains("task-level success criteria"));
     assert!(normal.contains(
-        "Once evidence or a valid derivation settles the question at the task's required scope"
+        "Stopping with any required condition unverified is failure; deliver only when all are closed and NEVER recheck closed conditions for confidence or reassurance."
     ));
     assert!(normal.contains("Stopping investigation is not stopping execution"));
     assert!(normal.contains("perform it and verify its relevant outcome"));

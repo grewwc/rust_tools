@@ -10,6 +10,10 @@ use std::{
 use rust_tools::commonw::FastSet;
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
+/// Negative-cache TTL for failed/empty discoveries. A transient spawn failure
+/// or timeout must not blank completion for the full success TTL, while
+/// back-to-back Tab presses still must not respawn a missing CLI every time.
+const FAILURE_CACHE_TTL: Duration = Duration::from_secs(5);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_OUTPUT_BYTES: u64 = 128 * 1024;
 
@@ -27,13 +31,20 @@ impl ModelCache {
         now: Instant,
         discover: impl FnOnce() -> Vec<String>,
     ) -> Vec<String> {
-        if self.binary != binary
-            || self
-                .refreshed_at
-                .is_none_or(|at| now.duration_since(at) >= CACHE_TTL)
-        {
-            // Cache failures as an empty list too, so repeated Tab presses do
-            // not repeatedly start a missing or broken CLI.
+        // Empty results are failures (spawn error, timeout, unparsable output):
+        // re-probe after a short TTL instead of the full success TTL.
+        let expired = match self.refreshed_at {
+            None => true,
+            Some(at) => {
+                let ttl = if self.names.is_empty() {
+                    FAILURE_CACHE_TTL
+                } else {
+                    CACHE_TTL
+                };
+                now.duration_since(at) >= ttl
+            }
+        };
+        if self.binary != binary || expired {
             self.names = discover();
             self.binary = binary.to_string();
             self.refreshed_at = Some(now);
@@ -219,6 +230,14 @@ mod tests {
                     "failed lookup must be cached"
                 ))
                 .is_empty()
+        );
+        // A transient failure must recover quickly, not linger for the full
+        // success TTL: past the short failure TTL the next lookup re-probes.
+        assert_eq!(
+            cache.get_or_refresh("absent", now + FAILURE_CACHE_TTL, || vec![
+                "M-recovered".to_string()
+            ]),
+            ["M-recovered"]
         );
         assert!(discover_model_names("/definitely/not/a/traecli-binary").is_empty());
     }

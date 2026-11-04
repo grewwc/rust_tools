@@ -1008,6 +1008,40 @@ fn runtime_synthetic_user_auto_image_followup_is_multimodal() {
 }
 
 #[test]
+fn auto_image_followup_skips_missing_file_without_failing_turn() {
+    // A failed image read is already reported to the model as a tool error
+    // result; the followup snapshot must not turn it into a turn failure.
+    let mut app = test_app_with_tools(&[]);
+    let dir = std::env::temp_dir().join(format!("tool-followup-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    app.config.history_file = dir.join("history.sqlite");
+    let missing = dir.join("gone.png");
+    app.current_model = crate::ai::model_names::all()
+        .iter()
+        .find(|m| m.is_vl)
+        .map(|m| m.name.clone())
+        .expect("model registry must contain at least one VL model");
+
+    let mut messages = Vec::new();
+    let mut turn_messages = Vec::new();
+    let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+    append_auto_image_followup_message(
+        &app,
+        "describe the file",
+        &shared_mcp,
+        &[missing.to_string_lossy().to_string()],
+        &mut messages,
+        &mut turn_messages,
+    )
+    .unwrap();
+
+    assert!(messages.is_empty());
+    assert!(turn_messages.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn empty_response_retry_note_is_idempotent_and_clears_stale_hints() {
     // A stale truncation hint must not survive: an empty response invalidates the
     // previous "shrink your output" instruction, so the two signals never stack.
